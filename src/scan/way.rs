@@ -85,7 +85,8 @@ struct ResolvedTagIndices {
 /// Extract way IDs and their node refs from decompressed PrimitiveBlock bytes.
 ///
 /// For each way, calls `callback(way_id, &refs)` where refs is the decoded
-/// node ID list. Uses a caller-provided `refs_buf` to avoid per-way allocation.
+/// node ID list, including an empty list for zero-ref ways. Uses a
+/// caller-provided `refs_buf` to avoid per-way allocation.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub(crate) fn scan_way_refs(
     decompressed: &[u8],
@@ -173,10 +174,8 @@ fn parse_way_refs(
     use crate::read::wire::WireWay;
 
     let way = WireWay::parse(way_data)?;
-    if way.refs_data.is_empty() {
-        return Ok(());
-    }
-
+    // Emit every Way, including zero-ref ways: the external location join
+    // records one refcount per callback and consumes one per Way at assembly.
     refs_buf.clear();
     accumulate_refs(way.refs_data, refs_buf)?;
     callback(way.id, refs_buf);
@@ -500,6 +499,17 @@ mod tests {
     }
 
     #[test]
+    fn empty_refs_emit_a_way_and_clear_the_previous_refs() {
+        let mut block = way_block(10, &[], false);
+        block.extend(way_block(11, &[7], true));
+        block.extend(way_block(12, &[], true));
+        assert_eq!(
+            collect(&block),
+            vec![(10, vec![]), (11, vec![7]), (12, vec![])]
+        );
+    }
+
+    #[test]
     fn a_single_unpacked_ref_is_not_read_as_no_refs() {
         // The old matcher took `(8, WIRE_LEN)` only, so an unpacked `refs`
         // fell to `skip_field`, `refs_data` stayed `None`, and the callback
@@ -520,10 +530,11 @@ mod tests {
     }
 
     #[test]
-    fn a_way_with_no_refs_yields_no_callback() {
-        assert!(
-            collect(&way_block(42, &[], true)).is_empty(),
-            "a way with an empty refs array contributes nothing"
+    fn a_way_with_no_refs_yields_an_empty_callback() {
+        assert_eq!(
+            collect(&way_block(42, &[], true)),
+            vec![(42, vec![])],
+            "a zero-ref way is reported with an empty refs list"
         );
     }
 }

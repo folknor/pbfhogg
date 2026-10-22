@@ -421,9 +421,11 @@ impl BlockBuilder {
         let lat = i64::from(decimicro_lat);
         let lon = i64::from(decimicro_lon);
 
-        self.dense_ids.push(id - self.last_dense_id);
-        self.dense_lats.push(lat - self.last_dense_lat);
-        self.dense_lons.push(lon - self.last_dense_lon);
+        // Dense fields store signed deltas. Preserve their two's-complement
+        // wire values explicitly so debug and release builds encode alike.
+        self.dense_ids.push(id.wrapping_sub(self.last_dense_id));
+        self.dense_lats.push(lat.wrapping_sub(self.last_dense_lat));
+        self.dense_lons.push(lon.wrapping_sub(self.last_dense_lon));
 
         self.last_dense_id = id;
         self.last_dense_lat = lat;
@@ -469,22 +471,23 @@ impl BlockBuilder {
 
         // Timestamp - delta-encoded
         self.dense_timestamps
-            .push(meta.timestamp - self.last_dense_timestamp);
+            .push(meta.timestamp.wrapping_sub(self.last_dense_timestamp));
         self.last_dense_timestamp = meta.timestamp;
 
         // Changeset - delta-encoded
         self.dense_changesets
-            .push(meta.changeset - self.last_dense_changeset);
+            .push(meta.changeset.wrapping_sub(self.last_dense_changeset));
         self.last_dense_changeset = meta.changeset;
 
         // UID - delta-encoded
-        self.dense_uids.push(meta.uid - self.last_dense_uid);
+        self.dense_uids
+            .push(meta.uid.wrapping_sub(self.last_dense_uid));
         self.last_dense_uid = meta.uid;
 
         // User SID - delta-encoded
         let user_sid = self.string_table.add(meta.user) as i32;
         self.dense_user_sids
-            .push(user_sid - self.last_dense_user_sid);
+            .push(user_sid.wrapping_sub(self.last_dense_user_sid));
         self.last_dense_user_sid = user_sid;
 
         // Visible (only meaningful for history files, but we preserve it)
@@ -513,20 +516,25 @@ impl BlockBuilder {
     /// in a block that already has metadata from other nodes.
     ///
     /// Delta-encodes the transition back to zero for all fields so that a
-    /// subsequent node with real metadata can delta from zero correctly.
+    /// subsequent node with real metadata can delta from zero correctly. The
+    /// signed minimum has no positive counterpart, so these wire deltas use
+    /// two's-complement wrapping when negating it.
     fn push_default_dense_metadata(&mut self) {
         self.dense_versions.push(0);
 
-        self.dense_timestamps.push(-self.last_dense_timestamp);
+        self.dense_timestamps
+            .push(self.last_dense_timestamp.wrapping_neg());
         self.last_dense_timestamp = 0;
 
-        self.dense_changesets.push(-self.last_dense_changeset);
+        self.dense_changesets
+            .push(self.last_dense_changeset.wrapping_neg());
         self.last_dense_changeset = 0;
 
-        self.dense_uids.push(-self.last_dense_uid);
+        self.dense_uids.push(self.last_dense_uid.wrapping_neg());
         self.last_dense_uid = 0;
 
-        self.dense_user_sids.push(-self.last_dense_user_sid);
+        self.dense_user_sids
+            .push(self.last_dense_user_sid.wrapping_neg());
         self.last_dense_user_sid = 0;
 
         self.dense_visibles.push(true);
@@ -705,9 +713,9 @@ impl BlockBuilder {
 
         let lat = i64::from(decimicro_lat);
         let lon = i64::from(decimicro_lon);
-        self.dense_ids.push(id - self.last_dense_id);
-        self.dense_lats.push(lat - self.last_dense_lat);
-        self.dense_lons.push(lon - self.last_dense_lon);
+        self.dense_ids.push(id.wrapping_sub(self.last_dense_id));
+        self.dense_lats.push(lat.wrapping_sub(self.last_dense_lat));
+        self.dense_lons.push(lon.wrapping_sub(self.last_dense_lon));
         self.last_dense_id = id;
         self.last_dense_lat = lat;
         self.last_dense_lon = lon;
@@ -846,16 +854,19 @@ impl BlockBuilder {
     fn add_dense_metadata_raw(&mut self, meta: &RawMetadata) {
         self.has_dense_metadata = true;
         self.dense_versions.push(meta.version);
+        // Raw signed metadata uses the same wrapping wire-delta convention as
+        // values decoded and re-encoded through `add_dense_metadata`.
         self.dense_timestamps
-            .push(meta.timestamp - self.last_dense_timestamp);
+            .push(meta.timestamp.wrapping_sub(self.last_dense_timestamp));
         self.last_dense_timestamp = meta.timestamp;
         self.dense_changesets
-            .push(meta.changeset - self.last_dense_changeset);
+            .push(meta.changeset.wrapping_sub(self.last_dense_changeset));
         self.last_dense_changeset = meta.changeset;
-        self.dense_uids.push(meta.uid - self.last_dense_uid);
+        self.dense_uids
+            .push(meta.uid.wrapping_sub(self.last_dense_uid));
         self.last_dense_uid = meta.uid;
         self.dense_user_sids
-            .push(meta.user_sid - self.last_dense_user_sid);
+            .push(meta.user_sid.wrapping_sub(self.last_dense_user_sid));
         self.last_dense_user_sid = meta.user_sid;
         self.dense_visibles.push(meta.visible);
     }
@@ -1148,7 +1159,7 @@ impl BlockBuilder {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{BlockBuilder, MemberData};
+    use super::{BlockBuilder, MemberData, Metadata, RawMetadata};
     use crate::{MemberId, MemberType};
 
     /// A ref/location length mismatch must not reach the encoder.
@@ -1372,5 +1383,91 @@ mod tests {
             !bb.should_flush(),
             "a fresh builder holds nothing regardless of its cap"
         );
+    }
+
+    #[test]
+    fn dense_node_id_deltas_wrap_at_signed_boundaries() {
+        let mut bb = BlockBuilder::new();
+        bb.add_node(-1, 0, 0, [], None);
+        bb.add_node(i64::MAX, 0, 0, [], None);
+
+        assert_eq!(bb.dense_ids, [-1, i64::MIN]);
+        assert!(bb.take().unwrap().is_some());
+    }
+
+    #[test]
+    fn dense_metadata_deltas_wrap_at_signed_boundaries() {
+        let mut bb = BlockBuilder::new();
+        let first = Metadata {
+            version: 1,
+            timestamp: i64::MAX,
+            changeset: i64::MAX,
+            uid: i32::MAX,
+            user: "first",
+            visible: true,
+        };
+        let next = Metadata {
+            version: 1,
+            timestamp: -1,
+            changeset: -1,
+            uid: -1,
+            user: "next",
+            visible: true,
+        };
+        bb.add_node(1, 0, 0, [], Some(&first));
+        bb.add_node(2, 0, 0, [], Some(&next));
+
+        assert_eq!(bb.dense_timestamps, [i64::MAX, i64::MIN]);
+        assert_eq!(bb.dense_changesets, [i64::MAX, i64::MIN]);
+        assert_eq!(bb.dense_uids, [i32::MAX, i32::MIN]);
+        assert!(bb.take().unwrap().is_some());
+    }
+
+    #[test]
+    fn raw_dense_metadata_deltas_wrap_at_signed_boundaries() {
+        let mut bb = BlockBuilder::new();
+        let first = RawMetadata {
+            version: 1,
+            timestamp: i64::MAX,
+            changeset: i64::MAX,
+            uid: i32::MAX,
+            user_sid: i32::MAX,
+            visible: true,
+        };
+        let next = RawMetadata {
+            version: 1,
+            timestamp: -1,
+            changeset: -1,
+            uid: -1,
+            user_sid: -1,
+            visible: true,
+        };
+        bb.add_dense_metadata_raw(&first);
+        bb.add_dense_metadata_raw(&next);
+
+        assert_eq!(bb.dense_timestamps, [i64::MAX, i64::MIN]);
+        assert_eq!(bb.dense_changesets, [i64::MAX, i64::MIN]);
+        assert_eq!(bb.dense_uids, [i32::MAX, i32::MIN]);
+        assert_eq!(bb.dense_user_sids, [i32::MAX, i32::MIN]);
+    }
+
+    #[test]
+    fn missing_dense_metadata_wraps_the_transition_back_to_zero() {
+        let mut bb = BlockBuilder::new();
+        let min_metadata = Metadata {
+            version: 1,
+            timestamp: i64::MIN,
+            changeset: i64::MIN,
+            uid: i32::MIN,
+            user: "minimum",
+            visible: true,
+        };
+        bb.add_node(1, 0, 0, [], Some(&min_metadata));
+        bb.add_node(2, 0, 0, [], None);
+
+        assert_eq!(bb.dense_timestamps, [i64::MIN, i64::MIN]);
+        assert_eq!(bb.dense_changesets, [i64::MIN, i64::MIN]);
+        assert_eq!(bb.dense_uids, [i32::MIN, i32::MIN]);
+        assert!(bb.take().unwrap().is_some());
     }
 }

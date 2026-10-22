@@ -299,7 +299,10 @@ pub(super) fn build_node_index_sparse(
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("altw_pass1_store_bytes", total_bytes as i64);
 
-    let file = open_anonymous_sparse_file(scratch_dir, total_bytes, host, token)?;
+    // No referenced nodes (e.g. every way has zero refs): posix_fallocate and
+    // mmap both reject a zero length, so back the store with one unused slot.
+    // `capacity_bytes` below stays at `total_bytes`, so no rank can address it.
+    let file = open_anonymous_sparse_file(scratch_dir, total_bytes.max(8), host, token)?;
 
     // SAFETY: file is exclusively owned, opened read+write, sized to total_bytes.
     let mut mmap = unsafe {

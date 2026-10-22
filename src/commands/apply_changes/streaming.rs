@@ -125,7 +125,7 @@ pub(super) struct StreamingChannels {
     /// Drain inputs. Workers send `DrainItem`s directly so the drain has
     /// one unified input stream (the
     /// scanner's fast-path `DrainItem::CopyRange` and worker outputs
-    /// merge into the same byte-budget reorder buffer keyed by global
+    /// merge into the same unbounded reorder buffer keyed by global
     /// seq).
     pub drain_tx: mpsc::SyncSender<DrainItem>,
 }
@@ -210,7 +210,7 @@ impl WorkerCounters {
 /// Errors are not returned: every one, setup or per-blob, is published to
 /// `cfg.failure` while the failing thread still holds a drain sender (the
 /// drain's post-disconnect check relies on that ordering), and the drain
-/// returns it. Worker panics are not caught and unwind through the scope.
+/// returns it. Worker panics are caught and published before sender release.
 ///
 /// The `drain_tx` clone owned by this function is dropped on return;
 /// downstream drain sees `Disconnected` once every worker's clone is
@@ -285,27 +285,31 @@ pub(super) fn run_workers(
             let diff = &*diff;
 
             scope.spawn(move || {
-                let result = worker_loop(
-                    worker_id,
-                    file,
-                    candidate_rx,
-                    &drain_tx,
-                    counters,
-                    ranges,
-                    diff,
-                    locations_on_ways,
-                    coord_slot.as_ref(),
-                    loc_map_handle.as_ref(),
-                    needed_set.as_deref(),
-                    &compression,
-                    use_copy_range,
-                    #[cfg(feature = "test-hooks")]
-                    panic_at_blob_seq,
-                );
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker_loop(
+                        worker_id,
+                        file,
+                        candidate_rx,
+                        &drain_tx,
+                        counters,
+                        ranges,
+                        diff,
+                        locations_on_ways,
+                        coord_slot.as_ref(),
+                        loc_map_handle.as_ref(),
+                        needed_set.as_deref(),
+                        &compression,
+                        use_copy_range,
+                        #[cfg(feature = "test-hooks")]
+                        panic_at_blob_seq,
+                    )
+                }));
                 // Publish before this closure returns: `drain_tx` (moved in
                 // above) is only dropped after it.
-                if let Err(e) = result {
-                    failure.publish(e);
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => failure.publish(e),
+                    Err(payload) => failure.publish_panic("streaming worker", &*payload),
                 }
                 drop(drain_tx);
             });
@@ -364,8 +368,8 @@ fn worker_loop(
 
         // Test-only: arm this from `MergeOptions::with_panic_at_blob_seq`
         // to trigger a mid-stream worker panic at a deterministic point,
-        // exercising the worker-panic -> scope-join -> scratch-cleanup
-        // recovery path. Production builds don't compile this block.
+        // exercising panic publication, barrier shutdown and scratch cleanup.
+        // Production builds don't compile this block.
         #[cfg(feature = "test-hooks")]
         {
             let seq = match &item {

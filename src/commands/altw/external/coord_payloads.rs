@@ -107,10 +107,10 @@ pub(super) struct ConcurrentBlobLocationRouter {
     // stage-4 waiters at any moment) and avoids per-slot Condvar
     // allocation at planet (~57K blobs would be ~3 MB of Condvars).
     notify: std::sync::Condvar,
-    // Dummy mutex paired with `notify` for Condvar::wait. Waiters lock
-    // the slot mutex to check the predicate, release it, then lock this
-    // dummy to wait. This is OK because Condvar::wait only requires
-    // *some* mutex, not the one guarding the predicate state.
+    // Notification gate: every publisher locks this after changing its
+    // predicate, before notifying. Waiters hold it from their final predicate
+    // check until Condvar::wait atomically unlocks it and starts waiting.
+    // Slot locks are released before publishers take this gate.
     notify_mu: std::sync::Mutex<()>,
     aborted: std::sync::atomic::AtomicBool,
     producer_done: std::sync::atomic::AtomicBool,
@@ -220,7 +220,7 @@ impl ConcurrentBlobLocationRouter {
             s.num_worker += 1;
             s.worker_bytes += byte_length;
         }
-        self.notify.notify_all();
+        self.notify_waiters();
         Ok(())
     }
 
@@ -301,8 +301,20 @@ impl ConcurrentBlobLocationRouter {
             s.straddler_bytes += byte_len;
             s.straddler_encode_ns += encode_ns;
         }
-        self.notify.notify_all();
+        self.notify_waiters();
         Ok(())
+    }
+
+    /// Pair notifications with the waiter's final predicate check. Updating
+    /// slots before taking this gate keeps publication and encoding parallel;
+    /// the gate only prevents a notification from passing a waiter between
+    /// its last check and the atomic unlock-and-wait operation.
+    fn notify_waiters(&self) {
+        let _guard = self
+            .notify_mu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.notify.notify_all();
     }
 
     /// Signal that stage 3 has finished producing. Any `wait_ready` caller
@@ -311,7 +323,7 @@ impl ConcurrentBlobLocationRouter {
     pub(super) fn mark_producer_done(&self) {
         self.producer_done
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.notify.notify_all();
+        self.notify_waiters();
     }
 
     /// Signal a terminal failure. Wakes all waiters; subsequent waits and
@@ -328,7 +340,7 @@ impl ConcurrentBlobLocationRouter {
         }
         self.aborted
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.notify.notify_all();
+        self.notify_waiters();
     }
 
     pub(super) fn is_aborted(&self) -> bool {
@@ -359,13 +371,9 @@ impl ConcurrentBlobLocationRouter {
                 .notify_mu
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // Re-check predicates under the notify mutex to avoid a missed
-            // wakeup. Publishers take slot-mu, set slot, drop slot-mu,
-            // then notify_all. Waiters check slot-mu first, release it,
-            // then lock notify-mu and re-check - so if the publisher
-            // notified between our slot check and our notify-mu acquire,
-            // we see the populated slot on the re-check. If it notified
-            // after we acquire notify-mu, wait picks up the notification.
+            // Publishers release their predicate locks before taking
+            // notify_mu to notify. A change after this check therefore cannot
+            // notify until wait has atomically released notify_mu and parked.
             if self.aborted.load(std::sync::atomic::Ordering::SeqCst) {
                 drop(mu_guard);
                 let err = self
@@ -993,6 +1001,89 @@ mod tests {
         encode_blob_payload(&cb, &decoded, &mut from_decoded).expect("encode decoded");
 
         assert_eq!(from_record, from_decoded);
+    }
+
+    #[test]
+    fn every_router_notification_waits_for_the_final_check_gate() {
+        use std::sync::atomic::Ordering::SeqCst;
+        use std::time::{Duration, Instant};
+
+        // Hold the gate exactly where wait_ready holds it after its last
+        // predicate check. Every event must wait for the atomic unlock/wait,
+        // including completion and abort, which may be the final event.
+        for event in 0..4 {
+            let pwr = make_per_way_rcs(&[&[1]]);
+            let router = ConcurrentBlobLocationRouter::new(&pwr, vec![]).expect("router");
+            let gate = router.notify_mu.lock().expect("gate");
+            std::thread::scope(|scope| {
+                let (sent, received) = std::sync::mpsc::channel();
+                let router_ref = &router;
+                let pwr_ref = &pwr;
+                let publisher = scope.spawn(move || {
+                    let router = router_ref;
+                    let pwr = pwr_ref;
+                    match event {
+                        0 => router.publish_worker(0, 0, 0, 1).expect("worker"),
+                        1 => {
+                            let coords = make_coord_bytes(&[(10, 20)]);
+                            let mut scratch = Vec::new();
+                            router
+                                .publish_straddler_half(
+                                    0,
+                                    StraddlerSide::Left,
+                                    coords[..4].to_vec(),
+                                    pwr,
+                                    false,
+                                    &mut scratch,
+                                )
+                                .expect("left half");
+                            router
+                                .publish_straddler_half(
+                                    0,
+                                    StraddlerSide::Right,
+                                    coords[4..].to_vec(),
+                                    pwr,
+                                    false,
+                                    &mut scratch,
+                                )
+                                .expect("right half");
+                        }
+                        2 => router.mark_producer_done(),
+                        _ => router.abort("test failure".to_string()),
+                    }
+                    sent.send(()).expect("publication completed");
+                });
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let changed = match event {
+                        0 | 1 => router.slots[0].lock().expect("slot").is_some(),
+                        2 => router.producer_done.load(SeqCst),
+                        _ => router.aborted.load(SeqCst),
+                    };
+                    if changed {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "publisher did not update predicate"
+                    );
+                    std::thread::yield_now();
+                }
+                // The predicate is visible, but its notification must still
+                // be blocked by the gate. No later publication rescues us.
+                assert!(matches!(
+                    received.recv_timeout(Duration::from_millis(50)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ));
+                let (gate, result) = router
+                    .notify
+                    .wait_timeout(gate, Duration::from_secs(5))
+                    .expect("wait");
+                drop(gate);
+                publisher.join().expect("publisher");
+                assert!(!result.timed_out(), "event {event} lost its notification");
+            });
+        }
     }
 
     // Helper: build a PerWayRcs directly from slice-of-slices.

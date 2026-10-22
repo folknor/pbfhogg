@@ -1,6 +1,6 @@
 //! Multi-extract: single-pass multi-region extraction for sorted inputs (simple strategy).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
@@ -36,6 +36,7 @@ use crate::owned::{dense_node_metadata, element_metadata};
 pub(super) fn try_extract_multi_single_pass(
     input: &Path,
     slots: &[ExtractSlot],
+    display_paths: Option<&[PathBuf]>,
     set_bounds: bool,
     compression: Compression,
     direct_io: bool,
@@ -114,7 +115,8 @@ pub(super) fn try_extract_multi_single_pass(
     // stable matched measurement at a larger scale - the single-region writer's
     // shape is not known to transfer to N concurrent outputs.
     let mut writers: Vec<PbfWriter<BufWriter<std::fs::File>>> = Vec::with_capacity(n);
-    for slot in slots {
+    for (i, slot) in slots.iter().enumerate() {
+        let display_path = display_paths.map_or(&slot.output, |paths| &paths[i]);
         let bbox = slot.region.bbox();
         let header_bytes = super::super::build_output_header(&header, true, overrides, |hb| {
             let hb = if set_bounds {
@@ -126,11 +128,11 @@ pub(super) fn try_extract_multi_single_pass(
         })?;
         let file = BufWriter::new(
             std::fs::File::create(&slot.output)
-                .map_err(|e| format!("failed to create {}: {e}", slot.output.display()))?,
+                .map_err(|e| format!("failed to create {}: {e}", display_path.display()))?,
         );
         let mut w = PbfWriter::new(file, compression);
         w.write_header(&header_bytes)
-            .map_err(|e| format!("failed to write header to {}: {e}", slot.output.display()))?;
+            .map_err(|e| format!("failed to write header to {}: {e}", display_path.display()))?;
         writers.push(w);
     }
 
@@ -642,13 +644,15 @@ pub(super) fn try_extract_multi_single_pass(
 
     // Flush all writers (workers already flushed their BlockBuilders per blob).
     for (i, slot) in slots.iter().enumerate() {
+        let display_path = display_paths.map_or(&slot.output, |paths| &paths[i]);
         writers[i]
             .flush()
-            .map_err(|e| format!("failed to flush {}: {e}", slot.output.display()))?;
+            .map_err(|e| format!("failed to flush {}: {e}", display_path.display()))?;
     }
 
     // Print per-region stats.
     for (i, slot) in slots.iter().enumerate() {
+        let display_path = display_paths.map_or(&slot.output, |paths| &paths[i]);
         let s = &stats[i];
         let total = s.nodes_in_bbox + s.ways_written + s.relations_written;
         crate::host::diag!(
@@ -657,7 +661,7 @@ pub(super) fn try_extract_multi_single_pass(
             "extract.multi.slot_counts",
             "  [{}] {}: {} elements ({} nodes, {} ways, {} relations)",
             i + 1,
-            slot.output
+            display_path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("?"),

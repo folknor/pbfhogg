@@ -72,19 +72,13 @@ impl Default for BuildConfig {
 
 impl BuildConfig {
     fn validate(&self) -> Result<()> {
-        // The upper bound is the segment sampling budget, not the S2 format
-        // limit of 30. Cell covering samples each segment at a fraction of the
-        // cell width, so the per-segment work doubles with every level; past
-        // `MAX_BUILD_S2_LEVEL` a single long or antimeridian-crossing segment
-        // can need billions of samples, which is a hang rather than a build.
-        // See the budget commentary in `pass3.rs`. Rejecting here is the whole
-        // enforcement mechanism, so it must happen before any input is read.
+        // Street and coarse levels are bounded by the segment sampling budget,
+        // not the S2 format limit of 30. Cell covering samples each segment at
+        // a fraction of the cell width, so per-segment work doubles with every
+        // level. Reject before reading input so a long or antimeridian-crossing
+        // segment cannot turn a build into an unbounded walk.
         let max_level = pass3::MAX_BUILD_S2_LEVEL;
-        for (name, level) in [
-            ("street", self.street_level),
-            ("coarse", self.coarse_level),
-            ("admin", self.admin_level),
-        ] {
+        for (name, level) in [("street", self.street_level), ("coarse", self.coarse_level)] {
             if level > max_level {
                 return Err(format!(
                     "{name} S2 level must be in 0..={max_level}, got {level}. Levels above \
@@ -97,6 +91,16 @@ impl BuildConfig {
                 "level {level} passed validation but exceeds the sampling budget"
             );
         }
+        if pass3::admin_level_exceeds_cell_budget(self.admin_level) {
+            let max_level = pass3::MAX_ADMIN_S2_LEVEL;
+            return Err(format!(
+                "admin S2 level must be in 0..={max_level}, got {}. Higher levels exceed the \
+                 per-polygon flood-fill cell budget.",
+                self.admin_level
+            )
+            .into());
+        }
+        debug_assert!(self.admin_level <= pass3::MAX_ADMIN_S2_LEVEL);
         if self.coarse_level >= self.street_level {
             return Err(format!(
                 "coarse S2 level ({}) must be less than street S2 level ({})",

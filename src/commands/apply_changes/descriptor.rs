@@ -13,7 +13,7 @@
 //! workers so they can pread the full frame bytes and emit `OwnedBytes`.
 //!
 //! The drain actor consumes a unified [`DrainItem`] stream (scanner's
-//! passthrough stream + worker outputs merged into a byte-budget reorder
+//! passthrough stream + worker outputs merged into an unbounded reorder
 //! buffer keyed by global seq) and produces the output PBF in file order.
 
 use crate::blob_meta::{BlobIndex, ElemKind};
@@ -213,8 +213,9 @@ impl DrainItem {
         }
     }
 
-    /// Approximate byte cost for the reorder buffer's byte-budget
-    /// backpressure. CopyRange descriptors are small; Rewritten carries
+    /// Approximate retained byte cost for reorder high-water accounting.
+    /// This is telemetry, not an admission permit or a memory bound.
+    /// CopyRange descriptors are small; Rewritten carries
     /// the full re-encoded payload; OwnedBytes carries the compressed
     /// frame.
     pub(super) fn byte_cost(&self) -> usize {

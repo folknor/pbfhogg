@@ -30,6 +30,12 @@ use protohoggr::{encode_bytes_field, encode_int64_field_always, encode_sint64_fi
 /// ```
 pub struct HeaderBuilder<'a> {
     bbox: Option<(f64, f64, f64, f64)>,
+    // True when `bbox` was copied from input headers rather than set by
+    // the caller. Input boxes are re-serialized as read (an out-of-range
+    // or inverted box in an input file round-trips, as it did before
+    // validation existed); only caller-set boxes get the range and order
+    // checks in `build`.
+    bbox_from_input: bool,
     replication_timestamp: Option<i64>,
     replication_sequence_number: Option<i64>,
     replication_base_url: Option<&'a str>,
@@ -55,6 +61,7 @@ impl<'a> HeaderBuilder<'a> {
     pub fn new() -> Self {
         HeaderBuilder {
             bbox: None,
+            bbox_from_input: false,
             replication_timestamp: None,
             replication_sequence_number: None,
             replication_base_url: None,
@@ -80,7 +87,7 @@ impl<'a> HeaderBuilder<'a> {
     pub fn from_header(header: &'a crate::HeaderBlock) -> Self {
         let mut hb = Self::new();
         if let Some(b) = header.bbox() {
-            hb.bbox = Some((b.left, b.bottom, b.right, b.top));
+            hb = hb.input_bbox(b.left, b.bottom, b.right, b.top);
         }
         hb.replication_timestamp = header.osmosis_replication_timestamp();
         hb.replication_sequence_number = header.osmosis_replication_sequence_number();
@@ -91,9 +98,28 @@ impl<'a> HeaderBuilder<'a> {
     }
 
     /// Set the bounding box (left/bottom/right/top in degrees).
+    ///
+    /// [`build`](Self::build) returns `InvalidInput` if a coordinate is
+    /// non-finite, outside the usual longitude/latitude bounds, or if either
+    /// minimum is greater than its maximum. A box copied by
+    /// [`from_header`](Self::from_header) is re-serialized as read instead;
+    /// calling this replaces it and subjects the new box to the checks.
     #[must_use]
     pub fn bbox(mut self, left: f64, bottom: f64, right: f64, top: f64) -> Self {
         self.bbox = Some((left, bottom, right, top));
+        self.bbox_from_input = false;
+        self
+    }
+
+    /// Set a bounding box derived from input headers (a copy or a union of
+    /// them). [`build`](Self::build) still refuses a non-finite coordinate,
+    /// but serializes an out-of-range or inverted box as given: refusing an
+    /// input file for its header extent would turn a passthrough into a
+    /// failure on data the command did not author.
+    #[must_use]
+    pub(crate) fn input_bbox(mut self, left: f64, bottom: f64, right: f64, top: f64) -> Self {
+        self.bbox = Some((left, bottom, right, top));
+        self.bbox_from_input = true;
         self
     }
 
@@ -186,31 +212,66 @@ impl<'a> HeaderBuilder<'a> {
     /// osmosis_replication_timestamp (int64, field 32),
     /// osmosis_replication_sequence_number (int64, field 33),
     /// osmosis_replication_base_url (string, field 34).
+    ///
+    /// Returns `InvalidInput` when the bounding box has a non-finite
+    /// coordinate, or when a box set through [`bbox`](Self::bbox) is out of
+    /// range or inverted. A box copied from an input header is not range-
+    /// or order-checked; see [`bbox`](Self::bbox).
     #[allow(clippy::cast_possible_truncation)]
     pub fn build(self) -> io::Result<Vec<u8>> {
+        // Validate and quantize before writing any bytes. A non-finite
+        // value would silently quantize to 0 or saturate, so it is refused
+        // whatever its origin (an input header decodes from sint64 and is
+        // always finite). Range and order are checked only for caller-set
+        // boxes: input boxes round-trip as read.
+        let bbox = if let Some((left, bottom, right, top)) = self.bbox {
+            if !left.is_finite() || !bottom.is_finite() || !right.is_finite() || !top.is_finite() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "bounding box coordinates must be finite",
+                ));
+            }
+            if !self.bbox_from_input {
+                if !(-180.0..=180.0).contains(&left) || !(-180.0..=180.0).contains(&right) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "bounding box longitude must be within [-180, 180] degrees",
+                    ));
+                }
+                if !(-90.0..=90.0).contains(&bottom) || !(-90.0..=90.0).contains(&top) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "bounding box latitude must be within [-90, 90] degrees",
+                    ));
+                }
+                if left > right || bottom > top {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "bounding box minima must not exceed maxima",
+                    ));
+                }
+            }
+            Some((
+                (left * 1e9).round() as i64,
+                (bottom * 1e9).round() as i64,
+                (right * 1e9).round() as i64,
+                (top * 1e9).round() as i64,
+            ))
+        } else {
+            None
+        };
+
         let mut buf = Vec::new();
 
         // Field 1: bbox (HeaderBBox submessage, optional)
         // HeaderBBox: left (sint64, field 1), right (sint64, field 2),
         //             top (sint64, field 3), bottom (sint64, field 4).
-        if let Some((left, bottom, right, top)) = self.bbox {
+        if let Some((left, bottom, right, top)) = bbox {
             let mut bbox_buf = Vec::new();
-            encode_sint64_field_always(
-                &mut bbox_buf,
-                header_bbox::LEFT,
-                (left * 1e9).round() as i64,
-            );
-            encode_sint64_field_always(
-                &mut bbox_buf,
-                header_bbox::RIGHT,
-                (right * 1e9).round() as i64,
-            );
-            encode_sint64_field_always(&mut bbox_buf, header_bbox::TOP, (top * 1e9).round() as i64);
-            encode_sint64_field_always(
-                &mut bbox_buf,
-                header_bbox::BOTTOM,
-                (bottom * 1e9).round() as i64,
-            );
+            encode_sint64_field_always(&mut bbox_buf, header_bbox::LEFT, left);
+            encode_sint64_field_always(&mut bbox_buf, header_bbox::RIGHT, right);
+            encode_sint64_field_always(&mut bbox_buf, header_bbox::TOP, top);
+            encode_sint64_field_always(&mut bbox_buf, header_bbox::BOTTOM, bottom);
             encode_bytes_field(&mut buf, header_block::BBOX, &bbox_buf);
         }
 
@@ -278,7 +339,9 @@ impl<'a> HeaderBuilder<'a> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::HeaderBuilder;
+    use super::{
+        HeaderBuilder, encode_bytes_field, encode_sint64_field_always, header_bbox, header_block,
+    };
 
     /// Minimal protobuf field walker, written from the wire format rather
     /// than built on this crate's reader.
@@ -419,5 +482,71 @@ mod tests {
             field_bytes(&bare, 33).is_none() && field_bytes(&bare, 32).is_none(),
             "an unset Option must still emit nothing"
         );
+    }
+
+    #[test]
+    fn invalid_bounding_boxes_are_rejected() {
+        let invalid = [
+            (f64::NAN, 0.0, 1.0, 1.0),
+            (0.0, 0.0, f64::INFINITY, 1.0),
+            (f64::NEG_INFINITY, 0.0, 1.0, 1.0),
+            (1.0, 0.0, 0.0, 1.0),
+            (0.0, 1.0, 1.0, 0.0),
+            (-181.0, 0.0, 1.0, 1.0),
+            (0.0, 0.0, 181.0, 1.0),
+            (0.0, -91.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0, 91.0),
+        ];
+
+        for (left, bottom, right, top) in invalid {
+            let err = HeaderBuilder::new()
+                .bbox(left, bottom, right, top)
+                .build()
+                .expect_err("invalid bounds must not be serialized");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn geographic_bbox_edges_are_accepted() {
+        let bytes = HeaderBuilder::new()
+            .bbox(-180.0, -90.0, 180.0, 90.0)
+            .build()
+            .unwrap();
+        let parsed = crate::HeaderBlock::parse_from_bytes(&bytes).unwrap();
+        let bbox = parsed.bbox().unwrap();
+        assert_eq!(
+            (bbox.left, bbox.bottom, bbox.right, bbox.top),
+            (-180.0, -90.0, 180.0, 90.0)
+        );
+    }
+
+    /// An input header's box is the input's claim, not ours: an
+    /// out-of-range or inverted one must round-trip rather than fail every
+    /// command that copies the header.
+    #[test]
+    fn rebuilding_preserves_an_out_of_range_bbox_from_an_input_header() {
+        let mut bbox = Vec::new();
+        encode_sint64_field_always(&mut bbox, header_bbox::LEFT, 2_000_000_000);
+        encode_sint64_field_always(&mut bbox, header_bbox::RIGHT, 1_000_000_000);
+        encode_sint64_field_always(&mut bbox, header_bbox::TOP, 91_000_000_000);
+        encode_sint64_field_always(&mut bbox, header_bbox::BOTTOM, 0);
+
+        let mut header_bytes = Vec::new();
+        encode_bytes_field(&mut header_bytes, header_block::BBOX, &bbox);
+        let parsed = crate::HeaderBlock::parse_from_bytes(&header_bytes).unwrap();
+        let rebuilt = HeaderBuilder::from_header(&parsed)
+            .build()
+            .expect("an input bbox is re-serialized as read");
+        let reparsed = crate::HeaderBlock::parse_from_bytes(&rebuilt).unwrap();
+        let b = reparsed.bbox().unwrap();
+        assert_eq!((b.left, b.bottom, b.right, b.top), (2.0, 0.0, 1.0, 91.0));
+
+        // Replacing it through `bbox` subjects the new box to the checks.
+        let err = HeaderBuilder::from_header(&parsed)
+            .bbox(0.0, 0.0, 1.0, 91.0)
+            .build()
+            .expect_err("a caller-set out-of-range bbox must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

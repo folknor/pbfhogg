@@ -272,7 +272,9 @@ fn reconciled_header(
                 },
             )
         };
-        hb = hb.bbox(
+        // The union of input header boxes is still the inputs' claim, so it
+        // round-trips unchecked like a single copied header box.
+        hb = hb.input_bbox(
             fold(f64::min, |b| b.left),
             fold(f64::min, |b| b.bottom),
             fold(f64::max, |b| b.right),

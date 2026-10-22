@@ -342,6 +342,11 @@ Extract elements within a geographic region (bounding box or polygon).
 Three strategies: `--simple` (single pass, fast, may have dangling refs), complete-ways (default, two passes, all way nodes included), `--smart` (three passes, completes multipolygon/boundary relations).
 
 Supports multi-extract via `--config` with a JSON config file specifying multiple regions.
+Relative `directory` and `polygon_file` values resolve from the config file's
+directory. Relative `output` paths resolve from `directory`, or from the config
+file's directory when it is omitted. `-d` rebases configured outputs under its
+directory, preserving paths below the configured output directory; an absolute
+output outside that root keeps only its filename.
 
 ```
 pbfhogg extract [OPTIONS] <FILE>
@@ -353,7 +358,7 @@ pbfhogg extract [OPTIONS] <FILE>
 | `-b, --bbox <BBOX>` | Bounding box: minlon,minlat,maxlon,maxlat |
 | `-p, --polygon <FILE>` | Polygon GeoJSON file |
 | `-c, --config <FILE>` | Multi-extract JSON config file |
-| `-d, --directory <DIR>` | Output directory override (only with --config) |
+| `-d, --directory <DIR>` | Rebase config outputs under this directory (only with --config) |
 | `-s, --simple` | Simple strategy (single pass) |
 | `--smart` | Smart strategy (three passes, complete relations) |
 | `--set-bounds` | Write the extract region bounding box to the output header |
@@ -658,7 +663,7 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | `--output-dir <DIR>` | Output directory for index files |
 | `--street-level <N>` | S2 cell level for streets/addresses, 0-19 [default: 17] |
 | `--coarse-level <N>` | Fallback cell level for rural areas, 0-19 [default: 14] |
-| `--admin-level <N>` | S2 cell level for admin boundaries, 0-19 [default: 10] |
+| `--admin-level <N>` | S2 cell level for admin boundaries, 0-10 [default: 10] |
 | `--max-admin-vertices <N>` | Douglas-Peucker cap for local admin polygons; levels 5, 4, 3, and 2 retain up to 2x, 4x, 8x, and 16x this value [default: 500] |
 | `--search-radius <M>` | Fine-level max search distance in meters [default: 75] |
 | `--coarse-search-radius <M>` | Coarse-level max search distance in meters [default: 1000] |
@@ -670,12 +675,16 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 All three cell levels are validated before any input is read, and a violation
 exits 2 with an explicit message:
 
-- Each level must be in `0..=19`. The upper bound is 19, not the S2 format
-  limit of 30, because cell covering samples each way segment at a fraction of
-  the cell width for the level: the per-segment sample count doubles with every
-  level, and past 19 a single long or antimeridian-crossing segment exceeds the
-  builder's per-segment budget of 2^24 samples. Accepting such a level would
-  produce a build that never finishes rather than one that is merely slow.
+- Street and coarse levels must be in `0..=19`. The upper bound is 19, not the
+  S2 format limit of 30, because cell covering samples each way segment at a
+  fraction of the cell width for the level: the per-segment sample count
+  doubles with every level, and past 19 a single long or antimeridian-crossing
+  segment exceeds the builder's per-segment budget of 2^24 samples.
+- Admin level must be in `0..=10`. Admin indexing flood-fills interior cells,
+  so its work and memory grow with the number of cells in a polygon. Level 10
+  caps the unique cells considered for one polygon at the whole sphere's
+  6,291,456 S2 cells; each higher level multiplies that bound by four. The
+  default remains at the maximum accepted admin level.
 - `--coarse-level` must be strictly less than `--street-level`. The coarse
   index is the fallback for rural queries and must be the coarser of the two.
 

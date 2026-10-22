@@ -733,7 +733,7 @@ enum Command {
         /// Multi-extract JSON config file
         #[arg(short = 'c', long, conflicts_with_all = ["bbox", "polygon", "output"])]
         config: Option<PathBuf>,
-        /// Output directory override (only with --config)
+        /// Rebase config outputs under this directory (only with --config)
         #[arg(short = 'd', long, requires = "config")]
         directory: Option<PathBuf>,
         /// Simple strategy (single pass, may have dangling refs)
@@ -1036,7 +1036,7 @@ enum Command {
         /// Fallback cell level for rural areas (0-19, must be below --street-level)
         #[arg(long, default_value = "14")]
         coarse_level: u8,
-        /// S2 cell level for admin boundaries (0-19)
+        /// S2 cell level for admin boundaries (0-10)
         #[arg(long, default_value = "10")]
         admin_level: u8,
         /// Douglas-Peucker cap for local admin polygons; levels 5, 4, 3, and 2 retain up to 2x, 4x, 8x, and 16x this value
@@ -3292,21 +3292,10 @@ fn run_extract_config(
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (config_dir, mut slots) = pbfhogg::extract::parse_extract_config(config_path)?;
-
-    // If -d/--directory is given on CLI, override the config's directory
-    if let Some(dir) = directory_override {
-        let config_parent = config_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let old_dir = config_dir.as_deref().unwrap_or(config_parent);
-        for slot in &mut slots {
-            // Re-resolve output relative to new directory
-            if let Ok(relative) = slot.output.strip_prefix(old_dir) {
-                slot.output = dir.join(relative);
-            }
-        }
-    }
+    let (_, mut slots) = pbfhogg::extract::parse_extract_config_with_output_directory(
+        config_path,
+        directory_override,
+    )?;
 
     for slot in &slots {
         reject_aliases(&[file], &slot.output)?;
@@ -3344,9 +3333,10 @@ fn run_extract_config(
     }
 
     output::cli_eprintln!("Multi-extract: {} extracts from config", slots.len());
-    let all_stats = pbfhogg::extract::extract_multi(
+    let all_stats = pbfhogg::extract::extract_multi_with_display_paths(
         file,
         &slots,
+        &final_paths,
         strategy,
         set_bounds,
         clean,

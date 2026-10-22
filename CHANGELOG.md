@@ -4,6 +4,19 @@
 
 ### Breaking
 
+- **`build-geocode-index --admin-level` is capped at 10** (was 19). The
+  admin flood fill grows 4x per level, and level 19 asked for billions of
+  cells on a large country: a hang and an OOM rather than a refusal. Levels
+  above 10 are now refused before any output is created.
+
+- **Multi-extract config paths no longer depend on the working directory.**
+  A relative `"directory"` in the config resolves against the config file's
+  directory, and `-d` rebases every output under its directory: outputs
+  below the configured root keep their relative path, absolute outputs
+  outside it keep their file name. Previously a relative directory followed
+  the process working directory, and `-d` silently left absolute outputs
+  where the config put them.
+
 - **Commands take an explicit `&Host`** (`pbfhogg::host`), which supplies the
   caller's process actions, resource probes and diagnostics; there is no
   default. The library no longer calls `mallopt`, raises `RLIMIT_NOFILE` or
@@ -574,6 +587,25 @@
   makes the decision before the header is read.
 
 ### Fixed
+
+- **`add-locations-to-ways --index-type external` accepts ways with no
+  refs.** A zero-ref way used to desynchronise the per-way refcount sidecar
+  and fail the run, while the sparse backend accepted the same input; which
+  backend `auto` picked decided whether a legal file was accepted.
+
+- **An apply-changes scanner or worker panic is returned as an error**
+  carrying the panic message, instead of being dropped when the drain also
+  failed or escalating into a process panic.
+
+- **Multi-extract progress lines name the final output files** instead of
+  the hidden `.pbfhogg-tmp-*` scratch names.
+
+- **Geocode indexes no longer carry duplicate coarse-cell entries** for
+  segments crossing more than four coarse cells.
+
+- **`HeaderBuilder::build` refuses a caller-set bbox that is non-finite, out
+  of range or inverted**, instead of writing `0,0,0,0` or a nonsense header.
+  A bbox copied from an input header is still passed through as read.
 
 - **`derive-changes --update-timestamp` stamps every delete in a run with the
   same timestamp**, taken once at start. It used to read the clock per

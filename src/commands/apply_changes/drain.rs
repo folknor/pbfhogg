@@ -114,7 +114,8 @@ pub(super) struct DrainConfig<'a> {
     /// barrier. Drain calls `set` once with the merged map. `None` when
     /// `locations_on_ways == false`.
     pub loc_map_out: Option<LocMapHandle>,
-    /// First worker-pool failure. Polled every loop iteration and once
+    /// First producer failure (scanner or worker pool, errors and caught
+    /// panics alike). Polled every loop iteration and once
     /// after the drain channel disconnects; a published failure is
     /// returned as the drain's own error. See `failure.rs` for the
     /// publish-before-disconnect protocol that makes the final check
@@ -257,6 +258,16 @@ pub(super) fn run_drain(
     // ~100 s wall.
     let recv_timeout = std::time::Duration::from_millis(25);
 
+    // This reorder map has no admission budget: bytes_in_buffer is only
+    // high-water telemetry. Do not stop receiving at a byte threshold when
+    // next_seq is missing: that worker sends on the same bounded channel,
+    // and later items can fill it ahead of the head, deadlocking the drain.
+    // A real bound needs ordered admission before dispatch, with permits
+    // retained through delivery, covering scanner passthroughs and workers.
+    // Worker-only byte permits can also starve the head behind later work.
+    // That changes scheduling on the measured splice/rewrite path and needs
+    // memory-bound tests plus matched performance measurements before use.
+    //
     // Main loop: pull items (or timeout), reorder, advance, fire
     // barrier when ready. Exits when `drain_rx` disconnects AND the
     // reorder buffer is empty.
@@ -363,36 +374,30 @@ pub(super) fn run_drain(
 
         // Exit as soon as all senders have closed. If the buffer is
         // empty we're done cleanly; if it still has items, a producer
-        // dropped a seq (worker panic) and the post-loop check below
-        // surfaces the specific error. The previous
-        // `&& buffer.is_empty()` gate spun forever on worker panic
-        // because the buffer holds seqs ahead of the missing one and
-        // the reorder loop can't advance past the gap.
+        // dropped a seq and the post-loop checks below surface the
+        // published failure or the gap. An `&& buffer.is_empty()` gate
+        // would spin forever here, because the buffer holds seqs ahead
+        // of the missing one and the reorder loop can't advance past it.
         if drain_disconnected {
             break;
         }
     }
 
-    // Channel closed. A worker that returned an error published it before
-    // releasing its sender (see `failure.rs`), so checking here, after the
-    // disconnect, cannot miss one.
+    // Channel closed. A producer (scanner or worker) that returned an error
+    // or panicked published it before releasing its sender (see
+    // `failure.rs`), so checking here, after the disconnect, cannot miss one.
     if cfg.failure.has_failed() {
         return Err(cfg.failure.take().unwrap_or_else(|| {
             new_error(ErrorKind::Io(std::io::Error::other(
-                "drain: a worker failed and its error was already reported",
+                "drain: a producer failed and its error was already reported",
             )))
         }));
     }
 
-    // Reorder buffer should be empty.
-    //
-    // Two root causes can reach this error. First, a genuine producer bug
-    // (a worker dropped a seq) - the message points there. Second, a worker
-    // thread panicked mid-stream; its `drain_tx` clone drops unwound, the
-    // drain sees the channel close, and the reorder buffer still holds
-    // seqs from other workers. Panics bypass the failure slot, so this
-    // message is what the caller sees first; the panic itself only
-    // surfaces when the enclosing thread scope joins the worker pool.
+    // Reorder buffer should be empty. Scanner and worker errors and panics
+    // are caught and published before their senders drop, so reaching this
+    // with items left means a producer dropped a seq without failing: a
+    // genuine producer bug, which is what the message points at.
     if !state.buffer.is_empty() {
         let first_remaining = state.buffer.keys().next().copied().unwrap_or(0);
         return Err(new_error(ErrorKind::Io(std::io::Error::other(format!(

@@ -61,8 +61,8 @@ pub struct MergeOptions {
     /// [`crate::osc::CompactDiffOverlay::allow_version_regression`].
     pub allow_version_regression: bool,
     /// Test-only: panic in the worker loop when a blob with this seq
-    /// is dequeued, to exercise the worker-panic → scope-join →
-    /// scratch-cleanup recovery path. Only compiled when the
+    /// is dequeued, to exercise panic publication through the failure
+    /// slot, barrier shutdown and scratch cleanup. Only compiled when the
     /// `test-hooks` feature is enabled. Set via
     /// `MergeOptions::with_panic_at_blob_seq` from tests; production
     /// callers never touch this field (and never see it on non-
@@ -490,41 +490,49 @@ pub fn merge(
     // Drain runs in this (the merge() caller's) thread because it owns
     // `&mut writer`. Scanner and worker pool run in scoped threads.
     //
-    // Worker-pool errors travel through `failure` (see `failure.rs`): the
-    // drain returns the first one as its own error, so the `?` below
-    // surfaces the real cause, and returning drops the drain's channels,
-    // which unblocks the scanner and the surviving workers before the
-    // scope joins them.
-    //
-    // Still open: a scanner error after some candidates were dispatched
-    // can reach the drain as "channel closed with N items in reorder
-    // buffer", returned by the `?` below while the scanner's own error is
-    // dropped at the implicit scope join; and a worker panic bypasses the
-    // failure slot entirely.
+    // Producers publish failures before releasing their last drain sender.
+    // A drain error drops its receiver and barrier sender before we join,
+    // unblocking scanner dispatch, barrier waits and worker sends. Join both
+    // threads on every path so an implicit scope join cannot discard a cause.
+    let scanner_failure = Arc::clone(&failure);
+    let scanner_sender_guard = streaming_channels.drain_tx.clone();
     let stats = std::thread::scope(|scope| -> Result<MergeStats> {
-        let scanner_handle = scope.spawn(move || scanner::run_scanner(scanner_cfg, host));
+        let scanner_handle = scope.spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                scanner::run_scanner(scanner_cfg, host)
+            }));
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => scanner_failure.publish(e),
+                Err(payload) => scanner_failure.publish_panic("scanner", &*payload),
+            }
+            // Keep the channel connected until publication, even though
+            // run_scanner has already dropped its own channels on return.
+            drop(scanner_sender_guard);
+        });
         let workers_counters_inner = Arc::clone(&worker_counters);
         let workers_handle = scope.spawn(move || {
             streaming::run_workers(streaming_cfg, streaming_channels, &workers_counters_inner);
         });
 
-        let drain_stats =
-            drain::run_drain(drain_cfg, drain_channels, &mut writer, &drain_counters)?;
+        let drain_stats = drain::run_drain(drain_cfg, drain_channels, &mut writer, &drain_counters);
 
-        scanner_handle
-            .join()
-            .map_err(|_| -> Box<dyn std::error::Error> { "scanner thread panicked".into() })?
-            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        workers_handle
-            .join()
-            .map_err(|_| -> Box<dyn std::error::Error> { "worker pool thread panicked".into() })?;
-        // The drain's post-disconnect check makes this unreachable; kept so
-        // a published failure can never be dropped on a success path.
+        let scanner_join = scanner_handle.join();
+        let workers_join = workers_handle.join();
+        if let Err(payload) = scanner_join {
+            failure.publish_panic("scanner", &*payload);
+        }
+        if let Err(payload) = workers_join {
+            failure.publish_panic("worker pool", &*payload);
+        }
+        // The drain checks producer failures before reporting a seq gap.
+        // Keep its error: a later scanner send failure can be a consequence
+        // of the drain dropping its receiver after an output write failed.
+        let stats = drain_stats.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         if let Some(e) = failure.take() {
             return Err(e.into());
         }
-
-        Ok(drain_stats)
+        Ok(stats)
     })?;
 
     let pipeline_ms = pipeline_start

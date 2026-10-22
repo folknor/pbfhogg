@@ -1,6 +1,6 @@
 //! Extract elements within a geographic bounding box. Equivalent to `osmium extract`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::cat::CleanAttrs;
 use crate::coord_fmt::e7_to_deg;
@@ -388,13 +388,22 @@ pub struct ExtractSlot {
 pub fn parse_extract_config(
     config_path: &Path,
 ) -> Result<(Option<std::path::PathBuf>, Vec<ExtractSlot>)> {
+    parse_extract_config_with_output_directory(config_path, None)
+}
+
+/// Parse a multi-extract config, optionally rebasing its outputs under a CLI
+/// output-directory override.
+pub fn parse_extract_config_with_output_directory(
+    config_path: &Path,
+    directory_override: Option<&Path>,
+) -> Result<(Option<PathBuf>, Vec<ExtractSlot>)> {
     let data = std::fs::read_to_string(config_path)?;
     let value: serde_json::Value = serde_json::from_str(&data)?;
 
     let directory = value
         .get("directory")
         .and_then(serde_json::Value::as_str)
-        .map(std::path::PathBuf::from);
+        .map(PathBuf::from);
 
     let extracts_arr = value
         .get("extracts")
@@ -410,7 +419,15 @@ pub fn parse_extract_config(
 
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
 
-    let resolve_dir = directory.as_deref().unwrap_or(config_dir);
+    let configured_output_dir = directory.as_deref().map(|dir| {
+        if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            config_dir.join(dir)
+        }
+    });
+    let default_output_dir = configured_output_dir.as_deref().unwrap_or(config_dir);
+    let resolve_dir = directory_override.unwrap_or(default_output_dir);
 
     let mut slots = Vec::with_capacity(extracts_arr.len());
     let mut output_paths: Vec<std::path::PathBuf> = Vec::with_capacity(extracts_arr.len());
@@ -421,7 +438,12 @@ pub fn parse_extract_config(
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| format!("extract[{i}] missing 'output' field"))?;
 
-        let output_path = resolve_dir.join(output_name);
+        let output_name_path = Path::new(output_name);
+        let output_path = if directory_override.is_some() {
+            rebase_config_output(output_name_path, default_output_dir, resolve_dir)
+        } else {
+            resolve_dir.join(output_name_path)
+        };
         if output_paths.contains(&output_path) {
             return Err(format!("duplicate output path: {}", output_path.display()).into());
         }
@@ -435,6 +457,23 @@ pub fn parse_extract_config(
     }
 
     Ok((directory, slots))
+}
+
+fn rebase_config_output(output: &Path, old_root: &Path, new_root: &Path) -> PathBuf {
+    let relative = if output.is_absolute() {
+        output
+            .strip_prefix(old_root)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| {
+                output
+                    .file_name()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| output.to_path_buf())
+            })
+    } else {
+        output.to_path_buf()
+    };
+    new_root.join(relative)
 }
 
 /// Parse the geometry for a single extract entry in a config file.
@@ -533,12 +572,82 @@ pub fn extract_multi(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<Vec<ExtractStats>> {
+    extract_multi_inner(
+        input,
+        slots,
+        None,
+        strategy,
+        set_bounds,
+        clean,
+        compression,
+        direct_io,
+        force,
+        overrides,
+        host,
+    )
+}
+
+/// Run multiple extracts while reporting the final output paths separately
+/// from the paths used to write intermediate output files.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_multi_with_display_paths(
+    input: &Path,
+    slots: &[ExtractSlot],
+    display_paths: &[PathBuf],
+    strategy: ExtractStrategy,
+    set_bounds: bool,
+    clean: &CleanAttrs,
+    compression: Compression,
+    direct_io: bool,
+    force: bool,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<Vec<ExtractStats>> {
+    if display_paths.len() != slots.len() {
+        return Err(format!(
+            "got {} display paths for {} extract slots",
+            display_paths.len(),
+            slots.len()
+        )
+        .into());
+    }
+
+    extract_multi_inner(
+        input,
+        slots,
+        Some(display_paths),
+        strategy,
+        set_bounds,
+        clean,
+        compression,
+        direct_io,
+        force,
+        overrides,
+        host,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_multi_inner(
+    input: &Path,
+    slots: &[ExtractSlot],
+    display_paths: Option<&[PathBuf]>,
+    strategy: ExtractStrategy,
+    set_bounds: bool,
+    clean: &CleanAttrs,
+    compression: Compression,
+    direct_io: bool,
+    force: bool,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<Vec<ExtractStats>> {
     // Try single-pass multi-extract for simple strategy on sorted input.
     if matches!(strategy, ExtractStrategy::Simple)
         && !clean.any()
         && let Some(stats) = multi::try_extract_multi_single_pass(
             input,
             slots,
+            display_paths,
             set_bounds,
             compression,
             direct_io,
@@ -552,6 +661,7 @@ pub fn extract_multi(
     // Sequential fallback: one extract at a time.
     let mut all_stats = Vec::with_capacity(slots.len());
     for (i, slot) in slots.iter().enumerate() {
+        let display_path = display_paths.map_or(&slot.output, |paths| &paths[i]);
         crate::host::diag!(
             host.diagnostics,
             Progress,
@@ -559,7 +669,7 @@ pub fn extract_multi(
             "[{}/{}] Extracting to {}",
             i + 1,
             slots.len(),
-            slot.output.display()
+            display_path.display()
         );
         let stats = extract(
             input,

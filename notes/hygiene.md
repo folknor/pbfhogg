@@ -19,11 +19,28 @@ found on the way are in `notes/bugs.md`.
    stable only until this document is drained; the next hunt writes new ones,
    and they are never deduplicated through git history. Carry the context
    inline instead.
+6. The higher an entry's anger index, the higher the bar for implementing
+   anything as a result of it. A high-anger entry should more often than not
+   end as a code comment (rule 3) rather than a code change.
+7. The higher an entry's anger index, the more care is owed - exponentially -
+   against performance regression from any change made for it. Before
+   touching code under a higher-index entry, read
+   `reference/performance-history.md` and `reference/performance.md`. The
+   current code is likely not an accident.
 ```
+
+Each entry carries an `Anger:` rating from 0 to 10: how likely resolving it
+is to make the maintainer angry. 10 is rebuilds or contract changes on
+measured paths; 9 is hot-path or contract changes that need benchmarks or
+the maintainer's decision; 8 is altw, renumber and apply-changes internals
+and observability contracts; 7 is geocode output and format, and CLI
+behaviour; below that the work is progressively more contained.
 
 ---
 
 ## HYG-001 - Worker-count policy is spelled at about twenty sites and the copies have diverged
+
+Anger: 10 - worker counts for every command.
 
 The rule "how many threads by default" is reimplemented wherever a pool is
 built:
@@ -74,6 +91,8 @@ the owner. Every hunter proposed the same lint independently.
 Reported by: all nine scopes.
 
 ## HYG-002 - No scope has an answer to "what are the tunables"
+
+Anger: 10 - tunables, including POOL_SIZE, which was measured at 16.
 
 Every scope's knobs live wherever they were first needed, mostly private, with
 no injection point:
@@ -146,6 +165,8 @@ Reported by: all nine scopes.
 
 ## HYG-005 - Header feature-name strings are spelled as literals beside their constants
 
+Anger: 0 - constants, output bytes unchanged.
+
 `HeaderBlock::LOCATIONS_ON_WAYS` exists in `read/block.rs`, yet
 `"LocationsOnWays"` is spelled in `altw/external/stage4.rs`, `altw/mod.rs`,
 `altw/passthrough.rs`, `apply_changes/rewrite.rs`, `degrade/mod.rs`,
@@ -161,6 +182,8 @@ quoted literals outside `read/block.rs`.
 Reported by: write path.
 
 ## HYG-007 - "Node, way or relation" has a dozen encodings
+
+Anger: 8 - element kinds, expression semantics.
 
 - Two enums named `ElemKind`: `crate::blob_meta::ElemKind` (apply-changes,
   merge_join) and `crate::osc::xml_parse::ElemKind` (merge-changes, tags-filter
@@ -194,6 +217,8 @@ Reported by: change application, filtering and spatial, CLI and plumbing.
 
 ## HYG-010 - The read engine's ordered pipeline exists twice and has drifted
 
+Anger: 10 - unifies the read engine and the blob pools; the batched-pipeline rebuild was already measured and reverted.
+
 `read/pipeline.rs` has `run_pipeline` (admission gate, permit riding with the
 item, shutdown flag, panic capture, reorder buffer, metrics) and
 `run_pipeline_fused`, a near-verbatim copy the comment says to "keep
@@ -210,6 +235,8 @@ too; afterwards make `ReorderBuffer` private to the engine module.
 Reported by: read path.
 
 ## HYG-011 - The pread-decompress-dispatch-reorder pool is hand-built about fifteen times
+
+Anger: 10 - unifies the read engine and the blob pools; the batched-pipeline rebuild was already measured and reverted.
 
 The same machine (a dispatcher feeding `Arc<Mutex<Receiver>>`, N workers doing
 pread into a reused buffer, `decompress_blob_raw`, the per-blob work, a bounded
@@ -278,6 +305,8 @@ geocode index.
 
 ## HYG-012 - Sort and `cat --dedupe` are one algorithm in two copies
 
+Anger: 10 - merging sort and dedupe could undo sort's deliberate pread-walker trade-off.
+
 `sort/mod.rs` and `cat/dedupe.rs` each define `BlobEntry`, `HasId`,
 `build_blob_index`, `type_order`, `detect_overlaps`, `write_passthrough_blob`,
 `read_frame_into`, `extract_blob_bytes`, `count_entry`, a sweep merge and
@@ -296,6 +325,8 @@ Reported by: re-encoding.
 
 ## HYG-013 - Diff and derive-changes share a parallel core in two copies
 
+Anger: 9 - diff core on a hot path.
+
 `diff/parallel.rs` and `diff/derive_parallel.rs` each define `BlobDesc`,
 `WalkedFile`, `walk_file`, `Shard`, `plan_shards`, `build_shard`,
 `pread_decode`, `Side`, `element_merge`, `kind_type_char`,
@@ -313,6 +344,8 @@ Fix: one shared shard core; an equivalence test asserting byte-identical
 Reported by: re-encoding.
 
 ## HYG-014 - Three frame decoders for one frame format
+
+Anger: 9 - frame decoders on a hot path.
 
 `BlobReader::read_blob_header` (streaming, stamps offsets),
 `frame::read_frame_header` (streaming, used by `raw_frame.rs`) and
@@ -337,6 +370,8 @@ embryo.
 Reported by: read path.
 
 ## HYG-015 - Write-side blob framing and dispatch are copied
+
+Anger: 9 - writer framing on a hot path.
 
 - `PbfWriter::write_framed_blob` (sync path) reimplements `frame_blob_into`
   line for line; the test `the_sync_path_refuses_an_oversize_blob_body` records
@@ -363,6 +398,8 @@ Reported by: write path.
 
 ## HYG-016 - Writer loops are copied per backend and their metrics mean different things
 
+Anger: 9 - writer loops on a hot path.
+
 `pipeline::writer_thread`, `uring_writer::uring_main_loop` and
 `parallel_writer::dispatch_loop` each reimplement recv, `record_recv_wait`,
 push, high-water, `pop_ready` and `check_stream_complete`, and every backend
@@ -382,6 +419,8 @@ Reported by: write path.
 
 ## HYG-017 - `copy_file_range` and pread loops are written five times with three EINTR rules
 
+Anger: 8 - I/O fallbacks, gating, alignment.
+
 `copy_range::copy_range` (implicit out offset), `parallel_writer::copy_range_to_fd`
 (explicit), fallbacks `copy_range_fallback` and `copy_range_fallback_pwrite`,
 and `uring_writer::handle_copy_range_uring`'s own pread loop. Diverged:
@@ -400,6 +439,8 @@ elsewhere.
 Reported by: write path.
 
 ## HYG-018 - Output backend choice is two bools, decided in four functions and re-derived by commands
+
+Anger: 9 - output backend enum: API, plus copy-range behaviour.
 
 `commands/mod.rs::writer_from_header_bytes` and
 `writer_from_header_bytes_parallel` are the same 30 lines except the default
@@ -427,6 +468,8 @@ Reported by: write path, change application, re-encoding, CLI and plumbing.
 
 ## HYG-020 - Library error text names CLI flags and commands
 
+Anger: 9 - error kinds and texts: API and output.
+
 `require_indexdata` tells the user to run `pbfhogg cat input.osm.pbf -o
 indexed.osm.pbf` and to pass `--force`; `require_sorted*` says `pbfhogg sort`;
 `verify_ids` repeats the cat recipe; renumber suggests `pbfhogg cat --clean`
@@ -450,6 +493,8 @@ exempt. The alternative is to accept CLI-first wording and say so in
 Reported by: CLI and plumbing, write path, re-encoding.
 
 ## HYG-021 - Error kinds are stringified away at thread boundaries and reported as I/O
+
+Anger: 9 - error kinds and texts: API and output.
 
 - `streaming::io_err`, `drain::io_err` ("Mirrors the io_err helper in
   streaming.rs") and about eight inline
@@ -496,6 +541,8 @@ spatial, read path, geocode index.
 
 ## HYG-022 - Errors that reach the operator name no file, offset or subject
 
+Anger: 7 - message content.
+
 - No write-path error names the output file: `check_stream_complete` names a
   backend but not the path; ENOSPC reaches the operator as "No space left on
   device"; `parallel_writer` attaches `create {path}` to the copy on `init_tx`
@@ -536,6 +583,8 @@ re-encoding, filtering and spatial, read path.
 
 ## HYG-023 - Thread panic payloads are discarded
 
+Anger: 7 - message content.
+
 `parallel_writer_thread_inner` formats a worker join error with `{e:?}` on a
 `Box<dyn Any + Send>`, printing `Any { .. }`; the uring and gzip paths say
 "panicked" with no payload; diff and derive shard joins do
@@ -547,6 +596,8 @@ pipeline's "decode task panicked" drops it; `PipelinedBlocks::drop` does
 Reported by: write path, re-encoding, read path.
 
 ## HYG-024 - Counter declaration and emission is hand-written boilerplate
+
+Anger: 8 - counter machinery and semantics.
 
 Altw stages each declare 10 to 35 `AtomicU64` locals, a `_ref` binding for
 each, and an emit block repeating `emit_counter("x", x.load(Relaxed) as i64)`
@@ -572,6 +623,8 @@ Reported by: altw and scanning, write path.
 
 ## HYG-027 - OSC and apply-changes element writers are duplicated
 
+Anger: 7 - OSC output bytes.
+
 `osc/write.rs` has owned writers (`write_node_xml`, `write_way_xml`,
 `write_relation_xml`) and borrowed ones (`write_dense_node_xml`,
 `write_borrowed_node_xml`, `write_borrowed_way_xml`,
@@ -591,6 +644,8 @@ both owned and borrowed types implement; a `BlockSink` trait for
 Reported by: change application.
 
 ## HYG-028 - Where scratch goes is decided per command, with no override
+
+Anger: 9 - scratch location, a new --tmp-dir, reaping old scratch.
 
 - Altw sparse (`referenced * 8`, 29 GB at europe) and external (hundreds of GB
   at planet) put scratch in `output.parent()`, with no `--tmp-dir`, `TMPDIR`
@@ -617,6 +672,8 @@ index dir.
 Reported by: altw and scanning, re-encoding, geocode index.
 
 ## HYG-029 - Scratch naming and cleanup use a different mechanism at every site, and nothing reaps crashed runs
+
+Anger: 9 - scratch location, a new --tmp-dir, reaping old scratch.
 
 Naming: `diff-par-{pid}{run}-{kind}-{shard}.txt.tmp`;
 `derive-{creates,modifies,deletes}-{pid}{run}.xml.tmp`, where `{run}` is the
@@ -669,6 +726,8 @@ Reported by: re-encoding, altw and scanning, geocode index, CLI and plumbing.
 
 ## HYG-030 - Output publication policy is implemented four ways
 
+Anger: 9 - output .partial and rename for every command.
+
 - Every write backend creates the final path up front (`File::create` /
   `O_TRUNC`) and none removes, renames into place or marks it on failure.
   `pipeline::writer_thread`'s own comment says a short file "ends on a blob
@@ -703,6 +762,8 @@ plumbing, altw and scanning.
 
 ## HYG-032 - Record layouts are serialised by hand at both ends
 
+Anger: 8 - record codecs.
+
 `compact.rs` writes metadata field by field in `arena_append_meta` and
 `read_meta` reads back at hand-written offsets `+1, +5, +13, +21, +25`;
 `META_LEN = 29` is a hand sum; `NODE_META_OFF = 20` and `WAY_META_OFF = 16`
@@ -725,6 +786,8 @@ packed structs, so a layout mismatch is a type error; a generic
 Reported by: change application, altw and scanning, geocode index.
 
 ## HYG-033 - The CLI's arena cap is process-global and depends on which command ran
+
+Anger: 7 - RSS.
 
 The library no longer calls `mallopt`: `check_refs`, `verify_ids`, `cat`
 (`cat_filtered`), `repack`, `degrade` (`degrade_decode_path`), `renumber`,
@@ -749,6 +812,8 @@ textlint rule.
 Reported by: re-encoding, geocode index, CLI and plumbing.
 
 ## HYG-034 - Decode failures are turned into plausible default values
+
+Anger: 9 - decode failures and aborts become errors: new refusals, Results on builder hot paths.
 
 - `elements.rs` (three sites): `WireInfo::parse(data).ok().unwrap_or_default()`,
   so corrupt metadata becomes version 0 / timestamp 0, indistinguishable from
@@ -791,6 +856,8 @@ Reported by: read path, CLI and plumbing, change application.
 
 ## HYG-035 - Configuration is validated at the moment of use
 
+Anger: 9 - validate flags earlier, refuse no-op flags.
+
 - `--io-uring` / `--direct-io` without the feature are refused in
   `writer_from_header_bytes*`, after the input is opened, headers read and
   sometimes a full first pass done; on altw or apply-changes the refusal can
@@ -827,6 +894,8 @@ path, re-encoding.
 
 ## HYG-036 - "This flag has no effect here" is refused, warned or ignored depending on the command
 
+Anger: 9 - validate flags earlier, refuse no-op flags.
+
 Refused: `-j` with `-R`, `--distrust-metadata` outside the scanning report,
 `-v` with `-j` on diff, `inspect -j` / `--force` outside `--nodes`. Warned
 (`Warning!` from `run_*`): `tags-filter -R -t`, `getid -t` without `-r`, and
@@ -858,6 +927,8 @@ and scanning, re-encoding.
 
 ## HYG-037 - `--direct-io` is accepted and ignored on many paths
 
+Anger: 9 - validate flags earlier, refuse no-op flags.
+
 The parameter is taken and discarded in altw `stage1_way_pass(_direct_io)`,
 `build_node_index_sparse(_direct_io)`, `collect_way_referenced_node_ids`,
 `collect_relation_member_ids` (every pread path, so the flag does nothing to
@@ -877,6 +948,8 @@ Reported by: altw and scanning, re-encoding, filtering and spatial, CLI and
 plumbing.
 
 ## HYG-038 - Linux behaviours are gated on features that have nothing to do with them
+
+Anger: 8 - I/O fallbacks, gating, alignment.
 
 - `copy_file_range`, `OutputChunk::CopyRange`, `write_raw_copy` and the
   parallel backend's `WriteOp::CopyRange` compile only with `linux-direct-io`,
@@ -910,6 +983,8 @@ application.
 
 ## HYG-039 - O_DIRECT alignment is a hardcoded 4096 and the O_DIRECT open is spelled three times
 
+Anger: 8 - I/O fallbacks, gating, alignment.
+
 `PAGE_SIZE = 4096` is "universally safe across Linux filesystems" on both the
 read and write sides. The real requirement is the device and filesystem DIO
 alignment that Linux reports via `statx(STATX_DIOALIGN)` (6.1+), which can be
@@ -924,6 +999,8 @@ with 4096 as fallback; one `open_direct_for_write`; a text rule on
 Reported by: read path, write path.
 
 ## HYG-040 - Unix-only APIs are used without the crate saying it is Unix-only
+
+Anger: 7 - Unix-only decision.
 
 `std::os::unix::fs::FileExt` is imported unconditionally in
 `read/header_walker.rs`, `write/parallel_writer.rs` (compiled unconditionally,
@@ -943,6 +1020,8 @@ Reported by: read path, write path, change application, re-encoding, filtering
 and spatial, altw and scanning, geocode index.
 
 ## HYG-041 - Whether missing indexdata is an error, a warning or nothing is decided per command
+
+Anger: 7 - indexdata policy.
 
 `getid` and `removeid` refuse without indexdata unless `--force`, with two
 different hand-written messages; `getparents` calls `has_indexdata` only to
@@ -965,6 +1044,8 @@ Reported by: filtering and spatial, re-encoding, CLI and plumbing.
 
 ## HYG-042 - `IdSet`'s rank index is a runtime state rather than a type
 
+Anger: 8 - IdSet typestate.
+
 `rank`, `resolve` and `total_count` `expect` a built rank index, while
 `rank_if_set` returns `None` when it is absent, which sparse altw reads as
 "node missing"; forgetting `build_rank_index()` shows up as every coordinate
@@ -982,6 +1063,8 @@ Reported by: altw and scanning, re-encoding.
 
 ## HYG-043 - Altw raises `RLIMIT_NOFILE` from inside a library call and never restores it
 
+Anger: 7 - altw limits and routing.
+
 `raise_nofile_to_hard_cap` permanently raises the process soft limit as a side
 effect of a library function, with no opt-out; a host application relying on
 its own limit (some do, to bound sockets) finds it changed. It is narrated as a
@@ -997,6 +1080,8 @@ shape) removes that. Fix: raise it in the CLI, or restore it on exit from
 Reported by: altw and scanning.
 
 ## HYG-044 - Altw auto routing reads the host directly and misreads containers
+
+Anger: 7 - altw limits and routing.
 
 `page_cache_budget_bytes` reads `/proc/meminfo` inside the decision; the pure
 `route_sorted_indexed` is tested but the end-to-end decision can only be tested
@@ -1017,6 +1102,8 @@ minimum; propagate probe errors.
 Reported by: altw and scanning.
 
 ## HYG-046 - Altw restates the same rules once per backend
+
+Anger: 8 - merges altw backend rules.
 
 - `altw/mod.rs::collect_relation_member_ids` and
   `external/relation_scan.rs::collect_relation_member_ids_indexed` both encode
@@ -1040,6 +1127,8 @@ shared pipeline of HYG-011, and stage 4's `missing` removed from the signature.
 Reported by: altw and scanning.
 
 ## HYG-047 - Code aborts on caller-controlled input where a refusal was owed
+
+Anger: 9 - decode failures and aborts become errors: new refusals, Results on builder hot paths.
 
 - `BlockBuilder::add_node`, `add_way`, `add_relation`,
   `add_way_with_locations` and the `_raw` variants `assert!(self.can_add_*())`,
@@ -1081,6 +1170,8 @@ re-encoding, altw and scanning.
 
 ## HYG-048 - Writer `Drop` discards errors and nothing enforces `flush`
 
+Anger: 0 - debug-only assertion.
+
 `PbfWriter::Drop`, `ParallelGzipWriter::Drop` and `DirectWriter::Drop` are
 best-effort and say callers MUST call `flush` / `finish`. There is no
 `#[must_use]` and no debug check that a pipelined writer reached `flush` on a
@@ -1092,6 +1183,8 @@ turns every forgotten `flush` in tests into a failure.
 Reported by: write path.
 
 ## HYG-049 - Durability and buffering differ between the sync and pipelined writers
+
+Anger: 8 - sync writer fsync cost.
 
 Pipelined backends fsync at end of stream; `PbfWriter::new` (sync) never does,
 so multi-extract, every command on the sync writer and the library examples
@@ -1107,6 +1200,8 @@ that owns the buffer; private variants.
 Reported by: write path.
 
 ## HYG-050 - Compression levels are validated in one place and defaulted in several
+
+Anger: 8 - compression level types.
 
 The `Zstd` doc says "1-22"; `FromStr` accepts `-7..=22`. `Zlib(u32)` is
 validated to `0..=9` only by `FromStr`, so a library caller's
@@ -1126,6 +1221,8 @@ already `#[non_exhaustive]`), docs pulled from the same consts;
 Reported by: write path, re-encoding, CLI and plumbing.
 
 ## HYG-051 - Per-run metrics live in process-global statics
+
+Anger: 8 - counter machinery and semantics.
 
 `PIPELINE_METRICS` is a `static` never reset, and `emit()` runs at the end of
 every `run_pipeline` / `run_pipeline_fused`: a command running two pipelines
@@ -1153,6 +1250,8 @@ Reported by: read path, write path, CLI and plumbing, altw and scanning.
 
 ## HYG-053 - Reorder buffers are bounded only statistically
 
+Anger: 10 - a credit scheme inside the read engine and blob pools.
+
 The channel bounds queued messages, but consumers drain the channel into the
 `ReorderBuffer` whether or not the head seq has arrived, so one slow blob lets
 the buffer grow by however many blobs the other workers finish meanwhile.
@@ -1175,6 +1274,8 @@ Reported by: re-encoding, read path, filtering and spatial, altw and scanning.
 
 ## HYG-054 - Read-path growth with no guard
 
+Anger: 8 - memory bounds change algorithms and output.
+
 `IndexedReader` keeps a `Vec<BlobInfo>` for the whole file and
 `read_ways_and_deps` collects referenced node IDs into a `BTreeSet<i64>`
 (documented as potentially billions), with no guard; at planet the failure is
@@ -1189,6 +1290,8 @@ Reported by: read path.
 
 ## HYG-055 - Write-path growth with no guard
 
+Anger: 8 - memory bounds change algorithms and output.
+
 `FrameScratch::take_with_capacity` reserves every replacement buffer to the
 high-water mark ever seen on that thread, so one oversize blob pins that
 capacity in every rayon thread's scratch for the process lifetime, bounded by
@@ -1200,6 +1303,8 @@ end (not reachable today).
 Reported by: write path.
 
 ## HYG-056 - Change-application memory grows with the whole input
+
+Anger: 8 - memory bounds change algorithms and output.
 
 Merge-changes N>1 streaming holds every input's fully re-emitted compressed XML
 (`Vec<(Vec<u8>, u64)>`) before writing any; at planet `--osc-range` that is the
@@ -1219,6 +1324,8 @@ Reported by: change application, filtering and spatial.
 
 ## HYG-057 - Multi-GB scratch writes have no free-space precheck
 
+Anger: 7 - new refusals.
+
 Sparse altw checks `statvfs` before preallocating; external altw writes hundreds
 of GB into the output directory with no precheck and finds ENOSPC whenever stage
 1 or 2 hits it, minutes to hours in. Diff and derive scratch is the full output
@@ -1230,6 +1337,8 @@ Reported by: altw and scanning, re-encoding.
 
 ## HYG-058 - Sort and dedupe memory on adversarial input
 
+Anger: 8 - memory bounds change algorithms and output.
+
 Sort holds every overlap run's re-encoded output (`overlap_outputs`) before the
 write loop; the comment says for pathologically unsorted input it can approach
 the input size, which is planet-sized RSS on exactly the input sort exists for.
@@ -1240,6 +1349,8 @@ range makes the whole kind.
 Reported by: re-encoding.
 
 ## HYG-059 - `geo::assemble_rings` is an unbounded backtracking search
+
+Anger: 7 - geocode output.
 
 Each ring start runs a DFS over all endpoint candidates with full backtracking
 (`used[segment_idx] = false; ring.truncate(..)`), cloning a candidate `Vec` per
@@ -1253,6 +1364,8 @@ non-backtracking assembler (osmium's, in `research/libosmium/`).
 Reported by: filtering and spatial.
 
 ## HYG-060 - Spatial primitives live in three homes, and region properties are recomputed per query
+
+Anger: 8 - spatial floating point.
 
 `extract::Bbox` lives in the extract command, `commands/spatial.rs` (the
 declared shared owner) imports it from there, and `geo.rs` owns ring math.
@@ -1277,6 +1390,8 @@ Reported by: filtering and spatial.
 
 ## HYG-061 - The indexdata trust model is decided per command
 
+Anger: 9 - indexdata trust model.
+
 Sort trusts indexdata only under a sorted header and otherwise decodes; dedupe
 trusts it whenever present; renumber trusts `count` but cross-checks per blob,
 and trusts `max_id` for preallocation but checks per ID; repack and degrade
@@ -1298,6 +1413,8 @@ this is the consequence) and have each command cite it.
 Reported by: change application, re-encoding, altw and scanning, geocode index.
 
 ## HYG-062 - Fault-injection hooks are process-global statics
+
+Anger: 8 - fault plans in options structs.
 
 Hooks live as statics in `read/pipeline.rs`,
 `read/region_grid.rs`, `write/parallel_writer.rs`, `write/parallel_gzip.rs`,
@@ -1331,6 +1448,8 @@ index, change application, CLI and plumbing.
 
 ## HYG-063 - "Element matches any expression" is implemented four times
 
+Anger: 8 - element kinds, expression semantics.
+
 `tags_filter/mod.rs::element_matches` (bool triple), `tags_count` (same body),
 `tags_filter/osc.rs::matches_any` (a `char` with `_ => false`) and
 `export/mod.rs::matches_expressions` (a `TypeFilter` used as a kind, with
@@ -1345,6 +1464,8 @@ Reported by: filtering and spatial.
 
 ## HYG-064 - Three hand-written `/proc` parsers that return zero on failure
 
+Anger: 7 - CLI behaviour.
+
 `read_page_faults` (`debug.rs`), `read_peak_rss_kb` (`main.rs`) and
 `micros_since_process_start`, in two crates, each parse `/proc` themselves and
 silently return zero or `None` on failure (the page-fault one now parses from
@@ -1354,6 +1475,8 @@ that callers handle.
 Reported by: CLI and plumbing, altw and scanning.
 
 ## HYG-065 - CLI defaults, help text and docs restate library constants
+
+Anger: 7 - CLI behaviour.
 
 - Geocode build defaults `17 / 14 / 10 / 500 / 75 / 1000` live in
   `BuildConfig::default()`, clap `default_value = "..."` strings,
@@ -1389,6 +1512,8 @@ Reported by: geocode index, CLI and plumbing, altw and scanning.
 
 ## HYG-066 - Two element-ID spec parsers for one syntax, already diverged
 
+Anger: 7 - CLI behaviour.
+
 `inspect --show` parses `n123` and `node/123` via `parse_element_spec` in
 `cli/src/main.rs`; `getid` and `getparents` parse via
 `getid::parse_id_spec_inner`. `node/123` works for `--show` and is rejected by
@@ -1400,6 +1525,8 @@ Reported by: CLI and plumbing.
 
 ## HYG-067 - The negative-answer exit travels as an error
 
+Anger: 7 - CLI behaviour.
+
 `ExitWithCode` is modelled as an `Err` downcast in `main` and `guarded_output`.
 Any wrapper that re-boxes or maps the error would turn "diff found differences"
 into exit 2 with `Error: exit with code 1`. Its `Display` exists only to
@@ -1409,6 +1536,8 @@ satisfy `Error`. Fix: `run_*` returns `Result<Outcome, Error>` with
 Reported by: CLI and plumbing.
 
 ## HYG-070 - CLI-driving tests live in the library crate, so binary resolution is restated and guessed
+
+Anger: 8 - moves every CLI test.
 
 `tests/common/cli.rs::pbfhogg_bin()` resolves `BROKKR_TEST_BIN_DIR`, else
 `CARGO_TARGET_DIR`, else `CARGO_MANIFEST_DIR/target`, plus a
@@ -1431,6 +1560,8 @@ unset.
 Reported by: test harness, CLI and plumbing.
 
 ## HYG-072 - Real-data tests hard-code dataset paths that `brokkr.toml` owns, and they have diverged
+
+Anger: 6 - needs brokkr changes.
 
 `data/denmark-20260220-seq4704.osm.pbf` appears in `tests/roundtrip_real.rs`
 and `tests/cli_apply_changes.rs`, `...-with-indexdata.osm.pbf` in
@@ -1455,6 +1586,8 @@ Reported by: test harness, CLI and plumbing.
 
 ## HYG-077 - The enforcement levers most of these findings need are unused
 
+Anger: 8 - clippy.toml with expect_used denied means hundreds of edits.
+
 There is no `clippy.toml`, so `disallowed-methods`, `disallowed-types` and
 `disallowed-macros` are unused; `expect_used`, `print_stderr`, `print_stdout`,
 `arithmetic_side_effects`, `panic`, `unreachable` and `exit` are not enabled;
@@ -1469,6 +1602,8 @@ when the library is built alone from a published tarball.
 Reported by: all nine scopes.
 
 ## HYG-078 - Inputs are opened and their headers read several times per run
+
+Anger: 8 - open the input once in altw and apply-changes.
 
 Altw checks sorted and indexed preconditions through four separate opens
 (`auto_select_index_type` opens an `ElementReader` and a `BlobReader`, the
@@ -1487,6 +1622,8 @@ spatial.
 
 ## HYG-079 - The altw inject-prepass pin bit is stolen from latitude
 
+Anger: 8 - altw pin bit.
+
 Stage 2 writes `lat = (tuple.lat << 1) | pin` into `ResolvedEntry` when
 `inject_prepass` is set, and stages 3 and 4 decode based on the same flag passed
 separately: a second coordinate encoding beside `coord_pack`, whose doc says
@@ -1503,6 +1640,8 @@ Reported by: altw and scanning.
 
 ## HYG-080 - Unsafe shared state whose safety rests on lexical co-location
 
+Anger: 8 - unsafe sparse writer.
+
 `SharedSparseWriter` is a raw pointer with hand-written `Send + Sync`; soundness
 rests on the mmap outliving the writer lexically in `build_node_index_sparse`.
 Borrow the mmap as `&[AtomicU64]` with a lifetime and drop the `unsafe impl`s.
@@ -1518,6 +1657,8 @@ invariant held by a field comment.
 Reported by: altw and scanning, read path, write path.
 
 ## HYG-081 - The apply-changes node-to-way barrier is a three-party protocol held together by polling
+
+Anger: 10 - rewrites apply-changes' barrier.
 
 Scanner, workers and drain coordinate through `last_node_seq_tx`, `barrier_tx`,
 an `OnceLock` loc map and per-worker `Arc<Mutex<FxHashMap>>` coord slots.
@@ -1546,6 +1687,8 @@ Reported by: change application.
 
 ## HYG-083 - The library evicts page cache by default
 
+Anger: 8 - eviction default.
+
 Eviction is on by default for the buffered `BlobReader` constructors and
 re-advises the whole consumed prefix `0..offset` per blob (the source notes it
 is unmeasured and tracked in TODO.md). For a library this evicts pages another
@@ -1557,6 +1700,8 @@ in.
 Reported by: read path.
 
 ## HYG-084 - Geocode format vocabulary is held in literals and argument order
+
+Anger: 7 - geocode format bump.
 
 - Admin level 11 means "postal code" (invented in `pass1.rs` as `else { 11 }`),
   relied on by `reader.rs` (`best_by_level: [...; 12]` twice, `level < 12`
@@ -1591,6 +1736,8 @@ Reported by: geocode index.
 
 ## HYG-085 - Geocode `Reader::open` validation is O(index size) with no opt-out
 
+Anger: 7 - new API.
+
 `validate_structure` walks every record of every file at open, faulting in many
 GB at planet and making `open` take seconds to minutes; the builder's smoke test
 repeats the walk. A legitimate trade, but undocumented as a cost and with no
@@ -1601,6 +1748,8 @@ to this walk.
 Reported by: geocode index.
 
 ## HYG-086 - Geocode street classification is defined twice
+
+Anger: 7 - geocode output.
 
 Pass 1.5 decides which ways' nodes to keep via
 `scan::way::GeocodeTagLiterals::standard()` (`is_street`, `is_building_addr`,
@@ -1617,6 +1766,8 @@ Reported by: geocode index.
 
 ## HYG-087 - Geocode `--force` means two things, and bad-element policy differs per rule
 
+Anger: 7 - geocode output.
+
 `config.force` is passed to `require_indexdata` (skip the requirement) and also
 gates overwriting an existing index, so rebuilding in place also opts out of the
 indexdata check (which on unindexed input now costs a decode of every blob to
@@ -1629,6 +1780,8 @@ aborts. Fix: `overwrite` and `allow_unindexed` as two fields and two flags; one
 Reported by: geocode index.
 
 ## HYG-088 - Geocode build drops data silently and its smoke test cannot be acted on
+
+Anger: 7 - geocode output.
 
 `classify_way_into` drops refs whose node is absent (`filter_map`), shortening
 streets and opening admin rings, with no counter or line; on an extract this is
@@ -1648,6 +1801,8 @@ SmokeOutcome`. The smoke test exists only to need `first_addr_lat_e7` /
 Reported by: geocode index.
 
 ## HYG-091 - Significant fallbacks and events happen with no line or counter
+
+Anger: 8 - new diagnostic lines and wording.
 
 - `diff` and `derive-changes` fall back from parallel to sequential when either
   input lacks indexdata or `--verbose` is set (derive gates on
@@ -1677,6 +1832,8 @@ application.
 
 ## HYG-093 - `PipelineConfig` clamping lives in the builder, not the type
 
+Anger: 5 - API.
+
 `ElementReader`'s `read_ahead` / `decode_ahead` setters clamp `n.max(1)`, and
 `AdmissionGate::new` clamps again with `cap.max(1)`. `sync_channel(0)` is a
 rendezvous channel, not an error, so a `PipelineConfig` built another way
@@ -1687,6 +1844,8 @@ Reported by: read path.
 
 ## HYG-094 - io_uring setup treats a failed probe as support and gives memlock advice that may be wrong
 
+Anger: 7 - CLI behaviour.
+
 `uring_init_and_run` refuses only when the probe succeeds and says WriteFixed
 is unsupported; a failed `register_probe` proceeds. The `RLIMIT_MEMLOCK` advice
 printed for ENOMEM / EPERM can be wrong on kernels 5.12+, where registered
@@ -1696,6 +1855,8 @@ hosts in use. 16 MB locked memory is assumed.
 Reported by: write path.
 
 ## HYG-095 - Filtering, inspect and check memory grow without bound
+
+Anger: 8 - memory bounds change algorithms and output.
 
 `inspect tags` (`tags_count`) accumulates a global
 `FxHashMap<String, FxHashMap<String, u64>>` over the whole file, filters by
@@ -1713,6 +1874,8 @@ Reported by: CLI and plumbing, filtering and spatial.
 
 ## HYG-096 - Geocode builder holds all intermediate state in RAM, some of it twice
 
+Anger: 7 - geocode output.
+
 `way_geom` (every admin way's geometry), `admin_polygons`, `interp_ways`,
 `StringPool` and `admin_cell_entries` grow with input; the doc acknowledges
 planet limits. `StringPool` stores every string twice (bytes in `data` plus an
@@ -1727,6 +1890,8 @@ only after the fact).
 Reported by: geocode index, altw and scanning.
 
 ## HYG-097 - Geocode query behaviour depends on the cell level rather than distance
+
+Anger: 7 - geocode output.
 
 Interpolation endpoint matching scans the street-level cell and its 8
 neighbours: about 450 m at level 17, about 100 m at `--street-level 19`, where
@@ -1743,6 +1908,8 @@ Reported by: geocode index.
 
 ## HYG-102 - The library `IndexType::from_str` keeps a "dense" arm
 
+Anger: 5 - API decision.
+
 The library `IndexType::from_str` "dense" arm (an error explaining dense was
 removed) has no in-repo caller; it is public API, so whether it stays is a
 decision. Its wording has diverged from the CLI's `IndexTypeArg::resolve`
@@ -1752,12 +1919,16 @@ Reported by: altw and scanning.
 
 ## HYG-105 - Geocode `BuildStats` repeats the header counts
 
+Anger: 4 - BuildStats API.
+
 `BuildStats` repeats the header counts; it could be derived from the header
 plus `dropped_admin_relations`.
 
 Reported by: geocode index.
 
 ## HYG-106 - Dead or stale code in the CLI, plumbing and brokkr configuration
+
+Anger: 6 - removes public functions and CLI aliases.
 
 - `process::malloc_trim` and `process::set_mmap_threshold`: no caller in
   `src/`, `cli/` or tests; their docs describe investigations. `process` is
@@ -1775,6 +1946,8 @@ Reported by: geocode index.
 Reported by: CLI and plumbing, test harness.
 
 ## HYG-107 - Library-use survey follow-ups
+
+Anger: 3 - mostly observations.
 
 - `common::write_indexed_pbf` says the sync writer emits no indexdata,
   but `write_primitive_block` now emits it on the sync path too. Fixtures
@@ -1796,6 +1969,8 @@ match substrings, so bless and compare names must not contain each other.
 Reported by: library-use implementation survey.
 
 ## HYG-108 - Diagnostic wording is inconsistent across commands
+
+Anger: 8 - new diagnostic lines and wording.
 
 The library now reports through keyed `host::Diagnostics` events and the CLI
 prints each as one stderr line, byte for byte as before; the wording itself
@@ -1827,6 +2002,8 @@ library stopped writing stderr).
 
 ## HYG-003 - Altw keeps its own copies of the I/O buffer size
 
+Anger: 8 - altw buffer sizes.
+
 `write::IO_BUF_BYTES` now owns the 256 KiB read and write buffer size, with a
 source-scan test under `src/write/`. Altw still spells its own:
 `altw/external/radix.rs::BUCKET_BUF_SIZE`, the private shadowing
@@ -1837,6 +2014,8 @@ quantity as `IO_BUF_BYTES` and which are separate altw tunables.
 Reported by: write path, read path, altw and scanning.
 
 ## HYG-008 - Two coordinate conversions remain outside the shared pair, and one changed arithmetic is unproven
+
+Anger: 8 - OSC coordinate parse.
 
 `coord_fmt::e7_to_deg` / `deg_to_e7` now own the conversion in spatial,
 extract, export, `geo.rs` and the geocode builder. Left:
@@ -1849,6 +2028,8 @@ Reported by: filtering and spatial, CLI and plumbing.
 
 ## HYG-009 - Two coordinate-domain checks still restate the rule
 
+Anger: 8 - altw stage 2 coordinate check.
+
 `coord_pack::in_domain`, `validate_lat` and `validate_lon` now own the
 +/-90 / +/-180 rule for packing and extract. Still separate:
 `altw/external/stage2.rs` (literal ranges and its own error text) and
@@ -1858,6 +2039,8 @@ out-of-domain node to both altw backends is still missing.
 Reported by: altw and scanning, filtering and spatial.
 
 ## HYG-026 - Two OSC writers still frame documents by hand
+
+Anger: 7 - OSC output bytes.
 
 `osc/write.rs` now owns OSC document framing, gzip suffix detection and the
 compression level (`OscDocumentWriter`, `OscOutput`), used by merge-changes
@@ -1871,6 +2054,8 @@ Reported by: change application.
 
 ## HYG-052 - The marker FIFO setup moved to an explicit call the CLI does not make yet
 
+Anger: 4 - brokkr mirror, pub mod debug.
+
 `debug` now has golden tests for both line shapes and an explicit
 `initialize_marker_fifo(path)`. The CLI still calls the removed
 `enable_marker_fifo_from_env()`: it must read `BROKKR_MARKER_FIFO` itself,
@@ -1882,6 +2067,8 @@ Reported by: CLI and plumbing, test harness.
 
 ## HYG-068 - Nothing verifies the workspace MSRV
 
+Anger: 5 - toolchain install.
+
 `rust-version` is inherited from `[workspace.package]`, but no sweep checks
 the workspace builds on it. `cargo-msrv` is not installed and only a nightly
 toolchain is, so a sweep needs the pinned toolchain installed and either
@@ -1890,6 +2077,8 @@ toolchain is, so a sweep needs the pinned toolchain installed and either
 Reported by: CLI and plumbing.
 
 ## HYG-069 - Code comments and help text still hard-code drifting figures
+
+Anger: 5 - CLI help text, and the "recommended" question.
 
 The durable docs are reworded and point at `reference/pipeline.md` (the altw
 auto rule) and `reference/performance.md` (measurements). Still hard-coded:
@@ -1907,6 +2096,8 @@ Reported by: altw and scanning, geocode index, CLI and plumbing, test harness.
 
 ## HYG-071 - Unit tests under `src/` still pick their own scratch
 
+Anger: 3 - unit-test scratch and test timeouts.
+
 Integration tests now share `common::test_scratch()` under the gitignored
 `data/test-scratch/`, and `path_guard.rs` / `tag_expr.rs` unit tests share
 `path_guard::tests::scratch()` on the same root. Unit-test scratch sites still
@@ -1923,6 +2114,8 @@ Reported by: test harness, change application, CLI and plumbing, read path.
 
 ## HYG-073 - Test skips outside the converted files still pass silently
 
+Anger: 6 - needs brokkr changes.
+
 `common::skip()` prints `PBFHOGG_TEST_SKIP:` and fails when
 `PBFHOGG_TEST_MUST_RUN` is set. Unconverted skip sites remain in
 `cli_digest.rs`, `cli_add_locations_to_ways.rs`, `cli_sort.rs`,
@@ -1933,6 +2126,8 @@ Reported by: test harness, change application, CLI and plumbing, read path.
 Reported by: test harness.
 
 ## HYG-076 - Durable source still cites transient documents and line numbers
+
+Anger: 2 - comment citations.
 
 The `notes/` and `.plans/` halves are enforced by
 `scripts/check_doc_links.py`, and `decisions/` now has a place in the
@@ -1946,6 +2141,8 @@ plumbing.
 
 ## HYG-090 - The geocode builder carries an always-true cfg
 
+Anger: 1 - one always-true cfg.
+
 A `geocode-reader`-only sweep now exists. Inside the builder,
 `#[cfg(feature = "geocode-reader")]` around the smoke test is always true
 (`commands` pulls in `geocode-reader`); drop it.
@@ -1953,6 +2150,8 @@ A `geocode-reader`-only sweep now exists. Inside the builder,
 Reported by: geocode index.
 
 ## HYG-111 - Two small inaccuracies in apply-changes instrumentation
+
+Anger: 6 - counter meaning.
 
 `open_osc_reader` times plain-file reads too, so the OSC decompress counter
 includes input-read time for uncompressed input. The drain watermark
@@ -1963,8 +2162,22 @@ Reported by: the wave-1a change fixer.
 
 ## HYG-112 - Export compares nanodegree geometry against a decimicrodegree bbox
 
+Anger: 6 - export output.
+
 Export's way geometry uses nanodegree-derived coordinates while its node bbox
 checks use decimicrodegrees, so a way and its nodes can be judged against the
 bbox at different precision.
 
 Reported by: the wave-1a geo fixer.
+
+## HYG-113 - The altw router's WAIT marker comment claims the spans feed `--stalls`
+
+Anger: 2 - comment correction.
+
+The comment on the `WAIT_*` marker pairs in
+`altw/external/coord_payloads.rs` says they feed `brokkr sidecar --stalls`.
+They do not: `--stalls` reads `*_wait_ns` counters, and marker pairs surface
+only in `--durations`. Reword the comment, or add a `*_wait_ns` counter if
+the router's blocking is meant to show in `--stalls`.
+
+Reported by: the wave-1 altw fixer.

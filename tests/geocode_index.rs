@@ -1568,23 +1568,18 @@ fn force_invalidates_the_header_before_pass_two_writes() {
     );
 }
 
-/// The sampling budget is enforced at config validation, before any input is
-/// read, because that is the only place the work can be bounded without ever
-/// discarding coverage. This asserts the bound is *enforced*, not that a
-/// typical segment happens to be cheap: level 20 is a legal S2 level and a
-/// legal value for the CLI flag, and it must be refused.
+/// The segment sampling budget is enforced at config validation, before any
+/// input is read, because that is the only place the work can be bounded
+/// without ever discarding coverage. This asserts the bound is enforced, not
+/// that a typical segment happens to be cheap.
 #[test]
 fn levels_past_the_sampling_budget_are_refused_before_reading_input() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     write_synthetic_indexed_input(&input);
-    let cases: [(&str, u8, u8, u8); 3] = [
-        ("street", 20, 14, 10),
-        ("coarse", 21, 20, 10),
-        ("admin", 17, 14, 20),
-    ];
-    for (name, street, coarse, admin) in cases {
+    let cases: [(&str, u8, u8); 2] = [("street", 20, 14), ("coarse", 21, 20)];
+    for (name, street, coarse) in cases {
         let err = pbfhogg::geocode_index::builder::build_geocode_index(
             &pbfhogg::geocode_index::builder::BuildConfig {
                 input_path: input.clone(),
@@ -1592,7 +1587,6 @@ fn levels_past_the_sampling_budget_are_refused_before_reading_input() {
                 force: true,
                 street_level: street,
                 coarse_level: coarse,
-                admin_level: admin,
                 ..Default::default()
             },
             &crate::common::test_host(),
@@ -1608,9 +1602,28 @@ fn levels_past_the_sampling_budget_are_refused_before_reading_input() {
         );
     }
 
-    // The boundary is a boundary, not a blanket refusal: the highest accepted
-    // level must actually build. Without this the test above would still pass
-    // if the cap were lowered to zero.
+    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input.clone(),
+            output_dir: index_dir.clone(),
+            force: true,
+            admin_level: 11,
+            ..Default::default()
+        },
+        &crate::common::test_host(),
+    )
+    .expect_err("an admin level over the flood-fill budget must be refused");
+    assert!(
+        err.to_string().contains("admin S2 level must be in 0..=10"),
+        "unexpected admin level error: {err}"
+    );
+    assert!(
+        !index_dir.exists(),
+        "admin level rejection must happen before any output directory is created"
+    );
+
+    // Level 19 remains accepted for the segment-sampled street index while
+    // admin indexing uses its separate, lower flood-fill budget.
     pbfhogg::geocode_index::builder::build_geocode_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,

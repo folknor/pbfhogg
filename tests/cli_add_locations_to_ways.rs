@@ -813,6 +813,42 @@ fn backend_parity_sparse_external_auto() {
     assert_elements_equivalent(&out_external, &out_auto);
 }
 
+#[test]
+fn zero_ref_ways_survive_sparse_and_external_assembly() {
+    // Mixed blobs exercise refcount alignment on both sides of a nonempty
+    // way; all-empty blobs exercise the router's pre-populated Empty slot.
+    for all_empty in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("input.osm.pbf");
+        let sparse = dir.path().join("sparse.osm.pbf");
+        let external = dir.path().join("external.osm.pbf");
+        let mut ways = generate_ways(3, 10, 1, 1);
+        ways[0].refs.clear();
+        ways[1].refs = if all_empty { vec![] } else { vec![1, 2, 3] };
+        ways[2].refs.clear();
+        write_indexed_pbf(&input, &test_nodes(), &ways, &[]);
+        for (output, backend) in [
+            (&sparse, IndexBackend::Sparse),
+            (&external, IndexBackend::External),
+        ] {
+            let out = run_altw(&input, output, true, backend, false);
+            assert!(
+                out.status.success(),
+                "all_empty={all_empty} output={}: {}",
+                output.display(),
+                out.stderr_str().replace('\n', " | ")
+            );
+        }
+        assert_elements_equivalent(&sparse, &external);
+        let locations = read_way_locations(&external);
+        assert_eq!(locations.len(), 3);
+        assert_eq!(locations[0], (10, vec![]));
+        assert_eq!(locations[2], (12, vec![]));
+        assert_eq!(locations[1].0, 11);
+        assert_eq!(locations[1].1.len(), if all_empty { 0 } else { 3 });
+    }
+}
+
 /// Scale-aware auto routing: sorted + indexed no
 /// longer implies external. A small input's estimated node store sits
 /// far below any real host's page-cache budget, so auto must route it

@@ -17,11 +17,28 @@ are marked "likely" by the hunter who found them.
    stable only until this document is drained; the next hunt writes new ones,
    and they are never deduplicated through git history. Carry the context
    inline instead.
+6. The higher an entry's anger index, the higher the bar for implementing
+   anything as a result of it. A high-anger entry should more often than not
+   end as a code comment (rule 3) rather than a code change.
+7. The higher an entry's anger index, the more care is owed - exponentially -
+   against performance regression from any change made for it. Before
+   touching code under a higher-index entry, read
+   `reference/performance-history.md` and `reference/performance.md`. The
+   current code is likely not an accident.
 ```
+
+Each entry carries an `Anger:` rating from 0 to 10: how likely resolving it
+is to make the maintainer angry. 10 is rebuilds or contract changes on
+measured paths; 9 is hot-path or contract changes that need benchmarks or
+the maintainer's decision; 8 is altw, renumber and apply-changes internals
+and observability contracts; 7 is geocode output and format, and CLI
+behaviour; below that the work is progressively more contained.
 
 ---
 
 ## BUG-005 - Indexdata claims are folded into observed element counts
+
+Anger: 9 - verifying indexdata costs a per-blob decode.
 
 `sort`, `getid` and `cat --dedupe` keep a separate `passthrough_claimed`
 count, and extract verifies a passthrough blob by decoding it before
@@ -33,6 +50,8 @@ model).
 Reported by: re-encoding, filtering and spatial, change application.
 
 ## BUG-009 - `apply-changes --locations-on-ways` does not update untouched base ways
+
+Anger: 10 - apply-changes -l loses its splice fast path.
 
 Decided: fix it, as its own project. Until then the CLI help, both CLI
 references and DEVIATIONS.md document the current scope (OSC-touched ways
@@ -58,43 +77,9 @@ untouched way, and on one that deletes such a node.
 
 Reported by: change application.
 
-## BUG-013 - The apply-changes drain's "byte-budget reorder buffer" has no budget
-
-`descriptor.rs` ("merged into a byte-budget reorder buffer"),
-`DrainItem::byte_cost` ("for the reorder buffer's byte-budget backpressure")
-and `streaming.rs` describe backpressure. `run_drain` only records
-`bytes_in_buffer` into a high-water counter, always pulls the next item and
-inserts it into the `BTreeMap`. When one worker stalls on seq N, the drain
-keeps emptying the 256-slot channel, the scanner and other workers never
-block, and every `Rewritten { framed_chunks }` after N piles up; the limit is
-how far ahead the scanner can get, which is the whole file.
-
-Fix: stop `recv` while `bytes_in_buffer > budget` and the head seq is
-missing, or have workers take a budget permit before decompressing, as the
-writer does. A `test-hooks` delay at seq N can assert the high-water stays
-under budget.
-
-Reported by: change application.
-
-## BUG-020 - Apply-changes discards or escalates a scanner error or worker panic when the drain fails
-
-Worker errors now reach the caller: workers publish into a shared
-first-error slot (`apply_changes/failure.rs`) before releasing their drain
-channel, and the drain returns that error. Two paths remain.
-`drain::run_drain(...)?` still returns early out of the scope closure, so
-the explicit `scanner_handle.join()` never runs and a scanner that returned
-`Err` has its error dropped. A worker that panics bypasses the slot; the
-worker pool's inner scope turns the panic into a `scope` panic after the
-join, so the cause becomes a process panic, and under `--locations-on-ways`
-a panicking node-blob worker can still hang the barrier.
-
-Fix: have the scanner publish into the same slot, catch worker panics into
-it, and always join both before picking the root cause. The existing
-`panic_at_blob_seq` hook test should assert which message the caller gets.
-
-Reported by: change application.
-
 ## BUG-021 - `apply_changes::merge` does not refuse output equal to the base input
+
+Anger: 7 - CLI behaviour.
 
 The library entry point never checks whether `output_pbf` is the same file as
 `base_pbf`; the writer would truncate the input it is about to
@@ -104,26 +89,9 @@ output-publication policy.
 
 Reported by: change application.
 
-## BUG-022 - The altw external backend rejects any input with a zero-ref way (likely)
-
-`scan::way::parse_way_refs` returns without calling back when
-`way.refs_data.is_empty()`. Stage 1 pass A pushes `per_way_rcs.push(refs.len())`
-inside that callback, so a zero-ref way gets no entry in the per-way refcount
-sidecar. Stage 4's `reframe_way_blob_with_locations` reads one sidecar varint
-per `Way` message, so it reads the next way's count, then fails with
-"encountered more way messages than the per-way sidecar record declares".
-Sparse accepts the same input (`reframe.rs` handles empty refs explicitly).
-`tests/edge_cases.rs::zero_ref_way_roundtrips` covers plain read/write only.
-Which backend runs, including what `--index-type auto` picks, decides whether
-a legal input is accepted.
-
-Fix: call back with an empty slice, or count Way messages instead of
-callbacks. Enforce with a cross-backend test: a zero-ref-way fixture through
-sparse and external must give byte-identical way output.
-
-Reported by: altw and scanning.
-
 ## BUG-024 - `IdSet::pre_allocate` sizes from an unverified `max_id`
+
+Anger: 8 - IdSet preallocation.
 
 `IdSet` memory now follows the number of distinct IDs rather than their
 size (small chunks are sorted arrays, IDs from 2^43 up live in an ordered
@@ -138,22 +106,9 @@ the same, per CORRECTNESS.md's rule for allocations sized from indexdata.
 
 Reported by: altw and scanning, geocode index, re-encoding.
 
-## BUG-029 - Lost wakeup in the altw stage 4 location router
-
-`ConcurrentBlobLocationRouter` waits on `notify` with `notify_mu: Mutex<()>`,
-while the predicate lives under per-slot mutexes and atomics. The comment
-argues waiters re-check under `notify_mu`, but `publish_worker` sets the slot,
-drops the slot lock and calls `notify_all()` without taking `notify_mu`. A
-publish between the waiter's re-check and its `wait` is lost, and the waiter
-sleeps until the next publish, `mark_producer_done` or `abort`. The final
-`mark_producer_done` guarantees one more wakeup, so it should not hang, but a
-stage 4 worker can stall for an arbitrary stretch of stage 3. Fix: publishers
-take `notify_mu` around the update and notify, or put the predicate under it.
-A loom test of `wait_ready` against `publish_worker` would hold it.
-
-Reported by: altw and scanning.
-
 ## BUG-030 - `with_blob_filter` is silently ignored by `for_each` and `par_map_reduce`
+
+Anger: 7 - CLI behaviour.
 
 `ElementReader::with_blob_filter` documents that the pipeline skips
 decompressing blobs whose type does not match. `for_each` destructures
@@ -167,6 +122,8 @@ honour it.
 Reported by: read path.
 
 ## BUG-037 - `StringTable::pre_seed` identity mapping is not structural
+
+Anger: 9 - string-table remap in the rewrite hot path.
 
 `pre_seed` feeds input strings 1..len through `add`, which dedups. The
 `add_*_raw` / `add_way_raw_bytes*` paths then write the input block's raw
@@ -192,59 +149,9 @@ reason is wrong.
 
 Reported by: write path.
 
-## BUG-039 - `HeaderBuilder::bbox` accepts NaN, infinities and inverted boxes
-
-`bbox` takes raw `f64`s and converts with `(x * 1e9).round() as i64`
-(saturating, NaN to 0), with no check for NaN, infinity, `left > right` or
-out-of-range latitude. A bad `--bbox` or a broken input header round-trips
-into a header claiming `0,0,0,0`. `HeaderBuilder::build` returns `io::Result`
-but cannot fail. Validate in `bbox()` or a checked `Bbox` type, and make
-`build` the place that returns the error.
-
-Reported by: write path.
-
-## BUG-040 - BlockBuilder delta encoding behaves differently in debug and release
-
-`BlockBuilder` computes `id - last_dense_id`, `meta.uid - last_dense_uid` on
-`i32`, and user-sid deltas. Extreme but legal inputs (uid `i32::MAX` followed
-by a negative uid from an OSC) overflow. Release has no `overflow-checks`, so
-it wraps, which is what a wrapping varint delta decoder needs, but debug
-builds panic: the two builds disagree on the same input. Use `wrapping_sub`
-explicitly and say why.
-
-Reported by: write path.
-
-## BUG-041 - Multi-extract prints scratch file names as if they were the outputs
-
-`run_extract_config` redirects every `slot.output` to its `OutputFile`
-scratch sibling (`.pbfhogg-tmp-<pid>-<seq>.<name>`) before calling
-`extract_multi`. Inside the library, `extract/mod.rs`
-("`[i/N] Extracting to {}`", sequential fallback) and `extract/multi.rs`
-("`  [i] {name}: N elements`", single-pass) print `slot.output`. The operator
-sees dot-prefixed temporary names that no longer exist after commit; the CLI
-then prints a second, correct summary from `final_paths`, so single-pass runs
-report every region twice under two names. The library lines are now
-`Diagnostics` events (`extract.multi.slot`, `extract.multi.slot_counts`), but
-their text still carries the scratch name; carry a display name in
-`ExtractSlot`. Testable via a `CliInvoker` stderr assertion.
-
-Reported by: filtering and spatial.
-
-## BUG-042 - Multi-extract output locations depend on the working directory and on how `-d` strips
-
-In `parse_extract_config`, `polygon_file` resolves against `config_dir` and
-`output` against `directory.unwrap_or(config_dir)`, but a relative
-`"directory"` is used as-is, relative to the process working directory. The
-same config writes to different places depending on where it is run.
-Separately, `run_extract_config` rewrites `slot.output` for the `-d` override
-only `if let Ok(relative) = slot.output.strip_prefix(old_dir)`; an absolute
-`output` in the config stays where the config put it, silently. Fix: join a
-relative `directory` onto `config_dir`, and pass the override into
-`parse_extract_config` as the resolve root.
-
-Reported by: filtering and spatial.
-
 ## BUG-077 - Two osmium parity gaps not yet checked against DEVIATIONS.md
+
+Anger: 7 - CLI behaviour.
 
 Found while fixing the list-file readers, not verified further:
 
@@ -260,6 +167,8 @@ Reported by: the list-file reader fix.
 
 ## BUG-044 - Degenerate polygon rings produce an empty extract with exit 0
 
+Anger: 7 - CLI behaviour.
+
 `extract::parse_ring` accepts rings of any length, including 0 to 2 points
 and unclosed rings; `point_in_ring` then returns `false`. A polygon file with
 a degenerate exterior yields an empty extract and success: the wrong answer
@@ -268,6 +177,8 @@ reported as success that `parse_bbox`'s comment says was fixed for bboxes.
 Reported by: filtering and spatial.
 
 ## BUG-046 - The geocode reader skips out-of-range entries, and one off-by-one reads the next way
+
+Anger: 7 - geocode output.
 
 Reader entry lists are validated for length but not content
 (`way_index < street_way_count`, `segment_index + 1 < node_count`,
@@ -288,6 +199,8 @@ Reported by: geocode index.
 
 ## BUG-076 - The shared node scanner silently skips plain `Node` messages
 
+Anger: 9 - plain nodes in the shared node scanner.
+
 `src/scan/node.rs` reads only `DenseNodes` and stops reading a group at its
 dense nodes, so a plain (non-dense) `Node` is never seen, with no error, by
 its users: altw (both backends' node passes) and the external join. Their
@@ -304,6 +217,8 @@ produces the input.
 Reported by: the apply-changes and extract fixes.
 
 ## BUG-079 - The version gate refuses identical repeats from overlapping diffs
+
+Anger: 10 - the version-gate contract.
 
 The version rule refuses any change whose version is not strictly greater
 than the highest claimed so far, so an identical change appearing twice is
@@ -326,6 +241,8 @@ Reported by: the version-floor A/B on germany.
 
 ## BUG-080 - The decoder accepts two block shapes the index scanner refuses
 
+Anger: 9 - decoder refusals.
+
 Found while making the `blob_meta` scanner strict, which now refuses both:
 `PackedUint32Iter` truncates a key sid above `u32::MAX` to a different,
 possibly valid, sid instead of failing, and `WireGroup::dense` reads only
@@ -336,6 +253,8 @@ different block from the one on the wire, with no error.
 Reported by: the blob_meta strict-scanner fix.
 
 ## BUG-081 - Extract still trusts indexdata on the paths verification does not cover
+
+Anger: 9 - verifying indexdata costs a per-blob decode.
 
 Extract now decodes a passthrough candidate before copying it raw, but: a
 verified raw copy keeps the input's BlobHeader, so a false `count` or ID range
@@ -349,6 +268,8 @@ Reported by: the extract passthrough fix.
 
 ## BUG-082 - Apply-changes LocationsOnWays gaps outside the fixed paths
 
+Anger: 9 - verifying indexdata costs a per-blob decode.
+
 Node blobs whose indexdata labels them way or relation skip coordinate
 extraction and can be spliced untouched; the `Pending` location mode protects
 only ways being rewritten, not routing that trusts a wrong kind. The
@@ -360,6 +281,8 @@ Reported by: the apply-changes LocationsOnWays fix.
 
 ## BUG-083 - Measured figures in comments from the 2026-10-22 fixes
 
+Anger: 1 - nothing to do until the figures drift.
+
 Several comments written in that round carry measured figures (the IdSet
 `set` fast path's per-ref cost, `SPARSE_MAX`'s copy volume, renumber's
 `PREALLOC_IDS_PER_BYTE` denmark numbers). They are measurement provenance
@@ -368,6 +291,8 @@ today and will drift; reword when they do.
 Reported by: the 2026-10-22 fix round.
 
 ## BUG-084 - Claims and paths from the 2026-10-22 round that nobody has verified
+
+Anger: 9 - planet runs and verifies on the maintainer's hardware.
 
 - DEVIATIONS.md's renumber cross-validation now says the differences from
   osmium are confined to orphan refs in relation member lists. That was true
@@ -387,6 +312,8 @@ Reported by: the 2026-10-22 fix round.
 
 ## BUG-075 - A repeated OSMHeader is skipped by some commands and refused by others
 
+Anger: 9 - repeated-header policy.
+
 `sort` and plain `cat` silently skip an OSMHeader blob that is not the
 first; `digest` and `cat --dedupe` refuse one. A file with a second header
 (naive concatenation of two PBFs) is therefore accepted or rejected
@@ -396,6 +323,8 @@ command inherit it.
 Reported by: the cat-dedupe header fix.
 
 ## BUG-074 - Geocode builder output differs between runs of the same input
+
+Anger: 7 - geocode output.
 
 `parallel_classify_phase` delivers results in worker-completion order and
 both Pass 2 merges ignore `seq`, so record order, string offsets, the
@@ -411,6 +340,8 @@ Reported by: the geocode fix for the former coordinate-race entry.
 
 ## BUG-048 - Rebuilding a geocode index with `--force` truncates files under open readers
 
+Anger: 7 - geocode output.
+
 `--force` removes the header and `File::create`s every data file in place.
 Any process with a `Reader` open on that directory has those files mmapped;
 truncation turns its next page access into `SIGBUS`, and a `read_string` on
@@ -425,33 +356,9 @@ old data files beside an absent header.
 
 Reported by: geocode index.
 
-## BUG-049 - Admin flood fill is unbounded at the admin levels validation permits
-
-`MAX_BUILD_S2_LEVEL` bounds per-segment sampling, not the interior flood fill
-in `admin_cells_for_polygon`, whose work and memory (`visited`, `queue`,
-`entries`) grow 4x per level. At the default 10 a country is about 10^5 cells;
-`--admin-level 19` passes validation and asks for about 10^10 cells for
-Russia: a hang and an OOM, the failure the segment budget was introduced to
-prevent. Fix: a separate `MAX_ADMIN_S2_LEVEL` derived from a cell-count budget
-over the largest legal polygon, checked in `validate`, tested like
-`max_build_level_is_exactly_the_sampling_budget_boundary`. The structural fix
-is the region coverer tracked in ADR-0015.
-
-Reported by: geocode index.
-
-## BUG-050 - Geocode Stage A writes duplicate coarse entries for long segments
-
-The fused fine/coarse cover closure in `bucketed_cell_assignment_fused` dedups
-coarse cells with `coarse_seen[4]`, which remembers four. A segment crossing
-more than four coarse cells re-emits the fifth onward for each fine sample,
-inflating per-cell counts toward the u16 limit (the reader tolerates
-duplicates). The closure appears verbatim twice and the bucket write loop three
-times, so any fix has to be made more than once; extract `cover_way_fused` and
-a `BucketSink`.
-
-Reported by: geocode index.
-
 ## BUG-051 - The admin edge cover skips the closing segment of an open ring
+
+Anger: 7 - geocode output.
 
 `admin_cells_for_polygon` covers edges with `poly.vertices.windows(2)`, which
 never covers last-to-first unless the ring repeats its first vertex. Whether
@@ -465,6 +372,8 @@ in `format.rs`, assert it in `write_admin_data`, check it in
 Reported by: geocode index.
 
 ## BUG-052 - Geocode `StringPool` offsets wrap silently past 4 GiB
+
+Anger: 7 - geocode output.
 
 `StringPool::intern` uses `self.data.len() as u32`; past 4 GiB of strings,
 offsets wrap and every later string points at the wrong text, with no error.
@@ -482,6 +391,8 @@ Reported by: geocode index.
 
 ## BUG-054 - `inspect --show` prints to stderr on the exit-1 path the contract says is silent
 
+Anger: 7 - CLI behaviour.
+
 `reference/cli-reference.md` and the `ExitStatus` doc in `main.rs` say exit 1
 prints nothing to stderr beyond normal output. `run_show_element` prints
 `Element not found: <spec>` to stderr before exiting 1. Either the message or
@@ -492,6 +403,8 @@ empty stderr on every negative-answer path would hold it.
 Reported by: CLI and plumbing.
 
 ## BUG-056 - `bench-merge` deletes the user-named output before running
+
+Anger: 7 - CLI behaviour.
 
 `run_bench_merge` does `drop(std::fs::remove_file(output))` up front and is
 not routed through `guarded_output`. Every other command moved to
@@ -505,6 +418,8 @@ path the command owns; test that a pre-existing output survives failure.
 Reported by: CLI and plumbing.
 
 ## BUG-063 - Platform-skip predicates turn real failures into passes
+
+Anger: 7 - CLI behaviour.
 
 - `CliOutput::is_uring_unsupported` treats any stderr containing
   `"not supported"` as io_uring unavailable, including unrelated refusals.
@@ -528,6 +443,8 @@ Reported by: test harness, write path, CLI and plumbing.
 
 ## BUG-070 - `uring_writer` shutdown is not guaranteed to finish
 
+Anger: 7 - CLI behaviour.
+
 `uring_writer`'s `drain_best_effort` gives up after a fixed number of error
 rounds, and each `submit_and_wait(1)` can block indefinitely, so its
 shutdown is not guaranteed clean. Split out of the former `PbfWriter` framing
@@ -537,6 +454,8 @@ not a process-ownership question and was out of that scope.
 Reported by: write path.
 
 ## BUG-072 - Index-generating callers turn a malformed block into "no index" instead of an error
+
+Anger: 9 - malformed blocks refused in cat and the writer.
 
 The `blob_meta` scanners now come in two forms: `try_scan_block_ids_checked`
 and `try_scan_block_tags` return `Err` for a block they cannot parse, while
@@ -559,6 +478,8 @@ Reported by: the blob_meta fix for the former strict-scanner entry.
 
 ## BUG-073 - `BlockBuilder` leaves empty-string keys out of tagdata
 
+Anger: 9 - tagdata change in the block builder.
+
 `src/write/block_builder.rs` drops the empty key from the tag index it
 writes, so a blob whose elements carry a tag with key `""` advertises a key
 set without it, and `tags-filter -e ',highway'` style expressions that
@@ -569,6 +490,8 @@ scanner now includes empty keys, so `check --index` flags such blobs as
 Reported by: the blob_meta fix for the former strict-scanner entry.
 
 ## BUG-086 - Decompression buffers under-reserve
+
+Anger: 9 - per-blob decompression reserve.
 
 `src/read/decompress.rs::pool_get` calls
 `buf.reserve(capacity.saturating_sub(buf.capacity()))` on a cleared
@@ -583,6 +506,8 @@ Reported by: the wave-0 reviews.
 
 ## BUG-088 - The check detail cap does not bound check memory
 
+Anger: 8 - check aggregation.
+
 `--max-errors` now caps the retained detail lists, but `verify_ids` still
 collects per-blob violations uncapped before merging, and `check_refs` keeps
 its counting and deferred-reference vectors whole. Total memory on a hostile
@@ -592,6 +517,8 @@ exact counts carried through a different aggregation.
 Reported by: the wave-0 review.
 
 ## BUG-064 - Unit tests use fixed scratch names and collide across parallel sweeps
+
+Anger: 3 - unit-test scratch and test timeouts.
 
 The integration-test sites are fixed (unique dirs under
 `common::test_scratch()`). Still fixed-name in unit tests:
@@ -607,6 +534,8 @@ harness.
 
 ## BUG-089 - The CliInvoker 10 s default can kill legitimately slow CLI tests
 
+Anger: 3 - unit-test scratch and test timeouts.
+
 `tests/common/cli.rs` now defaults `CliInvoker` to a 10 s timeout so it fires
 before the 20 s `brokkr check` watchdog. Tests run individually via
 `brokkr test --timeout N` (the denmark roundtrip, the osmium
@@ -615,3 +544,68 @@ now fail at 10 s. They need explicit timeouts, or the default should follow
 the watchdog brokkr sets.
 
 Reported by: the wave-1a coordinator.
+
+## BUG-090 - The apply-changes scanner can hold every post-node descriptor until EOF
+
+Anger: 8 - apply-changes internals.
+
+Under `--locations-on-ways`, `apply_changes/scanner.rs` holds back way and
+relation descriptors until the node-to-way barrier fires. Nothing bounds how
+many it holds, so on an input where the barrier fires late the scanner can
+buffer every descriptor after the node phase until end of file, separately
+from the drain's reorder map. Unverified beyond the fixer's reading.
+
+Reported by: the wave-1 drain fixer.
+
+## BUG-091 - Way, relation and dense-decode delta arithmetic still differs between debug and release
+
+Anger: 8 - builder and decoder deltas.
+
+`BlockBuilder`'s dense-node deltas now use explicit wrapping arithmetic. The
+same class remains elsewhere: `src/write/encode.rs` computes way-ref and
+relation-member deltas with plain subtraction, and `src/read/dense.rs`
+reconstructs dense IDs and metadata with plain addition. Release builds
+wrap, which is what modular varint deltas need; debug builds panic on the
+same extreme but legal input. Use `wrapping_sub` / `wrapping_add` and say
+why.
+
+Reported by: the wave-1 write-path fixer.
+
+## BUG-092 - Single-pass multi-extract still reports each region twice
+
+Anger: 7 - CLI behaviour.
+
+Multi-extract diagnostics now name the final output paths rather than the
+scratch siblings, but a single-pass run still prints each region twice: the
+library's `extract.multi.slot_counts` event and the CLI's own summary from
+`final_paths`. Drop one of them.
+
+Reported by: the wave-1 reviewer.
+
+## BUG-093 - Multi-extract config path resolution deviates from osmium, undocumented
+
+Anger: 7 - CLI behaviour.
+
+A relative `"directory"` in a multi-extract config now resolves against the
+config file's directory; osmium resolves it against the working directory.
+With `-d`, an absolute `output` in the config keeps only its file name under
+the override directory; osmium concatenates directory and output. Both are
+deliberate and tested, and DEVIATIONS.md mentions neither. Document them, or
+change the absolute-output rule if the maintainer prefers osmium's.
+
+Reported by: the wave-1 reviewer.
+
+## BUG-094 - The apply-changes `-j 1` refusal may rest on a fixed hazard
+
+Anger: 7 - CLI behaviour.
+
+`apply_changes/rewrite.rs` refuses `--jobs 1` because a single worker had a
+deadlock hazard on a mid-stream worker panic. Scanner and worker panics are
+now caught into the shared failure slot and the drain drops its channels, so
+the lone worker's exit drops the candidate receiver and the scanner's send
+fails; the hazard looks gone. The error text and the `MergeOptions::jobs` doc
+still state the old rationale. The node-to-way barrier deadlock recorded
+under HYG-081 is a separate `-j 1` case and must be ruled out before the
+refusal is lifted.
+
+Reported by: the wave-1 reviewer.

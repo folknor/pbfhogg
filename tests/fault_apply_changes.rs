@@ -20,10 +20,11 @@ mod apply_changes {
 
     use flate2::write::GzEncoder;
     use pbfhogg::apply_changes::{MergeOptions, merge};
-    use pbfhogg::writer::Compression;
+    use pbfhogg::block_builder::{self, BlockBuilder};
+    use pbfhogg::writer::{Compression, PbfWriter};
     use tempfile::TempDir;
 
-    use crate::common::{self, generate_nodes, write_multi_block_test_pbf};
+    use crate::common::{self, TestNode, generate_nodes, write_multi_block_test_pbf};
 
     fn write_osc(path: &Path, xml: &str) {
         let file = File::create(path).expect("create osc file");
@@ -32,13 +33,38 @@ mod apply_changes {
         enc.finish().expect("finish gz");
     }
 
-    /// A worker panic mid-stream surfaces as either a returned Err or a
-    /// propagated panic (depending on which pipeline stage errors first),
-    /// the command never silently succeeds, scratch is clean, and the
-    /// output file is absent-or-truncated (never a zero-filled short file
-    /// masquerading as valid output).
+    /// Node-only sorted base whose header claims LocationsOnWays, one blob
+    /// per `block_size` nodes, written like `write_multi_block_test_pbf`.
+    fn write_multi_block_locations_pbf(path: &Path, nodes: &[TestNode], block_size: usize) {
+        let file = File::create(path).expect("create base");
+        let mut writer = PbfWriter::new(file, Compression::default());
+        let header = block_builder::HeaderBuilder::new()
+            .sorted()
+            .optional_feature("LocationsOnWays")
+            .build()
+            .expect("build header");
+        writer.write_header(&header).expect("write header");
+        let mut bb = BlockBuilder::new();
+        for chunk in nodes.chunks(block_size) {
+            for n in chunk {
+                bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), None);
+            }
+            if let Some(bytes) = bb.take().expect("take") {
+                writer.write_primitive_block(bytes).expect("write block");
+            }
+        }
+        writer.flush().expect("flush base");
+    }
+
+    /// A worker panic must return its original message as an error, release
+    /// the node barrier when enabled, and leave no scratch behind.
     #[test]
     fn fault_injection_worker_panic_surfaces_error_and_leaves_scratch_clean() {
+        check_worker_panic(false);
+        check_worker_panic(true);
+    }
+
+    fn check_worker_panic(locations_on_ways: bool) {
         let dir = TempDir::new().expect("tempdir");
         let base = dir.path().join("base.osm.pbf");
         let osc = dir.path().join("diff.osc.gz");
@@ -48,7 +74,14 @@ mod apply_changes {
         // Enough blobs that the scanner dispatches several candidates before
         // the injected panic fires.
         let nodes = generate_nodes(40, 1);
-        write_multi_block_test_pbf(&base, &nodes, &[], &[], 5);
+        if locations_on_ways {
+            // `merge --locations-on-ways` refuses a base whose header lacks
+            // LocationsOnWays before any worker runs, so the panic path
+            // needs a base that claims it.
+            write_multi_block_locations_pbf(&base, &nodes, 5);
+        } else {
+            write_multi_block_test_pbf(&base, &nodes, &[], &[], 5);
+        }
 
         // OSC that creates node candidates overlapping every base blob.
         // The scanner will route every node blob to the worker pool.
@@ -84,18 +117,15 @@ mod apply_changes {
             direct_io: false,
             io_uring: false,
             force: true,
-            locations_on_ways: false,
+            locations_on_ways,
             ignore_missing_nodes: false,
             jobs: Some(2),
             allow_version_regression: false,
             panic_at_blob_seq: Some(3),
         };
 
-        // A worker panic propagates through thread::scope. Depending on
-        // whether the drain's "channel closed" check fires first, merge()
-        // may either return Err or panic - both are acceptable: the
-        // invariant is "does not silently succeed" + "scratch stays clean"
-        // + "output is absent-or-truncated-to-zero".
+        // Catch only as a guard: the public API must return an error,
+        // including when a missing node seq would otherwise hang the barrier.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             merge(
                 &base,
@@ -106,10 +136,15 @@ mod apply_changes {
                 &crate::common::test_host(),
             )
         }));
-        let silently_succeeded = matches!(result, Ok(Ok(_)));
+        let err = match result {
+            Ok(Err(e)) => e.to_string(),
+            Ok(Ok(_)) => panic!("merge must fail when the worker panic hook fires"),
+            Err(_) => panic!("merge must return a worker panic as an error, not unwind"),
+        };
         assert!(
-            !silently_succeeded,
-            "merge must not silently succeed when panic_at_blob_seq fires"
+            err.contains("streaming worker panicked")
+                && err.contains("panic_at_blob_seq=3 triggered"),
+            "merge must preserve the worker panic payload, got: {err}"
         );
 
         // Scratch tracking: the only new path relative to `before` is the

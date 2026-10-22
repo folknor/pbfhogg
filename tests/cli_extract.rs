@@ -1110,6 +1110,122 @@ fn multi_extract_two_bbox_regions() {
     assert_eq!(relation_ids(&cb), vec![101]);
 }
 
+#[test]
+fn multi_extract_diagnostics_use_final_output_paths() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let config = dir.path().join("config.json");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    let simple_output = dir.path().join("simple.osm.pbf");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{{"output":"simple.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}}]}}"#,
+            dir.path().display()
+        ),
+    )
+    .expect("write config");
+    let simple = run_extract_multi(&input, &config, Strategy::Simple);
+    let simple_stderr = simple.stderr_str();
+    assert!(
+        simple_stderr.contains(simple_output.to_str().expect("UTF-8 output path")),
+        "the summary should report the final simple output path; stderr:\n{simple_stderr}"
+    );
+    assert!(
+        !simple_stderr.contains(".pbfhogg-tmp-"),
+        "single-pass diagnostics must not expose scratch paths; stderr:\n{simple_stderr}"
+    );
+
+    let sequential_output = dir.path().join("sequential.osm.pbf");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[{{"output":"sequential.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}}]}}"#,
+            dir.path().display()
+        ),
+    )
+    .expect("write config");
+    let sequential = run_extract_multi(&input, &config, Strategy::CompleteWays);
+    let sequential_stderr = sequential.stderr_str();
+    assert!(
+        sequential_stderr.contains(&format!("Extracting to {}", sequential_output.display())),
+        "sequential diagnostics should report the final output path; stderr:\n{sequential_stderr}"
+    );
+    assert!(
+        !sequential_stderr.contains(".pbfhogg-tmp-"),
+        "sequential diagnostics must not expose scratch paths; stderr:\n{sequential_stderr}"
+    );
+}
+
+#[test]
+fn multi_extract_config_paths_resolve_from_config_and_directory_override() {
+    let dir = TempDir::new().expect("tempdir");
+    let config_dir = dir.path().join("config");
+    let configured_dir = config_dir.join("configured");
+    let override_dir = dir.path().join("override");
+    let external_dir = dir.path().join("external");
+    std::fs::create_dir(&config_dir).expect("create config directory");
+    std::fs::create_dir(&configured_dir).expect("create configured output directory");
+    std::fs::create_dir(configured_dir.join("nested")).expect("create configured nested directory");
+    std::fs::create_dir(&override_dir).expect("create override directory");
+    std::fs::create_dir(override_dir.join("nested")).expect("create override nested directory");
+    std::fs::create_dir(&external_dir).expect("create external output directory");
+
+    let input = dir.path().join("input.osm.pbf");
+    let config = config_dir.join("extract.json");
+    let relative_output = override_dir.join("nested/relative.osm.pbf");
+    let absolute_output = external_dir.join("absolute.osm.pbf");
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"configured","extracts":[
+                {{"output":"nested/relative.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}},
+                {{"output":"{}","bbox":[13.5,55.5,14.5,55.9]}}
+            ]}}"#,
+            absolute_output.display()
+        ),
+    )
+    .expect("write config");
+
+    let result = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("--config")
+        .arg(&config)
+        .arg("--directory")
+        .arg(&override_dir)
+        .arg("--simple")
+        .arg("--set-bounds")
+        .arg("--force")
+        .assert_success();
+
+    assert!(relative_output.exists());
+    assert!(override_dir.join("absolute.osm.pbf").exists());
+    assert!(!configured_dir.join("nested/relative.osm.pbf").exists());
+    assert!(!absolute_output.exists());
+    assert!(
+        result
+            .stderr_str()
+            .contains(relative_output.to_str().expect("UTF-8 output path")),
+        "summary should report the rebased relative output; stderr:\n{}",
+        result.stderr_str()
+    );
+
+    let config_relative_dir = config_dir.join("relative-dir.json");
+    let resolved_dir = config_dir.join("relative-outputs");
+    std::fs::create_dir(&resolved_dir).expect("create config-relative output directory");
+    std::fs::write(
+        &config_relative_dir,
+        r#"{"directory":"relative-outputs","extracts":[{"output":"anchored.osm.pbf","bbox":[12.4,55.6,12.7,55.8]}]}"#,
+    )
+    .expect("write relative directory config");
+    run_extract_multi(&input, &config_relative_dir, Strategy::Simple);
+    assert!(resolved_dir.join("anchored.osm.pbf").exists());
+}
+
 /// The config path parses bbox floats with serde_json, the CLI `-b` path
 /// with std `FromStr`. serde_json's default float parse is best-effort
 /// and can land 1 ULP off the correctly-rounded value on 17-digit inputs

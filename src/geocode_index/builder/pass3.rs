@@ -105,13 +105,50 @@ const MAX_SEGMENT_SAMPLES: f64 = 16_777_216.0;
 /// up. Latitude spans at most 180 degrees and longitude at most 360.
 const MAX_SEGMENT_SPAN_DEG: f64 = 405.0;
 
-/// Highest S2 level the builder accepts for any of its three cell levels.
+/// Highest S2 level accepted for the segment-sampled street and coarse cells.
 ///
 /// Pinned to `MAX_SEGMENT_SAMPLES` by `level_exceeds_sampling_budget` and by
 /// the unit test below, which walks every level and asserts this is exactly
 /// the boundary - raising the constant without raising the budget fails the
 /// test rather than reintroducing the hang.
 pub(in crate::geocode_index) const MAX_BUILD_S2_LEVEL: u8 = 19;
+
+/// Maximum number of S2 cells the admin flood fill may visit for one polygon.
+/// This is the full sphere's cell count at level 10: six faces times 4^10.
+const ADMIN_CELL_COUNT_BUDGET: u64 = 6_291_456;
+
+const fn max_admin_s2_level_for_cell_budget() -> u8 {
+    let mut level = 0;
+    let mut cells = 6u64;
+    while level < 30 && cells <= ADMIN_CELL_COUNT_BUDGET / 4 {
+        cells *= 4;
+        level += 1;
+    }
+    level
+}
+
+/// Highest S2 level that keeps even a whole-sphere admin polygon inside the
+/// flood-fill cell budget. Admin indexing visits interior cells, unlike the
+/// segment sampler bounded by `MAX_BUILD_S2_LEVEL`.
+pub(in crate::geocode_index) const MAX_ADMIN_S2_LEVEL: u8 = max_admin_s2_level_for_cell_budget();
+
+const fn admin_s2_cell_count_upper_bound(level: u8) -> u64 {
+    if level > 30 {
+        u64::MAX
+    } else {
+        let mut count = 6u64;
+        let mut current_level = 0u8;
+        while current_level < level {
+            count *= 4;
+            current_level += 1;
+        }
+        count
+    }
+}
+
+pub(in crate::geocode_index) fn admin_level_exceeds_cell_budget(level: u8) -> bool {
+    admin_s2_cell_count_upper_bound(level) > ADMIN_CELL_COUNT_BUDGET
+}
 
 /// Sampling step for `level`, in degrees: a little under half the globally
 /// smallest S2 cell width at that level, so no cell can be stepped over.
@@ -207,6 +244,48 @@ fn cover_segment(
     }
     debug_assert!(seen.contains(&c1.0));
     debug_assert!(seen.contains(&c2.0));
+}
+
+/// Cover at the fine level and emit each coarse parent once per segment.
+/// Common segments keep their coarse-cell set in a four-entry stack array;
+/// a hash set is allocated only when a segment reaches a fifth distinct
+/// coarse cell, so long segments remain correct without penalizing the usual
+/// short segments with another allocation.
+fn cover_segment_fused(
+    lat1_e7: i32,
+    lon1_e7: i32,
+    lat2_e7: i32,
+    lon2_e7: i32,
+    fine_level: u8,
+    coarse_level: u8,
+    mut emit: impl FnMut(u64, Option<u64>),
+) {
+    let mut coarse_seen = [0u64; 4];
+    let mut coarse_n = 0usize;
+    let mut coarse_overflow: Option<rustc_hash::FxHashSet<u64>> = None;
+
+    cover_segment(lat1_e7, lon1_e7, lat2_e7, lon2_e7, fine_level, |fine_cid| {
+        let coarse_cid = CellID(fine_cid).parent(coarse_level as u64).0;
+        let coarse_to_emit = if coarse_seen[..coarse_n].contains(&coarse_cid) {
+            None
+        } else if coarse_n < coarse_seen.len() {
+            coarse_seen[coarse_n] = coarse_cid;
+            coarse_n += 1;
+            Some(coarse_cid)
+        } else {
+            let seen = coarse_overflow.get_or_insert_with(|| {
+                let mut seen = rustc_hash::FxHashSet::default();
+                seen.extend(coarse_seen[..coarse_n].iter().copied());
+                seen
+            });
+            if seen.insert(coarse_cid) {
+                Some(coarse_cid)
+            } else {
+                None
+            }
+        };
+        emit(fine_cid, coarse_to_emit);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -350,8 +429,8 @@ pub(super) struct FusedCellAssignmentParams<'a> {
 /// segment is walked once at the fine S2 level, and every emitted fine
 /// cell derives its coarse parent via `s2::CellID(cid).parent()`.
 /// Multiple fine cells in a segment commonly share a coarse parent, so
-/// per-segment dedup via a 4-entry stack set emits each coarse cell
-/// once per segment. Addr points (single cell per point) trivially
+/// per-segment dedup uses a 4-entry stack set for common segments and spills
+/// to a hash set for longer ones. Addr points (single cell per point) trivially
 /// derive coarse from fine without any cover work.
 ///
 /// Stage B runs separately on each of the two bucket trees -
@@ -465,28 +544,22 @@ pub(super) fn bucketed_cell_assignment_fused(
                                     read_node_at(street_nodes_mmap, off1 as u64),
                                     read_node_at(street_nodes_mmap, off2 as u64),
                                 ) {
-                                    let mut coarse_seen = [0u64; 4];
-                                    let mut coarse_n = 0usize;
-                                    cover_segment(n1.0, n1.1, n2.0, n2.1, fine_level, |fine_cid| {
-                                        let coarse_cid =
-                                            CellID(fine_cid).parent(coarse_level as u64).0;
-                                        let coarse_to_emit =
-                                            if coarse_seen[..coarse_n].contains(&coarse_cid) {
-                                                None
-                                            } else {
-                                                if coarse_n < coarse_seen.len() {
-                                                    coarse_seen[coarse_n] = coarse_cid;
-                                                    coarse_n += 1;
-                                                }
-                                                Some(coarse_cid)
-                                            };
-                                        out.push((
-                                            fine_cid,
-                                            coarse_to_emit,
-                                            way_idx,
-                                            seg_idx as u16,
-                                        ));
-                                    });
+                                    cover_segment_fused(
+                                        n1.0,
+                                        n1.1,
+                                        n2.0,
+                                        n2.1,
+                                        fine_level,
+                                        coarse_level,
+                                        |fine_cid, coarse_to_emit| {
+                                            out.push((
+                                                fine_cid,
+                                                coarse_to_emit,
+                                                way_idx,
+                                                seg_idx as u16,
+                                            ));
+                                        },
+                                    );
                                 }
                             }
                         }
@@ -590,27 +663,22 @@ pub(super) fn bucketed_cell_assignment_fused(
                                 read_node_at(interp_nodes_mmap, off1 as u64),
                                 read_node_at(interp_nodes_mmap, off2 as u64),
                             ) {
-                                let mut coarse_seen = [0u64; 4];
-                                let mut coarse_n = 0usize;
-                                cover_segment(n1.0, n1.1, n2.0, n2.1, fine_level, |fine_cid| {
-                                    let coarse_cid = CellID(fine_cid).parent(coarse_level as u64).0;
-                                    let coarse_to_emit =
-                                        if coarse_seen[..coarse_n].contains(&coarse_cid) {
-                                            None
-                                        } else {
-                                            if coarse_n < coarse_seen.len() {
-                                                coarse_seen[coarse_n] = coarse_cid;
-                                                coarse_n += 1;
-                                            }
-                                            Some(coarse_cid)
-                                        };
-                                    out.push((
-                                        fine_cid,
-                                        coarse_to_emit,
-                                        way_idx as u32,
-                                        seg_idx as u16,
-                                    ));
-                                });
+                                cover_segment_fused(
+                                    n1.0,
+                                    n1.1,
+                                    n2.0,
+                                    n2.1,
+                                    fine_level,
+                                    coarse_level,
+                                    |fine_cid, coarse_to_emit| {
+                                        out.push((
+                                            fine_cid,
+                                            coarse_to_emit,
+                                            way_idx as u32,
+                                            seg_idx as u16,
+                                        ));
+                                    },
+                                );
                             }
                         }
                     }
@@ -1122,6 +1190,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fused_segment_deduplicates_after_four_coarse_cells() {
+        let mut entries = Vec::new();
+        cover_segment_fused(
+            556_700_000,
+            125_600_000,
+            556_700_000,
+            135_000_000,
+            17,
+            14,
+            |fine, coarse| entries.push((fine, coarse)),
+        );
+
+        let mut fine_seen = rustc_hash::FxHashSet::default();
+        let mut coarse_seen = rustc_hash::FxHashSet::default();
+        for &(fine, coarse) in &entries {
+            assert!(fine_seen.insert(fine), "fine cells must be unique");
+            if let Some(coarse) = coarse {
+                assert_eq!(
+                    CellID(fine).parent(14).0,
+                    coarse,
+                    "coarse entry must be the fine cell's parent"
+                );
+                assert!(
+                    coarse_seen.insert(coarse),
+                    "a coarse cell must be emitted once even after the four-cell stack set fills"
+                );
+            }
+        }
+        assert!(
+            coarse_seen.len() > 4,
+            "fixture must cross more than four coarse cells, got {}",
+            coarse_seen.len()
+        );
+    }
+
     /// `MAX_BUILD_S2_LEVEL` is not a taste judgement, it is exactly the
     /// boundary of `MAX_SEGMENT_SAMPLES`. Walking every level and asserting
     /// the boundary lands where the constant says it does means the constant
@@ -1148,6 +1252,26 @@ mod tests {
         assert!(
             level_exceeds_sampling_budget(30),
             "level 30 must be over budget: it is the level that motivated the bound"
+        );
+    }
+
+    #[test]
+    fn max_admin_level_is_exactly_the_flood_fill_cell_budget_boundary() {
+        for level in 0..=MAX_ADMIN_S2_LEVEL {
+            assert!(
+                !admin_level_exceeds_cell_budget(level),
+                "level {level} must fit the admin flood-fill cell budget"
+            );
+        }
+        assert_eq!(
+            admin_s2_cell_count_upper_bound(MAX_ADMIN_S2_LEVEL),
+            ADMIN_CELL_COUNT_BUDGET,
+            "the accepted ceiling must use the full configured cell budget"
+        );
+        assert!(
+            admin_level_exceeds_cell_budget(MAX_ADMIN_S2_LEVEL + 1),
+            "level {} must exceed the admin flood-fill cell budget",
+            MAX_ADMIN_S2_LEVEL + 1
         );
     }
 

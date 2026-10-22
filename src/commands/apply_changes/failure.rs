@@ -1,4 +1,4 @@
-//! First-failure slot shared by the worker pool and the drain.
+//! First-failure slot shared by the scanner, worker pool and drain.
 //!
 //! A worker that fails never delivers its blob's seq to the drain. Without
 //! a side channel the drain cannot tell "slow" from "never": it keeps
@@ -8,21 +8,21 @@
 //! candidate channel, and the run hangs. When it did not hang, the drain's
 //! "producer dropped a seq" error was returned in place of the real cause.
 //!
-//! Protocol: every worker-pool error is published here BEFORE the
+//! Protocol: every producer error or caught panic is published here BEFORE the
 //! publishing thread releases its drain sender. The drain polls the slot
 //! on every loop iteration and once more after it observes the drain
 //! channel disconnect; because publication precedes sender release, a
-//! disconnected channel with an empty slot proves no worker failed.
+//! disconnected channel with an empty slot proves no producer failed.
 //! Returning the error from the drain drops the drain receiver and the
 //! barrier sender, which unblocks the scanner and every worker.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::error::Error;
+use crate::error::{Error, ErrorKind, new_error};
 
 pub(super) struct FailureSlot {
-    /// Set once by the first publication and never cleared, so "a worker
+    /// Set once by the first publication and never cleared, so "a producer
     /// failed" stays observable after the error itself has been taken.
     failed: AtomicBool,
     error: Mutex<Option<Error>>,
@@ -46,6 +46,18 @@ impl FailureSlot {
         if !self.failed.swap(true, Ordering::AcqRel) {
             *slot = Some(error);
         }
+    }
+
+    /// Preserve a thread's panic message as an ordinary pipeline failure.
+    pub(super) fn publish_panic(&self, owner: &str, payload: &(dyn std::any::Any + Send)) {
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic payload");
+        self.publish(new_error(ErrorKind::Io(std::io::Error::other(format!(
+            "{owner} panicked: {message}",
+        )))));
     }
 
     /// True once any failure has been published.

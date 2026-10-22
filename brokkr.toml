@@ -7,7 +7,9 @@ capture_env = ["PBFHOGG*", "MALLOC*"]
 # test) pass with its own feature shape. Profiles in [test.profiles]
 # reference these by name and layer libtest filters on top.
 #
-#  - "all"      = test-hooks (fault-injection hooks) + linux-direct-io
+#  - "all"      = test-hooks (per-instance fault-injection hooks; the
+#                 process-global ones are `static-test-hooks`, which only
+#                 the "faults" sweep enables) + linux-direct-io
 #                 + linux-io-uring. Mirrors what --all-features used to
 #                 pull in MINUS hotpath (#[hotpath::measure] turns into
 #                 runtime measurement that emits a banner to stdout at
@@ -51,9 +53,24 @@ build_packages = ["pbfhogg-cli", "process-trace-shim"]
 # one), and `claims 1-1` on the second means the budget needs raising (see
 # brokkr man config parallel). Since the test fold (autotests = false) the
 # sweep's binaries are the lib unit tests, the one `all` binary, and the
-# static-hook fault_* targets that must own their process; the fan-out
-# therefore parallelizes mostly inside `all`, and shared scratch between
-# concurrent cli_* modules is the class to suspect first if a test flakes.
+# process_nofile target; the fan-out therefore parallelizes mostly inside
+# `all`, and shared scratch between concurrent cli_* modules is the class
+# to suspect first if a test flakes. The static-hook fault_* targets run in
+# the `faults` sweep below.
+parallel = {}
+
+# "faults" = `all` plus `static-test-hooks`: the only shape in which the
+# library's process-global fault hooks exist, and so the only sweep that
+# builds the [[test]] targets requiring them (each its own process). In
+# this shape tests/all.rs is cfg'd out to an empty harness and the lib
+# unit tests compile without the statics (they are gated on `not(test)`),
+# so neither of the root package's shared harnesses can hold one. Unfiltered on purpose: every target
+# requiring the feature runs whatever it is named, and the gate audits the
+# whole shape. The lib unit tests run here a second time, as the same code
+# the `all` sweep runs.
+[[check]]
+name = "faults"
+features = ["test-hooks", "static-test-hooks", "linux-direct-io", "linux-io-uring"]
 parallel = {}
 
 [[check]]
@@ -167,19 +184,6 @@ exclude = ["cli/src/output.rs"]
 region = "code"
 message = "only cli/src/output.rs acquires stdout; use output::buffered, or have the library take an io::Write"
 
-# Process-global fault hooks (the `*_test_hooks` modules) are armed only from
-# tests/fault_*.rs, each its own [[test]] target in Cargo.toml. A hook armed
-# from a module of the shared tests/all.rs binary fires in every concurrent
-# test that reaches the same code path, which is a flake nobody can trace.
-# Covers the import path; a hook re-exported under another name needs adding.
-[[textlint]]
-name = "static-test-hooks-only-in-fault-targets"
-pattern = '\b[a-z_]*_test_hooks\b'
-paths = ["tests/**/*.rs"]
-exclude = ["tests/fault_*.rs"]
-region = "code"
-message = "process-global test hooks are armed only from a tests/fault_*.rs target of its own (see Cargo.toml); do not arm them inside the shared all binary"
-
 [bin]
 default = "pbfhogg"
 install = ["pbfhogg-cli"]
@@ -192,12 +196,12 @@ gate_profile = "gate"
 
 # Tier 1 - fast contracts. brokkr check's inner-loop signal during
 # refactor. Skips the tier2/tier3/platform/serial submodules; runs
-# everything else across all three sweeps. `minimal` contributes
+# everything else across every listed sweep. `minimal` contributes
 # mostly a compile + clippy gate: the commands-gated test files cfg
 # themselves out there.
 [test.profiles.tier1]
 description = "Fast edit loop used by brokkr check (tier 1)"
-sweeps = ["all", "consumer", "minimal", "cli"]
+sweeps = ["all", "faults", "consumer", "minimal", "cli"]
 skip = ["tier2::", "tier3::", "platform::", "serial::"]
 include_ignored = false
 
@@ -220,7 +224,7 @@ include_ignored = false
 # it; before naming a new test, check it does not contain an entry below.
 [test.profiles.full]
 description = "Full in-project correctness gate (tier 3, pre-merge); over-watchdog tests run individually via brokkr test"
-sweeps = ["all"]
+sweeps = ["all", "faults"]
 skip = [
     "host_identity_",
     "platform::",
@@ -280,7 +284,7 @@ skip = ["platform::", "serial::"]
 # a test that stops running cannot go unnoticed here.
 [test.profiles.gate-tests]
 description = "Every sweep, unfiltered"
-sweeps = ["all", "consumer", "minimal", "cli"]
+sweeps = ["all", "faults", "consumer", "minimal", "cli"]
 
 [test.profiles.doc-twin]
 description = "The doc-only carrier"

@@ -18,7 +18,7 @@ pub mod reader;
 pub(crate) mod region_grid;
 pub(crate) mod wire;
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "static-test-hooks", not(test)))]
 pub mod pipeline_test_hooks {
     pub use super::pipeline::test_hooks::{
         REORDER_FILLED_HIGH_WATER, REORDER_WINDOW_HIGH_WATER, arm_block_decode,
@@ -26,7 +26,7 @@ pub mod pipeline_test_hooks {
     };
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "static-test-hooks", not(test)))]
 pub mod region_grid_test_hooks {
     pub use super::region_grid::test_hooks::{FORCE_LINEAR, reset};
 }

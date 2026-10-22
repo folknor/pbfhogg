@@ -22,13 +22,14 @@ use super::pass2::SlimInterpWay;
 
 use super::super::format::*;
 
-// Fault-injection hooks for tests. Gated behind the `test-hooks`
-// Cargo feature; release builds don't compile this module at all.
+// Fault-injection hooks for tests. Gated behind the `static-test-hooks`
+// Cargo feature and `not(test)`: product builds and the library's own
+// unit-test harness never compile this module.
 // Static atomic fired inside the rayon streets par_iter closure on
 // a matching way_idx. Verifies that the `PathGuard::dir()` bucket
 // cleanup (see ADR-0003) fires correctly when a rayon worker
 // panics during Pass 3 Stage A.
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "static-test-hooks", not(test)))]
 pub mod test_hooks {
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -437,7 +438,7 @@ pub(super) fn bucketed_cell_assignment_fused(
                     // around `fine_bucket_dir` / `coarse_bucket_dir`
                     // (ADR-0003) sweep the scratch trees on the unwind.
                     // Release builds compile this out entirely.
-                    #[cfg(feature = "test-hooks")]
+                    #[cfg(all(feature = "static-test-hooks", not(test)))]
                     if test_hooks::PANIC_AT_STREETS_WAY_IDX
                         .load(std::sync::atomic::Ordering::Relaxed)
                         == way_idx

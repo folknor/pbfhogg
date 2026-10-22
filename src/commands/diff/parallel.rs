@@ -26,13 +26,15 @@ use crate::owned::TypeFilter;
 use super::shard::{BlobDesc, Shard, plan_shards, walk_pair};
 use super::{DiffOptions, DiffStats};
 
-// Fault-injection hooks for tests. Gated behind the `test-hooks`
-// Cargo feature; release builds don't compile this module at all.
+// Fault-injection hooks for tests. Gated behind the `static-test-hooks`
+// Cargo feature and `not(test)`: product builds and the library's own
+// unit-test harness never compile this module.
 // Static atomics rather than per-instance config because the hook
 // wants to fire on a specific shard index, inside the per-shard
 // scope.spawn closure, and threading a config through every entry
-// point would be invasive. Tests serialize via `--test-threads=1`.
-#[cfg(feature = "test-hooks")]
+// point would be invasive. The test that arms it owns its own process
+// (a `[[test]]` target of its own, see Cargo.toml).
+#[cfg(all(feature = "static-test-hooks", not(test)))]
 pub mod test_hooks {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -113,7 +115,7 @@ fn run_shard(
     // path turns the panic into an `Err("shard worker panicked")` and
     // the surrounding cleanup pass sweeps every possible per-shard
     // scratch file. Release builds compile this out entirely.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(all(feature = "static-test-hooks", not(test)))]
     {
         use std::sync::atomic::Ordering;
         if test_hooks::PANIC_AT_SHARD_IDX.load(Ordering::Relaxed) == shard_idx {

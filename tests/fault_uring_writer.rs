@@ -4,7 +4,7 @@
 //! its own `[[test]]` target in `Cargo.toml`,
 //! so the static `PANIC_AT_*` atomics are per-process and race-free
 //! without `#[ignore]` or `--test-threads=1`. See
-//! `reference/testing.md` > "Conventions" (`test-hooks` + per-binary
+//! `reference/testing.md` > "Conventions" (`static-test-hooks` + per-binary
 //! isolation).
 //!
 //! The test still skips cleanly on hosts where io_uring init fails
@@ -16,7 +16,7 @@
 
 mod common;
 
-#[cfg(all(feature = "test-hooks", feature = "linux-io-uring"))]
+#[cfg(all(feature = "static-test-hooks", feature = "linux-io-uring"))]
 mod uring_writer {
     use std::sync::atomic::Ordering;
 

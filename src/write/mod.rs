@@ -32,10 +32,10 @@ mod pipeline;
 mod pool_failure;
 mod string_table;
 
-// Under the `test-hooks` feature, expose the static fault-injection
-// hooks so integration tests can arm them. The rest of
+// Under the `static-test-hooks` feature, expose the static fault-injection
+// hooks so an integration-test target of its own can arm them. The rest of
 // `parallel_writer` stays crate-private.
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "static-test-hooks", not(test)))]
 pub mod parallel_writer_test_hooks {
     pub use super::parallel_writer::test_hooks::{
         HELD_POOL_WORKERS, HOLD_OTHER_POOL_WORKERS, HOOK_TIMED_OUT, JOIN_REACHED_HELD_WORKER,
@@ -43,10 +43,10 @@ pub mod parallel_writer_test_hooks {
     };
 }
 
-// Under the `test-hooks` feature, expose the parallel_gzip hooks and
+// Under the `static-test-hooks` feature, expose the parallel_gzip hooks and
 // the `ParallelGzipWriter` type so integration tests can drive the
 // writer directly.
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "static-test-hooks", not(test)))]
 pub mod parallel_gzip_test_hooks {
     pub use super::parallel_gzip::test_hooks::{
         BARRIERS_QUEUED, HOOK_TIMED_OUT, PANIC_AT_POOL_OP_COUNT, PANIC_WAITS_FOR_BARRIER,
@@ -55,10 +55,10 @@ pub mod parallel_gzip_test_hooks {
     pub use super::parallel_gzip::{DEFAULT_CHUNK_SIZE, ParallelGzipWriter};
 }
 
-// Under the `test-hooks` feature, expose the uring_writer hooks.
+// Under the `static-test-hooks` feature, expose the uring_writer hooks.
 // Test arms `PANIC_AT_DISPATCH_COUNT` before invoking any code path
 // that constructs a `PbfWriter::to_path_uring`.
-#[cfg(all(feature = "test-hooks", feature = "linux-io-uring"))]
+#[cfg(all(feature = "static-test-hooks", not(test), feature = "linux-io-uring"))]
 pub mod uring_writer_test_hooks {
     pub use super::uring_writer::test_hooks::{DISPATCH_COUNT, PANIC_AT_DISPATCH_COUNT, reset};
 }

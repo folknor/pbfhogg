@@ -1461,26 +1461,22 @@ Reported by: change application, re-encoding, altw and scanning, geocode index.
 
 ## HYG-062 - Fault-injection hooks are process-global statics
 
-Hooks live as statics in about twelve modules (`read/pipeline.rs`,
+Hooks live as statics in `read/pipeline.rs`,
 `read/region_grid.rs`, `write/parallel_writer.rs`, `write/parallel_gzip.rs`,
 `write/uring_writer.rs`, `commands/diff/parallel.rs`,
-`commands/diff/derive_parallel.rs`, `commands/altw/external/stage3.rs`,
-`geocode_index/builder/pass3.rs`, `geocode_index/reader.rs`,
-`commands/apply_changes/{rewrite,streaming}.rs`), re-exported through four
-`mod.rs` files under four naming schemes (`read::pipeline_test_hooks`,
+`commands/diff/derive_parallel.rs`, `commands/altw/external/stage3.rs` and
+`geocode_index/builder/pass3.rs` (the hooks in `geocode_index/reader.rs`,
+`write/writer.rs` and `commands/apply_changes/` are per-instance),
+re-exported through several `mod.rs` files under differing naming schemes (`read::pipeline_test_hooks`,
 `read::region_grid_test_hooks`, a `write::` re-export, an `altw::` re-export),
 so nothing answers "what can a test inject". Reset discipline differs:
 `parallel_writer` says reset at start and end, `region_grid`
 resets both sides, stage 3's `PANIC_AT_BUCKET_IDX` doc says reset "at the start
-AND end of any test". The comments in `parallel_writer.rs`, `parallel_gzip.rs`,
-`uring_writer.rs` and `diff/parallel.rs` say tests serialise via
-`--test-threads=1` enforced by `brokkr test`; that has not been true since the
-per-binary split, and the sweeps run in parallel with no thread limit. The
-real invariant (each static-hook test owns its process) is now stated in
-`Cargo.toml`, where each static-hook `fault_*` file has its own `[[test]]`
-target with the hook it arms and `required-features = ["test-hooks"]`, but
-nothing enforces "one test per target" and several comments still describe the
-old serialisation story. The `read/pipeline.rs` test now arms through a guard
+AND end of any test". The statics now sit behind their own
+`static-test-hooks` feature, which keeps them out of the shared `all` and
+lib unit-test harnesses by construction (reference/testing.md, "Test
+binaries"), but nothing enforces "one test per target" (BUG-059). The
+`read/pipeline.rs` test now arms through a guard
 that releases, joins and resets on every exit path; the other hooks still rely
 on manual reset at start and end. Apply-changes is the one seam with an injection
 point (`MergeOptions::panic_at_blob_seq`), and that field forces every struct
@@ -2285,7 +2281,6 @@ Reported by: CLI and plumbing, test harness.
 
 ## HYG-107 - Library-use survey follow-ups
 
-- `osc/merge_join.rs` describes a `rayon::join` that no longer exists.
 - `common::write_indexed_pbf` says the sync writer emits no indexdata,
   but `write_primitive_block` now emits it on the sync path too. Fixtures
   requiring its absence must remove it explicitly.
@@ -2298,9 +2293,6 @@ Reported by: CLI and plumbing, test harness.
   `Host::scratch_parent` says otherwise. Derive's gzip workers ignore `-j`.
 - The panic-hook-swapping reader test can silence concurrent panic output.
 - Raising RLIMIT_NOFILE is inherited by children and can break select(2).
-- The static-hook textlint exempts every `tests/fault_*.rs`, but
-  `fault_apply_changes.rs` belongs to `all` and only uses per-instance hooks.
-  Narrow the exemption to the standalone targets or rename that file.
 
 The identity instrument blesses the unchanged product build itself: brokkr
 owns BROKKR_TEST_BIN_DIR and cannot be redirected to a baseline. Test filters

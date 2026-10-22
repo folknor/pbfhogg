@@ -13,7 +13,7 @@
 
 mod common;
 
-#[cfg(feature = "test-hooks")]
+#[cfg(feature = "static-test-hooks")]
 mod read_pipeline {
     use std::sync::atomic::Ordering::Relaxed;
     use std::sync::mpsc;

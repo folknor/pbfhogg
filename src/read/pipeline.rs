@@ -119,7 +119,10 @@ impl Drop for Permit {
 /// Every wait here is bounded and panics with a named message rather
 /// than hanging until the check watchdog reports an unrelated-looking
 /// futex wait.
-#[cfg(feature = "test-hooks")]
+///
+/// Process-global, so gated behind `static-test-hooks` and `not(test)`:
+/// only an integration-test target of its own can arm it.
+#[cfg(all(feature = "static-test-hooks", not(test)))]
 pub(crate) mod test_hooks {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
@@ -333,7 +336,7 @@ fn spawn_decode_task(decode_pool: &rayon::ThreadPool, task: DecodeTask) {
             // Inside catch_unwind so the hook's park-timeout panic becomes a
             // decode error on the pipeline instead of escaping the rayon
             // spawn, which has no panic handler and would abort the process.
-            #[cfg(feature = "test-hooks")]
+            #[cfg(all(feature = "static-test-hooks", not(test)))]
             test_hooks::maybe_block_decode(seq);
             match blob.get_type() {
                 BlobType::OsmData => {
@@ -409,7 +412,7 @@ where
         };
         pending.push(seq, (item, permit));
         PIPELINE_METRICS.record_reorder_levels(pending.filled_len(), pending.pending_len());
-        #[cfg(feature = "test-hooks")]
+        #[cfg(all(feature = "static-test-hooks", not(test)))]
         test_hooks::record_reorder_levels(pending.filled_len(), pending.pending_len());
 
         while let Some((item, permit)) = pending.pop_ready() {
@@ -803,7 +806,7 @@ where
         };
         pending.push(seq, (item, permit));
         PIPELINE_METRICS.record_reorder_levels(pending.filled_len(), pending.pending_len());
-        #[cfg(feature = "test-hooks")]
+        #[cfg(all(feature = "static-test-hooks", not(test)))]
         test_hooks::record_reorder_levels(pending.filled_len(), pending.pending_len());
         while let Some((item, permit)) = pending.pop_ready() {
             match item {

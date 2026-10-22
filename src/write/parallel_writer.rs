@@ -99,15 +99,16 @@ enum WriteOp {
     },
 }
 
-// Fault-injection hooks for tests. Gated behind the `test-hooks`
-// Cargo feature; release builds don't compile this module at all.
+// Fault-injection hooks for tests. Gated behind the `static-test-hooks`
+// Cargo feature and `not(test)`: product builds and the library's own
+// unit-test harness never compile this module.
 // Plumbed via process-global atomics rather than a per-instance
 // config because pool workers are spawned deep inside
 // `parallel_writer_thread_inner` - threading a config field through
 // every entry point (PbfWriter::to_path_parallel, merge(), etc.)
 // would be invasive. A test that arms them owns its own `[[test]]`
 // binary (see reference/testing.md, "Test binaries").
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "static-test-hooks", not(test)))]
 pub mod test_hooks {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
     use std::time::{Duration, Instant};
@@ -371,9 +372,9 @@ fn run_pool<'scope, 'env>(
     // output after the caller had been handed the result.
     drop(worker_txs);
     for (index, handle) in worker_handles.into_iter().enumerate() {
-        #[cfg(feature = "test-hooks")]
+        #[cfg(all(feature = "static-test-hooks", not(test)))]
         test_hooks::before_join(index);
-        #[cfg(not(feature = "test-hooks"))]
+        #[cfg(not(all(feature = "static-test-hooks", not(test))))]
         let _ = index;
         // `pool_worker` catches its own panics, so this is a backstop for a
         // panic outside that catch (in the payload's own destructor, say).
@@ -556,7 +557,7 @@ fn send_to_worker(
 /// see this worker's channel close after the cause is on record - otherwise
 /// its "worker channel closed" could be recorded first and mask the panic.
 fn pool_worker(index: usize, rx: Receiver<WriteOp>, file: &File, failure: &FirstFailure) {
-    #[cfg(feature = "test-hooks")]
+    #[cfg(all(feature = "static-test-hooks", not(test)))]
     let _live = test_hooks::LiveWorker::enter();
     let caught =
         std::panic::catch_unwind(AssertUnwindSafe(|| worker_loop(index, &rx, file, failure)));
@@ -571,7 +572,7 @@ fn pool_worker(index: usize, rx: Receiver<WriteOp>, file: &File, failure: &First
 /// failure wins) and exit. Once the pool is stopped, exits without running
 /// the op it just popped; the ops still queued are dropped with `rx`.
 fn worker_loop(index: usize, rx: &Receiver<WriteOp>, file: &File, failure: &FirstFailure) {
-    #[cfg(not(feature = "test-hooks"))]
+    #[cfg(not(all(feature = "static-test-hooks", not(test))))]
     let _ = index;
     while let Ok(op) = rx.recv() {
         // One Acquire load per op - next to two Relaxed RMWs on the shared
@@ -582,7 +583,7 @@ fn worker_loop(index: usize, rx: &Receiver<WriteOp>, file: &File, failure: &Firs
 
         // Test-only: see `test_hooks`. Simulates an OOM or internal unwrap
         // inside a pool worker. Release builds compile this out entirely.
-        #[cfg(feature = "test-hooks")]
+        #[cfg(all(feature = "static-test-hooks", not(test)))]
         test_hooks::on_pool_op(index);
 
         let t = std::time::Instant::now();

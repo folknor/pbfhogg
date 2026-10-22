@@ -9,7 +9,7 @@
 
 mod common;
 
-#[cfg(feature = "test-hooks")]
+#[cfg(feature = "static-test-hooks")]
 mod geocode_pass3 {
     use std::sync::atomic::Ordering;
 

@@ -9,7 +9,7 @@
 
 mod common;
 
-#[cfg(feature = "test-hooks")]
+#[cfg(feature = "static-test-hooks")]
 mod diff_parallel {
     use std::sync::atomic::Ordering;
 

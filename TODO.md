@@ -834,7 +834,8 @@ The fault-injection tests whose hooks are **process-global static atomics** are 
 longer `#[ignore]`d and no longer rely on `--test-threads=1`. Integration tests are
 folded into one `all` binary (`autotests = false`, `tests/all.rs`), and each
 static-hook test owns its process as a separate `[[test]]` target in `Cargo.toml`
-(`required-features = ["test-hooks"]`), one test per file: `tests/fault_parallel_writer.rs`,
+(`required-features = ["static-test-hooks"]`, built and run only by the `faults`
+check sweep), one test per file: `tests/fault_parallel_writer.rs`,
 `fault_parallel_gzip.rs`, `fault_parallel_gzip_flush.rs`, `fault_uring_writer.rs`,
 `fault_diff_parallel.rs`, `fault_derive_parallel.rs`, `fault_altw_stage3.rs`,
 `fault_geocode_pass3.rs`, `fault_extract_grid.rs` and `fault_read_pipeline.rs`. The

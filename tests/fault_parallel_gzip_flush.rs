@@ -10,7 +10,7 @@
 
 mod common;
 
-#[cfg(feature = "test-hooks")]
+#[cfg(feature = "static-test-hooks")]
 mod parallel_gzip_flush {
     use std::io::Write;
     use std::sync::atomic::Ordering;

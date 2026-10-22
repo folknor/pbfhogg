@@ -42,13 +42,14 @@ use flate2::write::GzEncoder;
 
 use crate::write::pool_failure::FirstFailure;
 
-// Fault-injection hooks for tests. Gated behind the `test-hooks`
-// Cargo feature; release builds don't compile this module at all.
+// Fault-injection hooks for tests. Gated behind the `static-test-hooks`
+// Cargo feature and `not(test)`: product builds and the library's own
+// unit-test harness never compile this module.
 // Same shape as `parallel_writer::test_hooks`: process-global
 // atomics rather than per-instance config because pool workers are
 // spawned deep inside `ParallelGzipWriter::new`. A test that arms them
 // owns its own `[[test]]` binary (see reference/testing.md).
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "static-test-hooks", not(test)))]
 pub mod test_hooks {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
@@ -428,7 +429,7 @@ impl<W: Write + Send + 'static> Write for ParallelGzipWriter<W> {
         self.flush_current()?;
         let (ack_tx, ack_rx) = sync_channel::<io::Result<()>>(1);
         self.dispatch(Job::Barrier(ack_tx))?;
-        #[cfg(feature = "test-hooks")]
+        #[cfg(all(feature = "static-test-hooks", not(test)))]
         test_hooks::on_barrier_queued();
         match ack_rx.recv() {
             Ok(reply) => reply,
@@ -519,13 +520,13 @@ fn compress_job(seq: u64, raw: &[u8], failure: &FirstFailure) -> Out {
     if failure.stopped() {
         return Out::Dropped;
     }
-    #[cfg(not(feature = "test-hooks"))]
+    #[cfg(not(all(feature = "static-test-hooks", not(test))))]
     let _ = seq;
     let compressed = guarded(failure, "parallel gzip worker", || {
         // Test-only: arm via `test_hooks::PANIC_AT_POOL_OP_COUNT`.
         // Simulates an OOM or internal unwrap inside a compress
         // worker. Release builds compile this out entirely.
-        #[cfg(feature = "test-hooks")]
+        #[cfg(all(feature = "static-test-hooks", not(test)))]
         test_hooks::on_compress(seq);
         compress_one(raw)
     });

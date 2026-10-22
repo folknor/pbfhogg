@@ -24,7 +24,7 @@
 
 mod common;
 
-#[cfg(feature = "test-hooks")]
+#[cfg(feature = "static-test-hooks")]
 mod parallel_writer {
     use std::fs::File;
     use std::io::Write;
@@ -110,6 +110,7 @@ mod parallel_writer {
                     ignore_missing_nodes: false,
                     jobs: Some(2),
                     allow_version_regression: false,
+                    #[cfg(feature = "test-hooks")]
                     panic_at_blob_seq: None,
                 },
                 &pbfhogg::HeaderOverrides::default(),

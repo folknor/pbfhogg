@@ -293,7 +293,7 @@ let mut reader = BlobReader::from_path("tests/test.osm.pbf")?;
 
 for blob in &mut reader {
     let blob = blob?;
-    if blob.blob_type() == BlobType::OsmData {
+    if blob.get_type() == BlobType::OsmData {
         let block = blob.to_primitiveblock()?;
         println!("Block with {} elements", block.elements().count());
     }

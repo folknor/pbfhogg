@@ -71,12 +71,25 @@ hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 linux-direct-io = []
 linux-io-uring = ["dep:io-uring"]
-# Test-only fault-injection hooks for the parallel pipelines (worker
-# panic / IO error at a named blob seq). Release builds never enable
-# this; the hook fields and checks compile out entirely. Turned on by
-# the `all` check sweep's feature list in brokkr.toml, and required by the
-# fault_* test targets below.
+# Test-only fault-injection hooks, in two shapes. Product builds enable
+# neither; the hook fields, statics and checks then compile out entirely.
+#
+# `test-hooks`: per-instance hooks, a fault plan carried by one call's
+# options or one writer (MergeOptions::panic_at_blob_seq and friends).
+# They cannot fire in a sibling test, so any test binary may use them.
+#
+# `static-test-hooks`: process-global static hooks (the `*test_hooks`
+# modules). An armed static fires in every concurrent test of the process
+# that reaches its code path, so the capability is kept out of this
+# package's shared harnesses by construction rather than by convention:
+# tests/all.rs is crate-level cfg'd out whenever this feature is on, and
+# the library gates every static on `not(test)` as well, so its unit-test
+# harness never has them. In this package only the [[test]] targets below
+# that require it can arm one, each in a process of its own (the CLI
+# crate's own test harness is kept clear by configuration: nothing builds
+# it with this feature). The `faults` check sweep in brokkr.toml enables it.
 test-hooks = []
+static-test-hooks = []
 
 [dependencies]
 protohoggr = "0.4.0"
@@ -113,14 +126,16 @@ name = "all"
 path = "tests/all.rs"
 
 # The fault-injection tests below each arm a process-global static hook in
-# the library's `test-hooks` code. An armed static fires in any concurrent
-# test of the same process that reaches that code path, so each keeps a
-# process to itself; one test per target. A shared binary serialized by a
-# lock is not equivalent: queueing on a lock ages the check watchdog's
+# the library's `static-test-hooks` code. An armed static fires in any
+# concurrent test of the same process that reaches that code path, so each
+# keeps a process to itself; one test per target. A shared binary serialized
+# by a lock is not equivalent: queueing on a lock ages the check watchdog's
 # per-test clock, and only the write pools are known to join every thread
 # they start before returning - no audit has checked the other hooked
-# pipelines. `required-features` keeps them out of sweeps without
-# `test-hooks`, where they would be empty harnesses.
+# pipelines. `required-features` builds them only where the statics exist
+# (the `faults` sweep) and keeps them out of every other sweep, where they
+# would be empty harnesses. The fault_ prefix is naming only; the feature
+# requirement is what puts a target in the faults sweep.
 
 # The worker-panic and hold handshake hooks in write::parallel_writer
 # (PANIC_IN_POOL_WORKER and friends), reached by every parallel-writer
@@ -128,64 +143,64 @@ path = "tests/all.rs"
 [[test]]
 name = "fault_parallel_writer"
 path = "tests/fault_parallel_writer.rs"
-required-features = ["test-hooks"]
+required-features = ["static-test-hooks"]
 
 # PANIC_AT_POOL_OP_COUNT in write::parallel_gzip, shared with the flush
 # variant below, so the two cannot share a binary either.
 [[test]]
 name = "fault_parallel_gzip"
 path = "tests/fault_parallel_gzip.rs"
-required-features = ["test-hooks"]
+required-features = ["static-test-hooks"]
 
 [[test]]
 name = "fault_parallel_gzip_flush"
 path = "tests/fault_parallel_gzip_flush.rs"
-required-features = ["test-hooks"]
+required-features = ["static-test-hooks"]
 
 # PANIC_AT_SHARD_IDX in diff::parallel.
 [[test]]
 name = "fault_diff_parallel"
 path = "tests/fault_diff_parallel.rs"
-required-features = ["test-hooks"]
+required-features = ["static-test-hooks"]
 
 # PANIC_AT_SHARD_IDX in diff::derive_parallel.
 [[test]]
 name = "fault_derive_parallel"
 path = "tests/fault_derive_parallel.rs"
-required-features = ["test-hooks"]
+required-features = ["static-test-hooks"]
 
 # PANIC_AT_BUCKET_IDX in altw external stage 3.
 [[test]]
 name = "fault_altw_stage3"
 path = "tests/fault_altw_stage3.rs"
-required-features = ["test-hooks"]
+required-features = ["static-test-hooks"]
 
 # PANIC_AT_STREETS_WAY_IDX in the geocode builder's pass 3; the builder
 # itself needs `commands`.
 [[test]]
 name = "fault_geocode_pass3"
 path = "tests/fault_geocode_pass3.rs"
-required-features = ["test-hooks", "commands"]
+required-features = ["static-test-hooks", "commands"]
 
 # FORCE_LINEAR in read::region_grid, which silently switches every
 # concurrent extract to the linear scan; extract needs `commands`.
 [[test]]
 name = "fault_extract_grid"
 path = "tests/fault_extract_grid.rs"
-required-features = ["test-hooks", "commands"]
+required-features = ["static-test-hooks", "commands"]
 
 # PANIC_AT_DISPATCH_COUNT in write::uring_writer.
 [[test]]
 name = "fault_uring_writer"
 path = "tests/fault_uring_writer.rs"
-required-features = ["test-hooks", "linux-io-uring"]
+required-features = ["static-test-hooks", "linux-io-uring"]
 
 # The decode gate and the reorder high-water marks in read::pipeline,
 # consulted by every pipelined read in the process.
 [[test]]
 name = "fault_read_pipeline"
 path = "tests/fault_read_pipeline.rs"
-required-features = ["test-hooks"]
+required-features = ["static-test-hooks"]
 
 [profile.release]
 opt-level = 3

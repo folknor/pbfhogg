@@ -35,15 +35,17 @@ fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-// Fault-injection hooks for tests. Gated behind the `test-hooks`
-// Cargo feature; release builds don't compile this module at all.
+// Fault-injection hooks for tests. Gated behind the `static-test-hooks`
+// Cargo feature and `not(test)`: product builds and the library's own
+// unit-test harness never compile this module.
 // Same process-global static shape as `parallel_writer::test_hooks` /
 // `parallel_gzip::test_hooks`. The uring writer is single-threaded
 // (one submitter thread, no worker pool), so "op count" here is the
 // count of items popped from the reorder buffer and dispatched to
 // `UringState::write` - same granularity as a parallel_writer
-// dispatch. Tests serialize access via `--test-threads=1`.
-#[cfg(feature = "test-hooks")]
+// dispatch. The test that arms it owns its own process (a `[[test]]`
+// target of its own, see Cargo.toml).
+#[cfg(all(feature = "static-test-hooks", not(test)))]
 pub mod test_hooks {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -716,7 +718,7 @@ fn uring_main_loop(
             // Simulates a mid-stream panic in the uring writer thread;
             // `to_path_uring`'s `handle.join()` path surfaces it as an
             // `io::Error`. Release builds compile this out entirely.
-            #[cfg(feature = "test-hooks")]
+            #[cfg(all(feature = "static-test-hooks", not(test)))]
             {
                 use std::sync::atomic::Ordering;
                 let n = test_hooks::DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1;

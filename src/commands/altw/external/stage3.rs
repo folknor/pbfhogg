@@ -5,14 +5,15 @@ use super::super::Result;
 #[cfg(feature = "linux-direct-io")]
 use super::radix::advise_dontneed_file;
 
-// Fault-injection hooks for tests. Gated behind the `test-hooks`
-// Cargo feature; release builds don't compile this module at all.
+// Fault-injection hooks for tests. Gated behind the `static-test-hooks`
+// Cargo feature and `not(test)`: product builds and the library's own
+// unit-test harness never compile this module.
 // Static atomics (same shape as `diff/parallel::test_hooks`): fire
 // at a specific bucket index inside the stage 3 worker loop.
 // Verifies the `AbortOnDrop` panic-safety pattern propagates to
 // stage 4 waiters and that `ScratchDir`'s Drop cleans up on the
 // error path.
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "static-test-hooks", not(test)))]
 pub mod test_hooks {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -196,7 +197,7 @@ pub(super) fn stage3_slot_reorder(
                     // `router.abort(...)` on unwind, waking stage 4
                     // waiters; `ScratchDir::drop` cleans up the scratch
                     // tree. Release builds compile this out entirely.
-                    #[cfg(feature = "test-hooks")]
+                    #[cfg(all(feature = "static-test-hooks", not(test)))]
                     if test_hooks::PANIC_AT_BUCKET_IDX.load(Relaxed) == bucket_idx {
                         panic!(
                             "test-hooks: altw stage 3 worker {worker_id} panicking at bucket {bucket_idx}"

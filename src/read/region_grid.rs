@@ -57,8 +57,10 @@ fn coverage_is_within_budget(total_pairs: u64) -> bool {
 /// Test-only hook: force [`RegionGrid::build`] to return `None` so that
 /// classification runs the linear scan even at/above the region threshold.
 /// Lets a test drive one identical config down both the grid and the linear
-/// code paths and compare their output byte-for-byte.
-#[cfg(feature = "test-hooks")]
+/// code paths and compare their output byte-for-byte. Process-global, so
+/// gated behind `static-test-hooks` and `not(test)`: only an
+/// integration-test target of its own can arm it.
+#[cfg(all(feature = "static-test-hooks", not(test)))]
 pub mod test_hooks {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -71,13 +73,13 @@ pub mod test_hooks {
     }
 }
 
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "static-test-hooks", not(test)))]
 #[inline]
 fn force_linear() -> bool {
     test_hooks::FORCE_LINEAR.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-#[cfg(not(feature = "test-hooks"))]
+#[cfg(not(all(feature = "static-test-hooks", not(test))))]
 #[inline]
 fn force_linear() -> bool {
     false

@@ -26,12 +26,13 @@ use crate::{Element, PrimitiveBlock};
 
 use super::derive::DeriveChangesStats;
 
-// Fault-injection hooks for tests. Gated behind the `test-hooks`
-// Cargo feature; release builds don't compile this module at all.
+// Fault-injection hooks for tests. Gated behind the `static-test-hooks`
+// Cargo feature and `not(test)`: product builds and the library's own
+// unit-test harness never compile this module.
 // Mirror of `parallel::test_hooks`. Could unify in the future when
 // the shard planning infrastructure is hoisted into a shared
 // module (see the duplication note below).
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "static-test-hooks", not(test)))]
 pub mod test_hooks {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -154,7 +155,7 @@ fn run_shard(
     // and the post-join cleanup sweeps every possible per-shard
     // scratch file (creates / modifies / deletes). Release builds
     // compile this out entirely.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(all(feature = "static-test-hooks", not(test)))]
     {
         use std::sync::atomic::Ordering;
         if test_hooks::PANIC_AT_SHARD_IDX.load(Ordering::Relaxed) == shard_idx {

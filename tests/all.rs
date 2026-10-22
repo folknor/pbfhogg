@@ -13,11 +13,19 @@
 //! the module prefix only prepends.
 //!
 //! Every module here shares one process with every other, concurrently. The
-//! process-wide state they share: the global rayon pool;
-//! `RLIMIT_NOFILE`, raised once by `common::test_host()`; and every
-//! `test-hooks` static in the library, which nothing here may arm. A test that arms a process-global hook, or
-//! needs any of this state to itself, gets its own `[[test]]` target in
-//! `Cargo.toml` with the reason beside it - see the `fault_*` targets.
+//! process-wide state they share: the global rayon pool; and
+//! `RLIMIT_NOFILE`, raised once by `common::test_host()`. A test that needs
+//! any of this state to itself gets its own `[[test]]` target in
+//! `Cargo.toml` with the reason beside it.
+//!
+//! The library's process-global fault hooks cannot be armed from here at
+//! all: they exist only under `static-test-hooks`, and the `cfg` below
+//! empties this whole binary whenever that feature is on. A build that has
+//! the statics therefore has no tests here, and a build that has tests here
+//! has no statics to name. A test that arms one gets its own `[[test]]`
+//! target requiring `static-test-hooks` - see the `fault_*` targets.
+//! Per-instance hooks (`test-hooks`) are fine here.
+#![cfg(not(feature = "static-test-hooks"))]
 
 mod common;
 

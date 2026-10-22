@@ -19,7 +19,8 @@ Tests go where they couple least.
   `pbfhogg` binary via `CliInvoker`; internal modules are invisible.
 - **Fault-injection tests** in `tests/fault_*.rs` - the ones that arm
   a process-global static hook each own a process (see "Test
-  binaries"). Partially coupled to internal hook surfaces by design.
+  binaries"); a fault test on a per-instance hook may live in `all`.
+  Partially coupled to internal hook surfaces by design.
 - **External cross-validation** in `brokkr verify`
   (`verify_<command>.rs` modules in brokkr) - compares pbfhogg
   output against osmium / osmosis / osmconvert.
@@ -51,16 +52,34 @@ NAME` list each harness in turn to find one test.
   `fault_parallel_gzip`, `fault_parallel_gzip_flush`,
   `fault_diff_parallel`, `fault_derive_parallel`, `fault_altw_stage3`,
   `fault_geocode_pass3`, `fault_extract_grid`, `fault_uring_writer` and
-  `fault_read_pipeline`, one test each, each with `required-features`
-  so sweeps without `test-hooks` skip them instead of linking empty
-  harnesses. `fault_apply_changes` uses a per-instance hook and is a
-  module of `all`.
+  `fault_read_pipeline`, one test each, each with
+  `required-features = ["static-test-hooks", ...]`, so they are built
+  and run only by the `faults` check sweep. `fault_apply_changes` uses a
+  per-instance hook and is a module of `all`.
 - **What the shared binary shares.** Every module of `all` runs
-  concurrently in one process with: the global rayon pool;
-  `RLIMIT_NOFILE`, raised once per process by `common::test_host()`; and every
-  `test-hooks` static, which nothing in `all` may arm.
-  A test that needs any of this to itself, or arms a static hook,
-  takes a target of its own.
+  concurrently in one process with: the global rayon pool; and
+  `RLIMIT_NOFILE`, raised once per process by `common::test_host()`.
+  A test that needs any of this to itself takes a target of its own.
+- **Static hooks cannot reach a shared harness.** The process-global
+  hooks exist only under the `static-test-hooks` feature, and the
+  root package's two shared harnesses are excluded by construction:
+  `tests/all.rs` carries `#![cfg(not(feature = "static-test-hooks"))]`,
+  so any build that has the statics compiles `all` to an empty harness;
+  and the library gates every static (module, facade re-export and call
+  site) on `all(feature = "static-test-hooks", not(test))`, so its
+  unit-test harness never has them. A test naming a static from either
+  is therefore a compile error or compiled out, never a race; a text
+  rule used to approximate this and could be spelled around. The
+  `faults` sweep (`all`'s features plus `static-test-hooks`, unfiltered)
+  is the one shape where the statics exist; every target requiring the
+  feature runs there whatever it is named, and the gate audits the
+  whole shape. Limits: a new shared harness in the root package needs
+  the same crate-level `cfg` line; the CLI crate's `cli/tests/cli.rs`
+  links the library too and is protected by configuration only
+  (`pbfhogg-cli` does not forward `static-test-hooks` and no sweep
+  enables it there); doctests are outside the boundary (the doc-only
+  sweep enables no hook feature); and nothing enforces one test per
+  static-hook target.
 - **Why the static-hook tests are not one lock-serialized binary.**
   Mutual exclusion inside one process is only equivalent to a process
   each if every thread that can read a hook has exited before the next
@@ -203,18 +222,22 @@ exception, not a tier - should not survive across many PRs.
 
 ## Conventions
 
-- **`test-hooks` Cargo feature.** Gates fault-injection hooks across
-  every parallel pipeline. Off by default; enabled by the `all`
-  check sweep's feature list in `brokkr.toml`, and required by the
-  `fault_*` test targets. Release builds never see the hook code.
+- **`test-hooks` and `static-test-hooks` Cargo features.** One per
+  hook shape (below). Both off by default and never on in a product
+  build, which therefore never sees the hook code. `test-hooks` is
+  enabled by the `all` and `faults` check sweeps; `static-test-hooks`
+  only by `faults`, and is required by the static-hook `fault_*`
+  targets.
 - **Two hook shapes.** Per-instance field on a public config struct
-  (race-free with sibling tests, so the test lives in `all`) vs.
-  process-global static atomics. Picker: per-instance when the
-  pipeline has a public config struct on its entry path, static
-  atomics otherwise. A static-atomic hook's test gets its own
-  `[[test]]` target holding that one test (see "Test binaries"),
-  which makes it race-free without `#[ignore]` or
-  `--test-threads=1`.
+  (race-free with sibling tests, so the test lives in `all`; gated on
+  `test-hooks`) vs. process-global static atomics (gated on
+  `all(feature = "static-test-hooks", not(test))`). Picker:
+  per-instance when the pipeline has a public config struct on its
+  entry path, static atomics otherwise. A static-atomic hook's test
+  gets its own `[[test]]` target holding that one test (see "Test
+  binaries"), which makes it race-free without `#[ignore]` or
+  `--test-threads=1`. A new static hook must use the static gate; one
+  put under `test-hooks` instead would reach `all`.
 - **CliInvoker for CLI-driven tests.** `tests/common/cli.rs`. Every
   new `tests/cli_*.rs` goes through it. 60 s default wall-clock
   timeout, override via `.timeout(Duration)`. Platform-skip

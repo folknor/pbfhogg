@@ -18,10 +18,10 @@ mod pass2;
 mod pass3;
 mod strings;
 
-// Under the `test-hooks` feature, expose Pass 3 Stage A fault-
-// injection hooks so integration tests can arm them. The rest of
+// Under the `static-test-hooks` feature, expose Pass 3 Stage A fault-
+// injection hooks so an integration-test target of its own can arm them. The rest of
 // `pass3` stays crate-private.
-#[cfg(feature = "test-hooks")]
+#[cfg(all(feature = "static-test-hooks", not(test)))]
 pub mod pass3_test_hooks {
     pub use super::pass3::test_hooks::{PANIC_AT_STREETS_WAY_IDX, reset};
 }

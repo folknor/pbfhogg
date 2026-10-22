@@ -7,7 +7,7 @@
 //! not. This test drives ONE fixed 20-region config through both paths on the
 //! same input and asserts the per-region output files are byte-for-byte equal.
 //!
-//! Under the `test-hooks` feature a process-global
+//! Under the `static-test-hooks` feature a process-global
 //! `region_grid::FORCE_LINEAR` makes `RegionGrid::build` return `None`, so the
 //! at/above-threshold config that would normally build a grid instead runs the
 //! verbatim linear scan. This file is its own `[[test]]` target in `Cargo.toml`,
@@ -17,7 +17,7 @@
 
 mod common;
 
-#[cfg(feature = "test-hooks")]
+#[cfg(feature = "static-test-hooks")]
 mod grid_parity {
     use std::sync::atomic::Ordering;
 

@@ -9,7 +9,7 @@
 
 mod common;
 
-#[cfg(feature = "test-hooks")]
+#[cfg(feature = "static-test-hooks")]
 mod altw_external_stage3 {
     use std::sync::atomic::Ordering;
 

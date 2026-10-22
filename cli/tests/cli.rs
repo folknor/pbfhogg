@@ -339,3 +339,221 @@ fn cli_io_uring_rejected_without_feature() {
         "error should mention missing feature, got: {stderr}"
     );
 }
+
+#[test]
+fn cli_rejects_ambiguous_inspect_and_missing_extract_region() {
+    for args in [
+        vec!["inspect", "first.pbf", "tags", "second.pbf"],
+        vec!["inspect"],
+        vec!["extract", "input.pbf", "-o", "output.pbf"],
+        vec![
+            "diff", "old.pbf", "new.pbf", "-q", "-o", "out.osc", "--format", "osc",
+        ],
+    ] {
+        let output = Command::new(pbfhogg_bin())
+            .args(&args)
+            .output()
+            .expect("run CLI");
+        assert_eq!(output.status.code(), Some(2), "args: {args:?}");
+    }
+}
+
+#[test]
+fn cli_tags_filter_ambiguous_content_uses_legacy_fallback() {
+    let dir = tempfile::tempdir().expect("directory");
+    for (name, bytes) in [
+        ("unknown.pbf", b"not a PBF".as_slice()),
+        ("unknown.osc.gz", b"\x1f\x8bnot OSC".as_slice()),
+        ("unknown.osc.bz2", b"BZhnot OSC".as_slice()),
+    ] {
+        let input = dir.path().join(name);
+        std::fs::write(&input, bytes).expect("write input");
+        let output = Command::new(pbfhogg_bin())
+            .arg("tags-filter")
+            .arg(&input)
+            .arg("name")
+            .arg("-o")
+            .arg(dir.path().join("out.pbf"))
+            .output()
+            .expect("run tags-filter");
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("Cannot determine input format"));
+    }
+}
+
+#[test]
+fn cli_tags_filter_unknown_extension_does_not_skip_bom_and_whitespace() {
+    let dir = tempfile::tempdir().expect("directory");
+    let input = dir.path().join("changes.unknown");
+    std::fs::write(
+        &input,
+        b"\xef\xbb\xbf  \n<osmChange version=\"0.6\"></osmChange>",
+    )
+    .expect("write XML");
+    let output = Command::new(pbfhogg_bin())
+        .arg("tags-filter")
+        .arg(&input)
+        .arg("name")
+        .arg("-o")
+        .arg(dir.path().join("out.osc"))
+        .output()
+        .expect("run tags-filter");
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("Cannot determine input format"));
+}
+
+#[test]
+fn cli_diff_quiet_osc_without_output_retains_error() {
+    let output = Command::new(pbfhogg_bin())
+        .args(["diff", "old.pbf", "new.pbf", "--format", "osc", "-q"])
+        .output()
+        .expect("run diff");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--output is required with --format osc")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_check_json_preserves_non_utf8_filename_lossily() {
+    use std::os::unix::ffi::OsStringExt;
+    let dir = tempfile::tempdir().expect("directory");
+    let name = std::ffi::OsString::from_vec(b"actual-\xff.pbf".to_vec());
+    let input = dir.path().join(&name);
+    write_minimal_pbf(&input);
+    let output = Command::new(pbfhogg_bin())
+        .arg("check")
+        .arg(&input)
+        .args(["--ids", "--json"])
+        .output()
+        .expect("run check");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert!(json.to_string().contains(name.to_string_lossy().as_ref()));
+    assert!(!json.to_string().contains("input.osm.pbf"));
+}
+
+#[test]
+fn cli_osc_outputs_keep_legacy_transport_and_metadata() {
+    let dir = tempfile::tempdir_in(".").expect("directory");
+    let input = dir.path().join("input.osc");
+    std::fs::write(&input, b"<osmChange version=\"0.6\"><create><node id=\"7\" lat=\"1\" lon=\"2\" timestamp=\"yesterday\" changeset=\"no\" uid=\"&#48;\" visible=\"False\"><tag k=\"name\" v=\"test\"/></node></create></osmChange>").expect("XML");
+    for (command, gzip) in [("tags-filter", true), ("merge-changes", false)] {
+        let output = dir.path().join(format!("{command}.osc"));
+        let mut cli = Command::new(pbfhogg_bin());
+        cli.arg(command).arg(&input);
+        if command == "tags-filter" {
+            cli.args(["--input-kind", "osc", "name"]);
+        }
+        let result = cli.arg("-o").arg(&output).output().expect("run command");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let bytes = std::fs::read(&output).expect("output");
+        assert_eq!(bytes.starts_with(b"\x1f\x8b"), gzip);
+        if gzip {
+            continue;
+        }
+        let xml = String::from_utf8(bytes).expect("XML");
+        for attribute in [
+            "timestamp=\"yesterday\"",
+            "changeset=\"no\"",
+            "uid=\"0\"",
+            "visible=\"False\"",
+        ] {
+            assert!(xml.contains(attribute), "{xml}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_merge_changes_non_utf8_gz_path_stays_plain() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = tempfile::tempdir_in(".").expect("directory");
+    let input = dir.path().join("input.osc");
+    std::fs::write(&input, b"<osmChange version=\"0.6\"></osmChange>").expect("XML");
+    for simplify in [false, true] {
+        let output = dir
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"invalid-\xff.osc.gz"));
+        let mut cli = Command::new(pbfhogg_bin());
+        cli.arg("merge-changes").arg(&input).arg("-o").arg(&output);
+        if simplify {
+            cli.arg("--simplify");
+        }
+        let result = cli.output().expect("merge");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let xml = std::fs::read(&output).expect("output");
+        assert!(xml.starts_with(b"<?xml"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_osc_counters_keep_historical_name_and_per_file_values() {
+    let dir = tempfile::tempdir_in(".").expect("directory");
+    let input = dir.path().join("input.osc");
+    let base = dir.path().join("base.pbf");
+    write_minimal_sorted_pbf(&base);
+    std::fs::write(&input, b"<osmChange version=\"0.6\"></osmChange>").expect("XML");
+    for command in ["merge-changes", "tags-filter", "apply-changes"] {
+        let markers = dir.path().join(format!("{command}.markers"));
+        std::fs::write(&markers, []).expect("markers");
+        let mut cli = Command::new(pbfhogg_bin());
+        cli.env("BROKKR_MARKER_FIFO", &markers).arg(command);
+        match command {
+            "apply-changes" => {
+                cli.arg(&base).arg(&input);
+            }
+            "tags-filter" => {
+                cli.arg(&input).args(["--input-kind", "osc", "name"]);
+            }
+            _ => {
+                cli.arg(&input).arg(&input);
+            }
+        }
+        let result = cli
+            .arg("-o")
+            .arg(dir.path().join(format!("{command}.out")))
+            .output()
+            .expect("command");
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let events = std::fs::read_to_string(&markers).expect("markers");
+        let values: Vec<_> = events
+            .lines()
+            .filter_map(|line| {
+                line.split_once("@merge_changes_decompress_ns=")
+                    .map(|(_, value)| value)
+            })
+            .collect();
+        assert_eq!(
+            values.len(),
+            if command == "merge-changes" { 2 } else { 1 },
+            "{events}"
+        );
+        // The historical timer includes reader work even for plain XML. Every
+        // input emits its own sample, rather than a command-specific total.
+        assert!(
+            values.iter().all(|value| value.parse::<u64>().is_ok()),
+            "{events}"
+        );
+        assert!(!events.contains("apply_changes_osc_decompress_ns"));
+        assert!(!events.contains("tags_filter_osc_decompress_ns"));
+    }
+}

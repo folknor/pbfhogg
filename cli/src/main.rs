@@ -488,6 +488,8 @@ enum Command {
         file: PathBuf,
         #[command(flatten)]
         output: OutputArg,
+        // Deliberately keep the extension-default help contract alongside the
+        // four-byte sniff. Promising stricter content detection misstates fallback.
         /// Input kind override: pbf or osc (autodetect from extension by default)
         #[arg(long = "input-kind")]
         input_kind: Option<InputKind>,
@@ -717,7 +719,13 @@ enum Command {
         #[arg(short, long, required_unless_present = "config")]
         output: Option<PathBuf>,
         /// Bounding box: minlon,minlat,maxlon,maxlat
-        #[arg(short = 'b', long, group = "area", conflicts_with = "config")]
+        #[arg(
+            short = 'b',
+            long,
+            group = "area",
+            required_unless_present_any = ["polygon", "config"],
+            conflicts_with = "config"
+        )]
         bbox: Option<String>,
         /// Polygon GeoJSON file
         #[arg(short = 'p', long, group = "area", conflicts_with = "config")]
@@ -809,7 +817,7 @@ enum Command {
         header: HeaderOverrideArg,
     },
     /// Inspect PBF file: metadata, block breakdown, ordering analysis
-    #[command(subcommand_negates_reqs = true)]
+    #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
     Inspect {
         #[command(subcommand)]
         subcommand: Option<InspectCommand>,
@@ -1168,6 +1176,9 @@ struct GeocodeLevels {
     coarse_search_radius: f32,
 }
 
+// Deliberately sniff only four bytes, then use extensions with unknown = PBF.
+// Gzip magic means OSC; no BOM/whitespace skipping or format refusal is added.
+// Stricter sniffing would break accepted inputs and the extension fallback contract.
 fn detect_input_kind(path: &std::path::Path) -> InputKind {
     // Content sniffing: read first bytes to distinguish PBF from OSC
     if let Ok(kind) = sniff_input_kind(path) {
@@ -1225,7 +1236,7 @@ fn combine_expressions(
 
 #[allow(clippy::too_many_lines)]
 fn main() -> process::ExitCode {
-    pbfhogg::debug::enable_marker_fifo_from_env();
+    host::init_marker_fifo();
     let host = host::cli_host();
     let _guard = hotpath::HotpathGuardBuilder::new("pbfhogg::main")
         .percentiles(&[50.0, 95.0, 99.0])
@@ -1524,6 +1535,9 @@ fn main() -> process::ExitCode {
                 io,
             } => match format {
                 DiffFormat::Osc => {
+                    // Deliberately require output before rejecting text-only flags.
+                    // Even -q without -o must retain this historical missing-output
+                    // error; moving checks changes the user-facing error contract.
                     let output = output.ok_or("--output is required with --format osc")?;
                     if suppress_common {
                         return Err("--suppress-common is not valid with --format osc".into());
@@ -1534,6 +1548,8 @@ fn main() -> process::ExitCode {
                     if osmium_summary {
                         return Err("--osmium-summary is not valid with --format osc".into());
                     }
+                    // Deliberately reject quiet OSC after the output requirement.
+                    // Allowing it changes the historical CLI error contract.
                     if quiet {
                         return Err("--quiet is not valid with --format osc".into());
                     }
@@ -1845,7 +1861,7 @@ fn main() -> process::ExitCode {
                         &host,
                     )
                 } else {
-                    let file = file.ok_or("Input PBF file is required")?;
+                    let file = file.expect("clap requires a file without an inspect subcommand");
                     if let Some(ref show_id) = show {
                         return run_show_element(&file, show_id, io.direct_io, &host);
                     }
@@ -2117,8 +2133,8 @@ fn run_check(
     let mut failed = false;
     let file_name = path
         .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("input.osm.pbf");
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
     let check_options = pbfhogg::check::CheckOptions {
         max_errors,
         direct_io,
@@ -2174,10 +2190,10 @@ fn run_check(
         if json {
             let mut combined = serde_json::Map::new();
             if let Some(ref report) = ids_report {
-                combined.insert("ids".to_string(), report.to_json_value(file_name));
+                combined.insert("ids".to_string(), report.to_json_value(&file_name));
             }
             if let Some(ref report) = index_report {
-                combined.insert("index".to_string(), report.to_json_value(file_name));
+                combined.insert("index".to_string(), report.to_json_value(&file_name));
             }
             if let Some(ref result) = refs_result {
                 let mut refs_obj = serde_json::json!({
@@ -2217,13 +2233,13 @@ fn run_check(
             )?;
         } else if !quiet {
             if let Some(ref report) = ids_report {
-                report.write_human(&mut out, file_name)?;
+                report.write_human(&mut out, &file_name)?;
             }
             if let Some(ref report) = index_report {
                 if ids_report.is_some() {
                     writeln!(out, "\n---\n")?;
                 }
-                report.write_human(&mut out, file_name)?;
+                report.write_human(&mut out, &file_name)?;
             }
             if let Some(ref result) = refs_result {
                 if show_ids {
@@ -3005,13 +3021,22 @@ fn run_derive_changes(
     } else {
         jobs
     };
+    let timestamp = if update_timestamp {
+        Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+        )
+    } else {
+        None
+    };
     let stats = pbfhogg::diff::derive::derive_changes(
         old,
         new,
         output,
         direct_io,
         increment_version,
-        update_timestamp,
+        timestamp,
         jobs_resolved,
         host,
     )?;

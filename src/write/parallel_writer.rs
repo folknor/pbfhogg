@@ -689,7 +689,7 @@ fn copy_range_fallback_pwrite(
     mut out_offset: u64,
     mut remaining: u64,
 ) -> io::Result<()> {
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut buf = vec![0u8; crate::write::IO_BUF_BYTES];
     while remaining > 0 {
         let chunk = buf.len().min(remaining as usize);
         let n = loop {

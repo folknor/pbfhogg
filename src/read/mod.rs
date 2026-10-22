@@ -16,6 +16,7 @@ pub(crate) mod raw_frame;
 pub mod reader;
 pub(crate) mod region_grid;
 pub(crate) mod wire;
+pub(crate) mod wire_schema;
 
 #[cfg(all(feature = "static-test-hooks", not(test)))]
 pub mod pipeline_test_hooks {

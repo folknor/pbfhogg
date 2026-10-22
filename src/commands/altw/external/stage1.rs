@@ -584,7 +584,7 @@ pub(super) fn stage1_way_pass(
             Developer,
             "altw.external.workers",
             "[altw external] num_workers = {num_workers} \
-             (capped from cpu={cpu_cap} by fd budget; each worker holds {NUM_BUCKETS} rank-shards)"
+             (capped from cpu={cpu_cap} by fd budget; each worker holds {NUM_BUCKETS} ID shards)"
         );
     } else {
         crate::host::diag!(

@@ -201,6 +201,7 @@ fn assert_indexed_passes_for_standard_fixture() {
 /// "binary not found" panic, the workspace build did not produce the
 /// CLI binary before tests ran; see the panic message in
 /// `tests/common/cli.rs::pbfhogg_bin` for the recovery recipe.
+#[cfg(feature = "commands")]
 #[test]
 fn cli_invoker_runs_version_command() {
     let out = crate::common::cli::CliInvoker::new()

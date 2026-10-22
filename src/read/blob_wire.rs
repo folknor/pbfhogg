@@ -5,6 +5,8 @@
 
 use bytes::Bytes;
 
+use super::wire_schema::{blob, blob_header};
+
 use crate::blob_meta::{INDEX_SIZE, INDEX_SIZE_V1, WireIndexdata};
 use crate::error::{BlobError, Result, new_blob_error, new_wire_error};
 
@@ -81,7 +83,7 @@ impl WireBlobHeader {
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match field {
-                1 => {
+                blob_header::TYPE => {
                     // type: string (len-delimited)
                     let bytes = cursor.read_len_delimited()?;
                     blob_type = match bytes {
@@ -93,7 +95,7 @@ impl WireBlobHeader {
                         ),
                     };
                 }
-                2 if parse_indexdata => {
+                blob_header::INDEXDATA if parse_indexdata => {
                     // indexdata: bytes (len-delimited). The length and version
                     // checks live in `blob_meta`, next to the format.
                     //
@@ -124,14 +126,14 @@ impl WireBlobHeader {
                         indexdata_present = true;
                     }
                 }
-                3 => {
+                blob_header::DATASIZE => {
                     // datasize: int32 (varint)
                     #[allow(clippy::cast_possible_truncation)]
                     {
                         datasize = cursor.read_varint()? as i32;
                     }
                 }
-                4 if parse_tagdata => {
+                blob_header::TAGDATA if parse_tagdata => {
                     // tagdata: per-blob tag key index (len-delimited). Same
                     // duplicate rule as indexdata: a second non-empty
                     // occurrence leaves the blob with no tag index, sticky.
@@ -153,7 +155,7 @@ impl WireBlobHeader {
                         tagdata_seen = true;
                     }
                 }
-                5 if parse_waymembers => {
+                blob_header::WAYMEMBERS if parse_waymembers => {
                     // waymembers: WayMembers-v1 bitmap incl. preamble (len-delimited)
                     let bytes = cursor.read_len_delimited()?;
                     if !bytes.is_empty() {
@@ -276,7 +278,7 @@ impl WireBlob {
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match field {
-                1 | 3 | 7 => {
+                blob::RAW | blob::ZLIB_DATA | blob::ZSTD_DATA => {
                     // raw (1) / zlib_data (3) / zstd_data (7): the three
                     // mutually exclusive payload encodings.
                     let slice = cursor.read_len_delimited()?;
@@ -286,12 +288,12 @@ impl WireBlob {
                         return Err(multiple_payload_fields());
                     }
                     data = Some(match field {
-                        1 => BlobData::Raw(payload),
-                        3 => BlobData::Zlib(payload),
+                        blob::RAW => BlobData::Raw(payload),
+                        blob::ZLIB_DATA => BlobData::Zlib(payload),
                         _ => BlobData::Zstd(payload),
                     });
                 }
-                2 => {
+                blob::RAW_SIZE => {
                     // raw_size: int32 (varint)
                     #[allow(clippy::cast_possible_truncation)]
                     {
@@ -306,6 +308,8 @@ impl WireBlob {
     }
 
     /// Parse a Blob from `&[u8]`, copying the input internally.
+    /// Slice-based decode helpers need owned payload slices after parsing;
+    /// callers already holding `Bytes` should use `parse` to avoid the copy.
     pub fn parse_slice(data: &[u8]) -> Result<Self> {
         let bytes = Bytes::copy_from_slice(data);
         Self::parse(&bytes)

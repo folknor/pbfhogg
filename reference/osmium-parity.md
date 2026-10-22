@@ -221,7 +221,7 @@ These osmium flags have no pbfhogg equivalent:
 | `--fsync` | Always enabled (no flag needed) |
 | `-H, --with-history` | Current-snapshot tool, no history file support |
 | `--buffer-data` | Pipelined writer handles buffering internally |
-| `--index-type` | `sparse` (default), `external` (bounded memory, sequential I/O, only mode that survives at planet on memory-constrained hosts), `auto` (scale-aware: sparse unless the input is sorted+indexed and the estimated node store exceeds ~80 % of available RAM; see reference/pipeline.md). Different valid values from osmium's `-i, --index-type`. |
+| `--index-type` | `sparse` (default), `external` (bounded-memory join with sequential I/O), `auto` (runtime routing; see [add-locations-to-ways](pipeline.md#add-locations-to-ways)). Different valid values from osmium's `-i, --index-type`. |
 
 ### Flags only pbfhogg has
 

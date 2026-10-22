@@ -290,6 +290,9 @@ pub(super) struct Scratch {
     group: Vec<u8>,
 }
 
+// Deliberately copy key string indices without bounds checks or key lists.
+// Corrupt indices pass through as on the read side; per-key validation adds work
+// to this measured rewrite loop and changes which inputs it accepts.
 /// What a rewrite saw in one block.
 pub(super) struct Outcome {
     /// Elements rewritten.

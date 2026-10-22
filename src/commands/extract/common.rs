@@ -300,7 +300,6 @@ where
     // 1-5 us per open, 3-15 us total per run - invisible against the ~tens of
     // seconds of pread+decode work. Hoisting to the caller is possible but
     // buys nothing measurable; the local-scope Arc keeps the API simple.
-    // See TODO.md history 2026-04-19 for the investigation.
     let shared_file = std::sync::Arc::new(
         std::fs::File::open(input)
             .map_err(|e| format!("failed to open {}: {e}", input.display()))?,

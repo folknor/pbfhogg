@@ -452,3 +452,49 @@ pre-allocates its node set to the smaller of the claimed `max_id` and a bound
 from the file size, and inserts any decoded ID above that afterwards, so a
 false claim costs neither memory nor a refusal. New code that sizes anything
 from `indexdata` must do likewise.
+
+## OSC compatibility and emission contracts
+
+Input detection for `tags-filter` deliberately reads only the first four bytes.
+Gzip magic or an initial `<` selects OSC; a positive big-endian header size below
+1000 selects PBF. If sniffing fails, `.osc`, `.osc.gz` and `.osc.bz2` select OSC;
+every other extension selects PBF. This is detection, not a promise of bzip2
+decoding. No BOM or whitespace skipping, or new ambiguous-format refusal, is
+part of this contract. The help text retains the extension-default description.
+
+The owned OSC sinks (`merge-changes` and `tags-filter --input-kind osc`)
+deliberately parse version but pass timestamp, changeset, uid and visible through
+as normalized XML attribute text without native-value validation. They do not
+preserve raw entity spellings or raw attribute whitespace. The apply-changes
+overlay retains its native numeric metadata parsing and treats only literal
+`false` as hidden. Malformed or missing member roles become empty in all sinks.
+Unifying these policies would reject accepted input or add per-element work.
+A delete remains pending until a re-create is accepted; a rejected stale
+re-create must not erase it.
+
+`tags-filter --input-kind osc` always writes gzip, regardless of output suffix.
+`merge-changes` writes gzip only when the entire output path is valid UTF-8 and
+ends in `.gz`. Changing these decisions changes the output transport contract.
+Integer decimicrodegree conversion for diff text and OSC output deliberately
+divides by `1e7`; multiplication can change rounding and therefore output bytes.
+`diff --format osc -q` without `-o` deliberately errors with
+`--output is required with --format osc`: the output requirement precedes
+text-only flag validation.
+
+## Renumber terminal output and hot path
+
+Renumber deliberately writes no tagdata. It is a terminal step whose output is
+not tag-filtered. Its payload-only pread and byte rewrite do not read tagdata
+headers, parse key lists, or bounds-check copied key string indices. Corrupt
+indices pass through as on the read side. Adding those operations changes the
+historical output or adds per-blob or per-tag work to the measured hot path.
+
+## Sidecar comparison contracts
+
+The historical names `merge_scanner_to_drain_bytes_high_water` and
+`merge_scanner_to_workers_bytes_high_water` deliberately describe the existing
+largest-item estimates, not sampled queue occupancy. Renaming them breaks
+brokkr comparisons across runs. All OSC parser callers emit
+`merge_changes_decompress_ns` once per input file, with that file's time rather
+than an accumulated command total, including the apply-changes overlay and
+OSC tags-filter. There are no command-specific replacement counters.

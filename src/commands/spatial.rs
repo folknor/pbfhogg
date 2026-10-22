@@ -2,28 +2,23 @@
 
 use super::extract::Bbox;
 
-/// Decimicrodegree scale. Element coordinates reach `f64` via
-/// `point_e7 as f64 * 1e-7`, so every boundary conversion here must be
-/// checked against that exact expression: `degrees / 1e-7` is *not* its
-/// inverse in binary floating point. `55.6 / 1e-7` is exactly `556_000_000`,
-/// yet `556_000_000 as f64 * 1e-7` lands just below `55.6`, so a bound
-/// derived by division claims a point is inside that the comparison the
-/// caller actually runs says is outside.
-const E7: f64 = 1e-7;
+use crate::coord_fmt::{deg_to_e7, e7_to_deg};
 
-/// Convert a decimicrodegree value the way every element consumer does.
-fn to_degrees(value_e7: i32) -> f64 {
-    f64::from(value_e7) * E7
+// Spatial membership deliberately uses multiplication, matching reader geometry.
+// The text/OSC conversion divides for byte compatibility; sharing that function
+// would change which boundary nodes extraction includes.
+fn to_degrees(value: i32) -> f64 {
+    e7_to_deg(f64::from(value))
 }
 
 /// Smallest decimicrodegree value whose degree form is `>= limit`.
 ///
-/// The guess comes from division, then walks until the *forward* conversion
+/// The guess comes from scaling, then walks until the *forward* conversion
 /// satisfies the comparison in both directions, so the result is exact
 /// regardless of which way the two conversions round.
 #[allow(clippy::cast_possible_truncation)]
 fn ceil_e7(limit: f64) -> i32 {
-    let mut v = (limit / E7).ceil().clamp(-2.1e9, 2.1e9) as i32;
+    let mut v = deg_to_e7(limit).ceil().clamp(-2.1e9, 2.1e9) as i32;
     while to_degrees(v) < limit {
         match v.checked_add(1) {
             Some(next) => v = next,
@@ -43,7 +38,7 @@ fn ceil_e7(limit: f64) -> i32 {
 /// Largest decimicrodegree value whose degree form is `<= limit`.
 #[allow(clippy::cast_possible_truncation)]
 fn floor_e7(limit: f64) -> i32 {
-    let mut v = (limit / E7).floor().clamp(-2.1e9, 2.1e9) as i32;
+    let mut v = deg_to_e7(limit).floor().clamp(-2.1e9, 2.1e9) as i32;
     while to_degrees(v) > limit {
         match v.checked_sub(1) {
             Some(prev) => v = prev,

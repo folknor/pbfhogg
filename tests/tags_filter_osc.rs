@@ -279,3 +279,27 @@ fn node_without_usable_coords_is_refused() {
         "error must name the node and the attribute; got: {text}"
     );
 }
+
+#[test]
+fn legacy_output_is_gzip_without_suffix_and_metadata_is_normalized() {
+    let dir = tempfile::tempdir_in(".").expect("directory");
+    let input = dir.path().join("in.osc");
+    let output = dir.path().join("out.unknown");
+    std::fs::write(&input, b"<osmChange version=\"0.6\"><create><node id=\"7\" lat=\"1\" lon=\"2\" timestamp=\"yesterday\" changeset=\"no\" uid=\"&#48;\" visible=\"False\"><tag k=\"name\" v=\"test\"/></node></create></osmChange>").expect("XML");
+    tags_filter_osc(
+        &input,
+        &output,
+        &exprs(&["name"]),
+        &crate::common::test_host(),
+    )
+    .expect("filter");
+    let xml = read_osc_gz(&output);
+    for attribute in [
+        "timestamp=\"yesterday\"",
+        "changeset=\"no\"",
+        "uid=\"0\"",
+        "visible=\"False\"",
+    ] {
+        assert!(xml.contains(attribute), "{xml}");
+    }
+}

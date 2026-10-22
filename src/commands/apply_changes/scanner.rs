@@ -105,8 +105,8 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
     let mut seq: u64 = 0;
     let mut pending_post_barrier: Vec<ScannerEmit> = Vec::new();
     let mut barrier_open = !locations_on_ways; // open by default when not --locations-on-ways
-    let mut bytes_high_water_fastpath: usize = 0;
-    let mut bytes_high_water_slowpath: usize = 0;
+    let mut max_item_bytes_fastpath: usize = 0;
+    let mut max_item_bytes_slowpath: usize = 0;
     // Tracks the seq of the most recently emitted Node descriptor.
     // Used to send `last_node_seq` to the drain at the node→way
     // transition (or at EOF if no way blobs exist).
@@ -194,9 +194,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
             ScannerEmit::Candidate(ScannedBlob::Candidate(descriptor))
         };
 
-        // Track rough bytes in flight for the high-water counters that
-        // the plan doc's "Trust measurement, not estimates" section
-        // calls out.
+        // Track the largest descriptor estimate, not channel occupancy.
         let approx_cost = scanner_emit_cost(&item);
 
         // Node→way barrier. Under --locations-on-ways, way/relation
@@ -228,8 +226,8 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         dispatch_item(
             &channels,
             item,
-            &mut bytes_high_water_fastpath,
-            &mut bytes_high_water_slowpath,
+            &mut max_item_bytes_fastpath,
+            &mut max_item_bytes_slowpath,
             approx_cost,
         )?;
 
@@ -285,8 +283,8 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         dispatch_item(
             &channels,
             item,
-            &mut bytes_high_water_fastpath,
-            &mut bytes_high_water_slowpath,
+            &mut max_item_bytes_fastpath,
+            &mut max_item_bytes_slowpath,
             approx_cost,
         )?;
     }
@@ -296,13 +294,15 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         "merge_scanner_blobs_emitted",
         i64::try_from(seq).unwrap_or(i64::MAX),
     );
+    // Deliberately retain the historical counter names and emission semantics.
+    // Renaming these estimates breaks brokkr comparisons with measured runs.
     crate::debug::emit_counter(
         "merge_scanner_to_drain_bytes_high_water",
-        i64::try_from(bytes_high_water_fastpath).unwrap_or(i64::MAX),
+        i64::try_from(max_item_bytes_fastpath).unwrap_or(i64::MAX),
     );
     crate::debug::emit_counter(
         "merge_scanner_to_workers_bytes_high_water",
-        i64::try_from(bytes_high_water_slowpath).unwrap_or(i64::MAX),
+        i64::try_from(max_item_bytes_slowpath).unwrap_or(i64::MAX),
     );
 
     Ok(seq)
@@ -324,8 +324,8 @@ enum ScannerEmit {
 fn dispatch_item(
     channels: &ScannerChannels,
     item: ScannerEmit,
-    bytes_hw_fast: &mut usize,
-    bytes_hw_slow: &mut usize,
+    max_item_bytes_fast: &mut usize,
+    max_item_bytes_slow: &mut usize,
     approx_cost: usize,
 ) -> Result<()> {
     match item {
@@ -335,11 +335,11 @@ fn dispatch_item(
                     "scanner: fast-path emitted but drain_tx is None - misconfigured channels",
                 )))
             })?;
-            *bytes_hw_fast = (*bytes_hw_fast).max(approx_cost);
+            *max_item_bytes_fast = (*max_item_bytes_fast).max(approx_cost);
             tx.send(drain_item).map_err(send_err)?;
         }
         ScannerEmit::Candidate(scanned) => {
-            *bytes_hw_slow = (*bytes_hw_slow).max(approx_cost);
+            *max_item_bytes_slow = (*max_item_bytes_slow).max(approx_cost);
             channels.candidate_tx.send(scanned).map_err(send_err)?;
         }
     }

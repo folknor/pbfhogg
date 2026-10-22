@@ -1,5 +1,7 @@
 //! Builder for the `OSMHeader` blob that starts every PBF file.
 
+use crate::read::wire_schema::{header_bbox, header_block};
+
 use std::io;
 
 use protohoggr::{encode_bytes_field, encode_int64_field_always, encode_sint64_field_always};
@@ -193,20 +195,32 @@ impl<'a> HeaderBuilder<'a> {
         //             top (sint64, field 3), bottom (sint64, field 4).
         if let Some((left, bottom, right, top)) = self.bbox {
             let mut bbox_buf = Vec::new();
-            encode_sint64_field_always(&mut bbox_buf, 1, (left * 1e9).round() as i64);
-            encode_sint64_field_always(&mut bbox_buf, 2, (right * 1e9).round() as i64);
-            encode_sint64_field_always(&mut bbox_buf, 3, (top * 1e9).round() as i64);
-            encode_sint64_field_always(&mut bbox_buf, 4, (bottom * 1e9).round() as i64);
-            encode_bytes_field(&mut buf, 1, &bbox_buf);
+            encode_sint64_field_always(
+                &mut bbox_buf,
+                header_bbox::LEFT,
+                (left * 1e9).round() as i64,
+            );
+            encode_sint64_field_always(
+                &mut bbox_buf,
+                header_bbox::RIGHT,
+                (right * 1e9).round() as i64,
+            );
+            encode_sint64_field_always(&mut bbox_buf, header_bbox::TOP, (top * 1e9).round() as i64);
+            encode_sint64_field_always(
+                &mut bbox_buf,
+                header_bbox::BOTTOM,
+                (bottom * 1e9).round() as i64,
+            );
+            encode_bytes_field(&mut buf, header_block::BBOX, &bbox_buf);
         }
 
         // Field 4: required_features (repeated string)
-        encode_bytes_field(&mut buf, 4, b"OsmSchema-V0.6");
-        encode_bytes_field(&mut buf, 4, b"DenseNodes");
+        encode_bytes_field(&mut buf, header_block::REQUIRED_FEATURES, b"OsmSchema-V0.6");
+        encode_bytes_field(&mut buf, header_block::REQUIRED_FEATURES, b"DenseNodes");
         if self.historical_information {
             encode_bytes_field(
                 &mut buf,
-                4,
+                header_block::REQUIRED_FEATURES,
                 crate::HeaderBlock::HISTORICAL_INFORMATION.as_bytes(),
             );
         }
@@ -215,20 +229,28 @@ impl<'a> HeaderBuilder<'a> {
         if self.sorted {
             encode_bytes_field(
                 &mut buf,
-                5,
+                header_block::OPTIONAL_FEATURES,
                 crate::HeaderBlock::SORT_TYPE_THEN_ID.as_bytes(),
             );
         }
         for feature in &self.optional_features {
-            encode_bytes_field(&mut buf, 5, feature.as_bytes());
+            encode_bytes_field(
+                &mut buf,
+                header_block::OPTIONAL_FEATURES,
+                feature.as_bytes(),
+            );
         }
 
         // Field 16: writingprogram (string)
-        encode_bytes_field(&mut buf, 16, self.writing_program.as_bytes());
+        encode_bytes_field(
+            &mut buf,
+            header_block::WRITING_PROGRAM,
+            self.writing_program.as_bytes(),
+        );
 
         // Field 17: source (string)
         if let Some(source) = self.source {
-            encode_bytes_field(&mut buf, 17, source.as_bytes());
+            encode_bytes_field(&mut buf, header_block::SOURCE, source.as_bytes());
         }
 
         // Fields 32/33: replication timestamp and sequence number (int64).
@@ -237,16 +259,16 @@ impl<'a> HeaderBuilder<'a> {
         // sequence number 0 - a real sequence number, and the one a fresh
         // replication chain starts at.
         if let Some(ts) = self.replication_timestamp {
-            encode_int64_field_always(&mut buf, 32, ts);
+            encode_int64_field_always(&mut buf, header_block::REPLICATION_TIMESTAMP, ts);
         }
 
         if let Some(seq) = self.replication_sequence_number {
-            encode_int64_field_always(&mut buf, 33, seq);
+            encode_int64_field_always(&mut buf, header_block::REPLICATION_SEQUENCE_NUMBER, seq);
         }
 
         // Field 34: osmosis_replication_base_url (string)
         if let Some(url) = self.replication_base_url {
-            encode_bytes_field(&mut buf, 34, url.as_bytes());
+            encode_bytes_field(&mut buf, header_block::REPLICATION_BASE_URL, url.as_bytes());
         }
 
         Ok(buf)

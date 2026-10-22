@@ -70,6 +70,7 @@
 //!   claims sortedness). Requires `block_cap >= 2`; a cap of 1 cannot
 //!   hold two same-kind elements in one block and is rejected up front.
 
+use crate::read::wire_schema::{BlobHeaderField, HeaderBlockField};
 use std::collections::BinaryHeap;
 use std::path::Path;
 
@@ -591,7 +592,7 @@ fn passthrough_header_bytes(
         crate::read::decompress::decompress_blob_data_into(frame.blob_bytes(), &mut header_block)?;
         if flags.strip_bbox {
             let mut stripped = Vec::with_capacity(header_block.len());
-            strip_header_block_fields(&header_block, &[1], &mut stripped)?;
+            strip_header_block_fields(&header_block, &[HeaderBlockField::Bbox], &mut stripped)?;
             Ok(stripped)
         } else {
             Ok(header_block)
@@ -740,12 +741,12 @@ fn reframe_raw(
     corrupt_tagdata: bool,
     corrupt_index: Option<crate::blob_meta::BlobIndex>,
 ) -> std::io::Result<Vec<u8>> {
-    let mut strip_fields: Vec<u32> = Vec::with_capacity(2);
+    let mut strip_fields: Vec<BlobHeaderField> = Vec::with_capacity(2);
     if strip_indexdata {
-        strip_fields.push(2);
+        strip_fields.push(BlobHeaderField::Indexdata);
     }
     if strip_tagdata {
-        strip_fields.push(4);
+        strip_fields.push(BlobHeaderField::Tagdata);
     }
     let mut header_buf = Vec::new();
     strip_blob_header_fields(header_bytes, &strip_fields, &mut header_buf)?;

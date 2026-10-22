@@ -668,7 +668,7 @@ fn derive_changes_non_indexed_parity() {
         &osc_ii,
         false,
         false,
-        false,
+        None,
         1,
         &crate::common::test_host(),
     )
@@ -679,7 +679,7 @@ fn derive_changes_non_indexed_parity() {
         &osc_nn,
         false,
         false,
-        false,
+        None,
         1,
         &crate::common::test_host(),
     )

@@ -9,6 +9,7 @@
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use crate::coord_fmt::e7_to_deg;
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
 use s2::metric::MIN_WIDTHMETRIC;
@@ -157,15 +158,17 @@ fn cover_segment(
     level: u8,
     mut emit: impl FnMut(u64),
 ) {
-    let lat1 = lat1_e7 as f64 * 1e-7;
-    let lon1 = lon1_e7 as f64 * 1e-7;
-    let lat2 = lat2_e7 as f64 * 1e-7;
+    let lat1 = e7_to_deg(lat1_e7 as f64);
+    let lon1 = e7_to_deg(lon1_e7 as f64);
+    let lat2 = e7_to_deg(lat2_e7 as f64);
     // Unwrap the far endpoint around the near one. A segment from 179.9 to
     // -179.9 is 0.2 degrees wide, not 359.8: sampling it in the raw frame
     // walks the long way around the globe and covers half the planet in
     // cells. Sampled longitudes are normalized again below.
     let lon2 = lon1
-        + geo::wrapped_longitude_delta_e7(i64::from(lon2_e7) - i64::from(lon1_e7)) as f64 * 1e-7;
+        + e7_to_deg(
+            geo::wrapped_longitude_delta_e7(i64::from(lon2_e7) - i64::from(lon1_e7)) as f64,
+        );
 
     let c1 = CellID::from(LatLng::from_degrees(lat1, lon1)).parent(level as u64);
     let c2 = CellID::from(LatLng::from_degrees(lat2, lon2)).parent(level as u64);
@@ -531,7 +534,10 @@ pub(super) fn bucketed_cell_assignment_fused(
                 .into_par_iter()
                 .filter_map(|idx| {
                     let pt = read_addr_point_mmap(addr_points_mmap, idx as u32)?;
-                    let ll = LatLng::from_degrees(pt.lat_e7 as f64 * 1e-7, pt.lon_e7 as f64 * 1e-7);
+                    let ll = LatLng::from_degrees(
+                        e7_to_deg(pt.lat_e7 as f64),
+                        e7_to_deg(pt.lon_e7 as f64),
+                    );
                     let fine_cid = CellID::from(ll).parent(fine_level as u64).0;
                     let coarse_cid = CellID(fine_cid).parent(coarse_level as u64).0;
                     Some((fine_cid, coarse_cid, idx as u32))
@@ -1208,8 +1214,8 @@ mod tests {
                 (sl + i64::from(v.lat_e7), sn + i64::from(v.lon_e7), c + 1)
             });
         let (mean_lat, mean_lon) = (
-            sum_lat as f64 / n as f64 * 1e-7,
-            sum_lon as f64 / n as f64 * 1e-7,
+            e7_to_deg(sum_lat as f64 / n as f64),
+            e7_to_deg(sum_lon as f64 / n as f64),
         );
         let (ext, holes) = parse_polygon_rings(poly.vertices.iter().copied());
         let hole_slices: Vec<&[(f64, f64)]> = holes.iter().map(Vec::as_slice).collect();

@@ -691,18 +691,18 @@ pub(crate) fn external_join_in(
     )?;
 
     // External-join cannot function without indexdata: the stage-1/2
-    // rank-based bucket ranges are computed from per-blob `(min_id,
+    // ID bucket ranges are computed from per-blob `(min_id,
     // max_id)` derived from indexdata, and `scan_blob_metadata` hard-
     // errors if any OsmData blob lacks it. Under `--force` the
     // indexdata check upstream returns `Ok(false)` instead of a clear
     // error, which previously let the command proceed and then fail
-    // at `blob_meta.rs:50` with an opaque "OsmData blob missing
+    // in `scan_blob_metadata` with an opaque "OsmData blob missing
     // indexdata" message. Reject the combination up front with a
     // clear migration hint.
     if !has_indexdata {
         return Err(
             "add-locations-to-ways --index-type external requires indexed input; \
-             --force is not supported on this path because the rank-based bucket \
+             --force is not supported on this path because the ID bucket \
              ranges depend on per-blob indexdata.\n\n\
              Generate an indexed PBF first:\n\n\
              \x20 pbfhogg cat <input.osm.pbf> -o indexed.osm.pbf\n\n\

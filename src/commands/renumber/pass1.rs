@@ -59,6 +59,8 @@ pub(super) fn pass1_parallel_scan(
         |w: &mut Pass1Worker, idx| {
             let task = &schedule[idx];
             let base = bases[idx];
+            // Deliberately load only payload bytes and emit no tagdata. Carrying
+            // header key lists would change output and add per-blob rewrite work.
             w.buffers.load(shared_file, task, &counters)?;
 
             let t = std::time::Instant::now();

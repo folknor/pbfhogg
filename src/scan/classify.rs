@@ -442,7 +442,7 @@ pub(crate) fn build_classify_schedules_split(
 ///
 /// Use for dense/hot paths (node classify, way classify) where per-worker
 /// accumulation would be unbounded at planet scale. Each per-blob `R` is
-/// bounded by blob size (~8000 elements). `S` persists across blobs for
+/// bounded by the contents of one input blob. `S` persists across blobs for
 /// scratch reuse (DenseNodeColumns, decompress buffers, etc.).
 ///
 /// For sparse paths that want per-worker accumulation, use
@@ -704,14 +704,13 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
 /// ~7 GB total (UUID `7e74981a`). Mechanism: per-worker bitmap × N
 /// workers is bounded by ID space × N, not by element count, so a few
 /// dozen workers each with a planet-wide bitmap saturates RSS. Per-blob
-/// `Vec<i64>` is bounded by element count (`~8000 elements/blob × 8 bytes`
-/// at planet ≈ ~640 KB), and the bounded result channel caps the queue
-/// depth.
+/// `Vec<i64>` size follows the refs in that input blob, and the bounded result
+/// channel caps the queue depth.
 ///
 /// Unsafe: per-worker `Vec<i64>` accumulation of node IDs during dense
 /// node classify (would be O(billions of i64) per worker). Use
 /// [`parallel_classify_phase`] instead - its per-blob merge is bounded
-/// by blob size (~8 000 elements).
+/// by the contents of one input blob.
 ///
 /// # When you can't migrate to `parallel_classify_phase`
 ///

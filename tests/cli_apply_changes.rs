@@ -47,7 +47,6 @@ use flate2::write::GzEncoder;
 use pbfhogg::block_builder::{self, BlockBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, MemberId, MemberType};
-use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -176,7 +175,7 @@ fn run_apply_ok(base: &Path, osc: &Path, output: &Path) -> CliOutput {
 
 #[test]
 fn merge_basic_create_modify_delete() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -223,7 +222,7 @@ fn merge_basic_create_modify_delete() {
 
 #[test]
 fn merge_create_between_existing_ids() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -282,7 +281,7 @@ fn merge_create_between_existing_ids() {
 
 #[test]
 fn merge_create_beyond_max_id() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -339,7 +338,7 @@ fn merge_create_beyond_max_id() {
 /// Exercises block 1 passthrough, block 2 rewritten, block 3 passthrough.
 #[test]
 fn merge_multi_block_partial_rewrite() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -472,7 +471,7 @@ fn merge_multi_block_partial_rewrite() {
 
 #[test]
 fn merge_nodes_only_diff_ways_passthrough() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -552,7 +551,7 @@ fn merge_nodes_only_diff_ways_passthrough() {
 
 #[test]
 fn merge_ways_only_diff() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -633,7 +632,7 @@ fn merge_ways_only_diff() {
 
 #[test]
 fn merge_relations_only_diff() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -727,7 +726,7 @@ fn merge_relations_only_diff() {
 
 #[test]
 fn merge_all_types() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -832,7 +831,7 @@ fn merge_all_types() {
 /// no output for that block.
 #[test]
 fn merge_delete_entire_block() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -924,7 +923,7 @@ fn merge_delete_entire_block() {
 
 #[test]
 fn merge_stats_accuracy() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -1028,7 +1027,7 @@ fn merge_stats_accuracy() {
 /// so that a future reader is not misled into preserving the bug.
 #[test]
 fn merge_metadata_preservation() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -1242,7 +1241,7 @@ fn read_way_locations(path: &Path) -> Vec<(i64, Vec<(i32, i32)>)> {
 
 #[test]
 fn merge_locations_on_ways_basic() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -1368,7 +1367,7 @@ fn merge_locations_on_ways_basic() {
 
 #[test]
 fn merge_locations_on_ways_osc_node_coords() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -1436,7 +1435,7 @@ fn merge_locations_on_ways_osc_node_coords() {
 
 #[test]
 fn merge_locations_on_ways_rejects_missing_node_unless_explicitly_ignored() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -1510,7 +1509,7 @@ fn merge_locations_on_ways_rejects_missing_node_unless_explicitly_ignored() {
 /// absent one; either alone leaves the counting bug invisible.
 #[test]
 fn merge_locations_on_ways_duplicate_base_records_cannot_mask_a_missing_node() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -1556,7 +1555,7 @@ fn merge_locations_on_ways_duplicate_base_records_cannot_mask_a_missing_node() {
 /// Merge with --locations-on-ways requires LocationsOnWays in base PBF.
 #[test]
 fn merge_locations_on_ways_requires_base_feature() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -1712,7 +1711,7 @@ fn low_opts() -> ApplyOpts {
 /// be resolved".
 #[test]
 fn merge_locations_on_ways_resolves_plain_node_messages() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -1753,7 +1752,7 @@ fn merge_locations_on_ways_resolves_plain_node_messages() {
 /// used to leave the node-to-way barrier unfired forever.
 #[test]
 fn merge_locations_on_ways_fails_loudly_on_undecodable_node_coordinates() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -1787,7 +1786,7 @@ fn merge_locations_on_ways_fails_loudly_on_undecodable_node_coordinates() {
 /// that still claims LocationsOnWays.
 #[test]
 fn merge_locations_on_ways_refuses_to_strip_ways_routed_before_the_barrier() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -1832,7 +1831,7 @@ fn merge_locations_on_ways_refuses_to_strip_ways_routed_before_the_barrier() {
 /// coordinates used to satisfy the missing-node guard.
 #[test]
 fn merge_locations_on_ways_counts_a_deleted_node_reference_as_missing() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -1880,7 +1879,7 @@ fn merge_locations_on_ways_counts_a_deleted_node_reference_as_missing() {
 /// Create elements with IDs that fall in gaps between base blobs.
 #[test]
 fn merge_gap_creates_between_blobs() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -1963,7 +1962,7 @@ fn merge_gap_creates_between_blobs() {
 /// Base has only nodes and relations (no ways). Diff creates ways.
 #[test]
 fn merge_type_transition_node_to_relation_skipping_ways() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -2052,7 +2051,7 @@ fn merge_type_transition_node_to_relation_skipping_ways() {
 /// merely inert also passes "the flag parsed".
 #[test]
 fn merge_refuses_a_version_regression_and_honours_the_escape_hatch() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -2127,7 +2126,7 @@ fn merge_refuses_a_version_regression_and_honours_the_escape_hatch() {
 fn merge_rejects_force_with_locations_on_ways_on_non_indexed() {
     use crate::common::write_test_pbf_non_indexed;
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -2194,7 +2193,7 @@ fn merge_rejects_force_with_locations_on_ways_on_non_indexed() {
 /// hazard on mid-stream worker panic and no production use case.
 #[test]
 fn merge_rejects_jobs_equal_one() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("out.osm.pbf");
@@ -2269,7 +2268,7 @@ mod platform {
     #[cfg(feature = "linux-direct-io")]
     #[test]
     fn merge_basic_create_modify_delete_direct_io() {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let base = dir.path().join("base.osm.pbf");
         let osc = dir.path().join("diff.osc.gz");
         let output = dir.path().join("output.osm.pbf");
@@ -2285,7 +2284,7 @@ mod platform {
             },
         );
         if out.is_o_direct_unsupported() {
-            eprintln!("O_DIRECT not supported on this filesystem, skipping test");
+            crate::common::skip("O_DIRECT not supported on this filesystem");
             return;
         }
         assert!(
@@ -2304,7 +2303,7 @@ mod platform {
     #[cfg(feature = "linux-io-uring")]
     #[test]
     fn merge_basic_create_modify_delete_uring() {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let base = dir.path().join("base.osm.pbf");
         let osc = dir.path().join("diff.osc.gz");
         let output = dir.path().join("output.osm.pbf");
@@ -2320,7 +2319,7 @@ mod platform {
             },
         );
         if out.is_uring_unsupported() {
-            eprintln!("io_uring not available, skipping test");
+            crate::common::skip("io_uring not available");
             return;
         }
         assert!(
@@ -2499,11 +2498,11 @@ fn merge_cross_validate_osmium() {
     let osc = manifest.join("data/denmark-20260221-seq4705.osc.gz");
 
     if !base_pbf.exists() {
-        eprintln!("Skipping: {} not found", base_pbf.display());
+        crate::common::skip(format!("{} not found", base_pbf.display()));
         return;
     }
     if !osc.exists() {
-        eprintln!("Skipping: {} not found", osc.display());
+        crate::common::skip(format!("{} not found", osc.display()));
         return;
     }
 
@@ -2512,15 +2511,16 @@ fn merge_cross_validate_osmium() {
         .output()
         .is_ok_and(|o| o.status.success());
     if !osmium_ok {
-        eprintln!("Skipping: osmium not found in PATH");
+        crate::common::skip("osmium not found in PATH");
         return;
     }
 
-    let target_dir = manifest.join("target");
-    std::fs::create_dir_all(&target_dir).ok();
+    let scratch = crate::common::test_scratch();
+    let target_dir = scratch.path();
     let pbfhogg_out = target_dir.join("merge-xval-pbfhogg.osm.pbf");
     let osmium_out = target_dir.join("merge-xval-osmium.osm.pbf");
 
+    use pbfhogg::osc::OscElementKind;
     let diff = pbfhogg::osc::parse_osc_file(&osc).expect("parse osc");
 
     eprintln!("Running pbfhogg apply-changes...");
@@ -2586,24 +2586,24 @@ fn merge_cross_validate_osmium() {
         missing_n.len(),
         missing_w.len(),
         missing_r.len(),
-        diff.deleted_nodes.len(),
-        diff.deleted_ways.len(),
-        diff.deleted_relations.len(),
+        diff.deleted_ids(OscElementKind::Node).len(),
+        diff.deleted_ids(OscElementKind::Way).len(),
+        diff.deleted_ids(OscElementKind::Relation).len(),
     );
     for id in &missing_n {
-        if !diff.deleted_nodes.contains(id) {
+        if !diff.is_deleted(OscElementKind::Node, *id) {
             eprintln!("FAIL: node {id} missing but NOT in delete set");
             failures += 1;
         }
     }
     for id in &missing_w {
-        if !diff.deleted_ways.contains(id) {
+        if !diff.is_deleted(OscElementKind::Way, *id) {
             eprintln!("FAIL: way {id} missing but NOT in delete set");
             failures += 1;
         }
     }
     for id in &missing_r {
-        if !diff.deleted_relations.contains(id) {
+        if !diff.is_deleted(OscElementKind::Relation, *id) {
             eprintln!("FAIL: relation {id} missing but NOT in delete set");
             failures += 1;
         }

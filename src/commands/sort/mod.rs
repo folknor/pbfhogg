@@ -315,7 +315,7 @@ pub fn sort(
     // Passthrough coalescer: adjacent blobs contiguous in the input file
     // collapse into one `copy_file_range` call. On already-sorted input this
     // is the entire file, cutting syscall count from O(blobs) to O(1).
-    // Mirrors the apply_changes drain coalescer (drain.rs:408-410).
+    // Mirrors the contiguous-range passthrough coalescer in apply_changes.
     let mut copy_run: Option<(u64, u64)> = None;
     let mut copy_run_calls: u64 = 0;
     let mut copy_run_coalesced: u64 = 0;

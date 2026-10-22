@@ -3,10 +3,15 @@
 //! Reads an OSM PBF file in multiple passes and writes the set of binary index
 //! files defined by the `format` module.
 
+// Mmap offsets and record indices below require a 64-bit address space.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("the geocode index builder requires 64-bit pointers");
+
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 use crate::ElementReader;
+use crate::coord_fmt::e7_to_deg;
 
 use super::format::*;
 
@@ -503,8 +508,8 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
         let test_reader = super::reader::Reader::open(&config.output_dir)?;
         if addr_point_count > 0 {
             let result = test_reader.query(
-                first_addr_lat_e7 as f64 * 1e-7,
-                first_addr_lon_e7 as f64 * 1e-7,
+                e7_to_deg(first_addr_lat_e7 as f64),
+                e7_to_deg(first_addr_lon_e7 as f64),
             )?;
             if result.address.is_none() && result.street.is_none() {
                 crate::host::diag!(

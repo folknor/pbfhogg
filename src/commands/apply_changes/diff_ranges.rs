@@ -29,7 +29,7 @@ impl DiffRanges {
     pub(super) fn from_diff(diff: &CompactDiffOverlay) -> Self {
         let mut node_ids: Vec<i64> = diff
             .node_ids()
-            .chain(diff.deleted_nodes.iter())
+            .chain(diff.deleted_ids(crate::osc::OscElementKind::Node).iter())
             .copied()
             .collect();
         node_ids.sort_unstable_by(|a, b| crate::osm_id::osm_id_cmp(*a, *b));
@@ -37,7 +37,7 @@ impl DiffRanges {
 
         let mut way_ids: Vec<i64> = diff
             .way_ids()
-            .chain(diff.deleted_ways.iter())
+            .chain(diff.deleted_ids(crate::osc::OscElementKind::Way).iter())
             .copied()
             .collect();
         way_ids.sort_unstable_by(|a, b| crate::osm_id::osm_id_cmp(*a, *b));
@@ -45,7 +45,10 @@ impl DiffRanges {
 
         let mut rel_ids: Vec<i64> = diff
             .relation_ids()
-            .chain(diff.deleted_relations.iter())
+            .chain(
+                diff.deleted_ids(crate::osc::OscElementKind::Relation)
+                    .iter(),
+            )
             .copied()
             .collect();
         rel_ids.sort_unstable_by(|a, b| crate::osm_id::osm_id_cmp(*a, *b));

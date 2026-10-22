@@ -14,11 +14,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::NonNull;
 
-use super::{PAGE_SIZE, alloc_page_aligned};
-
-/// Internal buffer capacity. Matches the 256 KB `BufWriter` capacity used
-/// elsewhere. Must be a multiple of `PAGE_SIZE`.
-const BUF_CAPACITY: usize = 256 * 1024;
+use super::{IO_BUF_BYTES, PAGE_SIZE, alloc_page_aligned};
 
 // ---------------------------------------------------------------------------
 // AlignedBuffer - page-aligned heap allocation
@@ -123,7 +119,7 @@ impl DirectWriter {
             .truncate(true)
             .custom_flags(libc::O_DIRECT)
             .open(path)?;
-        let buf = AlignedBuffer::new(BUF_CAPACITY)?;
+        let buf = AlignedBuffer::new(IO_BUF_BYTES)?;
         Ok(Self {
             file,
             buf,

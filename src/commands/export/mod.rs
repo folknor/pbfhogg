@@ -182,8 +182,8 @@ pub fn export<W: Write>(
                 }
                 if opts.bbox.as_ref().is_some_and(|bbox| {
                     !bbox.contains(
-                        f64::from(node.decimicro_lat()) * 1e-7,
-                        f64::from(node.decimicro_lon()) * 1e-7,
+                        crate::coord_fmt::from_decimicro(node.decimicro_lat()),
+                        crate::coord_fmt::from_decimicro(node.decimicro_lon()),
                     )
                 }) || !matches_expressions(&opts.expressions, &tags, &node_kind())
                 {
@@ -208,8 +208,8 @@ pub fn export<W: Write>(
                 }
                 if opts.bbox.as_ref().is_some_and(|bbox| {
                     !bbox.contains(
-                        f64::from(node.decimicro_lat()) * 1e-7,
-                        f64::from(node.decimicro_lon()) * 1e-7,
+                        crate::coord_fmt::from_decimicro(node.decimicro_lat()),
+                        crate::coord_fmt::from_decimicro(node.decimicro_lon()),
                     )
                 }) || !matches_expressions(&opts.expressions, &tags, &node_kind())
                 {
@@ -243,17 +243,17 @@ pub fn export<W: Write>(
                 }
                 let is_area = is_area_way(&way);
                 collect_coords(&way, &mut coords);
-                if write_way_geometry(&mut geometry, &mut coord_scratch, &coords, is_area)
-                    == WayGeom::Invalid
-                {
-                    stats.skipped_invalid_ways += 1;
-                    return;
-                }
                 if opts
                     .bbox
                     .as_ref()
                     .is_some_and(|bbox| !way_hits_bbox(&coords, bbox))
                 {
+                    return;
+                }
+                if write_way_geometry(&mut geometry, &mut coord_scratch, &coords, is_area)
+                    == WayGeom::Invalid
+                {
+                    stats.skipped_invalid_ways += 1;
                     return;
                 }
                 let info = way.info();

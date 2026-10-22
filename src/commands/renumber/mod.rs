@@ -200,6 +200,9 @@ struct BlobBuffers {
 }
 
 impl BlobBuffers {
+    // Deliberately read only the payload, never the tagdata header or key lists.
+    // Renumber is a terminal step whose output is not tag-filtered; adding header
+    // reads or key parsing adds work to the measured per-blob rewrite hot path.
     /// pread the blob `task` addresses and decompress it into
     /// `self.decompressed`.
     fn load(

@@ -257,8 +257,8 @@ pub(super) fn stage2_node_join(
     // re-decompressed by adjacent workers; high values mean wasted
     // decode work. With id-bucketing, a node blob's id range can be
     // wider than the bucket width, so straddler density is expected
-    // to differ from the rank-bucketing baseline - watch this metric
-    // when comparing pre/post-A1 traces.
+    // to be high for sparse ID ranges. Watch this metric when
+    // diagnosing repeated node decompression.
     let s2_node_straddler_blobs = std::sync::atomic::AtomicU64::new(0);
     let s2_resolve_ms = std::sync::atomic::AtomicU64::new(0);
     let s2_bucket_load_ms = std::sync::atomic::AtomicU64::new(0);
@@ -392,6 +392,7 @@ pub(super) fn stage2_node_join(
 
                         let t_resolve = std::time::Instant::now();
                         let mut record_ptr = 0usize;
+                        let resolved_before_bucket = local_resolved;
                         let mut bucket_blobs_read: u64 = 0;
                         let mut bucket_straddlers: u64 = 0;
 
@@ -658,11 +659,11 @@ pub(super) fn stage2_node_join(
                             bucket_blobs_read += 1;
                         }
 
-                        // Records past the last blob's max_id are orphans
-                        // (their global id has no matching node anywhere
-                        // in the input - the canonical absent-node case).
-                        let orphans = bkt.records.len().saturating_sub(record_ptr);
-                        orphan_ref.fetch_add(orphans as u64, Relaxed);
+                        // Count every absent record, including IDs in gaps
+                        // within a blob range and past the last blob.
+                        let bucket_resolved = local_resolved - resolved_before_bucket;
+                        let orphans = (bkt.records.len() as u64).saturating_sub(bucket_resolved);
+                        orphan_ref.fetch_add(orphans, Relaxed);
 
                         node_blobs_ref.fetch_add(bucket_blobs_read, Relaxed);
                         node_straddler_ref.fetch_add(bucket_straddlers, Relaxed);

@@ -9,7 +9,6 @@ use std::path::Path;
 
 use crate::common::{TestMember, TestNode, TestRelation, TestWay, write_test_pbf_sorted};
 use pbfhogg::MemberId;
-use tempfile::TempDir;
 
 pub(crate) fn write_synthetic_indexed_input(path: &Path) {
     write_test_pbf_sorted(
@@ -852,7 +851,7 @@ fn write_addr_cell_overflow_input(path: &Path) {
 
 #[test]
 fn synthetic_build_query_matches_low_level_api() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
@@ -953,7 +952,7 @@ fn synthetic_build_query_matches_low_level_api() {
 
 #[test]
 fn null_island_street_vertex_is_not_treated_as_absent() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     write_test_pbf_sorted(
@@ -1061,7 +1060,7 @@ fn build_into(
 /// metadata, not a panic and not a silently shortened street.
 #[test]
 fn understated_node_max_id_is_an_error_not_a_panic() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     let lying = dir.path().join("lying.osm.pbf");
     write_test_pbf_sorted(
@@ -1110,7 +1109,7 @@ fn understated_node_max_id_is_an_error_not_a_panic() {
 /// reason as the understated-indexdata case.
 #[test]
 fn dangling_ref_above_every_node_id_is_dropped_not_fatal() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     write_test_pbf_sorted(
@@ -1134,7 +1133,7 @@ fn dangling_ref_above_every_node_id_is_dropped_not_fatal() {
 /// `IdSet` chunk.
 #[test]
 fn force_without_indexdata_bounds_node_ids_from_the_blobs() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     crate::common::write_test_pbf_non_indexed(
@@ -1153,9 +1152,12 @@ fn force_without_indexdata_bounds_node_ids_from_the_blobs() {
     );
 }
 
+// BlockBuilder emits dense nodes only. Exercise plain nodes with osmium:
+// brokkr test legal_non_dense_nodes_build_a_queryable_index --sweep all
 #[test]
+#[ignore = "external"]
 fn legal_non_dense_nodes_build_a_queryable_index() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let dense = dir.path().join("dense.osm.pbf");
     let input = dir.path().join("non-dense.osm.pbf");
     let index_dir = dir.path().join("index");
@@ -1164,8 +1166,15 @@ fn legal_non_dense_nodes_build_a_queryable_index() {
         .args(["cat", "-f", "pbf,pbf_dense_nodes=false", "-o"])
         .arg(&input)
         .arg(&dense)
-        .status()
-        .expect("run osmium to produce a legal non-dense fixture");
+        .status();
+    let status = match status {
+        Ok(status) => status,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::common::skip("osmium not found in PATH");
+            return;
+        }
+        Err(error) => panic!("run osmium to produce a legal non-dense fixture: {error}"),
+    };
     assert!(status.success(), "osmium fixture conversion failed");
     let stats = pbfhogg::geocode_index::builder::build_geocode_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
@@ -1193,7 +1202,7 @@ fn legal_non_dense_nodes_build_a_queryable_index() {
 
 #[test]
 fn builder_refuses_a_truly_empty_index() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     write_test_pbf_sorted(
@@ -1227,7 +1236,7 @@ fn builder_refuses_a_truly_empty_index() {
 
 #[test]
 fn reader_rejects_hostile_entry_offset_instead_of_panicking() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     write_synthetic_indexed_input(&input);
@@ -1267,7 +1276,7 @@ fn reader_rejects_hostile_entry_offset_instead_of_panicking() {
 /// so the caller cannot tell a truncated list from an empty one.
 #[test]
 fn reader_rejects_every_out_of_bounds_offset_kind() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let good = dir.path().join("good");
     write_all_record_kinds_input(&input);
@@ -1454,7 +1463,7 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
 
 #[test]
 fn force_with_bad_input_leaves_the_existing_index_intact() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     write_synthetic_indexed_input(&input);
@@ -1508,7 +1517,7 @@ fn force_with_bad_input_leaves_the_existing_index_intact() {
 /// Pass 2 writes, so a mid-build death is detectable.
 #[test]
 fn force_invalidates_the_header_before_pass_two_writes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     write_synthetic_indexed_input(&input);
@@ -1566,7 +1575,7 @@ fn force_invalidates_the_header_before_pass_two_writes() {
 /// legal value for the CLI flag, and it must be refused.
 #[test]
 fn levels_past_the_sampling_budget_are_refused_before_reading_input() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     write_synthetic_indexed_input(&input);
@@ -1619,7 +1628,7 @@ fn levels_past_the_sampling_budget_are_refused_before_reading_input() {
 
 #[test]
 fn fallback_recovers_hits_outside_fine_radius() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let no_fallback_dir = dir.path().join("index_no_fallback");
     let coarse_fallback_dir = dir.path().join("index_with_fallback");
@@ -1685,7 +1694,7 @@ fn fallback_recovers_hits_outside_fine_radius() {
 
 #[test]
 fn fallback_fills_address_when_fine_street_exists() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     write_synthetic_indexed_input(&input);
@@ -1729,7 +1738,7 @@ fn fallback_fills_address_when_fine_street_exists() {
 
 #[test]
 fn synthetic_admin_polygon_query_returns_country_match() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
@@ -1786,7 +1795,7 @@ fn synthetic_admin_polygon_query_returns_country_match() {
 
 #[test]
 fn nested_same_level_admin_prefers_smallest_polygon() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
@@ -1863,7 +1872,7 @@ fn nested_same_level_admin_prefers_smallest_polygon() {
 
 #[test]
 fn admin_polygon_hole_excludes_queries_inside_the_hole() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
@@ -1988,7 +1997,7 @@ fn admin_cell_neighborhood(lat: f64, lon: f64, level: u8) -> (u64, Vec<u64>) {
 /// to the polygon. The fix always runs the PIP test; this pins that behavior.
 #[test]
 fn admin_interior_hint_does_not_bypass_point_in_polygon() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
@@ -2094,7 +2103,7 @@ fn admin_interior_hint_does_not_bypass_point_in_polygon() {
 
 #[test]
 fn synthetic_interpolation_query_resolves_even_house_number() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
@@ -2162,7 +2171,7 @@ fn synthetic_interpolation_query_resolves_even_house_number() {
 
 #[test]
 fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
@@ -2228,7 +2237,7 @@ fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
 
 #[test]
 fn fallback_recovers_interpolation_outside_fine_radius() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let no_fallback_dir = dir.path().join("index_no_fallback");
     let coarse_fallback_dir = dir.path().join("index_with_fallback");
@@ -2314,7 +2323,7 @@ fn fallback_recovers_interpolation_outside_fine_radius() {
 /// user-visible answer got.
 #[test]
 fn antimeridian_interpolation_snaps_on_the_short_arc() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
@@ -2370,7 +2379,7 @@ fn antimeridian_interpolation_snaps_on_the_short_arc() {
 /// suppress the coarse interpolation that would have produced one.
 #[test]
 fn unresolvable_fine_interpolation_does_not_shadow_the_fallback() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
@@ -2437,7 +2446,7 @@ fn unresolvable_fine_interpolation_does_not_shadow_the_fallback() {
 
 #[test]
 fn synthetic_postal_boundary_query_returns_level_11_match() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
@@ -2483,7 +2492,7 @@ fn synthetic_postal_boundary_query_returns_level_11_match() {
 
 #[test]
 fn build_rejects_street_way_coord_count_over_u16_max() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
@@ -2509,7 +2518,7 @@ fn build_rejects_street_way_coord_count_over_u16_max() {
 
 #[test]
 fn build_rejects_interpolation_way_coord_count_over_u16_max() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
@@ -2535,7 +2544,7 @@ fn build_rejects_interpolation_way_coord_count_over_u16_max() {
 
 #[test]
 fn build_rejects_addr_entry_count_over_u16_max_for_one_cell() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
@@ -2572,7 +2581,7 @@ fn build_rejects_addr_entry_count_over_u16_max_for_one_cell() {
 /// cell.
 #[test]
 fn build_rejects_street_entry_count_over_u16_max_for_one_cell() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
@@ -2606,7 +2615,7 @@ fn build_rejects_street_entry_count_over_u16_max_for_one_cell() {
 /// (`build_rejects_interpolation_way_coord_count_over_u16_max`).
 #[test]
 fn build_rejects_interp_entry_count_over_u16_max_for_one_cell() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
@@ -2641,7 +2650,7 @@ fn build_rejects_interp_entry_count_over_u16_max_for_one_cell() {
 /// outer ring (so every polygon's bbox lands in the same S2 cell).
 #[test]
 fn build_rejects_admin_entry_count_over_u16_max_for_one_cell() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
 
@@ -2677,41 +2686,22 @@ fn denmark_indexed_path() -> std::path::PathBuf {
         .join("data/denmark-20260220-seq4704-with-indexdata.osm.pbf")
 }
 
-fn output_dir() -> std::path::PathBuf {
-    // Use existing scratch directory if available (built by brokkr run),
-    // otherwise use target/geocode-test.
-    let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/scratch/geocode-denmark");
-    if scratch.join("geocode_header.bin").exists() {
-        return scratch;
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("target/geocode-test")
-}
-
-fn ensure_index_exists() -> Option<std::path::PathBuf> {
-    let dir = output_dir();
-    if dir.join("geocode_header.bin").exists()
-        && pbfhogg::geocode_index::reader::Reader::open(&dir).is_ok()
-    {
-        return Some(dir);
-    }
-    // Try building (only reasonable in release mode)
+fn ensure_index_exists() -> Option<tempfile::TempDir> {
+    // Each caller owns its build and cannot remove another caller's index.
     let input = denmark_indexed_path();
     if !input.exists() {
         return None;
     }
-    let build_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/geocode-test");
-    if build_dir.exists() {
-        std::fs::remove_dir_all(&build_dir).ok();
-    }
+    let scratch = crate::common::test_scratch();
     let config = pbfhogg::geocode_index::builder::BuildConfig {
         input_path: input,
-        output_dir: build_dir.clone(),
+        output_dir: scratch.path().join("index"),
         force: false,
         ..Default::default()
     };
     pbfhogg::geocode_index::builder::build_geocode_index(&config, &crate::common::test_host())
-        .ok()?;
-    Some(build_dir)
+        .expect("build Denmark index");
+    Some(scratch)
 }
 
 /// Build the index and verify counts are reasonable for Denmark.
@@ -2720,14 +2710,12 @@ fn ensure_index_exists() -> Option<std::path::PathBuf> {
 fn build_denmark_index() {
     let input = denmark_indexed_path();
     if !input.exists() {
-        eprintln!("Skipping: {} not found", input.display());
+        crate::common::skip(format!("{} not found", input.display()));
         return;
     }
 
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/geocode-test-build");
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).ok();
-    }
+    let scratch = crate::common::test_scratch();
+    let dir = scratch.path().join("index");
 
     let config = pbfhogg::geocode_index::builder::BuildConfig {
         input_path: input,
@@ -2791,11 +2779,12 @@ fn build_denmark_index() {
 #[test]
 #[ignore]
 fn query_copenhagen() {
-    let Some(dir) = ensure_index_exists() else {
-        eprintln!("Skipping: index not available");
+    let Some(scratch) = ensure_index_exists() else {
+        crate::common::skip("indexed Denmark input not available");
         return;
     };
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&dir).expect("reader should open");
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&scratch.path().join("index"))
+        .expect("reader should open");
 
     // 55.6761°N, 12.5683°E - Copenhagen City Hall / Rådhuspladsen
     let result = reader.query(55.6761, 12.5683).expect("valid query");
@@ -2832,11 +2821,12 @@ fn query_copenhagen() {
 #[test]
 #[ignore]
 fn query_rural_jutland() {
-    let Some(dir) = ensure_index_exists() else {
-        eprintln!("Skipping: index not available");
+    let Some(scratch) = ensure_index_exists() else {
+        crate::common::skip("indexed Denmark input not available");
         return;
     };
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&dir).expect("reader should open");
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&scratch.path().join("index"))
+        .expect("reader should open");
 
     // 57.5°N, 10.0°E - sparse area in northern Jutland
     let result = reader.query(57.5, 10.0).expect("valid query");
@@ -2848,11 +2838,12 @@ fn query_rural_jutland() {
 #[test]
 #[ignore]
 fn query_north_sea() {
-    let Some(dir) = ensure_index_exists() else {
-        eprintln!("Skipping: index not available");
+    let Some(scratch) = ensure_index_exists() else {
+        crate::common::skip("indexed Denmark input not available");
         return;
     };
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&dir).expect("reader should open");
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&scratch.path().join("index"))
+        .expect("reader should open");
 
     // 56.0°N, 4.0°E - North Sea
     let result = reader.query(56.0, 4.0).expect("valid query");
@@ -2864,11 +2855,12 @@ fn query_north_sea() {
 #[test]
 #[ignore]
 fn api_equivalence() {
-    let Some(dir) = ensure_index_exists() else {
-        eprintln!("Skipping: index not available");
+    let Some(scratch) = ensure_index_exists() else {
+        crate::common::skip("indexed Denmark input not available");
         return;
     };
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&dir).expect("reader should open");
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&scratch.path().join("index"))
+        .expect("reader should open");
 
     let points = [(55.6761, 12.5683), (56.15, 10.2), (55.4, 12.3)];
 
@@ -2910,11 +2902,12 @@ fn api_equivalence() {
 #[test]
 #[ignore]
 fn coarse_fallback() {
-    let Some(dir) = ensure_index_exists() else {
-        eprintln!("Skipping: index not available");
+    let Some(scratch) = ensure_index_exists() else {
+        crate::common::skip("indexed Denmark input not available");
         return;
     };
-    let reader = pbfhogg::geocode_index::reader::Reader::open(&dir).expect("reader should open");
+    let reader = pbfhogg::geocode_index::reader::Reader::open(&scratch.path().join("index"))
+        .expect("reader should open");
 
     // Thy National Park, northern Jutland: 56.92°N, 8.52°E
     let result = reader.query(56.92, 8.52).expect("valid query");

@@ -76,33 +76,6 @@ under budget.
 
 Reported by: change application.
 
-## BUG-014 - Apply-changes scanner "bytes high water" counters record the largest single item
-
-`run_scanner` does `*bytes_hw_fast = (*bytes_hw_fast).max(approx_cost)` under
-a comment saying it tracks bytes in flight.
-`merge_scanner_to_drain_bytes_high_water` and
-`merge_scanner_to_workers_bytes_high_water` therefore report the largest
-descriptor seen (about 64 bytes plus tagdata). Anyone sizing channels from
-the sidecar gets a meaningless number. Rename or delete.
-
-Reported by: change application.
-
-## BUG-015 - OSC decompress counter is attributed to merge-changes for every caller
-
-`xml_parse::parse_osc_path` emits `merge_changes_decompress_ns` for every
-caller: apply-changes, tags-filter OSC and merge-changes. Brokkr therefore
-books apply-changes' OSC decompress time under a merge-changes name. On
-multi-input merge-changes it is emitted once per file under one name from
-parallel workers, so the max-wins view keeps one file's time. Apply-changes
-uses `merge_*` counters (named after the internal function), merge-changes
-uses `merge_changes_*`, and the markers are `MERGE_*` vs `MERGECHANGES_*`;
-`MERGECHANGES_WRITE_FINISH_START/END` are emitted back to back with nothing
-between them. Fix: pass the counter prefix or a typed counters handle into
-`parse_osc_path`; a const table of counter names per command lets a test
-assert uniqueness.
-
-Reported by: change application.
-
 ## BUG-020 - Apply-changes discards or escalates a scanner error or worker panic when the drain fails
 
 Worker errors now reach the caller: workers publish into a shared
@@ -164,15 +137,6 @@ builder (pass 1.5) still passes indexdata's claim unbounded and should do
 the same, per CORRECTNESS.md's rule for allocations sized from indexdata.
 
 Reported by: altw and scanning, geocode index, re-encoding.
-
-## BUG-027 - `s2_orphan_records` undercounts
-
-The counter is `bkt.records.len() - record_ptr` after the blob walk. Records
-the walk passed over without resolving (an ID in a gap between tuples inside a
-blob's range) are not counted, so it covers only orphans past the last blob.
-It is the counter you would check when `missing_locations` is non-zero.
-
-Reported by: altw and scanning.
 
 ## BUG-029 - Lost wakeup in the altw stage 4 location router
 
@@ -338,14 +302,6 @@ why no fixture caught this; `osmium cat -f pbf,pbf_dense_nodes=false`
 produces the input.
 
 Reported by: the apply-changes and extract fixes.
-
-## BUG-078 - Renumber output carries no tagdata
-
-Renumber writes its re-framed blobs with tagdata `None`, so `tags-filter`
-and `tags-count` cannot skip blobs of a renumbered file by tag key, while
-indexdata is written. Its rewriters already walk every element's keys.
-
-Reported by: the renumber fix.
 
 ## BUG-079 - The version gate refuses identical repeats from overlapping diffs
 
@@ -548,76 +504,6 @@ path the command owns; test that a pre-existing output survives failure.
 
 Reported by: CLI and plumbing.
 
-## BUG-058 - Small CLI parsing defects
-
-- `inspect tags` takes its own `file` positional, so
-  `pbfhogg inspect x.pbf tags y.pbf` parses two files and silently uses the
-  second.
-- `run_extract`'s region group `area` is not marked `required`, so
-  `(None, None)` is reachable and handled at run time instead of by clap.
-- `Inspect` has `file: Option<PathBuf>` with `required = true` plus
-  `subcommand_negates_reqs`, then `file.ok_or("Input PBF file is required")`, a
-  second check clap already does.
-- `diff -q` has `conflicts_with = "output"`, while the `--format osc` arm
-  requires `--output` and rejects `--quiet` by hand; the hand check is
-  unreachable.
-- `detect_input_kind` (tags-filter) falls back to extension for a gzipped
-  non-OSC file or an OSC with a BOM or leading whitespace, defaults unknown
-  extensions to PBF, and lists `.osc.bz2`, which the OSC reader cannot read,
-  so a bz2 input fails inside the XML parser. Refuse ambiguous input naming
-  `--input-kind`; drop `.bz2`.
-- `run_check` uses `"input.osm.pbf"` as the file name when the path has no
-  UTF-8 file name and emits it into JSON; `inspect` uses `to_string_lossy`.
-  Use `to_string_lossy` everywhere.
-
-Reported by: CLI and plumbing.
-
-## BUG-059 - Nothing enforces one test per static-hook target
-
-The read-pipeline decode hook itself is fixed: it is a locked gate with a
-bounded park that panics with a named message, and `reset()` frees a parked
-decode before clearing, and the statics now exist only under the
-`static-test-hooks` feature, which empties `tests/all.rs` and is absent from
-the library's unit-test harness, so neither of the root package's shared
-harnesses can arm one
-(reference/testing.md, "Test binaries"). What remains: nothing checks that
-each fault target holds a single `#[test]`, so a second test added to one
-would share the armed static with the first. HYG-062 covers removing the
-globals outright.
-
-Reported by: test harness.
-
-## BUG-061 - The `minimal` sweep runs CLI tests against a binary another sweep built
-
-`brokkr.toml` says `build_packages` is "Required for tests/cli_*.rs: without
-it ... CliInvoker silently hits a stale binary". `minimal` has no
-`build_packages` by design, but `cli_cat.rs`, `cli_sort.rs`, `cli_diff.rs`,
-`cli_repack.rs`, `cli_degrade.rs`, `cli_exit_codes.rs` and
-`fixture_helpers.rs::cli_invoker_runs_version_command` carry no
-`#![cfg(feature = "commands")]`, so they run in `minimal` against whichever
-binary `all` or `consumer` left, with different features. `cli_sort.rs`'s
-`cfg(not(feature = "linux-..."))` feature-missing tests are true in `minimal`
-while the binary may have the features. With parallel sweeps this is order-
-and timing-dependent. Fix: gate `tests/common/cli.rs` itself out of `minimal`
-so an ungated user fails to compile, or have brokkr not export
-`BROKKR_TEST_BIN_DIR` for a sweep that did not build the binary. See HYG-070
-for moving CLI tests into `cli/tests/`.
-
-Reported by: test harness.
-
-## BUG-062 - A tier-1 test requires `osmium` on PATH with no skip
-
-`tests/geocode_index.rs::legal_non_dense_nodes_build_a_queryable_index` is a
-plain `#[test]` that shells out to `osmium cat ... pbf_dense_nodes=false` and
-`expect`s it. `reference/testing.md` says contributors do not need external
-tools for a clean `brokkr check`; the other osmium users are
-`#[ignore = "external"]` with skip-on-missing. On a host without osmium the
-default check fails. The fixture could be emitted by pbfhogg's own
-`BlockBuilder`. Enforce with a text rule: `Command::new("osmium")` only in a fn
-with `#[ignore = "external"]`.
-
-Reported by: test harness.
-
 ## BUG-063 - Platform-skip predicates turn real failures into passes
 
 - `CliOutput::is_uring_unsupported` treats any stderr containing
@@ -639,45 +525,6 @@ nothing; wiring it so the predicates fail rather than skip under that profile
 would stop a platform run that skips everything from passing green.
 
 Reported by: test harness, write path, CLI and plumbing.
-
-## BUG-064 - Tests use fixed scratch names in shared locations and collide across parallel sweeps
-
-Commit `b353de8` made the `all`, `consumer` and `minimal` sweeps run
-concurrently. Several tests use fixed or weakly unique scratch paths:
-
-- `src/tag_expr.rs` test: `std::env::temp_dir().join("pbfhogg_test_expr")`, a
-  fixed name, then `remove_dir_all`. A live cross-sweep collision.
-- `src/osc/parse.rs::make_test_dir` and `src/osc/write.rs`:
-  `temp_dir().join("pbfhogg_osc_test_{suffix}")`, no pid or random part,
-  `remove_dir_all` first, so two sweeps delete each other's directory
-  mid-test.
-- `src/read/direct_reader.rs::direct_reader_reads_file` writes
-  `$CARGO_MANIFEST_DIR/data/bench-tmp/direct_reader_test.bin`, brokkr's
-  configured scratch on some hosts, with a fixed name, then `remove_dir(&dir)`,
-  which deletes brokkr's scratch dir when it happens to be empty.
-- `tests/geocode_index.rs::ensure_index_exists` does
-  `remove_dir_all(target/geocode-test)` before rebuilding, so two concurrent
-  geocode tests can delete each other's index mid-read.
-
-The `path_guard.rs` test comment already says never to use
-`std::env::temp_dir()` because of exactly this, and the project forbids
-`/tmp`. Fix and location policy are HYG-071; enforce with `clippy.toml`
-`disallowed-methods = ["std::env::temp_dir"]`.
-
-Reported by: change application, filtering and spatial, read path, test
-harness.
-
-## BUG-065 - The scratch leak check is vacuous when the scratch root is wrong
-
-`tests/common/mod.rs::snapshot_dir_inner` swallows `read_dir` errors and
-returns an empty set; `assert_scratch_unchanged` then compares two empty sets
-and passes. A typo or uncreated root makes the leak check meaningless. The
-root call should fail; only subdirectories removed mid-walk merit tolerance.
-Related: `ensure_index_exists` in `geocode_index.rs` turns any build failure
-into `None` via `.ok()?`, which callers treat as a skip, so a builder
-regression on Denmark reads as "data missing".
-
-Reported by: test harness.
 
 ## BUG-070 - `uring_writer` shutdown is not guaranteed to finish
 
@@ -743,3 +590,28 @@ input still grows with the number of violations. Bounding it needs the
 exact counts carried through a different aggregation.
 
 Reported by: the wave-0 review.
+
+## BUG-064 - Unit tests use fixed scratch names and collide across parallel sweeps
+
+The integration-test sites are fixed (unique dirs under
+`common::test_scratch()`). Still fixed-name in unit tests:
+`src/osc/parse.rs::make_test_dir` and `src/osc/write.rs`
+(`temp_dir().join("pbfhogg_osc_test_{suffix}")`, `remove_dir_all` first, so
+two sweeps delete each other's directory), and
+`src/read/direct_reader.rs::direct_reader_reads_file` (a fixed file under
+`data/bench-tmp`, then `remove_dir` of brokkr's scratch dir when empty). The
+fix is HYG-071's shared scratch.
+
+Reported by: change application, filtering and spatial, read path, test
+harness.
+
+## BUG-089 - The CliInvoker 10 s default can kill legitimately slow CLI tests
+
+`tests/common/cli.rs` now defaults `CliInvoker` to a 10 s timeout so it fires
+before the 20 s `brokkr check` watchdog. Tests run individually via
+`brokkr test --timeout N` (the denmark roundtrip, the osmium
+cross-validations) that drive a slow CLI command through the default would
+now fail at 10 s. They need explicit timeouts, or the default should follow
+the watchdog brokkr sets.
+
+Reported by: the wave-1a coordinator.

@@ -151,6 +151,8 @@ pub(super) fn relation_r2d_assembly(
         writer,
         |w: &mut R2dWorker, idx| {
             let task = &relation_schedule[idx];
+            // Deliberately load only payload bytes and emit no tagdata. Carrying
+            // header key lists would change output and add per-blob rewrite work.
             w.buffers.load(shared_file, task, &counters)?;
 
             let t = std::time::Instant::now();

@@ -27,6 +27,14 @@ pub use super::compact::{
 // CompactDiffOverlay
 // ---------------------------------------------------------------------------
 
+/// OSM object kind for overlay deletion queries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OscElementKind {
+    Node,
+    Way,
+    Relation,
+}
+
 /// Arena-packed diff overlay for OSC change files.
 ///
 /// Instead of per-element heap allocations (`HashMap<i64, OscNode>` etc.), all
@@ -51,9 +59,9 @@ pub struct CompactDiffOverlay {
     node_index: FxHashMap<i64, usize>,
     way_index: FxHashMap<i64, usize>,
     relation_index: FxHashMap<i64, usize>,
-    pub deleted_nodes: HashSet<i64>,
-    pub deleted_ways: HashSet<i64>,
-    pub deleted_relations: HashSet<i64>,
+    deleted_nodes: HashSet<i64>,
+    deleted_ways: HashSet<i64>,
+    deleted_relations: HashSet<i64>,
     // Version floors: history the live record no longer holds. The gate
     // reads the stored version from the live record, and two transitions
     // throw that away. A delete drops the live index entry: without a
@@ -316,6 +324,20 @@ impl CompactDiffOverlay {
         total
     }
 
+    /// Deleted IDs by OSM object kind, without mutable access to overlay state.
+    pub fn deleted_ids(&self, kind: OscElementKind) -> &HashSet<i64> {
+        match kind {
+            OscElementKind::Node => &self.deleted_nodes,
+            OscElementKind::Way => &self.deleted_ways,
+            OscElementKind::Relation => &self.deleted_relations,
+        }
+    }
+
+    /// Whether the final change for an object deletes it.
+    pub fn is_deleted(&self, kind: OscElementKind, id: i64) -> bool {
+        self.deleted_ids(kind).contains(&id)
+    }
+
     // -----------------------------------------------------------------------
     // Mutators (crate-internal)
     //
@@ -377,6 +399,7 @@ impl CompactDiffOverlay {
         }
         let offset = arena_append_node(&mut self.node_arena, id, lat, lon, tags, meta)?;
         self.node_index.insert(id, offset);
+        self.deleted_nodes.remove(&id);
         Ok(())
     }
 
@@ -397,6 +420,7 @@ impl CompactDiffOverlay {
         }
         let offset = arena_append_way(&mut self.way_arena, id, refs, tags, meta)?;
         self.way_index.insert(id, offset);
+        self.deleted_ways.remove(&id);
         Ok(())
     }
 
@@ -417,6 +441,7 @@ impl CompactDiffOverlay {
         }
         let offset = arena_append_relation(&mut self.relation_arena, id, members, tags, meta)?;
         self.relation_index.insert(id, offset);
+        self.deleted_relations.remove(&id);
         Ok(())
     }
 
@@ -513,6 +538,8 @@ impl Default for CompactDiffOverlay {
 /// [`CompactDiffOverlay::allow_version_regression`].
 pub fn parse_osc_file_into(path: &Path, overlay: &mut CompactDiffOverlay) -> ParseResult<()> {
     let mut sink = CompactSink::new(overlay);
+    // Deliberately use the shared historical per-file decompression counter.
+    // Command-specific names or accumulation would break brokkr comparisons.
     parse_osc_path(path, &mut sink)
 }
 

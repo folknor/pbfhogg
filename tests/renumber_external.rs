@@ -75,6 +75,7 @@ fn renumber_nodes_sequentially() {
     )
     .expect("renumber");
 
+    crate::common::assert_no_tagdata_all_blobs(&output);
     assert_eq!(stats.nodes_written, 3);
     assert_eq!(stats.ways_written, 0);
     assert_eq!(stats.relations_written, 0);

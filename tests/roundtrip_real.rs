@@ -16,12 +16,6 @@ fn denmark_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("data/denmark-20260220-seq4704.osm.pbf")
 }
 
-fn output_path() -> std::path::PathBuf {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
-    std::fs::create_dir_all(&dir).ok();
-    dir.join("denmark-roundtrip.osm.pbf")
-}
-
 #[derive(Default, Debug)]
 struct Counts {
     nodes: u64,
@@ -189,10 +183,11 @@ fn write_pbf_copy(input: &Path, output: &Path) {
 #[ignore] // 54s on Denmark - run with: cargo test -- --ignored
 fn roundtrip_denmark() {
     let dk = denmark_path();
-    let out = output_path();
+    let scratch = crate::common::test_scratch();
+    let out = scratch.path().join("denmark-roundtrip.osm.pbf");
 
     if !dk.exists() {
-        eprintln!("Skipping: {} not found", dk.display());
+        crate::common::skip(format!("{} not found", dk.display()));
         return;
     }
 

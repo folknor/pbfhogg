@@ -10,6 +10,8 @@
 //! [`super::direct_writer::DirectWriter`]). When a buffer fills, a `WriteFixed`
 //! SQE is submitted. CQEs are reaped to recycle buffer indices via a free-list.
 
+use super::IO_BUF_BYTES;
+
 use std::collections::VecDeque;
 
 use crate::reorder_buffer::ReorderBuffer;
@@ -80,9 +82,6 @@ const fn ud_buf_idx(ud: u64) -> u16 {
 const fn ud_expected_len(ud: u64) -> u32 {
     (ud >> 16) as u32
 }
-
-/// Size of each registered buffer (256 KB, matches DirectWriter / BufWriter).
-const BUF_SIZE: usize = 256 * 1024;
 
 /// Number of registered buffers. 64 × 256 KB = 16 MB total.
 /// Charged against `RLIMIT_MEMLOCK`.
@@ -264,7 +263,7 @@ impl UringState {
     /// Handles O_DIRECT page-alignment padding, advances `write_offset` and
     /// `in_flight`. Releases the buffer immediately if `data_len` is zero.
     /// Does **not** update `logical_size` - the caller is responsible.
-    #[allow(clippy::cast_possible_truncation)] // aligned_len as u32/u64, buf_idx as u64: bounded by BUF_SIZE/NUM_BUFS
+    #[allow(clippy::cast_possible_truncation)] // aligned_len as u32/u64, buf_idx as u64: bounded by IO_BUF_BYTES/NUM_BUFS
     fn submit_buffer(&mut self, buf_idx: u16, data_len: usize) -> io::Result<()> {
         if data_len == 0 {
             self.pool.release(buf_idx);
@@ -498,8 +497,8 @@ const fn round_up_to_page(n: usize) -> usize {
 /// `OSMData` blob header should have been.
 ///
 /// The buffered path below preserves the writer's core invariant: mid-stream
-/// `WriteFixed` SQEs are always `BUF_SIZE` (page-aligned) because
-/// `submit_current` only fires when `current_len == BUF_SIZE`; only the
+/// `WriteFixed` SQEs are always `IO_BUF_BYTES` (page-aligned) because
+/// `submit_current` only fires when `current_len == IO_BUF_BYTES`; only the
 /// final flush_final SQE is partial, and its trailing zero-padding is then
 /// truncated by `set_len`.
 ///
@@ -531,11 +530,11 @@ fn handle_copy_range_uring(
         let space = state.pool.buf_size - state.current_len;
         let chunk = space.min(remaining as usize);
         // Safety: buf_idx is valid (acquired from pool), current_len is
-        // within BUF_SIZE, chunk <= remaining space, so dst is within the
+        // within IO_BUF_BYTES, chunk <= remaining space, so dst is within the
         // buffer allocation.
         let dst = unsafe { state.pool.buf_ptr(buf_idx).add(state.current_len) };
 
-        // Safety: dst points into a valid registered buffer of size BUF_SIZE,
+        // Safety: dst points into a valid registered buffer of size IO_BUF_BYTES,
         // chunk <= remaining space in that buffer, and in_fd is a valid
         // readable file descriptor passed in from the caller.
         let n = unsafe { libc::pread(in_fd, dst.cast::<libc::c_void>(), chunk, src_offset as i64) };
@@ -603,7 +602,7 @@ fn uring_init_and_run(
     expected: &SeqTotal,
 ) -> io::Result<()> {
     // Step 1: Allocate buffer pool.
-    let pool = AlignedBufferPool::new(NUM_BUFS, BUF_SIZE)?;
+    let pool = AlignedBufferPool::new(NUM_BUFS, IO_BUF_BYTES)?;
     let iovecs = pool.iovecs();
 
     // Step 2: Create io_uring ring.
@@ -655,7 +654,7 @@ fn uring_init_and_run(
                 format!(
                     "register_buffers failed: RLIMIT_MEMLOCK too low \
                      (need {} MB, try `ulimit -l unlimited`): {e}",
-                    (NUM_BUFS as usize * BUF_SIZE) / (1024 * 1024)
+                    (NUM_BUFS as usize * IO_BUF_BYTES) / (1024 * 1024)
                 ),
             )
         } else {
@@ -837,9 +836,12 @@ mod tests {
     #[test]
     fn user_data_encoding() {
         // Write CQE: buf_idx=42, aligned_len=256KB
-        let write_ud = (262_144u64 << 16) | 42u64;
+        let write_ud = (u64::try_from(IO_BUF_BYTES).unwrap() << 16) | 42u64;
         assert_eq!(ud_buf_idx(write_ud), 42);
-        assert_eq!(ud_expected_len(write_ud), 262_144);
+        assert_eq!(
+            ud_expected_len(write_ud),
+            u32::try_from(IO_BUF_BYTES).unwrap()
+        );
 
         // Edge case: buf_idx=63 (max with NUM_BUFS=64)
         let max_ud = (4096u64 << 16) | 63u64;

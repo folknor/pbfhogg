@@ -6,6 +6,7 @@ use super::wire::{
     WireBlock, WireBlockMeta, WireDenseInfo, WireDenseNodes, WireGroup, WireMessageIter, WireNode,
     WireRelation, WireWay,
 };
+use super::wire_schema::{header_bbox, header_block};
 use crate::error::{ErrorKind, Result, new_error, new_wire_error};
 use bytes::Bytes;
 use std;
@@ -34,10 +35,10 @@ impl WireHeaderBBox {
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match (field, wire_type) {
-                (1, 0) => left = cursor.read_sint64()?,
-                (2, 0) => right = cursor.read_sint64()?,
-                (3, 0) => top = cursor.read_sint64()?,
-                (4, 0) => bottom = cursor.read_sint64()?,
+                (header_bbox::LEFT, 0) => left = cursor.read_sint64()?,
+                (header_bbox::RIGHT, 0) => right = cursor.read_sint64()?,
+                (header_bbox::TOP, 0) => top = cursor.read_sint64()?,
+                (header_bbox::BOTTOM, 0) => bottom = cursor.read_sint64()?,
                 _ => cursor.skip_field(wire_type)?,
             }
         }
@@ -80,26 +81,26 @@ impl WireHeaderBlock {
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match field {
-                1 => {
+                header_block::BBOX => {
                     // bbox: HeaderBBox submessage
                     let sub_data = cursor.read_len_delimited()?;
                     bbox = Some(WireHeaderBBox::parse(sub_data)?);
                 }
-                4 => {
+                header_block::REQUIRED_FEATURES => {
                     // required_features: repeated string
                     let bytes = cursor.read_len_delimited()?;
                     let s = String::from_utf8(bytes.to_vec())
                         .map_err(|_| new_wire_error("invalid UTF-8 in required_features"))?;
                     required_features.push(s);
                 }
-                5 => {
+                header_block::OPTIONAL_FEATURES => {
                     // optional_features: repeated string
                     let bytes = cursor.read_len_delimited()?;
                     let s = String::from_utf8(bytes.to_vec())
                         .map_err(|_| new_wire_error("invalid UTF-8 in optional_features"))?;
                     optional_features.push(s);
                 }
-                16 => {
+                header_block::WRITING_PROGRAM => {
                     // writingprogram: string
                     let bytes = cursor.read_len_delimited()?;
                     writingprogram = Some(
@@ -107,7 +108,7 @@ impl WireHeaderBlock {
                             .map_err(|_| new_wire_error("invalid UTF-8 in writingprogram"))?,
                     );
                 }
-                17 => {
+                header_block::SOURCE => {
                     // source: string
                     let bytes = cursor.read_len_delimited()?;
                     source = Some(
@@ -115,15 +116,15 @@ impl WireHeaderBlock {
                             .map_err(|_| new_wire_error("invalid UTF-8 in source"))?,
                     );
                 }
-                32 => {
+                header_block::REPLICATION_TIMESTAMP => {
                     // osmosis_replication_timestamp: int64
                     osmosis_replication_timestamp = Some(cursor.read_varint_i64()?);
                 }
-                33 => {
+                header_block::REPLICATION_SEQUENCE_NUMBER => {
                     // osmosis_replication_sequence_number: int64
                     osmosis_replication_sequence_number = Some(cursor.read_varint_i64()?);
                 }
-                34 => {
+                header_block::REPLICATION_BASE_URL => {
                     // osmosis_replication_base_url: string
                     let bytes = cursor.read_len_delimited()?;
                     osmosis_replication_base_url =

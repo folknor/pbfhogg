@@ -19,12 +19,12 @@
 //!
 //! ## Timeout
 //!
-//! Every invocation has a wall-clock timeout (default 60 s,
+//! Every invocation has a wall-clock timeout (default 10 s,
 //! [`CliInvoker::timeout`] overrides). On expiry the child is sent
 //! `SIGKILL` and the test panics with a clear "timed out" message
-//! instead of wedging the test runner. This is load-bearing for
-//! `brokkr check`: a hung CLI test would block every subsequent test
-//! in the binary indefinitely.
+//! instead of wedging the test runner. The default leaves time to report diagnostics before the
+//! 20 s per-test watchdog in `brokkr check`. Explicit overrides
+//! remain subject to that outer watchdog.
 //!
 //! ## Platform skips
 //!
@@ -34,6 +34,8 @@
 //! exercise `--direct-io` or `--io-uring` should consult these
 //! before asserting success - tmpfs / overlayfs and hosts with low
 //! `RLIMIT_MEMLOCK` are common.
+
+#![cfg(feature = "commands")]
 
 use std::ffi::OsStr;
 use std::io::Read;
@@ -45,13 +47,44 @@ use std::time::{Duration, Instant};
 /// doesn't override via [`CliInvoker::timeout`]. Sized for Tier 1 /
 /// Tier 2 fixtures; tests that exercise real datasets should bump
 /// it explicitly.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Polling cadence for [`std::process::Child::try_wait`] inside the
 /// timeout loop. 20 ms is fast enough that test wall-time isn't
 /// noticeably padded; slow enough that the loop doesn't burn CPU on
 /// a long-running command.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Retain the first and last MiB while continuing to drain the pipe.
+fn capture(mut reader: impl Read) -> Vec<u8> {
+    const EDGE: usize = 1024 * 1024;
+    let mut first = Vec::with_capacity(EDGE);
+    let mut last = std::collections::VecDeque::with_capacity(EDGE);
+    let mut total = 0_usize;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let count = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        total = total.saturating_add(count);
+        let prefix = count.min(EDGE - first.len());
+        first.extend_from_slice(&chunk[..prefix]);
+        for byte in &chunk[prefix..count] {
+            if last.len() == EDGE {
+                last.pop_front();
+            }
+            last.push_back(*byte);
+        }
+    }
+    if total > EDGE * 2 {
+        first.extend_from_slice(b"\n[output truncated; first and last MiB retained]\n");
+    }
+    first.extend(last);
+    first
+}
 
 /// Invokes the `pbfhogg` binary with a set of arguments, captures
 /// stdout/stderr, returns a [`CliOutput`] that assertions read from.
@@ -188,21 +221,11 @@ impl CliInvoker {
         // but consumes the child by value, which we can't afford -
         // we need to keep `child` available so the timeout path can
         // call `kill()`.
-        let mut stdout = child.stdout.take().expect("stdout piped");
+        let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take();
 
-        let stdout_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            stdout.read_to_end(&mut buf).ok();
-            buf
-        });
-        let stderr_thread = stderr.map(|mut stderr| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                stderr.read_to_end(&mut buf).ok();
-                buf
-            })
-        });
+        let stdout_thread = std::thread::spawn(move || capture(stdout));
+        let stderr_thread = stderr.map(|stderr| std::thread::spawn(move || capture(stderr)));
 
         let start = Instant::now();
         let status: ExitStatus = loop {

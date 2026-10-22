@@ -78,8 +78,8 @@ impl RefCheckResult {
     }
 }
 
-/// Per-way-blob classify result. Bounded by blob size (~8000 elements × typical
-/// ~10 refs/way). Streamed back to the main thread for merge.
+/// Per-way-blob classify result. Its retained references follow the contents
+/// of that input blob. Streamed back to the main thread for merge.
 #[derive(Default)]
 struct WayBlobResult {
     way_count: u64,

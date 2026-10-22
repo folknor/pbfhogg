@@ -53,7 +53,10 @@ impl FileReader {
             // SAFETY: valid fd, advisory-only, no-op on failure.
             unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
         }
-        Ok(Self::Buffered(BufReader::with_capacity(256 * 1024, f)))
+        Ok(Self::Buffered(BufReader::with_capacity(
+            crate::write::IO_BUF_BYTES,
+            f,
+        )))
     }
 
     /// Open a file for O_DIRECT reading with page-aligned buffers.

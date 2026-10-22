@@ -591,52 +591,36 @@ fn kind_name(kind: ElemKind) -> &'static str {
 /// Both checks use `osm_id` blob-range keys, not raw `i64`, so negative IDs
 /// order the way `osm_id_cmp` orders them everywhere else.
 pub(crate) struct BlobOrderGuard {
-    prev: Option<(ElemKind, crate::osm_id::OsmIdKey)>,
+    watermark: crate::osm_id::OrderWatermark,
 }
 
 impl BlobOrderGuard {
     pub(crate) fn new() -> Self {
-        Self { prev: None }
+        Self {
+            watermark: crate::osm_id::OrderWatermark::default(),
+        }
     }
 
     /// Observe the next blob in file order. Returns the error message a
     /// caller should surface, or `Ok(())`.
     pub(crate) fn observe(&mut self, index: &crate::blob_meta::BlobIndex) -> Result<(), String> {
-        let first_key = crate::osm_id::blob_osm_first_key(index.min_id, index.max_id);
-        let last_key = crate::osm_id::blob_osm_last_key(index.min_id, index.max_id);
-        // Transitive watermark, not the immediately-previous blob: the
-        // sequence 10..30, 5..8, 40..50 passes every adjacent-pair test
-        // only if you forget 30. Same shape as the drain's output guard.
-        let mut watermark = last_key.max(first_key);
-        if let Some((prev_kind, prev_last)) = self.prev {
-            let prev_ord = kind_order(prev_kind);
-            let this_ord = kind_order(index.kind);
-            if this_ord < prev_ord {
-                return Err(format!(
-                    "block-pair merge: found a {} blob after a {} blob. The input's header \
-                     claims Sort.Type_then_ID but its blobs are not in canonical order \
-                     (nodes, then ways, then relations); re-sort it first with `pbfhogg sort`.",
-                    kind_name(index.kind),
-                    kind_name(prev_kind),
-                ));
-            }
-            if this_ord == prev_ord && first_key < prev_last {
-                return Err(format!(
-                    "block-pair merge: a {} blob starting at id {} follows a {} blob \
-                     already reaching id {}. The input's header claims Sort.Type_then_ID \
-                     but its blobs are not in canonical order; re-sort it first with \
-                     `pbfhogg sort`.",
-                    kind_name(index.kind),
-                    crate::osm_id::blob_osm_first_id(index.min_id, index.max_id),
-                    kind_name(prev_kind),
-                    crate::osm_id::osm_id_from_key(prev_last),
-                ));
-            }
-            if this_ord == prev_ord {
-                watermark = watermark.max(prev_last);
-            }
+        if let Err((previous_kind, previous_id)) =
+            self.watermark
+                .observe(kind_order(index.kind), index.min_id, index.max_id)
+        {
+            return Err(format!(
+                "block-pair merge: a {} blob starting at id {} follows {} \
+                 output already reaching id {previous_id}. The input's header claims \
+                 Sort.Type_then_ID but its blobs are not in canonical order; re-sort it \
+                 first with `pbfhogg sort`.",
+                kind_name(index.kind),
+                crate::osm_id::blob_osm_first_id(index.min_id, index.max_id),
+                ["node", "way", "relation"]
+                    .get(usize::from(previous_kind))
+                    .copied()
+                    .unwrap_or("unknown"),
+            ));
         }
-        self.prev = Some((index.kind, watermark));
         Ok(())
     }
 }

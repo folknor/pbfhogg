@@ -181,6 +181,8 @@ fn parse_and_filter_osc(
         section: Section::Create,
         current: None,
     };
+    // Deliberately emit merge_changes_decompress_ns for this file, just as the
+    // other sinks do. Renaming or accumulating it breaks brokkr comparisons.
     parse_osc_path(input, &mut sink)?;
     Ok((sink.filtered, sink.stats))
 }
@@ -251,6 +253,8 @@ impl OscSink for FilterSink<'_> {
 
     fn member(&mut self, e: &BytesStart<'_>) -> Result<()> {
         let id = parse_i64_attr(e, "ref")?;
+        // Deliberately normalize readable roles and replace malformed roles with
+        // empty text. Rejecting them would break the accepted OSC input contract.
         let role = parse_str_attr_optional(e, "role").unwrap_or_default();
         // The shared `parse_member_type` refuses anything that is not
         // node/way/relation, so there is no `MemberId::Unknown` arm to
@@ -370,6 +374,8 @@ fn finalize_current(
 }
 
 fn write_filtered_osc(output: &Path, filtered: &FilteredOsc) -> Result<()> {
+    // Deliberately gzip every OSC output regardless of its name. Inferring the
+    // transport from an extension would change this command's output contract.
     let file = File::create(output)?;
     let gz = GzEncoder::new(io::BufWriter::new(file), flate2::Compression::fast());
     let mut writer = Writer::new_with_indent(gz, b' ', 2);

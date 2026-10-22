@@ -81,8 +81,11 @@ pub mod uring_writer;
 pub mod writer;
 
 /// Page size for alignment. 4096 is universally safe across Linux filesystems.
-#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
-const PAGE_SIZE: usize = 4096;
+pub(crate) const PAGE_SIZE: usize = 4096;
+
+/// Shared buffered and aligned I/O transfer size.
+pub(crate) const IO_BUF_BYTES: usize = 256 * 1024;
+const _: () = assert!(IO_BUF_BYTES.is_multiple_of(PAGE_SIZE));
 
 /// Allocate `size` bytes aligned to `PAGE_SIZE`. Returns the pointer and layout
 /// (needed for deallocation). Centralizes the unsafe page-aligned allocation
@@ -91,10 +94,13 @@ const PAGE_SIZE: usize = 4096;
 fn alloc_page_aligned(size: usize) -> std::io::Result<(std::ptr::NonNull<u8>, std::alloc::Layout)> {
     let layout = std::alloc::Layout::from_size_align(size, PAGE_SIZE)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    // Safety: layout has non-zero size (callers pass BUF_CAPACITY or total > 0).
+    // Safety: layout has non-zero size (callers pass IO_BUF_BYTES or total > 0).
     let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
     let ptr = std::ptr::NonNull::new(ptr).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::OutOfMemory, "aligned alloc failed")
     })?;
     Ok((ptr, layout))
 }
+
+#[cfg(test)]
+mod io_buffer_contract;

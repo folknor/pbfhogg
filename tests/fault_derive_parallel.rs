@@ -49,7 +49,7 @@ mod derive_parallel {
         std::fs::create_dir(&scratch).unwrap();
         let mut host = crate::common::test_host();
         host.scratch_parent = Some(scratch.clone());
-        derive_changes(&old, &new, &osc, false, false, false, 3, &host).unwrap();
+        derive_changes(&old, &new, &osc, false, false, None, 3, &host).unwrap();
         assert!(snapshot_dir(&scratch).is_empty());
         let before = snapshot_dir(dir.path());
 
@@ -59,7 +59,7 @@ mod derive_parallel {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             derive_changes(
                 &old, &new, &osc, /* direct_io */ false, /* increment_version */ false,
-                /* update_timestamp */ false, /* jobs */ 3, &host,
+                /* delete timestamp */ None, /* jobs */ 3, &host,
             )
         }));
 

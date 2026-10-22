@@ -31,7 +31,7 @@ impl FileWriter {
     pub fn buffered(path: &Path) -> io::Result<Self> {
         let file = File::create(path)?;
         Ok(FileWriter::Buffered(BufWriter::with_capacity(
-            256 * 1024,
+            crate::write::IO_BUF_BYTES,
             file,
         )))
     }

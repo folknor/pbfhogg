@@ -538,7 +538,7 @@ fn run_scratch_backend(
             output,
             false,
             false,
-            false,
+            None,
             jobs,
             host,
         )

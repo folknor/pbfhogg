@@ -3,6 +3,7 @@
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use crate::coord_fmt::{deg_to_e7, e7_to_deg};
 use rustc_hash::FxHashMap;
 use s2::cellid::CellID;
 
@@ -98,8 +99,8 @@ fn hole_inside_outer(hole: &[(i32, i32)], outer_f64: &[(f64, f64)]) -> bool {
     for &(lat, lon) in hole.iter().step_by(step).take(SAMPLES) {
         tested += 1;
         if crate::geo::point_in_ring_with_antimeridian(
-            lon as f64 * 1e-7,
-            lat as f64 * 1e-7,
+            e7_to_deg(lon as f64),
+            e7_to_deg(lat as f64),
             outer_f64,
         ) {
             inside += 1;
@@ -138,7 +139,7 @@ fn assemble_one_relation(
     for outer_ring in &outer_rings {
         let outer_f64: Vec<(f64, f64)> = outer_ring
             .iter()
-            .map(|&(lat, lon)| (lon as f64 * 1e-7, lat as f64 * 1e-7))
+            .map(|&(lat, lon)| (e7_to_deg(lon as f64), e7_to_deg(lat as f64)))
             .collect();
 
         let simplified = if max_verts > 0 {
@@ -158,8 +159,8 @@ fn assemble_one_relation(
         for &(lon_deg, lat_deg) in &simplified {
             #[allow(clippy::cast_possible_truncation)]
             vertices.push(NodeCoord {
-                lat_e7: (lat_deg * 1e7) as i32,
-                lon_e7: (lon_deg * 1e7) as i32,
+                lat_e7: deg_to_e7(lat_deg) as i32,
+                lon_e7: deg_to_e7(lon_deg) as i32,
             });
         }
 
@@ -183,7 +184,7 @@ fn assemble_one_relation(
 
             let hole_f64: Vec<(f64, f64)> = hole
                 .iter()
-                .map(|&(lat, lon)| (lon as f64 * 1e-7, lat as f64 * 1e-7))
+                .map(|&(lat, lon)| (e7_to_deg(lon as f64), e7_to_deg(lat as f64)))
                 .collect();
             let sh = if max_verts > 0 {
                 crate::geo::simplify_ring(&hole_f64, max_verts)
@@ -196,8 +197,8 @@ fn assemble_one_relation(
                 for &(lon_deg, lat_deg) in &sh {
                     #[allow(clippy::cast_possible_truncation)]
                     vertices.push(NodeCoord {
-                        lat_e7: (lat_deg * 1e7) as i32,
-                        lon_e7: (lon_deg * 1e7) as i32,
+                        lat_e7: deg_to_e7(lat_deg) as i32,
+                        lon_e7: deg_to_e7(lon_deg) as i32,
                     });
                 }
             }
@@ -356,6 +357,7 @@ pub(super) fn write_admin_index(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use crate::coord_fmt::deg_to_e7;
     use rustc_hash::FxHashMap;
 
     use super::{admin_vertex_cap, assemble_admin_polygons, hole_inside_outer};
@@ -449,7 +451,7 @@ mod tests {
     fn rect_ring_e7(lon0: f64, lat0: f64, lon1: f64, lat1: f64) -> Vec<(i32, i32)> {
         rect_lonlat(lon0, lat0, lon1, lat1)
             .into_iter()
-            .map(|(lon, lat)| ((lat * 1e7) as i32, (lon * 1e7) as i32))
+            .map(|(lon, lat)| (deg_to_e7(lat) as i32, deg_to_e7(lon) as i32))
             .collect()
     }
 

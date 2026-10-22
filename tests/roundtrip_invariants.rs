@@ -197,7 +197,8 @@ fn derive_then_apply_roundtrip() {
         &osc,
         false,
         true, // increment_version
-        true, // update_timestamp
+        // Delete timestamp: any fixed instant stands in for "now" here.
+        Some(1_700_000_000),
         1,
         &crate::common::test_host(),
     )
@@ -329,7 +330,7 @@ fn derive_then_apply_preserves_metadata() {
         &osc,
         false,
         false, // increment_version: keep raw metadata
-        false, // update_timestamp: keep raw metadata
+        None,  // delete timestamp: keep raw metadata
         1,
         &crate::common::test_host(),
     )

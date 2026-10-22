@@ -22,7 +22,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::sync_channel;
 
 // Compression type moved to the sibling `compression` module; re-exported
-// here so the existing `crate::writer::Compression` path keeps resolving.
+// here to preserve the public `crate::writer::Compression` API.
 pub use crate::write::compression::{Compression, ParseCompressionError};
 
 // Blob framing / encoding helpers live in the sibling `framing` module.
@@ -421,7 +421,7 @@ impl<W: Write> PbfWriter<W> {
     /// Create a new `PbfWriter` wrapping the given writer.
     ///
     /// If `writer` is backed by a file, callers should wrap it in
-    /// `BufWriter::with_capacity(256 * 1024, file)` for best performance.
+    /// `BufWriter` with a 256 KiB capacity for best performance.
     /// PBF blobs are typically 16-64KB compressed, so the default 8KB
     /// `BufWriter` causes excessive write syscalls. See [`to_path`](Self::to_path)
     /// which applies this automatically.
@@ -560,6 +560,8 @@ impl<W: Write> PbfWriter<W> {
     /// The `PrimitiveBlock` payload itself is unchanged - only the outer
     /// `BlobHeader` differs. Readers that skip missing optional fields
     /// treat the output identically to an indexed blob.
+    // Keep this public: emitting standard PBF without private indexes is a
+    // supported writer operation, including for downstream fixture producers.
     #[hotpath::measure]
     pub fn write_primitive_block_no_indexdata(&mut self, block_bytes: &[u8]) -> io::Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {

@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use crate::cat::CleanAttrs;
+use crate::coord_fmt::e7_to_deg;
 use crate::writer::Compression;
 
 use super::{HeaderOverrides, Result, require_indexdata};
@@ -74,14 +75,10 @@ pub fn parse_bbox(s: &str) -> Result<Bbox> {
     // representability: they have different domains, and a value can be a
     // perfectly good f64 while being no latitude at all.
     for (name, value) in [("min_lat", min_lat), ("max_lat", max_lat)] {
-        if !value.is_finite() || !(-90.0..=90.0).contains(&value) {
-            return Err(format!("{name} ({value}) must be within -90 and 90 degrees").into());
-        }
+        crate::coord_pack::validate_lat(name, value)?;
     }
     for (name, value) in [("min_lon", min_lon), ("max_lon", max_lon)] {
-        if !value.is_finite() || !(-180.0..=180.0).contains(&value) {
-            return Err(format!("{name} ({value}) must be within -180 and 180 degrees").into());
-        }
+        crate::coord_pack::validate_lon(name, value)?;
     }
 
     if min_lon >= max_lon {
@@ -152,13 +149,13 @@ impl Region {
             // `bbox_int` is deliberately widened for conservative blob
             // selection. Exact point membership must retain the user's f64
             // boundary, or a point up to one e7 unit outside can match.
-            Region::Bbox(bbox) => bbox.contains(lat as f64 * 1e-7, lon as f64 * 1e-7),
+            Region::Bbox(bbox) => bbox.contains(e7_to_deg(lat as f64), e7_to_deg(lon as f64)),
             Region::Polygon { polygons, .. } => {
                 if !bbox_int.contains(lat, lon) {
                     return false;
                 }
-                let lat_f64 = lat as f64 * 1e-7;
-                let lon_f64 = lon as f64 * 1e-7;
+                let lat_f64 = e7_to_deg(lat as f64);
+                let lon_f64 = e7_to_deg(lon as f64);
                 polygon_contains(polygons, lon_f64, lat_f64)
             }
         }
@@ -308,16 +305,8 @@ fn parse_ring(ring: &serde_json::Value) -> Result<Vec<(f64, f64)>> {
         }
         let lon = pair[0].as_f64().ok_or("coordinate lon must be a number")?;
         let lat = pair[1].as_f64().ok_or("coordinate lat must be a number")?;
-        if !lon.is_finite() || !(-180.0..=180.0).contains(&lon) {
-            return Err(
-                format!("polygon longitude ({lon}) must be within -180 and 180 degrees").into(),
-            );
-        }
-        if !lat.is_finite() || !(-90.0..=90.0).contains(&lat) {
-            return Err(
-                format!("polygon latitude ({lat}) must be within -90 and 90 degrees").into(),
-            );
-        }
+        crate::coord_pack::validate_lon("polygon longitude", lon)?;
+        crate::coord_pack::validate_lat("polygon latitude", lat)?;
         result.push((lon, lat));
     }
     Ok(result)

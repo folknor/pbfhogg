@@ -137,6 +137,8 @@ pub(crate) fn parse_str_attr(
     Err(format!("missing attribute '{name}'").into())
 }
 
+// Deliberately treat malformed optional roles as absent. Refusing them would
+// change the accepted OSC input contract; all sinks retain their old fallback.
 pub(crate) fn parse_str_attr_optional(
     e: &quick_xml::events::BytesStart<'_>,
     name: &str,
@@ -484,6 +486,8 @@ pub(crate) fn drive_osc<R: io::BufRead, S: OscSink>(
 pub(crate) fn parse_osc_path<S: OscSink>(path: &Path, sink: &mut S) -> ParseResult<()> {
     let (mut reader, decompress_total) = open_osc_reader(path)?;
     let result = drive_osc(&mut reader, sink);
+    // Deliberately emit this historical name once per file, without accumulation,
+    // from every sink. Changing attribution or totals breaks brokkr run comparisons.
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     crate::debug::emit_counter(
         "merge_changes_decompress_ns",
@@ -565,6 +569,9 @@ pub(crate) fn coord_to_decimicro(
 /// kept, so filtering a change stream silently erased version,
 /// timestamp, changeset, uid, user and visible from every surviving
 /// change - the same data loss, in the sink nobody had looked at.
+// Deliberately normalize XML text without validating timestamp, changeset, uid
+// or visible. These re-emitting sinks pass metadata through; numeric validation
+// would reject previously accepted input and add work to every changed element.
 pub(crate) fn parse_owned_metadata(
     e: &quick_xml::events::BytesStart<'_>,
 ) -> ParseResult<Option<crate::osc::write::OwnedMetadata>> {
@@ -603,6 +610,8 @@ pub(crate) fn parse_owned_metadata(
 }
 
 /// Read an element's metadata into the arena representation.
+// Deliberately keep the overlay's native numeric parsing and false-only visible
+// test. Sharing owned-sink validation would change accepted input and its cost.
 fn arena_meta(
     e: &quick_xml::events::BytesStart<'_>,
     overlay: &mut CompactDiffOverlay,
@@ -693,10 +702,12 @@ impl OscSink for CompactSink<'_> {
         let id = parse_i64_attr(e, "id")?;
 
         if action == OscAction::Delete {
-            // A delete's version is a claim about the object state it
-            // supersedes. The overlay stores it in the version floor before
-            // removing the live entry, so a later version check still sees
-            // the highest claim after the object is deleted.
+            // A delete's metadata is read for the same reason a
+            // create's is: its `version` is a claim about which state of
+            // the object this change supersedes, and the overlay records
+            // it as a versioned tombstone so a later stale change cannot
+            // resurrect an earlier version through the gap a bare
+            // index removal used to leave.
             let meta = arena_meta(e, self.overlay)?;
             match kind {
                 ElemKind::Node => self.overlay.delete_node(id, &meta)?,
@@ -707,20 +718,8 @@ impl OscSink for CompactSink<'_> {
             return Ok(());
         }
 
-        // Create/modify: the element is live again, so drop any pending
-        // delete for it.
-        match kind {
-            ElemKind::Node => {
-                self.overlay.deleted_nodes.remove(&id);
-            }
-            ElemKind::Way => {
-                self.overlay.deleted_ways.remove(&id);
-            }
-            ElemKind::Relation => {
-                self.overlay.deleted_relations.remove(&id);
-            }
-        }
-
+        // Deliberately leave the delete pending until insertion succeeds. Clearing it
+        // here would let a rejected stale re-create erase the accepted deletion.
         let meta = arena_meta(e, self.overlay)?;
         let (lat, lon) = if kind == ElemKind::Node {
             (
@@ -773,6 +772,8 @@ impl OscSink for CompactSink<'_> {
         }
         let member_type = parse_member_type(&parse_str_attr(e, "type")?)?;
         let ref_id = parse_i64_attr(e, "ref")?;
+        // Deliberately replace an unreadable role with empty text, as the owned
+        // sinks do. Propagating this error would refuse previously accepted OSC.
         let role = parse_str_attr(e, "role").unwrap_or_default();
         let type_byte = member_type_to_byte(member_type)?;
         let role_id = self.overlay.intern(&role)?;
@@ -801,5 +802,87 @@ impl OscSink for CompactSink<'_> {
                 .overlay
                 .push_relation(st.id, &st.members, &tags, &st.meta),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn owned_sinks_pass_metadata_without_native_validation() -> crate::BoxResult<()> {
+        for attributes in [
+            "timestamp=\"yesterday\"",
+            "changeset=\"no\"",
+            "uid=\"2147483648\"",
+            "visible=\"False\"",
+        ] {
+            let element =
+                quick_xml::events::BytesStart::from_content(format!("node {attributes}"), 4);
+            assert!(parse_owned_metadata(&element)?.is_some(), "{attributes}");
+        }
+        let element = quick_xml::events::BytesStart::from_content("node version=\"no\"", 4);
+        assert!(parse_owned_metadata(&element).is_err());
+        assert!(arena_meta(&element, &mut CompactDiffOverlay::new()).is_err());
+        let element = quick_xml::events::BytesStart::from_content(
+            "node uid=\"&#48;\" visible=\"False\" timestamp=\"a\tb\"",
+            4,
+        );
+        let owned = parse_owned_metadata(&element)?.ok_or("metadata missing")?;
+        assert_eq!(owned.uid, "0");
+        assert_eq!(owned.timestamp, "a b");
+        let visible = quick_xml::events::BytesStart::from_content("node visible=\"False\"", 4);
+        assert_eq!(
+            arena_meta(&visible, &mut CompactDiffOverlay::new())?.flags & META_FLAG_HIDDEN,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn absent_and_malformed_roles_both_default_to_empty() {
+        let absent = quick_xml::events::BytesStart::new("member");
+        let malformed = quick_xml::events::BytesStart::from_content("member role=broken", 6);
+        assert_eq!(
+            parse_str_attr_optional(&absent, "role").unwrap_or_default(),
+            ""
+        );
+        assert_eq!(
+            parse_str_attr_optional(&malformed, "role").unwrap_or_default(),
+            ""
+        );
+        assert_eq!(parse_str_attr(&malformed, "role").unwrap_or_default(), "");
+        assert!(parse_member_type("unknown").is_err());
+    }
+
+    #[test]
+    fn failed_recreation_keeps_delete_and_success_clears_it() -> crate::BoxResult<()> {
+        use crate::osc::OscElementKind;
+        let mut overlay = CompactDiffOverlay::new();
+        let deletion =
+            quick_xml::events::BytesStart::from_content("node id=\"7\" version=\"5\"", 4);
+        CompactSink::new(&mut overlay).begin_element(
+            OscAction::Delete,
+            ElemKind::Node,
+            &deletion,
+        )?;
+        let stale = quick_xml::events::BytesStart::from_content(
+            "node id=\"7\" version=\"4\" lat=\"1\" lon=\"2\"",
+            4,
+        );
+        let mut sink = CompactSink::new(&mut overlay);
+        sink.begin_element(OscAction::Create, ElemKind::Node, &stale)?;
+        assert!(sink.end_element().is_err());
+        assert!(overlay.is_deleted(OscElementKind::Node, 7));
+        assert!(!overlay.has_node(7));
+        let current = quick_xml::events::BytesStart::from_content(
+            "node id=\"7\" version=\"6\" lat=\"1\" lon=\"2\"",
+            4,
+        );
+        let mut sink = CompactSink::new(&mut overlay);
+        sink.begin_element(OscAction::Create, ElemKind::Node, &current)?;
+        sink.end_element()?;
+        assert!(!overlay.is_deleted(OscElementKind::Node, 7));
+        assert!(overlay.has_node(7));
+        Ok(())
     }
 }

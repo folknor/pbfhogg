@@ -10,6 +10,8 @@ use super::super::Result;
 /// `data_size` address the compressed blob body for pread. `element_count`
 /// comes from the indexdata `BlobIndex.count` and lets the caller precompute
 /// base new_ids without racing decode; each blob verifies it after decode.
+// Deliberately schedule payloads without tagdata header lengths or key lists.
+// Renumber is terminal; carrying those adds per-blob work and changes output.
 pub(super) struct BlobTask {
     pub(super) data_offset: u64,
     pub(super) data_size: usize,

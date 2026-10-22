@@ -68,7 +68,10 @@ impl NodeLocationIndex {
         for &node_id in &all_needed {
             if let Some(node) = diff.get_node(node_id) {
                 locations.insert(node_id, (node.decimicro_lat(), node.decimicro_lon()));
-            } else if !diff.deleted_nodes.contains(&node_id) {
+            } else if !diff
+                .deleted_ids(crate::osc::OscElementKind::Node)
+                .contains(&node_id)
+            {
                 still_needed.insert(node_id);
             }
         }

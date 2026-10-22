@@ -1,8 +1,6 @@
 //! Chunked sparse bitset for O(1) element ID membership testing.
 //!
-//! Shared across commands that need planet-scale ID sets (extract,
-//! tags_filter, getid, renumber, check, add-locations-to-ways, the geocode
-//! builder).
+//! Shared sparse bitset for command ID membership.
 
 // The whole module is bit arithmetic between `i64` ids, `u64` chunk ids and
 // `u32` / `usize` in-chunk offsets. Every narrowing cast is bounded by
@@ -28,30 +26,26 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 ///
 /// # Representation
 ///
-/// - **Directory.** Chunks below [`DIRECT_CHUNKS`] (IDs below 2^43, several
-///   hundred times the live OSM node ID range) live in a directly indexed
-///   `Vec`, so real data never pays more than an index for the chunk lookup.
+/// - **Directory.** Chunks below [`DIRECT_CHUNKS`] (IDs below 2^43) live in a
+///   directly indexed `Vec`, so real data never pays more than an index for
+///   the chunk lookup.
 ///   Chunks at or above it live in an ordered map. The directory therefore
 ///   no longer grows with the largest ID ever inserted: one way ref near
 ///   `i64::MAX` used to resize the `Vec` to ~2^38 entries (about 4 TB) and
 ///   abort the process.
 /// - **Chunks.** A chunk starts as a sorted array of in-chunk offsets and is
 ///   promoted to the 4 MiB bit array when it would exceed [`SPARSE_MAX`]
-///   members. Real OSM data promotes almost at once (a Denmark-sized extract
-///   already holds ~10^5 referenced IDs per chunk), so its steady state is the
-///   bit array; an isolated ID no longer costs a whole 4 MiB chunk.
+///   members. Heavily populated chunks use the bit-array form, while an
+///   isolated ID does not cost a whole 4 MiB chunk.
 ///
 /// # Memory
 ///
 /// For a set populated by `set` / `set_if_new` and merges of such sets,
 /// memory is bounded by the number of distinct IDs, not by their spread or
-/// their maximum: at most 4 bytes (plus `Vec` slack) per ID in an array chunk,
-/// and a bit-array chunk holds more than [`SPARSE_MAX`] IDs, so the worst case
-/// is about 4 MiB / (`SPARSE_MAX` + 1) ~= 4 KiB per distinct ID at the
-/// promotion boundary,
-/// plus the direct directory (at most `DIRECT_CHUNKS` entries) and a transient
-/// array during each promotion. A planet node set is ~400 bit-array chunks,
-/// about 1.6 GB.
+/// their maximum. Sparse chunks store offsets and promote to bit arrays after
+/// [`SPARSE_MAX`] members; the direct directory is bounded by
+/// [`DIRECT_CHUNKS`]. A promotion temporarily holds both representations.
+/// See `reference/performance.md` for measured memory use on real workloads.
 ///
 /// The exception is [`Self::pre_allocate`], which creates empty bit-array
 /// chunks for a whole ID range on request; its argument is the caller's
@@ -83,11 +77,9 @@ const DIRECT_CHUNKS: u64 = 1 << 18;
 
 /// Largest member count of an array chunk. The insertion of member
 /// `SPARSE_MAX + 1` promotes the chunk to a bit array. Inserting in random
-/// order (way refs in way order) moves about `SPARSE_MAX^2` bytes per chunk
-/// before promotion, so the threshold is a speed/memory trade: at 4096 that
-/// was ~16 MiB per chunk, several GB on a country-sized pass 0 and a measured
-/// regression in its single-threaded merge; at 1024 it is ~1 MiB, while the
-/// worst-case memory per distinct ID stays a few KiB.
+/// order can move up to roughly `SPARSE_MAX^2` bytes per chunk before
+/// promotion, so the threshold trades insertion work against memory. See
+/// `reference/performance.md` for measured tuning results.
 const SPARSE_MAX: usize = 1024;
 
 /// Rank block: 64 bytes = 8 words = 512 bits. At most 7 words scanned per

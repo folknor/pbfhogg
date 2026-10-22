@@ -77,7 +77,7 @@ fn copy_range_fallback(
     use std::io::Write;
     use std::os::unix::io::FromRawFd;
 
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut buf = vec![0u8; crate::write::IO_BUF_BYTES];
     // Wrap in ManuallyDrop so we don't close the fd when done - caller owns it.
     let mut out = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(out_fd) });
     // Read from in_fd using pread (doesn't change file position).

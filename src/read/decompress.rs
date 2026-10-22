@@ -2,6 +2,7 @@
 //! the zlib thread-local state, and the suite of `decompress_*` entry points
 //! called from pipelined and pread read paths.
 
+use super::wire_schema::blob as blob_fields;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
@@ -373,14 +374,14 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
 
     while let Some((field, wire_type)) = cursor.read_tag()? {
         match field {
-            1 | 3 | 7 => {
+            blob_fields::RAW | blob_fields::ZLIB_DATA | blob_fields::ZSTD_DATA => {
                 let slice = cursor.read_len_delimited()?;
                 if payload.is_some() {
                     return Err(crate::read::blob_wire::multiple_payload_fields());
                 }
                 payload = Some((field, slice));
             }
-            2 => {
+            blob_fields::RAW_SIZE => {
                 // raw_size: int32
                 #[allow(clippy::cast_possible_truncation)]
                 {
@@ -394,7 +395,7 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
     let Some((field, slice)) = payload else {
         return Err(new_blob_error(BlobError::Empty));
     };
-    if field == 1 {
+    if field == blob_fields::RAW {
         let size = slice.len() as u64;
         if size > MAX_BLOB_MESSAGE_SIZE {
             return Err(new_blob_error(BlobError::MessageTooBig { size }));
@@ -407,7 +408,7 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
             #[allow(clippy::cast_sign_loss)]
             buf.reserve(clamp_capacity_hint(rs as usize).saturating_sub(buf.capacity()));
         }
-        if field == 3 {
+        if field == blob_fields::ZLIB_DATA {
             zlib_decompress_into(slice, buf)?;
         } else {
             zstd_decompress_into(slice, buf)?;

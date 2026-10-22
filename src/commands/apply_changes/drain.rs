@@ -491,7 +491,7 @@ struct DrainState {
     /// Running (kind, `osm_id_key`) high-water mark across every item
     /// already dispatched. Drives [`check_output_order`]; see there for
     /// why this is a running max rather than a pairwise-adjacent check.
-    order_watermark: Option<(ElemKind, crate::osm_id::OsmIdKey, i64)>,
+    order_watermark: crate::osm_id::OrderWatermark,
 }
 
 impl DrainState {
@@ -507,7 +507,7 @@ impl DrainState {
             passthrough_chunks: Vec::new(),
             loc_map: None,
             barrier_done: false,
-            order_watermark: None,
+            order_watermark: crate::osm_id::OrderWatermark::default(),
         }
     }
 }
@@ -560,43 +560,23 @@ fn check_output_order(
     min_id: i64,
     max_id: i64,
 ) -> Result<()> {
-    let first_id = crate::osm_id::blob_osm_first_id(min_id, max_id);
-    let last_id = crate::osm_id::blob_osm_last_id(min_id, max_id);
-    let first_key = crate::osm_id::osm_id_key(first_id);
-    let last_key = crate::osm_id::osm_id_key(last_id);
-
-    let mut watermark = (kind, last_key, last_id);
-    if let Some((prev_kind, prev_key, prev_id)) = state.order_watermark {
-        let prev_ord = kind_ordinal(prev_kind);
-        let this_ord = kind_ordinal(kind);
-        if this_ord < prev_ord {
-            return Err(new_error(ErrorKind::Io(std::io::Error::other(format!(
-                "apply-changes: refusing to write an unsorted PBF under a Sort.Type_then_ID \
-                 header - a {} blob follows a {} blob. The base PBF's header claims \
-                 Sort.Type_then_ID but its blobs are not in canonical order; re-sort it \
-                 first with `pbfhogg sort`.",
-                kind_name(kind),
-                kind_name(prev_kind),
-            )))));
-        }
-        if this_ord == prev_ord {
-            if first_key < prev_key {
-                return Err(new_error(ErrorKind::Io(std::io::Error::other(format!(
-                    "apply-changes: refusing to write an unsorted PBF under a \
-                     Sort.Type_then_ID header - a {} blob starting at id {first_id} follows \
-                     {} output already reaching id {prev_id}. The base PBF's header claims \
-                     Sort.Type_then_ID but its blobs are not in canonical order; re-sort it \
-                     first with `pbfhogg sort`.",
-                    kind_name(kind),
-                    kind_name(prev_kind),
-                )))));
-            }
-            if prev_key > last_key {
-                watermark = (kind, prev_key, prev_id);
-            }
-        }
+    if let Err((previous_kind, previous_id)) =
+        state
+            .order_watermark
+            .observe(kind_ordinal(kind), min_id, max_id)
+    {
+        return Err(new_error(ErrorKind::Io(std::io::Error::other(format!(
+            "apply-changes: refusing to write an unsorted PBF under a Sort.Type_then_ID \
+             header - a {} blob starting at id {} follows {} output \
+             already reaching id {previous_id}; re-sort the base with `pbfhogg sort`.",
+            kind_name(kind),
+            crate::osm_id::blob_osm_first_id(min_id, max_id),
+            ["node", "way", "relation"]
+                .get(usize::from(previous_kind))
+                .copied()
+                .unwrap_or("unknown"),
+        )))));
     }
-    state.order_watermark = Some(watermark);
     Ok(())
 }
 

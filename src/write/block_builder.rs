@@ -42,8 +42,7 @@ use super::encode::{
 };
 use super::string_table::StringTable;
 
-// Re-exported so `crate::block_builder::HeaderBuilder` keeps resolving after
-// the type was lifted into its own sibling module.
+// Preserve the public builder import path for downstream callers.
 pub use crate::write::header_builder::HeaderBuilder;
 
 /// Default per-block element cap used by [`BlockBuilder::new`].

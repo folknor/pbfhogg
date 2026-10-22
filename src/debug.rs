@@ -2,25 +2,60 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 static ARMED: AtomicBool = AtomicBool::new(false);
 
-/// Enable lazy marker FIFO initialization from the environment.
-pub fn enable_marker_fifo_from_env() {
+type MarkerState = (std::fs::File, std::time::Instant, u64);
+static STATE: std::sync::OnceLock<MarkerState> = std::sync::OnceLock::new();
+
+/// Initialize instrumentation from a path supplied by the caller.
+///
+/// The caller reads its environment and reports an error through its own
+/// diagnostics. A failed open leaves initialization retryable.
+pub fn initialize_marker_fifo(path: &std::path::Path) -> std::io::Result<()> {
+    let file = open_marker_fifo(path)?;
+    let state = (
+        file,
+        std::time::Instant::now(),
+        micros_since_process_start().unwrap_or(0),
+    );
+    STATE.set(state).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "marker FIFO already initialized",
+        )
+    })?;
     ARMED.store(true, Relaxed);
+    Ok(())
 }
 
-/// No-op unless `enable_marker_fifo_from_env` has been called.
+#[cfg(unix)]
+fn open_marker_fifo(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_marker_fifo(_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "marker FIFO requires Unix",
+    ))
+}
+
+/// No-op unless `initialize_marker_fifo` has succeeded.
 ///
 /// Emit a named phase marker to the sidecar profiler (if active).
 ///
 /// The marker is timestamped with monotonic microseconds since process start
 /// (on Linux the epoch is recovered from `/proc/self/stat`, so it covers
 /// dynamic-loader and pre-`main` time too; elsewhere it is the first FIFO
-/// use) and written to the FIFO at `BROKKR_MARKER_FIFO`. If no sidecar is
-/// running (env var absent), this is a no-op. If the FIFO buffer is full,
+/// use) and written to the FIFO at the caller-supplied path. Before
+/// initialization this is a no-op. If the FIFO buffer is full,
 /// the marker is silently dropped (O_NONBLOCK) - never partially written.
 pub fn emit_marker(name: &str) {
     write_fifo(|f, us| {
-        let mut line = Line::new();
-        line.push(format_args!("{us} {name}\n"));
+        let line = Line::marker(us, name);
         line.emit(f);
     });
 }
@@ -34,8 +69,7 @@ pub fn emit_marker(name: &str) {
 /// Format: `<timestamp_us> @<name>=<value>\n`
 pub fn emit_counter(name: &str, value: i64) {
     write_fifo(|f, us| {
-        let mut line = Line::new();
-        line.push(format_args!("{us} @{name}={value}\n"));
+        let line = Line::counter(us, name, value);
         line.emit(f);
     });
 }
@@ -144,6 +178,18 @@ struct Line {
 }
 
 impl Line {
+    fn marker(us: u128, name: &str) -> Self {
+        let mut line = Self::new();
+        line.push(format_args!("{us} {name}\n"));
+        line
+    }
+
+    fn counter(us: u128, name: &str, value: i64) -> Self {
+        let mut line = Self::new();
+        line.push(format_args!("{us} @{name}={value}\n"));
+        line
+    }
+
     fn new() -> Self {
         Self {
             buf: [0; PIPE_BUF],
@@ -225,35 +271,7 @@ fn write_fifo(f: impl FnOnce(&std::fs::File, u128)) {
     if !ARMED.load(Relaxed) {
         return;
     }
-    use std::sync::OnceLock;
-
-    /// The FIFO handle plus the marker-clock epoch: an `Instant` and the
-    /// process-age offset already elapsed at that `Instant`.
-    static STATE: OnceLock<Option<(std::fs::File, std::time::Instant, u64)>> = OnceLock::new();
-
-    let state = STATE.get_or_init(|| {
-        let path = std::env::var("BROKKR_MARKER_FIFO").ok()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK)
-                .open(&path)
-                .ok()?;
-            // Take the age *after* the open so the open's own cost is
-            // inside the offset rather than lost between the two reads.
-            let now = std::time::Instant::now();
-            Some((file, now, micros_since_process_start().unwrap_or(0)))
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            None
-        }
-    });
-
-    if let Some((file, anchor, age_at_anchor)) = state.as_ref() {
+    if let Some((file, anchor, age_at_anchor)) = STATE.get() {
         let us = u128::from(*age_at_anchor) + anchor.elapsed().as_micros();
         f(file, us);
     }
@@ -277,10 +295,27 @@ mod tests {
 
     #[test]
     fn line_formats_marker_exactly() {
-        let mut line = Line::new();
-        line.push(format_args!("{} {}\n", 42_u128, "PASS1_END"));
+        let line = Line::marker(42, "PASS1_END");
         assert_eq!(&line.buf[..line.len], b"42 PASS1_END\n");
         assert!(!line.overflow);
+    }
+
+    #[test]
+    fn line_formats_counter_exactly() {
+        let line = Line::counter(42, "nodes", -7);
+        assert_eq!(&line.buf[..line.len], b"42 @nodes=-7\n");
+        assert!(!line.overflow);
+    }
+
+    #[test]
+    fn marker_open_failure_is_returned_to_caller() {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let error = super::open_marker_fifo(&dir.path().join("missing"))
+            .expect_err("missing FIFO must be diagnosed by caller");
+        #[cfg(unix)]
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        #[cfg(not(unix))]
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
     }
 
     /// The failure that matters is not the flag, it is bytes reaching the

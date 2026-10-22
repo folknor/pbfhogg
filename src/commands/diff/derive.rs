@@ -58,6 +58,9 @@ impl DeriveChangesStats {
 /// written as gzipped OsmChange XML. Memory is bounded by the number of
 /// changed elements, not total input size.
 ///
+/// `timestamp` overrides every emitted delete timestamp with the same Unix second.
+/// Pass `None` to omit delete timestamps.
+///
 /// Requires both inputs to declare `Sort.Type_then_ID` - returns an
 /// actionable error if either is unsorted.
 #[allow(clippy::too_many_arguments)]
@@ -68,7 +71,7 @@ pub fn derive_changes(
     output: &Path,
     direct_io: bool,
     increment_version: bool,
-    update_timestamp: bool,
+    timestamp: Option<u64>,
     jobs: usize,
     host: &crate::host::Host,
 ) -> Result<DeriveChangesStats> {
@@ -107,7 +110,7 @@ pub fn derive_changes(
             scratch_dir,
             jobs,
             increment_version,
-            update_timestamp,
+            timestamp,
             host,
             &token,
         )
@@ -126,7 +129,7 @@ pub fn derive_changes(
         return Ok(stats);
     }
 
-    let mut sink = ChangeSink::new(scratch_dir, &token, increment_version, update_timestamp)?;
+    let mut sink = ChangeSink::new(scratch_dir, &token, increment_version, timestamp)?;
 
     let result = (|| -> Result<DeriveChangesStats> {
         if both_indexed {
@@ -174,7 +177,7 @@ struct ChangeSink {
     modify_count: u64,
     delete_count: u64,
     increment_version: bool,
-    update_timestamp: bool,
+    timestamp: Option<u64>,
     coord_buf: String,
     // Declared after the writers so files close before their paths are removed.
     _scratch_guards: [crate::path_guard::PathGuard; 3],
@@ -185,7 +188,7 @@ impl ChangeSink {
         scratch_dir: &Path,
         token: &crate::scratch::RunToken,
         increment_version: bool,
-        update_timestamp: bool,
+        timestamp: Option<u64>,
     ) -> io::Result<Self> {
         let pid = std::process::id();
         let suffix = token.suffix();
@@ -211,7 +214,7 @@ impl ChangeSink {
             modify_count: 0,
             delete_count: 0,
             increment_version,
-            update_timestamp,
+            timestamp,
             coord_buf: String::new(),
             _scratch_guards: [creates_guard, modifies_guard, deletes_guard],
         })
@@ -237,7 +240,7 @@ impl ChangeSink {
                 id,
                 meta.as_ref(),
                 self.increment_version,
-                self.update_timestamp,
+                self.timestamp,
             )?;
             self.delete_count += 1;
         }
@@ -419,7 +422,7 @@ fn derive_changes_element_stream(
     let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io, host)?;
 
     let iv = sink.increment_version;
-    let ut = sink.update_timestamp;
+    let ut = sink.timestamp;
 
     // Phase 1: Nodes
     crate::debug::emit_marker("DERIVECHANGES_PHASE_NODE_START");
@@ -616,7 +619,7 @@ fn write_delete_element<W: Write>(
     id: i64,
     metadata: Option<&OwnedMetadata>,
     increment_version: bool,
-    update_timestamp: bool,
+    timestamp: Option<u64>,
 ) -> Result<()> {
     let mut elem = BytesStart::new(tag_name);
     let id_str = id.to_string();
@@ -633,12 +636,8 @@ fn write_delete_element<W: Write>(
         let v_str = version.to_string();
         elem.push_attribute(("version", v_str.as_str()));
     }
-    if update_timestamp {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let ts =
-            crate::commands::format_epoch_secs(i64::try_from(now.as_secs()).unwrap_or(i64::MAX));
+    if let Some(timestamp) = timestamp {
+        let ts = crate::commands::format_epoch_secs(i64::try_from(timestamp).unwrap_or(i64::MAX));
         elem.push_attribute(("timestamp", ts.as_str()));
     }
     writer.write_event(Event::Empty(elem))?;
@@ -651,6 +650,17 @@ mod scratch_tests {
     use crate::scratch::RunToken;
 
     #[test]
+    fn delete_elements_use_the_supplied_timestamp() {
+        let mut writer = quick_xml::Writer::new(Vec::new());
+        for id in [1, 2] {
+            super::write_delete_element(&mut writer, "node", id, None, false, Some(0))
+                .expect("write delete");
+        }
+        let xml = String::from_utf8(writer.into_inner()).expect("XML");
+        assert_eq!(xml.matches("timestamp=\"1970-01-01T00:00:00Z\"").count(), 2);
+    }
+
+    #[test]
     fn partial_sink_construction_removes_created_fragments() {
         let dir = tempfile::tempdir().expect("directory");
         let token = RunToken::next().expect("token");
@@ -660,7 +670,7 @@ mod scratch_tests {
             token.suffix()
         ));
         std::fs::create_dir(&blocked).expect("block second fragment");
-        let err = ChangeSink::new(dir.path(), &token, false, false)
+        let err = ChangeSink::new(dir.path(), &token, false, None)
             .err()
             .expect("second fragment must fail");
         assert!(err.to_string().contains(&blocked.display().to_string()));
@@ -676,7 +686,7 @@ mod scratch_tests {
         let dir = tempfile::tempdir().expect("directory");
         let token = RunToken::next().expect("token");
         let result = std::panic::catch_unwind(|| {
-            let _sink = ChangeSink::new(dir.path(), &token, false, false).expect("sink");
+            let _sink = ChangeSink::new(dir.path(), &token, false, None).expect("sink");
             panic!("simulate a failed derive run");
         });
         assert!(result.is_err());

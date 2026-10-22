@@ -129,7 +129,10 @@ pub(super) fn rewrite_block_parallel(
         match &element {
             Element::DenseNode(dn) => {
                 let id = dn.id();
-                if diff.deleted_nodes.contains(&id) {
+                if diff
+                    .deleted_ids(crate::osc::OscElementKind::Node)
+                    .contains(&id)
+                {
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_node(id) {
                     ensure_node_capacity_local(bb, &mut output)?;
@@ -149,7 +152,10 @@ pub(super) fn rewrite_block_parallel(
             }
             Element::Node(n) => {
                 let id = n.id();
-                if diff.deleted_nodes.contains(&id) {
+                if diff
+                    .deleted_ids(crate::osc::OscElementKind::Node)
+                    .contains(&id)
+                {
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_node(id) {
                     ensure_node_capacity_local(bb, &mut output)?;
@@ -169,7 +175,10 @@ pub(super) fn rewrite_block_parallel(
             }
             Element::Way(w) => {
                 let id = w.id();
-                if diff.deleted_ways.contains(&id) {
+                if diff
+                    .deleted_ids(crate::osc::OscElementKind::Way)
+                    .contains(&id)
+                {
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_way(id) {
                     write_osc_way_local(bb, &mut output, &osc, loc)?;
@@ -185,7 +194,10 @@ pub(super) fn rewrite_block_parallel(
             }
             Element::Relation(r) => {
                 let id = r.id();
-                if diff.deleted_relations.contains(&id) {
+                if diff
+                    .deleted_ids(crate::osc::OscElementKind::Relation)
+                    .contains(&id)
+                {
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_relation(id) {
                     ensure_relation_capacity_local(bb, &mut output)?;

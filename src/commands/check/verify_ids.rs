@@ -581,9 +581,9 @@ fn verify_single_kind_streaming(
 
 /// Per-blob classify result for the parallel full-mode verifier.
 ///
-/// Kept small: the main-thread merge sees one of these per blob and aggregates
-/// in schedule-order. Bounded by blob size (~8000 elements) so it streams
-/// cheaply back over the parallel_classify_phase channel.
+/// The main-thread merge sees one of these per blob and aggregates in
+/// schedule order. Each result follows the contents of its input blob and
+/// streams back over the parallel_classify_phase channel.
 struct BlobVerifyResult {
     first_id: Option<i64>,
     last_id: Option<i64>,

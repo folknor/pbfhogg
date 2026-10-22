@@ -101,6 +101,14 @@ no_default_features = true
 features = []
 parallel = {}
 
+# Library-only geocode reader configuration, without the builder or CLI.
+[[check]]
+name = "geocode-reader"
+packages = ["pbfhogg"]
+no_default_features = true
+features = ["geocode-reader"]
+parallel = {}
+
 # The CLI crate's own tests (cli/tests/cli.rs). Every other sweep selects only
 # the root package - `build_packages` builds pbfhogg-cli but never tests it -
 # so until this entry existed these tests ran under no sweep at all, and the
@@ -201,7 +209,7 @@ gate_profile = "gate"
 # themselves out there.
 [test.profiles.tier1]
 description = "Fast edit loop used by brokkr check (tier 1)"
-sweeps = ["all", "faults", "consumer", "minimal", "cli"]
+sweeps = ["all", "faults", "consumer", "minimal", "geocode-reader", "cli"]
 skip = ["tier2::", "tier3::", "platform::", "serial::"]
 include_ignored = false
 
@@ -284,7 +292,7 @@ skip = ["platform::", "serial::"]
 # a test that stops running cannot go unnoticed here.
 [test.profiles.gate-tests]
 description = "Every sweep, unfiltered"
-sweeps = ["all", "faults", "consumer", "minimal", "cli"]
+sweeps = ["all", "faults", "consumer", "minimal", "geocode-reader", "cli"]
 
 [test.profiles.doc-twin]
 description = "The doc-only carrier"
@@ -1098,9 +1106,8 @@ message = "Host probes must use Resources at the original program point"
 name = "no-env-read"
 pattern = '\benv::(?:var|var_os|vars|vars_os)\b'
 paths = ["src/**/*.rs"]
-exclude = ["src/debug.rs"]
 region = "code"
-message = "Only explicitly armed sidecar instrumentation reads the environment"
+message = "Environment access belongs to the caller"
 
 [[textlint]]
 name = "no-public-reader-in-commands"
@@ -1127,3 +1134,11 @@ paths = ["src/**/*.rs", "cli/src/**/*.rs"]
 exclude = ["cli/src/output.rs"]
 region = "code"
 message = "Library diagnostics must use the caller's Diagnostics handle; the CLI writes stderr through output::cli_eprintln! and cli_eprint!, which survive a closed stderr"
+
+# Source-only guard: no build or test-harness startup.
+[[script_check]]
+name = "static-hook-test-isolation"
+command = "python3 scripts/check_static_hook_targets.py"
+expect = "static hook targets ok"
+match = "last-line"
+stage = "pre-clippy"

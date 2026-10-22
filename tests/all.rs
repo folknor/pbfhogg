@@ -48,24 +48,43 @@ mod geocode_index;
 #[cfg(feature = "commands")]
 mod inspect;
 
+#[cfg(feature = "commands")]
 mod cli_add_locations_to_ways;
+#[cfg(feature = "commands")]
 mod cli_apply_changes;
+#[cfg(feature = "commands")]
 mod cli_apply_changes_invariants;
+#[cfg(feature = "commands")]
 mod cli_cat;
+#[cfg(feature = "commands")]
 mod cli_defensive_input;
+#[cfg(feature = "commands")]
 mod cli_degrade;
+#[cfg(feature = "commands")]
 mod cli_derive_changes;
+#[cfg(feature = "commands")]
 mod cli_diff;
+#[cfg(feature = "commands")]
 mod cli_digest;
+#[cfg(feature = "commands")]
 mod cli_exit_codes;
+#[cfg(feature = "commands")]
 mod cli_inject_prepass;
+#[cfg(feature = "commands")]
 mod cli_merge_changes;
+#[cfg(feature = "commands")]
 mod cli_merge_join_trust;
+#[cfg(feature = "commands")]
 mod cli_negative_id_invariants;
+#[cfg(feature = "commands")]
 mod cli_repack;
+#[cfg(feature = "commands")]
 mod cli_sort;
+#[cfg(feature = "commands")]
 mod cli_tags_filter;
+#[cfg(feature = "commands")]
 mod cli_time_filter;
+#[cfg(feature = "commands")]
 mod cli_truncation_sweep;
 mod corrupt_input;
 mod edge_cases;
@@ -82,10 +101,12 @@ mod renumber_external;
 mod roundtrip;
 mod roundtrip_invariants;
 mod roundtrip_real;
+#[cfg(feature = "commands")]
 mod tags_count;
 mod tags_filter_osc;
 
 #[cfg(all(feature = "commands", target_os = "linux", target_env = "gnu"))]
+#[cfg(feature = "commands")]
 mod cli_host_identity;
 
 mod host_contract;

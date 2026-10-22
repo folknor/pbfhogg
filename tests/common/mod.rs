@@ -33,6 +33,23 @@ use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, ElementReader, MemberId};
 
+/// Project-owned scratch, separate from Cargo output and benchmark scratch.
+/// TempDir's random names isolate concurrent tests and feature sweeps.
+pub fn test_scratch() -> tempfile::TempDir {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/test-scratch");
+    std::fs::create_dir_all(&root).expect("create test scratch root");
+    tempfile::TempDir::new_in(root).expect("create test scratch directory")
+}
+
+/// Emit one machine-countable skip marker; required runs fail on a skip.
+pub fn skip(reason: impl std::fmt::Display) {
+    assert!(
+        std::env::var_os("PBFHOGG_TEST_MUST_RUN").is_none(),
+        "required test skipped: {reason}"
+    );
+    eprintln!("PBFHOGG_TEST_SKIP: {reason}");
+}
+
 // ---------------------------------------------------------------------------
 // Test element structs - lightweight descriptions of OSM elements for building
 // test PBF files. These mirror the PBF data model but use static strings for
@@ -793,74 +810,21 @@ pub fn assert_no_tagdata(path: &Path) {
 /// `BlobHeader` protobuf just far enough to find `datasize` (field 3, to
 /// advance past the Blob) and detect `tagdata` (field 4).
 pub fn count_tagdata_blobs(path: &Path) -> usize {
-    fn read_varint(buf: &[u8], pos: &mut usize) -> u64 {
-        let mut value = 0u64;
-        let mut shift = 0u32;
-        loop {
-            let byte = buf[*pos];
-            *pos += 1;
-            value |= u64::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-        }
-        value
-    }
-
-    // Returns (datasize, has_tagdata) for one BlobHeader message.
-    fn scan_header(header: &[u8]) -> (usize, bool) {
-        let mut pos = 0usize;
-        let mut datasize = 0usize;
-        let mut has_tagdata = false;
-        while pos < header.len() {
-            let tag = read_varint(header, &mut pos);
-            let field = tag >> 3;
-            let wire = tag & 0x7;
-            match wire {
-                0 => {
-                    let v = read_varint(header, &mut pos);
-                    if field == 3 {
-                        datasize = usize::try_from(v).expect("datasize fits usize");
-                    }
-                }
-                2 => {
-                    let len = usize::try_from(read_varint(header, &mut pos))
-                        .expect("field len fits usize");
-                    pos += len;
-                    if field == 4 {
-                        has_tagdata = true;
-                    }
-                }
-                1 => pos += 8,
-                5 => pos += 4,
-                other => panic!("unexpected wire type {other} in BlobHeader"),
-            }
-        }
-        (datasize, has_tagdata)
-    }
-
     let bytes = std::fs::read(path).expect("read pbf");
-    let mut pos = 0usize;
-    let mut count = 0usize;
-    while pos + 4 <= bytes.len() {
-        let header_len =
-            u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
-                as usize;
-        let hstart = pos + 4;
-        let hend = hstart + header_len;
-        assert!(
-            hend <= bytes.len(),
-            "truncated BlobHeader in {}",
-            path.display()
-        );
-        let (datasize, has_tagdata) = scan_header(&bytes[hstart..hend]);
-        if has_tagdata {
-            count += 1;
-        }
-        pos = hend + datasize;
-    }
-    count
+    let blobs = adversarial::locate_blobs(&bytes);
+    assert_eq!(
+        blobs.last().map_or(0, |blob| blob.blob_end),
+        bytes.len(),
+        "incomplete PBF framing in {}",
+        path.display()
+    );
+    blobs
+        .iter()
+        .filter(|blob| {
+            adversarial::header_has_tagdata(&bytes[blob.header_start..blob.header_end])
+                .expect("valid BlobHeader")
+        })
+        .count()
 }
 
 /// Assert that *no* blob in the PBF carries tagdata, walking every blob
@@ -1462,9 +1426,11 @@ fn snapshot_dir_inner(
 ) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return,
+        Err(error) if dir != base && error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => panic!("read scratch directory {}: {error}", dir.display()),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.expect("read scratch directory entry");
         let path = entry.path();
         let rel = path.strip_prefix(base).unwrap_or(&path).to_path_buf();
         out.insert(rel);
@@ -1541,5 +1507,26 @@ pub(crate) fn test_host() -> pbfhogg::host::Host {
         page_cache: pbfhogg::host::PageCachePolicy::Keep,
         executor: pbfhogg::host::Executor::Ambient,
         scratch_parent: None,
+    }
+}
+
+// Excluded from the static-hook fault binaries, each of which must define
+// exactly one test.
+#[cfg(all(test, not(feature = "static-test-hooks")))]
+mod scratch_contracts {
+    #[test]
+    #[should_panic(expected = "read scratch directory")]
+    fn missing_snapshot_root_is_an_error() {
+        let dir = super::test_scratch();
+        super::snapshot_dir(&dir.path().join("missing"));
+    }
+
+    #[test]
+    #[should_panic(expected = "read scratch directory")]
+    fn file_snapshot_root_is_an_error() {
+        let dir = super::test_scratch();
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").expect("create file");
+        super::snapshot_dir(&file);
     }
 }

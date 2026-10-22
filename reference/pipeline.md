@@ -209,20 +209,21 @@ counterpart doesn't exist yet.
 ### add-locations-to-ways
 
 Embeds node coordinates in ways. Index strategies (`--index-type`, default
-`sparse`; `dense` was removed 2026-04 - sparse is faster at every measured
-scale):
+`sparse`; `dense` was removed. See [performance.md](performance.md) for
+measured comparisons):
 
 **Sparse** (default): rank-indexed flat mmap. Builds an `IdSet` of
 way-referenced nodes; pass 1 workers store packed `(lat, lon)` at byte
 offset `rank_if_set(node_id) << 3` via relaxed `AtomicU64::store`
 directly into a pre-allocated, `MmapMut`-mapped values file
-(`referenced_count * 8` bytes, ~29 GB at europe) - no chunk format, no
+(`referenced_count * 8` bytes) - no chunk format, no
 serial writer bottleneck. Pass 2's `get(node_id)` is
 `rank_if_set(node_id)` plus an `AtomicU64::load` at the same offset;
 once pass 1 finishes, the store is advised `MADV_RANDOM` so pass 2's
 genuinely-random per-ref lookups stop paying kernel readahead
-speculation (matched A/B at europe: pass-2 disk read -57%, total wall
--6.5%). Small-to-europe scale; likely thrashes at planet.
+speculation. The effect on disk reads and wall time depends on the dataset
+and host; see [performance.md](performance.md) for measured results. Its
+working-set limit depends on available page cache.
 
 **External** (`altw/external/`, 4-stage bounded-memory join; requires
 sorted + indexed input):
@@ -233,21 +234,17 @@ sorted + indexed input):
    delta-varint `coord_payloads`
 4. Assembly → pread workers reframe way blobs, splicing coord payloads
 
-~8.7 GB RAM, ~256 GB peak temp disk at planet; the only mode that survives
-planet on a 30 GB-class host.
+Bounded memory with high scratch-disk demand. See
+[performance.md](performance.md) for measured resource use. Requires sorted
+input with indexdata.
 
-**Auto**: scale-aware routing (2026-07-16). Sparse unless the input is
-sorted + indexed (external's precondition) AND the estimated sparse
-store - total node count from per-blob indexdata, times 8 bytes -
-exceeds 80 % of the page-cache budget (`MemAvailable` minus ~3 GB anon
-headroom, computed at runtime, never a hardcoded byte constant). The
-knee is store-vs-cache: sparse pass 2 ran linear at 75 % of budget
-(north-america) and thrashed 5.3x at 116 % (europe); walls are
-non-monotonic in file size, so only the store estimate routes correctly.
-When the store or budget cannot be estimated
-(missing indexdata mid-file, no `/proc/meminfo`), sorted + indexed
-inputs fall back to external - the pre-2026-07-16 behavior, and the
-cheap direction to be wrong in.
+**Auto**: sparse is selected unless the input is sorted and indexed and the
+estimated sparse store (the per-blob indexed node count times 8 bytes) exceeds
+80 % of the page-cache budget. The budget is `MemAvailable` minus 3 GiB of
+anonymous-memory headroom. If the store or budget cannot be estimated, sorted
+and indexed inputs fall back to external; otherwise auto selects sparse.
+This runtime rule follows the measured store-versus-cache behavior documented
+in [performance.md](performance.md).
 
 ### renumber
 

@@ -147,7 +147,7 @@ fn run_shard(
     scratch_dir: &Path,
     scratch_suffix: &str,
     increment_version: bool,
-    update_timestamp: bool,
+    timestamp: Option<u64>,
 ) -> Result<ShardOutput> {
     // Test-only: arm via `test_hooks::PANIC_AT_SHARD_IDX`. Simulates
     // a mid-phase shard crash; the caller's `scope.spawn(...).join()`
@@ -234,13 +234,7 @@ fn run_shard(
                     if id > t_high {
                         break;
                     }
-                    emit_delete(
-                        &mut deletes_w,
-                        &elem,
-                        kind,
-                        increment_version,
-                        update_timestamp,
-                    )?;
+                    emit_delete(&mut deletes_w, &elem, kind, increment_version, timestamp)?;
                     delete_count += 1;
                 }
             }
@@ -269,13 +263,7 @@ fn run_shard(
                         if id > t_high {
                             break;
                         }
-                        emit_delete(
-                            &mut deletes_w,
-                            &elem,
-                            kind,
-                            increment_version,
-                            update_timestamp,
-                        )?;
+                        emit_delete(&mut deletes_w, &elem, kind, increment_version, timestamp)?;
                         delete_count += 1;
                     }
                     continue;
@@ -309,7 +297,7 @@ fn run_shard(
                     &mut modify_count,
                     &mut delete_count,
                     increment_version,
-                    update_timestamp,
+                    timestamp,
                 )?;
             }
         }
@@ -354,7 +342,7 @@ fn merge_overlapping_pair<W: Write>(
     modify_count: &mut u64,
     delete_count: &mut u64,
     increment_version: bool,
-    update_timestamp: bool,
+    timestamp: Option<u64>,
 ) -> Result<()> {
     let mut os = old_decoded.take().expect("checked");
     let mut ns = new_decoded.take().expect("checked");
@@ -376,7 +364,7 @@ fn merge_overlapping_pair<W: Write>(
         modify_count,
         delete_count,
         increment_version,
-        update_timestamp,
+        timestamp,
     )?;
 
     if os.index.max_id > merge_up_to {
@@ -407,7 +395,7 @@ fn element_merge<W: Write>(
     modify_count: &mut u64,
     delete_count: &mut u64,
     increment_version: bool,
-    update_timestamp: bool,
+    timestamp: Option<u64>,
 ) -> Result<(usize, usize)> {
     let mut old_iter = old_block.elements().skip(old_skip).peekable();
     let mut new_iter = new_block.elements().skip(new_skip).peekable();
@@ -440,7 +428,7 @@ fn element_merge<W: Write>(
             (false, false) => break,
             (true, false) => {
                 let o = old_iter.next().expect("checked peek");
-                emit_delete(deletes_w, &o, kind, increment_version, update_timestamp)?;
+                emit_delete(deletes_w, &o, kind, increment_version, timestamp)?;
                 *delete_count += 1;
                 old_consumed += 1;
             }
@@ -456,7 +444,7 @@ fn element_merge<W: Write>(
                 match crate::osm_id::osm_id_cmp(o_id, n_id) {
                     std::cmp::Ordering::Less => {
                         let o = old_iter.next().expect("checked");
-                        emit_delete(deletes_w, &o, kind, increment_version, update_timestamp)?;
+                        emit_delete(deletes_w, &o, kind, increment_version, timestamp)?;
                         *delete_count += 1;
                         old_consumed += 1;
                     }
@@ -506,20 +494,13 @@ fn emit_delete<W: Write>(
     elem: &Element<'_>,
     kind: ElemKind,
     increment_version: bool,
-    update_timestamp: bool,
+    timestamp: Option<u64>,
 ) -> Result<()> {
     let Some((tag, id, meta)) = extract_delete_info(elem, kind) else {
         return Ok(());
     };
-    write_delete_element(
-        writer,
-        tag,
-        id,
-        meta.as_ref(),
-        increment_version,
-        update_timestamp,
-    )
-    .map_err(map_emit_err)
+    write_delete_element(writer, tag, id, meta.as_ref(), increment_version, timestamp)
+        .map_err(map_emit_err)
 }
 
 fn extract_delete_info(
@@ -560,7 +541,7 @@ fn write_delete_element<W: Write>(
     id: i64,
     metadata: Option<&OwnedMetadata>,
     increment_version: bool,
-    update_timestamp: bool,
+    timestamp: Option<u64>,
 ) -> crate::BoxResult<()> {
     use quick_xml::events::{BytesStart, Event};
     let mut elem = BytesStart::new(tag_name);
@@ -578,12 +559,8 @@ fn write_delete_element<W: Write>(
         let v_str = version.to_string();
         elem.push_attribute(("version", v_str.as_str()));
     }
-    if update_timestamp {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let ts =
-            crate::commands::format_epoch_secs(i64::try_from(now.as_secs()).unwrap_or(i64::MAX));
+    if let Some(timestamp) = timestamp {
+        let ts = crate::commands::format_epoch_secs(i64::try_from(timestamp).unwrap_or(i64::MAX));
         elem.push_attribute(("timestamp", ts.as_str()));
     }
     writer.write_event(Event::Empty(elem))?;
@@ -610,7 +587,7 @@ pub(crate) fn derive_changes_parallel(
     scratch_dir: &Path,
     shard_count: usize,
     increment_version: bool,
-    update_timestamp: bool,
+    timestamp: Option<u64>,
     host: &crate::host::Host,
     token: &crate::scratch::RunToken,
 ) -> Result<Option<DeriveChangesStats>> {
@@ -740,7 +717,7 @@ pub(crate) fn derive_changes_parallel(
                         scratch_dir,
                         suffix,
                         increment_version,
-                        update_timestamp,
+                        timestamp,
                     )
                 });
                 handles.push(h);

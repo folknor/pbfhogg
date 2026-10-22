@@ -526,9 +526,8 @@ mod tests {
 
     #[test]
     fn read_expressions_from_file() {
-        let dir = std::env::temp_dir().join("pbfhogg_test_expr");
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let path = dir.join("test_expressions.txt");
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("test_expressions.txt");
         std::fs::write(
             &path,
             "# comment line\n\
@@ -543,7 +542,6 @@ mod tests {
         // The space before the inline comment survives the reader, exactly as
         // in osmium; the parser strips it from the key.
         assert_eq!(exprs, vec!["highway=primary", "amenity ", "w/building=yes"]);
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// The comment rule is osmium's `read_expressions_file`: cut at the first
@@ -577,7 +575,7 @@ mod tests {
     /// and turned it into the plain key.
     #[test]
     fn a_tab_led_key_from_a_file_keeps_its_tab() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("exprs.txt");
         std::fs::write(&path, "\thighway=primary\n  amenity  \r\n").expect("write");
         let exprs = read_expressions_file(&path).expect("read");

@@ -20,6 +20,8 @@ use crate::read::blob_wire::{MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE};
 use crate::write::metrics::WRITER_METRICS;
 use std::sync::atomic::Ordering::Relaxed;
 
+use crate::read::wire_schema::{BlobHeaderField, HeaderBlockField, blob, blob_header};
+
 use super::compression::Compression;
 use super::pipeline::{FramedBlobParts, elapsed_ns_u64};
 
@@ -265,7 +267,7 @@ pub(super) fn encode_blob_body(
         Compression::None => {
             // Blob field 1: raw (bytes, len-delimited). Always emitted; see
             // the doc block.
-            encode_bytes_field_always(&mut scratch.blob_buf, 1, uncompressed);
+            encode_bytes_field_always(&mut scratch.blob_buf, blob::RAW, uncompressed);
         }
         Compression::Zlib(level) => {
             compress_zlib(uncompressed, *level, scratch)?;
@@ -294,9 +296,13 @@ pub(super) fn encode_blob_body(
                 ))
             })?;
             // Blob field 2: raw_size (int32, varint)
-            encode_int32_field(&mut scratch.blob_buf, 2, raw_size);
+            encode_int32_field(&mut scratch.blob_buf, blob::RAW_SIZE, raw_size);
             // Blob field 7: zstd_data (bytes, len-delimited). Always emitted.
-            encode_bytes_field_always(&mut scratch.blob_buf, 7, &scratch.compress_buf);
+            encode_bytes_field_always(
+                &mut scratch.blob_buf,
+                blob::ZSTD_DATA,
+                &scratch.compress_buf,
+            );
         }
     }
     Ok(())
@@ -336,9 +342,13 @@ fn compress_zlib(uncompressed: &[u8], level: u32, scratch: &mut FrameScratch) ->
             uncompressed.len()
         ))
     })?;
-    encode_int32_field(&mut scratch.blob_buf, 2, raw_size);
+    encode_int32_field(&mut scratch.blob_buf, blob::RAW_SIZE, raw_size);
     // Blob field 3: zlib_data. Always emitted; see `encode_blob_body`.
-    encode_bytes_field_always(&mut scratch.blob_buf, 3, &scratch.compress_buf);
+    encode_bytes_field_always(
+        &mut scratch.blob_buf,
+        blob::ZLIB_DATA,
+        &scratch.compress_buf,
+    );
     Ok(())
 }
 
@@ -426,20 +436,20 @@ fn encode_blob_header_fields(
 ) {
     buf.clear();
     // Field 1: type (string = len-delimited bytes)
-    encode_bytes_field(buf, 1, blob_type.as_bytes());
+    encode_bytes_field(buf, blob_header::TYPE, blob_type.as_bytes());
     // Field 2: indexdata (optional bytes)
     if let Some(data) = indexdata {
-        encode_bytes_field(buf, 2, data);
+        encode_bytes_field(buf, blob_header::INDEXDATA, data);
     }
     // Field 3: datasize (int32 varint)
-    encode_int32_field(buf, 3, datasize);
+    encode_int32_field(buf, blob_header::DATASIZE, datasize);
     // Field 4: tagdata (optional bytes - per-blob tag key index)
     if let Some(data) = tagdata {
-        encode_bytes_field(buf, 4, data);
+        encode_bytes_field(buf, blob_header::TAGDATA, data);
     }
     // Field 5: WayMembers-v1 payload (optional bytes).
     if let Some(data) = way_members {
-        encode_bytes_field(buf, 5, data);
+        encode_bytes_field(buf, blob_header::WAYMEMBERS, data);
     }
 }
 
@@ -473,10 +483,15 @@ fn encode_blob_header_fields(
 /// `datasize` (field 3) stays consistent.
 pub(crate) fn strip_blob_header_fields(
     header_bytes: &[u8],
-    strip_fields: &[u32],
+    strip_fields: &[BlobHeaderField],
     out: &mut Vec<u8>,
 ) -> io::Result<()> {
-    strip_message_fields(header_bytes, strip_fields, out, "BlobHeader")
+    strip_message_fields(
+        header_bytes,
+        |field| strip_fields.iter().any(|f| *f as u32 == field),
+        out,
+        "BlobHeader",
+    )
 }
 
 /// Re-emit a `HeaderBlock` protobuf message (the decompressed OSMHeader
@@ -498,10 +513,15 @@ pub(crate) fn strip_blob_header_fields(
 /// This preserves everything.
 pub(crate) fn strip_header_block_fields(
     header_block_bytes: &[u8],
-    strip_fields: &[u32],
+    strip_fields: &[HeaderBlockField],
     out: &mut Vec<u8>,
 ) -> io::Result<()> {
-    strip_message_fields(header_block_bytes, strip_fields, out, "HeaderBlock")
+    strip_message_fields(
+        header_block_bytes,
+        |field| strip_fields.iter().any(|f| *f as u32 == field),
+        out,
+        "HeaderBlock",
+    )
 }
 
 /// Shared protobuf field-copy core for the two strippers above. Copies every
@@ -509,7 +529,7 @@ pub(crate) fn strip_header_block_fields(
 /// `strip_fields`. `ctx` names the message in parse errors.
 fn strip_message_fields(
     msg_bytes: &[u8],
-    strip_fields: &[u32],
+    strip_field: impl Fn(u32) -> bool,
     out: &mut Vec<u8>,
     ctx: &str,
 ) -> io::Result<()> {
@@ -528,7 +548,7 @@ fn strip_message_fields(
             .skip_field(wire_type)
             .map_err(|e| io::Error::other(format!("{ctx} parse: {e}")))?;
         let field_end = cursor.position();
-        if !strip_fields.contains(&field) {
+        if !strip_field(field) {
             out.extend_from_slice(&msg_bytes[field_start..field_end]);
         }
     }
@@ -819,7 +839,8 @@ mod tests {
         encode_varint_field(&mut expect_no_tag, 9, 0x0102);
         encode_bytes_field(&mut expect_no_tag, 11, &unknown);
         let mut out = Vec::new();
-        strip_blob_header_fields(&header, &[4], &mut out).expect("strip tagdata");
+        strip_blob_header_fields(&header, &[BlobHeaderField::Tagdata], &mut out)
+            .expect("strip tagdata");
         assert_eq!(
             out, expect_no_tag,
             "stripping field 4 must drop only tagdata and preserve v1 index, \
@@ -849,7 +870,8 @@ mod tests {
         encode_varint_field(&mut expect_no_index, 9, 0x0102);
         encode_bytes_field(&mut expect_no_index, 11, &unknown);
         let mut out = Vec::new();
-        strip_blob_header_fields(&header, &[2], &mut out).expect("strip indexdata");
+        strip_blob_header_fields(&header, &[BlobHeaderField::Indexdata], &mut out)
+            .expect("strip indexdata");
         assert_eq!(
             out, expect_no_index,
             "stripping field 2 must drop only indexdata and preserve tagdata, \
@@ -864,7 +886,12 @@ mod tests {
         encode_varint_field(&mut expect_neither, 9, 0x0102);
         encode_bytes_field(&mut expect_neither, 11, &unknown);
         let mut out = Vec::new();
-        strip_blob_header_fields(&header, &[2, 4], &mut out).expect("strip both");
+        strip_blob_header_fields(
+            &header,
+            &[BlobHeaderField::Indexdata, BlobHeaderField::Tagdata],
+            &mut out,
+        )
+        .expect("strip both");
         assert_eq!(
             out, expect_neither,
             "stripping fields 2 and 4 must leave WayMembers and unknown fields intact"
@@ -920,7 +947,8 @@ mod tests {
         encode_varint_field(&mut expect, 60, 0x0102);
         encode_bytes_field(&mut expect, 61, &unknown);
         let mut out = Vec::new();
-        strip_header_block_fields(&header, &[1], &mut out).expect("strip bbox");
+        strip_header_block_fields(&header, &[HeaderBlockField::Bbox], &mut out)
+            .expect("strip bbox");
         assert_eq!(
             out, expect,
             "stripping field 1 must drop only the bbox and preserve source, \

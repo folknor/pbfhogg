@@ -27,23 +27,17 @@ pub struct CheckOptions {
 //
 // Both check modes populate an `IdSet` that cannot grow once the parallel
 // phase starts, so its size has to be chosen up front. These are *floors*, not
-// ceilings: callers take `max(indexdata_max_id, floor)` so the allocation
-// tracks the file, and treat an ID beyond that as a reportable input property
-// rather than a panic. A bare hard-coded ceiling was wrong on its own terms -
-// live OSM way IDs are already ~1.4e9 against the old 1.5e9 cap, so the
-// passage of time alone would have turned `check` into a crash.
-//
-// The floors keep small files from allocating a tiny bitset that a
-// slightly-stale index would immediately overshoot; they are approximately the
-// live OSM ID space rounded up.
+// ceilings: callers take `max(indexdata_max_id, floor)` so allocation tracks
+// the file while retaining a minimum range for small files. A file-derived
+// ceiling below caps indexdata-driven allocation above those per-kind floors.
 
-/// Node ID-space floor (~14e9; live OSM is ~13e9).
+/// Minimum node ID-space allocation used by check commands.
 pub(super) const NODE_ID_FLOOR: i64 = 14_000_000_000;
 
-/// Way ID-space floor (~2e9; live OSM is ~1.4e9).
+/// Minimum way ID-space allocation used by check commands.
 pub(super) const WAY_ID_FLOOR: i64 = 2_000_000_000;
 
-/// Relation ID-space floor (~25e6; live OSM is ~18e6).
+/// Minimum relation ID-space allocation used by check commands.
 pub(super) const RELATION_ID_FLOOR: i64 = 25_000_000;
 
 /// Choose the `IdSet::pre_allocate` argument for one element kind.
@@ -60,7 +54,7 @@ pub(super) const RELATION_ID_FLOOR: i64 = 25_000_000;
 /// The bound is derived from the input file rather than reinstated as a
 /// constant, so it still tracks the file the way the original fix intended:
 /// **the ID bitset may never exceed the size of the input file**, floored at
-/// the live-OSM ID space above. `IdSet` costs one bit per ID, so `file_len`
+/// the per-kind minimum above. `IdSet` costs one bit per ID, so `file_len`
 /// bytes of input buy `file_len * 8` IDs of range. That is generous by orders
 /// of magnitude against any real PBF (a PBF spends several bytes per element
 /// even packed and compressed, and IDs are dense), so no honest file is ever

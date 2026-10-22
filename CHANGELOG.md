@@ -9,7 +9,9 @@
   default. The library no longer calls `mallopt`, raises `RLIMIT_NOFILE` or
   reads `BROKKR_MARKER_FIFO` unless the caller asks: `ProcessActions` hooks
   fire at the same program points the CLI used to mutate the process, and
-  sidecar markers are inert until `debug::enable_marker_fifo_from_env`.
+  sidecar markers are inert until the caller opens a FIFO with
+  `debug::initialize_marker_fifo(path)`; the library never reads
+  `BROKKR_MARKER_FIFO` itself.
   `debug::cap_malloc_arenas`, `debug::set_mmap_threshold` and
   `debug::malloc_trim` moved to `process::`. Thread counts and the altw
   `auto` memory budget come from `host::Resources` (`MachineProbe` or
@@ -442,6 +444,14 @@
   always-zero sub-counts and reads
   `Blobs: N passthrough (M index-hit), R rewritten (of T total)`.
 
+- **`CompactDiffOverlay`'s deleted-ID sets are private.** Read them through
+  `deleted_ids(OscElementKind)` and `is_deleted(..)`; inserting into them
+  directly could leave the overlay's index and the sets disagreeing.
+
+- **`diff::derive::derive_changes` takes `timestamp: Option<u64>`** in place
+  of `update_timestamp: bool`. Pass the epoch seconds to stamp deletes with,
+  or `None` to leave them unstamped.
+
 ### Added
 
 - **`pbfhogg digest`: an encoding-independent digest of a PBF's element
@@ -564,6 +574,26 @@
   makes the decision before the header is read.
 
 ### Fixed
+
+- **`derive-changes --update-timestamp` stamps every delete in a run with the
+  same timestamp**, taken once at start. It used to read the clock per
+  delete, so one run's output straddled seconds and differed between `-j 1`
+  and `-j N`.
+
+- **`inspect FILE tags OTHER` is refused** instead of silently inspecting
+  `OTHER`, and `extract` with no `--bbox`, `--polygon` or `--config` is now a
+  usage error at argument parsing.
+
+- **`check --json` reports the real file name** (converted lossily if it is
+  not UTF-8) instead of the placeholder `input.osm.pbf`.
+
+- **`export`'s invalid-way count no longer includes ways outside the bbox**;
+  the bbox filter now runs before way geometry is built, which also skips
+  that work for rejected ways.
+
+- **A delete followed by a stale re-create of the same object in an OSC no
+  longer drops the delete.** The re-create was refused by the version gate,
+  but the delete had already been cleared, so the object survived.
 
 - **`check --max-errors` now bounds the reference check, and `0` means
   unlimited in every check.** The reference check collected every missing

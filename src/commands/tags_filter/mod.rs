@@ -1321,10 +1321,11 @@ fn collect_way_node_dependencies(
     // worker's bitmap grew to ~1.5 GB and the cumulative across ~30
     // decode threads peaked at 24 GB anon - the documented
     // parallel_classify_accumulate caution at scan/classify.rs:300-308.
-    // parallel_classify_phase emits per-blob `Vec<i64>` (bounded by
-    // blob size: ~8000 ways × ~10 refs × 8 bytes = ~640 KB max) through
-    // a 32-slot bounded result channel, so in-flight memory is
-    // ~32 × 640 KB = ~20 MB regardless of corpus size.
+    // parallel_classify_phase emits per-blob `Vec<i64>` through a
+    // 32-slot bounded result channel. At DEFAULT_ELEMENT_CAP
+    // (crate::block_builder) ways per blob, with about 10 refs per way,
+    // the queued reference vectors occupy about 20 MB. Larger input
+    // blocks or more refs per way increase this estimate.
     crate::scan::classify::parallel_classify_phase(
         &shared_file,
         &schedule,

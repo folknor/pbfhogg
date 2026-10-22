@@ -7,6 +7,8 @@
 //! layouts below (magic bytes, header, and the per-file records) are the
 //! format.
 
+use crate::coord_fmt::e7_to_deg;
+
 /// Magic bytes for the index header: `GIDX`.
 pub const HEADER_MAGIC: [u8; 4] = *b"GIDX";
 
@@ -461,7 +463,7 @@ pub fn parse_rings(coords: impl Iterator<Item = NodeCoord>) -> Vec<Vec<(f64, f64
                 current.clear();
             }
         } else {
-            current.push((nc.lon_e7 as f64 * 1e-7, nc.lat_e7 as f64 * 1e-7));
+            current.push((e7_to_deg(nc.lon_e7 as f64), e7_to_deg(nc.lat_e7 as f64)));
         }
     }
     if current.len() >= 3 {

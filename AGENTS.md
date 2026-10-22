@@ -140,11 +140,11 @@ Commands requiring indexdata: `apply-changes`, `sort`, `add-locations-to-ways`, 
 
 | Type | Memory | Temp disk | Best for |
 |------|--------|-----------|----------|
-| `sparse` (default) | ~540 MB + IdSet/rank index | `referenced_count * 8` bytes (japan 2 GB, europe ~29 GB) | rank-indexed flat mmap; small to europe scale |
-| `external` | ~8.7 GB | ~256 GB (planet) | rank-bucketed counting sort, parallel stages; the only mode that survives at planet on 30 GB-class hosts |
-| `auto` | (one of the above) | (one of the above) | scale-aware: sparse unless sorted+indexed AND estimated node store (nodes x 8 B from indexdata) exceeds 80 % of available RAM; falls back to external when the estimate is unavailable (reference/pipeline.md) |
+| `sparse` (default) | Depends on the referenced-node working set | `referenced_count * 8` bytes of scratch storage | rank-indexed flat mmap; see [reference/performance.md](reference/performance.md) for measurements |
+| `external` | Bounded-memory join | High scratch-disk demand; see [reference/performance.md](reference/performance.md) for measurements | ID- and slot-position-bucketed join; requires sorted input with indexdata |
+| `auto` | (one of the above) | (one of the above) | Runtime routing; see [reference/pipeline.md](reference/pipeline.md) |
 
-`dense` was removed - sparse rank-indexed flat is faster than the prior dense path at every measured scale and works in regimes dense didn't (europe survives at ~6 minutes on a 27 GB-RAM host). See `notes/altw.md` "Don't re-attempt" and "Status".
+`dense` was removed. See [reference/performance.md](reference/performance.md) for measured comparisons with the rank-indexed sparse path.
 
 ## Benchmarking Rules
 - **Ignore performance differences below 2-3 %.** They are noise for every decision here: not a regression to fix, not a win to claim, not a reason to run more cells. Do not chase them with extra benchmark runs or code-layout tweaks (`#[inline]` attributes and the like).
@@ -174,7 +174,7 @@ CLI-driven integration tests live in `tests/cli_*.rs` and drive the compiled `pb
 - `PbfWriter`: blob framing, compression (zlib/zstd/none), raw passthrough. `to_path` (parallel compression), `to_path_direct` (O_DIRECT), `to_path_uring` (io_uring), `new(writer)` (sync).
 - `uring_writer.rs`: io_uring with 64×256KB registered buffers.
 
-**Geocode index:** `geocode_index/` - `format.rs` (19-file on-disk format), `reader.rs` (mmap, S2 cell lookup), `builder.rs` (4-pass pipeline).
+**Geocode index:** `geocode_index/` - `format.rs` (on-disk format), `reader.rs` (mmap, S2 cell lookup), `builder.rs` (4-pass pipeline).
 
 **Geometry:** `geo.rs` - point-in-polygon, ring assembly, Douglas-Peucker, antimeridian, cos-projection distance.
 
@@ -196,29 +196,32 @@ Zlib backend: `zlib-rs` (pure Rust, no C). No feature flags for backend selectio
 
 ## Document folders
 
-The standing layout, across every project. Three live folders plus one retired,
-split by durability first, subject second.
+The standing layout, across every project, split by durability first, subject
+second.
 
 | Folder | Contents | Rule |
 |---|---|---|
 | `reference/` | Durable in-repo reference for anyone working on or with the code - how the thing is built and why: `architecture.md`, `technical-implementation-spec.md`, `performance.md` (the durable record of measured numbers over time), invariants, protocol contracts | Citable from source as a source of truth. What it says must be true. |
+| `decisions/` | Durable architecture decision records (ADRs) | Binding records of chosen design, cited from source and durable docs. |
 | `docs/` | Durable in-repo documentation of how the thing is used - guides, CLI reference, the consumer-facing API surface. Sometimes exposed as a hand-edited VitePress gh-pages site | Same must-be-true rule. |
 | `notes/` | Transient - work items (`todo.md`), future plans, hypotheticals, bug reports, research, analysis. Things that will die | No truth guarantee. Nothing durable cites it. |
 | `plans/` | Retired | Plan documents are transient: they go in `notes/`. |
 
-`reference/` and `docs/` are both durable and both binding. The difference is
-subject, not audience: `reference/` covers how the thing is built and why - what
-you need in order to change it safely - while `docs/` covers how it is used. A
-developer or library consumer reads both. Where a project publishes a site,
-`docs/` is what gets published; the folder means the same thing either way.
+`reference/`, `decisions/` and `docs/` are durable and binding. The difference
+is subject, not audience: `reference/` covers how the thing is built and why -
+what you need in order to change it safely; `decisions/` records why major
+choices were made; `docs/` covers how it is used. A developer or library
+consumer reads all three. Where a project publishes a site, `docs/` is what
+gets published; the folder means the same thing either way.
 `notes/` is neither durable nor binding, which is the whole point of keeping it
 separate: a document that may be wrong must not sit where a document that must
 be right is expected.
 
-The dependency direction is therefore one-way. `notes/` may cite `docs/` and
-`reference/`; nothing durable may cite `notes/` - not a code comment, not
-`docs/`, not `reference/`. A code comment must carry its full context, because
-it outlives the note.
+The dependency direction is therefore one-way. `notes/` may cite `decisions/`,
+`docs/` and `reference/`; nothing durable may cite `notes/` - not a code
+comment, not `docs/`, not `reference/`. Source and durable docs may cite
+`decisions/`. A code comment must carry its full context, because it outlives
+the note.
 
 **Root-level convention files are exempt.** `AGENTS.md`, `CLAUDE.md`,
 `README.md`, `LICENSE`, `CHANGELOG.md` and their kin are found by tooling and by

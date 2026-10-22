@@ -365,8 +365,9 @@ pub struct BlobReader<R: Read + Send> {
     /// Only needed for tag-filtered reads and merge/sort passthrough.
     parse_tagdata: bool,
     /// When `true`, `WireBlobHeader::parse` copies indexdata (field 2).
-    /// Default `true` for compatibility. Disabled in hot paths that never
-    /// call `Blob::index()` (par_map_reduce, unfiltered pipeline).
+    /// Default `true` so standalone readers expose `Blob::index()`. Disabled
+    /// in hot paths that never call `Blob::index()` (par_map_reduce,
+    /// unfiltered pipeline).
     parse_indexdata: bool,
     /// When `true`, `WireBlobHeader::parse` allocates field-5 waymembers.
     parse_waymembers: bool,
@@ -1177,7 +1178,7 @@ impl BlobReader<BufReader<File>> {
         // Although seekable_from_path supports seeking, this path is mostly used
         // for sequential iteration with occasional seek-back, where the large
         // buffer is still beneficial.
-        let buf_reader = BufReader::with_capacity(256 * 1024, f);
+        let buf_reader = BufReader::with_capacity(crate::write::IO_BUF_BYTES, f);
         let mut reader = Self::new_seekable(buf_reader)?;
         // `new_seekable` is generic and cannot know the path; this entry
         // point does, so it fills the input identity back in.

@@ -265,9 +265,9 @@ pub fn merge(
         diff.node_count(),
         diff.way_count(),
         diff.relation_count(),
-        diff.deleted_nodes.len(),
-        diff.deleted_ways.len(),
-        diff.deleted_relations.len(),
+        diff.deleted_ids(crate::osc::OscElementKind::Node).len(),
+        diff.deleted_ids(crate::osc::OscElementKind::Way).len(),
+        diff.deleted_ids(crate::osc::OscElementKind::Relation).len(),
     );
     let diff_heap_bytes = diff.heap_size_estimate() as u64;
     let osc_parse_ms = osc_start

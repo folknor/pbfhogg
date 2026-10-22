@@ -7,7 +7,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pbfhogg = "0.4"
+pbfhogg = "0.5"
 ```
 
 ## Example: Count ways

@@ -305,6 +305,9 @@ where
         order.admit(item.span)?;
         if let Some((bytes, index)) = item.block {
             let t = Instant::now();
+            // Deliberately write no tagdata: terminal renumber output is not
+            // tag-filtered. Carrying headers or rebuilding keys would add per-blob
+            // or per-tag work and change the historical output bytes.
             writer.write_primitive_block_owned(bytes, index, None, None)?;
             add_ns(&counters.consumer_write_ns, t);
         }

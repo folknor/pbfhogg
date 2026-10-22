@@ -5,6 +5,7 @@
 
 use std::f64::consts::PI;
 
+use crate::coord_fmt::e7_to_deg;
 /// Mean Earth radius in meters (WGS84 volumetric mean).
 pub const EARTH_RADIUS_M: f64 = 6_371_008.8;
 
@@ -168,7 +169,7 @@ pub fn meters_to_radians_sq(meters: f64) -> f64 {
 /// Convert decimicrodegrees (i32, 10⁻⁷ degrees) to radians.
 #[inline]
 pub fn e7_to_rad(e7: i32) -> f64 {
-    e7 as f64 * 1e-7 * PI / 180.0
+    e7_to_deg(e7 as f64) * PI / 180.0
 }
 
 /// Closest point on a line segment to a query point (cos projection).

@@ -15,6 +15,8 @@
 //!
 //! Internally we walk the wire format with a tiny varint reader. We never
 //! import pbfhogg internals - these helpers stay viable across rewrites.
+//! This is the shared independent framing oracle, so writer and reader bugs
+//! cannot agree accidentally through the production wire decoder.
 //!
 //! ## PBF layout (reference)
 //!
@@ -353,11 +355,27 @@ fn splice_frame(pbf: &[u8], target: BlobLocation, new_header: &[u8], new_blob: &
     out
 }
 
+/// Validate the entire header and detect the tagdata bytes field.
+pub fn header_has_tagdata(header: &[u8]) -> Option<bool> {
+    let mut pos = 0;
+    let mut found = false;
+    while pos < header.len() {
+        let (tag, n) = read_varint(&header[pos..])?;
+        pos += n;
+        if tag >> 3 == 0 {
+            return None;
+        }
+        found |= tag >> 3 == 4 && tag & 7 == 2;
+        skip_field(header, &mut pos, tag & 7)?;
+    }
+    Some(found)
+}
+
 fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
     let mut value = 0u64;
     let mut shift = 0u32;
     for (i, &b) in buf.iter().enumerate() {
-        if i >= 10 {
+        if i >= 10 || (i == 9 && b > 1) {
             return None;
         }
         value |= u64::from(b & 0x7F) << shift;
@@ -551,8 +569,9 @@ fn build_blob_header(
 }
 
 // Minimal sanity test for the helpers themselves. Larger smoke coverage
-// lives in `tests/fixture_helpers.rs`.
-#[cfg(test)]
+// lives in `tests/fixture_helpers.rs`. Excluded from the static-hook fault
+// binaries, each of which must define exactly one test.
+#[cfg(all(test, not(feature = "static-test-hooks")))]
 mod tests {
     use super::*;
 

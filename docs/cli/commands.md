@@ -501,10 +501,10 @@ pbfhogg getparents [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 
 Embed node coordinates in ways. Two index strategies:
 
-- **sparse** (default) - Rank-indexed flat mmap array. Pre-allocates `referenced.total_count() * 8` bytes; workers store `(lat, lon)` at byte offset `IdSet::rank_if_set(node_id) << 3` via atomic stores. Fast at small / medium scale; survives Europe at ~6 minutes on a 27 GB-RAM host. Likely thrashes at planet (working set exceeds free page cache) - use `external` for planet.
-- **external** - Double radix permutation via 4-stage pipeline. Bounded memory (~8.7 GB measured peak anon at planet). The only mode that survives at planet on memory-constrained hosts. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. Uses ~112 GB temp disk at Europe, ~256 GB at planet.
+- **sparse** (default) - Rank-indexed flat mmap array. Pre-allocates `referenced.total_count() * 8` bytes; workers store `(lat, lon)` at byte offset `IdSet::rank_if_set(node_id) << 3` via atomic stores. Working-set behavior depends on the available page cache; see `reference/performance.md` for measurements.
+- **external** - Double radix permutation via 4-stage pipeline. Bounded memory with high scratch-disk demand. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. See `reference/performance.md` for measured resource use.
 
-`--index-type dense` was removed - sparse rank-indexed flat dominated dense at every measured scale (japan dense 51.6 s vs sparse 11.9 s). `dense` survives as a hidden value (absent from `--help` and from completion) purely so passing it errors with a pointer to `sparse` rather than a bare "invalid value".
+`--index-type dense` was removed; see `reference/performance.md` for measured comparisons. `dense` survives as a hidden value (absent from `--help` and from completion) purely so passing it errors with a pointer to `sparse` rather than a bare "invalid value".
 
 By default, untagged nodes not referenced by a relation are dropped from output.
 
@@ -515,7 +515,7 @@ pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
-| `--index-type <TYPE>` | Node index type: `sparse` (default), `external`, or `auto` (scale-aware: sparse unless the input is sorted+indexed and the estimated node store exceeds ~80 % of available RAM) |
+| `--index-type <TYPE>` | Node index type: `sparse` (default), `external`, or `auto` (runtime routing; see `reference/pipeline.md`) |
 | `--keep-untagged-nodes` | Keep all untagged nodes in output |
 | `--inject-prepass` | Emit the opt-in `pbfhogg.WayMembers-v1` and `pbfhogg.SharedNodePins-v1` metadata for downstream reuse |
 | `--ignore-missing-nodes` | Accept ways whose node references are absent from the input, writing those vertices as `(0, 0)`. Without it the run fails and no output is written: `(0, 0)` is Null Island, a real coordinate, so a placeholder vertex cannot be told apart from genuine data by any reader. Matches osmium in name and in default. |
@@ -612,7 +612,7 @@ level, and beyond 19 a single long segment exceeds the builder's sampling
 budget. Readers still accept indexes written at levels up to 30.
 
 `--force` invalidates the existing index rather than swapping it: a geocode
-index is a directory of 19 files with no atomic replace, so the header is
+index is a directory of files with no atomic replace, so the header is
 removed first and a build that dies partway leaves a directory that fails to
 open instead of one that answers from two vintages. Invalidation happens only
 after every read-only check on the input has passed, so a bad input path leaves
@@ -622,4 +622,4 @@ A build that finds nothing queryable at all fails rather than publishing an
 empty index. Indexes holding only some record kinds, such as an
 admin-boundaries extract, still build.
 
-Outputs 19 binary files. Denmark (465 MB PBF): ~7s, 172 MB index. Europe (32.4 GB): 524s (8.7 min), 7.5 GB RSS. Planet (87 GB): 1,255s (20.9 min), 29.5 GB peak RSS (pass-1.5 transient).
+Outputs a set of binary files. See `reference/performance.md` for measured build times, index size, and peak memory.

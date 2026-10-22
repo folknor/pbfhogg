@@ -1,5 +1,6 @@
 //! Interpolation endpoint resolution (mmap-based).
 
+use crate::coord_fmt::e7_to_deg;
 use rayon::prelude::*;
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
@@ -78,8 +79,10 @@ fn build_cell_addr_csr(
                     .try_into()
                     .expect("par_chunks_exact always yields full AddrPoint records");
                 let point = AddrPoint::from_bytes(record);
-                let lat_lng =
-                    LatLng::from_degrees(point.lat_e7 as f64 * 1e-7, point.lon_e7 as f64 * 1e-7);
+                let lat_lng = LatLng::from_degrees(
+                    e7_to_deg(point.lat_e7 as f64),
+                    e7_to_deg(point.lon_e7 as f64),
+                );
                 let cell_id = CellID::from(lat_lng).parent(street_level as u64).0;
                 (cell_id, index as u32)
             })
@@ -242,7 +245,7 @@ fn find_endpoint_house_number_mmap(
     street_level: u8,
 ) -> Option<u32> {
     let (lat_e7, lon_e7) = endpoint;
-    let ll = LatLng::from_degrees(lat_e7 as f64 * 1e-7, lon_e7 as f64 * 1e-7);
+    let ll = LatLng::from_degrees(e7_to_deg(lat_e7 as f64), e7_to_deg(lon_e7 as f64));
     let center = CellID::from(ll).parent(street_level as u64);
 
     let mut best_idx: Option<u32> = None;
@@ -299,7 +302,7 @@ mod tests {
     }
 
     fn cell_id(lat_e7: i32, lon_e7: i32, street_level: u8) -> u64 {
-        let lat_lng = LatLng::from_degrees(lat_e7 as f64 * 1e-7, lon_e7 as f64 * 1e-7);
+        let lat_lng = LatLng::from_degrees(e7_to_deg(lat_e7 as f64), e7_to_deg(lon_e7 as f64));
         CellID::from(lat_lng).parent(street_level as u64).0
     }
 

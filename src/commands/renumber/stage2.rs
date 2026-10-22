@@ -56,6 +56,8 @@ pub(super) fn stage2d_parallel_way_assembly(
         |w: &mut Stage2dWorker<'_>, idx| {
             let task = &way_schedule[idx];
             let base = bases[idx];
+            // Deliberately load only payload bytes and emit no tagdata. Carrying
+            // header key lists would change output and add per-blob rewrite work.
             w.buffers.load(shared_file, task, &counters)?;
 
             let t = std::time::Instant::now();

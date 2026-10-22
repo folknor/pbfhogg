@@ -28,6 +28,30 @@ pub(crate) const PRESENT: u64 = 1 << 31;
 /// Longitude bound in decimicrodegrees: 180 degrees.
 pub(crate) const LON_LIMIT: i64 = 1_800_000_000;
 
+/// Whether an integer coordinate is in the geographic domain.
+pub(crate) fn in_domain(lat: i32, lon: i32) -> bool {
+    (-LAT_BIAS..=LAT_BIAS).contains(&i64::from(lat))
+        && (-LON_LIMIT..=LON_LIMIT).contains(&i64::from(lon))
+}
+
+/// Validate a named latitude in degrees, retaining the caller's field name.
+pub(crate) fn validate_lat(name: &str, value: f64) -> crate::BoxResult<()> {
+    validate_degrees(name, value, LAT_BIAS)
+}
+
+/// Validate a named longitude in degrees, retaining the caller's field name.
+pub(crate) fn validate_lon(name: &str, value: f64) -> crate::BoxResult<()> {
+    validate_degrees(name, value, LON_LIMIT)
+}
+
+fn validate_degrees(name: &str, value: f64, limit_e7: i64) -> crate::BoxResult<()> {
+    let limit = crate::coord_fmt::e7_to_deg(limit_e7 as f64);
+    if !value.is_finite() || !(-limit..=limit).contains(&value) {
+        return Err(format!("{name} ({value}) must be within -{limit} and {limit} degrees").into());
+    }
+    Ok(())
+}
+
 /// Pack a geographic coordinate into one slot word, with the presence bit
 /// set. Returns `None` when the coordinate is outside the geographic domain
 /// and therefore not representable - the caller must refuse rather than
@@ -37,11 +61,11 @@ pub(crate) const LON_LIMIT: i64 = 1_800_000_000;
 /// every `(i32, i32)` pair is representable in 64 bits, but only latitudes
 /// within +/-90 and longitudes within +/-180 are coordinates.
 pub(crate) fn pack(lat: i32, lon: i32) -> Option<u64> {
-    let lat = i64::from(lat);
-    let lon = i64::from(lon);
-    if !(-LAT_BIAS..=LAT_BIAS).contains(&lat) || !(-LON_LIMIT..=LON_LIMIT).contains(&lon) {
+    if !in_domain(lat, lon) {
         return None;
     }
+    let lat = i64::from(lat);
+    let lon = i64::from(lon);
     #[allow(clippy::cast_sign_loss)]
     let biased_lat = (lat + LAT_BIAS) as u64;
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]

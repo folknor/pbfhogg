@@ -144,36 +144,6 @@ rejecting `const` items declared inside `fn` bodies under `src/commands/`.
 
 Reported by: all nine scopes.
 
-## HYG-003 - The 256 KiB I/O buffer size has about ten owners
-
-`FileWriter::buffered` (`BufWriter::with_capacity(256 * 1024, ..)`),
-`direct_writer::BUF_CAPACITY`, `uring_writer::BUF_SIZE`,
-`copy_range::copy_range_fallback` and
-`parallel_writer::copy_range_fallback_pwrite` (`vec![0u8; 256 * 1024]`), the
-`PbfWriter::new` doc that tells callers to use `256 * 1024`,
-`read/file_reader.rs`, `read/direct_reader.rs::BUF_CAPACITY` (whose doc says it
-"Matches the 256 KB BufReader capacity used elsewhere"), `read/blob.rs`,
-`altw/external/radix.rs::BUCKET_BUF_SIZE` plus a private shadowing
-`BUCKET_BUF_SIZE` and `FLUSH_THRESHOLD` in `stage2.rs`, and stage 1's
-`64 * 1024` / `256 * 1024` sidecar literals. The "matches" claims are comments.
-Not yet diverged. Fix: one `IO_BUF_BYTES` beside `PAGE_SIZE`, a const assert
-that it is a multiple of `PAGE_SIZE`, and a source-scan test (the `metrics.rs`
-pattern) rejecting the literal under `src/write/` and `src/read/`.
-
-Reported by: write path, read path, altw and scanning.
-
-## HYG-004 - Doc comments restate the default block cap as a literal 8000
-
-`block_builder::DEFAULT_ELEMENT_CAP` now owns the default, read by the builder,
-degrade and both CLI defaults. Doc comments that use the default cap as a
-memory bound still spell it as "8000" (`write/string_table.rs`,
-`scan/classify.rs`, `check/refs.rs`, `check/verify_ids.rs`,
-`tags_filter/mod.rs`); they should name the constant or describe the bound.
-The "typical block size" mentions in `read/decompress.rs` and `read/block.rs`
-describe observed input shape and can stay.
-
-Reported by: write path, re-encoding, CLI and plumbing.
-
 ## HYG-005 - Header feature-name strings are spelled as literals beside their constants
 
 `HeaderBlock::LOCATIONS_ON_WAYS` exists in `read/block.rs`, yet
@@ -187,18 +157,6 @@ literals to filter them out. A typo produces a header advertising nothing.
 Fix: `HeaderBuilder::optional_feature` takes a `Feature` enum or a newtype with
 associated consts; add `OSM_SCHEMA_V06` and `DENSE_NODES`; text rule on the
 quoted literals outside `read/block.rs`.
-
-Reported by: write path.
-
-## HYG-006 - Protobuf field numbers are bare integers, spelled once per direction
-
-`encode_blob_body` (Blob fields 1, 2, 3, 7), `encode_blob_header_fields`
-(BlobHeader 1-5), `HeaderBuilder::build` (HeaderBlock 1, 4, 5, 16, 17, 32-34,
-HeaderBBox 1-4) and the string table spell the schema on the write side;
-`read/blob_wire.rs` has its own spelling. The degrade strippers
-(`strip_blob_header_fields`) take field numbers from callers as `&[u32]`. Fix:
-a shared `wire_schema` module of named consts; `strip_*` taking a typed field
-enum. The round-trip proptest partly holds this today.
 
 Reported by: write path.
 
@@ -233,39 +191,6 @@ better than three hand-written copies. Fix: one public `ElementKind` with
 `_ => false` arms.
 
 Reported by: change application, filtering and spatial, CLI and plumbing.
-
-## HYG-008 - Decimicrodegree conversion has two arithmetic conventions and about thirty inline sites
-
-`commands/spatial.rs` defines a private `const E7: f64 = 1e-7` with a long
-explanation that every boundary conversion must match the forward expression
-exactly, because `/ 1e7` and `* 1e-7` are not the same value in binary
-floating point. `extract/mod.rs` (`contains_decimicro`, twice), `export/mod.rs`
-(Node and DenseNode arms), `geo.rs::e7_to_rad` and the geocode builder (a dozen
-sites) spell `as f64 * 1e-7` inline. `coord_fmt::from_decimicro`, the module
-whose job is to own this, divides by `1e7`; diff text output and the OSC writer
-go through it, export goes through `* 1e-7`. At `{:.7}` the two usually print
-the same digits, so this is latent. `BboxInt::inside_bbox`'s exactness holds
-only while every caller's conversion is bit-identical to `to_degrees`. Fix: one
-`e7_to_deg` / `deg_to_e7` pair matching `spatial.rs`'s convention; a newtype
-`E7(i32)` with `degrees()` makes the bad spelling unrepresentable; a text rule
-in `brokkr check` rejecting `1e-7` / `1e7` outside the owner.
-
-Reported by: filtering and spatial, CLI and plumbing.
-
-## HYG-009 - Coordinate domain validation is written four times
-
-`coord_pack::pack` owns the +/-90 / +/-180 refusal (`LAT_BIAS`, `LON_LIMIT`).
-`altw/external/stage2.rs` restates it with literals
-(`-900_000_000..=900_000_000`) and its own error text; its comment says the
-backends "must agree on refusal", and nothing keeps them in step.
-`extract::parse_bbox`, `extract::parse_ring` and
-`xml_parse::coord_to_decimicro` are three more, with messages that have
-diverged ("min_lat (x) must be within..." vs "polygon latitude (x) must be
-within..."); only the bbox variant names the field. Fix: export
-`coord_pack::in_domain` and `validate_lat(name, v)` / `validate_lon`; a shared
-test feeding an out-of-domain node to both altw backends.
-
-Reported by: altw and scanning, filtering and spatial.
 
 ## HYG-010 - The read engine's ordered pipeline exists twice and has drifted
 
@@ -645,40 +570,6 @@ that fails when a `.rs` file under `src/write/` is missing from the funnel's
 
 Reported by: altw and scanning, write path.
 
-## HYG-025 - The output sortedness watermark is implemented twice
-
-`drain::check_output_order` and `merge_join::BlobOrderGuard::observe` are the
-same transitive-watermark rule; `BlobOrderGuard` says "Same shape as the
-drain's output guard". They differ in what they keep (the drain stores the
-real ID beside the key, the guard recovers it with `osm_id_from_key`) and in
-error wording, and the drain comment says `sort` and `cat --dedupe` "already use" the
-same rule. Fix: one `OrderWatermark` type in `osm_id.rs`.
-
-Reported by: change application.
-
-## HYG-026 - OSC document framing and gzip output policy are repeated per writer
-
-The `<osmChange version="0.6">` prelude and postlude are written at six sites
-(`merge_changes` single-input path, `build_prelude_bytes`,
-`build_postlude_bytes`, `tags_filter/osc.rs`, `diff/derive.rs`, the
-`osc/write.rs` tests); the parse side has `xml_parse::ROOT`, the write side has
-no owner, and `"0.6"` and the XML declaration are repeated. `emit_change`'s
-section open/close logic is something every OSC writer needs.
-`flate2::Compression::fast()` appears in `merge_changes` (twice),
-`tags_filter/osc.rs` and `write/parallel_gzip.rs` (wrapped in a private
-`compression_level()` with a doc explaining why, the only owner);
-`Writer::new_with_indent(_, b' ', 2)` is repeated; `.gz` detection via
-`to_str().is_some_and(|s| s.ends_with(".gz"))` appears three times in
-`merge_changes`, so a non-UTF-8 path silently writes plain XML into a `.gz`
-name. Merge-changes builds its own multi-member gzip (per-worker `GzEncoder`
-buffers concatenated) beside `write/parallel_gzip.rs`, whose doc says its only
-in-crate consumer is `diff --format osc`. Fix: an `OscDocumentWriter` and
-`OscOutput::create(path)` in `osc/write.rs`; text rule on
-`BytesStart::new("osmChange")` and `disallowed-methods` on
-`flate2::Compression::fast` outside it.
-
-Reported by: change application.
-
 ## HYG-027 - OSC and apply-changes element writers are duplicated
 
 `osc/write.rs` has owned writers (`write_node_xml`, `write_way_xml`,
@@ -809,29 +700,6 @@ forced-error test asserting the destination does not exist.
 
 Reported by: write path, change application, filtering and spatial, CLI and
 plumbing, altw and scanning.
-
-## HYG-031 - The two OSC sinks validate metadata and roles differently
-
-`parse_owned_metadata` (merge-changes, tags-filter OSC) parses only `version`
-and keeps `timestamp`, `changeset`, `uid`, `visible` as raw strings.
-`arena_meta` (apply-changes) parses `timestamp` as RFC 3339, `changeset` as
-i64, `uid` as i32, and treats `visible` as "exactly `false`". So `uid="abc"` or
-`timestamp="yesterday"` is a hard error in apply-changes and passes through
-merge-changes, which re-emits it; `visible="False"` is visible to apply-changes
-and re-emitted verbatim. The `scan_meta_attrs` doc claims "ONE leniency
-decision, shared by every sink", which covers presence, not validity. Roles:
-`CompactSink::member` uses `parse_str_attr(e, "role").unwrap_or_default()`,
-turning every error into `""`; `OwnedSink::member` and tags-filter OSC use
-`parse_str_attr_optional(...).unwrap_or_default()`, and
-`parse_str_attr_optional` itself `.flatten()`s attribute errors and `.ok()`s
-normalisation errors, so neither tells an absent role from an unreadable one.
-`OwnedSink::member`'s `MemberType::Unknown` arm can never run (`parse_member_type`
-errors on unknown strings) and its message differs from the live one. Fix: one
-typed `OscMeta` parsed once (`osc/write.rs::push_info_attrs` already takes those
-typed options), `parse_str_attr_opt -> ParseResult<Option<String>>`, delete
-`parse_str_attr_optional`, an OSC-specific three-variant member type.
-
-Reported by: change application.
 
 ## HYG-032 - Record layouts are serialised by hand at both ends
 
@@ -1283,24 +1151,6 @@ cumulative.
 
 Reported by: read path, write path, CLI and plumbing, altw and scanning.
 
-## HYG-052 - The brokkr marker channel is a contract nothing pins, read from ambient state
-
-`debug.rs` spells `BROKKR_MARKER_FIFO` once, but the name and line format
-(`<us> <name>\n`, `<us> @<name>=<value>\n`) are a contract with brokkr;
-`line_formats_marker_exactly` covers markers only, not the counter shape. The
-variable is read lazily on first marker, from whichever thread emits first, and
-cached in a process-global `OnceLock`: tests cannot inject a sink, a test cannot
-point two runs at different FIFOs, and anything emitting before setup caches
-`None` forever. The open is `O_NONBLOCK` and `.ok()?`, so a set variable with a
-typo or no reader silently disables all instrumentation with no diagnostic.
-`pub mod debug` makes the FIFO protocol, `/proc` readers and allocator pokes
-public API; decision 0012 keeps CLI bridges `doc(hidden)`, and `debug` is not
-even hidden. Fix: a golden test for both line shapes, mirrored by a brokkr
-parse test; a marker sink handed in by `main`; a one-line warning when the
-variable is set and the open fails; hide or narrow the module.
-
-Reported by: CLI and plumbing, test harness.
-
 ## HYG-053 - Reorder buffers are bounded only statistically
 
 The channel bounds queued messages, but consumers drain the channel into the
@@ -1463,7 +1313,8 @@ resets both sides, stage 3's `PANIC_AT_BUCKET_IDX` doc says reset "at the start
 AND end of any test". The statics now sit behind their own
 `static-test-hooks` feature, which keeps them out of the shared `all` and
 lib unit-test harnesses by construction (reference/testing.md, "Test
-binaries"), but nothing enforces "one test per target" (BUG-059). The
+binaries"), and `scripts/check_static_hook_targets.py` enforces one test
+per target. The
 `read/pipeline.rs` test now arms through a guard
 that releases, joins and resets on every exit path; the other hooks still rely
 on manual reset at start and end. Apply-changes is the one seam with an injection
@@ -1557,46 +1408,6 @@ satisfy `Error`. Fix: `run_*` returns `Result<Outcome, Error>` with
 
 Reported by: CLI and plumbing.
 
-## HYG-068 - Nothing verifies the workspace MSRV
-
-`rust-version` is now inherited from `[workspace.package]` by both crates,
-but no sweep checks that the workspace builds on it. Add `cargo msrv verify`
-(or a pinned-toolchain build) to a `brokkr.toml` sweep.
-
-Reported by: CLI and plumbing.
-
-## HYG-069 - Durable docs and comments hard-code figures that have drifted
-
-- Altw temp disk at planet: `IndexType::External`'s doc and the CLI help say
-  about 224 GB; `external_join`'s doc, AGENTS.md, `reference/pipeline.md`,
-  `reference/cli-reference.md`, `docs/guide/*` and `docs/cli/commands.md` say
-  about 256 GB.
-- Altw memory: the `external/mod.rs` doc says "<1 GB at every stage, no mmap";
-  everywhere else says about 8.7 GB peak anon.
-- Auto threshold: CLI help, AGENTS.md, `docs/guide/*` and both osmium-parity
-  docs say "~80% of available RAM"; the code is 80 % of `MemAvailable - 3 GiB`;
-  only `reference/pipeline.md` is right.
-- Auto status: CLI help calls `auto` "(recommended)" and
-  `docs/guide/performance.md` the "Recommended default", while the default is
-  `sparse`.
-- Algorithm: AGENTS.md and `docs/guide/advanced.md` call external a
-  "rank-bucketed counting sort"; the code is ID-bucketed and `stage2.rs`'s doc
-  says the rank path was replaced.
-- Geocode file count "19" in `builder/mod.rs`, AGENTS.md and
-  `cli-reference.md`, with nothing enumerating the set (HYG-084).
-- `src/lib.rs` crate doc says `pbfhogg = "0.4"`; the crate is 0.5.
-- `check`'s `NODE_ID_FLOOR = 14e9` and siblings carry comments with today's
-  live OSM counts; with the file-size ceiling in place the floors could be
-  derived or dropped.
-- `idset.rs` doc hard-codes planet memory figures and an incomplete user list.
-
-Per the documentation rule, reword so the drifting number is no longer
-hard-coded, or point at `reference/performance.md`; write the auto rule once in
-`reference/pipeline.md` and cite it. A docs test could check help text against
-`AUTO_STORE_BUDGET_PCT` and `AUTO_ANON_HEADROOM_BYTES`.
-
-Reported by: altw and scanning, geocode index, CLI and plumbing, test harness.
-
 ## HYG-070 - CLI-driving tests live in the library crate, so binary resolution is restated and guessed
 
 `tests/common/cli.rs::pbfhogg_bin()` resolves `BROKKR_TEST_BIN_DIR`, else
@@ -1612,37 +1423,12 @@ inside the `pbfhogg-cli` package (its tests now run under the `cli` sweep); that
 is the reason for the forced duplication. Fix: move every `cli_*.rs` into `cli/tests/`, where cargo builds
 the binary with the test's features and hands its path, which removes
 `BROKKR_TEST_BIN_DIR`, the profile heuristic, the `build_packages`
-stale-binary class and BUG-061; `tests/common` becomes a shared path or dev-only
+stale-binary class and the `minimal` sweep's cfg gates on CLI tests;
+`tests/common` becomes a shared path or dev-only
 crate. If the split stays, keep the rule in one place and treat empty as
 unset.
 
 Reported by: test harness, CLI and plumbing.
-
-## HYG-071 - Tests write into cargo's `target/`, the system temp dir and brokkr's scratch
-
-`tests/roundtrip_real.rs::output_path` (`target/denmark-roundtrip.osm.pbf`),
-`tests/cli_apply_changes.rs::merge_cross_validate_osmium`
-(`target/merge-xval-*.osm.pbf`), `tests/geocode_index.rs`
-(`target/geocode-test`, `target/geocode-test-build`), `src/path_guard.rs` unit
-tests (tempdirs under `target/`), `merge_changes/mod.rs` tests
-(`target/merge-changes-{name}-{pid}`, never cleaned) all hard-code
-`CARGO_MANIFEST_DIR/target`, while `pbfhogg_bin()` honours `CARGO_TARGET_DIR`.
-`target/` belongs to cargo: `cargo clean` destroys it mid-run, brokkr's
-per-worktree `CARGO_TARGET_DIR` means these write into the main tree's
-`target/` even when building elsewhere, and the Denmark-sized files survive
-every run invisibly until a clean. The `/tmp` and brokkr-scratch writers are in
-BUG-064. Three policies exist for one need, and the hunters propose two owners:
-`CARGO_TARGET_TMPDIR` (which cargo provides to integration tests for exactly
-this), or brokkr's scratch root exported as `BROKKR_SCRATCH_DIR` with a
-project-owned ignored directory (`.scratch/` or `data/test-scratch/`) for plain
-cargo runs. Either way: one `test_scratch()` helper creating
-`TempDir::new_in(<owned root>)`. The O_DIRECT reader test needs a non-tmpfs
-filesystem, so its location should come from the harness. Enforce with
-`disallowed-methods = ["std::env::temp_dir"]` and text rules on
-`join("target")` and `CARGO_MANIFEST_DIR` joined with `data` under `src/` and
-`tests/`.
-
-Reported by: test harness, change application, CLI and plumbing, read path.
 
 ## HYG-072 - Real-data tests hard-code dataset paths that `brokkr.toml` owns, and they have diverged
 
@@ -1666,61 +1452,6 @@ failure, not a skip. Enforce with a text rule banning `"data/` literals in
 `tests/`.
 
 Reported by: test harness, CLI and plumbing.
-
-## HYG-073 - Test skips are invisible and pass
-
-Skips are `eprintln!("Skipping: ...")` followed by `return`, which libtest
-reports as PASS, and nothing in `brokkr check` output counts them. With
-HYG-072 and BUG-063, a host can pass the whole real-data and platform tiers
-having run none of them. Fix: a shared `skip!(reason)` helper writing a
-countable marker, or panicking under a "must run" variable set by the owning
-profile.
-
-Reported by: test harness.
-
-## HYG-074 - The CliInvoker timeout can never fire, and its output capture is unbounded
-
-`CliInvoker`'s `DEFAULT_TIMEOUT` is 60 s; brokkr's per-test watchdog is 20 s on
-`brokkr check`; in-test waits in `read_paths.rs` are 5 s and 10 s. The watchdog
-always kills first and reports a `futex_do_wait` hang instead of the
-CliInvoker's message naming the command and its stderr; the doc calling the
-timeout "load-bearing for brokkr check" is not true under the current watchdog.
-`CliInvoker::run` drains stdout and stderr into unbounded `Vec`s, so a command
-looping on output grows test memory until a kill. Fix: default below the
-watchdog or read it from a brokkr-exported variable; cap capture to first and
-last N MB with a truncation mark.
-
-Reported by: test harness.
-
-## HYG-075 - The test harness reimplements PBF framing twice
-
-`tests/common/adversarial.rs` has its own `read_varint`, `write_varint`,
-`skip_field`, `parse_datasize`, `locate_blobs`, `decompress_blob`;
-`tests/common/mod.rs::count_tagdata_blobs` has a third `read_varint` (no
-overflow bound, panics on a short buffer) and its own frame walk. An
-independent oracle is defensible, but it should be one oracle, not two that
-differ (`Option` vs panic), with a note on why it does not reuse
-`src/read/wire.rs`.
-
-Reported by: test harness.
-
-## HYG-076 - Durable source cites transient documents and line numbers
-
-The `notes/` and `.plans/` halves are closed: `scripts/check_doc_links.py`
-(the `doc-links` script_check in `brokkr.toml`) now fails on any durable file
-that cites `notes/` or the gitignored `.plans/`, or names a repository path
-that does not exist. Still open: `extract/common.rs` cites "TODO.md history
-2026-04-19" (the script does not claim root-level `TODO.md`); stage 1's fd
-comment cites "`stage1.rs` Pass B loop at lines 385-405"; `coord_payloads.rs`
-cites `coord_payloads.rs:398`; `sort` cites `drain.rs:408-410`. `decisions/` is
-a document folder not covered by the `reference/` / `docs/` / `notes/` table in
-AGENTS.md, and source cites it (`path_guard.rs`, `getid`'s ADR-0006,
-`derive_parallel.rs`'s `decisions/0003`); it needs a place in that table.
-Enforce the remainder with a text check in `brokkr check` for `TODO.md` and
-`\.rs:[0-9]+` inside `src/` comments.
-
-Reported by: altw and scanning, filtering and spatial, re-encoding, CLI and
-plumbing.
 
 ## HYG-077 - The enforcement levers most of these findings need are unused
 
@@ -1810,18 +1541,6 @@ deadlocking; return coordinates inside the node `DrainItem` instead of the side
 channel; or at least a crossbeam `select` over both channels. Until then, a
 `test-hooks` stress test delaying the scanner's `last_node_seq` send past the
 drain's last node item.
-
-Reported by: change application.
-
-## HYG-082 - `CompactDiffOverlay` deletion state has two writers
-
-The comment above the mutators says invariants (a delete-set insert paired with
-an index remove) are why mutation goes through methods. But `deleted_nodes`,
-`deleted_ways` and `deleted_relations` are `pub`, and `CompactSink::begin_element`
-mutates them directly (`self.overlay.deleted_nodes.remove(&id)`), so the
-"un-delete on create" rule lives in the parser, and any library user can insert
-without touching the index or tombstones. Fix: private fields, `is_deleted` /
-`deleted_ids` accessors, un-delete inside `push_*`.
 
 Reported by: change application.
 
@@ -1928,30 +1647,6 @@ SmokeOutcome`. The smoke test exists only to need `first_addr_lat_e7` /
 
 Reported by: geocode index.
 
-## HYG-089 - The geocode builder assumes 64-bit pointers
-
-`interp.rs::read_node_at` says "u64->usize: Linux 64-bit only" and casts;
-`coord_array_len = referenced_count as usize * 8` truncates on 32-bit. The
-reader uses `usize::try_from`; the builder does not, so 32-bit gets wrong
-answers rather than a refusal. Fix: `compile_error!` on
-`target_pointer_width != "64"` for the builder.
-
-Reported by: geocode index.
-
-## HYG-090 - No sweep compiles the reader-only geocode build
-
-`geocode-reader` without `commands` is the configuration a geocoding service
-would use and `geocode_index/mod.rs` advertises it. No `[[check]]` sweep
-enables it alone (`minimal` has no features, `consumer` has `commands`), like
-the old untested `default-features = false` claim the `minimal` sweep's comment
-describes. Inside the builder, `#[cfg(feature = "geocode-reader")]` around the
-smoke test is always true (`commands` pulls in `geocode-reader`), suggesting a
-configuration that cannot be built. Fix: one more sweep with
-`features = ["geocode-reader"]` scoped to `-p pbfhogg`; drop the always-true
-cfg.
-
-Reported by: geocode index.
-
 ## HYG-091 - Significant fallbacks and events happen with no line or counter
 
 - `diff` and `derive-changes` fall back from parallel to sequential when either
@@ -1979,18 +1674,6 @@ key) and a counter.
 
 Reported by: re-encoding, filtering and spatial, read path, write path, change
 application.
-
-## HYG-092 - Derive-changes reads the clock per element
-
-`--update-timestamp` calls `SystemTime::now()` per emitted delete element, in
-both `derive.rs::write_delete_element` and its copy in `derive_parallel.rs`.
-Output is non-deterministic within one run (timestamps straddle a second),
-differs between `-j1` and `-jN`, and is untestable for equality. Fix: resolve
-`now` once in the CLI and pass `timestamp: Option<u64>`. Enforce with
-`disallowed-methods = ["std::time::SystemTime::now"]` in the library (the
-scratch-tag helper goes away with HYG-029).
-
-Reported by: re-encoding, CLI and plumbing.
 
 ## HYG-093 - `PipelineConfig` clamping lives in the builder, not the type
 
@@ -2058,37 +1741,6 @@ recorded so the next pass does not re-check it.
 
 Reported by: geocode index.
 
-## HYG-098 - Export's counters depend on filter order
-
-`export` builds a way's full geometry string before the bbox test and then
-discards it, and reports `skipped_invalid_ways` for ways the bbox would have
-rejected anyway, so the counter depends on filter order.
-
-Reported by: filtering and spatial.
-
-## HYG-099 - Dead or misleading code in the read path
-
-- `ReorderBuffer::with_max_window`: test-only in practice.
-- `WireBlob::parse_slice` wants a caller check.
-- `BlobReader::new` defaults `parse_indexdata: true` "for compatibility" while
-  every engine sets it explicitly; keep or drop deliberately.
-
-Enforce with `clippy::allow_attributes_without_reason`.
-
-Reported by: read path.
-
-## HYG-100 - Dead or misleading code in the write path
-
-- `write_primitive_block_no_indexdata`: public, its only non-test callers are
-  `#[cfg(test)]` blocks in getid and getparents; it is a fixture producer on
-  the writer's public surface.
-- `HeaderBuilder::build`'s `Result` is nominal (see BUG-039).
-- Re-exports kept "so the existing path keeps resolving"
-  (`crate::writer::Compression`, `crate::block_builder::HeaderBuilder`) are
-  compatibility shims in a pre-1.0 crate.
-
-Reported by: write path.
-
 ## HYG-102 - The library `IndexType::from_str` keeps a "dense" arm
 
 The library `IndexType::from_str` "dense" arm (an error explaining dense was
@@ -2122,7 +1774,6 @@ Reported by: geocode index.
 
 Reported by: CLI and plumbing, test harness.
 
-
 ## HYG-107 - Library-use survey follow-ups
 
 - `common::write_indexed_pbf` says the sync writer emits no indexdata,
@@ -2155,9 +1806,8 @@ was deliberately left alone. What remains is a CLI output change:
   `add-locations-to-ways:`, `[altw external]`, `[coord_payloads]`, bare text.
   The event kind (`Warning`, `Note`, `Progress`, `Developer`) now carries the
   class, so the CLI sink could render the prefix uniformly.
-- The apply-changes "Blobs:" summary is about 150 characters with two
-  always-zero sub-counts; the `-j 1` refusal is ten lines and the
-  version-regression errors about five each.
+- The apply-changes `-j 1` refusal is ten lines and the version-regression
+  errors about five each.
 - `warn_locations_on_ways_loss` reports once per input in `cat` with no
   filename; the unrecognised-indexdata warning names no file or offset.
 - sort's "verifying intra-blob order" line has no warning prefix though it
@@ -2175,11 +1825,146 @@ was deliberately left alone. What remains is a CLI output change:
 Reported by: all nine scopes (split out of the library stderr item when the
 library stopped writing stderr).
 
-## HYG-109 - Altw text still describes the removed rank path
+## HYG-003 - Altw keeps its own copies of the I/O buffer size
 
-The rank path is gone and the external buckets are ID buckets, but the
-user-facing `--force` refusal in `altw/external/mod.rs` and its comment say
-"rank-based bucket ranges", stage 1's worker-cap note says "rank-shards", and
-stage 2 comments refer to "pre/post-A1 traces".
+`write::IO_BUF_BYTES` now owns the 256 KiB read and write buffer size, with a
+source-scan test under `src/write/`. Altw still spells its own:
+`altw/external/radix.rs::BUCKET_BUF_SIZE`, the private shadowing
+`BUCKET_BUF_SIZE` and `FLUSH_THRESHOLD` in `stage2.rs`, and stage 1's
+`64 * 1024` / `256 * 1024` sidecar literals. Decide which are the same
+quantity as `IO_BUF_BYTES` and which are separate altw tunables.
 
-Reported by: the wave-0 review.
+Reported by: write path, read path, altw and scanning.
+
+## HYG-008 - Two coordinate conversions remain outside the shared pair, and one changed arithmetic is unproven
+
+`coord_fmt::e7_to_deg` / `deg_to_e7` now own the conversion in spatial,
+extract, export, `geo.rs` and the geocode builder. Left:
+`osc/xml_parse.rs::coord_to_decimicro` should use `deg_to_e7` (keeping its OSC
+context, representation checks and rounding). `coord_fmt::from_decimicro`
+deliberately keeps dividing by `1e7` (the user's call: `diff` text and OSC
+writer output must stay byte-identical); its comment says so.
+
+Reported by: filtering and spatial, CLI and plumbing.
+
+## HYG-009 - Two coordinate-domain checks still restate the rule
+
+`coord_pack::in_domain`, `validate_lat` and `validate_lon` now own the
++/-90 / +/-180 rule for packing and extract. Still separate:
+`altw/external/stage2.rs` (literal ranges and its own error text) and
+`osc/xml_parse.rs::coord_to_decimicro`. A shared test feeding an
+out-of-domain node to both altw backends is still missing.
+
+Reported by: altw and scanning, filtering and spatial.
+
+## HYG-026 - Two OSC writers still frame documents by hand
+
+`osc/write.rs` now owns OSC document framing, gzip suffix detection and the
+compression level (`OscDocumentWriter`, `OscOutput`), used by merge-changes
+and tags-filter OSC. Still separate: `diff/derive.rs` writes its own prelude,
+root and postlude around `ParallelGzipWriter`, and
+`write/parallel_gzip.rs` keeps a private `compression_level()`. A text rule
+on `BytesStart::new("osmChange")` and `flate2::Compression::fast` outside the
+owner would hold it.
+
+Reported by: change application.
+
+## HYG-052 - The marker FIFO setup moved to an explicit call the CLI does not make yet
+
+`debug` now has golden tests for both line shapes and an explicit
+`initialize_marker_fifo(path)`. The CLI still calls the removed
+`enable_marker_fifo_from_env()`: it must read `BROKKR_MARKER_FIFO` itself,
+call the new function, and report an open failure once through its
+diagnostics. Brokkr should mirror the line-shape goldens on its parse side.
+`pub mod debug` is still public API.
+
+Reported by: CLI and plumbing, test harness.
+
+## HYG-068 - Nothing verifies the workspace MSRV
+
+`rust-version` is inherited from `[workspace.package]`, but no sweep checks
+the workspace builds on it. `cargo-msrv` is not installed and only a nightly
+toolchain is, so a sweep needs the pinned toolchain installed and either
+`cargo-msrv` or brokkr support for a toolchain-pinned sweep.
+
+Reported by: CLI and plumbing.
+
+## HYG-069 - Code comments and help text still hard-code drifting figures
+
+The durable docs are reworded and point at `reference/pipeline.md` (the altw
+auto rule) and `reference/performance.md` (measurements). Still hard-coded:
+the altw `--index-type` help in `cli/src/main.rs` (europe time, host RAM,
+8.7 GB, 224 GB, the auto threshold); the `Sparse`, `External` and `Auto` docs
+in `altw/mod.rs`; `<1 GB at every stage` and `~256 GB` in
+`altw/external/mod.rs`; "19 files" and "~19 GB at planet" in
+`geocode_index/builder/mod.rs`; README's claim that every command processes
+the planet on a 32 GB machine. The guides and CLI help call `auto`
+"recommended" while the default is `sparse`: whether that is intended needs
+the user's answer. `docs/.vitepress/dist/` is generated and still says 19
+files.
+
+Reported by: altw and scanning, geocode index, CLI and plumbing, test harness.
+
+## HYG-071 - Unit tests under `src/` still pick their own scratch
+
+Integration tests now share `common::test_scratch()` under the gitignored
+`data/test-scratch/`, and `path_guard.rs` / `tag_expr.rs` unit tests share
+`path_guard::tests::scratch()` on the same root. Unit-test scratch sites still
+choosing their own location: `diff/derive.rs`, `altw/sparse.rs`,
+`altw/external/stage3.rs`, `getparents`, `getid`, `merge_changes`,
+`extract/mod.rs`, `tags_filter/mod.rs`, `debug.rs`,
+`write/{file_writer,writer,direct_writer,parallel_writer}.rs`,
+`osc/{parse,write}.rs`, `read/{blob,header_walker}.rs`, `scan/classify.rs`.
+One implementation for both harnesses needs a shared file such as
+`tests/common/scratch.rs` included by both. Enforce with
+`disallowed-methods = ["std::env::temp_dir"]`.
+
+Reported by: test harness, change application, CLI and plumbing, read path.
+
+## HYG-073 - Test skips outside the converted files still pass silently
+
+`common::skip()` prints `PBFHOGG_TEST_SKIP:` and fails when
+`PBFHOGG_TEST_MUST_RUN` is set. Unconverted skip sites remain in
+`cli_digest.rs`, `cli_add_locations_to_ways.rs`, `cli_sort.rs`,
+`fault_uring_writer.rs`, `roundtrip.rs`, `cli_cat.rs` and
+`cli_host_identity.rs`. Brokkr does not yet count the markers or set
+`PBFHOGG_TEST_MUST_RUN` for profiles that must run.
+
+Reported by: test harness.
+
+## HYG-076 - Durable source still cites transient documents and line numbers
+
+The `notes/` and `.plans/` halves are enforced by
+`scripts/check_doc_links.py`, and `decisions/` now has a place in the
+AGENTS.md folder table. Still open: the geocode reader and pass 3 cite
+`TODO.md`; `check/verify_ids.rs` cites `src/read/pipeline.rs` by line range.
+Enforce with a text check for `TODO.md` and `\.rs:[0-9]+` inside `src/`
+comments.
+
+Reported by: altw and scanning, filtering and spatial, re-encoding, CLI and
+plumbing.
+
+## HYG-090 - The geocode builder carries an always-true cfg
+
+A `geocode-reader`-only sweep now exists. Inside the builder,
+`#[cfg(feature = "geocode-reader")]` around the smoke test is always true
+(`commands` pulls in `geocode-reader`); drop it.
+
+Reported by: geocode index.
+
+## HYG-111 - Two small inaccuracies in apply-changes instrumentation
+
+`open_osc_reader` times plain-file reads too, so the OSC decompress counter
+includes input-read time for uncompressed input. The drain watermark
+comment's `10..30, 5..8, 40..50` example is already rejected by the adjacent
+range-bound check, so it does not show the distinction it claims.
+
+Reported by: the wave-1a change fixer.
+
+## HYG-112 - Export compares nanodegree geometry against a decimicrodegree bbox
+
+Export's way geometry uses nanodegree-derived coordinates while its node bbox
+checks use decimicrodegrees, so a way and its nodes can be judged against the
+bbox at different precision.
+
+Reported by: the wave-1a geo fixer.

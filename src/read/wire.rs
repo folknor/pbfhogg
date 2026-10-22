@@ -134,7 +134,7 @@ impl<'a> WireStringTable<'a> {
         let mut cursor = Cursor::new(data);
         out.clear();
         while let Some((field, wire_type)) = cursor.read_tag()? {
-            if field == 1 && wire_type == WIRE_LEN {
+            if field == super::wire_schema::string_table::STRINGS && wire_type == WIRE_LEN {
                 let bytes = cursor.read_len_delimited()?;
                 let offset = bytes.as_ptr() as usize - buffer.as_ptr() as usize;
                 #[allow(clippy::cast_possible_truncation)]
@@ -258,7 +258,7 @@ impl<'a> WireBlock<'a> {
 
             while let Some((field, wire_type)) = cursor.read_tag()? {
                 match (field, wire_type) {
-                    (1, WIRE_LEN) => {
+                    (super::wire_schema::primitive_block::STRING_TABLE, WIRE_LEN) => {
                         let data = cursor.read_len_delimited()?;
                         stringtable_offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
                         stringtable_len = data.len();

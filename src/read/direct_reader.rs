@@ -12,12 +12,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::NonNull;
 
-/// Page size for alignment. 4096 is universally safe across Linux filesystems.
-const PAGE_SIZE: usize = 4096;
-
-/// Internal buffer capacity. Matches the 256 KB `BufReader` capacity used
-/// elsewhere. Must be a multiple of `PAGE_SIZE`.
-const BUF_CAPACITY: usize = 256 * 1024;
+use crate::write::{IO_BUF_BYTES, PAGE_SIZE};
 
 // ---------------------------------------------------------------------------
 // AlignedReadBuffer - page-aligned heap allocation for reads
@@ -42,7 +37,7 @@ impl AlignedReadBuffer {
     fn new(capacity: usize) -> io::Result<Self> {
         let layout = Layout::from_size_align(capacity, PAGE_SIZE)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        // Safety: layout has non-zero size (BUF_CAPACITY > 0).
+        // Safety: layout has non-zero size (IO_BUF_BYTES > 0).
         let ptr = unsafe { alloc::alloc(layout) };
         let ptr = NonNull::new(ptr)
             .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "aligned alloc failed"))?;
@@ -112,6 +107,10 @@ pub struct DirectReader {
     buf: AlignedReadBuffer,
     /// Whether we've hit EOF on the underlying fd.
     eof: bool,
+    /// File length captured once at open. Input files are read-only for the
+    /// reader's lifetime, so `skip` validates an aligned target against this
+    /// instead of paying an `fstat` per skip.
+    file_len: u64,
 }
 
 impl DirectReader {
@@ -169,7 +168,7 @@ impl DirectReader {
         } else {
             // Already aligned. Seeking can succeed beyond EOF, so validate
             // the logical target before clearing the buffer.
-            if target > self.file.metadata()?.len() {
+            if target > self.file_len {
                 self.eof = true;
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -189,11 +188,13 @@ impl DirectReader {
             .read(true)
             .custom_flags(libc::O_DIRECT)
             .open(path)?;
-        let buf = AlignedReadBuffer::new(BUF_CAPACITY)?;
+        let file_len = file.metadata()?.len();
+        let buf = AlignedReadBuffer::new(IO_BUF_BYTES)?;
         Ok(Self {
             file,
             buf,
             eof: false,
+            file_len,
         })
     }
 }

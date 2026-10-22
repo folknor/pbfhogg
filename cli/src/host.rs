@@ -21,6 +21,29 @@ pub(crate) fn cli_host() -> Host {
     }
 }
 
+/// Arm the sidecar marker FIFO when brokkr names one in `BROKKR_MARKER_FIFO`.
+///
+/// The library does not read the environment, so the CLI does and hands the
+/// path over. A FIFO that cannot be opened is reported once, here, as a
+/// warning: the run continues unprofiled rather than failing.
+pub(crate) fn init_marker_fifo() {
+    use pbfhogg::host::DiagnosticSink as _;
+    let Some(path) = std::env::var_os("BROKKR_MARKER_FIFO") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    if let Err(error) = pbfhogg::debug::initialize_marker_fifo(&path) {
+        StderrSink.event(&pbfhogg::host::Event {
+            kind: pbfhogg::host::EventKind::Warning,
+            key: "debug.marker_fifo",
+            args: format_args!(
+                "Warning: cannot open marker FIFO {}: {error}; sidecar markers are disabled for this run",
+                path.display()
+            ),
+        });
+    }
+}
+
 pub(crate) struct StderrSink;
 impl pbfhogg::host::DiagnosticSink for StderrSink {
     fn event(&self, event: &pbfhogg::host::Event<'_>) {

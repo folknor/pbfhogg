@@ -8,6 +8,7 @@ use rustc_hash::FxHashMap;
 use protohoggr::{encode_bytes_field, encode_bytes_field_always};
 
 use crate::PrimitiveBlock;
+use crate::read::wire_schema::{primitive_block, string_table};
 
 /// Block-local string table. Index 0 is always the empty string.
 ///
@@ -68,9 +69,9 @@ impl StringTable {
     /// ## Fast path (cache hit, ~99% of calls)
     ///
     /// `self.index.get(s)` looks up the `&str` directly via the `Borrow` trait -
-    /// no allocation, just FxHash + probe. This is the hot path: a typical 8000-
-    /// element block has ~1200 unique strings but ~16,000+ add() calls, so the
-    /// vast majority are cache hits.
+    /// no allocation, just FxHash + probe. At the default element cap
+    /// (`super::block_builder::DEFAULT_ELEMENT_CAP`), typical blocks reuse
+    /// strings across many tags, so the vast majority are cache hits.
     ///
     /// ## Slow path (cache miss, ~1% of calls)
     ///
@@ -117,8 +118,8 @@ impl StringTable {
     pub(super) fn encode_to(&self, buf: &mut Vec<u8>, scratch: &mut Vec<u8>) {
         scratch.clear();
         for s in &self.strings {
-            encode_bytes_field_always(scratch, 1, s.as_bytes());
+            encode_bytes_field_always(scratch, string_table::STRINGS, s.as_bytes());
         }
-        encode_bytes_field(buf, 1, scratch);
+        encode_bytes_field(buf, primitive_block::STRING_TABLE, scratch);
     }
 }

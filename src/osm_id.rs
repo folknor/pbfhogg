@@ -114,9 +114,46 @@ pub(crate) fn blob_osm_last_id(min_id: i64, max_id: i64) -> i64 {
     }
 }
 
+/// Running canonical-order bound shared by sorted input and output guards.
+#[derive(Default)]
+pub(crate) struct OrderWatermark {
+    last: Option<(u8, OsmIdKey)>,
+}
+
+impl OrderWatermark {
+    /// Equality is allowed: duplicate IDs are a separate validation concern.
+    pub(crate) fn observe(&mut self, kind: u8, min_id: i64, max_id: i64) -> Result<(), (u8, i64)> {
+        let first = blob_osm_first_key(min_id, max_id);
+        let mut last = blob_osm_last_key(min_id, max_id).max(first);
+        if let Some((previous_kind, previous_last)) = self.last {
+            if kind < previous_kind || (kind == previous_kind && first < previous_last) {
+                return Err((previous_kind, osm_id_from_key(previous_last)));
+            }
+            if kind == previous_kind {
+                last = last.max(previous_last);
+            }
+        }
+        self.last = Some((kind, last));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watermark_handles_kinds_equal_bounds_and_signed_ids() {
+        let mut guard = OrderWatermark::default();
+        assert_eq!(guard.observe(0, -2, -1), Ok(()));
+        assert_eq!(guard.observe(0, -3, -2), Ok(()));
+        assert_eq!(guard.observe(0, -1, -1), Err((0, -3)));
+        assert_eq!(guard.observe(0, 1, 30), Ok(()));
+        assert_eq!(guard.observe(0, 5, 8), Err((0, 30)));
+        assert_eq!(guard.observe(0, 30, 40), Ok(()));
+        assert_eq!(guard.observe(1, 1, 2), Ok(()));
+        assert_eq!(guard.observe(0, 100, 200), Err((1, 2)));
+    }
 
     /// Distinct IDs must never share a key, including at the extremes where
     /// a saturating negation used to fold `i64::MIN` onto `-i64::MAX`, and

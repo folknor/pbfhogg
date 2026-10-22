@@ -516,7 +516,20 @@ impl IdSet {
     /// without an allocation proportional to the ID.
     #[inline]
     pub fn set(&mut self, id: i64) {
-        self.set_if_new(id);
+        let Some((cid, off)) = split(id) else {
+            return;
+        };
+        self.rank = None;
+        // Fast path: an existing bit-array chunk in the direct directory,
+        // the steady state for real OSM data. A plain OR, as the bitmap-only
+        // set had; routing every call through `set_if_new`'s chunk-kind
+        // match measured ~1.1 ns/ref slower in altw pass 0's serial union.
+        // An overflow chunk id is past `chunks.len()`, so `get_mut` misses.
+        if let Some(Some(Chunk::Dense(words))) = self.chunks.get_mut(cid as usize) {
+            *words[(off >> 6) as usize].get_mut() |= 1u64 << (off & 63);
+            return;
+        }
+        self.chunk_entry(cid).insert(off);
     }
 
     /// Set a bit and report whether it was previously unset. Returns `true`

@@ -374,11 +374,12 @@ fn refuses_a_second_header_blob() {
     let bytes = std::fs::read(&sorted).expect("read");
     let frames = locate_blobs(&bytes);
     let header = &bytes[frames[0].frame_start..frames[0].blob_end];
-    let mut doubled = header.to_vec();
-    doubled.extend_from_slice(&bytes[frames[0].frame_start..]);
-    let path = dir.path().join("two-headers.osm.pbf");
-    std::fs::write(&path, doubled).expect("write");
-    assert_refused(&path, "a file with two OsmHeader blobs");
+    for insertion in [frames[0].blob_end, bytes.len()] {
+        let doubled = [&bytes[..insertion], header, &bytes[insertion..]].concat();
+        let path = dir.path().join(format!("two-headers-{insertion}.osm.pbf"));
+        std::fs::write(&path, doubled).expect("write");
+        assert_refused(&path, "a file with two OsmHeader blobs");
+    }
 }
 
 #[test]

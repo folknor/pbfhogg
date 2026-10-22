@@ -13,6 +13,124 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::Result;
 
+/// IDs the dense node-ID bitmap may cover per input byte, passed to
+/// `IdSet::file_bounded_max_id` because `max_node_id` can come from
+/// unverified indexdata. References above the resulting bound are collected
+/// as plain per-worker ID lists and inserted with `IdSet::set` after the
+/// parallel scan, as in external renumber, so an honest high-ID extract is
+/// not rejected or silently dropped. Same factor as renumber's, for the same
+/// reason: country-sized extracts stay on the parallel path.
+///
+/// The lists are deliberately not per-worker `IdSet`s: every worker that
+/// sees more IDs in a 2^25-ID chunk than an array chunk holds would promote
+/// its own 4 MiB copy of that chunk, multiplying the overflow range's bitmap by the
+/// worker count - the per-worker accumulation shape this pass was moved off.
+const NODE_PREALLOC_IDS_PER_BYTE: u64 = 64;
+
+/// A worker's overflow list is sorted and deduplicated whenever it has
+/// doubled since its last compaction and holds at least this many IDs, so
+/// refs repeated across blobs cannot grow it far past its distinct count.
+const OVERFLOW_COMPACT_MIN: usize = 1 << 20;
+
+/// Record one accepted node ref: through `set_atomic` when it falls inside
+/// the pre-allocated range, otherwise onto this worker's overflow list.
+#[inline]
+fn record_referenced_node(
+    referenced_nodes: &crate::idset::IdSet,
+    overflow: &mut Vec<i64>,
+    prealloc_max: i64,
+    node_id: i64,
+) {
+    if node_id > prealloc_max {
+        overflow.push(node_id);
+    } else {
+        referenced_nodes.set_atomic(node_id);
+    }
+}
+
+/// Sort and deduplicate a worker's overflow list once it has doubled since
+/// the last compaction (`compacted_len`, updated here).
+fn compact_overflow_nodes(overflow: &mut Vec<i64>, compacted_len: &mut usize) {
+    if overflow.len() < OVERFLOW_COMPACT_MIN || overflow.len() < compacted_len.saturating_mul(2) {
+        return;
+    }
+    overflow.sort_unstable();
+    overflow.dedup();
+    *compacted_len = overflow.len();
+}
+
+/// Insert the workers' overflow lists after the parallel scan, where `set`
+/// may grow the set under `&mut`.
+fn insert_overflow_nodes(referenced_nodes: &mut crate::idset::IdSet, lists: Vec<Vec<i64>>) {
+    for list in lists {
+        for node_id in list {
+            referenced_nodes.set(node_id);
+        }
+    }
+}
+
+/// Record the accepted refs of one geocode-relevant way.
+fn record_way_refs(
+    referenced: &crate::idset::IdSet,
+    overflow_nodes: &mut Vec<i64>,
+    prealloc_max: i64,
+    max_node_id: i64,
+    refs: &[i64],
+) {
+    for &r in refs {
+        // Only refs in `0..=max_node_id`
+        // can name a node Phase 2a will
+        // see. Negative refs are skipped
+        // as non-atomic `IdSet::set` does.
+        // A ref above the claimed bound is a
+        // dangling ref on honest input (a
+        // simple-strategy extract keeps
+        // ways whose nodes lie outside it,
+        // with IDs that can exceed every
+        // node present): no coordinate can
+        // ever be written for it, so
+        // dropping it here changes nothing
+        // downstream. That holds only while
+        // the bound is true, which is why
+        // Phase 2a errors on any decoded
+        // node above it. Accepted refs above
+        // the size-bounded dense range go to
+        // this worker's overflow list instead
+        // of extending `pre_allocate`.
+        if r < 0 || r > max_node_id {
+            continue;
+        }
+        record_referenced_node(referenced, overflow_nodes, prealloc_max, r);
+    }
+}
+
+/// Whether any worker has already reported an error.
+fn has_first_err(slot: &Mutex<Option<String>>) -> bool {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+}
+
+/// Keep the first error any worker reports.
+fn store_first_err(slot: &Mutex<Option<String>>, e: String) {
+    let mut slot = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.is_none() {
+        *slot = Some(e);
+    }
+}
+
+/// Hand a finished worker's overflow list to the shared collection.
+fn push_overflow_list(lists: &Mutex<Vec<Vec<i64>>>, overflow_nodes: Vec<i64>) {
+    if !overflow_nodes.is_empty() {
+        lists
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(overflow_nodes);
+    }
+}
+
 #[hotpath::measure]
 pub(super) fn run_pass1_5(
     way_schedule: &[(usize, u64, usize)],
@@ -21,18 +139,21 @@ pub(super) fn run_pass1_5(
     needed_admin_ways: &crate::idset::IdSet,
     host: &crate::host::Host,
 ) -> Result<crate::idset::IdSet> {
+    let file_len = shared_file.metadata()?.len();
+    let prealloc_max =
+        crate::idset::IdSet::file_bounded_max_id(max_node_id, file_len, NODE_PREALLOC_IDS_PER_BYTE);
+
     // One shared pre-allocated IdSet; workers write concurrently via
     // `set_atomic`. Replaces the previous per-worker `IdSet`
     // accumulation that grew to ~20 GB anon on Germany (~29.5 GB at planet)
     // because each worker allocated independent chunks across the full
     // planet ID range. Pattern follows `renumber_external/pass1.rs`.
     //
-    // `pre_allocate(max_node_id)` covers every ID up to the node-ID bound
-    // from `build_pass2_schedules`, and the classify closure below only
-    // calls `set_atomic` on refs inside `0..=max_node_id`, so it cannot hit
-    // `set_atomic`'s out-of-range panic.
+    // `max_node_id` can come from indexdata for indexed blobs. Bound the
+    // eager bitmap by input size; workers keep accepted references above
+    // that bound in local ID lists, inserted after the scan.
     let mut referenced_nodes = crate::idset::IdSet::new();
-    referenced_nodes.pre_allocate(max_node_id);
+    referenced_nodes.pre_allocate(prealloc_max);
 
     // Custom worker pool that bypasses PrimitiveBlock construction
     // entirely (plan item #2). Workers pread the blob bytes, decompress,
@@ -55,6 +176,8 @@ pub(super) fn run_pass1_5(
         // the schedule is empty or the shared slot is populated.
         let first_err: Mutex<Option<String>> = Mutex::new(None);
         let first_err_ref = &first_err;
+        let overflow_lists: Mutex<Vec<Vec<i64>>> = Mutex::new(Vec::new());
+        let overflow_lists_ref = &overflow_lists;
 
         let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
 
@@ -66,14 +189,12 @@ pub(super) fn run_pass1_5(
                     let mut decompress_buf: Vec<u8> = Vec::new();
                     let mut refs_buf: Vec<i64> = Vec::new();
                     let mut group_starts: Vec<(usize, usize)> = Vec::new();
+                    let mut overflow_nodes: Vec<i64> = Vec::new();
+                    let mut overflow_compacted_len = 0_usize;
 
                     loop {
                         // Exit early if another worker has reported an error.
-                        if first_err_ref
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .is_some()
-                        {
+                        if has_first_err(first_err_ref) {
                             return;
                         }
 
@@ -102,47 +223,31 @@ pub(super) fn run_pass1_5(
                                         || flags.is_interp
                                         || is_admin
                                     {
-                                        for &r in refs {
-                                            // Only refs in `0..=max_node_id`
-                                            // can name a node Phase 2a will
-                                            // see. Negative refs are skipped
-                                            // as non-atomic `IdSet::set` does.
-                                            // A ref above the bound is a
-                                            // dangling ref on honest input (a
-                                            // simple-strategy extract keeps
-                                            // ways whose nodes lie outside it,
-                                            // with IDs that can exceed every
-                                            // node present): no coordinate can
-                                            // ever be written for it, so
-                                            // dropping it here changes nothing
-                                            // downstream. That holds only while
-                                            // the bound is true, which is why
-                                            // Phase 2a errors on any decoded
-                                            // node above it. Both checks also
-                                            // keep `set_atomic` inside the
-                                            // pre-allocated chunks.
-                                            if r < 0 || r > max_node_id {
-                                                continue;
-                                            }
-                                            referenced_ref.set_atomic(r);
-                                        }
+                                        record_way_refs(
+                                            referenced_ref,
+                                            &mut overflow_nodes,
+                                            prealloc_max,
+                                            max_node_id,
+                                            refs,
+                                        );
                                     }
                                 },
                             )
                             .map_err(|e| e.to_string())?;
+                            compact_overflow_nodes(
+                                &mut overflow_nodes,
+                                &mut overflow_compacted_len,
+                            );
                             Ok(())
                         })();
 
                         if let Err(e) = result {
-                            let mut slot = first_err_ref
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if slot.is_none() {
-                                *slot = Some(e);
-                            }
+                            store_first_err(first_err_ref, e);
                             return;
                         }
                     }
+
+                    push_overflow_list(overflow_lists_ref, overflow_nodes);
                 });
             }
         });
@@ -153,6 +258,13 @@ pub(super) fn run_pass1_5(
         {
             return Err(e.into());
         }
+
+        insert_overflow_nodes(
+            &mut referenced_nodes,
+            overflow_lists
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
     }
     crate::debug::emit_marker("GEOCODE_PASS1_5_SCAN_END");
     Ok(referenced_nodes)
@@ -160,8 +272,8 @@ pub(super) fn run_pass1_5(
 
 /// Single header pass that produces everything Pass 1.5 and Pass 2a need to
 /// start: the way-blob schedule (for Pass 1.5 + unused by Pass 2a), the
-/// node-blob schedule (for Pass 2a), the node-ID bound (so Pass 1.5 can
-/// `pre_allocate` the shared `IdSet` and Phase 2a can verify it), and a
+/// node-blob schedule (for Pass 2a), the node-ID bound (used for Pass 1.5's
+/// size-bounded `IdSet` pre-allocation and verified by Phase 2a), and a
 /// single shared file handle reused across both phases' `pread_at` workers.
 ///
 /// Consolidates two previously-separate header walks (Pass 1.5's
@@ -178,8 +290,9 @@ pub(super) fn run_pass1_5(
 /// `require_indexdata` at the `build_geocode_index` entry rejects
 /// non-indexed input unless `--force` is set; with `--force`, each
 /// unindexed blob is decoded once here (in parallel) to learn which kinds
-/// it holds and its largest node ID. Indexdata claims are trusted at this
-/// point and checked against the decoded nodes in Phase 2a.
+/// it holds and its largest node ID. Indexdata claims still supply the upper
+/// bound checked against decoded nodes in Phase 2a; Pass 1.5 separately caps
+/// dense `IdSet` pre-allocation by input file size.
 #[allow(clippy::type_complexity)]
 pub(super) fn build_pass2_schedules(
     input_path: &Path,
@@ -307,5 +420,63 @@ fn renumber(schedule: &mut [(usize, u64, usize)]) {
     schedule.sort_unstable_by_key(|&(_, offset, _)| offset);
     for (seq, entry) in schedule.iter_mut().enumerate() {
         entry.0 = seq;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        NODE_PREALLOC_IDS_PER_BYTE, OVERFLOW_COMPACT_MIN, compact_overflow_nodes,
+        insert_overflow_nodes, record_referenced_node,
+    };
+
+    #[test]
+    fn indexdata_node_bound_scales_with_input_size() {
+        let bound = |claimed, file_len| {
+            crate::idset::IdSet::file_bounded_max_id(claimed, file_len, NODE_PREALLOC_IDS_PER_BYTE)
+        };
+        assert_eq!(bound(i64::MAX, 4096), 4096 * 64);
+
+        let planet_bytes = 80_u64 * 1024 * 1024 * 1024;
+        assert_eq!(bound(60_000_000_000, planet_bytes), 60_000_000_000);
+        assert_eq!(bound(i64::MAX, u64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn references_above_the_dense_bound_survive_overflow_insertion() {
+        let mut referenced = crate::idset::IdSet::new();
+        referenced.pre_allocate(0);
+        let mut overflow = Vec::new();
+        let high_id = (1_i64 << 44) + 7;
+
+        record_referenced_node(&referenced, &mut overflow, 0, 0);
+        record_referenced_node(&referenced, &mut overflow, 0, high_id);
+        record_referenced_node(&referenced, &mut overflow, 0, high_id);
+        assert_eq!(overflow, vec![high_id, high_id]);
+        insert_overflow_nodes(&mut referenced, vec![overflow]);
+
+        assert!(referenced.get(0));
+        assert!(referenced.get(high_id));
+        // The pre-allocated chunk plus one chunk for the overflow ID.
+        assert_eq!(referenced.allocated_chunk_count(), 2);
+    }
+
+    #[test]
+    fn overflow_lists_compact_only_after_doubling() {
+        let mut compacted = 0;
+        let mut small = vec![3, 1, 3];
+        compact_overflow_nodes(&mut small, &mut compacted);
+        assert_eq!(
+            small,
+            vec![3, 1, 3],
+            "below the minimum, nothing is touched"
+        );
+
+        let mut list: Vec<i64> = std::iter::successors(Some(0_i64), |v| Some((v + 1) % 10))
+            .take(OVERFLOW_COMPACT_MIN)
+            .collect();
+        compact_overflow_nodes(&mut list, &mut compacted);
+        assert_eq!(list, (0..10).collect::<Vec<i64>>());
+        assert_eq!(compacted, 10);
     }
 }

@@ -518,10 +518,14 @@ where
         + Send
         + Sync,
 {
+    // Brokkr stores named counters generically and reports changes in sidecar
+    // comparisons; these samples are inert unless the CLI initialized the FIFO.
     crate::debug::emit_mallinfo2("MI_PRE_BLOB_SCHEDULE");
     crate::debug::emit_marker("PREAD_WRITE_BLOB_SCHEDULE_START");
     let schedule = build_blob_schedule(input, host)?;
     crate::debug::emit_marker("PREAD_WRITE_BLOB_SCHEDULE_END");
+    // Brokkr stores named counters generically and reports changes in sidecar
+    // comparisons; this sample is inert unless the CLI initialized the FIFO.
     crate::debug::emit_mallinfo2("MI_POST_BLOB_SCHEDULE");
     pread_write_pass_with_schedule(input, &schedule, writer, stats, block_fn, host)
 }
@@ -552,6 +556,8 @@ where
     crate::debug::emit_marker("PREAD_WRITE_EXECUTE_START");
     pread_execute(input, schedule, writer, stats, block_fn, host)?;
     crate::debug::emit_marker("PREAD_WRITE_EXECUTE_END");
+    // Brokkr stores named counters generically and reports changes in sidecar
+    // comparisons; this sample is inert unless the CLI initialized the FIFO.
     crate::debug::emit_mallinfo2("MI_POST_EXECUTE");
     crate::debug::emit_marker("PREAD_WRITE_FLUSH_START");
     writer.flush()?;

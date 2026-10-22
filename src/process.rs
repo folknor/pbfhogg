@@ -194,6 +194,9 @@ mod proc_metric_tests {
 /// free-list). Cheap enough to fire per snapshot batch (~140
 /// batches at planet, ~150 ms total).
 ///
+/// This remains public opt-in API even though the repository has no callers;
+/// downstream applications may use the process-wide operation.
+///
 /// On non-glibc / non-Linux this is a no-op returning 0.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn malloc_trim() -> i32 {
@@ -221,6 +224,9 @@ pub fn malloc_trim() -> i32 {
 ///
 /// Call once early in the run; the setting is process-global. On
 /// non-glibc / non-Linux this is a no-op returning 0.
+///
+/// This remains public opt-in API even though the repository has no callers;
+/// downstream applications may use the process-wide operation.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn set_mmap_threshold(bytes: i32) -> i32 {
     // SAFETY: mallopt is glibc and safe to call from any thread

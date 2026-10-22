@@ -559,6 +559,13 @@ pub(crate) fn assemble_osc_from_paths(
 ) -> Result<()> {
     use crate::write::parallel_gzip::{DEFAULT_CHUNK_SIZE, ParallelGzipWriter};
 
+    // OSC document framing has no shared owner: merge_changes chooses gzip
+    // from the output name, tags-filter always gzips, and this path emits
+    // ordered gzip chunks (CORRECTNESS.md, OSC emission contracts).
+    // Extracting only this framing would leave the other owners split, while
+    // replacing chunk compression risks changing member boundaries and output
+    // bytes. Preserve this assembler until all paths can share an owner
+    // without changing their established output bytes.
     let file = File::create(output)?;
     let buf = io::BufWriter::new(file);
 

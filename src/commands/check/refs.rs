@@ -322,6 +322,8 @@ pub fn check_refs(
         )?;
     }
     crate::debug::emit_marker("CHECKREFS_NODES_END");
+    // Brokkr stores named counters generically and reports changes in sidecar
+    // comparisons; this sample is inert unless the CLI initialized the FIFO.
     crate::debug::emit_mallinfo2("checkrefs_after_nodes");
 
     // ------------------------------------------------------------------
@@ -380,6 +382,8 @@ pub fn check_refs(
         )?;
     }
     crate::debug::emit_marker("CHECKREFS_WAYS_END");
+    // Brokkr stores named counters generically and reports changes in sidecar
+    // comparisons; this sample is inert unless the CLI initialized the FIFO.
     crate::debug::emit_mallinfo2("checkrefs_after_ways");
 
     // ------------------------------------------------------------------
@@ -487,6 +491,8 @@ pub fn check_refs(
             )?;
         }
         crate::debug::emit_marker("CHECKREFS_RELATIONS_END");
+        // Brokkr stores named counters generically and reports changes in sidecar
+        // comparisons; this sample is inert unless the CLI initialized the FIFO.
         crate::debug::emit_mallinfo2("checkrefs_after_relations");
     }
 
@@ -538,6 +544,8 @@ pub fn check_refs(
     result.missing_refs = missing_refs;
 
     crate::debug::emit_marker("CHECKREFS_SCAN_END");
+    // Brokkr stores named counters generically and reports changes in sidecar
+    // comparisons; this sample is inert unless the CLI initialized the FIFO.
     crate::debug::emit_mallinfo2("checkrefs_final");
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     {

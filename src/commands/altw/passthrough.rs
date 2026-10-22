@@ -47,6 +47,10 @@ use super::{NodeIndex, Stats, process_block};
 /// Per-blob descriptor produced once up front by the header walk and
 /// consumed by both the worker pool (decode) and the consumer thread
 /// (passthrough pread + write).
+///
+/// Unknown index kinds are allowed here for forced unindexed input; external
+/// instead requires known kinds and carries a way-sidecar index. Only their
+/// passthrough eligibility policy is shared, not their measured pipelines.
 #[derive(Clone, Copy)]
 struct BlobDescriptor {
     seq: usize,
@@ -128,13 +132,7 @@ fn build_schedule(
                     .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
                 let header = crate::blob::decode_blob_to_headerblock(&data_buf)?;
                 let bytes = build_output_header(&header, true, overrides, |hb| {
-                    use crate::read::block::Feature;
-                    let mut hb = hb.optional_feature(Feature::LOCATIONS_ON_WAYS);
-                    if inject_prepass {
-                        hb = hb.optional_feature(Feature::WAY_MEMBERS_V1);
-                        hb = hb.optional_feature(Feature::SHARED_NODE_PINS_V1);
-                    }
-                    hb
+                    super::altw_header_features(hb, inject_prepass)
                 })?;
                 header_bytes = Some(bytes);
             }
@@ -144,8 +142,7 @@ fn build_schedule(
                 let count = meta.index.as_ref().map_or(0, |idx| idx.count);
 
                 let is_way_blob = matches!(kind, Some(ElemKind::Way));
-                let is_passthrough = matches!(kind, Some(ElemKind::Relation))
-                    || matches!(kind, Some(ElemKind::Node) if keep_untagged_nodes);
+                let is_passthrough = super::blob_is_passthrough(kind, keep_untagged_nodes);
 
                 schedule.push(BlobDescriptor {
                     seq,

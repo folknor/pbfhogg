@@ -483,9 +483,9 @@ impl<R: Read + Send> BlobReader<R> {
         self.parse_waymembers = enable;
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    fn read_blob_header(&mut self) -> Option<Result<WireBlobHeader>> {
-        let header_size: u64 = {
+    /// Read the 4-byte big-endian length prefix. `None` is clean EOF.
+    fn read_length_prefix(&mut self) -> Option<Result<u64>> {
+        {
             let mut buf = [0u8; 4];
             // Read the first byte separately to distinguish clean EOF (0 bytes
             // available) from corruption (1-3 trailing bytes).
@@ -506,23 +506,31 @@ impl<R: Read + Send> BlobReader<R> {
             match self.reader.read_exact(&mut buf[1..]) {
                 Ok(()) => {
                     self.offset = self.offset.map(|x| ByteOffset(x.0 + 4));
-                    u64::from(u32::from_be_bytes(buf))
+                    Some(Ok(u64::from(u32::from_be_bytes(buf))))
                 }
                 Err(e) if e.kind() == ::std::io::ErrorKind::UnexpectedEof => {
                     // 1-3 trailing bytes after a complete previous frame
                     // are tolerated per `reference/truncation-handling.md`
                     // ("clean cut at frame boundary"). The partial length
                     // prefix can't start a new frame; treat as EOF.
-                    return None;
+                    None
                 }
                 Err(e) => {
                     // Genuine I/O error (broken pipe, permission denied,
                     // etc.) - propagate the real cause.
                     self.offset = None;
                     self.last_blob_ok = false;
-                    return Some(Err(self.stamp_input(e.into())));
+                    Some(Err(self.stamp_input(e.into())))
                 }
             }
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn read_blob_header(&mut self) -> Option<Result<WireBlobHeader>> {
+        let header_size = match self.read_length_prefix()? {
+            Ok(n) => n,
+            Err(e) => return Some(Err(e)),
         };
 
         // Both length-prefix guards (zero-length and MAX_BLOB_HEADER_SIZE)
@@ -583,6 +591,14 @@ impl<R: Read + Send> BlobReader<R> {
             Ok(header) => header,
             Err(e) => return self.handle_error(e),
         };
+        // The existing sequential blob count also covers non-seekable Read
+        // inputs. After a seek it is unknown, but the byte offset still tells
+        // whether this is the leading frame (currently past its 4-byte prefix).
+        let at_start = self.blob_index == Some(0)
+            || (self.blob_index.is_none() && self.offset == Some(ByteOffset(4)));
+        if let Err(err) = crate::frame::check_header_position(&header.blob_type, at_start) {
+            return self.handle_error(err);
+        }
         // These are wire lengths, not version numbers: v1 is 26 bytes,
         // while both v2 and v3 are 42. A new version need not add a length;
         // the version/length consistency check lives in blob_meta.
@@ -1442,6 +1458,26 @@ mod tests {
         frame.extend_from_slice(&u32::try_from(header.len()).unwrap().to_be_bytes());
         frame.extend_from_slice(&header);
         frame
+    }
+
+    #[test]
+    fn overflowing_datasize_is_refused_before_reading_the_payload() {
+        let frame = frame_with_datasize((1_u64 << 32) + 100);
+        let mut reader = BlobReader::new(Cursor::new(frame.clone()));
+        let err = reader.next().unwrap().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("BlobHeader.datasize exceeds int32")
+        );
+        assert!(reader.next().is_none());
+
+        let mut reader = BlobReader::new_seekable(Cursor::new(frame)).unwrap();
+        let err = reader.next_header_skip_blob().unwrap().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("BlobHeader.datasize exceeds int32")
+        );
+        assert!(reader.next_header_skip_blob().is_none());
     }
 
     /// A BlobHeader declaring `datasize == MAX_BLOB_DATASIZE` is rejected with

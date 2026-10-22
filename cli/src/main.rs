@@ -258,7 +258,8 @@ fn clean_attrs(attrs: &[CleanAttrArg]) -> CleanAttrs {
 ///
 /// `Dense` is hidden rather than absent: it was a real value until it was
 /// removed, and a user carrying an old command line deserves the pointer
-/// at `sparse` instead of a bare "invalid value".
+/// at `sparse` instead of a bare "invalid value". Repository search cannot
+/// establish whether downstream command lines still use it.
 #[derive(Clone, Copy, ValueEnum)]
 enum IndexTypeArg {
     Auto,
@@ -286,7 +287,8 @@ impl IndexTypeArg {
 }
 
 /// `count` and `name` were accepted as shorthands by the hand-written
-/// parser this replaced; they stay, as hidden aliases.
+/// parser this replaced. They stay as hidden aliases because repository
+/// search cannot establish whether downstream command lines still use them.
 #[derive(Clone, Copy, ValueEnum)]
 enum TagSortArg {
     #[value(alias = "count")]

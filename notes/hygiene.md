@@ -349,7 +349,8 @@ Anger: 9 - frame decoders on a hot path.
 `BlobReader::read_blob_header` (streaming, stamps offsets),
 `frame::read_frame_header` (streaming, used by `raw_frame.rs`) and
 `HeaderWalker::next_header_inner` (pread). `frame.rs` is called the one owner
-of frame policy but owns only the length-prefix guard. Each decoder
+of frame policy but owns only the length-prefix guard and the header-position
+rule (`check_header_position`, which every decoder applies). Each decoder
 reimplements the EOF policy (1-3 trailing bytes tolerated), the datasize guard
 (`BlobReader` carries "the inline twin of the check in
 `parse_blob_header_with_index`"), the truncation messages (the "shape 3" /
@@ -1092,31 +1093,6 @@ minimum; propagate probe errors.
 
 Reported by: altw and scanning.
 
-## HYG-046 - Altw restates the same rules once per backend
-
-Anger: 8 - merges altw backend rules.
-
-- `altw/mod.rs::collect_relation_member_ids` and
-  `external/relation_scan.rs::collect_relation_member_ids_indexed` both encode
-  "a member way counts only for `type=multipolygon|boundary`, negative IDs
-  skipped, want_nodes / want_ways gating"; if the type set changes in one, the
-  WayMembers payloads diverge. The `relation_scan.rs` doc justifies the second
-  copy by a sequential reader the generic version no longer uses.
-- The header feature closure (`LocationsOnWays`, plus `WAY_MEMBERS_V1` and
-  `SHARED_NODE_PINS_V1` under inject) is in `passthrough.rs::build_schedule`,
-  `stage4.rs::stage4_assembly` and, without inject, `write_output_decode_all`.
-- `passthrough.rs` and `stage4.rs` each define a `BlobDescriptor` with the same
-  fields and the same passthrough rule (relations always, nodes only under
-  `keep_untagged_nodes`, ways never).
-- `missing_locations` has two producers on the external path: stage 4's
-  reframe returns a per-blob value that is always 0, then `external_join`
-  overwrites `stats.missing_locations = total_slots - resolved_count`.
-
-Fix: one `relation_member_ids`, one `altw_header_features(hb, inject)`, the
-shared pipeline of HYG-011, and stage 4's `missing` removed from the signature.
-
-Reported by: altw and scanning.
-
 ## HYG-047 - Code aborts on caller-controlled input where a refusal was owed
 
 Anger: 9 - decode failures and aborts become errors: new refusals, Results on builder hot paths.
@@ -1675,19 +1651,6 @@ Anger: 7 - geocode format bump.
 
 Reported by: geocode index.
 
-## HYG-085 - Geocode `Reader::open` validation is O(index size) with no opt-out
-
-Anger: 7 - new API.
-
-`validate_structure` walks every record of every file at open, faulting in many
-GB at planet and making `open` take seconds to minutes; the builder's smoke test
-repeats the walk. A legitimate trade, but undocumented as a cost and with no
-`open_trusted` for an index the caller just built or checksummed. (A content
-checksum in the header would not make trust O(1): verifying it still reads
-every byte.)
-
-Reported by: geocode index.
-
 ## HYG-086 - Geocode street classification is defined twice
 
 Anger: 7 - geocode output.
@@ -1840,25 +1803,6 @@ plus `dropped_admin_relations`.
 
 Reported by: geocode index.
 
-## HYG-106 - Dead or stale code in the CLI, plumbing and brokkr configuration
-
-Anger: 6 - removes public functions and CLI aliases.
-
-- `process::malloc_trim` and `process::set_mmap_threshold`: no caller in
-  `src/`, `cli/` or tests; their docs describe investigations. `process` is
-  `pub`, so an external caller is possible in principle.
-- `debug::emit_mallinfo2` calls in `extract`, `check_refs` and `time_filter`
-  carry "DIAGNOSTIC (2026-04-11 round 3)" provenance and fire on every run;
-  whether brokkr still reads `MI_*` / `checkrefs_*_arena` needs a brokkr-side
-  check before removal.
-- `BROKKR_TEST_PLATFORM = "1"` in the `platform` profile is read by nothing in
-  this repo (see BUG-063); `[test.profiles.serial]` exists "reserved for any
-  future serial-only test" and has none.
-- `IndexTypeArg::Dense` hidden value and the `TagSortArg` aliases `count` /
-  `name` are compatibility with removed things, with no end date.
-
-Reported by: CLI and plumbing, test harness.
-
 ## HYG-107 - Library-use survey follow-ups
 
 Anger: 3 - mostly observations.
@@ -1913,58 +1857,6 @@ was deliberately left alone. What remains is a CLI output change:
 
 Reported by: all nine scopes (split out of the library stderr item when the
 library stopped writing stderr).
-
-## HYG-008 - Two coordinate conversions remain outside the shared pair, and one changed arithmetic is unproven
-
-Anger: 8 - OSC coordinate parse.
-
-`coord_fmt::e7_to_deg` / `deg_to_e7` now own the conversion in spatial,
-extract, export, `geo.rs` and the geocode builder. Left:
-`osc/xml_parse.rs::coord_to_decimicro` should use `deg_to_e7` (keeping its OSC
-context, representation checks and rounding). `coord_fmt::from_decimicro`
-deliberately keeps dividing by `1e7` (the user's call: `diff` text and OSC
-writer output must stay byte-identical); its comment says so.
-
-Reported by: filtering and spatial, CLI and plumbing.
-
-## HYG-009 - Two coordinate-domain checks still restate the rule
-
-Anger: 8 - altw stage 2 coordinate check.
-
-`coord_pack::in_domain`, `validate_lat` and `validate_lon` now own the
-+/-90 / +/-180 rule for packing and extract. Still separate:
-`altw/external/stage2.rs` (literal ranges and its own error text) and
-`osc/xml_parse.rs::coord_to_decimicro`. A shared test feeding an
-out-of-domain node to both altw backends is still missing.
-
-Reported by: altw and scanning, filtering and spatial.
-
-## HYG-026 - Two OSC writers still frame documents by hand
-
-Anger: 7 - OSC output bytes.
-
-`osc/write.rs` now owns OSC document framing, gzip suffix detection and the
-compression level (`OscDocumentWriter`, `OscOutput`), used by merge-changes
-and tags-filter OSC. Still separate: `diff/derive.rs` writes its own prelude,
-root and postlude around `ParallelGzipWriter`, and
-`write/parallel_gzip.rs` keeps a private `compression_level()`. A text rule
-on `BytesStart::new("osmChange")` and `flate2::Compression::fast` outside the
-owner would hold it.
-
-Reported by: change application.
-
-## HYG-052 - The marker FIFO setup moved to an explicit call the CLI does not make yet
-
-Anger: 4 - brokkr mirror, pub mod debug.
-
-`debug` now has golden tests for both line shapes and an explicit
-`initialize_marker_fifo(path)`. The CLI still calls the removed
-`enable_marker_fifo_from_env()`: it must read `BROKKR_MARKER_FIFO` itself,
-call the new function, and report an open failure once through its
-diagnostics. Brokkr should mirror the line-shape goldens on its parse side.
-`pub mod debug` is still public API.
-
-Reported by: CLI and plumbing, test harness.
 
 ## HYG-068 - Nothing verifies the workspace MSRV
 

@@ -549,7 +549,7 @@ impl IdSet {
     ///
     /// This eagerly allocates 4 MiB per 2^25 IDs of range, so `max_id` sizes
     /// the allocation directly: a caller deriving it from untrusted input
-    /// (indexdata) must bound it first, as `check`'s `id_alloc_bound` does.
+    /// (indexdata) must bound it first with [`IdSet::file_bounded_max_id`].
     ///
     /// # Invariant for callers
     ///
@@ -592,6 +592,27 @@ impl IdSet {
                 }
             }
         }
+    }
+
+    /// The `pre_allocate` argument for a highest ID claimed by unverified
+    /// input (indexdata): the smaller of `claimed_max` and
+    /// `file_len * ids_per_byte`, saturating at `i64::MAX`.
+    ///
+    /// A claim of `i64::MAX` from a 4 KB file would otherwise ask
+    /// `pre_allocate` for an exabyte before a single blob is read
+    /// (CORRECTNESS.md, the indexdata trust boundary). At one bit per ID the
+    /// bitmap stays within `ids_per_byte / 8` times the input's own size,
+    /// plus one chunk of rounding.
+    ///
+    /// `ids_per_byte` is the caller's, because what happens to an ID above
+    /// the bound differs: renumber and the geocode builder insert it after
+    /// their parallel pass, so their factor trades serial overflow work
+    /// against memory; `check` reports it as an input property and adds a
+    /// per-kind floor on top. A negative claim is returned unchanged, and
+    /// `pre_allocate` treats it as "nothing to allocate".
+    pub(crate) fn file_bounded_max_id(claimed_max: i64, file_len: u64, ids_per_byte: u64) -> i64 {
+        let by_size = i64::try_from(file_len.saturating_mul(ids_per_byte)).unwrap_or(i64::MAX);
+        claimed_max.min(by_size)
     }
 
     /// Atomically set a bit. Requires `pre_allocate()` to have been called
@@ -1016,6 +1037,21 @@ impl IdSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A false indexdata claim from a small file cannot size the bitmap; an
+    /// honest planet-scale claim passes untouched; nothing overflows.
+    #[test]
+    fn file_bounded_max_id_caps_a_claim_by_the_input_size() {
+        assert_eq!(IdSet::file_bounded_max_id(i64::MAX, 4096, 64), 4096 * 64);
+        assert_eq!(IdSet::file_bounded_max_id(i64::MAX, 4096, 8), 4096 * 8);
+        let planet_bytes = 80_u64 * 1024 * 1024 * 1024;
+        assert_eq!(
+            IdSet::file_bounded_max_id(60_000_000_000, planet_bytes, 8),
+            60_000_000_000
+        );
+        assert_eq!(IdSet::file_bounded_max_id(i64::MAX, u64::MAX, 64), i64::MAX);
+        assert_eq!(IdSet::file_bounded_max_id(-1, 4096, 64), -1);
+    }
 
     // --- Non-panicking atomic setters -----------------------------------
 

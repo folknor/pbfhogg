@@ -154,6 +154,9 @@ pub mod commands;
 pub(crate) mod content;
 pub(crate) mod coord_fmt;
 pub(crate) mod coord_pack;
+// Public because the separate `pbfhogg-cli` crate arms the sidecar marker
+// FIFO through `debug::initialize_marker_fifo`; the library never reads
+// `BROKKR_MARKER_FIFO` itself.
 pub mod debug;
 mod error;
 pub mod geo;

@@ -57,21 +57,26 @@ pub(super) const RELATION_ID_FLOOR: i64 = 25_000_000;
 /// constant, so it still tracks the file the way the original fix intended:
 /// **the ID bitset may never exceed the size of the input file**, floored at
 /// the per-kind minimum above. `IdSet` costs one bit per ID, so `file_len`
-/// bytes of input buy `file_len * 8` IDs of range. That is generous by orders
-/// of magnitude against any real PBF (a PBF spends several bytes per element
-/// even packed and compressed, and IDs are dense), so no honest file is ever
-/// clamped, while a 4 KB file can no longer request an exabyte.
+/// bytes of input buy `file_len * 8` IDs of range, so a 4 KB file can no
+/// longer request an exabyte. That ceiling covers a full planet, whose IDs
+/// are dense, but not a regional extract: an extract keeps global IDs, and
+/// renumber measured a country extract's highest node ID at well over 8 per
+/// input byte. For those files it is the per-kind floor that covers the real
+/// ID range, so a floor that falls behind live OSM IDs makes this function
+/// clamp honest extracts. The arithmetic is `IdSet::file_bounded_max_id`'s,
+/// shared with renumber and the geocode builder.
 ///
 /// Clamping is safe rather than lossy: an ID above the chosen bound is not
 /// recorded, and both callers already treat that as a reportable input
 /// property (`IdViolation::IdOutOfRange` in `verify_ids`, an over-reported
 /// missing ref in `check_refs`) instead of a panic.
 pub(super) fn id_alloc_bound(indexdata_max: i64, floor: i64, file_len: u64) -> i64 {
-    let ceiling = i64::try_from(file_len.saturating_mul(8))
-        .unwrap_or(i64::MAX)
-        .max(floor);
-    indexdata_max.clamp(0, ceiling).max(floor)
+    crate::idset::IdSet::file_bounded_max_id(indexdata_max, file_len, CHECK_IDS_PER_BYTE).max(floor)
 }
+
+/// IDs of range per input byte that `id_alloc_bound` allows above the floor:
+/// at one bit per ID, a bitset no larger than the input file.
+const CHECK_IDS_PER_BYTE: u64 = 8;
 
 #[cfg(test)]
 mod tests {

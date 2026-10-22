@@ -77,23 +77,6 @@ untouched way, and on one that deletes such a node.
 
 Reported by: change application.
 
-## BUG-024 - `IdSet::pre_allocate` sizes from an unverified `max_id`
-
-Anger: 8 - IdSet preallocation.
-
-`IdSet` memory now follows the number of distinct IDs rather than their
-size (small chunks are sorted arrays, IDs from 2^43 up live in an ordered
-map), so `set` on an input-controlled ID no longer aborts. `pre_allocate
-(max_id)` still allocates a 4 MiB bitmap per 2^25 IDs from 0 to `max_id`
-before anything is validated, so a caller passing an indexdata `max_id`
-that lies high allocates until it runs out of memory. `check` bounds its
-argument by the file size, and renumber by `min(claim, file_len * 64)` with
-IDs above it routed through `set` after its parallel pass; the geocode
-builder (pass 1.5) still passes indexdata's claim unbounded and should do
-the same, per CORRECTNESS.md's rule for allocations sized from indexdata.
-
-Reported by: altw and scanning, geocode index, re-encoding.
-
 ## BUG-037 - `StringTable::pre_seed` identity mapping is not structural
 
 Anger: 9 - string-table remap in the rewrite hot path.
@@ -213,18 +196,6 @@ Anger: 9 - planet runs and verifies on the maintainer's hardware.
 
 Reported by: the 2026-10-22 fix round.
 
-## BUG-075 - A repeated OSMHeader is skipped by some commands and refused by others
-
-Anger: 9 - repeated-header policy.
-
-`sort` and plain `cat` silently skip an OSMHeader blob that is not the
-first; `digest` and `cat --dedupe` refuse one. A file with a second header
-(naive concatenation of two PBFs) is therefore accepted or rejected
-depending on the command. Decide once, in the reader, and have every
-command inherit it.
-
-Reported by: the cat-dedupe header fix.
-
 ## BUG-063 - Platform-skip residue: `src/` unit tests and pre-5.12 ring ENOMEM
 
 Anger: 7 - CLI behaviour.
@@ -272,14 +243,46 @@ fix is HYG-071's shared scratch.
 Reported by: change application, filtering and spatial, read path, test
 harness.
 
-## BUG-104 - `BlobHeader.datasize` narrows before the size check
+## BUG-105 - `Blob.raw_size` narrows before the length comparison
 
 Anger: 9 - decoder refusals.
 
-`src/read/blob_wire.rs` reads `BlobHeader.datasize` and narrows it before
-any size validation, so a value such as `2^32 + 100` aliases to 100 and the
-frame is read at the wrong length rather than refused. Refuse a datasize
-outside the accepted range where the header is parsed (once per blob).
+`Blob.raw_size` is narrowed unchecked in `src/read/blob_wire.rs` and again
+in `src/read/decompress.rs`, so an oversized value can alias a small
+declared size and pass the decompressed-length comparison. The existing
+allocation caps still bound memory. Bound it where the blob is parsed, once
+per blob, as `datasize` now is through `read_int32`.
 
-Reported by: the wave-6 framing fixer.
+Reported by: the wave-7 framing fixer.
+
+## BUG-106 - `check`'s node ID floor will start clamping honest extracts
+
+Anger: 8 - check aggregation.
+
+`check` sizes its ID bitset to `min(claim, file_len * 8)`, raised to
+`NODE_ID_FLOOR = 14_000_000_000`. Regional extracts keep global IDs and
+denmark's highest node ID is about 29 per input byte, so for any extract
+under roughly 1.75 GB the floor alone covers the real ID range. Once live
+OSM node IDs pass 14e9, `check --ids` reports `IdOutOfRange` and
+`check --refs` over-reports missing refs on honest files. Fix: renumber's
+overflow path (insert above-bound IDs with `set` after the parallel phase),
+or a floor that tracks reality. The `id_alloc_bound` doc now states the
+limit; behaviour is unchanged.
+
+Reported by: the wave-7 reconciler.
+
+## BUG-107 - `BlobReader::new_seekable` refuses a PBF that does not start at offset 0
+
+Anger: 9 - repeated-header policy.
+
+The leading-header rule treats a frame as first only when the stream is
+counted from its start. `BlobReader::new_seekable` on a reader positioned
+past 0 has no blob index and an offset other than 4, so the OSMHeader it
+starts with is refused as "a second OSMHeader blob". Reading a PBF embedded
+at a non-zero offset of a larger file through `new_seekable` used to work.
+`BlobReader::new` and `ElementReader` are unaffected. Decide whether a
+header at the construction position counts as leading, and say so in the
+CHANGELOG entry and `reference/truncation-handling.md`.
+
+Reported by: the wave-7 reviewer.
 

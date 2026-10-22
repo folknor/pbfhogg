@@ -135,11 +135,11 @@ impl WireBlobHeader {
                     }
                 }
                 blob_header::DATASIZE => {
-                    // datasize: int32 (varint)
-                    #[allow(clippy::cast_possible_truncation)]
-                    {
-                        datasize = cursor.read_varint()? as i32;
-                    }
+                    // Validate before narrowing: otherwise 2^32 + N aliases
+                    // to N and moves the next frame boundary. Sign-extended
+                    // negative int32 values remain intact for the size guard.
+                    datasize =
+                        super::wire::read_int32(&mut cursor, "BlobHeader.datasize exceeds int32")?;
                 }
                 blob_header::TAGDATA if parse_tagdata => {
                     // tagdata: per-blob tag key index (len-delimited). Same
@@ -527,6 +527,41 @@ mod tests {
                 assert_eq!(size, over);
             }
             other => panic!("expected DataSizeTooBig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn datasize_overflow_cannot_alias_a_small_frame_length() {
+        for value in [1_u64 << 31, (1_u64 << 32) + 100, 0xffff_fffe_ffff_ffff] {
+            let bytes = header_with_datasize(value);
+            // Both the direct BlobReader parser and the indexed framing
+            // funnel must refuse the original value before reading a body.
+            let err = WireBlobHeader::parse(&bytes, false, false, false).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("BlobHeader.datasize exceeds int32")
+            );
+            let err = parse_blob_header_with_index(&bytes, &crate::host::Diagnostics::discard())
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("BlobHeader.datasize exceeds int32")
+            );
+        }
+    }
+
+    #[test]
+    fn sign_extended_negative_datasize_reaches_the_negative_size_guard() {
+        for (wire, expected) in [(u64::MAX, -1), (0xffff_ffff_8000_0000, i32::MIN)] {
+            let bytes = header_with_datasize(wire);
+            let parsed = WireBlobHeader::parse(&bytes, false, false, false).unwrap();
+            assert_eq!(parsed.datasize, expected);
+            let err = parse_blob_header_with_index(&bytes, &crate::host::Diagnostics::discard())
+                .unwrap_err();
+            assert!(matches!(
+                err.into_kind(),
+                ErrorKind::Blob(BlobError::InvalidDataSize { size }) if size == expected
+            ));
         }
     }
 

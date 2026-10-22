@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use crate::blob_meta::ElemKind;
 use crate::block::PrimitiveBlock;
-use crate::elements::{Element, MemberId};
 
 use super::super::Result;
 use super::blob_meta::BlobMeta;
@@ -53,24 +52,13 @@ pub(super) fn collect_relation_member_ids_indexed(
             &mut st_scratch,
             &mut gr_scratch,
         )?;
-        for element in block.elements_skip_metadata() {
-            if let Element::Relation(r) = element {
-                let complete = r.tags().any(|(key, value)| {
-                    key == "type" && matches!(value, "multipolygon" | "boundary")
-                });
-                for member in r.members() {
-                    match member.id {
-                        MemberId::Node(id) if want_nodes && id >= 0 => {
-                            node_ids.as_mut().expect("requested").set(id);
-                        }
-                        MemberId::Way(id) if want_ways && complete && id >= 0 => {
-                            way_ids.as_mut().expect("requested").set(id);
-                        }
-                        _ => {}
-                    }
-                }
+        super::super::relation_member_ids(&block, want_nodes, want_ways, |way, id| {
+            if way {
+                way_ids.as_mut().expect("requested").set(id);
+            } else {
+                node_ids.as_mut().expect("requested").set(id);
             }
-        }
+        });
     }
 
     Ok(RelationScanOutput {

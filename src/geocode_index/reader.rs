@@ -219,9 +219,21 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 impl Reader {
     /// Open an index directory. Memory-maps all files.
     ///
-    /// Opening walks cells, geometry records and referenced strings; it is not
-    /// constant-time and can fault file-backed pages into memory. Entry-list
-    /// spans are checked, but individual entry references are not certified.
+    /// Opening performs a structural validation pass, so its work grows with
+    /// the number of fine and coarse cells, admin cells, street and
+    /// interpolation ways, address points, and admin polygons. It checks
+    /// header-counted record-file lengths, every cell's entry-list span, each
+    /// geometry span, and every string offset referenced by a way, address
+    /// point, or polygon.
+    /// The string checks read through each referenced string's terminator.
+    /// This touches file-backed mmap pages and can fault them into memory.
+    /// Coordinate payloads and individual cell-entry references are not
+    /// scanned; the latter are bounds-checked when queries use them. The
+    /// builder's smoke test calls this same open path, so its validation pass
+    /// is also part of build time. There is no unvalidated open: a caller that
+    /// reopens an index it has just built or checksummed pays this pass again
+    /// (a content checksum would not avoid it, since verifying one reads every
+    /// byte).
     pub fn open(dir: &Path) -> Result<Self> {
         let header_bytes = std::fs::read(dir.join(format::FILE_HEADER))?;
         if header_bytes.len() < HEADER_SIZE {

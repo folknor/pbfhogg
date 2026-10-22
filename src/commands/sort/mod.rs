@@ -514,8 +514,8 @@ fn build_blob_index(
                 });
             }
             _ => {
-                // Duplicate OsmHeader or unknown blob kind: walker has
-                // already advanced past the payload.
+                // Unknown extension blob: walker has already advanced past
+                // the payload. It rejects non-leading OSMHeader frames.
             }
         }
     }

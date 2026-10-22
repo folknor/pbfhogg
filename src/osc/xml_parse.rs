@@ -27,6 +27,8 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use quick_xml::events::attributes::Attribute;
 
+use crate::coord_fmt::deg_to_e7;
+use crate::coord_pack::{validate_lat, validate_lon};
 use crate::read::elements::MemberType;
 
 use super::ParseResult;
@@ -535,16 +537,16 @@ pub(crate) fn coord_to_decimicro(
     // i32 happily holds 1_000_000_000 decimicrodegrees, so the
     // representation check below would wave it through. Such a node would
     // enter the overlay as an ordinary node and could propagate into
-    // LocationsOnWays, where nothing downstream re-validates it.
-    let limit = if name == "lat" { 90.0_f64 } else { 180.0_f64 };
-    if !(degrees.is_finite() && degrees.abs() <= limit) {
-        return Err(format!(
-            "OSC node {id}: {name} value {degrees} is outside the valid geographic range \
-             -{limit} to {limit}"
-        )
-        .into());
-    }
-    let scaled = degrees * 1e7;
+    // LocationsOnWays, where nothing downstream re-validates it. The range
+    // rule itself is `coord_pack`'s; only the OSC node context is added here.
+    let validate = if name == "lat" {
+        validate_lat
+    } else {
+        validate_lon
+    };
+    validate(name, degrees)
+        .map_err(|err| -> Box<dyn std::error::Error> { format!("OSC node {id}: {err}").into() })?;
+    let scaled = deg_to_e7(degrees);
     if !scaled.is_finite() || scaled < f64::from(i32::MIN) || scaled > f64::from(i32::MAX) {
         return Err(format!(
             "OSC node {id}: {name} value {degrees} is outside the range representable in \

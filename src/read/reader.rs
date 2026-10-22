@@ -199,21 +199,10 @@ impl<R: Read + Send> ElementReader<R> {
 
         for blob in blob_iter {
             let blob = blob?;
-            // Only OsmData blobs carry elements, so any other blob type is
-            // skipped WITHOUT decompressing or parsing it. This is a deliberate
-            // decode-semantics parity choice with the pipelined path: the
-            // parallel frame pump (`pipeline.rs`) also matches on
-            // `BlobType::OsmData` and returns `None` for every other type, never
-            // touching a mid-stream header or unknown blob's payload. The header
-            // blob was already consumed and validated at construction.
-            //
-            // Consequence, spelled out because it is a behavior change from the
-            // old `blob.decode()` route: neither read path validates the
-            // compression or protobuf integrity of a *repeated* OsmHeader blob
-            // or an unknown blob appearing later in the stream. The old
-            // sequential path decoded (and thus error-checked) those blobs even
-            // though it discarded the result; the pipelined path never did. We
-            // converge both on "skip without decode" so the two paths agree.
+            // Only OsmData carries elements. Unknown extension blobs are
+            // skipped without decompression, matching the pipeline pump.
+            // BlobReader rejects non-leading OSMHeader frames before either
+            // path sees them, so later feature claims cannot be discarded.
             if blob.get_type() != BlobType::OsmData {
                 continue;
             }

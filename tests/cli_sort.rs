@@ -1247,3 +1247,27 @@ fn sort_io_uring_feature_missing_error() {
         "stderr must name the missing feature; got:\n{stderr}",
     );
 }
+
+#[test]
+fn sort_refuses_non_leading_header_frames() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    write_unsorted_overlapping_pbf(&input);
+    let bytes = std::fs::read(&input).expect("read fixture");
+    let frames = crate::common::adversarial::locate_blobs(&bytes);
+    let header = &bytes[..frames[0].blob_end];
+    for insertion in [frames[0].blob_end, bytes.len()] {
+        let bad = dir.path().join(format!("header-at-{insertion}.osm.pbf"));
+        let doubled = [&bytes[..insertion], header, &bytes[insertion..]].concat();
+        std::fs::write(&bad, doubled).expect("write repeated header");
+        let out = CliInvoker::new()
+            .arg("sort")
+            .arg(&bad)
+            .arg("-o")
+            .arg(dir.path().join(format!("out-{insertion}.osm.pbf")))
+            .arg("--force")
+            .run();
+        assert!(!out.status.success(), "{}", out.stderr_str());
+        assert!(out.stderr_str().contains("a second OSMHeader blob"));
+    }
+}

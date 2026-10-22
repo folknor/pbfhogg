@@ -329,6 +329,7 @@ impl HeaderWalker {
         // issues against it - is bounded, never a hostile multi-GB size.
         let (blob_type, data_size, raw_index, _index_present, tagdata, _tagdata_present) =
             parse_blob_header_with_index(&self.header_buf[4..header_end], &self.diagnostics)?;
+        crate::frame::check_header_position(&blob_type, frame_start == 0)?;
         let index = raw_index.as_ref().and_then(|b| BlobIndex::deserialize(b));
 
         let data_offset = self.offset + header_end as u64;

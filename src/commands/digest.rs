@@ -153,12 +153,8 @@ fn walk_envelope(path: &Path, host: &crate::host::Host) -> Result<Vec<Option<Blo
     let mut seen_header = false;
     while let Some(meta) = walker.next_header()? {
         match meta.blob_type {
-            BlobKind::OsmHeader if !seen_header => seen_header = true,
-            BlobKind::OsmHeader => {
-                return Err("a second OsmHeader blob follows the first; digest accepts \
-                            exactly one header, as the first blob"
-                    .into());
-            }
+            // HeaderWalker enforces the shared leading-header policy.
+            BlobKind::OsmHeader => seen_header = true,
             BlobKind::OsmData if seen_header => indexes.push(meta.index),
             BlobKind::OsmData => {
                 return Err("the first blob is not an OsmHeader".into());

@@ -227,12 +227,9 @@ impl SharedSparseWriter {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn insert(&self, node_id: i64, rank: u64, lat: i32, lon: i32) -> crate::error::Result<()> {
         let packed = pack(lat, lon).ok_or_else(|| {
-            crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(format!(
-                "node {node_id} has coordinates outside the geographic domain \
-                 (lat {lat}, lon {lon} in decimicrodegrees; latitude must be \
-                 within +/-90 degrees and longitude within +/-180). Refusing \
-                 to build a node index from it."
-            ))))
+            crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
+                super::node_coordinate_domain_error(node_id, lat, lon),
+            )))
         })?;
         let byte_offset = (rank * 8) as usize;
         assert!(

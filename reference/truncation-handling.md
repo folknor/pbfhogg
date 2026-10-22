@@ -22,6 +22,33 @@ bytes or 1-3 leftover bytes of an incomplete next length prefix.
 That shape is the natural signal of "end of input" and is
 tolerated.
 
+## Header position and declared size
+
+Every reader rejects an OSMHeader frame after the first frame, before
+reading or skipping its payload. `read::frame::check_header_position` owns
+this policy; the streaming frame helper, BlobReader and HeaderWalker all
+apply it once per blob. Sequential, parallel, pipelined, raw passthrough
+and header-only command paths therefore inherit the same refusal. A caller
+that intentionally stops early need not inspect later frames.
+
+This matches libosmium's `pbf_input_format.hpp`: its initial header parse
+expects OSMHeader, then its data loop expects OSMData. Ignoring a second
+header would discard its feature requirements and metadata, interpreting
+its data under the first header instead. The alternative would be to
+accept and reconcile every header, including incompatible feature claims;
+that policy is not implemented. Pass separately framed PBF files as
+separate command inputs instead of concatenating their bytes.
+
+Low-level blob APIs still permit reading a data frame alone, including by
+seeking to it, and retain their existing handling of unknown extension
+blobs. An OSMHeader is accepted again after rewinding to offset zero.
+
+`WireBlobHeader::parse` checks `datasize` as a signed int32 before narrowing.
+Out-of-range varints cannot alias a smaller frame length (for example,
+2^32 + 100 becoming 100). Sign-extended negative int32 values retain their
+value and reach the existing negative-size guard; the existing 32 MiB
+serialized-body cap still applies before any body allocation or skip.
+
 ## The five shapes
 
 PBF wire format:

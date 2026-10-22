@@ -784,30 +784,29 @@ fn blobreader_seek_raw() {
 /// `next()`, so callers that recover by seeking past bad bytes can resume.
 #[test]
 fn blobreader_seek_raw_clears_error_state() {
-    // Bytes layout: [oversized blob header length | good PBF].
-    //  - The first 4 bytes claim a blob header of ~4 GB, tripping the
-    //    MAX_BLOB_HEADER_SIZE guard on the very first `next()` call.
+    // Bytes layout: [good PBF | oversized blob header length].
+    //  - The trailing 4 bytes claim a blob header of ~4 GB, tripping the
+    //    MAX_BLOB_HEADER_SIZE guard once the good frames are consumed.
     //  - After the failure, `last_blob_ok = false` makes the reader sticky.
-    //  - Seeking past the 4 sentinel bytes should reset the state and let
-    //    iteration resume on the good PBF that follows.
+    //  - Seeking back to the start should reset the state and let
+    //    iteration resume on the leading OSMHeader (an OSMHeader is only
+    //    accepted as the first frame, so the junk cannot come first).
     let dir = TempDir::new().unwrap();
     let good_path = dir.path().join("good.osm.pbf");
     write_test_pbf(&good_path);
-    let good_bytes = std::fs::read(&good_path).unwrap();
-
-    let mut bytes = vec![0xFFu8, 0xFF, 0xFF, 0xFF]; // claimed header length = 0xFFFFFFFF
-    bytes.extend_from_slice(&good_bytes);
+    let mut bytes = std::fs::read(&good_path).unwrap();
+    bytes.extend_from_slice(&[0xFFu8, 0xFF, 0xFF, 0xFF]); // claimed header length = 0xFFFFFFFF
 
     let mut reader = BlobReader::new(std::io::Cursor::new(bytes));
 
-    // First call: HeaderTooBig error; reader becomes sticky.
-    assert!(reader.next().unwrap().is_err());
+    // Consume the good frames until the HeaderTooBig error; reader becomes sticky.
+    while let Ok(_blob) = reader.next().unwrap() {}
     assert!(reader.next().is_none(), "reader must stay dead until seek");
 
-    // Seek past the sentinel; state must clear.
-    reader.seek_raw(SeekFrom::Start(4)).unwrap();
+    // Seek back to the start; state must clear.
+    reader.seek_raw(SeekFrom::Start(0)).unwrap();
 
-    // Iteration resumes on the good PBF.
+    // Iteration resumes on the leading header.
     let blob = reader.next().unwrap().unwrap();
     assert_eq!(blob.get_type(), BlobType::OsmHeader);
 }
@@ -1180,4 +1179,57 @@ fn trailing_partial_length_prefix_4_bytes_is_committed_frame() {
         "4 trailing bytes (a complete length prefix declaring N>0 \
          header bytes that don't follow) is shape 2, must hard-error"
     );
+}
+
+/// A second header is refused at framing, including on a non-seekable Read
+/// and after seeking. No decoder may silently discard its feature claims.
+#[test]
+fn non_leading_headers_are_refused_by_all_streaming_read_paths() {
+    let dir = crate::common::test_scratch();
+    let good = dir.path().join("good.osm.pbf");
+    write_test_pbf(&good);
+    let bytes = std::fs::read(&good).unwrap();
+    let frames = crate::common::adversarial::locate_blobs(&bytes);
+    let header = &bytes[..frames[0].blob_end];
+    for insertion in [frames[0].blob_end, bytes.len()] {
+        let mut doubled = bytes[..insertion].to_vec();
+        doubled.extend_from_slice(header);
+        doubled.extend_from_slice(&bytes[insertion..]);
+        let bad = dir.path().join(format!("header-at-{insertion}.osm.pbf"));
+        std::fs::write(&bad, &doubled).unwrap();
+        let expected = "a second OSMHeader blob";
+
+        let mut raw = BlobReader::new(Cursor::new(doubled.clone()));
+        let err = raw.try_for_each(|blob| blob.map(|_| ())).unwrap_err();
+        assert!(err.to_string().contains(expected));
+        assert!(raw.next().is_none());
+
+        let mut seekable = BlobReader::new_seekable(Cursor::new(doubled)).unwrap();
+        seekable
+            .seek_raw(SeekFrom::Start(insertion as u64))
+            .unwrap();
+        let err = seekable.next_header_skip_blob().unwrap().unwrap_err();
+        assert!(err.to_string().contains(expected));
+        seekable.seek_raw(SeekFrom::Start(0)).unwrap();
+        assert_eq!(
+            seekable.next().unwrap().unwrap().get_type(),
+            BlobType::OsmHeader
+        );
+
+        let err = ElementReader::from_path(&bad)
+            .unwrap()
+            .for_each(|_| {})
+            .unwrap_err();
+        assert!(err.to_string().contains(expected));
+        let err = ElementReader::from_path(&bad)
+            .unwrap()
+            .for_each_pipelined(|_| {})
+            .unwrap_err();
+        assert!(err.to_string().contains(expected));
+        let err = ElementReader::from_path(&bad)
+            .unwrap()
+            .par_map_reduce(|_| 1_usize, || 0_usize, |a, b| a + b)
+            .unwrap_err();
+        assert!(err.to_string().contains(expected));
+    }
 }

@@ -3,6 +3,12 @@
 //! Metadata fields are String-typed for direct XML attribute output.
 //! See `crate::owned` for the PBF-oriented variant with native types.
 
+// This module owns OSC element XML, not whole-document framing or transport.
+// The command output paths have distinct transport rules: merge_changes
+// chooses gzip from the output name, tags-filter always gzips, and diff writes
+// ordered gzip chunks. Keep document framing at those owners until a shared
+// writer can preserve each output contract and its existing gzip bytes.
+
 use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 

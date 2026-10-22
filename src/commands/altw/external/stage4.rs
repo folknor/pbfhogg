@@ -23,6 +23,10 @@ use crate::owned::{dense_node_metadata, element_metadata};
 use super::blob_meta::BlobMeta;
 
 /// Blob descriptor for the stage 4 pre-scan schedule.
+///
+/// Unlike sparse pass 2, external requires a known kind and a way-sidecar
+/// index. Share eligibility policy, but keep these backend-specific fields
+/// and the measured dispatch/reorder pipelines local.
 struct BlobDescriptor {
     seq: usize,
     /// Start of the on-disk 4-byte length prefix. Used by the consumer-side
@@ -186,14 +190,8 @@ pub(super) fn stage4_assembly(
         };
 
         let is_way_blob = matches!(meta.kind, crate::blob_meta::ElemKind::Way);
-        // Passthrough eligibility mirrors the rule in
-        // write_output_passthrough:
-        //   - Relation blobs: always.
-        //   - Node blobs: only when keep_untagged_nodes is set (no
-        //     per-element filtering needed; the blob is kept as-is).
-        //   - Ways: never (they need coord_payloads splicing).
-        let is_passthrough = matches!(meta.kind, crate::blob_meta::ElemKind::Relation)
-            || (matches!(meta.kind, crate::blob_meta::ElemKind::Node) && keep_untagged_nodes);
+        let is_passthrough =
+            super::super::blob_is_passthrough(Some(meta.kind), keep_untagged_nodes);
 
         #[allow(clippy::cast_possible_truncation)]
         let frame_size = (meta.data_offset - meta.frame_offset) as usize + meta.data_size;
@@ -236,15 +234,7 @@ pub(super) fn stage4_assembly(
         &header,
         true,
         overrides,
-        |hb| {
-            use crate::read::block::Feature;
-            let mut hb = hb.optional_feature(Feature::LOCATIONS_ON_WAYS);
-            if inject_prepass {
-                hb = hb.optional_feature(Feature::WAY_MEMBERS_V1);
-                hb = hb.optional_feature(Feature::SHARED_NODE_PINS_V1);
-            }
-            hb
-        },
+        |hb| super::super::altw_header_features(hb, inject_prepass),
         direct_io,
         false,
         host,
@@ -1148,7 +1138,10 @@ impl WayReframeScratch {
 /// zigzag-decoding or re-encoding.
 ///
 /// The whole-pipeline missing-location count is computed once in
-/// `external_join` from the total and resolved slot counts.
+/// `external_join` from the total and resolved slot counts. Stage 3 has
+/// already replaced absent slots with zero coordinates in this payload;
+/// those bytes cannot distinguish missing nodes from real Null Island nodes.
+/// Do not derive a per-blob missing count here.
 #[hotpath::measure]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn reframe_way_blob_with_locations(

@@ -20,6 +20,8 @@ pub(crate) use protohoggr::{
 /// to a different, plausible one (`100`). Shared by both PrimitiveBlock
 /// header scans (`WireBlock` here and `blob_meta`'s ID scan) so the two agree
 /// on which `granularity` and `date_granularity` values a block may carry.
+/// BlobHeader parsing uses the same check before trusting `datasize` as a
+/// frame length, so out-of-range values cannot move frame boundaries.
 #[inline]
 pub(crate) fn read_int32(cursor: &mut Cursor<'_>, overflow_msg: &'static str) -> Result<i32> {
     i32::try_from(cursor.read_varint_i64()?).map_err(|_| new_wire_error(overflow_msg))

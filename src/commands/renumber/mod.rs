@@ -300,28 +300,15 @@ fn validate_start_ids(opts: &RenumberOptions) -> Result<()> {
     Ok(())
 }
 
-/// The `pre_allocate` argument for the pass 1 node set.
-///
-/// The highest node ID the schedule's indexdata claims, bounded by the
-/// input's size: `pre_allocate` eagerly allocates one bit per ID from 0 to
-/// its argument, indexdata is unverified, and a claim of `i64::MAX` would
-/// otherwise ask for an exabyte before a single blob is read (CORRECTNESS.md,
-/// the indexdata trust boundary). At one bit per ID, `file_len *
-/// PREALLOC_IDS_PER_BYTE` keeps a false claim's bitmap within eight times
-/// the file's own size, plus one chunk of rounding.
+/// IDs the pass 1 node pre-allocation may cover per input byte, passed to
+/// `IdSet::file_bounded_max_id` with the schedule's claimed highest node ID.
 ///
 /// Unlike `check`'s `id_alloc_bound` there is no live-OSM floor, because
 /// nothing depends on the bound covering every ID: pass 1 hands an ID
 /// outside the pre-allocation back as overflow and inserts it after the
 /// pass, where `IdSet` memory follows the number of distinct IDs. A small
 /// extract carrying real ~1e10 node IDs therefore costs memory in proportion
-/// to its nodes, not to its largest ID, and is not refused.
-fn node_prealloc_bound(claimed_max: i64, file_len: u64) -> i64 {
-    let by_size = i64::try_from(file_len.saturating_mul(PREALLOC_IDS_PER_BYTE)).unwrap_or(i64::MAX);
-    claimed_max.min(by_size)
-}
-
-/// IDs the node pre-allocation may cover per input byte. The overflow path
+/// to its nodes, not to its largest ID, and is not refused. The overflow path
 /// is serial (~3.7 ns per ID on bygg), and honest files gain nothing from a
 /// tight bound: their set ends as the same bitmaps either way. At 8 per
 /// byte, denmark (highest node ID about 29 times its size in bytes) sent 37
@@ -429,10 +416,11 @@ pub fn renumber_external(
     // One shared IdSet, pre-allocated so workers can `set_atomic_checked`
     // through `&self`. The whole schedule is scanned for the claimed max
     // rather than trusting the last blob; the claim is then bounded by the
-    // file size (see `node_prealloc_bound`).
+    // file size (see `PREALLOC_IDS_PER_BYTE`).
     let mut node_id_set = crate::idset::IdSet::new();
     if let Some(claimed_max) = pass1_schedule.iter().map(|t| t.max_id).max() {
-        let bound = node_prealloc_bound(claimed_max, file_len);
+        let bound =
+            crate::idset::IdSet::file_bounded_max_id(claimed_max, file_len, PREALLOC_IDS_PER_BYTE);
         if bound >= 0 {
             node_id_set.pre_allocate(bound);
         }
@@ -638,9 +626,12 @@ mod tests {
     /// size the pre-allocation; an honest planet-scale claim still does.
     #[test]
     fn the_node_preallocation_is_bounded_by_the_file() {
-        assert_eq!(node_prealloc_bound(i64::MAX, 4096), 262_144);
+        let bound = |claimed, file_len| {
+            crate::idset::IdSet::file_bounded_max_id(claimed, file_len, PREALLOC_IDS_PER_BYTE)
+        };
+        assert_eq!(bound(i64::MAX, 4096), 262_144);
         let planet = 80_u64 * 1024 * 1024 * 1024;
-        assert_eq!(node_prealloc_bound(13_000_000_000, planet), 13_000_000_000);
-        assert_eq!(node_prealloc_bound(i64::MAX, u64::MAX), i64::MAX);
+        assert_eq!(bound(13_000_000_000, planet), 13_000_000_000);
+        assert_eq!(bound(i64::MAX, u64::MAX), i64::MAX);
     }
 }

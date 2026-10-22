@@ -523,21 +523,14 @@ pub(super) fn stage2_node_join(
                                     let tuple = &node_tuples[tuple_ptr];
                                     // Same geographic-domain refusal as the
                                     // sparse backend's slot encoding
-                                    // (`sparse.rs::pack`): a referenced node
+                                    // (`coord_pack::pack`): a referenced node
                                     // outside +/-90 / +/-180 degrees is not a
                                     // coordinate, and writing it through
                                     // would make `--index-type` change what
                                     // the command accepts. The backends must
                                     // agree on refusal, not just on counting.
-                                    if !(-900_000_000..=900_000_000).contains(&tuple.lat)
-                                        || !(-1_800_000_000..=1_800_000_000).contains(&tuple.lon)
-                                    {
-                                        return Err(format!(
-                                            "node {} has coordinates outside the geographic \
-                                             domain (lat {}, lon {} in decimicrodegrees; \
-                                             latitude must be within +/-90 degrees and \
-                                             longitude within +/-180). Refusing to build a \
-                                             node index from it.",
+                                    if !crate::coord_pack::in_domain(tuple.lat, tuple.lon) {
+                                        return Err(super::super::node_coordinate_domain_error(
                                             tuple.id, tuple.lat, tuple.lon,
                                         ));
                                     }

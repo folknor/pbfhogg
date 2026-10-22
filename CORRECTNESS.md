@@ -448,10 +448,12 @@ being wrong. `check`'s `id_alloc_bound` bounds the ID bitset by the input file's
 own size rather than by the claimed `max_id`, and both `verify_ids` and
 `check_refs` report an out-of-range ID as an input property instead of panicking.
 `repack` bounds its `BlockBuilder` pre-allocation the same way. `renumber`
-pre-allocates its node set to the smaller of the claimed `max_id` and a bound
-from the file size, and inserts any decoded ID above that afterwards, so a
-false claim costs neither memory nor a refusal. New code that sizes anything
-from `indexdata` must do likewise.
+and the geocode builder's node pass pre-allocate their node sets to the
+smaller of the claimed `max_id` and a bound from the file size, and insert
+any ID above that afterwards, so a false claim costs neither memory nor a
+refusal. All three ID-bitset callers take the bound from
+`IdSet::file_bounded_max_id`, each with its own IDs-per-byte factor. New
+code that sizes anything from `indexdata` must do likewise.
 
 ## OSC compatibility and emission contracts
 

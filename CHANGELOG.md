@@ -492,6 +492,19 @@
   of `update_timestamp: bool`. Pass the epoch seconds to stamp deletes with,
   or `None` to leave them unstamped.
 
+- **An OSMHeader blob anywhere but first is an error in every command.**
+  A file made by appending one PBF's bytes to another's carries a second
+  OSMHeader. `sort`, plain `cat` and the library readers (`BlobReader`,
+  `ElementReader`) used to skip it, reading the second file's data under the
+  first file's header and silently dropping what the second declared
+  (`HistoricalInformation`, required features, bbox); plain `cat` even kept
+  the first header's `Sort.Type_then_ID` over the unsorted result. Every
+  reader now refuses it, as `digest` and `cat --dedupe` already did and as
+  osmium does. Pass the original files as separate inputs instead
+  (`pbfhogg cat a.osm.pbf b.osm.pbf -o merged.osm.pbf`), which reconciles
+  their headers. Seeking a `BlobReader` back to offset 0 still reads the
+  leading header.
+
 ### Added
 
 - **`getid` and `getparents` accept named element IDs** (`node/123`,

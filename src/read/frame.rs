@@ -22,6 +22,8 @@
 //! * [`read_frame_header`] - prefix, header bytes, and header parse in one
 //!   call, for the decoders that go on to materialise, skip, or index a
 //!   payload.
+//! * [`check_header_position`] - the leading-header rule (an OSMHeader only
+//!   as the first frame), applied by every decoder once per frame.
 //!
 //! # EOF policy
 //!
@@ -59,6 +61,21 @@ pub(crate) fn check_header_len(header_len: u32) -> Result<usize> {
         return Err(new_blob_error(BlobError::HeaderTooBig { size: len }));
     }
     Ok(header_len as usize)
+}
+
+/// OSMHeader is allowed only at the start of a PBF stream. Ignoring a later
+/// header discards its feature requirements and metadata while interpreting
+/// its data under the first header. libosmium likewise expects OSMData after
+/// the leading OSMHeader (pbf_input_format.hpp). Unknown extension blobs keep
+/// their existing skip policy; low-level readers may still read data alone.
+/// Call once per frame, before reading or skipping its payload.
+pub(crate) fn check_header_position(blob_type: &BlobKind, at_start: bool) -> Result<()> {
+    if matches!(blob_type, BlobKind::OsmHeader) && !at_start {
+        return Err(crate::error::new_wire_error(
+            "a second OSMHeader blob follows the first frame; OSMHeader is allowed only as the first blob",
+        ));
+    }
+    Ok(())
 }
 
 /// Read and validate the 4-byte length prefix of the next frame.
@@ -109,10 +126,12 @@ impl FrameHeader {
 ///
 /// `header_buf` is a caller-owned scratch buffer, resized to the header length
 /// and left holding exactly the header bytes so callers that reframe a
-/// passthrough blob can copy them verbatim.
+/// passthrough blob can copy them verbatim. `frame_start` is the absolute
+/// prefix offset in the input, used to enforce the leading-header policy.
 pub(crate) fn read_frame_header<R: Read>(
     reader: &mut R,
     header_buf: &mut Vec<u8>,
+    frame_start: u64,
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<Option<FrameHeader>> {
     let Some(header_len) = read_frame_prefix(reader)? else {
@@ -130,6 +149,10 @@ pub(crate) fn read_frame_header<R: Read>(
     // hostile `BlobHeader.datasize`.
     let (blob_type, data_size, raw_index, raw_index_present, tagdata, tagdata_present) =
         parse_blob_header_with_index(header_buf, diagnostics)?;
+    // Stamp the frame start: the raw-frame callers otherwise report this
+    // refusal with no position, and on a multi-input command no input either.
+    check_header_position(&blob_type, frame_start == 0)
+        .map_err(|err| err.at(crate::ByteOffset(frame_start)))?;
     Ok(Some(FrameHeader {
         header_len,
         blob_type,
@@ -146,6 +169,19 @@ pub(crate) fn read_frame_header<R: Read>(
 mod tests {
     use super::{check_header_len, read_frame_header, read_frame_prefix};
     use crate::error::{BlobError, ErrorKind};
+
+    #[test]
+    fn only_leading_header_frames_are_accepted() {
+        use crate::blob::BlobKind;
+
+        super::check_header_position(&BlobKind::OsmHeader, true).unwrap();
+        let err = super::check_header_position(&BlobKind::OsmHeader, false).unwrap_err();
+        assert!(err.to_string().contains("a second OSMHeader blob"));
+        for at_start in [false, true] {
+            super::check_header_position(&BlobKind::OsmData, at_start).unwrap();
+            super::check_header_position(&BlobKind::Unknown("extension".into()), at_start).unwrap();
+        }
+    }
 
     /// The two guards every decoder shares, at their exact boundaries. The cap
     /// is strict (`>=`) so the largest accepted prefix is one below it.
@@ -218,7 +254,12 @@ mod tests {
         input.extend_from_slice(&[0x0A, 0x07, b'O']);
         let mut cursor = std::io::Cursor::new(input);
         let mut buf = Vec::new();
-        match read_frame_header(&mut cursor, &mut buf, &crate::host::Diagnostics::discard()) {
+        match read_frame_header(
+            &mut cursor,
+            &mut buf,
+            0,
+            &crate::host::Diagnostics::discard(),
+        ) {
             Err(err) => assert!(
                 matches!(err.into_kind(), ErrorKind::Io(_)),
                 "a truncated BlobHeader must surface as an I/O error"

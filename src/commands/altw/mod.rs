@@ -31,6 +31,67 @@ use super::Result;
 use self::passthrough::write_output_passthrough;
 use self::sparse::{SparseArrayIndex, build_node_index_sparse};
 
+/// Shared refusal text for a referenced node rejected by the coordinate owner.
+fn node_coordinate_domain_error(node_id: i64, lat: i32, lon: i32) -> String {
+    format!(
+        "node {node_id} has coordinates outside the geographic domain \
+         (lat {lat}, lon {lon} in decimicrodegrees; latitude must be \
+         within +/-90 degrees and longitude within +/-180). Refusing \
+         to build a node index from it."
+    )
+}
+
+/// Apply the output features owned by ALTW, including the injected payloads.
+fn altw_header_features<'a>(
+    hb: crate::block_builder::HeaderBuilder<'a>,
+    inject_prepass: bool,
+) -> crate::block_builder::HeaderBuilder<'a> {
+    use crate::read::block::Feature;
+    let hb = hb.optional_feature(Feature::LOCATIONS_ON_WAYS);
+    if inject_prepass {
+        hb.optional_feature(Feature::WAY_MEMBERS_V1)
+            .optional_feature(Feature::SHARED_NODE_PINS_V1)
+    } else {
+        hb
+    }
+}
+
+/// Relations need no edits; nodes can bypass filtering only when all are kept.
+/// Unknown kinds must decode, and ways always need location splicing.
+fn blob_is_passthrough(
+    kind: Option<crate::blob_meta::ElemKind>,
+    keep_untagged_nodes: bool,
+) -> bool {
+    use crate::blob_meta::ElemKind;
+    matches!(kind, Some(ElemKind::Relation))
+        || matches!(kind, Some(ElemKind::Node) if keep_untagged_nodes)
+}
+
+/// Select relation dependencies without owning their accumulation strategy.
+/// Sparse streams per-blob vectors into one IdSet; external inserts directly
+/// while preading its existing metadata table. Keep those measured shapes.
+fn relation_member_ids(
+    block: &PrimitiveBlock,
+    want_nodes: bool,
+    want_ways: bool,
+    mut emit: impl FnMut(bool, i64),
+) {
+    for element in block.elements_skip_metadata() {
+        if let Element::Relation(r) = element {
+            let complete = r
+                .tags()
+                .any(|(key, value)| key == "type" && matches!(value, "multipolygon" | "boundary"));
+            for member in r.members() {
+                match member.id {
+                    MemberId::Node(id) if want_nodes && id >= 0 => emit(false, id),
+                    MemberId::Way(id) if want_ways && complete && id >= 0 => emit(true, id),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Index type selection
 // ---------------------------------------------------------------------------
@@ -961,22 +1022,9 @@ pub(crate) fn collect_relation_member_ids(
         || (),
         |block, _state| {
             let mut ids: Vec<(bool, i64)> = Vec::new();
-            for element in block.elements_skip_metadata() {
-                if let Element::Relation(r) = element {
-                    let complete = r.tags().any(|(key, value)| {
-                        key == "type" && matches!(value, "multipolygon" | "boundary")
-                    });
-                    for member in r.members() {
-                        match member.id {
-                            MemberId::Node(id) if want_nodes && id >= 0 => ids.push((false, id)),
-                            MemberId::Way(id) if want_ways && complete && id >= 0 => {
-                                ids.push((true, id));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
+            relation_member_ids(block, want_nodes, want_ways, |way, id| {
+                ids.push((way, id));
+            });
             ids
         },
         |_seq, ids| {
@@ -1074,7 +1122,7 @@ fn write_output_decode_all(
         reader.header(),
         true,
         overrides,
-        |hb| hb.optional_feature(crate::read::block::Feature::LOCATIONS_ON_WAYS),
+        |hb| altw_header_features(hb, false),
         direct_io,
         false,
         host,

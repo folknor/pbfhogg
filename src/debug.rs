@@ -92,6 +92,10 @@ pub fn emit_counter(name: &str, value: i64) {
 /// - `<prefix>_fordblks`  - bytes free in normal blocks (free-list)
 /// - `<prefix>_keepcost`  - top-most releasable block in arena
 ///
+/// Brokkr stores application counters by their supplied names and reports
+/// added, missing, or changed counters in comparisons. This function does no
+/// allocator query unless the caller initialized the marker FIFO.
+///
 /// On non-glibc platforms this is a no-op.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn emit_mallinfo2(prefix: &str) {

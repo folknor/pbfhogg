@@ -1319,3 +1319,40 @@ fn passthrough_rejects_malformed_unindexed_payload() {
         "a refused cat must not publish its output"
     );
 }
+
+#[test]
+fn every_cat_path_refuses_non_leading_header_frames() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    write_sorted_pbf_with(&input, 1, |hb| hb);
+    let bytes = std::fs::read(&input).expect("read fixture");
+    let frames = crate::common::adversarial::locate_blobs(&bytes);
+    let header = &bytes[..frames[0].blob_end];
+    for insertion in [frames[0].blob_end, bytes.len()] {
+        let bad = dir.path().join(format!("header-at-{insertion}.osm.pbf"));
+        let doubled = [&bytes[..insertion], header, &bytes[insertion..]].concat();
+        std::fs::write(&bad, doubled).expect("write repeated header");
+        for (mode, flags) in [
+            ("passthrough", vec![]),
+            ("filtered", vec!["--type", "node"]),
+            ("clean", vec!["-c", "version"]),
+            ("dedupe", vec!["--dedupe"]),
+        ] {
+            let mut cli = CliInvoker::new().arg("cat").arg(&bad);
+            for flag in flags {
+                cli = cli.arg(flag);
+            }
+            let out = cli
+                .arg("-o")
+                .arg(dir.path().join(format!("out-{mode}-{insertion}.osm.pbf")))
+                .arg("--force")
+                .run();
+            assert!(!out.status.success(), "{mode}: {}", out.stderr_str());
+            assert!(
+                out.stderr_str().contains("a second OSMHeader blob"),
+                "{mode}: {}",
+                out.stderr_str()
+            );
+        }
+    }
+}

@@ -294,6 +294,8 @@ fn time_filter_snapshot(
     };
 
     crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_START");
+    // Brokkr stores named counters generically and reports changes in sidecar
+    // comparisons; these samples are inert unless the CLI initialized the FIFO.
     crate::debug::emit_mallinfo2("timefilter_snapshot_start_mallinfo");
 
     let (schedule, shared_file) = build_classify_schedule(input, None, &host.diagnostics)?;
@@ -393,6 +395,8 @@ fn time_filter_snapshot(
         return Err(e.into());
     }
 
+    // Brokkr stores named counters generically and reports changes in sidecar
+    // comparisons; this sample is inert unless the CLI initialized the FIFO.
     crate::debug::emit_mallinfo2("timefilter_snapshot_end_mallinfo");
     crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_END");
     Ok(stats)

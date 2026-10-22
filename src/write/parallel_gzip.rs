@@ -127,6 +127,10 @@ const QUEUE_SLOTS_PER_WORKER: usize = 2;
 /// (DEFLATE level 1) matches what the serial `assemble_osc` path used
 /// to hand to `flate2::GzEncoder`, so compressed size is directly
 /// comparable in benches.
+// merge_changes and tags-filter select `Compression::fast` at their own
+// writers. Moving this value alone would leave those paths with separate
+// owners and would imply a shared compression policy that the current tree
+// does not have.
 fn compression_level() -> flate2::Compression {
     flate2::Compression::fast()
 }

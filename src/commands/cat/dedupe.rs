@@ -315,7 +315,8 @@ pub fn merge_pbf(
 /// across all inputs was kept, an input with no OSMHeader at all never met
 /// the sortedness check, so an unsorted headerless input was merged under a
 /// `Sort.Type_then_ID` stamp as long as some other input had a header. A
-/// second header later in a file is refused rather than ignored, because
+/// second header later in a file is refused by the shared framing policy
+/// (`read::frame::check_header_position`) rather than ignored, because
 /// whatever it declares (history, a bbox, enrichment) would otherwise be
 /// silently left out of the reconciled output header.
 fn build_blob_index(
@@ -389,7 +390,17 @@ fn index_input(
         // previously resized `header_buf` straight from the unvalidated 4-byte
         // prefix, so four bytes of corrupt input asked for up to a 4 GiB
         // allocation - the one frame decoder that had neither guard.
-        let Some(frame) = read_frame_header(&mut reader, header_buf, &host.diagnostics)? else {
+        // Name the input: this loop indexes several files, and the shared
+        // framing refusals (a non-leading OSMHeader among them, which this
+        // loop used to report itself with the input path) carry none.
+        let Some(frame) =
+            read_frame_header(&mut reader, header_buf, frame_start, &host.diagnostics).map_err(
+                |err| {
+                    err.at(crate::ByteOffset(frame_start))
+                        .in_input(Some(&std::sync::Arc::<Path>::from(input)), None)
+                },
+            )?
+        else {
             break;
         };
         let raw_index = frame
@@ -401,7 +412,7 @@ fn index_input(
         file_offset += frame_len;
 
         match (&frame.blob_type, header.is_some()) {
-            (BlobKind::OsmHeader, false) => {
+            (BlobKind::OsmHeader, _) => {
                 blob_buf.resize(data_size, 0);
                 reader.read_exact(blob_buf)?;
                 let hdr = decode_blob_to_headerblock(blob_buf)?;
@@ -412,12 +423,6 @@ fn index_input(
                     "Cat dedupe requires sorted inputs so it can merge them in type-then-ID order.",
                 )?;
                 header = Some(hdr);
-            }
-            (BlobKind::OsmHeader, true) => {
-                return Err(frame_order_error(
-                    input,
-                    &format!("a second OSMHeader blob at offset {frame_start}"),
-                ));
             }
             (_, false) => {
                 return Err(frame_order_error(

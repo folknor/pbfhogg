@@ -406,8 +406,8 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
     // -----------------------------------------------------------------------
     // One header walk produces everything Pass 1.5 and Pass 2a need: the
     // way schedule (Pass 1.5), the node schedule (Pass 2a), the node-ID
-    // bound (Pass 1.5's `IdSet::pre_allocate`, verified in Pass 2a), and a
-    // single shared file handle reused by both phases' pread workers.
+    // bound (used for Pass 1.5's file-size-bounded `IdSet` pre-allocation and
+    // verified in Pass 2a), and one shared file handle for both pread phases.
     // Previously two separate header walks: Pass 1.5's own walker and
     // Pass 2a's `build_classify_schedule(Node)` call. Consolidated walker
     // saves ~26 s at Europe / ~80 s at planet (2026-04-18 bench `bf8f2038`).
@@ -660,7 +660,11 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
     };
     std::fs::write(config.output_dir.join(FILE_HEADER), header.to_bytes())?;
 
-    // Build-time smoke test
+    // `Reader::open` runs the same record and string validation described on
+    // its public API, so this smoke test intentionally repeats that structural
+    // pass on the files just written before querying the result. Its work is
+    // part of the build wall time; skipping it would leave written output
+    // unchecked by the reader path.
     {
         crate::host::diag!(
             host.diagnostics,

@@ -510,6 +510,8 @@ pub(super) fn extract_smart(
         collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler, host)?;
     let mut extra_node_ids = handler.extra_node_ids;
     crate::debug::emit_marker("SMART_PASS1_END");
+    // Brokkr stores named counters generically and reports changes in sidecar
+    // comparisons; this sample is inert unless the CLI initialized the FIFO.
     crate::debug::emit_mallinfo2("MI_PASS1_END");
 
     // --- Pass 2: Resolve extra way node deps (parallel pread) ---

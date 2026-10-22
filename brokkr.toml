@@ -256,6 +256,8 @@ description = "Platform-sensitive tests (--direct-io, --io-uring)"
 sweeps = ["all"]
 only = ["platform::"]
 include_ignored = true
+# Shared test helpers read this to fail when a requested platform feature
+# cannot be exercised, rather than treating the setup refusal as a pass.
 env = { BROKKR_TEST_PLATFORM = "1" }
 
 # Tests requiring --test-threads=1. The fault-injection split

@@ -556,7 +556,8 @@ pub fn merge(
         .into());
     }
 
-    final_stats.write_summary(&mut host.diagnostics.summary_writer("apply_changes.summary"))?;
+    // No summary here: the caller renders the returned stats, as for every
+    // other command. Writing it here too printed it twice on the CLI.
 
     // Surface phase counters that callers expect from the legacy shape.
     crate::debug::emit_counter("merge_osc_parse_ms", osc_parse_ms);

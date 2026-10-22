@@ -561,6 +561,10 @@
   relation went unreported (same for `diff --format osc`). Blocks with no
   elements are now skipped.
 
+- **`apply-changes` printed its merge summary twice.** The library wrote
+  it and the CLI wrote it again; library callers rendering the returned
+  stats themselves got a stray copy too. The library no longer writes it.
+
 - **`diff` with negative IDs at the default `-j`.** The parallel shard
   planner compares IDs as raw numbers, which orders negative IDs wrongly;
   release builds could mis-shard silently and the blob-order check could

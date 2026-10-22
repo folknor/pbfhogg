@@ -536,10 +536,6 @@ fn next_blob_for_kind(
 }
 
 /// Decompress a pending blob into a decoded BlockState.
-///
-/// Returns `crate::error::Result` (not `BoxResult`) so the result is `Send` -
-/// required by `rayon::join` in the parallel overlapping-decode path.
-/// `Box<dyn Error>` is not `Send` by default.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::needless_pass_by_value)] // consumes blob to drop compressed bytes after decode
 fn decode_pending(

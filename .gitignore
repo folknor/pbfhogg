@@ -1,7 +1,5 @@
 target
 Cargo.lock
-# Pin the workspace, including the process-trace verification instrument.
-!/Cargo.lock
 .*.swp
 .*.swo
 .idea

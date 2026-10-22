@@ -42,8 +42,6 @@
 //! a block outright - so the gap can only cost an index over a block nobody
 //! can read, never a wrong skip.
 
-use std::collections::HashSet;
-
 use protohoggr::Cursor;
 
 use super::{BlobBbox, BlobIndex, ElemKind, TagIndex};
@@ -61,24 +59,21 @@ use crate::read::wire::{WIRE_LEN, WIRE_VARINT, WireDenseNodes, WireNode, WireRel
 /// See the module docs for what `Err` and `Ok(None)` mean.
 #[hotpath::measure]
 pub(crate) fn try_scan_block_ids_checked(raw: &[u8]) -> Result<Option<(BlobIndex, bool)>> {
-    let walk = Walk::run(raw, false)?;
-    if walk.unsupported_group || walk.kinds_differ {
-        return Ok(None);
-    }
-    let Some(kind) = walk.kind else {
-        return Ok(None);
-    };
-    let bbox = walk.bbox(kind);
-    Ok(Some((
-        BlobIndex {
-            kind,
-            min_id: walk.min_id,
-            max_id: walk.max_id,
-            count: walk.count,
-            bbox,
-        },
-        walk.sorted,
-    )))
+    Ok(Walk::run(raw, false)?.index())
+}
+
+/// The index with its sortedness flag, and the tag key set, of one block.
+pub(crate) type BlockScan = (Option<(BlobIndex, bool)>, Option<TagIndex>);
+
+/// Both scans from one walk: the [`BlobIndex`] with its sortedness flag, and
+/// the tag key set. Equal to calling [`try_scan_block_ids_checked`] and
+/// [`try_scan_block_tags`] separately (the walk is the same, so the two agree
+/// on what is an `Err`), at the cost of one walk instead of two. Callers that
+/// need both, the indexdata-generating passthrough paths, use this.
+#[hotpath::measure]
+pub(crate) fn try_scan_block_ids_and_tags(raw: &[u8]) -> Result<BlockScan> {
+    let walk = Walk::run(raw, true)?;
+    Ok((walk.index(), walk.tags()))
 }
 
 /// Scan a PrimitiveBlock for the set of unique tag keys its elements carry.
@@ -91,21 +86,7 @@ pub(crate) fn try_scan_block_ids_checked(raw: &[u8]) -> Result<Option<(BlobIndex
 /// the result `Ok(None)`.
 #[hotpath::measure]
 pub(crate) fn try_scan_block_tags(raw: &[u8]) -> Result<Option<TagIndex>> {
-    let walk = Walk::run(raw, true)?;
-    if walk.groups == 0 || walk.unsupported_group {
-        return Ok(None);
-    }
-    let mut keys: Vec<Box<[u8]>> = walk
-        .key_sids
-        .iter()
-        // In range by construction: `Walk::run` checked the largest sid.
-        .filter_map(|&sid| usize::try_from(sid).ok())
-        .filter_map(|sid| walk.strings.get(sid))
-        .map(|&s| s.into())
-        .collect();
-    keys.sort();
-    keys.dedup();
-    Ok(Some(TagIndex::from_sorted_keys(keys)))
+    Ok(Walk::run(raw, true)?.tags())
 }
 
 /// Raw coordinate extremes of every node seen, before the block's
@@ -145,7 +126,11 @@ struct Walk<'a> {
     /// over the other nodes would exclude this one.
     extent_unknown: bool,
 
-    key_sids: HashSet<u64>,
+    /// One flag per string-table entry, set when the entry is used as a key.
+    /// Sized once the string table is read; empty unless `collect_keys`. A
+    /// flag vector instead of a hash set: this is set once per tag of every
+    /// element of every blob on the indexdata-generating paths.
+    key_seen: Vec<bool>,
     /// Largest key sid referenced anywhere, checked against the string table
     /// in both modes so the two scanners agree on what is an `Err`.
     max_key_sid: Option<u64>,
@@ -170,7 +155,7 @@ impl<'a> Walk<'a> {
             sorted: true,
             extent: None,
             extent_unknown: false,
-            key_sids: HashSet::new(),
+            key_seen: Vec::new(),
             max_key_sid: None,
         };
 
@@ -183,6 +168,9 @@ impl<'a> Walk<'a> {
             } else {
                 st.skip_field(wire_type)?;
             }
+        }
+        if walk.collect_keys {
+            walk.key_seen = vec![false; walk.strings.len()];
         }
 
         walk.groups = groups.len();
@@ -341,9 +329,51 @@ impl<'a> Walk<'a> {
 
     fn key(&mut self, sid: u64) {
         self.max_key_sid = Some(self.max_key_sid.map_or(sid, |m| m.max(sid)));
-        if self.collect_keys {
-            self.key_sids.insert(sid);
+        // An out-of-range sid has no flag; `run` turns it into an `Err`.
+        if self.collect_keys
+            && let Ok(i) = usize::try_from(sid)
+            && let Some(seen) = self.key_seen.get_mut(i)
+        {
+            *seen = true;
         }
+    }
+
+    /// The blob's index and sortedness flag, or `None` when no single index
+    /// describes it.
+    fn index(&self) -> Option<(BlobIndex, bool)> {
+        if self.unsupported_group || self.kinds_differ {
+            return None;
+        }
+        let kind = self.kind?;
+        Some((
+            BlobIndex {
+                kind,
+                min_id: self.min_id,
+                max_id: self.max_id,
+                count: self.count,
+                bbox: self.bbox(kind),
+            },
+            self.sorted,
+        ))
+    }
+
+    /// The tag key set, or `None` when it cannot be described. Requires a
+    /// walk run with `collect_keys`.
+    fn tags(&self) -> Option<TagIndex> {
+        if self.groups == 0 || self.unsupported_group {
+            return None;
+        }
+        // Distinct sids can name equal strings, so dedup after sorting.
+        let mut keys: Vec<Box<[u8]>> = self
+            .key_seen
+            .iter()
+            .zip(&self.strings)
+            .filter(|(seen, _)| **seen)
+            .map(|(_, &s)| s.into())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        Some(TagIndex::from_sorted_keys(keys))
     }
 
     /// Walk one `DenseNodes` message: IDs, coordinates, and `keys_vals`.

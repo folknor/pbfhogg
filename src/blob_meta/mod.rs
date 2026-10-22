@@ -21,7 +21,9 @@
 mod scan;
 mod tag_index;
 
-pub(crate) use scan::{try_scan_block_ids_checked, try_scan_block_tags};
+pub(crate) use scan::{
+    try_scan_block_ids_and_tags, try_scan_block_ids_checked, try_scan_block_tags,
+};
 pub(crate) use tag_index::{TagIndex, encode_tag_index};
 
 /// Scan a decompressed PrimitiveBlock for its [`BlobIndex`], or `None`.
@@ -48,6 +50,15 @@ pub(crate) fn scan_block_ids_checked(raw: &[u8]) -> Option<(BlobIndex, bool)> {
 /// malformed bytes as an `Err`. Never a truncated key set.
 pub(crate) fn scan_block_tags(raw: &[u8]) -> Option<TagIndex> {
     try_scan_block_tags(raw).ok().flatten()
+}
+
+/// [`scan_block_ids`] and [`scan_block_tags`] from one walk of the block,
+/// with the same collapse of malformed bytes into `(None, None)`.
+pub(crate) fn scan_block_ids_and_tags(raw: &[u8]) -> (Option<BlobIndex>, Option<TagIndex>) {
+    match try_scan_block_ids_and_tags(raw) {
+        Ok((index, tags)) => (index.map(|(index, _sorted)| index), tags),
+        Err(_) => (None, None),
+    }
 }
 
 /// Element type stored in a blob index.

@@ -9,7 +9,7 @@ use super::{
     ensure_way_capacity_local, require_indexdata,
 };
 use crate::blob::{BlobKind, decode_blob_to_headerblock, decompress_blob_data_into};
-use crate::blob_meta::{scan_block_ids, scan_block_tags};
+use crate::blob_meta::scan_block_ids_and_tags;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
 use crate::owned::{TypeFilter, dense_node_metadata, element_metadata};
@@ -363,7 +363,8 @@ fn cat_passthrough(
                         // No indexdata - decompress to scan IDs/tags, reframe with index.
                         let blob_bytes = frame.blob_bytes();
                         decompress_blob_data_into(blob_bytes, &mut decompress_buf)?;
-                        let index = match scan_block_ids(&decompress_buf) {
+                        let (index, tagdata) = scan_block_ids_and_tags(&decompress_buf);
+                        let index = match index {
                             Some(idx) => idx,
                             None => {
                                 // Unrecognized block - pass through without indexdata.
@@ -373,7 +374,6 @@ fn cat_passthrough(
                                 continue;
                             }
                         };
-                        let tagdata = scan_block_tags(&decompress_buf);
                         let tagdata_bytes = tagdata
                             .as_ref()
                             .and_then(crate::blob_meta::TagIndex::serialize);

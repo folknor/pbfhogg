@@ -124,15 +124,18 @@ target via its `id_map::m_extra_ids` overflow table. These ids continue past
 the last in-input id for each type. Guarantees contiguous new-space output,
 at the cost of assigning ids to "phantom" objects that don't exist in the output.
 
-**pbfhogg behavior:** Orphan refs pass through with their old id. The output
-contains a mix of new-space ids (for in-input targets) and old-space ids
-(for orphans).
+**pbfhogg behavior:** An orphan ref with old id X becomes `start + count + X`
+for its kind: the first id past the renumbered range, plus the old id. Two
+refs to the same orphan stay equal, the old id is recoverable by
+subtraction, and an orphan id never names an element in the output. (Passing
+orphans through unchanged, the earlier policy, let an old id collide with a
+new one.)
 
-**Cross-validation:** Denmark: 306 relations differ, all in their `member`
-list only. Total match: 59,151,976 / 59,152,282 elements (99.9995%).
+**Cross-validation:** the differences from osmium are confined to orphan refs
+in relation member lists.
 
 **Impact:** Downstream tools that assume output ids are contiguous in
-`[start_id, start_id + N)` must tolerate orphan refs outside that range.
+`[start_id, start_id + N)` must tolerate orphan refs above that range.
 Tools that only chase live references don't hit the orphan ids at all.
 
 ## renumber: negative input IDs rejected

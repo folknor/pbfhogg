@@ -693,8 +693,8 @@ fn derive_changes_non_indexed_parity() {
 // ---------------------------------------------------------------------------
 //
 // Unlike the commands with a `force: true` bypass, `renumber_external`
-// rejects non-indexed input outright - it depends on per-blob
-// `IdSet::resolve()` fast-paths and has no degraded fallback. Pin
+// rejects non-indexed input outright - it schedules blobs from their
+// indexdata and has no degraded fallback. Pin
 // the error message so the contract is explicit and anyone removing
 // the check sees this test break.
 

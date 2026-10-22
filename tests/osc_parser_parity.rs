@@ -489,3 +489,306 @@ fn re_emit_sinks_escape_user_data_identically() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Version precedence
+// ---------------------------------------------------------------------------
+
+/// Write one OSC file per body, in order, and return their paths.
+fn write_sequence(dir: &Path, case: &str, bodies: &[&str]) -> Vec<PathBuf> {
+    bodies
+        .iter()
+        .enumerate()
+        .map(|(i, body)| {
+            let path = dir.join(format!("{case}-{i:03}.osc.gz"));
+            write_gz(
+                &path,
+                &format!(
+                    "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  {body}\n</osmChange>"
+                ),
+            );
+            path
+        })
+        .collect()
+}
+
+/// apply-changes' side: every file accumulated into one overlay, in
+/// order, the way `load_all_diffs` and repeated `parse_osc_file_into`
+/// calls build it.
+fn overlay_sequence_verdict(inputs: &[PathBuf]) -> Verdict {
+    let mut overlay = pbfhogg::osc::CompactDiffOverlay::new();
+    for input in inputs {
+        pbfhogg::osc::parse_osc_file_into(input, &mut overlay).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn simplify_sequence_verdict(inputs: &[PathBuf], out: &Path) -> Verdict {
+    let refs: Vec<&Path> = inputs.iter().map(PathBuf::as_path).collect();
+    pbfhogg::commands::merge_changes::merge_changes(
+        &refs,
+        out,
+        true,
+        Some(1),
+        false,
+        &crate::common::test_host(),
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// The part of a version refusal that states the rule: everything after
+/// the refusing consumer's name and the object, and before that
+/// consumer's own opt-out advice. Anchored on the text rather than on a
+/// separator, so a caller that wraps the error with file context does
+/// not shift it.
+fn refusal_core(err: &str) -> &str {
+    let start = err.find("carries version").unwrap_or(0);
+    let end = err
+        .find("correct their order")
+        .map_or(err.len(), |i| i + "correct their order".len());
+    &err[start..end]
+}
+
+const UNVERSIONED_NODE: &str = r#"<modify><node id="1" lat="5.0" lon="5.0"/></modify>"#;
+
+/// Sequences both gates must refuse: case name, one OSC body per file in
+/// input order, and the floor the stale claim fails to advance past.
+const REFUSED: &[(&str, &[&str], i32)] = &[
+    (
+        "bug017-delete-unversioned-stale",
+        &[
+            r#"<delete><node id="1" version="9"/></delete>"#,
+            UNVERSIONED_NODE,
+            r#"<modify><node id="1" lat="8.0" lon="8.0" version="8"/></modify>"#,
+        ],
+        9,
+    ),
+    (
+        "later-delete-raises-the-floor",
+        &[
+            r#"<modify><node id="1" lat="5.0" lon="5.0" version="5"/></modify>"#,
+            r#"<delete><node id="1" version="9"/></delete>"#,
+            UNVERSIONED_NODE,
+            r#"<modify><node id="1" lat="8.0" lon="8.0" version="8"/></modify>"#,
+        ],
+        9,
+    ),
+    (
+        "unversioned-overwrite-of-a-live-claim",
+        &[
+            r#"<modify><node id="1" lat="9.0" lon="9.0" version="9"/></modify>"#,
+            UNVERSIONED_NODE,
+            r#"<modify><node id="1" lat="8.0" lon="8.0" version="8"/></modify>"#,
+        ],
+        9,
+    ),
+    (
+        "unversioned-overwrite-above-an-old-delete",
+        &[
+            r#"<delete><node id="1" version="4"/></delete>"#,
+            r#"<create><node id="1" lat="9.0" lon="9.0" version="9"/></create>"#,
+            UNVERSIONED_NODE,
+            r#"<delete><node id="1" version="8"/></delete>"#,
+        ],
+        9,
+    ),
+    (
+        "unversioned-overwrite-of-a-live-way",
+        &[
+            r#"<modify><way id="7" version="4"><nd ref="1"/></way></modify>"#,
+            r#"<modify><way id="7"><nd ref="1"/></way></modify>"#,
+            r#"<modify><way id="7" version="3"><nd ref="1"/></way></modify>"#,
+        ],
+        4,
+    ),
+    (
+        "unversioned-overwrite-of-a-live-relation",
+        &[
+            r#"<modify><relation id="7" version="4"><member type="node" ref="1" role=""/></relation></modify>"#,
+            r#"<modify><relation id="7"><member type="node" ref="1" role=""/></relation></modify>"#,
+            r#"<modify><relation id="7" version="3"><member type="node" ref="1" role=""/></relation></modify>"#,
+        ],
+        4,
+    ),
+    (
+        "two-unversioned-overwrites",
+        &[
+            r#"<create><node id="1" lat="9.0" lon="9.0" version="9"/></create>"#,
+            UNVERSIONED_NODE,
+            UNVERSIONED_NODE,
+            r#"<modify><node id="1" lat="8.0" lon="8.0" version="9"/></modify>"#,
+        ],
+        9,
+    ),
+    (
+        "later-modify-raises-the-floor",
+        &[
+            r#"<modify><node id="1" lat="5.0" lon="5.0" version="5"/></modify>"#,
+            r#"<modify><node id="1" lat="9.0" lon="9.0" version="9"/></modify>"#,
+            r#"<modify><node id="1" lat="8.0" lon="8.0" version="8"/></modify>"#,
+        ],
+        9,
+    ),
+    (
+        "bug017-in-one-file",
+        &[concat!(
+            r#"<delete><node id="1" version="9"/></delete>"#,
+            r#"<modify><node id="1" lat="5.0" lon="5.0"/></modify>"#,
+            r#"<modify><node id="1" lat="8.0" lon="8.0" version="8"/></modify>"#,
+        )],
+        9,
+    ),
+    (
+        "bug017-equal-claim",
+        &[
+            r#"<delete><node id="1" version="9"/></delete>"#,
+            UNVERSIONED_NODE,
+            r#"<create><node id="1" lat="8.0" lon="8.0" version="9"/></create>"#,
+        ],
+        9,
+    ),
+    (
+        "bug017-unversioned-delete-between",
+        &[
+            r#"<delete><node id="1" version="9"/></delete>"#,
+            r#"<delete><node id="1"/></delete>"#,
+            r#"<delete><node id="1" version="8"/></delete>"#,
+        ],
+        9,
+    ),
+    (
+        "bug017-way",
+        &[
+            r#"<delete><way id="7" version="4"/></delete>"#,
+            r#"<modify><way id="7"><nd ref="1"/></way></modify>"#,
+            r#"<modify><way id="7" version="3"><nd ref="1"/></way></modify>"#,
+        ],
+        4,
+    ),
+    (
+        "bug017-relation",
+        &[
+            r#"<delete><relation id="7" version="4"/></delete>"#,
+            r#"<modify><relation id="7"><member type="node" ref="1" role=""/></relation></modify>"#,
+            r#"<modify><relation id="7" version="3"><member type="node" ref="1" role=""/></relation></modify>"#,
+        ],
+        4,
+    ),
+    (
+        "repeated-claim",
+        &[
+            r#"<modify><node id="1" lat="9.0" lon="9.0" version="9"/></modify>"#,
+            r#"<modify><node id="1" lat="9.0" lon="9.0" version="9"/></modify>"#,
+        ],
+        9,
+    ),
+];
+
+/// apply-changes and `merge-changes --simplify` both keep the last change
+/// per object by position, so both gate version precedence, and they must
+/// gate it by the same rule: an incoming version claim must exceed the
+/// highest version ever claimed for the object, deletes included, and a
+/// change that claims no version neither raises nor resets that floor.
+///
+/// The divergence that was real: `--simplify` compared only against the
+/// previous change, so `delete v9`, an unversioned `modify`, then
+/// `modify v8` was refused by apply-changes (whose versioned tombstone
+/// still held 9) and accepted by merge-changes (whose previous change
+/// claimed nothing). Each case is fed, as the same files in the same
+/// order, through both, and the refusals must agree on the explanation,
+/// not just on failing.
+///
+/// The mirror divergence was real too, in the overlay: an unversioned
+/// create or modify overwrote the live record and took its version with
+/// it, so `modify v9`, an unversioned `modify`, then `modify v8` was
+/// accepted there, and refused by merge-changes once it kept the highest
+/// claim.
+#[test]
+fn both_version_gates_refuse_a_claim_below_the_highest_ever_made() {
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("simplify-out.osc.gz");
+    for &(case, bodies, floor) in REFUSED {
+        let inputs = write_sequence(dir.path(), case, bodies);
+        let Err(overlay) = overlay_sequence_verdict(&inputs) else {
+            panic!("{case}: apply-changes overlay accepted a stale claim");
+        };
+        let Err(simplify) = simplify_sequence_verdict(&inputs, &out) else {
+            panic!("{case}: merge-changes --simplify accepted a stale claim");
+        };
+        let needle = format!("does not advance past version {floor}");
+        for (name, err) in [
+            ("overlay", overlay.as_str()),
+            ("simplify", simplify.as_str()),
+        ] {
+            assert!(
+                err.contains(&needle),
+                "{case}: {name} refused for the wrong reason; wanted {needle:?}, got: {err}"
+            );
+        }
+        assert_eq!(
+            refusal_core(overlay.as_str()),
+            refusal_core(simplify.as_str()),
+            "{case}: the two refusals must state the rule identically"
+        );
+    }
+}
+
+/// The counterparts, so the agreement above is not satisfied by both
+/// gates refusing everything after an unversioned change.
+const ACCEPTED: &[(&str, &[&str])] = &[
+    (
+        "advance-past-the-delete-floor",
+        &[
+            r#"<delete><node id="1" version="9"/></delete>"#,
+            UNVERSIONED_NODE,
+            r#"<create><node id="1" lat="8.0" lon="8.0" version="10"/></create>"#,
+        ],
+    ),
+    (
+        "advance-past-an-overwritten-live-claim",
+        &[
+            r#"<modify><node id="1" lat="9.0" lon="9.0" version="9"/></modify>"#,
+            UNVERSIONED_NODE,
+            r#"<modify><node id="1" lat="8.0" lon="8.0" version="10"/></modify>"#,
+        ],
+    ),
+    (
+        "in-sequence",
+        &[
+            r#"<create><node id="1" lat="1.0" lon="1.0" version="1"/></create>"#,
+            r#"<modify><node id="1" lat="2.0" lon="2.0" version="2"/></modify>"#,
+            r#"<delete><node id="1" version="3"/></delete>"#,
+        ],
+    ),
+    (
+        "unversioned-only",
+        &[
+            r#"<create><node id="1" lat="1.0" lon="1.0"/></create>"#,
+            UNVERSIONED_NODE,
+            r#"<delete><node id="1"/></delete>"#,
+        ],
+    ),
+    (
+        "first-claim-after-unversioned",
+        &[
+            UNVERSIONED_NODE,
+            r#"<modify><node id="1" lat="2.0" lon="2.0" version="0"/></modify>"#,
+        ],
+    ),
+];
+
+#[test]
+fn both_version_gates_admit_a_claim_above_the_highest_ever_made() {
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("simplify-out.osc.gz");
+    for &(case, bodies) in ACCEPTED {
+        let inputs = write_sequence(dir.path(), case, bodies);
+        if let Err(e) = overlay_sequence_verdict(&inputs) {
+            panic!("{case}: apply-changes overlay refused an advancing sequence: {e}");
+        }
+        if let Err(e) = simplify_sequence_verdict(&inputs, &out) {
+            panic!("{case}: merge-changes --simplify refused an advancing sequence: {e}");
+        }
+    }
+}

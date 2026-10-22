@@ -1,14 +1,14 @@
 //! Stage 2d: parallel way rewrite - fused ref resolve + wire-format splice.
 //!
 //! Single pass over way blobs on the shared ordered pool: resolves refs
-//! inline via `node_id_set.rank()` and splices new IDs into the wire format.
-//! Each worker records the way IDs it sees in its own `IdSet` shard; the
-//! caller merges the shards for relation member resolution.
+//! inline through the node `IdSpace` and splices new IDs into the wire
+//! format. Each worker records the way IDs it sees in its own `IdSet` shard;
+//! the caller merges the shards for relation member resolution.
 
 use super::super::Result;
 use super::pool::{Rewritten, run_rewrite_stage};
 use super::schedule::BlobTask;
-use super::wire_rewrite::{Scratch, reframe_ways_with_new_ids};
+use super::wire_rewrite::{IdSpace, Scratch, reframe_ways_with_new_ids};
 use super::{BlobBuffers, StageCounters, add_ns, blob_index, positional_bases};
 use crate::idset::IdSet;
 
@@ -31,8 +31,7 @@ pub(super) fn stage2d_parallel_way_assembly(
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
     way_id_sets: &mut [IdSet],
     way_schedule: &[BlobTask],
-    node_id_set: &IdSet,
-    start_node_id: i64,
+    nodes: &IdSpace<'_>,
     start_way_id: i64,
 ) -> Result<Stage2dResult> {
     let bases = positional_bases(start_way_id, way_schedule, "way")?;
@@ -63,8 +62,7 @@ pub(super) fn stage2d_parallel_way_assembly(
             let outcome = reframe_ways_with_new_ids(
                 &w.buffers.decompressed,
                 base,
-                node_id_set,
-                start_node_id,
+                nodes,
                 &mut *w.way_ids,
                 &mut w.reframe_buf,
                 &mut w.scratch,

@@ -700,6 +700,76 @@ fn simplify_gates_a_stale_change_after_a_delete() {
     );
 }
 
+/// The floor is the highest version ever claimed, not the previous
+/// change's version. Comparing against the previous change let an
+/// unversioned change in between reset it, so a stale change after it
+/// sailed through. Both shapes: the floor set by a delete (where
+/// apply-changes already refused, so the two commands disagreed), and
+/// the floor set by a live modify.
+#[test]
+fn simplify_floor_survives_an_unversioned_change() {
+    let dir = TempDir::new().expect("tempdir");
+    let out = dir.path().join("out.osc.gz");
+
+    for (case, first) in [
+        ("delete", r#"<delete><node id="1" version="9"/></delete>"#),
+        (
+            "modify",
+            r#"<modify><node id="1" lat="9.0" lon="9.0" version="9"/></modify>"#,
+        ),
+    ] {
+        let a = dir.path().join(format!("{case}-001.osc.gz"));
+        let b = dir.path().join(format!("{case}-002.osc.gz"));
+        let c = dir.path().join(format!("{case}-003.osc.gz"));
+        write_osc_gz(
+            &a,
+            &format!(
+                "<?xml version=\"1.0\"?>\n<osmChange version=\"0.6\">\n  {first}\n</osmChange>"
+            ),
+        );
+        write_osc_gz(
+            &b,
+            r#"<?xml version="1.0"?>
+<osmChange version="0.6">
+  <modify><node id="1" lat="5.0" lon="5.0"/></modify>
+</osmChange>"#,
+        );
+        write_osc_gz(
+            &c,
+            r#"<?xml version="1.0"?>
+<osmChange version="0.6">
+  <modify><node id="1" lat="8.0" lon="8.0" version="8"/></modify>
+</osmChange>"#,
+        );
+        let stderr = merge_changes_failure(&[&a, &b, &c], &out, &["--simplify"]);
+        assert!(
+            stderr.contains("does not advance past version 9"),
+            "{case}: the unversioned change must not reset the floor; stderr:\n{stderr}"
+        );
+
+        // The counterpart: a claim above the floor is still admitted
+        // after the unversioned change, and wins.
+        let d = dir.path().join(format!("{case}-004.osc.gz"));
+        write_osc_gz(
+            &d,
+            r#"<?xml version="1.0"?>
+<osmChange version="0.6">
+  <modify><node id="1" lat="7.0" lon="7.0" version="10"/></modify>
+</osmChange>"#,
+        );
+        let stderr = run_merge_changes(&[&a, &b, &d], &out, true);
+        assert!(
+            stderr.contains("-> 1 output changes (simplified)"),
+            "{case}: stats line unexpected; stderr:\n{stderr}"
+        );
+        let xml = read_osc_gz(&out);
+        assert!(
+            xml.contains(r#"version="10""#),
+            "{case}: the advancing change must win; output was:\n{xml}"
+        );
+    }
+}
+
 /// The counterpart: elements that claim no version at all are still
 /// deduped positionally, because there is nothing to compare.
 #[test]

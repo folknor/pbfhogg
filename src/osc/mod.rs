@@ -14,6 +14,7 @@ mod compact;
 mod interner;
 pub(crate) mod merge_join;
 pub mod parse;
+pub(crate) mod version_floor;
 pub(crate) mod write;
 pub(crate) mod xml_parse;
 

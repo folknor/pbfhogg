@@ -887,7 +887,11 @@ enum Command {
         uring: UringArg,
         #[command(flatten)]
         force: ForceArg,
-        /// Preserve and update way-node locations through the merge.
+        /// Preserve way-node locations through the merge. Ways the OSC
+        /// creates or modifies get locations from the merged nodes; base
+        /// ways the OSC does not touch keep their existing locations, even
+        /// if the OSC moves or deletes a node they reference. Rerun
+        /// add-locations-to-ways on the output for a full refresh.
         /// Requires the base PBF to have LocationsOnWays and be sorted.
         #[arg(long)]
         locations_on_ways: bool,
@@ -920,7 +924,8 @@ enum Command {
         #[arg(long)]
         simplify: bool,
         /// Accept an incoming change whose version does not advance past
-        /// the one it replaces. Off by default: --simplify keeps the LAST
+        /// the highest version already claimed for that object, deletes
+        /// included. Off by default: --simplify keeps the LAST
         /// change per object by input position, so inputs listed out of
         /// sequence order otherwise downgrade objects to older versions
         /// and report success. Requires --simplify: without it every change

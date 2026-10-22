@@ -12,7 +12,7 @@
 //!   old node IDs in one shared, pre-allocated `IdSet`; a rank index built
 //!   after the pass gives O(1) old-to-new lookup.
 //! - **Stage 2d**: parallel wire-format way splice rewriter. Resolves way
-//!   refs inline via `node_id_set.rank()` during the splice - no
+//!   refs inline through the node set's rank during the splice - no
 //!   intermediate files. Per-worker `IdSet` shards for `way_id_set`, merged
 //!   after stage 2d.
 //! - **R1**: sequential relation scan to collect all relation IDs into
@@ -35,12 +35,16 @@
 //!
 //! ## Orphan references
 //!
-//! Way refs and relation members whose old ID is not present in the
-//! corresponding `IdSet` (i.e. not seen in the input) pass through
-//! with their old ID unchanged, matching the in-memory path's
-//! `unwrap_or(old_id)` behavior. Consumers that assume new IDs are dense
-//! starting at `start_*_id` must tolerate mixed old/new ID spaces in the
-//! output.
+//! A way ref or relation member whose target is not in the input (an
+//! orphan) with old ID X becomes `start + count + X`, where `start` and
+//! `count` are that kind's start ID and number of input elements: the
+//! first ID past the renumbered range, plus the old ID. Passing it through
+//! unchanged let X equal the new ID of a different element. The shift needs
+//! no extra pass, keeps two refs to one orphan equal, keeps X recoverable by
+//! subtraction, and refuses a shift past `i64::MAX`
+//! (`wire_rewrite::IdSpace`). The rule is per kind, so it only holds when
+//! each kind's count equals its set's cardinality, which
+//! [`renumber_external`] checks after every stage.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -68,9 +72,9 @@ pub struct RenumberStats {
     pub nodes_written: u64,
     pub ways_written: u64,
     pub relations_written: u64,
-    /// Way refs and relation members whose old ID was not found in the
-    /// corresponding ID set. These pass through with their old ID
-    /// unchanged (orphan passthrough).
+    /// Way refs and relation members whose target is not in the input.
+    /// Each became old ID + start ID + input element count of its kind,
+    /// past that kind's renumbered range.
     pub orphan_refs: u64,
 }
 
@@ -88,8 +92,10 @@ impl RenumberStats {
         if self.orphan_refs > 0 {
             writeln!(
                 w,
-                "Warning: {} orphan refs preserved with old IDs (referenced \
-                 elements not present in input)",
+                "Warning: {} orphan refs (referenced elements not present in \
+                 input) shifted past their kind's renumbered range: new ID = \
+                 old ID + start ID + element count, separately for nodes, \
+                 ways and relations",
                 self.orphan_refs,
             )?;
         }
@@ -109,6 +115,7 @@ use pass1::pass1_parallel_scan;
 use relations::{relation_r1_collect_ids, relation_r2d_assembly};
 use schedule::{BlobTask, build_all_blob_schedules};
 use stage2::stage2d_parallel_way_assembly;
+use wire_rewrite::IdSpace;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -458,6 +465,8 @@ pub fn renumber_external(
     node_id_set.build_rank_index();
     emit_elapsed_ms("renumber_ext_node_rank_ms", t_rank);
     emit_count("renumber_ext_node_map_entries", node_id_set.total_count());
+    set_matches_written("node", node_id_set.total_count(), pass1.nodes_written)?;
+    let nodes = IdSpace::new("node", &node_id_set, opts.start_node_id);
 
     // ---- Stage 2d: fused way resolve + rewrite (single pass) ----
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_START");
@@ -469,8 +478,7 @@ pub fn renumber_external(
         &mut writer,
         &mut way_id_sets,
         &way_schedule,
-        &node_id_set,
-        opts.start_node_id,
+        &nodes,
         opts.start_way_id,
     )?;
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_END");
@@ -485,6 +493,7 @@ pub fn renumber_external(
     way_id_set.build_rank_index();
     emit_elapsed_ms("renumber_ext_way_merge_rank_ms", t_way_merge);
     emit_count("renumber_ext_way_map_entries", way_id_set.total_count());
+    set_matches_written("way", way_id_set.total_count(), stage2d.ways_written)?;
 
     let mut relation_id_set = crate::idset::IdSet::new();
     relation_r1_collect_ids(&shared_file, &relation_schedule, &mut relation_id_set)?;
@@ -506,15 +515,16 @@ pub fn renumber_external(
         &relation_schedule,
         &mut writer,
         &wire_rewrite::RelationIdSpaces {
-            relations: &relation_id_set,
-            start_relation_id: opts.start_relation_id,
-            nodes: &node_id_set,
-            start_node_id: opts.start_node_id,
-            ways: &way_id_set,
-            start_way_id: opts.start_way_id,
+            relations: IdSpace::new("relation", &relation_id_set, opts.start_relation_id),
+            nodes,
+            ways: IdSpace::new("way", &way_id_set, opts.start_way_id),
         },
         host,
     )?;
+    // Relations are numbered by rank, not position, so this is not about
+    // numbering: a relation R1 collected but R2d did not write would leave
+    // refs to it resolving as live while it is absent from the output.
+    set_matches_written("relation", relation_count, r2d.relations_written)?;
     crate::debug::emit_marker("RENUMBER_EXT_R2D_END");
 
     writer.flush()?;
@@ -543,6 +553,23 @@ fn positional_last_fits(start: i64, count: u64, kind: &str) -> Result<()> {
              runs past the largest 64-bit id"
         )
         .into())
+    }
+}
+
+/// Refuse a run whose ID set and written count for `kind` disagree. A
+/// reference resolves by rank in the set while an element is numbered by
+/// position, and an orphan is shifted to `start + set cardinality`: if the
+/// two counts differed, a live ref could name the wrong element and an
+/// orphan could land inside the renumbered range. The order checks already
+/// make them equal; this states the invariant the orphan shift rests on.
+fn set_matches_written(kind: &str, in_set: u64, written: u64) -> Result<()> {
+    if in_set == written {
+        Ok(())
+    } else {
+        Err(
+            format!("renumber: collected {in_set} distinct {kind} ids but wrote {written} {kind}s")
+                .into(),
+        )
     }
 }
 

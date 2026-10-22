@@ -58,9 +58,11 @@ Reported by: re-encoding.
 
 ## BUG-009 - `apply-changes --locations-on-ways` does not update untouched base ways
 
-`reference/cli-reference.md` documents the flag as "Preserve and update
-way-node locations through the merge". Only ways the OSC touches get fresh
-coordinates: `NodeLocationIndex::build_from_diff` collects refs of OSC ways
+Decided: fix it, as its own project. Until then the CLI help, both CLI
+references and DEVIATIONS.md document the current scope (OSC-touched ways
+only, rerun altw for a full refresh); those docs change when this lands.
+
+Only ways the OSC touches get fresh coordinates: `NodeLocationIndex::build_from_diff` collects refs of OSC ways
 only; `rewrite_block_parallel` writes a surviving base way through
 `write_base_way_local_with_locations`, which copies the old coordinate bytes;
 way blobs with no diff overlap take the splice fast path. If the OSC moves
@@ -70,11 +72,13 @@ osmium's `apply-changes -l` recomputes from the merged node set.
 `reference/pipeline.md` says the production loop re-runs altw after each
 merge instead, which is probably why nobody has hit it.
 
-Fixing it needs the set of base ways referencing any modified or deleted node
+Project scope: the set of base ways referencing any modified or deleted node
 (a reverse index or a full way pass), routed through rewrite instead of
-splice; otherwise the doc has to say "OSC ways only". Enforce with a
-cross-validation test against `osmium apply-changes -l` on a diff that moves
-a node referenced only by an untouched way.
+splice. Expect the splice fast path to be lost for many way blobs on a daily
+diff, so the cost needs measuring at planet before it becomes the default;
+an opt-in flag is the fallback. Enforce with a cross-validation test against
+`osmium apply-changes -l` on a diff that moves a node referenced only by an
+untouched way, and on one that deletes such a node.
 
 Reported by: change application.
 
@@ -120,26 +124,6 @@ uses `merge_changes_*`, and the markers are `MERGE_*` vs `MERGECHANGES_*`;
 between them. Fix: pass the counter prefix or a typed counters handle into
 `parse_osc_path`; a const table of counter names per command lets a test
 assert uniqueness.
-
-Reported by: change application.
-
-## BUG-017 - The version-advance rule differs between apply-changes and `merge-changes --simplify`
-
-`CompactDiffOverlay::check_version_advance` (apply-changes) compares against
-the max of the live record's version and a versioned tombstone map, so after
-`delete v9`, an unversioned change, then `modify v8`, the v8 is refused.
-`merge_changes::check_version_advance` compares only against the previous
-change for the key in `last_by_object`; that change has no version, so v8 is
-accepted. The same three-file input is refused by one command and accepted by
-the other. The error texts are separate prose with different remediation
-advice. The `xml_parse.rs` module doc argues that two paths answering one
-question differently is the recurring defect; this is that defect one layer
-down.
-
-Fix: a `VersionFloor` type (live max plus tombstone max per `(kind, id)`)
-owned by `osc`, used by both. Enforce by extending
-`tests/osc_parser_parity.rs` with a version-gate case fed through both
-commands.
 
 Reported by: change application.
 
@@ -779,24 +763,6 @@ entry, whose deadlock half the library-use executor work fixed; this half is
 not a process-ownership question and was out of that scope.
 
 Reported by: write path.
-
-## BUG-071 - Renumber orphan refs can collide with new IDs
-
-DEVIATIONS.md "renumber: orphan-reference handling" says orphan refs (to
-objects absent from the input) pass through with their old ID, and claims
-"the output never contains ids for objects that aren't in the output" and
-that "a ref to old id X always means the thing that had id X in the input".
-Both are false. An orphan ref is by definition an ID for an object not in
-the output, and its old ID can equal a new ID assigned to a different
-object: with the default start ID, an orphan ref to old node 5 and the
-renumbered node 5 are the same number, so the way silently points at the
-wrong node. Derived from the documented behaviour, not reproduced.
-
-Options: assign orphans fresh IDs past the in-input range (osmium), refuse,
-or keep pass-through and document the collision. The DEVIATIONS rationale
-needs rewriting whichever is chosen.
-
-Reported by: cross-reference of the notes against DEVIATIONS.md.
 
 ## BUG-072 - Index-generating callers turn a malformed block into "no index" instead of an error
 

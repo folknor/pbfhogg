@@ -831,9 +831,9 @@ fn renumber_rejects_negative_way_ref() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn renumber_orphan_way_ref_preserves_old_id() {
-    // Way references a node id that doesn't exist in the input.
-    // Orphan ref passes through with old id unchanged.
+fn renumber_orphan_way_ref_is_shifted_past_the_new_range() {
+    // Way references a node id that doesn't exist in the input. The orphan
+    // becomes old id + start + node count: 99999 + 1 + 2.
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -879,19 +879,17 @@ fn renumber_orphan_way_ref_preserves_old_id() {
     assert_eq!(stats.orphan_refs, 1);
 
     let norm = read_normalized(&output);
-    assert_eq!(norm.ways[0].refs, vec![1, 99999, 2]);
+    assert_eq!(norm.ways[0].refs, vec![1, 100_002, 2]);
 }
 
 // ---------------------------------------------------------------------------
 // Tier B contract gaps from 2026-04-26 review
 // ---------------------------------------------------------------------------
 
-/// B3 - relation-member orphan preservation. DEVIATIONS.md says
-/// orphan refs (relation members pointing at objects absent from
-/// the input) keep their old id, mirroring the way-ref orphan
-/// behavior pinned above. Pre-batch coverage existed only for
-/// orphan way refs (`renumber_orphan_way_ref_preserves_old_id`);
-/// this test extends the contract to relation members.
+/// B3 - relation-member orphans. Relation members pointing at objects
+/// absent from the input are shifted past their kind's renumbered range,
+/// mirroring the way-ref orphan behavior pinned above
+/// (`renumber_orphan_way_ref_is_shifted_past_the_new_range`).
 ///
 /// Reviewer pass 2 follow-up: previously the way orphan and node
 /// orphan shared id 99999, so a `contains(&99999)` check could pass
@@ -900,7 +898,7 @@ fn renumber_orphan_way_ref_preserves_old_id() {
 /// and asserts the full member sequence: type + ref id + role for
 /// every member, preserving order.
 #[test]
-fn renumber_orphan_relation_member_preserves_old_id() {
+fn renumber_orphan_relation_members_are_shifted_past_the_new_range() {
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -965,18 +963,17 @@ fn renumber_orphan_relation_member_preserves_old_id() {
     )
     .expect("renumber");
 
-    assert!(
-        stats.orphan_refs >= 2,
-        "expected >=2 orphan refs (way 99998 + node 99999); got {}",
-        stats.orphan_refs,
+    assert_eq!(
+        stats.orphan_refs, 2,
+        "expected exactly 2 orphan refs (way 99998 + node 99999)"
     );
 
     let norm = read_normalized(&output);
     assert_eq!(norm.relations.len(), 1);
     let rel = &norm.relations[0];
     // In-input refs are remapped (way 100 -> way 1, node 10 -> node
-    // 1); orphans (way 99998, node 99999) keep their old id and
-    // their original member type.
+    // 1); orphans keep their member type and become old id + start +
+    // count of their kind: way 99998 + 1 + 1, node 99999 + 1 + 2.
     let member_summary: Vec<(&str, i64, &str)> = rel
         .members
         .iter()
@@ -986,13 +983,155 @@ fn renumber_orphan_relation_member_preserves_old_id() {
         member_summary,
         vec![
             ("way", 1, "outer"),
-            ("way", 99998, "outer"),
+            ("way", 100_000, "outer"),
             ("node", 1, "label"),
-            ("node", 99999, "label"),
+            ("node", 100_002, "label"),
         ],
         "member sequence must preserve type + ref id + role for both \
          in-input remaps and orphans (DEVIATIONS contract); got {member_summary:?}",
     );
+}
+
+fn member(id: MemberId, role: &'static str) -> TestMember {
+    TestMember { id, role }
+}
+
+fn relation_of(id: i64, members: Vec<TestMember>) -> TestRelation {
+    TestRelation {
+        id,
+        members,
+        tags: vec![],
+        meta: None,
+    }
+}
+
+/// BUG-071, the collision itself. Every orphan's old id equals the new id
+/// some *other* element of its kind receives (node 1000, way 51, relation
+/// 7), which passthrough turned into a reference to the wrong element. With
+/// distinct starts per kind each orphan lands at its own kind's
+/// `start + count + old`, refs to one orphan stay equal across a way and a
+/// relation, and no orphan ref names any element in the output.
+#[test]
+fn renumber_orphans_whose_old_id_is_a_new_id_do_not_alias() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[plain_node(10), plain_node(20)],
+        &[
+            plain_way(100, vec![10, 20]),
+            plain_way(200, vec![20, 1000, 10]),
+        ],
+        &[
+            relation_of(
+                1000,
+                vec![
+                    member(MemberId::Node(1000), "a"),
+                    member(MemberId::Way(51), "b"),
+                    member(MemberId::Relation(7), "c"),
+                    member(MemberId::Node(1000), "d"),
+                    member(MemberId::Way(100), "e"),
+                    // Forward reference: relation 2000 comes later.
+                    member(MemberId::Relation(2000), "f"),
+                    member(MemberId::Node(20), "g"),
+                ],
+            ),
+            relation_of(2000, vec![member(MemberId::Relation(1000), "h")]),
+        ],
+    );
+
+    // New ranges: nodes 1000..=1001 (base 1002), ways 50..=51 (base 52),
+    // relations 7..=8 (base 9).
+    let opts = RenumberOptions {
+        start_node_id: 1000,
+        start_way_id: 50,
+        start_relation_id: 7,
+    };
+    let stats = run_renumber(&input, &output, &opts).expect("renumber");
+    assert_eq!(stats.orphan_refs, 5, "node 1000 thrice, way 51, relation 7");
+
+    let norm = read_normalized(&output);
+    let node_ids: Vec<i64> = norm.nodes.iter().map(|n| n.id).collect();
+    let way_ids: Vec<i64> = norm.ways.iter().map(|w| w.id).collect();
+    let rel_ids: Vec<i64> = norm.relations.iter().map(|r| r.id).collect();
+    assert_eq!(node_ids, vec![1000, 1001]);
+    assert_eq!(way_ids, vec![50, 51]);
+    assert_eq!(rel_ids, vec![7, 8]);
+
+    assert_eq!(norm.ways[0].refs, vec![1000, 1001]);
+    assert_eq!(
+        norm.ways[1].refs,
+        vec![1001, 2002, 1000],
+        "orphan node 1000 -> 1002 + 1000, not the renumbered node 10"
+    );
+
+    let summary = |r: &crate::common::NormalizedRelation| -> Vec<(String, i64, String)> {
+        r.members
+            .iter()
+            .map(|m| (m.member_type.clone(), m.ref_id, m.role.clone()))
+            .collect()
+    };
+    let s = |t: &str, id: i64, role: &str| (t.to_string(), id, role.to_string());
+    assert_eq!(
+        summary(&norm.relations[0]),
+        vec![
+            s("node", 2002, "a"),
+            s("way", 103, "b"),
+            s("relation", 16, "c"),
+            s("node", 2002, "d"),
+            s("way", 50, "e"),
+            s("relation", 8, "f"),
+            s("node", 1001, "g"),
+        ]
+    );
+    assert_eq!(summary(&norm.relations[1]), vec![s("relation", 7, "h")]);
+
+    // No orphan names an element of its kind in the output.
+    assert!(!node_ids.contains(&2002));
+    assert!(!way_ids.contains(&103));
+    assert!(!rel_ids.contains(&16));
+}
+
+/// An orphan whose shifted id would pass `i64::MAX` is an error, not a
+/// wrapped or saturated id: way ref to node `i64::MAX - 1` with two nodes
+/// (base 3).
+#[test]
+fn renumber_orphan_way_ref_shift_overflow_is_an_error() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf_sorted(
+        &input,
+        &[plain_node(10), plain_node(20)],
+        &[plain_way(100, vec![10, i64::MAX - 1])],
+        &[],
+    );
+    let err = run_renumber(&input, &output, &default_opts()).expect_err("shifted orphan overflows");
+    assert!(err.contains("overflows a 64-bit id"), "got: {err}");
+    assert!(err.contains("orphan node ref"), "got: {err}");
+    assert!(err.contains("in way 100"), "got: {err}");
+}
+
+/// The relation-member half: a relation member to relation `i64::MAX`.
+#[test]
+fn renumber_orphan_relation_member_shift_overflow_is_an_error() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf_sorted(
+        &input,
+        &[plain_node(10)],
+        &[],
+        &[relation_of(
+            5,
+            vec![member(MemberId::Relation(i64::MAX), "x")],
+        )],
+    );
+    let err = run_renumber(&input, &output, &default_opts()).expect_err("shifted orphan overflows");
+    assert!(err.contains("orphan relation ref"), "got: {err}");
+    assert!(err.contains("in relation 5"), "got: {err}");
 }
 
 /// B4 - negative relation-member ref rejection. Per DEVIATIONS.md

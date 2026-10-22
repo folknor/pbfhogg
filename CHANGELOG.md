@@ -552,6 +552,16 @@
   trusted, and an inverted ID range or a repeated indexdata or tagdata field
   now reads as no index.
 
+- **`renumber` shifts orphan references past the renumbered range.** A way
+  ref or relation member pointing at an object absent from the input used to
+  keep its old ID, which could equal the new ID of a different element, so
+  the reference silently pointed at the wrong object. An orphan with old ID
+  X now becomes `start + count + X` for its kind; the old ID is recoverable
+  by subtraction. This changes the IDs of orphan references in the output.
+  Relation member types are now read as int32, as every reader reads them:
+  a raw type value of 2^32 or above used to be treated as unknown and kept
+  its old ID, while readers saw a node member.
+
 - **`renumber` refuses input it would renumber wrongly, and no longer hangs.**
   New IDs are assigned by position but references resolved by rank, which
   only agree when IDs strictly increase; a file whose header falsely claimed
@@ -566,6 +576,15 @@
   indexdata `max_id` no longer drives the node set's pre-allocation, and
   per-stage timing counters, which truncated each blob to whole
   milliseconds, are now in nanoseconds.
+
+- **apply-changes and `merge-changes --simplify` enforce one version rule.**
+  Both refuse a change whose `version` does not exceed the highest version
+  ever claimed for that object in the run, deletes included, and a change
+  without a `version` no longer resets that floor. Before, `merge-changes
+  --simplify` compared only against the previous change, so a stale version
+  after an unversioned change was accepted, and apply-changes forgot a live
+  record's version when an unversioned change overwrote it. Both commands
+  now print the same refusal.
 
 - **`merge-changes --allow-version-regression` without `--simplify` is a
   usage error.** It used to be accepted and do nothing, since only

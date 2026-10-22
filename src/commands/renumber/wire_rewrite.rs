@@ -171,16 +171,68 @@ fn inc(n: u64) -> Result<u64, String> {
         .ok_or_else(|| "renumber: element count overflow".to_string())
 }
 
-/// Single-lookup `resolve`-equivalent: returns `(new_id, is_orphan)`.
-/// On hit, `new_id = start_id + rank`. On miss, passes the old id through
-/// unchanged (orphan passthrough, see DEVIATIONS.md). Used by the way-ref
-/// and relation-member-ref renumber hot loops to avoid the
-/// `resolve(id) + get(id)` double chunk lookup.
-#[inline]
-fn resolve_with_orphan(set: &IdSet, old_id: i64, start_id: i64) -> Result<(i64, bool), String> {
-    match set.rank_if_set(old_id) {
-        Some(r) => Ok((offset_id(start_id, r)?, false)),
-        None => Ok((old_id, true)),
+/// One element kind's old-to-new ID mapping, for resolving references.
+///
+/// An ID in the set becomes `start + rank`. An orphan - a reference to an
+/// object absent from the input - becomes `orphan_base + old_id`, where
+/// `orphan_base = start + count` is the first ID past the renumbered range.
+/// Passing orphans through unchanged let an old ID equal a new ID given to a
+/// different object, so a reference silently pointed at the wrong element.
+/// The shift keeps every orphan outside the new range, keeps two references
+/// to one orphan equal, and keeps the old ID recoverable by subtraction
+/// (DEVIATIONS.md, "renumber: orphan-reference handling").
+///
+/// The base is held as an `i128`: a live range may end exactly at
+/// `i64::MAX`, which leaves no representable base, and that input is only
+/// an error once an orphan actually needs one.
+#[derive(Clone, Copy)]
+pub(super) struct IdSpace<'a> {
+    kind: &'static str,
+    set: &'a IdSet,
+    start: i64,
+    orphan_base: i128,
+}
+
+impl<'a> IdSpace<'a> {
+    /// `set` must be complete and carry its rank index (`total_count` and
+    /// `rank_if_set` read it), so build this only once every ID of `kind`
+    /// has been recorded.
+    pub(super) fn new(kind: &'static str, set: &'a IdSet, start: i64) -> Self {
+        let orphan_base = i128::from(start).saturating_add(i128::from(set.total_count()));
+        Self {
+            kind,
+            set,
+            start,
+            orphan_base,
+        }
+    }
+
+    /// The new ID of an element that must be in the set (a relation's own
+    /// ID in R2d). `None` when it is not.
+    #[inline]
+    fn live(&self, old_id: i64) -> Result<Option<i64>, String> {
+        self.set
+            .rank_if_set(old_id)
+            .map(|r| offset_id(self.start, r))
+            .transpose()
+    }
+
+    /// `(new_id, is_orphan)` for a reference, with a single chunk lookup.
+    #[inline]
+    fn resolve(&self, old_id: i64) -> Result<(i64, bool), String> {
+        if let Some(new_id) = self.live(old_id)? {
+            return Ok((new_id, false));
+        }
+        let shifted = self.orphan_base.saturating_add(i128::from(old_id));
+        i64::try_from(shifted).map(|id| (id, true)).map_err(|_| {
+            format!(
+                "renumber: orphan {kind} ref {old_id} (the {kind} is not in the input) \
+                 would become {shifted}, the first id past the renumbered {kind}s \
+                 ({base}) plus its old id, which overflows a 64-bit id",
+                kind = self.kind,
+                base = self.orphan_base,
+            )
+        })
     }
 }
 
@@ -242,7 +294,8 @@ pub(super) struct Scratch {
 pub(super) struct Outcome {
     /// Elements rewritten.
     pub(super) count: u64,
-    /// References passed through with their old ID (target not in input).
+    /// References whose target is not in the input, shifted past the
+    /// renumbered range (see [`IdSpace`]).
     pub(super) orphans: u64,
     /// First and last input ID, `None` when the block held no elements.
     pub(super) span: Option<(i64, i64)>,
@@ -462,13 +515,12 @@ pub(super) fn reframe_dense_with_new_ids(
 /// and node refs while copying everything else verbatim.
 ///
 /// For each way: decode old way id, assign new sequential way id,
-/// resolve each ref's new node id via `node_id_set.rank()`, delta-encode
-/// the new refs, and copy keys/vals/info raw bytes verbatim.
+/// resolve each ref's new node id through `nodes`, delta-encode the new
+/// refs, and copy keys/vals/info raw bytes verbatim.
 pub(super) fn reframe_ways_with_new_ids(
     decompressed: &[u8],
     base_new_way_id: i64,
-    node_id_set: &IdSet,
-    start_node_id: i64,
+    nodes: &IdSpace<'_>,
     way_id_set: &mut IdSet,
     output: &mut Vec<u8>,
     s: &mut Scratch,
@@ -491,8 +543,7 @@ pub(super) fn reframe_ways_with_new_ids(
                     let way_orphans = reframe_way(
                         way_bytes,
                         new_way_id,
-                        node_id_set,
-                        start_node_id,
+                        nodes,
                         way_id_set,
                         &mut span,
                         &mut s.packed,
@@ -528,8 +579,7 @@ pub(super) fn reframe_ways_with_new_ids(
 fn reframe_way(
     way_bytes: &[u8],
     new_way_id: i64,
-    node_id_set: &IdSet,
-    start_node_id: i64,
+    nodes: &IdSpace<'_>,
     way_id_set: &mut IdSet,
     span: &mut Span,
     refs_out: &mut Vec<u8>,
@@ -605,7 +655,9 @@ fn reframe_way(
                  processing."
             ));
         }
-        let (new_ref, is_orphan) = resolve_with_orphan(node_id_set, old_node_id, start_node_id)?;
+        let (new_ref, is_orphan) = nodes
+            .resolve(old_node_id)
+            .map_err(|e| format!("{e} (in way {old_way_id})"))?;
         if is_orphan {
             orphans = inc(orphans)?;
         }
@@ -681,12 +733,9 @@ pub(super) fn relation_id(rel_bytes: &[u8]) -> Result<i64, String> {
 
 /// The three ID spaces a relation's members resolve against.
 pub(super) struct RelationIdSpaces<'a> {
-    pub(super) relations: &'a IdSet,
-    pub(super) start_relation_id: i64,
-    pub(super) nodes: &'a IdSet,
-    pub(super) start_node_id: i64,
-    pub(super) ways: &'a IdSet,
-    pub(super) start_way_id: i64,
+    pub(super) relations: IdSpace<'a>,
+    pub(super) nodes: IdSpace<'a>,
+    pub(super) ways: IdSpace<'a>,
 }
 
 /// Wire-format splice rewriter for relations. Patches field 1 (id) and
@@ -820,10 +869,9 @@ fn reframe_relation(
     span.push("relation", old_rel_id)?;
     // R1 recorded every relation id through `relation_id`, which reads the
     // same field this loop does, so a miss is a bug rather than input.
-    let rank = ids.relations.rank_if_set(old_rel_id).ok_or_else(|| {
+    let new_rel_id = ids.relations.live(old_rel_id)?.ok_or_else(|| {
         format!("renumber: relation {old_rel_id} was not collected by the R1 pass")
     })?;
-    let new_rel_id = offset_id(ids.start_relation_id, rank)?;
 
     // ---- Patch memids: decode old deltas + types, look up new ids ----
     memids_out.clear();
@@ -869,11 +917,27 @@ fn reframe_relation(
                 ));
             }
 
-            let (new_abs_id, is_orphan) = match member_type {
-                0 => resolve_with_orphan(ids.nodes, old_abs_id, ids.start_node_id)?,
-                1 => resolve_with_orphan(ids.ways, old_abs_id, ids.start_way_id)?,
-                2 => resolve_with_orphan(ids.relations, old_abs_id, ids.start_relation_id)?,
-                _ => (old_abs_id, false), // unknown type - preserve
+            // `types` is `repeated int32`: dispatch on the varint truncated
+            // to 32 bits, as protobuf and pbfhogg's own reader decode it.
+            // Matching the raw u64 instead treated 2^32 as an unknown type
+            // and kept its ID, which every reader then took as a node ref -
+            // to whichever renumbered node now holds that number. The type
+            // bytes themselves are copied through unchanged.
+            #[allow(clippy::cast_possible_truncation)]
+            let member_type = member_type as u32;
+            let space = match member_type {
+                0 => Some(&ids.nodes),
+                1 => Some(&ids.ways),
+                2 => Some(&ids.relations),
+                _ => None,
+            };
+            // An unknown type names no ID space renumber reassigns, so its
+            // ID cannot alias a renumbered element: preserved, uncounted.
+            let (new_abs_id, is_orphan) = match space {
+                Some(space) => space
+                    .resolve(old_abs_id)
+                    .map_err(|e| format!("{e} (in relation {old_rel_id})"))?,
+                None => (old_abs_id, false),
             };
             if is_orphan {
                 orphans = inc(orphans)?;
@@ -984,12 +1048,9 @@ mod tests {
         let mut way_ids = IdSet::new();
         way_ids.build_rank_index();
         let ids = RelationIdSpaces {
-            relations: &rel_ids,
-            start_relation_id: 1_000,
-            nodes: &node_ids,
-            start_node_id: 100,
-            ways: &way_ids,
-            start_way_id: 500,
+            relations: IdSpace::new("relation", &rel_ids, 1_000),
+            nodes: IdSpace::new("node", &node_ids, 100),
+            ways: IdSpace::new("way", &way_ids, 500),
         };
         let mut out = Vec::new();
         reframe_relations_with_new_ids(block, &ids, &mut out, &mut Scratch::default())
@@ -1074,8 +1135,7 @@ mod tests {
         reframe_ways_with_new_ids(
             block,
             1_000,
-            &node_ids,
-            100,
+            &IdSpace::new("node", &node_ids, 100),
             &mut way_ids,
             &mut out,
             &mut Scratch::default(),
@@ -1237,9 +1297,12 @@ mod tests {
         let mut way = Vec::new();
         way.push(0x08);
         varint(3, &mut way);
+        // The first ref is node 7, which resolves; the second delta then
+        // overflows. (A first ref of i64::MAX would be an orphan whose shift
+        // overflows before the delta is read.)
         let mut refs = Vec::new();
+        varint(zz(7), &mut refs);
         varint(zz(i64::MAX), &mut refs);
-        varint(zz(1), &mut refs);
         len_delimited(8, &refs, &mut way);
         let mut group = Vec::new();
         len_delimited(3, &way, &mut group);
@@ -1254,9 +1317,10 @@ mod tests {
         let mut rel = Vec::new();
         rel.push(0x08);
         varint(5, &mut rel);
+        // As for way refs: member node 7 resolves, then the delta overflows.
         let mut memids = Vec::new();
+        varint(zz(7), &mut memids);
         varint(zz(i64::MAX), &mut memids);
-        varint(zz(1), &mut memids);
         len_delimited(9, &memids, &mut rel);
         len_delimited(10, &[0, 0], &mut rel);
         let mut group = Vec::new();
@@ -1453,6 +1517,96 @@ mod tests {
              an orphan - proving both members were actually walked"
         );
         assert_eq!(outcome.new_range, Some((1_000, 1_000)));
+    }
+
+    fn ranked(ids: &[i64]) -> IdSet {
+        let mut set = IdSet::new();
+        for &id in ids {
+            set.set(id);
+        }
+        set.build_rank_index();
+        set
+    }
+
+    /// The collision BUG-071 names: old ids 1 and 2 are orphans here and
+    /// are also the new ids of nodes 10 and 20. Shifted by start + count
+    /// they land past the renumbered range, distinct from every live id.
+    #[test]
+    fn an_orphan_is_shifted_past_the_renumbered_range() {
+        let set = ranked(&[10, 20]);
+        let nodes = IdSpace::new("node", &set, 1);
+        assert_eq!(nodes.resolve(10).unwrap(), (1, false));
+        assert_eq!(nodes.resolve(20).unwrap(), (2, false));
+        assert_eq!(nodes.resolve(1).unwrap(), (4, true));
+        assert_eq!(nodes.resolve(2).unwrap(), (5, true));
+        assert_eq!(
+            nodes.resolve(0).unwrap(),
+            (3, true),
+            "orphan 0 maps to the base"
+        );
+        assert_eq!(nodes.live(1).unwrap(), None);
+    }
+
+    /// A live range may end exactly at i64::MAX; only an orphan that would
+    /// need an id past it is an error.
+    #[test]
+    fn a_range_ending_at_the_largest_id_fails_only_on_an_orphan() {
+        let set = ranked(&[7]);
+        let nodes = IdSpace::new("node", &set, i64::MAX);
+        assert_eq!(nodes.resolve(7).unwrap(), (i64::MAX, false));
+        let err = nodes.resolve(0).expect_err("orphan 0 needs i64::MAX + 1");
+        assert!(err.contains("overflows a 64-bit id"), "got: {err}");
+        assert!(err.contains("orphan node ref 0"), "got: {err}");
+
+        let set = ranked(&[7]);
+        let ways = IdSpace::new("way", &set, i64::MAX - 10);
+        // Base i64::MAX - 9: orphan 9 is exactly i64::MAX, orphan 10 is past it.
+        assert_eq!(ways.resolve(9).unwrap(), (i64::MAX, true));
+        assert!(ways.resolve(10).is_err());
+    }
+
+    /// PrimitiveBlock with relation 5 whose members are `(raw type, id)`.
+    fn relation_block_typed(members: &[(u64, i64)]) -> Vec<u8> {
+        let mut rel = vec![0x08];
+        varint(5, &mut rel);
+        let mut memids = Vec::new();
+        let mut types = Vec::new();
+        let mut prev = 0_i64;
+        for &(t, id) in members {
+            varint(zz(id - prev), &mut memids);
+            prev = id;
+            varint(t, &mut types);
+        }
+        len_delimited(9, &memids, &mut rel);
+        len_delimited(10, &types, &mut rel);
+        let mut group = Vec::new();
+        len_delimited(4, &rel, &mut group);
+        block_of(&[group])
+    }
+
+    /// `types` is int32: a raw 2^32 is read back as Node by pbfhogg's reader,
+    /// so renumber must resolve it as one. Matched on the raw u64 it was an
+    /// "unknown" type whose id was kept, and so aliased the renumbered node
+    /// with that number.
+    #[test]
+    fn member_types_are_dispatched_as_int32() {
+        // Node 7 is live (-> 100), node 9 is an orphan.
+        let outcome = run(&relation_block_typed(&[(1 << 32, 7), (1 << 32, 9)])).unwrap();
+        assert_eq!(
+            outcome.orphans, 1,
+            "2^32 is a node type, so node 9 is an orphan"
+        );
+        // 2^32 + 2 is a relation: relation 5 is live, relation 6 is not.
+        let outcome = run(&relation_block_typed(&[
+            ((1 << 32) | 2, 5),
+            ((1 << 32) | 2, 6),
+        ]))
+        .unwrap();
+        assert_eq!(outcome.orphans, 1);
+        // Genuinely unknown types (3, and u32::MAX, which is int32 -1) are
+        // preserved and not counted.
+        let outcome = run(&relation_block_typed(&[(3, 9), (u64::from(u32::MAX), 11)])).unwrap();
+        assert_eq!(outcome.orphans, 0);
     }
 
     #[test]

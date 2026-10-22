@@ -72,6 +72,27 @@ reference is written with `(0, 0)` as its coordinate and no warning.
 cannot distinguish missing data from real data. Failure by default matches
 `add-locations-to-ways` and keeps the lossy behavior explicit.
 
+The check covers the ways apply-changes writes locations for, which is the
+scope of the next section: a base way the OSC does not touch is not checked.
+
+## apply-changes: --locations-on-ways updates only the ways the OSC touches
+
+**osmium behavior:** `osmium apply-changes -l` recomputes way-node locations
+from the merged node set, so every way referencing a moved node gets the new
+position.
+
+**pbfhogg behavior:** Ways the OSC creates or modifies get locations from the
+merged nodes. A base way the OSC does not touch is copied through with the
+locations it already carried, even when the OSC moves or deletes a node it
+references; a deleted node leaves its last position in such a way. Rerun
+`add-locations-to-ways` on the output for a full refresh.
+
+**Rationale:** Most way blobs are spliced into the output without decoding.
+Finding every base way that references a changed node needs a node-to-way
+lookup across the whole file and would send those blobs through the rewrite
+path, a cost the splice exists to avoid. The behaviour is documented rather
+than approximated.
+
 ## diff: content equality vs version ordering
 
 **osmium behavior:** Matches elements by `(type, id, version, timestamp)` ordering,
@@ -103,12 +124,15 @@ whatever version it claims. Feeding the same diff twice, or feeding diffs
 out of sequence order, downgrades objects to an older state and exits 0.
 osmium offers no check and no warning.
 
-**pbfhogg behavior:** An incoming change whose `version` is at or below the
-version already held for that object is a hard error naming both versions.
-This applies to `CompactDiffOverlay` accumulation (so `apply-changes` and
-`osc::load_all_diffs`) and to `merge-changes --simplify`. The comparison is
-only made when **both** sides claim a version: an element with no `version`
-attribute makes no claim, and the positional rule stands for it unchanged.
+**pbfhogg behavior:** An incoming change whose `version` is not strictly
+greater than the highest version ever claimed for that object, by any create,
+modify or delete read earlier in the same run (across all input files), is a
+hard error naming both versions. This applies to `CompactDiffOverlay`
+accumulation (so `apply-changes` and `osc::load_all_diffs`) and to
+`merge-changes --simplify`, which share the rule and its error text. A change
+that carries no `version` makes no claim: it is always admitted, and neither
+raises nor resets the floor, so an unversioned change between v9 and v8 does
+not let the v8 through.
 The default `merge-changes` mode is untouched - it preserves the full
 change stream in input order by design and resolves nothing, so there is
 nothing to regress.
@@ -171,25 +195,26 @@ orphan way refs as 6,616,527, 6,616,528, ... in the order they're first
 encountered. Guarantees contiguous new-space output, at the cost of assigning
 ids to "phantom" objects that don't exist in the output.
 
-**pbfhogg behavior:** Orphan refs pass through with their old id. The output
-contains a mix of new-space ids (for in-input targets) and old-space ids
-(for orphans).
+**pbfhogg behavior:** An orphan ref with old id X becomes `start + count + X`,
+where `start` is that kind's start id and `count` the number of elements of
+that kind in the input: the first id past the renumbered range, plus the old
+id. Nodes, ways and relations are shifted independently, with no extra pass.
+Two refs to the same orphan stay equal, the old id is recoverable as
+`new - (start + count)`, and an orphan whose shifted id would pass the largest
+64-bit id is an error. An orphan id therefore never names an element in the
+output. Relation members of an unknown type (anything but node, way or
+relation once the type is read as int32) keep their id unchanged.
 
-**Cross-validation:** Denmark: 306 relations differ, all in their `member`
-list only. No nodes, ways, or other relation fields differ. The 306 affected
-relations are all transboundary admin boundaries, route relations, and TMC
-(Traffic Message Channel) segments - all expected to have cross-border
-member references. Total match: 59,151,976 / 59,152,282 elements (99.9995%).
+**Cross-validation:** the differences from osmium are confined to orphan refs,
+which in a Geofabrik-style extract are the members of cross-border relations
+(admin boundaries, routes, TMC segments); no node, way, or other relation
+field differs.
 
-**Rationale:** Both policies are defensible. pbfhogg preserves the original
-id space boundary (a ref to old id `X` always means "the thing that had
-id X in the input" - whether or not X is in the output), while osmium
-produces contiguous new-space output at the cost of introducing ids that
-reference nothing. pbfhogg's choice is the lower-surprise default: the
-output never contains ids for objects that aren't in the output.
-
-Users who need osmium-compatible orphan handling can add a followup
-`--orphan-policy {preserve,assign}` flag.
+**Rationale:** Passing orphans through with their old id, the earlier policy,
+let an old id equal the new id of a different element, so a reference
+silently pointed at the wrong object. osmium's sequential assignment needs
+per-orphan state in first-encounter order; the shift is stateless,
+deterministic under parallel rewriting, and keeps the old id recoverable.
 
 **Start IDs below 1 are refused.** osmium accepts a negative start ID and
 counts downward from it; pbfhogg requires every `--start-id` value to be at
@@ -197,9 +222,11 @@ least 1, since its outputs are positive-only like its inputs (see "Negative
 input IDs rejected project-wide" below), and refuses before reading the input.
 
 **Impact:** Downstream tools that assume output ids are contiguous in
-`[start_id, start_id + N)` must tolerate orphan refs outside that range.
+`[start_id, start_id + N)` must tolerate orphan refs above that range.
 Tools that only chase live references don't hit the orphan ids at all
-(because no output element has the orphan id).
+(because no output element has the orphan id). Orphan ids also differ from
+osmium's, which numbers orphans `count + 1, count + 2, ...` in the order it
+meets them.
 
 ## check-refs: occurrence-counting vs unique-counting for missing references
 

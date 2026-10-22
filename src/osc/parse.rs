@@ -15,6 +15,7 @@ use super::compact::{
     arena_append_relation, arena_append_way, version_at,
 };
 use super::interner::StringInterner;
+use super::version_floor::{VersionFloor, regression_message};
 use super::xml_parse::{CompactSink, parse_osc_path};
 
 pub use super::compact::{
@@ -53,48 +54,52 @@ pub struct CompactDiffOverlay {
     pub deleted_nodes: HashSet<i64>,
     pub deleted_ways: HashSet<i64>,
     pub deleted_relations: HashSet<i64>,
-    // Versioned tombstones. A delete drops the live index entry, which is
-    // where the version-regression gate reads the stored version from, so
-    // without these a delete erases the object's version history and the
-    // very next stale change sails through the gate: delete node 1
-    // version 9, then modify node 1 version 8, and version 8 is
-    // resurrected. These maps carry the highest version ever seen for a
-    // deleted id - the delete's own claim, and whatever the live record
-    // held before it was removed - so the gate has a floor to compare
-    // against after the index entry is gone. Only deleted ids are stored,
-    // so the cost is proportional to the delete count, not the change
-    // count.
-    deleted_node_versions: FxHashMap<i64, i32>,
-    deleted_way_versions: FxHashMap<i64, i32>,
-    deleted_relation_versions: FxHashMap<i64, i32>,
+    // Version floors: history the live record no longer holds. The gate
+    // reads the stored version from the live record, and two transitions
+    // throw that away. A delete drops the live index entry: without a
+    // floor, delete node 1 version 9 then modify node 1 version 8
+    // resurrects version 8. An unversioned create or modify overwrites
+    // the live record with one that claims nothing: without a floor,
+    // modify version 9, an unversioned modify, then modify version 8 is
+    // accepted. Each of those transitions folds the version it is about
+    // to lose (and a delete's own claim) into these maps, so the gate
+    // compares against the highest version ever claimed for the id. Only
+    // ids that went through such a transition are stored, so the cost is
+    // proportional to the delete and unversioned-change count, not the
+    // change count. Entries are never removed: a recreated object keeps
+    // its floor.
+    node_version_floors: FxHashMap<i64, i32>,
+    way_version_floors: FxHashMap<i64, i32>,
+    relation_version_floors: FxHashMap<i64, i32>,
     interner: StringInterner,
     /// When false (the default), an incoming change whose `version` is at
-    /// or below the version of the record it would replace is a hard
+    /// or below the highest version already claimed for the id is a hard
     /// error. See [`CompactDiffOverlay::allow_version_regression`].
     allow_version_regression: bool,
 }
 
 /// A read-only view of one element kind's storage: the arena, the live
-/// index, the versioned tombstones, and where the metadata block sits in
-/// a record of that kind. Bundled because the version-regression gate
+/// index, the version floors, and where the metadata block sits in a
+/// record of that kind. Bundled because the version-regression gate
 /// needs all four together and each of the three kinds supplies its own.
 #[derive(Clone, Copy)]
 struct KindStore<'a> {
     arena: &'a [u8],
     index: &'a FxHashMap<i64, usize>,
-    tombstones: &'a FxHashMap<i64, i32>,
+    floors: &'a FxHashMap<i64, i32>,
     meta_off: usize,
 }
 
 impl KindStore<'_> {
-    /// The highest version this overlay already holds for `id`, live or
-    /// deleted, or `None` when nothing stored for it ever claimed one.
+    /// The highest version this overlay already holds for `id`, from the
+    /// live record or the floor map, or `None` when nothing stored for it
+    /// ever claimed one.
     fn stored_version(&self, id: i64) -> Option<i32> {
         let live = self
             .index
             .get(&id)
             .and_then(|&offset| version_at(self.arena, offset, self.meta_off));
-        let dead = self.tombstones.get(&id).copied();
+        let dead = self.floors.get(&id).copied();
         match (live, dead) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
@@ -115,9 +120,9 @@ impl CompactDiffOverlay {
             deleted_nodes: HashSet::new(),
             deleted_ways: HashSet::new(),
             deleted_relations: HashSet::new(),
-            deleted_node_versions: FxHashMap::default(),
-            deleted_way_versions: FxHashMap::default(),
-            deleted_relation_versions: FxHashMap::default(),
+            node_version_floors: FxHashMap::default(),
+            way_version_floors: FxHashMap::default(),
+            relation_version_floors: FxHashMap::default(),
             interner: StringInterner::new(),
             allow_version_regression: false,
         }
@@ -136,6 +141,16 @@ impl CompactDiffOverlay {
     ///
     /// Set this to restore the old positional behaviour, for the case
     /// where a caller genuinely intends to replay history backwards.
+    ///
+    /// The flag may be toggled between parses, but history is only fully
+    /// kept while the gate is on. With the gate off, a create or modify
+    /// is neither checked nor recorded beyond its own live record, so a
+    /// versioned overwrite replaces the live version outright and an
+    /// unversioned one does not carry the old version into the floor;
+    /// deletes still record their floor either way. Turning the gate back
+    /// on therefore enforces against the highest version still held -
+    /// the live record and the floors - which can be lower than a version
+    /// admitted while the gate was off.
     pub fn allow_version_regression(&mut self, allow: bool) {
         self.allow_version_regression = allow;
     }
@@ -147,35 +162,38 @@ impl CompactDiffOverlay {
     /// neither does a stored record that had none. Only an actual
     /// backwards or repeated claim is refused.
     ///
-    /// "Stored" spans both the live index and the versioned tombstone
-    /// map, so a delete is as much a version claim as a create is.
+    /// "Stored" spans both the live index and the version floor map, so
+    /// a delete is as much a version claim as a create is, and an
+    /// unversioned change in between does not erase either.
+    ///
+    /// Takes the incoming claim already unwrapped: the callers branch on
+    /// whether the change claims a version anyway (an unversioned create
+    /// or modify carries the live version into the floor instead), so a
+    /// versioned change pays one claim test, one flag test and one
+    /// `stored_version` call (live index plus floor map), as it did when
+    /// this function did the unwrapping.
     fn check_version_advance(
         &self,
         kind: &str,
         id: i64,
         store: KindStore<'_>,
-        incoming: &ArenaMeta,
+        incoming_version: i32,
     ) -> ParseResult<()> {
         if self.allow_version_regression {
             return Ok(());
         }
-        let Some(incoming_version) = incoming.version_claim() else {
+        let Err(stored) = VersionFloor::new(store.stored_version(id)).admit(Some(incoming_version))
+        else {
             return Ok(());
         };
-        let Some(stored) = store.stored_version(id) else {
-            return Ok(());
-        };
-        if incoming_version > stored {
-            return Ok(());
-        }
-        Err(format!(
-            "OSC {kind} {id} carries version {incoming_version}, which does not advance past \
-             version {stored} already held for it in this change overlay. Accepting it would \
-             silently downgrade the object to an older state and report success - the usual \
-             cause is applying the same diff twice, or feeding diffs out of sequence order. \
-             Re-order the inputs, or call \
-             `CompactDiffOverlay::allow_version_regression(true)` if replaying backwards is \
-             genuinely intended."
+        Err(regression_message(
+            "OSC change overlay",
+            kind,
+            id,
+            incoming_version,
+            stored,
+            "pass apply-changes --allow-version-regression \
+             (`CompactDiffOverlay::allow_version_regression(true)` from the library)",
         )
         .into())
     }
@@ -286,11 +304,11 @@ impl CompactDiffOverlay {
         total += self.deleted_ways.capacity() * delete_entry_size;
         total += self.deleted_relations.capacity() * delete_entry_size;
 
-        // Versioned tombstones: FxHashMap<i64, i32>, (i64, i32) + control byte.
-        let tombstone_entry_size = std::mem::size_of::<(i64, i32)>() + 1;
-        total += self.deleted_node_versions.capacity() * tombstone_entry_size;
-        total += self.deleted_way_versions.capacity() * tombstone_entry_size;
-        total += self.deleted_relation_versions.capacity() * tombstone_entry_size;
+        // Version floors: FxHashMap<i64, i32>, (i64, i32) + control byte.
+        let floor_entry_size = std::mem::size_of::<(i64, i32)>() + 1;
+        total += self.node_version_floors.capacity() * floor_entry_size;
+        total += self.way_version_floors.capacity() * floor_entry_size;
+        total += self.relation_version_floors.capacity() * floor_entry_size;
 
         // Interner
         total += self.interner.heap_size_estimate();
@@ -314,7 +332,7 @@ impl CompactDiffOverlay {
         KindStore {
             arena: &self.node_arena,
             index: &self.node_index,
-            tombstones: &self.deleted_node_versions,
+            floors: &self.node_version_floors,
             meta_off: NODE_META_OFF,
         }
     }
@@ -325,7 +343,7 @@ impl CompactDiffOverlay {
         KindStore {
             arena: &self.way_arena,
             index: &self.way_index,
-            tombstones: &self.deleted_way_versions,
+            floors: &self.way_version_floors,
             meta_off: WAY_META_OFF,
         }
     }
@@ -336,7 +354,7 @@ impl CompactDiffOverlay {
         KindStore {
             arena: &self.relation_arena,
             index: &self.relation_index,
-            tombstones: &self.deleted_relation_versions,
+            floors: &self.relation_version_floors,
             meta_off: RELATION_META_OFF,
         }
     }
@@ -351,7 +369,12 @@ impl CompactDiffOverlay {
         tags: &[(u32, &str)],
         meta: &ArenaMeta,
     ) -> ParseResult<()> {
-        self.check_version_advance("node", id, self.node_store(), meta)?;
+        if let Some(claim) = meta.version_claim() {
+            self.check_version_advance("node", id, self.node_store(), claim)?;
+        } else if !self.allow_version_regression {
+            let carried = self.node_store().stored_version(id);
+            Self::raise_floor(&mut self.node_version_floors, id, carried, meta);
+        }
         let offset = arena_append_node(&mut self.node_arena, id, lat, lon, tags, meta)?;
         self.node_index.insert(id, offset);
         Ok(())
@@ -366,7 +389,12 @@ impl CompactDiffOverlay {
         tags: &[(u32, &str)],
         meta: &ArenaMeta,
     ) -> ParseResult<()> {
-        self.check_version_advance("way", id, self.way_store(), meta)?;
+        if let Some(claim) = meta.version_claim() {
+            self.check_version_advance("way", id, self.way_store(), claim)?;
+        } else if !self.allow_version_regression {
+            let carried = self.way_store().stored_version(id);
+            Self::raise_floor(&mut self.way_version_floors, id, carried, meta);
+        }
         let offset = arena_append_way(&mut self.way_arena, id, refs, tags, meta)?;
         self.way_index.insert(id, offset);
         Ok(())
@@ -381,7 +409,12 @@ impl CompactDiffOverlay {
         tags: &[(u32, &str)],
         meta: &ArenaMeta,
     ) -> ParseResult<()> {
-        self.check_version_advance("relation", id, self.relation_store(), meta)?;
+        if let Some(claim) = meta.version_claim() {
+            self.check_version_advance("relation", id, self.relation_store(), claim)?;
+        } else if !self.allow_version_regression {
+            let carried = self.relation_store().stored_version(id);
+            Self::raise_floor(&mut self.relation_version_floors, id, carried, meta);
+        }
         let offset = arena_append_relation(&mut self.relation_arena, id, members, tags, meta)?;
         self.relation_index.insert(id, offset);
         Ok(())
@@ -390,13 +423,15 @@ impl CompactDiffOverlay {
     /// Mark a node as deleted and drop any live entry from the node index.
     ///
     /// The delete is version-gated exactly like a create or modify, and
-    /// records a versioned tombstone so a later stale change still has a
+    /// records a version floor so a later stale change still has a
     /// version to be measured against.
     #[inline]
     pub(super) fn delete_node(&mut self, id: i64, meta: &ArenaMeta) -> ParseResult<()> {
-        self.check_version_advance("node", id, self.node_store(), meta)?;
+        if let Some(claim) = meta.version_claim() {
+            self.check_version_advance("node", id, self.node_store(), claim)?;
+        }
         let carried = self.node_store().stored_version(id);
-        Self::record_tombstone(&mut self.deleted_node_versions, id, carried, meta);
+        Self::raise_floor(&mut self.node_version_floors, id, carried, meta);
         self.deleted_nodes.insert(id);
         self.node_index.remove(&id);
         Ok(())
@@ -405,9 +440,11 @@ impl CompactDiffOverlay {
     /// Mark a way as deleted and drop any live entry from the way index.
     #[inline]
     pub(super) fn delete_way(&mut self, id: i64, meta: &ArenaMeta) -> ParseResult<()> {
-        self.check_version_advance("way", id, self.way_store(), meta)?;
+        if let Some(claim) = meta.version_claim() {
+            self.check_version_advance("way", id, self.way_store(), claim)?;
+        }
         let carried = self.way_store().stored_version(id);
-        Self::record_tombstone(&mut self.deleted_way_versions, id, carried, meta);
+        Self::raise_floor(&mut self.way_version_floors, id, carried, meta);
         self.deleted_ways.insert(id);
         self.way_index.remove(&id);
         Ok(())
@@ -416,19 +453,23 @@ impl CompactDiffOverlay {
     /// Mark a relation as deleted and drop any live entry from the relation index.
     #[inline]
     pub(super) fn delete_relation(&mut self, id: i64, meta: &ArenaMeta) -> ParseResult<()> {
-        self.check_version_advance("relation", id, self.relation_store(), meta)?;
+        if let Some(claim) = meta.version_claim() {
+            self.check_version_advance("relation", id, self.relation_store(), claim)?;
+        }
         let carried = self.relation_store().stored_version(id);
-        Self::record_tombstone(&mut self.deleted_relation_versions, id, carried, meta);
+        Self::raise_floor(&mut self.relation_version_floors, id, carried, meta);
         self.deleted_relations.insert(id);
         self.relation_index.remove(&id);
         Ok(())
     }
 
-    /// Store the highest version known for a now-deleted id: the version
-    /// the live record held before removal, and the delete's own claim.
+    /// Fold the version a transition is about to lose into the id's
+    /// floor: the version the live record held (live or already floored)
+    /// before a delete or unversioned overwrite, and the incoming
+    /// change's own claim, if any.
     #[inline]
-    fn record_tombstone(
-        tombstones: &mut FxHashMap<i64, i32>,
+    fn raise_floor(
+        floors: &mut FxHashMap<i64, i32>,
         id: i64,
         carried: Option<i32>,
         meta: &ArenaMeta,
@@ -438,7 +479,7 @@ impl CompactDiffOverlay {
             (Some(a), None) | (None, Some(a)) => a,
             (None, None) => return,
         };
-        tombstones
+        floors
             .entry(id)
             .and_modify(|v| *v = (*v).max(highest))
             .or_insert(highest);

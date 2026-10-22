@@ -976,28 +976,6 @@ impl IdSet {
         }
     }
 
-    /// Combined get + rank in a single lookup. Returns `start_id + rank(id)`
-    /// if `id` is set, or `id` unchanged if not (orphan passthrough, which
-    /// includes every negative ID).
-    /// Requires `build_rank_index()` (panics without it when `id` is set).
-    #[inline]
-    pub fn resolve(&self, id: i64, start_id: i64) -> i64 {
-        let Some((cid, off)) = split(id) else {
-            return id;
-        };
-        let Some((slot, chunk)) = self.chunk(cid) else {
-            return id;
-        };
-        if !chunk.contains(off) {
-            return id; // not set -> orphan
-        }
-        let idx = self
-            .rank
-            .as_ref()
-            .expect("resolve() called without build_rank_index()");
-        start_id + Self::rank_in_chunk(idx, slot, cid, chunk, off) as i64
-    }
-
     /// Combined get + rank in a single lookup. Returns `Some(rank)` if `id`
     /// is set, `None` if not. Avoids the double chunk lookup of separate
     /// `get()` + `rank()` calls. Returns `None` without `build_rank_index()`.
@@ -1042,7 +1020,7 @@ impl IdSet {
     }
 
     /// Drop the rank index built by `build_rank_index()`. After this call,
-    /// `rank()`, `resolve()`, `count_below()`, `count_in_range()` and
+    /// `rank()`, `count_below()`, `count_in_range()` and
     /// `total_count()` panic, and `rank_if_set()` returns `None`. The members
     /// themselves are retained - `get()`, `set()`, and `has_any()` still work.
     ///
@@ -1592,8 +1570,6 @@ mod tests {
             assert_eq!(s.count_below(p), below, "count_below({p})");
             let expected_rank = reference.contains(&p).then_some(below);
             assert_eq!(s.rank_if_set(p), expected_rank, "rank_if_set({p})");
-            let expected_resolve = expected_rank.map_or(p, |r| 1_000 + r as i64);
-            assert_eq!(s.resolve(p, 1_000), expected_resolve, "resolve({p})");
         }
         for _ in 0..400 {
             let a = interesting_id(&mut rng);

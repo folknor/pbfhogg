@@ -4,6 +4,7 @@
 //! `--simplify` keeps only the last change per object (type + id).
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
@@ -15,6 +16,7 @@ use rayon::prelude::*;
 
 use super::Result;
 use crate::MemberId;
+use crate::osc::version_floor::{VersionFloor, regression_message};
 use crate::osc::write::{
     OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, write_delete_xml,
     write_node_xml, write_relation_xml, write_way_xml,
@@ -738,37 +740,42 @@ fn change_version(change: &Change) -> Option<i32> {
     meta.and_then(|m| m.version)
 }
 
-/// Refuse a `--simplify` dedupe in which the later change does not
-/// advance the object's version.
+/// Refuse a `--simplify` dedupe in which the incoming change does not
+/// advance the object's version, then fold its claim into the floor.
 ///
 /// `--simplify` keeps the last change per `(kind, id)` in **input**
-/// order and never looked at `version`, so listing the inputs out of
-/// sequence order - which `brokkr`'s `--osc-range` makes easy to do by
-/// accident - silently regressed objects to older versions and reported
-/// success. That is data corruption, not a preference, so it is refused
-/// by default. Both sides must claim a version for the comparison to
-/// mean anything.
-fn check_version_advance(previous: &Change, incoming: &Change) -> Result<()> {
-    let (Some(prev), Some(next)) = (change_version(previous), change_version(incoming)) else {
-        return Ok(());
-    };
-    if next > prev {
-        return Ok(());
+/// order, so listing the inputs out of sequence order - which `brokkr`'s
+/// `--osc-range` makes easy to do by accident - would silently regress
+/// objects to older versions and report success. That is data
+/// corruption, so it is refused by default.
+///
+/// The floor is the highest version ever claimed for the object, not
+/// the version of the change it replaces: comparing only against the
+/// previous change let an unversioned change in between reset it, so
+/// `delete v9`, unversioned `modify`, `modify v8` was accepted here and
+/// refused by apply-changes. [`VersionFloor`] holds the rule both use.
+fn check_version_advance(floor: &mut VersionFloor, incoming: &Change) -> Result<()> {
+    let claim = change_version(incoming);
+    if let Some(version) = claim
+        && let Err(held) = floor.admit(claim)
+    {
+        let (kind, id) = match &incoming.element {
+            ChangeElement::Node(n) => ("node", n.id),
+            ChangeElement::Way(w) => ("way", w.id),
+            ChangeElement::Relation(r) => ("relation", r.id),
+        };
+        return Err(regression_message(
+            "merge-changes --simplify",
+            kind,
+            id,
+            version,
+            held,
+            "pass --allow-version-regression to restore the positional rule",
+        )
+        .into());
     }
-    let (kind, id) = match &incoming.element {
-        ChangeElement::Node(n) => ("node", n.id),
-        ChangeElement::Way(w) => ("way", w.id),
-        ChangeElement::Relation(r) => ("relation", r.id),
-    };
-    Err(format!(
-        "merge-changes --simplify: {kind} {id} appears again with version {next}, which does \
-         not advance past version {prev} seen earlier in the input order. --simplify keeps the \
-         LAST change per object by position, so accepting this would silently downgrade the \
-         object to an older state and report success - the usual cause is listing the input \
-         OSC files out of sequence order. Re-order the inputs, or pass \
-         --allow-version-regression to restore the old positional behaviour."
-    )
-    .into())
+    floor.raise(claim);
+    Ok(())
 }
 
 #[hotpath::measure]
@@ -781,19 +788,34 @@ fn write_simplified(
     crate::debug::emit_marker("MERGECHANGES_SIMPLIFY_START");
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("merge_changes_changes_in", stream.changes.len() as i64);
-    let mut last_by_object: BTreeMap<(u8, i64), Change> = BTreeMap::new();
+    // Each object's last change, beside the highest version ever claimed
+    // for it. The floor is only maintained while the gate is on; with
+    // `--allow-version-regression` the dedupe is purely positional.
+    let mut last_by_object: BTreeMap<(u8, i64), (Change, VersionFloor)> = BTreeMap::new();
     for change in stream.changes {
         let key = change.element.key();
-        if !allow_version_regression && let Some(previous) = last_by_object.get(&key) {
-            check_version_advance(previous, &change)?;
+        if allow_version_regression {
+            last_by_object.insert(key, (change, VersionFloor::default()));
+            continue;
         }
-        last_by_object.insert(key, change);
+        match last_by_object.entry(key) {
+            Entry::Vacant(slot) => {
+                let mut floor = VersionFloor::default();
+                floor.raise(change_version(&change));
+                slot.insert((change, floor));
+            }
+            Entry::Occupied(mut slot) => {
+                let (last, floor) = slot.get_mut();
+                check_version_advance(floor, &change)?;
+                *last = change;
+            }
+        }
     }
 
     let mut creates = Vec::new();
     let mut modifies = Vec::new();
     let mut deletes = Vec::new();
-    for (_, change) in last_by_object {
+    for (_, (change, _)) in last_by_object {
         match change.action {
             Action::Create => creates.push(change),
             Action::Modify => modifies.push(change),

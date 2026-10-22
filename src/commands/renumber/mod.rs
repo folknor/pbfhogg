@@ -296,8 +296,9 @@ fn validate_start_ids(opts: &RenumberOptions) -> Result<()> {
 /// input's size: `pre_allocate` eagerly allocates one bit per ID from 0 to
 /// its argument, indexdata is unverified, and a claim of `i64::MAX` would
 /// otherwise ask for an exabyte before a single blob is read (CORRECTNESS.md,
-/// the indexdata trust boundary). At one bit per ID, `file_len * 8` keeps the
-/// bitmap within the file's own size, plus one chunk of rounding.
+/// the indexdata trust boundary). At one bit per ID, `file_len *
+/// PREALLOC_IDS_PER_BYTE` keeps a false claim's bitmap within eight times
+/// the file's own size, plus one chunk of rounding.
 ///
 /// Unlike `check`'s `id_alloc_bound` there is no live-OSM floor, because
 /// nothing depends on the bound covering every ID: pass 1 hands an ID
@@ -306,9 +307,18 @@ fn validate_start_ids(opts: &RenumberOptions) -> Result<()> {
 /// extract carrying real ~1e10 node IDs therefore costs memory in proportion
 /// to its nodes, not to its largest ID, and is not refused.
 fn node_prealloc_bound(claimed_max: i64, file_len: u64) -> i64 {
-    let by_size = i64::try_from(file_len.saturating_mul(8)).unwrap_or(i64::MAX);
+    let by_size = i64::try_from(file_len.saturating_mul(PREALLOC_IDS_PER_BYTE)).unwrap_or(i64::MAX);
     claimed_max.min(by_size)
 }
+
+/// IDs the node pre-allocation may cover per input byte. The overflow path
+/// is serial (~3.7 ns per ID on bygg), and honest files gain nothing from a
+/// tight bound: their set ends as the same bitmaps either way. At 8 per
+/// byte, denmark (highest node ID about 29 times its size in bytes) sent 37
+/// of its 52 M nodes through overflow, 137 ms of a 0.85 s run; at 64 every
+/// country-sized extract stays on the parallel path, and only small files
+/// with high IDs, whose overflow is small, take it.
+const PREALLOC_IDS_PER_BYTE: u64 = 64;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -593,7 +603,7 @@ mod tests {
     /// size the pre-allocation; an honest planet-scale claim still does.
     #[test]
     fn the_node_preallocation_is_bounded_by_the_file() {
-        assert_eq!(node_prealloc_bound(i64::MAX, 4096), 32_768);
+        assert_eq!(node_prealloc_bound(i64::MAX, 4096), 262_144);
         let planet = 80_u64 * 1024 * 1024 * 1024;
         assert_eq!(node_prealloc_bound(13_000_000_000, planet), 13_000_000_000);
         assert_eq!(node_prealloc_bound(i64::MAX, u64::MAX), i64::MAX);

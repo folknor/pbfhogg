@@ -215,7 +215,7 @@ map), so `set` on an input-controlled ID no longer aborts. `pre_allocate
 (max_id)` still allocates a 4 MiB bitmap per 2^25 IDs from 0 to `max_id`
 before anything is validated, so a caller passing an indexdata `max_id`
 that lies high allocates until it runs out of memory. `check` bounds its
-argument by the file size, and renumber by `min(claim, file_len * 8)` with
+argument by the file size, and renumber by `min(claim, file_len * 64)` with
 IDs above it routed through `set` after its parallel pass; the geocode
 builder (pass 1.5) still passes indexdata's claim unbounded and should do
 the same, per CORRECTNESS.md's rule for allocations sized from indexdata.

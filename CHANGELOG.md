@@ -588,6 +588,23 @@
 
 ### Fixed
 
+- **`extract --polygon` refuses a degenerate ring** (fewer than three
+  positions, or zero area) instead of producing an empty extract and exiting
+  0. Open rings are still accepted and closed implicitly.
+
+- **`inspect --show` prints nothing to stderr when the element is absent**,
+  matching the exit-1 contract; the exit code alone carries the answer.
+
+- **A malformed data block is refused instead of being written without an
+  index.** Plain `cat` and `PbfWriter::write_primitive_block` used to treat
+  a block the index scanner could not parse as merely unindexable and copy
+  it through; `check --index` passed such a block when it carried no stored
+  metadata. All three now fail.
+
+- **`apply_changes::merge` refuses an output path that is the base input**
+  (same file, symlink or hard link) before opening anything. The CLI already
+  refused it; a library caller would have truncated the base.
+
 - **`add-locations-to-ways --index-type external` accepts ways with no
   refs.** A zero-ref way used to desynchronise the per-way refcount sidecar
   and fail the run, while the sparse backend accepted the same input; which
@@ -1433,12 +1450,12 @@
   (text `-o` and `--format osc`), `getid`, `getparents`,
   `extract` (single and `--config` multi-extract),
   `add-locations-to-ways`, `time-filter`, `apply-changes` and
-  `merge-changes`. Each writes to a scratch sibling in the destination's
-  directory and renames it into place only once the run has succeeded, so
-  the destination is untouched until then and is replaced by a single
-  `rename` - atomic on Unix. The one exclusion is `bench-write`'s sibling
-  `bench-merge`, a synthetic benchmark, where the rename would land in the
-  region being measured.
+  `merge-changes`, and the synthetic `bench-merge` benchmark, which no
+  longer deletes a pre-existing `-o` file before it starts and commits
+  outside its timed region. Each writes to a scratch sibling in the
+  destination's directory and renames it into place only once the run has
+  succeeded, so the destination is untouched until then and is replaced
+  by a single `rename` - atomic on Unix.
 
   A multi-extract extracts all-or-nothing: no region is published unless
   every region succeeded. Publishing them is not a transaction, though -

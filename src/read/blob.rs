@@ -583,6 +583,9 @@ impl<R: Read + Send> BlobReader<R> {
             Ok(header) => header,
             Err(e) => return self.handle_error(e),
         };
+        // These are wire lengths, not version numbers: v1 is 26 bytes,
+        // while both v2 and v3 are 42. A new version need not add a length;
+        // the version/length consistency check lives in blob_meta.
         if let Some(len) = header.unrecognised_indexdata_len {
             crate::host::diag_once!(
                 self.diagnostics,

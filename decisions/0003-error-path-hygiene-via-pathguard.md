@@ -73,13 +73,11 @@ user-facing summary counters must match output.
   leaves a `.pbfhogg-tmp-*` sibling behind, which nothing removes
   automatically.
 
-  One command is deliberately outside the helper: `bench-merge`, a
-  synthetic write benchmark, where a `rename` would land inside the
-  region being measured. Its output is not user-facing data, so
-  `bench-merge -o existing.pbf` keeps the pre-guard behaviour
-  (truncate up front, partial file on failure). If a guard is ever
-  wanted there, commit *outside* the timed region rather than wrapping
-  the whole run.
+  `bench-merge`, a synthetic write benchmark, goes through the helper
+  too, but its `elapsed_ms` is taken inside the closure, so the scratch
+  file's creation and the commit `rename` both fall outside the timed
+  region. Keep it that way: a guard on a benchmark must commit outside
+  what it measures.
 - **A command with several user-named outputs gets a guard each, and a
   preflight before the first commit.** `extract --config` is the only
   such command today. Extraction is all-or-nothing - a failure drops

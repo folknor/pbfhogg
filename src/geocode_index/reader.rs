@@ -218,6 +218,10 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 impl Reader {
     /// Open an index directory. Memory-maps all files.
+    ///
+    /// Opening walks cells, geometry records and referenced strings; it is not
+    /// constant-time and can fault file-backed pages into memory. Entry-list
+    /// spans are checked, but individual entry references are not certified.
     pub fn open(dir: &Path) -> Result<Self> {
         let header_bytes = std::fs::read(dir.join(format::FILE_HEADER))?;
         if header_bytes.len() < HEADER_SIZE {
@@ -293,6 +297,20 @@ impl Reader {
         Ok(reader)
     }
 
+    // Deliberately no per-entry reference sweep here (way_index against
+    // street_way_count, segment_index + 1 against the way's node_count,
+    // address and admin indices against their counts). Fine and coarse trees
+    // repeat segment references across cells, so the sweep is a walk over
+    // every entry file plus a scattered way-table read per segment entry, on
+    // every open and again in the builder smoke test. Open is already
+    // O(index size); growing it further belongs after a trusted-open path
+    // exists, not before. The builder derives every entry from an in-range
+    // index and fails the build on missing producer data, and every
+    // query-time consumer bounds-checks the entry it reads - the
+    // segment checks against the owning way's node_count, not the shared
+    // node file length, so an entry can never borrow the next way's nodes.
+    // To revisit: Reader::open wall and majflt on a cold planet index, with
+    // and without the sweep.
     fn validate_structure(&self) -> Result<()> {
         fn exact(name: &str, actual: usize, count: u32, size: usize) -> Result<()> {
             let expected = usize::try_from(count)
@@ -435,6 +453,10 @@ impl Reader {
                 read_record::<ADMIN_POLYGON_SIZE>(&self.admin_polygons, index * ADMIN_POLYGON_SIZE)
                     .ok_or("invalid admin polygon record")?;
             let poly = AdminPolygon::from_bytes(rec);
+            // Producer rings repeat their first vertex: assemble_rings keeps
+            // only closed rings and simplify_ring preserves both endpoints.
+            // Do not scan every vertex here solely to recertify closure; that
+            // would add coordinate-page reads to metadata validation at open.
             validate_span(
                 poly.vertex_offset,
                 u64::from(poly.vertex_count),
@@ -1175,6 +1197,11 @@ impl Reader {
         let (cells, count) = cell_neighborhood(ctx.lat, ctx.lon, level);
         let cell_count = geo_cells_mmap.len() / GEO_CELL_SIZE;
 
+        // An entry naming a record that does not exist is skipped, not
+        // reported: open certifies list spans but not entry contents (see
+        // validate_structure for why), and only a corrupt or hand-edited
+        // index can carry one. The segment distance helpers return f64::MAX
+        // for the same case, which never passes the radius test.
         for &cell_id in &cells[..count] {
             let Some(gc) = binary_search_cells(geo_cells_mmap, cell_count, cell_id) else {
                 continue;
@@ -1238,6 +1265,7 @@ impl Reader {
             for (poly_idx, _is_interior) in
                 AdminEntryIter::new(&self.admin_entries, ac.entries_offset)
             {
+                // Out-of-range entry: skipped, as in search_level.
                 let Some(poly) = self.read_admin_polygon(poly_idx) else {
                     continue;
                 };
@@ -1297,6 +1325,7 @@ impl Reader {
                 if !first_admin_attempt(&mut seen, poly_idx) {
                     continue;
                 }
+                // Out-of-range entry: skipped, as in search_level.
                 let Some(poly) = self.read_admin_polygon(poly_idx) else {
                     continue;
                 };
@@ -1354,6 +1383,11 @@ impl Reader {
             return (0, 0, f64::MAX);
         };
         let way = StreetWay::from_bytes(rec);
+        // A globally in-bounds node can belong to the next way. A segment
+        // needs two nodes within this way, including when node_count is zero.
+        if u32::from(seg_ref.segment_index) + 1 >= u32::from(way.node_count) {
+            return (0, 0, f64::MAX);
+        }
         let Some(node_byte_offset) = usize::try_from(way.node_offset).ok().and_then(|base| {
             usize::from(seg_ref.segment_index)
                 .checked_mul(NODE_COORD_SIZE)?
@@ -1371,6 +1405,10 @@ impl Reader {
             return (0, 0, f64::MAX);
         };
         let way = InterpWay::from_bytes(rec);
+        // Check the owning geometry before accessing the shared node file.
+        if u32::from(seg_ref.segment_index) + 1 >= u32::from(way.node_count) {
+            return (0, 0, f64::MAX);
+        }
         let Some(node_byte_offset) = usize::try_from(way.node_offset).ok().and_then(|base| {
             usize::from(seg_ref.segment_index)
                 .checked_mul(NODE_COORD_SIZE)?

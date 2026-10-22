@@ -8,16 +8,8 @@ All commands support `-h, --help` and `-V, --version`.
 
 ## Exit codes
 
-| Code | Meaning |
-|------|---------|
-| `0` | Success. |
-| `1` | The command ran and its answer is negative. Only `diff` (differences found), `inspect --indexed` (no indexdata), `inspect --show` (element not found) and `check` (integrity violations) produce it. |
-| `2` | The command failed: missing or unreadable input, an invalid argument combination, a malformed PBF, an I/O error. `Error: ...` goes to stderr; clap's usage errors also exit `2`. |
-
-Before 0.6.0 both meanings shared `1`, so "the files differ" and "the file
-does not exist" were indistinguishable. `1` kept its meaning, so callers
-branching on the semantic answer, or on any non-zero for failure, are
-unaffected.
+The full exit status contract, including stderr behavior, lives in the
+[CLI reference](https://github.com/folknor/pbfhogg/blob/main/reference/cli-reference.md#exit-codes).
 
 ## Common flags
 

@@ -17,7 +17,8 @@
 //! `--corrupt-indexdata-kind` / `--corrupt-tagdata` can manufacture a file whose
 //! hints are well-formed and false - but the pair was one-sided. This is the
 //! other side: it decompresses every blob, re-derives the metadata from the
-//! payload with [`scan_block_ids`] / [`scan_block_tags`], and diffs. Those are
+//! payload with [`crate::blob_meta::try_scan_block_ids_checked`] /
+//! [`scan_block_tags`], and diffs. Those are
 //! the writer's *passthrough*-path scanners; the ordinary write path derives
 //! its index incrementally inside `BlockBuilder` and never rescans what it
 //! emitted, so against it this check is genuinely independent.
@@ -80,7 +81,7 @@ use std::path::Path;
 
 use crate::BoxResult as Result;
 use crate::blob::BlobKind;
-use crate::blob_meta::{BlobBbox, BlobIndex, ElemKind, scan_block_ids, scan_block_tags};
+use crate::blob_meta::{BlobBbox, BlobIndex, ElemKind, scan_block_tags};
 use crate::file_reader::FileReader;
 use crate::read::decompress::decompress_blob_data_into;
 use crate::read::raw_frame::read_raw_frame;
@@ -110,8 +111,9 @@ pub enum IndexViolationKind {
         claimed: [i32; 4],
         observed: [i32; 4],
     },
-    /// The header carries an indexdata for a blob this crate refuses to index
-    /// at all (a group mixing element kinds, an unparseable payload). Whatever
+    /// The header carries an indexdata for a well-formed blob this crate
+    /// refuses to index at all (a group mixing element kinds). A malformed
+    /// payload is not this: `check_index` fails with an error. Whatever
     /// the claim says, it cannot be checked and cannot have been produced
     /// honestly by this crate.
     IndexOnUnindexableBlob,
@@ -128,9 +130,8 @@ pub enum IndexViolationKind {
     /// index. Readers silently ignore it, which costs nothing but means the
     /// file is not what it says it is.
     MalformedTagdata,
-    /// The header carries a valid, readable `tagdata` for a blob this crate
-    /// refuses to index at all (a group mixing element kinds, an unparseable
-    /// payload).
+    /// The header carries a valid, readable `tagdata` for a well-formed blob
+    /// this crate refuses to index at all (a group mixing element kinds).
     ///
     /// This is not cosmetic. A mixed-kind group makes `scan_block_tags` return
     /// `None` precisely because the scanner would see only the first element
@@ -198,7 +199,7 @@ impl std::fmt::Display for IndexViolation {
             IndexViolationKind::IndexOnUnindexableBlob => write!(
                 f,
                 "indexdata is present for a blob that cannot be indexed \
-                 (mixed-kind group or unparseable payload)"
+                 (e.g. a mixed-kind group)"
             ),
             IndexViolationKind::MalformedIndexdata => write!(
                 f,
@@ -211,7 +212,7 @@ impl std::fmt::Display for IndexViolation {
             IndexViolationKind::TagdataOnUnindexableBlob => write!(
                 f,
                 "tagdata is present for a blob that cannot be indexed \
-                 (mixed-kind group or unparseable payload), so the key set \
+                 (e.g. a mixed-kind group), so the key set \
                  cannot be complete"
             ),
             IndexViolationKind::TagKeysMissing { missing, example } => write!(
@@ -410,8 +411,9 @@ fn diff_tagdata(stored_bytes: Option<&[u8]>, block: &[u8], out: &mut Vec<IndexVi
         return;
     };
     let Some(observed) = scan_block_tags(block) else {
-        // The blob is one no tag index can describe (mixed-kind group,
-        // unparseable payload), yet a well-formed tag index was stored for it.
+        // The blob is one no tag index can describe (a mixed-kind group; a
+        // malformed payload already failed the ID scan in `check_index`), yet
+        // a well-formed tag index was stored for it.
         //
         // An earlier draft returned here without reporting, on the reasoning
         // that `scan_block_ids` refuses the same blob and so
@@ -485,7 +487,16 @@ pub fn check_index(
         // Unconditional decode: the stored metadata is under test, so it must
         // not be allowed to decide which blobs get looked at.
         decompress_blob_data_into(frame.blob_bytes(), &mut block)?;
-        let observed = scan_block_ids(&block);
+        // A malformed payload is an error even when no metadata was stored.
+        // Valid unsupported shapes remain unindexable rather than malformed.
+        let observed = crate::blob_meta::try_scan_block_ids_checked(&block)
+            .map_err(|e| {
+                format!(
+                    "blob {ordinal} (offset {}): malformed payload: {e}",
+                    frame.file_offset
+                )
+            })?
+            .map(|(index, _sorted)| index);
         if observed.is_none() {
             report.blobs_unindexable += 1;
         }

@@ -187,7 +187,8 @@ fn read_header(
 /// # Errors
 ///
 /// Returns an error if the base PBF or OSC file cannot be read, the
-/// output file cannot be written, or any PBF parsing/encoding fails.
+/// output path aliases the base PBF, the output file cannot be written, or
+/// any PBF parsing/encoding fails.
 #[allow(
     clippy::too_many_lines,
     clippy::cognitive_complexity,
@@ -202,6 +203,20 @@ pub fn merge(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<MergeStats> {
+    // `merge` is public library API, so direct callers need the same guard as
+    // CLI callers before writer setup truncates its destination. The later
+    // passthrough path reads from the base file after that setup. A
+    // not-yet-created output cannot be the base, so the CLI's extra
+    // planned-path check is not needed here.
+    if crate::path_guard::same_file(base_pbf, output_pbf)? {
+        return Err(format!(
+            "apply-changes output '{}' aliases base input '{}'",
+            output_pbf.display(),
+            base_pbf.display()
+        )
+        .into());
+    }
+
     let MergeOptions {
         compression,
         direct_io,
@@ -620,4 +635,39 @@ pub fn merge(
     }
 
     Ok(final_stats)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_refuses_output_equal_to_base_before_reading_inputs() {
+        let dir = crate::path_guard::tests::scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        let original: &[u8] = b"base file must survive";
+        std::fs::write(&base, original).expect("write base sentinel");
+
+        let error = merge(
+            &base,
+            &osc,
+            &base,
+            &MergeOptions::default(),
+            &HeaderOverrides::default(),
+            &crate::host::Host::for_tests(),
+        )
+        .err()
+        .expect("the base input must not also be the output");
+
+        assert!(
+            error.to_string().contains("aliases base input"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&base).expect("read base sentinel").as_slice(),
+            original
+        );
+    }
 }

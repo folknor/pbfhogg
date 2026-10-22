@@ -52,13 +52,14 @@ pub(crate) fn scan_block_tags(raw: &[u8]) -> Option<TagIndex> {
     try_scan_block_tags(raw).ok().flatten()
 }
 
-/// [`scan_block_ids`] and [`scan_block_tags`] from one walk of the block,
-/// with the same collapse of malformed bytes into `(None, None)`.
-pub(crate) fn scan_block_ids_and_tags(raw: &[u8]) -> (Option<BlobIndex>, Option<TagIndex>) {
-    match try_scan_block_ids_and_tags(raw) {
-        Ok((index, tags)) => (index.map(|(index, _sorted)| index), tags),
-        Err(_) => (None, None),
-    }
+/// Scan IDs and tags in one walk, preserving malformed-block errors for
+/// index-generating callers. A valid unsupported shape still has no index.
+pub(crate) fn scan_block_ids_and_tags(
+    raw: &[u8],
+) -> std::io::Result<(Option<BlobIndex>, Option<TagIndex>)> {
+    let (index, tags) = try_scan_block_ids_and_tags(raw)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok((index.map(|(index, _sorted)| index), tags))
 }
 
 /// Element type stored in a blob index.

@@ -739,12 +739,14 @@ Anger: 9 - output .partial and rename for every command.
   through here". `run_export` hand-rolls the `OutputFile` dance and repeats
   the alias check with a different message; `run_extract_config` builds a guard
   vector with preflight; `run_diff` calls `File::create(path)` directly;
-  `bench-merge` deletes the output first (BUG-056); `build-geocode-index` writes
+  `build-geocode-index` writes
   the index directory in place, so a failed build leaves a partial index under
   the user's name, though `PathGuard::dir` exists.
 - Merge-changes builds its own `OutputFile`-or-`PathGuard` choice from
   `output.exists()` (a TOCTOU with no consequence today); apply-changes'
-  library entry does nothing (BUG-021); `tags_filter/osc.rs::write_filtered_osc`
+  library entry refuses an output that is the base file, through
+  `path_guard::same_file`, the one owner of file identity, but has no
+  publication guard; `tags_filter/osc.rs::write_filtered_osc`
   and `multi.rs` `File::create` whatever they are given, so library callers get
   truncate-then-fail.
 - Altw's `DestinationGuard` cites the merge-changes precedent.
@@ -1741,9 +1743,9 @@ Anger: 7 - new API.
 `validate_structure` walks every record of every file at open, faulting in many
 GB at planet and making `open` take seconds to minutes; the builder's smoke test
 repeats the walk. A legitimate trade, but undocumented as a cost and with no
-`open_trusted` for an index the caller just built or checksummed. A content
-checksum in the header would make trust O(1). The content checks of BUG-046 add
-to this walk.
+`open_trusted` for an index the caller just built or checksummed. (A content
+checksum in the header would not make trust O(1): verifying it still reads
+every byte.)
 
 Reported by: geocode index.
 

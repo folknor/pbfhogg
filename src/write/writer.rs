@@ -495,20 +495,24 @@ impl<W: Write> PbfWriter<W> {
                 // of the framing work panics. See `PermitGuard`.
                 let _permit = PermitGuard::new(permit_tx);
                 assert!(!panic_here, "test hook: framing panic at seq {seq}");
-                let (index, tags) = blob_meta::scan_block_ids_and_tags(&uncompressed);
-                let indexdata = index.map(|idx| idx.serialize());
-                let tagdata = tags.and_then(|ti| ti.serialize());
-                let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
-                    frame_blob_into(
-                        "OSMData",
-                        &uncompressed,
-                        &compression,
-                        indexdata.as_ref().map(<[u8; 42]>::as_slice),
-                        tagdata.as_deref(),
-                        None,
-                        scratch,
-                    )
-                });
+                // Keep scanner failures on the existing ordered error channel.
+                // Scanning still happens once, inside the framing worker.
+                let result =
+                    blob_meta::scan_block_ids_and_tags(&uncompressed).and_then(|(index, tags)| {
+                        let indexdata = index.map(|idx| idx.serialize());
+                        let tagdata = tags.and_then(|ti| ti.serialize());
+                        PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
+                            frame_blob_into(
+                                "OSMData",
+                                &uncompressed,
+                                &compression,
+                                indexdata.as_ref().map(<[u8; 42]>::as_slice),
+                                tagdata.as_deref(),
+                                None,
+                                scratch,
+                            )
+                        })
+                    });
                 if let Ok(ref parts) = result {
                     WRITER_METRICS.payload_framed_items.fetch_add(1, Relaxed);
                     WRITER_METRICS
@@ -533,7 +537,7 @@ impl<W: Write> PbfWriter<W> {
             });
             Ok(())
         } else {
-            let (index, tags) = blob_meta::scan_block_ids_and_tags(block_bytes);
+            let (index, tags) = blob_meta::scan_block_ids_and_tags(block_bytes)?;
             let indexdata = index.map(|idx| idx.serialize());
             let tagdata = tags.and_then(|ti| ti.serialize());
             self.write_framed_blob(
@@ -1093,6 +1097,28 @@ mod tests {
     use crate::write::pipeline::{PipelineItem, SeqTotal};
     use std::io;
     use std::sync::mpsc::sync_channel;
+
+    #[test]
+    fn malformed_primitive_block_is_not_written_without_an_index() {
+        let mut writer = PbfWriter::new(Vec::new(), Compression::None);
+        let err = writer.write_primitive_block(&[0x80]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // An empty block is unsupported by the index, but is not malformed.
+        writer.write_primitive_block(&[]).unwrap();
+    }
+
+    #[test]
+    fn malformed_primitive_block_reaches_pipeline_flush() {
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("malformed.pbf");
+        let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
+        let mut writer =
+            PbfWriter::to_path(&path, Compression::None, &header, Executor::Ambient).unwrap();
+        // The worker reports on the ordered channel; enqueue may succeed.
+        let queued = writer.write_primitive_block(&[0x80]);
+        let result = queued.and_then(|()| writer.flush());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
 
     /// A `PbfWriter` whose writer thread has already exited with `outcome`.
     ///

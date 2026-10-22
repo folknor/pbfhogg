@@ -172,9 +172,15 @@ fn append_capped_missing_refs(
 /// ~1.6 GB for nodes (pre-allocated to 14 B), ~175 MB for ways (1.5 B),
 /// ~3 MB for relations (25 M).
 ///
-/// Missing-ID sets are small by construction (thousands to low millions
-/// even on a broken input) and are stored as `Vec<i64>` with a final
-/// `sort_unstable` + `dedup` to count unique missing IDs.
+/// `max_errors` caps retained display details, not working memory. The three
+/// missing-ID vectors retain occurrences until sort/dedup computes exact
+/// unique counts. Deferred relation IDs must survive until all relation IDs
+/// are known; their parallel source vector preserves detail attribution.
+/// Hostile inputs can therefore make this storage grow with reference count.
+/// Truncating these vectors would silently undercount or miss forward refs.
+/// A hard memory bound needs external sorting/spilling or another exact
+/// aggregation design, with scratch ownership and measured throughput; do
+/// not substitute a cap or a hot-loop set insertion for that design.
 ///
 /// # Why this is NOT an ID-only consumer
 ///

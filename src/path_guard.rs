@@ -168,6 +168,47 @@ impl Drop for OutputFile {
     }
 }
 
+/// Whether two paths name the same existing file: equal after
+/// canonicalization (which resolves symlinks), or on Unix the same device
+/// and inode (hard links). A path that does not exist names no file, so it
+/// aliases nothing and the answer is `false`; callers that also need to
+/// catch a not-yet-created output resolving onto an input do that planning
+/// themselves.
+///
+/// The one identity test behind every input/output alias refusal, in the
+/// library entry points and the CLI preflight alike.
+///
+/// # Errors
+/// Returns any canonicalization or metadata error other than not-found.
+#[doc(hidden)]
+pub fn same_file(a: &Path, b: &Path) -> std::io::Result<bool> {
+    let canonical = |path: &Path| match fs::canonicalize(path) {
+        Ok(path) => Ok(Some(path)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    };
+    let Some(a) = canonical(a)? else {
+        return Ok(false);
+    };
+    let Some(b) = canonical(b)? else {
+        return Ok(false);
+    };
+    if a == b {
+        return Ok(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let a_meta = fs::metadata(&a)?;
+        let b_meta = fs::metadata(&b)?;
+        Ok(a_meta.dev() == b_meta.dev() && a_meta.ino() == b_meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -273,6 +314,28 @@ pub(crate) mod tests {
             dest.parent(),
             "scratch must be a sibling so commit's rename stays intra-filesystem"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_file_recognizes_symlinks_and_hard_links() {
+        let dir = scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let hard = dir.path().join("hard.osm.pbf");
+        let symlink = dir.path().join("symlink.osm.pbf");
+        let other = dir.path().join("other.osm.pbf");
+        let absent = dir.path().join("absent.osm.pbf");
+        fs::write(&base, b"base").expect("write base");
+        fs::write(&other, b"base").expect("write other");
+        fs::hard_link(&base, &hard).expect("create hard link");
+        std::os::unix::fs::symlink(&base, &symlink).expect("create symlink");
+
+        assert!(same_file(&base, &base).expect("identity"));
+        assert!(same_file(&base, &hard).expect("hard link identity"));
+        assert!(same_file(&symlink, &base).expect("symlink identity"));
+        assert!(!same_file(&base, &other).expect("equal bytes, different file"));
+        assert!(!same_file(&base, &absent).expect("absent output"));
+        assert!(!same_file(&absent, &base).expect("absent input"));
     }
 
     #[test]

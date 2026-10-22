@@ -349,6 +349,49 @@ fn cat_failure_leaves_preexisting_destination_intact() {
     assert!(strays.is_empty(), "scratch file leaked: {strays:?}");
 }
 
+/// `bench-merge` must keep a failed merge away from the user-named output.
+/// A malformed but existing OSC reaches the command after alias validation;
+/// the old upfront remove deleted the destination before parsing it.
+#[test]
+fn bench_merge_failure_leaves_preexisting_destination_intact() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let changes = dir.path().join("malformed.osc");
+    crate::common::write_indexed_pbf(
+        &base,
+        &[crate::common::TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 200_000_000,
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
+    std::fs::write(&changes, b"<osmChange><create>").unwrap();
+    let dest = dir.path().join("precious.osm.pbf");
+    std::fs::write(&dest, b"user data").unwrap();
+
+    let out = CliInvoker::new()
+        .args([
+            "bench-merge",
+            base.to_str().unwrap(),
+            changes.to_str().unwrap(),
+            "-o",
+            dest.to_str().unwrap(),
+        ])
+        .run();
+    assert!(!out.status.success(), "malformed OSC should fail the merge");
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        b"user data",
+        "a failed benchmark merge destroyed the pre-existing destination"
+    );
+    let strays = scratch_leftovers(dir.path());
+    assert!(strays.is_empty(), "scratch file leaked: {strays:?}");
+}
+
 /// A PBF whose single way references a node that is not in the file.
 /// `add-locations-to-ways` writes a complete output and only then refuses,
 /// which is the post-writer CLI failure this file otherwise has no way to

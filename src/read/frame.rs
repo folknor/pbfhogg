@@ -89,6 +89,11 @@ pub(crate) struct FrameHeader {
     /// `WireBlobHeader::indexdata_present` for why a verifier needs the
     /// distinction every reader is right to collapse.
     pub(crate) raw_index_present: bool,
+    // Duplicate non-empty tagdata is collapsed to None by WireBlobHeader
+    // before this layer sees it. Adding presence here alone cannot recover
+    // that fact. Verification needs a separate presence/duplicate signal from
+    // read/blob_wire.rs through parse_blob_header_with_index; keep it separate
+    // from copied bytes so passthrough does not emit an invalid sentinel.
     pub(crate) tagdata: Option<Box<[u8]>>,
 }
 

@@ -584,6 +584,13 @@ fn verify_single_kind_streaming(
 /// The main-thread merge sees one of these per blob and aggregates in
 /// schedule order. Each result follows the contents of its input blob and
 /// streams back over the parallel_classify_phase channel.
+// The detail limit is applied by the ordered merge, not by these three
+// per-blob lists. On hostile input their retained storage grows with the
+// number of violations across the schedule. Capping them alone would lose
+// exact totals: a bounded redesign must carry separate totals for each list
+// and budget retained examples across blobs while preserving merge order.
+// Replacing the measured classify/merge path needs throughput validation;
+// max_errors is a display-detail limit, not a whole-check memory guarantee.
 struct BlobVerifyResult {
     first_id: Option<i64>,
     last_id: Option<i64>,

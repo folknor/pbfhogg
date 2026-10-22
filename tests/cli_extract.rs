@@ -457,6 +457,37 @@ fn polygon_from_geojson_file() {
     assert_eq!(node_ids(&c), vec![1, 3]);
 }
 
+#[test]
+fn polygon_rejects_degenerate_exterior_without_publishing_output() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let geojson = dir.path().join("region.geojson");
+
+    write_test_pbf(&input, &test_nodes(), &[], &[]);
+    write_geojson(
+        &geojson,
+        r#"{"type":"Polygon","coordinates":[[[12.0,55.0],[13.0,56.0]]] }"#,
+    );
+
+    let result = CliInvoker::new()
+        .arg("extract")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--polygon")
+        .arg(&geojson)
+        .arg("--simple")
+        .arg("--set-bounds")
+        .arg("--force")
+        .assert_failure();
+    result.assert_stderr_contains("at least 3");
+    assert!(
+        !output.exists(),
+        "invalid polygon input must not produce an empty output"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Smart strategy tests
 // ---------------------------------------------------------------------------

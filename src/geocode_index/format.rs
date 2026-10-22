@@ -372,6 +372,10 @@ pub struct AdminPolygon {
     /// Approximate area in square degrees (for smallest-polygon selection).
     pub area: f32,
     /// Byte offset into admin_vertices.bin.
+    /// Builder-produced exterior and hole rings repeat their first vertex at
+    /// the end; RING_SENTINEL separates rings. The closing edge is therefore
+    /// included in adjacent vertex pairs. Generic ring parsing also accepts
+    /// implicit closure, but does not certify this producer invariant.
     pub vertex_offset: u64,
     pub vertex_count: u32,
     pub name_offset: u32,

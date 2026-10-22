@@ -214,6 +214,11 @@ fn inspect_show_missing_element_is_the_negative_answer() {
         "element not found is the answer, not an error; stderr:\n{}",
         absent.stderr_str(),
     );
+    assert!(
+        absent.stderr.is_empty(),
+        "a negative answer must not emit diagnostics; stderr:\n{}",
+        absent.stderr_str(),
+    );
 
     let malformed = CliInvoker::new()
         .args(["inspect", input.to_str().unwrap(), "--show", "zzz"])

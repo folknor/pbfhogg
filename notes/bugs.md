@@ -77,18 +77,6 @@ untouched way, and on one that deletes such a node.
 
 Reported by: change application.
 
-## BUG-021 - `apply_changes::merge` does not refuse output equal to the base input
-
-Anger: 7 - CLI behaviour.
-
-The library entry point never checks whether `output_pbf` is the same file as
-`base_pbf`; the writer would truncate the input it is about to
-`copy_file_range` from. The CLI guards it, a library caller does not. Fix:
-refuse `same_file(base, output)` in the library. See HYG-030 for the wider
-output-publication policy.
-
-Reported by: change application.
-
 ## BUG-024 - `IdSet::pre_allocate` sizes from an unverified `max_id`
 
 Anger: 8 - IdSet preallocation.
@@ -105,21 +93,6 @@ builder (pass 1.5) still passes indexdata's claim unbounded and should do
 the same, per CORRECTNESS.md's rule for allocations sized from indexdata.
 
 Reported by: altw and scanning, geocode index, re-encoding.
-
-## BUG-030 - `with_blob_filter` is silently ignored by `for_each` and `par_map_reduce`
-
-Anger: 7 - CLI behaviour.
-
-`ElementReader::with_blob_filter` documents that the pipeline skips
-decompressing blobs whose type does not match. `for_each` destructures
-`Self { blob_iter, header, .. }` and drops the filter; `par_map_reduce` never
-reads it. A library user who sets a filter and calls either gets every
-element, with no error. Fix: apply it in all three engines (the check is
-`should_skip_blob`), or make the filter a parameter of the pipelined methods
-only. Enforceable by type: a `FilteredReader` offering only the methods that
-honour it.
-
-Reported by: read path.
 
 ## BUG-037 - `StringTable::pre_seed` identity mapping is not structural
 
@@ -164,38 +137,6 @@ Each is either a bug or an undocumented deviation; DEVIATIONS.md mentions
 neither.
 
 Reported by: the list-file reader fix.
-
-## BUG-044 - Degenerate polygon rings produce an empty extract with exit 0
-
-Anger: 7 - CLI behaviour.
-
-`extract::parse_ring` accepts rings of any length, including 0 to 2 points
-and unclosed rings; `point_in_ring` then returns `false`. A polygon file with
-a degenerate exterior yields an empty extract and success: the wrong answer
-reported as success that `parse_bbox`'s comment says was fixed for bboxes.
-
-Reported by: filtering and spatial.
-
-## BUG-046 - The geocode reader skips out-of-range entries, and one off-by-one reads the next way
-
-Anger: 7 - geocode output.
-
-Reader entry lists are validated for length but not content
-(`way_index < street_way_count`, `segment_index + 1 < node_count`,
-`addr idx < addr_point_count`, `poly_idx < admin_polygon_count`).
-Out-of-range values are skipped at query time (`continue`), the "safe is not
-correct" failure the `validate_way_geometry` doc argues against. A
-`segment_index` equal to `node_count - 1` is worse: `two_node_distance` reads
-the first node of the next way and returns a plausible wrong segment. Put the
-checks in `validate_structure` (see HYG-085 on its cost).
-
-Builder-side, the same class: Stage B's `match e.etype { ..., _ => {} }`
-drops unknown entry types, and Stage A's `if let Some(rec)` and
-`if let (Some(n1), Some(n2))` silently skip out-of-bounds records in files the
-builder just wrote. Those are builder bugs and should be errors or
-`debug_assert!` plus error.
-
-Reported by: geocode index.
 
 ## BUG-076 - The shared node scanner silently skips plain `Node` messages
 
@@ -356,21 +297,6 @@ old data files beside an absent header.
 
 Reported by: geocode index.
 
-## BUG-051 - The admin edge cover skips the closing segment of an open ring
-
-Anger: 7 - geocode output.
-
-`admin_cells_for_polygon` covers edges with `poly.vertices.windows(2)`, which
-never covers last-to-first unless the ring repeats its first vertex. Whether
-it does depends on `assemble_rings` and `simplify_ring`, and the format does
-not say whether rings are stored closed. `geo::point_in_ring` handles implicit
-closure, so the reader and the edge cover may disagree: the closing edge's
-cells get coverage only if the flood fill reaches them. State the closure rule
-in `format.rs`, assert it in `write_admin_data`, check it in
-`validate_structure`.
-
-Reported by: geocode index.
-
 ## BUG-052 - Geocode `StringPool` offsets wrap silently past 4 GiB
 
 Anger: 7 - geocode output.
@@ -388,34 +314,6 @@ function-level `cast_possible_truncation` allows across `pass3.rs`, `admin.rs`,
 `arithmetic_side_effects` on the module, so each site has to choose.
 
 Reported by: geocode index.
-
-## BUG-054 - `inspect --show` prints to stderr on the exit-1 path the contract says is silent
-
-Anger: 7 - CLI behaviour.
-
-`reference/cli-reference.md` and the `ExitStatus` doc in `main.rs` say exit 1
-prints nothing to stderr beyond normal output. `run_show_element` prints
-`Element not found: <spec>` to stderr before exiting 1. Either the message or
-the contract is wrong. The exit-code table is also duplicated in
-`docs/cli/commands.md`; keep it in one document and link. A CLI test asserting
-empty stderr on every negative-answer path would hold it.
-
-Reported by: CLI and plumbing.
-
-## BUG-056 - `bench-merge` deletes the user-named output before running
-
-Anger: 7 - CLI behaviour.
-
-`run_bench_merge` does `drop(std::fs::remove_file(output))` up front and is
-not routed through `guarded_output`. Every other command moved to
-`OutputFile` so a pre-existing file at `-o` survives failure.
-`bench-merge -o important.pbf` destroys it before the first byte is read, then
-writes directly to the final path; the remove error is swallowed, and
-`--force` is hard-wired `true`. Fix: `guarded_output`, or bench into a scratch
-path the command owns; test that a pre-existing output survives failure.
-`disallowed_methods` on `fs::remove_file` in `cli/` would have caught it.
-
-Reported by: CLI and plumbing.
 
 ## BUG-063 - Platform-skip predicates turn real failures into passes
 
@@ -453,26 +351,16 @@ not a process-ownership question and was out of that scope.
 
 Reported by: write path.
 
-## BUG-072 - Index-generating callers turn a malformed block into "no index" instead of an error
+## BUG-072 - `check --index` cannot see duplicate tagdata on its input
 
 Anger: 9 - malformed blocks refused in cat and the writer.
 
-The `blob_meta` scanners now come in two forms: `try_scan_block_ids_checked`
-and `try_scan_block_tags` return `Err` for a block they cannot parse, while
-the old `scan_block_ids`, `scan_block_ids_checked` and `scan_block_tags`
-keep their signatures and map that `Err` to `None`. The writer's passthrough
-reframe (`src/write/writer.rs`) and plain `cat` (`src/commands/cat/mod.rs`)
-still call the old forms, so a malformed payload is written out without an
-index rather than refused. `check --index` likewise does not report a
-scanner `Err` as its own violation, so a malformed payload with no stored
-sidecar metadata passes. Switch these to the `try_` forms. `sort` and
-`cat --dedupe` already turn `None` into an error.
-
-Related: duplicate tagdata reads as `None` rather than a placeholder,
-because sort, dedupe and apply-changes copy those bytes through, so
-`check --index` cannot see duplicate tagdata on its input; a presence flag
-in `read/frame.rs` and `raw_frame.rs` would close it. The read-path warning
-in `src/read/blob.rs` still spells the accepted lengths as "26 or 42".
+Plain `cat`, the writer's passthrough reframe and `check --index` now
+propagate scanner errors. Left: duplicate tagdata reads as `None` rather
+than a placeholder, because sort, dedupe and apply-changes copy those bytes
+through, so `check --index` cannot see duplicate tagdata on its input. The
+presence flag that would close it has to start in `src/read/blob_wire.rs`;
+comments in `read/frame.rs` and `raw_frame.rs` say so.
 
 Reported by: the blob_meta fix for the former strict-scanner entry.
 
@@ -502,19 +390,13 @@ the intended call. Other reservation calls in the same file subtract the
 existing capacity the same way. It is the only decompression-buffer path, so
 this is a performance change on every blob: measure before and after.
 
+Verified in wave 2 at four sites (`pool_get`, the parsed-blob zlib and zstd
+branches, the raw-wire path), which now carry comments saying the fix is
+pending measurement. The fix was declined only for want of a benchmark;
+benchmarks run after the resolution loop, so implement it and replace the
+comments.
+
 Reported by: the wave-0 reviews.
-
-## BUG-088 - The check detail cap does not bound check memory
-
-Anger: 8 - check aggregation.
-
-`--max-errors` now caps the retained detail lists, but `verify_ids` still
-collects per-blob violations uncapped before merging, and `check_refs` keeps
-its counting and deferred-reference vectors whole. Total memory on a hostile
-input still grows with the number of violations. Bounding it needs the
-exact counts carried through a different aggregation.
-
-Reported by: the wave-0 review.
 
 ## BUG-064 - Unit tests use fixed scratch names and collide across parallel sweeps
 
@@ -609,3 +491,40 @@ under HYG-081 is a separate `-j 1` case and must be ruled out before the
 refusal is lifted.
 
 Reported by: the wave-1 reviewer.
+
+## BUG-095 - `docs/cli/commands.md` says `check --max-errors` stops scanning
+
+Anger: 2 - doc correction.
+
+`--max-errors` caps the retained detail lists; the scan still runs to the
+end and the counts stay exact. The CLI guide says it stops scanning.
+
+Reported by: the wave-2 check fixer.
+
+## BUG-096 - Extract polygon rings are not checked for self-intersection
+
+Anger: 7 - CLI behaviour.
+
+`extract::parse_ring` now refuses empty, short, open and zero-area rings,
+but a self-intersecting (bow-tie) ring passes and point-in-polygon then
+answers by crossing parity, which may not match what the user drew. Either
+refuse such rings or document the even-odd interpretation.
+
+Reported by: the wave-2 extract fixer.
+
+## BUG-097 - `Reader::interpolate` trusts a caller-built candidate's segment index
+
+Anger: 7 - geocode output.
+
+`InterpolationCandidate` has all-public fields, and `Reader::interpolate`
+passes its `segment_index` to `accumulated_length_radians` unchecked. A
+hand-built candidate with `segment_index >= node_count - 1` reads nodes past
+the owning way. Candidates a query produces are already filtered by the
+segment-distance bound check, so only library callers constructing one by
+hand can hit it. A one-line guard in `interpolated_number` closes it. The
+plain-`cat` scanner error likewise carries no file or blob context (it is
+the scanner's message only), and `scan_block_ids_and_tags` converts the
+scanner error with `io::Error::new(InvalidData, e.to_string())`, dropping
+its source chain.
+
+Reported by: the wave-2 reviewer.

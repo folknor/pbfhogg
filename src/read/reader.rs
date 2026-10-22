@@ -79,6 +79,9 @@ impl<R: Read + Send> ElementReader<R> {
     ///
     /// This dramatically reduces CPU usage for type-filtered commands: e.g.
     /// filtering for ways only skips decompressing ~85% of blobs (nodes).
+    /// This optimization is consumed by the pipelined iteration methods only;
+    /// the sequential [`for_each`](Self::for_each) and parallel
+    /// [`par_map_reduce`](Self::par_map_reduce) methods process every element.
     pub fn with_blob_filter(mut self, filter: BlobFilter) -> Self {
         self.blob_filter = Some(filter);
         self
@@ -166,6 +169,10 @@ impl<R: Read + Send> ElementReader<R> {
     where
         F: for<'a> FnMut(Element<'a>),
     {
+        // `with_blob_filter` configures only the pipelined iteration methods.
+        // This sequential API decodes every OsmData blob and does not apply
+        // BlobFilter. It is a blob-level omission based on optional indexdata,
+        // not a post-decode element predicate shared by every reader engine.
         let Self {
             blob_iter, header, ..
         } = self;
@@ -434,6 +441,10 @@ impl<R: Read + Send> ElementReader<R> {
         ID: Fn() -> T + Sync + Send,
         T: Send,
     {
+        // `with_blob_filter` configures only the pipelined iteration methods.
+        // par_map_reduce maps every decoded element and intentionally disables
+        // indexdata parsing; using the optional metadata filter here would make
+        // results depend on indexdata presence and correctness.
         // par_map_reduce never inspects blob.index(); skip the per-blob
         // indexdata copy in the frame pump.
         self.blob_iter.set_parse_indexdata(false);

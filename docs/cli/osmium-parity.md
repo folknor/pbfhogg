@@ -193,7 +193,7 @@ worth knowing about.
 |--------|---------|----------|
 | `-t, --object-type` | `-t, --type` | cat, diff, inspect tags, check |
 | `--strategy simple\|complete_ways\|smart` | `--simple` / `--smart` (default: complete) | extract |
-| `-p, --polygon` (accepts `.poly`, GeoJSON, or OSM file) | `-p, --polygon` (GeoJSON only: bare Polygon/MultiPolygon geometry, Feature, or FeatureCollection - first feature only; Osmosis `.poly` files are not accepted) | extract |
+| `-p, --polygon` (accepts `.poly`, GeoJSON, or OSM file) | `-p, --polygon` (GeoJSON only: bare Polygon/MultiPolygon geometry, Feature, or FeatureCollection - every feature, where osmium takes the first; Osmosis `.poly` files are not accepted. Each ring needs at least three positions and a non-zero area; an open ring is closed implicitly) | extract |
 
 ### Flags pbfhogg doesn't have
 

@@ -2007,7 +2007,9 @@ fn main() -> process::ExitCode {
                 output,
                 compression,
                 io_mode,
-            } => run_bench_merge(&base, &changes, &output.output, compression, io_mode, &host),
+            } => guarded_output(&output.output, |path| {
+                run_bench_merge(&base, &changes, path, compression, io_mode, &host)
+            }),
         }
     })();
 
@@ -2591,28 +2593,22 @@ fn paths_alias(input: &std::path::Path, output: &std::path::Path) -> std::io::Re
     // with a bare aliasing-check IO error that never names the file. The
     // check runs before every command, so it must stay silent about
     // problems that are not aliasing and let the command speak first.
+    // `same_file` answers false for a missing path on either side.
+    //
+    // File identity (symlinks, hard links) is the library's test, shared
+    // with the library entry points that refuse an aliased output; only the
+    // not-yet-created planned-path case below is CLI-specific.
+    if pbfhogg::path_guard::same_file(input, output)? {
+        return Ok(true);
+    }
+    if output.exists() {
+        return Ok(false);
+    }
     let input_canonical = match std::fs::canonicalize(input) {
         Ok(path) => path,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
-    if output.exists() {
-        let output_canonical = std::fs::canonicalize(output)?;
-        if input_canonical == output_canonical {
-            return Ok(true);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let input_meta = std::fs::metadata(&input_canonical)?;
-            let output_meta = std::fs::metadata(&output_canonical)?;
-            return Ok(
-                input_meta.dev() == output_meta.dev() && input_meta.ino() == output_meta.ino()
-            );
-        }
-        #[cfg(not(unix))]
-        return Ok(false);
-    }
 
     let Some(planned) = planned_path(output)? else {
         return Ok(false);
@@ -3421,7 +3417,6 @@ fn run_show_element(
     let found = pbfhogg::inspect::show_element_to(path, elem_type, id, direct_io, &mut out, host)?;
     out.flush()?;
     if !found {
-        output::cli_eprintln!("Element not found: {spec}");
         return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
     }
     Ok(())
@@ -4023,8 +4018,6 @@ fn run_bench_merge(
     use std::time::Instant;
 
     let io_uring = matches!(io_mode, BenchIoMode::Uring);
-
-    drop(std::fs::remove_file(output));
 
     let start = Instant::now();
     let opts = pbfhogg::apply_changes::MergeOptions {

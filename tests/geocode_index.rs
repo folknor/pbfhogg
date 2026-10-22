@@ -2936,3 +2936,93 @@ fn coarse_fallback() {
         result.admin.len()
     );
 }
+
+/// A node still present in the shared node file must not extend a way whose
+/// declared geometry ends before it. Exercise both fine/coarse query consumers.
+#[test]
+fn segment_distance_respects_the_owning_way_node_count() {
+    use pbfhogg::geocode_index::{builder, reader::Reader};
+
+    for interpolation in [false, true] {
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("input.osm.pbf");
+        let index_dir = dir.path().join("index");
+        if interpolation {
+            write_synthetic_interpolation_input(&input);
+        } else {
+            write_synthetic_indexed_input(&input);
+        }
+        builder::build_geocode_index(
+            &builder::BuildConfig {
+                input_path: input,
+                output_dir: index_dir.clone(),
+                ..Default::default()
+            },
+            &crate::common::test_host(),
+        )
+        .expect("build fixture");
+        let lon = if interpolation { 12.5030 } else { 12.5005 };
+        let reader = Reader::open(&index_dir).expect("open baseline");
+        let baseline = reader.candidates(55.7, lon).expect("valid query");
+        assert!(if interpolation {
+            !baseline.interpolations.is_empty()
+        } else {
+            !baseline.streets.is_empty()
+        });
+        drop(baseline);
+        drop(reader);
+
+        let (file, count_offset) = if interpolation {
+            ("interp_ways.bin", 20)
+        } else {
+            ("street_ways.bin", 12)
+        };
+        let path = index_dir.join(file);
+        let original = std::fs::read(&path).expect("read way");
+        let count = u16::from_le_bytes([original[count_offset], original[count_offset + 1]]);
+        assert!(count >= 2);
+        let (nodes_file, entries_files) = if interpolation {
+            (
+                "interp_nodes.bin",
+                ["interp_entries.bin", "coarse_interp_entries.bin"],
+            )
+        } else {
+            (
+                "street_nodes.bin",
+                ["street_entries.bin", "coarse_street_entries.bin"],
+            )
+        };
+        // Keep the owning way intact and append another way's readable nodes.
+        // The invalid last-node segment can now produce a plausible distance
+        // unless the query checks the owning way's count.
+        let nodes_path = index_dir.join(nodes_file);
+        let mut nodes = std::fs::read(&nodes_path).expect("read nodes");
+        let extra = nodes.clone();
+        nodes.extend_from_slice(&extra);
+        std::fs::write(nodes_path, nodes).expect("append adjacent geometry");
+        for entries_file in entries_files {
+            let entries_path = index_dir.join(entries_file);
+            let mut entries = std::fs::read(&entries_path).expect("read entries");
+            let mut offset = 0;
+            while offset < entries.len() {
+                let len = usize::from(u16::from_le_bytes([entries[offset], entries[offset + 1]]));
+                offset += 2;
+                for _ in 0..len {
+                    entries[offset + 4..offset + 6].copy_from_slice(&(count - 1).to_le_bytes());
+                    offset += 6;
+                }
+            }
+            std::fs::write(entries_path, entries).expect("set last-node segment");
+        }
+        let reader = Reader::open(&index_dir).expect("spans remain in bounds");
+        let candidates = reader.candidates(55.7, lon).expect("valid query");
+        assert!(
+            if interpolation {
+                candidates.interpolations.is_empty()
+            } else {
+                candidates.streets.is_empty()
+            },
+            "a segment cannot use nodes outside its owning way"
+        );
+    }
+}

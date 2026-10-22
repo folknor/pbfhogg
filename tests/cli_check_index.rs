@@ -540,3 +540,23 @@ fn an_unreadable_input_is_exit_two_not_exit_one() {
         out.stderr_str(),
     );
 }
+
+#[test]
+fn malformed_payload_without_metadata_is_an_error() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("malformed.pbf");
+    let file = std::fs::File::create(&input).expect("create input");
+    let mut writer = pbfhogg::writer::PbfWriter::new(file, pbfhogg::writer::Compression::None);
+    let header = pbfhogg::block_builder::HeaderBuilder::new()
+        .build()
+        .expect("header");
+    writer.write_header(&header).expect("write header");
+    writer
+        .write_primitive_block_no_indexdata(&[0x80])
+        .expect("write adversarial payload");
+    writer.flush().expect("flush fixture");
+    drop(writer);
+
+    let out = check_index(&input);
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr_str());
+}

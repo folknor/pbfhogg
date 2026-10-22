@@ -365,7 +365,7 @@ fn cat_passthrough(
                         // No indexdata - decompress to scan IDs/tags, reframe with index.
                         let blob_bytes = frame.blob_bytes();
                         decompress_blob_data_into(blob_bytes, &mut decompress_buf)?;
-                        let (index, tagdata) = scan_block_ids_and_tags(&decompress_buf);
+                        let (index, tagdata) = scan_block_ids_and_tags(&decompress_buf)?;
                         let index = match index {
                             Some(idx) => idx,
                             None => {

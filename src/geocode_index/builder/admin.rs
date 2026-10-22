@@ -220,6 +220,11 @@ pub(super) fn write_admin_data(dir: &Path, polygons: &[AssembledPolygon]) -> Res
     let mut poly_out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADMIN_POLYGONS))?);
     let mut vert_out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADMIN_VERTICES))?);
     let mut offset: u64 = 0;
+    // assemble_admin_polygons obtains only explicitly closed rings from
+    // assemble_rings. simplify_ring preserves both endpoints and conversion
+    // back to e7 applies the same operation to equal endpoints. Sentinels
+    // separate closed exterior/hole rings; serialization preserves them verbatim.
+    // No extra vertex validation pass is needed for these producer-owned values.
     for p in polygons {
         let vertex_count =
             u32::try_from(p.vertices.len()).map_err(|_| -> Box<dyn std::error::Error> {

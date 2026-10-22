@@ -110,6 +110,14 @@ pub(crate) fn pool_get(pool: Option<&Arc<DecompressPool>>, capacity: usize) -> V
     match pool {
         Some(p) => {
             let mut buf = p.get();
+            // `reserve` takes an additional byte count relative to `len`, not
+            // a target capacity. Subtracting the pooled capacity can therefore
+            // leave this buffer smaller than the hint. Replacing this with
+            // `reserve(capacity)` eagerly grows every undersized pool hit
+            // before inflation, including cases where an estimate exceeds the
+            // decoded output. That changes allocation timing on every pooled
+            // decode and needs a matched benchmark against growth during
+            // inflation before changing.
             buf.reserve(capacity.saturating_sub(buf.capacity()));
             buf
         }
@@ -336,6 +344,11 @@ fn decompress_parsed_blob_body(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()>
         Some(BlobData::Zlib(bytes)) => {
             let cap = blob.estimated_capacity();
             if cap > 0 {
+                // `buf` was cleared above. `reserve` is additional capacity
+                // from `len`, so subtracting the existing capacity can leave
+                // the hint unmet. Reserving the full hint instead moves any
+                // growth ahead of inflation; keep this aligned with pool_get
+                // until a matched read-path benchmark establishes the effect.
                 buf.reserve(cap.saturating_sub(buf.capacity()));
             }
             zlib_decompress_into(bytes, buf)
@@ -343,6 +356,9 @@ fn decompress_parsed_blob_body(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()>
         Some(BlobData::Zstd(bytes)) => {
             let cap = blob.estimated_capacity();
             if cap > 0 {
+                // The same len-relative reserve issue as in the zlib arm
+                // applies here; reserving the full hint changes allocation
+                // timing and needs a matched benchmark before it is changed.
                 buf.reserve(cap.saturating_sub(buf.capacity()));
             }
             zstd_decompress_into(bytes, buf)
@@ -406,6 +422,11 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
             && rs > 0
         {
             #[allow(clippy::cast_sign_loss)]
+            // `buf` was cleared at function entry. `reserve` takes additional
+            // bytes, so subtracting the current capacity does not guarantee
+            // the declared hint. This reusable buffer is used in per-blob
+            // pread loops; changing the sizing shifts their allocation timing
+            // and needs a matched benchmark before it is changed.
             buf.reserve(clamp_capacity_hint(rs as usize).saturating_sub(buf.capacity()));
         }
         if field == blob_fields::ZLIB_DATA {

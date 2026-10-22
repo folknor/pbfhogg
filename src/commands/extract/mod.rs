@@ -295,6 +295,16 @@ fn parse_ring(ring: &serde_json::Value) -> Result<Vec<(f64, f64)>> {
     let points = ring
         .as_array()
         .ok_or("ring must be an array of coordinate pairs")?;
+    // A one- or two-point ring has a bounding box but no interior, so
+    // accepting it turns a malformed polygon into a successful empty
+    // extract. Open rings are accepted on purpose: RFC 7946 asks for a
+    // repeated first position, but the point-in-ring and antimeridian tests
+    // close a ring implicitly, and osmium accepts three-position rings too
+    // (its .poly parser closes them). Refusing them would break region
+    // files that have always worked.
+    if points.len() < 3 {
+        return Err("polygon ring must contain at least 3 coordinate positions".into());
+    }
     let mut result = Vec::with_capacity(points.len());
     for point in points {
         let pair = point
@@ -308,6 +318,22 @@ fn parse_ring(ring: &serde_json::Value) -> Result<Vec<(f64, f64)>> {
         crate::coord_pack::validate_lon("polygon longitude", lon)?;
         crate::coord_pack::validate_lat("polygon latitude", lat)?;
         result.push((lon, lat));
+    }
+    // A ring can still collapse to a line or point (fewer than three distinct
+    // positions, or all collinear) and so have no interior to select. Taking
+    // the shoelace sum relative to the first position makes the closing
+    // edge's term zero, so this is the full area whether or not the input
+    // repeats its first position.
+    let origin = result[0];
+    let twice_area = result
+        .windows(2)
+        .map(|edge| {
+            (edge[0].0 - origin.0) * (edge[1].1 - origin.1)
+                - (edge[1].0 - origin.0) * (edge[0].1 - origin.1)
+        })
+        .sum::<f64>();
+    if twice_area == 0.0 {
+        return Err("polygon ring must enclose a non-zero area".into());
     }
     Ok(result)
 }
@@ -1352,6 +1378,40 @@ mod tests {
         let b = region.bbox();
         assert!((b.min_lon - 10.0).abs() < 1e-9);
         assert!((b.max_lat - 52.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_ring_rejects_degenerate_rings_and_accepts_open_ones() {
+        for ring in [
+            serde_json::json!([]),
+            serde_json::json!([[12.0, 55.0], [13.0, 56.0]]),
+        ] {
+            let err = parse_ring(&ring)
+                .expect_err("rings with fewer than three positions must be rejected");
+            assert!(err.to_string().contains("at least 3"), "wrong error: {err}");
+        }
+
+        // Implicitly closed: the point-in-ring test supplies the last edge.
+        let open_ring = serde_json::json!([[12.0, 55.0], [13.0, 55.0], [13.0, 56.0], [12.0, 56.0]]);
+        let ring = parse_ring(&open_ring).expect("open rings are closed implicitly");
+        assert!(point_in_ring(12.5, 55.5, &ring));
+        let open_triangle = serde_json::json!([[12.0, 55.0], [13.0, 55.0], [12.0, 56.0]]);
+        parse_ring(&open_triangle).expect("an open triangle has an interior");
+
+        for ring in [
+            // Closed but collinear.
+            serde_json::json!([[12.0, 55.0], [13.0, 56.0], [14.0, 57.0], [12.0, 55.0]]),
+            // Open and collinear.
+            serde_json::json!([[12.0, 55.0], [13.0, 56.0], [14.0, 57.0]]),
+            // Three positions, two distinct.
+            serde_json::json!([[12.0, 55.0], [13.0, 56.0], [12.0, 55.0]]),
+        ] {
+            let err = parse_ring(&ring).expect_err("zero-area rings must be rejected");
+            assert!(
+                err.to_string().contains("non-zero area"),
+                "wrong error: {err}"
+            );
+        }
     }
 
     #[test]

@@ -446,6 +446,7 @@ pub(super) fn bucketed_cell_assignment_fused(
     p: &FusedCellAssignmentParams<'_>,
 ) -> Result<(u32, u32)> {
     use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering as AtomicOrdering};
 
     let FusedCellAssignmentParams {
         output_dir,
@@ -502,6 +503,13 @@ pub(super) fn bucketed_cell_assignment_fused(
     // (measured pre-fusion UUID bf8f2038) - the coarse cover_segment
     // pass is entirely eliminated.
 
+    // Lowest index of a way or point whose producer-written data is missing;
+    // MAX means none. Only the failure path touches these, so the parallel
+    // cover pays nothing for them on a well-formed build.
+    let first_missing_street = AtomicU32::new(u32::MAX);
+    let first_missing_addr = AtomicUsize::new(usize::MAX);
+    let first_missing_interp = AtomicUsize::new(usize::MAX);
+
     // Streets (fused fine + coarse)
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_STREETS_START");
     let mut chunk_start = 0u32;
@@ -533,41 +541,53 @@ pub(super) fn bucketed_cell_assignment_fused(
                         .and_then(|b| <&[u8; STREET_WAY_SIZE]>::try_from(b).ok())
                         .map(StreetWay::from_bytes);
                     let mut out = Vec::new();
-                    if let Some(rec) = rec {
-                        let nc = rec.node_count as usize;
-                        if nc >= 2 {
-                            out.reserve(nc * 2);
-                            for seg_idx in 0..nc - 1 {
-                                let off1 = rec.node_offset as usize + seg_idx * NODE_COORD_SIZE;
-                                let off2 = off1 + NODE_COORD_SIZE;
-                                if let (Some(n1), Some(n2)) = (
-                                    read_node_at(street_nodes_mmap, off1 as u64),
-                                    read_node_at(street_nodes_mmap, off2 as u64),
-                                ) {
-                                    cover_segment_fused(
-                                        n1.0,
-                                        n1.1,
-                                        n2.0,
-                                        n2.1,
-                                        fine_level,
-                                        coarse_level,
-                                        |fine_cid, coarse_to_emit| {
-                                            out.push((
-                                                fine_cid,
-                                                coarse_to_emit,
-                                                way_idx,
-                                                seg_idx as u16,
-                                            ));
-                                        },
-                                    );
-                                }
-                            }
+                    // Pass 2 wrote these files moments ago, so a record or node
+                    // out of bounds is a builder bug, not bad input: skipping it
+                    // would publish an index that silently lacks the street.
+                    // The failure is recorded here and raised after the chunk's
+                    // collect, so the success path stays a plain parallel cover
+                    // with no extra validation walk.
+                    let Some(rec) = rec else {
+                        first_missing_street.fetch_min(way_idx, AtomicOrdering::Relaxed);
+                        return out.into_iter();
+                    };
+                    let nc = rec.node_count as usize;
+                    if nc >= 2 {
+                        out.reserve(nc * 2);
+                        for seg_idx in 0..nc - 1 {
+                            let off1 = rec.node_offset as usize + seg_idx * NODE_COORD_SIZE;
+                            let off2 = off1 + NODE_COORD_SIZE;
+                            let (Some(n1), Some(n2)) = (
+                                read_node_at(street_nodes_mmap, off1 as u64),
+                                read_node_at(street_nodes_mmap, off2 as u64),
+                            ) else {
+                                first_missing_street.fetch_min(way_idx, AtomicOrdering::Relaxed);
+                                break;
+                            };
+                            cover_segment_fused(
+                                n1.0,
+                                n1.1,
+                                n2.0,
+                                n2.1,
+                                fine_level,
+                                coarse_level,
+                                |fine_cid, coarse_to_emit| {
+                                    out.push((fine_cid, coarse_to_emit, way_idx, seg_idx as u16));
+                                },
+                            );
                         }
                     }
                     out.into_iter()
                 })
                 .collect()
         });
+        let missing = first_missing_street.load(AtomicOrdering::Relaxed);
+        if missing != u32::MAX {
+            return Err(format!(
+                "geocode Stage A: street way {missing} has a record or node outside the files Pass 2 wrote"
+            )
+            .into());
+        }
 
         for &(fine_cid, coarse_opt, wi, si) in &entries {
             let b = bucket_for_cell(fine_cid);
@@ -606,7 +626,11 @@ pub(super) fn bucketed_cell_assignment_fused(
             (chunk_start..chunk_end)
                 .into_par_iter()
                 .filter_map(|idx| {
-                    let pt = read_addr_point_mmap(addr_points_mmap, idx as u32)?;
+                    // Same producer-owned file rule as the streets above.
+                    let Some(pt) = read_addr_point_mmap(addr_points_mmap, idx as u32) else {
+                        first_missing_addr.fetch_min(idx, AtomicOrdering::Relaxed);
+                        return None;
+                    };
                     let ll = LatLng::from_degrees(
                         e7_to_deg(pt.lat_e7 as f64),
                         e7_to_deg(pt.lon_e7 as f64),
@@ -617,6 +641,13 @@ pub(super) fn bucketed_cell_assignment_fused(
                 })
                 .collect()
         });
+        let missing = first_missing_addr.load(AtomicOrdering::Relaxed);
+        if missing != usize::MAX {
+            return Err(format!(
+                "geocode Stage A: address point {missing} is outside the file Pass 2 wrote"
+            )
+            .into());
+        }
         for &(fine_cid, coarse_cid, idx) in &addr_entries {
             let b = bucket_for_cell(fine_cid);
             ensure_bucket_writer(&mut fine_writers, b, &fine_bucket_dir)?;
@@ -659,33 +690,43 @@ pub(super) fn bucketed_cell_assignment_fused(
                         for seg_idx in 0..nc - 1 {
                             let off1 = iw.node_file_offset as usize + seg_idx * NODE_COORD_SIZE;
                             let off2 = off1 + NODE_COORD_SIZE;
-                            if let (Some(n1), Some(n2)) = (
+                            // Same producer-owned file rule as the streets above.
+                            let (Some(n1), Some(n2)) = (
                                 read_node_at(interp_nodes_mmap, off1 as u64),
                                 read_node_at(interp_nodes_mmap, off2 as u64),
-                            ) {
-                                cover_segment_fused(
-                                    n1.0,
-                                    n1.1,
-                                    n2.0,
-                                    n2.1,
-                                    fine_level,
-                                    coarse_level,
-                                    |fine_cid, coarse_to_emit| {
-                                        out.push((
-                                            fine_cid,
-                                            coarse_to_emit,
-                                            way_idx as u32,
-                                            seg_idx as u16,
-                                        ));
-                                    },
-                                );
-                            }
+                            ) else {
+                                first_missing_interp.fetch_min(way_idx, AtomicOrdering::Relaxed);
+                                break;
+                            };
+                            cover_segment_fused(
+                                n1.0,
+                                n1.1,
+                                n2.0,
+                                n2.1,
+                                fine_level,
+                                coarse_level,
+                                |fine_cid, coarse_to_emit| {
+                                    out.push((
+                                        fine_cid,
+                                        coarse_to_emit,
+                                        way_idx as u32,
+                                        seg_idx as u16,
+                                    ));
+                                },
+                            );
                         }
                     }
                     out.into_iter()
                 })
                 .collect()
         });
+        let missing = first_missing_interp.load(AtomicOrdering::Relaxed);
+        if missing != usize::MAX {
+            return Err(format!(
+                "geocode Stage A: interpolation way {missing} has a node outside the file Pass 2 wrote"
+            )
+            .into());
+        }
         for &(fine_cid, coarse_opt, wi, si) in &interp_entries {
             let b = bucket_for_cell(fine_cid);
             ensure_bucket_writer(&mut fine_writers, b, &fine_bucket_dir)?;
@@ -840,7 +881,11 @@ fn run_stage_b(
                         ENTRY_TYPE_STREET => streets.push(e),
                         ENTRY_TYPE_ADDR => addrs.push(e),
                         ENTRY_TYPE_INTERP => interps.push(e),
-                        _ => {}
+                        other => {
+                            return Err(format!(
+                                "geocode Stage B: unknown bucket entry type {other} in cell {cell_id}"
+                            ).into());
+                        }
                     }
                 }
 
@@ -1006,6 +1051,12 @@ fn admin_cells_for_polygon(
 
     let hole_slices: Vec<&[(f64, f64)]> = hole_rings.iter().map(Vec::as_slice).collect();
 
+    // Producer invariant: assemble_rings emits only explicitly closed rings;
+    // simplify_ring retains both endpoints, including the repeated first point.
+    // Thus windows(2) includes the closing edge for exterior and hole rings.
+    // Adding another last-to-first segment would cover a zero-length edge on
+    // every produced ring. Generic parse_polygon_rings also accepts open rings,
+    // but this function consumes AssembledPolygon from the builder.
     // Edge cells: cover each ring segment using cover_segment
     let mut edge_cells = rustc_hash::FxHashSet::default();
     for v in poly.vertices.windows(2) {

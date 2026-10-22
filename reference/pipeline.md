@@ -54,6 +54,8 @@ Skips entire blobs before decompression using metadata embedded in `BlobHeader`:
 | Spatial bbox | Coordinate bounds in indexdata | Skip blobs outside bounding box (nodes only) |
 
 Applied via `ElementReader::with_blob_filter()`. Used by `cat --type`, `tags-filter`, `extract`.
+Only the pipelined iteration methods honour it; the sequential `for_each` and
+`par_map_reduce` decode every blob and ignore a configured filter.
 
 ### Pipelined Write
 

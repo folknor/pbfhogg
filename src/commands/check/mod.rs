@@ -15,7 +15,9 @@ pub mod verify_ids;
 #[derive(Debug, Clone, Copy)]
 pub struct CheckOptions {
     /// Maximum number of detail entries to retain in this check.
-    /// Zero means unlimited.
+    /// Zero means unlimited. This bounds the report's detail list, not the
+    /// check's working memory: exact counting and deferred reference checks
+    /// retain intermediate data independently of this display limit.
     pub max_errors: usize,
     /// Read the input with `O_DIRECT` where the check supports it.
     pub direct_io: bool,

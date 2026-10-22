@@ -1275,3 +1275,37 @@ mod platform {
         assert_eq!(contents.relations[0].0, 20);
     }
 }
+
+#[test]
+fn passthrough_rejects_malformed_unindexed_payload() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("malformed.pbf");
+    let output = dir.path().join("output.pbf");
+    let file = std::fs::File::create(&input).expect("create input");
+    let mut writer = pbfhogg::writer::PbfWriter::new(file, pbfhogg::writer::Compression::None);
+    let header = pbfhogg::block_builder::HeaderBuilder::new()
+        .build()
+        .expect("header");
+    writer.write_header(&header).expect("write header");
+    writer
+        .write_primitive_block_no_indexdata(&[0x80])
+        .expect("write adversarial payload");
+    writer.flush().expect("flush fixture");
+    drop(writer);
+
+    let out = crate::common::cli::CliInvoker::new()
+        .arg("cat")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .run();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "malformed payload was not refused as a failure"
+    );
+    assert!(
+        !output.exists(),
+        "a refused cat must not publish its output"
+    );
+}

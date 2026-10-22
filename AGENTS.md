@@ -167,7 +167,6 @@ CLI-driven integration tests live in `tests/cli_*.rs` and drive the compiled `pb
 ## Architecture
 **Read path:** `BlobReader` (blob.rs) → `PrimitiveBlock` (block.rs) → `Element` (elements.rs)
 - `ElementReader` (reader.rs): sequential/parallel/pipelined iteration. Header parsed eagerly. `is_sorted()` for Sort.Type_then_ID. `for_each_block_pipelined` delivers owned blocks. `into_blocks_pipelined` returns iterator (early exit, zipping); requires `R: 'static`.
-- `IndexedReader` (indexed.rs): seekable reader with blob-level index.
 - `pipeline.rs`: 3-stage pipelined decoder (IO → rayon → reorder buffer).
 
 **Write path:** `BlockBuilder` (block_builder.rs) → `PbfWriter` (writer.rs)

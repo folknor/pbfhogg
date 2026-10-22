@@ -1,11 +1,16 @@
 [workspace]
 members = ["cli", "tools/process-trace-shim"]
 exclude = ["bench/osmpbf-baseline"]
-dependencies = {}
+
+[workspace.dependencies]
+# Correctly-rounded float parsing keeps config and GeoJSON coordinates
+# identical to their CLI-string-parsed equivalents at bbox boundaries.
+serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 
 [workspace.package]
 version = "0.5.0"
 edition = "2024"
+rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 authors = ["folknor <folk@folk.wtf>"]
 repository = "https://github.com/folknor/pbfhogg"
@@ -51,9 +56,9 @@ authors.workspace = true
 description = "Fast OpenStreetMap PBF reader and writer for Rust. Read, write, and merge .osm.pbf files with pipelined parallel decoding."
 license.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 repository.workspace = true
 readme = "LIBRARY.md"
-rust-version = "1.99"
 keywords = ["osm", "openstreetmap", "pbf", "protobuf", "gis"]
 categories = ["parser-implementations", "encoding", "science::geo"]
 # Integration tests are declared below rather than discovered: one binary
@@ -103,13 +108,7 @@ hotpath = "0.28.7"
 quick-xml = "0.42.0"
 # XXH3-128 for `digest`; pure Rust, xxh3 only.
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
-# float_roundtrip: serde_json's default float parse is best-effort and can
-# land 1 ULP off the correctly-rounded value std::str::FromStr produces.
-# Extract bboxes cross that ULP into a different decimicrodegree after
-# floor/ceil, so `extract --config`/GeoJSON coordinates would disagree with
-# the byte-identical `--bbox` CLI string (found via a one-node multi-extract
-# vs sequential-extract mismatch at a strip boundary).
-serde_json = { version = "1.0.150", optional = true, features = ["float_roundtrip"] }
+serde_json = { workspace = true, optional = true }
 s2 = { version = "0.2.0", default-features = false, optional = true }
 io-uring = { version = "0.7.13", optional = true }
 libc = "0.2.186"

@@ -1,6 +1,6 @@
-//! Sequential output-path helpers for `merge()`: gap creates, trailing
-//! creates at type transitions, and passthrough coalescing. These run on the
-//! main thread as slots are drained in file order.
+//! Output helpers for gap creates, trailing creates at type transitions,
+//! and passthrough coalescing. The drain calls these while processing items
+//! in file order.
 
 use crate::blob_meta::ElemKind;
 use crate::block_builder::BlockBuilder;

@@ -40,9 +40,11 @@ pub(super) fn build_all_blob_schedules(
     host: &crate::host::Host,
 ) -> Result<(Vec<BlobTask>, Vec<BlobTask>, Vec<BlobTask>)> {
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
-    let _ = walker
-        .next_header()?
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
+    drop(
+        walker
+            .next_header()?
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?,
+    );
     let mut nodes: Vec<BlobTask> = Vec::new();
     let mut ways: Vec<BlobTask> = Vec::new();
     let mut relations: Vec<BlobTask> = Vec::new();

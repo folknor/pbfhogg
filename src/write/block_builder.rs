@@ -4,10 +4,10 @@
 //! protobuf `PrimitiveBlock` bytes suitable for [`PbfWriter`](crate::writer::PbfWriter).
 //!
 //! Handles string table construction, delta encoding, dense node packing,
-//! and per-block element caps. The default cap is 8000 (matching osmium);
-//! [`BlockBuilder::with_element_cap`] picks a different cap, used by
-//! [`pbfhogg::repack`](crate::commands::repack) to produce alternate-density
-//! re-encodings.
+//! and per-block element caps. The default cap matches the PBF interop
+//! convention used by osmium.
+//! Callers that choose a different cap also provide a bound on pre-allocation
+//! through [`BlockBuilder::with_element_cap_prealloc`].
 
 use crate::PrimitiveBlock;
 use crate::blob_meta::{BlobIndex, ElemKind};
@@ -46,10 +46,10 @@ use super::string_table::StringTable;
 // the type was lifted into its own sibling module.
 pub use crate::write::header_builder::HeaderBuilder;
 
-/// Default per-block element cap. Matches osmium's hardcoded limit; the
-/// PBF interop convention. Callers that need a different cap construct
-/// the builder via [`BlockBuilder::with_element_cap`].
-const MAX_ENTITIES_PER_BLOCK: usize = 8000;
+/// Default per-block element cap used by [`BlockBuilder::new`].
+///
+/// Matches the common PBF packing convention used by osmium.
+pub const DEFAULT_ELEMENT_CAP: usize = 8000;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -128,7 +128,8 @@ pub(super) fn member_type_value(mt: MemberType) -> i32 {
 /// Builds `PrimitiveBlock` protobuf messages for PBF output.
 ///
 /// Elements are added one at a time. When the block reaches the cap
-/// (default 8000 entities; configurable via [`Self::with_element_cap`]),
+/// (default [`DEFAULT_ELEMENT_CAP`]; configurable via
+/// [`Self::with_element_cap_prealloc`]),
 /// [`should_flush`](Self::should_flush) returns `true` and
 /// [`take`](Self::take) should be called to serialize and reset.
 ///
@@ -216,37 +217,16 @@ impl Default for BlockBuilder {
 }
 
 impl BlockBuilder {
-    /// Create a new, empty block builder with the default 8000-entity cap.
+    /// Create a new, empty block builder with the default element cap.
     ///
-    /// Equivalent to `BlockBuilder::with_element_cap(8000)`.
+    /// Equivalent to `BlockBuilder::with_element_cap_prealloc(
+    /// DEFAULT_ELEMENT_CAP, DEFAULT_ELEMENT_CAP)`.
     pub fn new() -> Self {
-        Self::with_element_cap(MAX_ENTITIES_PER_BLOCK)
+        Self::with_element_cap_prealloc(DEFAULT_ELEMENT_CAP, DEFAULT_ELEMENT_CAP)
     }
 
     /// Create a new, empty block builder with a caller-supplied per-block
-    /// element cap.
-    ///
-    /// Used by [`pbfhogg::repack`](crate::commands::repack) to produce PBFs
-    /// with alternate blob densities. The default 8000 matches osmium and
-    /// is the PBF interop convention; overriding to larger values matches
-    /// `planet.openstreetmap.org`-style densities (~228 k entities/blob),
-    /// overriding to smaller values exercises blob-count-bound code paths.
-    ///
-    /// Dense node vectors are pre-allocated to `cap` to avoid reallocations
-    /// through the doubling growth strategy when the block fills. Wire-format
-    /// scratch buffers (`group_buf`, `elem_scratch`, ...) are left at zero
-    /// capacity: each block is single-type, so dense-node blocks never touch
-    /// them and way/relation blocks grow as needed.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `cap == 0`.
-    pub fn with_element_cap(cap: usize) -> Self {
-        Self::with_element_cap_prealloc(cap, usize::MAX)
-    }
-
-    /// [`with_element_cap`](Self::with_element_cap) with a separate ceiling on
-    /// how much is *pre-allocated*.
+    /// element cap and a separate ceiling on how much is *pre-allocated*.
     ///
     /// `cap` is a policy: how many elements go in a block before it is flushed.
     /// The pre-allocation is only an optimization - the vectors grow if they
@@ -257,21 +237,20 @@ impl BlockBuilder {
     /// unbounded allocations requested by a single integer, before a byte of
     /// input had been read.
     ///
-    /// `prealloc_bound` is the caller's honest ceiling on how many elements
-    /// could actually arrive - for `repack`, derived from the input file, since
-    /// a block can never hold more elements than the file contains. This is the
-    /// same shape as `check`'s `id_alloc_bound`: not a hard-coded constant that
-    /// the passage of time invalidates, but a number that tracks the input, so
-    /// no honest request is ever clipped in a way that costs anything beyond a
-    /// vector growth that will never happen.
+    /// `prealloc_bound` limits the initial capacity of each element vector.
+    /// `repack` derives this budget from the input file size, so a tiny input
+    /// with a huge requested cap cannot demand unbounded initial allocations.
+    /// Compressed input may contain more elements than bytes; the vectors can
+    /// still grow beyond the budget, and `cap` remains the flush threshold.
     ///
     /// # Panics
     ///
-    /// Panics if `cap == 0`.
+    /// Panics if `cap == 0`. The `repack` and `degrade` command paths validate
+    /// their caller-supplied caps before calling this low-level constructor.
     pub fn with_element_cap_prealloc(cap: usize, prealloc_bound: usize) -> Self {
         assert!(
             cap > 0,
-            "BlockBuilder::with_element_cap: --elements-per-blob must be > 0"
+            "BlockBuilder::with_element_cap_prealloc: cap must be > 0"
         );
         let prealloc = cap.min(prealloc_bound.max(1));
         // dense_keys_vals carries 2*N entries on average for tagless nodes
@@ -387,7 +366,8 @@ impl BlockBuilder {
     }
 
     /// Returns `true` if the block has reached its per-block element cap
-    /// (default 8000; configurable via [`Self::with_element_cap`]).
+    /// (default [`DEFAULT_ELEMENT_CAP`]; configurable via
+    /// [`Self::with_element_cap_prealloc`]).
     #[inline]
     pub fn should_flush(&self) -> bool {
         self.count >= self.cap

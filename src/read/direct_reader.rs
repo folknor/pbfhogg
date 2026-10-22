@@ -167,7 +167,16 @@ impl DirectReader {
             }
             self.buf.consume(gap);
         } else {
-            // Already aligned - just clear the buffer so next read refills.
+            // Already aligned. Seeking can succeed beyond EOF, so validate
+            // the logical target before clearing the buffer.
+            if target > self.file.metadata()?.len() {
+                self.eof = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "skip past end of file",
+                ));
+            }
+            // Clear the buffer so the next read refills at the target.
             self.buf.pos = 0;
             self.buf.len = 0;
         }
@@ -268,6 +277,47 @@ mod tests {
             }
             Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {}
             Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    mod platform {
+        use super::{DirectReader, PAGE_SIZE};
+
+        #[test]
+        fn aligned_skip_rejects_a_target_past_eof() {
+            let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("data")
+                .join("bench-tmp");
+            std::fs::create_dir_all(&dir).expect("create fixture directory");
+            let path = dir.join(format!(
+                "direct-reader-aligned-skip-{}.bin",
+                std::process::id()
+            ));
+            let size = u64::try_from(PAGE_SIZE).expect("page size fits u64");
+            std::fs::File::create(&path)
+                .and_then(|file| file.set_len(size))
+                .expect("create page-sized fixture");
+
+            let mut reader = match DirectReader::open(&path) {
+                Ok(reader) => reader,
+                Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {
+                    drop(std::fs::remove_file(&path));
+                    return;
+                }
+                Err(error) => {
+                    drop(std::fs::remove_file(&path));
+                    panic!("open direct reader: {error}");
+                }
+            };
+            let target = u64::try_from(PAGE_SIZE * 2).expect("skip target fits u64");
+            let result = reader.skip(target);
+            drop(reader);
+            drop(std::fs::remove_file(&path));
+
+            match result {
+                Ok(()) => panic!("aligned skip beyond EOF must fail"),
+                Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof),
+            }
         }
     }
 }

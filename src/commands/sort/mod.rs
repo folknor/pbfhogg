@@ -112,11 +112,6 @@ struct BlobEntry {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Sort a PBF file into standard order (nodes → ways → relations, by ID).
-///
-/// Uses blob-level permutation sort: O(num_blobs) memory. Non-overlapping
-/// blobs are passed through as raw bytes; overlapping blobs are decoded,
-/// sorted, and re-encoded.
 /// Options controlling sort I/O and compression behavior.
 pub struct SortOptions {
     pub compression: Compression,
@@ -125,6 +120,11 @@ pub struct SortOptions {
     pub force: bool,
 }
 
+/// Sort a PBF file into standard order (nodes -> ways -> relations, by ID).
+///
+/// Uses blob-level permutation sort: O(num_blobs) memory. Non-overlapping
+/// blobs are passed through as raw bytes; overlapping blobs are decoded,
+/// sorted, and re-encoded.
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub fn sort(

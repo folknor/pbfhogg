@@ -650,7 +650,9 @@ fn cat_filtered(
     let mut elements: u64 = 0;
 
     for file in files {
-        let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
+        // The fifth result sizes IdSets in check callers; filtered cat only
+        // needs the schedules.
+        let (node_schedule, way_schedule, rel_schedule, shared_file, _) =
             crate::scan::classify::build_classify_schedules_split(file, &host.diagnostics)?;
 
         if tf.nodes {

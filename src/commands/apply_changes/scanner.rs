@@ -8,7 +8,7 @@
 //!   [`ScannedBlob::Passthrough`] either directly to the drain (when the
 //!   output backend supports `copy_file_range`) or to the worker pool
 //!   (under `--direct-io`, workers pread the full frame and emit
-//!   [`super::descriptor::WorkerOutput::OwnedPassthrough`]).
+//!   `DrainItem::OwnedBytes`).
 //! - **Overlap candidate / unindexed**: routed as
 //!   [`ScannedBlob::Candidate`] to the worker pool for decompress +
 //!   precise check + rewrite.
@@ -186,7 +186,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         {
             // No-overlap indexed blob under --direct-io: route through
             // the worker pool so a worker can pread the full frame and
-            // emit `WorkerOutput::OwnedPassthrough`. Skipped for Node
+            // emit `DrainItem::OwnedBytes`. Skipped for Node
             // blobs under LOW - those route as `Candidate` below so
             // workers decompress and extract coords.
             ScannerEmit::Candidate(ScannedBlob::Passthrough(descriptor))
@@ -256,8 +256,6 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
     {
         let payload = last_node_seq.unwrap_or(u64::MAX);
         tx.send(payload).map_err(send_err)?;
-        // last_node_seq_sent is set here for symmetry; not read after.
-        let _ = last_node_seq_sent;
     }
 
     // End of input. If we buffered way/relation descriptors under the
@@ -360,10 +358,8 @@ fn scanner_emit_cost(item: &ScannerEmit) -> usize {
 }
 
 fn send_err<T>(_: mpsc::SendError<T>) -> crate::error::Error {
-    // Receiver gone - treat as a graceful shutdown from downstream.
-    // The caller (merge) will still observe the scanner's return Ok,
-    // because a closed receiver means downstream decided to stop. Map
-    // to an Io error only when we need to propagate.
+    // Return a channel-closure error so merge can propagate it if the
+    // drain has not already returned its own error.
     crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
         "scanner dispatch channel closed by downstream",
     )))

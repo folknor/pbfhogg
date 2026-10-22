@@ -26,9 +26,6 @@ use crate::osc::xml_parse::{
     parse_osc_path, parse_owned_metadata, parse_str_attr, parse_str_attr_optional,
 };
 
-/// `merge-changes` speaks the same three actions as the shared parser.
-type Action = OscAction;
-
 #[derive(Clone, Debug)]
 enum ChangeElement {
     Node(OwnedNode),
@@ -48,7 +45,7 @@ impl ChangeElement {
 
 #[derive(Clone, Debug)]
 struct Change {
-    action: Action,
+    action: OscAction,
     element: ChangeElement,
 }
 
@@ -58,7 +55,7 @@ struct ChangeStream {
 }
 
 impl ChangeStream {
-    fn push(&mut self, action: Action, element: ChangeElement) {
+    fn push(&mut self, action: OscAction, element: ChangeElement) {
         self.changes.push(Change { action, element });
     }
 }
@@ -377,7 +374,7 @@ impl ChangeDest for StreamDest<'_> {
 
 struct WriterDest<'a, W: io::Write> {
     writer: &'a mut OscWriter<W>,
-    open_action: &'a mut Option<Action>,
+    open_action: &'a mut Option<OscAction>,
     count: &'a mut u64,
 }
 
@@ -391,7 +388,7 @@ impl<W: io::Write> ChangeDest for WriterDest<'_, W> {
 
 struct OwnedSink<D: ChangeDest> {
     dest: D,
-    action: Action,
+    action: OscAction,
     current: Option<CurrentElem>,
 }
 
@@ -399,7 +396,7 @@ impl<D: ChangeDest> OwnedSink<D> {
     fn new(dest: D) -> Self {
         Self {
             dest,
-            action: Action::Create,
+            action: OscAction::Create,
             current: None,
         }
     }
@@ -408,7 +405,7 @@ impl<D: ChangeDest> OwnedSink<D> {
 impl<D: ChangeDest> OscSink for OwnedSink<D> {
     fn begin_element(
         &mut self,
-        action: Action,
+        action: OscAction,
         kind: ElemKind,
         e: &BytesStart<'_>,
     ) -> crate::BoxResult<()> {
@@ -423,7 +420,7 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
         // the Gulf of Guinea and clamped `lat="1e30"` to `i32::MAX`.
         // Same rule as the overlay parser now, because it is the same
         // function.
-        if kind == ElemKind::Node && action != Action::Delete {
+        if kind == ElemKind::Node && action != OscAction::Delete {
             elem.decimicro_lat = coord_to_decimicro(e, "lat", id)?;
             elem.decimicro_lon = coord_to_decimicro(e, "lon", id)?;
         }
@@ -586,7 +583,7 @@ fn write_streaming(inputs: &[&Path], output: &Path) -> Result<u64> {
         writer.write_event(Event::Start(root))?;
         crate::debug::emit_marker("MERGECHANGES_WRITE_OPEN_END");
 
-        let mut open_action: Option<Action> = None;
+        let mut open_action: Option<OscAction> = None;
         let mut count = 0u64;
         for path in inputs {
             if let Ok(meta) = std::fs::metadata(path) {
@@ -605,7 +602,7 @@ fn write_streaming(inputs: &[&Path], output: &Path) -> Result<u64> {
         }
 
         if let Some(prev) = open_action {
-            writer.write_event(Event::End(BytesEnd::new(action_tag(prev))))?;
+            writer.write_event(Event::End(BytesEnd::new(prev.tag())))?;
         }
         writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
         crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_START");
@@ -640,13 +637,13 @@ fn write_streaming(inputs: &[&Path], output: &Path) -> Result<u64> {
         .par_iter()
         .map(|path| -> std::result::Result<(Vec<u8>, u64), String> {
             let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
-            let mut open_action: Option<Action> = None;
+            let mut open_action: Option<OscAction> = None;
             let mut count = 0u64;
             parse_osc_streaming(path, &mut writer, &mut open_action, &mut count)
                 .map_err(|e| e.to_string())?;
             if let Some(prev) = open_action {
                 writer
-                    .write_event(Event::End(BytesEnd::new(action_tag(prev))))
+                    .write_event(Event::End(BytesEnd::new(prev.tag())))
                     .map_err(|e| e.to_string())?;
             }
             let bytes = writer.into_inner().map_err(|e| e.to_string())?;
@@ -704,7 +701,7 @@ fn build_postlude_bytes(is_gz: bool) -> Result<Vec<u8>> {
 fn parse_osc_streaming<W: io::Write>(
     path: &Path,
     writer: &mut OscWriter<W>,
-    open_action: &mut Option<Action>,
+    open_action: &mut Option<OscAction>,
     count: &mut u64,
 ) -> Result<()> {
     let mut sink = OwnedSink::new(WriterDest {
@@ -717,14 +714,14 @@ fn parse_osc_streaming<W: io::Write>(
 
 fn emit_change<W: io::Write>(
     writer: &mut OscWriter<W>,
-    open_action: &mut Option<Action>,
+    open_action: &mut Option<OscAction>,
     change: &Change,
 ) -> Result<()> {
     if *open_action != Some(change.action) {
         if let Some(prev) = open_action.take() {
-            writer.write_event(Event::End(BytesEnd::new(action_tag(prev))))?;
+            writer.write_event(Event::End(BytesEnd::new(prev.tag())))?;
         }
-        writer.write_event(Event::Start(BytesStart::new(action_tag(change.action))))?;
+        writer.write_event(Event::Start(BytesStart::new(change.action.tag())))?;
         *open_action = Some(change.action);
     }
     write_change_to(writer, change)
@@ -817,9 +814,9 @@ fn write_simplified(
     let mut deletes = Vec::new();
     for (_, (change, _)) in last_by_object {
         match change.action {
-            Action::Create => creates.push(change),
-            Action::Modify => modifies.push(change),
-            Action::Delete => deletes.push(change),
+            OscAction::Create => creates.push(change),
+            OscAction::Modify => modifies.push(change),
+            OscAction::Delete => deletes.push(change),
         }
     }
     crate::debug::emit_marker("MERGECHANGES_SIMPLIFY_END");
@@ -844,9 +841,9 @@ fn write_simplified(
     crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_START");
     let mut all_chunks: Vec<Vec<u8>> = Vec::new();
     for (action, group) in [
-        (Action::Create, &creates),
-        (Action::Modify, &modifies),
-        (Action::Delete, &deletes),
+        (OscAction::Create, &creates),
+        (OscAction::Modify, &modifies),
+        (OscAction::Delete, &deletes),
     ] {
         if group.is_empty() {
             continue;
@@ -857,13 +854,13 @@ fn write_simplified(
             .map(|chunk| -> std::result::Result<Vec<u8>, String> {
                 let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
                 writer
-                    .write_event(Event::Start(BytesStart::new(action_tag(action))))
+                    .write_event(Event::Start(BytesStart::new(action.tag())))
                     .map_err(|e| e.to_string())?;
                 for change in chunk {
                     write_change_to(&mut writer, change).map_err(|e| e.to_string())?;
                 }
                 writer
-                    .write_event(Event::End(BytesEnd::new(action_tag(action))))
+                    .write_event(Event::End(BytesEnd::new(action.tag())))
                     .map_err(|e| e.to_string())?;
                 writer.into_inner().map_err(|e| e.to_string())
             })
@@ -891,12 +888,8 @@ fn write_simplified(
     Ok(total_out)
 }
 
-fn action_tag(action: Action) -> &'static str {
-    action.tag()
-}
-
 fn write_change_to<W: io::Write>(writer: &mut OscWriter<W>, change: &Change) -> Result<()> {
-    let delete = change.action == Action::Delete;
+    let delete = change.action == OscAction::Delete;
     match writer {
         OscWriter::Gz(w) => write_change_element(w, &change.element, delete),
         OscWriter::Plain(w) => write_change_element(w, &change.element, delete),

@@ -1,12 +1,12 @@
 //! Parallel writer backend: `pwrite`-based output across a pool of
 //! writer threads.
 //!
-//! Motivation (plan item #17): the single-threaded `FileOutputSink`
-//! and `uring_writer` backends cap at ~1.5 GB/s on NVMe, far below the
-//! ~5 GB/s sequential peak. At planet scale with ~95-120 GB of output
-//! bytes this is the wall floor. Splitting the actual disk writes
-//! across N threads (each `pwrite`ing at its assigned offset on a
-//! shared file descriptor) should scale closer to NVMe peak.
+//! Motivation: the single-threaded `FileOutputSink` and `uring_writer`
+//! backends cap at ~1.5 GB/s on NVMe, far below the ~5 GB/s sequential
+//! peak. At planet scale with ~95-120 GB of output bytes this is the
+//! wall floor. Splitting the actual disk writes across N threads (each
+//! `pwrite`ing at its assigned offset on a shared file descriptor)
+//! should scale closer to NVMe peak.
 //!
 //! ## Design
 //!

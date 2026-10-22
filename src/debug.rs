@@ -87,10 +87,19 @@ pub fn read_page_faults() -> (u64, u64) {
     let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
         return (0, 0);
     };
-    // Fields are space-separated. Field 10 = minflt, field 12 = majflt (1-indexed).
-    let mut fields = stat.split_whitespace();
+    parse_page_faults(&stat)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_page_faults(stat: &str) -> (u64, u64) {
+    // `comm` (field 2) can contain spaces; field 10 and field 12 are
+    // indexes 7 and 9 after the closing parenthesis.
+    let Some((_, after_comm)) = stat.rsplit_once(')') else {
+        return (0, 0);
+    };
+    let mut fields = after_comm.split_whitespace();
     let minflt = fields
-        .nth(9)
+        .nth(7)
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
     // Skip field 11 (cminflt) to get field 12 (majflt).
@@ -107,6 +116,13 @@ pub fn read_page_faults() -> (u64, u64) {
         return (0, 0);
     }
     (0, 0)
+}
+
+pub(crate) fn page_fault_deltas(before: (u64, u64), after: (u64, u64)) -> (u64, u64) {
+    (
+        after.0.saturating_sub(before.0),
+        after.1.saturating_sub(before.1),
+    )
 }
 
 /// A protocol line assembled on the stack.
@@ -246,6 +262,19 @@ fn write_fifo(f: impl FnOnce(&std::fs::File, u128)) {
 #[cfg(test)]
 mod tests {
     use super::{Line, PIPE_BUF};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn page_fault_parser_handles_spaces_in_comm() {
+        let stat = "123 (program name with spaces) R 1 2 3 4 5 6 101 102 103 104";
+        assert_eq!(super::parse_page_faults(stat), (101, 103));
+    }
+
+    #[test]
+    fn page_fault_deltas_saturate_when_a_read_fails() {
+        assert_eq!(super::page_fault_deltas((8, 20), (15, 3)), (7, 0));
+    }
+
     #[test]
     fn line_formats_marker_exactly() {
         let mut line = Line::new();

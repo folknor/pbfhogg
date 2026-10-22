@@ -58,8 +58,6 @@ pub(super) struct IntegratedInputs<'a> {
 fn scatter_bucket_entries(
     data_buf: &[u8],
     bucket_idx: usize,
-    _bucket_start: u64,
-    _bucket_end: u64,
     scatter_buf: &mut [u8],
 ) -> std::result::Result<u64, String> {
     if !data_buf.len().is_multiple_of(RESOLVED_ENTRY_SIZE) {
@@ -99,23 +97,18 @@ pub(super) fn stage3_slot_reorder(
     slot_bucket_count: usize,
     total_slots: u64,
     integrated: &IntegratedInputs<'_>,
-    host: &crate::host::Host,
+    num_workers: usize,
 ) -> Result<()> {
     // Floor division: every bucket is `range_size` slots wide except
     // the LAST, which extends to `total_slots` and may be wider. This
     // keeps the smallest-bucket-width = range_size, which the caller
-    // sized so that range_size ≥ max_blob_slots - preserving the
+    // sized so that range_size >= max_blob_slots - preserving the
     // 2-piece straddler invariant for small inputs. (See
     // `ResolvedEntry::slot_bucket` for the matching routing logic.)
     let range_size = total_slots / slot_bucket_count as u64;
 
-    // Streaming cap: stage 3 and stage 4 worker buffers are now both
-    // resident concurrently (streaming stage 3 -> 4 landed in `beb7838`
-    // + `f93d896` + `eecb46c`). Back off from the pre-streaming `.min(6)`
-    // so peak anon RSS doesn't balloon on a 30 GB planet host.
-    // Must match the worker tmp file count allocated by mod.rs.
-    let num_workers = crate::host::sized_workers(&*host.resources, 2, 1, 4).min(4);
-
+    // `num_workers` is sized by the caller, which opens exactly that many
+    // router worker files; `router.worker_file(worker_id)` relies on it.
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let s3_open_ms = std::sync::atomic::AtomicU64::new(0);
     let s3_read_ms = std::sync::atomic::AtomicU64::new(0);
@@ -241,6 +234,8 @@ pub(super) fn stage3_slot_reorder(
                         })();
                         if let Err(e) = result {
                             *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.clone());
+                            router.abort(format!("stage 3 worker {worker_id} error: {e}"));
+                            abort_guard.disarm();
                             return Err(e);
                         }
                         continue;
@@ -276,13 +271,8 @@ pub(super) fn stage3_slot_reorder(
                         // its extra memory traffic; parsing happens in lockstep
                         // with the scatter stores.
                         let t_scatter = std::time::Instant::now();
-                        let stores = scatter_bucket_entries(
-                            &data_buf,
-                            bucket_idx,
-                            bucket_start,
-                            bucket_end,
-                            &mut scatter_buf,
-                        )?;
+                        let stores =
+                            scatter_bucket_entries(&data_buf, bucket_idx, &mut scatter_buf)?;
                         #[allow(clippy::cast_possible_truncation)]
                         s3_scatter_ref.fetch_add(t_scatter.elapsed().as_millis() as u64, Relaxed);
                         s3_scatter_stores_ref.fetch_add(stores, Relaxed);
@@ -328,6 +318,7 @@ pub(super) fn stage3_slot_reorder(
                         *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                             Some(e.clone());
                         router.abort(format!("stage 3 worker {worker_id} error: {e}"));
+                        abort_guard.disarm();
                         return Err(e);
                     }
                 }
@@ -539,4 +530,42 @@ fn emit_integrated_intersections(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IntegratedInputs, SlotBucketRef, stage3_slot_reorder};
+    use crate::commands::altw::external::coord_payloads::{
+        ConcurrentBlobLocationRouter, parse_per_way_refcount_sidecar_bytes,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn empty_bucket_error_aborts_router_with_the_actual_error() {
+        let per_way_rcs = parse_per_way_refcount_sidecar_bytes(&[1, 1], 1).expect("sidecar");
+        let temp = tempfile::tempdir().expect("scratch directory");
+        let worker_file = std::fs::File::create(temp.path().join("worker")).expect("worker file");
+        let router = ConcurrentBlobLocationRouter::new(&per_way_rcs, vec![Arc::new(worker_file)])
+            .expect("router");
+        let way_slot_starts = [0];
+        let integrated = IntegratedInputs {
+            way_slot_starts: &way_slot_starts,
+            per_way_rcs: &per_way_rcs,
+            router: &router,
+            inject_prepass: false,
+        };
+        let slot_buckets = SlotBucketRef {
+            paths: Vec::new(),
+            entry_counts: vec![0, 0],
+        };
+
+        let err = stage3_slot_reorder(&slot_buckets, 2, 100, &integrated, 1)
+            .expect_err("oversized blob must fail classification");
+        assert!(err.to_string().contains("blob 0 slot range"));
+
+        let router_err = router.wait_ready(0).expect_err("router must be aborted");
+        assert!(router_err.to_string().contains("stage 3 worker 0 error"));
+        assert!(router_err.to_string().contains("blob 0 slot range"));
+        assert!(!router_err.to_string().contains("panicked"));
+    }
 }

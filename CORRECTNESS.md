@@ -4,51 +4,30 @@ Parser/encoder edge cases and data representation limits that are accepted by
 design. For intentional behavioral differences from osmium, see
 DEVIATIONS.md.
 
-## Non-packed repeated fields (protobuf spec violation)
+## Repeated scalar fields: one non-empty wire occurrence
 
-**Status:** Known, accepted. Will not fix unless a real-world PBF triggers it.
+**Status:** Packed encoding and a single unpacked value are supported.
+Multiple data-bearing occurrences of the same field are rejected.
 
-**Context:** The protobuf spec requires decoders to accept both packed and non-packed
-encodings for repeated scalar fields. pbfhogg's wire parser (`src/read/wire.rs`) uses
-strict `(field_number, wire_type)` pattern matching and only accepts packed encoding
-(`WIRE_LEN`, wire type 2) for repeated fields like `keys`, `vals`, `refs`, `memids`,
-`dense_ids`, `dense_lats`, `dense_lons`, etc. Non-packed entries (`WIRE_VARINT`, wire
-type 0) hit the catch-all `_ => cursor.skip_field(wire_type)?` and are silently skipped.
+**Context:** `take_packed` in `src/read/wire.rs` accepts both a
+length-delimited packed segment and an individually tagged varint. A single
+unpacked value is retained as its original varint byte slice, so accepting it
+requires no per-element allocation or change to the packed iterators. This
+applies to the repeated scalar fields in `WireNode`, `WireWay`,
+`WireRelation`, `WireDenseNodes` and `WireDenseInfo`.
 
-**Impact:** If a PBF producer emits a repeated field as individual non-packed entries
-instead of a single packed blob, all values in that field are silently dropped. For
-tag fields (`keys`/`vals`), this means tags are lost. For `refs`, way node references
-are lost. For dense node coordinate fields, nodes get zero coordinates.
+Protobuf also permits several occurrences, with concatenation semantics.
+The borrowed-slice representation cannot join discontiguous segments, so a
+second non-empty occurrence is a hard error naming the field. Empty packed
+segments are ignored in either position. A field written as several
+unpacked values therefore errors rather than silently dropping values.
 
-**Why not fix:** Supporting non-packed encoding adds overhead to the read hot path -
-the most performance-critical code in the library. Every approach requires either
-heap allocation per element, a branch per iterator `.next()` call, or a fallback
-re-parse. The current parser processes 59M elements in 0.31s (parallel) / 1.3s
-(pipelined). Even a single extra branch per packed field iteration is measurable at
-that scale.
-
-**Practical risk:** Very low. All major PBF producers (osmium, JOSM, Osmosis,
-Planetiler, osmcoastline) use packed encoding. The only known producer that emits
-non-packed single-element fields is protobuf-net (C#), which is rarely used for OSM
-data. libosmium had the same bug ([libosmium#389](https://github.com/osmcode/libosmium/issues/389))
-for years before anyone noticed.
-
-**Fix approach (if ever needed):** For each packed repeated field, add an alternative
-match arm for `WIRE_VARINT` that reads a single value. Length-delimited repeated fields
-(like string table entries) already work since non-packed and packed use the same wire
-type - the fix is only needed for numeric repeated fields (varint, sint32, sint64, etc).
-Multiple non-packed entries for the same field should accumulate, not overwrite - repeated
-varint fields need to append to a buffer rather than storing a single slice. libosmium's
-fix (PR #400) handles only the single-value case; a general fix should handle multiple
-non-packed entries. The key performance question is whether checking both wire types in the
-hot path is acceptable, or whether a fallback re-parse on finding nothing is better.
-
-**Affected parsers:**
-- `WireNode::parse()` - fields 2 (keys), 3 (vals)
-- `WireWay::parse()` - fields 2 (keys), 3 (vals), 8 (refs), 9 (lats), 10 (lons)
-- `WireRelation::parse()` - fields 2 (keys), 3 (vals), 8 (roles_sid), 9 (memids), 10 (types)
-- `WireDenseNodes::parse()` - fields 1 (ids), 8 (lats), 9 (lons), 10 (keys_vals)
-- `WireDenseInfo::parse()` - fields 1 (versions), 2 (timestamps), 3 (changesets), 4 (uids), 5 (user_sids), 6 (visibles)
+**Remaining compatibility limit:** Legal protobuf messages that split an
+array across data-bearing occurrences are refused. Supporting them would
+require a different representation or an allocated fallback. The frame and
+block error contracts, including the byte-level rewriters' handling of
+these forms, are described in
+[reference/truncation-handling.md](reference/truncation-handling.md).
 
 ## Tag iterators end early on an out-of-range string index
 
@@ -195,25 +174,22 @@ and the second added one - see `DEVIATIONS.md`.
 numbers in `start_number: u32, end_number: u32`. The resolver
 (`resolve_interpolation_endpoints_mmap` in `src/geocode_index/builder/interp.rs`)
 runs after Pass 2 and matches each endpoint against nearby addr points
-with the same street name; on a match, it overwrites `start_number` and
-`end_number` with the matched house numbers. On failure, both stay at
-their initial `0` - the same value a legitimate OSM interpolation way
-starting at house number 0 would carry.
+with the same street name. Endpoint matching rejects house number 0;
+only positive matched numbers overwrite `start_number` and `end_number`.
+If either endpoint fails to match, both fields stay at their initial `0`.
 
-**Impact:** "Unresolved interp way" and "interp way starting at house 0"
-are identical bytes, and the reader resolves the ambiguity one way: a 0 at
-either end means unresolved, so the way yields no interpolated number
+**Impact:** A 0 at either end means unresolved, so the way yields no
+interpolated number
 (`interpolation_resolvable` and `interpolated_number` in
 `src/geocode_index/reader.rs`). House number 0 is therefore unsupported as
 an interpolation endpoint. "0" as a house number is rare but exists in
 some regions.
 
 **Why not fix:** The clean fix is a `resolved: bool` field persisted into
-`InterpWay` and a `FORMAT_VERSION` bump. Unrecorded observations in
-production so far; the extra byte of format growth and the regeneration
-cost for existing indexes aren't justified until the ambiguity is seen
-affecting real output. Fix shape is captured at the struct comment in
-`SlimInterpWay`.
+`InterpWay`, allowing zero-valued matches, and a `FORMAT_VERSION` bump.
+The format growth and regeneration cost for existing indexes remain
+deferred until support for house number 0 is needed. Fix shape is captured
+at the struct comment in `SlimInterpWay`.
 
 ## Geocode index: u16 on-disk count caps (hard error on overflow)
 

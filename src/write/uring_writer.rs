@@ -1,7 +1,8 @@
 //! io_uring writer thread with registered buffers for pipelined PBF output.
 //!
-//! Replaces the synchronous `writer_thread` in [`super::writer`] with an
-//! io_uring submission loop. Uses `O_DIRECT` + `WriteFixed` with pre-registered
+//! Replaces the buffered sink used by
+//! [`super::pipeline::writer_thread`] with an io_uring submission loop. Uses
+//! `O_DIRECT` + `WriteFixed` with pre-registered
 //! page-aligned buffers for maximum throughput when the pipeline is I/O-bound
 //! (e.g. `Compression::None` on erofs).
 //!
@@ -370,7 +371,6 @@ impl UringState {
             WRITER_METRICS
                 .uring_submit_and_wait_ns
                 .fetch_add(elapsed, Relaxed);
-            WRITER_METRICS.uring_cq_wait_ns.fetch_add(elapsed, Relaxed);
         }
         for cqe in self.ring.completion() {
             let ud = cqe.user_data();

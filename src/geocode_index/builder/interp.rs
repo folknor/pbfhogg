@@ -226,12 +226,7 @@ fn resolve_one_way(
         way.end_number = end;
         1
     } else {
-        // KNOWN LIMITATION: if either endpoint fails to match an addr point,
-        // we leave `start_number = 0, end_number = 0`. That collides with a
-        // real OSM interpolation way that genuinely starts and ends at house
-        // number 0. See `SlimInterpWay` doc. If this becomes an observed
-        // correctness problem, introduce a `resolved: bool` persisted into
-        // `InterpWay` and bump `FORMAT_VERSION`.
+        // Leave the zero sentinel when either endpoint does not match.
         0
     }
 }

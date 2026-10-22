@@ -107,14 +107,20 @@ impl Header {
                 "coarse S2 level ({coarse}) must be less than street S2 level ({street})"
             )));
         }
+        let fine_search_radius_m = f32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        let coarse_search_radius_m = f32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
+        validate_radius("search radius", fine_search_radius_m)
+            .map_err(FormatError::InvalidMetadata)?;
+        validate_radius("coarse search radius", coarse_search_radius_m)
+            .map_err(FormatError::InvalidMetadata)?;
         Ok(Self {
             format_version: version,
             street_cell_level: street,
             coarse_cell_level: coarse,
             admin_cell_level: admin,
             max_admin_vertices: u16::from_le_bytes([buf[12], buf[13]]),
-            fine_search_radius_m: f32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
-            coarse_search_radius_m: f32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]),
+            fine_search_radius_m,
+            coarse_search_radius_m,
             replication_sequence: u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
             replication_timestamp: u64::from_le_bytes([
                 buf[28], buf[29], buf[30], buf[31], buf[32], buf[33], buf[34], buf[35],
@@ -535,6 +541,18 @@ pub enum FormatError {
     InvalidMetadata(String),
 }
 
+/// Shared by the builder's config validation and the reader's header parse,
+/// so both sides accept exactly the same radii. The caller supplies the error
+/// framing: a bad build config is not bad index metadata.
+pub(crate) fn validate_radius(name: &str, radius: f32) -> Result<(), String> {
+    if !radius.is_finite() || radius < 0.0 {
+        return Err(format!(
+            "{name} must be a finite non-negative number, got {radius}"
+        ));
+    }
+    Ok(())
+}
+
 impl std::fmt::Display for FormatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -623,6 +641,35 @@ mod tests {
                     .contains("must be less than street S2 level"),
                 "coarse={coarse}: unexpected error: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn header_rejects_invalid_search_radii() {
+        assert!(
+            Header::from_bytes(&valid_header_bytes()).is_ok(),
+            "the baseline header must parse, or every case below is vacuous"
+        );
+        for byte in [16usize, 20] {
+            let mut header = valid_header_bytes();
+            header[byte..byte + 4].copy_from_slice(&0.0f32.to_le_bytes());
+            assert!(
+                Header::from_bytes(&header).is_ok(),
+                "zero is a valid non-negative search radius"
+            );
+        }
+        for (name, byte) in [("fine", 16usize), ("coarse", 20)] {
+            for radius in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -1.0] {
+                let mut header = valid_header_bytes();
+                header[byte..byte + 4].copy_from_slice(&radius.to_le_bytes());
+                let err = Header::from_bytes(&header)
+                    .expect_err("a non-finite or negative search radius must be rejected");
+                assert!(
+                    err.to_string()
+                        .contains("must be a finite non-negative number"),
+                    "{name} radius {radius}: unexpected error: {err}"
+                );
+            }
         }
     }
 

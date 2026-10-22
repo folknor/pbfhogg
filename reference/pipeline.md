@@ -39,7 +39,9 @@ Single-threaded: `BlobReader` → decompress → `PrimitiveBlock` on the calling
 
 Used by:
 - `diff` / `derive-changes` (via `StreamingBlocks::new_sequential()`) - two files read in lockstep
-- `inspect tags` (internally `tags_count`, osmium's `tags-count`) - avoids 25+ GB heap retention at planet scale
+
+`inspect tags` uses pread workers through `parallel_classify_phase`, with
+per-blob tag counts merged by the caller.
 
 ### Blob Filtering (pre-decode)
 
@@ -83,7 +85,7 @@ Used by `sort`, `cat --dedupe`, `apply-changes`.
 
 `src/write/block_builder.rs` - accumulates elements into PBF blocks.
 
-- Max 8000 entities per block, one element type per block
+- Default element cap from `block_builder::DEFAULT_ELEMENT_CAP`, one element type per block
 - `StringTable` with `FxHashMap<Rc<str>, u32>` dedup
 - Reusable wire scratch buffers (`wire.rs` encoding primitives)
 - Output: `OwnedBlock { bytes: Vec<u8>, index: BlobIndex, tagdata: Option<Vec<u8>>, way_members: Option<Vec<u8>> }` - serialized data + index + optional tagdata + optional BlobHeader field-5 way-member payload (`None` from every current producer)
@@ -94,7 +96,9 @@ Used by all commands that produce PBF output.
 
 `src/scan/node.rs` - parses `DenseNodes` directly from decompressed wire format, bypassing `PrimitiveBlock` construction. Zero per-block heap allocation. Extracts `(id, lat, lon)` tuples.
 
-Used internally by external join (stage 2), ALTW dense/sparse (pass 1), and merge `--locations-on-ways`.
+Used internally by external join (stage 2) and ALTW sparse (pass 1).
+Apply-changes uses its separate checked coordinate extractor in
+`src/commands/apply_changes/node_coords.rs`.
 
 ---
 
@@ -102,7 +106,9 @@ Used internally by external join (stage 2), ALTW dense/sparse (pass 1), and merg
 
 ### cat (passthrough)
 
-No `--type` filter: reads raw blob frames, adds indexdata via `reframe_raw_with_index()`, writes raw. Zero decompression.
+No `--type` filter: decompresses each blob to derive ID and tag metadata,
+then reframes the original compressed payload via `reframe_raw_with_index()`.
+The payload is not recompressed.
 
 ### cat --type / --clean
 
@@ -419,7 +425,7 @@ full file per step: passthrough saves little there.
 ## Write Side (shared by merge rewrite + cat filtered + add-locations-to-ways)
 
 **BlockBuilder** - `src/write/block_builder.rs`:
-- Dense node vectors pre-allocated to 8000 (MAX_ENTITIES_PER_BLOCK)
+- Dense node vectors pre-allocated up to the requested cap and preallocation budget
 - String table: `FxHashMap<Rc<str>, u32>` + `Vec<Rc<str>>` - one `Rc<str>` alloc per unique string, shared between map key and vec entry
 - Wire scratch buffers: `group_buf`, `elem_scratch`, `packed_scratch`, `info_scratch` - grow once, reused
 - `encode_buf` - serialized output, moved via `std::mem::take` (zero copy)

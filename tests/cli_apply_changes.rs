@@ -336,8 +336,7 @@ fn merge_create_beyond_max_id() {
 }
 
 /// Multi-block base PBF where the diff only affects the middle block.
-/// Exercises block 1 passthrough, block 2 rewritten, block 3 passthrough
-/// or skip-decompress.
+/// Exercises block 1 passthrough, block 2 rewritten, block 3 passthrough.
 #[test]
 fn merge_multi_block_partial_rewrite() {
     let dir = TempDir::new().expect("tempdir");
@@ -467,8 +466,7 @@ fn merge_multi_block_partial_rewrite() {
     let stderr = out.stderr_str();
     assert!(stderr.contains("Deleted: 1"), "stats: {stderr}");
     // "1 rewritten" appears in the Blobs line; blocks 1 and 3 land
-    // in the "passthrough" aggregate (which sums passthrough +
-    // skip-decompress).
+    // in the "passthrough" count.
     assert!(stderr.contains("1 rewritten"), "stats: {stderr}");
 }
 

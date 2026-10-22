@@ -210,7 +210,6 @@ pub use read::elements::{
     CheckedTagIter, Element, Info, MemberId, MemberType, Node, RawTagIter, RelMember,
     RelMemberIter, Relation, TagIter, Way, WayNodeLocation, WayNodeLocationsIter, WayRefIter,
 };
-pub use read::indexed::{IdRanges, IndexedReader};
 pub use read::reader::{ElementReader, PipelinedBlocks};
 
 // Module re-exports: short internal paths (`crate::blob`, `crate::block_builder`, etc.)
@@ -227,7 +226,7 @@ pub use commands::{
 pub use commands::{check, export, extract};
 #[doc(hidden)]
 pub use commands::{has_indexdata, has_tagdata};
-pub use read::{blob, block, dense, elements, indexed, reader};
+pub use read::{blob, block, dense, elements, reader};
 pub(crate) use read::{file_reader, frame};
 pub(crate) use write::file_writer;
 pub use write::{block_builder, writer};

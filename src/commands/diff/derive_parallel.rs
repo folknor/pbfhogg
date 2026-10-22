@@ -20,7 +20,7 @@ use quick_xml::Writer;
 
 use crate::blob_meta::{BlobIndex, ElemKind};
 use crate::error::Result;
-use crate::osc::merge_join::{element_id, element_version};
+use crate::osc::merge_join::element_id;
 use crate::osc::write::{OwnedMetadata, write_element_xml};
 use crate::{Element, PrimitiveBlock};
 
@@ -587,7 +587,6 @@ fn write_delete_element<W: Write>(
         elem.push_attribute(("timestamp", ts.as_str()));
     }
     writer.write_event(Event::Empty(elem))?;
-    let _ = element_version; // silence "unused helper" if future paths drop it
     Ok(())
 }
 
@@ -621,7 +620,7 @@ pub(crate) fn derive_changes_parallel(
     let suffix = token.suffix();
     let suffix = suffix.as_str();
 
-    // Outer temp files that `assemble_osc_raw` consumes. Wrap each in
+    // Outer temp files that `assemble_osc_from_paths` consumes. Wrap each in
     // a `PathGuard` (see `decisions/0003-*`) so any early return
     // (shard panic, sweep error, flush failure) removes them instead
     // of leaking into scratch. Guards are `commit()`ed after the

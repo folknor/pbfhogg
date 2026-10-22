@@ -114,7 +114,7 @@ impl Drop for Permit {
 /// hook, so it is safe on every exit path. It does not stop a pipeline
 /// that is still running: a pipeline that has not been joined can still
 /// record reorder levels or reach a re-armed seq, so join before
-/// re-arming or reading the high-water marks.
+/// re-arming or reading the filled high-water mark.
 ///
 /// Every wait here is bounded and panics with a named message rather
 /// than hanging until the check watchdog reports an unrelated-looking
@@ -129,7 +129,6 @@ pub(crate) mod test_hooks {
     use std::time::{Duration, Instant};
 
     pub static REORDER_FILLED_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
-    pub static REORDER_WINDOW_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
 
     /// How long an armed decode stays parked before it gives up and
     /// panics. Shorter than the 20 s check watchdog so the failure names
@@ -230,7 +229,6 @@ pub(crate) mod test_hooks {
         g.resetting = false;
         drop(g);
         REORDER_FILLED_HIGH_WATER.store(0, Relaxed);
-        REORDER_WINDOW_HIGH_WATER.store(0, Relaxed);
     }
 
     pub(crate) fn maybe_block_decode(seq: usize) {
@@ -264,9 +262,8 @@ pub(crate) mod test_hooks {
         GATE_CV.notify_all();
     }
 
-    pub(crate) fn record_reorder_levels(filled: usize, window: usize) {
+    pub(crate) fn record_reorder_filled(filled: usize) {
         cas_max_usize(&REORDER_FILLED_HIGH_WATER, filled);
-        cas_max_usize(&REORDER_WINDOW_HIGH_WATER, window);
     }
 
     fn cas_max_usize(field: &AtomicUsize, candidate: usize) {
@@ -413,7 +410,7 @@ where
         pending.push(seq, (item, permit));
         PIPELINE_METRICS.record_reorder_levels(pending.filled_len(), pending.pending_len());
         #[cfg(all(feature = "static-test-hooks", not(test)))]
-        test_hooks::record_reorder_levels(pending.filled_len(), pending.pending_len());
+        test_hooks::record_reorder_filled(pending.filled_len());
 
         while let Some((item, permit)) = pending.pop_ready() {
             match item {
@@ -807,7 +804,7 @@ where
         pending.push(seq, (item, permit));
         PIPELINE_METRICS.record_reorder_levels(pending.filled_len(), pending.pending_len());
         #[cfg(all(feature = "static-test-hooks", not(test)))]
-        test_hooks::record_reorder_levels(pending.filled_len(), pending.pending_len());
+        test_hooks::record_reorder_filled(pending.filled_len());
         while let Some((item, permit)) = pending.pop_ready() {
             match item {
                 Some(Ok(item)) => {

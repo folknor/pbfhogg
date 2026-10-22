@@ -416,6 +416,32 @@
   anything from metadata, so it stops needing the trust rather than gating
   it.
 
+- **`IndexedReader` and `IdRanges` are removed.** They kept a separate blob
+  index, populated ID ranges lazily by decoding blobs, and ignored the
+  indexdata pbfhogg writes. No command used them. For targeted ID lookups use
+  the `getid` library entry point, or `ElementReader` with a blob filter.
+
+- **`IdSet::count_below` and `count_in_range` are removed.** Use `rank` for
+  counts below an ID, and subtract ranks to count a range. For an inclusive
+  range ending at `i64::MAX`, use `total_count` as the upper bound.
+
+- **`BlockBuilder::with_element_cap` is removed.** It preallocated as if the
+  input were unbounded, so a large cap drove huge allocations. Use
+  `with_element_cap_prealloc(cap, bound)` with a real bound such as the input
+  size. The default cap is now the public `block_builder::DEFAULT_ELEMENT_CAP`;
+  `degrade::DEFAULT_BLOCK_CAP` stays as an alias of it.
+
+- **`check::refs::check_refs` takes a `CheckRefsOptions`** (embedding the
+  shared `check::CheckOptions`) in place of positional flags, and honours its
+  `max_errors`. `VerifyIdsOptions` moves its `max_errors` and `direct_io`
+  fields into the same embedded `check: CheckOptions`;
+  `check::index::CheckIndexOptions` is now an alias of `CheckOptions`.
+
+- **`MergeStats::blobs_skip_decompress` and `blobs_scan_only` are removed.**
+  Nothing incremented them. The apply-changes summary line drops the two
+  always-zero sub-counts and reads
+  `Blobs: N passthrough (M index-hit), R rewritten (of T total)`.
+
 ### Added
 
 - **`pbfhogg digest`: an encoding-independent digest of a PBF's element
@@ -538,6 +564,37 @@
   makes the decision before the header is read.
 
 ### Fixed
+
+- **`check --max-errors` now bounds the reference check, and `0` means
+  unlimited in every check.** The reference check collected every missing
+  reference whatever the cap, so `--show-ids` on an extract with millions of
+  dangling refs grew without bound; `verify_ids` with a cap of 0 kept no
+  details at all.
+
+- **`add-locations-to-ways -o out.osm.pbf` works with a bare relative output
+  name.** The sparse backend failed with "failed to query free space for
+  sparse index in :" because the output's parent directory was the empty
+  path; scratch for `diff` and `derive-changes` had the same gap.
+
+- **Truncated inputs are caught on more read paths.** An O_DIRECT read that
+  skips to a page-aligned point past the end of a truncated file now errors
+  instead of passing; a truncated raw frame no longer leaves the reported
+  offset past the failure; and opening a missing file through the header
+  walker keeps `io::ErrorKind::NotFound`.
+
+- **A geocode index with a non-finite or negative radius in its header is
+  refused on open**, instead of opening and answering "nothing here" for
+  every query.
+
+- **`degrade` bounds its preallocation by the input size** whatever the
+  block cap, its "needs at least one flag" error names `--drop-ids`, and its
+  help lists every transformation flag. The largest block cap no longer
+  overflows the unsort predicate in debug builds, and an unfinished boundary
+  swap no longer counts the held final element twice.
+
+- **Sorted reader assertions handle history and canonical OSM ID order.**
+  Both iteration paths allow repeated node IDs in history files, and debug
+  assertions accept negative IDs in canonical order.
 
 - **Blob indexdata and tagdata are generated and read strictly.** The
   scanners that derive a blob's index used to stop at the first bad tag and

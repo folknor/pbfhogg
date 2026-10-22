@@ -12,11 +12,11 @@ use std::sync::Arc;
 // Decompression infrastructure (pool, zlib helper, decompress_blob_*) lives
 // in the sibling `decompress` module. Re-exported here so existing paths like
 // `crate::blob::DecompressPool` keep resolving.
+use super::decompress::decompress_parsed_blob_into;
 pub(crate) use super::decompress::{
     DecompressPool, decompress_blob, decompress_blob_data_into, decompress_blob_raw,
-    decompress_wire_blob_into, pool_get_pub, pool_wrap,
+    decompress_wire_blob_into, pool_get, pool_wrap,
 };
-use super::decompress::{decompress_parsed_blob_into, pool_get};
 
 // Blob-level wire-format parsers live in the sibling `blob_wire` module.
 // Re-exported at pub(crate) so existing paths like `crate::blob::WireBlob`
@@ -1174,10 +1174,9 @@ impl BlobReader<BufReader<File>> {
         // syscalls per blob. 256KB fits several blobs per read and dramatically
         // reduces syscall overhead on sequential iteration.
         //
-        // Although seekable_from_path supports seeking, in practice callers that need
-        // random access use IndexedReader (which has no BufReader). This path is
-        // mostly used for sequential iteration with occasional seek-back, where the
-        // large buffer is still beneficial.
+        // Although seekable_from_path supports seeking, this path is mostly used
+        // for sequential iteration with occasional seek-back, where the large
+        // buffer is still beneficial.
         let buf_reader = BufReader::with_capacity(256 * 1024, f);
         let mut reader = Self::new_seekable(buf_reader)?;
         // `new_seekable` is generic and cannot know the path; this entry

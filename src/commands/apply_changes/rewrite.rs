@@ -1,6 +1,5 @@
-//! Apply-changes orchestrator: spawn scanner + workers + drain, join,
-//! surface stats. The legacy batch-loop merge() is replaced by the
-//! descriptor-first streaming pipeline assembled here.
+//! Apply-changes entry point: build the descriptor-first streaming
+//! pipeline, join scanner and workers with the drain, and surface stats.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
@@ -211,7 +210,7 @@ pub fn merge(
         locations_on_ways,
         ignore_missing_nodes,
         jobs,
-        allow_version_regression: _,
+        allow_version_regression,
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq,
     } = *opts;
@@ -254,7 +253,7 @@ pub fn merge(
     );
     let diff = Arc::new({
         let mut overlay = crate::osc::CompactDiffOverlay::new();
-        overlay.allow_version_regression(opts.allow_version_regression);
+        overlay.allow_version_regression(allow_version_regression);
         crate::osc::parse_osc_file_into(osc_file, &mut overlay)?;
         overlay
     });

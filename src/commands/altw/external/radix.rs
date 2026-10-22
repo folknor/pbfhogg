@@ -8,9 +8,6 @@
 //! ownership shapes (per-worker shards in stage 1, shared per-bucket
 //! mutexes in stage 2).
 //!
-//! Moved here from the former top-level `external_join` module during the
-//! renumber planet refactor (2026-04-11).
-
 use std::path::{Path, PathBuf};
 
 use super::Result;

@@ -376,7 +376,7 @@ fn element_merge(
                             // path. The dispatcher in mod.rs routes verbose
                             // diffs to the sequential `diff_block_pair`, so
                             // this arm never runs with verbose set.
-                            let _ = options.verbose;
+                            debug_assert!(!options.verbose);
                             stats.modified += 1;
                         }
                     }

@@ -37,7 +37,7 @@
 
 use std::ffi::OsStr;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -382,10 +382,4 @@ fn pbfhogg_bin() -> PathBuf {
         bin.display(),
     );
     bin
-}
-
-/// Convenience: convert a path to an OsStr for passing as an arg.
-/// Used by test code that builds command lines piecemeal.
-pub fn path_arg(p: &Path) -> &OsStr {
-    p.as_os_str()
 }

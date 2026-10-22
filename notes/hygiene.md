@@ -162,15 +162,15 @@ pattern) rejecting the literal under `src/write/` and `src/read/`.
 
 Reported by: write path, read path, altw and scanning.
 
-## HYG-004 - The 8000-element block cap has three owners plus prose
+## HYG-004 - Doc comments restate the default block cap as a literal 8000
 
-`block_builder::MAX_ENTITIES_PER_BLOCK = 8000` (private),
-`degrade::DEFAULT_BLOCK_CAP = 8000` (pub), repack's
-`#[arg(default_value_t = 8000)]` and "Default 8000" help text, plus "8000" as a
-load-bearing number in about ten doc comments (string table, classify, check,
-tags_filter memory bounds). Changing the builder leaves repack and degrade on
-the old number. Fix: one pub const in `block_builder` read by both CLI defaults
-and degrade.
+`block_builder::DEFAULT_ELEMENT_CAP` now owns the default, read by the builder,
+degrade and both CLI defaults. Doc comments that use the default cap as a
+memory bound still spell it as "8000" (`write/string_table.rs`,
+`scan/classify.rs`, `check/refs.rs`, `check/verify_ids.rs`,
+`tags_filter/mod.rs`); they should name the constant or describe the bound.
+The "typical block size" mentions in `read/decompress.rs` and `read/block.rs`
+describe observed input shape and can stay.
 
 Reported by: write path, re-encoding, CLI and plumbing.
 
@@ -304,8 +304,7 @@ slot) is built in:
 - `repack` and `degrade`: each defines `FRAME_BATCH`, `KindPayload`,
   `WorkerOutput`, `PhaseStats`, `run_kind_phase`, `frame_owned`,
   `frame_and_write_batch`; `cat/mod.rs::run_kind_phase` is a third member.
-  Degrade's copies have diverged from repack's in the prealloc bound (BUG-006)
-  and in the sort-preservation guard (repack drains when
+  Degrade's copies have diverged from repack's in the sort-preservation guard (repack drains when
   `!bb.is_empty() || !pending.is_empty()`, degrade only on `!bb.is_empty()`;
   the hunter could not construct a failing path, so it is latent and rests on
   an unstated flush-before-add property).
@@ -450,9 +449,7 @@ the loop is not backend logic; uring could be an `OutputSink` whose
 `write_chunk` does the opportunistic `reap_cqes(false)`. Meanings have
 diverged: `writer_write_ns` is wall time on the writer thread for buffered and
 uring, summed across 16 pool threads for parallel; parallel counts
-`writer_bytes_written` at dispatch, others after the write;
-`uring_cq_wait_ns` is incremented with exactly the value of
-`uring_submit_and_wait_ns` at its only site. Fix: `writer_thread<S: OutputSink>`
+`writer_bytes_written` at dispatch, others after the write. Fix: `writer_thread<S: OutputSink>`
 as the only loop with an `on_idle()` hook; a source-scan test that only
 `pipeline.rs` calls `pop_ready()` under `src/write/`.
 
@@ -555,7 +552,8 @@ Reported by: CLI and plumbing, write path, re-encoding.
   BlobReader" are internal faults reported as `Io(Other)`. Each site spells the
   full `new_error(ErrorKind::Io(std::io::Error::other(...)))` with its own
   wording and `io::ErrorKind` (`pipeline.rs` x5, `reader.rs` x3, `indexed.rs`,
-  `header_walker.rs` x5); that is how BUG-031 happened.
+  `header_walker.rs` x5); that is how the walker once lost the open error's
+`io::ErrorKind`.
 - The geocode builder and reader use `Result<T, Box<dyn Error>>` from
   `format!(...).into()` throughout and never use `error.rs`; pass 1.5 and 2b
   stringify worker errors.
@@ -717,8 +715,6 @@ Reported by: change application.
 - The geocode builder creates `.buckets-level{N}` inside `output_dir`, the
   user's index directory (possibly live, BUG-048), and `remove_dir_all`s any
   pre-existing directory of that name without checking it is its own.
-- The `unwrap_or(Path::new("."))` idiom misses the empty-parent case at every
-  site (BUG-023).
 
 Fix: one `scratch_dir` resolved once by the CLI (explicit `--tmp-dir`, else the
 output's directory with `""` mapped to `.`), validated up front, passed into
@@ -1152,17 +1148,6 @@ minimum; propagate probe errors.
 
 Reported by: altw and scanning.
 
-## HYG-045 - Altw stage 3's worker count must match a tmp-file count held by a second literal
-
-`stage3.rs` says its worker count "Must match the worker tmp file count
-allocated by mod.rs", and `router.worker_file(worker_id)` indexes
-`worker_files[worker_id]`; both sides are `available_parallelism()...min(4)`
-spelled separately, so changing either copy makes that index panic. Fix:
-compute the count once in `external_join`, pass it into `stage3_slot_reorder`,
-size `worker_files` from it, or have the router own it.
-
-Reported by: altw and scanning.
-
 ## HYG-046 - Altw restates the same rules once per backend
 
 - `altw/mod.rs::collect_relation_member_ids` and
@@ -1192,7 +1177,7 @@ Reported by: altw and scanning.
   `add_way_with_locations` and the `_raw` variants `assert!(self.can_add_*())`,
   aborting on a wrong element kind or full block, while the builder already has
   a non-panicking `poison` mechanism for other bad input.
-  `BlockBuilder::with_element_cap(0)` panics.
+  `BlockBuilder::with_element_cap_prealloc(0, _)` panics.
 - `PbfWriter::into_inner` panics on a pipelined writer, while `writer_mut` was
   changed to return an error for the same state.
 - `ReorderBuffer::push` asserts on stale, duplicate and window-exceeded seqs,
@@ -1511,9 +1496,9 @@ Reported by: filtering and spatial.
 
 `read_page_faults` (`debug.rs`), `read_peak_rss_kb` (`main.rs`) and
 `micros_since_process_start`, in two crates, each parse `/proc` themselves and
-silently return zero or `None` on failure; the page-fault one also splits
-`/proc/self/stat` on whitespace (BUG-028). Fix: one module, parsing from the
-last `)`, returning `Option` that callers handle.
+silently return zero or `None` on failure (the page-fault one now parses from
+the last `)` and its deltas saturate). Fix: one module returning `Option`
+that callers handle.
 
 Reported by: CLI and plumbing, altw and scanning.
 
@@ -1572,15 +1557,11 @@ satisfy `Error`. Fix: `run_*` returns `Result<Outcome, Error>` with
 
 Reported by: CLI and plumbing.
 
-## HYG-068 - Workspace manifest metadata is duplicated and the CLI MSRV is false
+## HYG-068 - Nothing verifies the workspace MSRV
 
-Root `rust-version = "1.99"`, CLI `rust-version = "1.96"`; the CLI depends on
-the library by path, so it cannot build on 1.96. The CLI restates `authors`.
-`serde_json` with `float_roundtrip` is declared in both manifests (deliberate
-and commented), with nothing keeping versions in step. Fix: `rust-version` and
-`authors` in `[workspace.package]`, `serde_json` in
-`[workspace.dependencies]`, inherited; `cargo msrv verify` in a sweep for the
-value.
+`rust-version` is now inherited from `[workspace.package]` by both crates,
+but no sweep checks that the workspace builds on it. Add `cargo msrv verify`
+(or a pinned-toolchain build) to a `brokkr.toml` sweep.
 
 Reported by: CLI and plumbing.
 
@@ -2087,21 +2068,8 @@ Reported by: filtering and spatial.
 
 ## HYG-099 - Dead or misleading code in the read path
 
-- `header_walker.rs` `pread_exact` and `read_blob_data`: `#[allow(dead_code)]`,
-  no callers in `src/` or `cli/src/`.
-- `raw_frame.rs` `RawBlobFrame::{index_present, tagdata, file_offset}`: marked
-  `#[allow(dead_code)]` but read by `commands/check/index.rs`; dead only in a
-  no-`commands` build, so use
-  `#[cfg_attr(not(feature = "commands"), allow(dead_code))]`. The `tagdata` doc
-  ("current readers don't access it directly") is stale.
 - `ReorderBuffer::with_max_window`: test-only in practice.
-- `block.rs` carries another `#[allow(dead_code)]` item worth the same check.
-- `IndexedReader` builds its own per-blob node and way ranges by full decode,
-  ignores `BlobHeader.indexdata` (which carries that plus relations, which it
-  does not track), and no command uses it; a public API kept from the osmpbf
-  heritage. Rebuild on `BlobIndex` or retire.
-- `pool_get_pub` is an exact duplicate of `pool_get(Some(..))`;
-  `WireBlob::parse_slice` wants a caller check.
+- `WireBlob::parse_slice` wants a caller check.
 - `BlobReader::new` defaults `parse_indexdata: true` "for compatibility" while
   every engine sets it explicitly; keep or drop deliberately.
 
@@ -2114,143 +2082,26 @@ Reported by: read path.
 - `write_primitive_block_no_indexdata`: public, its only non-test callers are
   `#[cfg(test)]` blocks in getid and getparents; it is a fixture producer on
   the writer's public surface.
-- The `#[cfg(feature = "linux-direct-io")]` sync branch of `write_raw_copy` is
-  unreachable: `write_raw_copy` exists only on `PbfWriter<FileWriter>`, whose
-  every public constructor is pipelined.
-- `uring_cq_wait_ns` duplicates `uring_submit_and_wait_ns`.
-- `compress_one`'s `io::Result` and `HeaderBuilder::build`'s `Result` are
-  nominal; `parallel_gzip::worker_loop` does `Err(_) => return` on
-  `compress_one`, so the `DeathNotice` names a chunk but not the cause; give it
-  `Out::Failed(io::Error)`.
-- `parallel_writer`'s doc frames itself against "plan item #17";
-  `uring_writer`'s says it replaces `writer_thread` "in `super::writer`", which
-  no longer lives there.
+- `HeaderBuilder::build`'s `Result` is nominal (see BUG-039).
 - Re-exports kept "so the existing path keeps resolving"
   (`crate::writer::Compression`, `crate::block_builder::HeaderBuilder`) are
   compatibility shims in a pre-1.0 crate.
 
 Reported by: write path.
 
-## HYG-101 - Dead or stale code in change application
+## HYG-102 - The library `IndexType::from_str` keeps a "dense" arm
 
-- `MergeStats::blobs_skip_decompress` and `blobs_scan_only` are never
-  incremented, yet `print_summary` prints "(N index-hit, 0 scan-only, 0
-  skip-decompress)" and adds `blobs_skip_decompress` into `total_blobs`;
-  leftovers of the removed batch-classify pipeline, `pub`, so library users see
-  them. Building `MergeStats` only through `merge_from` and constructors would
-  make an unwritten field show as dead.
-- `WorkerOutput` is a one-variant enum hosting `into_drain_item`.
-- `scanner.rs`: `let _ = last_node_seq_sent;` ("set here for symmetry"), a
-  no-op; `streaming.rs`: `let _ = worker_id; // reserved for per-worker counter
-  slots later`.
-- `write_osc_way(.., _stats)` and `write_osc_way_local(.., _stats)`: unused
-  parameters threaded through every caller.
-- `merge_changes::action_tag` wraps `OscAction::tag`, and
-  `type Action = OscAction` is an alias "for readability".
-- `osc::load_all_diffs` is `pub` with no production caller; it is the one
-  multi-diff accumulator, and still shapes the overlay (the `usize` offsets
-  comment cites it). Whether it is a library feature with a consumer (nidhogg?)
-  or dead cannot be told from the code; it needs the user's answer.
-  `parse_osc_file` is used by tests and is a supported API.
-- `rewrite.rs::merge()` destructures `allow_version_regression: _` and reads
-  `opts.allow_version_regression` anyway.
-- Stale docs: `apply_changes/mod.rs` describes the removed batch loop (Phase 1
-  parallel classify...); `classify.rs` says blobs pass through raw with
-  gap-creates afterward, while `streaming.rs` now forces a rewrite whenever
-  `inline_upserts` is non-empty; `stream_output.rs` says "run on the main thread
-  as slots are drained"; `rewrite.rs` narrates the legacy batch loop;
-  `diff_ranges.rs` cites a removed function "(see osc.rs)" and `osc.rs` does
-  not exist; `load_all_diffs`' doc says ".osc.gz" and its error says the only
-  recognised naming is `<sequence>.osc.gz`, while `parse_sequence_number` also
-  accepts `<seq>.osc`; `scanner.rs::send_err` says the caller still observes Ok
-  where it returns `Err`; `run_workers` and `drain.rs` cite a nonexistent
-  `rewrite::merge_with_overrides`; `osc/parse.rs` compares memory to a
-  `DiffOverlay` that no longer exists. Writing references as intra-doc links
-  under `-D rustdoc::broken_intra_doc_links` would catch the renamed-function
-  cases.
-
-Reported by: change application.
-
-## HYG-102 - Dead or stale code in altw and scanning
-
-- `#[allow(dead_code)]` markers saying "wired up in step 2 of A1" on
-  `BucketLayout`, its `impl`, `max_node_id_from_blob_meta`, `IdRecord` and its
-  `impl`, all called from production paths; `bucket_width`'s allow says
-  "exposed for testing" but `BucketLayout::new` calls it.
-- `IdSet::count_in_range` and `count_below`: no callers outside `idset.rs`,
-  docs describing the removed rank path; `drop_rank_index`'s doc cites a stage
-  2 use with no external caller.
-- `NodeBlobInfo` documents rank-range fields that no longer exist; stage 1 and
-  `Stage1Output` docs say it owns an `IdSet` it does not;
-  `relation_scan.rs` and `coord_payloads.rs` cite deleted functions and files;
-  stage 4's comment points at `add_locations_to_ways.rs`, which no longer
-  exists; `scan/node.rs` lists "ALTW dense pass 1" as a user.
-- Stage 4's reframe returns `missing_locations` (always 0) and `_new_slot_pos`
-  (unused); `BlobDescriptor::kind: Option<ElemKind>` in stage 4 is always
-  `Some`.
-- `scatter_bucket_entries(_bucket_start, _bucket_end)` unused parameters;
-  `build_way_schedule` returns `Result` but cannot fail.
-- `NodeIndex` is a one-variant enum "as future-proofing";
-  `IndexType::External | IndexType::Auto => unreachable!` in
-  `build_node_index` and the `altw_index_kind` counter emitting `i64::MIN`
-  exist because `IndexType` stays unresolved past dispatch; a `ResolvedBackend`
-  without `Auto` makes them unrepresentable.
-- The library `IndexType::from_str` "dense" arm has no in-repo caller; it is
-  public API, so whether it stays is a decision.
-- `radix.rs`'s module doc carries move history; it has one user.
-
-Deleting the stale `allow(dead_code)`s lets rustc's `dead_code` lint do the
-job.
+The library `IndexType::from_str` "dense" arm (an error explaining dense was
+removed) has no in-repo caller; it is public API, so whether it stays is a
+decision. Its wording has diverged from the CLI's `IndexTypeArg::resolve`
+copy (see HYG-065).
 
 Reported by: altw and scanning.
 
-## HYG-103 - Dead or stale code in the re-encoding commands
+## HYG-105 - Geocode `BuildStats` repeats the header counts
 
-- `diff/parallel.rs`: `let _ = options.verbose;` documenting a dispatch rule
-  that lives in `mod.rs`; a `debug_assert!(!options.verbose)` says it.
-- `derive_parallel.rs`: `let _ = element_version; // silence "unused helper"
-  if future paths drop it`.
-- `ChangeSink::write_create(_kind)` / `write_modify(_kind)`: unused parameter
-  on a private method.
-- `repack` and `cat_filtered` discard `_max_ids` from
-  `build_classify_schedules_split`; check whether any caller uses it.
-- `degrade::DEFAULT_BLOCK_CAP` is `pub` and documented as a test seam, and the
-  hidden `--block-cap` flag serves the same purpose; one seam is enough.
-- Comment rot: `renumber/mod.rs` "(moved from the former
-  src/commands/renumber.rs)"; `diff/parallel.rs` names `diff-par-*-{pid}-*`
-  while the pattern is `diff-par-{pid}-*`; `derive_parallel.rs` refers to
-  `assemble_osc_raw`, the function is `assemble_osc_from_paths`; `sort()`'s doc
-  comment sits on `SortOptions`, so rustdoc attributes both to the struct and
-  `sort()` has none; `schedule.rs`'s `let _ = walker.next_header()?...` keeps
-  the `?` and only discards the header, and a named `_header` binding would
-  stop readers.
-
-Reported by: re-encoding.
-
-## HYG-104 - Dead or stale code in filtering and spatial
-
-- `extract/common.rs::pread_execute`: `let _total_blobs = schedule.len();`.
-- `extract/mod.rs`: `use crate::geo::ring_crosses_antimeridian;` with a comment
-  citing `polygon_bbox_f64`, which is now `bbox_from_polygons`.
-- `getparents_with_min_blobs` (see HYG-002).
-
-Reported by: filtering and spatial.
-
-## HYG-105 - Dead or stale code in the geocode index
-
-- `pass3::parse_polygon_rings` is a one-line forwarding wrapper, and
-  `format::parse_polygon_rings` is used only by it.
-- `collect_candidates` forwards to `search_level` verbatim, "kept only to make
-  the two public call sites readable", with nine positional arguments.
-- The `SlimInterpWay` "house number 0" limitation is repeated in `pass2.rs`
-  twice and `interp.rs`, yet `find_endpoint_house_number_mmap` returns `None`
-  for `hn == 0` and the reader rejects `start == 0 || end == 0`, so the
-  ambiguity cannot arise; say "house number 0 is unsupported" once or add a
-  `resolved` flag.
-- `classify_way_into`'s doc says nodes at `lat==0 && lon==0` are dropped,
-  contradicting `coord_pack` and the comment 70 lines above it.
-- `BuildStats` repeats the header counts; it could be derived from the header
-  plus `dropped_admin_relations`.
+`BuildStats` repeats the header counts; it could be derived from the header
+plus `dropped_admin_relations`.
 
 Reported by: geocode index.
 
@@ -2268,17 +2119,6 @@ Reported by: geocode index.
   future serial-only test" and has none.
 - `IndexTypeArg::Dense` hidden value and the `TagSortArg` aliases `count` /
   `name` are compatibility with removed things, with no end date.
-- `commands/mod.rs`: the "Element type filter" section header sits above
-  passthrough-flush helpers; a stray "Map Osmosis sentinel -1 to 0" doc line is
-  fused onto `clean_metadata`'s doc, describing `map_sentinel`, now in
-  `owned.rs`.
-- `check/verify_ids.rs`: `#[allow(clippy::too_many_lines)]` sits on a 10-line
-  function instead of `verify_ids_streaming_parallel`.
-- `getid::parse_ids` and `parse_ids_from_file` (no-default-type wrappers): the
-  CLI uses the `_with_default_type` variants; check tests before deleting.
-- `tests/common/cli.rs::path_arg` is a one-line wrapper; the
-  `pipeline_test_hooks` re-export of `REORDER_WINDOW_HIGH_WATER` has no reader
-  in `tests/`; verify both before deleting.
 
 Reported by: CLI and plumbing, test harness.
 
@@ -2334,3 +2174,12 @@ was deliberately left alone. What remains is a CLI output change:
 
 Reported by: all nine scopes (split out of the library stderr item when the
 library stopped writing stderr).
+
+## HYG-109 - Altw text still describes the removed rank path
+
+The rank path is gone and the external buckets are ID buckets, but the
+user-facing `--force` refusal in `altw/external/mod.rs` and its comment say
+"rank-based bucket ranges", stage 1's worker-cap note says "rank-shards", and
+stage 2 comments refer to "pre/post-A1 traces".
+
+Reported by: the wave-0 review.

@@ -990,42 +990,13 @@ impl IdSet {
         Some(Self::rank_in_chunk(idx, slot, cid, chunk, off))
     }
 
-    /// Count of set IDs strictly less than `id`. Same as [`Self::rank`],
-    /// which is defined for every `i64`; kept as the name the range-count
-    /// callers read best with.
-    ///
-    /// Requires `build_rank_index()`.
-    pub fn count_below(&self, id: i64) -> u64 {
-        self.rank(id)
-    }
-
-    /// Count of set IDs in the inclusive range `[min_id, max_id]`. Returns
-    /// 0 for an empty range. Safe for arguments outside the allocated chunk
-    /// space.
-    ///
-    /// Used by external join's stage 1 to compute per-node-blob referenced
-    /// rank ranges from the blob's indexdata `(min_id, max_id)` without
-    /// decoding the blob.
-    ///
-    /// Requires `build_rank_index()`.
-    pub fn count_in_range(&self, min_id: i64, max_id: i64) -> u64 {
-        if max_id < min_id {
-            return 0;
-        }
-        let after_max = match max_id.checked_add(1) {
-            Some(v) => self.count_below(v),
-            None => self.total_count(),
-        };
-        after_max - self.count_below(min_id)
-    }
-
     /// Drop the rank index built by `build_rank_index()`. After this call,
-    /// `rank()`, `count_below()`, `count_in_range()` and
-    /// `total_count()` panic, and `rank_if_set()` returns `None`. The members
-    /// themselves are retained - `get()`, `set()`, and `has_any()` still work.
+    /// indexed rank queries and `total_count()` are unavailable, and
+    /// `rank_if_set()` returns `None`. The members themselves are retained -
+    /// `get()`, `set()`, and `has_any()` still work.
     ///
-    /// Used by stage 2 of the external ALTW join to free ~100 MB of rank
-    /// metadata once all rank consumers in stage 1 are finished.
+    /// Call this when rank queries are complete and releasing the rank
+    /// metadata is useful.
     pub fn drop_rank_index(&mut self) {
         self.rank = None;
     }
@@ -1185,7 +1156,6 @@ mod tests {
         assert_eq!(s.total_count(), 4);
         assert_eq!(s.rank(i64::MAX), 3);
         assert_eq!(s.rank_if_set(i64::MAX - 1), Some(2));
-        assert_eq!(s.count_in_range(0, i64::MAX), 4);
         assert!(s.any_in_range(i64::MAX, i64::MAX));
     }
 
@@ -1233,7 +1203,6 @@ mod tests {
         assert_eq!(empty.total_count(), 0);
         assert_eq!(empty.rank(i64::MAX), 0);
         assert_eq!(empty.rank(12_345), 0);
-        assert_eq!(empty.count_in_range(0, i64::MAX), 0);
     }
 
     #[test]
@@ -1371,60 +1340,6 @@ mod tests {
             assert!(!s.get(id), "precondition: {id} should not be set");
             assert_eq!(s.rank_if_set(id), None, "rank_if_set({id}) for unset");
         }
-    }
-
-    #[test]
-    fn count_in_range_basic() {
-        let mut s = IdSet::new();
-        for id in [5, 10, 15, 20, 100] {
-            s.set(id);
-        }
-        s.build_rank_index();
-
-        // Inclusive range semantics, exact and gap cases.
-        assert_eq!(s.count_in_range(5, 20), 4);
-        assert_eq!(s.count_in_range(5, 5), 1);
-        assert_eq!(s.count_in_range(6, 9), 0);
-        assert_eq!(s.count_in_range(0, 100), 5);
-        assert_eq!(s.count_in_range(0, 4), 0);
-        assert_eq!(s.count_in_range(101, 1_000), 0);
-
-        // Inverted range.
-        assert_eq!(s.count_in_range(50, 10), 0);
-    }
-
-    #[test]
-    fn count_in_range_safe_past_allocated_chunks() {
-        // Regression test for the external join build_node_blob_mapping
-        // path: a node blob's indexdata may report (min_id, max_id) where
-        // max_id sits in a chunk past the highest allocated chunk in
-        // IdSet (because no referenced node has an ID that high).
-        let mut s = IdSet::new();
-        s.set(100);
-        s.set(200);
-        s.build_rank_index();
-
-        // Probe IDs many chunks past the end.
-        let way_past_end: i64 = 1_000_000_000_000;
-        assert_eq!(s.count_below(way_past_end), 2);
-        assert_eq!(s.count_in_range(0, way_past_end), 2);
-        assert_eq!(s.count_in_range(150, way_past_end), 1);
-        assert_eq!(s.count_in_range(way_past_end / 2, way_past_end), 0);
-
-        // i64::MAX is the saturating-add boundary in build_node_blob_mapping;
-        // count_in_range must handle max_id = i64::MAX without overflow.
-        assert_eq!(s.count_in_range(0, i64::MAX), 2);
-    }
-
-    #[test]
-    fn count_below_negative_and_zero() {
-        let mut s = IdSet::new();
-        s.set(5);
-        s.build_rank_index();
-        assert_eq!(s.count_below(-1), 0);
-        assert_eq!(s.count_below(0), 0);
-        assert_eq!(s.count_below(5), 0);
-        assert_eq!(s.count_below(6), 1);
     }
 
     #[test]
@@ -1567,7 +1482,6 @@ mod tests {
             let below = below_of(p);
             assert_eq!(s.get(p), reference.contains(&p), "get({p})");
             assert_eq!(s.rank(p), below, "rank({p})");
-            assert_eq!(s.count_below(p), below, "count_below({p})");
             let expected_rank = reference.contains(&p).then_some(below);
             assert_eq!(s.rank_if_set(p), expected_rank, "rank_if_set({p})");
         }
@@ -1577,12 +1491,6 @@ mod tests {
             let (lo, hi) = (a.min(b), a.max(b));
             let hit = reference.range(lo..=hi).next().is_some();
             assert_eq!(s.any_in_range(lo, hi), hit, "any_in_range({lo}, {hi})");
-            let count = sorted.partition_point(|&x| x <= hi) as u64 - below_of(lo);
-            assert_eq!(
-                s.count_in_range(lo, hi),
-                count,
-                "count_in_range({lo}, {hi})"
-            );
         }
     }
 

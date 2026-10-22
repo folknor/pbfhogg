@@ -85,15 +85,8 @@ use crate::file_reader::FileReader;
 use crate::read::decompress::decompress_blob_data_into;
 use crate::read::raw_frame::read_raw_frame;
 
-/// Options for [`check_index`].
-#[derive(Debug, Clone, Copy)]
-pub struct CheckIndexOptions {
-    /// Stop storing individual violations after this many (0 = unlimited).
-    /// The running total is still counted past the cap.
-    pub max_errors: usize,
-    /// Read the input with `O_DIRECT`.
-    pub direct_io: bool,
-}
+/// Compatibility name for the options shared by all check modes.
+pub type CheckIndexOptions = super::CheckOptions;
 
 /// One way a blob's stored metadata disagrees with the blob.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,7 +239,7 @@ pub struct IndexReport {
     /// blob here without stored metadata is legal, one *with* stored metadata
     /// is a violation.
     pub blobs_unindexable: u64,
-    /// Stored violations, capped at `max_errors`.
+    /// Stored violations, limited by `max_errors` unless it is zero.
     pub violations: Vec<IndexViolation>,
     /// Total violations found, which may exceed `violations.len()`.
     pub total_violations: u64,

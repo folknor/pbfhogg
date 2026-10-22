@@ -12,8 +12,7 @@
 //!
 //! 1. Type transition: when `item.kind != last_type`, flush the
 //!    `copy_file_range` coalescer + the `OwnedBytes` passthrough buffer,
-//!    then call [`flush_remaining_upserts`] for the previous type
-//!    (verbatim port from `rewrite.rs`'s batch loop).
+//!    then call [`flush_remaining_upserts`] for the previous type.
 //!    - At the **node→way** transition under `--locations-on-ways`,
 //!      additionally merge per-worker [`CoordSlots`] into the published
 //!      `Arc<loc_map>` and signal the scanner over `barrier_tx` (so
@@ -212,6 +211,7 @@ impl DrainCounters {
 }
 
 /// Run the drain to completion. Returns accumulated `MergeStats`.
+/// Called by `rewrite::merge`, which owns the mutable output writer.
 ///
 /// Exits when `drain_rx` disconnects AND the reorder buffer is empty.
 /// If the channel closes with a seq gap, returns an error rather than

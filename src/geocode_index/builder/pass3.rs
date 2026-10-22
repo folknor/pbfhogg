@@ -925,7 +925,7 @@ fn admin_cells_for_polygon(
     admin_level: u8,
 ) -> Vec<AdminCellEntry> {
     // Parse vertices into rings (exterior + holes) separated by RING_SENTINEL
-    let (ext_f64, hole_rings) = parse_polygon_rings(&poly.vertices);
+    let (ext_f64, hole_rings) = parse_polygon_rings(poly.vertices.iter().copied());
     if ext_f64.len() < 3 {
         return Vec::new();
     }
@@ -1009,12 +1009,6 @@ fn admin_cells_for_polygon(
         }
     }
     entries
-}
-
-/// Parse polygon vertices (with sentinel separators) into exterior + hole rings as f64.
-#[allow(clippy::type_complexity)]
-fn parse_polygon_rings(vertices: &[NodeCoord]) -> (Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>) {
-    super::super::format::parse_polygon_rings(vertices.iter().copied())
 }
 
 #[cfg(test)]
@@ -1217,7 +1211,7 @@ mod tests {
             sum_lat as f64 / n as f64 * 1e-7,
             sum_lon as f64 / n as f64 * 1e-7,
         );
-        let (ext, holes) = parse_polygon_rings(&poly.vertices);
+        let (ext, holes) = parse_polygon_rings(poly.vertices.iter().copied());
         let hole_slices: Vec<&[(f64, f64)]> = holes.iter().map(Vec::as_slice).collect();
         assert!(
             !crate::geo::point_in_polygon(mean_lon, mean_lat, &ext, &hole_slices),

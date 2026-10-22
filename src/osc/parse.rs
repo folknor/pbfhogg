@@ -34,8 +34,8 @@ pub use super::compact::{
 /// index mapping element IDs to byte offsets. Tag keys and relation member roles
 /// are interned via `StringInterner` to eliminate duplicate string storage.
 ///
-/// This typically uses 40-60% less memory than the old `DiffOverlay` for
-/// real-world planet-scale diffs (millions of elements with repeated tag keys).
+/// This avoids per-element heap allocations and reuses repeated tag keys and
+/// relation member roles.
 pub struct CompactDiffOverlay {
     node_arena: Vec<u8>,
     way_arena: Vec<u8>,
@@ -516,7 +516,8 @@ pub fn parse_osc_file_into(path: &Path, overlay: &mut CompactDiffOverlay) -> Par
     parse_osc_path(path, &mut sink)
 }
 
-/// Parse a single .osc.gz file into a new `CompactDiffOverlay`.
+/// Parse a single gzip-compressed (`.osc.gz`) or plain (`.osc`) file into a
+/// new `CompactDiffOverlay`.
 pub fn parse_osc_file(path: &Path) -> ParseResult<CompactDiffOverlay> {
     let mut overlay = CompactDiffOverlay::new();
     parse_osc_file_into(path, &mut overlay)?;
@@ -529,18 +530,22 @@ pub fn parse_osc_file(path: &Path) -> ParseResult<CompactDiffOverlay> {
 
 /// Parse the numeric sequence number from an OSC filename.
 ///
-/// E.g. "4705.osc.gz" -> "4705.osc" -> "4705" -> 4705. Plain "4705.osc"
-/// is accepted too, now that the parser sniffs compression from the
-/// file's bytes rather than trusting its name.
+/// E.g. "4705.osc.gz" and "4705.osc" both produce sequence 4705.
 fn parse_sequence_number(filename: &str) -> Option<u64> {
     let stem = filename.strip_suffix(".gz").unwrap_or(filename);
     let num_str = stem.strip_suffix(".osc")?;
     num_str.parse::<u64>().ok()
 }
 
-/// Load all .osc.gz diffs from a directory, sorted by sequence number, and
-/// parse them into a single `CompactDiffOverlay`. Later diffs win for conflicts
-/// because `parse_osc_file_into` overwrites existing entries.
+/// Load numeric-sequence `.osc` and `.osc.gz` diffs from a directory, sorted
+/// by sequence number, and parse them into a single `CompactDiffOverlay`.
+/// Subdirectories are skipped; only files directly inside `diffs_dir` are
+/// considered.
+/// Later diffs win for conflicts because `parse_osc_file_into` overwrites
+/// existing entries.
+///
+/// This remains supported library API for callers that want to load a whole
+/// directory of diffs; the crate has no in-repository production caller.
 pub fn load_all_diffs(
     diffs_dir: &Path,
     diagnostics: &crate::host::Diagnostics,
@@ -564,14 +569,10 @@ pub fn load_all_diffs(
         }
     }
 
-    // Silence was the defect. `parse_sequence_number` accepts exactly
-    // `<digits>.osc.gz`, so a directory of `changes-4705.osc.gz`, plain
-    // `.osc`, or Geofabrik's nested `000/004/705.osc.gz` matched nothing
-    // and this function returned an empty overlay with a cheerful
-    // "Loaded 0 diffs" - the caller then applied no changes at all and
-    // reported success. An empty directory is a legitimate no-op; a
-    // directory full of files none of which matched is an operator
-    // error, and gets said out loud.
+    // An empty directory is a legitimate no-op. A directory with files but
+    // no numeric-sequence `.osc` or `.osc.gz` names is an operator error;
+    // otherwise it would load zero diffs and the caller could report success
+    // without applying any changes.
     if entries.is_empty() && !skipped.is_empty() {
         let mut shown: Vec<&str> = skipped.iter().map(String::as_str).take(5).collect();
         if skipped.len() > shown.len() {
@@ -579,7 +580,7 @@ pub fn load_all_diffs(
         }
         return Err(format!(
             "no OSC diffs matched in {}: {} file(s) are present but none is named \
-             `<sequence>.osc.gz`, which is the only naming this loader recognises (saw: {}). \
+             `<sequence>.osc` or `<sequence>.osc.gz`, which are the only names this loader recognises (saw: {}). \
              Loading them as zero diffs would apply no changes and report success.",
             diffs_dir.display(),
             skipped.len(),

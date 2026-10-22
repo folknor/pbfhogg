@@ -581,7 +581,7 @@ impl Reader {
         let ctx = QueryContext::new(lat, lon)?;
         let mut cands = CandidateCollector::new();
 
-        self.collect_candidates(
+        self.search_level(
             &ctx,
             &self.geo_cells,
             &self.street_entries,
@@ -595,7 +595,7 @@ impl Reader {
 
         if cands.streets.is_empty() || cands.addresses.is_empty() || cands.interpolations.is_empty()
         {
-            self.collect_candidates(
+            self.search_level(
                 &ctx,
                 &self.coarse_geo_cells,
                 &self.coarse_street_entries,
@@ -1219,34 +1219,6 @@ impl Reader {
                 }
             }
         }
-    }
-
-    /// Collector wrapper kept only to make the two public call sites readable;
-    /// traversal and filtering live exclusively in `search_level`.
-    #[allow(clippy::too_many_arguments)]
-    fn collect_candidates<'a>(
-        &'a self,
-        ctx: &QueryContext,
-        geo_cells_mmap: &Mmap,
-        street_entries_mmap: &Mmap,
-        addr_entries_mmap: &Mmap,
-        interp_entries_mmap: &Mmap,
-        level: u8,
-        max_dist_sq: f64,
-        kinds: SearchKinds,
-        cands: &mut CandidateCollector<'a>,
-    ) {
-        self.search_level(
-            ctx,
-            geo_cells_mmap,
-            street_entries_mmap,
-            addr_entries_mmap,
-            interp_entries_mmap,
-            level,
-            max_dist_sq,
-            kinds,
-            cands,
-        );
     }
 
     // -- Admin search --------------------------------------------------------

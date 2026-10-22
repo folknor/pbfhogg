@@ -34,18 +34,14 @@ struct BlobDescriptor {
     frame_size: usize,
     data_offset: u64,
     data_size: usize,
-    slot_start: u64,
     is_way_blob: bool,
     /// `true` when the blob can be passed through as raw compressed bytes
     /// without decompress + PrimitiveBlock decode + re-encode. Relations
     /// always qualify; node blobs qualify only when `keep_untagged_nodes`.
     /// Ways never qualify (they need coord_payloads splicing).
     is_passthrough: bool,
-    /// Blob kind from indexdata; `None` only for blobs with no indexdata
-    /// header, which never reach stage 4 in practice (require_indexdata
-    /// gates the whole pipeline) but the field stays optional to match
-    /// the scanner API.
-    kind: Option<crate::blob_meta::ElemKind>,
+    /// Blob kind from indexdata. External join requires indexdata.
+    kind: crate::blob_meta::ElemKind,
     /// Element count from indexdata, used to populate Stats on the
     /// passthrough path (no decode available for a live count).
     count: u64,
@@ -177,22 +173,21 @@ pub(super) fn stage4_assembly(
             }
         }
 
-        // Way blobs consume sidecar entries for slot_start.
-        let (slot_start, way_blob_idx) = if matches!(meta.kind, crate::blob_meta::ElemKind::Way) {
+        // Way blobs consume one sidecar entry each.
+        let way_blob_idx = if matches!(meta.kind, crate::blob_meta::ElemKind::Way) {
             if way_sidecar_idx >= way_slot_starts.len() {
                 return Err("ref count sidecar has fewer entries than way blobs in PBF".into());
             }
-            let start = way_slot_starts[way_sidecar_idx];
             let this_way_blob_idx = way_sidecar_idx;
             way_sidecar_idx += 1;
-            (start, this_way_blob_idx)
+            this_way_blob_idx
         } else {
-            (0, 0)
+            0
         };
 
         let is_way_blob = matches!(meta.kind, crate::blob_meta::ElemKind::Way);
-        // Passthrough eligibility mirrors the dense-path rule in
-        // write_output_passthrough (add_locations_to_ways.rs):
+        // Passthrough eligibility mirrors the rule in
+        // write_output_passthrough:
         //   - Relation blobs: always.
         //   - Node blobs: only when keep_untagged_nodes is set (no
         //     per-element filtering needed; the blob is kept as-is).
@@ -209,10 +204,9 @@ pub(super) fn stage4_assembly(
             frame_size,
             data_offset: meta.data_offset,
             data_size: meta.data_size,
-            slot_start,
             is_way_blob,
             is_passthrough,
-            kind: Some(meta.kind),
+            kind: meta.kind,
             count: meta.count,
             way_blob_idx,
         });
@@ -452,24 +446,22 @@ pub(super) fn stage4_assembly(
 
                             // Wire-format reframe: splice locations without
                             // full PrimitiveBlock decode or BlockBuilder.
-                            let (way_count, _new_slot_pos, min_id, max_id, missing) =
-                                reframe_way_blob_with_locations(
-                                    &decompress_buf,
-                                    &coord_payload_buf,
-                                    per_way_rcs.blob_record(desc.way_blob_idx),
-                                    desc.way_blob_idx,
-                                    desc.slot_start,
-                                    &mut reframe_output,
-                                    &mut way_reframe_scratch,
-                                    way_reframe_cref,
-                                    member_way_ids,
-                                    inject_prepass,
-                                )
-                                .map_err(|e| {
-                                    crate::error::new_error(crate::error::ErrorKind::Io(
-                                        std::io::Error::other(e),
-                                    ))
-                                })?;
+                            let (way_count, min_id, max_id) = reframe_way_blob_with_locations(
+                                &decompress_buf,
+                                &coord_payload_buf,
+                                per_way_rcs.blob_record(desc.way_blob_idx),
+                                desc.way_blob_idx,
+                                &mut reframe_output,
+                                &mut way_reframe_scratch,
+                                way_reframe_cref,
+                                member_way_ids,
+                                inject_prepass,
+                            )
+                            .map_err(|e| {
+                                crate::error::new_error(crate::error::ErrorKind::Io(
+                                    std::io::Error::other(e),
+                                ))
+                            })?;
 
                             let index = crate::blob_meta::BlobIndex {
                                 kind: crate::blob_meta::ElemKind::Way,
@@ -498,7 +490,6 @@ pub(super) fn stage4_assembly(
 
                             let block_stats = Stats {
                                 ways_written: way_count,
-                                missing_locations: missing,
                                 blobs_decoded: 1,
                                 ..Stats::default()
                             };
@@ -645,27 +636,15 @@ pub(super) fn stage4_assembly(
             );
 
         // Pre-seed passthrough items at their global seq positions.
-        //
-        // The `expect` is load-bearing on a stage-4 invariant: every
-        // descriptor pushed onto `passthrough_items` is constructed
-        // above with `kind: Some(meta.kind)` from indexdata. External
-        // join requires indexdata (enforced upstream via
-        // `require_indexdata`), so `meta.kind` is always populated
-        // and the `None` branch cannot be reached. If the external
-        // path ever grows a non-indexed `--force` mode, passthrough
-        // descriptor construction must be audited before removing
-        // this expect.
+        // Every descriptor has a kind from the required indexdata.
         for desc in &passthrough_items {
-            let kind = desc
-                .kind
-                .expect("passthrough eligibility requires a known blob kind");
             reorder.push(
                 desc.seq,
                 ConsumerItem::Passthrough {
                     frame_offset: desc.frame_offset,
                     frame_size: desc.frame_size,
                     count: desc.count,
-                    kind,
+                    kind: desc.kind,
                 },
             );
         }
@@ -1157,7 +1136,7 @@ impl WayReframeScratch {
 /// longer re-counts field-8 ref varints just to know how many coordinate
 /// pairs to splice.
 ///
-/// Returns `(way_count, way_slot_pos_after, min_way_id, max_way_id, missing_locations)`.
+/// Returns `(way_count, min_way_id, max_way_id)`.
 ///
 /// `coord_payload` is the per-blob delta-varint payload produced by stage 3.
 /// Each way consumes `2*ref_count` varints, interleaved (lat, lon, lat,
@@ -1166,10 +1145,8 @@ impl WayReframeScratch {
 /// copying raw varint bytes into `packed_lats` and `packed_lons` without
 /// zigzag-decoding or re-encoding.
 ///
-/// `missing_locations` is left at 0 here. The whole-pipeline value is
-/// computed once in `external_join` as `total_slots - stage2_resolved_count`
-/// so it matches the dense path's per-ref counter without paying a per-ref
-/// decode in this hot loop.
+/// The whole-pipeline missing-location count is computed once in
+/// `external_join` from the total and resolved slot counts.
 #[hotpath::measure]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn reframe_way_blob_with_locations(
@@ -1177,13 +1154,12 @@ fn reframe_way_blob_with_locations(
     coord_payload: &[u8],
     per_way_refcount_record: &[u8],
     way_blob_idx: usize,
-    mut way_slot_pos: u64,
     output: &mut Vec<u8>,
     scratch: &mut WayReframeScratch,
     counters: &WayReframeCounters,
     member_way_ids: Option<&IdSet>,
     inject_prepass: bool,
-) -> std::result::Result<(u64, u64, i64, i64, u64), String> {
+) -> std::result::Result<(u64, i64, i64), String> {
     use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
     use std::sync::atomic::Ordering::Relaxed;
 
@@ -1258,7 +1234,6 @@ fn reframe_way_blob_with_locations(
     let mut total_ways: u64 = 0;
     let mut min_way_id: i64 = i64::MAX;
     let mut max_way_id: i64 = i64::MIN;
-    let missing_locations: u64 = 0;
     let mut blob_refs: u64 = 0;
     // Blob-local accumulators for the previously-per-way shared atomics.
     // Published once at function exit so 453M+ way iterations produce
@@ -1386,7 +1361,6 @@ fn reframe_way_blob_with_locations(
                     payload_pos += pin_bytes;
                     scratch.pin_tally.record_way(&scratch.pins);
                 }
-                way_slot_pos += ref_count;
                 blob_refs_present += ref_count;
                 if ref_count > blob_max_refs_per_way {
                     blob_max_refs_per_way = ref_count;
@@ -1507,11 +1481,5 @@ fn reframe_way_blob_with_locations(
         ));
     }
 
-    Ok((
-        total_ways,
-        way_slot_pos,
-        min_way_id,
-        max_way_id,
-        missing_locations,
-    ))
+    Ok((total_ways, min_way_id, max_way_id))
 }

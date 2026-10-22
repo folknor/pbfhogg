@@ -105,9 +105,6 @@ impl DiffRanges {
     }
 }
 
-// osc_member_type_to_member_type removed: OscRelMember.member_type is now
-// a MemberType enum directly (see osc.rs), so no string→enum conversion needed.
-
 /// Grouped per-type cursors tracking how far through each upsert vector
 /// we have emitted creates. Replaces three bare `usize` variables.
 pub(super) struct UpsertCursors {

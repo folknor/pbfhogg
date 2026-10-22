@@ -22,15 +22,41 @@ fn write_nodes_in_order(path: &std::path::Path, ids: &[i64]) {
     write_test_pbf_sorted(path, &nodes, &[], &[]);
 }
 
-fn verify_node_ids(path: &std::path::Path) -> pbfhogg::check::verify_ids::VerifyIdsReport {
+fn verify_node_ids_with_max_errors(
+    path: &std::path::Path,
+    max_errors: usize,
+) -> pbfhogg::check::verify_ids::VerifyIdsReport {
     let opts = pbfhogg::check::verify_ids::VerifyIdsOptions {
+        check: pbfhogg::check::CheckOptions {
+            max_errors,
+            direct_io: false,
+        },
         full: false,
         type_filter: None,
-        max_errors: 16,
-        direct_io: false,
     };
     pbfhogg::check::verify_ids::verify_ids(path, &opts, &crate::common::test_host())
         .expect("verify_ids")
+}
+
+fn verify_node_ids(path: &std::path::Path) -> pbfhogg::check::verify_ids::VerifyIdsReport {
+    verify_node_ids_with_max_errors(path, 16)
+}
+
+fn run_check_refs(
+    path: &std::path::Path,
+    check_relations: bool,
+    show_ids: bool,
+    max_errors: usize,
+) -> Result<pbfhogg::check::refs::RefCheckResult, Box<dyn std::error::Error>> {
+    let opts = pbfhogg::check::refs::CheckRefsOptions {
+        check: pbfhogg::check::CheckOptions {
+            max_errors,
+            direct_io: false,
+        },
+        check_relations,
+        show_ids,
+    };
+    pbfhogg::check::refs::check_refs(path, &opts, &crate::common::test_host())
 }
 
 /// `check --ids` must judge monotonicity by the same canonical OSM ID order
@@ -73,6 +99,25 @@ fn check_ids_uses_canonical_osm_order_for_negative_ids() {
     );
 }
 
+#[test]
+fn check_ids_zero_max_errors_retains_all_violation_details() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("raw_sorted.osm.pbf");
+    write_nodes_in_order(&input, &[-2, -1, 0, 1, 2]);
+
+    let unlimited = verify_node_ids_with_max_errors(&input, 0);
+    assert_eq!(unlimited.total_violations, 2);
+    assert_eq!(
+        unlimited.violations.len(),
+        2,
+        "zero should retain every violation detail"
+    );
+
+    let limited = verify_node_ids_with_max_errors(&input, 1);
+    assert_eq!(limited.total_violations, 2);
+    assert_eq!(limited.violations.len(), 1);
+}
+
 /// A node the tracking `IdSet` cannot represent - a negative (JOSM
 /// editor-local) ID - is never recorded as present, so the way that references
 /// it is reported as having a missing ref. That over-report is deliberate, but
@@ -103,14 +148,7 @@ fn check_refs_reports_untrackable_ids_separately_from_missing_refs() {
         &[],
     );
 
-    let report = pbfhogg::check::refs::check_refs(
-        &untrackable,
-        true,
-        false,
-        false,
-        &crate::common::test_host(),
-    )
-    .expect("check_refs on negative IDs");
+    let report = run_check_refs(&untrackable, true, false, 0).expect("check_refs on negative IDs");
     assert_eq!(report.node_count, 1);
     assert_eq!(
         report.untrackable_ids[0], 1,
@@ -148,14 +186,7 @@ fn check_refs_reports_untrackable_ids_separately_from_missing_refs() {
         }],
         &[],
     );
-    let report = pbfhogg::check::refs::check_refs(
-        &trackable,
-        true,
-        false,
-        false,
-        &crate::common::test_host(),
-    )
-    .expect("check_refs on positive IDs");
+    let report = run_check_refs(&trackable, true, false, 0).expect("check_refs on positive IDs");
     assert_eq!(report.missing_node_refs, 1, "n6 is genuinely absent");
     assert_eq!(
         report.total_untrackable(),
@@ -221,9 +252,7 @@ fn check_refs_show_ids_reports_unique_counts_and_occurrences() {
         ],
     );
 
-    let report =
-        pbfhogg::check::refs::check_refs(&input, true, true, false, &crate::common::test_host())
-            .expect("check_refs with show_ids");
+    let report = run_check_refs(&input, true, true, 0).expect("check_refs with show_ids");
 
     assert_eq!(report.node_count, 1);
     assert_eq!(report.way_count, 1);
@@ -281,9 +310,15 @@ fn check_refs_show_ids_reports_unique_counts_and_occurrences() {
         "show_ids should preserve every missing-ref occurrence, including duplicate relation members"
     );
 
-    let counts_only =
-        pbfhogg::check::refs::check_refs(&input, true, false, false, &crate::common::test_host())
-            .expect("check_refs without show_ids");
+    let limited = run_check_refs(&input, true, true, 2).expect("check_refs with max_errors");
+    assert_eq!(limited.missing_refs.len(), 2);
+    assert_eq!(limited.total_missing(), report.total_missing());
+    assert_eq!(
+        limited.missing_relation_member_occurrences, report.missing_relation_member_occurrences,
+        "limiting displayed details must not limit the counts"
+    );
+
+    let counts_only = run_check_refs(&input, true, false, 0).expect("check_refs without show_ids");
     assert!(
         counts_only.missing_refs.is_empty(),
         "show_ids=false should not materialize missing_refs"

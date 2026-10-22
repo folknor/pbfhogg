@@ -1903,6 +1903,27 @@ fn degrade_strip_locations_and_strip_tagdata_compose() {
 // Validation
 // ---------------------------------------------------------------------------
 
+fn assert_transformation_flags(text: &str) {
+    for flag in [
+        "--unsort",
+        "--unsort-intra",
+        "--strip-locations",
+        "--strip-indexdata",
+        "--strip-tagdata",
+        "--corrupt-tagdata",
+        "--corrupt-indexdata",
+        "--corrupt-indexdata-kind",
+        "--strip-bbox",
+        "--drop-ids",
+    ] {
+        assert!(
+            text.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-'))
+                .any(|token| token == flag),
+            "missing transformation flag {flag}:\n{text}",
+        );
+    }
+}
+
 /// Running `degrade` with no transformation flags is rejected.
 #[test]
 fn degrade_requires_at_least_one_flag() {
@@ -1912,13 +1933,23 @@ fn degrade_requires_at_least_one_flag() {
 
     write_degrade_fixture(&input);
 
-    CliInvoker::new()
+    let cli_output = CliInvoker::new()
         .arg("degrade")
         .arg(&input)
         .arg("-o")
         .arg(&output)
-        .assert_failure()
-        .assert_stderr_contains("at least one transformation flag");
+        .assert_failure();
+    cli_output.assert_stderr_contains("at least one transformation flag");
+    assert_transformation_flags(&cli_output.stderr_str());
+}
+
+#[test]
+fn degrade_help_lists_every_transformation_flag() {
+    let cli_output = CliInvoker::new()
+        .arg("degrade")
+        .arg("--help")
+        .assert_success();
+    assert_transformation_flags(&cli_output.stdout_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -2160,6 +2191,54 @@ fn degrade_rejects_zero_block_cap() {
         .arg("0")
         .assert_failure()
         .assert_stderr_contains("must be > 0");
+}
+
+/// A cap larger than the input must not drive builder preallocation.
+#[test]
+fn degrade_bounds_preallocation_by_input_size() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+
+    write_degrade_fixture(&input);
+
+    for flag in ["--strip-locations", "--unsort"] {
+        CliInvoker::new()
+            .arg("degrade")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .arg(flag)
+            .arg("--block-cap")
+            .arg(usize::MAX.to_string())
+            .assert_success();
+
+        assert_eq!(normalized_count(&input), normalized_count(&output));
+    }
+}
+
+#[test]
+fn degrade_unsort_counts_a_trailing_held_element_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("in.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    let (nodes, ways, relations) = write_degrade_fixture(&input);
+    let count = nodes.len() + ways.len() + relations.len();
+
+    // The node count exactly fills the cap, leaving its final node held
+    // until the phase ends because no following node can complete the swap.
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--unsort")
+        .arg("--block-cap")
+        .arg(nodes.len().to_string())
+        .assert_success()
+        .assert_stderr_contains(&format!("Degraded {count} elements across"));
+
+    assert_eq!(normalized_count(&output), count);
 }
 
 /// `--unsort-intra --block-cap 1` is rejected: an intra-blob inversion

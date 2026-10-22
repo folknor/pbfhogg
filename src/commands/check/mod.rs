@@ -11,6 +11,16 @@ pub mod index;
 pub mod refs;
 pub mod verify_ids;
 
+/// Options shared by the ID, index, and reference checks.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckOptions {
+    /// Maximum number of detail entries to retain in this check.
+    /// Zero means unlimited.
+    pub max_errors: usize,
+    /// Read the input with `O_DIRECT` where the check supports it.
+    pub direct_io: bool,
+}
+
 // ---------------------------------------------------------------------------
 // ID-space allocation floors
 // ---------------------------------------------------------------------------

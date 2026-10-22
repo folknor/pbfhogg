@@ -10,7 +10,6 @@ pub mod elements;
 pub mod file_reader;
 pub(crate) mod frame;
 pub(crate) mod header_walker;
-pub mod indexed;
 pub(crate) mod pipeline;
 pub(crate) mod pipeline_metrics;
 pub(crate) mod raw_frame;
@@ -21,8 +20,8 @@ pub(crate) mod wire;
 #[cfg(all(feature = "static-test-hooks", not(test)))]
 pub mod pipeline_test_hooks {
     pub use super::pipeline::test_hooks::{
-        REORDER_FILLED_HIGH_WATER, REORDER_WINDOW_HIGH_WATER, arm_block_decode,
-        blocked_decode_ready, release_blocked_decode, reset,
+        REORDER_FILLED_HIGH_WATER, arm_block_decode, blocked_decode_ready, release_blocked_decode,
+        reset,
     };
 }
 

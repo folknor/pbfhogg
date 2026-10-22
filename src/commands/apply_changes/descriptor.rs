@@ -7,12 +7,10 @@
 //! overlap candidate (routes to the worker pool for decompress + precise
 //! check + maybe rewrite).
 //!
-//! Workers emit [`WorkerOutput`] after processing a candidate: false
-//! positives (no actual element overlap) come out as passthrough; true
-//! overlaps come out as rewritten blocks. Under `--direct-io` output where
-//! kernel-side `copy_file_range` is unavailable, passthrough descriptors
-//! also route through workers so they can pread the full frame bytes and
-//! emit `OwnedPassthrough`.
+//! Workers emit [`DrainItem`]s after processing candidates: false positives
+//! become `CopyRange` items, and true overlaps become rewritten blocks.
+//! Under `--direct-io` output, passthrough descriptors also route through
+//! workers so they can pread the full frame bytes and emit `OwnedBytes`.
 //!
 //! The drain actor consumes a unified [`DrainItem`] stream (scanner's
 //! passthrough stream + worker outputs merged into a byte-budget reorder
@@ -29,9 +27,8 @@ use crate::blob_meta::{BlobIndex, ElemKind};
 /// Under `--direct-io` output, passthrough still needs body bytes because
 /// `copy_file_range` is incompatible with the backend; workers pread the
 /// **full framed bytes** from `(frame_start, frame_len)` and emit an
-/// [`WorkerOutput::OwnedPassthrough`] carrying the complete frame, so the
+/// [`DrainItem::OwnedBytes`] carrying the complete frame, so the
 /// drain can forward via `write_raw_owned` without re-framing.
-#[derive(Clone)]
 pub(super) struct BlobDescriptor {
     /// Monotonic sequence number assigned by the scanner in file order.
     /// The drain's reorder buffer keys on this.
@@ -72,23 +69,8 @@ pub(super) enum ScannedBlob {
     /// drain forwards this directly as `DrainItem::CopyRange`.
     /// Under `--direct-io`, the scanner routes this through the worker
     /// pool instead (workers pread the full frame and emit
-    /// [`WorkerOutput::OwnedPassthrough`]).
+    /// [`DrainItem::OwnedBytes`]).
     Passthrough(BlobDescriptor),
-}
-
-/// Worker output for the false-positive path. Workers construct
-/// [`DrainItem::Rewritten`] (P1.5: framed inline) and
-/// [`DrainItem::OwnedBytes`] (`--direct-io` passthrough) directly at
-/// send time; only the false-positive descriptor reuses this wrapper
-/// so `into_drain_item` can fold the `BlobDescriptor`'s index/tagdata
-/// fields into a `DrainItem::CopyRange` for the drain's splice path.
-pub(super) enum WorkerOutput {
-    /// The blob had a loose range overlap but no element actually matched
-    /// the diff. Worker has already decompressed the body for the precise
-    /// check; on splice-capable backends the decompressed bytes are
-    /// discarded and the drain re-reads the raw frame via
-    /// `copy_file_range`.
-    FalsePositive(BlobDescriptor),
 }
 
 /// Unified drain input. Arrives from two sources:
@@ -164,10 +146,8 @@ impl BlobDescriptor {
             tagdata: self.tagdata,
         })
     }
-}
 
-impl WorkerOutput {
-    /// Convert the false-positive wrapper into a [`DrainItem::CopyRange`]
+    /// Convert a false-positive descriptor into a [`DrainItem::CopyRange`]
     /// for the unified drain stream. The drain splices the raw frame
     /// via `copy_file_range`; the descriptor's index/tagdata carry the
     /// frame boundaries forward.
@@ -177,32 +157,27 @@ impl WorkerOutput {
     /// supplies the element count walked from the already-parsed
     /// block so the drain can credit `base_<kind>` correctly (merge
     /// stats parity). For indexed blobs this value is ignored in
-    /// favour of `desc.index.count`.
-    pub(super) fn into_drain_item(self, fallback_count: u64) -> DrainItem {
-        match self {
-            WorkerOutput::FalsePositive(desc) => {
-                let seq = desc.seq;
-                let frame_start = desc.frame_start;
-                let frame_len = desc.frame_len;
-                let kind = desc.kind;
-                let id_range = desc.id_range.unwrap_or((0, 0));
-                let index = desc.index.unwrap_or(crate::blob_meta::BlobIndex {
-                    kind,
-                    min_id: id_range.0,
-                    max_id: id_range.1,
-                    count: fallback_count,
-                    bbox: None,
-                });
-                DrainItem::CopyRange {
-                    seq,
-                    frame_start,
-                    frame_len,
-                    kind,
-                    id_range,
-                    index,
-                    tagdata: desc.tagdata,
-                }
-            }
+    /// favour of `index.count`.
+    ///
+    /// Moves the tagdata into the item, retaining the descriptor for error
+    /// diagnostics without cloning its allocation.
+    pub(super) fn take_drain_item(&mut self, fallback_count: u64) -> DrainItem {
+        let id_range = self.id_range.unwrap_or((0, 0));
+        let index = self.index.unwrap_or(BlobIndex {
+            kind: self.kind,
+            min_id: id_range.0,
+            max_id: id_range.1,
+            count: fallback_count,
+            bbox: None,
+        });
+        DrainItem::CopyRange {
+            seq: self.seq,
+            frame_start: self.frame_start,
+            frame_len: self.frame_len,
+            kind: self.kind,
+            id_range,
+            index,
+            tagdata: self.tagdata.take(),
         }
     }
 }

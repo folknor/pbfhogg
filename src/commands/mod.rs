@@ -36,7 +36,7 @@ use crate::writer::{Compression, PbfWriter};
 pub(crate) type Result<T> = crate::BoxResult<T>;
 
 // ---------------------------------------------------------------------------
-// Element type filter
+// Shared output helpers
 // ---------------------------------------------------------------------------
 
 /// Flush coalesced passthrough chunks as a single `write_raw_chunks` (move, no copy).
@@ -470,7 +470,6 @@ pub(crate) fn writer_from_header_parallel(
     )
 }
 
-/// Map Osmosis sentinel -1 to 0 (protobuf default for absent) in dense node
 /// Apply per-attribute cleaning to metadata. Returns `None` if all attributes
 /// are cleaned or if the input has no metadata.
 pub(crate) fn clean_metadata<'a>(
@@ -528,43 +527,27 @@ pub(crate) fn require_indexdata(
 
 /// Check that a PBF file declares `Sort.Type_then_ID`.
 ///
-/// Returns an error with actionable guidance if the header lacks the sorted flag.
-/// `context` should identify the file role (e.g. "Old PBF" or "New PBF").
+/// `context` identifies the file role, and `reason` explains why this command
+/// requires sorted input.
 pub(crate) fn require_sorted(
-    header: &crate::HeaderBlock,
+    is_sorted: bool,
     path: &Path,
     context: &str,
+    reason: &str,
 ) -> Result<()> {
-    if !header.is_sorted() {
+    if !is_sorted {
         return Err(format!(
             "{context} is not sorted (missing Sort.Type_then_ID optional feature).\n\
              File: {}\n\n\
              Sort the input file first:\n\n\
              \x20 pbfhogg sort {} -o sorted.osm.pbf\n\n\
-             Streaming diff requires sorted inputs to operate in constant memory.",
+             {reason}",
             path.display(),
             path.display(),
         )
         .into());
     }
     Ok(())
-}
-
-/// Unconditionally return the "not sorted" error for a given path.
-///
-/// Used when the sorted flag has already been checked separately (e.g. via
-/// `check_sorted_and_indexed`) and we just need to emit the error.
-pub(crate) fn require_sorted_err(path: &Path, context: &str) -> Result<()> {
-    Err(format!(
-        "{context} is not sorted (missing Sort.Type_then_ID optional feature).\n\
-         File: {}\n\n\
-         Sort the input file first:\n\n\
-         \x20 pbfhogg sort {} -o sorted.osm.pbf\n\n\
-         Streaming diff requires sorted inputs to operate in constant memory.",
-        path.display(),
-        path.display(),
-    )
-    .into())
 }
 
 /// Choose between the pread header walker and the pipelined reader for a

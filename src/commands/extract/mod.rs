@@ -190,7 +190,7 @@ fn polygon_rings_contains(poly: &PolygonRings, px: f64, py: f64) -> bool {
         .any(|hole| crate::geo::point_in_ring_with_antimeridian(px, py, hole))
 }
 
-// Delegate to geo module - used by tests and polygon_bbox_f64
+// Delegate to geo module; used by tests and bbox_from_polygons.
 use crate::geo::ring_crosses_antimeridian;
 
 // ---------------------------------------------------------------------------

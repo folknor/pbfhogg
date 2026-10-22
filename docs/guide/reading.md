@@ -338,21 +338,3 @@ for blob in &mut reader {
 Both accessors return raw bitmap bytes, not a typed structure - this is
 low-level plumbing for tools that want to reuse pbfhogg's own prepass rather
 than a general-purpose API. Most library consumers will never need it.
-
-## IndexedReader - filtered reads
-
-`IndexedReader` builds an in-memory index of blob positions and ID ranges, then seeks directly to relevant blobs. Useful when you need specific elements by ID from a large file.
-
-```rust
-use pbfhogg::IndexedReader;
-use std::collections::BTreeSet;
-
-let mut reader = IndexedReader::from_path("tests/test.osm.pbf")?;
-
-// Find ways that reference specific node IDs
-let node_ids: BTreeSet<i64> = [1, 2, 3].into_iter().collect();
-let ways = reader.ways_with_node_ids(&node_ids)?;
-# Ok::<(), std::io::Error>(())
-```
-
-`IndexedReader` is used internally by commands like `getid` and `add-locations-to-ways` for efficient targeted reads.

@@ -11,8 +11,6 @@ pub struct MergeStats {
     pub deleted: u64,
     pub blobs_passthrough: u64,
     pub blobs_rewritten: u64,
-    pub blobs_skip_decompress: u64,
-    pub blobs_scan_only: u64,
     pub blobs_index_hit: u64,
     /// Bytes of raw passthrough frames (wire size including framing).
     pub bytes_passthrough: u64,
@@ -50,8 +48,6 @@ impl MergeStats {
             deleted: 0,
             blobs_passthrough: 0,
             blobs_rewritten: 0,
-            blobs_skip_decompress: 0,
-            blobs_scan_only: 0,
             blobs_index_hit: 0,
             bytes_passthrough: 0,
             bytes_rewritten: 0,
@@ -87,8 +83,7 @@ impl MergeStats {
     }
 
     pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
-        let total_blobs =
-            self.blobs_passthrough + self.blobs_rewritten + self.blobs_skip_decompress;
+        let total_blobs = self.blobs_passthrough + self.blobs_rewritten;
         writeln!(
             w,
             "Merge complete: {} elements written",
@@ -107,12 +102,8 @@ impl MergeStats {
         writeln!(w, "  Deleted: {}", self.deleted)?;
         writeln!(
             w,
-            "  Blobs: {} passthrough ({} index-hit, {} scan-only, {} skip-decompress), {} rewritten (of {total_blobs} total)",
-            self.blobs_passthrough + self.blobs_skip_decompress,
-            self.blobs_index_hit,
-            self.blobs_scan_only,
-            self.blobs_skip_decompress,
-            self.blobs_rewritten,
+            "  Blobs: {} passthrough ({} index-hit), {} rewritten (of {total_blobs} total)",
+            self.blobs_passthrough, self.blobs_index_hit, self.blobs_rewritten,
         )?;
         let total_bytes = self.bytes_passthrough + self.bytes_rewritten;
         if total_bytes > 0 {

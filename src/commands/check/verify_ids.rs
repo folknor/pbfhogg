@@ -32,15 +32,32 @@ fn not_after(id: i64, prev: i64) -> bool {
 
 /// Configuration for the `verify_ids` command.
 pub struct VerifyIdsOptions {
+    /// Options shared with the index and reference checks.
+    pub check: super::CheckOptions,
     /// When true, use `IdSet` per type to detect duplicate IDs.
     /// Increases memory usage but catches duplicates that monotonicity alone cannot.
     pub full: bool,
     /// Restrict the check to these element types. `None` = all types.
     pub type_filter: Option<TypeFilter>,
-    /// Maximum number of violations to store in the report (capped for memory).
-    pub max_errors: usize,
-    /// Whether to use O_DIRECT for reading.
-    pub direct_io: bool,
+}
+
+fn effective_error_limit(max_errors: usize) -> Option<usize> {
+    if max_errors == 0 {
+        None
+    } else {
+        Some(max_errors)
+    }
+}
+
+fn remaining_error_limit(max_errors: usize, stored: usize) -> Option<usize> {
+    effective_error_limit(max_errors).map(|limit| limit.saturating_sub(stored))
+}
+
+fn should_store_violation(current_len: usize, limit: Option<usize>) -> bool {
+    match limit {
+        Some(limit) => current_len < limit,
+        None => true,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -93,7 +110,7 @@ pub struct VerifyIdsReport {
     pub way_count: u64,
     /// Number of relations scanned.
     pub relation_count: u64,
-    /// Stored violations (up to `max_errors`).
+    /// Stored violations, limited by `max_errors` unless it is zero.
     pub violations: Vec<IdViolation>,
     /// Total violation count (may exceed `violations.len()`).
     pub total_violations: u64,
@@ -364,10 +381,10 @@ fn verify_ids_streaming_parallel(
     // reused across blobs) doesn't apply here.
     host.process.cross_thread_alloc_pool();
 
-    let header_sorted = ElementReader::open_in(path, opts.direct_io, host)?
+    let header_sorted = ElementReader::open_in(path, opts.check.direct_io, host)?
         .header()
         .is_sorted();
-    let indexed = crate::commands::has_indexdata(path, opts.direct_io, &host.diagnostics)?;
+    let indexed = crate::commands::has_indexdata(path, opts.check.direct_io, &host.diagnostics)?;
     warn_unindexed_triple_scan(indexed, host);
 
     let type_filter = TypeFilter::or_all(opts.type_filter);
@@ -391,7 +408,7 @@ fn verify_ids_streaming_parallel(
             &rel_schedule,
             &mut violations,
             &mut total_violations,
-            opts.max_errors,
+            effective_error_limit(opts.check.max_errors),
         );
     }
 
@@ -401,7 +418,7 @@ fn verify_ids_streaming_parallel(
             &shared_file,
             &node_schedule,
             "node",
-            opts.max_errors.saturating_sub(violations.len()),
+            remaining_error_limit(opts.check.max_errors, violations.len()),
             |el| match el {
                 Element::DenseNode(dn) => Some(dn.id()),
                 Element::Node(n) => Some(n.id()),
@@ -421,7 +438,7 @@ fn verify_ids_streaming_parallel(
             &shared_file,
             &way_schedule,
             "way",
-            opts.max_errors.saturating_sub(violations.len()),
+            remaining_error_limit(opts.check.max_errors, violations.len()),
             |el| match el {
                 Element::Way(w) => Some(w.id()),
                 _ => None,
@@ -440,7 +457,7 @@ fn verify_ids_streaming_parallel(
             &shared_file,
             &rel_schedule,
             "relation",
-            opts.max_errors.saturating_sub(violations.len()),
+            remaining_error_limit(opts.check.max_errors, violations.len()),
             |el| match el {
                 Element::Relation(r) => Some(r.id()),
                 _ => None,
@@ -476,7 +493,7 @@ fn verify_single_kind_streaming(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
     elem_type: &'static str,
-    max_errors_remaining: usize,
+    max_errors_remaining: Option<usize>,
     extract_id: impl Fn(&crate::Element) -> Option<i64> + Send + Sync,
     host: &crate::host::Host,
 ) -> Result<(u64, Vec<IdViolation>, u64)> {
@@ -534,7 +551,7 @@ fn verify_single_kind_streaming(
         count += r.count;
         for v in r.within_violations {
             total_violations += 1;
-            if violations.len() < max_errors_remaining {
+            if should_store_violation(violations.len(), max_errors_remaining) {
                 violations.push(v);
             }
         }
@@ -542,7 +559,7 @@ fn verify_single_kind_streaming(
             && not_after(fi, pl)
         {
             total_violations += 1;
-            if violations.len() < max_errors_remaining {
+            if should_store_violation(violations.len(), max_errors_remaining) {
                 violations.push(IdViolation::NonMonotonic {
                     elem_type,
                     id: fi,
@@ -601,6 +618,7 @@ impl BlobVerifyResult {
 /// dependency - verify_ids only cares about per-kind monotonicity and
 /// per-kind duplicates), so phase ordering is purely for phase-wall
 /// attribution in the sidecar.
+// This pass owns all three ID sets and their ordered phase merges.
 #[allow(clippy::too_many_lines)]
 fn verify_ids_full_parallel(
     path: &Path,
@@ -617,10 +635,10 @@ fn verify_ids_full_parallel(
     // Cheap: ElementReader::open reads the header and stops. Drop it
     // immediately; parallel_classify_phase reopens the file internally via
     // the shared_file from build_classify_schedules_split.
-    let header_sorted = ElementReader::open_in(path, opts.direct_io, host)?
+    let header_sorted = ElementReader::open_in(path, opts.check.direct_io, host)?
         .header()
         .is_sorted();
-    let indexed = crate::commands::has_indexdata(path, opts.direct_io, &host.diagnostics)?;
+    let indexed = crate::commands::has_indexdata(path, opts.check.direct_io, &host.diagnostics)?;
     warn_unindexed_triple_scan(indexed, host);
 
     let type_filter = TypeFilter::or_all(opts.type_filter);
@@ -699,7 +717,7 @@ fn verify_ids_full_parallel(
             &rel_schedule,
             &mut violations,
             &mut total_violations,
-            opts.max_errors,
+            effective_error_limit(opts.check.max_errors),
         );
     }
 
@@ -712,7 +730,7 @@ fn verify_ids_full_parallel(
             &node_schedule,
             node_ids_ref,
             "node",
-            opts.max_errors.saturating_sub(violations.len()),
+            remaining_error_limit(opts.check.max_errors, violations.len()),
             |el| match el {
                 Element::DenseNode(dn) => Some(dn.id()),
                 Element::Node(n) => Some(n.id()),
@@ -735,7 +753,7 @@ fn verify_ids_full_parallel(
             &way_schedule,
             way_ids_ref,
             "way",
-            opts.max_errors.saturating_sub(violations.len()),
+            remaining_error_limit(opts.check.max_errors, violations.len()),
             |el| match el {
                 Element::Way(w) => Some(w.id()),
                 _ => None,
@@ -757,7 +775,7 @@ fn verify_ids_full_parallel(
             &rel_schedule,
             relation_ids_ref,
             "relation",
-            opts.max_errors.saturating_sub(violations.len()),
+            remaining_error_limit(opts.check.max_errors, violations.len()),
             |el| match el {
                 Element::Relation(r) => Some(r.id()),
                 _ => None,
@@ -795,7 +813,7 @@ fn verify_single_kind_parallel(
     schedule: &[(usize, u64, usize)],
     id_set: &IdSet,
     elem_type: &'static str,
-    max_errors_remaining: usize,
+    max_errors_remaining: Option<usize>,
     extract_id: impl Fn(&crate::Element) -> Option<i64> + Send + Sync,
     host: &crate::host::Host,
 ) -> Result<(u64, Vec<IdViolation>, u64)> {
@@ -862,7 +880,7 @@ fn verify_single_kind_parallel(
         count += r.count;
         for v in r.within_violations {
             total_violations += 1;
-            if violations.len() < max_errors_remaining {
+            if should_store_violation(violations.len(), max_errors_remaining) {
                 violations.push(v);
             }
         }
@@ -870,7 +888,7 @@ fn verify_single_kind_parallel(
             && not_after(fi, pl)
         {
             total_violations += 1;
-            if violations.len() < max_errors_remaining {
+            if should_store_violation(violations.len(), max_errors_remaining) {
                 violations.push(IdViolation::NonMonotonic {
                     elem_type,
                     id: fi,
@@ -880,13 +898,13 @@ fn verify_single_kind_parallel(
         }
         for id in r.duplicate_ids {
             total_violations += 1;
-            if violations.len() < max_errors_remaining {
+            if should_store_violation(violations.len(), max_errors_remaining) {
                 violations.push(IdViolation::Duplicate { elem_type, id });
             }
         }
         for id in r.out_of_range_ids {
             total_violations += 1;
-            if violations.len() < max_errors_remaining {
+            if should_store_violation(violations.len(), max_errors_remaining) {
                 violations.push(IdViolation::IdOutOfRange { elem_type, id });
             }
         }
@@ -910,14 +928,14 @@ fn check_type_order(
     rel_sched: &[(usize, u64, usize)],
     violations: &mut Vec<IdViolation>,
     total_violations: &mut u64,
-    max_errors: usize,
+    max_errors: Option<usize>,
 ) {
     let record = |after: &'static str,
                   found: &'static str,
                   violations: &mut Vec<IdViolation>,
                   total_violations: &mut u64| {
         *total_violations += 1;
-        if violations.len() < max_errors {
+        if should_store_violation(violations.len(), max_errors) {
             violations.push(IdViolation::TypeOrder { found, after });
         }
     };

@@ -149,6 +149,7 @@ fn parse_id_spec_inner(spec: &str, default_type: Option<DefaultType>) -> Result<
 }
 
 /// Parse ID specs from command-line arguments.
+// Retain this public wrapper for library compatibility.
 pub fn parse_ids(specs: &[String]) -> Result<ElementIds> {
     parse_ids_with_default_type(specs, None)
 }
@@ -173,6 +174,7 @@ pub fn parse_ids_with_default_type(
 
 /// Parse ID specs from a file, one per line. See
 /// [`parse_ids_from_file_with_default_type`] for the line rules.
+// Retain this public wrapper for library compatibility.
 pub fn parse_ids_from_file(path: &Path) -> Result<ElementIds> {
     parse_ids_from_file_with_default_type(path, None)
 }

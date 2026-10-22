@@ -85,7 +85,12 @@ pub fn time_filter(
     // host's `cross_thread_alloc_pool` hook - see the in-function
     // comment in time_filter_snapshot.
     let reader = ElementReader::open_in(input, direct_io, host)?;
-    require_sorted(reader.header(), input, "Input history PBF")?;
+    require_sorted(
+        reader.header().is_sorted(),
+        input,
+        "Input history PBF",
+        "Time filtering requires sorted input to preserve type-then-ID ordering while selecting the snapshot.",
+    )?;
     warn_locations_on_ways_loss(reader.header(), host);
 
     let is_history = reader.header().has_historical_information();

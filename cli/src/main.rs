@@ -345,10 +345,13 @@ enum Command {
         file: PathBuf,
         #[command(flatten)]
         output: OutputArg,
-        /// Per-blob element cap. Default 8000 matches the PBF interop
-        /// convention; passing 8000 against a `planet.openstreetmap.org`-
+        /// Per-blob element cap. The default matches the PBF interop
+        /// convention; passing a small cap against a `planet.openstreetmap.org`-
         /// packed input (~228 k/blob) produces a Geofabrik-style packing.
-        #[arg(long = "elements-per-blob", default_value_t = 8000)]
+        #[arg(
+            long = "elements-per-blob",
+            default_value_t = pbfhogg::block_builder::DEFAULT_ELEMENT_CAP
+        )]
         elements_per_blob: usize,
         #[command(flatten)]
         compression: CompressionArg,
@@ -364,17 +367,12 @@ enum Command {
     /// Produce a valid-but-adversarial PBF by stripping properties or
     /// perturbing structure.
     ///
-    /// At least one flag is required, and flags compose - except
-    /// `--unsort` and `--unsort-intra`, which are mutually exclusive (they
-    /// request opposite blob shapes). Supports `--unsort`, `--unsort-intra`,
-    /// `--strip-locations`, `--strip-indexdata`, `--strip-tagdata`,
-    /// `--strip-bbox`, and `--drop-ids`. Both
-    /// unsort modes perturb
-    /// exactly one same-kind pair per kind that has more than `block_cap`
-    /// elements; kinds with fewer elements pass through unchanged. Used to
-    /// produce inputs for benchmarking non-optimal code paths
-    /// (`sort` overlap-rewrite, `add-locations-to-ways`, `--force`
-    /// fallbacks).
+    /// At least one transformation flag is required. Flags compose, except
+    /// `--unsort` and `--unsort-intra`, which are mutually exclusive.
+    /// `--unsort` swaps elements across a block boundary when a kind has
+    /// more than the block cap elements. `--unsort-intra` swaps the first
+    /// two elements of each kind inside a block. Smaller kinds pass through.
+    /// Used to produce inputs for benchmarking non-optimal code paths.
     Degrade {
         /// Input PBF file
         file: PathBuf,
@@ -436,8 +434,12 @@ enum Command {
         drop_ids: Option<String>,
         /// Per-block element cap on the decode path. Hidden; used by
         /// the test suite so `--unsort` can fire on small fixtures
-        /// without 8000+ elements per kind.
-        #[arg(long = "block-cap", default_value_t = pbfhogg::degrade::DEFAULT_BLOCK_CAP, hide = true)]
+        /// without large fixtures per element kind.
+        #[arg(
+            long = "block-cap",
+            default_value_t = pbfhogg::block_builder::DEFAULT_ELEMENT_CAP,
+            hide = true
+        )]
         block_cap: usize,
         /// Skip the indexdata precondition required by the decode path.
         /// The per-kind classify pipeline will fall back to scanning every
@@ -1232,9 +1234,8 @@ fn main() -> process::ExitCode {
 
     // `Cli::parse()` ends a parse error - and `--help` / `--version` - with
     // `clap::Error::exit`, which calls `process::exit` and so skips every
-    // destructor, including the hotpath guard built two lines up. That is
-    // exactly the hazard `ExitWithCode` exists to avoid on the command
-    // paths, so the argument path uses `try_parse` and returns instead.
+    // destructor, including the hotpath guard built two lines up. Use
+    // `try_parse` and return instead so the guard is dropped normally.
     // `Error::print` writes to the same stream clap would have used
     // (stdout for help and version, stderr for a usage error) and
     // `Error::exit_code` is clap's own code for the case, so neither the
@@ -2118,15 +2119,18 @@ fn run_check(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("input.osm.pbf");
+    let check_options = pbfhogg::check::CheckOptions {
+        max_errors,
+        direct_io,
+    };
 
     // Run checks and collect results
     let ids_report = if run_ids {
         use pbfhogg::check::verify_ids::VerifyIdsOptions;
         let opts = VerifyIdsOptions {
+            check: check_options,
             full,
             type_filter,
-            max_errors,
-            direct_io,
         };
         let report = pbfhogg::check::verify_ids::verify_ids(path, &opts, host)?;
         if !report.passed {
@@ -2138,15 +2142,7 @@ fn run_check(
     };
 
     let index_report = if run_index {
-        use pbfhogg::check::index::CheckIndexOptions;
-        let report = pbfhogg::check::index::check_index(
-            path,
-            &CheckIndexOptions {
-                max_errors,
-                direct_io,
-            },
-            host,
-        )?;
+        let report = pbfhogg::check::index::check_index(path, &check_options, host)?;
         if !report.passed() {
             failed = true;
         }
@@ -2156,8 +2152,12 @@ fn run_check(
     };
 
     let refs_result = if run_refs {
-        let result =
-            pbfhogg::check::refs::check_refs(path, check_relations, show_ids, direct_io, host)?;
+        let opts = pbfhogg::check::refs::CheckRefsOptions {
+            check: check_options,
+            check_relations,
+            show_ids,
+        };
+        let result = pbfhogg::check::refs::check_refs(path, &opts, host)?;
         if !result.is_valid() {
             failed = true;
         }
@@ -2608,6 +2608,7 @@ fn paths_alias(input: &std::path::Path, output: &std::path::Path) -> std::io::Re
 /// parent directory joined with the final component. Returns `None` when the
 /// path has no file name (e.g. a bare `..`), which can never be a valid output.
 fn planned_path(path: &std::path::Path) -> std::io::Result<Option<PathBuf>> {
+    // A bare relative filename has an empty parent, which means the current directory.
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -3228,6 +3229,7 @@ fn run_extract(
 /// the scratch file the run wrote into that same directory.
 fn preflight_publishable(paths: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
     for path in paths {
+        // A bare relative filename has an empty parent, which means the current directory.
         let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
         let parent = if parent.as_os_str().is_empty() {
             std::path::Path::new(".")

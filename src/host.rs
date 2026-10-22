@@ -24,7 +24,13 @@ impl Host {
         &'a self,
         default: &'a std::path::Path,
     ) -> &'a std::path::Path {
-        self.scratch_parent.as_deref().unwrap_or(default)
+        if let Some(parent) = self.scratch_parent.as_deref() {
+            parent
+        } else if default.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            default
+        }
     }
 }
 /// Page-cache policy for the input files a command reads.
@@ -191,6 +197,16 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scratch_parent_uses_current_directory_for_empty_output_parent() {
+        let host = Host::for_tests();
+        let output = std::path::Path::new("out.osm.pbf");
+        let parent = output.parent().expect("bare filename has a parent");
+        assert!(parent.as_os_str().is_empty());
+        assert_eq!(host.scratch_parent_or(parent), std::path::Path::new("."));
+    }
+
     #[test]
     fn worker_sizing_respects_fixed_resources() {
         for (reserve, min, fallback) in [(1, 1, 3), (2, 1, 4), (2, 2, 4), (0, 1, 8), (0, 1, 4)] {

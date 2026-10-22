@@ -73,7 +73,7 @@ pub(super) struct Stage1Output {
 }
 
 /// Build the way-blob schedule from the shared blob metadata scan.
-pub(super) fn build_way_schedule(blob_meta: &[BlobMeta]) -> Result<Vec<WayBlobTask>> {
+pub(super) fn build_way_schedule(blob_meta: &[BlobMeta]) -> Vec<WayBlobTask> {
     crate::debug::emit_marker("EXTJOIN_S1_WAY_SCHEDULE_START");
     let t0 = std::time::Instant::now();
     let mut schedule: Vec<WayBlobTask> = Vec::new();
@@ -95,7 +95,7 @@ pub(super) fn build_way_schedule(blob_meta: &[BlobMeta]) -> Result<Vec<WayBlobTa
         crate::debug::emit_counter("s1_way_schedule_build_ms", t0.elapsed().as_millis() as i64);
     }
     crate::debug::emit_marker("EXTJOIN_S1_WAY_SCHEDULE_END");
-    Ok(schedule)
+    schedule
 }
 
 /// Pass A: parallel way scan that emits one [`IdRecord`] per ref to
@@ -138,7 +138,7 @@ pub(super) fn stage1_pass_a(
     let mut total_refs: u64 = 0;
 
     let s1a_per_way_sidecar_bytes = std::sync::atomic::AtomicU64::new(0);
-    // A1 step 2 counters: per-ref IdRecord emission to id-bucket
+    // Pass A counters: per-ref IdRecord emission to id-bucket
     // shards. Records that can't be encoded (negative ref or
     // node_id > max_node_id) are skipped; those slots fall through to
     // stage 4 as zero-coord missing locations, matching the existing
@@ -254,7 +254,7 @@ pub(super) fn stage1_pass_a(
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_scan_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
 
-                            // A1 step 2: emit IdRecords per ref into
+                            // Emit IdRecords per ref into
                             // id-bucket shards. Records for negative refs
                             // or out-of-range node ids (> max_node_id)
                             // are skipped; those slots stay unresolved
@@ -477,7 +477,7 @@ pub(super) fn stage1_pass_a(
 }
 
 /// Header-only walk of node blobs that builds the `NodeBlobInfo` mapping
-/// stage 2 uses to find which blobs cover each rank bucket.
+/// stage 2 uses to find which blobs cover each id bucket.
 ///
 /// Replaces the historical 82 GB `coords_by_rank` file. No decompression
 /// happens here - for each node blob we read its indexdata `(min_id, max_id)`
@@ -545,7 +545,7 @@ pub(super) fn stage1_way_pass(
     inject_prepass: bool,
     host: &crate::host::Host,
 ) -> Result<Stage1Output> {
-    let schedule = build_way_schedule(blob_meta)?;
+    let schedule = build_way_schedule(blob_meta);
 
     // Cap num_workers against the file descriptor allowance. Pass A
     // below holds `num_workers * NUM_BUCKETS` id-shard files open

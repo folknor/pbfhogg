@@ -33,8 +33,8 @@ pub struct RefCheckResult {
     /// May exceed `missing_relation_members` when multiple relations reference
     /// the same missing relation.
     pub missing_relation_member_occurrences: u64,
-    /// Every missing reference occurrence (populated when `show_ids` is true).
-    /// Not deduplicated - each occurrence is a separate entry.
+    /// Missing reference occurrences retained for display when `show_ids` is
+    /// true. Limited by the shared `max_errors` value unless it is zero.
     pub missing_refs: Vec<MissingRef>,
     /// Element IDs that could not be entered into the tracking `IdSet` at all -
     /// negative, or above the bound `id_alloc_bound` allowed for the kind.
@@ -109,6 +109,34 @@ struct RelBlobResult {
     missing_refs: Vec<MissingRef>,
 }
 
+/// Options for [`check_refs`].
+#[derive(Debug, Clone, Copy)]
+pub struct CheckRefsOptions {
+    /// Options shared with the ID and index checks.
+    pub check: super::CheckOptions,
+    /// Also check relation member references.
+    pub check_relations: bool,
+    /// Retain missing reference IDs up to `check.max_errors`, or all if zero.
+    pub show_ids: bool,
+}
+
+fn should_store_missing_ref(current_len: usize, max_errors: usize) -> bool {
+    max_errors == 0 || current_len < max_errors
+}
+
+fn append_capped_missing_refs(
+    target: &mut Vec<MissingRef>,
+    entries: impl IntoIterator<Item = MissingRef>,
+    max_errors: usize,
+) {
+    let remaining = if max_errors == 0 {
+        usize::MAX
+    } else {
+        max_errors.saturating_sub(target.len())
+    };
+    target.extend(entries.into_iter().take(remaining));
+}
+
 /// Check referential integrity of a PBF file.
 ///
 /// Verifies that all node references in ways point to existing nodes.
@@ -168,11 +196,14 @@ struct RelBlobResult {
 #[hotpath::measure]
 pub fn check_refs(
     path: &Path,
-    check_relations: bool,
-    show_ids: bool,
-    direct_io: bool,
+    opts: &CheckRefsOptions,
     host: &crate::host::Host,
 ) -> Result<RefCheckResult> {
+    let check_relations = opts.check_relations;
+    let show_ids = opts.show_ids;
+    let direct_io = opts.check.direct_io;
+    let max_errors = opts.check.max_errors;
+
     // `direct_io` is not plumbed through the parallel pread workers yet
     // (parallel_classify_phase opens the input via a shared Arc<File>
     // without O_DIRECT). Accept silently for now; if this matters for a
@@ -314,7 +345,9 @@ pub fn check_refs(
                             r.way_refs_checked += 1;
                             if !node_ids_ref.get(nref) {
                                 r.missing_node_refs.push(nref);
-                                if show_ids {
+                                if show_ids
+                                    && should_store_missing_ref(r.missing_refs.len(), max_errors)
+                                {
                                     r.missing_refs.push(MissingRef {
                                         missing_type: 'n',
                                         missing_id: nref,
@@ -334,7 +367,7 @@ pub fn check_refs(
                 way_refs_checked += r.way_refs_checked;
                 missing_node_refs_vec.extend(r.missing_node_refs);
                 if show_ids {
-                    missing_refs.extend(r.missing_refs);
+                    append_capped_missing_refs(&mut missing_refs, r.missing_refs, max_errors);
                 }
             },
             &*host.resources,
@@ -379,7 +412,12 @@ pub fn check_refs(
                                         r.rel_node_members_checked += 1;
                                         if !node_ids_ref.get(id) {
                                             r.missing_node_members.push(id);
-                                            if show_ids {
+                                            if show_ids
+                                                && should_store_missing_ref(
+                                                    r.missing_refs.len(),
+                                                    max_errors,
+                                                )
+                                            {
                                                 r.missing_refs.push(MissingRef {
                                                     missing_type: 'n',
                                                     missing_id: id,
@@ -393,7 +431,12 @@ pub fn check_refs(
                                         r.rel_way_members_checked += 1;
                                         if !way_ids_ref.get(id) {
                                             r.missing_way_refs.push(id);
-                                            if show_ids {
+                                            if show_ids
+                                                && should_store_missing_ref(
+                                                    r.missing_refs.len(),
+                                                    max_errors,
+                                                )
+                                            {
                                                 r.missing_refs.push(MissingRef {
                                                     missing_type: 'w',
                                                     missing_id: id,
@@ -431,7 +474,7 @@ pub fn check_refs(
                     deferred_relation_refs.extend(r.deferred_relation_refs);
                     if show_ids {
                         deferred_relation_ref_sources.extend(r.deferred_relation_ref_sources);
-                        missing_refs.extend(r.missing_refs);
+                        append_capped_missing_refs(&mut missing_refs, r.missing_refs, max_errors);
                     }
                 },
                 &*host.resources,
@@ -464,11 +507,13 @@ pub fn check_refs(
     if check_relations {
         let mut missing_relation_members_vec: Vec<i64> = Vec::new();
         let mut occurrences: u64 = 0;
+        // `deferred_relation_ref_sources` is parallel to
+        // `deferred_relation_refs` when `show_ids` is set, and empty otherwise.
         for (i, &id) in deferred_relation_refs.iter().enumerate() {
             if !relation_ids.get(id) {
                 missing_relation_members_vec.push(id);
                 occurrences += 1;
-                if show_ids {
+                if show_ids && should_store_missing_ref(missing_refs.len(), max_errors) {
                     missing_refs.push(MissingRef {
                         missing_type: 'r',
                         missing_id: id,

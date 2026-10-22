@@ -22,7 +22,6 @@
 //!   there; its 256 KB buffer and `fadvise(SEQUENTIAL)` let the kernel
 //!   keep a pipeline of blob bodies in flight.
 
-use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -193,10 +192,9 @@ impl HeaderWalker {
     /// this helper.
     pub(crate) fn open(path: &Path, diagnostics: &crate::host::Diagnostics) -> Result<Self> {
         let file = std::fs::File::open(path).map_err(|e| {
-            crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(format!(
-                "failed to open {}: {e}",
-                path.display()
-            ))))
+            crate::error::new_error(crate::error::ErrorKind::Io(super::file_reader::open_error(
+                path, &e,
+            )))
         })?;
         let file_size = file
             .metadata()
@@ -383,36 +381,6 @@ impl HeaderWalker {
     }
 }
 
-/// `pread` helper for consumers that already have the `Arc<File>`.
-///
-/// Equivalent to [`HeaderWalker::pread_data`] but without needing the
-/// walker instance. Useful for worker threads that receive the shared
-/// file and a list of `(data_offset, data_size)` descriptors.
-#[allow(dead_code)]
-pub(crate) fn pread_exact(
-    file: &std::fs::File,
-    offset: u64,
-    size: usize,
-    buf: &mut Vec<u8>,
-) -> Result<()> {
-    use std::os::unix::fs::FileExt as _;
-    buf.resize(size, 0);
-    file.read_exact_at(buf, offset)
-        .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))
-}
-
-/// Read a blob's compressed data bytes through an arbitrary `Read`
-/// source. Used when the blob is being streamed and we don't have
-/// random access. For pread-based paths, use [`HeaderWalker::pread_data`].
-#[allow(dead_code)]
-pub(crate) fn read_blob_data<R: Read>(reader: &mut R, size: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; size];
-    reader
-        .read_exact(&mut buf)
-        .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-    Ok(buf)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -421,6 +389,24 @@ mod tests {
     };
     use crate::block_builder::{BlockBuilder, HeaderBuilder};
     use crate::writer::{Compression, PbfWriter};
+
+    #[test]
+    fn open_preserves_not_found_error_kind() {
+        let missing = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("data")
+            .join("bench-tmp")
+            .join(format!("missing-header-walker-{}.pbf", std::process::id()));
+        let result = super::HeaderWalker::open(&missing, &crate::host::Diagnostics::discard());
+
+        match result {
+            Ok(_) => panic!("opening a missing file must fail"),
+            Err(error) => assert!(matches!(
+                error.kind(),
+                crate::error::ErrorKind::Io(io_error)
+                    if io_error.kind() == std::io::ErrorKind::NotFound
+            )),
+        }
+    }
 
     fn write_fixture(path: &std::path::Path, with_data: bool) {
         let file = std::fs::File::create(path).expect("create fixture");

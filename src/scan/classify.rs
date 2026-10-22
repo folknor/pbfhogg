@@ -28,8 +28,9 @@
 use crate::BoxResult as Result;
 
 /// One entry in a classification schedule: `(seq, data_offset, data_size)`.
-/// `seq` is a contiguous 0..n index local to the schedule; `data_offset` and
-/// `data_size` address the blob's payload in the input PBF.
+/// `seq` is an ordering key supplied by the schedule builder; it may be
+/// sparse. `data_offset` and `data_size` address the blob's payload in the
+/// input PBF.
 pub(crate) type ScheduleEntry = (usize, u64, usize);
 
 const WILLNEED_COALESCE_GAP_BYTES: u64 = 4 * 1024;
@@ -265,9 +266,11 @@ pub(crate) fn build_classify_schedule_blob_filtered(
     // to the prior `next_header_skip_blob` call: on an empty file return
     // MissingHeader; on non-empty files the first blob is dropped without
     // kind validation (subsequent non-OsmData blobs are filtered below).
-    let _ = walker
-        .next_header()?
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
+    drop(
+        walker
+            .next_header()?
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?,
+    );
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
@@ -355,9 +358,11 @@ pub(crate) fn build_classify_schedules_split(
 )> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, diagnostics)?;
-    let _ = walker
-        .next_header()?
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
+    drop(
+        walker
+            .next_header()?
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?,
+    );
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
@@ -538,7 +543,7 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
                         read_buf.resize(data_size, 0);
                         file.read_exact_at(&mut read_buf, data_offset)
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-                        let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
+                        let mut buf = crate::blob::pool_get(Some(&worker_pool), data_size * 4);
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
                             buf,
@@ -788,7 +793,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
                         read_buf.resize(data_size, 0);
                         file.read_exact_at(&mut read_buf, data_offset)
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-                        let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
+                        let mut buf = crate::blob::pool_get(Some(&worker_pool), data_size * 4);
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
                             buf,

@@ -43,7 +43,6 @@ pub(crate) struct WriterMetrics {
     pub uring_submit_ns: AtomicU64,
     pub uring_submit_and_wait_calls: AtomicU64,
     pub uring_submit_and_wait_ns: AtomicU64,
-    pub uring_cq_wait_ns: AtomicU64,
 
     /// Blobs whose `tagdata` was dropped because the encoded `BlobHeader`
     /// would otherwise have hit the 64 KiB format cap. Non-zero means the
@@ -93,7 +92,6 @@ impl WriterMetrics {
             uring_submit_ns: AtomicU64::new(0),
             uring_submit_and_wait_calls: AtomicU64::new(0),
             uring_submit_and_wait_ns: AtomicU64::new(0),
-            uring_cq_wait_ns: AtomicU64::new(0),
             tagdata_dropped_oversize: AtomicU64::new(0),
             coop_wait_ns: AtomicU64::new(0),
             emitted: AtomicBool::new(false),
@@ -215,7 +213,6 @@ impl WriterMetrics {
             uring_submit_and_wait_calls
         );
         emit!("writer_uring_submit_and_wait_ns", uring_submit_and_wait_ns);
-        emit!("writer_uring_cq_wait_ns", uring_cq_wait_ns);
         emit!("writer_tagdata_dropped_oversize", tagdata_dropped_oversize);
         emit!("writer_coop_wait_ns", coop_wait_ns);
 

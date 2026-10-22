@@ -135,32 +135,39 @@ impl std::fmt::Display for IndexType {
 }
 
 // ---------------------------------------------------------------------------
-// Unified node index
+// Resolved backend
 // ---------------------------------------------------------------------------
 
-/// Unified node coordinate index. Currently a single-variant enum because
-/// `external` builds its own coord representation inline (stage 4 reads
-/// `coord_payloads` directly, never instantiates `NodeIndex`); `auto`
-/// resolves to either Sparse (here) or External (separate path) before
-/// the build step. The enum stays as a future-proofing shape - a follow-up
-/// shrink encoding (planet-scale, ~17 GB working set) would add a variant
-/// rather than reshape the dispatch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolvedBackend {
+    Sparse,
+    External,
+}
+
+impl std::fmt::Display for ResolvedBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sparse => f.write_str("sparse"),
+            Self::External => f.write_str("external"),
+        }
+    }
+}
+
+#[cfg(not(test))]
+type NodeIndex = SparseArrayIndex;
+
+// Keep the reframe wire-format tests independent of an mmap-backed index.
+#[cfg(test)]
 enum NodeIndex {
     Sparse(SparseArrayIndex),
-    /// Test-only in-memory index. `SparseArrayIndex` is mmap-backed and only
-    /// constructible by running a full node pass over a real file, which puts
-    /// `reframe`'s wire-format behaviour out of reach of a unit test. This
-    /// variant exists so that behaviour can be asserted directly; it is
-    /// `cfg(test)` so no production path can reach it.
-    #[cfg(test)]
     InMemory(std::collections::HashMap<i64, (i32, i32)>),
 }
 
+#[cfg(test)]
 impl NodeIndex {
     fn get(&self, node_id: i64) -> Option<(i32, i32)> {
         match self {
-            Self::Sparse(idx) => idx.get(node_id),
-            #[cfg(test)]
+            Self::Sparse(index) => index.get(node_id),
             Self::InMemory(map) => map.get(&node_id).copied(),
         }
     }
@@ -247,14 +254,14 @@ pub fn add_locations_to_ways(
 
     // Auto-select: sparse unless the input qualifies for external AND the
     // estimated store exceeds the page-cache budget (see IndexType::Auto).
-    let index_type = if options.index_type == IndexType::Auto {
-        auto_select_index_type(input, options.direct_io, host)?
-    } else {
-        options.index_type
+    let backend = match options.index_type {
+        IndexType::Sparse => ResolvedBackend::Sparse,
+        IndexType::External => ResolvedBackend::External,
+        IndexType::Auto => auto_select_backend(input, options.direct_io, host)?,
     };
 
     // External join has its own pipeline - dispatch early.
-    if index_type == IndexType::External {
+    if backend == ResolvedBackend::External {
         let dest = DestinationGuard::new(output)?;
         let stats = external::external_join_in(
             input,
@@ -319,25 +326,20 @@ pub fn add_locations_to_ways(
             "altw_referenced_node_ids",
             i64::try_from(referenced.iter().count()).unwrap_or(i64::MAX),
         );
-        crate::debug::emit_counter(
-            "altw_index_kind",
-            match index_type {
-                IndexType::Sparse => 1,
-                IndexType::External | IndexType::Auto => i64::MIN,
-            },
-        );
+        crate::debug::emit_counter("altw_index_kind", 1);
     }
 
     crate::debug::emit_marker("ALTW_PASS1_START");
-    let index = build_node_index(
+    let index = build_node_index_sparse(
         input,
         options.direct_io,
         scratch_dir,
         referenced,
-        index_type,
         host,
         &token,
     )?;
+    #[cfg(test)]
+    let index = NodeIndex::Sparse(index);
     crate::debug::emit_marker("ALTW_PASS1_END");
 
     let relation_scan = if options.keep_untagged_nodes && !options.inject_prepass {
@@ -521,11 +523,11 @@ const AUTO_ANON_HEADROOM_BYTES: u64 = 3 << 30;
 // The threshold is relative to runtime RAM, never a hardcoded byte
 // constant: the knee is defined by store-vs-cache, and a constant fitted
 // to one host misroutes every other machine.
-fn auto_select_index_type(
+fn auto_select_backend(
     input: &Path,
     direct_io: bool,
     host: &crate::host::Host,
-) -> Result<IndexType> {
+) -> Result<ResolvedBackend> {
     let reader = crate::ElementReader::open_in(input, direct_io, host)?;
     let sorted = reader.header().is_sorted();
     drop(reader);
@@ -548,7 +550,7 @@ fn auto_select_index_type(
             "altw.auto_select",
             "auto-selected --index-type sparse (sorted={sorted}, indexed={has_index})"
         );
-        return Ok(IndexType::Sparse);
+        return Ok(ResolvedBackend::Sparse);
     }
 
     // Both backends can run: route on scale. The walk is priced like any
@@ -573,7 +575,7 @@ fn auto_select_index_type(
     );
 
     if let (Some(store), Some(budget)) = (store, budget) {
-        let rel = if chosen == IndexType::External {
+        let rel = if chosen == ResolvedBackend::External {
             ">"
         } else {
             "<="
@@ -605,16 +607,16 @@ fn auto_select_index_type(
 /// store or budget estimate routes external - the pre-scale-aware
 /// behavior for these inputs, and the cheap direction to be wrong in
 /// (seconds wasted vs minutes of pass-2 thrash).
-fn route_sorted_indexed(store_bytes: Option<u64>, budget_bytes: Option<u64>) -> IndexType {
+fn route_sorted_indexed(store_bytes: Option<u64>, budget_bytes: Option<u64>) -> ResolvedBackend {
     match (store_bytes, budget_bytes) {
         (Some(store), Some(budget)) => {
             if store.saturating_mul(100) > budget.saturating_mul(AUTO_STORE_BUDGET_PCT) {
-                IndexType::External
+                ResolvedBackend::External
             } else {
-                IndexType::Sparse
+                ResolvedBackend::Sparse
             }
         }
-        _ => IndexType::External,
+        _ => ResolvedBackend::External,
     }
 }
 
@@ -810,28 +812,6 @@ fn emit_stats_counters(stats: &Stats) {
 // ---------------------------------------------------------------------------
 // Pass 1: Build node coordinate index
 // ---------------------------------------------------------------------------
-
-fn build_node_index(
-    input: &Path,
-    direct_io: bool,
-    scratch_dir: &Path,
-    referenced: IdSet,
-    index_type: IndexType,
-    host: &crate::host::Host,
-    token: &crate::scratch::RunToken,
-) -> Result<NodeIndex> {
-    match index_type {
-        IndexType::Sparse => {
-            // Sparse takes ownership: the rank-indexed flat layout
-            // builds rank index on the IdSet and carries it through to
-            // SparseArrayIndex so pass 2 lookups can do
-            // rank_if_set(node_id) -> mmap read at rank * 8.
-            build_node_index_sparse(input, direct_io, scratch_dir, referenced, host, token)
-                .map(NodeIndex::Sparse)
-        }
-        IndexType::External | IndexType::Auto => unreachable!("resolved before build_node_index"),
-    }
-}
 
 /// Collect all node IDs referenced by ways (pass 0).
 ///
@@ -1165,7 +1145,7 @@ use crate::owned::{dense_node_metadata, element_metadata};
 /// Process a single `PrimitiveBlock`, writing elements into the thread-local
 /// `BlockBuilder` and flushing complete blocks into `output`.
 ///
-/// Way refs resolve via inline `NodeIndex::get`. The earlier
+/// Way refs resolve via inline `SparseArrayIndex::get`. The earlier
 /// `resolve_batch_locations` pre-pass that converted random sparse mmap
 /// I/O to a sorted sequential scan was removed in favour of straight
 /// parallel inline lookups: the parallelism win (sparse pass 2 went from
@@ -1270,7 +1250,7 @@ fn process_block(
 
 #[cfg(test)]
 mod tests {
-    use super::{AUTO_STORE_BUDGET_PCT, IndexType, route_sorted_indexed};
+    use super::{AUTO_STORE_BUDGET_PCT, ResolvedBackend, route_sorted_indexed};
 
     const GB: u64 = 1_000_000_000;
 
@@ -1283,12 +1263,12 @@ mod tests {
         let budget = Some(25 * GB);
         assert_eq!(
             route_sorted_indexed(Some(18_750_000_000), budget),
-            IndexType::Sparse,
+            ResolvedBackend::Sparse,
             "north-america-shaped store must route sparse"
         );
         assert_eq!(
             route_sorted_indexed(Some(28_940_000_000), budget),
-            IndexType::External,
+            ResolvedBackend::External,
             "europe-shaped store must route external"
         );
     }
@@ -1299,12 +1279,12 @@ mod tests {
         let threshold = budget * AUTO_STORE_BUDGET_PCT / 100;
         assert_eq!(
             route_sorted_indexed(Some(threshold), Some(budget)),
-            IndexType::Sparse,
+            ResolvedBackend::Sparse,
             "exactly at the threshold stays sparse"
         );
         assert_eq!(
             route_sorted_indexed(Some(threshold + 1), Some(budget)),
-            IndexType::External,
+            ResolvedBackend::External,
             "one byte over the threshold routes external"
         );
     }
@@ -1316,23 +1296,26 @@ mod tests {
     fn route_unknowns_fall_back_to_external() {
         assert_eq!(
             route_sorted_indexed(None, Some(25 * GB)),
-            IndexType::External
+            ResolvedBackend::External
         );
-        assert_eq!(route_sorted_indexed(Some(GB), None), IndexType::External);
-        assert_eq!(route_sorted_indexed(None, None), IndexType::External);
+        assert_eq!(
+            route_sorted_indexed(Some(GB), None),
+            ResolvedBackend::External
+        );
+        assert_eq!(route_sorted_indexed(None, None), ResolvedBackend::External);
     }
 
     #[test]
     fn route_survives_extreme_inputs_without_overflow() {
         assert_eq!(
             route_sorted_indexed(Some(u64::MAX), Some(25 * GB)),
-            IndexType::External,
+            ResolvedBackend::External,
             "a store big enough to overflow the pct math must saturate \
              toward external, never wrap into a sparse verdict"
         );
         assert_eq!(
             route_sorted_indexed(Some(0), Some(0)),
-            IndexType::Sparse,
+            ResolvedBackend::Sparse,
             "zero store on a zero budget is not greater-than"
         );
     }

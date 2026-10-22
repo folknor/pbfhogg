@@ -370,7 +370,7 @@ where
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
 
                         // Decode path: full PrimitiveBlock → extract → OwnedBlocks.
-                        let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
+                        let mut buf = crate::blob::pool_get(Some(&worker_pool), data_size * 4);
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = PrimitiveBlock::from_vec_pooled_with_scratch(
                             buf,
@@ -413,7 +413,6 @@ where
             Passthrough(u64, usize, u64),
         }
 
-        let _total_blobs = schedule.len();
         let mut reorder: crate::reorder_buffer::ReorderBuffer<ConsumerItem> =
             crate::reorder_buffer::ReorderBuffer::with_capacity(32);
 

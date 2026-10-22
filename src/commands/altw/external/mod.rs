@@ -66,7 +66,7 @@ use stage4::stage4_assembly;
 /// lossless for any `node_id` inside `[0, max_node_id]`. At
 /// planet (max_node_id ~= 14e9, 256 buckets) `bucket_width ~= 55M`,
 /// six orders of magnitude under 2^32.
-pub(super) fn bucket_width(max_node_id: u64, num_buckets: usize) -> u64 {
+fn bucket_width(max_node_id: u64, num_buckets: usize) -> u64 {
     debug_assert!(num_buckets > 0, "num_buckets must be > 0");
     max_node_id.div_ceil(num_buckets as u64).max(1)
 }
@@ -181,8 +181,7 @@ impl BucketLayout {
 /// min_id`); both are producer-side bugs that pass A would otherwise
 /// silently absorb. Returns 0 when there are no node blobs (degenerate
 /// input - bucket_layout will then reject any non-zero ref).
-#[allow(dead_code, private_interfaces)] // wired up in step 2 of A1.
-pub(super) fn max_node_id_from_blob_meta(blob_meta: &[blob_meta::BlobMeta]) -> Result<u64> {
+fn max_node_id_from_blob_meta(blob_meta: &[blob_meta::BlobMeta]) -> Result<u64> {
     let mut max_id: i64 = 0;
     for meta in blob_meta {
         if !matches!(meta.kind, crate::blob_meta::ElemKind::Node) {
@@ -746,9 +745,9 @@ pub(crate) fn external_join_in(
     }
     crate::debug::emit_marker("EXTJOIN_META_SCAN_END");
 
-    // Build the BucketLayout for A1 step 2's IdRecord emission. Width
-    // is derived from the largest node-blob max_id in indexdata, not
-    // the planet-wide constant - tighter buckets on smaller fixtures
+    // Build the BucketLayout for IdRecord emission. Width is derived
+    // from the largest node-blob max_id in indexdata, not the
+    // planet-wide constant - tighter buckets on smaller fixtures
     // and exact for any real input.
     let max_node_id = max_node_id_from_blob_meta(&blob_meta)?;
     let bucket_layout = BucketLayout::new(max_node_id, NUM_BUCKETS)?;
@@ -846,6 +845,10 @@ pub(crate) fn external_join_in(
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let (s1_minflt_after, s1_majflt_after) = crate::debug::read_page_faults();
+    let (s1_minflt_delta, s1_majflt_delta) = crate::debug::page_fault_deltas(
+        (s1_minflt_before, s1_majflt_before),
+        (s1_minflt_after, s1_majflt_after),
+    );
     let total_id_records: u64 = stage1_out.id_bucket_counts.iter().sum();
     // Partition-balance diagnostics (max/min-per-shard convention, cf.
     // derivepar_*_shard_max/min): min is taken over nonempty buckets so
@@ -882,14 +885,8 @@ pub(crate) fn external_join_in(
             id_bucket_min_records as i64,
         );
         crate::debug::emit_counter("extjoin_id_buckets_nonempty", id_buckets_nonempty as i64);
-        crate::debug::emit_counter(
-            "s1_minflt_delta",
-            (s1_minflt_after - s1_minflt_before) as i64,
-        );
-        crate::debug::emit_counter(
-            "s1_majflt_delta",
-            (s1_majflt_after - s1_majflt_before) as i64,
-        );
+        crate::debug::emit_counter("s1_minflt_delta", s1_minflt_delta as i64);
+        crate::debug::emit_counter("s1_majflt_delta", s1_majflt_delta as i64);
     }
     crate::debug::emit_marker("EXTJOIN_STAGE1_END");
 
@@ -957,6 +954,10 @@ pub(crate) fn external_join_in(
     )?;
     slot_buckets.finish()?;
     let (s2_minflt_after, s2_majflt_after) = crate::debug::read_page_faults();
+    let (s2_minflt_delta, s2_majflt_delta) = crate::debug::page_fault_deltas(
+        (s2_minflt_before, s2_majflt_before),
+        (s2_minflt_after, s2_majflt_after),
+    );
     // Reclaim id-shard scratch (workers × NUM_BUCKETS files;
     // 80+ GB at planet) before the heavier stage 3/4 streaming
     // handoff allocates its own tmp space.
@@ -971,14 +972,8 @@ pub(crate) fn external_join_in(
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("extjoin_resolved_count", resolved_count as i64);
-        crate::debug::emit_counter(
-            "s2_minflt_delta",
-            (s2_minflt_after - s2_minflt_before) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_majflt_delta",
-            (s2_majflt_after - s2_majflt_before) as i64,
-        );
+        crate::debug::emit_counter("s2_minflt_delta", s2_minflt_delta as i64);
+        crate::debug::emit_counter("s2_majflt_delta", s2_majflt_delta as i64);
     }
     crate::debug::emit_marker("EXTJOIN_STAGE2_END");
 
@@ -994,6 +989,7 @@ pub(crate) fn external_join_in(
     // stage 3 and stage 4 worker buffers are now both resident at the
     // same time (streaming stage 3 -> 4 landed in `beb7838` + `f93d896`
     // + `eecb46c`).
+    // The stage 3 worker pool and its router backing files share this count.
     let num_workers = crate::host::sized_workers(&*host.resources, 2, 1, 4).min(4);
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("s3_worker_count", num_workers as i64);
@@ -1104,7 +1100,7 @@ pub(crate) fn external_join_in(
                 slot_bucket_count,
                 total_slots,
                 &integrated,
-                host,
+                num_workers,
             )
             .map_err(|e| e.to_string());
             // Signal the router that no more publishes are coming. Must
@@ -1152,26 +1148,23 @@ pub(crate) fn external_join_in(
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     let (s3_minflt_after, s3_majflt_after) = crate::debug::read_page_faults();
+    let (s3_minflt_delta, s3_majflt_delta) = crate::debug::page_fault_deltas(
+        (s3_minflt_before, s3_majflt_before),
+        (s3_minflt_after, s3_majflt_after),
+    );
     for i in 0..slot_bucket_count {
         drop(std::fs::remove_file(scratch_dir.bucket_path("slot", i)));
     }
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter(
-            "s3_minflt_delta",
-            (s3_minflt_after - s3_minflt_before) as i64,
-        );
-        crate::debug::emit_counter(
-            "s3_majflt_delta",
-            (s3_majflt_after - s3_majflt_before) as i64,
-        );
+        crate::debug::emit_counter("s3_minflt_delta", s3_minflt_delta as i64);
+        crate::debug::emit_counter("s3_majflt_delta", s3_majflt_delta as i64);
     }
     crate::debug::emit_marker("EXTJOIN_STAGE4_END");
     crate::debug::emit_marker("EXTJOIN_STAGE3_END");
     crate::debug::emit_marker("EXTJOIN_STREAMING_END");
 
-    // Emit router stats that the deleted `build_blob_location_router`
-    // used to report.
+    // Emit router statistics for the streaming stage 3 path.
     {
         let s = router
             .stats

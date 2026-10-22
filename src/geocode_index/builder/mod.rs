@@ -99,16 +99,8 @@ impl BuildConfig {
             )
             .into());
         }
-        for (name, radius) in [
-            ("search radius", self.fine_search_radius_m),
-            ("coarse search radius", self.coarse_search_radius_m),
-        ] {
-            if !radius.is_finite() || radius < 0.0 {
-                return Err(
-                    format!("{name} must be a finite non-negative number, got {radius}").into(),
-                );
-            }
-        }
+        validate_radius("search radius", self.fine_search_radius_m)?;
+        validate_radius("coarse search radius", self.coarse_search_radius_m)?;
         Ok(())
     }
 }
@@ -628,6 +620,9 @@ mod config_tests {
         config.fine_search_radius_m = f32::NAN;
         assert!(config.validate().is_err());
         config.fine_search_radius_m = -1.0;
+        assert!(config.validate().is_err());
+        config.fine_search_radius_m = 75.0;
+        config.coarse_search_radius_m = f32::INFINITY;
         assert!(config.validate().is_err());
     }
 }

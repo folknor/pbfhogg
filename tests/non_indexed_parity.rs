@@ -461,12 +461,18 @@ fn check_refs_non_indexed_parity() {
     let in_non = dir.path().join("in_non.osm.pbf");
     write_both(&in_idx, &in_non);
 
-    let idx =
-        pbfhogg::check::refs::check_refs(&in_idx, true, false, false, &crate::common::test_host())
-            .expect("check_refs indexed");
-    let non =
-        pbfhogg::check::refs::check_refs(&in_non, true, false, false, &crate::common::test_host())
-            .expect("check_refs non-indexed");
+    let opts = pbfhogg::check::refs::CheckRefsOptions {
+        check: pbfhogg::check::CheckOptions {
+            max_errors: 0,
+            direct_io: false,
+        },
+        check_relations: true,
+        show_ids: false,
+    };
+    let idx = pbfhogg::check::refs::check_refs(&in_idx, &opts, &crate::common::test_host())
+        .expect("check_refs indexed");
+    let non = pbfhogg::check::refs::check_refs(&in_non, &opts, &crate::common::test_host())
+        .expect("check_refs non-indexed");
 
     assert_eq!(idx.node_count, non.node_count, "node_count parity");
     assert_eq!(idx.way_count, non.way_count, "way_count parity");
@@ -575,10 +581,12 @@ fn check_ids_non_indexed_parity() {
     write_both(&in_idx, &in_non);
 
     let opts = pbfhogg::check::verify_ids::VerifyIdsOptions {
+        check: pbfhogg::check::CheckOptions {
+            max_errors: 100,
+            direct_io: false,
+        },
         full: true,
         type_filter: None,
-        max_errors: 100,
-        direct_io: false,
     };
     let idx = pbfhogg::check::verify_ids::verify_ids(&in_idx, &opts, &crate::common::test_host())
         .expect("verify_ids indexed");

@@ -2,7 +2,7 @@
 //!
 //! Spawns `worker_count` long-lived threads that pull [`ScannedBlob`]
 //! candidates from the scanner over `candidate_rx` and emit
-//! [`WorkerOutput`] to the drain over `output_tx`. Each worker owns a
+//! [`DrainItem`]s to the drain over `drain_tx`. Each worker owns a
 //! thread-local [`BlockBuilder`], decompress and parse scratch buffers,
 //! and (under `--locations-on-ways`) a private `FxHashMap` accumulator
 //! published into a per-worker `Arc<Mutex<_>>` slot for the drain to
@@ -16,18 +16,18 @@
 //!   encodings, see `node_coords.rs`) if the blob is a Node and
 //!   `--locations-on-ways` is active, parse via
 //!   [`PrimitiveBlock::from_vec_with_scratch`], precise-check via
-//!   [`block_overlaps_diff`]. False positives emit
-//!   [`WorkerOutput::FalsePositive`] (carrying the original descriptor so
-//!   the drain can `copy_file_range` the raw frame). True overlaps compute
+//!   [`block_overlaps_diff`]. False positives emit a `DrainItem::CopyRange`
+//!   carrying the original descriptor so the drain can `copy_file_range`
+//!   the raw frame. True overlaps compute
 //!   the inline-upsert range from the descriptor's `id_range` against the
 //!   diff's sorted upsert vector and call [`rewrite_block_parallel`] on the
 //!   worker's persistent `BlockBuilder`, emitting
-//!   [`WorkerOutput::Rewritten`].
+//!   `DrainItem::Rewritten`.
 //! - [`ScannedBlob::Passthrough`]: only routed through workers under
 //!   `--direct-io` output (where the drain can't `copy_file_range`).
 //!   Workers pread the **full framed bytes** via
 //!   `(frame_start, frame_len)` and emit
-//!   [`WorkerOutput::OwnedPassthrough`].
+//!   `DrainItem::OwnedBytes`.
 //!
 //! ## Failure
 //!
@@ -51,7 +51,7 @@ use crate::error::{Error, ErrorKind, Result, new_error};
 use crate::writer::{Compression, frame_blob_pipelined};
 
 use super::classify::block_overlaps_diff;
-use super::descriptor::{BlobDescriptor, DrainItem, ScannedBlob, WorkerOutput};
+use super::descriptor::{BlobDescriptor, DrainItem, ScannedBlob};
 use super::diff_ranges::DiffRanges;
 use super::drain::LocMapHandle;
 use super::failure::FailureSlot;
@@ -122,8 +122,8 @@ pub(super) struct StreamingChannels {
     /// Candidate descriptors from the scanner. Closed when the scanner
     /// finishes (which signals workers to drain and exit).
     pub candidate_rx: mpsc::Receiver<ScannedBlob>,
-    /// Drain inputs. Workers convert their `WorkerOutput` to `DrainItem`
-    /// at send time so the drain has one unified input stream (the
+    /// Drain inputs. Workers send `DrainItem`s directly so the drain has
+    /// one unified input stream (the
     /// scanner's fast-path `DrainItem::CopyRange` and worker outputs
     /// merge into the same byte-budget reorder buffer keyed by global
     /// seq).
@@ -205,6 +205,7 @@ impl WorkerCounters {
 
 /// Run the worker pool to completion. Returns once the candidate channel
 /// is closed and every worker has exited.
+/// Called by `rewrite::merge` after the scanner and drain channels are ready.
 ///
 /// Errors are not returned: every one, setup or per-blob, is published to
 /// `cfg.failure` while the failing thread still holds a drain sender (the
@@ -323,7 +324,7 @@ pub(super) fn run_workers(
 /// each candidate dispatches to the appropriate handler.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn worker_loop(
-    worker_id: usize,
+    _worker_id: usize,
     file: &std::fs::File,
     candidate_rx: &Mutex<mpsc::Receiver<ScannedBlob>>,
     drain_tx: &mpsc::SyncSender<DrainItem>,
@@ -371,15 +372,15 @@ fn worker_loop(
                 ScannedBlob::Candidate(d) | ScannedBlob::Passthrough(d) => d.seq,
             };
             if panic_at_blob_seq == Some(seq) {
-                panic!("test-hooks: panic_at_blob_seq={seq} triggered in worker {worker_id}");
+                panic!("test-hooks: panic_at_blob_seq={seq} triggered in worker {_worker_id}");
             }
         }
 
         match item {
-            ScannedBlob::Candidate(desc) => {
+            ScannedBlob::Candidate(mut desc) => {
                 handle_candidate(
                     file,
-                    &desc,
+                    &mut desc,
                     drain_tx,
                     counters,
                     ranges,
@@ -432,7 +433,6 @@ fn worker_loop(
         flush_local_coords(slot, &mut local_coords);
     }
 
-    let _ = worker_id; // reserved for per-worker counter slots later
     Ok(())
 }
 
@@ -446,7 +446,7 @@ fn worker_loop(
 #[allow(clippy::too_many_lines)]
 fn handle_candidate(
     file: &std::fs::File,
-    desc: &BlobDescriptor,
+    desc: &mut BlobDescriptor,
     drain_tx: &mpsc::SyncSender<DrainItem>,
     counters: &WorkerCounters,
     ranges: &DiffRanges,
@@ -570,13 +570,9 @@ fn handle_candidate(
             .map_or_else(|| count_block_elements(&block), |i| i.count);
         let effective_id_range = (effective_min_id, effective_max_id);
         if use_copy_range {
-            let mut patched = desc.clone();
-            patched.kind = effective_kind;
-            patched.id_range = Some(effective_id_range);
-            return send_drain(
-                drain_tx,
-                WorkerOutput::FalsePositive(patched).into_drain_item(blob_count),
-            );
+            desc.kind = effective_kind;
+            desc.id_range = Some(effective_id_range);
+            return send_drain(drain_tx, desc.take_drain_item(blob_count));
         }
         // Consumer build (no `linux-direct-io` feature) or `--direct-io`
         // output: the drain rejects `DrainItem::CopyRange` up front, so

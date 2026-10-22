@@ -196,7 +196,10 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
     /// does not check: `write` is called per small fragment on the derive
     /// path, and checking there would put a load on every call to report the
     /// error at most one chunk sooner.
+    ///
+    /// A zero `chunk_size` is treated as one byte.
     pub fn new(inner: W, chunk_size: usize, worker_count: usize) -> Self {
+        let chunk_size = chunk_size.max(1);
         let worker_count = worker_count.max(1);
         let raw_cap = worker_count * QUEUE_SLOTS_PER_WORKER;
         let compressed_cap = worker_count * QUEUE_SLOTS_PER_WORKER;
@@ -501,6 +504,8 @@ fn worker_loop(
         // forwarded once the pool has stopped, for the same reason.
         let out = match job {
             Job::Barrier(ack) => Out::Barrier(ack),
+            // On compression error, compress_job records it in FirstFailure
+            // before returning the Dropped placeholder.
             Job::Compress(raw) => compress_job(seq, &raw, failure),
         };
         if compressed_tx.send((seq, out)).is_err() {
@@ -679,6 +684,13 @@ mod tests {
     fn small_stream_single_chunk() {
         let payload = b"hello world!".repeat(32);
         let out = roundtrip(&payload, 4096, 2);
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn zero_chunk_size_is_treated_as_one_byte() {
+        let payload = b"zero chunk size";
+        let out = roundtrip(payload, 0, 2);
         assert_eq!(out, payload);
     }
 

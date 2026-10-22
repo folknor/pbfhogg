@@ -76,12 +76,18 @@ pub fn derive_changes(
     // Single-pass: check sorted headers + indexdata from one file open each.
     let (old_sorted, old_indexed) = super::check_sorted_and_indexed(old_path, direct_io, host)?;
     let (new_sorted, new_indexed) = super::check_sorted_and_indexed(new_path, direct_io, host)?;
-    if !old_sorted {
-        crate::commands::require_sorted_err(old_path, "Old PBF")?;
-    }
-    if !new_sorted {
-        crate::commands::require_sorted_err(new_path, "New PBF")?;
-    }
+    crate::commands::require_sorted(
+        old_sorted,
+        old_path,
+        "Old PBF",
+        "Streaming diff requires sorted inputs to operate in constant memory.",
+    )?;
+    crate::commands::require_sorted(
+        new_sorted,
+        new_path,
+        "New PBF",
+        "Streaming diff requires sorted inputs to operate in constant memory.",
+    )?;
     let both_indexed = old_indexed && new_indexed;
 
     // Scratch directory for temp files (same as brokkr scratch).
@@ -211,13 +217,13 @@ impl ChangeSink {
         })
     }
 
-    fn write_create(&mut self, elem: &crate::Element<'_>, _kind: ElemKind) -> Result<()> {
+    fn write_create(&mut self, elem: &crate::Element<'_>) -> Result<()> {
         write_element_xml(&mut self.creates, elem, &mut self.coord_buf)?;
         self.create_count += 1;
         Ok(())
     }
 
-    fn write_modify(&mut self, elem: &crate::Element<'_>, _kind: ElemKind) -> Result<()> {
+    fn write_modify(&mut self, elem: &crate::Element<'_>) -> Result<()> {
         write_element_xml(&mut self.modifies, elem, &mut self.coord_buf)?;
         self.modify_count += 1;
         Ok(())
@@ -380,17 +386,17 @@ fn collect_phase_block_pair(
             }
             BlockMergeAction::BlobNewOnly { block, skip, .. } => {
                 for elem in block.elements().skip(skip) {
-                    sink.write_create(&elem, kind)?;
+                    sink.write_create(&elem)?;
                 }
             }
             BlockMergeAction::ElementModified { new, .. } => {
-                sink.write_modify(new, kind)?;
+                sink.write_modify(new)?;
             }
             BlockMergeAction::ElementOldOnly(o) => {
                 sink.write_delete(o, kind)?;
             }
             BlockMergeAction::ElementNewOnly(n) => {
-                sink.write_create(n, kind)?;
+                sink.write_create(n)?;
             }
         }
         Ok(())

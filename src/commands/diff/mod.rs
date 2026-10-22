@@ -97,7 +97,7 @@ pub(crate) fn check_sorted_and_indexed(
     Ok((sorted, indexed))
 }
 
-// `require_sorted_err` is defined in `super::mod` and re-used here.
+// `require_sorted` is defined in `super::mod` and re-used here.
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -228,12 +228,18 @@ pub fn diff(
     // Single-pass: check sorted headers + indexdata from one file open each.
     let (old_sorted, old_indexed) = check_sorted_and_indexed(old_path, direct_io, host)?;
     let (new_sorted, new_indexed) = check_sorted_and_indexed(new_path, direct_io, host)?;
-    if !old_sorted {
-        super::require_sorted_err(old_path, "Old PBF")?;
-    }
-    if !new_sorted {
-        super::require_sorted_err(new_path, "New PBF")?;
-    }
+    super::require_sorted(
+        old_sorted,
+        old_path,
+        "Old PBF",
+        "Streaming diff requires sorted inputs to operate in constant memory.",
+    )?;
+    super::require_sorted(
+        new_sorted,
+        new_path,
+        "New PBF",
+        "Streaming diff requires sorted inputs to operate in constant memory.",
+    )?;
     let both_indexed = old_indexed && new_indexed;
 
     crate::debug::emit_marker("DIFF_SCAN_START");

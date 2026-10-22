@@ -6,8 +6,8 @@ license.workspace = true
 repository.workspace = true
 description = "Command-line OpenStreetMap PBF toolkit"
 readme = "README.md"
-rust-version = "1.96"
-authors = ["folknor <folk@folk.wtf>"]
+rust-version.workspace = true
+authors.workspace = true
 keywords = ["osm", "openstreetmap", "pbf", "cli", "gis"]
 categories = ["command-line-utilities", "science::geo"]
 # Integration tests are declared below rather than discovered, matching the
@@ -49,12 +49,7 @@ test-hooks = ["pbfhogg/test-hooks"]
 [dependencies]
 pbfhogg = { version = "0.5", path = "..", default-features = false, features = ["commands"] }
 clap = { version = "4.6.1", features = ["derive"] }
-# float_roundtrip must match the library's serde_json (see root Cargo.toml):
-# correctly-rounded float parsing keeps config/GeoJSON coordinates identical
-# to their CLI-string-parsed equivalents. Feature unification would apply it
-# anyway when both crates build together; stating it here makes the
-# guarantee explicit rather than an artifact of the build graph.
-serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
+serde_json.workspace = true
 hotpath = "0.28.7"
 
 [dev-dependencies]

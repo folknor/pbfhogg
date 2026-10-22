@@ -21,6 +21,8 @@ use super::loc_mode::{LocMap, LocMode};
 // Writing OSC elements (from diff, metadata carried from the OSC attributes)
 // ---------------------------------------------------------------------------
 
+// Callers own merge-stat accounting; these helpers only encode elements.
+
 pub(super) fn write_osc_way(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,

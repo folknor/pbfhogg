@@ -32,30 +32,6 @@ model).
 
 Reported by: re-encoding, filtering and spatial, change application.
 
-## BUG-006 - `degrade --block-cap N` drives an unbounded preallocation
-
-`repack` uses `BlockBuilder::with_element_cap_prealloc(cap, file_len)`, and
-its comment plus `block_builder.rs` explain why: a CLI integer must not drive
-preallocation (`--elements-per-blob usize::MAX/2` was several huge
-allocations). `degrade::run_kind_phase` uses
-`BlockBuilder::with_element_cap(block_cap)`, which is
-`prealloc(cap, usize::MAX)`. `--block-cap` is hidden but accepted. Same fix,
-missed copy. Enforce by deleting `with_element_cap` or making it
-`#[cfg(test)]`, so every caller has to name a bound.
-`BlockBuilder::with_element_cap(0)` also panics (see HYG-047).
-
-Reported by: re-encoding.
-
-## BUG-007 - Degrade's "needs at least one flag" error omits `--drop-ids`
-
-`DegradeFlags::any()` includes `drop_ids`; the error text listing the flags
-does not. The flag list is spelled at four sites (`any()`, `needs_decode()`,
-the error text, the `applied` list in `write_summary`) plus the CLI, and they
-have already diverged. Generate the text from one `(field, flag name)` table,
-or test that the error text names every field.
-
-Reported by: re-encoding.
-
 ## BUG-009 - `apply-changes --locations-on-ways` does not update untouched base ways
 
 Decided: fix it, as its own project. Until then the CLI help, both CLI
@@ -127,7 +103,6 @@ assert uniqueness.
 
 Reported by: change application.
 
-
 ## BUG-020 - Apply-changes discards or escalates a scanner error or worker panic when the drain fails
 
 Worker errors now reach the caller: workers publish into a shared
@@ -175,22 +150,6 @@ sparse and external must give byte-identical way output.
 
 Reported by: altw and scanning.
 
-## BUG-023 - Sparse altw fails when `-o` is a bare relative filename (likely)
-
-`add_locations_to_ways` computes
-`scratch_dir = output.parent().unwrap_or(Path::new("."))`. For `out.osm.pbf`,
-`Path::parent()` returns `Some("")`, not `None`, so the fallback never fires.
-`sparse.rs::preallocate_sparse_file` passes that to `statvfs`, and
-`statvfs("")` fails with ENOENT: "failed to query free space for sparse index
-in : No such file or directory". External's `ScratchDir::new` survives because
-`"".join(name)` is relative. The same idiom is in `external/mod.rs` and the
-CLI. A library caller writing to `/dev/stdout` or a FIFO likewise gets
-`/dev` as derive-changes' scratch dir. Integration tests use absolute paths.
-Fix: one helper mapping an empty parent to `.`, used by every scratch
-derivation (HYG-028). Pin with a CLI test using `current_dir` and a bare `-o`.
-
-Reported by: altw and scanning, re-encoding.
-
 ## BUG-024 - `IdSet::pre_allocate` sizes from an unverified `max_id`
 
 `IdSet` memory now follows the number of distinct IDs rather than their
@@ -206,37 +165,12 @@ the same, per CORRECTNESS.md's rule for allocations sized from indexdata.
 
 Reported by: altw and scanning, geocode index, re-encoding.
 
-## BUG-026 - Altw stage 3's empty-bucket error path reports a panic that did not happen
-
-In `stage3_slot_reorder`, the non-empty-bucket error path records the error,
-calls `router.abort(...)` with the real message, and returns. The empty-bucket
-branch (`entry_counts[bucket_idx] == 0`) records the error and returns `Err`
-without `router.abort`; the still-armed `AbortOnDrop` guard then fires
-`router.abort("stage 3 worker panicked (AbortOnDrop guard fired)")`. Stage 4
-waiters see a panic message for a plain error; the top-level message is right
-only because `external_join` prefers the stage 3 result. `AbortOnDrop` stands
-in for both "panicked" and "returned early", and its message assumes the
-first.
-
-Reported by: altw and scanning.
-
 ## BUG-027 - `s2_orphan_records` undercounts
 
 The counter is `bkt.records.len() - record_ptr` after the blob walk. Records
 the walk passed over without resolving (an ID in a gap between tuples inside a
 blob's range) are not counted, so it covers only orphans past the last blob.
 It is the counter you would check when `missing_locations` is non-zero.
-
-Reported by: altw and scanning.
-
-## BUG-028 - Page-fault deltas underflow, and `/proc/self/stat` parsing breaks on a spaced comm
-
-`external_join` computes `s1_majflt_after - s1_majflt_before` (and s2, s3) on
-`u64`. `read_page_faults` returns `(0, 0)` on any read failure, so a failure
-on the second read underflows: a panic in debug, a huge counter in release.
-The parser uses `split_whitespace`, so fields shift if the comm field contains
-a space, which a library consumer's binary name can. Use `saturating_sub` and
-parse from the last `)`. See HYG-064 for the three `/proc` parsers.
 
 Reported by: altw and scanning.
 
@@ -268,48 +202,6 @@ honour it.
 
 Reported by: read path.
 
-## BUG-031 - `HeaderWalker::open` destroys the `io::ErrorKind`
-
-`header_walker.rs` wraps the open error as
-`io::Error::other(format!("failed to open {}: {e}"))`. `file_reader.rs` has
-`open_error`, whose doc says it exists to keep `ErrorKind` "so callers
-matching on `NotFound` still match". The two implementations have diverged:
-a missing input opened through the walker reports `Other`, through
-`FileReader` reports `NotFound`. Fix: one `open_error` used by both.
-
-Reported by: read path.
-
-## BUG-032 - `read_raw_frame` advances the caller's offset before the read succeeds
-
-`*file_offset += frame_len` precedes `reader.read_exact(...)?`. On a truncated
-payload the error propagates with the offset already past the frame, so any
-caller that reports or resumes from `file_offset` points past the failure.
-Move the increment after the read.
-
-Reported by: read path.
-
-## BUG-034 - `DirectReader::skip` misses skip-past-EOF on an aligned target
-
-When `aligned == target`, `skip` seeks and clears the buffer with no EOF
-check. `FileReader::skip`'s doc says `DirectReader::skip` already validates
-EOF, which is true only for the unaligned branch. A file truncated at a
-page-aligned point passes `skip` and surfaces later, or never for callers like
-`has_indexdata`. This is the shape-4 hole the buffered arm closes with its
-sentinel byte. Fix: the same sentinel, or compare against file size. Testable
-with an aligned truncated fixture on the `platform` profile.
-
-Reported by: read path.
-
-## BUG-035 - Sequential `for_each` fires its sort debug-assert on sorted history files
-
-Sequential `for_each` debug-asserts strictly increasing node IDs
-(`id > last_node_id`) whenever the file is sorted; `for_each_pipelined` uses
-`>=` for history files. The sequential path therefore asserts on any sorted
-history file in debug builds. Extract one `check_sorted_order(header)` used by
-both; testable with a sorted history fixture in debug.
-
-Reported by: read path.
-
 ## BUG-037 - `StringTable::pre_seed` identity mapping is not structural
 
 `pre_seed` feeds input strings 1..len through `add`, which dedups. The
@@ -333,14 +225,6 @@ from in-process data, never from untrusted PBF input. `pre_seed` and every
 rewrite command's `add` take strings decoded from input PBFs and OSC XML. The
 8000-element block bound may still make FxHash acceptable, but the stated
 reason is wrong.
-
-Reported by: write path.
-
-## BUG-038 - `ParallelGzipWriter` with `chunk_size == 0` loops forever
-
-In `ParallelGzipWriter::new(inner, 0, n)`, `write` loops with `space == 0`
-and `take == 0`. `worker_count` is clamped to 1; `chunk_size` is not. Clamp
-it or take `NonZeroUsize`.
 
 Reported by: write path.
 
@@ -419,18 +303,6 @@ reported as success that `parse_bbox`'s comment says was fixed for bboxes.
 
 Reported by: filtering and spatial.
 
-## BUG-045 - Geocode header radii are not validated on read
-
-`BuildConfig::validate` rejects non-finite or negative radii, but
-`Header::from_bytes` accepts any `f32`. A NaN radius from another producer or
-corruption makes `fine_max_dist_sq` NaN and every `dist_sq < max_dist_sq`
-false: the index opens and answers "nothing here" everywhere. Level checks
-were mirrored into the reader; radius checks were not. Fix: one
-`validate_radius` shared by builder and reader, tested by poking header bytes
-16..24 like the existing level tests.
-
-Reported by: geocode index.
-
 ## BUG-046 - The geocode reader skips out-of-range entries, and one off-by-one reads the next way
 
 Reader entry lists are validated for length but not content
@@ -474,6 +346,88 @@ and `tags-count` cannot skip blobs of a renumbered file by tag key, while
 indexdata is written. Its rewriters already walk every element's keys.
 
 Reported by: the renumber fix.
+
+## BUG-079 - The version gate refuses identical repeats from overlapping diffs
+
+The version rule refuses any change whose version is not strictly greater
+than the highest claimed so far, so an identical change appearing twice is
+refused. Consecutive replication diffs overlap at their boundaries: bygg's
+germany seq 4705 and 4706 both carry node 135379864 at version 12 with the
+same timestamp and coordinates, and `merge-changes --simplify` refuses every
+germany range starting at 4705, at 3a664c7b as at HEAD. Applying an
+identical change twice is a no-op, so refusing it protects nothing. The
+documented promise that applying the same OSC twice is refused (DEVIATIONS.md,
+"Change stream: version precedence is enforced") is the same behaviour.
+
+Options: admit an equal version (a conflicting equal version then also
+passes, last wins); admit it only when the content is identical too (a
+cold-path comparison against the stored record or change); or keep it and
+document `--allow-version-regression` for overlapping diffs. Needs the user's
+call, since it changes a documented contract. Blocks benchmarking the
+merge-changes floor on real data.
+
+Reported by: the version-floor A/B on germany.
+
+## BUG-080 - The decoder accepts two block shapes the index scanner refuses
+
+Found while making the `blob_meta` scanner strict, which now refuses both:
+`PackedUint32Iter` truncates a key sid above `u32::MAX` to a different,
+possibly valid, sid instead of failing, and `WireGroup::dense` reads only
+the first `DenseNodes` of a group where protobuf merge semantics would
+combine them, silently dropping the rest. Either way the decoder yields a
+different block from the one on the wire, with no error.
+
+Reported by: the blob_meta strict-scanner fix.
+
+## BUG-081 - Extract still trusts indexdata on the paths verification does not cover
+
+Extract now decodes a passthrough candidate before copying it raw, but: a
+verified raw copy keeps the input's BlobHeader, so a false `count` or ID range
+in it carries into the output; a blob whose indexdata bbox claims it lies
+outside the region is skipped without decoding; and every extract schedule
+trusts the indexdata element kind. Verification also checks only what
+building a `PrimitiveBlock` validates, not metadata arithmetic done later
+during decode.
+
+Reported by: the extract passthrough fix.
+
+## BUG-082 - Apply-changes LocationsOnWays gaps outside the fixed paths
+
+Node blobs whose indexdata labels them way or relation skip coordinate
+extraction and can be spliced untouched; the `Pending` location mode protects
+only ways being rewritten, not routing that trusts a wrong kind. The
+plain-node rewrite path (`write_base_node_local`) still goes through
+`Node::nano_lat` and the block API's granularity arithmetic, which do not
+check overflow, while the new `node_coords.rs` extractor does.
+
+Reported by: the apply-changes LocationsOnWays fix.
+
+## BUG-083 - Measured figures in comments from the 2026-10-22 fixes
+
+Several comments written in that round carry measured figures (the IdSet
+`set` fast path's per-ref cost, `SPARSE_MAX`'s copy volume, renumber's
+`PREALLOC_IDS_PER_BYTE` denmark numbers). They are measurement provenance
+today and will drift; reword when they do.
+
+Reported by: the 2026-10-22 fix round.
+
+## BUG-084 - Claims and paths from the 2026-10-22 round that nobody has verified
+
+- DEVIATIONS.md's renumber cross-validation now says the differences from
+  osmium are confined to orphan refs in relation member lists. That was true
+  under the old pass-through policy; it has not been re-run under the orphan
+  shift. Run `brokkr verify renumber --dataset denmark` and reword to match.
+- Unmeasured after this round: extract's passthrough verification (germany's
+  indexdata nominated no candidates, so the A/B never exercised it; needs an
+  input whose node blobs carry v3 bboxes), apply-changes
+  `--locations-on-ways` (the new checked coordinate extractor runs per node
+  blob), and the `merge-changes --simplify` version floor (blocked by
+  BUG-079 on every germany range).
+- `IdSet`'s array-chunk representation was benchmarked only through altw,
+  tags-filter, extract and renumber on germany and denmark; a planet altw
+  cell has not been run.
+
+Reported by: the 2026-10-22 fix round.
 
 ## BUG-075 - A repeated OSMHeader is skipped by some commands and refused by others
 
@@ -570,16 +524,6 @@ function-level `cast_possible_truncation` allows across `pass3.rs`, `admin.rs`,
 
 Reported by: geocode index.
 
-## BUG-053 - The sorted-input error tells non-diff commands that diff needs sorting
-
-`commands/mod.rs` has `require_sorted` and `require_sorted_err` with
-byte-identical format strings ending "Streaming diff requires sorted inputs to
-operate in constant memory." That sentence is emitted for `renumber`,
-`time-filter` and `cat --dedupe` too. Fix: one function taking a reason, as
-`require_indexdata` does.
-
-Reported by: CLI and plumbing.
-
 ## BUG-054 - `inspect --show` prints to stderr on the exit-1 path the contract says is silent
 
 `reference/cli-reference.md` and the `ExitStatus` doc in `main.rs` say exit 1
@@ -601,17 +545,6 @@ writes directly to the final path; the remove error is swallowed, and
 `--force` is hard-wired `true`. Fix: `guarded_output`, or bench into a scratch
 path the command owns; test that a pre-existing output survives failure.
 `disallowed_methods` on `fs::remove_file` in `cli/` would have caught it.
-
-Reported by: CLI and plumbing.
-
-## BUG-057 - `check --max-errors` never reaches the refs check
-
-`--max-errors` (default 100, documented as "per check") bounds `verify_ids`
-and `check_index` but is not passed to `check_refs`
-(`check_refs(path, check_relations, show_ids, direct_io)`).
-`result.missing_refs` collects every missing reference, so on an extract with
-millions of dangling refs `--show-ids` grows without bound. Pass it through via
-an options struct shared by all three checks.
 
 Reported by: CLI and plumbing.
 
@@ -746,14 +679,6 @@ regression on Denmark reads as "data missing".
 
 Reported by: test harness.
 
-## BUG-068 - apply-changes prints its summary twice
-
-`apply_changes::merge` prints the summary in `rewrite.rs`, and the CLI's
-`run_apply_changes` prints it again. Remove the latter print after a separate
-CLI output change is approved. bench-merge also gets the library summary.
-
-Reported by: library-use implementation survey.
-
 ## BUG-070 - `uring_writer` shutdown is not guaranteed to finish
 
 `uring_writer`'s `drain_best_effort` gives up after a fixed number of error
@@ -795,3 +720,26 @@ scanner now includes empty keys, so `check --index` flags such blobs as
 `TagKeysMissing`.
 
 Reported by: the blob_meta fix for the former strict-scanner entry.
+
+## BUG-086 - Decompression buffers under-reserve
+
+`src/read/decompress.rs::pool_get` calls
+`buf.reserve(capacity.saturating_sub(buf.capacity()))` on a cleared
+(`len == 0`) pooled buffer. `reserve(n)` only guarantees
+`capacity >= len + n`, so a pooled 1 MiB buffer asked for 1.5 MiB reserves
+nothing and grows during decompression instead. `buf.reserve(capacity)` is
+the intended call. Other reservation calls in the same file subtract the
+existing capacity the same way. It is the only decompression-buffer path, so
+this is a performance change on every blob: measure before and after.
+
+Reported by: the wave-0 reviews.
+
+## BUG-088 - The check detail cap does not bound check memory
+
+`--max-errors` now caps the retained detail lists, but `verify_ids` still
+collects per-blob violations uncapped before merging, and `check_refs` keeps
+its counting and deferred-reference vectors whole. Total memory on a hostile
+input still grows with the number of violations. Bounding it needs the
+exact counts carried through a different aggregation.
+
+Reported by: the wave-0 review.

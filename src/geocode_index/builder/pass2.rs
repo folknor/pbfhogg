@@ -63,15 +63,12 @@ pub(super) const EXCLUDED_HIGHWAYS: &[&str] = &[
 /// Node coordinates are written directly to interp_nodes.bin;
 /// this struct stores only the file offset and count.
 ///
-/// KNOWN LIMITATION (sentinel ambiguity): `start_number == 0 && end_number == 0`
-/// is reused as the "unresolved" sentinel -
-/// `resolve_interpolation_endpoints_mmap` only overwrites these fields when it
-/// finds both endpoints among addr points. A real OSM interpolation way that
-/// genuinely starts at house number 0 is indistinguishable from an unresolved
-/// one at read time. "0" as a house number is rare but exists in some regions.
-/// If the caller ever needs to disambiguate, add a separate `resolved: bool`
-/// field here and persist it into [`crate::geocode_index::format::InterpWay`]
-/// (requires bumping `FORMAT_VERSION`).
+/// Interpolation endpoints must have positive house numbers. Endpoint matching
+/// rejects parsed zero values; serialized zero marks unresolved ways, so a
+/// real interpolation endpoint at house number 0 is unsupported (see
+/// CORRECTNESS.md). Fix shape if that is ever needed: persist a separate
+/// `resolved: bool` into [`crate::geocode_index::format::InterpWay`] and bump
+/// `FORMAT_VERSION`.
 pub(super) struct SlimInterpWay {
     pub(super) street_offset: u32,
     pub(super) interpolation_type: u8,
@@ -640,10 +637,7 @@ pub(super) fn run_pass2(
                         interpolation_type: pi.interpolation_type,
                         node_file_offset: interp_node_offset,
                         node_count: nc,
-                        // `(start_number = 0, end_number = 0)` is the unresolved
-                        // sentinel - `resolve_interpolation_endpoints_mmap`
-                        // overwrites when both endpoints match addr points.
-                        // KNOWN LIMITATION on `SlimInterpWay` applies.
+                        // Zero marks endpoints that were not resolved.
                         start_number: 0,
                         end_number: 0,
                     });

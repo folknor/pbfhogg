@@ -440,13 +440,15 @@ fn check_refs_rejects_schedule_entry_past_eof() {
     // Pre-fix: the schedule gets built cleanly, workers fail later
     // with an opaque `read_exact_at` UnexpectedEof. Post-fix: the
     // schedule builder catches the mismatch up front.
-    let result = pbfhogg::check::refs::check_refs(
-        &input,
-        false, // check_relations
-        false, // show_ids
-        false, // direct_io
-        &crate::common::test_host(),
-    );
+    let opts = pbfhogg::check::refs::CheckRefsOptions {
+        check: pbfhogg::check::CheckOptions {
+            max_errors: 0,
+            direct_io: false,
+        },
+        check_relations: false,
+        show_ids: false,
+    };
+    let result = pbfhogg::check::refs::check_refs(&input, &opts, &crate::common::test_host());
     let err = match result {
         Ok(_) => panic!("expected check_refs to error on truncated PBF"),
         Err(e) => e,

@@ -405,7 +405,12 @@ fn index_input(
                 blob_buf.resize(data_size, 0);
                 reader.read_exact(blob_buf)?;
                 let hdr = decode_blob_to_headerblock(blob_buf)?;
-                require_sorted(&hdr, input, &format!("Input file {}", input.display()))?;
+                require_sorted(
+                    hdr.is_sorted(),
+                    input,
+                    &format!("Input file {}", input.display()),
+                    "Cat dedupe requires sorted inputs so it can merge them in type-then-ID order.",
+                )?;
                 header = Some(hdr);
             }
             (BlobKind::OsmHeader, true) => {

@@ -369,17 +369,16 @@ fn classify_group(data: &[u8]) -> BlockType {
 /// No code in the crate needs to clone a `PrimitiveBlock`. For shared access, use
 /// `Arc<PrimitiveBlock>` - a single atomic increment regardless of block size.
 pub struct PrimitiveBlock {
-    /// Owns the decompressed protobuf bytes.
-    #[allow(dead_code)]
-    buffer: Bytes,
-    /// Zero-copy parsed view. Borrows from `buffer` via lifetime erasure.
+    /// Keeps alive the decompressed bytes borrowed by the zero-copy block view.
+    _buffer: Bytes,
+    /// Zero-copy parsed view. Borrows from `_buffer` via lifetime erasure.
     ///
     /// # Safety
     ///
-    /// The `'static` lifetime is a lie - `block` actually borrows from `buffer`.
+    /// The `'static` lifetime is a lie - `block` actually borrows from `_buffer`.
     /// This is safe because:
-    /// 1. `buffer` is `Bytes` (immutable, reference-counted), never mutated.
-    /// 2. `buffer` and `block` live in the same struct - `block` cannot outlive `buffer`.
+    /// 1. `_buffer` is `Bytes` (immutable, reference-counted), never mutated.
+    /// 2. `_buffer` and `block` live in the same struct - `block` cannot outlive `_buffer`.
     /// 3. `PrimitiveBlock` is not `Clone`, preventing accidental separation.
     /// 4. All public access goes through `&self`, tying the real lifetime to the borrow.
     block: WireBlock<'static>,
@@ -419,7 +418,7 @@ impl PrimitiveBlock {
         let block = unsafe { std::mem::transmute::<WireBlock<'_>, WireBlock<'static>>(block) };
 
         Ok(PrimitiveBlock {
-            buffer: bytes,
+            _buffer: bytes,
             block,
         })
     }

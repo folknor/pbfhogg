@@ -298,7 +298,7 @@ fn decode_one(
     // old route paid, going straight from the framed blob bytes via
     // `decompress_blob_raw` - the same wire-level path the way branch above uses.
     let t_dc = std::time::Instant::now();
-    let mut decompressed = crate::blob::pool_get_pub(&scratch.pool, 0);
+    let mut decompressed = crate::blob::pool_get(Some(&scratch.pool), 0);
     decompress_blob_raw(&scratch.read_buf, &mut decompressed).map_err(|e| e.to_string())?;
     #[allow(clippy::cast_possible_truncation)]
     counters

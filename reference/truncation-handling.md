@@ -132,8 +132,8 @@ seek-relative optimization for in-range targets and only pay the
 sentinel-read cost when the skip would otherwise pass EOF
 silently.
 
-Commands that consume `BlobReader` / `ElementReader` /
-`IndexedReader` inherit the contract automatically: an `Err` from
+Commands that consume `BlobReader` / `ElementReader` inherit the contract
+automatically: an `Err` from
 the read path propagates up through the command's `run()` and out
 to the CLI's `main`, which exits non-zero with the error message
 on stderr.

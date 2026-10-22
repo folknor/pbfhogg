@@ -19,8 +19,7 @@ use std::time::Duration;
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{
-    BlobFilter, BlobReader, BlobType, ByteOffset, Element, ElementReader, IndexedReader, Info,
-    MemberId,
+    BlobFilter, BlobReader, BlobType, ByteOffset, Element, ElementReader, Info, MemberId,
 };
 use tempfile::TempDir;
 
@@ -1103,72 +1102,6 @@ fn blobfilter_only_ways_passes_through_on_non_indexed_input() {
         "BlobFilter on non-indexed input must NOT drop node blobs - callers get every element"
     );
     assert_eq!(saw_ways, 5, "ways still delivered");
-}
-
-// ---------------------------------------------------------------------------
-// IndexedReader on non-indexed input
-// ---------------------------------------------------------------------------
-//
-// `IndexedReader::create_index` walks only blob headers (not bodies),
-// so it does not itself depend on `BlobHeader.indexdata`. The per-blob
-// `id_ranges` used by `ways_available` / `node_range_included` are
-// populated lazily from decoded blocks via `update_element_id_ranges`
-// (src/read/indexed.rs:184) - the same code path runs whether or not
-// the input carries indexdata. This test pins that contract: the
-// output of `read_ways_and_deps` on a non-indexed PBF must match the
-// output on its indexed twin.
-
-#[test]
-fn indexed_reader_output_matches_on_indexed_and_non_indexed_twins() {
-    let dir = TempDir::new().unwrap();
-    let indexed = dir.path().join("indexed.osm.pbf");
-    let non_indexed = dir.path().join("non_indexed.osm.pbf");
-
-    // 8 nodes + 4 ways; each way refs two consecutive nodes. "building"
-    // tag on odd-numbered ways so read_ways_and_deps has a meaningful
-    // filter and node-dependency resolution.
-    let nodes = crate::common::generate_nodes(8, 1);
-    let mut ways = crate::common::generate_ways(4, 1_000, 2, 1);
-    for (i, w) in ways.iter_mut().enumerate() {
-        if i % 2 == 0 {
-            w.tags = vec![("building", "yes")];
-        }
-    }
-
-    crate::common::write_test_pbf_sorted(&indexed, &nodes, &ways, &[]);
-    crate::common::write_test_pbf_non_indexed(&non_indexed, &nodes, &ways, &[]);
-    crate::common::assert_indexed(&indexed);
-    crate::common::assert_non_indexed(&non_indexed);
-
-    let collect = |path: &Path| -> (Vec<i64>, Vec<i64>) {
-        let mut reader = IndexedReader::from_path(path).unwrap();
-        let mut way_ids = Vec::new();
-        let mut node_ids = Vec::new();
-        reader
-            .read_ways_and_deps(
-                |w| w.tags().any(|(k, v)| k == "building" && v == "yes"),
-                |element| match element {
-                    Element::Way(w) => way_ids.push(w.id()),
-                    Element::Node(n) => node_ids.push(n.id()),
-                    Element::DenseNode(n) => node_ids.push(n.id()),
-                    _ => {}
-                },
-            )
-            .unwrap();
-        way_ids.sort_unstable();
-        node_ids.sort_unstable();
-        (way_ids, node_ids)
-    };
-
-    let (ways_idx, nodes_idx) = collect(&indexed);
-    let (ways_non, nodes_non) = collect(&non_indexed);
-
-    assert_eq!(ways_idx, ways_non, "way set diverges on non-indexed input");
-    assert_eq!(
-        nodes_idx, nodes_non,
-        "node dep set diverges on non-indexed input"
-    );
-    assert!(!ways_idx.is_empty(), "filter must match at least one way");
 }
 
 // ---------------------------------------------------------------------------

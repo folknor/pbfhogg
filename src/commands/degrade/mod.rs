@@ -3,8 +3,7 @@
 //! code paths that require less-optimised inputs (unsorted, missing
 //! indexdata, scattered coords).
 //!
-//! Transformations: `--unsort`, `--unsort-intra`, `--strip-locations`,
-//! `--strip-indexdata`, `--strip-tagdata`, `--strip-bbox`, `--drop-ids`.
+//! The transformation flags are defined by [`DegradeFlags`].
 //! Flags compose (except the two unsort modes, which are mutually
 //! exclusive).
 //!
@@ -83,6 +82,8 @@ use super::{
 };
 use crate::blob::BlobKind;
 use crate::blob_meta::ElemKind;
+/// Compatibility alias for [`crate::block_builder::DEFAULT_ELEMENT_CAP`].
+pub use crate::block_builder::DEFAULT_ELEMENT_CAP as DEFAULT_BLOCK_CAP;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
@@ -96,12 +97,6 @@ use crate::writer::{
     strip_header_block_fields,
 };
 use crate::{Element, ElementReader};
-
-/// Default per-block element cap. Matches the `BlockBuilder` default and
-/// the PBF interop convention. Tests pass a smaller cap via the hidden
-/// `--block-cap` CLI flag so fixtures don't need 8000+ elements per kind
-/// to exercise the `--unsort` swap.
-pub const DEFAULT_BLOCK_CAP: usize = 8000;
 
 /// Batch size for the parallel-framing fan-out on the merge thread.
 const FRAME_BATCH: usize = 32;
@@ -292,17 +287,33 @@ pub struct DegradeFlags {
 }
 
 impl DegradeFlags {
+    fn flag_states(self) -> [(bool, &'static str, bool); 10] {
+        [
+            (self.unsort, "--unsort", true),
+            (self.unsort_intra, "--unsort-intra", true),
+            (self.strip_locations, "--strip-locations", true),
+            (self.strip_indexdata, "--strip-indexdata", false),
+            (self.strip_tagdata, "--strip-tagdata", false),
+            (self.corrupt_tagdata, "--corrupt-tagdata", false),
+            (self.corrupt_indexdata, "--corrupt-indexdata", false),
+            (
+                self.corrupt_indexdata_kind,
+                "--corrupt-indexdata-kind",
+                false,
+            ),
+            (self.strip_bbox, "--strip-bbox", false),
+            (self.drop_ids.is_some(), "--drop-ids", true),
+        ]
+    }
+
+    fn flag_names(self) -> [&'static str; 10] {
+        self.flag_states().map(|(_, name, _)| name)
+    }
+
     pub fn any(self) -> bool {
-        self.unsort
-            || self.unsort_intra
-            || self.strip_locations
-            || self.strip_indexdata
-            || self.strip_tagdata
-            || self.corrupt_tagdata
-            || self.corrupt_indexdata
-            || self.corrupt_indexdata_kind
-            || self.strip_bbox
-            || self.drop_ids.is_some()
+        self.flag_states()
+            .into_iter()
+            .any(|(enabled, _, _)| enabled)
     }
 
     /// Returns `true` if elements must be decoded and re-encoded. Only the
@@ -310,7 +321,9 @@ impl DegradeFlags {
     /// `--strip-bbox`, alone or together) can run as a pure blob-level
     /// passthrough.
     fn needs_decode(self) -> bool {
-        self.unsort || self.unsort_intra || self.strip_locations || self.drop_ids.is_some()
+        self.flag_states()
+            .into_iter()
+            .any(|(enabled, _, needs_decode)| enabled && needs_decode)
     }
 
     /// Either unsort mode: workers ship every matching element as `Owned*`,
@@ -342,37 +355,12 @@ pub struct DegradeStats {
 
 impl DegradeStats {
     pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
-        let mut applied: Vec<&str> = Vec::new();
-        if self.flags.unsort {
-            applied.push("--unsort");
-        }
-        if self.flags.unsort_intra {
-            applied.push("--unsort-intra");
-        }
-        if self.flags.strip_locations {
-            applied.push("--strip-locations");
-        }
-        if self.flags.strip_indexdata {
-            applied.push("--strip-indexdata");
-        }
-        if self.flags.strip_tagdata {
-            applied.push("--strip-tagdata");
-        }
-        if self.flags.corrupt_tagdata {
-            applied.push("--corrupt-tagdata");
-        }
-        if self.flags.corrupt_indexdata {
-            applied.push("--corrupt-indexdata");
-        }
-        if self.flags.corrupt_indexdata_kind {
-            applied.push("--corrupt-indexdata-kind");
-        }
-        if self.flags.strip_bbox {
-            applied.push("--strip-bbox");
-        }
-        if self.flags.drop_ids.is_some() {
-            applied.push("--drop-ids");
-        }
+        let applied: Vec<&str> = self
+            .flags
+            .flag_states()
+            .into_iter()
+            .filter_map(|(enabled, name, _)| if enabled { Some(name) } else { None })
+            .collect();
         let dropped = if self.dropped > 0 {
             format!(" (dropped {} elements)", self.dropped)
         } else {
@@ -394,7 +382,7 @@ impl DegradeStats {
 /// Apply the requested degradations to `input` and emit `output`.
 ///
 /// `block_cap` is the per-block element cap used by the decode path's
-/// `BlockBuilder`. Production callers pass `DEFAULT_BLOCK_CAP`; tests pass
+/// `BlockBuilder`. Production callers pass [`DEFAULT_BLOCK_CAP`]; tests pass
 /// a smaller value so the `--unsort` swap can be exercised on fixtures of
 /// modest size.
 ///
@@ -415,11 +403,10 @@ pub fn degrade(
     host: &crate::host::Host,
 ) -> Result<DegradeStats> {
     if !flags.any() {
-        return Err("degrade requires at least one transformation flag \
-                    (--unsort, --unsort-intra, --strip-locations, \
-                     --strip-indexdata, --strip-tagdata, --corrupt-tagdata, \
-                     --corrupt-indexdata, --corrupt-indexdata-kind, --strip-bbox)"
-            .into());
+        let flag_names = flags.flag_names().join(", ");
+        return Err(
+            format!("degrade requires at least one transformation flag ({flag_names})").into(),
+        );
     }
     // The decode path rebuilds each blob's hints from the elements it just
     // re-encoded, so a corrupt hint written there would be overwritten by a
@@ -859,7 +846,7 @@ impl UnsortKindState {
     }
 
     fn should_inject_after(&self) -> bool {
-        self.seen + 1 == self.hold_at + 1 && self.held.is_some()
+        self.held.is_some() && self.seen == self.hold_at
     }
 }
 
@@ -903,6 +890,10 @@ fn degrade_decode_path(
 
     let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
         crate::scan::classify::build_classify_schedules_split(input, &host.diagnostics)?;
+    // Use the input size as a preallocation budget for the caller-supplied
+    // cap. Compressed input can expand to more elements than bytes; the
+    // vectors grow as needed without changing the requested block cap.
+    let prealloc_bound = usize::try_from(shared_file.metadata()?.len()).unwrap_or(usize::MAX);
 
     // Selection must finish before opening the writer: an over-large N must
     // not leave a header-only output behind.
@@ -949,6 +940,7 @@ fn degrade_decode_path(
         &node_schedule,
         ElemKind::Node,
         block_cap,
+        prealloc_bound,
         flags,
         compression,
         drop_sets.as_ref().map(|sets| sets.for_kind(ElemKind::Node)),
@@ -966,6 +958,7 @@ fn degrade_decode_path(
         &way_schedule,
         ElemKind::Way,
         block_cap,
+        prealloc_bound,
         flags,
         compression,
         drop_sets.as_ref().map(|sets| sets.for_kind(ElemKind::Way)),
@@ -983,6 +976,7 @@ fn degrade_decode_path(
         &rel_schedule,
         ElemKind::Relation,
         block_cap,
+        prealloc_bound,
         flags,
         compression,
         drop_sets
@@ -1113,6 +1107,7 @@ fn run_kind_phase(
     schedule: &[(usize, u64, usize)],
     kind: ElemKind,
     block_cap: usize,
+    prealloc_bound: usize,
     flags: DegradeFlags,
     compression: Compression,
     drop: Option<&FxHashSet<i64>>,
@@ -1132,7 +1127,7 @@ fn run_kind_phase(
     type PhaseResult = std::result::Result<WorkerOutput, String>;
     let mut reorder: ReorderBuffer<PhaseResult> = ReorderBuffer::with_capacity(32);
 
-    let mut bb = BlockBuilder::with_element_cap(block_cap);
+    let mut bb = BlockBuilder::with_element_cap_prealloc(block_cap, prealloc_bound);
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut pending: Vec<OwnedBlock> = Vec::with_capacity(FRAME_BATCH);
     let mut unsort = UnsortKindState::new(flags, block_cap);
@@ -1267,7 +1262,7 @@ fn run_kind_phase(
     if let Some(elem) = unsort.held.take() {
         write_owned_to_central(&elem, &mut bb, &mut output)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        elements += 1;
+        // This element was already counted in its input tail.
     }
 
     flush_local(&mut bb, &mut output).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -1322,7 +1317,7 @@ fn worker_decode_kind(
         (total - tail, tail)
     };
 
-    let mut bb = BlockBuilder::with_element_cap(cap);
+    let mut bb = BlockBuilder::with_element_cap_prealloc(cap, total);
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut full_framed: Vec<Vec<u8>> = Vec::new();
     let mut tail: KindPayload = match kind {
@@ -1634,6 +1629,20 @@ mod tests {
     use super::{DropKey, drop_hash, hash_kind, keep_smallest, mix64};
     use crate::blob_meta::ElemKind;
     use std::collections::BinaryHeap;
+
+    #[test]
+    fn unsort_accepts_the_largest_block_cap_without_overflow() {
+        let flags = super::DegradeFlags {
+            unsort: true,
+            ..super::DegradeFlags::default()
+        };
+        let mut state = super::UnsortKindState::new(flags, usize::MAX);
+        assert!(!state.should_hold());
+        assert!(!state.should_inject_after());
+        state.seen = 1;
+        assert!(!state.should_hold());
+        assert!(!state.should_inject_after());
+    }
 
     fn select(keys: impl IntoIterator<Item = DropKey>, n: u64) -> Vec<DropKey> {
         let mut heap = BinaryHeap::new();

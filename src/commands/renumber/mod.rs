@@ -367,7 +367,12 @@ pub fn renumber_external(
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
         header_blob.to_headerblock()?
     };
-    require_sorted(&header, input, "Input PBF")?;
+    require_sorted(
+        header.is_sorted(),
+        input,
+        "Input PBF",
+        "Renumber assigns IDs by file position and resolves references by rank.",
+    )?;
     super::warn_locations_on_ways_loss(&header, host);
     // Default to zlib:1 for external renumber - the compression pipeline
     // is on the critical path for pass 1 and stage 2d, and zlib:6 adds

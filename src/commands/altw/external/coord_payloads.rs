@@ -65,19 +65,17 @@ pub(super) enum BlobLocation {
 }
 
 // ====================================================================
-// ConcurrentBlobLocationRouter - streaming variant for item #2
+// ConcurrentBlobLocationRouter
 // ====================================================================
 //
 // Stage 3 publishes per-blob entries as it produces them; stage 4 workers
 // call `wait_ready(blob_idx)` before preading the input PBF way blob, so a
 // stalled decode thread never holds a decompressed block + StringTable
-// resident while waiting. The sequential `build_blob_location_router`
-// phase is gone.
+// resident while waiting.
 //
 // Three terminal states: populated (serve), aborted (return recorded
 // error), producer_done with empty slot (return deterministic missing-
-// publication error - matches the current build_blob_location_router
-// "non-zero refs but no entry" check at coord_payloads.rs:398).
+// publication error so a consumer cannot wait forever for a missing entry).
 
 /// Side of a straddler this worker is contributing.
 #[derive(Clone, Copy, Debug)]

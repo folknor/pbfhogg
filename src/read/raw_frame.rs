@@ -36,16 +36,14 @@ pub(crate) struct RawBlobFrame {
     /// it must not act on - and wrong for `check --index`, whose entire job is
     /// to notice that the file claims something it cannot back up. Malformed
     /// indexdata was passing verification silently until this field existed.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "commands"), allow(dead_code))]
     pub(crate) index_present: bool,
-    /// Per-blob tag key data from BlobHeader field 4, if present.
-    /// Populated by `read_raw_frame` for downstream callers; current
-    /// readers (extract, cat, diff, etc.) don't access it directly,
-    /// but it's part of the wire-correct frame snapshot.
-    #[allow(dead_code)]
+    /// Per-blob tag key data from BlobHeader field 4, if present. Retained
+    /// so `check --index` can compare the stored claim with decoded tags.
+    #[cfg_attr(not(feature = "commands"), allow(dead_code))]
     pub(crate) tagdata: Option<Box<[u8]>>,
     /// Byte offset of this frame in the input file (for copy_file_range).
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "commands"), allow(dead_code))]
     pub(crate) file_offset: u64,
 }
 
@@ -87,11 +85,11 @@ pub(crate) fn read_raw_frame<R: Read>(
 
     let blob_offset = header.payload_offset();
     let frame_len = blob_offset + header.data_size;
-    *file_offset += frame_len as u64;
     let mut frame_bytes = vec![0u8; frame_len];
     frame_bytes[..4].copy_from_slice(&u32::to_be_bytes(header.header_len as u32));
     frame_bytes[4..blob_offset].copy_from_slice(&header_bytes);
     reader.read_exact(&mut frame_bytes[blob_offset..])?;
+    *file_offset += frame_len as u64;
 
     Ok(Some(RawBlobFrame {
         frame_bytes,
@@ -149,4 +147,29 @@ pub(crate) fn read_blob_header_only(
         index,
         has_tagdata: header.tagdata.is_some(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_raw_frame;
+    use std::io::Cursor;
+
+    #[test]
+    fn truncated_payload_does_not_advance_file_offset() {
+        // BlobHeader: type = "OSMData", datasize = 1. The frame ends before
+        // the declared Blob payload, so read_raw_frame must leave the logical
+        // offset at the beginning of the incomplete frame.
+        let mut input = Cursor::new(vec![
+            0, 0, 0, 11, 0x0A, 7, b'O', b'S', b'M', b'D', b'a', b't', b'a', 0x18, 1,
+        ]);
+        let mut file_offset = 42;
+        let result = read_raw_frame(
+            &mut input,
+            &mut file_offset,
+            &crate::host::Diagnostics::discard(),
+        );
+
+        assert!(result.is_err(), "the missing payload must be an error");
+        assert_eq!(file_offset, 42);
+    }
 }

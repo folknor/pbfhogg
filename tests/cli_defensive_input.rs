@@ -63,13 +63,9 @@ fn write_lying_sorted_pbf(path: &Path) {
     writer.flush().expect("flush");
 }
 
-/// Cluster-2 fix #1: `renumber_external` scans the full schedule for
-/// `max_node_id` instead of trusting "last blob's max_id == global
-/// max". Before the fix the lying-sorted fixture caused a panic
-/// inside `IdSet::set_atomic` ("pre_allocate only covers..."). After
-/// the fix the command runs without that panic - either to
-/// completion, or to a clean error that does NOT mention
-/// `pre_allocate`.
+/// Renumber must refuse out-of-order blobs even when the header claims
+/// `Sort.Type_then_ID`: positional numbering and rank-based reference
+/// resolution agree only when IDs increase in file order.
 #[test]
 fn renumber_survives_lying_sorted_header_out_of_order_blobs() {
     let dir = TempDir::new().expect("tempdir");
@@ -84,14 +80,55 @@ fn renumber_survives_lying_sorted_header_out_of_order_blobs() {
         .arg(&output)
         .run();
 
-    // We don't require the command to produce "correct" output (the
-    // input is intentionally malformed). What we reject is a panic
-    // mentioning the `IdSet::set_atomic` failure mode.
+    assert!(
+        !out.status.success(),
+        "renumber must refuse out-of-order blobs; stdout:\n{}\nstderr:\n{}",
+        out.stdout_str(),
+        out.stderr_str(),
+    );
     let stderr = out.stderr_str();
     assert!(
+        stderr.contains("renumber requires node ids to strictly increase in file order"),
+        "expected the cross-blob order refusal; stderr:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("panicked at"),
+        "renumber must refuse malformed order without panicking; stderr:\n{stderr}",
+    );
+    assert!(
         !stderr.contains("pre_allocate only covers"),
-        "renumber panicked in IdSet::set_atomic despite the \
-         max_id scan fix; stderr:\n{stderr}",
+        "renumber hit the IdSet preallocation panic; stderr:\n{stderr}",
+    );
+}
+
+#[test]
+fn renumber_unsorted_header_error_explains_renumber_requirement() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf(&input, &[], &[], &[]);
+
+    let out = CliInvoker::new()
+        .arg("renumber")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .run();
+
+    assert!(
+        !out.status.success(),
+        "renumber must reject an unsorted header; stdout:\n{}\nstderr:\n{}",
+        out.stdout_str(),
+        out.stderr_str(),
+    );
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("Renumber assigns IDs by file position and resolves references by rank."),
+        "expected renumber-specific sortedness guidance; stderr:\n{stderr}",
+    );
+    assert!(
+        !stderr.contains("Streaming diff requires sorted inputs"),
+        "renumber error must not mention diff; stderr:\n{stderr}",
     );
 }
 

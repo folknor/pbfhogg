@@ -5,6 +5,9 @@
 //! that overlap the diff, and a single drain reorders the results by seq
 //! and writes the output.
 //!
+//! There is no separate batch-classify pass; the scanner and workers
+//! process descriptors as they flow through the pipeline.
+//!
 //! Key insight: we pass ALL upsert IDs in a blob's range to the rewrite function.
 //! IDs that match base elements are modifications (handled by normal element processing);
 //! IDs that don't match are creates (emitted by the cursor). This eliminates the need

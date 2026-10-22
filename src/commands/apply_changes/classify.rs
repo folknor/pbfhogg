@@ -21,9 +21,9 @@ use super::diff_ranges::DiffRanges;
 /// creates (new IDs not present in the base PBF) can cause
 /// `range_overlaps` to return true (the create IDs fall within the
 /// blob's range), but this function returns false (no element in the
-/// block has a matching diff ID). In that case the blob is passed
-/// through raw, and the creates are emitted afterward by the
-/// gap-create logic.
+/// block has a matching diff ID). The worker separately checks for
+/// upserts inside the blob's range and rewrites it when any are present,
+/// so those creates are interleaved at their sorted positions.
 pub(super) fn block_overlaps_diff(block: &PrimitiveBlock, ranges: &DiffRanges) -> bool {
     use std::cmp::Ordering;
 

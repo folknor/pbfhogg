@@ -1065,6 +1065,8 @@ impl PbfWriter<FileWriter> {
             record_send_wait(t_send);
             Ok(())
         } else {
+            // This is reachable through FileWriter::buffered plus the public
+            // generic PbfWriter::new constructor.
             let out_fd = self
                 .writer
                 .as_mut()

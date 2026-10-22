@@ -693,12 +693,10 @@ impl OscSink for CompactSink<'_> {
         let id = parse_i64_attr(e, "id")?;
 
         if action == OscAction::Delete {
-            // A delete's metadata is read for the same reason a
-            // create's is: its `version` is a claim about which state of
-            // the object this change supersedes, and the overlay records
-            // it as a versioned tombstone so a later stale change cannot
-            // resurrect an earlier version through the gap a bare
-            // index removal used to leave.
+            // A delete's version is a claim about the object state it
+            // supersedes. The overlay stores it in the version floor before
+            // removing the live entry, so a later version check still sees
+            // the highest claim after the object is deleted.
             let meta = arena_meta(e, self.overlay)?;
             match kind {
                 ElemKind::Node => self.overlay.delete_node(id, &meta)?,

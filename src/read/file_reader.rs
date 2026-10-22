@@ -29,7 +29,7 @@ pub enum FileReader {
 /// A bare `No such file or directory (os error 2)` is what a user saw for
 /// a mistyped input path: true, and useless on a command with several
 /// inputs. The path is known here and nowhere below here.
-fn open_error(path: &Path, err: &io::Error) -> io::Error {
+pub(crate) fn open_error(path: &Path, err: &io::Error) -> io::Error {
     io::Error::new(
         err.kind(),
         format!("failed to open {}: {err}", path.display()),

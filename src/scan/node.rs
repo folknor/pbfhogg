@@ -7,7 +7,6 @@
 //!
 //! Used by:
 //! - External join stage 2 (inline variant for interleaved merge-join)
-//! - ALTW dense pass 1 (node index build)
 //! - ALTW sparse pass 1 (node index build)
 //!
 //! # Known limitations

@@ -258,9 +258,9 @@ fn time_filter_history(
 /// pre-migration shape hit a structural ~28 GB anon ceiling at planet (five
 /// SIGKILL'd attempts, last three with full instrumentation) because the
 /// `par_iter().collect()` step materialises the full batch's
-/// `Vec<OwnedBlockTriple>` results before draining, and the upstream
-/// pipeline keeps stuffing the next batch's PrimitiveBlocks in flight
-/// under the cross-thread retention pattern (`pipeline.rs:66-89`).
+/// `Vec<OwnedBlockTriple>` results before draining, and the upstream pipeline
+/// can hold its bounded decode window of additional PrimitiveBlocks in flight
+/// while the batch drains.
 /// Allocator knobs (`malloc_trim` per batch, `M_MMAP_THRESHOLD=64K`,
 /// `decode_ahead=8`) all hit the same ceiling: mallinfo2 showed bytes
 /// shifting between `arena` and `hblkhd` but the total live set was

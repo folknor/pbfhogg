@@ -189,9 +189,10 @@ Anger: 9 - verifying indexdata costs a per-blob decode.
 Node blobs whose indexdata labels them way or relation skip coordinate
 extraction and can be spliced untouched; the `Pending` location mode protects
 only ways being rewritten, not routing that trusts a wrong kind. The
-plain-node rewrite path (`write_base_node_local`) still goes through
-`Node::nano_lat` and the block API's granularity arithmetic, which do not
-check overflow, while the new `node_coords.rs` extractor does.
+plain-node rewrite path (`write_base_node_local`) goes through
+`Node::nano_lat`, whose scaling now wraps by documented policy, while the
+`node_coords.rs` extractor does checked scaling; whether that rewrite path
+should check the way the extractor does is open.
 
 Reported by: the apply-changes LocationsOnWays fix.
 
@@ -310,42 +311,6 @@ fix is HYG-071's shared scratch.
 Reported by: change application, filtering and spatial, read path, test
 harness.
 
-## BUG-090 - The apply-changes scanner can hold every post-node descriptor until EOF
-
-Anger: 8 - apply-changes internals.
-
-Under `--locations-on-ways`, `apply_changes/scanner.rs` holds back way and
-relation descriptors until the node-to-way barrier fires. Nothing bounds how
-many it holds, so on an input where the barrier fires late the scanner can
-buffer every descriptor after the node phase until end of file, separately
-from the drain's reorder map. Unverified beyond the fixer's reading.
-
-Reported by: the wave-1 drain fixer.
-
-## BUG-094 - The apply-changes `-j 1` refusal may rest on a fixed hazard
-
-Anger: 7 - CLI behaviour.
-
-`apply_changes/rewrite.rs` refuses `--jobs 1` because a single worker had a
-deadlock hazard on a mid-stream worker panic. Scanner and worker panics are
-now caught into the shared failure slot and the drain drops its channels, so
-the lone worker's exit drops the candidate receiver and the scanner's send
-fails; the hazard looks gone. The error text and the `MergeOptions::jobs` doc
-still state the old rationale. The node-to-way barrier deadlock recorded
-under HYG-081 is a separate `-j 1` case and must be ruled out before the
-refusal is lifted.
-
-Reported by: the wave-1 reviewer.
-
-## BUG-095 - `docs/cli/commands.md` says `check --max-errors` stops scanning
-
-Anger: 2 - doc correction.
-
-`--max-errors` caps the retained detail lists; the scan still runs to the
-end and the counts stay exact. The CLI guide says it stops scanning.
-
-Reported by: the wave-2 check fixer.
-
 ## BUG-096 - Extract polygon rings are not checked for self-intersection
 
 Anger: 7 - CLI behaviour.
@@ -356,17 +321,6 @@ answers by crossing parity, which may not match what the user drew. Either
 refuse such rings or document the even-odd interpretation.
 
 Reported by: the wave-2 extract fixer.
-
-## BUG-097 - The plain-`cat` scanner error carries no context and drops its source
-
-Anger: 7 - message content.
-
-A malformed payload in plain `cat` now fails the run, but the error is the
-scanner's message only, with no file or blob, and
-`blob_meta::scan_block_ids_and_tags` converts the scanner error with
-`io::Error::new(InvalidData, e.to_string())`, dropping its source chain.
-
-Reported by: the wave-2 reviewer.
 
 ## BUG-099 - Staged geocode publication leaves edge cases open
 
@@ -389,30 +343,15 @@ directory and publishes with two renames. Open:
 
 Reported by: the wave-3 reviewer.
 
-## BUG-100 - Coordinate scaling and offset arithmetic is unchecked in the readers
-
-Anger: 8 - decoder arithmetic.
-
-Delta reconstruction is now modular everywhere, but the step after it is
-not covered by any policy: granularity scaling and lat/lon offset arithmetic
-in the dense, plain-node, way-location and columnar read paths uses plain
-`i64` multiplication and addition. Extreme but legal granularity or offset
-values overflow (a debug panic, a release wrap to a wrong coordinate).
-`block.rs` validates some header fields at construction; whether that bounds
-every product here is unverified.
-
-Reported by: the wave-4 delta fixer.
-
-## BUG-101 - Dense `keys_vals` string indices still narrow silently
+## BUG-103 - Block granularities are narrowed to i32 unchecked
 
 Anger: 9 - decoder refusals.
 
-Plain-element key/value indices above `u32::MAX` are now refused at block
-construction. The dense analogue is not: `read/dense.rs` `DenseRawTagIter`
-reads `keys_vals` sids with `read_varint() as i32`, so an index above
-`i32::MAX` narrows to a different, possibly valid, sid, and
-`validate_dense_keys_vals` in `read/block.rs` reads them with an unbounded
-`read_varint`. The bound belongs in the existing validation scan, as for
-plain elements, not in the per-element iterator.
+`read/wire.rs` reads `granularity` and `date_granularity` with
+`read_varint() as i32`, so a value above `i32::MAX` narrows to a different,
+possibly valid, granularity and every coordinate or timestamp in the block
+scales by it silently. Refuse an out-of-range value where the block header
+is parsed (once per block), like the other construction-time bounds.
 
-Reported by: the wave-4 reviewer.
+Reported by: the wave-5 reviewer.
+

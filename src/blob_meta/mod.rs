@@ -58,7 +58,7 @@ pub(crate) fn scan_block_ids_and_tags(
     raw: &[u8],
 ) -> std::io::Result<(Option<BlobIndex>, Option<TagIndex>)> {
     let (index, tags) = try_scan_block_ids_and_tags(raw)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok((index.map(|(index, _sorted)| index), tags))
 }
 
@@ -481,6 +481,20 @@ impl BlobFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combined_scanner_io_error_retains_scanner_source() {
+        let error = match scan_block_ids_and_tags(&[0x80]) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed block should fail scanning"),
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error.get_ref().is_some(),
+            "the scanner error must remain available as the I/O error source"
+        );
+    }
 
     #[test]
     fn roundtrip_v2_way_no_bbox() {

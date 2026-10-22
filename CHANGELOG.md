@@ -674,6 +674,13 @@
   different and possibly valid string. Both are now wire-format errors in
   every reader, in indexdata generation and in the raw node and way scanners.
 
+- **A dense-node tag string index above `i32::MAX` is refused** when a block
+  is decoded, instead of being narrowed to a different and possibly valid
+  string.
+
+- **Plain `cat` names the input file and byte offset** when a blob without
+  indexdata fails to scan, instead of printing the scanner's message alone.
+
 - **Element IDs whose deltas wrap are read the same way everywhere.** A
   block the writer produces for IDs `i64::MIN` then `i64::MAX` decodes to
   those IDs; indexdata generation (so `PbfWriter` itself), the

@@ -640,7 +640,7 @@ pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>
 | `-o, --output <FILE>` | Output file |
 | `--locations-on-ways` | Preserve way-node locations through the merge (requires base PBF with LocationsOnWays). Ways the OSC creates or modifies get locations from the merged nodes; base ways the OSC does not touch keep their existing locations, even when the OSC moves or deletes a node they reference. Rerun `add-locations-to-ways` on the output for a full refresh. See DEVIATIONS.md. |
 | `--ignore-missing-nodes` | With `--locations-on-ways`, permit unresolved references to retain the legacy `(0,0)` fallback instead of failing |
-| `-j, --jobs <N>` | Worker-pool size for the descriptor-first pipeline. `0` (default) uses the `nproc - 2` heuristic (leaves two cores for scanner + drain, min 1). Pass a specific N to measure scaling or constrain CPU use. |
+| `-j, --jobs <N>` | Worker-pool size for the descriptor-first pipeline. `0` (default) uses the `nproc - 2` heuristic (leaves two cores for scanner + drain, minimum 2). Pass a specific N >= 2 to measure scaling or constrain CPU use; an explicit `-j 1` is refused (single-worker operation is not a validated configuration). |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O |

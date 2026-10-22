@@ -1305,6 +1305,16 @@ fn passthrough_rejects_malformed_unindexed_payload() {
         "malformed payload was not refused as a failure"
     );
     assert!(
+        out.stderr_str().contains(&input.display().to_string()),
+        "scanner error omitted its input path; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert!(
+        out.stderr_str().contains("at byte offset"),
+        "scanner error omitted blob location; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert!(
         !output.exists(),
         "a refused cat must not publish its output"
     );

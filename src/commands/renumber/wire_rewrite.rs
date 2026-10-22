@@ -1538,7 +1538,7 @@ mod tests {
         set
     }
 
-    /// The collision BUG-071 names: old ids 1 and 2 are orphans here and
+    /// The orphan/new-id collision: old ids 1 and 2 are orphans here and
     /// are also the new ids of nodes 10 and 20. Shifted by start + count
     /// they land past the renumbered range, distinct from every live id.
     #[test]

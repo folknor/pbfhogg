@@ -768,8 +768,31 @@ fn packed_uint32_count(data: &[u8]) -> Result<usize> {
 /// `roles_sid`/`memids`/`types` on relations); the `DenseNodes` sub-message
 /// appears at most once (`WireGroup::dense`) and parses; its packed `id`, `lat` and `lon` arrays are well-formed and of
 /// equal length; its `keys_vals` array describes exactly as many per-node tag
-/// runs as there are ids; and every array in its optional `denseinfo`
-/// sub-message is either absent or exactly as long as the id array.
+/// runs as there are ids, and every string index in it fits a nonnegative
+/// `int32` (the dense tag iterators narrow to `i32`); and every array in its
+/// optional `denseinfo` sub-message is either absent or exactly as long as the
+/// id array.
+///
+/// # What is deliberately not checked
+///
+/// Coordinate and timestamp *values*. Delta reconstruction is modular, and so
+/// is the step after it: `offset + granularity * raw` for coordinates and
+/// `raw * date_granularity` for timestamps use wrapping `i64` arithmetic in
+/// every block-API accessor, so debug and release agree and nothing panics.
+/// A value whose scaling runs past `i64` is garbage in, garbage out, exactly
+/// like the far larger class of in-range but meaningless values (a latitude
+/// of 10^6 degrees) that no reader refuses, and like the `as i32` narrowing
+/// of the decimicrodegree accessors. Refusing overflow here would mean
+/// decoding every `lat` / `lon` array at construction instead of the byte
+/// count scan below - a second decode of the bulk of every file, on every
+/// read - to reject only the narrowest slice of nonsense. Nor can a bound
+/// come from the header alone: modular deltas let an accumulated value be any
+/// `i64`, so every header except granularity 0, or granularity 1 with a
+/// zero offset, admits some overflowing coordinate.
+/// Paths that turn coordinates into output they vouch for (the altw node
+/// scanner in `scan/node.rs`, apply-changes' `node_coords.rs` extractor) do
+/// their own checked scaling and narrowing during the decode they already
+/// perform.
 ///
 /// The framing walk comes first deliberately - it is the check that makes the
 /// element iterators used below unable to terminate early, so running the
@@ -908,8 +931,15 @@ fn validate_dense_keys_vals(keys_vals_data: &[u8], node_count: usize) -> Result<
     let mut cursor = Cursor::new(keys_vals_data);
     let mut runs = 0usize;
     let mut in_run = false;
+    // Dense tag iterators narrow to i32. Require nonnegative int32 string
+    // indices here, including values, so high bits cannot alias a valid sid.
+    // This is a width check, not string-table resolution: tags_checked still
+    // reports a fitting index that points beyond the table.
     while !cursor.is_empty() {
         let key = cursor.read_varint()?;
+        if key > 0x7fff_ffff {
+            return Err(new_wire_error("dense tag string index exceeds int32"));
+        }
         if key == 0 {
             runs += 1;
             in_run = false;
@@ -920,7 +950,9 @@ fn validate_dense_keys_vals(keys_vals_data: &[u8], node_count: usize) -> Result<
                 "dense keys_vals ends with a key that has no value",
             ));
         }
-        cursor.read_varint()?;
+        if cursor.read_varint()? > 0x7fff_ffff {
+            return Err(new_wire_error("dense tag string index exceeds int32"));
+        }
         in_run = true;
     }
     // A trailing run with no terminating 0 still describes one node.
@@ -1855,5 +1887,82 @@ mod strict_validation_tests {
             vec![(1, 130)],
             "the final tag must survive a run that ends without a delimiter"
         );
+    }
+
+    #[test]
+    fn dense_tag_indices_must_fit_signed_int32() {
+        use super::validate_dense_keys_vals;
+
+        // Largest nonnegative int32, first overflowing value, and a value
+        // whose low 32 bits alias string index 1.
+        let max = [0xff, 0xff, 0xff, 0xff, 0x07];
+        for sid in [
+            &[0x80, 0x80, 0x80, 0x80, 0x08][..],
+            &[0x81, 0x80, 0x80, 0x80, 0x10],
+        ] {
+            for as_key in [false, true] {
+                let mut tags = Vec::new();
+                tags.extend_from_slice(if as_key { sid } else { &[1] });
+                tags.extend_from_slice(if as_key { &[1] } else { sid });
+                tags.push(0);
+                let err = PrimitiveBlock::from_vec(block_with_groups(&[dense_group_with(
+                    1, &tags, None,
+                )]))
+                .expect_err("oversized dense string index must fail construction");
+                assert!(err.to_string().contains("exceeds int32"));
+            }
+        }
+        let mut tags = max.to_vec();
+        tags.extend_from_slice(&max);
+        tags.push(0);
+        validate_dense_keys_vals(&tags, 1).expect("int32 maximum fits");
+        validate_dense_keys_vals(&[0x81, 0x80, 0, 1, 0], 1)
+            .expect("overlong encoding of a small index fits");
+    }
+
+    #[test]
+    fn coordinate_scaling_overflow_wraps_instead_of_panicking() {
+        // Each encoding carries raw latitude 1. With default granularity 100
+        // and lat_offset i64::MAX the scaled value runs past i64; the block
+        // still constructs (values are not validated, by policy) and every
+        // accessor wraps, so debug and release agree.
+        let mut dense = len_field(1, &[2]);
+        dense.extend(len_field(8, &[2]));
+        dense.extend(len_field(9, &[0]));
+        let mut way = vec![0x08, 1];
+        way.extend(len_field(8, &[2]));
+        way.extend(len_field(9, &[2]));
+        way.extend(len_field(10, &[0]));
+        for group in [
+            len_field(1, &[0x08, 2, 0x40, 2, 0x48, 0]),
+            len_field(2, &dense),
+            len_field(3, &way),
+        ] {
+            PrimitiveBlock::from_vec(block_with_groups(std::slice::from_ref(&group)))
+                .expect("ordinary coordinate must parse");
+            let mut block = block_with_groups(&[group]);
+            // PrimitiveBlock field 19 (lat_offset), signed int64 MAX.
+            block.extend_from_slice(&[0x98, 0x01]);
+            block.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]);
+            let block = PrimitiveBlock::from_vec(block)
+                .expect("coordinate values are not validated at construction");
+            let wrapped = i64::MAX.wrapping_add(100);
+            let mut seen = 0;
+            for element in block.elements() {
+                let nano_lat = match element {
+                    super::Element::Node(node) => node.nano_lat(),
+                    super::Element::DenseNode(node) => node.nano_lat(),
+                    super::Element::Way(way) => way
+                        .node_locations()
+                        .next()
+                        .expect("one way location")
+                        .nano_lat(),
+                    super::Element::Relation(_) => continue,
+                };
+                assert_eq!(nano_lat, wrapped);
+                seen += 1;
+            }
+            assert_eq!(seen, 1);
+        }
     }
 }

@@ -135,15 +135,21 @@ impl<'a> Node<'a> {
     }
 
     /// Returns the latitude coordinate in nanodegrees (10^-9).
+    ///
+    /// Scaling wraps on `i64` overflow rather than panicking or erroring; see
+    /// "What is deliberately not checked" on block construction.
     #[inline]
     pub fn nano_lat(&self) -> i64 {
-        self.lat_offset + self.granularity * self.node.lat
+        self.lat_offset
+            .wrapping_add(self.granularity.wrapping_mul(self.node.lat))
     }
 
-    /// Returns the longitude in nanodegrees (10^-9).
+    /// Returns the longitude in nanodegrees (10^-9). Wraps like
+    /// [`nano_lat`](Self::nano_lat).
     #[inline]
     pub fn nano_lon(&self) -> i64 {
-        self.lon_offset + self.granularity * self.node.lon
+        self.lon_offset
+            .wrapping_add(self.granularity.wrapping_mul(self.node.lon))
     }
 
     impl_coordinate_conversions!();
@@ -437,9 +443,15 @@ impl Iterator for WayNodeLocationsIter<'_> {
             (Some(dlat), Some(dlon)) => {
                 self.clat = self.clat.wrapping_add(dlat);
                 self.clon = self.clon.wrapping_add(dlon);
+                // Scaling wraps like the deltas; see "What is deliberately
+                // not checked" on block construction.
                 Some(WayNodeLocation {
-                    lat: self.lat_offset + self.granularity * self.clat,
-                    lon: self.lon_offset + self.granularity * self.clon,
+                    lat: self
+                        .lat_offset
+                        .wrapping_add(self.granularity.wrapping_mul(self.clat)),
+                    lon: self
+                        .lon_offset
+                        .wrapping_add(self.granularity.wrapping_mul(self.clon)),
                 })
             }
             _ => None,
@@ -712,11 +724,14 @@ impl<'a> Info<'a> {
     }
 
     /// Returns the time stamp in milliseconds since the epoch.
+    ///
+    /// Scaling by `date_granularity` wraps on `i64` overflow: a timestamp
+    /// that far out is garbage in, garbage out, not a debug panic.
     #[inline]
     pub fn milli_timestamp(&self) -> Option<i64> {
         self.info
             .timestamp
-            .map(|ts| ts * i64::from(self.block.date_granularity))
+            .map(|ts| ts.wrapping_mul(i64::from(self.block.date_granularity)))
     }
 
     /// Returns the changeset id.

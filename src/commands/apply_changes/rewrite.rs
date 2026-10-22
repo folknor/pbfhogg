@@ -52,9 +52,10 @@ pub struct MergeOptions {
     /// Override the worker-pool size used by the descriptor-first
     /// pipeline. `None` (or `Some(0)`) keeps the default `nproc - 2`
     /// heuristic (leaves two cores for scanner + drain, minimum 2
-    /// workers). `Some(1)` is rejected at runtime - a single worker
-    /// has a deadlock hazard on mid-stream worker panic and no
-    /// production use case (2+ workers is strictly faster).
+    /// workers). `Some(1)` is rejected at runtime: single-worker
+    /// operation has not been validated through the node-to-way barrier
+    /// and its failure shutdown. This is a supported-configuration limit,
+    /// not a claim that a single worker necessarily deadlocks.
     pub jobs: Option<usize>,
     /// Accept a change whose `version` does not advance past the version
     /// already held for that object in the overlay. Off by default; see
@@ -376,26 +377,29 @@ pub fn merge(
     // default `nproc - 2` heuristic (leaves two cores for the scanner
     // and drain threads).
     //
-    // Minimum is 2 workers, not 1. With a single worker, a worker
-    // panic mid-stream deadlocks the pipeline: the scanner blocks on
-    // a full `candidate_rx` with no one draining, and the drain
-    // blocks waiting on senders that never drop. With 2+ workers the
-    // surviving one keeps draining `candidate_rx`, the scanner
-    // finishes normally, and the drain surfaces a clean error.
-    // Rejecting `-j 1` explicitly is loud but honest; silently
-    // bumping to 2 would mask a user's intent without benefit
-    // (single-threaded apply-changes has no production use case -
-    // it's strictly slower than 2+ workers on every host).
+    // Retain the supported minimum until single-worker barrier progress
+    // and shutdown have been validated. The former panic rationale no
+    // longer applies: run_workers catches and publishes worker panics to
+    // FailureSlot, and the drain polls it, drops its receiver and barrier
+    // sender on failure, then merge joins both producer threads. With one
+    // failed worker, run_workers also leaves its scope and drops the shared
+    // candidate receiver, releasing a scanner blocked in send.
+    //
+    // Normal barrier progress depends separately on the scanner's boundary
+    // message, the drain's 25 ms polling plus idle-fire check, and workers
+    // flushing coord slots before sending node outputs. These paths do not
+    // by themselves demonstrate a remaining single-worker deadlock. Before
+    // widening the supported configuration, exercise a boundary message
+    // delayed until after the final node output, empty/node-only inputs,
+    // and producer failures while scanner dispatch or its barrier wait is
+    // blocked, across splice and worker-only routing. Until that validation,
+    // keep the explicit refusal rather than silently substituting workers.
     let worker_count = match jobs {
         Some(1) => {
             return Err("apply-changes requires at least 2 worker threads \
                  (`--jobs N` with N >= 2, or omit `--jobs` for the \
-                 default). A single worker has a deadlock hazard on \
-                 mid-stream worker panic (scanner blocks on a full \
-                 candidate channel with no one draining). \
-                 Single-threaded operation has no production use \
-                 case here - 2 workers is strictly faster on every \
-                 host."
+                 default). Single-worker operation has not been validated \
+                 through the node-to-way barrier and failure shutdown."
                 .into());
         }
         Some(n) if n > 1 => n,

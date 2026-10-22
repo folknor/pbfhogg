@@ -1287,9 +1287,9 @@ impl Reader {
                 // covering) does not guarantee that a flagged cell is fully inside
                 // the polygon, so honoring the flag as a PIP bypass would mis-attribute
                 // near-boundary and neighbor-cell queries. A false flag now only costs
-                // wasted work, never a wrong answer. Re-enabling the skip requires the
-                // traccar-parity builder (interior erosion + geometric covering); see
-                // TODO.md "Geocode reader interior-hint PIP skip".
+                // wasted work, never a wrong answer. Re-enabling the skip requires a
+                // builder that makes the interior hint sound through interior erosion
+                // and geometric covering.
                 if self.admin_polygon_contains(ctx, &poly) {
                     best_by_level[level] = (Some(poly_idx), poly.area);
                 }
@@ -1337,10 +1337,10 @@ impl Reader {
                 let Some(poly) = self.read_admin_polygon(poly_idx) else {
                     continue;
                 };
-                // Interior high bit is a hint only; always run the PIP test. See the
-                // note in search_admin_ranked and TODO.md - pbfhogg's builder does not
-                // make the interior-skip sound, so a bypass mis-attributes near-boundary
-                // and neighbor-cell queries.
+                // Interior high bit is a hint only; always run the PIP test. The
+                // builder's flood-fill and cell-center sampling do not ensure flagged
+                // cells lie inside the polygon, so bypassing this test can misattribute
+                // near-boundary and neighbor-cell queries.
                 if self.admin_polygon_contains(ctx, &poly) {
                     result.push(AdminMatch {
                         admin_level: poly.admin_level,

@@ -1006,7 +1006,7 @@ fn relation_of(id: i64, members: Vec<TestMember>) -> TestRelation {
     }
 }
 
-/// BUG-071, the collision itself. Every orphan's old id equals the new id
+/// The orphan/new-id collision itself. Every orphan's old id equals the new id
 /// some *other* element of its kind receives (node 1000, way 51, relation
 /// 7), which passthrough turned into a reference to the wrong element. With
 /// distinct starts per kind each orphan lands at its own kind's

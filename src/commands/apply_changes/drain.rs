@@ -688,9 +688,11 @@ fn process_item(
     state.last_type = Some(item_kind);
 
     // Skip gap-creates for the reversed-range sentinel `(i64::MAX, i64::MIN)`
-    // that `infer_kind_and_range` emits when a --force non-indexed block's
-    // `block_type()` classification disagrees with its actual elements
-    // (streaming.rs:633-639). Without this guard, `blob_osm_first_id` would
+    // that `infer_kind_and_range` (the --force non-indexed path in
+    // `streaming.rs`) emits for an empty block, and for a block whose
+    // `block_type()` names a kind none of its elements has: its min/max
+    // accumulators never move off their starting values, so the range
+    // stays reversed. Without this guard, `blob_osm_first_id` would
     // return `i64::MAX` and `has_gap_creates` would emit every remaining
     // upsert of `item_kind` as a gap-create. The dispatch below still writes
     // the rewritten blob; trailing-creates picks up any legitimate upserts.

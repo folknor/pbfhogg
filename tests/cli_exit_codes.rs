@@ -8,6 +8,7 @@
 //!   1 - the command ran and its answer is negative (differences found,
 //!       no indexdata, integrity violations, element not found)
 //!   2 - the command failed
+//!   3 - a requested platform I/O feature is unavailable at setup
 //!
 //! Before this split every one of those outcomes was `1`, so a caller
 //! could not tell "the files differ" from "the file does not exist".

@@ -14,7 +14,10 @@ pub fn initialize_marker_fifo(path: &std::path::Path) -> std::io::Result<()> {
     let state = (
         file,
         std::time::Instant::now(),
-        micros_since_process_start().unwrap_or(0),
+        // Procfs recovers the true process epoch on Linux. If that probe is
+        // unavailable, zero age plus `Instant` still supplies a monotonic FIFO
+        // timestamp and preserves the marker wire format.
+        crate::process::micros_since_process_start().unwrap_or(0),
     );
     STATE.set(state).map_err(|_| {
         std::io::Error::new(
@@ -111,45 +114,21 @@ pub fn emit_mallinfo2(prefix: &str) {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 pub fn emit_mallinfo2(_prefix: &str) {}
 
-/// Read cumulative (minor, major) page faults from `/proc/self/stat`.
-/// Returns `(minflt, majflt)`. Returns `(0, 0)` on failure or non-Linux.
-#[cfg(target_os = "linux")]
+/// Read cumulative (minor, major) page faults for the active sidecar run.
+///
+/// The external ALTW stages publish numeric `s1_`, `s2_` and `s3_` fault
+/// counters consumed by brokkr. Keep this compatibility boundary numeric;
+/// the underlying procfs reader returns `Option`, and this adapter uses zero
+/// when a sample is unavailable so the counter names and line format remain
+/// stable. A failed sample therefore reads as zero and can distort one
+/// stage's delta (`page_fault_deltas` saturates rather than underflowing);
+/// carrying the `Option` through the stage callers would let them omit the
+/// counter instead.
 pub fn read_page_faults() -> (u64, u64) {
     if !ARMED.load(Relaxed) {
         return (0, 0);
     }
-    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
-        return (0, 0);
-    };
-    parse_page_faults(&stat)
-}
-
-#[cfg(target_os = "linux")]
-fn parse_page_faults(stat: &str) -> (u64, u64) {
-    // `comm` (field 2) can contain spaces; field 10 and field 12 are
-    // indexes 7 and 9 after the closing parenthesis.
-    let Some((_, after_comm)) = stat.rsplit_once(')') else {
-        return (0, 0);
-    };
-    let mut fields = after_comm.split_whitespace();
-    let minflt = fields
-        .nth(7)
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    // Skip field 11 (cminflt) to get field 12 (majflt).
-    let majflt = fields
-        .nth(1)
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    (minflt, majflt)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn read_page_faults() -> (u64, u64) {
-    if !ARMED.load(Relaxed) {
-        return (0, 0);
-    }
-    (0, 0)
+    crate::process::read_page_faults().unwrap_or((0, 0))
 }
 
 pub(crate) fn page_fault_deltas(before: (u64, u64), after: (u64, u64)) -> (u64, u64) {
@@ -231,41 +210,6 @@ impl std::fmt::Write for Line {
     }
 }
 
-/// Microseconds this process has been alive, recovered from
-/// `/proc/self/stat` field 22 (`starttime`, in clock ticks since boot) and
-/// `/proc/uptime`. Used to anchor the marker clock at real process start
-/// rather than at the first marker, which is what the emit docs promise and
-/// what brokkr assumes when correlating markers against its `/proc` samples.
-#[cfg(target_os = "linux")]
-fn micros_since_process_start() -> Option<u64> {
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
-    // `comm` (field 2) is parenthesised and may contain spaces; fields after
-    // the closing paren are space-separated, so field 22 is index 19 there.
-    let after_comm = stat.rsplit_once(')')?.1;
-    let starttime_ticks: u64 = after_comm.split_whitespace().nth(19)?.parse().ok()?;
-    // SAFETY: sysconf is a libc function safe to call from any thread.
-    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-    if ticks_per_sec <= 0 {
-        return None;
-    }
-    #[allow(clippy::cast_sign_loss)]
-    let ticks_per_sec = ticks_per_sec as u64;
-    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
-    let uptime_secs: f64 = uptime.split_whitespace().next()?.parse().ok()?;
-    let start_secs = starttime_ticks as f64 / ticks_per_sec as f64;
-    let alive = uptime_secs - start_secs;
-    if !alive.is_finite() || alive < 0.0 {
-        return None;
-    }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    Some((alive * 1e6) as u64)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn micros_since_process_start() -> Option<u64> {
-    None
-}
-
 /// Shared FIFO write logic for markers and counters.
 fn write_fifo(f: impl FnOnce(&std::fs::File, u128)) {
     if !ARMED.load(Relaxed) {
@@ -280,13 +224,6 @@ fn write_fifo(f: impl FnOnce(&std::fs::File, u128)) {
 #[cfg(test)]
 mod tests {
     use super::{Line, PIPE_BUF};
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn page_fault_parser_handles_spaces_in_comm() {
-        let stat = "123 (program name with spaces) R 1 2 3 4 5 6 101 102 103 104";
-        assert_eq!(super::parse_page_faults(stat), (101, 103));
-    }
 
     #[test]
     fn page_fault_deltas_saturate_when_a_read_fails() {
@@ -355,7 +292,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn process_start_epoch_is_recoverable() {
-        let us = super::micros_since_process_start().expect("readable on Linux");
+        let us = crate::process::micros_since_process_start().expect("readable on Linux");
         assert!(
             us < 86_400 * 1_000_000,
             "process age {us} us is implausible"

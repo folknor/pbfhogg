@@ -107,10 +107,10 @@ mod apply_changes {
         // Arm the hook at blob seq 3 (an arbitrary early-middle blob that
         // corresponds to a Candidate dispatched to the worker pool).
         //
-        // `jobs: Some(2)`: two workers so the surviving one keeps
-        // draining `candidate_rx` when the other panics. `Some(1)` is
-        // now rejected up front by `merge()` (the deadlock would fire
-        // if it weren't); see the companion test
+        // `jobs: Some(2)` uses the minimum supported worker count.
+        // FailureSlot publication and drain shutdown handle the panic;
+        // this test does not establish single-worker barrier safety.
+        // `Some(1)` remains rejected up front by `merge()`; see
         // `merge_rejects_jobs_equal_one`.
         let opts = MergeOptions {
             compression: Compression::default(),

@@ -365,7 +365,17 @@ fn cat_passthrough(
                         // No indexdata - decompress to scan IDs/tags, reframe with index.
                         let blob_bytes = frame.blob_bytes();
                         decompress_blob_data_into(blob_bytes, &mut decompress_buf)?;
-                        let (index, tagdata) = scan_block_ids_and_tags(&decompress_buf)?;
+                        // Name the input and the blob's frame offset through the
+                        // crate error's own location fields, which print as
+                        // "(in PATH, at byte offset N)". `From<io::Error>`
+                        // unwraps the scanner's own error from the io carrier,
+                        // so its kind survives rather than a stringified copy.
+                        let (index, tagdata) =
+                            scan_block_ids_and_tags(&decompress_buf).map_err(|source| {
+                                crate::error::Error::from(source)
+                                    .at(crate::ByteOffset(frame.file_offset))
+                                    .in_input(Some(&std::sync::Arc::<Path>::from(*file)), None)
+                            })?;
                         let index = match index {
                             Some(idx) => idx,
                             None => {
@@ -602,13 +612,16 @@ use super::clean_metadata;
 /// writing in seq order.
 ///
 /// Replaces an earlier `into_blocks_pipelined` + `for_each_primitive_block_batch_budgeted`
-/// shape that hit the documented cross-thread `PrimitiveBlock` retention
-/// pattern (`src/read/pipeline.rs:66-89`, ~25 GB at planet scale; OOM at
-/// 28.9 GB peak measured 2026-04-26 overnight). The pipelined reader allocated
-/// blocks on its decode pool and dropped them on the consumer thread; the
-/// batch-based mitigation listed in pipeline.rs only reduced the cross-thread
-/// window without eliminating it. `parallel_classify_phase` confines each
-/// blob's allocation and drop to a single worker thread.
+/// shape that hit the cross-thread `PrimitiveBlock` retention pattern of the
+/// pipelined reader at the time (~25 GB at planet scale; OOM at 28.9 GB peak
+/// measured 2026-04-26 overnight): blocks were allocated on its decode pool
+/// and dropped on the consumer thread, so glibc kept the freed pages on the
+/// decode threads' arenas, and batching only narrowed that window without
+/// closing it. `parallel_classify_phase` confines each blob's allocation and
+/// drop to a single worker thread. The pipelined reader has since moved its
+/// string-table entries inline into the pooled decompression buffer (see its
+/// "Memory: decoded-block working set" doc in `src/read/pipeline.rs`), so
+/// this history no longer describes a live hazard there.
 ///
 /// **Output ordering note.** Both modes are type-sorted: nodes first, then
 /// ways, then relations. For inputs that are already type-sorted (the

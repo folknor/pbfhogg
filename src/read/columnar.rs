@@ -96,35 +96,43 @@ impl DenseNodeColumns {
         // nano = offset + 100 * cumulative → decimicro = nano / 100
         //      = cumulative + offset / 100
         if granularity == 100 && lat_offset % 100 == 0 && lon_offset % 100 == 0 {
-            #[allow(clippy::cast_possible_wrap)]
-            let lat_off_e7 = (lat_offset / 100) as i32;
-            #[allow(clippy::cast_possible_wrap)]
-            let lon_off_e7 = (lon_offset / 100) as i32;
+            // Add in i64 before the final i32 narrowing, as the general
+            // path does: adding narrowed operands panics in debug on an
+            // offset or coordinate near the i32 edge. Scaling and offsets
+            // wrap rather than being validated (see "What is deliberately
+            // not checked" on block construction in `block.rs`), so a value
+            // past i64 is garbage, and this path and the general one need
+            // not agree on which garbage.
+            let lat_off_e7 = lat_offset / 100;
+            let lon_off_e7 = lon_offset / 100;
 
             let mut cumulative_lat: i64 = 0;
             for delta in PackedSint64Iter::new(dense.lat_data) {
                 cumulative_lat = cumulative_lat.wrapping_add(delta);
-                self.lats.push(cumulative_lat as i32 + lat_off_e7);
+                self.lats
+                    .push(cumulative_lat.wrapping_add(lat_off_e7) as i32);
             }
 
             let mut cumulative_lon: i64 = 0;
             for delta in PackedSint64Iter::new(dense.lon_data) {
                 cumulative_lon = cumulative_lon.wrapping_add(delta);
-                self.lons.push(cumulative_lon as i32 + lon_off_e7);
+                self.lons
+                    .push(cumulative_lon.wrapping_add(lon_off_e7) as i32);
             }
         } else {
-            // General path for non-standard granularity.
+            // General path for non-standard granularity. Scaling wraps, as
+            // in the element accessors.
             let mut cumulative_lat: i64 = 0;
             for delta in PackedSint64Iter::new(dense.lat_data) {
                 cumulative_lat = cumulative_lat.wrapping_add(delta);
-                let nano = lat_offset + gran * cumulative_lat;
+                let nano = lat_offset.wrapping_add(gran.wrapping_mul(cumulative_lat));
                 self.lats.push((nano / 100) as i32);
             }
 
             let mut cumulative_lon: i64 = 0;
             for delta in PackedSint64Iter::new(dense.lon_data) {
                 cumulative_lon = cumulative_lon.wrapping_add(delta);
-                let nano = lon_offset + gran * cumulative_lon;
+                let nano = lon_offset.wrapping_add(gran.wrapping_mul(cumulative_lon));
                 self.lons.push((nano / 100) as i32);
             }
         }
@@ -249,6 +257,22 @@ mod tests {
             assert_eq!(columns.lats, coords);
             assert_eq!(columns.lons, coords);
         }
+    }
+
+    #[test]
+    fn columnar_fast_path_adds_offset_before_narrowing() {
+        let coordinate = [0xfe, 0xff, 0xff, 0xff, 0x0f]; // zigzag(i32::MAX)
+        let dense = WireDenseNodes {
+            id_data: &[2],
+            lat_data: &coordinate,
+            lon_data: &coordinate,
+            keys_vals_data: &[],
+            info_data: None,
+        };
+        let mut columns = DenseNodeColumns::new();
+        columns.decode_append(&dense, 100, 100, 100);
+        assert_eq!(columns.lats, [i32::MIN]);
+        assert_eq!(columns.lons, [i32::MIN]);
     }
 
     fn next(state: &mut u64) -> u64 {

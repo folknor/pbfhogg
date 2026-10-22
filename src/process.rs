@@ -1,15 +1,115 @@
-//! Explicit caller-invoked process policy.
+//! Explicit caller-invoked process policy, and the procfs readers the CLI and
+//! the sidecar instrumentation sample. The readers return `Option`: a failed
+//! or unavailable sample is reported as absent, never as zero, and each
+//! caller decides what absence means for its output.
+
+/// Read cumulative minor and major page faults from `/proc/self/stat`.
+///
+/// Returns `None` when procfs is unavailable or the process-stat record is
+/// missing either counter. Non-Linux targets have no procfs implementation.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_page_faults() -> Option<(u64, u64)> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    parse_page_faults(&stat)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read_page_faults() -> Option<(u64, u64)> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_page_faults(stat: &str) -> Option<(u64, u64)> {
+    // `comm` (field 2) can contain spaces; field 10 and field 12 are
+    // indexes 7 and 9 after the closing parenthesis.
+    let after_comm = stat.rsplit_once(')')?.1;
+    let mut fields = after_comm.split_whitespace();
+    let minflt = fields.nth(7)?.parse::<u64>().ok()?;
+    // Skip field 11 (cminflt) to get field 12 (majflt).
+    let majflt = fields.nth(1)?.parse::<u64>().ok()?;
+    Some((minflt, majflt))
+}
+
+/// Microseconds elapsed since this process started, using `/proc/self/stat`
+/// and `/proc/uptime` to include dynamic-loader and pre-`main` time.
+///
+/// Returns `None` when procfs data, the clock tick rate, or a valid elapsed
+/// time is unavailable. Non-Linux targets return `None`.
+#[cfg(target_os = "linux")]
+pub(crate) fn micros_since_process_start() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // `comm` (field 2) is parenthesised and may contain spaces; fields after
+    // the closing paren are space-separated, so field 22 is index 19 there.
+    let after_comm = stat.rsplit_once(')')?.1;
+    let starttime_ticks: u64 = after_comm.split_whitespace().nth(19)?.parse().ok()?;
+    // SAFETY: sysconf is a libc function safe to call from any thread.
+    let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_sec <= 0 {
+        return None;
+    }
+    #[allow(clippy::cast_sign_loss)]
+    let ticks_per_sec = ticks_per_sec as u64;
+    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    let uptime_secs: f64 = uptime.split_whitespace().next()?.parse().ok()?;
+    let start_secs = starttime_ticks as f64 / ticks_per_sec as f64;
+    let alive = uptime_secs - start_secs;
+    if !alive.is_finite() || alive < 0.0 {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some((alive * 1e6) as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn micros_since_process_start() -> Option<u64> {
+    None
+}
+
+/// Read peak resident set size (`VmHWM`) from `/proc/self/status` in KiB.
+///
+/// Returns `None` when procfs is unavailable, the field is absent or the
+/// value is malformed. Non-Linux targets return `None`.
+#[cfg(target_os = "linux")]
+pub fn read_peak_rss_kb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    parse_peak_rss_kb(&status)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_peak_rss_kb() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_peak_rss_kb(status: &str) -> Option<u64> {
+    let rest = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))?;
+    let trimmed = rest.trim();
+    let kb_str = trimmed.strip_suffix("kB").unwrap_or(trimmed).trim();
+    kb_str.parse::<u64>().ok()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod proc_metric_tests {
+    #[test]
+    fn page_fault_parser_handles_spaces_in_comm() {
+        let stat = "123 (program name with spaces) R 1 2 3 4 5 6 101 102 103 104";
+        assert_eq!(super::parse_page_faults(stat), Some((101, 103)));
+    }
+}
 
 /// Ask glibc to return free chunks above the trim threshold to the OS
 /// (`malloc_trim(0)`). Returns 1 if memory was released, 0 otherwise.
 ///
-/// Use to fight the documented cross-thread `PrimitiveBlock` retention
-/// pattern (`src/read/pipeline.rs:66-89`): decoded blocks are
-/// allocated on rayon decode threads and dropped on the consumer
-/// thread; glibc retains those pages on the decode-thread arena's
-/// free list rather than returning them to the OS, which manifests
-/// as steadily-climbing anon RSS at scale. Calling `malloc_trim(0)`
-/// at a batch boundary forces a sweep across all arenas.
+/// Use at a phase boundary when glibc holds eligible freed heap chunks as
+/// anonymous RSS and returning them to the OS is useful. A former pipelined
+/// PBF reader allocated separate string-table entry arrays on decode workers
+/// and freed them on the consumer; glibc retained those pages and this reached
+/// 25+ GB anon at scale. The current reader stores entries inline in its pooled
+/// decompression buffer, removing that specific cross-thread retention path.
+/// Calling `malloc_trim(0)` sweeps all arenas for free chunks above the trim
+/// threshold.
 ///
 /// Cost: a few ms per call at planet scale (one pass over the
 /// free-list). Cheap enough to fire per snapshot batch (~140
@@ -33,9 +133,10 @@ pub fn malloc_trim() -> i32 {
 /// chunks accumulate as fragmentation when allocations interleave
 /// across threads.
 ///
-/// Use to fight the cross-thread `PrimitiveBlock` retention pattern
-/// when mallinfo2 shows growth concentrated in `arena` (brk) with
-/// `hblkhd` (mmap) flat. Default glibc threshold is 128 KB and is
+/// Use against cross-thread allocate-here, free-there retention (see
+/// [`malloc_trim`] for the reader-side instance that has since been
+/// designed out) when mallinfo2 shows growth concentrated in `arena` (brk)
+/// with `hblkhd` (mmap) flat. Default glibc threshold is 128 KB and is
 /// also dynamic (climbs as the program runs, up to 32 MB). This
 /// pins it to a hard floor.
 ///
@@ -60,9 +161,10 @@ pub fn set_mmap_threshold(_bytes: i32) -> i32 {
 /// or pread workers allocate, the merge / compression / consumer thread
 /// frees), the freed chunks land back on the allocating thread's arena
 /// and accumulate there as fragmentation instead of being reused or
-/// returned to the OS. At planet scale that is the cross-thread
-/// `PrimitiveBlock` retention pattern (`src/read/pipeline.rs`), and it
-/// shows as anon RSS climbing into the tens of GB. Two arenas force
+/// returned to the OS, which shows as anon RSS climbing with file size.
+/// The decode pipeline's per-block string-table allocations were the
+/// worst instance (tens of GB at planet) and are gone (see
+/// [`malloc_trim`]); other buffers still cross threads. Two arenas force
 /// the worker pool to share free lists, which keeps the peak bounded.
 ///
 /// The cost is lock contention on the shared arenas, which hurts

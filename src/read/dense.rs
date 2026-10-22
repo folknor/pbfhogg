@@ -43,15 +43,21 @@ impl<'a> DenseNode<'a> {
     }
 
     /// Returns the latitude coordinate in nanodegrees (10^-9).
+    ///
+    /// Scaling wraps on `i64` overflow rather than panicking or erroring; see
+    /// "What is deliberately not checked" on block construction.
     #[inline]
     pub fn nano_lat(&self) -> i64 {
-        self.lat_offset + self.granularity * self.lat
+        self.lat_offset
+            .wrapping_add(self.granularity.wrapping_mul(self.lat))
     }
 
-    /// Returns the longitude in nanodegrees (10^-9).
+    /// Returns the longitude in nanodegrees (10^-9). Wraps like
+    /// [`nano_lat`](Self::nano_lat).
     #[inline]
     pub fn nano_lon(&self) -> i64 {
-        self.lon_offset + self.granularity * self.lon
+        self.lon_offset
+            .wrapping_add(self.granularity.wrapping_mul(self.lon))
     }
 
     crate::impl_coordinate_conversions!();
@@ -315,9 +321,13 @@ impl<'a> DenseNodeInfo<'a> {
     }
 
     /// Returns the time stamp in milliseconds since the epoch.
+    ///
+    /// Scaling by `date_granularity` wraps on `i64` overflow, matching the
+    /// modular delta reconstruction before it: a timestamp that far out is
+    /// garbage in, garbage out, not a panic in debug and a wrap in release.
     #[inline]
     pub fn milli_timestamp(&self) -> i64 {
-        self.timestamp * self.date_granularity
+        self.timestamp.wrapping_mul(self.date_granularity)
     }
 
     /// Returns the visibility status of an element.

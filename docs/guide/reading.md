@@ -265,6 +265,12 @@ Both `Node` and `DenseNode` provide:
 | `nano_lat()` | `i64` | Latitude in nanodegrees (10^-9) |
 | `nano_lon()` | `i64` | Longitude in nanodegrees (10^-9) |
 
+Coordinates are read as stored, not validated. Scaling by the block's
+granularity and offsets wraps on `i64` overflow, and the decimicrodegree
+accessors narrow to `i32` without a range check, so a corrupt block yields
+wrong coordinates rather than an error or a panic. `milli_timestamp()`
+wraps the same way. Range-check the values if your input is untrusted.
+
 ### Way methods
 
 | Method | Description |

@@ -44,8 +44,9 @@
 //! What the walk validates is the index-relevant structure, not full decoder
 //! acceptance. Not checked here, and accepted where the decoder
 //! (`validate_groups_strict` in `read/block.rs`) rejects: `Info`/`DenseInfo`
-//! contents, way geometry and relation member arrays, string-table UTF-8, and
-//! equal `keys`/`vals` counts on Node/Way/Relation. None of those can make an
+//! contents, way geometry and relation member arrays, string-table UTF-8,
+//! equal `keys`/`vals` counts on Node/Way/Relation, and the `int32` width of
+//! dense `keys_vals` value indices. None of those can make an
 //! index omit something a successful decode yields - the decoder refuses such
 //! a block outright - so the gap can only cost an index over a block nobody
 //! can read, never a wrong skip.
@@ -415,6 +416,11 @@ impl<'a> Walk<'a> {
     /// zero-terminated run of (key, value) pairs per node, where the last run
     /// may omit its terminator. Zero is a delimiter only in key position - a
     /// value of 0 is a value.
+    ///
+    /// Index width is not checked here: a key past the string table is an
+    /// `Err` through `max_key_sid` in `run`, and the decoder's `int32` bound
+    /// on values (`validate_dense_keys_vals` in `read/block.rs`) is one of
+    /// the decoder-only refusals listed in the module docs.
     fn dense_keys_vals(&mut self, keys_vals: &[u8], nodes: u64) -> Result<()> {
         if keys_vals.is_empty() {
             return Ok(());

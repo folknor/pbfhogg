@@ -304,9 +304,11 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
 ///
 /// Both modes use the same per-blob worker shape to keep the planet-scale
 /// memory floor bounded. Streaming mode previously walked
-/// `for_each_pipelined` directly, which hit the documented cross-thread
-/// `PrimitiveBlock` retention pattern (`src/read/pipeline.rs:66-89`,
-/// ~25 GB at planet scale; OOM at 29.2 GB measured 2026-04-26 overnight).
+/// `for_each_pipelined` directly and reached about 25 GB anon at planet scale
+/// before OOM at 29.2 GB in the 2026-04-26 overnight run. That was the former
+/// decoder's cross-thread allocation retention: decoded blocks now use inline
+/// string-table entries backed by pooled decompression buffers, and pipeline
+/// admission bounds the number of in-flight blocks.
 ///
 /// # Planet-scale memory
 ///

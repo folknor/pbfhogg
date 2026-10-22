@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Lint the document-folder conventions from AGENTS.md ("Document folders").
 
-Two checks, over the files git tracks or would track (``git ls-files --cached
+Three checks, over the files git tracks or would track (``git ls-files --cached
 --others --exclude-standard``), so build output, ``data/``, ``research/`` and
 other ignored trees never matter:
 
@@ -36,6 +36,11 @@ other ignored trees never matter:
      not claimed, nor is a template placeholder such as ``NNNN-title.md``. In
      code files only comment text is read: a string literal legitimately
      carries a path that need not exist, such as a test's invented argv.
+
+  3. source-comment-citations: comments under ``src/`` do not cite the
+     transient root-level ``TODO.md`` or a Rust source line number. These
+     references lose their context as code moves; the comment must carry the
+     needed context inline.
 
 Root-level files and ``notes/`` are not scanned at all: the first are exempt,
 the second carries no truth guarantee, so a dead link there is its own business.
@@ -87,6 +92,7 @@ BARE_PATH_RE = re.compile(
 )
 ROOT_DOC_RE = re.compile(r"^[A-Z][A-Z0-9_-]*\.md$")
 PLACEHOLDER_RE =re.compile(r"N{3,}|X{3,}")
+SOURCE_COMMENT_CITATION_RE = re.compile(r"TODO\.md|\.rs:[0-9]+")
 SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 FENCE_RE = re.compile(r"^ {0,3}(```|~~~)")
 
@@ -320,6 +326,7 @@ def markdown_paragraphs(text):
 
 def main():
     transient_cites = []
+    source_comment_cites = []
     candidates = []  # (row, repository path used for the ignore test)
     durable_docs = 0
     for rel in FILES:
@@ -350,6 +357,11 @@ def main():
                 for cite in notes_citations(rel, scope):
                     transient_cites.append(f"{rel}:{num}: {cite}")
             if comment is not None:
+                if rel.startswith("src/") and suffix == ".rs":
+                    for match in SOURCE_COMMENT_CITATION_RE.finditer(comment):
+                        source_comment_cites.append(
+                            f"{rel}:{num}: {match.group(0)}"
+                        )
                 for _, desc, path in dangling_paths(rel, comment, markdown=False):
                     candidates.append((f"{rel}:{num}: {desc}", path))
 
@@ -367,11 +379,16 @@ def main():
     )
     dangling = [row for row, path in candidates if path not in skip]
 
-    for label, rows in (("durable-cites-notes", transient_cites), ("dangling", dangling)):
+    checks = (
+        ("durable-cites-notes", transient_cites),
+        ("dangling", dangling),
+        ("source-comment-citations", source_comment_cites),
+    )
+    for label, rows in checks:
         print(f"== {label}: {len(rows)}")
         for row in rows:
             print(f"   {row}")
-    if transient_cites or dangling:
+    if any(rows for _, rows in checks):
         return 1
     print("document conventions ok")
     return 0

@@ -22,7 +22,9 @@ use pbfhogg::{HeaderOverrides, TypeFilter};
 #[global_allocator]
 static ALLOC: hotpath::CountingAllocator = hotpath::CountingAllocator::new();
 
-/// The exit statuses `pbfhogg` guarantees to callers.
+/// The failure exit statuses `pbfhogg` guarantees to callers. `0` and `1`
+/// are a completed command's answer and travel as [`Outcome`], never through
+/// the error channel.
 ///
 /// The split follows the `diff`/`grep` convention: a command that ran to
 /// completion and answered "no" is not the same event as a command that
@@ -38,11 +40,6 @@ static ALLOC: hotpath::CountingAllocator = hotpath::CountingAllocator::new();
 /// without the flag is the fix, which no other failure promises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitStatus {
-    /// `1` - the command ran to completion and its answer is negative:
-    /// `diff` found differences, `check` found violations,
-    /// `inspect --indexed` found no index, `inspect --show` found no
-    /// element. Not an error; nothing is printed to stderr for it.
-    AnswerNegative,
     /// `2` - the command failed. Every error path but one lands here.
     Failed,
     /// `3` - the command failed because a requested platform I/O feature
@@ -54,11 +51,44 @@ enum ExitStatus {
 impl ExitStatus {
     const fn code(self) -> u8 {
         match self {
-            Self::AnswerNegative => 1,
             Self::Failed => 2,
             Self::PlatformUnsupported => 3,
         }
     }
+}
+
+/// A command's completed answer, carried separately from errors so a
+/// negative answer cannot be mistaken for a failed invocation: no wrapper
+/// that re-boxes or maps an error can turn it into exit `2`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// `0` - the command ran to completion and its answer is positive (or
+    /// the command has no yes/no answer).
+    Positive,
+    /// `1` - the command ran to completion and its answer is negative:
+    /// `diff` found differences, `check` found violations,
+    /// `inspect --indexed` found no index, `inspect --show` found no
+    /// element. Not an error; nothing is printed to stderr for it.
+    Negative,
+}
+
+impl Outcome {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Positive => 0,
+            Self::Negative => 1,
+        }
+    }
+}
+
+fn accept_outcome(
+    overall: &mut Outcome,
+    result: Result<Outcome, Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if result? == Outcome::Negative {
+        *overall = Outcome::Negative;
+    }
+    Ok(())
 }
 
 /// Whether `err` is, or wraps, a platform setup refusal. Walks
@@ -82,22 +112,6 @@ fn is_platform_unsupported(err: &(dyn std::error::Error + 'static)) -> bool {
     }
     false
 }
-
-/// Non-fatal exit code carrier. Subcommands that need to signal a
-/// specific non-zero exit status (e.g. `diff` with differences found)
-/// return this via the error channel instead of calling `process::exit`.
-/// `process::exit` skips destructors, which prevents the hotpath guard
-/// in `main` from flushing its JSON report.
-#[derive(Debug)]
-struct ExitWithCode(ExitStatus);
-
-impl std::fmt::Display for ExitWithCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "exit with code {}", self.0.code())
-    }
-}
-
-impl std::error::Error for ExitWithCode {}
 
 #[derive(Parser)]
 #[command(name = "pbfhogg", about = "OpenStreetMap PBF toolkit", version)]
@@ -949,8 +963,10 @@ enum Command {
         allow_version_regression: bool,
         /// Worker-pool size for the descriptor-first pipeline.
         /// `0` (default) uses the `nproc - 2` heuristic (leaves two
-        /// cores for the scanner + drain threads, min 1). Pass a
-        /// specific N to measure scaling or constrain CPU use.
+        /// cores for the scanner + drain threads, minimum 2). Pass a
+        /// specific N >= 2 to measure scaling or constrain CPU use; an
+        /// explicit `-j 1` is refused (single-worker operation is not a
+        /// validated configuration).
         #[arg(short = 'j', long = "jobs", default_value_t = 0)]
         jobs: usize,
         #[command(flatten)]
@@ -1010,7 +1026,8 @@ enum Command {
         /// Filter by element type for ID check (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type", value_parser = parse_type_filter)]
         type_filter: Option<TypeFilter>,
-        /// Stop after N violations per check (0 = unlimited)
+        /// Retain at most N violation details per check (0 = unlimited);
+        /// the scan still runs to the end and the counts stay exact
         #[arg(long, default_value = "100")]
         max_errors: usize,
         /// Machine-readable JSON output
@@ -1298,6 +1315,7 @@ fn main() -> process::ExitCode {
         }
     };
 
+    let mut outcome = Outcome::Positive;
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         validate_input_output_aliases(&cli.command)?;
         match cli.command {
@@ -1618,30 +1636,33 @@ fn main() -> process::ExitCode {
                         osmium_summary,
                         quiet,
                     };
-                    match output.as_deref() {
-                        Some(path) => guarded_output(path, |out| {
-                            run_diff(
+                    accept_outcome(
+                        &mut outcome,
+                        match output.as_deref() {
+                            Some(path) => guarded_output(path, |out| {
+                                run_diff(
+                                    &old,
+                                    &new,
+                                    flags,
+                                    Some(out),
+                                    type_filter,
+                                    jobs,
+                                    io.direct_io,
+                                    &host,
+                                )
+                            }),
+                            None => run_diff(
                                 &old,
                                 &new,
                                 flags,
-                                Some(out),
+                                None,
                                 type_filter,
                                 jobs,
                                 io.direct_io,
                                 &host,
-                            )
-                        }),
-                        None => run_diff(
-                            &old,
-                            &new,
-                            flags,
-                            None,
-                            type_filter,
-                            jobs,
-                            io.direct_io,
-                            &host,
-                        ),
-                    }
+                            ),
+                        },
+                    )
                 }
             },
             Command::Digest { file, io } => {
@@ -1899,26 +1920,32 @@ fn main() -> process::ExitCode {
                 } else {
                     let file = file.expect("clap requires a file without an inspect subcommand");
                     if let Some(show_id) = show {
-                        return run_show_element(&file, show_id, io.direct_io, &host);
+                        return accept_outcome(
+                            &mut outcome,
+                            run_show_element(&file, show_id, io.direct_io, &host),
+                        );
                     }
-                    run_inspect(
-                        &file,
-                        InspectFlags {
-                            indexed,
-                            nodes,
-                            id_ranges,
-                            locations,
-                            anomalies,
-                            extended,
-                            json,
-                            force,
-                            distrust_metadata: distrust.distrust_metadata,
-                        },
-                        jobs,
-                        blocks,
-                        get.as_deref(),
-                        io.direct_io,
-                        &host,
+                    accept_outcome(
+                        &mut outcome,
+                        run_inspect(
+                            &file,
+                            InspectFlags {
+                                indexed,
+                                nodes,
+                                id_ranges,
+                                locations,
+                                anomalies,
+                                extended,
+                                json,
+                                force,
+                                distrust_metadata: distrust.distrust_metadata,
+                            },
+                            jobs,
+                            blocks,
+                            get.as_deref(),
+                            io.direct_io,
+                            &host,
+                        ),
                     )
                 }
             }
@@ -1988,22 +2015,25 @@ fn main() -> process::ExitCode {
                 json,
                 quiet,
                 io,
-            } => run_check(
-                &file,
-                CheckFlags {
-                    ids,
-                    refs,
-                    index,
-                    check_relations,
-                    show_ids,
-                    full,
-                    json,
-                    quiet,
-                },
-                type_filter,
-                max_errors,
-                io.direct_io,
-                &host,
+            } => accept_outcome(
+                &mut outcome,
+                run_check(
+                    &file,
+                    CheckFlags {
+                        ids,
+                        refs,
+                        index,
+                        check_relations,
+                        show_ids,
+                        full,
+                        json,
+                        quiet,
+                    },
+                    type_filter,
+                    max_errors,
+                    io.direct_io,
+                    &host,
+                ),
             ),
             Command::BuildGeocodeIndex {
                 file,
@@ -2059,13 +2089,9 @@ fn main() -> process::ExitCode {
     pbfhogg::write::emit_writer_counters();
 
     match result {
-        Ok(()) => process::ExitCode::SUCCESS,
+        Ok(()) => process::ExitCode::from(outcome.code()),
         Err(e) => {
-            if let Some(exit) = e.downcast_ref::<ExitWithCode>() {
-                // Silent exit with a specific code (e.g. `diff` found
-                // differences). Not an error worth printing.
-                process::ExitCode::from(exit.0.code())
-            } else if output::reader_gone() {
+            if output::reader_gone() {
                 // Stdout's reader went away (`pbfhogg ... | head`) and the
                 // command stopped writing. Nobody is left to read a report
                 // and nothing failed, so end quietly with success - see
@@ -2130,7 +2156,7 @@ fn run_check(
     max_errors: usize,
     direct_io: bool,
     host: &pbfhogg::host::Host,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Outcome, Box<dyn std::error::Error>> {
     let CheckFlags {
         ids,
         refs,
@@ -2375,10 +2401,11 @@ fn run_check(
     })();
     output::tolerate_reader_gone(printed)?;
 
-    if failed {
-        return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
-    }
-    Ok(())
+    Ok(if failed {
+        Outcome::Negative
+    } else {
+        Outcome::Positive
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2767,8 +2794,9 @@ fn validate_input_output_aliases(command: &Command) -> Result<(), Box<dyn std::e
     }
 }
 
-/// Run a command that writes one final output file, through a scratch
-/// sibling that is renamed into place only once the command succeeded.
+/// Run a command that writes one final output file through a scratch sibling,
+/// renamed into place after the command completes without an error. A
+/// negative semantic outcome is still a completed result, so its file commits.
 ///
 /// Every user-named `--output` goes through here. Without it a mid-run
 /// failure leaves a truncated partial file under the name the user chose -
@@ -2779,24 +2807,15 @@ fn validate_input_output_aliases(command: &Command) -> Result<(), Box<dyn std::e
 /// The scratch file is a dot-prefixed sibling in the destination directory
 /// (so `commit`'s rename never crosses a filesystem), and keeps the
 /// destination's suffix so extension-sniffing writers behave identically.
-fn guarded_output<F>(output: &std::path::Path, run: F) -> Result<(), Box<dyn std::error::Error>>
+fn guarded_output<F, T>(output: &std::path::Path, run: F) -> Result<T, Box<dyn std::error::Error>>
 where
-    F: FnOnce(&std::path::Path) -> Result<(), Box<dyn std::error::Error>>,
+    F: FnOnce(&std::path::Path) -> Result<T, Box<dyn std::error::Error>>,
 {
     let out = pbfhogg::path_guard::OutputFile::new(output)?;
     match run(out.path()) {
-        Ok(()) => {
+        Ok(value) => {
             out.commit()?;
-            Ok(())
-        }
-        // `ExitWithCode` is not a failure: the command ran to completion and
-        // its answer is merely negative (`diff` found differences). Its
-        // output is complete and must be published, or a `diff -o` that
-        // found differences - the ordinary case - would delete its own
-        // result on the way out.
-        Err(e) if e.downcast_ref::<ExitWithCode>().is_some() => {
-            out.commit()?;
-            Err(e)
+            Ok(value)
         }
         Err(e) => Err(e),
     }
@@ -2987,7 +3006,7 @@ fn run_diff(
     jobs: usize,
     direct_io: bool,
     host: &pbfhogg::host::Host,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Outcome, Box<dyn std::error::Error>> {
     let DiffFlags {
         suppress_common,
         verbose,
@@ -3037,10 +3056,11 @@ fn run_diff(
             stats.write_summary(&mut host.diagnostics.summary_writer("diff.summary"))?;
         }
     }
-    if stats.has_differences() {
-        return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
-    }
-    Ok(())
+    Ok(if stats.has_differences() {
+        Outcome::Negative
+    } else {
+        Outcome::Positive
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3455,7 +3475,7 @@ fn run_show_element(
     element_ref: ElementRef,
     direct_io: bool,
     host: &pbfhogg::host::Host,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Outcome, Box<dyn std::error::Error>> {
     let elem_type = match element_ref.kind {
         ElemKindTag::Node => pbfhogg::inspect::ShowElementType::Node,
         ElemKindTag::Way => pbfhogg::inspect::ShowElementType::Way,
@@ -3471,10 +3491,11 @@ fn run_show_element(
         host,
     )?;
     out.flush()?;
-    if !found {
-        return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
-    }
-    Ok(())
+    Ok(if found {
+        Outcome::Positive
+    } else {
+        Outcome::Negative
+    })
 }
 
 /// Which of `run_inspect`'s four execution shapes a flag combination
@@ -3533,7 +3554,7 @@ fn run_inspect(
     get: Option<&str>,
     direct_io: bool,
     host: &pbfhogg::host::Host,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Outcome, Box<dyn std::error::Error>> {
     let mode = InspectMode::resolve(&flags, blocks, get);
     let InspectFlags {
         indexed,
@@ -3584,10 +3605,11 @@ fn run_inspect(
             // The answer is the exit status; a reader that left early must
             // not cost it.
             output::tolerate_reader_gone(printed.and_then(|()| out.flush()))?;
-            if !has_index {
-                return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
-            }
-            return Ok(());
+            return Ok(if has_index {
+                Outcome::Positive
+            } else {
+                Outcome::Negative
+            });
         }
         InspectMode::NodesOnly => {
             let report =
@@ -3595,7 +3617,7 @@ fn run_inspect(
             let mut out = output::buffered();
             report.write_report(&mut out)?;
             out.flush()?;
-            return Ok(());
+            return Ok(Outcome::Positive);
         }
         InspectMode::HeaderGet(key) => {
             let mut reader = pbfhogg::BlobReader::open(path, direct_io)?
@@ -3636,7 +3658,7 @@ fn run_inspect(
             let mut out = output::buffered();
             writeln!(out, "{v}")?;
             out.flush()?;
-            return Ok(());
+            return Ok(Outcome::Positive);
         }
         InspectMode::Full => {}
     }
@@ -3716,10 +3738,11 @@ fn run_inspect(
     })();
     output::tolerate_reader_gone(printed)?;
 
-    if exit_not_indexed {
-        return Err(Box::new(ExitWithCode(ExitStatus::AnswerNegative)));
-    }
-    Ok(())
+    Ok(if exit_not_indexed {
+        Outcome::Negative
+    } else {
+        Outcome::Positive
+    })
 }
 
 fn run_apply_changes(
@@ -4005,26 +4028,6 @@ fn run_bench_write(
     Ok(())
 }
 
-/// Read peak resident set size (VmHWM) from `/proc/self/status`.
-/// Returns `None` on non-Linux platforms or if parsing fails.
-#[cfg(target_os = "linux")]
-fn read_peak_rss_kb() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmHWM:") {
-            let trimmed = rest.trim();
-            let kb_str = trimmed.strip_suffix("kB").unwrap_or(trimmed).trim();
-            return kb_str.parse::<u64>().ok();
-        }
-    }
-    None
-}
-
-#[cfg(not(target_os = "linux"))]
-fn read_peak_rss_kb() -> Option<u64> {
-    None
-}
-
 #[allow(clippy::cast_precision_loss)]
 fn run_bench_merge(
     base: &std::path::Path,
@@ -4078,7 +4081,9 @@ fn run_bench_merge(
     output::cli_eprintln!("bytes_rewritten={}", stats.bytes_rewritten);
     output::cli_eprintln!("diff_heap_bytes={}", stats.diff_heap_bytes);
     output::cli_eprintln!("output_mb={output_mb:.2}");
-    if let Some(peak_kb) = read_peak_rss_kb() {
+    // Peak RSS is a best-effort diagnostic; omit the field when the probe
+    // cannot provide a reading instead of printing a fabricated zero.
+    if let Some(peak_kb) = pbfhogg::process::read_peak_rss_kb() {
         output::cli_eprintln!("peak_rss_kb={peak_kb}");
     }
     Ok(())

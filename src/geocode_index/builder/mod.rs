@@ -586,7 +586,6 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
     std::fs::write(config.output_dir.join(FILE_HEADER), header.to_bytes())?;
 
     // Build-time smoke test
-    #[cfg(feature = "geocode-reader")]
     {
         crate::host::diag!(
             host.diagnostics,

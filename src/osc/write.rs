@@ -822,7 +822,7 @@ mod tests {
         pb_field_bytes(&mut stringtable, 1, b"");
 
         // PrimitiveBlock: 1=stringtable, 2=primitivegroup. granularity (17)
-        // and date_granularity (19) are left at their protobuf defaults of
+        // and date_granularity (18) are left at their protobuf defaults of
         // 100 and 1000, which is what a real producer emits.
         let mut block = Vec::new();
         pb_field_bytes(&mut block, 1, &stringtable);

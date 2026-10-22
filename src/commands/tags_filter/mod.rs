@@ -1319,8 +1319,8 @@ fn collect_way_node_dependencies(
     // `parallel_classify_accumulate` with a per-worker `IdSet`; at
     // planet's invert-match keep-rate (~99 % of ways included) each
     // worker's bitmap grew to ~1.5 GB and the cumulative across ~30
-    // decode threads peaked at 24 GB anon - the documented
-    // parallel_classify_accumulate caution at scan/classify.rs:300-308.
+    // decode threads peaked at 24 GB anon - this per-worker bitmap shape made
+    // the memory peak scale with the number of decode workers.
     // parallel_classify_phase emits per-blob `Vec<i64>` through a
     // 32-slot bounded result channel. At DEFAULT_ELEMENT_CAP
     // (crate::block_builder) ways per blob, with about 10 refs per way,

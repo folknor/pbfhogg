@@ -103,6 +103,20 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
 
     let mut walker = HeaderWalker::open(base_pbf, &host.diagnostics)?;
     let mut seq: u64 = 0;
+    // Intentionally unbounded under --locations-on-ways: the non-node
+    // branch below appends and continues without polling barrier_rx. On a
+    // sorted base it therefore retains every way/relation descriptor until
+    // EOF, even if the drain published the map earlier. This is metadata,
+    // not blob bodies, but each entry can retain its own tagdata allocation;
+    // neither bounded output channel nor drain reorder telemetry bounds it.
+    //
+    // A local vector cap is not a safe independent change: returning early
+    // rejects otherwise valid large inputs, while waiting or releasing the
+    // tail changes scanner/barrier scheduling. A bounded design should wait
+    // at the first non-node descriptor after announcing last_node_seq, with
+    // the drain's late-boundary idle-fire path and producer-failure shutdown
+    // preserved and validated. That needs an explicit barrier change; do not
+    // disguise it as a channel-capacity or telemetry adjustment here.
     let mut pending_post_barrier: Vec<ScannerEmit> = Vec::new();
     let mut barrier_open = !locations_on_ways; // open by default when not --locations-on-ways
     let mut max_item_bytes_fastpath: usize = 0;

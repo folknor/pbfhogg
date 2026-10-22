@@ -1452,15 +1452,15 @@ type-gate semantics. Fix: `Expression::admits(ElementKind)` and
 
 Reported by: filtering and spatial.
 
-## HYG-064 - Three hand-written `/proc` parsers that return zero on failure
+## HYG-064 - Page-fault counters still read a failed `/proc` sample as zero
 
 Anger: 7 - CLI behaviour.
 
-`read_page_faults` (`debug.rs`), `read_peak_rss_kb` (`main.rs`) and
-`micros_since_process_start`, in two crates, each parse `/proc` themselves and
-silently return zero or `None` on failure (the page-fault one now parses from
-the last `)` and its deltas saturate). Fix: one module returning `Option`
-that callers handle.
+The `/proc` readers now live in `src/process.rs` and return `Option`; the
+CLI and the debug layer call them. `debug::read_page_faults` still maps a
+missing sample to zero for its six altw call sites, which publish the
+numbers for brokkr, so one failed sample distorts a delta. Fix: carry the
+`Option` through those call sites and skip the counter when absent.
 
 Reported by: CLI and plumbing, altw and scanning.
 
@@ -1499,18 +1499,6 @@ per-key needs; a unit test asserting `BuildConfig::default()` equals the
 clap-parsed empty-args config.
 
 Reported by: geocode index, CLI and plumbing, altw and scanning.
-
-## HYG-067 - The negative-answer exit travels as an error
-
-Anger: 7 - CLI behaviour.
-
-`ExitWithCode` is modelled as an `Err` downcast in `main` and `guarded_output`.
-Any wrapper that re-boxes or maps the error would turn "diff found differences"
-into exit 2 with `Error: exit with code 1`. Its `Display` exists only to
-satisfy `Error`. Fix: `run_*` returns `Result<Outcome, Error>` with
-`Outcome::{Positive, Negative}`.
-
-Reported by: CLI and plumbing.
 
 ## HYG-070 - CLI-driving tests live in the library crate, so binary resolution is restated and guessed
 
@@ -1661,20 +1649,6 @@ channel; or at least a crossbeam `select` over both channels. Until then, a
 drain's last node item.
 
 Reported by: change application.
-
-## HYG-083 - The library evicts page cache by default
-
-Anger: 8 - eviction default.
-
-Eviction is on by default for the buffered `BlobReader` constructors and
-re-advises the whole consumed prefix `0..offset` per blob (the source notes it
-is unmeasured and tracked in TODO.md). For a library this evicts pages another
-process (an `osmium` alongside, a second pbfhogg pass) is using. It is
-documented and opt-out exists, but the default is the surprising direction for
-a library consumer and the right one for the CLI; consider making the CLI opt
-in.
-
-Reported by: read path.
 
 ## HYG-084 - Geocode format vocabulary is held in literals and argument order
 
@@ -2077,30 +2051,6 @@ Anger: 6 - needs brokkr changes.
 `PBFHOGG_TEST_MUST_RUN` for profiles that must run.
 
 Reported by: test harness.
-
-## HYG-076 - Durable source still cites transient documents and line numbers
-
-Anger: 2 - comment citations.
-
-The `notes/` and `.plans/` halves are enforced by
-`scripts/check_doc_links.py`, and `decisions/` now has a place in the
-AGENTS.md folder table. Still open: the geocode reader and pass 3 cite
-`TODO.md`; `check/verify_ids.rs` cites `src/read/pipeline.rs` by line range.
-Enforce with a text check for `TODO.md` and `\.rs:[0-9]+` inside `src/`
-comments.
-
-Reported by: altw and scanning, filtering and spatial, re-encoding, CLI and
-plumbing.
-
-## HYG-090 - The geocode builder carries an always-true cfg
-
-Anger: 1 - one always-true cfg.
-
-A `geocode-reader`-only sweep now exists. Inside the builder,
-`#[cfg(feature = "geocode-reader")]` around the smoke test is always true
-(`commands` pulls in `geocode-reader`); drop it.
-
-Reported by: geocode index.
 
 ## HYG-111 - Two small inaccuracies in apply-changes instrumentation
 

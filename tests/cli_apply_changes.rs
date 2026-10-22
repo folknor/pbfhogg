@@ -2193,8 +2193,8 @@ fn merge_rejects_force_with_locations_on_ways_on_non_indexed() {
     );
 }
 
-/// `-j 1` is rejected up front - a single worker has a deadlock
-/// hazard on mid-stream worker panic and no production use case.
+/// `-j 1` remains outside the validated barrier/shutdown configurations.
+/// The refusal must not attribute this limit to the old worker-panic hazard.
 #[test]
 fn merge_rejects_jobs_equal_one() {
     let dir = crate::common::test_scratch();
@@ -2239,6 +2239,10 @@ fn merge_rejects_jobs_equal_one() {
     assert!(
         stderr.contains("at least 2") || stderr.contains(">= 2"),
         "error should name the minimum worker count; stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("has not been validated") && !stderr.contains("deadlock hazard"),
+        "error should describe the validation limit; stderr:\n{stderr}",
     );
 }
 

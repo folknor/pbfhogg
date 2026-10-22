@@ -55,12 +55,14 @@ user-facing summary counters must match output.
   directly would already have truncated it before the first byte of new
   output existed.
 
-  Two consequences the helper carries deliberately. First,
-  `ExitWithCode` is committed, not discarded: a command that ran to
-  completion and answered "no" (`diff -o` finding differences) has a
-  complete output, and treating its non-zero exit as a failure would
-  delete the very result the user asked for. Second, the scratch name is
-  `.pbfhogg-tmp-<pid>-<seq>.<name>` - marker in *front* - so the scratch
+  Two consequences the helper carries deliberately. First, a negative
+  answer (`Outcome::Negative`) is committed, not discarded: a command that
+  ran to completion and answered "no" (`diff -o` finding differences) has
+  a complete output, and treating its non-zero exit as a failure would
+  delete the very result the user asked for. The answer travels in the
+  `Ok` value, not the error channel, so the helper commits on every `Ok`.
+  Second, the scratch name is `.pbfhogg-tmp-<pid>-<seq>.<name>` - marker
+  in *front* - so the scratch
   file keeps the destination's suffix. `merge-changes` picks gzip from a
   `.gz` tail; a suffixed scratch name would have made it write plain XML
   into a `.gz` file.

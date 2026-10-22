@@ -874,8 +874,9 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
         // over a bounded range. That looks like an easy win and is left alone
         // deliberately: the cost was never measured, and changing which pages
         // get dropped changes the cache state every subsequent benchmark on a
-        // host observes, so it is not a change to make on inspection alone.
-        // Tracked in TODO.md, "Bug-hunt carry-over".
+        // host observes, so it is not a change to make on inspection alone:
+        // it wants a matched A/B of both ranges on a planet-sized input with
+        // the cache state recorded before it is narrowed.
         #[cfg(target_os = "linux")]
         if let Some(fd) = self.evict_fd
             && let Some(offset) = self.offset

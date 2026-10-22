@@ -89,9 +89,9 @@ pub(super) struct AdminCellEntry {
 // This is a bound, not the right long-term answer. Sampling a segment at
 // sub-cell resolution is inherently quadratic in the wrong places; the
 // structural fix is an exact S2 edge traversal, or an `S2RegionCoverer` over a
-// loop region as in `research/traccar-geocoder`. That rewrite is tracked in
-// ADR-0015 (`decisions/0015-defer-s2-admin-region-coverer.md`) and in TODO.md
-// under "Bug-hunt carry-over"; it is deliberately not attempted here.
+// loop region as in `research/traccar-geocoder`. That rewrite remains deferred
+// in ADR-0015 (`decisions/0015-defer-s2-admin-region-coverer.md`); this builder
+// currently uses bounded segment sampling.
 // ---------------------------------------------------------------------------
 
 /// Per-segment sampling budget: 2^24 points. In the pathological case that

@@ -2661,7 +2661,7 @@ fn run_tags_filter(
     }
     if remove_tags && omit_referenced {
         output::cli_eprintln!(
-            "Warning! With -R/--omit-referenced use of -t/--remove-tags isn't doing anything."
+            "Warning: With -R/--omit-referenced use of -t/--remove-tags isn't doing anything."
         );
     }
     let opts = pbfhogg::tags_filter::TagsFilterOptions {
@@ -3180,7 +3180,7 @@ fn run_getid(
 
     if remove_tags && !add_referenced {
         output::cli_eprintln!(
-            "Warning! Without -r/--add-referenced use of -t/--remove-tags isn't doing anything."
+            "Warning: Without -r/--add-referenced use of -t/--remove-tags isn't doing anything."
         );
     }
 

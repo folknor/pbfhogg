@@ -79,6 +79,10 @@ fn scatter_bucket_entries(
             ));
         }
         let offset = local_slot_pos * COORD_SLOT_SIZE;
+        // Preserve the private ResolvedEntry latitude/pin encoding verbatim.
+        // Zero-filled unwritten slots deliberately yield unpinned (0, 0)
+        // orphan vertices. Presence/missing counts come from the stage-2
+        // join, not a test of these bytes, so Null Island remains resolved.
         scatter_buf[offset..offset + 4].copy_from_slice(&chunk[4..8]);
         scatter_buf[offset + 4..offset + 8].copy_from_slice(&chunk[8..12]);
         stores += 1;

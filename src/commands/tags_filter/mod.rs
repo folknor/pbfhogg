@@ -718,6 +718,11 @@ fn tags_filter_two_pass(
             if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
                 continue;
             }
+            // Same predicate as `build_classify_schedule_blob_filtered`: only
+            // a kind or bbox filter loses pruning on an unindexed blob.
+            if expr_filter.as_ref().is_some_and(BlobFilter::uses_index) {
+                walker.observe_filter_index(meta.index.as_ref());
+            }
             let (skip, tag_skip) = crate::scan::classify::blob_filter_check(
                 meta.index.as_ref(),
                 meta.tagdata.as_deref(),
@@ -940,6 +945,9 @@ fn tags_filter_two_pass(
         // is ever relaxed, this site needs tightening: either bail out
         // earlier for non-indexed blobs, or decode-to-check the blob's kind
         // before admitting it to the schedule.
+        if blob_filter.as_ref().is_some_and(BlobFilter::uses_index) {
+            walker.observe_filter_index(meta.index.as_ref());
+        }
         if let Some(ref filter) = blob_filter
             && let Some(idx) = meta.index.as_ref()
             && !filter.wants_index(idx)

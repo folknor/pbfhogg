@@ -37,6 +37,30 @@ pub(crate) fn open_error(path: &Path, err: &io::Error) -> io::Error {
 }
 
 impl FileReader {
+    /// Advise away a consumed prefix using the currently owned file.
+    /// Returns whether an advisory syscall was issued; O_DIRECT has no cache.
+    /// The fd is borrowed only for this call, never cached by the caller.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn evict_consumed_prefix(&self, offset: u64) -> bool {
+        use std::os::unix::io::AsRawFd;
+        match self {
+            Self::Buffered(reader) => {
+                // SAFETY: the borrow keeps the owning File alive for the call.
+                unsafe {
+                    libc::posix_fadvise(
+                        reader.get_ref().as_raw_fd(),
+                        0,
+                        offset.try_into().unwrap_or(i64::MAX),
+                        libc::POSIX_FADV_DONTNEED,
+                    )
+                };
+                true
+            }
+            #[cfg(feature = "linux-direct-io")]
+            Self::Direct(_) => false,
+        }
+    }
+
     /// Open a file for buffered reading (256 KB `BufReader`).
     ///
     /// On Linux, advises the kernel for sequential readahead via

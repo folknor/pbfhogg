@@ -32,11 +32,8 @@ struct UnindexedFilterNote {
 
 impl UnindexedFilterNote {
     fn new(filter: Option<&BlobFilter>) -> Self {
-        let uses_index = filter.is_some_and(|f| {
-            !(f.want_nodes && f.want_ways && f.want_relations) || f.node_bbox.is_some()
-        });
         Self {
-            pending: uses_index,
+            pending: filter.is_some_and(BlobFilter::uses_index),
         }
     }
 

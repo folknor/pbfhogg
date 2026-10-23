@@ -1392,6 +1392,14 @@
 
 ### Changed
 
+- **CLI warnings and notes now carry one prefix each.** Every warning on
+  stderr starts with `Warning:` (previously also `warning:`, `Warning!` or an
+  indented `WARNING:`), and every informational note with `Note:` (previously
+  `hint:`, a bracketed command tag such as `[tags-filter]` or `[getid]`, or no
+  prefix at all). Indented warnings and notes now start at column 0. Progress,
+  summary and developer lines are unchanged. Scripts matching the old
+  prefixes need updating; the library's diagnostic event text is unchanged.
+
 - **`add-locations-to-ways --index-type external` checks scratch space
   before its node join.** Once the way pass knows the exact ref count, the
   run is refused unless the scratch filesystem holds about 23 bytes per ref

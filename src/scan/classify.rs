@@ -267,10 +267,12 @@ pub(crate) fn build_classify_schedule_blob_filtered(
 ) -> Result<(Vec<ScheduleEntry>, std::sync::Arc<std::fs::File>, u64)> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, diagnostics)?;
-    // Consume the first blob (expected OSMHeader). Bug-for-bug equivalent
-    // to the prior `next_header_skip_blob` call: on an empty file return
-    // MissingHeader; on non-empty files the first blob is dropped without
-    // kind validation (subsequent non-OsmData blobs are filtered below).
+    // Consume the first blob (expected OSMHeader): on an empty file return
+    // MissingHeader. `HeaderWalker::next_header` enforces header position -
+    // an OSMHeader anywhere after the first frame is a hard error - but it
+    // does not require the first frame to be an OSMHeader, so a file that
+    // opens with an OSMData blob has that blob dropped here unread.
+    // Subsequent non-OsmData blobs are filtered below.
     drop(
         walker
             .next_header()?
@@ -286,6 +288,14 @@ pub(crate) fn build_classify_schedule_blob_filtered(
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
+        }
+        // A tag-key-only blob filter prunes through tagdata, so missing
+        // indexdata only matters to a kind filter or an index-backed blob
+        // filter (same predicate as the pipelined reader's note).
+        if kind_filter.is_some()
+            || blob_filter.is_some_and(crate::blob_meta::BlobFilter::uses_index)
+        {
+            walker.observe_filter_index(meta.index.as_ref());
         }
         if let Some(filter_kind) = kind_filter
             && let Some(idx) = &meta.index
@@ -406,6 +416,7 @@ pub(crate) fn build_classify_schedules_split(
                 rels.push((rels.len(), meta.data_offset, meta.data_size));
             }
             None => {
+                walker.observe_filter_index(None);
                 // Unindexed: visible to every kind filter in the legacy path,
                 // so replicate to all three schedules here.
                 nodes.push((nodes.len(), meta.data_offset, meta.data_size));

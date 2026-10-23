@@ -404,6 +404,14 @@ impl BlobFilter {
         }
     }
 
+    /// Returns true if any part of this filter prunes through indexdata (a
+    /// kind is unwanted, or a node bbox is set). A tag-key-only filter prunes
+    /// through tagdata alone, so missing indexdata costs it nothing; the
+    /// "filter cannot skip unindexed blobs" notes key off this.
+    pub(crate) fn uses_index(&self) -> bool {
+        !(self.want_nodes && self.want_ways && self.want_relations) || self.node_bbox.is_some()
+    }
+
     /// Returns true if the filter accepts the blob described by `index`.
     ///
     /// Checks element type first, then spatial intersection for node blobs

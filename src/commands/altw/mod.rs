@@ -936,6 +936,16 @@ fn collect_way_referenced_node_ids(
         &host.diagnostics,
     )?;
     let mut referenced = IdSet::new();
+    // Prepass needs two independent facts: whether an ID has been seen at
+    // all, and whether it was referenced again (a closed ring's repeated last
+    // ref is stripped in the scan closure below and does not count).
+    // A single membership bit cannot retain both. Opting into injection thus
+    // allocates a second IdSet over the same node-ID range; its populated
+    // chunks can approach referenced's footprint, roughly doubling pass-0
+    // set memory in the worst case. The default path allocates no second set
+    // and keeps its cheaper set-only union loop below. Retain this explicit
+    // opt-in cost rather than replacing measured default-path membership
+    // with a multi-state encoding or a per-worker duplicate set.
     let mut shared = inject_prepass.then(IdSet::new);
     // Union-side attribution: the drain below runs on the main thread
     // and is a suspected pass-0 bottleneck at scale. Timed per drained

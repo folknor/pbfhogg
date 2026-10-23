@@ -44,7 +44,7 @@ The library never mutates process state, reads the environment or writes to stde
 |-------|-----------------|------------------|
 | `process: Arc<dyn ProcessActions>` | Process-wide actions, invoked at the exact point a command needs them: `cross_thread_alloc_pool` before a pool that allocates on one thread and frees on another, `fd_allowance(wanted)` before a run that holds many descriptors, answering how many it may open on top of those already open (`FdAllowance::host_grant` for a share the host reserves across concurrent calls) | `cross_thread_alloc_pool` caps glibc's malloc arenas at 2 (`process::cap_malloc_arenas`); `fd_allowance` raises the soft `RLIMIT_NOFILE` to the hard cap and subtracts the descriptors already open (`process::raise_nofile_to_hard_cap`) |
 | `resources: Arc<dyn Resources>` | Thread counts and memory budgets, probed where each command sizes them | `MachineProbe` (`available_parallelism`, `MemAvailable` from `/proc/meminfo`, on Linux capped by the visible cgroup v2 `memory.max - memory.current` headroom) |
-| `diagnostics: Diagnostics` | Where progress lines, warnings, notes and summaries go, one event per line | A sink that prints each event as one stderr line |
+| `diagnostics: Diagnostics` | Where progress lines, warnings, notes and summaries go, one event per line | A sink that prints each event as one stderr line, with `Warning:` before warnings and `Note:` before notes |
 | `page_cache: PageCachePolicy` | Whether commands drop their input files' pages behind the read head | `Evict` |
 | `executor: Executor` | Which rayon pool runs the library's parallel work and writer framing | `Ambient` |
 | `scratch_parent: Option<PathBuf>` | Where `add-locations-to-ways`, `diff` and `diff --format osc` place their scratch files; the directory must exist | `None` (beside the output, or beside the old input for `diff`) |
@@ -83,7 +83,7 @@ pbfhogg add-locations-to-ways input.osm.pbf -o output.osm.pbf --index-type exter
 | `external` | Bounded memory | High scratch-disk demand; see `reference/performance.md` for measurements | yes + indexdata | Sorted, indexed input when the sparse working set is too large |
 | `auto` | Runtime routing by input eligibility and estimated store/page-cache budget | varies | no (unsorted or unindexed input routes to sparse) | Selects a backend at runtime |
 
-**sparse** is a rank-indexed flat mmap array (~8 bytes per referenced node). Builds a referenced-id IdSet in pass 1, then writes locations in pass 2 indexed by rank within that set. Works on any PBF.
+**sparse** is a rank-indexed flat mmap array (~8 bytes per referenced node). Builds a referenced-id IdSet in pass 1, then writes locations in pass 2 indexed by rank within that set. Works on any PBF. With `--inject-prepass`, that first pass also builds a second IdSet over the same node-ID range (it must remember which referenced nodes are shared, not just referenced), so its set memory can approach double the default's.
 
 **external** uses a four-stage ID- and slot-position-bucketed join with bounded memory. Requires sorted input with indexdata. See `reference/performance.md` for measured scratch-disk needs.
 

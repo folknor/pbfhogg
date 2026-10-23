@@ -574,6 +574,9 @@ pub(super) fn stage2_node_join(
                                     } else {
                                         false
                                     };
+                                    // Private scratch codec documented on ResolvedEntry:
+                                    // domain validation above makes the shift lossless;
+                                    // the run-wide flag also governs payload decoding.
                                     let entry = ResolvedEntry {
                                         slot_pos: linear_slot_pos,
                                         lat: if inject_prepass {

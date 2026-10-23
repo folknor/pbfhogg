@@ -198,6 +198,7 @@ pub(super) fn try_extract_multi_single_pass(
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
         }
+        walker.observe_filter_index(meta.index.as_ref());
         if let Some(idx) = meta.index.as_ref() {
             if !spatial_filter.wants_index(idx) {
                 continue;

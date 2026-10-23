@@ -222,6 +222,10 @@ fn getparents_walker(
                 header_block = Some(decode_blob_to_headerblock(&header_buf)?);
             }
             BlobKind::OsmData => {
+                // A kind filter only prunes when some kind is unwanted.
+                if !(need_node_blobs && need_way_blobs && need_relation_blobs) {
+                    walker.observe_filter_index(meta.index.as_ref());
+                }
                 let keep = match meta.index.as_ref().map(|i| i.kind) {
                     Some(ElemKind::Node) => need_node_blobs,
                     Some(ElemKind::Way) => need_way_blobs,

@@ -488,6 +488,13 @@ pub(crate) fn diff_block_pair_parallel(
     // a scratch parent (the old input's parent is assumed to be on a
     // writable, fast filesystem; this is the same assumption the `--format
     // osc` sibling driver makes for its shard fragments).
+    // No input-size-based free-space refusal: compressed PBF sizes and index
+    // counts do not bound changed text bytes (identical inputs emit none).
+    // Exact sizing would repeat the measured comparison/serialization pass.
+    // Shards coexist until this kind is drained, then are removed one by one;
+    // the caller's arbitrary Write destination may share this filesystem or
+    // consume no disk at all, so twice the input size is not a space budget.
+    // Keep write errors authoritative rather than rejecting on that guess.
     let scratch_dir = host.scratch_parent_or(old_path.parent().unwrap_or(Path::new(".")));
     let suffix = token.suffix();
     let suffix = suffix.as_str();

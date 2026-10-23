@@ -164,6 +164,7 @@ pub(crate) struct BlobHeaderMeta {
 /// data payload on demand.
 pub(crate) struct HeaderWalker {
     diagnostics: crate::host::Diagnostics,
+    reported_unindexed_filter: bool,
     file: Arc<std::fs::File>,
     /// The file this walker was opened from. Stamped onto every error it
     /// raises, for the same reason `BlobReader` keeps one: a byte offset
@@ -217,6 +218,7 @@ impl HeaderWalker {
         }
         Ok(Self {
             diagnostics: diagnostics.clone(),
+            reported_unindexed_filter: false,
             file: Arc::new(file),
             path: Arc::from(path),
             offset: 0,
@@ -232,6 +234,24 @@ impl HeaderWalker {
     /// worse than never having had it.
     fn stamp(&self, err: crate::error::Error) -> crate::error::Error {
         err.in_input(Some(&self.path), Some(self.blob_index))
+    }
+
+    /// Report a filtered schedule retaining an unindexed data blob. Call only
+    /// where a schedule uses type or spatial index pruning, not on every walk.
+    /// Mixed indexed/unindexed files also need this note: later missing indexes
+    /// disable pruning even when the first data blob was indexed.
+    pub(crate) fn observe_filter_index(&mut self, index: Option<&BlobIndex>) {
+        if index.is_some() || self.reported_unindexed_filter {
+            return;
+        }
+        self.reported_unindexed_filter = true;
+        crate::host::diag_once!(
+            self.diagnostics,
+            Note,
+            "reader.filter_without_indexdata",
+            "Input contains blobs without indexdata; blob type and spatial filters cannot skip those blobs"
+        );
+        crate::debug::emit_counter("schedule_filter_without_indexdata", 1);
     }
 
     /// Shared `Arc<File>` for worker threads to `pread` data bodies.
@@ -390,6 +410,47 @@ mod tests {
     };
     use crate::block_builder::{BlockBuilder, HeaderBuilder};
     use crate::writer::{Compression, PbfWriter};
+
+    #[test]
+    fn filtered_walk_reports_missing_indexes_once_across_walkers() {
+        #[derive(Default)]
+        struct Sink(std::sync::Mutex<Vec<&'static str>>);
+        impl crate::host::DiagnosticSink for Sink {
+            fn event(&self, event: &crate::host::Event<'_>) {
+                self.0.lock().expect("sink").push(event.key);
+            }
+        }
+
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("filtered.pbf");
+        write_fixture(&path, true);
+        let sink = std::sync::Arc::new(Sink::default());
+        let diagnostics = crate::host::Diagnostics::new({
+            let shared: std::sync::Arc<Sink> = std::sync::Arc::clone(&sink);
+            shared
+        });
+        let index = crate::blob_meta::BlobIndex {
+            kind: crate::blob_meta::ElemKind::Node,
+            min_id: 1,
+            max_id: 1,
+            count: 1,
+            bbox: None,
+        };
+        let mut first = super::HeaderWalker::open(&path, &diagnostics).expect("walker");
+        first.observe_filter_index(Some(&index));
+        assert!(sink.0.lock().expect("sink").is_empty());
+        // A later missing index must report even after an indexed first blob.
+        first.observe_filter_index(None);
+        first.observe_filter_index(None);
+        let mut second = super::HeaderWalker::open(&path, &diagnostics).expect("walker");
+        second.observe_filter_index(None);
+        assert_eq!(
+            *sink.0.lock().expect("sink"),
+            ["reader.filter_without_indexdata"]
+        );
+        assert!(first.reported_unindexed_filter);
+        assert!(second.reported_unindexed_filter);
+    }
 
     #[test]
     fn open_preserves_not_found_error_kind() {

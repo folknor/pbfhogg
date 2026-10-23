@@ -587,6 +587,23 @@ mod id_record_tests {
 
 /// A resolved coordinate ready to be scattered into a slot bucket for
 /// stage 3's coord_payloads emission.
+// Scratch wire records are 12 bytes (u32 bucket-local slot, i32 lat, i32
+// lon), regardless of this Rust struct's padding. With inject_prepass, lat
+// carries (geographic_lat << 1) | pin; otherwise it is geographic_lat.
+// Stage 2 validates +/-900_000_000 before shifting, so both extremes fit
+// i32. Stage 3 scatters these bytes unchanged; coord_payloads decodes them
+// using the same run-wide inject_prepass option before stage 4 consumes
+// coordinate varints and a separate pin bitmap. These files are private to
+// one invocation, not a persistent format that can outlive that option.
+// Keep the 12-byte scratch record: a separate field would grow each encoded
+// entry by 1/3 at 16 bytes, and the slot's high bit is not spare (bucket
+// widths can use the full u32 range). coord_pack's presence bit serves rank
+// stores, where absence must remain distinct from Null Island. This scratch
+// stream intentionally maps unwritten orphan slots to (0, 0) placeholders
+// and counts absence in stage 2 independently of coordinate values. The
+// command rejects missing locations unless `--ignore-missing-nodes` accepts
+// those placeholders. With injection, coord_pack also leaves no bit for the
+// pin; preserving it would need a side bitmap or a wider scratch record.
 #[derive(Clone, Copy)]
 pub(super) struct ResolvedEntry {
     slot_pos: u64,

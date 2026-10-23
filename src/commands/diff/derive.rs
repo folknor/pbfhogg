@@ -103,6 +103,11 @@ pub fn derive_changes(
         crate::debug::emit_counter("derive_changes_sequential_fallback", 1);
     }
 
+    // No compressed-input multiplier can predict changed XML bytes: tag
+    // escaping, reference lists and the changed fraction determine expansion.
+    // An exact preflight would repeat comparison and XML serialization on this
+    // measured path. Keep write errors authoritative instead of refusing a
+    // potentially empty diff against an invented scratch-space requirement.
     // Scratch directory for temp files (same as brokkr scratch).
     let scratch_dir = host.scratch_parent_or(output.parent().unwrap_or(Path::new(".")));
 
@@ -578,6 +583,12 @@ pub(crate) fn assemble_osc_from_paths(
     // replacing chunk compression risks changing member boundaries and output
     // bytes. Preserve this assembler until all paths can share an owner
     // without changing their established output bytes.
+    // The three XML fragments remain live throughout gzip assembly. Their
+    // exact lengths are now known, but are not the compressed output size:
+    // refusing unless that much space remains would reject compressible XML.
+    // Output can also be on a different filesystem from host-selected scratch.
+    // A statvfs snapshot would not reserve capacity against concurrent writers;
+    // propagate actual output write failures rather than promise a preflight.
     let file = File::create(output)?;
     let buf = io::BufWriter::new(file);
 

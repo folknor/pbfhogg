@@ -604,6 +604,13 @@ pub(crate) fn derive_changes_parallel(
     let suffix = token.suffix();
     let suffix = suffix.as_str();
 
+    // Scratch peaks include completed outer action files plus the current
+    // kind's shard fragments. Appending temporarily duplicates the source
+    // shard, then removes it; gzip later keeps all three outer files alive.
+    // Header ranges/counts cannot predict changed XML bytes, so an input-size
+    // free-space refusal here would be a guess, not a lifetime-aware budget.
+    // An exact estimate requires repeating the measured serialization pass;
+    // retain bounded-memory streaming and propagate actual write failures.
     // Outer temp files that `assemble_osc_from_paths` consumes. Wrap each in
     // a `PathGuard` (see `decisions/0003-*`) so any early return
     // (shard panic, sweep error, flush failure) removes them instead

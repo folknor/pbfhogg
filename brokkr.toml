@@ -204,6 +204,22 @@ paths = ["tests/**/*.rs", "cli/tests/**/*.rs"]
 region = "string"
 message = "Resolve data and scratch paths through tests/common helpers so brokkr overrides apply"
 
+# Header feature spellings live in `read/block.rs` feature constants. Test
+# sources intentionally spell them when building or checking literal fixtures.
+# The renumber wire rewriter also uses `DenseNodes` as a protobuf field label.
+[[textlint]]
+name = "header-features-via-feature-constants"
+pattern = '"(?:OsmSchema-V0\.6|DenseNodes|Sort\.Type_then_ID|LocationsOnWays|HistoricalInformation|pbfhogg\.WayMembers-v1|pbfhogg\.SharedNodePins-v1)"'
+paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+exclude = ["src/read/block.rs"]
+except = [
+    '2 => "DenseNodes",',
+    'repeated_message_field_error\("PrimitiveGroup", "DenseNodes"\)',
+    '(?:unpacked_field_error|repeated_field_error)\("DenseNodes",',
+]
+region = "string"
+message = "Use the Feature constants from read/block.rs for PBF header feature names"
+
 [bin]
 default = "pbfhogg"
 install = ["pbfhogg-cli"]

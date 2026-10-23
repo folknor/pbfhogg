@@ -1,3 +1,3 @@
-auto-selected --index-type sparse (store estimate 0.0 GB <= 80 % of <MEM> GB page-cache budget)
+Note: auto-selected --index-type sparse (store estimate 0.0 GB <= 80 % of <MEM> GB page-cache budget)
 add-locations-to-ways: 300 nodes read, 30 written, 270 dropped, 40 ways, 5 relations, 0 missing locations
   Blobs: 1 passthrough, 4 decoded

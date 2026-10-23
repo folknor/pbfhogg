@@ -1224,7 +1224,8 @@ mod tests {
     ///
     /// The distinction this test draws is "the header was read without
     /// eviction" versus "the header was evicted". A reader in either state can
-    /// carry an armed `evict_fd` afterwards, so the fd cannot tell them apart;
+    /// carry an armed `evict_prefix` callback afterwards, so the callback
+    /// cannot tell them apart;
     /// the fadvise call count can, and it is what the kernel actually saw.
     #[test]
     #[cfg(target_os = "linux")]

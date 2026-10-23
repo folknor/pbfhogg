@@ -186,23 +186,28 @@ impl SparseArrayIndex {
 
 /// Thread-safe writer for parallel sparse-rank index population.
 ///
-/// Holds a raw pointer into the `SparseArrayIndex` mmap buffer. Each
-/// referenced node id maps to a disjoint 8-byte slot
-/// (`base + rank_if_set(id) * 8`). All writes use
-/// `AtomicU64::store(Relaxed)`, eliminating data-race UB even if
-/// duplicate node IDs appear in the input.
-struct SharedSparseWriter {
-    base: *mut u8,
-    capacity_bytes: usize,
+/// Borrows the `SparseArrayIndex` mmap as atomic slots for the duration of
+/// pass 1. Each referenced node id maps to an 8-byte slot
+/// (`rank_if_set(id) * 8`). All writes use `AtomicU64::store(Relaxed)`,
+/// eliminating data-race UB even if duplicate node IDs appear in the input.
+struct SharedSparseWriter<'a> {
+    slots: &'a [AtomicU64],
 }
 
-// SAFETY: All writes use atomic operations (AtomicU64 stores). The raw
-// pointer requires manual Send+Sync; lifetime is bounded by the
-// synchronous parallel scan in `build_node_index_sparse`.
-unsafe impl Send for SharedSparseWriter {}
-unsafe impl Sync for SharedSparseWriter {}
+impl<'a> SharedSparseWriter<'a> {
+    fn new(mmap: &'a mut memmap2::MmapMut, capacity_bytes: usize) -> Self {
+        assert!(capacity_bytes <= mmap.len());
+        assert!(capacity_bytes.is_multiple_of(8));
+        // SAFETY: mmap is page-aligned, initialized, and covers capacity_bytes.
+        // Every u64 bit pattern is valid. All access during this exclusive
+        // mapping borrow is through atomics, including duplicate node IDs.
+        // The returned lifetime keeps the mmap borrowed until workers finish.
+        let slots = unsafe {
+            std::slice::from_raw_parts(mmap.as_mut_ptr().cast::<AtomicU64>(), capacity_bytes / 8)
+        };
+        Self { slots }
+    }
 
-impl SharedSparseWriter {
     /// Insert a referenced node's coordinates at byte offset `rank * 8`.
     ///
     /// Errors when the coordinate is outside the geographic domain, because
@@ -215,23 +220,15 @@ impl SharedSparseWriter {
                 super::node_coordinate_domain_error(node_id, lat, lon),
             )))
         })?;
-        let byte_offset = (rank * 8) as usize;
-        assert!(
-            byte_offset + 8 <= self.capacity_bytes,
-            "sparse index rank {rank} is outside the {} byte store built from \
-             the same IdSet that produced it. Returning quietly here dropped \
-             the coordinate, which resurfaced downstream as a missing \
-             location and then as a (0, 0) way vertex, with no error \
-             anywhere.",
-            self.capacity_bytes
-        );
-        // SAFETY: byte_offset + 8 <= capacity_bytes = mmap length.
-        // Pointer is 8-byte aligned (page-aligned base + 8*rank).
-        // Atomic store eliminates data-race UB even with duplicate ids.
-        unsafe {
-            let ptr = self.base.add(byte_offset).cast::<AtomicU64>();
-            (*ptr).store(packed, Ordering::Relaxed);
-        }
+        let slot = self.slots.get(rank as usize).unwrap_or_else(|| {
+            panic!(
+                "sparse index rank {rank} is outside the {} slot store built from \
+                 the same IdSet that produced it; dropping this coordinate would \
+                 silently turn a missing location into a (0, 0) way vertex",
+                self.slots.len()
+            )
+        });
+        slot.store(packed, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -247,9 +244,9 @@ impl SharedSparseWriter {
 ///      (wire-only, no `PrimitiveBlock`). Each worker stores 8 bytes
 ///      into the mmap at `referenced.rank_if_set(id) << 3` for every
 ///      referenced id, via `AtomicU64::store(Relaxed)`. Workers do
-///      not coordinate beyond the shared `&IdSet` and `SharedSparseWriter` -
-///      each rank slot is touched at most once, atomic stores make
-///      race-free even on duplicates.
+///      not coordinate beyond the shared `&IdSet` and `SharedSparseWriter`.
+///      Duplicate node IDs can touch the same rank more than once; atomic
+///      stores keep those writes race-free.
 ///   4. Wrap the mmap into `SparseArrayIndex`, return.
 ///
 /// `direct_io` is intentionally dropped: blob bodies are pread'd from
@@ -282,7 +279,7 @@ pub(super) fn build_node_index_sparse(
 
     // No referenced nodes (e.g. every way has zero refs): posix_fallocate and
     // mmap both reject a zero length, so back the store with one unused slot.
-    // `capacity_bytes` below stays at `total_bytes`, so no rank can address it.
+    // The borrowed slot slice stays at `total_bytes`, so no rank can address it.
     let file = open_anonymous_sparse_file(scratch_dir, total_bytes.max(8), host, token)?;
 
     // SAFETY: file is exclusively owned, opened read+write, sized to total_bytes.
@@ -293,10 +290,7 @@ pub(super) fn build_node_index_sparse(
 
     let capacity_bytes = usize::try_from(total_bytes)
         .map_err(|_| "sparse index total_bytes does not fit in usize")?;
-    let writer = SharedSparseWriter {
-        base: mmap.as_mut_ptr(),
-        capacity_bytes,
-    };
+    let writer = SharedSparseWriter::new(&mut mmap, capacity_bytes);
 
     let (schedule, shared_input) = crate::scan::classify::build_classify_schedule(
         input,
@@ -415,6 +409,32 @@ fn advise_random_store(mmap: &memmap2::MmapMut) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn borrowed_sparse_writer_keeps_duplicate_stores_atomic() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let slots = [AtomicU64::new(0), AtomicU64::new(0)];
+        let writer = super::SharedSparseWriter { slots: &slots };
+        std::thread::scope(|scope| {
+            for (lat, lon) in [(-900_000_000, -1_800_000_000), (900_000_000, 1_800_000_000)] {
+                let writer = &writer;
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        writer.insert(1, 0, lat, lon).unwrap();
+                    }
+                });
+            }
+        });
+        let stored = slots[0].load(Ordering::Relaxed);
+        assert!(
+            stored == super::pack(-900_000_000, -1_800_000_000).unwrap()
+                || stored == super::pack(900_000_000, 1_800_000_000).unwrap()
+        );
+        assert_eq!(slots[1].load(Ordering::Relaxed), 0);
+        assert!(writer.insert(2, 1, 900_000_001, 0).is_err());
+        assert_eq!(slots[1].load(Ordering::Relaxed), 0);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn sparse_store_precheck_reports_insufficient_space_before_mapping() {

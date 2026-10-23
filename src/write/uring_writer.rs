@@ -190,14 +190,9 @@ struct UringState {
     current_len: usize,
     /// Physical write offset (always advances by page-aligned amounts).
     write_offset: u64,
-    /// Logical file size (actual data bytes, for ftruncate).
-    ///
-    /// Intentionally has no `Drop` impl that calls `file.set_len`.
-    /// `logical_size` is only consumed by `flush_final`, which is
-    /// called on the explicit success path. On any error, the surrounding
-    /// `uring_main_loop` propagates via `?` before `flush_final` runs,
-    /// so a partially-inflated `logical_size` cannot reach a `set_len`
-    /// call and extend the file past real bytes with kernel zeroes.
+    /// Bytes accepted into registered buffers, excluding alignment padding.
+    /// Updated only by `accept_buffered` after bytes have been copied/read.
+    /// Completion errors still abort before `flush_final` can truncate.
     logical_size: u64,
     /// Number of submitted but not yet completed SQEs.
     in_flight: u32,
@@ -209,9 +204,7 @@ impl UringState {
     /// Accumulates into the current registered buffer. When the buffer fills,
     /// submits a `WriteFixed` SQE. Handles any data size by splitting across
     /// multiple buffer fills.
-    #[allow(clippy::cast_possible_truncation)] // data.len() as u64: usize fits u64
     fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        self.logical_size += data.len() as u64;
         let mut offset = 0;
         while offset < data.len() {
             // Ensure we have a current buffer.
@@ -236,7 +229,7 @@ impl UringState {
                 let dst = self.pool.buf_ptr(buf_idx).add(self.current_len);
                 std::ptr::copy_nonoverlapping(data.as_ptr().add(offset), dst, chunk);
             }
-            self.current_len += chunk;
+            self.accept_buffered(chunk);
             offset += chunk;
 
             // If buffer is full, submit it.
@@ -245,6 +238,14 @@ impl UringState {
             }
         }
         Ok(())
+    }
+
+    /// Account for initialized payload bytes in the current buffer.
+    /// Both framed writes and CopyRange reads use this accounting protocol.
+    #[allow(clippy::cast_possible_truncation)] // bytes as u64: usize fits u64
+    fn accept_buffered(&mut self, bytes: usize) {
+        self.current_len += bytes;
+        self.logical_size += bytes as u64;
     }
 
     /// Submit the current accumulation buffer as a `WriteFixed` SQE.
@@ -262,7 +263,8 @@ impl UringState {
     ///
     /// Handles O_DIRECT page-alignment padding, advances `write_offset` and
     /// `in_flight`. Releases the buffer immediately if `data_len` is zero.
-    /// Does **not** update `logical_size` - the caller is responsible.
+    /// Does **not** update `logical_size`: `accept_buffered` already counted
+    /// payload bytes, and alignment padding must never contribute.
     #[allow(clippy::cast_possible_truncation)] // aligned_len as u32/u64, buf_idx as u64: bounded by IO_BUF_BYTES/NUM_BUFS
     fn submit_buffer(&mut self, buf_idx: u16, data_len: usize) -> io::Result<()> {
         if data_len == 0 {
@@ -522,9 +524,6 @@ fn handle_copy_range_uring(
     mut src_offset: u64,
     mut remaining: u64,
 ) -> io::Result<()> {
-    // Track logical size upfront since we bypass write() which normally does it.
-    state.logical_size += remaining;
-
     while remaining > 0 {
         if state.current_buf.is_none() {
             let idx = state.acquire_buffer()?;
@@ -556,7 +555,7 @@ fn handle_copy_range_uring(
             )));
         }
 
-        state.current_len += chunk;
+        state.accept_buffered(chunk);
         src_offset += chunk as u64;
         remaining -= chunk as u64;
 

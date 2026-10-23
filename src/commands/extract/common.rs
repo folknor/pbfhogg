@@ -211,6 +211,7 @@ pub(super) fn build_blob_schedule_with_passthrough(
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
         }
+        walker.observe_filter_index(meta.index.as_ref());
         let idx = meta.index.as_ref();
         let kind = idx.map(|i| i.kind);
 

@@ -884,7 +884,7 @@ fn auto_routes_small_sorted_indexed_input_to_sparse() {
          eligibility fallback; stderr:\n{stderr}",
     );
     assert!(
-        !stderr.contains("hint: this sorted indexed PBF is eligible"),
+        !stderr.contains("Note: this sorted indexed PBF is eligible"),
         "auto-resolved sparse must not be second-guessed by the \
          explicit-sparse hint; stderr:\n{stderr}",
     );

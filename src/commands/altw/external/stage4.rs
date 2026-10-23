@@ -119,6 +119,8 @@ pub(super) fn stage4_assembly(
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
     member_way_ids: Option<&IdSet>,
+    // Selects payload pin-bitmap framing, not the scratch latitude encoding:
+    // coord_payloads already decoded ResolvedEntry before publishing bytes.
     inject_prepass: bool,
     inject_metrics: &InjectMetrics,
     compression: Compression,

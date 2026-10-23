@@ -424,7 +424,7 @@ fn normalise(text: &str, dir: &Path) -> String {
     let memory = Regex::new(r"of [0-9.]+ GB page-cache budget").unwrap();
     s.split_inclusive('\n')
         .map(|line| {
-            if line.starts_with("auto-selected --index-type") {
+            if line.starts_with("Note: auto-selected --index-type") {
                 memory
                     .replace_all(line, "of <MEM> GB page-cache budget")
                     .into_owned()

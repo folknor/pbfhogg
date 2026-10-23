@@ -373,21 +373,21 @@ pub struct BlobReader<R: Read + Send> {
     parse_indexdata: bool,
     /// When `true`, `WireBlobHeader::parse` allocates field-5 waymembers.
     parse_waymembers: bool,
-    /// File descriptor for fadvise(DONTNEED) after each blob read. When set,
+    /// Borrowed-reader callback for fadvise(DONTNEED) after each blob read. When set,
     /// the reader evicts page cache pages behind the read head, preventing
     /// sequential reads from accumulating the entire file in the page cache.
     /// Only set for buffered FileReader - O_DIRECT has no pages to evict - and
     /// only when the caller opted in (`evict_page_cache(true)` or a host with
     /// `PageCachePolicy::Evict`).
     #[cfg(target_os = "linux")]
-    evict_fd: Option<std::os::unix::io::RawFd>,
+    evict_prefix: Option<fn(&R, u64) -> bool>,
     /// Count of `posix_fadvise(DONTNEED)` calls this reader has issued.
     ///
     /// Exists so a test can tell "never evicted anything" apart from "evicted,
-    /// then had eviction switched off" - a distinction the `evict_fd` field
+    /// then had eviction switched off" - a distinction the `evict_prefix` field
     /// alone cannot express, because a reader that already advised the header
-    /// blob away looks identical to one that never advised at all once the fd
-    /// is cleared. One increment inside a branch that is already making a
+    /// blob away looks identical to one that never advised at all once eviction
+    /// is disabled. One increment inside a branch that is already making a
     /// syscall.
     #[cfg(target_os = "linux")]
     evict_calls: u64,
@@ -432,7 +432,7 @@ impl<R: Read + Send> BlobReader<R> {
             parse_indexdata: true,
             parse_waymembers: false,
             #[cfg(target_os = "linux")]
-            evict_fd: None,
+            evict_prefix: None,
             #[cfg(target_os = "linux")]
             evict_calls: 0,
         }
@@ -649,21 +649,6 @@ impl<R: Read + Send> BlobReader<R> {
     }
 }
 
-/// The raw fd to advise `POSIX_FADV_DONTNEED` on, or `None` when there is
-/// nothing to evict.
-///
-/// Only the buffered arm has page cache behind it; an O_DIRECT reader never
-/// populates it, so advising on one is a syscall that can only do harm.
-#[cfg(target_os = "linux")]
-fn buffered_evict_fd(reader: &FileReader) -> Option<std::os::unix::io::RawFd> {
-    use std::os::unix::io::AsRawFd;
-    match reader {
-        FileReader::Buffered(r) => Some(r.get_ref().as_raw_fd()),
-        #[cfg(feature = "linux-direct-io")]
-        FileReader::Direct(_) => None,
-    }
-}
-
 impl BlobReader<FileReader> {
     /// Enable or disable page-cache eviction behind the read head.
     ///
@@ -700,8 +685,10 @@ impl BlobReader<FileReader> {
     pub fn evict_page_cache(mut self, enabled: bool) -> Self {
         #[cfg(target_os = "linux")]
         {
-            self.evict_fd = if enabled {
-                buffered_evict_fd(&self.reader)
+            // A callback preserves the generic Read API without caching an fd
+            // or imposing a file-specific trait bound on every BlobReader.
+            self.evict_prefix = if enabled && matches!(&self.reader, FileReader::Buffered(_)) {
+                Some(FileReader::evict_consumed_prefix)
             } else {
                 None
             };
@@ -755,7 +742,7 @@ impl BlobReader<FileReader> {
             parse_indexdata: true,
             parse_waymembers: false,
             #[cfg(target_os = "linux")]
-            evict_fd: None,
+            evict_prefix: None,
             #[cfg(target_os = "linux")]
             evict_calls: 0,
         })
@@ -780,7 +767,7 @@ impl BlobReader<FileReader> {
             parse_tagdata: false,
             parse_indexdata: true,
             parse_waymembers: false,
-            evict_fd: None, // O_DIRECT: no pages to evict
+            evict_prefix: None, // O_DIRECT: no pages to evict
             evict_calls: 0,
         })
     }
@@ -815,7 +802,7 @@ impl BlobReader<FileReader> {
             parse_indexdata: true,
             parse_waymembers: false,
             #[cfg(target_os = "linux")]
-            evict_fd: None,
+            evict_prefix: None,
             #[cfg(target_os = "linux")]
             evict_calls: 0,
         })
@@ -901,19 +888,10 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
         // it wants a matched A/B of both ranges on a planet-sized input with
         // the cache state recorded before it is narrowed.
         #[cfg(target_os = "linux")]
-        if let Some(fd) = self.evict_fd
+        if let Some(evict) = self.evict_prefix
             && let Some(offset) = self.offset
+            && evict(&self.reader, offset.0)
         {
-            // posix_fadvise(fd, 0, offset, POSIX_FADV_DONTNEED)
-            // SAFETY: fd is valid (owned by FileReader in same struct), offset is in range.
-            unsafe {
-                libc::posix_fadvise(
-                    fd,
-                    0,
-                    offset.0.try_into().unwrap_or(i64::MAX),
-                    libc::POSIX_FADV_DONTNEED,
-                )
-            };
             self.evict_calls += 1;
         }
 
@@ -964,7 +942,7 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
             parse_indexdata: true,
             parse_waymembers: false,
             #[cfg(target_os = "linux")]
-            evict_fd: None,
+            evict_prefix: None,
             #[cfg(target_os = "linux")]
             evict_calls: 0,
         })

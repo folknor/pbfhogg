@@ -267,6 +267,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
         }
+        walker.observe_filter_index(meta.index.as_ref());
         let idx = meta.index.as_ref();
         // Build pass3_blob_schedule unconditionally for all OsmData blobs.
         // Mirrors build_blob_schedule's behavior (no kind/spatial filter,

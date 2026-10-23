@@ -163,20 +163,6 @@ rejecting `const` items declared inside `fn` bodies under `src/commands/`.
 
 Reported by: all nine scopes.
 
-## HYG-005 - Nothing stops a header feature name being spelled as a literal again
-
-Anger: 0 - constants, output bytes unchanged.
-
-Every header feature name in `src/` and `cli/` now goes through the
-`Feature` newtype and `HeaderBlock` constants in `read/block.rs`. The text
-rule on quoted feature literals outside `read/block.rs` was not added: the
-existing textlint rules use `region = "code"`, which excludes string
-literals, so whether brokkr can match strings needs checking first, and
-`"DenseNodes"` legitimately appears as a field name in renumber's error
-strings and integration-test fixtures, which need an exclusion.
-
-Reported by: write path.
-
 ## HYG-007 - "Node, way or relation" has a dozen encodings
 
 Anger: 8 - element kinds, expression semantics.
@@ -867,7 +853,7 @@ Anger: 9 - validate flags earlier, refuse no-op flags.
 
 Refused: `-j` with `-R`, `--distrust-metadata` outside the scanning report,
 `-v` with `-j` on diff, `inspect -j` / `--force` outside `--nodes`. Warned
-(`Warning!` from `run_*`): `tags-filter -R -t`, `getid -t` without `-r`, and
+(a `Warning:` line from `run_*`): `tags-filter -R -t`, `getid -t` without `-r`, and
 `--remove-tags` without `--add-referenced` (which the library accepts
 silently). Ignored: `--direct-io` on `check`, `getid -I` and many pipeline
 passes (HYG-037), `--jobs` with `-R` in the tags-filter library. Validation is
@@ -1104,20 +1090,6 @@ ahead of the merged head.
 
 Reported by: re-encoding, read path, filtering and spatial, altw and scanning.
 
-## HYG-057 - Diff and derive scratch writes have no free-space precheck
-
-Anger: 7 - new refusals.
-
-Both altw backends now check free space (sparse before preallocating,
-external after stage 1 against its exact slot count). Diff and derive
-scratch is still unchecked: it is the full output size, written to shard
-files and again to the output (derive: three sequential XML files, or three
-per shard plus three outer files in parallel, then gzip; about 45 GB of XML
-at planet per its comment). A check must account for which filesystem holds
-scratch versus output and for overlapping file lifetimes.
-
-Reported by: altw and scanning, re-encoding.
-
 ## HYG-058 - Sort and dedupe memory on adversarial input
 
 Anger: 8 - memory bounds change algorithms and output.
@@ -1261,42 +1233,6 @@ decides sortedness. Fix: open once and hand the `File` and parsed header down
 Reported by: altw and scanning, change application, re-encoding, filtering and
 spatial.
 
-## HYG-079 - The altw inject-prepass pin bit is stolen from latitude
-
-Anger: 8 - altw pin bit.
-
-Stage 2 writes `lat = (tuple.lat << 1) | pin` into `ResolvedEntry` when
-`inject_prepass` is set, and stages 3 and 4 decode based on the same flag passed
-separately: a second coordinate encoding beside `coord_pack`, whose doc says
-nobody re-derives the layout. It is safe (`9e8 << 1` fits in i32), but a stored
-latitude's meaning depends on a bool carried through three stages, and stage
-3's zero-filled scatter buffer stands for absence (all-zero is Null Island,
-unpinned), the convention `coord_pack` was written to retire. Fix: a separate
-field (the record has room at 16 bytes, or the high bit of `local_slot_pos`), or
-a `coord_pack`-style codec with a type per encoding. Sparse pass 0 with
-`inject_prepass` also builds a second full `IdSet` the size of `referenced`,
-roughly doubling pass-0 memory, absent from the memory table.
-
-Reported by: altw and scanning.
-
-## HYG-080 - Unsafe shared state whose safety rests on lexical co-location
-
-Anger: 8 - unsafe sparse writer.
-
-`SharedSparseWriter` is a raw pointer with hand-written `Send + Sync`; soundness
-rests on the mmap outliving the writer lexically in `build_node_index_sparse`.
-Borrow the mmap as `&[AtomicU64]` with a lifetime and drop the `unsafe impl`s.
-`BlobReader` stores `evict_fd: Option<RawFd>` copied from `self.reader`; it is
-valid because `reader` is never replaced, and a future `set_reader`,
-`into_inner` or `mem::replace` would make `posix_fadvise(DONTNEED)` evict some
-other file's cache through a reused fd. Make eviction a method on `FileReader`
-and store a bool. `UringState.logical_size` is updated by two protocols
-(`write()` adds before copying, `handle_copy_range_uring` adds the whole range
-up front and may fail midway), safe only because no `set_len` runs on error, an
-invariant held by a field comment.
-
-Reported by: altw and scanning, read path, write path.
-
 ## HYG-081 - The apply-changes node-to-way barrier is a three-party protocol held together by polling
 
 Anger: 10 - rewrites apply-changes' barrier.
@@ -1326,43 +1262,23 @@ drain's last node item.
 
 Reported by: change application.
 
-## HYG-091 - Schedule-based filtered reads skip nothing silently on unindexed input
-
-Anger: 8 - new diagnostic lines and wording.
-
-The diff and derive sequential fallbacks, the multi-extract single-pass
-decline and its swallowed first-blob error, the region-grid rejection,
-`sort --force`, writer tagdata loss, apply-changes forced rewrites and the
-merge-changes strategy now all report through keyed diagnostics or
-counters. Left: the "blob filter on an unindexed file skips nothing" note
-lives only in the pipelined reader. The case that matters most ("why is my
-extract slow") runs through `HeaderWalker` schedules: `extract --simple` on
-unindexed input, complete and smart under `--force`, and the other
-schedule-based filtered commands treat a missing index as "include" and
-still say nothing.
-
-Reported by: re-encoding, filtering and spatial, read path, write path, change
-application.
-
 ## HYG-108 - Diagnostic wording is inconsistent across commands
 
 Anger: 8 - new diagnostic lines and wording.
 
-The library now reports through keyed `host::Diagnostics` events and the CLI
-prints each as one stderr line, byte for byte as before; the wording itself
-was deliberately left alone. What remains is a CLI output change:
+Warning and Note events now render as `Warning:` and `Note:` at column 0 in
+the CLI sink; Progress, Summary and Developer lines are unchanged by design
+(developer tags and the `add-locations-to-ways:` / `time-filter:` summary
+leads stay). What remains:
 
-- Prefixes for one class of event: `Warning:`, `warning:`, `Warning!`,
-  `hint:`, `[tags-count]`, `[getid --invert]`, `[inspect]`, `time-filter:`,
-  `add-locations-to-ways:`, `[altw external]`, `[coord_payloads]`, bare text.
-  The event kind (`Warning`, `Note`, `Progress`, `Developer`) now carries the
-  class, so the CLI sink could render the prefix uniformly.
+- renumber's orphan-refs warning goes out through the summary writer as a
+  Summary event whose text starts `Warning:`, not as a Warning event.
 - The apply-changes `-j 1` refusal is ten lines and the version-regression
   errors about five each.
 - `warn_locations_on_ways_loss` reports once per input in `cat` with no
   filename; the unrecognised-indexdata warning names no file or offset.
-- sort's "verifying intra-blob order" line has no warning prefix though it
-  means pass 1 decodes every blob.
+- sort's "verifying intra-blob order" line is now a `Note:`; whether it should
+  be a warning is open.
 - `[uring_writer] error: {e}` and `[parallel_writer] thread exit: {e}` are
   also returned as the error, so the operator sees each twice in different
   words; the CLI prints the geocode counts after the library's own `done`
@@ -1371,7 +1287,20 @@ was deliberately left alone. What remains is a CLI output change:
   firing, renumber orphan refs) go out as prose and as counters, spelled
   independently.
 - The CLI has no `--quiet` beyond `diff -q` and `check --quiet`; with keyed
-  events it could filter by kind.
+  events it is now a one-line kind filter in the CLI's stderr sink.
+- On unindexed input `check --ids` prints both its own triple-scan warning
+  and the schedule walker's unindexed-filter note; the second is redundant
+  there (likewise `cat --clean --force`, `check --refs`,
+  `repack --force-repack` and degrade).
+- The CLI sink strips each library event's own legacy prefix through a table
+  keyed on event key (`legacy_prefix` in `cli/src/host.rs`), a second copy of
+  the library's wording: a new warning or note that opens with its own
+  prefix prints it twice unless someone adds an entry. Stripping by kind
+  against a fixed prefix list, or dropping the prefixes from the library
+  text, would remove the copy.
+- getid's schedule walker gives no unindexed-filter note; its pruning is by
+  ID range, so the note's "blob type and spatial filters" wording would not
+  fit it.
 
 Reported by: all nine scopes (split out of the library stderr item when the
 library stopped writing stderr).

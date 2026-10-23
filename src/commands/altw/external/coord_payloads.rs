@@ -776,6 +776,14 @@ pub(super) fn encode_blob_payload_from_record(
 
         let mut last_lat: i32 = 0;
         let mut last_lon: i32 = 0;
+        // This is the inverse of stage 2's private ResolvedEntry codec,
+        // selected by the same invocation-wide flag. Keep the decode here:
+        // stage 3 scatters opaque 8-byte slots, while stage 4 receives plain
+        // delta-coordinate varints plus a distinct pin bitmap.
+        // The slot bytes have no presence bit: unwritten orphans intentionally
+        // become unpinned (0, 0) placeholders. Stage 2 counts absence from
+        // node matches, so a resolved Null Island stays resolved; the command
+        // rejects missing locations unless `--ignore-missing-nodes` is set.
         // When injecting, lat carries the pin bit in position 0; unpack it and
         // accumulate the per-way pin bitmap emitted after the coordinate
         // varints (v2 framing: 2*N varints then ceil(N/8) bitmap bytes).

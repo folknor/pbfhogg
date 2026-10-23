@@ -230,7 +230,7 @@ pub fn merge_pbf(
     // Reconciled across every input, not taken from the first: the merge's
     // header has to describe the merge. Always stamped sorted - every input
     // passed `require_sorted` and the sweep emits in type-then-ID order.
-    let header_bytes = super::output_header_bytes(&headers, true, overrides, host)?;
+    let header_bytes = super::output_header_bytes(inputs, &headers, true, overrides, host)?;
     let mut writer = writer_from_header_bytes(
         output,
         opts.compression,
@@ -394,13 +394,17 @@ fn index_input(
         // Name the input: this loop indexes several files, and the shared
         // framing refusals (a non-leading OSMHeader among them, which this
         // loop used to report itself with the input path) carry none.
-        let Some(frame) =
-            read_frame_header(&mut reader, header_buf, frame_start, &host.diagnostics).map_err(
-                |err| {
-                    err.at(crate::ByteOffset(frame_start))
-                        .in_input(Some(&std::sync::Arc::<Path>::from(input)), None)
-                },
-            )?
+        let Some(frame) = read_frame_header(
+            &mut reader,
+            header_buf,
+            frame_start,
+            &host.diagnostics,
+            Some(input),
+        )
+        .map_err(|err| {
+            err.at(crate::ByteOffset(frame_start))
+                .in_input(Some(&std::sync::Arc::<Path>::from(input)), None)
+        })?
         else {
             break;
         };

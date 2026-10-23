@@ -734,7 +734,7 @@ fn filter_by_id_walker(
             host.diagnostics,
             Note,
             "getid.blobs_skipped",
-            "[getid] {blobs_skipped} blobs skipped by ID range filter"
+            "{blobs_skipped} blobs skipped by ID range filter"
         );
     }
     if blobs_passthrough > 0 {
@@ -742,7 +742,7 @@ fn filter_by_id_walker(
             host.diagnostics,
             Note,
             "getid.invert.passthrough",
-            "[getid --invert] {blobs_passthrough} blobs passed through raw"
+            "{blobs_passthrough} blobs passed through raw"
         );
     }
     writer.flush()?;
@@ -803,7 +803,8 @@ fn filter_by_id_streaming(
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics)? {
+    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, input)?
+    {
         match frame.blob_type {
             BlobKind::OsmHeader if writer.is_none() => {
                 let header = decode_blob_to_headerblock(frame.blob_bytes())?;
@@ -901,7 +902,7 @@ fn filter_by_id_streaming(
             host.diagnostics,
             Note,
             "getid.blobs_skipped",
-            "[getid] {blobs_skipped} blobs skipped by ID range filter"
+            "{blobs_skipped} blobs skipped by ID range filter"
         );
     }
     writer.flush()?;

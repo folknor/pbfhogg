@@ -73,13 +73,20 @@ pub(crate) fn read_raw_frame<R: Read>(
     reader: &mut R,
     file_offset: &mut u64,
     diagnostics: &crate::host::Diagnostics,
+    source: &std::path::Path,
 ) -> Result<Option<RawBlobFrame>> {
     let frame_start = *file_offset;
 
     // Prefix, EOF policy, both size guards and the header parse all live in
     // `read::frame` - see that module for why they are not spelled out here.
     let mut header_bytes = Vec::new();
-    let Some(header) = read_frame_header(reader, &mut header_bytes, *file_offset, diagnostics)?
+    let Some(header) = read_frame_header(
+        reader,
+        &mut header_bytes,
+        *file_offset,
+        diagnostics,
+        Some(source),
+    )?
     else {
         return Ok(None);
     };
@@ -135,9 +142,16 @@ pub(crate) fn read_blob_header_only(
     reader: &mut FileReader,
     file_offset: &mut u64,
     diagnostics: &crate::host::Diagnostics,
+    source: &std::path::Path,
 ) -> Result<Option<BlobHeaderInfo>> {
     let mut header_bytes = Vec::new();
-    let Some(header) = read_frame_header(reader, &mut header_bytes, *file_offset, diagnostics)?
+    let Some(header) = read_frame_header(
+        reader,
+        &mut header_bytes,
+        *file_offset,
+        diagnostics,
+        Some(source),
+    )?
     else {
         return Ok(None);
     };
@@ -173,6 +187,7 @@ mod tests {
             &mut input,
             &mut file_offset,
             &crate::host::Diagnostics::discard(),
+            std::path::Path::new("test.osm.pbf"),
         );
 
         assert!(result.is_err(), "the missing payload must be an error");

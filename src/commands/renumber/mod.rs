@@ -89,18 +89,25 @@ impl RenumberStats {
             "Renumbered {total} elements: {} nodes, {} ways, {} relations",
             self.nodes_written, self.ways_written, self.relations_written,
         )?;
+        Ok(())
+    }
+
+    /// Report, as a warning event, the orphan refs the run shifted. Silent
+    /// when there are none. Separate from [`Self::write_summary`] because it
+    /// is a warning, not part of the summary text.
+    pub fn report_warnings(&self, diagnostics: &crate::host::Diagnostics) {
         if self.orphan_refs > 0 {
-            writeln!(
-                w,
-                "Warning: {} orphan refs (referenced elements not present in \
+            crate::host::diag!(
+                diagnostics,
+                Warning,
+                "renumber.orphan_refs",
+                "{} orphan refs (referenced elements not present in \
                  input) shifted past their kind's renumbered range: new ID = \
                  old ID + start ID + element count, separately for nodes, \
                  ways and relations",
                 self.orphan_refs,
-            )?;
+            );
         }
-
-        Ok(())
     }
 }
 
@@ -576,6 +583,45 @@ mod tests {
             max_id: 0,
             bbox: None,
         }
+    }
+
+    #[derive(Default)]
+    struct Collect(std::sync::Mutex<Vec<(crate::host::EventKind, &'static str, String)>>);
+    impl crate::host::DiagnosticSink for Collect {
+        fn event(&self, e: &crate::host::Event<'_>) {
+            self.0
+                .lock()
+                .expect("sink")
+                .push((e.kind, e.key, e.args.to_string()));
+        }
+    }
+
+    #[test]
+    fn orphan_refs_are_a_warning_event_not_summary_text() {
+        let sink = std::sync::Arc::new(Collect::default());
+        let diagnostics = crate::host::Diagnostics::new(
+            std::sync::Arc::clone(&sink) as std::sync::Arc<dyn crate::host::DiagnosticSink>
+        );
+        let mut stats = RenumberStats {
+            nodes_written: 1,
+            ways_written: 0,
+            relations_written: 0,
+            orphan_refs: 0,
+        };
+        stats.report_warnings(&diagnostics);
+        assert!(sink.0.lock().expect("sink").is_empty());
+
+        stats.orphan_refs = 3;
+        let mut summary = Vec::new();
+        stats.write_summary(&mut summary).expect("summary");
+        let summary = String::from_utf8(summary).expect("utf-8");
+        assert!(!summary.contains("orphan"), "summary: {summary}");
+        stats.report_warnings(&diagnostics);
+        let events = sink.0.lock().expect("sink");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, crate::host::EventKind::Warning);
+        assert_eq!(events[0].1, "renumber.orphan_refs");
+        assert!(events[0].2.starts_with("3 orphan refs"), "{}", events[0].2);
     }
 
     #[test]

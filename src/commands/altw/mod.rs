@@ -389,7 +389,7 @@ pub fn add_locations_to_ways(
                 host.diagnostics,
                 Note,
                 "altw.external_hint",
-                "hint: this sorted indexed PBF is eligible for --index-type external, \
+                "this sorted indexed PBF is eligible for --index-type external, \
                  which uses bounded working memory and sequential I/O. Sparse is faster \
                  while its node store fits in the page cache; external avoids the \
                  page-cache thrashing sparse hits when it does not. --index-type auto \

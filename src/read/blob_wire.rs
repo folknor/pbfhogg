@@ -341,6 +341,47 @@ impl WireBlob {
 /// is inlined at each use site with no memory address or indirection overhead.
 pub const MAX_BLOB_HEADER_SIZE: u64 = 64 * 1024;
 
+/// Where a blob header was read, for diagnostics that name it. Either part
+/// may be unknown: a bare `Read` has no path, a non-seekable stream no offset.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct BlobSite<'a> {
+    pub(crate) source: Option<&'a std::path::Path>,
+    /// Byte offset of the frame's length prefix in the input.
+    pub(crate) offset: Option<u64>,
+}
+
+impl std::fmt::Display for BlobSite<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(source) = self.source {
+            write!(f, " in {}", source.display())?;
+        }
+        if let Some(offset) = self.offset {
+            write!(f, " at byte offset {offset}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Report, once per run, a `BlobHeader.indexdata` whose length this crate does
+/// not recognise. The wire lengths are not version numbers: v1 is
+/// [`INDEX_SIZE_V1`] bytes while v2 and v3 are both [`INDEX_SIZE`]. A new
+/// version need not add a length; the version/length consistency check lives
+/// in blob_meta.
+pub(crate) fn warn_unrecognised_indexdata(
+    diagnostics: &crate::host::Diagnostics,
+    len: usize,
+    site: BlobSite<'_>,
+) {
+    crate::host::diag_once!(
+        diagnostics,
+        Warning,
+        "indexdata.unrecognised_length",
+        "BlobHeader.indexdata has an unrecognised length ({len} bytes; \
+         expected {INDEX_SIZE_V1} or {INDEX_SIZE}){site} - blob index ignored, reads fall back \
+         to full decode. Further occurrences are not reported."
+    );
+}
+
 /// Maximum allowed uncompressed `Blob` content size in bytes.
 /// Compile-time constant per the PBF spec. Uses `const` (not `static`) so the value
 /// is inlined at each use site with no memory address or indirection overhead.
@@ -390,10 +431,14 @@ pub const MAX_BLOB_DATASIZE: u64 = MAX_BLOB_MESSAGE_SIZE;
 /// `None` here, and every reader is right to treat that as "no index". A
 /// verifier is not - see [`WireBlobHeader::indexdata_present`] and
 /// [`WireBlobHeader::tagdata_present`].
+///
+/// `site` only feeds the one-shot unrecognised-indexdata warning, so it names
+/// where the first offender was found.
 #[allow(clippy::type_complexity)]
 pub(crate) fn parse_blob_header_with_index(
     header_bytes: &[u8],
     diagnostics: &crate::host::Diagnostics,
+    site: BlobSite<'_>,
 ) -> Result<(
     BlobKind,
     usize,
@@ -404,14 +449,7 @@ pub(crate) fn parse_blob_header_with_index(
 )> {
     let header = WireBlobHeader::parse(header_bytes, true, true, false)?;
     if let Some(len) = header.unrecognised_indexdata_len {
-        crate::host::diag_once!(
-            diagnostics,
-            Warning,
-            "indexdata.unrecognised_length",
-            "warning: BlobHeader.indexdata has an unrecognised length ({len} bytes; \
-             expected {INDEX_SIZE_V1} or {INDEX_SIZE}) - blob index ignored, reads fall back \
-             to full decode. Further occurrences are not reported."
-        );
+        warn_unrecognised_indexdata(diagnostics, len, site);
     }
 
     if header.datasize < 0 {
@@ -453,10 +491,24 @@ pub(crate) fn parse_blob_header_with_index(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 mod tests {
-    use super::{
-        BlobError, BlobKind, MAX_BLOB_DATASIZE, WireBlobHeader, parse_blob_header_with_index,
-    };
+    use super::{BlobError, BlobKind, BlobSite, MAX_BLOB_DATASIZE, WireBlobHeader};
     use crate::error::ErrorKind;
+
+    /// The production parser with no known site.
+    #[allow(clippy::type_complexity)]
+    fn parse_blob_header_with_index(
+        header_bytes: &[u8],
+        diagnostics: &crate::host::Diagnostics,
+    ) -> crate::error::Result<(
+        BlobKind,
+        usize,
+        Option<[u8; crate::blob_meta::INDEX_SIZE]>,
+        bool,
+        Option<Box<[u8]>>,
+        bool,
+    )> {
+        super::parse_blob_header_with_index(header_bytes, diagnostics, BlobSite::default())
+    }
 
     /// Hand-encode a minimal BlobHeader protobuf (`OSMData` type + a chosen
     /// datasize) so a test can drive `parse_blob_header_with_index` with a

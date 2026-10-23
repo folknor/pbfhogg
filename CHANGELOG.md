@@ -1423,7 +1423,21 @@
   `hint:`, a bracketed command tag such as `[tags-filter]` or `[getid]`, or no
   prefix at all). Indented warnings and notes now start at column 0. Progress,
   summary and developer lines are unchanged. Scripts matching the old
-  prefixes need updating; the library's diagnostic event text is unchanged.
+  prefixes need updating. Library event text no longer carries a kind prefix
+  at all: the host's sink renders `Warning:` or `Note:` from the event kind,
+  so an embedding host sees the bare message.
+
+- **Several diagnostics are sharper or no longer doubled.** `renumber`'s
+  orphan-refs message is now a real `Warning:` (it was summary text that
+  started with the word). `cat` names the input whose header carries
+  way-level metadata that will be lost, and the unrecognised-indexdata
+  warning names the file and the byte offset of the first offending blob.
+  `check --ids` on an unindexed input prints its triple-scan warning without
+  the extra unindexed-filter note. A failing `--io-uring` or parallel writer
+  thread is reported once, through the returned error, instead of also as a
+  `[uring_writer]` or `[parallel_writer]` line. `build-geocode-index` prints
+  its `Index built:` counts before `Done in` rather than after it. The
+  `apply-changes --jobs 1` refusal is two lines.
 
 - **`add-locations-to-ways --index-type external` checks scratch space
   before its node join.** Once the way pass knows the exact ref count, the

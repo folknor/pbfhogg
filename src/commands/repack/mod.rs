@@ -112,7 +112,7 @@ fn warn_way_metadata_loss(header: &crate::HeaderBlock, host: &crate::host::Host)
             host.diagnostics,
             Warning,
             "repack.way_metadata_loss",
-            "Warning: input PBF has way-level enrichment metadata. \
+            "input PBF has way-level enrichment metadata. \
              Injected prepass metadata (WayMembers/SharedNodePins) is not preserved in the output."
         );
     }
@@ -312,7 +312,7 @@ pub fn repack(
             host.diagnostics,
             Warning,
             "repack.cap_never_fired",
-            "Warning: --elements-per-blob {elements_per_blob} never fired; \
+            "--elements-per-blob {elements_per_blob} never fired; \
              every per-kind element count fits in a single output blob, \
              so the output is one blob per kind."
         );

@@ -32,20 +32,18 @@ pub(crate) fn cli_host() -> Host {
 /// path over. A FIFO that cannot be opened is reported once, here, as a
 /// warning: the run continues unprofiled rather than failing.
 pub(crate) fn init_marker_fifo() {
-    use pbfhogg::host::DiagnosticSink as _;
     let Some(path) = std::env::var_os("BROKKR_MARKER_FIFO") else {
         return;
     };
     let path = std::path::PathBuf::from(path);
     if let Err(error) = pbfhogg::debug::initialize_marker_fifo(&path) {
-        StderrSink.event(&pbfhogg::host::Event {
-            kind: pbfhogg::host::EventKind::Warning,
-            key: "debug.marker_fifo",
-            args: format_args!(
+        cli_warning(
+            "debug.marker_fifo",
+            format_args!(
                 "cannot open marker FIFO {}: {error}; sidecar markers are disabled for this run",
                 path.display()
             ),
-        });
+        );
     }
 }
 
@@ -66,55 +64,26 @@ fn diagnostic_prefix(kind: EventKind) -> Option<&'static str> {
     }
 }
 
-/// The body prefix a library warning or note still carries, keyed by event.
-///
-/// Library event text stays as it is for other sinks, so the CLI removes the
-/// old per-site prefix before adding its own. Leading indentation (a warning
-/// nested under a progress heading) is trimmed first, then this prefix. A new
-/// warning or note whose text opens with its own prefix needs an entry here,
-/// or it prints doubled.
-fn legacy_prefix(event: &Event<'_>) -> Option<&'static str> {
-    match (event.kind, event.key) {
-        (
-            EventKind::Warning,
-            "header.way_metadata_loss"
-            | "sort.unindexed_fallback"
-            | "repack.way_metadata_loss"
-            | "repack.cap_never_fired"
-            | "extract.passthrough_demoted"
-            | "writer.tagdata_dropped_oversize",
-        ) => Some("Warning: "),
-        (
-            EventKind::Warning,
-            "indexdata.unrecognised_length" | "check.ids.unindexed_triple_scan",
-        ) => Some("warning: "),
-        (EventKind::Warning, "geocode.pass2.admin_ring_budget") => Some("WARNING: "),
-        (EventKind::Note, "altw.external_hint") => Some("hint: "),
-        (EventKind::Note, "tags_count.blobs_skipped_by_tag") => Some("[tags-count] "),
-        (
-            EventKind::Note,
-            "tags_filter.blobs_skipped_by_tag" | "tags_filter.pass2_blobs_skipped",
-        ) => Some("[tags-filter] "),
-        (EventKind::Note, "getid.invert.passthrough") => Some("[getid --invert] "),
-        (EventKind::Note, "getid.blobs_skipped") => Some("[getid] "),
-        (EventKind::Note, "inspect.direct_io_ignored") => Some("[inspect] "),
-        _ => None,
+impl pbfhogg::host::DiagnosticSink for StderrSink {
+    /// The one place a diagnostic becomes stderr text. Library text carries no
+    /// kind prefix of its own, so the kind alone decides the rendering; a
+    /// `--quiet` kind filter or a `--json` sink (serializing kind, key and the
+    /// formatted arguments) belongs here and nowhere in the library.
+    fn event(&self, event: &pbfhogg::host::Event<'_>) {
+        match diagnostic_prefix(event.kind) {
+            Some(prefix) => crate::output::stderr_line(format_args!("{prefix}{}", event.args)),
+            None => crate::output::stderr_line(event.args),
+        }
     }
 }
 
-impl pbfhogg::host::DiagnosticSink for StderrSink {
-    fn event(&self, event: &pbfhogg::host::Event<'_>) {
-        let Some(prefix) = diagnostic_prefix(event.kind) else {
-            crate::output::stderr_line(event.args);
-            return;
-        };
-        // Warnings and notes are rare, so formatting them to a String first
-        // costs nothing that matters.
-        let message = event.args.to_string();
-        let body = message.trim_start_matches(' ');
-        let body = legacy_prefix(event)
-            .and_then(|old| body.strip_prefix(old))
-            .unwrap_or(body);
-        crate::output::stderr_line(format_args!("{prefix}{body}"));
-    }
+/// Report a warning the CLI itself raises (an option combination that does
+/// nothing), through the same sink and prefix as the library's events.
+pub(crate) fn cli_warning(key: &'static str, args: std::fmt::Arguments<'_>) {
+    use pbfhogg::host::DiagnosticSink as _;
+    StderrSink.event(&Event {
+        kind: EventKind::Warning,
+        key,
+        args,
+    });
 }

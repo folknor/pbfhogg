@@ -154,7 +154,7 @@ pub fn sort(
             host.diagnostics,
             Warning,
             "sort.unindexed_fallback",
-            "Warning: sorting without indexdata; every blob must be decompressed to scan element IDs"
+            "sorting without indexdata; every blob must be decompressed to scan element IDs"
         );
         crate::debug::emit_counter("sort_unindexed_fallback", 1);
     }
@@ -506,7 +506,7 @@ fn build_blob_index(
                                 host.diagnostics,
                                 Note,
                                 "sort.verify_unclaimed_order",
-                                "  input does not declare Sort.Type_then_ID; verifying \
+                                "input does not declare Sort.Type_then_ID; verifying \
                                  intra-blob order (pass 1 decodes every blob payload)"
                             );
                         }

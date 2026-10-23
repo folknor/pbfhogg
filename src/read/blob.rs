@@ -22,7 +22,8 @@ pub(crate) use super::decompress::{
 // Re-exported at pub(crate) so existing paths like `crate::blob::WireBlob`
 // and `crate::blob::parse_blob_header_with_index` keep resolving.
 pub(crate) use super::blob_wire::{
-    BlobData, BlobKind, WireBlob, WireBlobHeader, parse_blob_header_with_index,
+    BlobData, BlobKind, BlobSite, WireBlob, WireBlobHeader, parse_blob_header_with_index,
+    warn_unrecognised_indexdata,
 };
 pub use super::blob_wire::{MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE, MAX_BLOB_MESSAGE_SIZE};
 
@@ -607,13 +608,14 @@ impl<R: Read + Send> BlobReader<R> {
         // while both v2 and v3 are 42. A new version need not add a length;
         // the version/length consistency check lives in blob_meta.
         if let Some(len) = header.unrecognised_indexdata_len {
-            crate::host::diag_once!(
-                self.diagnostics,
-                Warning,
-                "indexdata.unrecognised_length",
-                "warning: BlobHeader.indexdata has an unrecognised length ({len} bytes; \
-             expected 26 or 42) - blob index ignored, reads fall back to full decode. \
-             Further occurrences are not reported."
+            // `self.offset` is the BlobHeader start, 4 bytes past the frame.
+            warn_unrecognised_indexdata(
+                &self.diagnostics,
+                len,
+                BlobSite {
+                    source: self.source.as_deref(),
+                    offset: self.offset.map(|o| o.0.saturating_sub(4)),
+                },
             );
         }
 

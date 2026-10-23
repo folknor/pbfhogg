@@ -159,7 +159,8 @@ fn read_header(
 ) -> Result<crate::HeaderBlock> {
     let mut reader = FileReader::open(file, direct_io)?;
     let mut file_offset: u64 = 0;
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics)? {
+    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, file)?
+    {
         if frame.blob_type == BlobKind::OsmHeader {
             return Ok(decode_blob_to_headerblock(frame.blob_bytes())?);
         }
@@ -185,7 +186,7 @@ fn cat_output_header_bytes(
         .map(|f| read_header(f, direct_io, host))
         .collect::<Result<Vec<_>>>()?;
     let sorted = matches!(headers.as_slice(), [only] if only.is_sorted());
-    output_header_bytes(&headers, sorted, overrides, host)
+    output_header_bytes(files, &headers, sorted, overrides, host)
 }
 
 /// Build the output header bytes for any `cat` path from the headers of
@@ -207,13 +208,14 @@ fn cat_output_header_bytes(
 /// sorted input, `--dedupe` always sets it (every input was required to be
 /// sorted and the merge emits in type-then-ID order).
 fn output_header_bytes(
+    inputs: &[&Path],
     headers: &[crate::HeaderBlock],
     sorted: bool,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<Vec<u8>> {
-    for header in headers {
-        super::warn_locations_on_ways_loss(header, host);
+    for (input, header) in inputs.iter().zip(headers) {
+        super::warn_locations_on_ways_loss_in(header, input, host);
     }
     let mut hb = reconciled_header(headers)?;
     if sorted {
@@ -353,7 +355,7 @@ fn cat_passthrough(
         let mut file_offset: u64 = 0;
 
         while let Some(mut frame) =
-            read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics)?
+            read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, file)?
         {
             match &frame.blob_type {
                 BlobKind::OsmHeader => {}
@@ -461,7 +463,7 @@ fn cat_type_passthrough(
         let mut file_offset: u64 = 0;
 
         while let Some(mut frame) =
-            read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics)?
+            read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, file)?
         {
             match &frame.blob_type {
                 BlobKind::OsmHeader => {}

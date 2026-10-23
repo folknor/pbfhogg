@@ -196,17 +196,45 @@ pub(crate) fn ensure_relation_capacity_local(
 /// Warn if the input header declares way-level metadata that re-encoding does
 /// not propagate.
 pub(crate) fn warn_locations_on_ways_loss(header: &crate::HeaderBlock, host: &crate::host::Host) {
+    warn_way_metadata_loss_of(header, None, host);
+}
+
+/// [`warn_locations_on_ways_loss`] for a command with several inputs: the
+/// warning names the input the header came from.
+pub(crate) fn warn_locations_on_ways_loss_in(
+    header: &crate::HeaderBlock,
+    input: &std::path::Path,
+    host: &crate::host::Host,
+) {
+    warn_way_metadata_loss_of(header, Some(input), host);
+}
+
+fn warn_way_metadata_loss_of(
+    header: &crate::HeaderBlock,
+    input: Option<&std::path::Path>,
+    host: &crate::host::Host,
+) {
     if header.has_locations_on_ways()
         || header.has_way_members_v1()
         || header.has_shared_node_pins_v1()
     {
-        crate::host::diag!(
-            host.diagnostics,
-            Warning,
-            "header.way_metadata_loss",
-            "Warning: input PBF has way-level enrichment metadata. \
-             LocationsOnWays and injected prepass metadata are not preserved in the output."
-        );
+        match input {
+            Some(input) => crate::host::diag!(
+                host.diagnostics,
+                Warning,
+                "header.way_metadata_loss",
+                "input PBF {} has way-level enrichment metadata. \
+                 LocationsOnWays and injected prepass metadata are not preserved in the output.",
+                input.display()
+            ),
+            None => crate::host::diag!(
+                host.diagnostics,
+                Warning,
+                "header.way_metadata_loss",
+                "input PBF has way-level enrichment metadata. \
+                 LocationsOnWays and injected prepass metadata are not preserved in the output."
+            ),
+        }
     }
 }
 
@@ -682,7 +710,7 @@ fn probe_first_data_blob(
     let mut reader = FileReader::open(path, direct_io)?;
     let mut offset = 0u64;
     while let Some(info) =
-        crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset, diagnostics)?
+        crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset, diagnostics, path)?
     {
         if matches!(info.blob_type, BlobKind::OsmData) {
             return Ok((info.index.is_some(), info.has_tagdata));

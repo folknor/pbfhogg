@@ -2197,18 +2197,8 @@ fn run_build_geocode_index(
         fine_search_radius_m: levels.search_radius,
         coarse_search_radius_m: levels.coarse_search_radius,
     };
-    let stats = pbfhogg::geocode_index::builder::build_geocode_index(&config, host)?;
-    output::cli_eprintln!(
-        "Index built: {} addr, {} streets, {} interp, {} admin ({} relations dropped), {} fine cells, {} coarse cells, {} admin cells",
-        stats.addr_points,
-        stats.street_ways,
-        stats.interp_ways,
-        stats.admin_polygons,
-        stats.dropped_admin_relations,
-        stats.fine_cells,
-        stats.coarse_cells,
-        stats.admin_cells,
-    );
+    // The library reports the counts itself, ahead of its closing "Done" line.
+    pbfhogg::geocode_index::builder::build_geocode_index(&config, host)?;
     Ok(())
 }
 
@@ -2656,6 +2646,7 @@ fn run_renumber(
         host,
     )?;
     stats.write_summary(&mut host.diagnostics.summary_writer("renumber.summary"))?;
+    stats.report_warnings(&host.diagnostics);
     Ok(())
 }
 
@@ -2682,8 +2673,9 @@ fn run_tags_filter(
         return Err("no filter expressions provided (use positional args or -e FILE)".into());
     }
     if remove_tags && omit_referenced {
-        output::cli_eprintln!(
-            "Warning: With -R/--omit-referenced use of -t/--remove-tags isn't doing anything."
+        host::cli_warning(
+            "tags_filter.remove_tags_ignored",
+            format_args!("With -R/--omit-referenced use of -t/--remove-tags isn't doing anything."),
         );
     }
     let opts = pbfhogg::tags_filter::TagsFilterOptions {
@@ -3196,8 +3188,11 @@ fn run_getid(
     )?;
 
     if remove_tags && !add_referenced {
-        output::cli_eprintln!(
-            "Warning: Without -r/--add-referenced use of -t/--remove-tags isn't doing anything."
+        host::cli_warning(
+            "getid.remove_tags_ignored",
+            format_args!(
+                "Without -r/--add-referenced use of -t/--remove-tags isn't doing anything."
+            ),
         );
     }
 

@@ -107,7 +107,7 @@ fn try_index_only_scan(
             host.diagnostics,
             Note,
             "inspect.direct_io_ignored",
-            "[inspect] --direct-io not used on the index-only fast path; \
+            "--direct-io not used on the index-only fast path; \
              HeaderWalker avoids page-cache pollution via \
              posix_fadvise(POSIX_FADV_RANDOM). If any blob lacks indexdata \
              this scan falls back to full decode and honours --direct-io there."
@@ -286,7 +286,7 @@ fn full_decode_scan(
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    while let Some(frame) = read_raw_frame(&mut reader, &mut offset, &host.diagnostics)? {
+    while let Some(frame) = read_raw_frame(&mut reader, &mut offset, &host.diagnostics, path)? {
         match frame.blob_type {
             BlobKind::OsmHeader => {
                 let header = decode_blob_to_headerblock(frame.blob_bytes())?;

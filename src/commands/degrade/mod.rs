@@ -582,7 +582,7 @@ fn passthrough_header_bytes(
         // first blob in a well-formed PBF.
         let mut reader = FileReader::open(input, direct_io)?;
         let mut file_offset: u64 = 0;
-        let frame = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics)?
+        let frame = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, input)?
             .ok_or("input PBF is empty: no OSMHeader blob")?;
         if !matches!(frame.blob_type, BlobKind::OsmHeader) {
             return Err("input PBF does not start with an OSMHeader blob".into());
@@ -642,7 +642,8 @@ fn degrade_passthrough(
     let mut blobs_written: u64 = 0;
 
     crate::debug::emit_marker("DEGRADE_PASSTHROUGH_START");
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics)? {
+    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, input)?
+    {
         match &frame.blob_type {
             BlobKind::OsmHeader => {}
             BlobKind::OsmData => {

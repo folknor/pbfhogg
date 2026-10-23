@@ -135,6 +135,7 @@ pub(crate) fn read_frame_header<R: Read>(
     header_buf: &mut Vec<u8>,
     frame_start: u64,
     diagnostics: &crate::host::Diagnostics,
+    source: Option<&std::path::Path>,
 ) -> Result<Option<FrameHeader>> {
     let Some(header_len) = read_frame_prefix(reader)? else {
         return Ok(None);
@@ -150,7 +151,14 @@ pub(crate) fn read_frame_header<R: Read>(
     // and no caller can be driven into an outsized payload allocation by a
     // hostile `BlobHeader.datasize`.
     let (blob_type, data_size, raw_index, raw_index_present, tagdata, tagdata_present) =
-        parse_blob_header_with_index(header_buf, diagnostics)?;
+        parse_blob_header_with_index(
+            header_buf,
+            diagnostics,
+            crate::blob::BlobSite {
+                source,
+                offset: Some(frame_start),
+            },
+        )?;
     // Stamp the frame start: the raw-frame callers otherwise report this
     // refusal with no position, and on a multi-input command no input either.
     check_header_position(&blob_type, frame_start == 0)
@@ -261,6 +269,7 @@ mod tests {
             &mut buf,
             0,
             &crate::host::Diagnostics::discard(),
+            None,
         ) {
             Err(err) => assert!(
                 matches!(err.into_kind(), ErrorKind::Io(_)),

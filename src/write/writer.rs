@@ -278,6 +278,8 @@ impl PbfWriter<FileWriter> {
     ) -> io::Result<Self> {
         use crate::write::uring_writer;
 
+        // The writer thread reports nothing; its error is its return value.
+        drop(diagnostics);
         let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
 
         // Oneshot channel for init errors from the writer thread.
@@ -294,7 +296,6 @@ impl PbfWriter<FileWriter> {
                 framed_header,
                 init_tx,
                 &thread_expected,
-                diagnostics,
             )
         });
 
@@ -364,6 +365,8 @@ impl PbfWriter<FileWriter> {
     ) -> io::Result<Self> {
         use crate::write::parallel_writer;
 
+        // The writer thread reports nothing; its error is its return value.
+        drop(diagnostics);
         let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
 
         let (init_tx, init_rx) = sync_channel(1);
@@ -378,7 +381,6 @@ impl PbfWriter<FileWriter> {
                 framed_header,
                 init_tx,
                 &thread_expected,
-                diagnostics,
             )
         });
 

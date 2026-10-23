@@ -93,7 +93,7 @@ pub fn report_writer_index_loss(diagnostics: &crate::host::Diagnostics) {
             diagnostics,
             Warning,
             "writer.tagdata_dropped_oversize",
-            "Warning: {dropped} output blobs lost their tag skip-index because their headers exceeded the size limit; tag filtering may decode more blobs"
+            "{dropped} output blobs lost their tag skip-index because their headers exceeded the size limit; tag filtering may decode more blobs"
         );
     }
 }

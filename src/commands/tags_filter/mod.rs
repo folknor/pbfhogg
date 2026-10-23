@@ -737,7 +737,7 @@ fn tags_filter_two_pass(
                 host.diagnostics,
                 Note,
                 "tags_filter.blobs_skipped_by_tag",
-                "[tags-filter] {blobs_skipped_by_tag} blobs skipped by tag index"
+                "{blobs_skipped_by_tag} blobs skipped by tag index"
             );
         }
         crate::debug::emit_marker("TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_END");
@@ -971,7 +971,7 @@ fn tags_filter_two_pass(
             host.diagnostics,
             Note,
             "tags_filter.pass2_blobs_skipped",
-            "[tags-filter] pass 2: {blobs_skipped} blobs skipped by type/tag index"
+            "pass 2: {blobs_skipped} blobs skipped by type/tag index"
         );
     }
 

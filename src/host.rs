@@ -489,6 +489,16 @@ impl Diagnostics {
     pub(crate) fn emit(&self, kind: EventKind, key: &'static str, args: std::fmt::Arguments<'_>) {
         self.sink.event(&Event { kind, key, args });
     }
+    /// Record that the event with `key` is already covered, so a later
+    /// `diag_once!` with that key stays silent. For a command that has just
+    /// reported the same condition in its own, more specific words.
+    pub(crate) fn mark_reported(&self, key: &'static str) {
+        self.once
+            .keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key);
+    }
     pub(crate) fn emit_once(
         &self,
         kind: EventKind,
@@ -573,6 +583,15 @@ mod diagnostic_tests {
             d.emit_once(EventKind::Warning, "key", format_args!("warning"));
         }
         assert_eq!(*sink.0.lock().expect("sink"), ["warning", "warning"]);
+    }
+    #[test]
+    fn a_reported_key_silences_a_later_once_event() {
+        let sink = Arc::new(Sink::default());
+        let d = Diagnostics::new(Arc::clone(&sink) as Arc<dyn DiagnosticSink>);
+        d.mark_reported("key");
+        d.emit_once(EventKind::Note, "key", format_args!("note"));
+        d.emit_once(EventKind::Note, "other", format_args!("other"));
+        assert_eq!(*sink.0.lock().expect("sink"), ["other"]);
     }
     #[test]
     fn summary_writer_splits_lines_and_keeps_partial_on_drop() {

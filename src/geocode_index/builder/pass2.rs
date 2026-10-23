@@ -799,7 +799,7 @@ pub(super) fn run_pass2(
             host.diagnostics,
             Warning,
             "geocode.pass2.missing_way_node_refs",
-            "  {missing_node_ref_count} geocode way node refs have no coordinate; \
+            "{missing_node_ref_count} geocode way node refs have no coordinate; \
              way IDs (sample): {missing_ref_way_ids:?}"
         );
     }

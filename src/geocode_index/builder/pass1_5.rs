@@ -155,7 +155,7 @@ fn report_negative_node_refs(count: &AtomicU64, sample: Mutex<Vec<i64>>, host: &
             host.diagnostics,
             Warning,
             "geocode.pass1_5.negative_node_refs",
-            "  skipped {negative_count} negative node refs; node IDs (sample): {sample:?}"
+            "skipped {negative_count} negative node refs; node IDs (sample): {sample:?}"
         );
     }
 }

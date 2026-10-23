@@ -570,18 +570,11 @@ pub(crate) fn uring_writer_thread(
     framed_header: Vec<u8>,
     init_tx: SyncSender<io::Result<()>>,
     expected: &SeqTotal,
-    diagnostics: crate::host::Diagnostics,
 ) -> io::Result<()> {
-    let result = uring_init_and_run(&rx, &path, &framed_header, &init_tx, expected);
-    if let Err(ref e) = result {
-        crate::host::diag!(
-            diagnostics,
-            Developer,
-            "writer.uring.error",
-            "[uring_writer] error: {e}"
-        );
-    }
-    result
+    // A failure is not logged here: it is the thread's return value, which the
+    // writer's `flush` (or the failed send that noticed the thread was gone)
+    // hands to the caller, so the operator sees it exactly once.
+    uring_init_and_run(&rx, &path, &framed_header, &init_tx, expected)
 }
 
 /// Refuse, as a typed platform refusal, a ring whose kernel cannot run

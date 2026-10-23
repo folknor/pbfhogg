@@ -173,7 +173,7 @@ pub(super) fn warn_passthrough_demotions(verified: u64, demoted: u64, host: &cra
             host.diagnostics,
             Warning,
             "extract.passthrough_demoted",
-            "Warning: {demoted} node blob(s) whose indexdata bbox lies inside the region \
+            "{demoted} node blob(s) whose indexdata bbox lies inside the region \
              hold out-of-region nodes or content other than DenseNodes, so they were \
              filtered instead of copied raw. The input's indexdata may be wrong \
              (`pbfhogg check --index` checks it)."

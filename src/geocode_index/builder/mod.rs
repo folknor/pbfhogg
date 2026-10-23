@@ -552,7 +552,7 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
             host.diagnostics,
             Warning,
             "geocode.pass2.admin_way_geometry_missing",
-            "  {} admin way member refs have no geometry; way IDs (sample): {:?}",
+            "{} admin way member refs have no geometry; way IDs (sample): {:?}",
             missing_admin_geometry.member_refs,
             missing_admin_geometry.sample_way_ids
         );
@@ -576,7 +576,7 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
             host.diagnostics,
             Warning,
             "geocode.pass2.admin_dropped_ids",
-            "  {dropped_admin_relations} admin relations dropped; relation IDs (sample): {:?}",
+            "{dropped_admin_relations} admin relations dropped; relation IDs (sample): {:?}",
             dropped_admin.sample_relation_ids
         );
     }
@@ -585,7 +585,7 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
             host.diagnostics,
             Warning,
             "geocode.pass2.admin_ring_budget",
-            "  WARNING: {} admin relations refused: ring assembly exceeded its search budget \
+            "{} admin relations refused: ring assembly exceeded its search budget \
              (counted among the dropped relations above)",
             dropped_admin.over_budget
         );
@@ -639,7 +639,7 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
             host.diagnostics,
             Warning,
             "geocode.pass2.interp_unresolved",
-            "  {unresolved_interpolation_count} interpolation ways have unresolved endpoints; \
+            "{unresolved_interpolation_count} interpolation ways have unresolved endpoints; \
              way IDs (sample): {unresolved_interpolation_ids:?}"
         );
     }
@@ -813,7 +813,7 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
                     host.diagnostics,
                     Warning,
                     "geocode.smoke_test.no_match",
-                    "  smoke test query at ({:.7}, {:.7}) in index {} returned no address \
+                    "smoke test query at ({:.7}, {:.7}) in index {} returned no address \
                      or street match",
                     e7_to_deg(f64::from(first_addr_point.lat_e7)),
                     e7_to_deg(f64::from(first_addr_point.lon_e7)),
@@ -837,6 +837,35 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
 
     #[cfg(feature = "hotpath")]
     let pass4_ms = pass4_start.elapsed().as_millis();
+
+    let stats = BuildStats {
+        addr_points: u64::from(header.addr_point_count),
+        street_ways: u64::from(header.street_way_count),
+        interp_ways: u64::from(header.interp_way_count),
+        admin_polygons: u64::from(header.admin_polygon_count),
+        dropped_admin_relations: dropped_admin_relations as u64,
+        fine_cells: u64::from(header.geo_cell_count),
+        coarse_cells: u64::from(header.coarse_cell_count),
+        admin_cells: u64::from(header.admin_cell_count),
+        smoke_test,
+    };
+    // The counts come before the closing "Done" line so the run reads in
+    // sequence; the CLI used to print them after it.
+    crate::host::diag!(
+        host.diagnostics,
+        Summary,
+        "geocode.index_built",
+        "Index built: {} addr, {} streets, {} interp, {} admin ({} relations dropped), \
+         {} fine cells, {} coarse cells, {} admin cells",
+        stats.addr_points,
+        stats.street_ways,
+        stats.interp_ways,
+        stats.admin_polygons,
+        stats.dropped_admin_relations,
+        stats.fine_cells,
+        stats.coarse_cells,
+        stats.admin_cells,
+    );
 
     let elapsed = start_time.elapsed();
     crate::host::diag!(
@@ -909,17 +938,7 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
     }
     crate::debug::emit_marker("GEOCODE_PASS3_END");
 
-    Ok(BuildStats {
-        addr_points: u64::from(header.addr_point_count),
-        street_ways: u64::from(header.street_way_count),
-        interp_ways: u64::from(header.interp_way_count),
-        admin_polygons: u64::from(header.admin_polygon_count),
-        dropped_admin_relations: dropped_admin_relations as u64,
-        fine_cells: u64::from(header.geo_cell_count),
-        coarse_cells: u64::from(header.coarse_cell_count),
-        admin_cells: u64::from(header.admin_cell_count),
-        smoke_test,
-    })
+    Ok(stats)
 }
 
 fn checked_count(count: usize, kind: &str) -> Result<u32> {

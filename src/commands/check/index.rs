@@ -463,7 +463,8 @@ pub fn check_index(
     let mut found = Vec::new();
 
     crate::debug::emit_marker("CHECK_INDEX_START");
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics)? {
+    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, path)?
+    {
         if !matches!(frame.blob_type, BlobKind::OsmData) {
             continue;
         }

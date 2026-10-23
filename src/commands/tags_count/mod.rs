@@ -137,7 +137,7 @@ pub fn tags_count(
             host.diagnostics,
             Note,
             "tags_count.blobs_skipped_by_tag",
-            "[tags-count] {blobs_skipped_by_tag} blobs skipped by tag index"
+            "{blobs_skipped_by_tag} blobs skipped by tag index"
         );
     }
     let thread_override = (opts.jobs > 0).then_some(opts.jobs);

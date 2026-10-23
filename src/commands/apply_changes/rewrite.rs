@@ -153,7 +153,7 @@ fn read_header(
     let mut reader = FileReader::open(base_pbf, direct_io)?;
     let mut offset: u64 = 0;
     loop {
-        match read_raw_frame(&mut reader, &mut offset, &host.diagnostics)? {
+        match read_raw_frame(&mut reader, &mut offset, &host.diagnostics, base_pbf)? {
             Some(frame) if frame.blob_type == BlobKind::OsmHeader => {
                 let header = decode_blob_to_headerblock(frame.blob_bytes())?;
                 return build_header_bytes(&header, locations_on_ways, overrides, host);
@@ -394,11 +394,11 @@ pub fn merge(
     // keep the explicit refusal rather than silently substituting workers.
     let worker_count = match jobs {
         Some(1) => {
-            return Err("apply-changes requires at least 2 worker threads \
-                 (`--jobs N` with N >= 2, or omit `--jobs` for the \
-                 default). Single-worker operation has not been validated \
-                 through the node-to-way barrier and failure shutdown."
-                .into());
+            return Err(
+                "apply-changes needs at least 2 workers (--jobs 2 or more, or omit \
+                 --jobs): a single worker has not been validated"
+                    .into(),
+            );
         }
         Some(n) if n > 1 => n,
         _ => crate::host::sized_workers(

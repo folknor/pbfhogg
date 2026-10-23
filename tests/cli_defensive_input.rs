@@ -508,6 +508,13 @@ fn bench_commands_report_unrecognised_indexdata() {
             warnings,
             "bench-read {mode}: {stderr}"
         );
+        if mode == "blobreader" {
+            // The warning names the file and where in it the header sits.
+            assert!(
+                stderr.contains("bad-indexdata.osm.pbf") && stderr.contains("at byte offset"),
+                "bench-read {mode}: {stderr}"
+            );
+        }
     }
     for mode in ["sync", "pipelined"] {
         let out = CliInvoker::new()

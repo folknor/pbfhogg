@@ -350,12 +350,16 @@ fn warn_unindexed_triple_scan(indexed: bool, host: &crate::host::Host) {
             host.diagnostics,
             Warning,
             "check.ids.unindexed_triple_scan",
-            "warning: input has no blob-level indexdata, so every blob is \
+            "input has no blob-level indexdata, so every blob is \
              decompressed three times - once per element kind, because an \
              unindexed blob has to be scheduled as all three. Generate an \
              indexed copy with `pbfhogg cat input.osm.pbf -o indexed.osm.pbf` \
              to check it in a single pass."
         );
+        // The schedule walker would add its unindexed-filter note for the
+        // same condition; this warning already says it.
+        host.diagnostics
+            .mark_reported("reader.filter_without_indexdata");
     }
 }
 

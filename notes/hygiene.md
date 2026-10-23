@@ -1069,46 +1069,22 @@ drain's last node item.
 
 Reported by: change application.
 
-## HYG-108 - Diagnostic wording is inconsistent across commands
+## HYG-109 - No general `--quiet`
 
-Anger: 8 - new diagnostic lines and wording.
+Anger: 7 - CLI behaviour.
 
-Warning and Note events now render as `Warning:` and `Note:` at column 0 in
-the CLI sink; Progress, Summary and Developer lines are unchanged by design
-(developer tags and the `add-locations-to-ways:` / `time-filter:` summary
-leads stay). What remains:
+Only `diff -q` and `check --quiet` exist. Library diagnostics are kinded,
+keyed events whose text carries no prefix, and `StderrSink::event` in
+`cli/src/host.rs` is the one place they become text, so a global `--quiet`
+is a kind filter there and `--json` a second sink serializing kind, key and
+arguments; neither needs library changes. Not yet events: the CLI's own raw
+`cli_eprintln!` lines (getid's requested and missing ID lists, the
+`elapsed_ms=` and `nodes=` key=value blocks, `Multi-extract: ...`,
+`distinct tag values`, the final `Error:` line), which a `--quiet` or
+`--json` covering them must route through the sink first; the key=value
+blocks may be parsed by brokkr. Which kinds `--quiet` drops (Note and
+Progress, presumably; never Warning) and how it interacts with the two
+existing flags is the maintainer's call.
 
-- renumber's orphan-refs warning goes out through the summary writer as a
-  Summary event whose text starts `Warning:`, not as a Warning event.
-- The apply-changes `-j 1` refusal is ten lines and the version-regression
-  errors about five each.
-- `warn_locations_on_ways_loss` reports once per input in `cat` with no
-  filename; the unrecognised-indexdata warning names no file or offset.
-- sort's "verifying intra-blob order" line is now a `Note:`; whether it should
-  be a warning is open.
-- `[uring_writer] error: {e}` and `[parallel_writer] thread exit: {e}` are
-  also returned as the error, so the operator sees each twice in different
-  words; the CLI prints the geocode counts after the library's own `done`
-  line.
-- Events that matter to an operator (sort overlaps, repack's cap never
-  firing, renumber orphan refs) go out as prose and as counters, spelled
-  independently.
-- The CLI has no `--quiet` beyond `diff -q` and `check --quiet`; with keyed
-  events it is now a one-line kind filter in the CLI's stderr sink.
-- On unindexed input `check --ids` prints both its own triple-scan warning
-  and the schedule walker's unindexed-filter note; the second is redundant
-  there (likewise `cat --clean --force`, `check --refs`,
-  `repack --force-repack` and degrade).
-- The CLI sink strips each library event's own legacy prefix through a table
-  keyed on event key (`legacy_prefix` in `cli/src/host.rs`), a second copy of
-  the library's wording: a new warning or note that opens with its own
-  prefix prints it twice unless someone adds an entry. Stripping by kind
-  against a fixed prefix list, or dropping the prefixes from the library
-  text, would remove the copy.
-- getid's schedule walker gives no unindexed-filter note; its pruning is by
-  ID range, so the note's "blob type and spatial filters" wording would not
-  fit it.
-
-Reported by: all nine scopes (split out of the library stderr item when the
-library stopped writing stderr).
+Reported by: split out of the diagnostic-wording item.
 

@@ -13,6 +13,166 @@ pub struct Host {
     pub page_cache: PageCachePolicy,
     /// Where the library's own data-parallel work and writer framing run.
     pub executor: Executor,
+    /// The invocation's cancellation token. Every command run under this host
+    /// stops at its next checkpoint once the token is tripped and returns
+    /// [`ErrorKind::Cancelled`](crate::ErrorKind::Cancelled). A token is
+    /// sticky: give each independent invocation a fresh one.
+    pub cancel: Cancel,
+}
+
+/// A cancellation request for one invocation.
+///
+/// Cloning shares the request: every clone observes [`cancel`](Self::cancel)
+/// on any of them. Tripping is permanent, so a token belongs to one
+/// invocation (or a group of invocations meant to stop together); there is no
+/// reset, because workers still unwinding from the last request would race
+/// it.
+///
+/// The library never trips a token and never installs a signal handler
+/// (ADR-0016): the caller decides what stops a run. The CLI trips its token
+/// from SIGINT and SIGTERM; an embedding caller can trip one from a timeout,
+/// a UI or a request deadline.
+///
+/// Commands observe the token only at points they already pass through
+/// (a blob read or dispatched, a result received from a pool, a stage
+/// boundary, a write of an output block, the publication decision) with a
+/// relaxed load, so an untripped token costs nothing measurable. A tripped
+/// one ends the run through the same path a failure takes: workers wind
+/// down, scratch and staging are removed, nothing is published, and the
+/// call returns [`ErrorKind::Cancelled`](crate::ErrorKind::Cancelled).
+#[derive(Clone, Default)]
+pub struct Cancel(Arc<CancelState>);
+
+#[derive(Default)]
+struct CancelState {
+    tripped: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "test-hooks")]
+    hook: std::sync::OnceLock<CheckHook>,
+    #[cfg(feature = "test-hooks")]
+    checks: std::sync::atomic::AtomicU64,
+}
+
+/// A test-only callback run at every checkpoint with the checkpoint's
+/// 1-based ordinal; it may block (a test parks the run there until it is
+/// cancelled).
+#[cfg(feature = "test-hooks")]
+type CheckHook = Box<dyn Fn(u64, &Cancel) + Send + Sync>;
+
+impl std::fmt::Debug for Cancel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Cancel").field(&self.is_cancelled()).finish()
+    }
+}
+
+impl Cancel {
+    /// A fresh, untripped token.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cancellation. Every run observing this token (or a clone)
+    /// stops at its next checkpoint. Idempotent, lock-free and safe to call
+    /// from any thread.
+    pub fn cancel(&self) {
+        self.0
+            .tripped
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether cancellation has been requested. An `Acquire` load: whatever
+    /// the tripping thread did before [`cancel`](Self::cancel) is visible
+    /// once this returns `true`.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.tripped.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The checkpoint: `Err(Cancelled)` once the token is tripped. A relaxed
+    /// load and a branch, called only where the run already passes. Public
+    /// so a caller's own work between library calls (a CLI mode that reads
+    /// only a header, a loop over several commands) can stop with the same
+    /// typed error the commands return.
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::Cancelled`](crate::ErrorKind::Cancelled) once the token
+    /// is tripped.
+    #[inline]
+    pub fn check(&self) -> crate::Result<()> {
+        #[cfg(feature = "test-hooks")]
+        self.run_hook();
+        if self.0.tripped.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(crate::error::new_cancelled());
+        }
+        Ok(())
+    }
+
+    /// Run a read-only command's `body` between its entry check and its
+    /// completion decision: a token tripped before the call, or by the time
+    /// the work is done, makes the call return `Cancelled`; one tripped after
+    /// that leaves the completed result standing. (A command with an output
+    /// has its completion decision in publication instead.)
+    pub(crate) fn decided<T>(&self, body: impl FnOnce() -> crate::Result<T>) -> crate::Result<T> {
+        self.check()?;
+        let value = body()?;
+        self.check()?;
+        Ok(value)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[cold]
+    fn run_hook(&self) {
+        if let Some(hook) = self.0.hook.get() {
+            let ordinal = self
+                .0
+                .checks
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            hook(ordinal, self);
+        }
+    }
+
+    /// Test hook: run `hook` at every checkpoint with its 1-based ordinal.
+    /// Set once; a second call is ignored.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn on_check(&self, hook: impl Fn(u64, &Cancel) + Send + Sync + 'static) {
+        drop(self.0.hook.set(Box::new(hook)));
+    }
+
+    /// Test hook: how many checkpoints have run under an installed
+    /// [`on_check`](Self::on_check) hook.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn checks_passed(&self) -> u64 {
+        self.0.checks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A reader that observes a cancellation token before every `read`: for the
+/// bulk copies of the library's own scratch files into a sink that is not
+/// cancellation-aware (a caller's `Write`, stdout). One relaxed load per read
+/// call, so not for per-element paths. A tripped token is
+/// `ErrorKind::Cancelled` carried in an `io::Error` of kind `Other`, which no
+/// `Read` or `Write` layer retries.
+pub(crate) struct CancellableRead<'a, R> {
+    inner: R,
+    cancel: &'a Cancel,
+}
+
+impl<'a, R> CancellableRead<'a, R> {
+    pub(crate) fn new(inner: R, cancel: &'a Cancel) -> Self {
+        Self { inner, cancel }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for CancellableRead<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.cancel.check().map_err(std::io::Error::from)?;
+        self.inner.read(buf)
+    }
 }
 /// Page-cache policy for the input files a command reads.
 ///
@@ -281,6 +441,7 @@ impl Host {
             }),
             page_cache: PageCachePolicy::Keep,
             executor: Executor::Ambient,
+            cancel: Cancel::new(),
         }
     }
 }

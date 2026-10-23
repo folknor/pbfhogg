@@ -72,6 +72,12 @@ pub(crate) fn new_output_error(kind: OutputError) -> Error {
     new_error(ErrorKind::Output(kind))
 }
 
+/// The error a tripped [`Cancel`](crate::host::Cancel) checkpoint returns.
+#[cold]
+pub(crate) fn new_cancelled() -> Error {
+    new_error(ErrorKind::Cancelled)
+}
+
 #[cold]
 pub(crate) fn new_missing_feature(feature: &'static str) -> Error {
     new_error(ErrorKind::MissingFeature(feature))
@@ -366,7 +372,23 @@ impl Error {
             | ErrorKind::Blob(_)
             | ErrorKind::WireFormat { .. }
             | ErrorKind::MissingHeader
-            | ErrorKind::MissingFeature(_) => None,
+            | ErrorKind::MissingFeature(_)
+            | ErrorKind::Cancelled => None,
+        }
+    }
+
+    /// Whether this error is a cancellation: the run stopped because its
+    /// [`Cancel`](crate::host::Cancel) token was tripped, not because
+    /// something failed. Looks through `io::Error` carriers (the writers'
+    /// `io::Result` boundaries carry the typed error inside one) and through
+    /// context, never through another error's cause: a failure that merely
+    /// mentions a cancellation among its causes is still that failure.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        match self.kind() {
+            ErrorKind::Cancelled => true,
+            ErrorKind::Io(io) => carried_error(io).is_some_and(Error::is_cancelled),
+            _ => false,
         }
     }
 
@@ -483,6 +505,11 @@ pub enum ErrorKind {
     /// An output could not be prepared or published; see
     /// [`crate::output`].
     Output(OutputError),
+    /// The invocation's [`Cancel`](crate::host::Cancel) token was tripped and
+    /// the run stopped at a checkpoint. Not a failure of the run: it stopped
+    /// because it was asked to, every guard dropped (scratch and output
+    /// staging removed) and nothing was published.
+    Cancelled,
 }
 
 /// Why an output was refused or could not be published.
@@ -759,6 +786,12 @@ impl From<Error> for io::Error {
 
 /// The `pbfhogg::Error` an `io::Error` carries as its payload, if any, seen
 /// through any number of `io::Error` layers wrapped around it.
+/// Whether `err` carries a cancellation raised by one of the crate's own
+/// checkpoints (an `io::Read` adapter that observed a tripped token).
+pub(crate) fn io_carries_cancellation(err: &io::Error) -> bool {
+    carried_error(err).is_some_and(Error::is_cancelled)
+}
+
 fn carried_error(err: &io::Error) -> Option<&Error> {
     let mut payload: &(dyn StdError + 'static) = err.get_ref()?;
     loop {
@@ -853,6 +886,12 @@ impl fmt::Display for Message<'_> {
             }
             ErrorKind::MissingHeader => {
                 write!(f, "PBF file does not start with an OsmHeader blob")
+            }
+            ErrorKind::Cancelled => {
+                write!(
+                    f,
+                    "cancelled: the run stopped before completing and published nothing"
+                )
             }
             // No CLI flag names here. This is a library `Display` impl and
             // it has no idea which front end is reading it; naming

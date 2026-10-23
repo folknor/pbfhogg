@@ -200,8 +200,9 @@ pub fn build_geocode_index(
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<BuildStats> {
+    host.cancel.check()?;
     let stats = build_geocode_index_to(config, &output, host, scratch)?;
-    output.0.publish()?;
+    output.0.publish(&host.cancel)?;
     Ok(stats)
 }
 
@@ -399,6 +400,9 @@ fn build_generation(
     // node in the file. Same pattern as ALTW pass 0.
     // -----------------------------------------------------------------------
     crate::debug::emit_marker("GEOCODE_PASS1_END");
+    // Every pass boundary is a checkpoint; the passes check their own blob
+    // reads, results and chunks in between.
+    host.cancel.check()?;
 
     // -----------------------------------------------------------------------
     // One header walk produces everything Pass 1.5 and Pass 2a need: the
@@ -479,6 +483,7 @@ fn build_generation(
     drop(way_schedule);
     drop(shared_file);
     crate::debug::emit_marker("GEOCODE_PASS2_SCAN_END");
+    host.cancel.check()?;
 
     // Ring assembly + simplification
     crate::debug::emit_marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_START");
@@ -538,6 +543,7 @@ fn build_generation(
         );
     }
     crate::debug::emit_marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_END");
+    host.cancel.check()?;
     // Deliberately a conjunction, not a disjunction. An admin-only index (a
     // boundaries extract with no addressable content) and an
     // interpolation-only index are both legitimate; only an index with
@@ -600,6 +606,7 @@ fn build_generation(
         interp_ways.len()
     );
     crate::debug::emit_marker("GEOCODE_PASS2_INTERP_RESOLVE_END");
+    host.cancel.check()?;
 
     // Write interp_ways.bin now (after resolution has set start/end numbers)
     crate::debug::emit_marker("GEOCODE_PASS2_WRITE_START");
@@ -632,6 +639,7 @@ fn build_generation(
 
     // -----------------------------------------------------------------------
     crate::debug::emit_marker("GEOCODE_PASS2_END");
+    host.cancel.check()?;
     crate::debug::emit_marker("GEOCODE_PASS3_START");
     // Pass 3: Bucketed S2 cell assignment + write cell index files
     //
@@ -657,6 +665,7 @@ fn build_generation(
     let admin_cell_entries =
         pass3::assign_admin_cells(&admin_polygons, config.admin_level, &host.executor);
     crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_CELLS_END");
+    host.cancel.check()?;
 
     // Fused fine + coarse cell assignment (plan item #4). Single Stage A
     // pass over streets/addrs/interps at the fine level derives coarse
@@ -686,11 +695,13 @@ fn build_generation(
             coarse_addr_entries_file: FILE_COARSE_ADDR_ENTRIES,
             coarse_interp_entries_file: FILE_COARSE_INTERP_ENTRIES,
             executor: &host.executor,
+            cancel: &host.cancel,
         })?;
     crate::debug::emit_marker("GEOCODE_PASS3_CELLS_END");
     crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_INDEX_START");
     let admin_count = admin::write_admin_index(output_dir, &mut { admin_cell_entries })?;
     crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_INDEX_END");
+    host.cancel.check()?;
 
     crate::host::diag!(
         host.diagnostics,

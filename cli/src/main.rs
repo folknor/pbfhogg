@@ -6,8 +6,9 @@
 mod exit_code;
 mod host;
 mod output;
+mod signals;
 
-use exit_code::{Hinted, error_report, is_platform_unsupported, output_hint};
+use exit_code::{Hinted, error_report, is_cancelled, is_platform_unsupported, output_hint};
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -1372,8 +1373,23 @@ fn combine_expressions(
 
 #[allow(clippy::too_many_lines)]
 fn main() -> process::ExitCode {
+    // First, before any thread exists: SIGINT and SIGTERM become a
+    // cancellation request (see `signals`). Every thread started from here on
+    // inherits the blocked mask.
+    let cancel = pbfhogg::host::Cancel::new();
+    if let Err(e) = signals::install(cancel.clone()) {
+        host::cli_warning(
+            "cli.signals",
+            format_args!(
+                "cannot take SIGINT and SIGTERM ({e}); an interrupted run will not clean up \
+                 its staging and scratch files"
+            ),
+        );
+    }
+    #[cfg(feature = "test-hooks")]
+    signals::test_hooks::arm(&cancel);
     host::init_marker_fifo();
-    let host = host::cli_host();
+    let host = host::cli_host(cancel);
     let _guard = hotpath::HotpathGuardBuilder::new("pbfhogg::main")
         .percentiles(&[50.0, 95.0, 99.0])
         .functions_limit(0)
@@ -2203,9 +2219,36 @@ fn main() -> process::ExitCode {
     pbfhogg::write::emit_writer_counters();
     pbfhogg::read::emit_read_counters();
     pbfhogg::write::report_writer_index_loss(&host.diagnostics);
+    #[cfg(feature = "test-hooks")]
+    signals::test_hooks::write_count(&host.cancel);
 
+    // From here on the outcome is decided; a "stopping" notice the signal
+    // thread has not printed yet would be stale.
+    signals::finish();
+    let signal = signals::first_signal(&host.cancel);
     match result {
-        Ok(()) => process::ExitCode::from(outcome.code()),
+        Ok(()) => {
+            if let Some(signo) = signal {
+                // The work and any publication had completed (every early
+                // stop is an error, and publication refuses once the token
+                // is tripped before its decision): the result stands.
+                output::cli_eprintln!(
+                    "Note: {} arrived after the run had completed; its result stands",
+                    signals::name(signo)
+                );
+            }
+            process::ExitCode::from(outcome.code())
+        }
+        // Decided before the reader-gone override: an interrupted run whose
+        // stdout reader also left must not report success.
+        Err(e) if is_cancelled(e.as_ref()) => {
+            output::cli_eprintln!(
+                "Error: interrupted by {}: the run stopped before completing, removed its \
+                 staging and scratch files and published nothing",
+                signal.map_or("a cancellation request", signals::name)
+            );
+            process::ExitCode::from(signals::exit_status(signal))
+        }
         Err(e) => {
             if output::reader_gone() {
                 // Stdout's reader went away (`pbfhogg ... | head`) and the
@@ -3089,11 +3132,11 @@ fn run_export(
     if let Some(output) = output {
         // The input/output alias refusal already ran in
         // `validate_input_output_aliases`, against the destination.
-        let mut buf = output.writer()?;
+        let mut buf = output.writer(&host.cancel)?;
         run_export_to(file, &mut buf, &options, host)?;
         // The checked flush that lets the output be published.
         buf.finish()?;
-        output.publish()?;
+        output.publish(&host.cancel)?;
     } else {
         // `export` flushes its writer when it finishes, so a failed final
         // flush surfaces as an error rather than vanishing in a drop.
@@ -3236,12 +3279,12 @@ fn run_diff(
         let mut sink = std::io::sink();
         pbfhogg::diff::diff(old, new, &mut sink, &options, direct_io, host, scratch)?
     } else if let Some(output) = output {
-        let mut out = output.writer()?;
+        let mut out = output.writer(&host.cancel)?;
         let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io, host, scratch)?;
         out.finish()?;
         // A diff that found differences is a completed answer, not a
         // failure: its output is published like any other.
-        output.publish()?;
+        output.publish(&host.cancel)?;
         stats
     } else {
         // A reader that leaves early stops the diff here, before its verdict
@@ -3691,7 +3734,11 @@ fn run_inspect(
 
     match mode {
         InspectMode::IndexedOnly => {
+            // Reads a header and at most one data blob: no checkpoint inside,
+            // so it is decided before and after like every read-only command.
+            host.cancel.check()?;
             let has_index = pbfhogg::has_indexdata(path, direct_io, &host.diagnostics)?;
+            host.cancel.check()?;
             let mut out = output::buffered();
             let printed = if json {
                 writeln!(out, "{}", serde_json::json!({"indexed": has_index}))
@@ -3720,6 +3767,7 @@ fn run_inspect(
         InspectMode::HeaderGet { key, known } => {
             // The reader parses the header eagerly, and reports a file
             // without one through the library's single missing-header error.
+            host.cancel.check()?;
             let reader = pbfhogg::ElementReader::open(path, direct_io)?;
             let header = reader.header();
             let val = match known {
@@ -3752,6 +3800,8 @@ fn run_inspect(
             let Some(v) = val else {
                 return Err(format!("key {key} has no value in this file").into());
             };
+            // The completion decision, as for `--indexed`.
+            host.cancel.check()?;
             let mut out = output::buffered();
             writeln!(out, "{v}")?;
             out.flush()?;
@@ -3899,7 +3949,8 @@ fn run_bench_read(
     let (elapsed_ms, nodes, ways, rels): (u128, u64, u64, u64) = match mode {
         BenchReadMode::Sequential => {
             let reader = pbfhogg::ElementReader::from_path_with_eviction(path, true)?
-                .diagnostics(host.diagnostics.clone());
+                .diagnostics(host.diagnostics.clone())
+                .cancel(host.cancel.clone());
             let mut nodes = 0u64;
             let mut ways = 0u64;
             let mut rels = 0u64;
@@ -3914,7 +3965,8 @@ fn run_bench_read(
         }
         BenchReadMode::Parallel => {
             let reader = pbfhogg::ElementReader::from_path_with_eviction(path, true)?
-                .diagnostics(host.diagnostics.clone());
+                .diagnostics(host.diagnostics.clone())
+                .cancel(host.cancel.clone());
             let start = Instant::now();
             let (nodes, ways, rels) = reader.par_map_reduce(
                 |el| match el {
@@ -3932,7 +3984,8 @@ fn run_bench_read(
         }
         BenchReadMode::Pipelined => {
             let reader = pbfhogg::ElementReader::from_path_with_eviction(path, true)?
-                .diagnostics(host.diagnostics.clone());
+                .diagnostics(host.diagnostics.clone())
+                .cancel(host.cancel.clone());
             let mut nodes = 0u64;
             let mut ways = 0u64;
             let mut rels = 0u64;
@@ -3951,7 +4004,8 @@ fn run_bench_read(
             // overhead of a default 8 KiB BufReader.
             let reader = pbfhogg::BlobReader::from_path(path)?
                 .evict_page_cache(true)
-                .diagnostics(host.diagnostics.clone());
+                .diagnostics(host.diagnostics.clone())
+                .cancel(host.cancel.clone());
             let mut nodes = 0u64;
             let mut ways = 0u64;
             let mut rels = 0u64;
@@ -3994,7 +4048,8 @@ fn bench_write_loop<W: std::io::Write>(
     // header-less file is the one missing-header error, not an empty run.
     drop(pbfhogg::ElementReader::open(path, false)?);
     let reader = pbfhogg::BlobReader::new(BufReader::new(std::fs::File::open(path)?))
-        .diagnostics(host.diagnostics.clone());
+        .diagnostics(host.diagnostics.clone())
+        .cancel(host.cancel.clone());
     let mut bb = BlockBuilder::new();
     let mut nodes = 0u64;
     let mut ways = 0u64;
@@ -4218,7 +4273,7 @@ mod scratch_location_tests {
         std::fs::create_dir(&tmp).unwrap();
         std::fs::create_dir(&out_dir).unwrap();
         let output = out_dir.join("result.pbf");
-        let host = host::cli_host();
+        let host = host::cli_host(pbfhogg::host::Cancel::new());
 
         let explicit = TmpDirArg {
             tmp_dir: Some(tmp.clone()),
@@ -4240,7 +4295,7 @@ mod scratch_location_tests {
     fn an_explicit_tmp_dir_error_names_the_flag_and_the_directory() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing");
-        let host = host::cli_host();
+        let host = host::cli_host(pbfhogg::host::Cancel::new());
         let tmp = TmpDirArg {
             tmp_dir: Some(missing.clone()),
         };

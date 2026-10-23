@@ -116,8 +116,9 @@ pub fn repack(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<RepackStats> {
+    host.cancel.check()?;
     let result = repack_to(input, &output, elements_per_blob, write, overrides, host)?;
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -182,7 +183,7 @@ pub(crate) fn repack_to(
     // The fifth result sizes IdSets in check callers; repack only needs the
     // schedules.
     let (node_schedule, way_schedule, rel_schedule, shared_file, _) =
-        crate::scan::classify::build_classify_schedules_split(input, &host.diagnostics)?;
+        crate::scan::classify::build_classify_schedules_split(input, host)?;
 
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -402,7 +403,7 @@ fn run_kind_phase(
     let mut write_error: Option<Error> = None;
     let mut classify_error: Option<Error> = None;
 
-    crate::scan::classify::parallel_classify_phase(
+    let pool_result = crate::scan::classify::parallel_classify_phase(
         shared_file,
         schedule,
         None,
@@ -540,15 +541,18 @@ fn run_kind_phase(
                 }
             }
         },
-        &*host.resources,
-    )?;
+        host,
+    );
 
+    // Errors the merge recorded came first: the pool's own (a cancellation
+    // observed at a later receive included) is the later one.
     if let Some(e) = write_error {
         return Err(e);
     }
     if let Some(e) = classify_error {
         return Err(e);
     }
+    pool_result?;
 
     // Final flush: emit the residual block (if any) for this kind. Any
     // blocks `output` holds at this point are residuals, not mid-stream

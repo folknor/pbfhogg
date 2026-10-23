@@ -148,6 +148,7 @@ pub fn merge_changes(
     allow_version_regression: bool,
     host: &crate::host::Host,
 ) -> Result<MergeChangesStats> {
+    host.cancel.check()?;
     let result = merge_changes_to(
         inputs,
         &output,
@@ -156,7 +157,7 @@ pub fn merge_changes(
         allow_version_regression,
         host,
     )?;
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -224,9 +225,10 @@ pub(crate) fn merge_changes_to(
     // producer ends up on a pool worker; this body writes OSC XML and drives
     // no `PbfWriter`, so wrapping all of it puts no producer on a worker.
     // Under `Executor::Ambient` (the CLI) this is a direct call.
+    let cancel = &host.cancel;
     let (changes_in, changes_out) = executor.install(|| -> crate::Result<(u64, u64)> {
         if simplify {
-            let stream = build_simplify_stream(inputs)?;
+            let stream = build_simplify_stream(inputs, cancel)?;
             let changes_in = stream.changes.len() as u64;
             let changes_out = write_simplified(
                 output,
@@ -234,10 +236,11 @@ pub(crate) fn merge_changes_to(
                 stream,
                 worker_count,
                 allow_version_regression,
+                cancel,
             )? as u64;
             Ok((changes_in, changes_out))
         } else {
-            let changes_out = write_streaming(inputs, output, is_gz, &executor)?;
+            let changes_out = write_streaming(inputs, output, is_gz, &executor, cancel)?;
             Ok((changes_out, changes_out))
         }
     })?;
@@ -264,11 +267,14 @@ pub(crate) fn merge_changes_to(
 /// `par_iter` fan-out into per-input streams, concatenated in input order
 /// so `write_simplified`'s "later inputs win" `BTreeMap` dedupe still
 /// observes inputs in sequence order.
-fn build_simplify_stream(inputs: &[&Path]) -> crate::Result<ChangeStream> {
+fn build_simplify_stream(
+    inputs: &[&Path],
+    cancel: &crate::host::Cancel,
+) -> crate::Result<ChangeStream> {
     if inputs.len() <= 1 {
         let mut stream = ChangeStream::default();
         for path in inputs {
-            parse_one_into_stream(path, &mut stream)?;
+            parse_one_into_stream(path, &mut stream, cancel)?;
         }
         return Ok(stream);
     }
@@ -285,7 +291,7 @@ fn build_simplify_stream(inputs: &[&Path]) -> crate::Result<ChangeStream> {
         .par_iter()
         .map(|path| -> crate::Result<ChangeStream> {
             let mut s = ChangeStream::default();
-            parse_osc_into(path, &mut s)?;
+            parse_osc_into(path, &mut s, cancel)?;
             Ok(s)
         })
         .collect();
@@ -311,14 +317,18 @@ fn build_simplify_stream(inputs: &[&Path]) -> crate::Result<ChangeStream> {
 /// `brokkr sidecar --durations` can measure each input's parse wall, and
 /// emit `merge_changes_changes_per_osc` on the post-parse stream length
 /// delta so the per-input change count is observable in the sidecar.
-fn parse_one_into_stream(path: &Path, stream: &mut ChangeStream) -> Result<()> {
+fn parse_one_into_stream(
+    path: &Path,
+    stream: &mut ChangeStream,
+    cancel: &crate::host::Cancel,
+) -> Result<()> {
     if let Ok(meta) = std::fs::metadata(path) {
         #[allow(clippy::cast_possible_wrap)]
         crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
     }
     let len_before = stream.changes.len();
     crate::debug::emit_marker("MERGECHANGES_PARSE_START");
-    let result = parse_osc_into(path, stream);
+    let result = parse_osc_into(path, stream, cancel);
     crate::debug::emit_marker("MERGECHANGES_PARSE_END");
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter(
@@ -467,11 +477,15 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
 }
 
 #[hotpath::measure]
-fn parse_osc_into(path: &Path, stream: &mut ChangeStream) -> Result<()> {
+fn parse_osc_into(
+    path: &Path,
+    stream: &mut ChangeStream,
+    cancel: &crate::host::Cancel,
+) -> Result<()> {
     let mut sink = OwnedSink::new(StreamDest { stream });
     // Deliberately use the shared historical per-file decompression counter.
     // Command-specific names or accumulation would break brokkr comparisons.
-    parse_osc_path(path, &mut sink)
+    parse_osc_path(path, &mut sink, cancel)
 }
 
 enum OscWriter<W: io::Write> {
@@ -513,8 +527,12 @@ fn gz_requested(destination: &Path) -> bool {
 }
 
 impl OscWriter<crate::output::OutputWriter> {
-    fn from_output(output: &crate::output::Output, is_gz: bool) -> Result<Self> {
-        let buf = output.writer()?;
+    fn from_output(
+        output: &crate::output::Output,
+        is_gz: bool,
+        cancel: &crate::host::Cancel,
+    ) -> Result<Self> {
+        let buf = output.writer(cancel)?;
         if is_gz {
             Ok(Self::Gz(Box::new(Writer::new_with_indent(
                 GzEncoder::new(buf, flate2::Compression::fast()),
@@ -561,6 +579,7 @@ fn write_streaming(
     output: &crate::output::Output,
     is_gz: bool,
     executor: &crate::host::Executor,
+    cancel: &crate::host::Cancel,
 ) -> Result<u64> {
     crate::debug::emit_counter(
         "merge_changes_buffered_strategy",
@@ -573,7 +592,7 @@ fn write_streaming(
         // buffer-and-drain would inflict at single-OSC scale (drain pass
         // is pure overhead when there is no parse to overlap with).
         crate::debug::emit_marker("MERGECHANGES_WRITE_OPEN_START");
-        let mut writer = OscWriter::from_output(output, is_gz)?;
+        let mut writer = OscWriter::from_output(output, is_gz, cancel)?;
 
         writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
         let mut root = BytesStart::new("osmChange");
@@ -590,7 +609,7 @@ fn write_streaming(
             }
             let count_before = count;
             crate::debug::emit_marker("MERGECHANGES_PARSE_START");
-            parse_osc_streaming(path, &mut writer, &mut open_action, &mut count)?;
+            parse_osc_streaming(path, &mut writer, &mut open_action, &mut count, cancel)?;
             crate::debug::emit_marker("MERGECHANGES_PARSE_END");
             #[allow(clippy::cast_possible_wrap)]
             crate::debug::emit_counter(
@@ -640,12 +659,12 @@ fn write_streaming(
     let window = rayon::current_num_threads().max(1);
     let prelude = build_prelude_bytes(is_gz)?;
     let postlude = build_postlude_bytes(is_gz)?;
-    let mut out = output.writer()?;
+    let mut out = output.writer(cancel)?;
     out.write_all(&prelude)?;
     let mut count = 0u64;
     // The per-member drain overlaps this span; DRAIN below is the postlude.
     crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_START");
-    emit_members_ordered(executor, inputs, is_gz, window, |bytes, n| {
+    emit_members_ordered(executor, inputs, is_gz, window, cancel, |bytes, n| {
         out.write_all(&bytes)?;
         count += n;
         #[allow(clippy::cast_possible_wrap)]
@@ -665,11 +684,15 @@ fn write_streaming(
 
 /// One input's self-contained output member: parse, XML re-emit and (under
 /// gzip) compression into an in-memory buffer, closing any open action.
-fn emit_member(path: &Path, is_gz: bool) -> crate::Result<(Vec<u8>, u64)> {
+fn emit_member(
+    path: &Path,
+    is_gz: bool,
+    cancel: &crate::host::Cancel,
+) -> crate::Result<(Vec<u8>, u64)> {
     let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
     let mut open_action: Option<Action> = None;
     let mut count = 0u64;
-    parse_osc_streaming(path, &mut writer, &mut open_action, &mut count)?;
+    parse_osc_streaming(path, &mut writer, &mut open_action, &mut count, cancel)?;
     if let Some(prev) = open_action {
         writer.write_event(Event::End(BytesEnd::new(action_tag(prev))))?;
     }
@@ -689,11 +712,17 @@ type MemberResult = (usize, crate::Result<(Vec<u8>, u64)>);
 /// ring. The drain runs on a pool worker and waits cooperatively, running
 /// queued members itself, so a one-thread pool cannot deadlock. Returns the
 /// first error received.
+///
+/// Cancellation: each member's parse stops at its next input read, and the
+/// drain checks the token after every member it receives. Every spawned
+/// member still sends its (cancelled) result, so no admitted position goes
+/// unanswered; the scope then waits only for members already running.
 fn emit_members_ordered(
     executor: &crate::host::Executor,
     inputs: &[&Path],
     is_gz: bool,
     window: usize,
+    cancel: &crate::host::Cancel,
     mut drain: impl FnMut(Vec<u8>, u64) -> crate::Result<()> + Send,
 ) -> crate::Result<()> {
     if inputs.is_empty() {
@@ -711,7 +740,7 @@ fn emit_members_ordered(
                 // A panicking member must still answer its position, or the
                 // drain would wait for it forever.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    emit_member(path, is_gz)
+                    emit_member(path, is_gz, cancel)
                 }))
                 .unwrap_or_else(|payload| {
                     Err(
@@ -731,6 +760,7 @@ fn emit_members_ordered(
         let mut next = 0;
         while next < inputs.len() {
             let (position, result) = recv_member(&rx, executor)?;
+            cancel.check()?;
             pending[position % window] = Some(result?);
             while let Some((bytes, n)) = pending[next % window].take() {
                 drain(bytes, n)?;
@@ -800,6 +830,7 @@ fn parse_osc_streaming<W: io::Write>(
     writer: &mut OscWriter<W>,
     open_action: &mut Option<Action>,
     count: &mut u64,
+    cancel: &crate::host::Cancel,
 ) -> Result<()> {
     let mut sink = OwnedSink::new(WriterDest {
         writer,
@@ -808,7 +839,7 @@ fn parse_osc_streaming<W: io::Write>(
     });
     // Deliberately use the shared historical per-file decompression counter.
     // Command-specific names or accumulation would break brokkr comparisons.
-    parse_osc_path(path, &mut sink)
+    parse_osc_path(path, &mut sink, cancel)
 }
 
 fn emit_change<W: io::Write>(
@@ -882,7 +913,9 @@ fn write_simplified(
     stream: ChangeStream,
     worker_count: usize,
     allow_version_regression: bool,
+    cancel: &crate::host::Cancel,
 ) -> Result<usize> {
+    cancel.check()?;
     crate::debug::emit_marker("MERGECHANGES_SIMPLIFY_START");
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("merge_changes_changes_in", stream.changes.len() as i64);
@@ -929,6 +962,9 @@ fn write_simplified(
         }
     }
     crate::debug::emit_marker("MERGECHANGES_SIMPLIFY_END");
+    // Stage boundary: the in-memory dedupe above has no checkpoint of its
+    // own (it is one pass over the parsed changes).
+    cancel.check()?;
 
     let total_out = creates.len() + modifies.len() + deletes.len();
     // Mirror the streaming-path parallel-drain shape: split each
@@ -972,13 +1008,14 @@ fn write_simplified(
             })
             .collect();
         all_chunks.extend(chunks?);
+        cancel.check()?;
     }
     crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_END");
 
     crate::debug::emit_marker("MERGECHANGES_DRAIN_START");
     let prelude = build_prelude_bytes(is_gz)?;
     let postlude = build_postlude_bytes(is_gz)?;
-    let mut out = output.writer()?;
+    let mut out = output.writer(cancel)?;
     out.write_all(&prelude)?;
     for bytes in &all_chunks {
         out.write_all(bytes)?;
@@ -1082,7 +1119,13 @@ mod tests {
                 let mut writer = OscWriter::new_buf(is_gz);
                 let mut action = None;
                 let mut count = 0;
-                parse_osc_streaming(path, &mut writer, &mut action, &mut count)?;
+                parse_osc_streaming(
+                    path,
+                    &mut writer,
+                    &mut action,
+                    &mut count,
+                    &crate::host::Cancel::new(),
+                )?;
                 if let Some(action) = action {
                     writer.write_event(Event::End(BytesEnd::new(action_tag(action))))?;
                 }

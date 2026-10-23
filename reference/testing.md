@@ -255,6 +255,20 @@ exception, not a tier - should not survive across many PRs.
   binaries"), which makes it race-free without `#[ignore]` or
   `--test-threads=1`. A new static hook must use the static gate; one
   put under `test-hooks` instead would reach `all`.
+- **Cancellation hooks.** `Cancel::on_check` (per-instance, `test-hooks`)
+  runs a callback with each checkpoint's 1-based ordinal and may block;
+  `Cancel::checks_passed` counts them. Library tests trip the token from
+  the callback (`tests/cancel.rs`). The CLI, built with `test-hooks`, reads
+  two variables: `PBFHOGG_TEST_CANCEL_COUNT=<file>` writes the run's
+  checkpoint count there at exit, and
+  `PBFHOGG_TEST_CANCEL_PAUSE=<k>:<ready file>[:stuck]` parks the thread
+  reaching checkpoint `k`, writes the ready file, and waits for the token;
+  `stuck` writes `<ready file>.ack` once tripped and never returns, so only
+  a second signal ends the run. The interruption tests in
+  `tests/cli_output_contract.rs` count a command's checkpoints, park it at
+  sampled ordinals, signal it, and assert the exit code and an empty
+  directory, with no sleeps. `CliInvoker::spawn` returns a `RunningCli`
+  that can be signalled and is killed on drop.
 - **CliInvoker for CLI-driven tests.** `tests/common/cli.rs`. Every
   new `tests/cli_*.rs` goes through it. Default wall-clock timeout
   set below `brokkr check`'s 20 s watchdog, override via

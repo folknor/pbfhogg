@@ -137,6 +137,7 @@ fn run_shard(
     scratch: &crate::scratch::RunScratch,
     increment_version: bool,
     timestamp: Option<u64>,
+    cancel: &crate::host::Cancel,
 ) -> Result<ShardOutput> {
     // Test-only: arm via `test_hooks::PANIC_AT_SHARD_IDX`. Simulates
     // a mid-phase shard crash; the caller's `scope.spawn(...).join()`
@@ -181,6 +182,9 @@ fn run_shard(
     let mut delete_count = 0u64;
 
     loop {
+        // Once per merge step (at most one blob decoded per side); shards are
+        // independent threads joined by the driver.
+        cancel.check()?;
         if old_decoded.is_none() && old_idx < old_slice.len() {
             let desc = old_slice[old_idx];
             old_idx += 1;
@@ -694,6 +698,7 @@ pub(crate) fn derive_changes_parallel(
                         scratch,
                         increment_version,
                         timestamp,
+                        &host.cancel,
                     )
                 });
                 handles.push(h);
@@ -709,14 +714,19 @@ pub(crate) fn derive_changes_parallel(
         });
 
         // Partition shard outputs into (successful, first error). On an error
-        // every shard file is left for the run directory's guard.
+        // every shard file is left for the run directory's guard. Shards run
+        // independently, so slot order is not time order: a real failure in
+        // any shard outranks the cancellation the others observed.
         let mut outputs: Vec<ShardOutput> = Vec::with_capacity(shard_outputs.len());
         let mut first_err: Option<crate::error::Error> = None;
         for slot in shard_outputs {
             match slot.expect("all slots filled") {
                 Ok(out) => outputs.push(out),
                 Err(e) => {
-                    if first_err.is_none() {
+                    if first_err
+                        .as_ref()
+                        .is_none_or(|kept| kept.is_cancelled() && !e.is_cancelled())
+                    {
                         first_err = Some(e);
                     }
                 }
@@ -736,6 +746,7 @@ pub(crate) fn derive_changes_parallel(
             outputs,
             &mut totals,
             scratch,
+            &host.cancel,
         )?;
 
         crate::debug::emit_marker(&end_marker);
@@ -783,9 +794,18 @@ fn append_shard_outputs(
     outputs: Vec<ShardOutput>,
     totals: &mut DeriveChangesStats,
     scratch: &crate::scratch::RunScratch,
+    cancel: &crate::host::Cancel,
 ) -> Result<()> {
     let mut first_err = None;
     for shard_out in outputs {
+        // Once per shard, between appends (the appends themselves are kernel
+        // copies with no checkpoint): after a cancellation the remaining
+        // shard files are removed below, as after a failed append.
+        if first_err.is_none()
+            && let Err(e) = cancel.check()
+        {
+            first_err = Some(e);
+        }
         if first_err.is_some() {
             scratch.remove(&shard_out.creates_path);
             scratch.remove(&shard_out.modifies_path);

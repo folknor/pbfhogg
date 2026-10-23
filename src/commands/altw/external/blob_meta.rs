@@ -34,7 +34,7 @@ pub(super) fn scan_blob_metadata(
     host: &crate::host::Host,
 ) -> Result<Vec<BlobMeta>> {
     crate::debug::emit_marker("ALTW_BLOB_META_SCAN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input))?;

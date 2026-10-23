@@ -168,8 +168,9 @@ pub fn tags_filter_osc(
     expression_strs: &[String],
     host: &crate::host::Host,
 ) -> Result<TagsFilterOscStats> {
+    host.cancel.check()?;
     let result = tags_filter_osc_to(input, &output, expression_strs, host)?;
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -181,11 +182,10 @@ pub(crate) fn tags_filter_osc_to(
     expression_strs: &[String],
     host: &crate::host::Host,
 ) -> Result<TagsFilterOscStats> {
-    let _ = host;
     let expressions = parse_expressions(expression_strs)?;
     crate::debug::emit_marker("TAGSFILTEROSC_START");
-    let (filtered, stats) = parse_and_filter_osc(input, &expressions)?;
-    write_filtered_osc(output, &filtered)?;
+    let (filtered, stats) = parse_and_filter_osc(input, &expressions, &host.cancel)?;
+    write_filtered_osc(output, &filtered, &host.cancel)?;
     crate::debug::emit_marker("TAGSFILTEROSC_END");
     Ok(stats)
 }
@@ -193,6 +193,7 @@ pub(crate) fn tags_filter_osc_to(
 fn parse_and_filter_osc(
     input: &Path,
     expressions: &[Expression],
+    cancel: &crate::host::Cancel,
 ) -> Result<(FilteredOsc, TagsFilterOscStats)> {
     let mut sink = FilterSink {
         filtered: FilteredOsc::new(),
@@ -203,7 +204,7 @@ fn parse_and_filter_osc(
     };
     // Deliberately emit merge_changes_decompress_ns for this file, just as the
     // other sinks do. Renaming or accumulating it breaks brokkr comparisons.
-    parse_osc_path(input, &mut sink)?;
+    parse_osc_path(input, &mut sink, cancel)?;
     Ok((sink.filtered, sink.stats))
 }
 
@@ -395,10 +396,14 @@ fn finalize_current(
     }
 }
 
-fn write_filtered_osc(output: &crate::output::Output, filtered: &FilteredOsc) -> Result<()> {
+fn write_filtered_osc(
+    output: &crate::output::Output,
+    filtered: &FilteredOsc,
+    cancel: &crate::host::Cancel,
+) -> Result<()> {
     // Deliberately gzip every OSC output regardless of its name. Inferring the
     // transport from an extension would change this command's output contract.
-    let gz = GzEncoder::new(output.writer()?, flate2::Compression::fast());
+    let gz = GzEncoder::new(output.writer(cancel)?, flate2::Compression::fast());
     let mut writer = Writer::new_with_indent(gz, b' ', 2);
 
     writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;

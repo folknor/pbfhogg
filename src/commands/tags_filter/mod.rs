@@ -233,8 +233,9 @@ pub fn tags_filter(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<TagsFilterStats> {
+    host.cancel.check()?;
     let result = tags_filter_to(input, &output, opts, overrides, host)?;
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -716,7 +717,7 @@ fn tags_filter_two_pass(
         // Avoids pulling blob bodies into the page cache for blobs we'll decide
         // to skip on the tag-index filter anyway.
         crate::debug::emit_marker("TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_START");
-        let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
+        let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
         let _ = walker
             .next_header()?
             .ok_or_else(|| crate::error::new_missing_header(input))?;
@@ -856,7 +857,7 @@ fn tags_filter_two_pass(
                     }
                 }
             },
-            &*host.resources,
+            host,
         )?;
     }
 
@@ -933,7 +934,7 @@ fn tags_filter_two_pass(
     };
 
     crate::debug::emit_marker("TAGSFILTER_PASS2_SCHEDULE_SCAN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input))?;
@@ -1167,10 +1168,15 @@ fn tags_filter_two_pass(
                     Ok(())
                 };
 
+            // Cancellation is checked here, on the consumer, per result: an
+            // early return drops the receiver (moved into this loop), failing
+            // the workers' sends and then the dispatcher's.
             for (s, item) in result_rx {
+                host.cancel.check()?;
                 reorder.push(s, item);
                 drain_ready(&mut reorder)?;
             }
+            host.cancel.check()?;
             drain_ready(&mut reorder)?;
 
             Ok(())
@@ -1218,7 +1224,7 @@ fn collect_relation_member_closure(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         kind_schedule_filter(crate::ElementKind::Relation, distrust_metadata),
-        &host.diagnostics,
+        host,
     )?;
 
     struct ClosureResult {
@@ -1269,7 +1275,7 @@ fn collect_relation_member_closure(
                 }
             },
             |cr| results.push(cr),
-            &*host.resources,
+            host,
         )?;
 
         // Merge phase: mutate included sets.
@@ -1339,7 +1345,7 @@ fn collect_way_node_dependencies(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         kind_schedule_filter(crate::ElementKind::Way, distrust_metadata),
-        &host.diagnostics,
+        host,
     )?;
 
     // Per-blob node-ref accumulation. Earlier this function used
@@ -1381,7 +1387,7 @@ fn collect_way_node_dependencies(
                 relation_dep_node_ids.set(id);
             }
         },
-        &*host.resources,
+        host,
     )?;
 
     Ok(())
@@ -1512,7 +1518,7 @@ mod tests {
             &crate::host::Host::for_tests(),
         )
         .unwrap();
-        staged.publish().unwrap();
+        staged.publish(&crate::host::Cancel::new()).unwrap();
         let mut ids = Vec::new();
         ElementReader::open_in(&output, false, &crate::host::Host::for_tests())
             .unwrap()

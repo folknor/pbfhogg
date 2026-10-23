@@ -260,7 +260,7 @@ pub(super) fn build_node_index_sparse(
     let (schedule, shared_input) = crate::scan::classify::build_classify_schedule(
         input,
         Some(crate::ElementKind::Node),
-        &host.diagnostics,
+        host,
     )?;
 
     // Per-blob rank-span accounting: on sorted inputs each blob's
@@ -316,7 +316,7 @@ pub(super) fn build_node_index_sparse(
             Ok(())
         },
         |_seq, ()| {},
-        &*host.resources,
+        host,
     )?;
 
     #[allow(clippy::cast_possible_wrap)]

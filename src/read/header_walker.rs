@@ -58,9 +58,9 @@ pub(crate) enum ScanArm {
 /// the frame-size mean: only OSMData frame bytes predict OSMData count.
 pub(crate) fn estimate_blob_count(
     path: &Path,
-    diagnostics: &crate::host::Diagnostics,
+    host: &crate::host::Host,
 ) -> Result<BlobCountEstimate> {
-    let mut walker = HeaderWalker::open(path, diagnostics)?;
+    let mut walker = HeaderWalker::open(path, host)?;
     let file_size = walker.file_size();
     if file_size == 0 {
         return Err(crate::error::new_missing_header(path));
@@ -154,6 +154,9 @@ pub(crate) struct BlobHeaderMeta {
 /// data payload on demand.
 pub(crate) struct HeaderWalker {
     diagnostics: crate::host::Diagnostics,
+    /// Checked before every header: a tripped token ends the walk with
+    /// `ErrorKind::Cancelled`.
+    cancel: crate::host::Cancel,
     reported_unindexed_filter: bool,
     file: Arc<std::fs::File>,
     /// The file this walker was opened from. Stamped onto every error it
@@ -181,7 +184,7 @@ impl HeaderWalker {
     /// body reads open their own worker fds alongside the walker's
     /// `shared_file()`, rather than flowing `--direct-io` through
     /// this helper.
-    pub(crate) fn open(path: &Path, diagnostics: &crate::host::Diagnostics) -> Result<Self> {
+    pub(crate) fn open(path: &Path, host: &crate::host::Host) -> Result<Self> {
         let file =
             std::fs::File::open(path).map_err(|e| super::file_reader::open_error(path, e))?;
         let file_size = file.metadata()?.len();
@@ -201,7 +204,8 @@ impl HeaderWalker {
             }
         }
         Ok(Self {
-            diagnostics: diagnostics.clone(),
+            diagnostics: host.diagnostics.clone(),
+            cancel: host.cancel.clone(),
             reported_unindexed_filter: false,
             file: Arc::new(file),
             path: Arc::from(path),
@@ -293,6 +297,8 @@ impl HeaderWalker {
     /// bit more). A second `pread` is only needed for the rare header that
     /// extends past the probe window.
     pub(crate) fn next_header(&mut self) -> Result<Option<BlobHeaderMeta>> {
+        // A cancellation is not a fault of the input: returned unlocated.
+        self.cancel.check()?;
         // One funnel for both the success counter and the error stamp, so
         // no early return inside the walk can escape unattributed.
         match self.next_header_inner() {
@@ -444,13 +450,17 @@ mod tests {
             count: 1,
             bbox: None,
         };
-        let mut first = super::HeaderWalker::open(&path, &diagnostics).expect("walker");
+        let host = crate::host::Host {
+            diagnostics,
+            ..crate::host::Host::for_tests()
+        };
+        let mut first = super::HeaderWalker::open(&path, &host).expect("walker");
         first.observe_filter_index(Some(&index));
         assert!(sink.0.lock().expect("sink").is_empty());
         // A later missing index must report even after an indexed first blob.
         first.observe_filter_index(None);
         first.observe_filter_index(None);
-        let mut second = super::HeaderWalker::open(&path, &diagnostics).expect("walker");
+        let mut second = super::HeaderWalker::open(&path, &host).expect("walker");
         second.observe_filter_index(None);
         assert_eq!(
             *sink.0.lock().expect("sink"),
@@ -464,7 +474,7 @@ mod tests {
     fn open_preserves_not_found_error_kind() {
         let scratch = crate::path_guard::tests::scratch();
         let missing = scratch.path().join("missing.pbf");
-        let result = super::HeaderWalker::open(&missing, &crate::host::Diagnostics::discard());
+        let result = super::HeaderWalker::open(&missing, &crate::host::Host::for_tests());
 
         match result {
             Ok(_) => panic!("opening a missing file must fail"),
@@ -514,7 +524,7 @@ mod tests {
         let good = std::fs::read(&base).expect("read fixture");
 
         let count_headers = |path: &std::path::Path| -> super::Result<usize> {
-            let mut walker = super::HeaderWalker::open(path, &crate::host::Diagnostics::discard())?;
+            let mut walker = super::HeaderWalker::open(path, &crate::host::Host::for_tests())?;
             let mut n = 0;
             while walker.next_header()?.is_some() {
                 n += 1;
@@ -585,8 +595,7 @@ mod tests {
         let header_only = dir.path().join("header-only.pbf");
         write_fixture(&header_only, false);
         assert_eq!(
-            estimate_blob_count(&header_only, &crate::host::Diagnostics::discard())
-                .expect("estimate"),
+            estimate_blob_count(&header_only, &crate::host::Host::for_tests()).expect("estimate"),
             BlobCountEstimate {
                 osmdata_blobs: 0,
                 exact: true,
@@ -596,8 +605,7 @@ mod tests {
         let one_block = dir.path().join("one-block.pbf");
         write_fixture(&one_block, true);
         assert_eq!(
-            estimate_blob_count(&one_block, &crate::host::Diagnostics::discard())
-                .expect("estimate"),
+            estimate_blob_count(&one_block, &crate::host::Host::for_tests()).expect("estimate"),
             BlobCountEstimate {
                 osmdata_blobs: 1,
                 exact: true,
@@ -610,7 +618,7 @@ mod tests {
         let dir = crate::path_guard::tests::scratch();
         let empty = dir.path().join("empty.pbf");
         std::fs::File::create(&empty).expect("create empty file");
-        assert!(estimate_blob_count(&empty, &crate::host::Diagnostics::discard()).is_err());
+        assert!(estimate_blob_count(&empty, &crate::host::Host::for_tests()).is_err());
     }
 
     #[test]
@@ -650,7 +658,7 @@ mod tests {
         writer.flush().expect("flush fixture");
 
         let estimate =
-            estimate_blob_count(&mixed, &crate::host::Diagnostics::discard()).expect("estimate");
+            estimate_blob_count(&mixed, &crate::host::Host::for_tests()).expect("estimate");
         assert!(!estimate.exact);
         let error = estimate.osmdata_blobs.abs_diff(actual_blobs);
         assert!(

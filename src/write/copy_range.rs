@@ -16,14 +16,23 @@ use std::os::unix::io::RawFd;
 /// Uses an explicit input offset (does not change `in_fd`'s file position),
 /// safe when `in_fd` is wrapped in a `BufReader` or `DirectReader`.
 /// Output uses the fd's current position (sequential write).
+///
+/// `cancel` is checked before every `copy_file_range` call: a coalesced
+/// passthrough run can span the whole input (sort of an already-sorted
+/// planet is one range), and the kernel copies at most about 2 GiB per call,
+/// so this is the point where a cancelled run stops splicing. The error is
+/// `ErrorKind::Cancelled` carried in an `io::Error` of kind `Other`, which no
+/// `Write` layer retries.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub(crate) fn copy_range(
     in_fd: RawFd,
     out_fd: RawFd,
     mut offset: u64,
     mut len: u64,
+    cancel: &crate::host::Cancel,
 ) -> io::Result<()> {
     while len > 0 {
+        cancel.check().map_err(io::Error::from)?;
         let mut off_in = offset as i64;
         // Safety: fds are valid and open. off_in is explicit (doesn't change
         // in_fd position). off_out is NULL (uses out_fd's current position).
@@ -41,7 +50,7 @@ pub(crate) fn copy_range(
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EXDEV) {
                 // Cross-device: fall back to pread+write.
-                return copy_range_fallback(in_fd, out_fd, offset, len);
+                return copy_range_fallback(in_fd, out_fd, offset, len, cancel);
             }
             return Err(err);
         }
@@ -73,6 +82,7 @@ fn copy_range_fallback(
     out_fd: RawFd,
     mut offset: u64,
     mut len: u64,
+    cancel: &crate::host::Cancel,
 ) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::io::FromRawFd;
@@ -82,6 +92,7 @@ fn copy_range_fallback(
     let mut out = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(out_fd) });
     // Read from in_fd using pread (doesn't change file position).
     while len > 0 {
+        cancel.check().map_err(io::Error::from)?;
         let chunk = buf.len().min(len as usize);
         let n = unsafe { libc::pread(in_fd, buf.as_mut_ptr().cast(), chunk, offset as i64) };
         if n < 0 {

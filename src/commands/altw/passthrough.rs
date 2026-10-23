@@ -120,7 +120,7 @@ fn build_schedule(
     host: &crate::host::Host,
 ) -> Result<(Vec<BlobDescriptor>, Vec<u8>, std::sync::Arc<std::fs::File>)> {
     crate::debug::emit_marker("ALTW_PASS2_SCHEDULE_WALK_START");
-    let mut walker = HeaderWalker::open(input, &host.diagnostics)?;
+    let mut walker = HeaderWalker::open(input, host)?;
     let mut header_bytes: Option<Vec<u8>> = None;
     let mut schedule: Vec<BlobDescriptor> = Vec::new();
     let mut seq: usize = 0;
@@ -518,6 +518,11 @@ pub(super) fn write_output_passthrough(
         }
         drop(desc_rx);
         drop(decoded_tx);
+        // Owned by this closure, so any early return (a write error, a
+        // cancellation) drops it before the scope joins the workers. Borrowed,
+        // it outlived the closure, and a worker parked in a full `send` held
+        // the join forever.
+        let decoded_rx = decoded_rx;
 
         // Consumer: reorder + write. Pre-seed passthrough items at
         // their global seq positions; decode results arrive on
@@ -648,6 +653,9 @@ pub(super) fn write_output_passthrough(
         )?;
 
         loop {
+            // Cancellation is checked on this consumer, before each wait and
+            // on each arrival; the early return is the write-error exit.
+            host.cancel.check()?;
             let t_recv = std::time::Instant::now();
             let msg = decoded_rx.recv();
             #[allow(clippy::cast_possible_truncation)]
@@ -658,6 +666,7 @@ pub(super) fn write_output_passthrough(
                 Ok(v) => v,
                 Err(_) => break,
             };
+            host.cancel.check()?;
             reorder.push(seq_num, ConsumerItem::Decoded(item));
             drain(
                 &mut reorder,

@@ -129,6 +129,12 @@ impl CliInvoker {
         self
     }
 
+    /// Run the child in `dir`.
+    pub fn current_dir(mut self, dir: impl AsRef<std::path::Path>) -> Self {
+        self.cmd.current_dir(dir);
+        self
+    }
+
     /// Start the child without inherited environment variables.
     pub fn clean_env(mut self) -> Self {
         self.cmd.env_clear();
@@ -265,6 +271,25 @@ impl CliInvoker {
         }
     }
 
+    /// Start the binary without waiting for it, for a test that signals it
+    /// mid-run. Stdout and stderr are captured as for [`Self::run`]. The
+    /// child is killed and reaped if the handle drops while it still runs, so
+    /// a failing assertion never leaves one behind.
+    pub fn spawn(mut self) -> RunningCli {
+        assert!(self.stdin.is_none(), "spawn does not feed stdin");
+        self.cmd.stdout(Stdio::piped());
+        self.cmd.stderr(Stdio::piped());
+        let mut child = self.cmd.spawn().expect("spawn pbfhogg binary");
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+        RunningCli {
+            child: Some(child),
+            stdout_thread: Some(std::thread::spawn(move || capture(stdout))),
+            stderr_thread: Some(std::thread::spawn(move || capture(stderr))),
+            timeout: self.timeout,
+        }
+    }
+
     /// Run and assert exit status is success. Returns captured output
     /// so the test can inspect stdout or stderr.
     pub fn assert_success(self) -> CliOutput {
@@ -295,6 +320,84 @@ impl CliInvoker {
 impl Default for CliInvoker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A `pbfhogg` child started by [`CliInvoker::spawn`].
+pub struct RunningCli {
+    child: Option<std::process::Child>,
+    stdout_thread: Option<std::thread::JoinHandle<Vec<u8>>>,
+    stderr_thread: Option<std::thread::JoinHandle<Vec<u8>>>,
+    timeout: Duration,
+}
+
+impl RunningCli {
+    /// Send `signal` (a `libc::SIG*` number) to the child.
+    pub fn signal(&self, signal: libc::c_int) {
+        let child = self.child.as_ref().expect("child is running");
+        let pid = libc::pid_t::try_from(child.id()).expect("pid fits pid_t");
+        // SAFETY: plain syscall on a child this handle owns and has not
+        // reaped, so the pid cannot have been reused.
+        let rc = unsafe { libc::kill(pid, signal) };
+        assert_eq!(rc, 0, "kill({pid}, {signal}) failed");
+    }
+
+    /// Whether the child has exited (it is reaped if so).
+    pub fn has_exited(&mut self) -> bool {
+        let child = self.child.as_mut().expect("child is running");
+        matches!(child.try_wait(), Ok(Some(_)))
+    }
+
+    /// Wait for the child to exit within the invoker's timeout and return
+    /// its output. On timeout the child is killed and the test panics.
+    pub fn wait(mut self) -> CliOutput {
+        let mut child = self.child.take().expect("child is running");
+        let start = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if start.elapsed() > self.timeout => {
+                    child.kill().ok();
+                    child.wait().ok();
+                    let stderr = self
+                        .stderr_thread
+                        .take()
+                        .map(|t| t.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    panic!(
+                        "pbfhogg did not exit within {:?} of being waited for; stderr:\n{}",
+                        self.timeout,
+                        String::from_utf8_lossy(&stderr)
+                    );
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+                Err(e) => panic!("error waiting for pbfhogg child: {e}"),
+            }
+        };
+        let stdout = self
+            .stdout_thread
+            .take()
+            .map(|t| t.join().unwrap_or_default())
+            .unwrap_or_default();
+        let stderr = self
+            .stderr_thread
+            .take()
+            .map(|t| t.join().unwrap_or_default())
+            .unwrap_or_default();
+        CliOutput {
+            status,
+            stdout,
+            stderr,
+        }
+    }
+}
+
+impl Drop for RunningCli {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            child.kill().ok();
+            child.wait().ok();
+        }
     }
 }
 

@@ -200,7 +200,7 @@ pub(super) fn build_blob_schedule_with_passthrough(
     host: &crate::host::Host,
 ) -> Result<Vec<BlobDesc>> {
     crate::debug::emit_marker("EXTRACT_SCHEDULE_SCAN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input))?;
@@ -438,7 +438,11 @@ where
 
         // Drain worker results into the reorder buffer.
         let mut frame_read_buf: Vec<u8> = Vec::new();
+        // Cancellation is checked per result on this consumer; an early
+        // return drops the receiver (moved into this loop), which fails the
+        // workers' sends and then the dispatcher's.
         for (s, item) in result_rx {
+            host.cancel.check()?;
             reorder.push(s, ConsumerItem::Decoded(item));
 
             while let Some(ci) = reorder.pop_ready() {
@@ -473,6 +477,7 @@ where
         }
 
         // Drain any remaining passthrough items after workers are done.
+        host.cancel.check()?;
         while let Some(ci) = reorder.pop_ready() {
             match ci {
                 ConsumerItem::Decoded(r) => {

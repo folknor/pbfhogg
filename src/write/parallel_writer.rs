@@ -243,11 +243,12 @@ pub(crate) fn parallel_writer_thread(
     init_tx: SyncSender<Result<()>>,
     expected: &SeqTotal,
     finish: super::Finish,
+    cancel: &crate::host::Cancel,
 ) -> Result<()> {
     // A failure is not logged here: it is the thread's return value, which the
     // writer's `flush` (or the failed send that noticed the thread was gone)
     // hands to the caller, so the operator sees it exactly once.
-    parallel_writer_thread_inner(rx, path, framed_header, init_tx, expected, finish)
+    parallel_writer_thread_inner(rx, path, framed_header, init_tx, expected, finish, cancel)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -258,6 +259,7 @@ fn parallel_writer_thread_inner(
     init_tx: SyncSender<Result<()>>,
     expected: &SeqTotal,
     finish: super::Finish,
+    cancel: &crate::host::Cancel,
 ) -> Result<()> {
     let file = match File::create(&path) {
         Ok(f) => f,
@@ -283,7 +285,7 @@ fn parallel_writer_thread_inner(
 
     let failure = FirstFailure::new();
     let header_len = framed_header.len() as u64;
-    std::thread::scope(|s| run_pool(s, &rx, &file, &failure, header_len, expected));
+    std::thread::scope(|s| run_pool(s, &rx, &file, &failure, header_len, expected, cancel));
 
     // Every pool thread has been joined; the record is final.
     if let Some(e) = failure.take() {
@@ -310,13 +312,14 @@ fn run_pool<'scope, 'env>(
     failure: &'scope FirstFailure,
     header_len: u64,
     expected: &SeqTotal,
+    cancel: &'scope crate::host::Cancel,
 ) {
     let mut worker_txs: Vec<SyncSender<WriteOp>> = Vec::with_capacity(POOL_SIZE);
     let mut worker_handles: Vec<ScopedJoinHandle<'scope, ()>> = Vec::with_capacity(POOL_SIZE);
     for index in 0..POOL_SIZE {
         let (wtx, wrx) = sync_channel::<WriteOp>(PER_WORKER_CAPACITY);
         match std::thread::Builder::new()
-            .spawn_scoped(s, move || pool_worker(index, wrx, file, failure))
+            .spawn_scoped(s, move || pool_worker(index, wrx, file, failure, cancel))
         {
             Ok(handle) => {
                 worker_txs.push(wtx);
@@ -535,11 +538,18 @@ fn send_to_worker(
 /// The panic is recorded BEFORE `rx` is dropped, so the dispatcher can only
 /// see this worker's channel close after the cause is on record - otherwise
 /// its "worker channel closed" could be recorded first and mask the panic.
-fn pool_worker(index: usize, rx: Receiver<WriteOp>, file: &File, failure: &FirstFailure) {
+fn pool_worker(
+    index: usize,
+    rx: Receiver<WriteOp>,
+    file: &File,
+    failure: &FirstFailure,
+    cancel: &crate::host::Cancel,
+) {
     #[cfg(all(feature = "static-test-hooks", not(test)))]
     let _live = test_hooks::LiveWorker::enter();
-    let caught =
-        std::panic::catch_unwind(AssertUnwindSafe(|| worker_loop(index, &rx, file, failure)));
+    let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        worker_loop(index, &rx, file, failure, cancel);
+    }));
     if let Err(payload) = caught {
         failure.record_panic("parallel writer pool worker", payload.as_ref());
     }
@@ -550,9 +560,17 @@ fn pool_worker(index: usize, rx: Receiver<WriteOp>, file: &File, failure: &First
 /// against the shared file. On error, record it in `failure` (first
 /// failure wins) and exit. Once the pool is stopped, exits without running
 /// the op it just popped; the ops still queued are dropped with `rx`.
-fn worker_loop(index: usize, rx: &Receiver<WriteOp>, file: &File, failure: &FirstFailure) {
+fn worker_loop(
+    index: usize,
+    rx: &Receiver<WriteOp>,
+    file: &File,
+    failure: &FirstFailure,
+    cancel: &crate::host::Cancel,
+) {
     #[cfg(not(all(feature = "static-test-hooks", not(test))))]
     let _ = index;
+    #[cfg(not(feature = "linux-direct-io"))]
+    let _ = cancel;
     while let Ok(op) = rx.recv() {
         // One Acquire load per op - next to two Relaxed RMWs on the shared
         // `WRITER_METRICS` and a multi-hundred-KB pwrite.
@@ -578,7 +596,14 @@ fn worker_loop(index: usize, rx: &Receiver<WriteOp>, file: &File, failure: &Firs
                 len,
             } => {
                 use std::os::unix::io::AsRawFd;
-                let r = copy_range_to_fd(file, in_file.as_raw_fd(), src_offset, out_offset, len);
+                let r = copy_range_to_fd(
+                    file,
+                    in_file.as_raw_fd(),
+                    src_offset,
+                    out_offset,
+                    len,
+                    cancel,
+                );
                 // The Arc is held across the splice, so the input cannot be
                 // closed out from under the kernel copy.
                 drop(in_file);
@@ -610,10 +635,14 @@ fn copy_range_to_fd(
     mut src_offset: u64,
     mut out_offset: u64,
     mut remaining: u64,
+    cancel: &crate::host::Cancel,
 ) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     let out_fd = out.as_raw_fd();
     while remaining > 0 {
+        // Between kernel calls (each at most about 2 GiB): a cancelled run
+        // stops a long splice here; see `copy_range::copy_range`.
+        cancel.check()?;
         let mut src_off_i64 = src_offset as i64;
         let mut out_off_i64 = out_offset as i64;
         let chunk_len = usize::try_from(remaining).unwrap_or(usize::MAX);
@@ -636,7 +665,9 @@ fn copy_range_to_fd(
                 // to pread → pwrite in userspace for the remaining
                 // range, using explicit offsets so parallel workers
                 // don't race on the output fd's position.
-                return copy_range_fallback_pwrite(out, in_fd, src_offset, out_offset, remaining);
+                return copy_range_fallback_pwrite(
+                    out, in_fd, src_offset, out_offset, remaining, cancel,
+                );
             }
             return Err(err.into());
         }
@@ -670,9 +701,11 @@ fn copy_range_fallback_pwrite(
     mut src_offset: u64,
     mut out_offset: u64,
     mut remaining: u64,
+    cancel: &crate::host::Cancel,
 ) -> Result<()> {
     let mut buf = vec![0u8; crate::write::IO_BUF_BYTES];
     while remaining > 0 {
+        cancel.check()?;
         let chunk = buf.len().min(remaining as usize);
         let n = loop {
             let ret =
@@ -729,6 +762,7 @@ mod tests {
                 init_tx,
                 &thread_total,
                 crate::write::Finish::Durable,
+                &crate::host::Cancel::new(),
             )
         });
 

@@ -616,6 +616,11 @@ pub(super) fn stage4_assembly(
         }
         drop(desc_rx);
         drop(decoded_tx);
+        // Owned by this closure, so any early return (a write error, a
+        // cancellation) drops it before the scope joins the workers. Borrowed,
+        // it outlived the closure, and a worker parked in a full `send` held
+        // the join forever.
+        let decoded_rx = decoded_rx;
 
         // Consumer: reorder + write to PbfWriter. Decode results arrive
         // from workers; passthrough items are pre-seeded and the consumer
@@ -760,6 +765,11 @@ pub(super) fn stage4_assembly(
         )?;
 
         loop {
+            // Cancellation is checked on this consumer, before each wait and
+            // on each arrival; the early return is the write-error exit.
+            // Workers parked in `wait_ready` are woken by stage 3, which
+            // observes the same token per bucket and aborts the router.
+            host.cancel.check()?;
             let t_recv = std::time::Instant::now();
             let msg = decoded_rx.recv();
             #[allow(clippy::cast_possible_truncation)]
@@ -774,6 +784,7 @@ pub(super) fn stage4_assembly(
                 }
                 Err(_) => break,
             };
+            host.cancel.check()?;
 
             reorder.push(seq_num, ConsumerItem::Decoded(item));
             drain(

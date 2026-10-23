@@ -618,6 +618,7 @@ pub fn extract_multi(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<Vec<ExtractStats>> {
+    host.cancel.check()?;
     if regions.len() != outputs.len() {
         return Err(Error::invalid_argument(format!(
             "got {} outputs for {} extract regions",
@@ -628,7 +629,7 @@ pub fn extract_multi(
     let stats = extract_multi_to(
         input, regions, &outputs, strategy, set_bounds, clean, write, overrides, host,
     )?;
-    outputs.publish()?;
+    outputs.publish(&host.cancel)?;
     Ok(stats)
 }
 
@@ -804,10 +805,11 @@ pub fn extract(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<ExtractStats> {
+    host.cancel.check()?;
     let result = extract_to(
         input, &output, region, strategy, set_bounds, clean, write, overrides, host,
     )?;
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 

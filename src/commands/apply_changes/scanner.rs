@@ -103,7 +103,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
 
     crate::debug::emit_marker("MERGE_SCANNER_START");
 
-    let mut walker = HeaderWalker::open(base_pbf, &host.diagnostics)?;
+    let mut walker = HeaderWalker::open(base_pbf, host)?;
     let mut seq: u64 = 0;
     // Intentionally unbounded under --locations-on-ways: the non-node
     // branch below appends and continues without polling barrier_rx. On a

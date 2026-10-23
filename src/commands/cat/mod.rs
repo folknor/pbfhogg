@@ -77,8 +77,9 @@ pub fn cat(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<CatStats> {
+    host.cancel.check()?;
     let result = cat_to(files, &output, type_filter, clean, write, overrides, host)?;
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -159,8 +160,7 @@ fn read_header(
 ) -> Result<crate::HeaderBlock> {
     let mut reader = FileReader::open(file, direct_io)?;
     let mut file_offset: u64 = 0;
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, file)?
-    {
+    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, host, file)? {
         if frame.blob_type == BlobKind::OsmHeader {
             return decode_blob_to_headerblock(frame.blob_bytes())
                 .map_err(|e| e.locate(frame_location(file, frame.file_offset)));
@@ -258,9 +258,7 @@ fn cat_passthrough(
         let mut reader = FileReader::open(file, direct_io)?;
         let mut file_offset: u64 = 0;
 
-        while let Some(mut frame) =
-            read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, file)?
-        {
+        while let Some(mut frame) = read_raw_frame(&mut reader, &mut file_offset, host, file)? {
             match &frame.blob_type {
                 BlobKind::OsmHeader => {}
                 BlobKind::OsmData => {
@@ -372,9 +370,7 @@ fn cat_type_passthrough(
         let mut reader = FileReader::open(file, direct_io)?;
         let mut file_offset: u64 = 0;
 
-        while let Some(mut frame) =
-            read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, file)?
-        {
+        while let Some(mut frame) = read_raw_frame(&mut reader, &mut file_offset, host, file)? {
             match &frame.blob_type {
                 BlobKind::OsmHeader => {}
                 BlobKind::OsmData => {
@@ -586,7 +582,7 @@ fn cat_filtered(
         // The fifth result sizes IdSets in check callers; filtered cat only
         // needs the schedules.
         let (node_schedule, way_schedule, rel_schedule, shared_file, _) =
-            crate::scan::classify::build_classify_schedules_split(file, &host.diagnostics)?;
+            crate::scan::classify::build_classify_schedules_split(file, host)?;
 
         if tf.nodes {
             crate::debug::emit_marker("CAT_NODES_START");
@@ -688,7 +684,7 @@ fn run_kind_phase(
     // so it can't ride the `S: Send` worker-state slot. Per-blob alloc inside
     // the closure is cheap (BlockBuilder::new is just a few empty Vec/HashMap
     // initialisers; no heap reservation until elements are added).
-    crate::scan::classify::parallel_classify_phase(
+    let pool_result = crate::scan::classify::parallel_classify_phase(
         shared_file,
         schedule,
         None,
@@ -760,15 +756,18 @@ fn run_kind_phase(
                 }
             }
         },
-        &*host.resources,
-    )?;
+        host,
+    );
 
+    // Errors the merge recorded came first: the pool's own (a cancellation
+    // observed at a later receive included) is the later one.
     if let Some(e) = write_error {
         return Err(e);
     }
     if let Some(e) = classify_error {
         return Err(e);
     }
+    pool_result?;
 
     Ok((total_blobs, total_elements))
 }

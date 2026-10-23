@@ -4,6 +4,31 @@
 
 ### Breaking
 
+- **Ctrl-C and SIGTERM now clean up and exit 130 / 143.** The first SIGINT
+  or SIGTERM stops any command at its next checkpoint: its output staging
+  and scratch directory are removed, nothing is published (an existing
+  output is left untouched), and it exits `130` (SIGINT) or `143` (SIGTERM)
+  with `Error: interrupted by SIGINT: ...`. Before, the default disposition
+  killed the process and left staging files and, for
+  `add-locations-to-ways --index-type external`, `diff` and
+  `build-geocode-index`, possibly hundreds of GB of scratch for the next run
+  to report. A second signal exits at once with the same convention,
+  leaving the rest for the next run's leftover scan. A signal that arrives
+  after the run completed no longer changes its result. Scripts that
+  matched the shell's own `130` keep working.
+
+- **`Host` gains a `cancel: pbfhogg::host::Cancel` field**, and
+  `Output::publish`, `OutputDir::publish` and `OutputSet::publish` take
+  `&Cancel`, as does `Output::writer`. A struct literal adds
+  `cancel: Cancel::new()`; callers that never cancel pass `&host.cancel`.
+  `Cancel::cancel` from any thread makes a running command stop at its next
+  checkpoint, remove its staging and scratch, publish nothing and return
+  `ErrorKind::Cancelled` (`Error::is_cancelled` looks through context and
+  `io::Error` carriers); `Cancel::check` gives a caller's own code between
+  library calls the same error. The library never installs a signal
+  handler; the caller decides what trips the token. A publication that has
+  started is never interrupted.
+
 - **Scratch is one hidden directory per run, and the library takes it as an
   argument.** `altw::add_locations_to_ways`, `altw::external::external_join`,
   `diff::diff`, `diff::derive::derive_changes` and
@@ -683,6 +708,11 @@
 
 ### Added
 
+- **`BlobReader::cancel` and `ElementReader::cancel`** attach a
+  `pbfhogg::host::Cancel` to a reader built by hand; it then stops with
+  `ErrorKind::Cancelled` at the next blob once the token is tripped.
+  Readers the commands open take `host.cancel` already.
+
 - **`--tmp-dir <DIR>` on `add-locations-to-ways`, `diff` and
   `build-geocode-index`** chooses where the run's scratch goes, for when the
   output's volume is small or slow (`--index-type external` needs hundreds of
@@ -856,6 +886,12 @@
   makes the decision before the header is read.
 
 ### Fixed
+
+- **`add-locations-to-ways` can no longer hang when its output write
+  fails.** The in-memory backends' rewrite pass over indexed input and the external backend's
+  final stage kept the decoded-block channel open after the writer
+  returned an error, so decode workers blocked on a full channel and the
+  run never ended; the error is now reported.
 
 - **A header-only PBF counts as indexed.** A valid file with a header and no
   data blobs has no blob lacking indexdata, so every command that wants

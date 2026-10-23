@@ -151,7 +151,7 @@ fn read_header(
     let mut reader = FileReader::open(base_pbf, direct_io)?;
     let mut offset: u64 = 0;
     loop {
-        match read_raw_frame(&mut reader, &mut offset, &host.diagnostics, base_pbf)? {
+        match read_raw_frame(&mut reader, &mut offset, host, base_pbf)? {
             Some(frame) if frame.blob_type == BlobKind::OsmHeader => {
                 let header = decode_blob_to_headerblock(frame.blob_bytes())?;
                 return build_header_bytes(&header, locations_on_ways, overrides, host);
@@ -191,8 +191,9 @@ pub fn merge(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<MergeStats> {
+    host.cancel.check()?;
     let result = merge_to(base_pbf, osc_file, &output_pbf, opts, overrides, host)?;
-    output_pbf.publish()?;
+    output_pbf.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -283,7 +284,7 @@ pub(crate) fn merge_to(
         // file: input-reader time (file reads, plus decompression for gzip),
         // not the full parse wall measured by osc_start here. Its owner,
         // TimedRead in osc/xml_parse.rs, documents the attribution.
-        crate::osc::parse_osc_file_into(osc_file, &mut overlay)?;
+        crate::osc::parse::parse_osc_file_into_until(osc_file, &mut overlay, &host.cancel)?;
         overlay
     });
     crate::host::diag!(

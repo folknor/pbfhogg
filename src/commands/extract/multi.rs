@@ -188,7 +188,7 @@ pub(super) fn try_extract_multi_single_pass(
     // page cache during the scan - the per-kind classification passes open
     // fresh fds and pread only the blobs they need.
     crate::debug::emit_marker("MULTI_SCHEDULE_SCAN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input))?;
@@ -393,7 +393,7 @@ pub(super) fn try_extract_multi_single_pass(
             worker_init,
             |block, (columns, scratch)| classify_columns(block, columns, scratch),
             |_pos, region_ids: Vec<Vec<i64>>| merge_region_ids(&mut bbox_node_ids, region_ids),
-            &*host.resources,
+            host,
         )?;
         crate::scan::classify::parallel_scan_blobs_raw(
             &shared_file,
@@ -417,7 +417,7 @@ pub(super) fn try_extract_multi_single_pass(
                 merge_region_ids(&mut bbox_node_ids, region_ids);
                 verified_nodes[pos] = verified;
             },
-            &*host.resources,
+            host,
         )?;
     } else {
         crate::scan::classify::parallel_classify_phase(
@@ -462,7 +462,7 @@ pub(super) fn try_extract_multi_single_pass(
                 scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>()
             },
             |_seq, region_ids: Vec<Vec<i64>>| merge_region_ids(&mut bbox_node_ids, region_ids),
-            &*host.resources,
+            host,
         )?;
     }
     crate::debug::emit_marker("MULTI_NODE_CLASSIFY_END");
@@ -596,7 +596,7 @@ pub(super) fn try_extract_multi_single_pass(
                 }
             }
         },
-        &*host.resources,
+        host,
     )?;
     crate::debug::emit_marker("MULTI_WAY_CLASSIFY_END");
 
@@ -658,7 +658,7 @@ pub(super) fn try_extract_multi_single_pass(
                 matched_relation_ids[i].merge(worker_set);
             }
         },
-        &*host.resources,
+        host,
     )?;
     crate::debug::emit_marker("MULTI_REL_CLASSIFY_END");
 
@@ -927,12 +927,17 @@ where
         }
 
         let mut frame_buf: Vec<u8> = Vec::new();
+        // Cancellation is checked per result on this consumer; an early
+        // return drops the receiver (moved into the loop), failing the
+        // workers' sends and then the dispatcher's.
         for (s, item) in result_rx {
+            host.cancel.check()?;
             reorder.push(s, item);
             while let Some(ci) = reorder.pop_ready() {
                 write_consumer_item(ci, n, shared_file, &mut frame_buf, writers, stats)?;
             }
         }
+        host.cancel.check()?;
         while let Some(ci) = reorder.pop_ready() {
             write_consumer_item(ci, n, shared_file, &mut frame_buf, writers, stats)?;
         }
@@ -1118,7 +1123,9 @@ where
                 crate::tunables::POOL_REORDER_CAPACITY,
             );
 
+        // Cancellation as in `multi_extract_pread_write_nodes`.
         for (s, item) in result_rx {
+            host.cancel.check()?;
             reorder.push(s, item);
 
             while let Some(result) = reorder.pop_ready() {
@@ -1143,6 +1150,7 @@ where
             }
         }
         // Drain remaining.
+        host.cancel.check()?;
         while let Some(result) = reorder.pop_ready() {
             let (region_blocks, counts) = result?;
             for (i, blocks) in region_blocks.into_iter().enumerate() {

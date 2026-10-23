@@ -493,7 +493,7 @@ pub(super) fn run_pass2(
         let referenced_ref = &referenced_nodes;
         let mut merge_err: Option<Error> = None;
         let mut semantic_err: Option<Error> = None;
-        crate::scan::classify::parallel_classify_phase_ordered(
+        let pool_result = crate::scan::classify::parallel_classify_phase_ordered(
             shared_file,
             node_schedule,
             None,
@@ -612,14 +612,18 @@ pub(super) fn run_pass2(
                     addr_point_count = next_count;
                 }
             },
-            &*host.resources,
-        )?;
+            host,
+        );
+        // Errors the merge recorded came first: the pool's own (a
+        // cancellation observed at a later receive included) is the later
+        // one.
         if let Some(e) = merge_err {
             return Err(e);
         }
         if let Some(e) = semantic_err {
             return Err(e);
         }
+        pool_result?;
     }
     crate::debug::emit_marker("GEOCODE_PASS2A_END");
 
@@ -643,7 +647,7 @@ pub(super) fn run_pass2(
         let needed_admin_ways_ref = &needed_admin_ways;
         let mut merge_err: Option<Error> = None;
 
-        crate::scan::classify::parallel_classify_phase_ordered(
+        let pool_result = crate::scan::classify::parallel_classify_phase_ordered(
             shared_file,
             way_schedule,
             None,
@@ -789,11 +793,13 @@ pub(super) fn run_pass2(
                     street_way_count = next_count;
                 }
             },
-            &*host.resources,
-        )?;
+            host,
+        );
+        // As in phase 2a: the merge's recorded error precedes the pool's.
         if let Some(e) = merge_err {
             return Err(e);
         }
+        pool_result?;
     }
     crate::debug::emit_marker("GEOCODE_PASS2B_END");
 

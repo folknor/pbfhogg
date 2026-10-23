@@ -120,14 +120,21 @@ slot) is built in:
 `getparents` and `getid --id-osm-file` use the shared helper; the rest do not.
 Divergence across copies is already fact:
 
-- Error policy: stage 2 overwrites `*err_ref = Some(e)` (last error wins),
-  stage 1's flush slot keeps the first, stage 3 has both a first-wins
-  `s3_error` and the router's `abort_error`; repack/degrade latch and keep
-  draining, renumber returns immediately (and hangs), sort uses rayon's
-  short-circuiting collect.
-- Cancellation: stage 2 polls the error mutex per bucket, classify relies on
-  channel drop, stage 1 runs until the schedule drains, getparents breaks the
-  scan on first error with a comment on why that matters at planet scale.
+- Error policy: stage 1's flush slot and stage 2 keep the first error, stage 3
+  has both a first-wins `s3_error` and the router's `abort_error`;
+  repack/degrade latch and keep draining, renumber returns immediately (and
+  hangs), sort uses rayon's short-circuiting collect.
+- Cancellation: every pool now observes `host.cancel`, but each copy wires it
+  by hand - ordered pools in the consumer (`recv_checked` in classify,
+  renumber's `run_ordered`, the altw and extract consumers), unordered ones
+  in the worker (accumulate, stage 2 and 3 buckets, diff and derive shards,
+  pass1_5) - and each copy's early return has to drop its receiver before
+  the scope joins, which two copies (altw passthrough and stage 4) got wrong
+  until the cancellation work moved the receiver into the consumer closure.
+  Internal early exit still differs: stage 2 polls the error mutex per
+  bucket, classify relies on channel drop, stage 1 runs until the schedule
+  drains, getparents breaks the scan on first error with a comment on why
+  that matters at planet scale.
 - Validation: `blob_body_within_file` runs in the classify and getparents
   schedule builders; the external `scan_blob_metadata`, passthrough
   `build_schedule`, extract and tags-filter scans skip it, so a past-EOF
@@ -1173,32 +1180,6 @@ runs in a read-only directory.
 
 Reported by: the command-matrix audit.
 
-## HYG-117 - Nothing handles SIGINT or SIGTERM, so every cleanup guard is skipped by Ctrl-C
-
-Anger: 7 - process policy and CLI behaviour.
-
-No handler exists in `src/`, `cli/` or the dependencies. Output staging
-removal (`Output` drop), the run scratch directory (`RunScratch` drop) and the
-group rollback of `extract --config` all run on return or unwind. Ctrl-C,
-`timeout`, a service manager's stop and a plain `kill` end the process
-without running a destructor, leaving `.pbfhogg-tmp-*` beside the output and,
-for altw, diff and build-geocode-index, the whole run directory, which the
-docs size at hundreds of GB. The docs name SIGKILL, power loss and the OOM
-killer as the causes of leftovers; the commonest, an operator's own
-interrupt, is not among them. The next run reports the leftovers
-(`find_stale`) but never removes them.
-
-Fix: first, say so in the "Scratch files" and "Output files" sections (cheap,
-and consistent with rule 6). The real fix is CLI-owned (ADR-0016 keeps the
-library free of process state): a handler through `signal-hook` that sets a
-cancellation flag, a cancellation token on the pool engine that HYG-011 wants
-anyway, an `Interrupted` error that unwinds normally so the guards run, and
-exit status 130 or 143. Enforce with a test that starts a long command,
-sends SIGINT and SIGTERM, and asserts no `.pbfhogg-*` entry remains and the
-exit status.
-
-Reported by: the command-matrix audit.
-
 ## HYG-118 - The cross-thread allocator cap is requested by some block-producing commands and not others
 
 Anger: 9 - measured memory behaviour on the planet path.
@@ -1315,4 +1296,60 @@ its own way or hold an empty file against indexdata. Fix: add rows for the
 modes above, and a merge-changes alias case per input.
 
 Reported by: the input-gate work.
+
+## HYG-125 - Some phases have no cancellation checkpoint inside them
+
+Anger: 9 - every remaining gap sits in a measured hot loop or an in-memory
+rayon pass on the planet path.
+
+Cancellation is observed only where a run already passes a blob, a pool
+result, a stage boundary or an output write (ADR-0019), so these phases run to
+their end after the token trips. Each is reasoned, not measured:
+
+- Geocode builder: pass 2 admin assembly (`GEOCODE_PASS2_ADMIN_ASSEMBLY`),
+  interpolation resolve (`GEOCODE_PASS2_INTERP_RESOLVE`), the pass 2 data
+  file writes, pass 3 admin cell assignment and the admin index write. All
+  are in-memory or `par_iter` passes bounded by the boundary checks around
+  them; at planet scale admin assembly is the longest, on the order of the
+  span the sidecar reports for it.
+- `merge-changes --simplify`: the in-memory dedupe loop between its stage
+  boundaries.
+- `renumber`: each `into_ranked` rank-table build (checked only before and
+  after).
+- altw external: one stage 3 bucket per worker (at most 256 buckets in all,
+  so about 1/256 of stage 3's work per worker) and, in stage 2, one node blob
+  per worker.
+- `apply-changes`: the drain observes the token after each
+  `DRAIN_RECV_TIMEOUT` poll plus the item in hand; the barrier itself is not
+  split.
+- Raw blob copies: one `copy_file_range` call (the kernel copies up to about
+  2 GiB per call) between checks.
+- Cleanup itself: removing a large run directory after the token trips
+  completes unless a second signal arrives.
+
+A check inside any of these would be per element or per polygon, which the
+policy rules out. Fix only if an operator reports a stop that took too long:
+split the offending pass into chunks and check per chunk, with a matched A/B
+that the untripped check costs nothing. Enforce with the checkpoint-count
+test hook (`PBFHOGG_TEST_CANCEL_COUNT`): a pass that gains chunks should gain
+ordinals.
+
+Reported by: the cancellation work.
+
+## HYG-126 - The interruption table samples checkpoints, it does not cover each one
+
+Anger: 3 - test coverage.
+
+`tests/cli_output_contract.rs` counts each output-writing command's
+checkpoints on a small fixture and interrupts it at a fixed number of evenly
+spread ordinals, asserting the exit code, no destination and no
+`.pbfhogg-*` entry. A checkpoint between two samples whose exit path leaks
+(a receiver kept alive past a scope, a guard moved out of reach) is not
+exercised, and the fixture's ordinals are not the planet's: a phase that
+has one checkpoint on the fixture may have thousands on real data. The
+library sweep in `tests/cancel.rs` covers every ordinal up to 64 and a
+spread of 64 beyond, and only for the commands it lists. Fix: run every ordinal for every row under the `full`
+profile (the table already knows the count), keeping the tier-1 sampling.
+
+Reported by: the cancellation work.
 

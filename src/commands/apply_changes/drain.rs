@@ -267,6 +267,12 @@ pub(super) fn run_drain(
     // barrier when ready. Exits when `drain_rx` disconnects AND the
     // reorder buffer is empty.
     let mut drain_disconnected = false;
+    // The invocation's token, checked beside the producer-failure poll
+    // below: at most one `DRAIN_RECV_TIMEOUT` plus the item in hand after
+    // a cancellation. Returning it leaves through the drain's existing error
+    // exit (receiver and barrier sender dropped, producers unblocked, both
+    // joined by `merge`), the same one a failed output write takes.
+    let cancel = writer.cancel_token().clone();
     loop {
         let recv_start = std::time::Instant::now();
         let item_opt = if drain_disconnected {
@@ -288,6 +294,7 @@ pub(super) fn run_drain(
         if let Some(e) = cfg.failure.take() {
             return Err(e);
         }
+        cancel.check()?;
 
         if state.buffer.is_empty() {
             counters

@@ -37,7 +37,10 @@ staged beside their destination because publication is a rename.
   buckets after stage 3, shard files after they are appended) goes through
   `RunScratch::remove`, which reports a failure and carries on; the final
   removal retries. The error-path sweeps and `PathGuard`s that preceded this
-  are gone.
+  are gone. A cancelled run (ADR-0019) returns through the same error path,
+  so its guard removes the directory like a failed run's; only a process
+  that ends without unwinding (SIGKILL, the OOM killer, power loss, the
+  CLI's second interrupt) leaves one for the leftover scan.
 - **Liveness.** The guard holds an exclusive `flock` on `LOCK` for its whole
   life and creates `READY` after taking it. A scanner locks only when `READY`
   exists, never creates anything, opens `LOCK` read-write (on NFS `flock` is

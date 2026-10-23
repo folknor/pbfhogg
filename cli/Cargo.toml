@@ -51,6 +51,8 @@ pbfhogg = { version = "0.5", path = "..", default-features = false, features = [
 clap = { version = "4.6.1", features = ["derive"] }
 serde_json.workspace = true
 hotpath = "0.28.7"
+# sigwait / pthread_sigmask / _exit for SIGINT and SIGTERM (src/signals.rs).
+libc = "0.2.186"
 
 [dev-dependencies]
 tempfile = "3.27.0"

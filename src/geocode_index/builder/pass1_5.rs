@@ -247,6 +247,10 @@ pub(super) fn run_pass1_5(
                         let (_seq, offset, size) = way_schedule[idx];
 
                         let result = (|| -> Result<()> {
+                            // Per way blob; a cancellation leaves through the
+                            // first-error slot like any blob failure (this
+                            // pool has no consumer, and no sequence to keep).
+                            host.cancel.check()?;
                             read_buf.resize(size, 0);
                             file.read_exact_at(&mut read_buf, offset).map_err(|e| {
                                 Error::from(e).context(format!("pread at {offset}"))
@@ -354,7 +358,7 @@ pub(super) fn build_pass2_schedules(
     i64,                      // max_node_id
     std::sync::Arc<std::fs::File>,
 )> {
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input_path, &host.diagnostics)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input_path, host)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input_path))?;
@@ -429,7 +433,7 @@ pub(super) fn build_pass2_schedules(
                     *slot = Some(kinds);
                 }
             },
-            &*host.resources,
+            host,
         )?;
         for (&(seq, offset, size), kinds) in unindexed.iter().zip(found) {
             let kinds = kinds.ok_or_else(|| {

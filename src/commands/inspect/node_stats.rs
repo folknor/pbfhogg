@@ -250,6 +250,17 @@ pub fn node_stats(
     jobs: usize,
     host: &crate::host::Host,
 ) -> Result<NodeStatsReport> {
+    host.cancel
+        .decided(|| node_stats_inner(path, direct_io, force, jobs, host))
+}
+
+fn node_stats_inner(
+    path: &Path,
+    direct_io: bool,
+    force: bool,
+    jobs: usize,
+    host: &crate::host::Host,
+) -> Result<NodeStatsReport> {
     require_indexdata(
         path,
         direct_io,
@@ -261,11 +272,8 @@ pub fn node_stats(
 
     crate::debug::emit_marker("NODESTATS_START");
 
-    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
-        path,
-        Some(crate::ElementKind::Node),
-        &host.diagnostics,
-    )?;
+    let (schedule, shared_file) =
+        crate::scan::classify::build_classify_schedule(path, Some(crate::ElementKind::Node), host)?;
 
     // `jobs == 0` means auto; `parallel_classify_accumulate` interprets
     // `Some(0)` as auto too, so pass through unchanged.
@@ -339,7 +347,7 @@ pub fn node_stats(
             global.lon_stats.total_blocks += worker.lon_stats.total_blocks;
             global.lon_stats.total_bits_weighted += worker.lon_stats.total_bits_weighted;
         },
-        &*host.resources,
+        host,
     )?;
 
     if global.node_count == 0 {

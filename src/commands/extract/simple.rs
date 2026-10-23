@@ -496,7 +496,11 @@ fn extract_simple_single_pass(
 
             // Consumer: merge matching IDs into bbox_node_ids, and record
             // which candidates verified, by node-schedule position.
+            // Cancellation is checked per result on this consumer; an early
+            // return drops the receiver (moved into the loop), failing the
+            // workers' sends and then the dispatcher's.
             for (seq, result) in ids_rx {
+                host.cancel.check()?;
                 let (matching_ids, verified) = result?;
                 for id in matching_ids {
                     bbox_node_ids.set(id);
@@ -637,7 +641,9 @@ fn extract_simple_single_pass(
             drop(cls_rx);
             drop(ids_tx);
 
+            // Cancellation as in the node classify consumer above.
             for (_seq, result) in ids_rx {
+                host.cancel.check()?;
                 let matching_ids = result?;
                 for id in matching_ids {
                     matched_way_ids.set(id);
@@ -712,7 +718,7 @@ fn extract_simple_single_pass(
             |worker_ids| {
                 matched_relation_ids.merge(worker_ids);
             },
-            &*host.resources,
+            host,
         )?;
     }
     crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_END");

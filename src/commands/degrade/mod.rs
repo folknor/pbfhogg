@@ -401,8 +401,9 @@ pub fn degrade(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<DegradeStats> {
+    host.cancel.check()?;
     let result = degrade_to(input, &output, flags, block_cap, write, overrides, host)?;
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -561,7 +562,7 @@ fn passthrough_header_bytes(
     // The OSMHeader is always the first blob in a well-formed PBF.
     let mut reader = FileReader::open(input, direct_io)?;
     let mut file_offset: u64 = 0;
-    let frame = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, input)?
+    let frame = read_raw_frame(&mut reader, &mut file_offset, host, input)?
         .ok_or_else(|| crate::error::new_missing_header(input))?;
     let locate = |e: Error| e.locate(frame_location(input, frame.file_offset));
     if !matches!(frame.blob_type, BlobKind::OsmHeader) {
@@ -598,8 +599,7 @@ fn degrade_passthrough(
     let mut blobs_written: u64 = 0;
 
     crate::debug::emit_marker("DEGRADE_PASSTHROUGH_START");
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, input)?
-    {
+    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, host, input)? {
         match &frame.blob_type {
             BlobKind::OsmHeader => {}
             BlobKind::OsmData => {
@@ -838,7 +838,7 @@ fn degrade_decode_path(
         .clone();
 
     let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
-        crate::scan::classify::build_classify_schedules_split(input, &host.diagnostics)?;
+        crate::scan::classify::build_classify_schedules_split(input, host)?;
     // Use the input size as a preallocation budget for the caller-supplied
     // cap. Compressed input can expand to more elements than bytes; the
     // vectors grow as needed without changing the requested block cap.
@@ -994,7 +994,7 @@ fn select_drop_sets(
                     keep_smallest(&mut heap, spec.n, key);
                 }
             },
-            &*host.resources,
+            host,
         )?;
     }
     if spec.n > total {
@@ -1099,7 +1099,7 @@ fn run_kind_phase(
     let mut write_error: Option<Error> = None;
     let mut classify_error: Option<Error> = None;
 
-    crate::scan::classify::parallel_classify_phase(
+    let pool_result = crate::scan::classify::parallel_classify_phase(
         shared_file,
         schedule,
         None,
@@ -1209,15 +1209,18 @@ fn run_kind_phase(
                 elements += full_count + tail_n;
             }
         },
-        &*host.resources,
-    )?;
+        host,
+    );
 
+    // Errors the merge recorded came first: the pool's own (a cancellation
+    // observed at a later receive included) is the later one.
     if let Some(e) = write_error {
         return Err(e);
     }
     if let Some(e) = classify_error {
         return Err(e);
     }
+    pool_result?;
 
     // End-of-phase: re-inject any held element (partial swap fire), then
     // flush the central builder one last time.

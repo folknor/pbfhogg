@@ -62,7 +62,7 @@ pub(super) fn build_all_blob_schedules(
     input: &Path,
     host: &crate::host::Host,
 ) -> Result<(Vec<BlobTask>, Vec<BlobTask>, Vec<BlobTask>)> {
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     drop(
         walker
             .next_header()?

@@ -115,6 +115,7 @@ fn run_shard(
     kind: ElementKind,
     options: &DiffOptions,
     scratch: &crate::scratch::RunScratch,
+    cancel: &crate::host::Cancel,
 ) -> Result<ShardOutput> {
     // Test-only: arm via `test_hooks::PANIC_AT_SHARD_IDX`. Simulates a
     // mid-phase shard crash. The caller's `scope.spawn(...).join()`
@@ -155,6 +156,10 @@ fn run_shard(
     let mut new_gr: Vec<(u32, u32)> = Vec::new();
 
     loop {
+        // Once per merge step, each of which decodes at most one blob per
+        // side. Shards are independent threads joined by the driver, so a
+        // cancelled shard simply returns; there is no sequence to keep.
+        cancel.check()?;
         // Ensure both sides have a decoded block (or we've exhausted one side).
         if old_decoded.is_none() && old_idx < old_slice.len() {
             let desc = old_slice[old_idx];
@@ -565,8 +570,18 @@ pub(crate) fn diff_block_pair_parallel(
                 let new_source = &new.path;
                 let h = s.spawn(move || {
                     run_shard(
-                        shard, shard_idx, old_descs, new_descs, &old_file, &new_file, old_source,
-                        new_source, kind, options, scratch,
+                        shard,
+                        shard_idx,
+                        old_descs,
+                        new_descs,
+                        &old_file,
+                        &new_file,
+                        old_source,
+                        new_source,
+                        kind,
+                        options,
+                        scratch,
+                        &host.cancel,
                     )
                 });
                 handles.push(h);
@@ -580,13 +595,19 @@ pub(crate) fn diff_block_pair_parallel(
 
         // Partition shard outputs into (successful, first error). On an
         // error every shard file is left for the run directory's guard.
+        // Shards run independently, so slot order is not time order: a
+        // real failure in any shard outranks the cancellation the others
+        // observed, which a signal racing that failure would otherwise mask.
         let mut outputs: Vec<ShardOutput> = Vec::with_capacity(shard_outputs.len());
         let mut first_err: Option<crate::error::Error> = None;
         for slot in shard_outputs {
             match slot.expect("all slots filled") {
                 Ok(out) => outputs.push(out),
                 Err(e) => {
-                    if first_err.is_none() {
+                    if first_err
+                        .as_ref()
+                        .is_none_or(|kept| kept.is_cancelled() && !e.is_cancelled())
+                    {
                         first_err = Some(e);
                     }
                 }
@@ -598,7 +619,7 @@ pub(crate) fn diff_block_pair_parallel(
 
         // All successful: emit shard outputs in shard order, streaming each
         // per-shard temp file to the caller's output and removing it.
-        emit_shard_outputs(output, outputs, &mut total, scratch)?;
+        emit_shard_outputs(output, outputs, &mut total, scratch, &host.cancel)?;
 
         crate::debug::emit_marker(&end_marker);
     }
@@ -619,6 +640,7 @@ fn emit_shard_outputs(
     outputs: Vec<ShardOutput>,
     total: &mut DiffStats,
     scratch: &crate::scratch::RunScratch,
+    cancel: &crate::host::Cancel,
 ) -> Result<()> {
     let mut first_err = None;
     for shard_out in outputs {
@@ -626,7 +648,7 @@ fn emit_shard_outputs(
             scratch.remove(&shard_out.text_path);
             continue;
         }
-        if let Err(e) = append_and_cleanup(output, &shard_out.text_path, scratch) {
+        if let Err(e) = append_and_cleanup(output, &shard_out.text_path, scratch, cancel) {
             first_err = Some(e);
             continue;
         }
@@ -648,8 +670,12 @@ fn append_and_cleanup(
     out: &mut impl Write,
     src: &crate::scratch::ScratchPath,
     scratch: &crate::scratch::RunScratch,
+    cancel: &crate::host::Cancel,
 ) -> Result<()> {
-    let copied = std::fs::File::open(src).and_then(|mut f| io::copy(&mut f, out));
+    // The copy checks the token at every read of the shard file (a shard
+    // can hold gigabytes of text, and stdout is not cancellation-aware).
+    let copied = std::fs::File::open(src)
+        .and_then(|f| io::copy(&mut crate::host::CancellableRead::new(f, cancel), out));
     scratch.remove(src);
     match copied {
         Ok(_) => Ok(()),

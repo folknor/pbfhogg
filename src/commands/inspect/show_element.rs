@@ -21,6 +21,18 @@ pub fn show_element_to<W: Write>(
     out: &mut W,
     host: &crate::host::Host,
 ) -> Result<bool> {
+    host.cancel
+        .decided(|| show_element_inner(path, target_kind, target_id, direct_io, out, host))
+}
+
+fn show_element_inner<W: Write>(
+    path: &Path,
+    target_kind: ElementKind,
+    target_id: i64,
+    direct_io: bool,
+    out: &mut W,
+    host: &crate::host::Host,
+) -> Result<bool> {
     let mut reader = crate::blob::BlobReader::open_in(path, direct_io, host)?;
     reader.set_parse_indexdata(true);
     let mut decompress_buf: Vec<u8> = Vec::new();

@@ -19,7 +19,8 @@ ran to completion and whose answer is negative; a command that could not
 run at all exits `2`, so a script can branch on the answer without
 swallowing failures. `3` is the one failure split out of `2`: a
 requested platform I/O feature is unavailable, so the same invocation
-without that flag can succeed.
+without that flag can succeed. `130` and `143` are interruptions, following
+the shell's `128 + signal` convention.
 
 | Code | Meaning |
 |------|---------|
@@ -27,6 +28,39 @@ without that flag can succeed.
 | `1` | The command ran and its answer is negative. Only four commands can produce it: `diff` (differences found), `inspect --indexed` (a data blob lacks indexdata; a header-only file is indexed), `inspect --show` (element not in the file), and `check` (integrity violations). Nothing is printed to stderr for it beyond the command's normal output. |
 | `2` | The command failed: missing or unreadable input, an invalid argument combination, a malformed PBF (a zero-byte file, or one whose first blob is not the OSMHeader, is `PBF file does not start with an OsmHeader blob` naming the file, from every command including `inspect --indexed`), an I/O error. `Error: ...` goes to stderr. Argument-parsing errors from clap also land here. |
 | `3` | The command failed because the host refused a requested I/O feature at setup: `--direct-io` on a filesystem that rejects `O_DIRECT` at open (tmpfs, some overlay and network filesystems), or `--io-uring` where the kernel lacks io_uring or `WriteFixed`, a sandbox denies `io_uring_setup`, or `RLIMIT_MEMLOCK` is below the writer's registered buffers. On kernels before 5.12, which also charge the ring itself to `RLIMIT_MEMLOCK`, a low limit can instead fail ring creation with a generic `ENOMEM` that pbfhogg cannot tell apart from kernel resource exhaustion; that case exits `2`. stderr carries `Error: platform feature <feature> unavailable: ...` with `<feature>` `direct-io` or `io-uring` (an `--io-uring` output also opens with `O_DIRECT`, so it can report either). A refused `--direct-io` input reads `Error: platform feature direct-io unavailable: failed to open <path>: Invalid argument (os error 22)`. Failures after setup, including an `EINVAL` or `ENOSPC` mid-run, stay `2`. The code follows the typed error chain, not the message text: it survives added context, `io::Error` carriers, and the thread joins of multi-stage commands, so it holds when the refusal is raised by a worker stage, such as the output writer of the external `add-locations-to-ways` backend (which previously exited `2` for the same refusal). |
+| `130` | Interrupted by SIGINT (Ctrl-C). See [Interruption](#interruption). |
+| `143` | Interrupted by SIGTERM. See [Interruption](#interruption). |
+
+### Interruption
+
+Every command handles SIGINT and SIGTERM the same way. The first one prints
+`Note: SIGINT received; stopping and removing this run's staging and scratch
+files. ...`, and the run stops at its next checkpoint: its workers wind down,
+its output staging and scratch directory are removed, and nothing is
+published - an existing output stays byte-identical. It then prints `Error:
+interrupted by SIGINT: the run stopped before completing, removed its staging
+and scratch files and published nothing` and exits `130` (`143` for
+SIGTERM). A run that was already publishing when the signal arrived finishes
+publishing, and a run that had already completed keeps its normal outcome
+and exit code with a `Note:` that the signal arrived too late to matter. A
+report printed to stdout once a command has decided its result is not cut
+short by a signal; output streamed while the command runs (`diff` text to
+stdout) stops where the run stopped.
+
+The run stops at the next block it reads, dispatches or writes, the next
+result a worker pool hands back, or the next stage boundary - normally well
+under a second. A few phases have no such point inside them and finish first:
+the geocode builder's in-memory admin assembly and interpolation passes and
+its writes of the index's own data files,
+`merge-changes --simplify`'s in-memory dedupe, `renumber`'s rank-table
+builds, one external-join bucket or `add-locations-to-ways` node blob in
+flight per worker, a single `copy_file_range` call of a raw blob copy, and
+the removal of a large scratch directory during cleanup.
+
+A **second** SIGINT or SIGTERM while that cleanup is under way exits at once
+with `128 +` that signal's number, leaving whatever staging and scratch the
+first had not yet removed; the next run in that directory reports it (see
+[Scratch files](#scratch-files)). SIGKILL is never handled.
 
 Before 0.6.0 every one of these outcomes exited `1`, so "the files
 differ" and "the file does not exist" were indistinguishable. Callers
@@ -155,9 +189,11 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   The command writes a hidden staging file beside the output
   (`.pbfhogg-tmp-<pid>-<n>.<name>`), syncs it and renames it into place after
   its final flush; a run that fails before that removes it, so it leaves no
-  file at the output path and leaves an existing output untouched. A run
-  killed outright (SIGKILL, power loss) before publication can leave the
-  hidden staging file behind, never a file under the output name. The
+  file at the output path and leaves an existing output untouched. So does a
+  run interrupted by SIGINT or SIGTERM (see [Interruption](#interruption)). A
+  run killed outright (SIGKILL, the OOM killer, power loss, a second
+  interrupt) before publication can leave the hidden staging file behind,
+  never a file under the output name. The
   rename itself is the last step, and the few failures possible after it are
   reported as such: a directory sync that fails after the output was put in
   place is an error that says the output *was* published (naming any backup
@@ -181,8 +217,8 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
 scratch: disposable files that can be very large (hundreds of GB for `add-locations-to-ways
 --index-type external` at planet scale). Each run makes **one** hidden directory,
 `.pbfhogg-run-<pid>-<random>`, holds everything it writes in there and removes it when it ends,
-whether it succeeded or failed. If the directory cannot be removed the run says where the
-leftover is.
+whether it succeeded, failed or was interrupted. If the directory cannot be removed the run
+says where the leftover is.
 
 - `--tmp-dir <DIR>` chooses the directory the run directory is made in. It must exist and be
   writable, and it is checked before any input is opened, so a bad value fails at once. Without
@@ -193,7 +229,8 @@ leftover is.
   (`.pbfhogg-backup-*`) stay beside the output whatever `--tmp-dir` says: publication is a
   rename, which needs the same filesystem.
 
-**Leftovers of runs that never finished** (SIGKILL, power loss, the OOM killer) are reported,
+**Leftovers of runs that never finished** (SIGKILL, power loss, the OOM killer, a second
+SIGINT or SIGTERM) are reported,
 never removed. Before it starts, a command that writes an output scans the output's directory
 (and `--tmp-dir`, when given) and prints one `Warning:` per entry it finds: an unfinished run
 directory, scratch left by older pbfhogg versions (`.pbfhogg-external-join-*`,
@@ -1002,10 +1039,11 @@ use a dedicated directory for the index. Allow disk space for both generations.
 
 Publication uses two renames, so it is not crash-atomic and there is a short
 pathname gap. Serialize publication with new reader opens and other builds;
-queries on readers already open need no coordination. An interrupted publication
-may leave the old index in a `.pbfhogg-backup-*` directory beside the output
-directory; a publication that fails and cannot put the old index back says so
-and names that directory. SIGKILL or power loss during a build can also leave an
+queries on readers already open need no coordination. A publication killed
+partway (SIGINT and SIGTERM do not stop one that has started) may leave the old
+index in a `.pbfhogg-backup-*` directory beside the output directory; a
+publication that fails and cannot put the old index back says so and names that
+directory. SIGKILL, power loss or a second SIGINT/SIGTERM during a build can also leave an
 incomplete `.pbfhogg-tmp-*` staging directory beside it because process cleanup
 does not run. The next command that writes in that directory reports both
 (see Scratch files) but never removes them: a directory may belong to a

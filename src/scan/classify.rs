@@ -249,10 +249,10 @@ pub(crate) fn blob_filter_check(
 pub(crate) fn build_classify_schedule(
     input: &std::path::Path,
     kind_filter: Option<crate::ElementKind>,
-    diagnostics: &crate::host::Diagnostics,
+    host: &crate::host::Host,
 ) -> Result<(Vec<ScheduleEntry>, std::sync::Arc<std::fs::File>)> {
     let (schedule, file, _skipped) =
-        build_classify_schedule_blob_filtered(input, kind_filter, None, diagnostics)?;
+        build_classify_schedule_blob_filtered(input, kind_filter, None, host)?;
     Ok((schedule, file))
 }
 
@@ -271,10 +271,10 @@ pub(crate) fn build_classify_schedule_blob_filtered(
     input: &std::path::Path,
     kind_filter: Option<crate::ElementKind>,
     blob_filter: Option<&crate::blob_meta::BlobFilter>,
-    diagnostics: &crate::host::Diagnostics,
+    host: &crate::host::Host,
 ) -> Result<(Vec<ScheduleEntry>, std::sync::Arc<std::fs::File>, u64)> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, diagnostics)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     // Consume the first blob (expected OSMHeader): on an empty file return
     // MissingHeader. `HeaderWalker::next_header` enforces header position -
     // an OSMHeader anywhere after the first frame is a hard error - but it
@@ -373,7 +373,7 @@ pub(crate) fn build_classify_schedule_blob_filtered(
 #[allow(clippy::type_complexity)]
 pub(crate) fn build_classify_schedules_split(
     input: &std::path::Path,
-    diagnostics: &crate::host::Diagnostics,
+    host: &crate::host::Host,
 ) -> Result<(
     Vec<ScheduleEntry>,
     Vec<ScheduleEntry>,
@@ -382,7 +382,7 @@ pub(crate) fn build_classify_schedules_split(
     [i64; 3],
 )> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, diagnostics)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     drop(
         walker
             .next_header()?
@@ -483,7 +483,7 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
     mut merge: impl FnMut(usize, R),
-    resources: &dyn crate::host::Resources,
+    host: &crate::host::Host,
 ) -> Result<()> {
     parallel_classify_phase_abortable(
         shared_file,
@@ -495,8 +495,32 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
             merge(seq, r);
             std::ops::ControlFlow::Continue(())
         },
-        resources,
+        host,
     )
+}
+
+/// The consumer's cancellation checkpoint for the pread pools: before each
+/// wait for a result, after each arrival and after normal closure. Returning
+/// the error from the consumer is the pools' existing early exit: the result
+/// receiver drops, the workers' sends fail, and the dispatcher's send fails
+/// once the last worker has gone. Workers and dispatchers of the ordered
+/// pools never check, so no admitted sequence position is abandoned while
+/// the consumer still waits for it.
+fn recv_checked<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+    cancel: &crate::host::Cancel,
+) -> Result<Option<T>> {
+    cancel.check()?;
+    match rx.recv() {
+        Ok(item) => {
+            cancel.check()?;
+            Ok(Some(item))
+        }
+        Err(_) => {
+            cancel.check()?;
+            Ok(None)
+        }
+    }
 }
 
 /// [`parallel_classify_phase`] whose merge closure can stop the scan.
@@ -519,16 +543,17 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
     mut merge: impl FnMut(usize, R) -> std::ops::ControlFlow<()>,
-    resources: &dyn crate::host::Resources,
+    host: &crate::host::Host,
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
     let mut willneed = WillneedPrefetch::new(schedule);
+    host.cancel.check()?;
     if schedule.is_empty() {
         return Ok(());
     }
 
-    let decode_threads = resolve_thread_count(threads, resources);
+    let decode_threads = resolve_thread_count(threads, &*host.resources);
 
     let (desc_tx, desc_rx) =
         std::sync::mpsc::sync_channel::<ScheduleEntry>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
@@ -594,10 +619,14 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
         drop(desc_rx);
         drop(result_tx);
 
-        for (seq, result) in result_rx {
+        // Moved into this closure so every return drops it before the scope
+        // joins the workers (a borrow would keep it alive past the join and
+        // leave a worker parked in `send`).
+        let result_rx = result_rx;
+        while let Some((seq, result)) = recv_checked(&result_rx, &host.cancel)? {
             if merge(seq, result?).is_break() {
-                // Dropping the receiver - the `for` loop owns it, and it falls
-                // out of scope right after this statement - fails the workers'
+                // Dropping the receiver - it falls out of scope when this
+                // closure returns, before the scope joins - fails the workers'
                 // `tx.send`, breaking their loops, which in turn fails the
                 // dispatcher's `desc_tx.send`.
                 break;
@@ -691,16 +720,17 @@ pub(crate) fn parallel_classify_phase_ordered<S: Send, R: Send>(
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
     mut merge: impl FnMut(usize, R),
-    resources: &dyn crate::host::Resources,
+    host: &crate::host::Host,
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
     let mut willneed = WillneedPrefetch::new(schedule);
+    host.cancel.check()?;
     if schedule.is_empty() {
         return Ok(());
     }
     let window = window.max(1);
-    let decode_threads = resolve_thread_count(threads, resources);
+    let decode_threads = resolve_thread_count(threads, &*host.resources);
 
     let credit: OrderedCredit = (std::sync::Mutex::new((0, false)), std::sync::Condvar::new());
     let (desc_tx, desc_rx) =
@@ -785,7 +815,11 @@ pub(crate) fn parallel_classify_phase_ordered<S: Send, R: Send>(
         let ring = window.min(schedule.len());
         let mut pending: Vec<Option<(usize, R)>> = (0..ring).map(|_| None).collect();
         let mut next = 0_usize;
-        for (position, seq, result) in result_rx {
+        // An early return (an error or a cancellation) drops `_close`, which
+        // wakes a dispatcher parked on credit, and the receiver (moved into
+        // this closure for that reason), which fails the workers' sends.
+        let result_rx = result_rx;
+        while let Some((position, seq, result)) = recv_checked(&result_rx, &host.cancel)? {
             pending[position % ring] = Some((seq, result?));
             let before = next;
             while let Some((seq, out)) = pending[next % ring].take() {
@@ -826,16 +860,17 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&[u8], &mut S) -> crate::error::Result<R> + Send + Sync,
     mut merge: impl FnMut(usize, R),
-    resources: &dyn crate::host::Resources,
+    host: &crate::host::Host,
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
     let mut willneed = WillneedPrefetch::new(schedule);
+    host.cancel.check()?;
     if schedule.is_empty() {
         return Ok(());
     }
 
-    let decode_threads = resolve_thread_count(threads, resources);
+    let decode_threads = resolve_thread_count(threads, &*host.resources);
 
     let (desc_tx, desc_rx) =
         std::sync::mpsc::sync_channel::<ScheduleEntry>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
@@ -889,7 +924,11 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
         drop(desc_rx);
         drop(result_tx);
 
-        for (seq, result) in result_rx {
+        // Moved into this closure so every return drops it before the scope
+        // joins the workers (a borrow would keep it alive past the join and
+        // leave a worker parked in `send`).
+        let result_rx = result_rx;
+        while let Some((seq, result)) = recv_checked(&result_rx, &host.cancel)? {
             merge(seq, result?);
         }
         Ok(())
@@ -965,16 +1004,18 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) + Send + Sync,
     mut merge: impl FnMut(S),
-    resources: &dyn crate::host::Resources,
+    host: &crate::host::Host,
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
     let mut willneed = WillneedPrefetch::new(schedule);
+    host.cancel.check()?;
     if schedule.is_empty() {
         return Ok(());
     }
 
-    let decode_threads = resolve_thread_count(threads, resources);
+    let decode_threads = resolve_thread_count(threads, &*host.resources);
+    let cancel = &host.cancel;
 
     let (desc_tx, desc_rx) =
         std::sync::mpsc::sync_channel::<ScheduleEntry>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
@@ -1005,8 +1046,14 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
                 let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
                 let mut state = worker_init_ref();
 
+                // This pool has no consumer loop while the scan runs (each
+                // worker sends one result at its end), so the workers check:
+                // inside the closure whose result is sent, so a cancelled
+                // worker still reports, and the consumer's first `?` then
+                // drops the receiver. There is no sequence to keep whole.
                 let result: crate::error::Result<()> = (|| {
                     loop {
+                        cancel.check()?;
                         let (_s, data_offset, data_size) = {
                             let guard =
                                 rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1100,8 +1147,7 @@ mod tests {
         let path = write_many_blob_pbf(dir.path(), BLOBS);
 
         let (schedule, shared_file) =
-            super::build_classify_schedule(&path, None, &crate::host::Diagnostics::discard())
-                .unwrap();
+            super::build_classify_schedule(&path, None, &crate::host::Host::for_tests()).unwrap();
         assert_eq!(
             schedule.len(),
             BLOBS,
@@ -1123,7 +1169,7 @@ mod tests {
                 merged += 1;
                 std::ops::ControlFlow::Break(())
             },
-            &crate::host::MachineProbe,
+            &crate::host::Host::for_tests(),
         )
         .unwrap();
 
@@ -1152,7 +1198,7 @@ mod tests {
             |_seq, ()| {
                 all.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
-            &crate::host::MachineProbe,
+            &crate::host::Host::for_tests(),
         )
         .unwrap();
         assert_eq!(all.into_inner(), BLOBS, "a non-breaking scan is exhaustive");
@@ -1171,8 +1217,7 @@ mod tests {
         const WINDOW: usize = 4;
         let path = write_many_blob_pbf(dir.path(), BLOBS);
         let (mut schedule, shared_file) =
-            super::build_classify_schedule(&path, None, &crate::host::Diagnostics::discard())
-                .unwrap();
+            super::build_classify_schedule(&path, None, &crate::host::Host::for_tests()).unwrap();
         assert_eq!(schedule.len(), BLOBS);
         for entry in &mut schedule {
             entry.0 *= 2;
@@ -1200,7 +1245,7 @@ mod tests {
                 );
                 merged.push(seq);
             },
-            &crate::host::MachineProbe,
+            &crate::host::Host::for_tests(),
         )
         .unwrap();
         assert_eq!(merged, (0..BLOBS).map(|n| n * 2).collect::<Vec<_>>());

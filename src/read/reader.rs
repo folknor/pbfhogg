@@ -75,6 +75,14 @@ impl<R: Read + Send> ElementReader<R> {
         self
     }
 
+    /// Stop once `cancel` is tripped: every iteration method then returns
+    /// `ErrorKind::Cancelled` at its next blob instead of finishing the file.
+    #[must_use]
+    pub fn cancel(mut self, cancel: crate::host::Cancel) -> Self {
+        self.blob_iter = self.blob_iter.cancel(cancel);
+        self
+    }
+
     /// Sets a blob-type filter for the pipelined reader.
     ///
     /// When set, the pipeline skips decompressing blobs whose element type

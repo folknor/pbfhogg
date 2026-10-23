@@ -334,9 +334,10 @@ pub fn add_locations_to_ways(
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<Stats> {
+    host.cancel.check()?;
     let result = add_locations_to_ways_to(input, &output, options, overrides, host, &scratch)?;
     drop(scratch);
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -633,7 +634,7 @@ fn route_sorted_indexed(store_bytes: Option<u64>, budget_bytes: Option<u64>) -> 
 /// `None` when any OsmData blob lacks indexdata, since the sum would
 /// silently undercount.
 fn estimate_sparse_store_bytes(input: &Path, host: &crate::host::Host) -> Result<Option<u64>> {
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let mut node_count: u64 = 0;
     while let Some(meta) = walker.next_header()? {
         if meta.blob_type != crate::blob::BlobKind::OsmData {
@@ -847,11 +848,8 @@ fn collect_way_referenced_node_ids(
     inject_prepass: bool,
     host: &crate::host::Host,
 ) -> Result<(IdSet, Option<IdSet>)> {
-    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
-        input,
-        Some(crate::ElementKind::Way),
-        &host.diagnostics,
-    )?;
+    let (schedule, shared_file) =
+        crate::scan::classify::build_classify_schedule(input, Some(crate::ElementKind::Way), host)?;
     let mut referenced = IdSet::new();
     // Prepass needs two independent facts: whether an ID has been seen at
     // all, and whether it was referenced again (a closed ring's repeated last
@@ -926,7 +924,7 @@ fn collect_way_referenced_node_ids(
                 union_ns += t_union.elapsed().as_nanos() as u64;
             }
         },
-        &*host.resources,
+        host,
     )?;
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -968,7 +966,7 @@ pub(crate) fn collect_relation_member_ids(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         Some(crate::ElementKind::Relation),
-        &host.diagnostics,
+        host,
     )?;
     let mut member_node_ids = want_nodes.then(IdSet::new);
     let mut member_way_ids = want_ways.then(IdSet::new);
@@ -993,7 +991,7 @@ pub(crate) fn collect_relation_member_ids(
                 }
             }
         },
-        &*host.resources,
+        host,
     )?;
     Ok((member_node_ids, member_way_ids))
 }

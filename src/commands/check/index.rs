@@ -455,7 +455,14 @@ pub fn check_index(
     opts: &CheckIndexOptions,
     host: &crate::host::Host,
 ) -> Result<IndexReport> {
-    let _ = host;
+    host.cancel.decided(|| check_index_inner(path, opts, host))
+}
+
+fn check_index_inner(
+    path: &Path,
+    opts: &CheckIndexOptions,
+    host: &crate::host::Host,
+) -> Result<IndexReport> {
     let mut reader = FileReader::open(path, opts.direct_io)?;
     let mut file_offset: u64 = 0;
     let mut block = Vec::new();
@@ -463,8 +470,7 @@ pub fn check_index(
     let mut found = Vec::new();
 
     crate::debug::emit_marker("CHECK_INDEX_START");
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, path)?
-    {
+    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, host, path)? {
         if !matches!(frame.blob_type, BlobKind::OsmData) {
             continue;
         }

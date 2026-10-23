@@ -65,8 +65,9 @@ pub fn getparents(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
+    host.cancel.check()?;
     let result = getparents_to(input, &output, ids, opts, write, overrides, host)?;
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -106,9 +107,10 @@ pub fn getparents_with_min_blobs(
     min_blobs: u64,
     host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
+    host.cancel.check()?;
     let result =
         getparents_with_min_blobs_to(input, &output, ids, opts, write, overrides, min_blobs, host)?;
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -196,7 +198,7 @@ fn getparents_walker(
     let (need_node_blobs, need_way_blobs, need_relation_blobs) = needed_blob_kinds(ids, opts);
 
     crate::debug::emit_marker("GETPARENTS_SCHEDULE_START");
-    let mut walker = HeaderWalker::open(input, &host.diagnostics)?;
+    let mut walker = HeaderWalker::open(input, host)?;
     let file_size = walker.file_size();
     let mut header_buf: Vec<u8> = Vec::new();
     let mut header_block: Option<crate::HeaderBlock> = None;
@@ -295,7 +297,7 @@ fn getparents_walker(
     // at the end of the phase.
     let mut write_err: Option<crate::Error> = None;
 
-    crate::scan::classify::parallel_classify_phase_abortable(
+    let pool_result = crate::scan::classify::parallel_classify_phase_abortable(
         &shared_file,
         &schedule,
         None,
@@ -355,12 +357,14 @@ fn getparents_walker(
             }
             ControlFlow::Continue(())
         },
-        &*host.resources,
-    )?;
+        host,
+    );
 
+    // The merge's recorded error came first; the pool's own is the later one.
     if let Some(e) = write_err {
         return Err(e);
     }
+    pool_result?;
 
     writer.flush()?;
     crate::debug::emit_marker("GETPARENTS_DECODE_END");
@@ -613,7 +617,9 @@ mod tests {
             &crate::host::Host::for_tests(),
         )
         .expect("getparents");
-        staged.publish().expect("publish");
+        staged
+            .publish(&crate::host::Cancel::new())
+            .expect("publish");
         assert_eq!(ids(&output), vec![1, 10]);
     }
 
@@ -644,7 +650,9 @@ mod tests {
                 &crate::host::Host::for_tests(),
             )
             .expect("getparents");
-            staged.publish().expect("publish");
+            staged
+                .publish(&crate::host::Cancel::new())
+                .expect("publish");
         }
         let walker_ids = ids(&walker);
         assert_eq!(walker_ids, ids(&pipelined));
@@ -811,7 +819,9 @@ mod tests {
                 &crate::host::Host::for_tests(),
             )
             .expect("getparents");
-            staged.publish().expect("publish");
+            staged
+                .publish(&crate::host::Cancel::new())
+                .expect("publish");
             assert_eq!(arm, expected_arm);
             assert_eq!(ids(&output), vec![1, 10]);
         }

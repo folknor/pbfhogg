@@ -290,13 +290,19 @@ where
 /// reads alone. It is neither isolated codec time nor the full parse wall
 /// (XML parsing and sink work happen outside these calls). The name and
 /// attribution are kept so the counter stays comparable with recorded runs.
+///
+/// It is also where an OSC parse observes the invocation's cancellation
+/// token: once per `read()` of the input (one buffer refill of the XML
+/// reader), never per XML event.
 struct TimedRead<R: io::Read> {
     inner: R,
     total: Rc<Cell<Duration>>,
+    cancel: crate::host::Cancel,
 }
 
 impl<R: io::Read> io::Read for TimedRead<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.cancel.check().map_err(io::Error::from)?;
         let start = Instant::now();
         let result = self.inner.read(buf);
         self.total.set(self.total.get() + start.elapsed());
@@ -317,7 +323,10 @@ pub(crate) type OscReader = Reader<BufReader<Box<dyn io::Read>>>;
 /// Returns the reader and the shared cell accumulating time spent in the
 /// input reader's `read()` calls (see `TimedRead`: file reads plus gzip
 /// decompression, or file reads alone for plain XML).
-pub(crate) fn open_osc_reader(path: &Path) -> ParseResult<(OscReader, Rc<Cell<Duration>>)> {
+pub(crate) fn open_osc_reader(
+    path: &Path,
+    cancel: &crate::host::Cancel,
+) -> ParseResult<(OscReader, Rc<Cell<Duration>>)> {
     let mut file = File::open(path)?;
     // A file shorter than two bytes cannot be gzip and cannot be XML
     // either; read what is there and let the XML parser produce the
@@ -338,11 +347,13 @@ pub(crate) fn open_osc_reader(path: &Path) -> ParseResult<(OscReader, Rc<Cell<Du
         Box::new(TimedRead {
             inner: MultiGzDecoder::new(file),
             total: Rc::clone(&total),
+            cancel: cancel.clone(),
         })
     } else {
         Box::new(TimedRead {
             inner: file,
             total: Rc::clone(&total),
+            cancel: cancel.clone(),
         })
     };
     let mut reader = Reader::from_reader(BufReader::new(inner));
@@ -471,7 +482,21 @@ pub(crate) fn drive_osc<R: io::BufRead, S: OscSink>(
             }
             Ok(Event::Eof) => break,
             Ok(_) => {}
-            Err(e) => return Err(xml_read_err(e)),
+            Err(e) => {
+                // A read the input's cancellation check refused reaches here
+                // wrapped in quick-xml's `Io(Arc<io::Error>)`, which the
+                // carrier walk behind `Error::is_cancelled` cannot see
+                // through: recognise that refusal and report the
+                // cancellation itself, typed. Only that refusal - a syntax
+                // error or a real read failure racing a cancellation stays
+                // what it is.
+                if let quick_xml::Error::Io(io_err) = &e
+                    && crate::error::io_carries_cancellation(io_err)
+                {
+                    return Err(crate::error::new_cancelled());
+                }
+                return Err(xml_read_err(e));
+            }
         }
         buf.clear();
     }
@@ -495,8 +520,13 @@ pub(crate) fn drive_osc<R: io::BufRead, S: OscSink>(
 
 /// Open `path`, drive it into `sink`, and emit the input-read counter
 /// (historically named `merge_changes_decompress_ns`; see `TimedRead`).
-pub(crate) fn parse_osc_path<S: OscSink>(path: &Path, sink: &mut S) -> ParseResult<()> {
-    let (mut reader, decompress_total) = open_osc_reader(path)?;
+/// `cancel` is observed at every read of the input (see `TimedRead`).
+pub(crate) fn parse_osc_path<S: OscSink>(
+    path: &Path,
+    sink: &mut S,
+    cancel: &crate::host::Cancel,
+) -> ParseResult<()> {
+    let (mut reader, decompress_total) = open_osc_reader(path, cancel)?;
     let result = drive_osc(&mut reader, sink);
     // Deliberately emit this historical name once per file, without accumulation,
     // from every sink. Changing attribution or totals breaks brokkr run comparisons.

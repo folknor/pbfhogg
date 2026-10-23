@@ -403,6 +403,9 @@ pub(super) struct FusedCellAssignmentParams<'a> {
     pub(super) coarse_addr_entries_file: &'a str,
     pub(super) coarse_interp_entries_file: &'a str,
     pub(super) executor: &'a crate::host::Executor,
+    /// Checked once per Stage A chunk and per Stage B sort window: the
+    /// chunk boundaries are where this pass already returns to one thread.
+    pub(super) cancel: &'a crate::host::Cancel,
 }
 
 /// Fused fine + coarse bucketed cell assignment. Returns
@@ -448,6 +451,7 @@ pub(super) fn bucketed_cell_assignment_fused(
         coarse_addr_entries_file,
         coarse_interp_entries_file,
         executor,
+        cancel,
     } = p;
     let street_way_count = *street_way_count;
     let addr_point_count = *addr_point_count;
@@ -485,6 +489,7 @@ pub(super) fn bucketed_cell_assignment_fused(
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_STREETS_START");
     let mut chunk_start = 0u32;
     while chunk_start < street_way_count {
+        cancel.check()?;
         let chunk_end = chunk_start
             .saturating_add(GEOCODE_STREET_CHUNK)
             .min(street_way_count);
@@ -598,6 +603,7 @@ pub(super) fn bucketed_cell_assignment_fused(
     let addr_count = addr_point_count as usize;
     let mut chunk_start = 0usize;
     while chunk_start < addr_count {
+        cancel.check()?;
         let chunk_end = (chunk_start + GEOCODE_ADDR_CHUNK).min(addr_count);
         let addr_entries: Vec<(u64, u64, u32)> = executor.install(|| {
             (chunk_start..chunk_end)
@@ -659,6 +665,7 @@ pub(super) fn bucketed_cell_assignment_fused(
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_INTERP_START");
     let mut interp_chunk_start = 0usize;
     while interp_chunk_start < interp_ways.len() {
+        cancel.check()?;
         let interp_chunk_end = (interp_chunk_start + GEOCODE_INTERP_CHUNK).min(interp_ways.len());
         #[allow(clippy::type_complexity)]
         let interp_entries: Vec<(u64, Option<u64>, u32, u16)> = executor.install(|| {
@@ -765,6 +772,7 @@ pub(super) fn bucketed_cell_assignment_fused(
         fine_addr_entries_file,
         fine_interp_entries_file,
         executor,
+        cancel,
     )?;
     scratch.remove_tree(&fine_bucket_dir);
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_FINE_END");
@@ -778,6 +786,7 @@ pub(super) fn bucketed_cell_assignment_fused(
         coarse_addr_entries_file,
         coarse_interp_entries_file,
         executor,
+        cancel,
     )?;
     scratch.remove_tree(&coarse_bucket_dir);
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_COARSE_END");
@@ -793,7 +802,11 @@ pub(super) fn bucketed_cell_assignment_fused(
 /// the serial group+write phase walks the bucket-ordered
 /// `sorted_buckets` Vec, preserving the debug_assert on cross-bucket
 /// cell_id monotonicity.
-#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cognitive_complexity,
+    clippy::too_many_arguments
+)]
 // Filenames are output roles; the fine/coarse caller also owns the matching
 // bucket directory. Keep those assignments together at each call site.
 fn run_stage_b(
@@ -804,6 +817,7 @@ fn run_stage_b(
     addr_entries_file: &str,
     interp_entries_file: &str,
     executor: &crate::host::Executor,
+    cancel: &crate::host::Cancel,
 ) -> Result<u32> {
     use rayon::prelude::*;
 
@@ -824,6 +838,7 @@ fn run_stage_b(
     // defeats the external bucketing and costs more RAM than the 15-byte
     // scratch records because ParsedBucketEntry is padded to 16 bytes.
     for window_start in (0..GEOCODE_NUM_BUCKETS).step_by(GEOCODE_STAGE_B_SORT_WINDOW) {
+        cancel.check()?;
         let window_end = (window_start + GEOCODE_STAGE_B_SORT_WINDOW).min(GEOCODE_NUM_BUCKETS);
         let sorted_buckets: Vec<Vec<ParsedBucketEntry>> = executor.install(|| {
             (window_start..window_end)

@@ -132,10 +132,17 @@ impl Drop for CancelOnUnwind<'_> {
 /// Either one ends the run promptly; workers stop claiming, and results
 /// already in flight are dropped. A worker panic resurfaces as a panic when
 /// the scope joins.
+///
+/// `cancel` is checked on this (the consumer's) thread only, before each wait
+/// and on each arrival, and a tripped token returns `Cancelled` through the
+/// same exit as a `consume` error: `CancelOnDrop` aborts the gate and the
+/// receiver drops. Workers never check it, so an admitted index is never
+/// abandoned while the consumer could still wait for it.
 pub(super) fn run_ordered<S, T, W, C>(
     n_tasks: usize,
     states: &mut [S],
     counters: &StageCounters,
+    cancel: &crate::host::Cancel,
     work: W,
     mut consume: C,
 ) -> Result<()>
@@ -202,12 +209,14 @@ where
 
         let mut reorder = crate::reorder_buffer::ReorderBuffer::with_max_window(window, window);
         loop {
+            cancel.check()?;
             let t = Instant::now();
             let msg = rx.recv();
             add_ns(&counters.consumer_recv_wait_ns, t);
             let Ok((idx, item)) = msg else {
                 break;
             };
+            cancel.check()?;
             reorder.push(idx, item);
             while let Some(item) = reorder.pop_ready() {
                 gate.advance(reorder.next_seq());
@@ -304,28 +313,36 @@ where
         written: 0,
         orphans: 0,
     };
-    run_ordered(n_tasks, states, counters, work, |item: Rewritten| {
-        order.admit(item.span).map_err(|e| {
-            e.locate(crate::error::Location::new(
-                Some(source),
-                Some(item.blob_index),
-                Some(crate::ByteOffset(item.frame_offset)),
-            ))
-        })?;
-        if let Some((bytes, index)) = item.block {
-            let t = Instant::now();
-            // Deliberately write no tagdata: terminal renumber output is not
-            // tag-filtered. Carrying headers or rebuilding keys would add per-blob
-            // or per-tag work and change the historical output bytes.
-            writer.write_primitive_block_owned(bytes, index, None, None)?;
-            add_ns(&counters.consumer_write_ns, t);
-        }
-        // Counted after the write, so on a mid-stream error the totals cover
-        // only output actually emitted.
-        totals.written = totals.written.saturating_add(item.count);
-        totals.orphans = totals.orphans.saturating_add(item.orphans);
-        Ok(())
-    })?;
+    let cancel = writer.cancel_token().clone();
+    run_ordered(
+        n_tasks,
+        states,
+        counters,
+        &cancel,
+        work,
+        |item: Rewritten| {
+            order.admit(item.span).map_err(|e| {
+                e.locate(crate::error::Location::new(
+                    Some(source),
+                    Some(item.blob_index),
+                    Some(crate::ByteOffset(item.frame_offset)),
+                ))
+            })?;
+            if let Some((bytes, index)) = item.block {
+                let t = Instant::now();
+                // Deliberately write no tagdata: terminal renumber output is not
+                // tag-filtered. Carrying headers or rebuilding keys would add per-blob
+                // or per-tag work and change the historical output bytes.
+                writer.write_primitive_block_owned(bytes, index, None, None)?;
+                add_ns(&counters.consumer_write_ns, t);
+            }
+            // Counted after the write, so on a mid-stream error the totals cover
+            // only output actually emitted.
+            totals.written = totals.written.saturating_add(item.count);
+            totals.orphans = totals.orphans.saturating_add(item.orphans);
+            Ok(())
+        },
+    )?;
     counters.emit(prefix);
     Ok(totals)
 }
@@ -357,7 +374,14 @@ mod tests {
     ) -> crate::Result<()> {
         let counters = StageCounters::new();
         let mut states = vec![(); workers];
-        run_ordered(n, &mut states, &counters, |_, idx| work(idx), consume)
+        run_ordered(
+            n,
+            &mut states,
+            &counters,
+            &crate::host::Cancel::new(),
+            |_, idx| work(idx),
+            consume,
+        )
     }
 
     #[test]

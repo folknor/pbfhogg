@@ -117,6 +117,10 @@ impl ContentDigest {
 /// outside the domain described in the module documentation.
 #[hotpath::measure]
 pub fn digest(path: &Path, direct_io: bool, host: &crate::host::Host) -> Result<ContentDigest> {
+    host.cancel.decided(|| digest_inner(path, direct_io, host))
+}
+
+fn digest_inner(path: &Path, direct_io: bool, host: &crate::host::Host) -> Result<ContentDigest> {
     crate::debug::emit_marker("DIGEST_ENVELOPE_START");
     let indexes = walk_envelope(path, host)?;
     crate::debug::emit_marker("DIGEST_ENVELOPE_END");
@@ -144,7 +148,7 @@ pub fn digest(path: &Path, direct_io: bool, host: &crate::host::Host) -> Result<
 fn walk_envelope(path: &Path, host: &crate::host::Host) -> Result<Vec<Option<BlobIndex>>> {
     use crate::blob::BlobKind;
 
-    let mut walker = HeaderWalker::open(path, &host.diagnostics)?;
+    let mut walker = HeaderWalker::open(path, host)?;
     let mut indexes = Vec::new();
     let mut seen_header = false;
     while let Some(meta) = walker.next_header()? {

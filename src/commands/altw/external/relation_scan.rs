@@ -26,6 +26,7 @@ pub(super) fn collect_relation_member_ids_indexed(
     blob_meta: &[BlobMeta],
     want_nodes: bool,
     want_ways: bool,
+    cancel: &crate::host::Cancel,
 ) -> Result<RelationScanOutput> {
     let file = Arc::new(
         std::fs::File::open(input)
@@ -45,6 +46,9 @@ pub(super) fn collect_relation_member_ids_indexed(
         .iter()
         .filter(|m| matches!(m.kind, ElementKind::Relation))
     {
+        // Once per relation blob: this scan runs beside stage 1 on a thread
+        // of its own, and the join waits for it.
+        cancel.check()?;
         read_buf.resize(meta.data_size, 0);
         let locate = |e: crate::Error| {
             e.locate(crate::error::Location::new(

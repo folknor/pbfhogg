@@ -317,10 +317,12 @@ pub fn verify_ids(
     opts: &VerifyIdsOptions,
     host: &crate::host::Host,
 ) -> Result<VerifyIdsReport> {
-    if opts.full {
-        return verify_ids_full_parallel(path, opts, host);
-    }
-    verify_ids_streaming_parallel(path, opts, host)
+    host.cancel.decided(|| {
+        if opts.full {
+            return verify_ids_full_parallel(path, opts, host);
+        }
+        verify_ids_streaming_parallel(path, opts, host)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -387,7 +389,7 @@ fn verify_ids_streaming_parallel(
     let type_filter = TypeFilter::or_all(opts.type_filter);
 
     let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
-        crate::scan::classify::build_classify_schedules_split(path, &host.diagnostics)?;
+        crate::scan::classify::build_classify_schedules_split(path, host)?;
 
     let mut node_count: u64 = 0;
     let mut way_count: u64 = 0;
@@ -533,7 +535,7 @@ fn verify_single_kind_streaming(
         |seq, r| {
             per_blob[seq] = Some(r);
         },
-        &*host.resources,
+        host,
     )?;
 
     // Serial merge in schedule (= file) order. duplicate_ids is always
@@ -649,7 +651,7 @@ fn verify_ids_full_parallel(
     let type_filter = TypeFilter::or_all(opts.type_filter);
 
     let (node_schedule, way_schedule, rel_schedule, shared_file, max_ids) =
-        crate::scan::classify::build_classify_schedules_split(path, &host.diagnostics)?;
+        crate::scan::classify::build_classify_schedules_split(path, host)?;
 
     // Indexdata only sizes the bounded parallel allocation. Decoded IDs
     // outside it are retained and inserted serially after each phase, so
@@ -858,7 +860,7 @@ fn verify_single_kind_parallel(
         |seq, r| {
             per_blob[seq] = Some(r);
         },
-        &*host.resources,
+        host,
     )?;
 
     // Serial merge in schedule (= file) order.

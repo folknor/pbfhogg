@@ -93,7 +93,7 @@ struct RawWalk {
 }
 
 fn walk_file(path: &Path, host: &crate::host::Host) -> Result<RawWalk> {
-    let mut walker = HeaderWalker::open(path, &host.diagnostics)?;
+    let mut walker = HeaderWalker::open(path, host)?;
     let mut in_file_order: Vec<BlobDesc> = Vec::new();
     let mut has_negative = false;
     let mut first = true;

@@ -164,6 +164,13 @@ pub struct PbfWriter<W: Write> {
     /// The writing session of the [`Output`](crate::Output) this writer
     /// fills, if any; see [`PbfWriter::with_completion`].
     completion: Option<Completion>,
+    /// The invocation's cancellation token (a fresh, never-tripped one for
+    /// the public constructors). Checked before every block a write method
+    /// accepts, and by the writer thread between `copy_file_range` calls, so
+    /// a long queued splice stops too. `flush`, `Drop` and the teardown they
+    /// run (joining the writer thread, draining framing permits) never check
+    /// it, so a cancelled writer still shuts down completely.
+    cancel: crate::host::Cancel,
 }
 
 impl PbfWriter<FileWriter> {
@@ -193,6 +200,7 @@ impl PbfWriter<FileWriter> {
             executor,
             Diagnostics::discard(),
             Finish::Durable,
+            crate::host::Cancel::new(),
         )
     }
 
@@ -203,11 +211,19 @@ impl PbfWriter<FileWriter> {
         executor: Executor,
         diagnostics: Diagnostics,
         finish: Finish,
+        cancel: crate::host::Cancel,
     ) -> Result<Self> {
         // The buffered backend's writer thread reports nothing.
         drop(diagnostics);
         let writer = FileWriter::buffered(path)?;
-        Self::start_pipeline(writer, compression, header_block_bytes, executor, finish)
+        Self::start_pipeline(
+            writer,
+            compression,
+            header_block_bytes,
+            executor,
+            finish,
+            cancel,
+        )
     }
 
     /// Create a pipelined `PbfWriter` with `O_DIRECT` for page-cache-free writes.
@@ -229,6 +245,7 @@ impl PbfWriter<FileWriter> {
             executor,
             Diagnostics::discard(),
             Finish::Durable,
+            crate::host::Cancel::new(),
         )
     }
 
@@ -240,11 +257,19 @@ impl PbfWriter<FileWriter> {
         executor: Executor,
         diagnostics: Diagnostics,
         finish: Finish,
+        cancel: crate::host::Cancel,
     ) -> Result<Self> {
         // The O_DIRECT backend's writer thread reports nothing.
         drop(diagnostics);
         let writer = FileWriter::direct(path)?;
-        Self::start_pipeline(writer, compression, header_block_bytes, executor, finish)
+        Self::start_pipeline(
+            writer,
+            compression,
+            header_block_bytes,
+            executor,
+            finish,
+            cancel,
+        )
     }
 
     /// Create a pipelined `PbfWriter` that uses io_uring for output I/O.
@@ -280,6 +305,7 @@ impl PbfWriter<FileWriter> {
             executor,
             Diagnostics::discard(),
             Finish::Durable,
+            crate::host::Cancel::new(),
         )
     }
 
@@ -291,6 +317,7 @@ impl PbfWriter<FileWriter> {
         executor: Executor,
         diagnostics: Diagnostics,
         finish: Finish,
+        cancel: crate::host::Cancel,
     ) -> Result<Self> {
         use crate::write::uring_writer;
 
@@ -305,6 +332,7 @@ impl PbfWriter<FileWriter> {
         let path_owned = path.to_path_buf();
         let expected = SeqTotal::new();
         let thread_expected = expected.clone();
+        let thread_cancel = cancel.clone();
         let handle = std::thread::spawn(move || {
             uring_writer::uring_writer_thread(
                 rx,
@@ -313,6 +341,7 @@ impl PbfWriter<FileWriter> {
                 init_tx,
                 &thread_expected,
                 finish,
+                &thread_cancel,
             )
         });
 
@@ -346,6 +375,7 @@ impl PbfWriter<FileWriter> {
             finished: false,
             scratch: FrameScratch::new(),
             completion: None,
+            cancel,
         })
     }
 
@@ -372,6 +402,7 @@ impl PbfWriter<FileWriter> {
             executor,
             Diagnostics::discard(),
             Finish::Durable,
+            crate::host::Cancel::new(),
         )
     }
 
@@ -382,6 +413,7 @@ impl PbfWriter<FileWriter> {
         executor: Executor,
         diagnostics: Diagnostics,
         finish: Finish,
+        cancel: crate::host::Cancel,
     ) -> Result<Self> {
         use crate::write::parallel_writer;
 
@@ -394,6 +426,7 @@ impl PbfWriter<FileWriter> {
         let path_owned = path.to_path_buf();
         let expected = SeqTotal::new();
         let thread_expected = expected.clone();
+        let thread_cancel = cancel.clone();
         let handle = std::thread::spawn(move || {
             parallel_writer::parallel_writer_thread(
                 rx,
@@ -402,6 +435,7 @@ impl PbfWriter<FileWriter> {
                 init_tx,
                 &thread_expected,
                 finish,
+                &thread_cancel,
             )
         });
 
@@ -436,6 +470,7 @@ impl PbfWriter<FileWriter> {
             finished: false,
             scratch: FrameScratch::new(),
             completion: None,
+            cancel,
         })
     }
 
@@ -446,6 +481,7 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
         finish: Finish,
+        cancel: crate::host::Cancel,
     ) -> Result<Self> {
         // Write header synchronously before starting the pipeline.
         let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
@@ -455,9 +491,8 @@ impl PbfWriter<FileWriter> {
         let (tx, rx) = sync_channel(WRITE_AHEAD);
         let expected = SeqTotal::new();
         let thread_expected = expected.clone();
-        let handle = std::thread::spawn(move || {
-            writer_thread(rx, FileOutputSink::new(writer, finish), &thread_expected)
-        });
+        let sink = FileOutputSink::new(writer, finish, cancel.clone());
+        let handle = std::thread::spawn(move || writer_thread(rx, sink, &thread_expected));
 
         Ok(PbfWriter {
             writer: None,
@@ -468,6 +503,7 @@ impl PbfWriter<FileWriter> {
             finished: false,
             scratch: FrameScratch::new(),
             completion: None,
+            cancel,
         })
     }
 }
@@ -497,6 +533,7 @@ impl<W: Write> PbfWriter<W> {
             finished: true,
             scratch: FrameScratch::new(),
             completion: None,
+            cancel: crate::host::Cancel::new(),
         }
     }
 
@@ -559,6 +596,21 @@ impl<W: Write> PbfWriter<W> {
         result
     }
 
+    /// The token this writer observes, for a stage that feeds it and checks
+    /// the same token at its own consumer.
+    pub(crate) fn cancel_token(&self) -> &crate::host::Cancel {
+        &self.cancel
+    }
+
+    /// The per-block checkpoint: once the invocation's token is tripped each
+    /// write method returns `ErrorKind::Cancelled` before doing any work,
+    /// which fails the output's session like any write error and sends the
+    /// command down its existing writer-error path.
+    #[inline]
+    fn check_cancel(&self) -> Result<()> {
+        self.cancel.check()
+    }
+
     /// Write the `OSMHeader` blob. Must be the first blob in the file.
     ///
     /// Not needed when using [`to_path`](Self::to_path), which writes the
@@ -584,7 +636,9 @@ impl<W: Write> PbfWriter<W> {
     /// `block_bytes` is produced by [`BlockBuilder::take`](crate::block_builder::BlockBuilder::take).
     #[hotpath::measure]
     pub fn write_primitive_block(&mut self, block_bytes: &[u8]) -> Result<()> {
-        let result = self.write_primitive_block_unchecked(block_bytes);
+        let result = self
+            .check_cancel()
+            .and_then(|()| self.write_primitive_block_unchecked(block_bytes));
         self.poison_on_error(result)
     }
 
@@ -696,7 +750,9 @@ impl<W: Write> PbfWriter<W> {
     // supported writer operation, including for downstream fixture producers.
     #[hotpath::measure]
     pub fn write_primitive_block_no_indexdata(&mut self, block_bytes: &[u8]) -> Result<()> {
-        let result = self.write_primitive_block_no_indexdata_unchecked(block_bytes);
+        let result = self
+            .check_cancel()
+            .and_then(|()| self.write_primitive_block_no_indexdata_unchecked(block_bytes));
         self.poison_on_error(result)
     }
 
@@ -786,8 +842,9 @@ impl<W: Write> PbfWriter<W> {
         tagdata: Option<&[u8]>,
         way_members: Option<&[u8]>,
     ) -> Result<()> {
-        let result =
-            self.write_primitive_block_owned_unchecked(block_bytes, index, tagdata, way_members);
+        let result = self.check_cancel().and_then(|()| {
+            self.write_primitive_block_owned_unchecked(block_bytes, index, tagdata, way_members)
+        });
         self.poison_on_error(result)
     }
 
@@ -884,7 +941,9 @@ impl<W: Write> PbfWriter<W> {
     /// In pipelined mode, the data is sent directly to the writer thread
     /// (no rayon task needed since there is no compression work).
     pub fn write_raw(&mut self, raw_framed_bytes: &[u8]) -> Result<()> {
-        let result = self.write_raw_unchecked(raw_framed_bytes);
+        let result = self
+            .check_cancel()
+            .and_then(|()| self.write_raw_unchecked(raw_framed_bytes));
         self.poison_on_error(result)
     }
 
@@ -927,7 +986,9 @@ impl<W: Write> PbfWriter<W> {
     /// owns the bytes and won't need them afterwards (e.g. merge passthrough
     /// with `std::mem::take`).
     pub fn write_raw_owned(&mut self, raw_framed_bytes: Vec<u8>) -> Result<()> {
-        let result = self.write_raw_owned_unchecked(raw_framed_bytes);
+        let result = self
+            .check_cancel()
+            .and_then(|()| self.write_raw_owned_unchecked(raw_framed_bytes));
         self.poison_on_error(result)
     }
 
@@ -969,7 +1030,9 @@ impl<W: Write> PbfWriter<W> {
     /// owned chunks. The writer thread writes each chunk sequentially.
     /// Used by passthrough coalescers to avoid `extend_from_slice` memcpy.
     pub fn write_raw_chunks(&mut self, chunks: Vec<Vec<u8>>) -> Result<()> {
-        let result = self.write_raw_chunks_unchecked(chunks);
+        let result = self
+            .check_cancel()
+            .and_then(|()| self.write_raw_chunks_unchecked(chunks));
         self.poison_on_error(result)
     }
 
@@ -1312,7 +1375,9 @@ impl PbfWriter<FileWriter> {
         offset: u64,
         len: u64,
     ) -> Result<()> {
-        let result = self.write_raw_copy_unchecked(in_file, offset, len);
+        let result = self
+            .check_cancel()
+            .and_then(|()| self.write_raw_copy_unchecked(in_file, offset, len));
         self.poison_on_error(result)
     }
 
@@ -1364,7 +1429,7 @@ impl PbfWriter<FileWriter> {
                 })?;
             // `copy_range` decides on the original errno (EXDEV) before
             // anything converts it.
-            let result = copy_range(in_file.as_raw_fd(), out_fd, offset, len);
+            let result = copy_range(in_file.as_raw_fd(), out_fd, offset, len, &self.cancel);
             if result.is_ok() {
                 self.mark_pending();
             }
@@ -1444,6 +1509,7 @@ mod tests {
             finished: false,
             scratch: FrameScratch::new(),
             completion: None,
+            cancel: crate::host::Cancel::new(),
         }
     }
 

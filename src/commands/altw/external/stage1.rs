@@ -125,6 +125,7 @@ pub(super) fn stage1_pass_a(
     ref_count_sidecar: &ScratchPath,
     per_way_refcount_sidecar: &ScratchPath,
     inject_prepass: bool,
+    host: &crate::host::Host,
 ) -> Result<(u64, Vec<u64>)> {
     use std::os::unix::fs::FileExt as _;
 
@@ -386,7 +387,11 @@ pub(super) fn stage1_pass_a(
             let mut reorder: crate::reorder_buffer::ReorderBuffer<crate::Result<(u64, Vec<u32>)>> =
                 crate::reorder_buffer::ReorderBuffer::with_capacity(POOL_REORDER_CAPACITY_WIDE);
 
+            // Cancellation is checked per result on this consumer: an early
+            // return drops the receiver (moved into the loop), so every
+            // worker's next send fails and it stops claiming blobs.
             for (seq_num, item) in rx {
+                host.cancel.check()?;
                 reorder.push(seq_num as usize, item);
                 while let Some(result) = reorder.pop_ready() {
                     let (ref_count, per_way_rcs) = result?;
@@ -634,6 +639,7 @@ pub(super) fn stage1_way_pass(
         ref_count_sidecar,
         per_way_refcount_sidecar,
         inject_prepass,
+        host,
     )?;
 
     // Build the per-blob mapping (header-only walk - no decompression).

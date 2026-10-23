@@ -356,6 +356,10 @@ pub(super) fn stage2_node_join(
                     if id_bucket_counts[bucket_idx] == 0 { continue; }
 
                     let result: crate::Result<()> = (|| {
+                        // Cancellation is checked per bucket and per node
+                        // blob inside it, and leaves through this worker's
+                        // error slot like any bucket failure.
+                        host.cancel.check()?;
                         // Load + sort id-bucket records.
                         let t_load = std::time::Instant::now();
                         let bkt = prepare_bucket(
@@ -407,6 +411,7 @@ pub(super) fn stage2_node_join(
                         let mut bucket_straddlers: u64 = 0;
 
                         for blob in &mapping_ref[lo_blob..hi_blob] {
+                            host.cancel.check()?;
                             // Straddler: blob extends past either bucket
                             // boundary, so it's also touched by an
                             // adjacent worker.
@@ -738,7 +743,13 @@ pub(super) fn stage2_node_join(
                     })();
 
                     if let Err(e) = result {
-                        *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+                        // The first error wins: a later one (another worker
+                        // stopping on the same cancellation, say) must not
+                        // replace the cause.
+                        err_ref
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get_or_insert(e);
                         break;
                     }
                 }

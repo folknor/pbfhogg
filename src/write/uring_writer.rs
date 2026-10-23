@@ -516,8 +516,13 @@ fn handle_copy_range_uring(
     in_fd: std::os::unix::io::RawFd,
     mut src_offset: u64,
     mut remaining: u64,
+    cancel: &crate::host::Cancel,
 ) -> Result<()> {
     while remaining > 0 {
+        // Once per registered buffer filled (each a `pread` syscall): a
+        // coalesced splice can span the whole input, and this is where a
+        // cancelled run stops it.
+        cancel.check()?;
         if state.current_buf.is_none() {
             let idx = state.acquire_buffer()?;
             state.current_buf = Some(idx);
@@ -578,11 +583,20 @@ pub(crate) fn uring_writer_thread(
     init_tx: SyncSender<Result<()>>,
     expected: &SeqTotal,
     finish: super::Finish,
+    cancel: &crate::host::Cancel,
 ) -> Result<()> {
     // A failure is not logged here: it is the thread's return value, which the
     // writer's `flush` (or the failed send that noticed the thread was gone)
     // hands to the caller, so the operator sees it exactly once.
-    uring_init_and_run(&rx, &path, &framed_header, &init_tx, expected, finish)
+    uring_init_and_run(
+        &rx,
+        &path,
+        &framed_header,
+        &init_tx,
+        expected,
+        finish,
+        cancel,
+    )
 }
 
 /// Refuse, as a typed platform refusal, a ring whose kernel cannot run
@@ -630,6 +644,7 @@ fn uring_init_and_run(
     init_tx: &SyncSender<Result<()>>,
     expected: &SeqTotal,
     finish: super::Finish,
+    cancel: &crate::host::Cancel,
 ) -> Result<()> {
     // Step 1: Allocate buffer pool.
     let pool = AlignedBufferPool::new(NUM_BUFS, IO_BUF_BYTES)?;
@@ -727,7 +742,7 @@ fn uring_init_and_run(
     state.write(framed_header)?;
 
     // Step 8: Main reorder + write loop (same as writer_thread in writer.rs).
-    uring_main_loop(rx, &mut state, expected)?;
+    uring_main_loop(rx, &mut state, expected, cancel)?;
 
     // Step 9: Flush and finalize.
     state.flush_final(&file, finish)?;
@@ -741,7 +756,10 @@ fn uring_main_loop(
     rx: &Receiver<PipelineItem>,
     state: &mut UringState,
     expected: &SeqTotal,
+    cancel: &crate::host::Cancel,
 ) -> Result<()> {
+    #[cfg(not(feature = "linux-direct-io"))]
+    let _ = cancel;
     let mut pending: ReorderBuffer<Result<OutputChunk>> = ReorderBuffer::with_capacity(WRITE_AHEAD);
 
     loop {
@@ -812,7 +830,7 @@ fn uring_main_loop(
                 } => {
                     use std::os::unix::io::AsRawFd;
                     let t_write = std::time::Instant::now();
-                    handle_copy_range_uring(state, in_file.as_raw_fd(), offset, len)?;
+                    handle_copy_range_uring(state, in_file.as_raw_fd(), offset, len, cancel)?;
                     // The Arc keeps the input open across the pread loop.
                     drop(in_file);
                     WRITER_METRICS

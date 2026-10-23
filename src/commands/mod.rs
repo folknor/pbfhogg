@@ -478,7 +478,7 @@ pub(crate) fn dispatch_scan_arm(
     if !has_indexdata {
         return Ok(ScanArm::Walker);
     }
-    let estimate = estimate_blob_count(input, &host.diagnostics)?;
+    let estimate = estimate_blob_count(input, host)?;
     crate::debug::emit_counter(
         "walk_estimated_blobs",
         i64::try_from(estimate.osmdata_blobs).unwrap_or(i64::MAX),

@@ -258,8 +258,7 @@ pub fn parse_ids_from_pbf(
 ) -> Result<ElementIds> {
     let mut set = ElementIds::empty();
 
-    let (schedule, shared_file) =
-        crate::scan::classify::build_classify_schedule(path, None, &host.diagnostics)?;
+    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(path, None, host)?;
 
     struct IdBatch {
         node_ids: Vec<i64>,
@@ -299,7 +298,7 @@ pub fn parse_ids_from_pbf(
                 set.relation_ids.set(id);
             }
         },
-        &*host.resources,
+        host,
     )?;
 
     Ok(set)
@@ -393,8 +392,9 @@ pub fn getid(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetidStats> {
+    host.cancel.check()?;
     let result = getid_to(input, &output, ids, opts, write, overrides, host)?;
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -492,8 +492,9 @@ pub fn removeid(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetidStats> {
+    host.cancel.check()?;
     let result = removeid_to(input, &output, ids, write, overrides, host)?;
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -612,7 +613,7 @@ fn filter_by_id_walker(
     // frame bytes). Include mode with a small ID set thus reads only
     // the header index (~140 MB at planet) plus a handful of matching
     // blob bodies.
-    let mut walker = HeaderWalker::open(input, &host.diagnostics)?;
+    let mut walker = HeaderWalker::open(input, host)?;
     let mut data_buf: Vec<u8> = Vec::new();
     let mut frame_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
@@ -850,8 +851,7 @@ fn filter_by_id_streaming(
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, input)?
-    {
+    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, host, input)? {
         // The frame loop owns the provenance of failures on this frame.
         let locate = |e: Error| e.locate(frame_location(input, frame.file_offset));
         match frame.blob_type {
@@ -1000,7 +1000,7 @@ fn getid_with_refs(
         let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
             input,
             Some(crate::ElementKind::Way),
-            &host.diagnostics,
+            host,
         )?;
 
         crate::scan::classify::parallel_classify_accumulate(
@@ -1025,7 +1025,7 @@ fn getid_with_refs(
                 }
                 dep_node_ids.merge(worker_node_ids);
             },
-            &*host.resources,
+            host,
         )?;
     }
     // When --remove-tags is set, referenced-only nodes (not explicitly requested)
@@ -1563,7 +1563,7 @@ mod tests {
             &crate::host::Host::for_tests(),
         )
         .unwrap();
-        staged.publish().unwrap();
+        staged.publish(&crate::host::Cancel::new()).unwrap();
         assert_eq!(
             read_ids(&output, &crate::host::Host::for_tests()),
             vec![1, 2, 10]
@@ -1598,7 +1598,7 @@ mod tests {
                 host,
             )
             .unwrap();
-            staged.publish().unwrap();
+            staged.publish(&crate::host::Cancel::new()).unwrap();
         }
         let walker_ids = read_ids(&walker, host);
         assert_eq!(walker_ids, read_ids(&full_scan, host));
@@ -1679,7 +1679,7 @@ mod tests {
                 &crate::host::Host::for_tests(),
             )
             .unwrap();
-            staged.publish().unwrap();
+            staged.publish(&crate::host::Cancel::new()).unwrap();
             assert_eq!(arm, Some(expected_arm));
             assert_eq!(
                 read_ids(&output, &crate::host::Host::for_tests()),

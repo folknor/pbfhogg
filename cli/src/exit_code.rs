@@ -30,6 +30,30 @@ pub fn is_platform_unsupported(err: &(dyn std::error::Error + 'static)) -> bool 
     false
 }
 
+/// Whether `err` is a cancellation: the run stopped because its token was
+/// tripped. Only the authoritative cause counts - the error itself, seen
+/// through the transparent carriers this front end and the library put
+/// around one (a [`Hinted`] wrapper, an `io::Error` holding a
+/// `pbfhogg::Error`) - never a cause further down another error's chain: a
+/// failure that merely records a cancellation among its causes is still that
+/// failure, and keeps its own exit status.
+pub fn is_cancelled(err: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(hinted) = err.downcast_ref::<Hinted>() {
+        return is_cancelled(&*hinted.source);
+    }
+    if let Some(error) = err.downcast_ref::<pbfhogg::Error>() {
+        return error.is_cancelled();
+    }
+    if let Some(io) = err.downcast_ref::<std::io::Error>()
+        && let Some(error) = io
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<pbfhogg::Error>())
+    {
+        return error.is_cancelled();
+    }
+    false
+}
+
 /// A library error with advice that only this front end can give (it names a
 /// CLI flag). The typed error stays reachable through `source()` until the
 /// final print, so exit-code and chain inspection still see it; only

@@ -81,6 +81,14 @@ pub fn tags_count(
     opts: &TagCountOptions<'_>,
     host: &crate::host::Host,
 ) -> Result<Vec<TagCount>> {
+    host.cancel.decided(|| tags_count_inner(path, opts, host))
+}
+
+fn tags_count_inner(
+    path: &Path,
+    opts: &TagCountOptions<'_>,
+    host: &crate::host::Host,
+) -> Result<Vec<TagCount>> {
     // Need indexdata either for the type-filter schedule or (when there
     // is no type filter) simply for the all-kinds schedule the parallel
     // path uses. `require_indexdata` gracefully accepts `force`.
@@ -130,7 +138,7 @@ pub fn tags_count(
             path,
             kind_filter,
             blob_filter.as_ref(),
-            &host.diagnostics,
+            host,
         )?;
     if blobs_skipped_by_tag > 0 {
         crate::host::diag!(
@@ -156,7 +164,7 @@ pub fn tags_count(
         |_seq, per_blob| {
             merge_counts(&mut counts, per_blob);
         },
-        &*host.resources,
+        host,
     )?;
 
     // Reserve for all D pairs, even if thresholds retain fewer. While the map

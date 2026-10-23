@@ -15,13 +15,16 @@ impl ProcessActions for LegacyProcessActions {
         pbfhogg::process::raise_nofile_to_hard_cap()
     }
 }
-pub(crate) fn cli_host() -> Host {
+/// The CLI's host. `cancel` is the token the signal waiter trips (see
+/// `signals`).
+pub(crate) fn cli_host(cancel: pbfhogg::host::Cancel) -> Host {
     Host {
         diagnostics: pbfhogg::host::Diagnostics::new(Arc::new(StderrSink)),
         process: Arc::new(LegacyProcessActions),
         resources: Arc::new(MachineProbe),
         page_cache: PageCachePolicy::Evict,
         executor: Executor::Ambient,
+        cancel,
     }
 }
 

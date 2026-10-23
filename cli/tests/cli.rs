@@ -115,6 +115,39 @@ mod exit_code_walker {
         assert!(output_hint(&carried).is_some());
         assert_eq!(output_hint(&platform()), None);
     }
+
+    /// A cancellation earns the interrupted status as the error itself or
+    /// through the transparent carriers, never as a cause buried under
+    /// another error.
+    #[test]
+    fn cancellation_is_classified_only_as_the_authoritative_cause() {
+        use super::exit_code::is_cancelled;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let output = pbfhogg::Output::new(
+            dir.path().join("out.osm.pbf"),
+            pbfhogg::Overwrite::Refuse,
+            &pbfhogg::host::Diagnostics::discard(),
+        )
+        .expect("fresh output");
+        let cancel = pbfhogg::host::Cancel::new();
+        cancel.cancel();
+        let cancelled = output
+            .publish(&cancel)
+            .expect_err("a tripped token refuses publication");
+        assert!(cancelled.is_cancelled());
+        assert!(is_cancelled(&cancelled));
+        assert!(is_cancelled(&cancelled.clone().context("stage 3")));
+        assert!(is_cancelled(&io::Error::from(cancelled.clone())));
+        assert!(is_cancelled(&Hinted::new(cancelled.clone(), "; advice")));
+        let boxed: Box<dyn std::error::Error> = Box::new(cancelled.clone());
+        assert!(is_cancelled(boxed.as_ref()));
+        // Buried as the cause of another failure: that failure stands.
+        assert!(!is_cancelled(&pbfhogg::Error::external(cancelled)));
+        assert!(!is_cancelled(&platform()));
+        assert!(!is_platform_unsupported(&pbfhogg::Error::from(
+            io::Error::other("x")
+        )));
+    }
 }
 
 /// Write a minimal valid PBF file using the library API.

@@ -11,6 +11,17 @@ All commands support `-h, --help` and `-V, --version`.
 The full exit status contract, including stderr behavior, lives in the
 [CLI reference](https://github.com/folknor/pbfhogg/blob/main/reference/cli-reference.md#exit-codes).
 
+## Interruption
+
+SIGINT (Ctrl-C) or SIGTERM stops any command at its next checkpoint: the run
+removes its output staging and scratch files, publishes nothing (an existing
+output is left untouched), prints `Error: interrupted by SIGINT: ...` and
+exits `130` (`143` for SIGTERM). A second signal exits at once with the same
+convention, leaving the cleanup unfinished for the next run to report. The
+full contract, including the few phases that finish before the run stops,
+is in the
+[CLI reference](https://github.com/folknor/pbfhogg/blob/main/reference/cli-reference.md#interruption).
+
 ## Common flags
 
 These flags appear on most commands that produce PBF output:
@@ -76,9 +87,10 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   The command writes a hidden staging file beside the output
   (`.pbfhogg-tmp-<pid>-<n>.<name>`), syncs it and renames it into place after its
   final flush; a run that fails before that removes it, so it leaves no file
-  at the output path and leaves an existing output untouched. A run killed
-  outright (SIGKILL, power loss) before publication can leave the hidden
-  staging file behind, never a file under the output name. The rename itself
+  at the output path and leaves an existing output untouched. So does a run
+  interrupted by SIGINT or SIGTERM. A run killed outright (SIGKILL, the OOM
+  killer, power loss, a second interrupt) before publication can leave the
+  hidden staging file behind, never a file under the output name. The rename itself
   is the last step, and the few failures possible after it are reported as
   such: a directory sync that fails after the output was put in place is an
   error that says the output *was* published (naming any backup of a
@@ -102,8 +114,8 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
 scratch: disposable files that can be very large (hundreds of GB for `add-locations-to-ways
 --index-type external` at planet scale). Each run makes **one** hidden directory,
 `.pbfhogg-run-<pid>-<random>`, holds everything it writes in there and removes it when it ends,
-whether it succeeded or failed. If the directory cannot be removed the run says where the
-leftover is.
+whether it succeeded, failed or was interrupted. If the directory cannot be removed the run
+says where the leftover is.
 
 - `--tmp-dir <DIR>` chooses the directory the run directory is made in. It must exist and be
   writable, and it is checked before any input is opened, so a bad value fails at once. Without
@@ -114,7 +126,8 @@ leftover is.
   (`.pbfhogg-backup-*`) stay beside the output whatever `--tmp-dir` says: publication is a
   rename, which needs the same filesystem.
 
-**Leftovers of runs that never finished** (SIGKILL, power loss, the OOM killer) are reported,
+**Leftovers of runs that never finished** (SIGKILL, power loss, the OOM killer, a second
+SIGINT or SIGTERM) are reported,
 never removed. Before it starts, a command that writes an output scans the output's directory
 (and `--tmp-dir`, when given) and prints one `Warning:` per entry it finds: an unfinished run
 directory, scratch left by older pbfhogg versions (`.pbfhogg-external-join-*`,
@@ -829,10 +842,11 @@ use a dedicated directory for the index. Allow disk space for both generations.
 
 Publication uses two renames, so it is not crash-atomic and there is a short
 pathname gap. Serialize publication with new reader opens and other builds;
-queries on readers already open need no coordination. An interrupted publication
-may leave the old index in a `.pbfhogg-backup-*` directory beside the output
-directory; a publication that fails and cannot put the old index back says so
-and names that directory. SIGKILL or power loss during a build can also leave an
+queries on readers already open need no coordination. A publication killed
+partway (SIGINT and SIGTERM do not stop one that has started) may leave the old
+index in a `.pbfhogg-backup-*` directory beside the output directory; a
+publication that fails and cannot put the old index back says so and names that
+directory. SIGKILL, power loss or a second SIGINT/SIGTERM during a build can also leave an
 incomplete `.pbfhogg-tmp-*` staging directory beside it because process cleanup
 does not run. The next command that writes in that directory reports both
 (see Scratch files) but never removes them: a directory may belong to a

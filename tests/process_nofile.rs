@@ -43,6 +43,7 @@ fn no_process_actions_leave_rlimit_nofile_unchanged() {
         resources: Arc::new(common::fixed_resources()),
         page_cache: pbfhogg::host::PageCachePolicy::Keep,
         executor: pbfhogg::host::Executor::Ambient,
+        cancel: pbfhogg::host::Cancel::new(),
     };
     let set_soft = |soft: u64| {
         // SAFETY: this standalone test owns its process and initializes the output.

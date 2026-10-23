@@ -329,8 +329,9 @@ pub fn renumber_external(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<RenumberStats> {
+    host.cancel.check()?;
     let result = renumber_external_to(input, &output, opts, write, overrides, host)?;
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -465,6 +466,9 @@ pub(crate) fn renumber_external_to(
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_END");
 
     // ---- Build rank index ----
+    // Stage boundaries are checkpoints: the rank builds between the parallel
+    // stages have none of their own.
+    host.cancel.check()?;
     let t_rank = Instant::now();
     let node_id_set = node_id_set.into_ranked();
     emit_elapsed_ms("renumber_ext_node_rank_ms", t_rank);
@@ -473,6 +477,7 @@ pub(crate) fn renumber_external_to(
     let nodes = IdSpace::new("node", &node_id_set, opts.start_node_id);
 
     // ---- Stage 2d: fused way resolve + rewrite (single pass) ----
+    host.cancel.check()?;
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_START");
     let mut way_id_sets: Vec<crate::idset::IdSet> = (0..RENUMBER_STAGE2D_WORKERS)
         .map(|_| crate::idset::IdSet::new())
@@ -495,6 +500,7 @@ pub(crate) fn renumber_external_to(
     for other in way_id_sets {
         way_id_set.merge(other);
     }
+    host.cancel.check()?;
     let way_id_set = way_id_set.into_ranked();
     emit_elapsed_ms("renumber_ext_way_merge_rank_ms", t_way_merge);
     emit_count("renumber_ext_way_map_entries", way_id_set.total_count());
@@ -506,6 +512,7 @@ pub(crate) fn renumber_external_to(
         &source,
         &relation_schedule,
         &mut relation_id_set,
+        &host.cancel,
     )?;
     let t_rel_rank = Instant::now();
     let relation_id_set = relation_id_set.into_ranked();

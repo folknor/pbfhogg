@@ -72,8 +72,9 @@ pub fn time_filter(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<TimeFilterStats> {
+    host.cancel.check()?;
     let result = time_filter_to(input, &output, cutoff_timestamp, write, overrides, host)?;
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -310,7 +311,7 @@ fn time_filter_snapshot(
     // comparisons; these samples are inert unless the CLI initialized the FIFO.
     crate::debug::emit_mallinfo2("timefilter_snapshot_start_mallinfo");
 
-    let (schedule, shared_file) = build_classify_schedule(input, None, &host.diagnostics)?;
+    let (schedule, shared_file) = build_classify_schedule(input, None, host)?;
 
     if schedule.is_empty() {
         crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_END");
@@ -328,7 +329,7 @@ fn time_filter_snapshot(
     // alloc inside the closure is cheap (BlockBuilder::new is just a
     // few empty Vec/HashMap initialisers; no heap reservation until
     // elements are added). Same pattern as cat --clean's run_kind_phase.
-    parallel_classify_phase(
+    let pool_result = parallel_classify_phase(
         &shared_file,
         &schedule,
         None,
@@ -397,15 +398,18 @@ fn time_filter_snapshot(
                 }
             }
         },
-        &*host.resources,
-    )?;
+        host,
+    );
 
+    // Errors the merge recorded came first: the pool's own (a cancellation
+    // observed at a later receive included) is the later one.
     if let Some(e) = write_error {
         return Err(e);
     }
     if let Some(e) = classify_error {
         return Err(e);
     }
+    pool_result?;
 
     // Brokkr stores named counters generically and reports changes in sidecar
     // comparisons; this sample is inert unless the CLI initialized the FIFO.

@@ -191,9 +191,17 @@ fn append_capped_missing_refs(
 /// decompression throughput (zstd input format, io_uring, direct I/O),
 /// not selective parse. Revisit step #3 only if a future change makes
 /// parse a meaningful share of wall again.
-#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
 pub fn check_refs(
+    path: &Path,
+    opts: &CheckRefsOptions,
+    host: &crate::host::Host,
+) -> Result<RefCheckResult> {
+    host.cancel.decided(|| check_refs_inner(path, opts, host))
+}
+
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+fn check_refs_inner(
     path: &Path,
     opts: &CheckRefsOptions,
     host: &crate::host::Host,
@@ -244,7 +252,7 @@ pub fn check_refs(
     // once. At Europe scale the header walk is ~15 s; three separate
     // `build_classify_schedule` calls would triple that cost.
     let (node_schedule, way_schedule, rel_schedule, shared_file, max_ids) =
-        build_classify_schedules_split(path, &host.diagnostics)?;
+        build_classify_schedules_split(path, host)?;
 
     // Bound indexdata-driven allocation, then insert observed positive IDs
     // above that allocation after each parallel phase joins. A regional
@@ -305,7 +313,7 @@ pub fn check_refs(
                 result.node_count += count;
                 result.untrackable_ids[0] += untrackable;
             },
-            &*host.resources,
+            host,
         )?;
     }
     for id in overflow_ids.drain(..) {
@@ -373,7 +381,7 @@ pub fn check_refs(
                     append_capped_missing_refs(&mut missing_refs, r.missing_refs, max_errors);
                 }
             },
-            &*host.resources,
+            host,
         )?;
     }
     for id in overflow_ids.drain(..) {
@@ -490,7 +498,7 @@ pub fn check_refs(
                         append_capped_missing_refs(&mut missing_refs, r.missing_refs, max_errors);
                     }
                 },
-                &*host.resources,
+                host,
             )?;
         }
         for id in overflow_ids.drain(..) {

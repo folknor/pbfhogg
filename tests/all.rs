@@ -34,6 +34,8 @@ mod common;
 // builder, and `serde_json`, a `commands`-only dependency), so the
 // `minimal` sweep drops them rather than failing to compile.
 #[cfg(feature = "commands")]
+mod cancel;
+#[cfg(feature = "commands")]
 mod check;
 #[cfg(feature = "commands")]
 mod cli_check_index;

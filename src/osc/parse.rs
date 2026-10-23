@@ -547,10 +547,20 @@ impl Default for CompactDiffOverlay {
 /// conflicts, but only when they do not move the object backwards: see
 /// [`CompactDiffOverlay::allow_version_regression`].
 pub fn parse_osc_file_into(path: &Path, overlay: &mut CompactDiffOverlay) -> ParseResult<()> {
+    parse_osc_file_into_until(path, overlay, &crate::host::Cancel::new())
+}
+
+/// [`parse_osc_file_into`] that stops at the next read of the input once
+/// `cancel` is tripped (`ErrorKind::Cancelled`).
+pub(crate) fn parse_osc_file_into_until(
+    path: &Path,
+    overlay: &mut CompactDiffOverlay,
+    cancel: &crate::host::Cancel,
+) -> ParseResult<()> {
     let mut sink = CompactSink::new(overlay);
     // Deliberately use the shared historical per-file decompression counter.
     // Command-specific names or accumulation would break brokkr comparisons.
-    parse_osc_path(path, &mut sink)
+    parse_osc_path(path, &mut sink, cancel)
 }
 
 /// Parse a single gzip-compressed (`.osc.gz`) or plain (`.osc`) file into a

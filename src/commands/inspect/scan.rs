@@ -49,6 +49,14 @@ pub fn inspect(
     opts: &InspectOptions,
     host: &crate::host::Host,
 ) -> Result<InspectReport> {
+    host.cancel.decided(|| inspect_inner(path, opts, host))
+}
+
+fn inspect_inner(
+    path: &Path,
+    opts: &InspectOptions,
+    host: &crate::host::Host,
+) -> Result<InspectReport> {
     // A zero-byte or header-less file is the one missing-header error, not an
     // empty report; neither scan below insists on a leading header itself.
     drop(crate::ElementReader::open_in(path, opts.direct_io, host)?);
@@ -121,7 +129,7 @@ fn try_index_only_scan(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
 
-    let mut walker = HeaderWalker::open(path, &host.diagnostics)?;
+    let mut walker = HeaderWalker::open(path, host)?;
     let mut header_meta = HeaderMeta::default();
     let mut data_buf: Vec<u8> = Vec::new();
 
@@ -288,7 +296,7 @@ fn full_decode_scan(
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    while let Some(frame) = read_raw_frame(&mut reader, &mut offset, &host.diagnostics, path)? {
+    while let Some(frame) = read_raw_frame(&mut reader, &mut offset, host, path)? {
         match frame.blob_type {
             BlobKind::OsmHeader => {
                 let header = decode_blob_to_headerblock(frame.blob_bytes())?;

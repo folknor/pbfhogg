@@ -152,6 +152,7 @@ pub fn export<W: Write>(
     opts: &ExportOptions,
     host: &crate::host::Host,
 ) -> crate::Result<ExportStats> {
+    host.cancel.check()?;
     let reader = ElementReader::open_in(input, false, host)?;
     if admits_ways(opts.types) && !reader.header().has_locations_on_ways() {
         return Err(crate::error::new_missing_feature(
@@ -269,10 +270,16 @@ pub fn export<W: Write>(
         }
     });
 
-    decode_result?;
+    // A write error recorded by the callback came first: the read carried on
+    // past it, so its own error (a cancellation observed at a later blob
+    // included) is the later one.
     if let Some(error) = first_err {
         return Err(error);
     }
+    decode_result?;
     writer.finish()?;
+    // The completion decision (the caller publishes, or has streamed to its
+    // own writer).
+    host.cancel.check()?;
     Ok(stats)
 }

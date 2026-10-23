@@ -103,6 +103,7 @@ pub(super) fn stage3_slot_reorder(
     total_slots: u64,
     integrated: &IntegratedInputs<'_>,
     num_workers: usize,
+    cancel: &crate::host::Cancel,
 ) -> Result<()> {
     // Floor division: every bucket is `range_size` slots wide except
     // the LAST, which extends to `total_slots` and may be wider. This
@@ -189,6 +190,19 @@ pub(super) fn stage3_slot_reorder(
                     let bucket_idx = next_ref.fetch_add(1, Relaxed);
                     if bucket_idx >= slot_bucket_count { break; }
 
+                    // Cancellation, once per bucket, leaves through the same
+                    // path as a bucket failure: record the cause first, then
+                    // abort the router (waking stage 4's `wait_ready`).
+                    if let Err(e) = cancel.check() {
+                        err_ref
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get_or_insert_with(|| e.clone());
+                        router.abort(e.clone());
+                        abort_guard.disarm();
+                        return Err(e);
+                    }
+
                     // Test-only: arm via `test_hooks::PANIC_AT_BUCKET_IDX`.
                     // Simulates a mid-phase stage 3 worker crash. The
                     // surrounding `AbortOnDrop` guard calls
@@ -238,7 +252,10 @@ pub(super) fn stage3_slot_reorder(
                             Ok(())
                         })();
                         if let Err(e) = result {
-                            *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.clone());
+                            err_ref
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .get_or_insert_with(|| e.clone());
                             router.abort(e.clone().context(format!("stage 3 worker {worker_id} error")));
                             abort_guard.disarm();
                             return Err(e);
@@ -320,8 +337,10 @@ pub(super) fn stage3_slot_reorder(
                     })();
 
                     if let Err(e) = result {
-                        *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(e.clone());
+                        err_ref
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .get_or_insert_with(|| e.clone());
                         router.abort(e.clone().context(format!("stage 3 worker {worker_id} error")));
                         abort_guard.disarm();
                         return Err(e);
@@ -353,10 +372,14 @@ pub(super) fn stage3_slot_reorder(
                 }
             }
         }
+        // Only fills an empty slot: a cause a worker recorded before it woke
+        // its peers outranks whatever the join loop meets first in handle
+        // order (a panic is the one cause no worker records itself).
         if let Some(e) = first_err {
-            *s3_error
+            s3_error
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert(e);
         }
     });
 
@@ -560,8 +583,15 @@ mod tests {
             entry_counts: vec![0, 0],
         };
 
-        let err = stage3_slot_reorder(&slot_buckets, 2, 100, &integrated, 1)
-            .expect_err("oversized blob must fail classification");
+        let err = stage3_slot_reorder(
+            &slot_buckets,
+            2,
+            100,
+            &integrated,
+            1,
+            &crate::host::Cancel::new(),
+        )
+        .expect_err("oversized blob must fail classification");
         assert!(err.to_string().contains("blob 0 slot range"));
 
         let router_err = router.wait_ready(0).expect_err("router must be aborted");

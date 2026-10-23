@@ -249,6 +249,8 @@ enum Prop {
     Failure,
     Published,
     TmpDir,
+    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+    Interrupted,
 }
 
 struct Row {
@@ -1317,4 +1319,512 @@ fn a_successful_run_leaves_only_its_outputs() {
 #[test]
 fn tmp_dir_is_checked_first_and_holds_the_scratch() {
     run_property(Prop::TmpDir, tmp_dir_contract, |row| row.tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Interruption: SIGINT and SIGTERM mid-run
+// ---------------------------------------------------------------------------
+//
+// The contract (`signals` in the CLI, ADR-0019): the first SIGINT or SIGTERM
+// cancels the run, every guard drops (staging and run scratch removed),
+// nothing is published and the process exits 128 + signo; a second signal
+// exits at once and leaves what it leaves for the next run to report.
+//
+// "Mid-run" is made deterministic by the CLI's `test-hooks` pause: with
+// `PBFHOGG_TEST_CANCEL_PAUSE=<k>:<file>` the thread reaching the k-th
+// cancellation checkpoint writes `<file>` and parks until the token trips.
+// The test waits for the file, looks at what exists, sends the signal, and
+// checks what is left. A counting run (`PBFHOGG_TEST_CANCEL_COUNT`) first
+// learns how many checkpoints a run of the row passes, and the sweep pauses
+// at ordinal positions spread over that range. Ordinals are positions, not
+// sites: which checkpoint is the k-th varies with scheduling, so the claim is
+// that every pause, wherever it lands, unwinds cleanly - and the sweep must
+// have observed populated staging (and, for scratch-writing rows, a scratch
+// payload) at some pause, so cleanup was exercised against real state rather
+// than inferred.
+
+#[cfg(feature = "test-hooks")]
+mod interrupted {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+    pub(super) fn signal_name(signal: libc::c_int) -> &'static str {
+        if signal == libc::SIGTERM {
+            "SIGTERM"
+        } else {
+            "SIGINT"
+        }
+    }
+
+    pub(super) fn exit_code(signal: libc::c_int) -> i32 {
+        128 + signal
+    }
+
+    /// Every regular file under `dir`, at any depth.
+    fn files_under(dir: &Path, out: &mut Vec<(PathBuf, u64)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => files_under(&path, out),
+                Ok(t) if t.is_file() => {
+                    let len = entry.metadata().map_or(0, |m| m.len());
+                    out.push((path, len));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A `.pbfhogg-tmp-*` staging entry with content: a non-empty file, or a
+    /// directory output's staging directory holding a non-empty file.
+    fn staging_populated(dir: &Path) -> bool {
+        names(dir)
+            .into_iter()
+            .filter(|n| n.starts_with(".pbfhogg-tmp-"))
+            .any(|n| {
+                let mut files = Vec::new();
+                let path = dir.join(&n);
+                if path.is_file() {
+                    return path.metadata().is_ok_and(|m| m.len() > 0);
+                }
+                files_under(&path, &mut files);
+                files.iter().any(|(_, len)| *len > 0)
+            })
+    }
+
+    /// A run directory holding scratch payload: a non-empty file other than
+    /// its `LOCK` and `READY` bookkeeping.
+    fn scratch_populated(dir: &Path) -> bool {
+        names(dir)
+            .into_iter()
+            .filter(|n| n.starts_with(".pbfhogg-run-"))
+            .any(|n| {
+                let mut files = Vec::new();
+                files_under(&dir.join(n), &mut files);
+                files.iter().any(|(path, len)| {
+                    let name = path.file_name().map(OsStr::to_os_string);
+                    *len > 0
+                        && name.as_deref() != Some(OsStr::new("LOCK"))
+                        && name.as_deref() != Some(OsStr::new("READY"))
+                })
+            })
+    }
+
+    /// Extra arguments that put a row on the path whose scratch is visible:
+    /// add-locations-to-ways picks the sparse store for a small input, and
+    /// that store is unlinked as soon as it is mapped, so only the external
+    /// join leaves scratch files a pause can observe.
+    pub(super) fn visible_scratch_args(row: &Row) -> Vec<OsString> {
+        if row.command == "add-locations-to-ways" {
+            vec!["--index-type".into(), "external".into()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The row's invocation in a fresh output directory, with `--tmp-dir`
+    /// for rows that take it (so scratch and staging are told apart).
+    struct Run {
+        out: TempDir,
+        tmp: Option<TempDir>,
+        inv: Invocation,
+        extra: Vec<OsString>,
+    }
+
+    impl Run {
+        fn new(fx: &Fx, row: &Row) -> Self {
+            let out = TempDir::new().unwrap();
+            let tmp = row.tmp_dir.then(|| TempDir::new().unwrap());
+            let inv = (row.build)(
+                &Ctx {
+                    fx,
+                    out: out.path(),
+                },
+                Input::Good,
+            );
+            Self {
+                out,
+                tmp,
+                inv,
+                extra: visible_scratch_args(row),
+            }
+        }
+
+        fn invoker(&self, extra: &[OsString]) -> CliInvoker {
+            CliInvoker::new()
+                .args(&self.inv.args)
+                .args(&self.extra)
+                .args(extra)
+                .args(tmp_args(self.tmp.as_ref().map(TempDir::path)))
+        }
+    }
+
+    /// How many cancellation checkpoints one uninterrupted run of `row`
+    /// passes.
+    pub(super) fn checkpoint_count(fx: &Fx, row: &Row) -> Result<u64, String> {
+        let run = Run::new(fx, row);
+        let control = TempDir::new().unwrap();
+        let count_file = control.path().join("count");
+        let out = run
+            .invoker(&[])
+            .env("PBFHOGG_TEST_CANCEL_COUNT", &count_file)
+            .run();
+        ensure!(
+            exited_ok(row, &out),
+            "the counting run failed: exit {:?}; stderr:\n{}",
+            out.status.code(),
+            out.stderr_str()
+        );
+        std::fs::read_to_string(&count_file)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&k| k > 0)
+            .ok_or_else(|| "the counting run passed no cancellation checkpoint".to_owned())
+    }
+
+    /// What a pause saw before the signal.
+    #[derive(Default)]
+    pub(super) struct Seen {
+        pub(super) staging: bool,
+        pub(super) scratch: bool,
+        /// The run finished before reaching the pause (scheduling made it
+        /// pass fewer checkpoints than the counting run).
+        pub(super) completed: bool,
+    }
+
+    /// Start `row`, park it at checkpoint `k`, signal it, and check that it
+    /// exits `128 + signal` leaving nothing behind (and, with `replace`, the
+    /// planted destination intact).
+    pub(super) fn interrupt_at(
+        fx: &Fx,
+        row: &Row,
+        k: u64,
+        signal: libc::c_int,
+        replace: bool,
+    ) -> Result<Seen, String> {
+        let run = Run::new(fx, row);
+        if replace {
+            for output in &run.inv.outputs {
+                seed(output, row.kind);
+            }
+        }
+        let control = TempDir::new().unwrap();
+        let ready = control.path().join("ready");
+        let mut pause = OsString::from(format!("{k}:"));
+        pause.push(ready.as_os_str());
+        let extra: Vec<OsString> = if replace {
+            vec!["--overwrite".into()]
+        } else {
+            Vec::new()
+        };
+        let mut child = run
+            .invoker(&extra)
+            .env("PBFHOGG_TEST_CANCEL_PAUSE", &pause)
+            .spawn();
+
+        let start = Instant::now();
+        let mut seen = Seen::default();
+        loop {
+            if ready.exists() {
+                break;
+            }
+            if child.has_exited() {
+                seen.completed = true;
+                break;
+            }
+            ensure!(
+                start.elapsed() < READY_TIMEOUT,
+                "checkpoint {k} was never reached"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if seen.completed {
+            let out = child.wait();
+            ensure!(
+                exited_ok(row, &out),
+                "a run that finished before checkpoint {k} failed: exit {:?}; stderr:\n{}",
+                out.status.code(),
+                out.stderr_str()
+            );
+            return Ok(seen);
+        }
+
+        seen.staging = staging_populated(run.out.path());
+        seen.scratch = run
+            .tmp
+            .as_ref()
+            .is_some_and(|tmp| scratch_populated(tmp.path()));
+        child.signal(signal);
+        let out = child.wait();
+        let stderr = out.stderr_str();
+        let name = signal_name(signal);
+        ensure!(
+            out.status.code() == Some(exit_code(signal)),
+            "{name} at checkpoint {k}: exit {:?}, wanted {}; stderr:\n{stderr}",
+            out.status.code(),
+            exit_code(signal)
+        );
+        ensure!(
+            stderr.contains(&format!("interrupted by {name}")),
+            "{name} at checkpoint {k}: the interruption was not reported; stderr:\n{stderr}"
+        );
+        if replace {
+            for output in &run.inv.outputs {
+                ensure!(
+                    intact(output, row.kind),
+                    "{name} at checkpoint {k} changed the existing {}",
+                    output.display()
+                );
+            }
+            ensure!(
+                names(run.out.path()) == output_names(&run.inv),
+                "{name} at checkpoint {k} left {:?} beside the existing outputs",
+                names(run.out.path())
+            );
+        } else {
+            ensure!(
+                names(run.out.path()).is_empty(),
+                "{name} at checkpoint {k} left {:?} in the output directory",
+                names(run.out.path())
+            );
+        }
+        if let Some(tmp) = &run.tmp {
+            ensure!(
+                names(tmp.path()).is_empty(),
+                "{name} at checkpoint {k} left {:?} in --tmp-dir",
+                names(tmp.path())
+            );
+        }
+        Ok(seen)
+    }
+
+    /// How many ordinal pause points one row's sweep visits at most.
+    const PAUSES_PER_ROW: u64 = 16;
+
+    /// Ordinal pause points spread over `1..=count`: every one for a short
+    /// run, else an even spread that always includes the first and the last
+    /// (just before publication).
+    pub(super) fn sample(count: u64) -> Vec<u64> {
+        if count <= PAUSES_PER_ROW {
+            return (1..=count).collect();
+        }
+        let mut ks: Vec<u64> = (0..PAUSES_PER_ROW)
+            .map(|i| 1 + i * (count - 1) / (PAUSES_PER_ROW - 1))
+            .collect();
+        ks.dedup();
+        ks
+    }
+}
+
+/// Every output-writing command, SIGINT or SIGTERM at checkpoints across the
+/// run (and once while replacing an existing output): the interrupted exit
+/// status, nothing at the destination, no `.pbfhogg-*` entry anywhere.
+#[cfg(feature = "test-hooks")]
+fn interrupted_run_leaves_nothing(fx: &Fx, row: &Row) -> Result<(), String> {
+    use interrupted::{checkpoint_count, interrupt_at, sample};
+    let count = checkpoint_count(fx, row)?;
+    let ks = sample(count);
+    let mut staging_seen = false;
+    let mut scratch_seen = false;
+    let mut interrupted = 0_usize;
+    for (i, &k) in ks.iter().enumerate() {
+        let signal = if i % 2 == 0 {
+            libc::SIGINT
+        } else {
+            libc::SIGTERM
+        };
+        let seen = interrupt_at(fx, row, k, signal, false)?;
+        if !seen.completed {
+            interrupted += 1;
+        }
+        staging_seen |= seen.staging;
+        scratch_seen |= seen.scratch;
+    }
+    // Replacing: an interrupted run leaves the previous output as it was.
+    let mid = ks[ks.len() / 2];
+    interrupt_at(fx, row, mid, libc::SIGTERM, true)?;
+    ensure!(
+        interrupted > 0,
+        "no pause landed before the run completed ({count} checkpoints counted)"
+    );
+    ensure!(
+        staging_seen,
+        "no pause observed a populated staging entry ({count} checkpoints, pauses at {ks:?})"
+    );
+    ensure!(
+        !row.tmp_dir || scratch_seen,
+        "no pause observed scratch payload in the run directory ({count} checkpoints, pauses \
+         at {ks:?})"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn an_interrupted_run_publishes_nothing_and_leaves_nothing() {
+    run_property(Prop::Interrupted, interrupted_run_leaves_nothing, |_| true);
+}
+
+/// A second signal while the first is still being acted on exits at once,
+/// with 128 + the second signal's number, and what it leaves is reported by
+/// the next run's leftover scan. The paused thread is told to stay parked
+/// after seeing the cancellation, so the run cannot finish its cleanup and
+/// only the second signal ends it.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
+    use std::time::{Duration, Instant};
+    let fx = Fx::new();
+    let row = ROWS
+        .iter()
+        .find(|row| row.command == "add-locations-to-ways")
+        .expect("the altw row");
+    let count = interrupted::checkpoint_count(&fx, row).unwrap();
+    for (first, second) in [
+        (libc::SIGINT, libc::SIGINT),
+        (libc::SIGTERM, libc::SIGTERM),
+        (libc::SIGINT, libc::SIGTERM),
+    ] {
+        let out_dir = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let control = TempDir::new().unwrap();
+        let inv = (row.build)(
+            &Ctx {
+                fx: &fx,
+                out: out_dir.path(),
+            },
+            Input::Good,
+        );
+        let ready = control.path().join("ready");
+        let ack = control.path().join("ready.ack");
+        let mut pause = OsString::from(format!("{}:", count.div_ceil(2)));
+        pause.push(ready.as_os_str());
+        pause.push(":stuck");
+        let mut child = CliInvoker::new()
+            .args(&inv.args)
+            .args(interrupted::visible_scratch_args(row))
+            .args(tmp_args(Some(tmp.path())))
+            .env("PBFHOGG_TEST_CANCEL_PAUSE", &pause)
+            .spawn();
+        let wait_for = |path: &Path, child: &mut crate::common::cli::RunningCli| {
+            let start = Instant::now();
+            while !path.exists() {
+                assert!(
+                    !child.has_exited(),
+                    "the run ended before {}",
+                    path.display()
+                );
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "{} never appeared",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        wait_for(&ready, &mut child);
+        child.signal(first);
+        // The first signal is taken (the paused thread saw the token trip)
+        // before the second is sent: two pending standard signals coalesce.
+        wait_for(&ack, &mut child);
+        let sent = Instant::now();
+        child.signal(second);
+        let out = child.wait();
+        assert_eq!(
+            out.status.code(),
+            Some(interrupted::exit_code(second)),
+            "{} then {}: stderr:\n{}",
+            interrupted::signal_name(first),
+            interrupted::signal_name(second),
+            out.stderr_str()
+        );
+        assert!(
+            sent.elapsed() < Duration::from_secs(5),
+            "the second signal did not end the run at once"
+        );
+        // The stuck run never cleaned up: its staging entry is still there,
+        // and the next run in the same directories reports it.
+        let left = hidden(out_dir.path());
+        assert!(
+            left.iter().any(|n| n.starts_with(".pbfhogg-tmp-")),
+            "expected the abandoned staging entry, found {left:?}"
+        );
+        let next = CliInvoker::new()
+            .args(&inv.args)
+            .args(interrupted::visible_scratch_args(row))
+            .args(tmp_args(Some(tmp.path())))
+            .run();
+        assert!(
+            exited_ok(row, &next),
+            "the next run failed: {}",
+            next.stderr_str()
+        );
+        let stderr = next.stderr_str();
+        assert!(
+            stderr.contains("Warning:") && stderr.contains("did not"),
+            "the next run did not report the leftovers; stderr:\n{stderr}"
+        );
+    }
+}
+
+/// The commands that write no output honour the same signals: the
+/// interrupted exit status and nothing left in the current directory.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_command_without_an_output_is_interrupted_too() {
+    use std::time::{Duration, Instant};
+    let fx = Fx::new();
+    let good = fx.pbf(Input::Good);
+    let commands: [&[&str]; 5] = [
+        &["inspect"],
+        &["digest"],
+        &["check", "--refs"],
+        &["bench-read", "--mode", "pipelined"],
+        &["bench-write"],
+    ];
+    for (i, words) in commands.iter().enumerate() {
+        let signal = if i % 2 == 0 {
+            libc::SIGINT
+        } else {
+            libc::SIGTERM
+        };
+        let cwd = TempDir::new().unwrap();
+        let control = TempDir::new().unwrap();
+        let ready = control.path().join("ready");
+        let mut pause = OsString::from("2:");
+        pause.push(ready.as_os_str());
+        let mut child = CliInvoker::new()
+            .args(*words)
+            .arg(&good)
+            .current_dir(cwd.path())
+            .env("PBFHOGG_TEST_CANCEL_PAUSE", &pause)
+            .spawn();
+        let start = Instant::now();
+        while !ready.exists() {
+            assert!(!child.has_exited(), "{words:?} ended before checkpoint 2");
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "{words:?} never paused"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        child.signal(signal);
+        let out = child.wait();
+        assert_eq!(
+            out.status.code(),
+            Some(interrupted::exit_code(signal)),
+            "{words:?}: stderr:\n{}",
+            out.stderr_str()
+        );
+        assert!(
+            names(cwd.path()).is_empty(),
+            "{words:?} left {:?}",
+            names(cwd.path())
+        );
+    }
 }

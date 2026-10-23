@@ -239,7 +239,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
 
     // Build per-type schedules from header-only scan via pread-only HeaderWalker.
     crate::debug::emit_marker("SMART_PASS1_SCHEDULE_SCAN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input))?;
@@ -392,7 +392,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                 bbox_node_ids.set(id);
             }
         },
-        &*host.resources,
+        host,
     )?;
     crate::debug::emit_marker("PASS1_NODE_CLASSIFY_END");
 
@@ -424,7 +424,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
                 all_way_node_ids.set(id);
             }
         },
-        &*host.resources,
+        host,
     )?;
     crate::debug::emit_marker("PASS1_WAY_CLASSIFY_END");
 
@@ -458,7 +458,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             matched_relation_ids.merge(worker_rel_ids);
             handler.merge_worker_extras(worker_extra_way_ids, worker_extra_node_ids);
         },
-        &*host.resources,
+        host,
     )?;
     crate::debug::emit_marker("PASS1_RELATION_CLASSIFY_END");
 
@@ -532,7 +532,7 @@ pub(super) fn extract_smart(
             crate::scan::classify::build_classify_schedule(
                 input,
                 Some(crate::ElementKind::Way),
-                &host.diagnostics,
+                host,
             )?
         } else {
             let shared_file = std::sync::Arc::new(
@@ -577,7 +577,7 @@ pub(super) fn extract_smart(
                     extra_node_ids.set(id);
                 }
             },
-            &*host.resources,
+            host,
         )?;
         crate::debug::emit_marker("SMART_PASS2_CLASSIFY_END");
     }

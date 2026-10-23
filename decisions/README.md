@@ -177,3 +177,10 @@ transient process note retired at the 0.3.0 release (commit `30ca861`);
   by the entry point; `--tmp-dir` chooses where; leftovers of crashed runs
   are returned as typed values and reported, never reaped, and backups are
   never touched.
+- [ADR-0019](0019-cancellation-is-a-caller-token-checked-where-the-run-already-passes.md) -
+  A run stops early only through the caller's `Cancel` token, checked where
+  the run already passes (blob dispatch, pool receives, stage boundaries,
+  output writes, the publication decision), and ends like a failure:
+  nothing published, staging and scratch removed, `Cancelled` returned. The
+  CLI trips it from SIGINT/SIGTERM and exits 130/143; a second signal exits
+  at once.

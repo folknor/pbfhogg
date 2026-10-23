@@ -669,6 +669,7 @@ pub fn external_join(
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<Stats> {
+    host.cancel.check()?;
     let result = external_join_in(
         input,
         &output,
@@ -680,7 +681,7 @@ pub fn external_join(
         &scratch,
     )?;
     drop(scratch);
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -855,6 +856,7 @@ pub(crate) fn external_join_in(
                         blob_meta_ref_parallel,
                         !keep_untagged_nodes,
                         inject_prepass,
+                        &host.cancel,
                     )?;
                     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
                     crate::debug::emit_counter(
@@ -874,8 +876,8 @@ pub(crate) fn external_join_in(
             // scan completes. Accepted as diagnostic-quality: stage-1
             // failures are rare (only fire on adversarial or malformed
             // input, mostly closed by the defensive-input checks in
-            // ADR-0004), and cancelling the relation scan would require
-            // plumbing a shutdown signal we don't otherwise need.
+            // ADR-0004). A cancellation is not delayed: both threads
+            // observe the invocation's token, the relation scan per blob.
             let s1_res = s1_handle.join().map_err(|payload| {
                 crate::error::panic_error("stage 1 thread", payload.as_ref())
             })??;
@@ -990,6 +992,9 @@ pub(crate) fn external_join_in(
         crate::debug::emit_counter("extjoin_total_id_shard_files", total_id_shard_files as i64);
     }
 
+    // Stage boundary: the sidecar loads and the scratch precheck above have
+    // no checkpoint of their own.
+    host.cancel.check()?;
     crate::debug::emit_marker("EXTJOIN_STAGE2_START");
     let s2_faults_before = crate::debug::read_page_faults();
     let slot_buckets = SlotBuckets::create(scratch, slot_bucket_count)?;
@@ -1107,6 +1112,7 @@ pub(crate) fn external_join_in(
     // as it encodes them; stage 4 workers block on `router.wait_ready`
     // ahead of any input pread so they never hold decompressed state
     // while waiting.
+    host.cancel.check()?;
     crate::debug::emit_marker("EXTJOIN_STREAMING_START");
     crate::debug::emit_marker("EXTJOIN_STAGE3_START");
     crate::debug::emit_marker("EXTJOIN_STAGE4_START");
@@ -1143,6 +1149,7 @@ pub(crate) fn external_join_in(
                 total_slots,
                 &integrated,
                 num_workers,
+                &host.cancel,
             );
             // Signal the router that no more publishes are coming. Must
             // run whether stage 3 succeeded or errored - otherwise stage

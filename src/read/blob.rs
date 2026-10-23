@@ -359,6 +359,9 @@ impl<T: AsRef<[u8]>> BlobReaderSource for Cursor<T> {}
 #[derive(Clone, Debug)]
 pub struct BlobReader<R: Read + Send> {
     diagnostics: crate::host::Diagnostics,
+    /// Checked before every frame is read: a tripped token ends iteration
+    /// with `ErrorKind::Cancelled`, the way an I/O error does.
+    cancel: crate::host::Cancel,
     reader: R,
     /// Current reader offset in bytes from the start of the stream.
     offset: Option<ByteOffset>,
@@ -421,6 +424,33 @@ impl<R: Read + Send> BlobReader<R> {
         self
     }
 
+    /// Stop at the next frame once `cancel` is tripped: iteration then
+    /// yields one `ErrorKind::Cancelled` and ends.
+    #[must_use]
+    pub fn cancel(mut self, cancel: crate::host::Cancel) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// The token this reader observes, for engines that run its blobs on
+    /// other threads and check it at their own consumer.
+    pub(crate) fn cancel_token(&self) -> &crate::host::Cancel {
+        &self.cancel
+    }
+
+    /// The checkpoint before a frame is read: on a tripped token the
+    /// iteration ends with `Cancelled`, which carries no location (the run
+    /// was stopped, nothing in the input is at fault).
+    fn cancelled<T>(&mut self) -> Option<Result<T>> {
+        match self.cancel.check() {
+            Ok(()) => None,
+            Err(e) => {
+                self.last_blob_ok = false;
+                Some(Err(e))
+            }
+        }
+    }
+
     /// Creates a new `BlobReader`.
     ///
     /// # Example
@@ -448,6 +478,7 @@ impl<R: Read + Send> BlobReader<R> {
             last_blob_ok: true,
             header_buf: Vec::new(),
             diagnostics: crate::host::Diagnostics::discard(),
+            cancel: crate::host::Cancel::new(),
             parse_tagdata: false,
             parse_indexdata: true,
             parse_waymembers: false,
@@ -768,6 +799,7 @@ impl BlobReader<FileReader> {
             last_blob_ok: true,
             header_buf: Vec::new(),
             diagnostics: crate::host::Diagnostics::discard(),
+            cancel: crate::host::Cancel::new(),
             parse_tagdata: false,
             parse_indexdata: true,
             parse_waymembers: false,
@@ -794,6 +826,7 @@ impl BlobReader<FileReader> {
             last_blob_ok: true,
             header_buf: Vec::new(),
             diagnostics: crate::host::Diagnostics::discard(),
+            cancel: crate::host::Cancel::new(),
             parse_tagdata: false,
             parse_indexdata: true,
             parse_waymembers: false,
@@ -811,6 +844,7 @@ impl BlobReader<FileReader> {
     ) -> Result<Self> {
         Self::open(path, direct).map(|r| {
             r.diagnostics(host.diagnostics.clone())
+                .cancel(host.cancel.clone())
                 .evict_page_cache(host.page_cache == crate::host::PageCachePolicy::Evict)
         })
     }
@@ -828,6 +862,7 @@ impl BlobReader<FileReader> {
             last_blob_ok: true,
             header_buf: Vec::new(),
             diagnostics: crate::host::Diagnostics::discard(),
+            cancel: crate::host::Cancel::new(),
             parse_tagdata: false,
             parse_indexdata: true,
             parse_waymembers: false,
@@ -847,6 +882,9 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
         // Stop iteration if there was an error.
         if !self.last_blob_ok {
             return None;
+        }
+        if let Some(cancelled) = self.cancelled() {
+            return Some(cancelled);
         }
 
         let prev_offset = self.offset;
@@ -968,6 +1006,7 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
             last_blob_ok: true,
             header_buf: Vec::new(),
             diagnostics: crate::host::Diagnostics::discard(),
+            cancel: crate::host::Cancel::new(),
             parse_tagdata: false,
             parse_indexdata: true,
             parse_waymembers: false,
@@ -1157,6 +1196,9 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
         // Stop iteration if there was an error.
         if !self.last_blob_ok {
             return None;
+        }
+        if let Some(cancelled) = self.cancelled() {
+            return Some(cancelled);
         }
 
         let prev_offset = self.offset;
@@ -1370,7 +1412,7 @@ mod tests {
         let walk_arm = |path: &std::path::Path| -> Result<usize> {
             let mut walker = super::super::header_walker::HeaderWalker::open(
                 path,
-                &crate::host::Diagnostics::discard(),
+                &crate::host::Host::for_tests(),
             )?;
             let mut count = 0;
             while walker.next_header()?.is_some() {

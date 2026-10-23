@@ -75,6 +75,7 @@ pub fn derive_changes(
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<DeriveChangesStats> {
+    host.cancel.check()?;
     let result = derive_changes_to(
         old_path,
         new_path,
@@ -87,7 +88,7 @@ pub fn derive_changes(
         &scratch,
     )?;
     drop(scratch);
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -594,6 +595,11 @@ pub(crate) fn assemble_osc_from_paths(
 ) -> Result<()> {
     use crate::write::parallel_gzip::{DEFAULT_CHUNK_SIZE, ParallelGzipWriter};
 
+    // Stage boundary. The assembly itself stops through the output writer,
+    // which observes the token at every buffer it writes (the gzip writer
+    // thread records that as its failure and every later `write` returns it).
+    host.cancel.check()?;
+
     // OSC document framing has no shared owner: merge_changes chooses gzip
     // from the output name, tags-filter always gzips, and this path emits
     // ordered gzip chunks (CORRECTNESS.md, OSC emission contracts).
@@ -607,7 +613,7 @@ pub(crate) fn assemble_osc_from_paths(
     // Output can also be on a different filesystem from host-selected scratch.
     // A statvfs snapshot would not reserve capacity against concurrent writers;
     // propagate actual output write failures rather than promise a preflight.
-    let buf = output.writer()?;
+    let buf = output.writer(&host.cancel)?;
 
     // Gzip member count = ceil(total_uncompressed_bytes / chunk_size).
     // At planet scale (~45 GB of XML across the three temp files) that's

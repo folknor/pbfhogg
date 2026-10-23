@@ -82,16 +82,20 @@ impl RawBlobFrame {
 
 /// Read the next raw blob frame. Returns `None` at EOF.
 /// Updates `file_offset` to track position for copy_file_range.
+///
+/// Checks `host.cancel` before reading, so every raw-frame walk stops at the
+/// next frame once the run is cancelled (`ErrorKind::Cancelled`, unlocated).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) fn read_raw_frame<R: Read>(
     reader: &mut R,
     file_offset: &mut u64,
-    diagnostics: &crate::host::Diagnostics,
+    host: &crate::host::Host,
     source: &std::path::Path,
 ) -> Result<Option<RawBlobFrame>> {
+    host.cancel.check()?;
     let frame_start = *file_offset;
-    read_raw_frame_inner(reader, file_offset, diagnostics, source)
+    read_raw_frame_inner(reader, file_offset, &host.diagnostics, source)
         .map_err(|e| e.locate(frame_location(source, frame_start)))
 }
 
@@ -225,7 +229,7 @@ mod tests {
         let result = read_raw_frame(
             &mut input,
             &mut file_offset,
-            &crate::host::Diagnostics::discard(),
+            &crate::host::Host::for_tests(),
             std::path::Path::new("test.osm.pbf"),
         );
 

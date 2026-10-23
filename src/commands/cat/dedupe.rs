@@ -158,8 +158,9 @@ pub fn merge_pbf(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<MergePbfStats> {
+    host.cancel.check()?;
     let result = merge_pbf_to(inputs, &output, opts, overrides, host)?;
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -389,6 +390,9 @@ fn index_input(
     let mut header: Option<crate::HeaderBlock> = None;
 
     loop {
+        // Once per frame: this walk reads its own frames rather than going
+        // through a cancellation-aware reader.
+        host.cancel.check()?;
         let frame_start = file_offset;
         // This loop walks the input, so it owns the provenance of every
         // failure in the frame it is on.
@@ -682,13 +686,15 @@ fn sweep_merge_dedup<T: Ord + HasId>(
     mut write_elem: impl FnMut(&T, &mut BlockBuilder, &mut PbfWriter<FileWriter>) -> Result<()>,
     host: &crate::host::Host,
 ) -> Result<(u64, u64)> {
-    let _ = host;
     let mut heap: BinaryHeap<Reverse<T>> = BinaryHeap::new();
     let mut frame_buf: Vec<u8> = Vec::new();
     let mut count: u64 = 0;
     let mut deduped: u64 = 0;
 
     for entry in entries {
+        // Once per blob of the run: a run whose heap only grows writes
+        // nothing (so the writer's own check never runs) until it drains.
+        host.cancel.check()?;
         flush_heap_below_dedup(
             &mut heap,
             crate::osm_id::blob_osm_first_id(entry.index.min_id, entry.index.max_id),

@@ -104,11 +104,22 @@ pub(crate) trait OutputSink {
 pub(crate) struct FileOutputSink {
     writer: FileWriter,
     finish: super::Finish,
+    /// Checked between `copy_file_range` calls of a queued splice.
+    #[cfg_attr(not(feature = "linux-direct-io"), allow(dead_code))]
+    cancel: crate::host::Cancel,
 }
 
 impl FileOutputSink {
-    pub(crate) fn new(writer: FileWriter, finish: super::Finish) -> Self {
-        Self { writer, finish }
+    pub(crate) fn new(
+        writer: FileWriter,
+        finish: super::Finish,
+        cancel: crate::host::Cancel,
+    ) -> Self {
+        Self {
+            writer,
+            finish,
+            cancel,
+        }
     }
 }
 
@@ -160,7 +171,7 @@ impl OutputSink for FileOutputSink {
                 let out_fd = self.writer.flush_and_raw_fd()?.ok_or_else(|| {
                     Error::invalid_argument("copy_file_range incompatible with O_DIRECT output")
                 })?;
-                super::copy_range::copy_range(in_fd, out_fd, offset, len)?;
+                super::copy_range::copy_range(in_fd, out_fd, offset, len, &self.cancel)?;
                 // Hold the input open until the splice has actually happened.
                 drop(in_file);
                 WRITER_METRICS

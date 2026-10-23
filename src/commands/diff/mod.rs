@@ -202,6 +202,7 @@ pub fn diff(
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<DiffStats> {
+    host.cancel.check()?;
     let filter = TypeFilter::or_all(options.type_filter);
 
     // Single-pass: check sorted headers + indexdata from one file open each.
@@ -280,6 +281,9 @@ pub fn diff(
     }
 
     drop(scratch);
+    // The completion decision: a cancellation observed by now is reported
+    // as one, whatever reached the caller's writer.
+    host.cancel.check()?;
     Ok(stats)
 }
 

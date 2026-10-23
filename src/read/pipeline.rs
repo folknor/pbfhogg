@@ -456,11 +456,18 @@ fn spawn_decode_task<'scope>(scope: &rayon::Scope<'scope>, task: DecodeTask<'sco
 fn drain_decoded<F>(
     decoded_rx: Receiver<DecodedItem>,
     decode_ahead: usize,
+    cancel: &crate::host::Cancel,
     block_fn: &mut F,
 ) -> Result<()>
 where
     F: FnMut(PrimitiveBlock) -> Result<()>,
 {
+    // Cancellation is checked here, on the consumer, before each wait and on
+    // each arrival (a gap in the reorder buffer can hold back every pop, so a
+    // pop-only check could starve), and returns through the same early exit
+    // as a `block_fn` error. Stage 1's reader also stops on the token and
+    // delivers `Cancelled` as a sequenced error item; this check only makes
+    // the stop independent of how many decoded items are queued ahead of it.
     // Normal completion: the dispatcher drops its sender after raw EOF, task
     // clones finish, and recv returns Err once the last sender is gone.
     //
@@ -471,6 +478,7 @@ where
         ReorderBuffer::with_capacity(decode_ahead);
 
     loop {
+        cancel.check()?;
         let t_recv = Instant::now();
         let next = decoded_rx.recv();
         PIPELINE_METRICS
@@ -480,6 +488,7 @@ where
             Ok(pair) => pair,
             Err(_) => break,
         };
+        cancel.check()?;
         pending.push(seq, (item, permit));
         PIPELINE_METRICS.record_reorder_levels(pending.filled_len(), pending.pending_len());
         #[cfg(all(feature = "static-test-hooks", not(test)))]
@@ -497,7 +506,7 @@ where
             }
         }
     }
-    Ok(())
+    cancel.check()
 }
 
 /// Runs a three-stage pipeline over a PBF file:
@@ -553,6 +562,7 @@ where
     blob_reader.set_parse_indexdata(blob_filter.is_some());
     let blob_filter = blob_filter.map(Arc::new);
     let source = blob_reader.source().cloned();
+    let cancel = blob_reader.cancel_token().clone();
     let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead.get());
     let (decoded_tx, decoded_rx) = sync_channel::<DecodedItem>(pipeline_config.decode_ahead.get());
 
@@ -683,6 +693,7 @@ where
         let result = drain_decoded(
             decoded_rx,
             pipeline_config.decode_ahead.get(),
+            &cancel,
             &mut block_fn,
         );
 
@@ -728,6 +739,7 @@ where
     blob_reader.set_parse_indexdata(blob_filter.is_some());
     let blob_filter = blob_filter.map(Arc::new);
     let source = blob_reader.source().cloned();
+    let cancel = blob_reader.cancel_token().clone();
     let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead.get());
     type FusedPayload<T> = Option<crate::error::Result<T>>;
     let (decoded_tx, decoded_rx) = sync_channel::<(usize, FusedPayload<T>, Option<Permit>)>(
@@ -864,7 +876,12 @@ where
             });
         });
         drop(decoded_tx);
-        let result = drain_fused(decoded_rx, pipeline_config.decode_ahead.get(), &mut consume);
+        let result = drain_fused(
+            decoded_rx,
+            pipeline_config.decode_ahead.get(),
+            &cancel,
+            &mut consume,
+        );
         PIPELINE_METRICS.emit();
         result
     })
@@ -874,13 +891,16 @@ where
 fn drain_fused<T, F>(
     decoded_rx: Receiver<(usize, Option<crate::error::Result<T>>, Option<Permit>)>,
     decode_ahead: usize,
+    cancel: &crate::host::Cancel,
     consume: &mut F,
 ) -> Result<()>
 where
     F: FnMut(T) -> Result<()>,
 {
+    // Cancellation checks as in `drain_decoded`.
     let mut pending = ReorderBuffer::with_capacity(decode_ahead);
     loop {
+        cancel.check()?;
         let start = Instant::now();
         let next = decoded_rx.recv();
         PIPELINE_METRICS
@@ -890,6 +910,7 @@ where
             Ok(item) => item,
             Err(_) => break,
         };
+        cancel.check()?;
         pending.push(seq, (item, permit));
         PIPELINE_METRICS.record_reorder_levels(pending.filled_len(), pending.pending_len());
         #[cfg(all(feature = "static-test-hooks", not(test)))]
@@ -906,7 +927,7 @@ where
             }
         }
     }
-    Ok(())
+    cancel.check()
 }
 
 #[cfg(test)]

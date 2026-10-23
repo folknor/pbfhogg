@@ -126,8 +126,9 @@ pub fn sort(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<SortStats> {
+    host.cancel.check()?;
     let result = sort_to(input, &output, opts, overrides, host)?;
-    output.publish()?;
+    output.publish(&host.cancel)?;
     Ok(result)
 }
 
@@ -331,7 +332,7 @@ pub(crate) fn sort_to(
             overlap_runs
                 .par_iter()
                 .map(|(start, end, kind)| {
-                    compute_overlap_run_local(&entries[*start..*end], *kind, input)
+                    compute_overlap_run_local(&entries[*start..*end], *kind, input, &host.cancel)
                 })
                 .collect()
         });
@@ -480,7 +481,7 @@ fn build_blob_index(
     _direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<(crate::HeaderBlock, Vec<BlobEntry>)> {
-    let mut walker = HeaderWalker::open(input, &host.diagnostics)?;
+    let mut walker = HeaderWalker::open(input, host)?;
     let mut entries = Vec::new();
     let mut header: Option<crate::HeaderBlock> = None;
     let mut data_buf: Vec<u8> = Vec::new();
@@ -876,6 +877,7 @@ fn compute_overlap_run_local(
     entries: &[BlobEntry],
     kind: ElementKind,
     input_path: &Path,
+    cancel: &crate::host::Cancel,
 ) -> crate::Result<(Vec<OwnedBlock>, OverlapCounts)> {
     let mut input_file =
         File::open(input_path).map_err(|e| crate::file_reader::open_error(input_path, e))?;
@@ -896,6 +898,7 @@ fn compute_overlap_run_local(
                 },
                 write_single_node_local,
                 input_path,
+                cancel,
             )?;
         }
         ElementKind::Way => {
@@ -911,6 +914,7 @@ fn compute_overlap_run_local(
                 },
                 write_single_way_local,
                 input_path,
+                cancel,
             )?;
         }
         ElementKind::Relation => {
@@ -926,6 +930,7 @@ fn compute_overlap_run_local(
                 },
                 write_single_relation_local,
                 input_path,
+                cancel,
             )?;
         }
     };
@@ -936,6 +941,7 @@ fn compute_overlap_run_local(
 // Local sweep merge (rayon-worker-friendly)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn sweep_merge_local<T: Ord + HasId>(
     entries: &[BlobEntry],
     input_file: &mut File,
@@ -944,12 +950,16 @@ fn sweep_merge_local<T: Ord + HasId>(
     mut extract: impl FnMut(&Element<'_>, &mut BinaryHeap<Reverse<T>>),
     mut write_elem: impl FnMut(&T, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> crate::Result<()>,
     input_path: &Path,
+    cancel: &crate::host::Cancel,
 ) -> crate::Result<u64> {
     let mut heap: BinaryHeap<Reverse<T>> = BinaryHeap::new();
     let mut frame_buf: Vec<u8> = Vec::new();
     let mut count: u64 = 0;
 
     for entry in entries {
+        // Once per blob of the run, before it is read: a pathological input
+        // can put most of the file into one run, decoded on one worker.
+        cancel.check()?;
         flush_heap_below_local(
             &mut heap,
             crate::osm_id::blob_osm_first_id(entry.index.min_id, entry.index.max_id),

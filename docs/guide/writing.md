@@ -209,10 +209,10 @@ let mut writer = output.pbf_writer(
 )?;
 // ... write blocks ...
 writer.flush()?;              // finishes the file; does not fsync
-output.publish()?;            // fsyncs, then renames into place
+output.publish(&host.cancel)?; // fsyncs, then renames into place
 ```
 
-`Output::pbf_writer` opens the output's one writing session: the output is published only if that writer's `flush` succeeded and none of its writes failed. Writing to `Output::path` with a writer of your own is not published at all; for a format that is not PBF use `Output::writer`, an `std::io::Write` ended by `OutputWriter::finish`. Dropping the `Output` without publishing removes the staging file. The command entry points (`sort::sort`, `cat::cat`, ...) take an `Output` by value and publish it themselves.
+`Output::pbf_writer` opens the output's one writing session: the output is published only if that writer's `flush` succeeded and none of its writes failed. Writing to `Output::path` with a writer of your own is not published at all; for a format that is not PBF use `Output::writer(&host.cancel)`, an `std::io::Write` ended by `OutputWriter::finish`. Both writers observe `host.cancel` on each write (the `PbfWriter` not in its final `flush`), and `publish` refuses a tripped token with `ErrorKind::Cancelled` before it touches anything; once it has started it completes. Dropping the `Output` without publishing removes the staging file. The command entry points (`sort::sort`, `cat::cat`, ...) take an `Output` by value and publish it themselves.
 
 ### to_path - pipelined parallel compression
 

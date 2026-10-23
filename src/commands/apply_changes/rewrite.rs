@@ -42,14 +42,14 @@ pub struct MergeOptions {
     /// Permit unresolved way-node references to retain the legacy `(0, 0)`
     /// fallback under `--locations-on-ways`.
     pub ignore_missing_nodes: bool,
-    /// Override the worker-pool size used by the descriptor-first
-    /// pipeline. `None` (or `Some(0)`) keeps the default `nproc - 2`
-    /// heuristic (leaves two cores for scanner + drain, minimum 2
-    /// workers). `Some(1)` is rejected at runtime: single-worker
-    /// operation has not been validated through the node-to-way barrier
-    /// and its failure shutdown. This is a supported-configuration limit,
-    /// not a claim that a single worker necessarily deadlocks.
-    pub jobs: Option<usize>,
+    /// Worker-pool size for the descriptor-first pipeline. `Auto` keeps the
+    /// `nproc - 2` heuristic (leaves two cores for scanner + drain, minimum
+    /// 2 workers). `Fixed(1)` is refused by [`MergeOptions::validate`]:
+    /// single-worker operation has not been validated through the
+    /// node-to-way barrier and its failure shutdown. This is a
+    /// supported-configuration limit, not a claim that a single worker
+    /// necessarily deadlocks.
+    pub parallelism: crate::host::Parallelism,
     /// Accept a change whose `version` is lower than the version already
     /// held for that object in the overlay. Off by default; see
     /// [`crate::osc::CompactDiffOverlay::allow_version_regression`].
@@ -77,11 +77,45 @@ impl Default for MergeOptions {
             write: WriteOptions::default(),
             locations_on_ways: false,
             ignore_missing_nodes: false,
-            jobs: None,
+            parallelism: crate::host::Parallelism::Auto,
             allow_version_regression: false,
             #[cfg(feature = "test-hooks")]
             panic_at_blob_seq: None,
         }
+    }
+}
+
+impl MergeOptions {
+    /// Refuse option values and combinations the pipeline cannot honour,
+    /// before any input is opened. [`merge`] calls it first; a caller can
+    /// call it earlier to refuse before reserving an output.
+    ///
+    /// - A single worker: not a validated configuration (see
+    ///   [`MergeOptions::parallelism`]).
+    /// - `force` with `locations_on_ways`: on an indexed base `force` does
+    ///   nothing, and on an unindexed one the combination is unsound (the
+    ///   scanner cannot tell node blobs from way blobs, which defeats the
+    ///   node-to-way barrier), so `force` can never take effect there.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` naming the refused option.
+    pub fn validate(&self) -> Result<()> {
+        if self.parallelism.fixed() == Some(1) {
+            return Err(crate::Error::invalid_argument(
+                "apply-changes needs at least 2 workers: a single worker has not been \
+                 validated",
+            ));
+        }
+        if self.write.force && self.locations_on_ways {
+            return Err(crate::Error::invalid_argument(
+                "apply-changes: force has no effect with locations_on_ways, which \
+                 requires an indexed base (an unindexed base would silently lose \
+                 LocationsOnWays on base ways). Generate an indexed PBF first:\n\n\
+                 \x20 pbfhogg cat <input.osm.pbf> -o indexed.osm.pbf",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -212,6 +246,9 @@ pub(crate) fn merge_to(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<MergeStats> {
+    // Option refusals first: none of them needs the input.
+    opts.validate()?;
+
     // `merge` is public library API, so direct callers need the same refusal
     // as CLI callers. Writing goes to a staging file, so the base is never
     // truncated, but publication would replace the base the run read from.
@@ -236,12 +273,17 @@ pub(crate) fn merge_to(
             },
         locations_on_ways,
         ignore_missing_nodes,
-        jobs,
+        parallelism,
         allow_version_regression,
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq,
     } = *opts;
-    let has_base_indexdata = require_indexdata(
+    // `validate` refused `force` with `locations_on_ways`: under force the
+    // scanner tags every unindexed blob as a placeholder `Node` (its real
+    // kind is not known until decompress), which defeats the node-to-way
+    // barrier that gates the worker pool until the node-coord loc_map is
+    // published. So with `-l` an unindexed base is always refused here.
+    require_indexdata(
         base_pbf,
         direct_io,
         force,
@@ -250,24 +292,17 @@ pub(crate) fn merge_to(
         host,
     )?;
 
-    // --force --locations-on-ways on a non-indexed base PBF is unsound:
-    // under --force the scanner tags every blob as a placeholder `Node`
-    // (real kind is not known until decompress), which defeats the
-    // Node->Way barrier that would otherwise gate the worker pool
-    // until the node-coord loc_map is published. Way blobs would then
-    // reach workers before the map exists. That used to strip
-    // LocationsOnWays from every base way silently; `LocMode::Pending`
-    // now turns it into a mid-run error, and this check rejects the
-    // combination up front with a clear migration path instead.
-    if force && locations_on_ways && !has_base_indexdata {
-        return Err(crate::Error::invalid_argument(
-            "apply-changes --force --locations-on-ways on a non-indexed PBF would \
-             silently strip LocationsOnWays data from base ways. Generate an indexed \
-             PBF first:\n\n\
-             \x20 pbfhogg cat <input.osm.pbf> -o indexed.osm.pbf\n\n\
-             Then run apply-changes against the indexed output.",
-        ));
-    }
+    // The base header's refusals (unsorted base, `-l` without
+    // LocationsOnWays) come before the OSC is parsed: the header read
+    // happens either way, so ordering it first costs nothing and keeps a
+    // multi-minute OSC parse from preceding a refusal it cannot change.
+    let header_start = std::time::Instant::now();
+    let header_bytes = read_header(base_pbf, direct_io, locations_on_ways, overrides, host)?;
+    let header_read_ms = header_start
+        .elapsed()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX);
 
     let osc_start = std::time::Instant::now();
     crate::host::diag!(
@@ -351,14 +386,6 @@ pub(crate) fn merge_to(
         (None, None, (0, 0, 0))
     };
 
-    let header_start = std::time::Instant::now();
-    let header_bytes = read_header(base_pbf, direct_io, locations_on_ways, overrides, host)?;
-    let header_read_ms = header_start
-        .elapsed()
-        .as_millis()
-        .try_into()
-        .unwrap_or(i64::MAX);
-
     let writer_setup_start = std::time::Instant::now();
     // Apply-changes' output pass is writer-bound at default compression, so
     // an unspecified (buffered) backend becomes the parallel writer.
@@ -380,9 +407,9 @@ pub(crate) fn merge_to(
     let input_file = std::sync::Arc::new(std::fs::File::open(base_pbf)?);
     let splice = backend.supports_copy_range();
 
-    // Worker count: `-j N` override if supplied (non-zero), else the
-    // default `nproc - 2` heuristic (leaves two cores for the scanner
-    // and drain threads).
+    // Worker count: a fixed parallelism if supplied, else the default
+    // `nproc - 2` heuristic (leaves two cores for the scanner and drain
+    // threads). `MergeOptions::validate` refused a single worker.
     //
     // Retain the supported minimum until single-worker barrier progress
     // and shutdown have been validated. The former panic rationale no
@@ -401,21 +428,14 @@ pub(crate) fn merge_to(
     // and producer failures while scanner dispatch or its barrier wait is
     // blocked, across splice and worker-only routing. Until that validation,
     // keep the explicit refusal rather than silently substituting workers.
-    let worker_count = match jobs {
-        Some(1) => {
-            return Err(crate::Error::invalid_argument(
-                "apply-changes needs at least 2 workers (--jobs 2 or more, or omit \
-                 --jobs): a single worker has not been validated",
-            ));
-        }
-        Some(n) if n > 1 => n,
-        _ => crate::host::sized_workers(
+    let worker_count = parallelism.resolve(|| {
+        crate::host::sized_workers(
             &*host.resources,
             APPLY_CHANGES_WORKERS_RESERVED,
             APPLY_CHANGES_WORKERS_MIN,
             APPLY_CHANGES_WORKERS_FALLBACK,
-        ),
-    };
+        )
+    });
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("merge_worker_count", worker_count as i64);
 

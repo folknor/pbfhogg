@@ -103,7 +103,7 @@ A previous `dense` mode (a direct-mapped mmap array indexed by node ID) was remo
 Extract multiple regions in a single pass using a JSON config file:
 
 ```sh
-pbfhogg extract input.osm.pbf -c regions.json
+pbfhogg extract input.osm.pbf --config regions.json
 ```
 
 The config file defines multiple extract regions, each with a name, output path, and bounding box or polygon. All regions are extracted in one pass over the input, which is much faster than running separate extracts.
@@ -111,7 +111,7 @@ The config file defines multiple extract regions, each with a name, output path,
 Use `-d` to override the output directory for all extracts:
 
 ```sh
-pbfhogg extract input.osm.pbf -c regions.json -d /data/extracts/
+pbfhogg extract input.osm.pbf --config regions.json -d /data/extracts/
 ```
 
 ## Tags-filter with and without -R

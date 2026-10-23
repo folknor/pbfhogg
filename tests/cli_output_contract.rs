@@ -473,7 +473,7 @@ fn cat(c: &Ctx, i: Input) -> Invocation {
     // `-c version` forces the re-encode path; plain `cat` passes blobs through.
     Invocation::new(&["cat"])
         .arg(c.fx.pbf(i))
-        .words(&["-c", "version"])
+        .words(&["--clean", "version"])
         .out("-o", pbf_out(c))
 }
 

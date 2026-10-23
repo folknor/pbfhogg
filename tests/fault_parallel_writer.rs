@@ -108,7 +108,7 @@ mod parallel_writer {
                     },
                     locations_on_ways: false,
                     ignore_missing_nodes: false,
-                    jobs: Some(2),
+                    parallelism: pbfhogg::Parallelism::from_jobs(2),
                     allow_version_regression: false,
                     #[cfg(feature = "test-hooks")]
                     panic_at_blob_seq: None,

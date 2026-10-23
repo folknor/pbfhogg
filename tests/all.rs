@@ -44,6 +44,8 @@ mod cli_export;
 #[cfg(feature = "commands")]
 mod cli_extract;
 #[cfg(feature = "commands")]
+mod cli_flag_contract;
+#[cfg(feature = "commands")]
 mod cli_input_contract;
 #[cfg(feature = "commands")]
 mod cli_output_contract;

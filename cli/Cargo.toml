@@ -16,11 +16,12 @@ categories = ["command-line-utilities", "science::geo"]
 # binary.
 autotests = false
 
-# No inline tests in cli/src, so no unit-test harness to link and start.
+# The unit tests in cli/src walk the clap command tree itself (the short-flag
+# vocabulary, the retired shorts), which only code inside the binary can
+# reach.
 [[bin]]
 name = "pbfhogg"
 path = "src/main.rs"
-test = false
 
 # Drives the binary through cargo's CARGO_BIN_EXE_pbfhogg, which only this
 # package's tests receive.

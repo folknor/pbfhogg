@@ -562,7 +562,7 @@ fn node_stats_parallel_classify_parity() {
         &input,
         false,
         true,
-        1,
+        pbfhogg::Parallelism::from_jobs(1),
         &crate::common::test_host(),
     )
     .expect("node_stats seq");
@@ -570,7 +570,7 @@ fn node_stats_parallel_classify_parity() {
         &input,
         false,
         true,
-        4,
+        pbfhogg::Parallelism::from_jobs(4),
         &crate::common::test_host(),
     )
     .expect("node_stats par");

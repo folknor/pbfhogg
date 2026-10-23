@@ -42,9 +42,9 @@ pub struct TagCountOptions<'a> {
     pub type_filter: Option<TypeFilter>,
     pub direct_io: bool,
     pub force: bool,
-    /// Parallel worker count. `0` picks from `available_parallelism()`;
-    /// higher values override that.
-    pub jobs: usize,
+    /// Size of the classify worker pool. `Auto` keeps the decode pool's own
+    /// host-derived sizing.
+    pub parallelism: crate::host::Parallelism,
 }
 
 /// Count tag key=value frequencies in a PBF file.
@@ -89,6 +89,17 @@ fn tags_count_inner(
     opts: &TagCountOptions<'_>,
     host: &crate::host::Host,
 ) -> Result<Vec<TagCount>> {
+    // Deliberately reuse tags-filter's expression grammar, including its
+    // n/w/r type prefixes. osmium tags-count treats these strings as tag
+    // matchers only, so `w/highway` has different meaning between the tools.
+    // Parsed before the input is probed, so a malformed expression is refused
+    // without touching the file.
+    let expressions = if opts.expressions.is_empty() {
+        None
+    } else {
+        Some(parse_expressions(opts.expressions)?)
+    };
+
     // Need indexdata either for the type-filter schedule or (when there
     // is no type filter) simply for the all-kinds schedule the parallel
     // path uses. `require_indexdata` gracefully accepts `force`.
@@ -100,15 +111,6 @@ fn tags_count_inner(
          is a no-op - all blobs are decompressed (significantly slower).",
         host,
     )?;
-
-    // Deliberately reuse tags-filter's expression grammar, including its
-    // n/w/r type prefixes. osmium tags-count treats these strings as tag
-    // matchers only, so `w/highway` has different meaning between the tools.
-    let expressions = if opts.expressions.is_empty() {
-        None
-    } else {
-        Some(parse_expressions(opts.expressions)?)
-    };
 
     let tf = TypeFilter::or_all(opts.type_filter);
     // Narrow the blob schedule only when the filter names exactly one
@@ -148,7 +150,7 @@ fn tags_count_inner(
             "{blobs_skipped_by_tag} blobs skipped by tag index"
         );
     }
-    let thread_override = (opts.jobs > 0).then_some(opts.jobs);
+    let thread_override = opts.parallelism.fixed();
     let mut counts: CountMap = FxHashMap::default();
 
     crate::scan::classify::parallel_classify_phase(

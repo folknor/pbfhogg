@@ -127,8 +127,16 @@ osmium tags-count -t way -s count-desc --min-count 100 input.pbf
 
 # pbfhogg
 pbfhogg inspect tags input.pbf highway
-pbfhogg inspect tags input.pbf -t way -s count-desc --min-count 100
+pbfhogg inspect tags input.pbf -t way --sort count-desc --min-count 100
 ```
+
+Each short flag has one meaning across all pbfhogg subcommands, so some of
+osmium's per-command shorts are long-only here and refuse naming the long
+flag: `tags-count -s` is `--sort`, `tags-filter -i` / `-t` are
+`--invert-match` / `--remove-tags`, `getid -t` is `--remove-tags`,
+`getparents -s` is `--add-self`, `renumber -s` is `--start-id`, `extract -c`
+is `--config`, `cat -c` is `--clean`, and `fileinfo -e` (`inspect`) is
+`--extended`.
 
 pbfhogg also accepts the tags-filter type-prefix syntax in these expressions.
 For example, `w/highway` counts the `highway` key on ways. Osmium's

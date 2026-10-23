@@ -420,6 +420,50 @@ pub(crate) fn sized_workers(
         .map(|n| n.get().saturating_sub(reserve).max(min))
         .unwrap_or(fallback)
 }
+
+/// How many worker threads a command may run its worker pools with.
+///
+/// The one shape every command with a `-j/--jobs` knob takes. `Auto` is not
+/// one rule: each command sizes itself as it always has (a reserve of cores
+/// for its scanner, drain or writer threads, a minimum, a fallback when the
+/// host cannot say how many cores it has), and that sizing lives with the
+/// command. `Fixed(1)` runs a command's sequential path where it has one;
+/// `Fixed(n)` caps its worker pools at `n` threads. For `diff`, `n` is also
+/// the number of ID-range shards.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Parallelism {
+    /// The command sizes its own pools from the host.
+    #[default]
+    Auto,
+    /// At most this many worker threads.
+    Fixed(NonZeroUsize),
+}
+
+impl Parallelism {
+    /// The CLI spelling: `0` is [`Parallelism::Auto`], any other count is
+    /// [`Parallelism::Fixed`].
+    #[must_use]
+    pub const fn from_jobs(jobs: usize) -> Self {
+        match NonZeroUsize::new(jobs) {
+            Some(n) => Self::Fixed(n),
+            None => Self::Auto,
+        }
+    }
+
+    /// The explicit cap, if one was asked for.
+    #[must_use]
+    pub const fn fixed(self) -> Option<usize> {
+        match self {
+            Self::Auto => None,
+            Self::Fixed(n) => Some(n.get()),
+        }
+    }
+
+    /// The cap, or `auto()` - the command's own sizing - when none was asked for.
+    pub(crate) fn resolve(self, auto: impl FnOnce() -> usize) -> usize {
+        self.fixed().unwrap_or_else(auto)
+    }
+}
 #[derive(Clone)]
 pub(crate) struct ResourcesHandle(pub(crate) Arc<dyn Resources>);
 impl std::fmt::Debug for ResourcesHandle {

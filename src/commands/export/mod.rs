@@ -47,11 +47,10 @@ impl ExportOptions {
         types: ExportTypes,
         expressions: &[String],
         properties: Option<Vec<String>>,
-        bbox: Option<&str>,
+        bbox: Option<Bbox>,
         metadata: bool,
     ) -> crate::Result<Self> {
         let expressions = parse_expressions(expressions)?;
-        let bbox = bbox.map(crate::commands::extract::parse_bbox).transpose()?;
         Ok(Self {
             format,
             types,

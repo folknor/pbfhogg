@@ -247,18 +247,18 @@ pub fn node_stats(
     path: &Path,
     direct_io: bool,
     force: bool,
-    jobs: usize,
+    parallelism: crate::host::Parallelism,
     host: &crate::host::Host,
 ) -> Result<NodeStatsReport> {
     host.cancel
-        .decided(|| node_stats_inner(path, direct_io, force, jobs, host))
+        .decided(|| node_stats_inner(path, direct_io, force, parallelism, host))
 }
 
 fn node_stats_inner(
     path: &Path,
     direct_io: bool,
     force: bool,
-    jobs: usize,
+    parallelism: crate::host::Parallelism,
     host: &crate::host::Host,
 ) -> Result<NodeStatsReport> {
     require_indexdata(
@@ -275,9 +275,8 @@ fn node_stats_inner(
     let (schedule, shared_file) =
         crate::scan::classify::build_classify_schedule(path, Some(crate::ElementKind::Node), host)?;
 
-    // `jobs == 0` means auto; `parallel_classify_accumulate` interprets
-    // `Some(0)` as auto too, so pass through unchanged.
-    let thread_override = (jobs > 0).then_some(jobs);
+    // `None` keeps the classify pool's own host-derived sizing.
+    let thread_override = parallelism.fixed();
     let mut global = WorkerAccum::new();
 
     crate::scan::classify::parallel_classify_accumulate(

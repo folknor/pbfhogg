@@ -57,7 +57,7 @@ mod diff_parallel {
             verbose: false,
             summary: false,
             type_filter: None,
-            jobs: 3,
+            parallelism: pbfhogg::Parallelism::from_jobs(3),
         };
         diff(
             &old,
@@ -82,7 +82,7 @@ mod diff_parallel {
                 verbose: false,
                 summary: false,
                 type_filter: None,
-                jobs: 3,
+                parallelism: pbfhogg::Parallelism::from_jobs(3),
             };
             diff(
                 &old,

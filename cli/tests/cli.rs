@@ -361,7 +361,7 @@ fn cli_renumber_custom_start_id() {
     let result = Command::new(pbfhogg_bin())
         .args([
             "renumber",
-            "-s",
+            "--start-id",
             "1000,5000,9000",
             input.to_str().expect("path"),
             "-o",
@@ -413,8 +413,8 @@ fn cli_renumber_custom_start_id() {
 // Feature-gated flag tests
 // ---------------------------------------------------------------------------
 
-/// When built without `linux-direct-io`, `--direct-io` should be accepted by
-/// the CLI parser but the command should fail with a clear feature error.
+/// When built without `linux-direct-io`, `--direct-io` is refused while the
+/// arguments are parsed, with a clear feature error.
 #[cfg(not(feature = "linux-direct-io"))]
 #[test]
 fn cli_direct_io_rejected_without_feature() {

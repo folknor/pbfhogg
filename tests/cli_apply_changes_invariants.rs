@@ -54,13 +54,17 @@ fn run_apply_changes(
         .arg(osc)
         .arg("-o")
         .arg(output);
-    if locations_on_ways {
-        cli = cli.arg("--locations-on-ways");
-    }
+    // `--locations-on-ways` needs an indexed base whatever `--force` says,
+    // so it refuses the flag.
+    cli = if locations_on_ways {
+        cli.arg("--locations-on-ways")
+    } else {
+        cli.arg("--force")
+    };
     if let Some(j) = jobs {
         cli = cli.arg("-j").arg(j.to_string());
     }
-    cli.arg("--force").assert_success()
+    cli.assert_success()
 }
 
 fn run_apply_simple(base: &Path, osc: &Path, output: &Path) -> CliOutput {

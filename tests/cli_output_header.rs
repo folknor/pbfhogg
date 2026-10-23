@@ -377,7 +377,7 @@ const ROWS: &[Row] = &[
     Row {
         command: "cat",
         label: "cat -c version",
-        build: |fx, f| simple(fx, "cat", &[fx.path(f)], &["-c", "version"]),
+        build: |fx, f| simple(fx, "cat", &[fx.path(f)], &["--clean", "version"]),
         expect: |f| Outcome::Writes(Exp::reencoded(f)),
     },
     Row {
@@ -558,7 +558,14 @@ const ROWS: &[Row] = &[
     Row {
         command: "extract",
         label: "extract --simple",
-        build: |fx, f| simple(fx, "extract", &[fx.path(f)], &["-s", "-b", &region_arg()]),
+        build: |fx, f| {
+            simple(
+                fx,
+                "extract",
+                &[fx.path(f)],
+                &["--simple", "-b", &region_arg()],
+            )
+        },
         expect: |f| Outcome::Writes(Exp::reencoded(f)),
     },
     Row {
@@ -588,7 +595,7 @@ const ROWS: &[Row] = &[
                 fx,
                 "extract",
                 &[fx.path(f)],
-                &["-s", "--set-bounds", "-b", &region_arg()],
+                &["--simple", "--set-bounds", "-b", &region_arg()],
             )
         },
         expect: |f| {
@@ -1220,7 +1227,7 @@ fn an_extract_of_unsorted_input_does_not_declare_sorted() {
     let fx = Fx::new(&[Fixture::Unsorted]);
     let region = region_arg();
     let mut runs: Vec<Invocation> = [
-        &["-s", "-b", region.as_str()][..],
+        &["--simple", "-b", region.as_str()][..],
         &["-b", region.as_str()][..],
         &["--smart", "-b", region.as_str()][..],
     ]

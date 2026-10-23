@@ -1696,7 +1696,6 @@ fn diff_rejects_explicit_jobs_with_verbose() {
         .arg(&old)
         .arg(&new)
         .arg("-v")
-        .arg("-q")
         .run();
     assert!(
         out.status.success(),

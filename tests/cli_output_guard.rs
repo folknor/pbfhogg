@@ -186,7 +186,7 @@ fn framing_error_names_the_input_file() {
             "cat",
             good.to_str().unwrap(),
             bad.to_str().unwrap(),
-            "-c",
+            "--clean",
             "version",
             "--force",
             "-o",
@@ -228,7 +228,7 @@ fn cat_failure_leaves_preexisting_destination_intact() {
             "cat",
             good.to_str().unwrap(),
             bad.to_str().unwrap(),
-            "-c",
+            "--clean",
             "version",
             "--force",
             "-o",
@@ -333,7 +333,7 @@ fn altw_publishes_through_the_guard() {
 }
 
 /// A usage error keeps clap's own exit code and its own message. The switch
-/// from `Cli::parse` to `Cli::try_parse` exists to drop the hotpath guard
+/// from `Cli::parse` to a fallible parse exists to drop the hotpath guard
 /// on the way out, and must be invisible otherwise - so this is a guard
 /// against the change, not a demonstration of it.
 #[test]

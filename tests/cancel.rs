@@ -150,7 +150,7 @@ fn merge_changes(
         &[&osc, &osc],
         crate::common::out(out.join("merged.osc.gz")),
         false,
-        Some(2),
+        pbfhogg::Parallelism::from_jobs(2),
         false,
         host,
     )
@@ -173,7 +173,7 @@ fn diff_parallel(
             verbose: false,
             summary: false,
             type_filter: None,
-            jobs: 2,
+            parallelism: pbfhogg::Parallelism::from_jobs(2),
         },
         false,
         host,
@@ -195,7 +195,7 @@ fn derive_changes(
         false,
         false,
         None,
-        2,
+        pbfhogg::Parallelism::from_jobs(2),
         host,
         pbfhogg::scratch::RunScratch::create(scratch, host)?,
     )

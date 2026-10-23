@@ -921,17 +921,15 @@ fn degrade_rejects_contradictory_corruption_combinations() {
         inv.assert_failure().assert_stderr_contains(expect);
     };
 
-    reject(
-        &["--corrupt-indexdata", "--unsort"],
-        "cannot be combined with a transformation that re-encodes blobs",
-    );
+    // clap's own conflict refusal, before the input is opened.
+    reject(&["--corrupt-indexdata", "--unsort"], "cannot be used with");
     reject(
         &["--corrupt-tagdata", "--strip-locations"],
-        "cannot be combined with a transformation that re-encodes blobs",
+        "cannot be used with",
     );
     reject(
         &["--corrupt-indexdata-kind", "--unsort"],
-        "cannot be combined with a transformation that re-encodes blobs",
+        "cannot be used with",
     );
 
     // Passing counterpart: each corruption flag on its own is accepted, so the
@@ -1931,7 +1929,8 @@ fn degrade_requires_at_least_one_flag() {
         .arg("-o")
         .arg(&output)
         .assert_failure();
-    cli_output.assert_stderr_contains("at least one transformation flag");
+    // A clap usage error naming the required group of transformation flags.
+    cli_output.assert_stderr_contains("required arguments were not provided");
     assert_transformation_flags(&cli_output.stderr_str());
 }
 

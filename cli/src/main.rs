@@ -103,6 +103,14 @@ fn accept_outcome(
     Ok(())
 }
 
+/// Print a clap error (a usage error, or `--help` / `--version`) to the
+/// stream clap would use and return clap's own exit code for it.
+fn clap_exit(err: &clap::Error) -> process::ExitCode {
+    let code = err.exit_code();
+    drop(err.print());
+    process::ExitCode::from(u8::try_from(code).unwrap_or(ExitStatus::Failed.code()))
+}
+
 #[derive(Parser)]
 #[command(name = "pbfhogg", about = "OpenStreetMap PBF toolkit", version)]
 struct Cli {
@@ -162,10 +170,458 @@ impl OverwriteArg {
     }
 }
 
-/// Every free-form flag is parsed exactly once, here at the argument
-/// boundary, into the typed value the library consumes. Nothing
-/// downstream re-parses a user string: `run_*` takes `Compression`,
-/// `TypeFilter`, `IndexType` and friends, not `&str`.
+/// `-O` for a command whose output is optional (stdout otherwise): without
+/// `-o` there is no output to replace, so `-O` alone is refused.
+#[derive(Args)]
+struct OverwriteOutputArg {
+    /// Replace an output that already exists. Without it an existing output
+    /// is refused before any work is done. A symlink is refused either way.
+    /// Requires -o: stdout is never replaced.
+    #[arg(short = 'O', long, requires = "output")]
+    overwrite: bool,
+}
+
+impl OverwriteOutputArg {
+    const fn intent(&self) -> pbfhogg::Overwrite {
+        pbfhogg::Overwrite::from_flag(self.overwrite)
+    }
+}
+
+/// A command-line refusal found after clap parsed the arguments: a rule
+/// clap cannot express (one that depends on a flag's value, or on the input
+/// kind sniffed from the file), rendered by clap so it reads like clap's own
+/// errors and exits with clap's usage status.
+#[derive(Debug)]
+struct UsageError(clap::Error);
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.render())
+    }
+}
+
+impl std::error::Error for UsageError {}
+
+/// A [`UsageError`] for the subcommand at `path` (`["inspect", "tags"]`).
+fn usage(path: &[&str], message: impl std::fmt::Display) -> Box<dyn std::error::Error> {
+    // Built first, so the subcommand's usage line carries its full name
+    // (`pbfhogg inspect tags`).
+    let mut cmd = cli_command();
+    cmd.build();
+    for name in path {
+        let Some(sub) = cmd.find_subcommand(name).cloned() else {
+            break;
+        };
+        cmd = sub;
+    }
+    Box::new(UsageError(
+        cmd.error(clap::error::ErrorKind::ArgumentConflict, message),
+    ))
+}
+
+/// A short flag a command used to have with a meaning that is not the
+/// short's meaning in the one vocabulary every subcommand shares
+/// (`reference/cli-reference.md`, "Short flags"). The letter stays reserved
+/// on that command as a hidden argument whose only job is to refuse, naming
+/// the long flag to spell instead, so an old command line never silently
+/// means something else.
+struct RetiredShort {
+    /// Subcommand path, e.g. `["inspect", "tags"]`.
+    path: &'static [&'static str],
+    id: &'static str,
+    short: char,
+    /// The long flag the short used to stand for on this command.
+    now: &'static str,
+}
+
+const RETIRED_SHORTS: &[RetiredShort] = &[
+    RetiredShort {
+        path: &["cat"],
+        id: "retired-short-c",
+        short: 'c',
+        now: "--clean",
+    },
+    RetiredShort {
+        path: &["extract"],
+        id: "retired-short-c",
+        short: 'c',
+        now: "--config",
+    },
+    RetiredShort {
+        path: &["extract"],
+        id: "retired-short-s",
+        short: 's',
+        now: "--simple",
+    },
+    RetiredShort {
+        path: &["renumber"],
+        id: "retired-short-s",
+        short: 's',
+        now: "--start-id",
+    },
+    RetiredShort {
+        path: &["getparents"],
+        id: "retired-short-s",
+        short: 's',
+        now: "--add-self",
+    },
+    RetiredShort {
+        path: &["inspect", "tags"],
+        id: "retired-short-s",
+        short: 's',
+        now: "--sort",
+    },
+    RetiredShort {
+        path: &["inspect"],
+        id: "retired-short-e",
+        short: 'e',
+        now: "--extended",
+    },
+    RetiredShort {
+        path: &["tags-filter"],
+        id: "retired-short-t",
+        short: 't',
+        now: "--remove-tags",
+    },
+    RetiredShort {
+        path: &["getid"],
+        id: "retired-short-t",
+        short: 't',
+        now: "--remove-tags",
+    },
+    RetiredShort {
+        path: &["tags-filter"],
+        id: "retired-short-i",
+        short: 'i',
+        now: "--invert-match",
+    },
+];
+
+/// The value parser of a retired short: it refuses whatever it is given.
+#[derive(Clone)]
+struct RetiredShortParser {
+    short: char,
+    now: &'static str,
+}
+
+impl clap::builder::TypedValueParser for RetiredShortParser {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        _value: &std::ffi::OsStr,
+    ) -> Result<String, clap::Error> {
+        Err(cmd.clone().error(
+            clap::error::ErrorKind::UnknownArgument,
+            format!(
+                "-{} no longer stands for {} on this command (every short flag now has \
+                 one meaning across all subcommands); spell it {}",
+                self.short, self.now, self.now
+            ),
+        ))
+    }
+}
+
+impl RetiredShort {
+    fn arg(&self) -> clap::Arg {
+        // `Set` with an optional value: the parser runs whether the letter is
+        // given bare (`-s`) or with the value it used to take (`-s 5`), and
+        // never when the letter is absent (no default value is parsed).
+        clap::Arg::new(self.id)
+            .short(self.short)
+            .hide(true)
+            .action(clap::ArgAction::Set)
+            .num_args(0..=1)
+            .default_missing_value("")
+            .value_parser(RetiredShortParser {
+                short: self.short,
+                now: self.now,
+            })
+    }
+}
+
+fn mut_subcommand_at(
+    cmd: clap::Command,
+    path: &[&str],
+    f: &dyn Fn(clap::Command) -> clap::Command,
+) -> clap::Command {
+    match path {
+        [] => f(cmd),
+        [name, rest @ ..] => cmd.mut_subcommand(*name, |sub| mut_subcommand_at(sub, rest, f)),
+    }
+}
+
+/// The command tree production parses: the derived one, plus the retired
+/// shorts.
+fn cli_command() -> clap::Command {
+    let mut cmd = <Cli as clap::CommandFactory>::command();
+    for retired in RETIRED_SHORTS {
+        cmd = mut_subcommand_at(cmd, retired.path, &|sub| sub.arg(retired.arg()));
+    }
+    cmd
+}
+
+/// tags-filter's input kind and its checked expressions, as validation
+/// resolved them.
+type TagsFilterPlan = (InputKind, Vec<String>);
+
+/// Whether `id` was given on the command line of subcommand `name`, as
+/// opposed to taking its default.
+fn given(matches: &clap::ArgMatches, name: &str, id: &str) -> bool {
+    matches
+        .subcommand_matches(name)
+        .and_then(|sub| sub.value_source(id))
+        == Some(clap::parser::ValueSource::CommandLine)
+}
+
+/// The flag rules clap cannot express, one function per command that has
+/// any. They run before any input is opened, except tags-filter's OSC-mode
+/// rules when the input kind is autodetected: those need the kind, which the
+/// four-byte sniff (the read that has always decided it) provides.
+///
+/// The rule behind every refusal: a flag the command line itself makes
+/// ineffective is refused. A fallback the host or the input selects at run
+/// time (an unindexed input taking a sequential path, a one-core host) is
+/// not grounds for refusal: the same command line would then be valid on one
+/// machine or file and invalid on another.
+///
+/// Returns tags-filter's resolved input kind and checked expressions (the
+/// expressions, and an `-e` file, are read before the kind sniff opens the
+/// input).
+fn validate_command(
+    command: &Command,
+    matches: &clap::ArgMatches,
+) -> Result<Option<TagsFilterPlan>, Box<dyn std::error::Error>> {
+    match command {
+        Command::TagsFilter { .. } => validate_tags_filter(command, matches).map(Some),
+        Command::Diff { .. } => validate_diff(command).map(|()| None),
+        Command::AddLocationsToWays {
+            index_type, force, ..
+        } => {
+            let index_type = index_type
+                .resolve()
+                .map_err(|e| usage(&["add-locations-to-ways"], e))?;
+            if *force && index_type == IndexType::External {
+                return Err(usage(
+                    &["add-locations-to-ways"],
+                    "--force has no effect with --index-type external, which requires indexed \
+                     input whatever --force says (its ID bucket ranges come from per-blob \
+                     indexdata)",
+                ));
+            }
+            Ok(None)
+        }
+        Command::Degrade {
+            unsort_intra,
+            block_cap,
+            ..
+        } if *unsort_intra && *block_cap < 2 => Err(usage(
+            &["degrade"],
+            "--unsort-intra needs --block-cap >= 2: an intra-blob inversion requires at least \
+             two same-kind elements inside one output block",
+        )),
+        Command::Check { .. } => validate_check(command).map(|()| None),
+        _ => Ok(None),
+    }
+}
+
+fn validate_tags_filter(
+    command: &Command,
+    matches: &clap::ArgMatches,
+) -> Result<(InputKind, Vec<String>), Box<dyn std::error::Error>> {
+    let Command::TagsFilter {
+        file,
+        expressions_file,
+        expressions,
+        input_kind,
+        omit_referenced,
+        invert_match,
+        remove_tags,
+        distrust,
+        io,
+        force,
+        header,
+        ..
+    } = command
+    else {
+        return Ok((InputKind::Pbf, Vec::new()));
+    };
+    // The expressions first: they need no input, and the sniff below opens it.
+    let expressions = filter_expressions(expressions_file.as_deref(), expressions)?;
+    let kind = input_kind.unwrap_or_else(|| detect_input_kind(file));
+    if matches!(kind, InputKind::Pbf) {
+        return Ok((kind, expressions));
+    }
+    let how = if input_kind.is_some() {
+        "selected by --input-kind osc"
+    } else {
+        "detected from the file; pass --input-kind pbf if it is a PBF"
+    };
+    // Each flag that only means something for a PBF: an OSC is XML, read by
+    // one parser thread, with no blobs, no indexdata and no PBF header.
+    let refused: [(bool, &str, &str); 9] = [
+        (
+            *omit_referenced,
+            "-R/--omit-referenced",
+            "OSC filtering keeps direct matches only",
+        ),
+        (
+            *invert_match,
+            "--invert-match",
+            "the OSC filter has no inverted mode",
+        ),
+        (
+            *remove_tags,
+            "--remove-tags",
+            "the OSC filter emits no referenced objects",
+        ),
+        (
+            distrust.distrust_metadata,
+            "--distrust-metadata",
+            "OSC input carries no blob metadata",
+        ),
+        (
+            given(matches, "tags-filter", "jobs"),
+            "-j/--jobs",
+            "the OSC parse is single-threaded",
+        ),
+        (
+            header.is_set(),
+            "--generator/--output-header",
+            "OSC output has no PBF header",
+        ),
+        (
+            given(matches, "tags-filter", "compression"),
+            "--compression",
+            "OSC output is not a PBF and is always gzipped",
+        ),
+        (
+            io.direct_io,
+            "--direct-io",
+            "the OSC path reads and writes through buffered I/O",
+        ),
+        (*force, "--force", "OSC input has no indexdata to require"),
+    ];
+    if let Some((_, flag, why)) = refused.iter().find(|(set, _, _)| *set) {
+        return Err(usage(
+            &["tags-filter"],
+            format!("{flag} is not valid in OSC mode ({how}): {why}"),
+        ));
+    }
+    Ok((kind, expressions))
+}
+
+fn validate_diff(command: &Command) -> Result<(), Box<dyn std::error::Error>> {
+    let Command::Diff {
+        suppress_common,
+        verbose,
+        osmium_summary,
+        quiet,
+        output,
+        type_filter,
+        jobs,
+        format,
+        increment_version,
+        update_timestamp,
+        tmp,
+        ..
+    } = command
+    else {
+        return Ok(());
+    };
+    let refuse = |message: &str| Err(usage(&["diff"], message));
+    match format {
+        DiffFormat::Osc => {
+            // Deliberately require output before rejecting text-only flags.
+            // Even -q without -o keeps this missing-output error first.
+            if output.is_none() {
+                return refuse("--output is required with --format osc");
+            }
+            for (set, flag) in [
+                (*suppress_common, "--suppress-common"),
+                (*verbose, "--verbose"),
+                (*osmium_summary, "--osmium-summary"),
+                (*quiet, "--quiet"),
+                (type_filter.is_some(), "--type"),
+            ] {
+                if set {
+                    return refuse(&format!("{flag} is not valid with --format osc"));
+                }
+            }
+        }
+        DiffFormat::Text => {
+            for (set, flag) in [
+                (*increment_version, "--increment-version"),
+                (*update_timestamp, "--update-timestamp"),
+            ] {
+                if set {
+                    return refuse(&format!("{flag} is only valid with --format osc"));
+                }
+            }
+            // `-j 1` selects the sequential text path, which writes no
+            // scratch. (`--format osc` keeps its scratch on the sequential
+            // path too, so it keeps --tmp-dir.)
+            if tmp.tmp_dir.is_some() && jobs.fixed() == Some(1) {
+                return refuse(
+                    "--tmp-dir has no effect with -j 1: the sequential text diff writes no \
+                     scratch files",
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_check(command: &Command) -> Result<(), Box<dyn std::error::Error>> {
+    let Command::Check {
+        ids,
+        refs,
+        index,
+        check_relations,
+        show_ids,
+        full,
+        type_filter,
+        ..
+    } = command
+    else {
+        return Ok(());
+    };
+    // With no selector the --ids + --refs pair runs; --index alone runs only
+    // the metadata verification.
+    let any_selector = *ids || *refs || *index;
+    let run_ids = *ids || !any_selector;
+    let run_refs = *refs || !any_selector;
+    let refuse = |message: &str| Err(usage(&["check"], message));
+    if !run_ids {
+        if *full {
+            return refuse("--full requires --ids (or omit --refs to run both checks)");
+        }
+        if type_filter.is_some() {
+            return refuse("--type requires --ids (or omit --refs to run both checks)");
+        }
+    }
+    if !run_refs {
+        if *check_relations {
+            return refuse("--check-relations requires --refs (or omit --ids to run both checks)");
+        }
+        if *show_ids {
+            return refuse("--show-ids requires --refs (or omit --ids to run both checks)");
+        }
+    }
+    Ok(())
+}
+
+/// Every free-form flag is parsed here at the argument boundary, by its
+/// `value_parser`, into the typed value the library consumes, so a malformed
+/// value is refused before any input is opened. Nothing downstream re-parses
+/// a flag string: `run_*` takes `Compression`, `TypeFilter`, `Bbox`,
+/// `StartIds` and friends, not `&str`. The exceptions are values that only
+/// mean something together with another flag (positional IDs depend on
+/// `--default-type`) or that live in a file the flag names (expression
+/// files, `--polygon`, `--config`): those are checked by the command's
+/// validation step, still before the command's main input is opened.
 fn parse_type_filter(value: &str) -> Result<TypeFilter, String> {
     value.parse::<TypeFilter>().map_err(|e| e.to_string())
 }
@@ -184,6 +640,154 @@ fn parse_compression(value: &str) -> Result<Compression, String> {
     value.parse::<Compression>().map_err(|e| e.to_string())
 }
 
+fn parse_bbox(value: &str) -> Result<pbfhogg::extract::Bbox, String> {
+    pbfhogg::extract::parse_bbox(value).map_err(|e| e.to_string())
+}
+
+fn parse_block_cap(value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(0) => Err("must be > 0".to_owned()),
+        Ok(cap) => Ok(cap),
+        Err(_) => Err(format!("'{value}' is not an element count")),
+    }
+}
+
+fn parse_drop_ids(value: &str) -> Result<pbfhogg::degrade::DropSpec, String> {
+    pbfhogg::degrade::DropSpec::parse(value).map_err(|e| e.to_string())
+}
+
+fn parse_output_header(value: &str) -> Result<pbfhogg::OutputHeaderEntry, String> {
+    value
+        .parse::<pbfhogg::OutputHeaderEntry>()
+        .map_err(|e| e.to_string())
+}
+
+/// `time-filter`'s cutoff: UNIX seconds or an RFC 3339 UTC timestamp.
+fn parse_timestamp(input: &str) -> Result<i64, String> {
+    if let Ok(value) = input.parse::<i64>() {
+        return Ok(value);
+    }
+    pbfhogg::commands::parse_rfc3339_utc(input).map_err(|e| format!("{e} (or UNIX seconds)"))
+}
+
+/// `renumber --start-id`: one value for all three kinds, or
+/// `node,way,relation`.
+#[derive(Clone, Copy, Debug)]
+struct StartIds {
+    node: i64,
+    way: i64,
+    relation: i64,
+}
+
+fn parse_start_ids(value: &str) -> Result<StartIds, String> {
+    let parse = |part: &str, what: &str| -> Result<i64, String> {
+        part.trim()
+            .parse()
+            .map_err(|_| format!("invalid {what}start ID: {part}"))
+    };
+    let parts: Vec<&str> = value.split(',').collect();
+    match parts[..] {
+        [one] => {
+            let id = parse(one, "")?;
+            Ok(StartIds {
+                node: id,
+                way: id,
+                relation: id,
+            })
+        }
+        [node, way, relation] => Ok(StartIds {
+            node: parse(node, "node ")?,
+            way: parse(way, "way ")?,
+            relation: parse(relation, "relation ")?,
+        }),
+        _ => {
+            Err("must be a single value or 3 comma-separated values (node,way,relation)".to_owned())
+        }
+    }
+}
+
+/// The one help text of `-j/--jobs`, on every command that has it.
+const JOBS_HELP: &str = "Worker threads: 0 (default) sizes the worker pools automatically, \
+     1 runs sequentially, N caps the worker pools at N threads. For diff, N is also the number \
+     of ID-range shards; apply-changes refuses 1";
+
+/// `-j/--jobs`: `0` is auto, any other count a cap.
+fn parse_jobs(value: &str) -> Result<pbfhogg::Parallelism, String> {
+    value
+        .parse::<usize>()
+        .map(pbfhogg::Parallelism::from_jobs)
+        .map_err(|_| format!("'{value}' is not a worker count (0 for automatic, or N >= 1)"))
+}
+
+/// apply-changes' `-j`: as [`parse_jobs`], refusing `1`. A single worker has
+/// not been validated through the node-to-way barrier and its failure
+/// shutdown, so it stays refused until that barrier is reworked.
+fn parse_apply_changes_jobs(value: &str) -> Result<pbfhogg::Parallelism, String> {
+    let parallelism = parse_jobs(value)?;
+    if parallelism.fixed() == Some(1) {
+        return Err(
+            "apply-changes needs at least 2 workers (-j 2 or more, or 0 for automatic): \
+             a single worker has not been validated"
+                .to_owned(),
+        );
+    }
+    Ok(parallelism)
+}
+
+/// The one help text of `--force`, on every command that has it.
+const FORCE_HELP: &str = "Proceed on input without blob-level indexdata, which this command \
+     would otherwise refuse, through its slower fallback path";
+
+/// A switch that asks for a platform feature this build may lack. Refused
+/// while the arguments are parsed, as a usage error, rather than when a
+/// reader or writer is first opened - which on some commands comes minutes
+/// into the run.
+#[derive(Clone)]
+struct CompiledSwitch {
+    backend: OutputBackend,
+    flag: &'static str,
+    feature: &'static str,
+}
+
+impl clap::builder::TypedValueParser for CompiledSwitch {
+    type Value = bool;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<bool, clap::Error> {
+        let on = value == "true";
+        if on && !self.backend.is_compiled() {
+            return Err(cmd.clone().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!(
+                    "{} requires the {} feature, which this build was compiled without",
+                    self.flag, self.feature
+                ),
+            ));
+        }
+        Ok(on)
+    }
+}
+
+const fn direct_io_switch() -> CompiledSwitch {
+    CompiledSwitch {
+        backend: OutputBackend::Direct,
+        flag: "--direct-io",
+        feature: "linux-direct-io",
+    }
+}
+
+const fn io_uring_switch() -> CompiledSwitch {
+    CompiledSwitch {
+        backend: OutputBackend::Uring,
+        flag: "--io-uring",
+        feature: "linux-io-uring",
+    }
+}
+
 #[derive(Args)]
 struct CompressionArg {
     /// Compression: none, zlib (default), zstd. Append :LEVEL for custom (e.g. zlib:9, zstd:19)
@@ -194,7 +798,7 @@ struct CompressionArg {
 #[derive(Args)]
 struct DirectIoArg {
     /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
-    #[arg(long)]
+    #[arg(long, value_parser = direct_io_switch())]
     direct_io: bool,
 }
 
@@ -208,15 +812,14 @@ struct DistrustMetadataArg {
 
 #[derive(Args)]
 struct ForceArg {
-    /// Proceed even if input lacks indexdata (slower fallback path)
-    #[arg(long)]
+    #[arg(long, help = FORCE_HELP)]
     force: bool,
 }
 
 #[derive(Args)]
 struct UringArg {
     /// Use io_uring for output I/O (requires linux-io-uring feature)
-    #[arg(long)]
+    #[arg(long, value_parser = io_uring_switch())]
     io_uring: bool,
 }
 
@@ -229,9 +832,20 @@ struct HeaderOverrideArg {
         long = "output-header",
         value_name = "KEY=VALUE",
         help = "Set output header fields.",
-        long_help = pbfhogg::HeaderOverrides::output_header_help()
+        long_help = pbfhogg::HeaderOverrides::output_header_help(),
+        value_parser = parse_output_header
     )]
-    output_headers: Vec<String>,
+    output_headers: Vec<pbfhogg::OutputHeaderEntry>,
+}
+
+impl HeaderOverrideArg {
+    fn overrides(self) -> HeaderOverrides {
+        HeaderOverrides::from_entries(self.generator, self.output_headers)
+    }
+
+    fn is_set(&self) -> bool {
+        self.generator.is_some() || !self.output_headers.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -385,6 +999,11 @@ enum BenchIoMode {
 #[derive(Subcommand)]
 enum Command {
     /// Concatenate PBF files with optional type filtering
+    #[command(group(
+        clap::ArgGroup::new("cat_indexed_paths")
+            .args(["type_filter", "clean", "dedupe"])
+            .multiple(true)
+    ))]
     Cat {
         /// Input PBF files
         #[arg(required = true)]
@@ -392,11 +1011,16 @@ enum Command {
         #[command(flatten)]
         output: OutputArg,
         /// Strip metadata attribute (version, timestamp, changeset, uid, user).
-        /// Can be specified multiple times, e.g. -c changeset -c uid -c user
-        #[arg(short = 'c', long = "clean", value_name = "ATTR")]
+        /// Can be specified multiple times, e.g. --clean changeset --clean uid
+        #[arg(long = "clean", value_name = "ATTR", conflicts_with = "dedupe")]
         clean: Vec<CleanAttrArg>,
         /// Filter by element type (comma-separated: node, way, relation)
-        #[arg(short = 't', long = "type", value_parser = parse_type_filter)]
+        #[arg(
+            short = 't',
+            long = "type",
+            value_parser = parse_type_filter,
+            conflicts_with = "dedupe"
+        )]
         type_filter: Option<TypeFilter>,
         /// Sorted k-way merge with dedup by (type, id). Requires sorted inputs.
         #[arg(long)]
@@ -405,10 +1029,16 @@ enum Command {
         compression: CompressionArg,
         #[command(flatten)]
         io: DirectIoArg,
-        #[command(flatten)]
-        uring: UringArg,
-        #[command(flatten)]
-        force: ForceArg,
+        /// Use io_uring for output I/O (requires linux-io-uring feature).
+        /// Only with --dedupe: plain cat has no io_uring writer
+        #[arg(long, value_parser = io_uring_switch(), requires = "dedupe")]
+        io_uring: bool,
+        /// Proceed on input without blob-level indexdata, which --type,
+        /// --clean and --dedupe would otherwise refuse, through the slower
+        /// fallback path. Plain cat adds the indexdata and never refuses, so
+        /// --force needs one of those three
+        #[arg(long, requires = "cat_indexed_paths")]
+        force: bool,
         #[command(flatten)]
         header: HeaderOverrideArg,
     },
@@ -473,6 +1103,21 @@ enum Command {
     /// more than the block cap elements. `--unsort-intra` swaps the first
     /// two elements of each kind inside a block. Smaller kinds pass through.
     /// Used to produce inputs for benchmarking non-optimal code paths.
+    #[command(group(
+        clap::ArgGroup::new("degrade_transform")
+            .args([
+                "unsort", "unsort_intra", "strip_locations", "strip_indexdata",
+                "strip_tagdata", "corrupt_tagdata", "corrupt_indexdata",
+                "corrupt_indexdata_kind", "strip_bbox", "drop_ids",
+            ])
+            .multiple(true)
+            .required(true)
+    ))]
+    #[command(group(
+        clap::ArgGroup::new("degrade_decode")
+            .args(["unsort", "unsort_intra", "strip_locations", "drop_ids"])
+            .multiple(true)
+    ))]
     Degrade {
         /// Input PBF file
         file: PathBuf,
@@ -507,21 +1152,30 @@ enum Command {
         /// cannot produce, since a missing index is decoded rather than
         /// trusted. Header-only, so it cannot be combined with a
         /// blob-re-encoding flag.
-        #[arg(long = "corrupt-tagdata", conflicts_with = "strip_tagdata")]
+        #[arg(
+            long = "corrupt-tagdata",
+            conflicts_with_all = ["strip_tagdata", "degrade_decode"]
+        )]
         corrupt_tagdata: bool,
         /// Replace `BlobHeader.indexdata` on every OsmData blob with a
         /// well-formed index that overstates the blob: same element kind,
         /// inflated count, widened max ID. Produces the file `inspect`
         /// reports from without decoding anything, which is what
         /// `inspect --distrust-metadata` exists to see through.
-        #[arg(long = "corrupt-indexdata", conflicts_with = "strip_indexdata")]
+        #[arg(
+            long = "corrupt-indexdata",
+            conflicts_with_all = ["strip_indexdata", "degrade_decode"]
+        )]
         corrupt_indexdata: bool,
         /// Rotate the element *kind* in every OsmData blob's
         /// `BlobHeader.indexdata` - node to way to relation to node - leaving
         /// count and ID range honest. The kind is what per-kind blob
         /// schedules select on, so this is the corruption that makes a
         /// consumer skip a blob entirely rather than misreport it. Header-only.
-        #[arg(long = "corrupt-indexdata-kind", conflicts_with = "strip_indexdata")]
+        #[arg(
+            long = "corrupt-indexdata-kind",
+            conflicts_with_all = ["strip_indexdata", "degrade_decode"]
+        )]
         corrupt_indexdata_kind: bool,
         /// Clear the `HeaderBlock.bbox` from the OSMHeader so the output
         /// declares no file-level bounding box. Header-only change; every
@@ -530,21 +1184,24 @@ enum Command {
         strip_bbox: bool,
         /// Drop exactly N elements chosen deterministically from their kind,
         /// ID, and SEED. Format: N:SEED (for example 5000:42).
-        #[arg(long = "drop-ids", value_name = "N:SEED")]
-        drop_ids: Option<String>,
+        #[arg(long = "drop-ids", value_name = "N:SEED", value_parser = parse_drop_ids)]
+        drop_ids: Option<pbfhogg::degrade::DropSpec>,
         /// Per-block element cap on the decode path. Hidden; used by
         /// the test suite so `--unsort` can fire on small fixtures
         /// without large fixtures per element kind.
         #[arg(
             long = "block-cap",
             default_value_t = pbfhogg::block_builder::DEFAULT_ELEMENT_CAP,
+            value_parser = parse_block_cap,
             hide = true
         )]
         block_cap: usize,
-        /// Skip the indexdata precondition required by the decode path.
-        /// The per-kind classify pipeline will fall back to scanning every
-        /// blob for every kind, so runs are slower.
-        #[arg(long)]
+        /// Proceed on input without blob-level indexdata, which the decode
+        /// path (--unsort, --unsort-intra, --strip-locations, --drop-ids)
+        /// would otherwise refuse; it falls back to scanning every blob for
+        /// every kind. The header-only flags never refuse, so --force needs
+        /// a decode-path flag
+        #[arg(long, requires = "degrade_decode")]
         force: bool,
         #[command(flatten)]
         compression: CompressionArg,
@@ -565,8 +1222,8 @@ enum Command {
         #[command(flatten)]
         output: OutputArg,
         /// Starting ID(s): single value or comma-separated node,way,relation
-        #[arg(short = 's', long, default_value = "1")]
-        start_id: String,
+        #[arg(long, default_value = "1", value_parser = parse_start_ids)]
+        start_id: StartIds,
         #[command(flatten)]
         compression: CompressionArg,
         #[command(flatten)]
@@ -581,8 +1238,14 @@ enum Command {
     /// relations, and node refs of included ways.
     ///
     /// With `--input-kind osc`, filters an OSC change file instead, always
-    /// preserving deletes. PBF-only flags (`-R`, `-i`, `-t`) are not valid
-    /// in OSC mode.
+    /// preserving deletes. Flags that only mean something for a PBF are
+    /// refused in OSC mode.
+    #[command(group(
+        clap::ArgGroup::new("tags_filter_expressions")
+            .args(["expressions", "expressions_file"])
+            .multiple(true)
+            .required(true)
+    ))]
     TagsFilter {
         /// Input file (PBF or OSC)
         file: PathBuf,
@@ -594,13 +1257,13 @@ enum Command {
         #[arg(long = "input-kind")]
         input_kind: Option<InputKind>,
         /// Omit referenced objects (faster, single pass, direct matches only)
-        #[arg(short = 'R', long = "omit-referenced")]
+        #[arg(short = 'R', long = "omit-referenced", conflicts_with_all = ["remove_tags", "jobs"])]
         omit_referenced: bool,
         /// Invert match: exclude matching objects, keep non-matching
-        #[arg(short = 'i', long = "invert-match")]
+        #[arg(long = "invert-match")]
         invert_match: bool,
-        /// Remove tags from referenced objects not directly matched (use without -R)
-        #[arg(short = 't', long = "remove-tags")]
+        /// Remove tags from referenced objects not directly matched (not with -R)
+        #[arg(long = "remove-tags")]
         remove_tags: bool,
         /// Read filter expressions from file (one per line, # comments)
         #[arg(short = 'e', long = "expressions")]
@@ -611,15 +1274,22 @@ enum Command {
         compression: CompressionArg,
         #[command(flatten)]
         io: DirectIoArg,
-        #[command(flatten)]
-        force: ForceArg,
+        /// Proceed on input without blob-level indexdata, which this command
+        /// would otherwise refuse, through its slower fallback path. Not
+        /// with --invert-match or --distrust-metadata, which never refuse
+        #[arg(long, conflicts_with_all = ["invert_match", "distrust_metadata"])]
+        force: bool,
         #[command(flatten)]
         distrust: DistrustMetadataArg,
-        /// Worker-pool size for the parallel classify phases.
-        /// `0` (default) uses rayon's `available_parallelism()`.
-        /// Pass a specific N to measure scaling or constrain CPU use.
-        #[arg(short = 'j', long = "jobs", default_value_t = 0)]
-        jobs: usize,
+        #[arg(
+            short = 'j',
+            long = "jobs",
+            value_name = "N",
+            default_value = "0",
+            value_parser = parse_jobs,
+            help = JOBS_HELP
+        )]
+        jobs: pbfhogg::Parallelism,
         #[command(flatten)]
         header: HeaderOverrideArg,
     },
@@ -631,12 +1301,12 @@ enum Command {
         #[arg(short, long)]
         output: Option<PathBuf>,
         #[command(flatten)]
-        overwrite: OverwriteArg,
+        overwrite: OverwriteOutputArg,
         /// Output format: geojsonseq or geojson.
         #[arg(long = "format", default_value = "geojsonseq")]
         format: ExportFormatArg,
         /// Only export this element type.
-        #[arg(long = "type")]
+        #[arg(short = 't', long = "type")]
         type_filter: Option<ExportTypeArg>,
         /// Read filter expressions from file, one per line.
         #[arg(short = 'e', long = "expressions")]
@@ -647,8 +1317,8 @@ enum Command {
         #[arg(long = "properties", value_delimiter = ',')]
         properties: Option<Vec<String>>,
         /// Spatial filter min_lon,min_lat,max_lon,max_lat. Way overlap is vertex-only and lossy.
-        #[arg(long = "bbox")]
-        bbox: Option<String>,
+        #[arg(short = 'b', long = "bbox", value_parser = parse_bbox)]
+        bbox: Option<pbfhogg::extract::Bbox>,
         /// Include OSM metadata properties.
         #[arg(long = "metadata")]
         metadata: bool,
@@ -666,8 +1336,9 @@ enum Command {
         /// Hide unchanged elements (show only created/modified/deleted)
         #[arg(short = 'c', long = "suppress-common")]
         suppress_common: bool,
-        /// Show detailed changes for modified elements
-        #[arg(short = 'v', long)]
+        /// Show detailed changes for modified elements. Sequential-only, so not
+        /// with -j or --tmp-dir, which only the parallel path uses
+        #[arg(short = 'v', long, conflicts_with_all = ["jobs", "tmp_dir"])]
         verbose: bool,
         /// Print osmium-style summary (left/right/same/different
         /// counts) to stderr instead of the default pbfhogg-format
@@ -676,38 +1347,36 @@ enum Command {
         /// format, it does not control whether a summary is shown.
         #[arg(short = 's', long = "osmium-summary")]
         osmium_summary: bool,
-        /// Exit-code only, suppress diff output and summary
-        #[arg(short = 'q', long, conflicts_with = "output")]
+        /// Exit-code only, suppress diff output and summary. Not with the
+        /// flags that only shape that output (-o, -c, -v, -s)
+        #[arg(
+            short = 'q',
+            long,
+            conflicts_with_all = ["output", "suppress_common", "verbose", "osmium_summary"]
+        )]
         quiet: bool,
         /// Write diff output to file instead of stdout
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
         #[command(flatten)]
-        overwrite: OverwriteArg,
+        overwrite: OverwriteOutputArg,
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type", value_parser = parse_type_filter)]
         type_filter: Option<TypeFilter>,
-        /// Number of parallel shards for the block-pair merge. `0` (default)
-        /// auto-picks from available cores; `1` restores the sequential,
-        /// scratch-free path; higher values partition the ID space across
-        /// that many worker threads. Applies to both --format text and osc;
-        /// parallel sharding requires both inputs to be indexed, and
-        /// `-v/--verbose` always uses the sequential path (per-field detail
-        /// lines are sequential-only). The parallel path writes shard temp
-        /// files (planet scale: ~30 GB text, ~45 GB osc XML), removed on
-        /// completion - pass `-j 1` if temp disk is scarce.
-        ///
-        /// Rejected with `-v/--verbose`: per-field detail lines are
-        /// sequential-only, so an explicit `-j` there was accepted and
-        /// discarded. `tags-filter` already rejects the equivalent
-        /// `-R` + `-j`; the two now agree.
+        // Diff's N is a shard count as well as a thread cap: the parallel
+        // path partitions the ID space into N shards, writes their text to
+        // scratch and stitches it in order. Sharding needs both inputs
+        // indexed and no negative IDs; otherwise the run takes the
+        // sequential path with a note, whatever -j says.
         #[arg(
             short = 'j',
             long = "jobs",
+            value_name = "N",
             default_value = "0",
-            conflicts_with = "verbose"
+            value_parser = parse_jobs,
+            help = JOBS_HELP
         )]
-        jobs: usize,
+        jobs: pbfhogg::Parallelism,
         /// Output format: text (default) or osc
         #[arg(long, default_value = "text")]
         format: DiffFormat,
@@ -742,6 +1411,12 @@ enum Command {
     ///
     /// By default, keeps only the listed IDs. With `--invert`, removes the
     /// listed IDs and keeps everything else.
+    #[command(group(
+        clap::ArgGroup::new("getid_ids")
+            .args(["ids", "id_file", "id_osm_file"])
+            .multiple(true)
+            .required(true)
+    ))]
     Getid {
         /// Input PBF file
         file: PathBuf,
@@ -753,8 +1428,8 @@ enum Command {
         /// Include referenced nodes of matching ways (two-pass)
         #[arg(short = 'r', long = "add-referenced", conflicts_with = "invert")]
         add_referenced: bool,
-        /// Remove tags from referenced objects not explicitly requested (use with -r)
-        #[arg(short = 't', long = "remove-tags", conflicts_with = "invert")]
+        /// Remove tags from referenced objects not explicitly requested (requires -r)
+        #[arg(long = "remove-tags", requires = "add_referenced")]
         remove_tags: bool,
         /// Print requested IDs and report which were not found
         #[arg(long, conflicts_with = "invert")]
@@ -780,13 +1455,19 @@ enum Command {
         header: HeaderOverrideArg,
     },
     /// Find ways/relations referencing given IDs (reverse lookup)
+    #[command(group(
+        clap::ArgGroup::new("getparents_ids")
+            .args(["ids", "id_file", "id_osm_file"])
+            .multiple(true)
+            .required(true)
+    ))]
     Getparents {
         /// Input PBF file
         file: PathBuf,
         #[command(flatten)]
         output: OutputArg,
         /// Also include the queried objects themselves in the output
-        #[arg(short = 's', long = "add-self")]
+        #[arg(long = "add-self")]
         add_self: bool,
         /// Test instrument: override the ADR-0006 FullScan dispatch threshold.
         // Bounded at the CLI boundary rather than trusted raw into the
@@ -835,20 +1516,21 @@ enum Command {
             long,
             group = "area",
             required_unless_present_any = ["polygon", "config"],
-            conflicts_with = "config"
+            conflicts_with = "config",
+            value_parser = parse_bbox
         )]
-        bbox: Option<String>,
+        bbox: Option<pbfhogg::extract::Bbox>,
         /// Polygon GeoJSON file
         #[arg(short = 'p', long, group = "area", conflicts_with = "config")]
         polygon: Option<PathBuf>,
         /// Multi-extract JSON config file
-        #[arg(short = 'c', long, conflicts_with_all = ["bbox", "polygon", "output"])]
+        #[arg(long, conflicts_with_all = ["bbox", "polygon", "output"])]
         config: Option<PathBuf>,
         /// Rebase config outputs under this directory (only with --config)
         #[arg(short = 'd', long, requires = "config")]
         directory: Option<PathBuf>,
         /// Simple strategy (single pass, may have dangling refs)
-        #[arg(short = 's', long, conflicts_with = "smart")]
+        #[arg(long, conflicts_with = "smart")]
         simple: bool,
         /// Smart strategy (three passes, complete multipolygon/boundary relations)
         #[arg(long, conflicts_with = "simple")]
@@ -864,8 +1546,11 @@ enum Command {
         compression: CompressionArg,
         #[command(flatten)]
         io: DirectIoArg,
-        #[command(flatten)]
-        force: ForceArg,
+        /// Proceed on input without blob-level indexdata, which the
+        /// complete-ways and smart strategies would otherwise refuse, through
+        /// their slower fallback path. Not with --simple, which never refuses
+        #[arg(long, conflicts_with = "simple")]
+        force: bool,
         #[command(flatten)]
         header: HeaderOverrideArg,
     },
@@ -906,8 +1591,12 @@ enum Command {
         compression: CompressionArg,
         #[command(flatten)]
         io: DirectIoArg,
-        #[command(flatten)]
-        force: ForceArg,
+        /// Proceed on input without blob-level indexdata, which this command
+        /// would otherwise refuse, through its slower fallback path. Not with
+        /// --inject-prepass or --index-type external, which need indexdata
+        /// whatever --force says
+        #[arg(long, conflicts_with = "inject_prepass")]
+        force: bool,
         #[command(flatten)]
         header: HeaderOverrideArg,
         #[command(flatten)]
@@ -920,7 +1609,8 @@ enum Command {
         #[command(flatten)]
         output: OutputArg,
         /// Snapshot cutoff timestamp (UNIX seconds or RFC3339 UTC: YYYY-MM-DDTHH:MM:SSZ)
-        timestamp: String,
+        #[arg(value_parser = parse_timestamp)]
+        timestamp: i64,
         #[command(flatten)]
         compression: CompressionArg,
         #[command(flatten)]
@@ -943,11 +1633,18 @@ enum Command {
         /// Analyze node coordinate statistics for FOR compression sizing
         #[arg(long)]
         nodes: bool,
-        /// Parallel worker threads for `--nodes` (only). `1` forces sequential,
-        /// `0` auto-picks from `available_parallelism()`, higher values cap
-        /// the worker pool. Rejected outside `--nodes` rather than ignored.
-        #[arg(short = 'j', long = "jobs", default_value = "0", requires = "nodes")]
-        jobs: usize,
+        // Only the `--nodes` scan has a worker pool, so `-j` is refused
+        // outside `--nodes` rather than ignored.
+        #[arg(
+            short = 'j',
+            long = "jobs",
+            value_name = "N",
+            default_value = "0",
+            value_parser = parse_jobs,
+            requires = "nodes",
+            help = JOBS_HELP
+        )]
+        jobs: pbfhogg::Parallelism,
         /// Show per-block distribution stats and optional block listing
         #[arg(long, num_args = 0..=1, default_missing_value = "0")]
         blocks: Option<usize>,
@@ -963,7 +1660,7 @@ enum Command {
         )]
         anomalies: bool,
         /// Extended scan: timestamp range, data bbox, metadata coverage, ordering
-        #[arg(short, long)]
+        #[arg(long)]
         extended: bool,
         /// Show a single element by type/ID (e.g. "n123" or "node/123").
         ///
@@ -983,18 +1680,25 @@ enum Command {
         show: Option<ElementRef>,
         /// Get a single value by key path (e.g. "header.bbox", "data.timestamp.first").
         /// Data and metadata paths enable extended stats automatically.
-        #[arg(short, long, value_name = "KEY")]
+        /// Not with --blocks or --anomalies, which only shape the full report.
+        #[arg(
+            short,
+            long,
+            value_name = "KEY",
+            conflicts_with_all = ["blocks", "anomalies"]
+        )]
         get: Option<String>,
-        /// Machine-readable JSON output
-        #[arg(long)]
+        /// Machine-readable JSON output. Not with --nodes (node stats have no
+        /// JSON form) or --get
+        #[arg(long, conflicts_with_all = ["nodes", "get"])]
         json: bool,
         #[command(flatten)]
         io: DirectIoArg,
         #[command(flatten)]
         distrust: DistrustMetadataArg,
-        /// Proceed even if the input lacks indexdata (slower fallback path).
-        /// Only the `--nodes` scan has such a fallback, so the flag is
-        /// rejected outside `--nodes` rather than ignored.
+        /// Proceed on input without blob-level indexdata, which the --nodes
+        /// scan would otherwise refuse, through its slower fallback path.
+        /// Only --nodes refuses, so --force requires --nodes
         #[arg(long, requires = "nodes")]
         force: bool,
     },
@@ -1012,8 +1716,12 @@ enum Command {
         io: DirectIoArg,
         #[command(flatten)]
         uring: UringArg,
-        #[command(flatten)]
-        force: ForceArg,
+        /// Proceed on a base without blob-level indexdata, which this command
+        /// would otherwise refuse, through its slower fallback path. Not with
+        /// --locations-on-ways, which needs an indexed base whatever --force
+        /// says
+        #[arg(long, conflicts_with = "locations_on_ways")]
+        force: bool,
         /// Preserve way-node locations through the merge. Ways the OSC
         /// creates or modifies get locations from the merged nodes; base
         /// ways the OSC does not touch keep their existing locations, even
@@ -1032,14 +1740,18 @@ enum Command {
         /// change wins.
         #[arg(long)]
         allow_version_regression: bool,
-        /// Worker-pool size for the descriptor-first pipeline.
-        /// `0` (default) uses the `nproc - 2` heuristic (leaves two
-        /// cores for the scanner + drain threads, minimum 2). Pass a
-        /// specific N >= 2 to measure scaling or constrain CPU use; an
-        /// explicit `-j 1` is refused (single-worker operation is not a
-        /// validated configuration).
-        #[arg(short = 'j', long = "jobs", default_value_t = 0)]
-        jobs: usize,
+        // Auto keeps the `nproc - 2` heuristic (two cores left for the
+        // scanner and drain threads, minimum 2 workers). `-j 1` is refused:
+        // single-worker operation is not a validated configuration.
+        #[arg(
+            short = 'j',
+            long = "jobs",
+            value_name = "N",
+            default_value = "0",
+            value_parser = parse_apply_changes_jobs,
+            help = JOBS_HELP
+        )]
+        jobs: pbfhogg::Parallelism,
         #[command(flatten)]
         header: HeaderOverrideArg,
     },
@@ -1063,13 +1775,17 @@ enum Command {
         /// is kept in input order and no version is compared.
         #[arg(long, requires = "simplify")]
         allow_version_regression: bool,
-        /// Parallel worker threads. `1` forces sequential, `0` auto-picks
-        /// from `available_parallelism()`, higher values cap the worker
-        /// pool. Affects both the per-input parse fan-out (capped by
-        /// input count) and the simplify path's `write_simplified` chunk
-        /// fan-out.
-        #[arg(short = 'j', long = "jobs", default_value_t = 0)]
-        jobs: usize,
+        // Sizes both the per-input parse fan-out (capped by input count) and
+        // the simplify path's `write_simplified` chunk fan-out.
+        #[arg(
+            short = 'j',
+            long = "jobs",
+            value_name = "N",
+            default_value = "0",
+            value_parser = parse_jobs,
+            help = JOBS_HELP
+        )]
+        jobs: pbfhogg::Parallelism,
     },
     /// Validate PBF file integrity (IDs + referential integrity)
     Check {
@@ -1105,8 +1821,9 @@ enum Command {
         /// Machine-readable JSON output
         #[arg(long)]
         json: bool,
-        /// Exit-code only, no output
-        #[arg(long, conflicts_with = "json")]
+        /// Exit-code only, no output. Not with the flags that only shape that
+        /// output (--json, --show-ids, --max-errors)
+        #[arg(short = 'q', long, conflicts_with_all = ["json", "show_ids", "max_errors"])]
         quiet: bool,
         #[command(flatten)]
         io: DirectIoArg,
@@ -1150,7 +1867,7 @@ enum Command {
         /// Input PBF file
         file: PathBuf,
         /// Output directory for index files
-        #[arg(long)]
+        #[arg(short = 'o', long)]
         output_dir: PathBuf,
         /// S2 cell level for streets/addresses; must exceed --coarse-level
         /// and fit the builder limit
@@ -1201,7 +1918,8 @@ enum Command {
         /// Accept input without blob-level indexdata (slower fallback path).
         #[arg(long)]
         allow_unindexed: bool,
-        /// Legacy shorthand for both --overwrite and --allow-unindexed.
+        /// Legacy shorthand for both --overwrite and --allow-unindexed; it
+        /// warns that it also grants overwrite. Spell the two out instead.
         #[arg(long)]
         force: bool,
         #[command(flatten)]
@@ -1222,7 +1940,7 @@ enum InspectCommand {
         #[arg(short = 'M', long)]
         max_count: Option<u64>,
         /// Sort order: count-desc (default), count-asc, name-asc, name-desc
-        #[arg(short = 's', long, default_value = "count-desc")]
+        #[arg(long, default_value = "count-desc")]
         sort: TagSortArg,
         /// Read tag expressions from file (one per line, # comments)
         #[arg(short = 'e', long = "expressions")]
@@ -1232,11 +1950,15 @@ enum InspectCommand {
         /// Filter by element type: node, way, or relation
         #[arg(short = 't', long = "type", value_parser = parse_single_type)]
         type_filter: Option<TypeFilter>,
-        /// Parallel worker threads. `1` forces sequential, `0` auto-picks
-        /// from `available_parallelism()`, higher values cap the worker
-        /// pool.
-        #[arg(short = 'j', long = "jobs", default_value = "0")]
-        jobs: usize,
+        #[arg(
+            short = 'j',
+            long = "jobs",
+            value_name = "N",
+            default_value = "0",
+            value_parser = parse_jobs,
+            help = JOBS_HELP
+        )]
+        jobs: pbfhogg::Parallelism,
         #[command(flatten)]
         io: DirectIoArg,
         #[command(flatten)]
@@ -1251,15 +1973,6 @@ struct GetidFlags {
     add_referenced: bool,
     remove_tags: bool,
     verbose_ids: bool,
-}
-
-/// `tags-filter`'s three matching-mode booleans.
-#[derive(Clone, Copy)]
-struct TagsFilterFlags {
-    omit_referenced: bool,
-    invert_match: bool,
-    remove_tags: bool,
-    distrust_metadata: bool,
 }
 
 /// `check`'s selectors and reporting booleans.
@@ -1403,19 +2116,25 @@ fn main() -> process::ExitCode {
     // (stdout for help and version, stderr for a usage error) and
     // `Error::exit_code` is clap's own code for the case, so neither the
     // text nor the status a caller sees changes.
-    let cli = match Cli::try_parse() {
-        Ok(cli) => cli,
-        Err(err) => {
-            let code = err.exit_code();
-            drop(err.print());
-            return process::ExitCode::from(
-                u8::try_from(code).unwrap_or(ExitStatus::Failed.code()),
-            );
-        }
+    //
+    // The tree parsed is `cli_command()`, the derived one plus the retired
+    // short flags; the matches are kept so a validation step can ask whether
+    // a defaulted flag was given explicitly.
+    let parsed = cli_command().try_get_matches().and_then(|matches| {
+        <Cli as clap::FromArgMatches>::from_arg_matches(&matches).map(|cli| (cli, matches))
+    });
+    let (cli, matches) = match parsed {
+        Ok(parsed) => parsed,
+        Err(err) => return clap_exit(&err),
     };
 
     let mut outcome = Outcome::Positive;
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        // Every flag rule clap cannot express, before anything else looks at
+        // the filesystem. Only tags-filter's autodetected input kind needs a
+        // read (the four-byte sniff it always did), so its OSC-mode refusals
+        // ride that read.
+        let tags_filter_kind = validate_command(&cli.command, &matches)?;
         validate_input_output_aliases(&cli.command)?;
         let mut leftovers = LeftoverScanner::default();
         leftovers.command(&cli.command, &host);
@@ -1428,29 +2147,20 @@ fn main() -> process::ExitCode {
                 dedupe,
                 compression,
                 io,
-                uring,
+                io_uring,
                 force,
                 header,
             } => {
-                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let overrides = header.overrides();
                 let write = WriteOptions {
                     compression: compression.compression,
-                    backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
+                    backend: OutputBackend::from_flags(io.direct_io, io_uring),
                     direct_reads: io.direct_io,
-                    force: force.force,
+                    force,
                 };
                 if dedupe {
-                    if type_filter.is_some() {
-                        return Err("--type is not valid with --dedupe".into());
-                    }
-                    if !clean.is_empty() {
-                        return Err("--clean is not valid with --dedupe".into());
-                    }
                     run_merge_pbf(&files, output.open(&host)?, &write, &overrides, &host)
                 } else {
-                    if uring.io_uring {
-                        return Err("--io-uring is only valid with --dedupe".into());
-                    }
                     run_cat(
                         &files,
                         output.open(&host)?,
@@ -1471,7 +2181,7 @@ fn main() -> process::ExitCode {
                 force,
                 header,
             } => {
-                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let overrides = header.overrides();
                 let write = WriteOptions {
                     compression: compression.compression,
                     backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
@@ -1490,7 +2200,7 @@ fn main() -> process::ExitCode {
                 force,
                 header,
             } => {
-                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let overrides = header.overrides();
                 let write = WriteOptions {
                     compression: compression.compression,
                     backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
@@ -1526,7 +2236,7 @@ fn main() -> process::ExitCode {
                 uring,
                 header,
             } => {
-                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let overrides = header.overrides();
                 let write = WriteOptions {
                     compression: compression.compression,
                     backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
@@ -1546,10 +2256,7 @@ fn main() -> process::ExitCode {
                     corrupt_indexdata,
                     corrupt_indexdata_kind,
                     strip_bbox,
-                    drop_ids: drop_ids
-                        .as_deref()
-                        .map(pbfhogg::degrade::DropSpec::parse)
-                        .transpose()?,
+                    drop_ids,
                 };
                 run_degrade(
                     &file,
@@ -1569,7 +2276,7 @@ fn main() -> process::ExitCode {
                 io,
                 header,
             } => {
-                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let overrides = header.overrides();
                 let write = WriteOptions {
                     compression: compression.compression,
                     backend: OutputBackend::from_flags(io.direct_io, false),
@@ -1579,7 +2286,7 @@ fn main() -> process::ExitCode {
                 run_renumber(
                     &file,
                     output.open(&host)?,
-                    &start_id,
+                    start_id,
                     &write,
                     &overrides,
                     &host,
@@ -1588,12 +2295,12 @@ fn main() -> process::ExitCode {
             Command::TagsFilter {
                 file,
                 output,
-                input_kind,
+                input_kind: _,
                 omit_referenced,
                 invert_match,
                 remove_tags,
-                expressions_file,
-                expressions,
+                expressions_file: _,
+                expressions: _,
                 compression,
                 force,
                 distrust,
@@ -1601,68 +2308,40 @@ fn main() -> process::ExitCode {
                 jobs,
                 header,
             } => {
-                let kind = input_kind.unwrap_or_else(|| detect_input_kind(&file));
+                // `validate_command` read and checked the expressions before
+                // the input was opened: a malformed expression, or an
+                // expressions file with none in it, is refused first.
+                let (kind, expressions) = tags_filter_kind.unwrap_or((InputKind::Pbf, Vec::new()));
                 match kind {
-                InputKind::Osc => {
-                    if omit_referenced {
-                        return Err("-R/--omit-referenced is not valid in OSC mode".into());
+                    InputKind::Osc => {
+                        run_tags_filter_osc(&file, output.open(&host)?, &expressions, &host)
                     }
-                    if invert_match {
-                        return Err("-i/--invert-match is not valid in OSC mode".into());
+                    InputKind::Pbf => {
+                        let write = WriteOptions {
+                            compression: compression.compression,
+                            backend: OutputBackend::from_flags(io.direct_io, false),
+                            direct_reads: io.direct_io,
+                            force,
+                        };
+                        let opts = pbfhogg::tags_filter::TagsFilterOptions {
+                            expression_strs: &expressions,
+                            omit_referenced,
+                            invert: invert_match,
+                            remove_tags,
+                            write,
+                            parallelism: jobs,
+                            distrust_metadata: distrust.distrust_metadata,
+                        };
+                        opts.validate()?;
+                        run_tags_filter(
+                            &file,
+                            output.open(&host)?,
+                            &opts,
+                            &header.overrides(),
+                            &host,
+                        )
                     }
-                    if remove_tags {
-                        return Err("-t/--remove-tags is not valid in OSC mode".into());
-                    }
-                    // OSC is XML: there are no blobs and no sidecar metadata,
-                    // so nothing to distrust. Rejecting says that; accepting
-                    // would imply the OSC path had a trust boundary it does
-                    // not have.
-                    if distrust.distrust_metadata {
-                        return Err(
-                            "--distrust-metadata is not valid in OSC mode (OSC input carries no blob metadata)".into(),
-                        );
-                    }
-                    if jobs != 0 {
-                        return Err("-j/--jobs is not valid in OSC mode (OSC parse is single-threaded)".into());
-                    }
-                    // OSC output has no PBF header for these to land in.
-                    if header.generator.is_some() || !header.output_headers.is_empty() {
-                        return Err(
-                            "--generator and --output-header are not valid in OSC mode (OSC output has no PBF header)".into(),
-                        );
-                    }
-                    run_tags_filter_osc(&file, output.open(&host)?, expressions_file.as_deref(), &expressions, &host)
                 }
-                InputKind::Pbf if omit_referenced && jobs != 0 => {
-                    Err("-j/--jobs has no effect with -R/--omit-referenced (single-pass mode uses the pipelined reader, not the parallel classify path). Drop -R or drop -j.".into())
-                }
-                InputKind::Pbf => {
-                    let overrides =
-                        HeaderOverrides::parse(header.generator, &header.output_headers)?;
-                    let write = WriteOptions {
-                        compression: compression.compression,
-                        backend: OutputBackend::from_flags(io.direct_io, false),
-                        direct_reads: io.direct_io,
-                        force: force.force,
-                    };
-                    let flags = TagsFilterFlags {
-                        omit_referenced,
-                        invert_match,
-                        remove_tags,
-                        distrust_metadata: distrust.distrust_metadata,
-                    };
-                    run_tags_filter(
-                        &file,
-                        output.open(&host)?,
-                        expressions_file.as_deref(),
-                        &expressions,
-                        flags,
-                        &write,
-                        jobs,
-                        &overrides,
-                     &host)
-                }
-            }
             }
             Command::Export {
                 file,
@@ -1675,21 +2354,31 @@ fn main() -> process::ExitCode {
                 properties,
                 bbox,
                 metadata,
-            } => run_export(
-                &file,
-                output
-                    .as_deref()
-                    .map(|path| pbfhogg::Output::new(path, overwrite.intent(), &host.diagnostics))
-                    .transpose()?,
-                format,
-                type_filter,
-                expressions_file.as_deref(),
-                &expressions,
-                properties,
-                bbox.as_deref(),
-                metadata,
-                &host,
-            ),
+            } => {
+                // The options (expressions included) are built before the
+                // output is reserved, so a malformed expression is refused
+                // first.
+                let options = export_options(
+                    format,
+                    type_filter,
+                    expressions_file.as_deref(),
+                    &expressions,
+                    properties,
+                    bbox,
+                    metadata,
+                )?;
+                run_export(
+                    &file,
+                    output
+                        .as_deref()
+                        .map(|path| {
+                            pbfhogg::Output::new(path, overwrite.intent(), &host.diagnostics)
+                        })
+                        .transpose()?,
+                    &options,
+                    &host,
+                )
+            }
             Command::Diff {
                 old,
                 new,
@@ -1708,32 +2397,17 @@ fn main() -> process::ExitCode {
                 io,
             } => match format {
                 DiffFormat::Osc => {
-                    // Deliberately require output before rejecting text-only flags.
-                    // Even -q without -o must retain this historical missing-output
-                    // error; moving checks changes the user-facing error contract.
+                    // `validate_diff` refused a missing -o.
                     let output = output.ok_or("--output is required with --format osc")?;
-                    if suppress_common {
-                        return Err("--suppress-common is not valid with --format osc".into());
-                    }
-                    if verbose {
-                        return Err("--verbose is not valid with --format osc".into());
-                    }
-                    if osmium_summary {
-                        return Err("--osmium-summary is not valid with --format osc".into());
-                    }
-                    // Deliberately reject quiet OSC after the output requirement.
-                    // Allowing it changes the historical CLI error contract.
-                    if quiet {
-                        return Err("--quiet is not valid with --format osc".into());
-                    }
-                    if type_filter.is_some() {
-                        return Err("--type is not valid with --format osc".into());
-                    }
+                    // The output is checked before the scratch directory is
+                    // made, so a missing output directory reports the output.
+                    let output_handle =
+                        pbfhogg::Output::new(&output, overwrite.intent(), &host.diagnostics)?;
                     let scratch = run_scratch(&tmp, Some(&output), &host)?;
                     run_derive_changes(
                         &old,
                         &new,
-                        pbfhogg::Output::new(&output, overwrite.intent(), &host.diagnostics)?,
+                        output_handle,
                         io.direct_io,
                         increment_version,
                         update_timestamp,
@@ -1743,26 +2417,22 @@ fn main() -> process::ExitCode {
                     )
                 }
                 DiffFormat::Text => {
-                    if increment_version {
-                        return Err("--increment-version is only valid with --format osc".into());
-                    }
-                    if update_timestamp {
-                        return Err("--update-timestamp is only valid with --format osc".into());
-                    }
-                    // A quiet diff writes no output file, whatever -o says.
-                    let scratch = run_scratch(&tmp, output.as_deref().filter(|_| !quiet), &host)?;
                     let flags = DiffFlags {
                         suppress_common,
                         verbose,
                         osmium_summary,
                         quiet,
                     };
-                    let output = output
+                    let output_handle = output
                         .as_deref()
                         .map(|path| {
                             pbfhogg::Output::new(path, overwrite.intent(), &host.diagnostics)
                         })
                         .transpose()?;
+                    // A quiet diff writes no output file (clap refuses -o
+                    // with -q).
+                    let scratch = run_scratch(&tmp, output.as_deref(), &host)?;
+                    let output = output_handle;
                     accept_outcome(
                         &mut outcome,
                         run_diff(
@@ -1802,21 +2472,22 @@ fn main() -> process::ExitCode {
                 io,
                 header,
             } => {
-                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let overrides = header.overrides();
                 let write = WriteOptions {
                     compression: compression.compression,
                     backend: OutputBackend::from_flags(io.direct_io, false),
                     direct_reads: io.direct_io,
                     force: force.force,
                 };
+                // Positional IDs are parsed before the output is reserved; the
+                // ID files are read after, so an existing output is refused
+                // before a full pass over an -I PBF.
+                let sources = IdSources::parse("getid", &ids, id_file, id_osm_file, default_type)?;
                 if invert {
                     run_removeid(
                         &file,
                         output.open(&host)?,
-                        id_file.as_deref(),
-                        id_osm_file.as_deref(),
-                        default_type,
-                        &ids,
+                        sources,
                         &write,
                         &overrides,
                         &host,
@@ -1831,10 +2502,7 @@ fn main() -> process::ExitCode {
                         &file,
                         output.open(&host)?,
                         flags,
-                        id_file.as_deref(),
-                        id_osm_file.as_deref(),
-                        default_type,
-                        &ids,
+                        sources,
                         &write,
                         &overrides,
                         &host,
@@ -1854,21 +2522,20 @@ fn main() -> process::ExitCode {
                 io,
                 header,
             } => {
-                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let overrides = header.overrides();
                 let write = WriteOptions {
                     compression: compression.compression,
                     backend: OutputBackend::from_flags(io.direct_io, false),
                     direct_reads: io.direct_io,
                     force: false,
                 };
+                let sources =
+                    IdSources::parse("getparents", &ids, id_file, id_osm_file, default_type)?;
                 run_getparents(
                     &file,
                     output.open(&host)?,
                     add_self,
-                    id_file.as_deref(),
-                    id_osm_file.as_deref(),
-                    default_type,
-                    &ids,
+                    sources,
                     &write,
                     &overrides,
                     full_scan_min_blobs,
@@ -1892,12 +2559,12 @@ fn main() -> process::ExitCode {
                 io,
                 header,
             } => {
-                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let overrides = header.overrides();
                 let write = WriteOptions {
                     compression: compression.compression,
                     backend: OutputBackend::from_flags(io.direct_io, false),
                     direct_reads: io.direct_io,
-                    force: force.force,
+                    force,
                 };
                 let overwrite = pbfhogg::Overwrite::from_flag(overwrite);
                 if let Some(config_path) = config.as_deref() {
@@ -1915,11 +2582,13 @@ fn main() -> process::ExitCode {
                         &mut leftovers,
                     )
                 } else if let Some(output) = output.as_ref() {
+                    // The region (a polygon file is read here) is parsed
+                    // before the output is reserved.
+                    let region = extract_region(bbox, polygon.as_deref())?;
                     run_extract(
                         &file,
                         pbfhogg::Output::new(output, overwrite, &host.diagnostics)?,
-                        bbox.as_deref(),
-                        polygon.as_deref(),
+                        &region,
                         extract_strategy(simple, smart),
                         set_bounds,
                         &clean_attrs(&clean),
@@ -1944,14 +2613,14 @@ fn main() -> process::ExitCode {
                 header,
                 tmp,
             } => {
-                let scratch = run_scratch(&tmp, Some(&output.output), &host)?;
+                // `validate_command` refused the hidden `dense` value.
                 let index_type = index_type.resolve()?;
-                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let overrides = header.overrides();
                 let write = WriteOptions {
                     compression: compression.compression,
                     backend: OutputBackend::from_flags(io.direct_io, false),
                     direct_reads: io.direct_io,
-                    force: force.force,
+                    force,
                 };
                 let options = pbfhogg::altw::AltwOptions {
                     keep_untagged_nodes,
@@ -1960,14 +2629,11 @@ fn main() -> process::ExitCode {
                     inject_prepass,
                     ignore_missing_nodes,
                 };
-                run_add_locations_to_ways(
-                    &file,
-                    output.open(&host)?,
-                    &options,
-                    &overrides,
-                    &host,
-                    scratch,
-                )
+                // The output is checked before the scratch directory is made,
+                // so a missing output directory reports the output.
+                let output = output.open(&host)?;
+                let scratch = run_scratch(&tmp, Some(output.destination()), &host)?;
+                run_add_locations_to_ways(&file, output, &options, &overrides, &host, scratch)
             }
             Command::TimeFilter {
                 file,
@@ -1977,7 +2643,7 @@ fn main() -> process::ExitCode {
                 io,
                 header,
             } => {
-                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let overrides = header.overrides();
                 let write = WriteOptions {
                     compression: compression.compression,
                     backend: OutputBackend::from_flags(io.direct_io, false),
@@ -1987,7 +2653,7 @@ fn main() -> process::ExitCode {
                 run_time_filter(
                     &file,
                     output.open(&host)?,
-                    &timestamp,
+                    timestamp,
                     &write,
                     &overrides,
                     &host,
@@ -2083,22 +2749,23 @@ fn main() -> process::ExitCode {
                 jobs,
                 header,
             } => {
-                let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+                let overrides = header.overrides();
                 let write = WriteOptions {
                     compression: compression.compression,
                     backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
                     direct_reads: io.direct_io,
-                    force: force.force,
+                    force,
                 };
                 let opts = pbfhogg::apply_changes::MergeOptions {
                     write,
                     locations_on_ways,
                     ignore_missing_nodes,
-                    jobs: if jobs == 0 { None } else { Some(jobs) },
+                    parallelism: jobs,
                     allow_version_regression,
                     #[cfg(feature = "test-hooks")]
                     panic_at_blob_seq: None,
                 };
+                opts.validate()?;
                 run_apply_changes(
                     &base,
                     &changes,
@@ -2169,23 +2836,39 @@ fn main() -> process::ExitCode {
                 allow_unindexed,
                 force,
                 tmp,
-            } => run_build_geocode_index(
-                &file,
-                &output_dir,
-                GeocodeLevels {
-                    street_level,
-                    coarse_level,
-                    admin_level,
-                    max_admin_vertices,
-                    search_radius,
-                    coarse_search_radius,
-                },
-                io.direct_io,
-                overwrite || force,
-                allow_unindexed || force,
-                &tmp,
-                &host,
-            ),
+            } => {
+                // The one --force that is not the indexdata rule: it predates
+                // --overwrite and --allow-unindexed and still grants both, so
+                // say so every time rather than let it replace an index
+                // silently.
+                if force {
+                    host::cli_warning(
+                        "geocode.force_grants_overwrite",
+                        format_args!(
+                            "build-geocode-index --force also grants --overwrite: an existing \
+                             index at --output-dir is replaced. Pass --overwrite and/or \
+                             --allow-unindexed instead to say which you mean."
+                        ),
+                    );
+                }
+                run_build_geocode_index(
+                    &file,
+                    &output_dir,
+                    GeocodeLevels {
+                        street_level,
+                        coarse_level,
+                        admin_level,
+                        max_admin_vertices,
+                        search_radius,
+                        coarse_search_radius,
+                    },
+                    io.direct_io,
+                    overwrite || force,
+                    allow_unindexed || force,
+                    &tmp,
+                    &host,
+                )
+            }
             Command::BenchRead { file, mode } => run_bench_read(&file, mode, &host),
             Command::BenchWrite {
                 file,
@@ -2249,6 +2932,12 @@ fn main() -> process::ExitCode {
             );
             process::ExitCode::from(signals::exit_status(signal))
         }
+        // A refusal found by a command's validation step: printed by clap,
+        // with clap's status, exactly like a refusal clap found itself.
+        Err(e) if e.is::<UsageError>() => match e.downcast_ref::<UsageError>() {
+            Some(UsageError(err)) => clap_exit(err),
+            None => process::ExitCode::from(ExitStatus::Failed.code()),
+        },
         Err(e) => {
             if output::reader_gone() {
                 // Stdout's reader went away (`pbfhogg ... | head`) and the
@@ -2346,26 +3035,8 @@ fn run_check(
     let run_ids = ids || !any_selector;
     let run_refs = refs || !any_selector;
     let run_index = index;
-
-    // Validate flags that only apply to one check mode
-    if !run_ids {
-        if full {
-            return Err("--full requires --ids (or omit --refs to run both checks)".into());
-        }
-        if type_filter.is_some() {
-            return Err("--type requires --ids (or omit --refs to run both checks)".into());
-        }
-    }
-    if !run_refs {
-        if check_relations {
-            return Err(
-                "--check-relations requires --refs (or omit --ids to run both checks)".into(),
-            );
-        }
-        if show_ids {
-            return Err("--show-ids requires --refs (or omit --ids to run both checks)".into());
-        }
-    }
+    // Flags that apply to one check mode only were refused by
+    // `validate_check`.
 
     let mut failed = false;
     let file_name = path
@@ -2585,12 +3256,14 @@ fn run_tags_count(
     expressions_file: Option<&std::path::Path>,
     expressions: &[String],
     type_filter: Option<TypeFilter>,
-    jobs: usize,
+    parallelism: pbfhogg::Parallelism,
     direct_io: bool,
     force: bool,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let all_expressions = combine_expressions(expressions_file, expressions)?;
+    pbfhogg::tag_expr::validate_expressions(&all_expressions)
+        .map_err(|e| usage(&["inspect", "tags"], format!("invalid expression: {e}")))?;
     let opts = pbfhogg::tags_count::TagCountOptions {
         min_count,
         max_count,
@@ -2599,7 +3272,7 @@ fn run_tags_count(
         type_filter,
         direct_io,
         force,
-        jobs,
+        parallelism,
     };
     let results = pbfhogg::tags_count::tags_count(path, &opts, host)?;
 
@@ -2670,93 +3343,49 @@ fn run_degrade(
 fn run_renumber(
     file: &std::path::Path,
     output: pbfhogg::Output,
-    start_id: &str,
+    start_id: StartIds,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let parts: Vec<&str> = start_id.split(',').collect();
-    let opts =
-        match parts.len() {
-            1 => {
-                let id: i64 = parts[0]
-                    .trim()
-                    .parse()
-                    .map_err(|_| format!("invalid start ID: {}", parts[0]))?;
-                pbfhogg::renumber::RenumberOptions {
-                    start_node_id: id,
-                    start_way_id: id,
-                    start_relation_id: id,
-                }
-            }
-            3 => {
-                let node_id: i64 = parts[0]
-                    .trim()
-                    .parse()
-                    .map_err(|_| format!("invalid node start ID: {}", parts[0]))?;
-                let way_id: i64 = parts[1]
-                    .trim()
-                    .parse()
-                    .map_err(|_| format!("invalid way start ID: {}", parts[1]))?;
-                let rel_id: i64 = parts[2]
-                    .trim()
-                    .parse()
-                    .map_err(|_| format!("invalid relation start ID: {}", parts[2]))?;
-                pbfhogg::renumber::RenumberOptions {
-                    start_node_id: node_id,
-                    start_way_id: way_id,
-                    start_relation_id: rel_id,
-                }
-            }
-            _ => return Err(
-                "--start-id must be a single value or 3 comma-separated values (node,way,relation)"
-                    .into(),
-            ),
-        };
+    let opts = pbfhogg::renumber::RenumberOptions {
+        start_node_id: start_id.node,
+        start_way_id: start_id.way,
+        start_relation_id: start_id.relation,
+    };
     let stats = pbfhogg::renumber::renumber_external(file, output, &opts, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("renumber.summary"))?;
     stats.report_warnings(&host.diagnostics);
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// tags-filter's expressions: the positional ones, then the `-e` file's,
+/// checked to parse and to be non-empty. clap already refused a command line
+/// with neither; this catches an `-e` file that holds none.
+fn filter_expressions(
+    expressions_file: Option<&std::path::Path>,
+    expressions: &[String],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let all = combine_expressions(expressions_file, expressions)?;
+    if all.is_empty() {
+        return Err(usage(
+            &["tags-filter"],
+            "no filter expressions: the --expressions file holds none",
+        ));
+    }
+    pbfhogg::tag_expr::validate_expressions(&all)
+        .map_err(|e| usage(&["tags-filter"], format!("invalid expression: {e}")))?;
+    Ok(all)
+}
+
 fn run_tags_filter(
     file: &std::path::Path,
     output: pbfhogg::Output,
-    expressions_file: Option<&std::path::Path>,
-    expressions: &[String],
-    flags: TagsFilterFlags,
-    write: &WriteOptions,
-    jobs: usize,
+    opts: &pbfhogg::tags_filter::TagsFilterOptions<'_>,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let TagsFilterFlags {
-        omit_referenced,
-        invert_match,
-        remove_tags,
-        distrust_metadata,
-    } = flags;
-    let all_expressions = combine_expressions(expressions_file, expressions)?;
-    if all_expressions.is_empty() {
-        return Err("no filter expressions provided (use positional args or -e FILE)".into());
-    }
-    if remove_tags && omit_referenced {
-        host::cli_warning(
-            "tags_filter.remove_tags_ignored",
-            format_args!("With -R/--omit-referenced use of -t/--remove-tags isn't doing anything."),
-        );
-    }
-    let opts = pbfhogg::tags_filter::TagsFilterOptions {
-        expression_strs: &all_expressions,
-        omit_referenced,
-        invert: invert_match,
-        remove_tags,
-        write: *write,
-        jobs: if jobs == 0 { None } else { Some(jobs) },
-        distrust_metadata,
-    };
-    let stats = pbfhogg::tags_filter::tags_filter(file, output, &opts, overrides, host)?;
+    let stats = pbfhogg::tags_filter::tags_filter(file, output, opts, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("tags_filter.summary"))?;
     Ok(())
 }
@@ -2764,16 +3393,10 @@ fn run_tags_filter(
 fn run_tags_filter_osc(
     changes: &std::path::Path,
     output: pbfhogg::Output,
-    expressions_file: Option<&std::path::Path>,
     expressions: &[String],
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let all_expressions = combine_expressions(expressions_file, expressions)?;
-    if all_expressions.is_empty() {
-        return Err("no filter expressions provided (use positional args or -e FILE)".into());
-    }
-    let stats =
-        pbfhogg::tags_filter::osc::tags_filter_osc(changes, output, &all_expressions, host)?;
+    let stats = pbfhogg::tags_filter::osc::tags_filter_osc(changes, output, expressions, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("tags_filter.osc.summary"))?;
     Ok(())
 }
@@ -3098,19 +3721,15 @@ fn export_error(err: pbfhogg::Error) -> Box<dyn std::error::Error> {
     Box::new(err)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_export(
-    file: &std::path::Path,
-    output: Option<pbfhogg::Output>,
+fn export_options(
     format: ExportFormatArg,
     type_filter: Option<ExportTypeArg>,
     expressions_file: Option<&std::path::Path>,
     expressions: &[String],
     properties: Option<Vec<String>>,
-    bbox: Option<&str>,
+    bbox: Option<pbfhogg::extract::Bbox>,
     metadata: bool,
-    host: &pbfhogg::host::Host,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<pbfhogg::export::ExportOptions, Box<dyn std::error::Error>> {
     let expressions = combine_expressions(expressions_file, expressions)?;
     let format = match format {
         ExportFormatArg::Geojsonseq => pbfhogg::export::ExportFormat::GeoJsonSeq,
@@ -3120,56 +3739,86 @@ fn run_export(
         pbfhogg::export::ExportTypes::All,
         pbfhogg::export::ExportTypes::from,
     );
-    let options = pbfhogg::export::ExportOptions::new(
-        format,
-        types,
-        &expressions,
-        properties,
-        bbox,
-        metadata,
-    )?;
+    // Only the expressions can fail here, and a malformed one is a usage
+    // error like any other malformed flag value.
+    pbfhogg::export::ExportOptions::new(format, types, &expressions, properties, bbox, metadata)
+        .map_err(|e| usage(&["export"], format!("invalid expression: {e}")))
+}
 
+fn run_export(
+    file: &std::path::Path,
+    output: Option<pbfhogg::Output>,
+    options: &pbfhogg::export::ExportOptions,
+    host: &pbfhogg::host::Host,
+) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(output) = output {
         // The input/output alias refusal already ran in
         // `validate_input_output_aliases`, against the destination.
         let mut buf = output.writer(&host.cancel)?;
-        run_export_to(file, &mut buf, &options, host)?;
+        run_export_to(file, &mut buf, options, host)?;
         // The checked flush that lets the output be published.
         buf.finish()?;
         output.publish(&host.cancel)?;
     } else {
         // `export` flushes its writer when it finishes, so a failed final
         // flush surfaces as an error rather than vanishing in a drop.
-        run_export_to(file, output::buffered(), &options, host)?;
+        run_export_to(file, output::buffered(), options, host)?;
     }
     Ok(())
 }
 
-fn resolve_ids(
-    id_file: Option<&std::path::Path>,
-    id_osm_file: Option<&std::path::Path>,
-    default_type: Option<DefaultTypeArg>,
-    ids: &[String],
-    direct_io: bool,
-    host: &pbfhogg::host::Host,
-) -> Result<pbfhogg::getid::ElementIds, Box<dyn std::error::Error>> {
-    let default_type = default_type.map(ElementKind::from);
-    // Start with CLI positional IDs
-    let mut id_set = pbfhogg::getid::parse_ids_with_default_type(ids, default_type)?;
-    // Merge IDs from text file
-    if let Some(path) = id_file {
-        let file_ids = pbfhogg::getid::parse_ids_from_file_with_default_type(path, default_type)?;
-        pbfhogg::getid::merge_id_sets(&mut id_set, &file_ids);
+/// getid's and getparents' IDs: the positional ones already parsed (they
+/// depend on `--default-type`, so they are parsed right after clap, before
+/// any input is opened), and the ID files still to read.
+struct IdSources {
+    positional: pbfhogg::getid::ElementIds,
+    id_file: Option<PathBuf>,
+    id_osm_file: Option<PathBuf>,
+    default_type: Option<ElementKind>,
+}
+
+impl IdSources {
+    /// `command` names the subcommand for a usage error on a malformed ID.
+    fn parse(
+        command: &str,
+        ids: &[String],
+        id_file: Option<PathBuf>,
+        id_osm_file: Option<PathBuf>,
+        default_type: Option<DefaultTypeArg>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let default_type = default_type.map(ElementKind::from);
+        Ok(Self {
+            positional: pbfhogg::getid::parse_ids_with_default_type(ids, default_type)
+                .map_err(|e| usage(&[command], e))?,
+            id_file,
+            id_osm_file,
+            default_type,
+        })
     }
-    // Merge IDs from OSM/PBF file
-    if let Some(path) = id_osm_file {
-        let pbf_ids = pbfhogg::getid::parse_ids_from_pbf(path, direct_io, host)?;
-        pbfhogg::getid::merge_id_sets(&mut id_set, &pbf_ids);
+
+    /// Read the ID files and merge everything. clap already refused a
+    /// command line naming no ID source; this catches sources that hold no
+    /// ID.
+    fn resolve(
+        self,
+        direct_io: bool,
+        host: &pbfhogg::host::Host,
+    ) -> Result<pbfhogg::getid::ElementIds, Box<dyn std::error::Error>> {
+        let mut id_set = self.positional;
+        if let Some(path) = self.id_file.as_deref() {
+            let file_ids =
+                pbfhogg::getid::parse_ids_from_file_with_default_type(path, self.default_type)?;
+            pbfhogg::getid::merge_id_sets(&mut id_set, &file_ids);
+        }
+        if let Some(path) = self.id_osm_file.as_deref() {
+            let pbf_ids = pbfhogg::getid::parse_ids_from_pbf(path, direct_io, host)?;
+            pbfhogg::getid::merge_id_sets(&mut id_set, &pbf_ids);
+        }
+        if id_set.is_empty() {
+            return Err("no IDs: the --id-file and --id-osm-file inputs hold none".into());
+        }
+        Ok(id_set)
     }
-    if id_set.is_empty() {
-        return Err("no IDs specified (use positional args, -i FILE, or -I OSM-FILE)".into());
-    }
-    Ok(id_set)
 }
 
 // `--verbose-ids` is a deliberately exhaustive diagnostic: no output cap,
@@ -3248,7 +3897,7 @@ fn run_diff(
     flags: DiffFlags,
     output: Option<pbfhogg::Output>,
     type_filter: Option<TypeFilter>,
-    jobs: usize,
+    parallelism: pbfhogg::Parallelism,
     direct_io: bool,
     host: &pbfhogg::host::Host,
     scratch: pbfhogg::scratch::RunScratch,
@@ -3260,20 +3909,12 @@ fn run_diff(
         quiet,
     } = flags;
 
-    let jobs_resolved = if jobs == 0 {
-        host.resources
-            .parallelism()
-            .map_or(1, std::num::NonZeroUsize::get)
-    } else {
-        jobs
-    };
-
     let options = pbfhogg::diff::DiffOptions {
         suppress_common,
         verbose,
         summary: osmium_summary,
         type_filter,
-        jobs: jobs_resolved,
+        parallelism,
     };
     let stats = if quiet {
         let mut sink = std::io::sink();
@@ -3319,17 +3960,10 @@ fn run_derive_changes(
     direct_io: bool,
     increment_version: bool,
     update_timestamp: bool,
-    jobs: usize,
+    parallelism: pbfhogg::Parallelism,
     host: &pbfhogg::host::Host,
     scratch: pbfhogg::scratch::RunScratch,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let jobs_resolved = if jobs == 0 {
-        host.resources
-            .parallelism()
-            .map_or(1, std::num::NonZeroUsize::get)
-    } else {
-        jobs
-    };
     let timestamp = if update_timestamp {
         Some(
             std::time::SystemTime::now()
@@ -3346,7 +3980,7 @@ fn run_derive_changes(
         direct_io,
         increment_version,
         timestamp,
-        jobs_resolved,
+        parallelism,
         host,
         scratch,
     )?;
@@ -3354,15 +3988,11 @@ fn run_derive_changes(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_getid(
     file: &std::path::Path,
     output: pbfhogg::Output,
     flags: GetidFlags,
-    id_file: Option<&std::path::Path>,
-    id_osm_file: Option<&std::path::Path>,
-    default_type: Option<DefaultTypeArg>,
-    ids: &[String],
+    sources: IdSources,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
@@ -3372,23 +4002,7 @@ fn run_getid(
         remove_tags,
         verbose_ids,
     } = flags;
-    let id_set = resolve_ids(
-        id_file,
-        id_osm_file,
-        default_type,
-        ids,
-        write.direct_reads,
-        host,
-    )?;
-
-    if remove_tags && !add_referenced {
-        host::cli_warning(
-            "getid.remove_tags_ignored",
-            format_args!(
-                "Without -r/--add-referenced use of -t/--remove-tags isn't doing anything."
-            ),
-        );
-    }
+    let id_set = sources.resolve(write.direct_reads, host)?;
 
     if verbose_ids {
         print_requested_ids(&id_set);
@@ -3414,23 +4028,13 @@ fn run_getparents(
     file: &std::path::Path,
     output: pbfhogg::Output,
     add_self: bool,
-    id_file: Option<&std::path::Path>,
-    id_osm_file: Option<&std::path::Path>,
-    default_type: Option<DefaultTypeArg>,
-    ids: &[String],
+    sources: IdSources,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     full_scan_min_blobs: Option<u64>,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let id_set = resolve_ids(
-        id_file,
-        id_osm_file,
-        default_type,
-        ids,
-        write.direct_reads,
-        host,
-    )?;
+    let id_set = sources.resolve(write.direct_reads, host)?;
     let opts = pbfhogg::getparents::GetparentsOptions { add_self };
     let stats = if let Some(min_blobs) = full_scan_min_blobs {
         pbfhogg::getparents::getparents_with_min_blobs(
@@ -3443,26 +4047,15 @@ fn run_getparents(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_removeid(
     file: &std::path::Path,
     output: pbfhogg::Output,
-    id_file: Option<&std::path::Path>,
-    id_osm_file: Option<&std::path::Path>,
-    default_type: Option<DefaultTypeArg>,
-    ids: &[String],
+    sources: IdSources,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let id_set = resolve_ids(
-        id_file,
-        id_osm_file,
-        default_type,
-        ids,
-        write.direct_reads,
-        host,
-    )?;
+    let id_set = sources.resolve(write.direct_reads, host)?;
     let stats = pbfhogg::getid::removeid(file, output, &id_set, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("getid.summary"))?;
     Ok(())
@@ -3478,12 +4071,25 @@ fn extract_strategy(simple: bool, smart: bool) -> pbfhogg::extract::ExtractStrat
     }
 }
 
+/// The single-extract region. clap made `--bbox` and `--polygon` a required,
+/// exclusive pair and already parsed the bbox; a polygon file is read here.
+fn extract_region(
+    bbox: Option<pbfhogg::extract::Bbox>,
+    polygon_path: Option<&std::path::Path>,
+) -> Result<pbfhogg::extract::Region, Box<dyn std::error::Error>> {
+    match (bbox, polygon_path) {
+        (Some(bbox), None) => Ok(pbfhogg::extract::Region::Bbox(bbox)),
+        (None, Some(p)) => Ok(pbfhogg::extract::parse_geojson(p)?),
+        (None, None) => Err("one of --bbox or --polygon is required".into()),
+        (Some(_), Some(_)) => Err("--bbox and --polygon are mutually exclusive".into()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_extract(
     file: &std::path::Path,
     output: pbfhogg::Output,
-    bbox_str: Option<&str>,
-    polygon_path: Option<&std::path::Path>,
+    region: &pbfhogg::extract::Region,
     strategy: pbfhogg::extract::ExtractStrategy,
     set_bounds: bool,
     clean: &CleanAttrs,
@@ -3491,17 +4097,8 @@ fn run_extract(
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let region = match (bbox_str, polygon_path) {
-        (Some(s), None) => {
-            let bbox = pbfhogg::extract::parse_bbox(s)?;
-            pbfhogg::extract::Region::Bbox(bbox)
-        }
-        (None, Some(p)) => pbfhogg::extract::parse_geojson(p)?,
-        (None, None) => return Err("one of --bbox or --polygon is required".into()),
-        (Some(_), Some(_)) => return Err("--bbox and --polygon are mutually exclusive".into()),
-    };
     let stats = pbfhogg::extract::extract(
-        file, output, &region, strategy, set_bounds, clean, write, overrides, host,
+        file, output, region, strategy, set_bounds, clean, write, overrides, host,
     )?;
     stats.write_summary(&mut host.diagnostics.summary_writer("extract.summary"))?;
     Ok(())
@@ -3585,23 +4182,14 @@ fn run_add_locations_to_ways(
 fn run_time_filter(
     file: &std::path::Path,
     output: pbfhogg::Output,
-    timestamp: &str,
+    cutoff: i64,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cutoff = parse_timestamp(timestamp)?;
     let stats = pbfhogg::time_filter::time_filter(file, output, cutoff, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("time_filter.summary"))?;
     Ok(())
-}
-
-fn parse_timestamp(input: &str) -> Result<i64, Box<dyn std::error::Error>> {
-    if let Ok(value) = input.parse::<i64>() {
-        return Ok(value);
-    }
-    pbfhogg::commands::parse_rfc3339_utc(input)
-        .map_err(|e| Box::new(Hinted::new(e, " (or UNIX seconds)")).into())
 }
 
 fn run_show_element(
@@ -3688,7 +4276,7 @@ impl<'a> InspectMode<'a> {
 fn run_inspect(
     path: &std::path::Path,
     flags: InspectFlags,
-    jobs: usize,
+    jobs: pbfhogg::Parallelism,
     blocks: Option<usize>,
     get: Option<&str>,
     direct_io: bool,
@@ -3713,23 +4301,21 @@ fn run_inspect(
     // does not change the answer), `--nodes` decodes every node already, and
     // Header and file get paths read without the inspect scan. Rejecting says so
     // rather than accepting a flag that would do nothing.
+    // Decided before the input is touched. (`--json` with `--nodes` or
+    // `--get`, which have no JSON shape, is refused by clap.) The key table is
+    // the whole set `get_value` answers, so an unknown key is refused here
+    // rather than after a scan.
+    if let (Some(key), Some(lookup)) = (get, get_lookup)
+        && lookup.kind().is_none()
+    {
+        return Err(usage(&["inspect"], format!("unknown key: {key}")));
+    }
     if distrust_metadata && !matches!(mode, InspectMode::Full) {
-        return Err(
+        return Err(usage(
+            &["inspect"],
             "--distrust-metadata applies to the scanning report only, not to --indexed, --nodes \
-             or a header/file --get key"
-                .into(),
-        );
-    }
-
-    // JSON pairings that have no output shape, rejected up front for every
-    // mode. (`--indexed --json` alone is fine and handled below.)
-    if nodes && json {
-        return Err(
-            "--nodes and --json cannot be used together (node stats have no JSON output)".into(),
-        );
-    }
-    if get.is_some() && json {
-        return Err("--get and --json cannot be used together".into());
+             or a header/file --get key",
+        ));
     }
 
     match mode {
@@ -3921,12 +4507,11 @@ fn run_merge_changes(
     changes: &[PathBuf],
     output: pbfhogg::Output,
     simplify: bool,
-    jobs: usize,
+    jobs: pbfhogg::Parallelism,
     allow_version_regression: bool,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let inputs: Vec<&std::path::Path> = changes.iter().map(AsRef::as_ref).collect();
-    let jobs = if jobs == 0 { None } else { Some(jobs) };
     let stats = pbfhogg::merge_changes::merge_changes(
         &inputs,
         output,
@@ -4217,7 +4802,7 @@ fn run_bench_merge(
         },
         locations_on_ways: false,
         ignore_missing_nodes: false,
-        jobs: None,
+        parallelism: pbfhogg::Parallelism::Auto,
         allow_version_regression: false,
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq: None,
@@ -4258,6 +4843,201 @@ fn run_bench_merge(
         output::cli_eprintln!("peak_rss_kb={peak_kb}");
     }
     Ok(())
+}
+
+/// The short-flag vocabulary: every short letter has one meaning across all
+/// subcommands. `reference/cli-reference.md` "Short flags" is the same table
+/// for readers, and a test keeps the two equal.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod short_flag_tests {
+    use super::{RETIRED_SHORTS, cli_command};
+
+    /// Letter, then the long flag(s) it stands for. `-o` is the output
+    /// location: `--output`, or build-geocode-index's `--output-dir`.
+    const VOCABULARY: &[(char, &[&str])] = &[
+        ('b', &["bbox"]),
+        ('c', &["suppress-common"]),
+        ('d', &["directory"]),
+        ('e', &["expressions"]),
+        ('g', &["get"]),
+        ('h', &["help"]),
+        ('i', &["id-file"]),
+        ('I', &["id-osm-file"]),
+        ('j', &["jobs"]),
+        ('M', &["max-count"]),
+        ('o', &["output", "output-dir"]),
+        ('O', &["overwrite"]),
+        ('p', &["polygon"]),
+        ('q', &["quiet"]),
+        ('r', &["add-referenced"]),
+        ('R', &["omit-referenced"]),
+        ('s', &["osmium-summary"]),
+        ('t', &["type"]),
+        ('v', &["verbose"]),
+        ('V', &["version"]),
+    ];
+
+    fn is_retired(arg: &clap::Arg) -> bool {
+        arg.get_id().as_str().starts_with("retired-short-")
+    }
+
+    /// Every (command path, short, long) in the built tree, retired shorts
+    /// excluded.
+    fn shorts() -> Vec<(String, char, String)> {
+        fn walk(cmd: &clap::Command, path: &str, out: &mut Vec<(String, char, String)>) {
+            for arg in cmd.get_arguments() {
+                if is_retired(arg) {
+                    continue;
+                }
+                let long = arg.get_long().unwrap_or("<none>").to_owned();
+                for short in arg
+                    .get_short()
+                    .into_iter()
+                    .chain(arg.get_all_short_aliases().unwrap_or_default())
+                {
+                    out.push((path.to_owned(), short, long.clone()));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), out);
+            }
+        }
+        let mut cmd = cli_command();
+        cmd.build();
+        let mut out = Vec::new();
+        walk(&cmd, "pbfhogg", &mut out);
+        out
+    }
+
+    #[test]
+    fn the_command_tree_is_well_formed() {
+        cli_command().debug_assert();
+    }
+
+    #[test]
+    fn every_short_flag_has_one_meaning_across_all_subcommands() {
+        let mut problems = Vec::new();
+        for (path, short, long) in shorts() {
+            match VOCABULARY.iter().find(|(letter, _)| *letter == short) {
+                None => problems.push(format!(
+                    "`{path}` uses -{short} (--{long}), which the vocabulary does not define"
+                )),
+                Some((_, longs)) if !longs.contains(&long.as_str()) => problems.push(format!(
+                    "`{path}` uses -{short} for --{long}; in the vocabulary -{short} is --{}",
+                    longs.join(" / --")
+                )),
+                Some(_) => {}
+            }
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn every_vocabulary_letter_is_used() {
+        let used = shorts();
+        for (letter, _) in VOCABULARY {
+            assert!(
+                used.iter().any(|(_, short, _)| short == letter),
+                "-{letter} is in the vocabulary but no command uses it"
+            );
+        }
+    }
+
+    /// A command line that parses, per retired-short command path.
+    fn valid_argv(path: &[&str]) -> Vec<&'static str> {
+        match path {
+            ["cat"] => vec!["cat", "in.pbf", "-o", "out.pbf"],
+            ["extract"] => vec!["extract", "in.pbf", "-b", "0,0,1,1", "-o", "out.pbf"],
+            ["renumber"] => vec!["renumber", "in.pbf", "-o", "out.pbf"],
+            ["getparents"] => vec!["getparents", "in.pbf", "-o", "out.pbf", "n1"],
+            ["getid"] => vec!["getid", "in.pbf", "-o", "out.pbf", "n1"],
+            ["inspect", "tags"] => vec!["inspect", "tags", "in.pbf"],
+            ["inspect"] => vec!["inspect", "in.pbf"],
+            ["tags-filter"] => vec!["tags-filter", "in.pbf", "-o", "out.pbf", "highway"],
+            other => panic!("no valid command line for {other:?}: add one"),
+        }
+    }
+
+    fn parse(argv: &[&str]) -> Result<(), String> {
+        cli_command()
+            .try_get_matches_from(std::iter::once("pbfhogg").chain(argv.iter().copied()))
+            .map(drop)
+            .map_err(|e| e.render().to_string())
+    }
+
+    #[test]
+    fn a_retired_short_is_refused_naming_its_long_flag_and_only_when_given() {
+        for retired in RETIRED_SHORTS {
+            let valid = valid_argv(retired.path);
+            parse(&valid).unwrap_or_else(|e| {
+                panic!(
+                    "{:?} without -{} must parse:\n{e}",
+                    retired.path, retired.short
+                )
+            });
+            let flag = format!("-{}", retired.short);
+            // Bare, as a flag; and followed by a value, as an option.
+            let bare: Vec<&str> = valid.iter().copied().chain([flag.as_str()]).collect();
+            let with_value: Vec<&str> = valid.iter().copied().chain([flag.as_str(), "5"]).collect();
+            for argv in [bare, with_value] {
+                let err = parse(&argv).expect_err(&format!("{argv:?} must be refused"));
+                assert!(
+                    err.contains(retired.now) && err.contains(&flag),
+                    "{argv:?}: the refusal must name {flag} and {}:\n{err}",
+                    retired.now
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_reference_table_is_the_vocabulary() {
+        let doc = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../reference/cli-reference.md"
+        ))
+        .unwrap();
+        let section = doc
+            .split("## Short flags")
+            .nth(1)
+            .expect("reference/cli-reference.md has a `## Short flags` section");
+        let section = section.split("\n## ").next().unwrap_or(section);
+        let mut documented: Vec<(char, Vec<String>)> = Vec::new();
+        for line in section.lines() {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            // | `-x` | `--long` (, `--long`) | ... |
+            let [_, short, longs, ..] = cells[..] else {
+                continue;
+            };
+            let Some(letter) = short
+                .strip_prefix("`-")
+                .and_then(|s| s.strip_suffix('`'))
+                .filter(|s| s.chars().count() == 1)
+                .and_then(|s| s.chars().next())
+            else {
+                continue;
+            };
+            let longs = longs
+                .split(',')
+                .filter_map(|l| {
+                    l.trim()
+                        .strip_prefix("`--")
+                        .and_then(|l| l.strip_suffix('`'))
+                        .map(str::to_owned)
+                })
+                .collect();
+            documented.push((letter, longs));
+        }
+        let expected: Vec<(char, Vec<String>)> = VOCABULARY
+            .iter()
+            .map(|(letter, longs)| (*letter, longs.iter().map(|l| (*l).to_owned()).collect()))
+            .collect();
+        documented.sort();
+        let mut expected = expected;
+        expected.sort();
+        assert_eq!(documented, expected);
+    }
 }
 
 #[cfg(test)]

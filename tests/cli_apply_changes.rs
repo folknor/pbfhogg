@@ -15,7 +15,7 @@
 //! descriptor-first streaming rewrite (landed 2026-04) moved large
 //! parts of the internal API around; the CLI surface (`pbfhogg apply-changes
 //! <base> <changes> -o <output> [--locations-on-ways] [-j N]
-//! [--direct-io] [--io-uring] --force`) is the only thing this file
+//! [--direct-io] [--io-uring] [--force]`) is the only thing this file
 //! pins.
 //!
 //! Per-test stats assertions on `MergeStats` counters survive via
@@ -155,7 +155,12 @@ fn run_apply_changes(base: &Path, osc: &Path, output: &Path, opts: ApplyOpts) ->
     if opts.io_uring {
         cli = cli.arg("--io-uring");
     }
-    cli.arg("--force").run()
+    // `--locations-on-ways` needs an indexed base whatever `--force` says,
+    // so it refuses the flag.
+    if !opts.locations_on_ways {
+        cli = cli.arg("--force");
+    }
+    cli.run()
 }
 
 fn run_apply_ok(base: &Path, osc: &Path, output: &Path) -> CliOutput {
@@ -2259,10 +2264,35 @@ fn merge_admits_equal_versions_from_overlapping_diffs() {
     assert_eq!(c.nodes[1].1, 330_000_000, "the escape hatch is positional");
 }
 
-/// Regression: `apply-changes --force --locations-on-ways` against a
-/// non-indexed base PBF must reject the combination up front.
+/// `apply-changes --force --locations-on-ways` can never take effect (an
+/// indexed base makes `--force` a no-op, an unindexed one is unsound under
+/// `-l`), so the combination is a usage error, before any input is opened.
 #[test]
-fn merge_rejects_force_with_locations_on_ways_on_non_indexed() {
+fn merge_refuses_force_with_locations_on_ways_before_any_input() {
+    let dir = crate::common::test_scratch();
+    let out = CliInvoker::new()
+        .arg("apply-changes")
+        .arg(dir.path().join("no-such-base.osm.pbf"))
+        .arg(dir.path().join("no-such-diff.osc.gz"))
+        .arg("-o")
+        .arg(dir.path().join("out.osm.pbf"))
+        .args(["--locations-on-ways", "--force"])
+        .run();
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{}", out.stderr_str());
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("--force")
+            && stderr.contains("--locations-on-ways")
+            && !stderr.contains("no-such-base"),
+        "expected the argument refusal, not an input error; stderr:\n{stderr}",
+    );
+}
+
+/// Without `--force`, a non-indexed base under `--locations-on-ways` is
+/// refused by the indexdata gate, which points at the indexed-generation
+/// workflow.
+#[test]
+fn merge_refuses_locations_on_ways_on_non_indexed() {
     use crate::common::write_test_pbf_non_indexed;
 
     let dir = crate::common::test_scratch();
@@ -2314,14 +2344,10 @@ fn merge_rejects_force_with_locations_on_ways_on_non_indexed() {
     );
     assert!(
         !out.status.success(),
-        "must reject --force --locations-on-ways on non-indexed PBF; stderr:\n{}",
+        "must refuse --locations-on-ways on a non-indexed base; stderr:\n{}",
         out.stderr_str(),
     );
     let stderr = out.stderr_str();
-    assert!(
-        stderr.contains("--force") && stderr.contains("--locations-on-ways"),
-        "expected setup-time rejection message; stderr:\n{stderr}",
-    );
     assert!(
         stderr.contains("pbfhogg cat"),
         "error should point at the indexed-generation workflow; stderr:\n{stderr}",

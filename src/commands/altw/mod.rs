@@ -171,6 +171,43 @@ pub struct AltwOptions {
     pub ignore_missing_nodes: bool,
 }
 
+impl AltwOptions {
+    /// Refuse option combinations in which `force` can never take effect,
+    /// before any input is opened. [`add_locations_to_ways`] calls it first.
+    ///
+    /// - A requested external index needs indexdata (its ID bucket ranges come
+    ///   from per-blob indexdata), so on an unindexed input it refuses and on
+    ///   an indexed one `force` does nothing. `IndexType::Auto` routes an
+    ///   unindexed input to sparse, so `force` stays meaningful there.
+    /// - `inject_prepass` attaches per-blob WayMembers metadata, which the
+    ///   decode-all fallback cannot do, so it needs indexdata too.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` naming the refused combination.
+    pub fn validate(&self) -> Result<()> {
+        if !self.write.force {
+            return Ok(());
+        }
+        if self.index_type == IndexType::External {
+            return Err(Error::invalid_argument(
+                "add-locations-to-ways: force has no effect with the external index, \
+                 which requires indexed input because its ID bucket ranges come from \
+                 per-blob indexdata. Generate an indexed PBF first:\n\n\
+                 \x20 pbfhogg cat <input.osm.pbf> -o indexed.osm.pbf",
+            ));
+        }
+        if self.inject_prepass {
+            return Err(Error::invalid_argument(
+                "add-locations-to-ways: force has no effect with inject_prepass, which \
+                 requires indexed input because the decode-all fallback cannot attach \
+                 per-blob WayMembers metadata",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Parse error for [`IndexType`].
 #[derive(Debug, Clone)]
 pub struct ParseIndexTypeError(String);
@@ -352,6 +389,7 @@ pub(crate) fn add_locations_to_ways_to(
     host: &crate::host::Host,
     scratch: &crate::scratch::RunScratch,
 ) -> Result<Stats> {
+    options.validate()?;
     // Auto-select: sparse unless the input qualifies for external AND the
     // estimated store exceeds the page-cache budget (see IndexType::Auto).
     let backend = match options.index_type {
@@ -1016,6 +1054,10 @@ fn write_output_checked(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<Stats> {
+    // Backstop only: `AltwOptions::validate` refuses `force` with
+    // `inject_prepass`, so an unindexed input is refused by the indexdata
+    // probe before pass 0. Kept so the decode-all writer can never be asked
+    // for metadata it cannot attach.
     if inject_prepass && !indexdata_present {
         return Err(Error::invalid_argument(
             "--inject-prepass requires blob-level indexdata; --force cannot enable the decode-all fallback because it cannot attach per-blob WayMembers metadata",

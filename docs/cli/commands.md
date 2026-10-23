@@ -32,9 +32,41 @@ These flags appear on most commands that produce PBF output:
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--compression <COMPRESSION>` | Blob compression: `none`, `zlib` (default), `zstd`, or with level (`zlib:9`, `zstd:19`) |
 | `--direct-io` | Use O_DIRECT to bypass page cache (requires `linux-direct-io` feature) |
-| `--force` | Proceed even if input lacks indexdata (slower fallback path) |
+| `--force` | On a command that would refuse unindexed input: proceed with the slower fallback. Only those commands have it |
 | `--generator <GENERATOR>` | Override the writing program name in the output header |
 | `--output-header <KEY=VALUE>` | Set output header fields (repeatable). Keys: `osmosis_replication_timestamp` (UNIX seconds or `YYYY-MM-DDTHH:MM:SSZ`), `osmosis_replication_sequence_number`, `osmosis_replication_base_url`. Each key replaces only its own field |
+
+## Flag rules
+
+- Every short flag has one meaning across all subcommands: `-b` bbox, `-c`
+  suppress-common, `-d` directory, `-e` expressions, `-g` get, `-i` id-file,
+  `-I` id-osm-file, `-j` jobs, `-M` max-count, `-o` output (output-dir on
+  build-geocode-index), `-O` overwrite, `-p` polygon, `-q` quiet, `-r`
+  add-referenced, `-R` omit-referenced, `-s` osmium-summary, `-t` type, `-v`
+  verbose. A short that used to mean something else on a command now refuses
+  there, naming the long flag to spell: `cat -c` (`--clean`), `extract -c`
+  (`--config`) and `-s` (`--simple`), `renumber -s` (`--start-id`),
+  `getparents -s` (`--add-self`), `inspect -e` (`--extended`), `inspect tags
+  -s` (`--sort`), `tags-filter -t` (`--remove-tags`) and `-i`
+  (`--invert-match`), `getid -t` (`--remove-tags`).
+- A flag the command line makes ineffective is refused as a usage error
+  (exit `2`), not ignored or warned about: `-O` without `-o`, `--force` where
+  nothing would refuse, `--tmp-dir` on a path that writes no scratch, `-j` on
+  a path with no worker pool, a PBF-only flag on OSC input. A fallback the
+  host or the input picks at run time (an unindexed input taking a
+  sequential path) is never grounds for refusal.
+- Every flag, malformed values included, is checked before any input is
+  opened.
+- `-j/--jobs`, on every command that has it: `0` (default) sizes the worker
+  pools automatically, `1` runs sequentially, `N` caps them at `N` threads.
+  For `diff`, `N` is also the shard count; `apply-changes` refuses `-j 1`.
+  Commands without `-j` size their pools themselves.
+- `--force`: a command that would refuse unindexed input proceeds with the
+  slower fallback. `build-geocode-index --force` is the exception: a legacy
+  shorthand for `--overwrite --allow-unindexed` that warns every time.
+
+The full rules are in the
+[CLI reference](https://github.com/folknor/pbfhogg/blob/main/reference/cli-reference.md#flag-rules).
 
 ## Output header
 
@@ -181,18 +213,18 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 |------|-------------|
 | `--indexed` | Check if PBF has blob-level indexdata (exit code 0 = yes, 1 = no). Reads the first data blob only; later blobs are not checked. A header-only file (no data blobs) is indexed; a file without a leading OSMHeader is an error (exit 2), not a "no" |
 | `--nodes` | Analyze node coordinate statistics for FOR compression sizing |
-| `-j, --jobs <N>` | Parallel worker threads for `--nodes`. `0` (default) auto-picks from `available_parallelism()`, `1` forces sequential, higher values cap the pool. **Requires `--nodes`**: no other inspect mode reads it, so passing it elsewhere is an error rather than a no-op |
+| `-j, --jobs <N>` | Worker threads for `--nodes`. **Requires `--nodes`**: no other inspect mode has a worker pool, so passing it elsewhere is an error rather than a no-op |
 | `--blocks [N]` | Show per-block distribution stats and optional block listing (N limits to first/last N blocks) |
 | `--id-ranges` | Show min/max element IDs per type and monotonicity |
 | `--locations` | Show locations-on-ways diagnostics |
 | `--anomalies` | Show blocks outside inspect's per-type median thresholds, plus mixed blocks |
-| `-e, --extended` | Extended scan: timestamp range, data bbox, metadata coverage, ordering |
-| `-g, --get <KEY>` | Get a single value by key path (e.g. `header.bbox`, `data.timestamp.first`). Data and metadata paths enable extended stats automatically |
-| `--json` | Machine-readable JSON output |
+| `--extended` | Extended scan: timestamp range, data bbox, metadata coverage, ordering |
+| `-g, --get <KEY>` | Get a single value by key path (e.g. `header.bbox`, `data.timestamp.first`). Data and metadata paths enable extended stats automatically. Not with `--blocks` or `--anomalies`; an unknown key is refused before the input is opened |
+| `--json` | Machine-readable JSON output. Not with `--nodes` or `--get` |
 | `--show <TYPE_ID>` | Display a single element by ID (e.g. `n123` or `node/123`). Also accepts `w456` / `way/456` and `r789` / `relation/789`, including signed IDs. Uses indexdata to skip non-matching blobs, early exit on sorted PBFs. **A mode of its own**: mutually exclusive with every other `inspect` flag, which it used to accept and discard |
 | `--distrust-metadata` | Decode every blob instead of reporting counts, ID ranges and per-block stats out of the blobs' own indexdata. Nothing validates indexdata against the payload it describes, so on a file you are inspecting because you suspect it, the fast path reports the file's claims rather than its contents. Scanning report only: rejected with `--indexed`, `--nodes`, and a `file.*` or `header.*` `--get` key |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
-| `--force` | Proceed even if input lacks indexdata. **Requires `--nodes`**, the only mode that reads it |
+| `--force` | Proceed on unindexed input with the slower fallback. **Requires `--nodes`**, the only mode that refuses unindexed input |
 
 #### inspect tags
 
@@ -202,12 +234,12 @@ Count tag key=value frequencies (subcommand of `inspect`).
 |------|-------------|
 | `--min-count <N>` | Only show tags with at least this many occurrences [default: 1] |
 | `-M, --max-count <N>` | Only show tags with at most this many occurrences |
-| `-s, --sort <ORDER>` | Sort order: count-desc (default), count-asc, name-asc, name-desc |
+| `--sort <ORDER>` | Sort order: count-desc (default), count-asc, name-asc, name-desc |
 | `-e, --expressions <FILE>` | Read tag expressions from file (one per line, # comments) |
 | `-t, --type <TYPE>` | Filter by element type: node, way, or relation |
-| `-j, --jobs <N>` | Parallel worker threads. `0` (default) auto-picks from `available_parallelism()`, `1` forces sequential, higher values cap the pool |
+| `-j, --jobs <N>` | Worker threads |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
-| `--force` | Proceed even if input lacks indexdata (slower fallback path) |
+| `--force` | Proceed on unindexed input with the slower fallback |
 
 `inspect tags` expressions use the same syntax as `tags-filter`, including
 element-type prefixes. For example, `w/highway=primary` counts that match only
@@ -256,7 +288,7 @@ pbfhogg check [OPTIONS] <FILE>
 | `--check-relations` | Also check relation member references (applies to ref check) |
 | `--show-ids` | Show IDs of missing objects, format: `n123 in w456` (applies to ref check) |
 | `--json` | Machine-readable JSON output |
-| `--quiet` | Exit-code only, no output. Not combinable with `--json` |
+| `-q, --quiet` | Exit-code only, no output. Not combinable with `--json`, `--show-ids` or `--max-errors` |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 
 For missing relation-to-relation members, reports unique missing IDs with occurrence count when they differ: `Missing relation members: 706 (777 references)`.
@@ -328,12 +360,12 @@ pbfhogg cat [OPTIONS] --output <OUTPUT> <FILES>...
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation) |
-| `-c, --clean <ATTR>` | Strip metadata attribute (repeatable: version, timestamp, changeset, uid, user) |
+| `--clean <ATTR>` | Strip metadata attribute (repeatable: version, timestamp, changeset, uid, user) |
 | `--dedupe` | K-way sorted merge with dedup (all inputs must be sorted). Rejects `--type` and `--clean`: the dedupe path is blob-level passthrough and implements neither |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O (only with `--dedupe`) |
-| `--force` | Proceed even if input lacks indexdata |
+| `--force` | Proceed on unindexed input with the slower fallback. Requires `--type`, `--clean` or `--dedupe`: plain `cat` never refuses |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
@@ -363,7 +395,7 @@ pbfhogg sort [OPTIONS] --output <OUTPUT> <FILE>
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O |
-| `--force` | Proceed even if input lacks indexdata |
+| `--force` | Proceed on unindexed input with the slower fallback |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
@@ -387,7 +419,7 @@ pbfhogg repack [OPTIONS] --output <OUTPUT> <FILE>
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O |
-| `--force` | Proceed even if input lacks indexdata |
+| `--force` | Proceed on unindexed input with the slower fallback |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
@@ -417,7 +449,7 @@ pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
 | `--corrupt-indexdata-kind` | Rotate the element kind declared by `BlobHeader.indexdata` on every OsmData blob (node to way to relation to node), leaving count and ID range honest. The kind is what per-kind blob schedules select on, so this makes a consumer skip a blob outright rather than misreport it. Mutually exclusive with `--strip-indexdata`; combinable with `--corrupt-indexdata`. |
 | `--strip-bbox` | Clear `HeaderBlock.bbox` so the output declares no file-level extent. Header-only change; no OsmData blob is touched. Does not affect `extract --bbox`, which derives its region from the CLI argument and per-blob indexdata bboxes rather than the header. |
 | `--drop-ids <N:SEED>` | Deterministically remove exactly N elements selected globally by kind, ID, and seed. Surviving references to removed elements intentionally dangle. |
-| `--force` | Skip the indexdata precondition required by the decode path (falls back to scanning every blob for every kind; slower). |
+| `--force` | Proceed on unindexed input on the decode path (`--unsort`, `--unsort-intra`, `--strip-locations`, `--drop-ids`), which scans every blob for every kind; slower. Refused without a decode-path flag, since the header-only flags never refuse |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O |
@@ -440,7 +472,7 @@ pbfhogg renumber [OPTIONS] --output <OUTPUT> <FILE>
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
-| `-s, --start-id <ID>` | Starting ID(s): single value or comma-separated node,way,relation [default: 1] |
+| `--start-id <ID>` | Starting ID(s): single value or comma-separated node,way,relation [default: 1] |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--generator` | Override writing program name |
@@ -472,15 +504,15 @@ pbfhogg extract [OPTIONS] <FILE>
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `-b, --bbox <BBOX>` | Bounding box: minlon,minlat,maxlon,maxlat |
 | `-p, --polygon <FILE>` | Polygon GeoJSON file |
-| `-c, --config <FILE>` | Multi-extract JSON config file |
+| `--config <FILE>` | Multi-extract JSON config file |
 | `-d, --directory <DIR>` | Rebase config outputs under this directory (only with --config) |
-| `-s, --simple` | Simple strategy (single pass) |
+| `--simple` | Simple strategy (single pass). Never refuses unindexed input, so not with `--force` |
 | `--smart` | Smart strategy (three passes, complete relations) |
 | `--set-bounds` | Write the extract region bounding box to the output header instead of the input's. complete_ways and smart exceed it by design with the out-of-region nodes of selected ways |
 | `--clean <ATTR>` | Strip metadata attribute (repeatable: version, timestamp, changeset, uid, user) |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
-| `--force` | Proceed even if input lacks indexdata |
+| `--force` | Proceed on unindexed input with the slower fallback |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
@@ -488,7 +520,7 @@ pbfhogg extract [OPTIONS] <FILE>
 
 Filter elements by tag expressions. Default mode resolves relation members transitively (matched relations pull in member ways, nodes, and nested relations). With `-R`, only directly matched elements are emitted.
 
-With `--input-kind osc` (or autodetected from `.osc`/`.osc.gz` extension), filters an OSC change file instead, always preserving deletes. PBF-only flags (`-R`, `-i`, `-t`, `-j`) are not valid in OSC mode (OSC parsing is single-threaded).
+With `--input-kind osc` (or autodetected from `.osc`/`.osc.gz` extension), filters an OSC change file instead, always preserving deletes. Every flag that only means something for a PBF is refused in OSC mode: `-R`, `--invert-match`, `--remove-tags`, `--distrust-metadata`, an explicit `-j`, `--generator`, `--output-header`, an explicit `--compression`, `--direct-io` and `--force`.
 
 Expressions use osmium syntax: `highway=primary`, `amenity`, `w/building=yes`, etc.
 
@@ -522,14 +554,14 @@ pbfhogg tags-filter [OPTIONS] --output <OUTPUT> <FILE> [EXPRESSIONS]...
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--input-kind <KIND>` | Input kind override: `pbf` or `osc` (autodetect from extension by default) |
 | `--distrust-metadata` | Do not skip blobs on their indexdata or tag index; decode every blob (PBF only). Nothing validates a blob's tag index against its payload, so a file whose index omits a key its elements carry silently loses those elements. Trades the skip speedup for an answer that depends only on element data, and waives the indexdata precondition |
-| `-R, --omit-referenced` | Omit referenced objects (faster, single pass, direct matches only; PBF only) |
-| `-i, --invert-match` | Invert match: exclude matching objects, keep non-matching (PBF only) |
-| `-t, --remove-tags` | Remove tags from referenced objects not directly matched (use without -R; PBF only) |
+| `-R, --omit-referenced` | Omit referenced objects (faster, single pass, direct matches only; PBF only). Not with `--remove-tags` or `-j` |
+| `--invert-match` | Invert match: exclude matching objects, keep non-matching (PBF only) |
+| `--remove-tags` | Remove tags from referenced objects not directly matched (not with -R; PBF only) |
 | `-e, --expressions <FILE>` | Read filter expressions from file (one per line, # comments) |
-| `-j, --jobs <N>` | Worker-pool size for the parallel classify phases (PBF only). `0` (default) uses rayon's `available_parallelism()`. Two-pass mode only: combining `-j` with `-R` is an error since the single-pass path uses the pipelined reader, not the parallel classify path |
+| `-j, --jobs <N>` | Worker threads for the two-pass mode (PBF only). Refused with `-R`, whose single pass has no worker pool |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
-| `--force` | Proceed even if input lacks indexdata |
+| `--force` | Proceed on unindexed input with the slower fallback. Not with `--invert-match` or `--distrust-metadata`, which never refuse |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
@@ -553,12 +585,12 @@ pbfhogg export [OPTIONS] <FILE> [EXPRESSIONS]...
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Write to a file instead of stdout |
-| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way. Requires `-o` |
 | `--format <FORMAT>` | `geojsonseq` (default) or `geojson` |
-| `--type <TYPE>` | Export only `node` or `way` |
+| `-t, --type <TYPE>` | Export only `node` or `way` |
 | `-e, --expressions <FILE>` | Read tag expressions from a file, one per line |
 | `--properties <KEYS>` | Comma-separated whitelist of tag property keys |
-| `--bbox <BBOX>` | `min_lon,min_lat,max_lon,max_lat`; ways match by vertex containment only, so crossing or enclosing geometry without an inside vertex is omitted |
+| `-b, --bbox <BBOX>` | `min_lon,min_lat,max_lon,max_lat`; ways match by vertex containment only, so crossing or enclosing geometry without an inside vertex is omitted |
 | `--metadata` | Add available `@version`, `@timestamp`, `@changeset`, `@uid`, `@user`, and `@visible` properties |
 
 Every feature includes `@id` and `@type`. Metadata timestamps are RFC 3339 UTC
@@ -580,16 +612,16 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 |------|-------------|
 | `--format <FORMAT>` | Output format: `text` (default) or `osc` |
 | `-c, --suppress-common` | Hide unchanged elements (text only) |
-| `-v, --verbose` | Show detailed changes for modified elements (text only). Always takes the sequential path regardless of `-j` |
+| `-v, --verbose` | Show detailed changes for modified elements (text only). Sequential-only, so not with `-j` or `--tmp-dir` |
 | `-s, --osmium-summary` | Print osmium-style summary (left/right/same/different counts) to stderr instead of the default pbfhogg-format summary (text only). The pbfhogg-format summary always fires on stderr unless `--quiet` - this flag only swaps the format |
-| `-q, --quiet` | Exit-code only, suppress output (text only) |
+| `-q, --quiet` | Exit-code only, suppress output (text only). Not with `-o`, `-c`, `-v` or `-s`, which only shape that output |
 | `-o, --output <FILE>` | Write output to file (required for `--format osc`) |
-| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way. Requires `-o` |
 | `-t, --type <TYPE>` | Filter by element type (text only) |
-| `-j, --jobs <N>` | Parallel shard count for the block-pair merge. `0` (default) auto-picks from available cores; `1` restores the sequential, scratch-free path; higher values partition the ID space across that many worker threads. Applies to both `--format text` and `osc`; requires both inputs indexed. **Rejected with `-v/--verbose`**, which is sequential-only - an explicit `-j` there used to be accepted and discarded. The parallel path writes shard temp files, removed on completion; scratch demand varies by input. See `reference/performance.md` for measurements |
+| `-j, --jobs <N>` | Worker threads and ID-range shard count. `0` (default) uses one shard per core; `1` takes the sequential path (for text, scratch-free). Applies to both `--format text` and `osc`; sharding requires both inputs indexed. **Refused with `-v/--verbose`**, which is sequential-only. The parallel path writes shard files to scratch, removed on completion; scratch demand varies by input. See `reference/performance.md` for measurements |
 | `--increment-version` | Bump version of deleted elements by 1 (osc only) |
 | `--update-timestamp` | Set delete timestamp to current time (osc only) |
-| `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read. Default: the output's directory, or the current directory without `-o` |
+| `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read. Default: the output's directory, or the current directory without `-o`. Refused with text `-j 1` and with `-v`, which write no scratch |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 
 With `--format osc`, produces a lossless roundtrip - applying the derived OSC to the old PBF reproduces the new PBF exactly (see [DEVIATIONS](/cli/deviations#derive-changes-lossless-delete-roundtrip)).
@@ -648,14 +680,14 @@ pbfhogg getid [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--invert` | Invert selection: remove listed IDs instead of keeping them |
 | `-r, --add-referenced` | Include referenced nodes of matching ways (two-pass; not with `--invert`) |
-| `-t, --remove-tags` | Remove tags from referenced objects (use with -r; not with `--invert`) |
+| `--remove-tags` | Remove tags from referenced objects. Requires `-r` (so not with `--invert`) |
 | `--verbose-ids` | Print requested IDs, then report which were not found (not with `--invert`). Both lists go to stderr. The found set is collected on the write path, so this costs no extra pass over the output |
 | `-i, --id-file <FILE>` | Read IDs from text file (one per line) |
 | `-I, --id-osm-file <FILE>` | Read IDs from an OSM/PBF file (all element IDs are collected) |
 | `--default-type <TYPE>` | Type for bare numeric IDs: node, way, relation. No type is assumed when this option is omitted. |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
-| `--force` | Proceed even if input lacks indexdata |
+| `--force` | Proceed on unindexed input with the slower fallback |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
@@ -682,7 +714,7 @@ pbfhogg getparents [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
-| `-s, --add-self` | Also include the queried objects themselves in the output |
+| `--add-self` | Also include the queried objects themselves in the output |
 | `-i, --id-file <FILE>` | Read IDs from text file (one per line) |
 | `-I, --id-osm-file <FILE>` | Read IDs from an OSM/PBF file (all element IDs are collected) |
 | `--default-type <TYPE>` | Type for bare numeric IDs: node, way, relation. No type is assumed when this option is omitted. |
@@ -716,7 +748,7 @@ pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 | `--ignore-missing-nodes` | Accept ways whose node references are absent from the input, writing those vertices as `(0, 0)`. Without it the run fails and no output is written: `(0, 0)` is Null Island, a real coordinate, so a placeholder vertex cannot be told apart from genuine data by any reader. Matches osmium in name and in default. |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
-| `--force` | Proceed even if input lacks indexdata |
+| `--force` | Proceed on unindexed input with the slower fallback. Not with `--index-type external` or `--inject-prepass`, which need indexdata whatever `--force` says |
 | `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read. Default: the output's directory |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
@@ -764,11 +796,11 @@ pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--locations-on-ways` | Preserve way-node locations through the merge (requires base PBF with LocationsOnWays). Ways the OSC creates or modifies get locations from the merged nodes; base ways the OSC does not touch keep their existing locations, even when the OSC moves or deletes a node they reference. Rerun `add-locations-to-ways` on the output for a full refresh |
 | `--ignore-missing-nodes` | With `--locations-on-ways`, permit unresolved references to retain the legacy `(0,0)` fallback instead of failing |
-| `-j, --jobs <N>` | Worker-pool size for the descriptor-first pipeline. `0` (default) uses the `nproc - 2` heuristic (leaves two cores for the scanner + drain threads, minimum 2). An explicit `-j 1` is refused |
+| `-j, --jobs <N>` | Worker threads for the descriptor-first pipeline. `0` (default) uses the `nproc - 2` heuristic (leaves two cores for the scanner + drain threads, minimum 2). An explicit `-j 1` is refused |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O |
-| `--force` | Proceed even if input lacks indexdata |
+| `--force` | Proceed on an unindexed base with the slower fallback. Not with `--locations-on-ways`, which needs an indexed base whatever `--force` says |
 | `--allow-version-regression` | Accept a change whose `version` is lower than the version already held for that object. Off by default: feeding diffs out of sequence order is refused rather than silently downgrading objects to an older state. A delete leaves a versioned tombstone, so a stale change after a delete is refused too. An equal version is always accepted and the later change wins, so overlapping diffs and regional-extract deletes at the held version apply. Elements that claim no `version` are unaffected |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
@@ -787,7 +819,7 @@ pbfhogg merge-changes [OPTIONS] --output <OUTPUT> <CHANGES>...
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--simplify` | Keep only the last change per object (type + id) |
 | `--allow-version-regression` | Requires `--simplify`, the mode that resolves conflicts; passing it alone is a usage error. Accepts a later change whose `version` is lower than one seen earlier in input order. Off by default, so listing the input files out of sequence order is an error rather than a silent downgrade. An equal version is always accepted and the later change wins |
-| `-j, --jobs <N>` | Parallel worker threads. `1` forces sequential, `0` (default) auto-picks from `available_parallelism()`, higher values cap the worker pool. Affects both the per-input parse fan-out and the simplify path's chunk fan-out |
+| `-j, --jobs <N>` | Worker threads. Sizes both the per-input parse fan-out and the simplify path's chunk fan-out |
 
 ### build-geocode-index
 
@@ -801,7 +833,7 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 
 | Flag | Description |
 |------|-------------|
-| `--output-dir <DIR>` | Output directory for index files |
+| `-o, --output-dir <DIR>` | Output directory for index files |
 | `--street-level <N>` | S2 cell level for streets/addresses; must exceed `--coarse-level` and fit the builder limit. Default comes from the builder configuration |
 | `--coarse-level <N>` | Fallback cell level for rural areas; must be below `--street-level` and fit the builder limit. Default comes from the builder configuration |
 | `--admin-level <N>` | S2 cell level for admin boundaries, within the builder's work limit. Default comes from the builder configuration |
@@ -811,7 +843,7 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `-O, --overwrite` | Replace an existing index (or empty directory) at `--output-dir` after the new build succeeds. Without it an existing `--output-dir` is refused before any work. Does not bypass the indexdata requirement |
 | `--allow-unindexed` | Accept input without blob-level indexdata (slower fallback path). Does not replace an existing index |
-| `--force` | Legacy shorthand equivalent to `--overwrite --allow-unindexed` |
+| `--force` | Legacy shorthand equivalent to `--overwrite --allow-unindexed`; every use warns that it also grants overwrite |
 | `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read. Default: the directory containing `--output-dir` |
 
 A node whose coordinates fall outside the geographic domain fails the whole

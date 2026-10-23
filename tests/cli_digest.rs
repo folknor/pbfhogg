@@ -78,13 +78,14 @@ fn assert_refused(path: &Path, why: &str) {
     );
 }
 
-/// `diff --suppress-common` exit code: 0 identical, 1 different, 2 error.
+/// `diff --quiet` exit code: 0 identical, 1 different, 2 error. (The verdict
+/// is the same with or without `--suppress-common`, which `--quiet` refuses
+/// as an output-only flag.)
 fn diff_code(old: &Path, new: &Path, jobs: Option<usize>) -> Option<i32> {
     let mut cli = CliInvoker::new()
         .arg("diff")
         .arg(old)
         .arg(new)
-        .arg("--suppress-common")
         .arg("--quiet");
     if let Some(j) = jobs {
         cli = cli.arg("-j").arg(j.to_string());

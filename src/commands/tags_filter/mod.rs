@@ -197,15 +197,13 @@ pub struct TagsFilterOptions<'a> {
     pub remove_tags: bool,
     /// Output compression, backend and the shared input flags.
     pub write: WriteOptions,
-    /// Override the worker-pool size for the parallel classify passes
-    /// in two-pass mode (`parallel_classify_phase` for blob scanning
-    /// plus two `parallel_classify_accumulate` calls for relation
-    /// closure + way-node deps). `None` uses the rayon default
-    /// (`available_parallelism()`). Ignored in single-pass mode
-    /// (`-R`, which uses the pipelined reader rather than
-    /// `parallel_classify_*`); the CLI rejects that combination
-    /// upfront.
-    pub jobs: Option<usize>,
+    /// Worker-pool size for two-pass mode: the classify passes (blob
+    /// scanning, relation closure, way-node dependencies) and the pass-2
+    /// decode-and-filter pool. `Auto` keeps the decode pools' host-derived
+    /// sizing. Single-pass mode (`omit_referenced`) reads through the
+    /// pipelined reader and has no such pool, so a `Fixed` value there is
+    /// refused rather than ignored.
+    pub parallelism: crate::host::Parallelism,
     /// Do not trust the per-blob sidecar metadata. Every blob is decompressed
     /// and every element examined, regardless of what the blob's `indexdata`
     /// and tag index claim about its contents.
@@ -219,6 +217,34 @@ pub struct TagsFilterOptions<'a> {
     /// hatch: it costs the blob-skip speedup and buys an answer that depends
     /// only on element data.
     pub distrust_metadata: bool,
+}
+
+impl TagsFilterOptions<'_> {
+    /// Refuse option combinations in which one option cannot take effect.
+    ///
+    /// Single-pass mode emits only direct matches, so there are no referenced
+    /// objects for `remove_tags` to strip, and it has no worker pool for a
+    /// fixed `parallelism` to size. Called first by [`tags_filter`]; a caller
+    /// can call it earlier to refuse before reserving an output.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` naming the options that cannot be combined.
+    pub fn validate(&self) -> Result<()> {
+        if self.omit_referenced && self.remove_tags {
+            return Err(crate::Error::invalid_argument(
+                "tags-filter: remove_tags has no effect with omit_referenced, which \
+                 emits no referenced objects to strip",
+            ));
+        }
+        if self.omit_referenced && self.parallelism != crate::host::Parallelism::Auto {
+            return Err(crate::Error::invalid_argument(
+                "tags-filter: a fixed parallelism has no effect with omit_referenced, \
+                 whose single pass has no worker pool to size",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Filter a PBF file by tag expressions.
@@ -248,6 +274,11 @@ pub(crate) fn tags_filter_to(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<TagsFilterStats> {
+    // Options that cannot take effect together are refused before the input
+    // is touched, and so is a malformed expression.
+    opts.validate()?;
+    let expressions = parse_expressions(opts.expression_strs)?;
+
     // Blob-level filtering can't help in invert mode (we want non-matching
     // blobs), and `--distrust-metadata` declines to use it at all - demanding
     // indexdata the run will not consult would be a pointless refusal.
@@ -262,12 +293,11 @@ pub(crate) fn tags_filter_to(
         )?;
     }
 
-    if let Some(n) = opts.jobs {
+    if let Some(n) = opts.parallelism.fixed() {
         #[allow(clippy::cast_possible_wrap)]
         crate::debug::emit_counter("tagsfilter_worker_count", n as i64);
     }
 
-    let expressions = parse_expressions(opts.expression_strs)?;
     if opts.omit_referenced {
         let result = tags_filter_single_pass(
             input,
@@ -298,7 +328,7 @@ pub(crate) fn tags_filter_to(
             opts.distrust_metadata,
             opts.remove_tags,
             &opts.write,
-            opts.jobs,
+            opts.parallelism,
             overrides,
             host,
         )?;
@@ -664,10 +694,11 @@ fn tags_filter_two_pass(
     distrust_metadata: bool,
     remove_tags: bool,
     write: &WriteOptions,
-    jobs: Option<usize>,
+    parallelism: crate::host::Parallelism,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<TagsFilterStats> {
+    let jobs = parallelism.fixed();
     let WriteOptions {
         compression,
         backend,
@@ -1037,12 +1068,16 @@ fn tags_filter_two_pass(
             std::fs::File::open(input).map_err(|e| crate::file_reader::open_error(input, e))?,
         );
 
-        let decode_threads = crate::host::sized_workers(
-            &*host.resources,
-            crate::tunables::DECODE_WORKERS_RESERVED,
-            crate::tunables::DECODE_WORKERS_MIN,
-            crate::tunables::DECODE_WORKERS_FALLBACK,
-        );
+        // A fixed parallelism caps this pool too, not only the classify
+        // passes; `Auto` keeps the decode pool's host-derived sizing.
+        let decode_threads = parallelism.resolve(|| {
+            crate::host::sized_workers(
+                &*host.resources,
+                crate::tunables::DECODE_WORKERS_RESERVED,
+                crate::tunables::DECODE_WORKERS_MIN,
+                crate::tunables::DECODE_WORKERS_FALLBACK,
+            )
+        });
 
         let decode_items: Vec<(usize, u64, usize)> = schedule
             .iter()

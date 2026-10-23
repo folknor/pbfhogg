@@ -144,7 +144,7 @@ pub fn merge_changes(
     inputs: &[&Path],
     output: crate::output::Output,
     simplify: bool,
-    jobs: Option<usize>,
+    parallelism: crate::host::Parallelism,
     allow_version_regression: bool,
     host: &crate::host::Host,
 ) -> Result<MergeChangesStats> {
@@ -153,7 +153,7 @@ pub fn merge_changes(
         inputs,
         &output,
         simplify,
-        jobs,
+        parallelism,
         allow_version_regression,
         host,
     )?;
@@ -167,7 +167,7 @@ pub(crate) fn merge_changes_to(
     inputs: &[&Path],
     output: &crate::output::Output,
     simplify: bool,
-    jobs: Option<usize>,
+    parallelism: crate::host::Parallelism,
     allow_version_regression: bool,
     host: &crate::host::Host,
 ) -> Result<MergeChangesStats> {
@@ -177,15 +177,14 @@ pub(crate) fn merge_changes_to(
         ));
     }
 
-    let worker_count = match jobs {
-        Some(n) if n > 0 => n,
-        _ => crate::host::sized_workers(
+    let worker_count = parallelism.resolve(|| {
+        crate::host::sized_workers(
             &*host.resources,
             crate::tunables::MERGE_CHANGES_WORKERS_RESERVED,
             crate::tunables::MERGE_CHANGES_WORKERS_MIN,
             crate::tunables::MERGE_CHANGES_WORKERS_FALLBACK,
-        ),
-    };
+        )
+    });
 
     crate::debug::emit_marker("MERGECHANGES_START");
     #[allow(clippy::cast_possible_wrap)]
@@ -200,13 +199,13 @@ pub(crate) fn merge_changes_to(
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("merge_changes_total_bytes_in", total_bytes_in as i64);
 
-    // Build a scoped rayon pool when the caller passed an explicit `jobs`.
+    // Build a scoped rayon pool when the caller fixed the parallelism.
     // Pool controls par_iter and par_chunks thread count for both the
-    // streaming and simplify paths. When `jobs` is None, the host's executor
-    // is used (rayon's ambient pool under `Executor::Ambient`).
+    // streaming and simplify paths. Under `Auto` the host's executor is used
+    // (rayon's ambient pool under `Executor::Ambient`).
     // The streaming path's ordered window spawns onto the same executor its
     // body is installed on, so the explicit pool is carried as one.
-    let executor = if jobs.is_some() {
+    let executor = if parallelism.fixed().is_some() {
         crate::host::Executor::Pool(std::sync::Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(worker_count)
@@ -1143,7 +1142,7 @@ mod tests {
                         &crate::host::Diagnostics::discard(),
                     )?,
                     false,
-                    Some(jobs),
+                    crate::host::Parallelism::from_jobs(jobs),
                     false,
                     &crate::host::Host::for_tests(),
                 )?;
@@ -1194,7 +1193,7 @@ mod tests {
             )
             .unwrap(),
             false,
-            Some(1),
+            crate::host::Parallelism::from_jobs(1),
             false,
             &crate::host::Host::for_tests(),
         )
@@ -1234,7 +1233,7 @@ mod tests {
             )
             .unwrap(),
             false,
-            Some(1),
+            crate::host::Parallelism::from_jobs(1),
             false,
             &crate::host::Host::for_tests(),
         )
@@ -1276,7 +1275,7 @@ mod tests {
             )
             .unwrap(),
             false,
-            Some(1),
+            crate::host::Parallelism::from_jobs(1),
             false,
             &crate::host::Host::for_tests(),
         )

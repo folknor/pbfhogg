@@ -349,6 +349,14 @@ pub(super) fn encode_blob_body(
             match &scratch.zstd_compressor {
                 Some((cached_level, _)) if *cached_level == *level => {}
                 _ => {
+                    // Built lazily, per worker, on its first zstd blob. A
+                    // parsed `Compression` (the CLI's argument boundary) has
+                    // its level range-checked already, so from the CLI a
+                    // failure here is a resource failure (zstd could not
+                    // allocate its context), not a configuration error found
+                    // late; only a library caller building
+                    // `Compression::Zstd` by hand can reach it with a bad
+                    // level.
                     scratch.zstd_compressor = Some((*level, zstd::bulk::Compressor::new(*level)?));
                 }
             }

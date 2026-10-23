@@ -30,10 +30,11 @@ use crate::common::{
 use pbfhogg::MemberId;
 use tempfile::TempDir;
 
-/// Invoke `pbfhogg tags-filter <input> -o <output> [-R] [-i] [-t]
-/// [-j N] <expressions...> --force` and assert success. Returns
-/// the captured stderr (which carries the
-/// `TagsFilterStats::write_summary` line).
+/// Invoke `pbfhogg tags-filter <input> -o <output> [-R] [--invert-match]
+/// [--remove-tags] [-j N] <expressions...> [--force]` and assert success.
+/// `--force` is left out with `--invert-match`, which never refuses an
+/// unindexed input and so refuses the flag. Returns the captured stderr
+/// (which carries the `TagsFilterStats::write_summary` line).
 fn run_filter_full(
     input: &Path,
     output: &Path,
@@ -52,15 +53,16 @@ fn run_filter_full(
         cli = cli.arg("-R");
     }
     if invert {
-        cli = cli.arg("-i");
+        cli = cli.arg("--invert-match");
+    } else {
+        cli = cli.arg("--force");
     }
     if remove_tags {
-        cli = cli.arg("-t");
+        cli = cli.arg("--remove-tags");
     }
     if let Some(j) = jobs {
         cli = cli.arg("-j").arg(j.to_string());
     }
-    cli = cli.arg("--force");
     for expr in expressions {
         cli = cli.arg(*expr);
     }

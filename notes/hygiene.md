@@ -470,83 +470,20 @@ with per-site `#[allow(reason = ...)]`.
 
 Reported by: read path, CLI and plumbing, change application.
 
-## HYG-035 - Configuration is validated at the moment of use
+## HYG-036 - `too_many_arguments` is denied and then allowed locally all over
 
 Anger: 9 - validate flags earlier, refuse no-op flags.
 
-- `--io-uring` / `--direct-io` without the feature are refused in
-  `Output::pbf_writer` (writer backends) and `FileReader::open` (direct
-  reads), after the input is opened, headers read and sometimes a full first
-  pass done; on altw or apply-changes the refusal can come minutes in.
-- Apply-changes refuses `-j 1` after parsing the whole OSC, building
-  `DiffRanges` and creating the output writer; the sortedness refusal and the
-  `--locations-on-ways` without LocationsOnWays refusal (both in
-  `build_header_bytes`) also come after the OSC is parsed and the ranges are
-  built, while the `--force --locations-on-ways` refusal is up front, as it
-  should be. `MergeOptions` wants a `validate()` called first.
-- Refusals that depend on parsing are ordered differently per command:
-  `tags_filter_to` runs `require_indexdata` (a file probe) before
-  `parse_expressions`, so a syntax error in an expression surfaces after the
-  probe; extract parses `--bbox` and the polygon after its output is
-  reserved; getid resolves its IDs (a full pass over the `-I` PBF) after the
-  output is reserved, and refuses an empty ID set only then. When two
-  problems exist at once, which error the operator sees depends on the arm:
-  altw and diff make their scratch directory before the output is checked
-  (a missing output directory reads "scratch directory X is unusable"),
-  build-geocode-index checks the output first, every other command reports
-  the output's own error.
-- Altw refuses `inject_prepass && !indexdata_present` inside
-  `write_output_checked`, after pass 0 and pass 1 have built the whole sparse
-  store.
-- Zstd compressor construction happens on the first blob inside a rayon
-  closure, after the header is written and the output created, surfacing via
-  `WriterGone` lag; `copy_file_range` incompatibility with `--direct-io` is
-  discovered when the first `CopyRange` chunk reaches the sink.
-- `--output-header` and `--generator` are parsed per dispatch arm
-  (`HeaderOverrides::parse` in every arm that writes a PBF); `--drop-ids`,
-  `--start-id`, time-filter's timestamp and `--bbox` are parsed in `run_*` or
-  the library. The `main.rs` comment "Every free-form flag is parsed exactly
-  once, here at the argument boundary" is not true for these. `tags-filter`
-  with no expressions and `getid` with no IDs are refused after the fact.
-
-Fix: `value_parser`s for every free-form flag; feature-availability checks at
-argument time; a `validate()` per options struct; an altw `AltwPlan::resolve`
-that opens the input once, validates every combination and the scratch
-filesystem, and chooses the backend. Enforce with a test per flag that the
-refusal happens with no input file present.
-
-Reported by: CLI and plumbing, change application, altw and scanning, write
-path, re-encoding.
-
-## HYG-036 - "This flag has no effect here" is refused, warned or ignored depending on the command
-
-Anger: 9 - validate flags earlier, refuse no-op flags.
-
-Refused: `-j` with `-R`, `--distrust-metadata` outside the scanning report,
-`-v` with `-j` on diff, `inspect -j` / `--force` outside `--nodes`. Warned
-(a `Warning:` line from `run_*`): `tags-filter -R -t`, `getid -t` without `-r`, and
-`--remove-tags` without `--add-referenced` (which the library accepts
-silently). Ignored: `--direct-io` on `check --refs`, `getid -I` and many
-pipeline passes (HYG-037), `--jobs` with `-R` in the tags-filter library;
-`tags-filter --input-kind osc`, which refuses `-R`, `-i`, `-t`,
-`--distrust-metadata`, `-j`, `--generator` and `--output-header` but accepts
-and discards `--compression`, `--direct-io` and `--force` (its output is OSC,
-so none can apply); `-O` when `export` or `diff` write to stdout and no
-output exists to replace; plain `cat --force`, which is consulted only with
-`--type`, `--clean` or `--dedupe`; a `diff --tmp-dir` on a run that takes the
-scratch-free `-j 1` path. Validation is split between clap attributes and
-many hand-written `if x { return Err(...) }` lines in `main`, which exit 2
-with a different message format from clap's. The library now takes one `WriteOptions`
-(compression, `OutputBackend`, direct reads, force) instead of the positional
+The flag-refusal policy is done (`reference/cli-reference.md`, "Flag rules").
+What remains is the lint side: the library takes one `WriteOptions`
+(compression, `OutputBackend`, direct reads, force) instead of positional
 bools, but `too_many_arguments` is still `#[allow]`ed on the extract entry
 points, `writer_from_header`, `getid_dispatched`, `filter_by_id`, the
-getparents dispatchers, altw's `write_output_*`, `tags_filter_*`, apply-changes'
-`worker_loop` and `handle_candidate`, and more; `too_many_lines` likewise. A
-denied lint with that many local exemptions does not enforce anything. Fix:
-one policy (refuse) expressed in clap (`conflicts_with`, `requires`,
-`ArgGroup`) or one validation function per command; consider splitting modal
-commands (`diff text` / `diff osc`, `tags-filter pbf` / `osc`, `cat` /
-`cat dedupe`) so invalid combinations stop existing.
+getparents dispatchers, altw's `write_output_*`, `tags_filter_*`,
+apply-changes' `worker_loop` and `handle_candidate`, several CLI `run_*`
+functions, and more; `too_many_lines` likewise. A denied lint with that many
+local exemptions does not enforce anything. Fix: group the parameters into
+option structs and drop the exemptions, or stop denying the lint.
 
 Reported by: CLI and plumbing, filtering and spatial, change application, altw
 and scanning, re-encoding.
@@ -916,7 +853,9 @@ decides sortedness. `inspect`, `bench-write`, `renumber` and `diff` also open
 a reader (or run a probe) whose only job is to make a header-less file fail
 with the missing-header error before the scan proper, which would otherwise
 read it as empty. Fix: open once and hand the `File` and parsed header down
-(the altw `AltwPlan` of HYG-035).
+(for altw, a plan that opens the input once, checks every option combination
+that depends on it and the scratch filesystem, and chooses the backend; the
+input-free combinations are already refused by `AltwOptions::validate`).
 
 Reported by: altw and scanning, change application, re-encoding, filtering and
 spatial.
@@ -1009,93 +948,6 @@ covers).
 Reported by: the output-publication review fixes; the command-matrix audit
 found the decoder now owns the policy.
 
-## HYG-111 - `-j/--jobs` is on a minority of commands and means something different on each
-
-Anger: 7 - CLI behaviour.
-
-Flag by flag, with `0` and `1` as the values that differ:
-
-- tags-filter: `0` is auto, N caps the parallel classify workers; only the
-  two-pass mode reads it. The CLI refuses a non-zero value with `-R` and in
-  OSC mode; the library accepts and ignores it with `-R`.
-- `inspect --nodes` (clap `requires = "nodes"`) and `inspect tags`: `0` auto,
-  `1` sequential, N caps the pool.
-- diff and `diff --format osc`: the CLI resolves `0` to the host's
-  parallelism, `1` selects the sequential path that the docs call scratch-free,
-  and N is a shard count for the ID space, not only a thread cap. Refused with
-  `-v`. The library `jobs: usize` has no auto: `0` behaves as sequential
-  (`options.jobs > 1` gates the parallel path), and a comment says the caller
-  resolves it.
-- apply-changes: `0` is a `nproc - 2` heuristic with a minimum of 2, `1` is
-  refused (after the OSC is parsed, HYG-035), N >= 2 is the worker count.
-- merge-changes: `0` auto through `sized_workers` with the merge-changes
-  reserve, minimum and fallback constants, `1` builds a one-thread pool and
-  runs, N builds a pool of N.
-
-"Auto" is not one thing either: every core (tags-filter, diff), cores minus a
-reserve (apply-changes, merge-changes, each with its own constants). The
-library has three shapes for the same knob: `usize` with `0` as auto
-(`tags_count`, `node_stats`), `usize` the caller must have resolved (`diff`,
-`derive_changes`), `Option<usize>` (`tags_filter`, `apply_changes`,
-`merge_changes`, where `Some(0)` also means auto). Sort, cat, repack,
-degrade, renumber, extract, altw, getid, getparents, time-filter, check and
-build-geocode-index all run worker pools and have no flag; their size comes
-from host probes and constants. `docs/cli/commands.md` and
-`reference/cli-reference.md` describe each flag where it appears and state no
-cross-command rule.
-
-Fix: one `JobsArg` in the CLI (`0` auto, N a cap on worker threads, one help
-text) and one library `Parallelism` (`Auto | Fixed(NonZeroUsize)`) replacing
-the three shapes, diff's shard count derived from it; either give the pooled
-commands the flag or say once in the references that they have none. Apply-
-changes' `-j 1` refusal stays as a documented exception until its barrier is
-reworked (HYG-081). Enforce with a text rule rejecting a `jobs: usize` field
-in `src/`, and a contract test table of command times `-j 0|1|2` expecting
-accept or refuse.
-
-Reported by: the command-matrix audit.
-
-## HYG-112 - `--force` means a different thing on each command that has it
-
-Anger: 7 - CLI behaviour.
-
-The common-flags table says "Proceed even if input lacks indexdata (slower
-fallback path)". What the flag does:
-
-- cat: consulted only with `--type`, `--clean` or `--dedupe`; on plain `cat`
-  it is accepted and does nothing (plain cat adds the indexdata).
-- sort, repack, tags-filter (not with `-i` or `--distrust-metadata`), getid
-  and `getid --invert`, apply-changes, add-locations-to-ways with sparse,
-  extract complete and smart (not `--simple`), `inspect --nodes`, `inspect
-  tags`: refuse without it, fall back to decoding with it.
-- altw `--index-type external`: accepted, then refused ("--force is not
-  supported on this path"). apply-changes `--force --locations-on-ways` on an
-  unindexed base: refused.
-- degrade: its own plain `bool` field with its own help text, consulted only
-  on the decode path; the header-and-blob passthrough path never reads it.
-- build-geocode-index: the indexdata switch is `--allow-unindexed`, and
-  `--force` is "legacy shorthand for both `--overwrite` and
-  `--allow-unindexed`", the only `--force` that also bypasses output
-  protection and the only place where force and overwrite are linked.
-- renumber, getparents, time-filter, diff, digest, check, export: no flag.
-  Renumber's schedule scan hard-errors on an unindexed blob with no escape;
-  getparents, time-filter and diff fall back silently (diff with a `Note`).
-- bench-merge hard-codes `force: true`.
-
-The unwritten rule seems to be "refuse where the unindexed fallback changes the
-cost class (three decodes per blob, a full element stream), fall back where it
-does not", and it is applied by hand per command (HYG-061 lists the
-indexdata-absent outcomes).
-
-Fix: write the rule once in `reference/cli-reference.md`; give the flag to
-every command that refuses and to none that does not; keep geocode's `--force`
-working but warn that it grants overwrite and point at `--overwrite` and
-`--allow-unindexed`. Enforce with the contract table of HYG-061 (unindexed
-input times command) plus a clap-tree test that every command with a
-`--force` also calls the shared gate.
-
-Reported by: the command-matrix audit.
-
 ## HYG-114 - OSC output is gzipped by three different rules, and no user document says which
 
 Anger: 6 - CLI behaviour; likely ends as documentation.
@@ -1160,7 +1012,6 @@ Anger: 6 - CLI behaviour, small.
 - Where the directory goes: the output's directory (altw, geocode, `diff -o`),
   the current directory (`diff` to stdout or `-q`), or `--tmp-dir`, which
   exists on exactly those three commands.
-- When it is made relative to the output check differs (HYG-035).
 - Free-space preflight: altw sparse (`insufficient free space for sparse
   node index`) and altw external (`space::precheck`) have one; diff and derive
   deliberately have none (a comment in `derive.rs` explains); the geocode
@@ -1203,34 +1054,42 @@ called from one place.
 
 Reported by: the command-matrix audit.
 
-## HYG-119 - The flag vocabulary reuses short flags for unrelated options
+## HYG-119 - The same long flag takes a different value grammar per command
 
-Anger: 7 - CLI behaviour; any rename breaks scripts.
+Anger: 7 - CLI behaviour; any change breaks scripts.
 
-- `-t`: `--type` on cat, diff, check and `inspect tags`; `--remove-tags` on
-  tags-filter and getid.
-- `-i`: `--id-file` on getid and getparents; `--invert-match` on tags-filter
-  (getid's own inversion is long-only `--invert`).
-- `-c`: `--clean` on cat, `--suppress-common` on diff, `--config` on extract;
-  extract's `--clean` has no short while cat's has.
-- `-s`: `--simple` on extract, `--add-self` on getparents, `--osmium-summary`
-  on diff, `--sort` on `inspect tags`.
-- `-e`: `--expressions` on tags-filter, export and `inspect tags`;
-  `--extended` on inspect.
-- `--type` grammar: a comma list on cat, diff and check, exactly one on
-  `inspect tags`, a `node|way` enum with no short on export (and export cannot
-  name a relation).
-- Quiet and verbose: `diff -q`, `check --quiet` (long only), nothing elsewhere;
-  `diff -v`, `getid --verbose-ids`.
-- Output location: `--output-dir` on build-geocode-index, `-o/--output` on
-  every other writer.
+The short-flag vocabulary is settled (`reference/cli-reference.md`, "Short
+flags"; enforced by the clap-tree tests in `cli/src/main.rs`). What remains
+is grammar, not letters:
 
-Fix: an owner ruling on one vocabulary table in `reference/cli-reference.md`;
-add aliases rather than rename. Enforce with a test that walks the clap
-`Command` tree and asserts each short flag has one meaning across subcommands
-or sits in an allow-list with a reason.
+- `--type`: a comma list on cat, diff and check, exactly one on
+  `inspect tags`, a `node|way` enum on export (which cannot name a relation).
+- Verbosity: `diff -v` and `getid --verbose-ids` are different long flags for
+  the same idea; only diff and check have `--quiet`.
+
+Fix: an owner ruling on whether `--type` is one grammar everywhere (a comma
+list, with commands that take one kind refusing more) and on one verbosity
+spelling.
 
 Reported by: the command-matrix audit.
+
+## HYG-127 - The indexdata gate advises `--force` where `--force` is refused
+
+Anger: 5 - error text, contained.
+
+`require_indexdata` ends every refusal with "Or pass --force to proceed
+anyway." On the paths that need indexdata whatever `--force` says, that
+advice now leads straight to a usage error: `add-locations-to-ways
+--index-type external` and `--inject-prepass` (the external join's own
+refusal and the sparse probe both go through the gate), and `apply-changes
+--locations-on-ways` on an unindexed base. `build-geocode-index` gets the same
+sentence although its switch is `--allow-unindexed`. Fix: let the caller say
+whether a fallback exists (and which flag grants it), so the gate's advice
+names `--force`, `--allow-unindexed` or nothing. Enforce in
+`tests/cli_flag_contract.rs`: a command whose `--force` is refused with a
+mode must not print the advice in that mode.
+
+Reported by: the CLI flag consistency batch.
 
 ## HYG-121 - apply-changes carries the base's replication state onto a newer output
 

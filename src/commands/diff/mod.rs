@@ -90,11 +90,37 @@ pub struct DiffOptions {
     pub summary: bool,
     /// Restrict the comparison to these element types. `None` = all.
     pub type_filter: Option<TypeFilter>,
-    /// Number of parallel shards for the block-pair merge. `1` runs the
-    /// sequential path (default); `>=2` dispatches N shards across
-    /// worker threads. The caller is responsible for resolving `0` =
-    /// auto before passing this in.
-    pub jobs: usize,
+    /// Number of parallel shards (and worker threads) for the block-pair
+    /// merge. `Fixed(1)` runs the sequential path; `Fixed(n)` dispatches `n`
+    /// shards across worker threads; `Auto` uses one shard per core the host
+    /// reports (one when it reports none). `verbose` is sequential-only, so
+    /// a fixed count above one is refused alongside it, and `Auto` with
+    /// `verbose` runs sequentially.
+    pub parallelism: crate::host::Parallelism,
+}
+
+impl DiffOptions {
+    /// The shard count this run uses: the fixed count, else one per core.
+    fn shards(&self, host: &crate::host::Host) -> usize {
+        if self.verbose {
+            return 1;
+        }
+        resolve_shards(self.parallelism, host)
+    }
+}
+
+/// The derive (`--format osc`) shard count: the fixed count, else one per
+/// core the host reports (one when it reports none). The same rule as
+/// [`DiffOptions`] without the verbose case.
+pub(crate) fn resolve_shards(
+    parallelism: crate::host::Parallelism,
+    host: &crate::host::Host,
+) -> usize {
+    parallelism.resolve(|| {
+        host.resources
+            .parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+    })
 }
 
 /// Statistics from a diff operation.
@@ -203,6 +229,13 @@ pub fn diff(
     scratch: crate::scratch::RunScratch,
 ) -> Result<DiffStats> {
     host.cancel.check()?;
+    if options.verbose && options.parallelism.fixed().is_some_and(|n| n > 1) {
+        return Err(crate::Error::invalid_argument(
+            "diff: a fixed shard count above one has no effect with verbose, whose \
+             per-field detail lines are produced by the sequential path only",
+        ));
+    }
+    let jobs = options.shards(host);
     let filter = TypeFilter::or_all(options.type_filter);
 
     // Single-pass: check sorted headers + indexdata from one file open each.
@@ -221,17 +254,12 @@ pub fn diff(
         "Streaming diff requires sorted inputs to operate in constant memory.",
     )?;
     let both_indexed = old_indexed && new_indexed;
-    if options.jobs > 1 && (!both_indexed || options.verbose) {
-        let reason = if !both_indexed {
-            "missing indexdata"
-        } else {
-            "verbose detail output"
-        };
+    if jobs > 1 && !both_indexed {
         crate::host::diag!(
             host.diagnostics,
             Note,
             "diff.sequential_fallback",
-            "Using sequential comparison: {reason}"
+            "Using sequential comparison: missing indexdata"
         );
         crate::debug::emit_counter("diff_sequential_fallback", 1);
     }
@@ -244,17 +272,9 @@ pub fn diff(
     // would be worse than the wall-time cost of a sequential verbose
     // diff. Verbose is a human-inspection mode; the parallel default
     // serves the common non-verbose case.
-    let parallel_stats = if both_indexed && options.jobs > 1 && !options.verbose {
+    let parallel_stats = if both_indexed && jobs > 1 {
         parallel::diff_block_pair_parallel(
-            old_path,
-            new_path,
-            output,
-            options,
-            direct_io,
-            &filter,
-            options.jobs,
-            host,
-            &scratch,
+            old_path, new_path, output, options, direct_io, &filter, jobs, host, &scratch,
         )?
     } else {
         None

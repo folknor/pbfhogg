@@ -108,19 +108,20 @@ mod apply_changes {
         // Arm the hook at blob seq 3 (an arbitrary early-middle blob that
         // corresponds to a Candidate dispatched to the worker pool).
         //
-        // `jobs: Some(2)` uses the minimum supported worker count.
+        // Two workers is the minimum supported worker count.
         // FailureSlot publication and drain shutdown handle the panic;
         // this test does not establish single-worker barrier safety.
-        // `Some(1)` remains rejected up front by `merge()`; see
-        // `merge_rejects_jobs_equal_one`.
+        // One worker remains rejected up front by `merge()`; see
+        // `merge_rejects_jobs_equal_one`. `force` is refused alongside
+        // `locations_on_ways` (it can never take effect there).
         let opts = MergeOptions {
             write: WriteOptions {
-                force: true,
+                force: !locations_on_ways,
                 ..WriteOptions::default()
             },
             locations_on_ways,
             ignore_missing_nodes: false,
-            jobs: Some(2),
+            parallelism: pbfhogg::Parallelism::from_jobs(2),
             allow_version_regression: false,
             panic_at_blob_seq: Some(3),
         };

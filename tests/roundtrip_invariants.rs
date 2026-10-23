@@ -202,7 +202,7 @@ fn derive_then_apply_roundtrip() {
         true, // increment_version
         // Delete timestamp: any fixed instant stands in for "now" here.
         Some(1_700_000_000),
-        1,
+        pbfhogg::Parallelism::from_jobs(1),
         &crate::common::test_host(),
         crate::common::scratch_in(dir.path()),
     )
@@ -217,7 +217,7 @@ fn derive_then_apply_roundtrip() {
         write: forced(Compression::default()),
         locations_on_ways: false,
         ignore_missing_nodes: false,
-        jobs: None,
+        parallelism: pbfhogg::Parallelism::Auto,
         allow_version_regression: false,
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq: None,
@@ -332,7 +332,7 @@ fn derive_then_apply_preserves_metadata() {
         false,
         false, // increment_version: keep raw metadata
         None,  // delete timestamp: keep raw metadata
-        1,
+        pbfhogg::Parallelism::from_jobs(1),
         &crate::common::test_host(),
         crate::common::scratch_in(dir.path()),
     )
@@ -346,7 +346,7 @@ fn derive_then_apply_preserves_metadata() {
         write: forced(Compression::default()),
         locations_on_ways: false,
         ignore_missing_nodes: false,
-        jobs: None,
+        parallelism: pbfhogg::Parallelism::Auto,
         allow_version_regression: false,
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq: None,
@@ -405,7 +405,7 @@ fn tags_filter_idempotence() {
         invert: false,
         remove_tags: false,
         write: forced(Compression::default()),
-        jobs: None,
+        parallelism: pbfhogg::Parallelism::Auto,
     };
 
     pbfhogg::tags_filter::tags_filter(
@@ -499,7 +499,7 @@ fn tags_filter_blob_layout_independence() {
         invert: false,
         remove_tags: false,
         write: forced(Compression::default()),
-        jobs: None,
+        parallelism: pbfhogg::Parallelism::Auto,
     };
     pbfhogg::tags_filter::tags_filter(
         &b1,
@@ -552,7 +552,7 @@ fn diff_blob_layout_independence() {
         verbose: false,
         summary: false,
         type_filter: None,
-        jobs: 1,
+        parallelism: pbfhogg::Parallelism::from_jobs(1),
     };
     let diff_stats = |old: &Path, new: &Path| -> pbfhogg::diff::DiffStats {
         let mut sink: Vec<u8> = Vec::new();
@@ -679,7 +679,7 @@ fn tags_filter_compression_level_parity() {
             invert: false,
             remove_tags: false,
             write: forced(*compression),
-            jobs: None,
+            parallelism: pbfhogg::Parallelism::Auto,
         };
         pbfhogg::tags_filter::tags_filter(
             &input,

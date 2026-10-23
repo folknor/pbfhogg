@@ -4,6 +4,75 @@
 
 ### Breaking
 
+- **Every short flag now has one meaning across all subcommands.** Shorts
+  that meant something else on one command are long-only there:
+  `cat --clean` (was `-c`), `extract --config` (was `-c`) and `--simple`
+  (was `-s`), `renumber --start-id` (was `-s`), `getparents --add-self`
+  (was `-s`), `inspect --extended` (was `-e`), `inspect tags --sort` (was
+  `-s`), `tags-filter --remove-tags` (was `-t`) and `--invert-match` (was
+  `-i`), `getid --remove-tags` (was `-t`). The old letter is refused on that
+  command with an error naming the long flag, so an old command line never
+  silently means something new. The vocabulary is in
+  `reference/cli-reference.md`, "Short flags". New shorts:
+  `build-geocode-index -o` (`--output-dir`), `export -t` (`--type`) and
+  `-b` (`--bbox`), `check -q` (`--quiet`).
+
+- **A flag the command line makes ineffective is refused, not warned about
+  or ignored**, as a usage error (exit `2`) before any input is opened:
+  `-O` without `-o` (`export`, `diff`); `cat --force` without `--type`,
+  `--clean` or `--dedupe`; `degrade --force` without a decode-path flag;
+  `extract --simple --force`; `tags-filter --force` with `--invert-match` or
+  `--distrust-metadata`; `tags-filter -R` with `--remove-tags` or any
+  explicit `-j` (was a warning, and `-j 0` was accepted); `getid
+  --remove-tags` without `-r` (was a warning); `add-locations-to-ways
+  --force` with `--index-type external` or `--inject-prepass`, and
+  `apply-changes --force --locations-on-ways` (all three used to be refused
+  only on unindexed input, after the input was opened; on indexed input
+  `--force` did nothing); `diff --tmp-dir` with text `-j 1` or `-v`; `diff
+  -q` with `-c`, `-v` or `-s`; `check -q` with `--show-ids` or
+  `--max-errors`; and in OSC-mode `tags-filter`, `--compression`,
+  `--direct-io` and `--force`, which were accepted and discarded. `getid`
+  and `getparents` with no ID source, `tags-filter` with no expressions and
+  `degrade` with no transformation flag are refused by the argument parser.
+
+- **Flags are checked before any input is opened.** Malformed values of
+  `--output-header`, `--start-id`, the `time-filter` timestamp, `--bbox`,
+  `--drop-ids` and `-j`, malformed expressions and positional IDs, and
+  `--direct-io` / `--io-uring` in a build without the feature, are refused
+  as usage errors before the command touches its input (a missing feature
+  used to be found when a reader or writer first opened, minutes into some
+  runs). `apply-changes` refuses an unsorted base, or `-l` on a base without
+  `LocationsOnWays`, before parsing the OSC, and `-j 1` before anything.
+  `add-locations-to-ways` and `diff` check their output before making their
+  scratch directory, so a missing output directory reports the output.
+
+- **`-j/--jobs` means one thing everywhere**: `0` (the default, unchanged)
+  sizes the worker pools automatically, `1` runs sequentially, `N` caps them
+  at `N`; one help text on every command. `tags-filter -j N` now also caps
+  its final decode-and-filter pool, which ignored `-j` before.
+
+- **Library: `pbfhogg::Parallelism { Auto, Fixed(NonZeroUsize) }`** replaces
+  the jobs parameters: `TagsFilterOptions::parallelism`,
+  `TagCountOptions::parallelism`, `MergeOptions::parallelism`,
+  `DiffOptions::parallelism`, and the `parallelism` argument of
+  `merge_changes`, `derive_changes` and `node_stats`
+  (`Parallelism::from_jobs(n)` maps the old `0`-is-auto count). `diff` and
+  `derive_changes` now resolve `Auto` themselves (one shard per core). New
+  refusals, before any input is opened: `TagsFilterOptions::validate`
+  (`omit_referenced` with `remove_tags` or a fixed parallelism),
+  `MergeOptions::validate` (one worker; `force` with `locations_on_ways`),
+  `AltwOptions::validate` (`force` with `IndexType::External` or
+  `inject_prepass`), `getid` with `remove_tags` but not `add_referenced`,
+  and `diff` with `verbose` and a fixed shard count above one.
+  `ExportOptions::new` takes a parsed `Option<Bbox>`. New:
+  `OutputHeaderEntry` (one parsed `--output-header` entry) with
+  `HeaderOverrides::from_entries`, `tag_expr::validate_expressions`, and
+  `OutputBackend::is_compiled`.
+
+- **`build-geocode-index --force` warns** that it also grants
+  `--overwrite`, naming `--overwrite` and `--allow-unindexed` as the flags
+  to spell instead. It keeps working.
+
 - **Ctrl-C and SIGTERM now clean up and exit 130 / 143.** The first SIGINT
   or SIGTERM stops any command at its next checkpoint: its output staging
   and scratch directory are removed, nothing is published (an existing

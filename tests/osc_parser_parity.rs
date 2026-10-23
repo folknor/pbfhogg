@@ -66,7 +66,7 @@ fn merge_verdict(input: &Path, out: &Path) -> Verdict {
         &[input],
         crate::common::out_replace(out),
         false,
-        Some(1),
+        pbfhogg::Parallelism::from_jobs(1),
         false,
         &crate::common::test_host(),
     )
@@ -79,7 +79,7 @@ fn simplify_verdict(input: &Path, out: &Path) -> Verdict {
         &[input],
         crate::common::out_replace(out),
         true,
-        Some(1),
+        pbfhogg::Parallelism::from_jobs(1),
         false,
         &crate::common::test_host(),
     )
@@ -299,7 +299,7 @@ fn every_consumer_agrees_on_metadata_leniency() {
         &[&input],
         crate::common::out_replace(&merge_out),
         false,
-        Some(1),
+        pbfhogg::Parallelism::from_jobs(1),
         false,
         &crate::common::test_host(),
     )
@@ -396,7 +396,7 @@ fn only_the_overlay_interprets_changeset_uid_and_timestamp() {
             &[&input],
             crate::common::out_replace(&merge_out),
             false,
-            Some(1),
+            pbfhogg::Parallelism::from_jobs(1),
             false,
             &crate::common::test_host(),
         )
@@ -454,7 +454,7 @@ fn re_emit_sinks_escape_user_data_identically() {
         &[&input],
         crate::common::out_replace(&merge_out),
         false,
-        Some(1),
+        pbfhogg::Parallelism::from_jobs(1),
         false,
         &crate::common::test_host(),
     )
@@ -529,7 +529,7 @@ fn simplify_sequence_verdict(inputs: &[PathBuf], out: &Path) -> Verdict {
         &refs,
         crate::common::out_replace(out),
         true,
-        Some(1),
+        pbfhogg::Parallelism::from_jobs(1),
         false,
         &crate::common::test_host(),
     )

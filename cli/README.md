@@ -41,9 +41,12 @@ Most write commands accept:
 - `-O, --overwrite` - replace the output if it already exists (an existing output is refused before any work without it; a symlink is refused either way)
 - `--compression <SPEC>` - `none`, `zlib` (default), `zstd`, or with level (`zlib:9`, `zstd:19`)
 - `--direct-io` - bypass page cache (Linux, requires `linux-direct-io` feature)
-- `--force` - proceed without indexdata (slower) on commands that accept it; for `build-geocode-index`, it is a legacy shorthand for `--overwrite --allow-unindexed`
+- `--force` - on a command that would refuse unindexed input, proceed with the slower fallback; only those commands have it. For `build-geocode-index` it is a legacy shorthand for `--overwrite --allow-unindexed` that warns every time
 - `--generator <NAME>` - override writing program in output header
 - `--output-header <K=V>` - set replication metadata fields
+- `-j, --jobs <N>` (on the commands with worker pools that take it) - `0` (default) sizes them automatically, `1` runs sequentially, `N` caps them at `N` threads
+
+Every short flag means the same thing on every subcommand (`-t` is always `--type`, `-c` always `--suppress-common`, `-s` always `--osmium-summary`, and so on). Shorts that used to mean something else on a command (`cat -c`, `extract -c` / `-s`, `renumber -s`, `getparents -s`, `inspect -e`, `inspect tags -s`, `tags-filter -t` / `-i`, `getid -t`) now refuse, naming the long flag to use. A flag that would have no effect on a command line is refused rather than ignored, and every flag is checked before any input is opened. The full rules are in `reference/cli-reference.md`.
 
 ## Indexdata
 
@@ -53,7 +56,7 @@ pbfhogg embeds blob-level index metadata (element type, ID range, spatial bbox, 
 pbfhogg cat input.osm.pbf -o indexed.osm.pbf
 ```
 
-Commands that benefit from indexdata will error if it's missing. Pass `--force` to proceed anyway. For `build-geocode-index`, use `--allow-unindexed` to opt into the slower fallback while keeping overwrite permission separate; its `--force` flag remains a shorthand for both `--overwrite` and `--allow-unindexed`.
+Commands that benefit from indexdata will error if it's missing. Pass `--force` to proceed anyway (where a mode needs indexdata whatever happens, such as `add-locations-to-ways --index-type external`, `--force` is refused instead). For `build-geocode-index`, use `--allow-unindexed` to opt into the slower fallback while keeping overwrite permission separate; its `--force` flag remains a shorthand for both `--overwrite` and `--allow-unindexed`.
 
 ## Performance
 

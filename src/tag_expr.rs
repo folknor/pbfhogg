@@ -238,6 +238,20 @@ pub(crate) fn parse_expressions(inputs: &[String]) -> Result<Vec<Expression>> {
     inputs.iter().map(|s| parse_expression(s)).collect()
 }
 
+/// Check every expression parses, so a front end can refuse a malformed one
+/// before it opens any input. The commands that take expressions parse them
+/// again themselves; parsing a few short strings twice costs nothing.
+///
+/// # Errors
+///
+/// The first expression that does not parse.
+pub fn validate_expressions(inputs: &[String]) -> Result<()> {
+    for input in inputs {
+        parse_expression(input)?;
+    }
+    Ok(())
+}
+
 /// Read expressions from a file, one per line.
 ///
 /// Mirrors `read_expressions_file` in osmium's `command_tags_filter.cpp` and

@@ -1368,7 +1368,11 @@ impl PbfWriter<FileWriter> {
     /// `offset` and `len` describe the framed blob's position in the input file.
     ///
     /// Callers must not use this when the output writer is O_DIRECT - use
-    /// [`write_raw`](Self::write_raw) instead.
+    /// [`write_raw`](Self::write_raw) instead. Every library caller decides
+    /// the route once, from `OutputBackend::supports_copy_range`, before any
+    /// output is written, so `--direct-io` never reaches the sink's own
+    /// refusal of a splice into an O_DIRECT file: that refusal is a backstop
+    /// for a direct library caller, not where a flag combination is checked.
     pub fn write_raw_copy(
         &mut self,
         in_file: &std::sync::Arc<std::fs::File>,

@@ -79,8 +79,10 @@ impl pbfhogg::host::DiagnosticSink for StderrSink {
     }
 }
 
-/// Report a warning the CLI itself raises (an option combination that does
-/// nothing), through the same sink and prefix as the library's events.
+/// Report a warning the CLI itself raises (a degraded environment, a legacy
+/// flag that grants more than it says), through the same sink and prefix as
+/// the library's events. An option that would have no effect is refused, not
+/// warned about.
 pub(crate) fn cli_warning(key: &'static str, args: std::fmt::Arguments<'_>) {
     use pbfhogg::host::DiagnosticSink as _;
     StderrSink.event(&Event {

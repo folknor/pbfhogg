@@ -320,7 +320,7 @@ pub struct GetidOptions {
     /// Include referenced nodes of matching ways (two-pass).
     pub add_referenced: bool,
     /// Strip tags from referenced objects not explicitly requested.
-    /// Only meaningful with `add_referenced`.
+    /// Requires `add_referenced`; refused without it.
     pub remove_tags: bool,
     /// Collect the requested IDs that were actually written, into
     /// [`GetidStats::found`].
@@ -437,6 +437,14 @@ fn getid_dispatched(
     min_blobs: u64,
     host: &crate::host::Host,
 ) -> Result<(Option<ScanArm>, GetidStats)> {
+    // Refused before the input is touched: without `add_referenced` no
+    // referenced object is emitted, so there is nothing to strip tags from.
+    if opts.remove_tags && !opts.add_referenced {
+        return Err(crate::Error::invalid_argument(
+            "getid: remove_tags has no effect without add_referenced, which is what \
+             emits the referenced objects it strips",
+        ));
+    }
     let has_indexdata = require_indexdata(
         input,
         write.direct_reads,

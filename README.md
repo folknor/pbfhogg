@@ -121,7 +121,7 @@ pbfhogg degrade <file> -o <out>           Adversarial PBF generator
 pbfhogg renumber <file> -o <out>          Renumber all IDs sequentially, remap cross-references
 pbfhogg extract <file> -o <out> -b <bbox> Extract by bounding box
 pbfhogg extract <file> -o <out> -p <geo>  Extract by GeoJSON polygon
-pbfhogg extract <file> -c <config>        Multi-extract from JSON config
+pbfhogg extract <file> --config <config>  Multi-extract from JSON config
 pbfhogg add-locations-to-ways <f> -o <o>  Embed node coordinates in ways
 pbfhogg apply-changes <base> <osc> -o <o> Apply OSC diff (--locations-on-ways)
 pbfhogg merge-changes <oscs...> -o <out>  Merge multiple OSC files (--simplify)
@@ -131,7 +131,7 @@ pbfhogg tags-filter <file> -o <out> <exp> Filter by tag expressions (PBF or OSC 
 pbfhogg getid <file> -o <out> <ids>       Extract elements by ID (--invert to remove)
 pbfhogg getparents <file> -o <out> <ids>  Find ways/relations referencing given IDs
 pbfhogg time-filter <file> -o <out> <ts>  Filter history PBF to a timestamp
-pbfhogg build-geocode-index <f> -d <dir>  Build reverse geocoding index
+pbfhogg build-geocode-index <f> -o <dir>  Build reverse geocoding index
 ```
 
 All write commands accept `--compression` (`none`, `zlib`, `zstd`, or with level: `zlib:9`). Default is `zlib:6` for osmium interop. For internal pipelines that do not need osmium/JOSM compatibility, `zstd:1` can help when output compression limits the pipeline. The effect depends on the command and input; see [reference/performance.md](reference/performance.md) for measured comparisons. Commands that benefit from indexdata will error without it - pass `--force` to proceed (slower), or generate indexed PBFs with `pbfhogg cat input.osm.pbf -o indexed.osm.pbf`.

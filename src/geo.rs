@@ -10,6 +10,7 @@ use crate::coord_fmt::deg_to_e7;
 use crate::coord_fmt::e7_to_deg;
 
 /// A geographic bounding box in WGS84 degrees.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bbox {
     pub min_lon: f64,
     pub min_lat: f64,

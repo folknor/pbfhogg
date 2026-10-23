@@ -148,8 +148,18 @@ fn test_relations() -> Vec<TestRelation> {
     ]
 }
 
+/// The strategy flag, plus `--force` for the strategies that refuse an
+/// unindexed input (`--simple` never refuses, so it refuses `--force`).
+fn strategy_args(cli: CliInvoker, strategy: Strategy) -> CliInvoker {
+    match strategy {
+        Strategy::Simple => cli.arg("--simple"),
+        Strategy::CompleteWays => cli.arg("--force"),
+        Strategy::Smart => cli.arg("--smart").arg("--force"),
+    }
+}
+
 /// Invoke `pbfhogg extract <input> -o <output> [--bbox|--polygon]
-/// [--simple|--smart] --set-bounds --force` and assert success.
+/// [--simple|--smart] --set-bounds [--force]` and assert success.
 fn run_extract(
     input: &Path,
     output: &Path,
@@ -165,28 +175,22 @@ fn run_extract(
         RegionArg::Bbox(s) => cli = cli.arg("--bbox").arg(*s),
         RegionArg::Polygon(p) => cli = cli.arg("--polygon").arg(*p),
     }
-    match strategy {
-        Strategy::Simple => cli = cli.arg("--simple"),
-        Strategy::CompleteWays => {}
-        Strategy::Smart => cli = cli.arg("--smart"),
-    }
-    cli.arg("--set-bounds").arg("--force").assert_success()
+    strategy_args(cli, strategy)
+        .arg("--set-bounds")
+        .assert_success()
 }
 
 /// Invoke `pbfhogg extract <input> --config <config>
-/// [--simple|--smart] --set-bounds --force` and assert success.
+/// [--simple|--smart] --set-bounds [--force]` and assert success.
 fn run_extract_multi(input: &Path, config: &Path, strategy: Strategy) -> CliOutput {
-    let mut cli = CliInvoker::new()
+    let cli = CliInvoker::new()
         .arg("extract")
         .arg(input)
         .arg("--config")
         .arg(config);
-    match strategy {
-        Strategy::Simple => cli = cli.arg("--simple"),
-        Strategy::CompleteWays => {}
-        Strategy::Smart => cli = cli.arg("--smart"),
-    }
-    cli.arg("--set-bounds").arg("--force").assert_success()
+    strategy_args(cli, strategy)
+        .arg("--set-bounds")
+        .assert_success()
 }
 
 fn write_geojson(path: &Path, content: &str) {
@@ -479,7 +483,6 @@ fn polygon_rejects_degenerate_exterior_without_publishing_output() {
         .arg(&geojson)
         .arg("--simple")
         .arg("--set-bounds")
-        .arg("--force")
         .assert_failure();
     result.assert_stderr_contains("at least 3");
     assert!(
@@ -992,7 +995,6 @@ fn multi_extract_rejects_outputs_that_normalize_to_one_path() {
         .arg(&config)
         .arg("--simple")
         .arg("--set-bounds")
-        .arg("--force")
         .assert_failure();
     result.assert_stderr_contains("resolve to the same file");
     assert!(
@@ -1036,7 +1038,6 @@ fn multi_extract_rejects_symlinked_output_paths() {
         .arg(&config)
         .arg("--simple")
         .arg("--set-bounds")
-        .arg("--force")
         .assert_failure();
     result.assert_stderr_contains("resolve to the same file");
     assert_eq!(
@@ -1087,7 +1088,6 @@ fn multi_extract_refuses_when_a_destination_cannot_be_published() {
         .arg(&config)
         .arg("--simple")
         .arg("--set-bounds")
-        .arg("--force")
         .arg("--overwrite")
         .assert_failure();
     // Refused before any extraction, even with overwrite permission: a
@@ -1238,7 +1238,6 @@ fn multi_extract_config_paths_resolve_from_config_and_directory_override() {
         .arg(&override_dir)
         .arg("--simple")
         .arg("--set-bounds")
-        .arg("--force")
         .assert_success();
 
     assert!(relative_output.exists());
@@ -1767,7 +1766,7 @@ fn multi_bbox_classifies_plain_nodes_with_and_without_passthrough_candidates() {
     drop(writer);
     let single = dir.path().join("single.osm.pbf");
     CliInvoker::new()
-        .args(["extract", "--simple", "--bbox=-1,-1,1,1", "--force"])
+        .args(["extract", "--simple", "--bbox=-1,-1,1,1"])
         .arg(&input)
         .arg("-o")
         .arg(&single)

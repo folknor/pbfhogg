@@ -215,7 +215,7 @@ fn cat_type(c: &Ctx, input: &Path) -> Invocation {
 }
 
 fn cat_clean(c: &Ctx, input: &Path) -> Invocation {
-    cat(c, input).words(&["-c", "version"])
+    cat(c, input).words(&["--clean", "version"])
 }
 
 fn cat_dedupe(c: &Ctx, input: &Path) -> Invocation {

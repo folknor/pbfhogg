@@ -21,11 +21,13 @@ use crate::common::{
 };
 use pbfhogg::MemberId;
 
-/// Invoke `pbfhogg cat <inputs...> -o <output> [--type T] [-c A]... [--direct-io] --force`
-/// and assert success. Returns the captured `CliOutput` so callers
-/// can inspect stderr for stats and stdout if needed.
+/// Invoke `pbfhogg cat <inputs...> -o <output> [--type T] [--clean A]...
+/// [--direct-io] [--force]` and assert success. Returns the captured
+/// `CliOutput` so callers can inspect stderr for stats and stdout if needed.
+/// `--force` is passed only with `--type` or `--clean`: plain cat never
+/// refuses unindexed input, so it refuses `--force`.
 ///
-/// `clean_attrs` is the list of `-c <name>` flags to pass; passing
+/// `clean_attrs` is the list of `--clean <name>` flags to pass; passing
 /// `&[]` is equivalent to `CleanAttrs::default()` (no fields cleaned).
 fn run_cat(
     inputs: &[&Path],
@@ -43,12 +45,15 @@ fn run_cat(
         cli = cli.arg("--type").arg(types);
     }
     for attr in clean_attrs {
-        cli = cli.arg("-c").arg(*attr);
+        cli = cli.arg("--clean").arg(*attr);
     }
     if direct_io {
         cli = cli.arg("--direct-io");
     }
-    cli.arg("--force").run()
+    if type_filter.is_some() || !clean_attrs.is_empty() {
+        cli = cli.arg("--force");
+    }
+    cli.run()
 }
 
 #[test]
@@ -913,7 +918,7 @@ fn clean_on_an_unindexed_input_refuses_without_force() {
         .arg(&unindexed)
         .arg("-o")
         .arg(&output)
-        .arg("-c")
+        .arg("--clean")
         .arg("version")
         .run();
     assert!(
@@ -931,7 +936,7 @@ fn clean_on_an_unindexed_input_refuses_without_force() {
         .arg(&unindexed)
         .arg("-o")
         .arg(&output)
-        .arg("-c")
+        .arg("--clean")
         .arg("version")
         .arg("--force")
         .assert_success();
@@ -941,7 +946,7 @@ fn clean_on_an_unindexed_input_refuses_without_force() {
         .arg("-o")
         .arg(&output)
         .arg("--overwrite")
-        .arg("-c")
+        .arg("--clean")
         .arg("version")
         .assert_success();
 }
@@ -1335,17 +1340,21 @@ fn every_cat_path_refuses_non_leading_header_frames() {
         for (mode, flags) in [
             ("passthrough", vec![]),
             ("filtered", vec!["--type", "node"]),
-            ("clean", vec!["-c", "version"]),
+            ("clean", vec!["--clean", "version"]),
             ("dedupe", vec!["--dedupe"]),
         ] {
             let mut cli = CliInvoker::new().arg("cat").arg(&bad);
+            // Plain cat never refuses unindexed input, so it refuses --force.
+            let force = !flags.is_empty();
             for flag in flags {
                 cli = cli.arg(flag);
+            }
+            if force {
+                cli = cli.arg("--force");
             }
             let out = cli
                 .arg("-o")
                 .arg(dir.path().join(format!("out-{mode}-{insertion}.osm.pbf")))
-                .arg("--force")
                 .run();
             assert!(!out.status.success(), "{mode}: {}", out.stderr_str());
             assert!(

@@ -579,7 +579,7 @@ fn run_scratch_backend(
                 verbose: false,
                 summary: false,
                 type_filter: None,
-                jobs,
+                parallelism: pbfhogg::Parallelism::from_jobs(jobs),
             };
             pbfhogg::diff::diff(
                 base,
@@ -600,7 +600,7 @@ fn run_scratch_backend(
             false,
             false,
             None,
-            jobs,
+            pbfhogg::Parallelism::from_jobs(jobs),
             host,
             scratch,
         )

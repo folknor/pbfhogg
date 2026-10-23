@@ -89,7 +89,7 @@ impl IndexBackend {
 }
 
 /// Invoke `pbfhogg add-locations-to-ways <input> -o <output>
-/// [--keep-untagged-nodes] [--index-type T] [--direct-io] --force`.
+/// [--keep-untagged-nodes] [--index-type T] [--direct-io] [--force]`.
 /// Returns the captured output.
 fn run_altw(
     input: &Path,
@@ -106,13 +106,24 @@ fn run_altw(
     if keep_untagged_nodes {
         cli = cli.arg("--keep-untagged-nodes");
     }
-    if let Some(name) = backend.flag() {
-        cli = cli.arg("--index-type").arg(name);
-    }
+    cli = backend_args(cli, backend);
     if direct_io {
         cli = cli.arg("--direct-io");
     }
-    cli.arg("--force").run()
+    cli.run()
+}
+
+/// `--index-type T`, plus `--force` on the backends that take it: external
+/// requires indexed input whatever `--force` says, so it refuses the flag.
+fn backend_args(mut cli: CliInvoker, backend: IndexBackend) -> CliInvoker {
+    if let Some(name) = backend.flag() {
+        cli = cli.arg("--index-type").arg(name);
+    }
+    if backend.flag() == Some("external") {
+        cli
+    } else {
+        cli.arg("--force")
+    }
 }
 
 /// Same as [`run_altw`] but adds `--ignore-missing-nodes`, which is what a
@@ -133,10 +144,7 @@ fn run_altw_ignoring_missing(
     if keep_untagged_nodes {
         cli = cli.arg("--keep-untagged-nodes");
     }
-    if let Some(name) = backend.flag() {
-        cli = cli.arg("--index-type").arg(name);
-    }
-    cli.arg("--force").run()
+    backend_args(cli, backend).run()
 }
 
 /// Assert a run refused because of unresolvable node references, on that
@@ -909,14 +917,35 @@ fn auto_routes_non_indexed_input_to_sparse_without_estimate() {
     );
 }
 
-/// Regression: `--index-type external --force` against a non-indexed
-/// PBF must reject the combination up front with a clear migration
-/// hint, not accept `--force` and fail much later with an opaque
-/// "OsmData blob missing indexdata" error. External join depends on
-/// per-blob indexdata to compute rank-based bucket ranges, so
-/// `--force` cannot meaningfully apply to this path.
+/// `--index-type external --force` can never take effect: external join
+/// depends on per-blob indexdata to compute rank-based bucket ranges, so an
+/// unindexed input is refused whatever `--force` says and on an indexed one
+/// `--force` does nothing. The combination is refused as a usage error,
+/// before any input is opened.
 #[test]
-fn altw_external_rejects_force_on_non_indexed() {
+fn altw_external_refuses_force_before_any_input() {
+    let dir = TempDir::new().expect("tempdir");
+    let out = CliInvoker::new()
+        .arg("add-locations-to-ways")
+        .arg(dir.path().join("no-such-input.osm.pbf"))
+        .arg("-o")
+        .arg(dir.path().join("out.osm.pbf"))
+        .args(["--index-type", "external", "--force"])
+        .run();
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{}", out.stderr_str());
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("--force")
+            && stderr.contains("external")
+            && !stderr.contains("no-such-input"),
+        "expected the argument refusal, not an input error; stderr:\n{stderr}",
+    );
+}
+
+/// Without `--force`, an unindexed input on the external path is refused by
+/// the indexdata gate, which points at the indexed-generation workflow.
+#[test]
+fn altw_external_refuses_non_indexed_input() {
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -958,7 +987,7 @@ fn altw_external_rejects_force_on_non_indexed() {
     let out = run_altw(&input, &output, true, IndexBackend::External, false);
     assert!(
         !out.status.success(),
-        "expected external-join to reject --force on non-indexed PBF, but it succeeded; stdout:\n{}\nstderr:\n{}",
+        "expected external-join to refuse a non-indexed PBF, but it succeeded; stdout:\n{}\nstderr:\n{}",
         out.stdout_str(),
         out.stderr_str(),
     );
@@ -1088,7 +1117,6 @@ mod platform {
                 write: pbfhogg::write::WriteOptions {
                     backend: pbfhogg::write::OutputBackend::Direct,
                     direct_reads: false,
-                    force: true,
                     ..pbfhogg::write::WriteOptions::default()
                 },
                 index_type: pbfhogg::altw::IndexType::External,

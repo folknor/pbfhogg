@@ -255,50 +255,91 @@ impl HeaderOverrideKey {
     }
 }
 
+/// One parsed `--output-header KEY=VALUE` entry.
+///
+/// Parsing one entry on its own is what lets a front end refuse a malformed
+/// value at its argument boundary, before any input is opened; the overrides
+/// are then assembled from already-typed entries by
+/// [`HeaderOverrides::from_entries`], which cannot fail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutputHeaderEntry {
+    ReplicationTimestamp(i64),
+    ReplicationSequenceNumber(i64),
+    ReplicationBaseUrl(String),
+}
+
+impl std::str::FromStr for OutputHeaderEntry {
+    type Err = Error;
+
+    fn from_str(entry: &str) -> Result<Self> {
+        let (key, value) = entry.split_once('=').ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "invalid --output-header format: '{entry}' (expected key=value)"
+            ))
+        })?;
+        let key = HeaderOverrideKey::parse(key).ok_or_else(|| {
+            Error::invalid_argument(format!("unknown --output-header key: '{key}'"))
+        })?;
+        Ok(match key.kind {
+            // Integer seconds or RFC 3339, the same two spellings
+            // time-filter's cutoff takes.
+            HeaderOverrideKind::Timestamp => {
+                Self::ReplicationTimestamp(match value.parse::<i64>() {
+                    Ok(seconds) => seconds,
+                    Err(_) => parse_rfc3339_utc(value).map_err(|_| {
+                        Error::invalid_argument(format!(
+                            "invalid {}: '{value}' (expected UNIX seconds or \
+                             YYYY-MM-DDTHH:MM:SSZ)",
+                            key.name
+                        ))
+                    })?,
+                })
+            }
+            HeaderOverrideKind::SequenceNumber => {
+                Self::ReplicationSequenceNumber(value.parse::<i64>().map_err(|_| {
+                    Error::invalid_argument(format!("invalid {}: '{value}'", key.name))
+                })?)
+            }
+            HeaderOverrideKind::BaseUrl => Self::ReplicationBaseUrl(value.to_string()),
+        })
+    }
+}
+
 impl HeaderOverrides {
     /// Parse CLI arguments into header overrides.
     ///
     /// `output_headers` entries have the format `key=value`.
     pub fn parse(generator: Option<String>, output_headers: &[String]) -> Result<Self> {
+        let entries = output_headers
+            .iter()
+            .map(|entry| entry.parse::<OutputHeaderEntry>())
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self::from_entries(generator, entries))
+    }
+
+    /// Assemble overrides from already-parsed entries. A later entry for the
+    /// same field replaces an earlier one.
+    #[must_use]
+    pub fn from_entries(
+        generator: Option<String>,
+        entries: impl IntoIterator<Item = OutputHeaderEntry>,
+    ) -> Self {
         let mut ov = HeaderOverrides {
             generator,
             ..Default::default()
         };
-        for entry in output_headers {
-            let (key, value) = entry.split_once('=').ok_or_else(|| {
-                Error::invalid_argument(format!(
-                    "invalid --output-header format: '{entry}' (expected key=value)"
-                ))
-            })?;
-            let key = HeaderOverrideKey::parse(key).ok_or_else(|| {
-                Error::invalid_argument(format!("unknown --output-header key: '{key}'"))
-            })?;
-            match key.kind {
-                // Integer seconds or RFC 3339, the same two spellings
-                // time-filter's cutoff takes.
-                HeaderOverrideKind::Timestamp => {
-                    ov.replication_timestamp = Some(match value.parse::<i64>() {
-                        Ok(seconds) => seconds,
-                        Err(_) => parse_rfc3339_utc(value).map_err(|_| {
-                            Error::invalid_argument(format!(
-                                "invalid {}: '{value}' (expected UNIX seconds or \
-                                 YYYY-MM-DDTHH:MM:SSZ)",
-                                key.name
-                            ))
-                        })?,
-                    });
+        for entry in entries {
+            match entry {
+                OutputHeaderEntry::ReplicationTimestamp(ts) => ov.replication_timestamp = Some(ts),
+                OutputHeaderEntry::ReplicationSequenceNumber(seq) => {
+                    ov.replication_sequence_number = Some(seq);
                 }
-                HeaderOverrideKind::SequenceNumber => {
-                    ov.replication_sequence_number = Some(value.parse::<i64>().map_err(|_| {
-                        Error::invalid_argument(format!("invalid {}: '{value}'", key.name))
-                    })?);
-                }
-                HeaderOverrideKind::BaseUrl => {
-                    ov.replication_base_url = Some(value.to_string());
+                OutputHeaderEntry::ReplicationBaseUrl(url) => {
+                    ov.replication_base_url = Some(url);
                 }
             }
         }
-        Ok(ov)
+        ov
     }
 
     /// Return the generated long help for the supported output-header keys.

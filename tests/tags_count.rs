@@ -17,7 +17,7 @@ fn default_opts() -> TagCountOptions<'static> {
         type_filter: None,
         direct_io: false,
         force: true,
-        jobs: 1,
+        parallelism: pbfhogg::Parallelism::from_jobs(1),
     }
 }
 
@@ -80,10 +80,10 @@ fn tags_count_parallel_classify_parity() {
     write_multi_block_test_pbf(&input, &nodes, &[], &[], 10);
 
     let mut opts = default_opts();
-    opts.jobs = 1;
+    opts.parallelism = pbfhogg::Parallelism::from_jobs(1);
     let seq = tags_count(&input, &opts, &crate::common::test_host()).expect("tags_count seq");
 
-    opts.jobs = 4;
+    opts.parallelism = pbfhogg::Parallelism::from_jobs(4);
     let par = tags_count(&input, &opts, &crate::common::test_host()).expect("tags_count par");
 
     // Sort by (key, value) for order-independent comparison - NameAsc

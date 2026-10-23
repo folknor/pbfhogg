@@ -94,6 +94,22 @@ during decode.
 
 Reported by: the extract passthrough fix.
 
+## BUG-110 - `merge-changes` reports a missing input without naming it
+
+Anger: 4 - error text, contained.
+
+`pbfhogg merge-changes missing.osc.gz -o out.osc.gz` exits 2 with only
+`Error: No such file or directory (os error 2)`: the open of an input OSC
+loses its path on the way out, unlike the PBF commands, whose open errors name
+the file (`file_reader::open_error`). Found by the `-j` table in
+`tests/cli_flag_contract.rs`, which had to judge merge-changes' acceptance by
+the absence of a usage error instead of by the input's name for this reason.
+Likely the `std::fs::metadata` / `File::open` calls in
+`commands/merge_changes/mod.rs` or the OSC parser's open. Fix: wrap the open
+with the path, and switch that table row back to checking the input's name.
+
+Reported by: the CLI flag consistency batch.
+
 ## BUG-085 - `HeaderBuilder` drops an empty-string base URL or `source`
 
 Anger: 4 - header bytes, contained.

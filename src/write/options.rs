@@ -60,6 +60,20 @@ impl OutputBackend {
         }
     }
 
+    /// Whether this build can construct the backend at all: `Direct` needs
+    /// the `linux-direct-io` feature, `Uring` the `linux-io-uring` feature.
+    /// A front end checks this at its argument boundary so a request for a
+    /// backend the build lacks is refused before any input is opened.
+    /// (`Direct` also stands for direct *reads*, which need the same feature.)
+    #[must_use]
+    pub const fn is_compiled(self) -> bool {
+        match self {
+            Self::Buffered | Self::Parallel => true,
+            Self::Direct => cfg!(feature = "linux-direct-io"),
+            Self::Uring => cfg!(feature = "linux-io-uring"),
+        }
+    }
+
     /// Whether `PbfWriter::write_raw_copy` (a kernel-space `copy_file_range`
     /// splice of an input byte range into the output) is available.
     ///

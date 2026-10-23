@@ -234,7 +234,7 @@ fn tags_filter_non_indexed_parity() {
         invert: false,
         remove_tags: false,
         write: forced(),
-        jobs: None,
+        parallelism: pbfhogg::Parallelism::Auto,
     };
     pbfhogg::tags_filter::tags_filter(
         &in_idx,
@@ -407,7 +407,7 @@ fn apply_changes_non_indexed_parity() {
         write: forced(),
         locations_on_ways: false,
         ignore_missing_nodes: false,
-        jobs: None,
+        parallelism: pbfhogg::Parallelism::Auto,
         allow_version_regression: false,
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq: None,
@@ -663,7 +663,7 @@ fn derive_changes_non_indexed_parity() {
         false,
         false,
         None,
-        1,
+        pbfhogg::Parallelism::from_jobs(1),
         &crate::common::test_host(),
         crate::common::scratch_in(dir.path()),
     )
@@ -675,7 +675,7 @@ fn derive_changes_non_indexed_parity() {
         false,
         false,
         None,
-        1,
+        pbfhogg::Parallelism::from_jobs(1),
         &crate::common::test_host(),
         crate::common::scratch_in(dir.path()),
     )

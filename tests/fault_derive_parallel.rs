@@ -54,7 +54,7 @@ mod derive_parallel {
             false,
             false,
             None,
-            3,
+            pbfhogg::Parallelism::from_jobs(3),
             &host,
             crate::common::scratch_in(&scratch),
         )
@@ -73,7 +73,7 @@ mod derive_parallel {
                 /* direct_io */ false,
                 /* increment_version */ false,
                 /* delete timestamp */ None,
-                /* jobs */ 3,
+                pbfhogg::Parallelism::from_jobs(3),
                 &host,
                 crate::common::scratch_in(&scratch),
             )

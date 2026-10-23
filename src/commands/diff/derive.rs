@@ -71,7 +71,7 @@ pub fn derive_changes(
     direct_io: bool,
     increment_version: bool,
     timestamp: Option<u64>,
-    jobs: usize,
+    parallelism: crate::host::Parallelism,
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<DeriveChangesStats> {
@@ -83,7 +83,7 @@ pub fn derive_changes(
         direct_io,
         increment_version,
         timestamp,
-        jobs,
+        parallelism,
         host,
         &scratch,
     )?;
@@ -102,10 +102,11 @@ pub(crate) fn derive_changes_to(
     direct_io: bool,
     increment_version: bool,
     timestamp: Option<u64>,
-    jobs: usize,
+    parallelism: crate::host::Parallelism,
     host: &crate::host::Host,
     scratch: &crate::scratch::RunScratch,
 ) -> Result<DeriveChangesStats> {
+    let jobs = super::resolve_shards(parallelism, host);
     // Single-pass: check sorted headers + indexdata from one file open each.
     let (old_sorted, old_indexed) = super::check_sorted_and_indexed(old_path, direct_io, host)?;
     let (new_sorted, new_indexed) = super::check_sorted_and_indexed(new_path, direct_io, host)?;

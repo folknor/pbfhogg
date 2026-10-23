@@ -298,6 +298,17 @@ anon RSS at Europe scale via 4-stage radix join pipeline (node-only wire
 scanner for stage 2, scatter buffer for stage 3, sequential reader for
 stage 4).
 
+External's anon figures exclude the per-way ref-count sidecar, which
+stages 3 and 4 read through a read-only mmap of the scratch file. Its
+pages are file-backed and reclaimable: they show in RSS as file pages,
+not in peak anon, and under memory pressure they are dropped and
+re-read rather than swapped. The anonymous part of that index is one
+byte offset per way blob. Before the mmap the whole encoded sidecar
+was read into heap and counted in anon, so anon peaks recorded before
+the change and after it are not directly comparable on this term.
+The blob-order slot-start prefix vector (one `u64` per way blob) is
+still anonymous.
+
 Current Europe external baseline on `main` (post-A1 commit `0dc8ae1`):
 **270.8 s** (`4m31s`, UUID `0b89f986`, `--bench 1`). A1 (rankless
 node-ID bucketed stage 1+2, landed 2026-04-25) cut europe from
@@ -1115,6 +1126,20 @@ gzip member, the 7 worker chunks in input order, and a postlude gzip
 member. Multi-member gzip is valid (osmium, osmosis, gzip CLI,
 `MultiGzDecoder` all support it); output decompresses to the
 concatenation of all members.
+
+Since the measurement below, emission runs through a bounded ordered
+window instead of collecting every member first: input `k` is admitted
+only once `k` is less than the number of members already written plus
+the pool's thread count, and each member is written as soon as it and
+its predecessors are done. At most one member per pool thread is
+alive, so memory no longer grows with the number of inputs (one huge
+input is still held whole). Output bytes are identical. When the input
+count is at most the thread count, as in the 7-OSC planet cell on a
+24-thread host, every input is admitted at once and the shape matches
+the run below except that member writes overlap the emit phase:
+`MERGECHANGES_PARALLEL_EMIT` now spans the per-member writes, and
+`MERGECHANGES_DRAIN` covers only the postlude and flush. Not yet
+re-benched.
 
 Phase breakdown of the 54.7 s `b6e964cc` run:
 

@@ -140,7 +140,7 @@ pub fn sort(
         io_uring,
         force,
     } = *opts;
-    require_indexdata(
+    let indexed = require_indexdata(
         input,
         direct_io,
         force,
@@ -148,6 +148,15 @@ pub fn sort(
          decompressed to scan element IDs (significantly slower).",
         host,
     )?;
+    if !indexed {
+        crate::host::diag!(
+            host.diagnostics,
+            Warning,
+            "sort.unindexed_fallback",
+            "Warning: sorting without indexdata; every blob must be decompressed to scan element IDs"
+        );
+        crate::debug::emit_counter("sort_unindexed_fallback", 1);
+    }
 
     #[allow(clippy::cast_possible_wrap)]
     if let Ok(meta) = std::fs::metadata(input) {

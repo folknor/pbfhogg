@@ -59,7 +59,20 @@ pub(super) fn try_extract_multi_single_pass(
                 }
                 _ => return Ok(None),
             },
-            _ => return Ok(None),
+            Some(Err(e)) => {
+                // Declining here keeps the historical fallback (the
+                // sequential passes then fail on their own read), but the
+                // first error must not vanish: name it before falling back.
+                crate::host::diag!(
+                    host.diagnostics,
+                    Note,
+                    "extract.multi.probe_read_error",
+                    "Multi-extract single-pass probe could not read the first blob: {e}"
+                );
+                crate::debug::emit_counter("multi_extract_probe_read_error", 1);
+                return Ok(None);
+            }
+            None => return Ok(None),
         }
     };
 
@@ -134,6 +147,21 @@ pub(super) fn try_extract_multi_single_pass(
         writers.push(w);
     }
 
+    // Three persistent membership sets per region; regions may overlap, so
+    // sharing one set would lose which outputs need an object. These are lazy
+    // IdSets, not pre-allocated full-ID-space bitmaps. Budget 4 MiB per dense
+    // 2^25-ID chunk per region and kind, plus sparse chunks and directories.
+    // For dense coverage through maximum IDs Mn/Mw/Mr, the bitmap component is
+    // N * 4 MiB * sum(floor(Mkind / 2^25) + 1). Overlap can multiply this by
+    // all N regions; the region-count limit is not a memory limit. Worker
+    // classification results, relation sets and output builders add to this.
+    // No up-front refusal uses this worst case: disjoint small regions can
+    // touch far fewer chunks, and header ID ranges cannot predict membership.
+    // A useful admission budget needs observed chunk occupancy and a caller's
+    // memory policy, not a machine-RAM guess inside this library. Preserve the
+    // measured per-blob Vec accumulation: direct hot-loop set insertion and
+    // whole-worker dense accumulation have already lost on time and memory,
+    // respectively (reference/performance-history.md).
     // Per-region ID sets and stats.
     let mut bbox_node_ids: Vec<IdSet> = (0..n).map(|_| IdSet::new()).collect();
     let mut matched_way_ids: Vec<IdSet> = (0..n).map(|_| IdSet::new()).collect();
@@ -275,9 +303,23 @@ pub(super) fn try_extract_multi_single_pass(
         .iter()
         .map(|bi| (bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon))
         .collect();
-    let grid = (n >= GRID_REGION_THRESHOLD)
-        .then(|| RegionGrid::build(&region_bboxes))
-        .flatten();
+    let grid = if n >= GRID_REGION_THRESHOLD {
+        let grid = RegionGrid::build(&region_bboxes);
+        if grid.is_none() {
+            // Output is unchanged (the linear classifier tests every
+            // region), but node classification cost grows with N.
+            crate::host::diag!(
+                host.diagnostics,
+                Note,
+                "extract.multi.grid_fallback",
+                "Multi-extract region grid declined {n} regions (coverage over budget or an empty interior); classifying nodes against every region"
+            );
+            crate::debug::emit_counter("multi_extract_grid_fallback", 1);
+        }
+        grid
+    } else {
+        None
+    };
     crate::debug::emit_marker("MULTI_NODE_CLASSIFY_START");
     // Observed node count per node-schedule position, for passthrough
     // candidates that verified. See `Passthrough`.

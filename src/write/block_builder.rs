@@ -869,6 +869,16 @@ impl BlockBuilder {
     // Raw fields intentionally bypass interning and decoding in release builds.
     // Check the source-table contract here in debug builds, including values,
     // roles and users that are not represented in tag_key_indices.
+    // Pre-seeding preserves slots, not validity: PrimitiveBlock construction
+    // checks index widths and structure, but does not prove table bounds.
+    // Thus release rewrites can preserve an invalid source sid. These internal
+    // methods promise identity passthrough, not sanitization. Making these
+    // assertions unconditional would decode values, roles and users again for
+    // every rewritten element. A strict policy belongs at block construction,
+    // covering tags, relation roles, Info users and delta-coded DenseInfo users
+    // together; it would change the current fallible string-access contract
+    // and add integer decoding to the byte-oriented structural validation.
+    // Retain that policy rather than add incomplete per-element validation.
     #[cfg(debug_assertions)]
     fn debug_assert_raw_strings(
         &self,

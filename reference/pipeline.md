@@ -246,6 +246,16 @@ Bounded memory with high scratch-disk demand. See
 [performance.md](performance.md) for measured resource use. Requires sorted
 input with indexdata.
 
+Free space is checked once, between the way pass and the node join, on
+Linux: the way pass yields the exact ref count, and the join then refuses
+unless the scratch filesystem holds 23 bytes per ref (12-byte resolved
+records plus at most 11 payload bytes per ref) plus per-file slack, on
+top of the way pass's own ID shards already on disk. Indexdata counts
+elements, not refs, so no earlier figure is exact without an extra
+decode of every way blob; a full scratch filesystem during the way pass
+itself still fails as an ordinary write error within that pass. The
+final output's space is not included.
+
 **Auto**: sparse is selected unless the input is sorted and indexed and the
 estimated sparse store (the per-blob indexed node count times 8 bytes) exceeds
 80 % of the page-cache budget. The budget is the host's available memory

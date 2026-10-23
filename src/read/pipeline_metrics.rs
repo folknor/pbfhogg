@@ -1,11 +1,9 @@
 //! Sidecar counters for the 3-stage pipelined PBF reader (`run_pipeline`).
 //!
-//! Mirrors `src/write/metrics.rs` for the read side. All counters are
-//! lightweight atomics; emitted at the end of `run_pipeline` via
-//! [`PIPELINE_METRICS.emit()`]. The decompression-pool drop counters are also
-//! emitted by `par_map_reduce`, which shares the pool without using that
-//! pipeline. Names track `pipeline_*` so they sort next to the writer's
-//! `writer_*` counters in `--counters` views.
+//! Pipeline counters are emitted at pipeline completion. Pool-drop counters
+//! are process totals, emitted by the host after dispatch through
+//! [`crate::read::emit_read_counters`], including pools outside this pipeline.
+//! Existing `pipeline_*` counter names remain stable for sidecar consumers.
 //!
 //! Bench scope: every command that consumes blocks via
 //! `for_each_pipelined` / `into_blocks_pipelined` gets these counters
@@ -180,11 +178,9 @@ impl PipelineMetrics {
         );
         emit!("pipeline_decode_tasks", decode_tasks);
         emit!("pipeline_blobs_skipped_by_filter", blobs_skipped_by_filter);
-        self.emit_decompress_pool_counters();
     }
 
-    /// Emit pool-drop counters from the `par_map_reduce` path, which uses the
-    /// shared decompression pool but does not run `run_pipeline`.
+    /// Emit process-wide pool-drop totals after all command work has joined.
     pub fn emit_decompress_pool_counters(&self) {
         macro_rules! emit {
             ($name:literal, $field:ident) => {
@@ -236,4 +232,45 @@ pub(crate) static PIPELINE_METRICS: PipelineMetrics = PipelineMetrics::new();
 #[inline]
 pub(crate) fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    /// The pool-drop counters are process totals, so only the one
+    /// process-exit hook may emit them; the read-side twin of the writer's
+    /// `writer_counters_are_emitted_only_from_the_process_exit_hook`. A
+    /// per-pipeline emission (where they used to live) would publish N
+    /// samples of a total, and the latch would turn the exit call into a
+    /// no-op after the first.
+    #[test]
+    fn pool_drop_counters_are_emitted_only_from_the_process_exit_hook() {
+        const SOURCES: [(&str, &str); 5] = [
+            ("pipeline.rs", include_str!("pipeline.rs")),
+            ("reader.rs", include_str!("reader.rs")),
+            ("blob.rs", include_str!("blob.rs")),
+            ("decompress.rs", include_str!("decompress.rs")),
+            ("scan/classify.rs", include_str!("../scan/classify.rs")),
+        ];
+        for (name, src) in SOURCES {
+            let squashed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+            for spelling in ["emit_decompress_pool_counters(", "emit_read_counters("] {
+                assert!(
+                    !squashed.contains(spelling),
+                    "{name} emits the pool-drop counters via `{spelling}`; emission \
+                     belongs to pbfhogg::read::emit_read_counters, called once per process"
+                );
+            }
+        }
+        // Strip `//` line comments so a commented-out call cannot satisfy it.
+        let main_rs: String = include_str!("../../cli/src/main.rs")
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .flat_map(str::chars)
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            main_rs.contains("emit_read_counters()"),
+            "the CLI must call pbfhogg::read::emit_read_counters on its exit path"
+        );
+    }
 }

@@ -370,12 +370,11 @@ pub fn write_many_block_pbf(path: &Path, node_blocks: usize) {
 }
 
 /// Write a sorted PBF whose OsmData blobs carry `indexdata` in their
-/// `BlobHeader`s. [`PbfWriter::to_path`] is the pipelined writer that embeds
-/// indexdata via `scan_block_ids`; commands that require blob-level indexdata
-/// (`add-locations-to-ways --index-type external`, `--inject-prepass`) need
-/// this rather than [`write_test_pbf`], which uses the sync writer and emits
-/// no indexdata. Each element type is flushed into its own block so way blobs
-/// are well-formed. Allowlist-only.
+/// `BlobHeader`s. This helper uses [`PbfWriter::to_path`] to exercise the
+/// pipelined writer and flushes each element type into its own block. The
+/// regular sync fixture helpers also emit indexdata through
+/// `write_primitive_block`; use [`write_test_pbf_non_indexed`] when a fixture
+/// needs that field absent. Allowlist-only.
 pub fn write_indexed_pbf(
     path: &Path,
     nodes: &[TestNode],

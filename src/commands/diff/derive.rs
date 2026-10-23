@@ -92,12 +92,24 @@ pub fn derive_changes(
         "Streaming diff requires sorted inputs to operate in constant memory.",
     )?;
     let both_indexed = old_indexed && new_indexed;
+    if jobs > 1 && !both_indexed {
+        let reason = "missing indexdata";
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "derive_changes.sequential_fallback",
+            "Using sequential comparison: {reason}"
+        );
+        crate::debug::emit_counter("derive_changes_sequential_fallback", 1);
+    }
 
     // Scratch directory for temp files (same as brokkr scratch).
     let scratch_dir = host.scratch_parent_or(output.parent().unwrap_or(Path::new(".")));
 
     crate::debug::emit_marker("DERIVECHANGES_SCAN_START");
 
+    // Derivation has no verbose-detail mode: only indexdata and worker count
+    // gate this attempt, unlike the text diff driver.
     // Parallel shard-based path. Only valid when both inputs are indexed
     // (same constraint as derive_changes_block_pair) and hold no negative
     // IDs (the driver declines with `None`). Falls through to the
@@ -574,6 +586,10 @@ pub(crate) fn assemble_osc_from_paths(
     // ~23k 2 MB members; the 18 B per-member framing is ~400 KB of
     // overhead, and the per-chunk dictionary reset costs ~1-3% on the
     // ratio. See the CHANGELOG for measured wall wins.
+    // The gzip worker count comes from host parallelism (every available
+    // thread; 4 when the host reports none), not from `-j`: `-j` gates and
+    // sizes the shard comparison, and this assembler runs after it has
+    // finished. A `-j 1` run therefore still compresses on every thread.
     let worker_count = crate::host::sized_workers(&*host.resources, 0, 1, 4);
     let gz = ParallelGzipWriter::new(buf, DEFAULT_CHUNK_SIZE, worker_count);
     let mut writer = Writer::new_with_indent(gz, b' ', 2);

@@ -33,6 +33,7 @@ mod blob_meta;
 mod coord_payloads;
 mod radix;
 mod relation_scan;
+mod space;
 mod stage1;
 mod stage2;
 mod stage3;
@@ -670,6 +671,44 @@ pub fn external_join(
     )
 }
 
+/// Validate before stage 2 writes slot buckets. Each nonempty blob is no
+/// wider than the smallest bucket, so it intersects at most two adjacent
+/// buckets. Empty blobs publish no straddler half, including at total_slots.
+fn validate_slot_layout(starts: &[u64], total: u64, buckets: usize) -> Result<()> {
+    if buckets == 0 || starts.first().is_some_and(|&start| start != 0) {
+        return Err("external join: invalid slot bucket layout".into());
+    }
+    let width = total / buckets as u64;
+    for (i, &start) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(total);
+        let length = end
+            .checked_sub(start)
+            .ok_or("external join: way slot starts are not monotonic")?;
+        if end > total || length > width {
+            return Err(format!("external join: way blob {i} spans {length} slots, exceeding slot bucket width {width}; two-piece straddler bound would be violated").into());
+        }
+    }
+    if starts.is_empty() && total != 0 {
+        return Err("external join: nonzero slots without way blobs".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod slot_layout_tests {
+    use super::validate_slot_layout;
+
+    #[test]
+    fn checks_straddler_bound_before_bucket_writes() {
+        assert!(validate_slot_layout(&[0, 3, 6, 9], 12, 4).is_ok());
+        assert!(validate_slot_layout(&[0, 4], 12, 4).is_err());
+        assert!(validate_slot_layout(&[0, 6, 3], 12, 2).is_err());
+        assert!(validate_slot_layout(&[0, 0], 0, 256).is_ok());
+        assert!(validate_slot_layout(&[], 0, 256).is_ok());
+        assert!(validate_slot_layout(&[0], 1, 0).is_err());
+    }
+}
+
 /// [`external_join`] under a scratch token the caller already took, so
 /// `add_locations_to_ways` names its scratch with the one token it allocated
 /// at its own entry.
@@ -923,6 +962,22 @@ pub(crate) fn external_join_in(
         .checked_div(max_blob_slots)
         .map(|n| n.max(1).min(NUM_BUCKETS as u64) as usize)
         .unwrap_or(NUM_BUCKETS);
+    validate_slot_layout(&way_slot_starts, total_slots, slot_bucket_count)?;
+    // Worker count: back off from the pre-streaming `.min(6)` because
+    // stage 3 and stage 4 worker buffers are now both resident at the
+    // same time (streaming stage 3 -> 4 landed in `beb7838` + `f93d896`
+    // + `eecb46c`).
+    // The stage 3 worker pool and its router backing files share this count;
+    // the scratch precheck counts one payload file per worker.
+    let num_workers = crate::host::sized_workers(&*host.resources, 2, 1, 4).min(4);
+    // Stage 1's exact ref count is the first point at which stage 2-4
+    // scratch can be sized without an extra input pass; see `space`.
+    space::precheck(
+        &scratch_dir.path,
+        total_slots,
+        slot_bucket_count,
+        num_workers,
+    )?;
     let total_id_shard_files = num_shard_workers * NUM_BUCKETS;
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -985,12 +1040,6 @@ pub(crate) fn external_join_in(
         &per_way_refcount_sidecar,
         way_slot_starts.len(),
     )?;
-    // Worker count: back off from the pre-streaming `.min(6)` because
-    // stage 3 and stage 4 worker buffers are now both resident at the
-    // same time (streaming stage 3 -> 4 landed in `beb7838` + `f93d896`
-    // + `eecb46c`).
-    // The stage 3 worker pool and its router backing files share this count.
-    let num_workers = crate::host::sized_workers(&*host.resources, 2, 1, 4).min(4);
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("s3_worker_count", num_workers as i64);
 

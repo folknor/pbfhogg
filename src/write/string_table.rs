@@ -23,6 +23,12 @@ use crate::read::wire_schema::{primitive_block, string_table};
 /// batches, not adversarial string counts: a pre-seeded table copies every
 /// source slot, including unused entries. A hardened hasher would require
 /// measuring rewrite CPU and allocations on representative input.
+/// This is a throughput policy, not an input-safety guarantee: the reader's
+/// blob byte limit bounds storage but does not prevent collision-heavy work.
+/// Retain the existing hasher rather than impose a new hashing cost on every
+/// tag lookup to harden pre-seeding alone. Replacing it is a separate policy
+/// choice covering both `add` and `pre_seed`; an element-count bound or slot
+/// deduplication is not a substitute (deduplication breaks raw sid identity).
 pub(super) struct StringTable {
     pub(super) strings: Vec<Rc<str>>,
     index: FxHashMap<Rc<str>, u32>,

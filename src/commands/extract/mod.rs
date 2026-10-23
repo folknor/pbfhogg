@@ -655,6 +655,19 @@ fn extract_multi_inner(
         return Ok(stats);
     }
 
+    if matches!(strategy, ExtractStrategy::Simple) && !clean.any() {
+        // The single-pass probe declines unsorted, empty or missing-header
+        // input and a first-blob read error. Keep the fallback visible; the
+        // probe reports a swallowed read error under its own event first.
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "extract.multi.sequential_fallback",
+            "Multi-extract single-pass probe declined the input; using one full pass per region"
+        );
+        crate::debug::emit_counter("multi_extract_sequential_fallback", 1);
+    }
+
     // Sequential fallback: one extract at a time.
     let mut all_stats = Vec::with_capacity(slots.len());
     for (i, slot) in slots.iter().enumerate() {

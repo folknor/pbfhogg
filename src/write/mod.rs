@@ -76,6 +76,27 @@ pub(crate) mod metrics;
 pub fn emit_writer_counters() {
     metrics::WRITER_METRICS.emit_once();
 }
+
+/// Report, once, that output blobs lost their optional tag skip-index
+/// (`tagdata`) because their headers exceeded the size limit.
+///
+/// Call after dispatch, beside [`emit_writer_counters`]: the count is the
+/// same process total behind the `writer_tagdata_dropped_oversize` counter,
+/// surfaced here for users who never read sidecar counters. Output stays
+/// valid; later tag filtering of that file decodes more blobs.
+pub fn report_writer_index_loss(diagnostics: &crate::host::Diagnostics) {
+    let dropped = metrics::WRITER_METRICS
+        .tagdata_dropped_oversize
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if dropped != 0 {
+        crate::host::diag_once!(
+            diagnostics,
+            Warning,
+            "writer.tagdata_dropped_oversize",
+            "Warning: {dropped} output blobs lost their tag skip-index because their headers exceeded the size limit; tag filtering may decode more blobs"
+        );
+    }
+}
 #[cfg(feature = "linux-io-uring")]
 pub mod uring_writer;
 pub mod writer;

@@ -5,7 +5,6 @@ use super::block::{HeaderBlock, PrimitiveBlock};
 use super::elements::Element;
 use super::file_reader::FileReader;
 use super::pipeline::PipelineConfig;
-use super::pipeline_metrics::PIPELINE_METRICS;
 use crate::blob_meta::BlobFilter;
 use crate::error::{ErrorKind, Result, new_error};
 use std::collections::VecDeque;
@@ -30,6 +29,7 @@ pub struct ElementReader<R: Read + Send> {
     decode_threads: Option<usize>,
     pipeline_config: PipelineConfig,
     blob_filter: Option<BlobFilter>,
+    diagnostics: crate::host::Diagnostics,
 }
 
 impl<R: Read + Send> ElementReader<R> {
@@ -62,13 +62,15 @@ impl<R: Read + Send> ElementReader<R> {
             decode_threads: None,
             pipeline_config: PipelineConfig::default(),
             blob_filter: None,
+            diagnostics: crate::host::Diagnostics::discard(),
         })
     }
 
     /// Attach per-run diagnostics to this reader.
     #[must_use]
     pub fn diagnostics(mut self, diagnostics: crate::host::Diagnostics) -> Self {
-        self.blob_iter = self.blob_iter.diagnostics(diagnostics);
+        self.blob_iter = self.blob_iter.diagnostics(diagnostics.clone());
+        self.diagnostics = diagnostics;
         self
     }
 
@@ -279,6 +281,7 @@ impl<R: Read + Send> ElementReader<R> {
             self.pipeline_config,
             self.blob_filter,
             self.resources,
+            self.diagnostics,
             f,
         )
     }
@@ -298,6 +301,7 @@ impl<R: Read + Send> ElementReader<R> {
             self.pipeline_config,
             self.blob_filter,
             self.resources,
+            self.diagnostics,
             &transform,
             consume,
         )
@@ -335,6 +339,7 @@ impl<R: Read + Send> ElementReader<R> {
         let pipeline_config = self.pipeline_config;
         let blob_filter = self.blob_filter;
         let resources = self.resources;
+        let diagnostics = self.diagnostics;
 
         let handle = std::thread::spawn(move || {
             let deliver = |block: PrimitiveBlock| {
@@ -350,6 +355,7 @@ impl<R: Read + Send> ElementReader<R> {
                 pipeline_config,
                 blob_filter,
                 resources,
+                diagnostics,
                 deliver,
             );
             if let Err(e) = result {
@@ -513,7 +519,7 @@ where
     let identity = &identity;
     let reduce_op = &reduce_op;
 
-    let result = std::thread::scope(|scope| -> Result<T> {
+    std::thread::scope(|scope| -> Result<T> {
         // Installed before the first worker spawns: if the calling thread
         // unwinds inside this scope - a `scope.spawn` failure, or a panicking
         // `R::read` inside the pump - this closes the queue and shuts the budget
@@ -580,9 +586,7 @@ where
             acc = reduce_op(acc, partial);
         }
         Ok(acc)
-    });
-    PIPELINE_METRICS.emit_decompress_pool_counters();
-    result
+    })
 }
 
 /// Total compressed bytes allowed in flight across the frame pump's queue and
@@ -968,6 +972,7 @@ impl ElementReader<FileReader> {
             decode_threads: None,
             pipeline_config: PipelineConfig::default(),
             blob_filter: None,
+            diagnostics: crate::host::Diagnostics::discard(),
         })
     }
 
@@ -983,6 +988,7 @@ impl ElementReader<FileReader> {
             decode_threads: None,
             pipeline_config: PipelineConfig::default(),
             blob_filter: None,
+            diagnostics: crate::host::Diagnostics::discard(),
         })
     }
 
@@ -1015,6 +1021,7 @@ impl ElementReader<FileReader> {
             decode_threads: None,
             pipeline_config: PipelineConfig::default(),
             blob_filter: None,
+            diagnostics: crate::host::Diagnostics::discard(),
         })
     }
 
@@ -1055,6 +1062,7 @@ impl ElementReader<FileReader> {
             decode_threads: None,
             pipeline_config: PipelineConfig::default(),
             blob_filter: None,
+            diagnostics: host.diagnostics.clone(),
         })
     }
 
@@ -1070,6 +1078,7 @@ impl ElementReader<FileReader> {
             decode_threads: None,
             pipeline_config: PipelineConfig::default(),
             blob_filter: None,
+            diagnostics: crate::host::Diagnostics::discard(),
         })
     }
 }

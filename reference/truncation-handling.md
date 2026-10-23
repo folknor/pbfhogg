@@ -217,9 +217,11 @@ makes the element iterators used in steps 2-4 unable to terminate
 early, so running them first would silently examine a prefix.
 
 This is a structural pass, not a second decode - sub-message
-parsing walks field headers and records slice bounds without
-decoding any packed array, and the dense length check is a byte
-scan. On a matched interleaved A/B over Denmark
+parsing walks field headers and records slice bounds, and the
+packed-array checks count varints with a byte scan rather than
+decoding their values. The one exception is the dense `keys_vals`
+walk described below, which decodes that array's varints to find
+each node's tag-run terminator. On a matched interleaved A/B over Denmark
 (`add-locations-to-ways`, commit `40cbae08`, host `bygg`) the cost
 was at or below run-to-run noise: 2201 ms / 2100 ms / 2100 ms for
 on / off / on.

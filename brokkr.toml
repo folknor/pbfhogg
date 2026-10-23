@@ -1107,7 +1107,8 @@ exclude = ["src/process.rs"]
 region = "code"
 message = "Process mutations belong to the caller's explicit process toolbox"
 
-# statvfs in altw/sparse.rs guards preallocation and sizes no host resource.
+# statvfs in altw (sparse preallocation, external scratch precheck) guards
+# scratch writes and sizes no host resource.
 [[textlint]]
 name = "no-host-probe"
 pattern = 'available_parallelism|/proc/meminfo'

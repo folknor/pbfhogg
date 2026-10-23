@@ -18,7 +18,13 @@ pub struct MergeStats {
     pub bytes_rewritten: u64,
     /// Heap bytes used by the CompactDiffOverlay after OSC parsing.
     pub diff_heap_bytes: u64,
-    /// Per-blob frame sizes in bytes for percentile computation.
+    /// Per-blob frame sizes in bytes for exact percentile computation.
+    /// Retains 4 bytes per observed blob (plus Vec spare capacity); summary
+    /// temporarily clones that allocation to sort without mutating stats.
+    /// A fixed-width histogram gives approximate percentiles and changes the
+    /// reported values. Keep exact samples: compare this 8-byte-per-blob peak
+    /// with overlay and decoded-block RSS before trading observability for a
+    /// bound. An exact size-frequency map can cost more on varied frame sizes.
     pub(super) blob_sizes: Vec<u32>,
     // -- locations-on-ways stats (only populated when flag is on) --
     /// Unique node IDs referenced by OSC ways.

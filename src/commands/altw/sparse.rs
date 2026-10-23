@@ -46,25 +46,9 @@ use super::Result;
 
 #[cfg(target_os = "linux")]
 fn preallocate_sparse_file(file: &std::fs::File, scratch_dir: &Path, bytes: u64) -> Result<()> {
-    use std::ffi::CString;
     use std::os::fd::AsRawFd as _;
-    use std::os::unix::ffi::OsStrExt as _;
 
-    let path = CString::new(scratch_dir.as_os_str().as_bytes())
-        .map_err(|_| "scratch directory path contains a NUL byte")?;
-    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // Safety: `path` is NUL-terminated and `stats` points to writable storage.
-    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return Err(format!(
-            "failed to query free space for sparse index in {}: {}",
-            scratch_dir.display(),
-            std::io::Error::last_os_error()
-        )
-        .into());
-    }
-    // Safety: statvfs initialized `stats` on success.
-    let stats = unsafe { stats.assume_init() };
-    let available = stats.f_bavail.saturating_mul(stats.f_frsize);
+    let available = super::filesystem_available_bytes(scratch_dir, "sparse index")?;
     if available < bytes {
         return Err(format!(
             "insufficient free space for sparse node index: need {bytes} bytes, have {available} bytes in {}",

@@ -135,6 +135,11 @@ pub(super) struct WorkerCounters {
     pub blobs_processed: AtomicU64,
     pub blobs_rewritten: AtomicU64,
     pub blobs_false_positive: AtomicU64,
+    /// Candidates whose base elements the diff does not touch but whose ID
+    /// span holds inline upserts (pure creates), so they are rewritten
+    /// rather than passed through to keep the output sorted. A subset of
+    /// `blobs_rewritten`.
+    pub blobs_forced_rewrite: AtomicU64,
     pub blobs_owned_passthrough: AtomicU64,
     /// Decompress wall summed across all workers (cumulative ns).
     pub decompress_ns: AtomicU64,
@@ -164,6 +169,7 @@ impl WorkerCounters {
             blobs_processed: AtomicU64::new(0),
             blobs_rewritten: AtomicU64::new(0),
             blobs_false_positive: AtomicU64::new(0),
+            blobs_forced_rewrite: AtomicU64::new(0),
             blobs_owned_passthrough: AtomicU64::new(0),
             decompress_ns: AtomicU64::new(0),
             parse_ns: AtomicU64::new(0),
@@ -186,6 +192,7 @@ impl WorkerCounters {
         emit!("merge_streaming_blobs_processed", blobs_processed);
         emit!("merge_streaming_blobs_rewritten", blobs_rewritten);
         emit!("merge_streaming_blobs_false_positive", blobs_false_positive);
+        emit!("merge_streaming_blobs_forced_rewrite", blobs_forced_rewrite);
         emit!(
             "merge_streaming_blobs_owned_passthrough",
             blobs_owned_passthrough
@@ -593,6 +600,11 @@ fn handle_candidate(
             blob_count,
             Some((effective_kind, effective_id_range)),
         );
+    }
+    if !overlaps {
+        counters
+            .blobs_forced_rewrite
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     // The drain publishes `loc_map` at the node→way barrier; the scanner

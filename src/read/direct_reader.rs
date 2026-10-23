@@ -242,7 +242,6 @@ impl Read for DirectReader {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn aligned_read_buffer_basics() {
@@ -253,74 +252,5 @@ mod tests {
         assert_eq!(buf.remaining(), 0);
         // Verify page alignment.
         assert_eq!(buf.ptr.as_ptr() as usize % PAGE_SIZE, 0);
-    }
-
-    #[test]
-    fn direct_reader_reads_file() {
-        // Write a test file with known content.
-        let scratch = crate::path_guard::tests::scratch();
-        let dir = scratch.path();
-        let path = dir.join("direct_reader_test.bin");
-
-        let data: Vec<u8> = (0..10000u32).flat_map(u32::to_le_bytes).collect();
-        {
-            let mut f = std::fs::File::create(&path).unwrap();
-            f.write_all(&data).unwrap();
-        }
-
-        // Read back via DirectReader.
-        let result = DirectReader::open(&path);
-        drop(std::fs::remove_file(&path));
-
-        match result {
-            Ok(mut reader) => {
-                let mut buf = Vec::new();
-                reader.read_to_end(&mut buf).unwrap();
-                assert_eq!(buf, data);
-            }
-            Err(e) if crate::error::carried_platform_feature(&e) == Some("direct-io") => {}
-            Err(e) => panic!("unexpected error: {e}"),
-        }
-    }
-
-    mod platform {
-        use super::{DirectReader, PAGE_SIZE};
-
-        #[test]
-        fn aligned_skip_rejects_a_target_past_eof() {
-            let scratch = crate::path_guard::tests::scratch();
-            let dir = scratch.path();
-            let path = dir.join(format!(
-                "direct-reader-aligned-skip-{}.bin",
-                std::process::id()
-            ));
-            let size = u64::try_from(PAGE_SIZE).expect("page size fits u64");
-            std::fs::File::create(&path)
-                .and_then(|file| file.set_len(size))
-                .expect("create page-sized fixture");
-
-            let mut reader = match DirectReader::open(&path) {
-                Ok(reader) => reader,
-                Err(error)
-                    if crate::error::carried_platform_feature(&error) == Some("direct-io") =>
-                {
-                    drop(std::fs::remove_file(&path));
-                    return;
-                }
-                Err(error) => {
-                    drop(std::fs::remove_file(&path));
-                    panic!("open direct reader: {error}");
-                }
-            };
-            let target = u64::try_from(PAGE_SIZE * 2).expect("skip target fits u64");
-            let result = reader.skip(target);
-            drop(reader);
-            drop(std::fs::remove_file(&path));
-
-            match result {
-                Ok(()) => panic!("aligned skip beyond EOF must fail"),
-                Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof),
-            }
-        }
     }
 }

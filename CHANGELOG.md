@@ -1392,6 +1392,30 @@
 
 ### Changed
 
+- **`add-locations-to-ways --index-type external` checks scratch space
+  before its node join.** Once the way pass knows the exact ref count, the
+  run is refused unless the scratch filesystem holds about 23 bytes per ref
+  plus per-file slack, instead of failing with ENOSPC minutes to hours
+  later. The figure is a worst-case bound and excludes the final output.
+
+- **The writer refuses a block whose uncompressed payload exceeds 32 MiB.**
+  Such a blob compressed into an in-limit body was previously written and
+  then refused by every reader, including pbfhogg's own. It is now an error
+  at write time.
+
+- **New notes when a run silently lost parallelism or skipping.** `diff` and
+  `derive-changes` say when they fall back to a sequential comparison
+  (missing indexdata, `--verbose`, negative IDs); `multi-extract` says when
+  its single-pass probe or region grid declines; `sort --force` on unindexed
+  input warns that every blob is decompressed; a filtered read whose input
+  has no indexdata says the filter cannot skip blobs; and a run whose output
+  blobs lost their tag skip-index to oversized headers ends with a warning.
+
+- **`merge-changes` with several inputs no longer holds every re-emitted
+  input in memory before writing.** Members are written in input order as
+  soon as they and their predecessors finish, with at most one in flight per
+  worker thread. Output bytes are unchanged.
+
 - **CLI: a closed stderr no longer aborts the command.** With stderr's
   reader gone (`pbfhogg sort in.pbf -o out.pbf 2>&1 | head`), the first
   progress line used to panic and end the run with status 101, leaving no

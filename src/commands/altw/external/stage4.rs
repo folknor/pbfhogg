@@ -56,34 +56,40 @@ struct BlobDescriptor {
 
 /// Load the ref-count sidecar and compute prefix sums for slot_start values.
 pub(super) fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
-    let data = std::fs::read(path).map_err(|e| format!("failed to read ref count sidecar: {e}"))?;
-    if data.len() < 8 {
+    use std::io::Read as _;
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("failed to open ref count sidecar: {e}"))?;
+    let bytes = file.metadata()?.len();
+    if bytes < 8 {
         return Err("ref count sidecar is too small".into());
     }
-    // Last 8 bytes are the trailer (total ref count).
-    let trailer_bytes: [u8; 8] = data[data.len() - 8..]
+    if bytes % 8 != 0 {
+        return Err("ref count sidecar has non-aligned entries".into());
+    }
+    let num_entries: usize = (bytes / 8 - 1)
         .try_into()
-        .map_err(|_| "ref count sidecar trailer read failed")?;
-    let trailer_total = u64::from_le_bytes(trailer_bytes);
+        .map_err(|_| "ref count sidecar has too many entries")?;
+    // Only the prefix vector must survive: stages 2/3 use it for random
+    // blob-to-slot lookup. Stream the counts instead of holding a second,
+    // equally large encoded byte vector during prefix construction.
+    let mut reader = std::io::BufReader::new(file);
+    let mut slot_starts = Vec::with_capacity(num_entries);
+    let mut cumulative: u64 = 0;
+    let mut chunk = [0_u8; 8];
+    for _ in 0..num_entries {
+        reader.read_exact(&mut chunk)?;
+        slot_starts.push(cumulative);
+        cumulative = cumulative
+            .checked_add(u64::from_le_bytes(chunk))
+            .ok_or("ref count sidecar cumulative count overflow")?;
+    }
+    reader.read_exact(&mut chunk)?;
+    let trailer_total = u64::from_le_bytes(chunk);
     if trailer_total != total_slots {
         return Err(format!(
             "ref count sidecar total ({trailer_total}) != stage 1 total_slots ({total_slots})"
         )
         .into());
-    }
-
-    let entry_bytes = &data[..data.len() - 8];
-    if entry_bytes.len() % 8 != 0 {
-        return Err("ref count sidecar has non-aligned entries".into());
-    }
-    let num_entries = entry_bytes.len() / 8;
-    let mut slot_starts = Vec::with_capacity(num_entries);
-    let mut cumulative: u64 = 0;
-    let (chunks, _rem) = entry_bytes.as_chunks::<8>();
-    for chunk in chunks {
-        slot_starts.push(cumulative);
-        let count = u64::from_le_bytes(*chunk);
-        cumulative += count;
     }
     if cumulative != total_slots {
         return Err(format!(
@@ -1477,4 +1483,33 @@ fn reframe_way_blob_with_locations(
     }
 
     Ok((total_ways, min_way_id, max_way_id))
+}
+
+#[cfg(test)]
+mod ref_count_sidecar_tests {
+    use super::load_ref_count_sidecar;
+
+    #[test]
+    fn streamed_prefixes_check_alignment_trailer_and_overflow() {
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("refcounts");
+        let write = |counts: &[u64]| {
+            let bytes: Vec<u8> = counts.iter().flat_map(|n| n.to_le_bytes()).collect();
+            std::fs::write(&path, bytes).expect("sidecar");
+        };
+        write(&[3, 0, 2, 5]);
+        assert_eq!(
+            load_ref_count_sidecar(&path, 5).expect("prefixes"),
+            [0, 3, 3]
+        );
+        assert!(load_ref_count_sidecar(&path, 4).is_err());
+        write(&[u64::MAX, 1, 0]);
+        assert!(load_ref_count_sidecar(&path, 0).is_err());
+        write(&[0]);
+        assert!(load_ref_count_sidecar(&path, 0).expect("empty").is_empty());
+        std::fs::write(&path, [0_u8; 9]).expect("unaligned");
+        assert!(load_ref_count_sidecar(&path, 0).is_err());
+        std::fs::write(&path, b"").expect("short");
+        assert!(load_ref_count_sidecar(&path, 0).is_err());
+    }
 }

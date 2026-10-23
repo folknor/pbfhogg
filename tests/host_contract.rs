@@ -571,3 +571,104 @@ fn run_scratch_backend(
         _ => unreachable!("test backend"),
     }
 }
+
+// `has_indexdata` is a `commands` export.
+#[cfg(all(feature = "linux-direct-io", feature = "commands"))]
+mod platform {
+    use crate::common::{self, TestNode};
+
+    fn direct_input(path: &std::path::Path) {
+        common::write_test_pbf_sorted(
+            path,
+            &[TestNode {
+                id: 1,
+                lat: 0,
+                lon: 0,
+                tags: vec![],
+                meta: None,
+            }],
+            &[],
+            &[],
+        );
+    }
+
+    #[test]
+    fn direct_reader_reads_a_pbf() {
+        let dir = common::test_scratch();
+        let path = dir.path().join("direct-reader.osm.pbf");
+        direct_input(&path);
+
+        let reader = match pbfhogg::BlobReader::open(&path, true) {
+            Ok(reader) => reader,
+            Err(error) if common::is_einval(&error) => return,
+            Err(error) => panic!("open direct PBF reader: {error}"),
+        };
+        let mut count = 0;
+        for blob in reader {
+            blob.expect("read direct PBF blob");
+            count += 1;
+        }
+        assert_eq!(count, 2, "header and data blobs must be readable");
+    }
+
+    #[test]
+    fn direct_skip_rejects_a_truncated_header_blob() {
+        let dir = common::test_scratch();
+        let path = dir.path().join("direct-skip-truncated.osm.pbf");
+        direct_input(&path);
+        let bytes = std::fs::read(&path).expect("read fixture");
+        let header_blob = common::adversarial::locate_blobs(&bytes)
+            .into_iter()
+            .next()
+            .expect("header blob");
+        std::fs::write(&path, &bytes[..header_blob.blob_end - 1]).expect("truncate fixture");
+
+        let error =
+            match pbfhogg::has_indexdata(&path, true, &pbfhogg::host::Diagnostics::discard()) {
+                Ok(_) => panic!("truncated header blob must fail while skipping"),
+                Err(error) if common::is_einval(&*error) => return,
+                Err(error) => error,
+            };
+        let error = error
+            .downcast_ref::<pbfhogg::Error>()
+            .expect("pbfhogg error");
+        assert!(matches!(
+            error.kind(),
+            pbfhogg::ErrorKind::Io(source)
+                if source.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+    }
+
+    /// The direct reader's page-aligned skip branch: seeking succeeds past
+    /// EOF, so the target must be checked against the file length. The
+    /// fixture is one bare frame header whose declared payload ends exactly
+    /// on a page boundary (4-byte prefix + 14-byte header + 8174 = 8192),
+    /// with no payload bytes on disk.
+    #[test]
+    fn direct_skip_rejects_a_page_aligned_target_past_eof() {
+        let dir = common::test_scratch();
+        let path = dir.path().join("direct-skip-aligned.osm.pbf");
+        // BlobHeader: type "OSMHeader" (field 1), datasize 8174 (field 3,
+        // varint 0xEE 0x3F).
+        let mut frame = vec![0, 0, 0, 14, 0x0A, 9];
+        frame.extend_from_slice(b"OSMHeader");
+        frame.extend_from_slice(&[0x18, 0xEE, 0x3F]);
+        assert_eq!(frame.len(), 18);
+        std::fs::write(&path, &frame).expect("write fixture");
+
+        let error =
+            match pbfhogg::has_indexdata(&path, true, &pbfhogg::host::Diagnostics::discard()) {
+                Ok(_) => panic!("aligned skip beyond EOF must fail"),
+                Err(error) if common::is_einval(&*error) => return,
+                Err(error) => error,
+            };
+        let error = error
+            .downcast_ref::<pbfhogg::Error>()
+            .expect("pbfhogg error");
+        assert!(matches!(
+            error.kind(),
+            pbfhogg::ErrorKind::Io(source)
+                if source.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+    }
+}

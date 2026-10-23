@@ -18,6 +18,55 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Instant;
 
 type RawItem = (usize, crate::error::Result<crate::blob::Blob>);
+
+/// Notes, once per run (checked at most once per pipeline), that a blob filter can skip nothing because
+/// the input's first data blob carries no indexdata (the common "why is my
+/// filtered read slow" case). Inert when no filter is set, or when the
+/// filter has no indexdata-backed part (every kind wanted, no bbox: a
+/// tag-key-only filter skips through tagdata, which this note does not
+/// cover); costs one branch per blob on the reader thread after the first
+/// data blob.
+struct UnindexedFilterNote {
+    pending: bool,
+}
+
+impl UnindexedFilterNote {
+    fn new(filter: Option<&BlobFilter>) -> Self {
+        let uses_index = filter.is_some_and(|f| {
+            !(f.want_nodes && f.want_ways && f.want_relations) || f.node_bbox.is_some()
+        });
+        Self {
+            pending: uses_index,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        blob_result: &crate::error::Result<crate::blob::Blob>,
+        diagnostics: &crate::host::Diagnostics,
+    ) {
+        if !self.pending {
+            return;
+        }
+        let Ok(blob) = blob_result else { return };
+        if blob.get_type() != BlobType::OsmData {
+            return;
+        }
+        self.pending = false;
+        if blob.index().is_none() {
+            // Once per run: multi-pass commands open several filtered
+            // pipelines over the same input.
+            crate::host::diag_once!(
+                diagnostics,
+                Note,
+                "reader.filter_without_indexdata",
+                "Input has no indexdata on its first data blob; blob type and spatial filters cannot skip unindexed blobs"
+            );
+            crate::debug::emit_counter("pipeline_filter_without_indexdata", 1);
+        }
+    }
+}
+
 type DecodedPayload = Option<crate::error::Result<PrimitiveBlock>>;
 type DecodedItem = (usize, DecodedPayload, Option<Permit>);
 
@@ -482,6 +531,7 @@ pub(crate) fn run_pipeline<R, F>(
     pipeline_config: PipelineConfig,
     blob_filter: Option<BlobFilter>,
     resources: Option<crate::host::ResourcesHandle>,
+    diagnostics: crate::host::Diagnostics,
     mut block_fn: F,
 ) -> Result<()>
 where
@@ -491,6 +541,7 @@ where
     // Enable tagdata parsing only when the filter needs tag key matching.
     // Enable indexdata parsing only when any filter is active (should_skip_blob
     // checks blob.index() for type + spatial filtering).
+    let mut unindexed = UnindexedFilterNote::new(blob_filter.as_ref());
     let has_tag_filter = blob_filter.as_ref().is_some_and(BlobFilter::has_tag_filter);
     blob_reader.set_parse_tagdata(has_tag_filter);
     blob_reader.set_parse_indexdata(blob_filter.is_some());
@@ -502,6 +553,7 @@ where
         // Stage 1: Sequential I/O reader thread
         scope.spawn(move || {
             for (seq, blob_result) in blob_reader.enumerate() {
+                unindexed.observe(&blob_result, &diagnostics);
                 let t_send = Instant::now();
                 let send_result = raw_tx.send((seq, blob_result));
                 PIPELINE_METRICS
@@ -624,8 +676,8 @@ where
         );
 
         // Emit reader-pipeline counters before returning so that even
-        // an error path produces sidecar data. Mirrors the writer's
-        // WRITER_METRICS.emit() in flush().
+        // an error path produces sidecar data. Process-wide pool-drop
+        // totals are emitted separately by the host after dispatch.
         PIPELINE_METRICS.emit();
         result
     })
@@ -637,7 +689,11 @@ where
 
 /// Fused sibling of `run_pipeline`. Keep this additive: the plain engine
 /// continues to serve non-transform consumers with a different read shape.
-#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
 #[hotpath::measure]
 pub(crate) fn run_pipeline_fused<R, T, X, F>(
     mut blob_reader: BlobReader<R>,
@@ -645,6 +701,7 @@ pub(crate) fn run_pipeline_fused<R, T, X, F>(
     pipeline_config: PipelineConfig,
     blob_filter: Option<BlobFilter>,
     resources: Option<crate::host::ResourcesHandle>,
+    diagnostics: crate::host::Diagnostics,
     transform: &X,
     mut consume: F,
 ) -> Result<()>
@@ -654,6 +711,7 @@ where
     X: Fn(PrimitiveBlock) -> std::result::Result<T, String> + Sync,
     F: FnMut(T) -> Result<()>,
 {
+    let mut unindexed = UnindexedFilterNote::new(blob_filter.as_ref());
     let has_tag_filter = blob_filter.as_ref().is_some_and(BlobFilter::has_tag_filter);
     blob_reader.set_parse_tagdata(has_tag_filter);
     blob_reader.set_parse_indexdata(blob_filter.is_some());
@@ -667,6 +725,7 @@ where
     std::thread::scope(|scope| {
         scope.spawn(move || {
             for (seq, blob_result) in blob_reader.enumerate() {
+                unindexed.observe(&blob_result, &diagnostics);
                 let start = Instant::now();
                 let send_result = raw_tx.send((seq, blob_result));
                 PIPELINE_METRICS

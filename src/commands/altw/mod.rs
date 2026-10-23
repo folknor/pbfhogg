@@ -31,6 +31,32 @@ use super::Result;
 use self::passthrough::write_output_passthrough;
 use self::sparse::{SparseArrayIndex, build_node_index_sparse};
 
+/// Bytes available to an unprivileged writer on the filesystem holding `dir`
+/// (`statvfs` `f_bavail * f_frsize`). `purpose` names the caller in the
+/// error text. The one free-space probe for both backends: sparse checks it
+/// before preallocating, external before stage 2.
+#[cfg(target_os = "linux")]
+fn filesystem_available_bytes(dir: &Path, purpose: &str) -> Result<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| "scratch directory path contains a NUL byte")?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // Safety: `path` is NUL-terminated and `stats` points to writable storage.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(format!(
+            "failed to query free space for {purpose} in {}: {}",
+            dir.display(),
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+    // Safety: statvfs initialized `stats` on success.
+    let stats = unsafe { stats.assume_init() };
+    Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
+}
+
 /// Shared refusal text for a referenced node rejected by the coordinate owner.
 fn node_coordinate_domain_error(node_id: i64, lat: i32, lon: i32) -> String {
     format!(

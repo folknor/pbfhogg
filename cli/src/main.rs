@@ -2119,6 +2119,8 @@ fn main() -> process::ExitCode {
     // passes through, success or failure, and it runs before the hotpath
     // guard drops.
     pbfhogg::write::emit_writer_counters();
+    pbfhogg::read::emit_read_counters();
+    pbfhogg::write::report_writer_index_loss(&host.diagnostics);
 
     match result {
         Ok(()) => process::ExitCode::from(outcome.code()),

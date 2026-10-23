@@ -592,6 +592,13 @@ pub(crate) fn derive_changes_parallel(
     token: &crate::scratch::RunToken,
 ) -> Result<Option<DeriveChangesStats>> {
     let Some((old, new)) = walk_pair(old_path, new_path, host)? else {
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "derive_changes.negative_id_fallback",
+            "Using sequential comparison: negative IDs cannot use parallel ID-range shards"
+        );
+        crate::debug::emit_counter("derive_changes_negative_id_fallback", 1);
         return Ok(None);
     };
     let suffix = token.suffix();

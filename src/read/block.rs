@@ -809,6 +809,15 @@ fn packed_uint32_count(data: &[u8]) -> Result<usize> {
 /// No stringtable index is resolved (that is `str_from_stringtable`'s job,
 /// which is already fallible).
 ///
+/// Consequently a block accepted here is not a certificate that raw rewrite
+/// indices are in table bounds. Enforcing that globally would change when
+/// out-of-range strings fail and require decoding regular-element keys and
+/// values, relation roles and Info/DenseInfo user indices even for readers
+/// that never access those strings (dense `keys_vals` is the one array this
+/// pass already decodes, for its run count and int32 width checks).
+/// Keep structural validation distinct from string resolution; do not infer
+/// a raw rewrite sanitization guarantee from successful construction.
+///
 /// No error raised here carries a byte offset. These sites sit below the
 /// framing layer and cannot know their position in the file; the enclosing
 /// `BlobReader` stamps the blob's offset on the way out, and the innermost-wins

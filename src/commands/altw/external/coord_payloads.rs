@@ -514,18 +514,36 @@ impl Drop for AbortOnDrop<'_> {
 
 /// Indexed per-way ref-count sidecar.
 ///
-/// Retains the original varint-encoded sidecar bytes and records only the
+/// Maps the original varint-encoded sidecar bytes and records only the
 /// per-blob byte offsets. Callers decode one blob's refcounts on demand,
 /// avoiding the planet-scale flat `Vec<u32>` residency that stage 3/finalize
 /// used to keep alive simultaneously.
 pub(super) struct PerWayRcs {
-    data: Vec<u8>,
+    data: RefCountBytes,
     offsets: Vec<usize>, // len == num_blobs + 1; offsets[num_blobs] == data.len()
+}
+
+enum RefCountBytes {
+    Empty,
+    Mapped(memmap2::Mmap),
+    #[cfg(test)]
+    Owned(Vec<u8>),
+}
+
+impl RefCountBytes {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Empty => &[],
+            Self::Mapped(data) => data,
+            #[cfg(test)]
+            Self::Owned(data) => data,
+        }
+    }
 }
 
 impl PerWayRcs {
     pub(super) fn blob_record(&self, blob_idx: usize) -> &[u8] {
-        &self.data[self.offsets[blob_idx]..self.offsets[blob_idx + 1]]
+        &self.data.as_bytes()[self.offsets[blob_idx]..self.offsets[blob_idx + 1]]
     }
 
     pub(super) fn num_blobs(&self) -> usize {
@@ -613,11 +631,11 @@ fn blob_record_has_nonzero_refs(record: &[u8], blob_idx: usize) -> Result<bool> 
     Ok(false)
 }
 
-fn build_per_way_refcount_index(data: Vec<u8>, num_way_blobs: usize) -> Result<PerWayRcs> {
-    let mut cursor = protohoggr::Cursor::new(&data);
+fn build_per_way_refcount_index(data: RefCountBytes, num_way_blobs: usize) -> Result<PerWayRcs> {
+    let mut cursor = protohoggr::Cursor::new(data.as_bytes());
     let mut offsets: Vec<usize> = Vec::with_capacity(num_way_blobs + 1);
     offsets.push(0);
-    let data_len = data.len();
+    let data_len = data.as_bytes().len();
 
     for blob_idx in 0..num_way_blobs {
         scan_blob_record(&mut cursor, blob_idx)?;
@@ -641,7 +659,7 @@ pub(super) fn parse_per_way_refcount_sidecar_bytes(
     data: &[u8],
     num_way_blobs: usize,
 ) -> Result<PerWayRcs> {
-    build_per_way_refcount_index(data.to_vec(), num_way_blobs)
+    build_per_way_refcount_index(RefCountBytes::Owned(data.to_vec()), num_way_blobs)
 }
 
 /// Load the per-way refcount sidecar into an indexed `PerWayRcs`.
@@ -649,7 +667,23 @@ pub(super) fn load_per_way_refcount_sidecar_indexed(
     path: &Path,
     num_way_blobs: usize,
 ) -> Result<PerWayRcs> {
-    let data = std::fs::read(path).map_err(|e| format!("read per-way refcount sidecar: {e}"))?;
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("open per-way refcount sidecar: {e}"))?;
+    let data = if file.metadata()?.len() == 0 {
+        RefCountBytes::Empty
+    } else {
+        // Safety: stage 1 has joined and closed its writers before this
+        // read-only mapping is created. This run's private sidecar is never
+        // modified again, and ScratchDir is dropped after stage 3/4 join.
+        // Encoded bytes remain file-backed and reclaimable; anonymous memory
+        // here is only (num_way_blobs + 1) * size_of::<usize>() for offsets.
+        // Both stages revisit records out of order, so retaining these byte
+        // offsets avoids a seek/read or reparsing preceding ways per blob.
+        RefCountBytes::Mapped(
+            unsafe { memmap2::Mmap::map(&file) }
+                .map_err(|e| format!("map per-way refcount sidecar: {e}"))?,
+        )
+    };
     build_per_way_refcount_index(data, num_way_blobs)
 }
 
@@ -1084,6 +1118,25 @@ mod tests {
                 assert!(!result.timed_out(), "event {event} lost its notification");
             });
         }
+    }
+
+    #[test]
+    fn mapped_sidecar_matches_owned_records_and_handles_empty_input() {
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("refcounts");
+        let bytes = make_sidecar_bytes(&[&[0, 3, 128], &[], &[1]]);
+        std::fs::write(&path, &bytes).expect("write sidecar");
+        let mapped = load_per_way_refcount_sidecar_indexed(&path, 3).expect("map");
+        let owned = parse_per_way_refcount_sidecar_bytes(&bytes, 3).expect("parse");
+        for blob in 0..3 {
+            assert_eq!(mapped.blob_record(blob), owned.blob_record(blob));
+        }
+        assert!(load_per_way_refcount_sidecar_indexed(&path, 2).is_err());
+        drop(mapped);
+        std::fs::write(&path, b"").expect("empty sidecar");
+        let empty = load_per_way_refcount_sidecar_indexed(&path, 0).expect("empty");
+        assert_eq!(empty.num_blobs(), 0);
+        assert!(load_per_way_refcount_sidecar_indexed(&path, 1).is_err());
     }
 
     // Helper: build a PerWayRcs directly from slice-of-slices.

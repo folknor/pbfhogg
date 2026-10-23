@@ -1,13 +1,18 @@
 //! Baseline CLI host-policy identity instrument.
 //! First bless (baseline fa94c6c7, host bygg): 24.1 s wall for the three-run
-//! matrix, well inside the 280 s ceiling. The two `_uring` scenarios are an
-//! environment skip wherever `CliOutput::is_uring_unsupported` matches, the
-//! same convention every other uring test in the suite follows: bygg's
-//! `RLIMIT_MEMLOCK` hard limit is 8 MB against the writer's 16 MB of
-//! registered buffers, and a seccomp sandbox denies `io_uring_setup`. A
-//! skipped scenario writes no goldens and is named on stderr by both tests,
-//! so a gate log never reads as full coverage; on a host where io_uring
-//! works, bless there and the scenarios become mandatory by themselves.
+//! matrix, well inside the 280 s ceiling. The two `_uring` scenarios may skip
+//! on an ordinary run when `CliOutput::is_uring_unsupported` sees a typed
+//! setup refusal. The platform profile makes that predicate fail instead,
+//! so it requires the feature. The original bygg baseline run skipped because
+//! its hard `RLIMIT_MEMLOCK` was 8 MB against the writer's 16 MB registered
+//! buffers, and its seccomp sandbox denied `io_uring_setup`. A skipped
+//! scenario writes no goldens and is named on stderr by both tests.
+//!
+//! The committed captures record the baseline behavior, but `CliInvoker`
+//! launches the product binary selected by `BROKKR_TEST_BIN_DIR` during a
+//! brokkr run. These tests bless or compare the current build; they cannot
+//! launch a separate baseline executable. Brokkr filters are substrings, so
+//! use `bless_goldens` or `matches_goldens` to run one test at a time.
 //! Only the explicitly listed path, PID, inode, memory, timing and
 //! inherited-descriptor-count fields are masked. The id-W<worker>- scratch routing component is also masked:
 //! the dispatcher assigns the same blob to whichever worker is ready first.
@@ -49,6 +54,10 @@ fn prerequisites() {
     );
 }
 fn shim() -> PathBuf {
+    // The product CLI ELF inspected for this instrument has BIND_NOW,
+    // GNU_RELRO, and no JUMP_SLOT relocations, so ltrace has no PLT calls to
+    // trap. The preload shim records libc calls such as mallopt; use strace
+    // for syscall-backed calls.
     let dir = std::env::var_os("BROKKR_TEST_BIN_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| root().join("target/debug"));
@@ -654,8 +663,8 @@ fn output_digests(path: &Path, variable: bool, pbf: bool) -> String {
     }
     out.join("\n") + "\n"
 }
-/// `None` is the io_uring environment skip; every other outcome is a
-/// capture or a panic.
+/// `None` is a typed io_uring setup skip on ordinary runs. The platform
+/// profile makes the shared predicate panic on that refusal.
 fn capture(s: &Scenario) -> Option<BTreeMap<&'static str, String>> {
     use std::os::unix::process::ExitStatusExt;
     let runs = root().join("target/host-identity/run");
@@ -707,9 +716,9 @@ fn capture(s: &Scenario) -> Option<BTreeMap<&'static str, String>> {
     std::fs::write(rawdir.join("stdout.txt"), &output.stdout).unwrap();
     std::fs::write(rawdir.join("stderr.txt"), &output.stderr).unwrap();
     if s.name.ends_with("_uring") && output.is_uring_unsupported() {
-        // Same environment skip every other uring test in the suite
-        // makes: bygg's RLIMIT_MEMLOCK hard limit is 8 MB (the writer
-        // registers 16 MB) and a seccomp sandbox denies io_uring_setup.
+        // The shared predicate permits this skip only outside the required
+        // platform profile. The baseline host had an 8 MB memlock limit and
+        // denied io_uring_setup through seccomp.
         crate::common::skip(format!(
             "host-identity scenario {}: io_uring unavailable on this host: {}",
             s.name,

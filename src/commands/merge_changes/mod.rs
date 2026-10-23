@@ -176,15 +176,17 @@ pub fn merge_changes(
     // Pool controls par_iter and par_chunks thread count for both the
     // streaming and simplify paths. When `jobs` is None, the host's executor
     // is used (rayon's ambient pool under `Executor::Ambient`).
-    let pool = if jobs.is_some() {
-        Some(
+    // The streaming path's ordered window spawns onto the same executor its
+    // body is installed on, so the explicit pool is carried as one.
+    let executor = if jobs.is_some() {
+        crate::host::Executor::Pool(std::sync::Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(worker_count)
                 .build()
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?,
-        )
+        ))
     } else {
-        None
+        host.executor.clone()
     };
 
     // The closure converts errors to String so it is Send across the
@@ -199,7 +201,8 @@ pub fn merge_changes(
                     .map_err(|e| e.to_string())? as u64;
             Ok((changes_in, changes_out))
         } else {
-            let changes_out = write_streaming(inputs, write_path).map_err(|e| e.to_string())?;
+            let changes_out =
+                write_streaming(inputs, write_path, &executor).map_err(|e| e.to_string())?;
             Ok((changes_out, changes_out))
         }
     };
@@ -244,11 +247,9 @@ pub fn merge_changes(
         // OSC XML and drives no `PbfWriter`, so wrapping all of it puts no
         // producer on a worker. Under `Executor::Ambient` (the CLI) this is a
         // direct call, exactly as before.
-        let result = match &pool {
-            Some(p) => p.install(|| do_work(write_path)),
-            None => host.executor.install(|| do_work(write_path)),
-        }
-        .map_err(|s| -> Box<dyn std::error::Error> { s.into() })?;
+        let result = executor
+            .install(|| do_work(write_path))
+            .map_err(|s| -> Box<dyn std::error::Error> { s.into() })?;
 
         if let Some(scratch) = scratch {
             scratch.commit()?;
@@ -556,7 +557,7 @@ impl OscWriter<io::BufWriter<File>> {
 impl OscWriter<Vec<u8>> {
     /// In-memory `OscWriter` for parallel-drain workers. Each worker
     /// emits its OSC's XML into its own `Vec<u8>` buffer (gz-encoded if
-    /// `is_gz`); main thread concatenates worker buffers in input order.
+    /// `is_gz`); the ordered drain appends worker buffers in input order.
     /// Multi-member gzip is valid: the resulting output file is the
     /// concatenation of self-contained gzip streams, decoded as the
     /// concatenation of their decompressed contents.
@@ -574,11 +575,19 @@ impl OscWriter<Vec<u8>> {
 }
 
 #[hotpath::measure]
-fn write_streaming(inputs: &[&Path], output: &Path) -> Result<u64> {
+fn write_streaming(
+    inputs: &[&Path],
+    output: &Path,
+    executor: &crate::host::Executor,
+) -> Result<u64> {
     // Deliberately require a UTF-8 name ending in .gz, including for worker
     // chunks. Extension-only detection changes the historical output contract.
     let is_gz = output.to_str().is_some_and(|s| s.ends_with(".gz"));
 
+    crate::debug::emit_counter(
+        "merge_changes_buffered_strategy",
+        i64::from(inputs.len() > 1),
+    );
     if inputs.len() <= 1 {
         // N <= 1: no parallelism available. Use the original serial
         // streaming path that emits XML during parse - one-pass, no
@@ -624,10 +633,10 @@ fn write_streaming(inputs: &[&Path], output: &Path) -> Result<u64> {
 
     // N > 1: parallel-drain. Each worker runs the full per-input pipeline
     // (parse + XML re-emit + gzip-compress) into its own in-memory buffer.
-    // Main thread writes the prelude (XML decl + osmChange opening) as its
-    // own gzip member, concatenates worker buffers in input order (also
-    // self-contained gzip members), and writes the postlude (osmChange
-    // closing) as its own gzip member. Multi-member gzip is valid; on
+    // The prelude (XML decl + osmChange opening) is written as its own gzip
+    // member, the ordered drain appends worker buffers in input order (also
+    // self-contained gzip members), and the postlude (osmChange closing) is
+    // written as its own gzip member. Multi-member gzip is valid; on
     // decompress the members concatenate to produce the full XML document.
     //
     // Why this beats parallel-parse + serial-drain (commit 43dd620,
@@ -643,40 +652,32 @@ fn write_streaming(inputs: &[&Path], output: &Path) -> Result<u64> {
         }
     }
 
-    crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_START");
-    let chunks: std::result::Result<Vec<(Vec<u8>, u64)>, String> = inputs
-        .par_iter()
-        .map(|path| -> std::result::Result<(Vec<u8>, u64), String> {
-            let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
-            let mut open_action: Option<Action> = None;
-            let mut count = 0u64;
-            parse_osc_streaming(path, &mut writer, &mut open_action, &mut count)
-                .map_err(|e| e.to_string())?;
-            if let Some(prev) = open_action {
-                writer
-                    .write_event(Event::End(BytesEnd::new(action_tag(prev))))
-                    .map_err(|e| e.to_string())?;
-            }
-            let bytes = writer.into_inner().map_err(|e| e.to_string())?;
-            Ok((bytes, count))
-        })
-        .collect();
-    let chunks = chunks.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-    crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_END");
-
-    crate::debug::emit_marker("MERGECHANGES_DRAIN_START");
+    // Bounded ordered window: at most one member per pool worker is alive
+    // between emit and drain, and the head member is written as soon as it
+    // and its predecessors are done, so workers never idle behind a batch
+    // barrier and memory does not grow with the input count. One huge input
+    // remains unbounded; this is a member-count bound, not a byte budget.
+    // Each input keeps its own writer and member boundary, so output bytes
+    // are identical to collecting every member first.
+    let window = rayon::current_num_threads().max(1);
     let prelude = build_prelude_bytes(is_gz)?;
     let postlude = build_postlude_bytes(is_gz)?;
     let file = File::create(output)?;
     let mut out = io::BufWriter::new(file);
     out.write_all(&prelude)?;
     let mut count = 0u64;
-    for (bytes, n) in chunks {
-        out.write_all(&bytes)?;
+    // The per-member drain overlaps this span; DRAIN below is the postlude.
+    crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_START");
+    emit_members_ordered(executor, inputs, is_gz, window, |bytes, n| {
+        out.write_all(&bytes).map_err(|e| e.to_string())?;
         count += n;
         #[allow(clippy::cast_possible_wrap)]
         crate::debug::emit_counter("merge_changes_changes_per_osc", n as i64);
-    }
+        Ok(())
+    })
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_END");
+    crate::debug::emit_marker("MERGECHANGES_DRAIN_START");
     out.write_all(&postlude)?;
     out.flush()?;
     crate::debug::emit_marker("MERGECHANGES_DRAIN_END");
@@ -684,6 +685,118 @@ fn write_streaming(inputs: &[&Path], output: &Path) -> Result<u64> {
     crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_END");
 
     Ok(count)
+}
+
+/// One input's self-contained output member: parse, XML re-emit and (under
+/// gzip) compression into an in-memory buffer, closing any open action.
+fn emit_member(path: &Path, is_gz: bool) -> std::result::Result<(Vec<u8>, u64), String> {
+    let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
+    let mut open_action: Option<Action> = None;
+    let mut count = 0u64;
+    parse_osc_streaming(path, &mut writer, &mut open_action, &mut count)
+        .map_err(|e| e.to_string())?;
+    if let Some(prev) = open_action {
+        writer
+            .write_event(Event::End(BytesEnd::new(action_tag(prev))))
+            .map_err(|e| e.to_string())?;
+    }
+    let bytes = writer.into_inner().map_err(|e| e.to_string())?;
+    Ok((bytes, count))
+}
+
+type MemberResult = (usize, std::result::Result<(Vec<u8>, u64), String>);
+
+/// Emit every input's member on `executor`'s pool and hand them to `drain`
+/// in input order, with at most `window` members alive at once.
+///
+/// The same admission-credit shape as `scan::classify`'s ordered classify
+/// phase: input `k` is spawned only once `k < drained + window`, so a slow
+/// head input stalls admission rather than letting finished members pile
+/// up behind it, and the in-flight positions stay distinct modulo the
+/// ring. The drain runs on a pool worker and waits cooperatively, running
+/// queued members itself, so a one-thread pool cannot deadlock. Returns the
+/// first error received.
+fn emit_members_ordered(
+    executor: &crate::host::Executor,
+    inputs: &[&Path],
+    is_gz: bool,
+    window: usize,
+    mut drain: impl FnMut(Vec<u8>, u64) -> std::result::Result<(), String> + Send,
+) -> std::result::Result<(), String> {
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let window = window.clamp(1, inputs.len());
+    let (tx, rx) = std::sync::mpsc::channel::<MemberResult>();
+    // `move`: the body may run on a pool worker, and a borrowed Receiver
+    // is not Send.
+    executor.scope(move |scope| {
+        let spawn = |position: usize| {
+            let tx = tx.clone();
+            let path = inputs[position];
+            scope.spawn(move |_| {
+                // A panicking member must still answer its position, or the
+                // drain would wait for it forever.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    emit_member(path, is_gz)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(format!(
+                        "merge-changes worker panicked on {}",
+                        path.display()
+                    ))
+                });
+                drop(tx.send((position, result)));
+            });
+        };
+        let mut pending: Vec<Option<(Vec<u8>, u64)>> = (0..window).map(|_| None).collect();
+        let mut dispatched = 0;
+        while dispatched < window {
+            spawn(dispatched);
+            dispatched += 1;
+        }
+        let mut next = 0;
+        while next < inputs.len() {
+            let (position, result) = recv_member(&rx, executor)?;
+            pending[position % window] = Some(result?);
+            while let Some((bytes, n)) = pending[next % window].take() {
+                drain(bytes, n)?;
+                next += 1;
+                if dispatched < inputs.len() {
+                    spawn(dispatched);
+                    dispatched += 1;
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Receive one member, running queued pool jobs while waiting when the
+/// caller is a pool worker (the writer's `recv_permit` shape).
+fn recv_member(
+    rx: &std::sync::mpsc::Receiver<MemberResult>,
+    executor: &crate::host::Executor,
+) -> std::result::Result<MemberResult, String> {
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+    const LOST: &str = "merge-changes workers exited without a result";
+    loop {
+        match rx.try_recv() {
+            Ok(item) => return Ok(item),
+            Err(TryRecvError::Disconnected) => return Err(LOST.into()),
+            Err(TryRecvError::Empty) => match executor.yield_now() {
+                Some(rayon::Yield::Executed) => {}
+                Some(rayon::Yield::Idle) => {
+                    match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+                        Ok(item) => return Ok(item),
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => return Err(LOST.into()),
+                    }
+                }
+                None => return rx.recv().map_err(|_| LOST.to_string()),
+            },
+        }
+    }
 }
 
 /// Pre-build the XML prelude (`<?xml ?><osmChange version="0.6">`) as
@@ -801,6 +914,14 @@ fn write_simplified(
     // Each object's last change, beside the highest version ever claimed
     // for it. The floor is only maintained while the gate is on; with
     // `--allow-version-regression` the dedupe is purely positional.
+    // Memory is O(input changes + surviving payload), not three copies of the
+    // payload: this loop moves changes out of the stream, then moves survivors
+    // out of the map into action groups. The stream's outer allocation remains
+    // until the loop ends. A position index still retains every overwritten
+    // payload until compaction, and must preserve version-floor checks and the
+    // (kind, ID) order that defines group chunking and gzip member bytes. Keep
+    // this measured path until a replacement demonstrates lower peak RSS and
+    // equivalent bytes; disk spooling would add another full payload write/read.
     let mut last_by_object: BTreeMap<(u8, i64), (Change, VersionFloor)> = BTreeMap::new();
     for change in stream.changes {
         let key = change.element.key();
@@ -958,6 +1079,66 @@ mod tests {
         assert!(xml.contains("<osmChange version=\"0.6\">"));
         assert!(xml.contains("<create>"));
         assert!(xml.ends_with("</osmChange>"));
+        Ok(())
+    }
+
+    // Reconstruct the previous all-results-at-once byte sequence independently
+    // of admission order, including empty inputs and action transitions. The
+    // one-thread pool exercises the drain's cooperative wait (window 1).
+    #[test]
+    fn ordered_window_preserves_buffered_member_bytes() -> crate::BoxResult<()> {
+        let scratch = crate::path_guard::tests::scratch();
+        let mut paths = Vec::new();
+        for i in 0..5 {
+            let path = scratch.path().join(format!("input-{i}.osc"));
+            let body = if i == 2 {
+                String::new()
+            } else {
+                format!(
+                    "<create><node id=\"{}\" lat=\"1\" lon=\"2\"/></create>\
+                     <delete><way id=\"{}\"/></delete>",
+                    i + 1,
+                    i + 10,
+                )
+            };
+            std::fs::write(
+                &path,
+                format!("<osmChange version=\"0.6\">{body}</osmChange>"),
+            )?;
+            paths.push(path);
+        }
+        let inputs: Vec<&Path> = paths.iter().map(std::path::PathBuf::as_path).collect();
+        for is_gz in [false, true] {
+            let mut expected = build_prelude_bytes(is_gz)?;
+            for path in &inputs {
+                let mut writer = OscWriter::new_buf(is_gz);
+                let mut action = None;
+                let mut count = 0;
+                parse_osc_streaming(path, &mut writer, &mut action, &mut count)?;
+                if let Some(action) = action {
+                    writer.write_event(Event::End(BytesEnd::new(action_tag(action))))?;
+                }
+                expected.extend(writer.into_inner()?);
+            }
+            expected.extend(build_postlude_bytes(is_gz)?);
+            for jobs in [1, 2, 8] {
+                let name = if is_gz { "out.osc.gz" } else { "out.osc" };
+                let output = scratch.path().join(name);
+                merge_changes(
+                    &inputs,
+                    &output,
+                    false,
+                    Some(jobs),
+                    false,
+                    &crate::host::Host::for_tests(),
+                )?;
+                assert_eq!(
+                    std::fs::read(output)?,
+                    expected,
+                    "jobs={jobs}, gzip={is_gz}"
+                );
+            }
+        }
         Ok(())
     }
 

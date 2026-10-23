@@ -12,6 +12,11 @@ Tests go where they couple least.
 - **Inline unit tests** in `src/**/*.rs` `#[cfg(test)] mod tests` -
   module internals; die with the module on rewrite, which is the
   point.
+- **Platform-dependent tests** that distinguish an ordinary skip from a
+  required platform run belong outside `src/`, where `tests/common` can
+  consult `BROKKR_TEST_PLATFORM`; source tests must not read the environment,
+  so they cannot tell the two apart. Either way, put them in a `platform`
+  module so the platform profile selects them.
 - **Stable-API integration tests** in `tests/<topic>.rs` (e.g.
   `tests/roundtrip.rs`, `read_paths.rs`, `edge_cases.rs`) - use
   only the stable allowlist below.
@@ -59,7 +64,14 @@ NAME` list each harness in turn to find one test.
 - **What the shared binary shares.** Every module of `all` runs
   concurrently in one process with: the global rayon pool; and
   `RLIMIT_NOFILE`, raised once per process by `common::test_host()`.
+  Child processes inherit that limit unless `CliInvoker::child_limits`
+  changes it. `WRITER_METRICS` and `PIPELINE_METRICS` are process-global
+  accumulators, so concurrent tests can contribute to the same totals.
   A test that needs any of this to itself takes a target of its own.
+- **Process-wide panic hook.** The reader pipeline-death unit test temporarily
+  swaps the panic hook to silence its deliberate worker panic. While the
+  replacement is installed, it can also suppress panic output from another
+  concurrently running unit test.
 - **Static hooks cannot reach a shared harness.** The process-global
   hooks exist only under the `static-test-hooks` feature, and the
   root package's two shared harnesses are excluded by construction:
@@ -242,7 +254,9 @@ exception, not a tier - should not survive across many PRs.
   new `tests/cli_*.rs` goes through it. Default wall-clock timeout
   set below `brokkr check`'s 20 s watchdog, override via
   `.timeout(Duration)`. Platform-skip
-  predicates `is_o_direct_unsupported`, `is_uring_unsupported`.
+  predicates `is_o_direct_unsupported`, `is_uring_unsupported` require
+  exit code 3 and a typed setup error; `BROKKR_TEST_PLATFORM=1` makes either
+  predicate fail instead of returning a skip.
   Binary located via `BROKKR_TEST_BIN_DIR` (set per sweep) with
   fallback to `CARGO_TARGET_DIR + cfg!(debug_assertions)`.
 - **Dataset and scratch paths.** `tests/common/mod.rs` resolves the

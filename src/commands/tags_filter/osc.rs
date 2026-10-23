@@ -93,6 +93,17 @@ impl CurrentElem {
     }
 }
 
+// Nine action/kind vectors retain only matching creates/modifies, but every
+// delete (with metadata). Memory is O(retained payload + largest input element),
+// not O(compressed input bytes); a match-all filter can retain the whole OSC.
+// This grouping preserves create/modify/delete then node/way/relation order,
+// including encounter order within each group, through one gzip encoder.
+// Three action spools alone cannot preserve kind order for interleaved input:
+// a bounded replacement needs nine spools (or offsets plus a reorder pass).
+// That adds a full retained-XML scratch write/read and needs scratch ownership,
+// cleanup and disk-failure handling. Keep this measured in-memory path until
+// match-all/catch-up RSS warrants that trade; simply emitting on encounter would
+// change XML ordering, and concatenating gzip spools changes member bytes.
 struct FilteredOsc {
     create_nodes: Vec<OwnedNode>,
     create_ways: Vec<OwnedWay>,

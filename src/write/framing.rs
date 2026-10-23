@@ -16,7 +16,7 @@ use flate2::FlushCompress;
 use flate2::Status;
 use protohoggr::{encode_bytes_field, encode_bytes_field_always, encode_int32_field};
 
-use crate::read::blob_wire::{MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE};
+use crate::read::blob_wire::{MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE, MAX_BLOB_MESSAGE_SIZE};
 use crate::write::metrics::WRITER_METRICS;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -338,6 +338,18 @@ pub(super) fn encode_blob_body(
     scratch: &mut FrameScratch,
 ) -> io::Result<()> {
     scratch.blob_buf.clear();
+    // Check once per blob, before compression or copying. The encoded-body
+    // guard cannot catch a highly compressible oversized block. Element caps
+    // do not bound bytes: even one element can carry a very large tag value.
+    // Both sync and pipelined framing use this encoder. Exactly the raw limit
+    // is legal; the separate encoded-body limit can still reject its framing.
+    if uncompressed.len() as u64 > MAX_BLOB_MESSAGE_SIZE {
+        return Err(io::Error::other(format!(
+            "uncompressed blob payload is {} bytes, must be at most \
+             {MAX_BLOB_MESSAGE_SIZE} (lower --elements-per-blob or reduce element size)",
+            uncompressed.len()
+        )));
+    }
     match compression {
         Compression::None => {
             // Blob field 1: raw (bytes, len-delimited). Always emitted; see
@@ -684,6 +696,34 @@ pub(crate) fn reframe_raw_with_index_scratch(
 mod tests {
     use super::*;
     use crate::read::blob_wire::WireBlobHeader;
+
+    #[test]
+    fn oversized_raw_payload_is_refused_before_compression() {
+        let payload = vec![0; usize::try_from(MAX_BLOB_MESSAGE_SIZE).expect("limit fits") + 1];
+        for compression in [
+            Compression::None,
+            Compression::Zlib(1),
+            Compression::Zstd(1),
+        ] {
+            let mut scratch = FrameScratch::new();
+            let error = encode_blob_body(&payload, &compression, &mut scratch)
+                .expect_err("compression must not hide an oversized raw block");
+            assert!(error.to_string().contains("uncompressed blob payload"));
+            assert!(scratch.blob_buf.is_empty());
+            assert!(scratch.compress_buf.is_empty());
+            assert!(scratch.zlib_compressor.is_none());
+            assert!(scratch.zstd_compressor.is_none());
+        }
+    }
+
+    #[test]
+    fn compressed_payload_at_raw_limit_can_be_framed() {
+        let payload = vec![0; usize::try_from(MAX_BLOB_MESSAGE_SIZE).expect("limit fits")];
+        for compression in [Compression::Zlib(1), Compression::Zstd(1)] {
+            frame_blob("OSMData", &payload, &compression, None)
+                .expect("raw limit is inclusive when the encoded body fits");
+        }
+    }
 
     /// An empty payload must still produce a `Blob` with its payload field.
     ///
@@ -1285,7 +1325,8 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("blob body for OSMData") && msg.contains("--elements-per-blob"),
+            (msg.contains("blob body for OSMData") || msg.contains("uncompressed blob payload"))
+                && msg.contains("--elements-per-blob"),
             "the writer must name the cap and the knob, got: {msg}"
         );
     }

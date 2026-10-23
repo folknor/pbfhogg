@@ -753,6 +753,9 @@ fn dispatch_variant(
             stats.bytes_passthrough += frame_len as u64;
             stats.blobs_passthrough += 1;
             stats.blobs_index_hit += 1;
+            // One original input frame, not the coalesced copy range: the
+            // HeaderWalker caps its body below 32 MiB and header below 64 KiB
+            // (plus the 4-byte prefix), so this sample fits u32.
             #[allow(clippy::cast_possible_truncation)]
             stats.blob_sizes.push(frame_len as u32);
             match kind {
@@ -774,6 +777,9 @@ fn dispatch_variant(
             state.passthrough_chunks.push(frame_bytes);
             stats.bytes_passthrough += frame_len;
             stats.blobs_passthrough += 1;
+            // Workers copy one validated original frame here. The same
+            // 32 MiB body + 64 KiB header + 4-byte prefix bound applies;
+            // this is not the accumulated passthrough buffer's length.
             #[allow(clippy::cast_possible_truncation)]
             stats.blob_sizes.push(frame_len as u32);
             // Credit per-kind base_* stats the same way the CopyRange arm

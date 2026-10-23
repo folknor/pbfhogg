@@ -145,6 +145,9 @@ impl CliInvoker {
     }
 
     /// Pin the child to the first CPUs in our mask and explicit fd limits.
+    /// Child processes otherwise inherit the test binary's current
+    /// `RLIMIT_NOFILE`. Keep descriptors below `FD_SETSIZE` in tests that
+    /// exercise libraries using `select(2)`, or set a controlled limit here.
     #[cfg(target_os = "linux")]
     pub fn child_limits(mut self, cpus: usize, nofile: (u64, u64)) -> Self {
         use std::os::unix::process::CommandExt;

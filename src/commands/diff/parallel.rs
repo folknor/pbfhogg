@@ -474,6 +474,13 @@ pub(crate) fn diff_block_pair_parallel(
     // are emitted by the calling `diff()` function in `mod.rs`; do not
     // re-emit here.
     let Some((old, new)) = walk_pair(old_path, new_path, host)? else {
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "diff.negative_id_fallback",
+            "Using sequential comparison: negative IDs cannot use parallel ID-range shards"
+        );
+        crate::debug::emit_counter("diff_negative_id_fallback", 1);
         return Ok(None);
     };
 

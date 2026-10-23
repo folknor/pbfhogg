@@ -647,6 +647,11 @@ fn uring_init_and_run(
     // for bursty submission.
     let ring_depth = u32::from(NUM_BUFS) * 2;
     let ring = builder.build(ring_depth).map_err(|e| {
+        // Before Linux 5.12, ring memory can be charged to RLIMIT_MEMLOCK.
+        // io_uring_setup also uses ENOMEM for generic kernel resource
+        // exhaustion. The later threshold covers registered buffers; ring
+        // memory depends on kernel ring parameters. Keep ENOMEM ordinary until
+        // a reliable ring-specific threshold is available.
         // Only setup refusal is skippable. Resource exhaustion and runtime
         // submission/completion errors remain ordinary I/O failures.
         let refused = matches!(

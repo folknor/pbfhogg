@@ -242,6 +242,9 @@ impl From<protohoggr::WireError> for Error {
 
 impl From<Error> for io::Error {
     fn from(err: Error) -> io::Error {
+        // Keep the concrete error in the io::Error payload. The CLI follows
+        // this chain to distinguish setup refusals from ordinary failures;
+        // converting it to display text would erase that distinction.
         io::Error::other(err)
     }
 }

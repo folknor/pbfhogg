@@ -44,6 +44,15 @@ pub enum OscElementKind {
 ///
 /// This avoids per-element heap allocations and reuses repeated tag keys and
 /// relation member roles.
+///
+/// Storage is bounded by parsed payload, not surviving object count: replacing
+/// or deleting an object leaves its old arena record and interned strings
+/// (including user names) allocated. Append-only storage avoids moving records
+/// and rebuilding offsets during parsing. Compaction would need to rewrite all
+/// live offsets and intern IDs, with a second live arena at peak or an in-place
+/// relocation algorithm. Keep that cost off the measured daily-diff path until
+/// repeated-update catch-up inputs justify it; splitting a catch-up into smaller
+/// apply operations bounds each overlay's history without changing this layout.
 pub struct CompactDiffOverlay {
     node_arena: Vec<u8>,
     way_arena: Vec<u8>,
@@ -291,7 +300,11 @@ impl CompactDiffOverlay {
     /// Estimate the heap memory used by this overlay in bytes.
     ///
     /// Counts arena backing store, index HashMap overhead, deleted set overhead,
-    /// and interner memory. Does not include the stack size of the struct itself.
+    /// and interner memory. Includes superseded records, unused capacity and
+    /// strings no surviving object references: these still consume heap, so
+    /// subtracting them would underreport retained memory. This is an allocated
+    /// storage estimate, not a live-payload estimate or allocator/RSS accounting.
+    /// Does not include the stack size of the struct itself.
     pub fn heap_size_estimate(&self) -> usize {
         let mut total: usize = 0;
 

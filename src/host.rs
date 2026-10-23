@@ -81,6 +81,18 @@ impl Executor {
             Self::Pool(pool) => pool.install(op),
         }
     }
+    /// Run `op` with a scope whose spawned work runs on the pool (`Ambient`:
+    /// `rayon::scope`, i.e. the calling thread's pool, or the global pool off
+    /// any pool). Returns once `op` and everything it spawned has finished.
+    pub(crate) fn scope<'scope, R: Send>(
+        &self,
+        op: impl FnOnce(&rayon::Scope<'scope>) -> R + Send,
+    ) -> R {
+        match self {
+            Self::Ambient => rayon::scope(op),
+            Self::Pool(pool) => pool.scope(op),
+        }
+    }
     /// Queue `op` on the pool (`Ambient`: `rayon::spawn`).
     pub(crate) fn spawn(&self, op: impl FnOnce() + Send + 'static) {
         match self {

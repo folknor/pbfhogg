@@ -1104,36 +1104,17 @@ ahead of the merged head.
 
 Reported by: re-encoding, read path, filtering and spatial, altw and scanning.
 
-## HYG-056 - Change-application memory grows with the whole input
-
-Anger: 8 - memory bounds change algorithms and output.
-
-Merge-changes N>1 streaming holds every input's fully re-emitted compressed XML
-(`Vec<(Vec<u8>, u64)>`) before writing any; at planet `--osc-range` that is the
-whole compressed output. An ordered drain writing chunk i as soon as it and its
-predecessors are done caps memory at about `jobs` chunks. `--simplify` holds
-the whole `ChangeStream` with owned strings, a `BTreeMap` of survivors and three
-grouped `Vec`s; a key-to-position index would cut it to O(objects).
-`CompactDiffOverlay` arenas are append-only (a superseding change appends and
-repoints, interned strings including every distinct `user` are never freed),
-and `heap_size_estimate` counts the garbage as live. `MergeStats::blob_sizes` is
-a `Vec<u32>` per blob, cloned in `print_summary` to sort, with `frame_len as u32`
-unchecked; a fixed-bucket histogram does the same job. Tags-filter OSC holds the
-whole filtered change set in nine `Vec`s before writing; three section spools
-would bound it.
-
-Reported by: change application, filtering and spatial.
-
-## HYG-057 - Multi-GB scratch writes have no free-space precheck
+## HYG-057 - Diff and derive scratch writes have no free-space precheck
 
 Anger: 7 - new refusals.
 
-Sparse altw checks `statvfs` before preallocating; external altw writes hundreds
-of GB into the output directory with no precheck and finds ENOSPC whenever stage
-1 or 2 hits it, minutes to hours in. Diff and derive scratch is the full output
-size, written to shard files and again to the output (derive: shard, outer,
-gzip, about 45 GB of XML at planet per its comment), with no check. Fix: check
-in the up-front plan (HYG-035) against the scratch filesystem.
+Both altw backends now check free space (sparse before preallocating,
+external after stage 1 against its exact slot count). Diff and derive
+scratch is still unchecked: it is the full output size, written to shard
+files and again to the output (derive: three sequential XML files, or three
+per shard plus three outer files in parallel, then gzip; about 45 GB of XML
+at planet per its comment). A check must account for which filesystem holds
+scratch versus output and for overlapping file lifetimes.
 
 Reported by: altw and scanning, re-encoding.
 
@@ -1345,86 +1326,23 @@ drain's last node item.
 
 Reported by: change application.
 
-## HYG-091 - Significant fallbacks and events happen with no line or counter
+## HYG-091 - Schedule-based filtered reads skip nothing silently on unindexed input
 
 Anger: 8 - new diagnostic lines and wording.
 
-- `diff` and `derive-changes` fall back from parallel to sequential when either
-  input lacks indexdata or `--verbose` is set (derive gates on
-  `both_indexed && jobs > 1`): a user who passed `-j 16` gets a single-threaded
-  run with nothing saying why.
-- `try_extract_multi_single_pass` returns `Ok(None)`, and the run falls back to
-  N sequential full passes, on unsorted input, a missing header, and any
-  `BlobReader` error on the first blob (`_ => return Ok(None)`), which is also
-  a swallow: sequential then fails differently, later.
-- `RegionGrid::build(..)` returning `None` (over budget) is `.flatten()`ed into
-  the linear classifier.
-- `sort --force` past `require_indexdata` says nothing.
-- A blob filter that skips nothing because the file has no indexdata is silent
-  (the common "why is my extract slow" case, detectable at the first OsmData
-  blob).
-- `tagdata` dropped for oversize headers is counted only under the sidecar, so
-  a CLI user never learns `tags-filter` speedups were lost.
-- Apply-changes' forced rewrite of a false-positive blob because of inline
-  upserts is counted nowhere; merge-changes' N>1 vs N<=1 strategy choice is
-  unrecorded.
-
-Fix: route each through the `host::Diagnostics` channel (an event with its own
-key) and a counter.
+The diff and derive sequential fallbacks, the multi-extract single-pass
+decline and its swallowed first-blob error, the region-grid rejection,
+`sort --force`, writer tagdata loss, apply-changes forced rewrites and the
+merge-changes strategy now all report through keyed diagnostics or
+counters. Left: the "blob filter on an unindexed file skips nothing" note
+lives only in the pipelined reader. The case that matters most ("why is my
+extract slow") runs through `HeaderWalker` schedules: `extract --simple` on
+unindexed input, complete and smart under `--force`, and the other
+schedule-based filtered commands treat a missing index as "include" and
+still say nothing.
 
 Reported by: re-encoding, filtering and spatial, read path, write path, change
 application.
-
-## HYG-095 - Multi-extract keeps 3N ID sets with no estimate or refusal
-
-Anger: 8 - memory bounds change algorithms and output.
-
-`inspect tags` documents its exact-count memory growth, and getid's
-exhaustive `--verbose-ids` output is documented as deliberate. Still open:
-`multi.rs` keeps `3 * N` `IdSet`s for up to 500 regions with no estimate or
-refusal. `parse_geojson`, configs and ID files are read with
-`read_to_string` of any size (acceptable for operator inputs, noted for
-completeness).
-
-Reported by: CLI and plumbing, filtering and spatial.
-
-## HYG-096 - Altw holds the per-way sidecar in RAM, and the straddler bound is unchecked
-
-Anger: 8 - altw internals.
-
-The geocode builder's `StringPool` no longer stores strings twice, and why
-its other intermediates stay RAM-resident is recorded in `builder/mod.rs`.
-Left, in altw: `PerWayRcs` and `load_ref_count_sidecar` hold the whole
-per-way sidecar in RAM (encoded bytes plus offsets), proportional to way
-count and absent from the memory accounting the docs quote; stage 4's
-straddler payloads are bounded by the two-piece straddler invariant, which
-`slot_bucket_count` arithmetic maintains and nothing checks at run time
-(`classify_blobs_in_bucket` errors only after the fact).
-
-Reported by: geocode index, altw and scanning.
-
-## HYG-107 - Library-use survey follow-ups
-
-Anger: 3 - mostly observations.
-
-- `common::write_indexed_pbf` says the sync writer emits no indexdata,
-  but `write_primitive_block` now emits it on the sync path too. Fixtures
-  requiring its absence must remove it explicitly.
-- ltrace cannot observe pbfhogg's calls: BIND_NOW/full RELRO leaves no PLT
-  breakpoints. Use strace for syscall-backed calls and LD_PRELOAD for mallopt.
-- `WRITER_METRICS` and `PIPELINE_METRICS` mix counters across concurrent
-  runs. `process_scratch_tag` is also process-global;
-  the per-run scratch tokens make sharing that tag harmless.
-- `diff/parallel.rs` puts scratch beside the old input unless
-  `Host::scratch_parent` says otherwise. Derive's gzip workers ignore `-j`.
-- The panic-hook-swapping reader test can silence concurrent panic output.
-- Raising RLIMIT_NOFILE is inherited by children and can break select(2).
-
-The identity instrument blesses the unchanged product build itself: brokkr
-owns BROKKR_TEST_BIN_DIR and cannot be redirected to a baseline. Test filters
-match substrings, so bless and compare names must not contain each other.
-
-Reported by: library-use implementation survey.
 
 ## HYG-108 - Diagnostic wording is inconsistent across commands
 
@@ -1457,21 +1375,6 @@ was deliberately left alone. What remains is a CLI output change:
 
 Reported by: all nine scopes (split out of the library stderr item when the
 library stopped writing stderr).
-
-## HYG-054 - Decompress-pool drop counters are emitted only from two pipelines
-
-Anger: 8 - counter machinery and semantics.
-
-The read path's `ByteBudget` now debug-asserts its release, and every
-`DecompressPool` records buffers dropped for oversize, a full pool or a
-poisoned lock. Those `pipeline_decompress_pool_*` counters are emitted only
-from `run_pipeline` and `par_map_reduce`, so drops in the classify worker
-pools, extract, tags-filter and altw passthrough are invisible unless a
-pipeline also runs in the same process, and are then folded into its
-numbers. Emitting once at process exit, as `WRITER_METRICS` does, is the
-shape of a fix; it is an observability-contract change.
-
-Reported by: read path; narrowed by the wave-11 reconciler.
 
 ## HYG-068 - Nothing verifies the workspace MSRV
 

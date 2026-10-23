@@ -1423,7 +1423,8 @@ mod tests {
             .expect_err("a blob body past the datasize cap must not be written by the sync path");
         let msg = err.to_string();
         assert!(
-            msg.contains("blob body for OSMHeader") && msg.contains("--elements-per-blob"),
+            (msg.contains("blob body for OSMHeader") || msg.contains("uncompressed blob payload"))
+                && msg.contains("--elements-per-blob"),
             "the sync path must name the cap and the knob, got: {msg}"
         );
         w.flush().unwrap();

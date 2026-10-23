@@ -241,6 +241,20 @@ pub fn diff(
         "Streaming diff requires sorted inputs to operate in constant memory.",
     )?;
     let both_indexed = old_indexed && new_indexed;
+    if options.jobs > 1 && (!both_indexed || options.verbose) {
+        let reason = if !both_indexed {
+            "missing indexdata"
+        } else {
+            "verbose detail output"
+        };
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "diff.sequential_fallback",
+            "Using sequential comparison: {reason}"
+        );
+        crate::debug::emit_counter("diff_sequential_fallback", 1);
+    }
 
     crate::debug::emit_marker("DIFF_SCAN_START");
 

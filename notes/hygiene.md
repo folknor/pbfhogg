@@ -1002,24 +1002,6 @@ the path.
 
 Reported by: the output-header policy work.
 
-## HYG-124 - The input-contract table drives one mode per command
-
-Anger: 2 - test coverage.
-
-`tests/cli_input_contract.rs` feeds header-only, zero-byte and header-less
-files to one or a few invocations per command, and an output aliasing each
-secondary input flag. Modes that read the input through a different path are
-not in it: `inspect --show` and `--blocks`/`--extended`/`--locations`/
-`--id-ranges`/`--anomalies`, `check` with `--ids`, `--refs` or `--index`,
-`getid --add-referenced` and `--invert`, `getparents --add-self`, `cat --type
-way|relation`, `diff --format osc`, `time-filter` on an input with metadata,
-and `merge-changes`, whose OSC inputs have no alias case of their own (it sits
-in the table's no-PBF list). Each could still spell the missing-header error
-its own way or hold an empty file against indexdata. Fix: add rows for the
-modes above, and a merge-changes alias case per input.
-
-Reported by: the input-gate work.
-
 ## HYG-125 - Some phases have no cancellation checkpoint inside them
 
 Anger: 9 - every remaining gap sits in a measured hot loop or an in-memory
@@ -1088,7 +1070,9 @@ scratch location unless `-j 1` is given, which the `--tmp-dir` refusal and the
 scratch-free rule do not say for `-q`. Fix, if wanted: let the shard workers
 count without formatting when the caller discards the text (an option on
 `DiffOptions`), which would also make `-q` scratch-free; it touches the diff
-core (anger 9 territory), so it needs measuring first.
+core (anger 9 territory), so it needs measuring first. Making quiet diff
+sequential was tried and reverted because it loses the sharding speedup; the
+fix is to keep sharding but count differences without formatting text.
 
 Reported by: the scratch-lifecycle review fixes.
 
@@ -1101,18 +1085,6 @@ writes a present, empty field. Nothing removes `source`, the replication base
 URL or the writing program from an output header (`degrade --strip-bbox` is
 the only removal, and only of the bbox). Whether removal is wanted, and with
 what spelling, is the maintainer's call; no syntax is reserved today.
-
-Reported by: the scratch-lifecycle review fixes.
-
-## HYG-129 - The one-header guard of getid's streaming arm has no CLI case
-
-Anger: 2 - test coverage.
-
-`tests/cli_input_contract.rs` runs a two-OSMHeader file through getid's
-indexed walker arm, apply-changes and altw (sparse and external). getid's
-streaming full-scan arm, which reads frames through its own loop, needs
-unindexed input and `--force` to be reached from the CLI and has no
-two-header case; the library-level reader tests cover the decoder it shares.
 
 Reported by: the scratch-lifecycle review fixes.
 

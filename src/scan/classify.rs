@@ -369,6 +369,20 @@ pub(crate) fn build_classify_schedule(
     Ok((schedule, file))
 }
 
+/// Read the first frame of `input` and require it to be the OSMHeader.
+fn consume_leading_header(
+    walker: &mut crate::read::header_walker::HeaderWalker,
+    input: &std::path::Path,
+) -> Result<()> {
+    let first = walker
+        .next_header()?
+        .ok_or_else(|| crate::error::new_missing_header(input))?;
+    if first.blob_type != crate::blob::BlobKind::OsmHeader {
+        return Err(crate::error::new_missing_header(input));
+    }
+    Ok(())
+}
+
 /// [`build_classify_schedule`] plus an optional blob-level tag filter.
 ///
 /// The third return value is how many blobs the tag index let us skip, for the
@@ -388,17 +402,14 @@ pub(crate) fn build_classify_schedule_blob_filtered(
 ) -> Result<(Vec<ScheduledBlob>, InputFile, u64)> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
-    // Consume the first blob (expected OSMHeader): on an empty file return
-    // MissingHeader. `HeaderWalker::next_header` enforces header position -
-    // an OSMHeader anywhere after the first frame is a hard error - but it
-    // does not require the first frame to be an OSMHeader, so a file that
-    // opens with an OSMData blob has that blob dropped here unread.
+    // Consume the first blob, which must be the OSMHeader: an empty file or
+    // one that opens with anything else is MissingHeader.
+    // `HeaderWalker::next_header` enforces header position (an OSMHeader
+    // anywhere after the first frame is a hard error) but does not require
+    // the first frame to be one, so that is checked here; without it a file
+    // that opens with an OSMData blob would have that blob dropped unread.
     // Subsequent non-OsmData blobs are filtered below.
-    drop(
-        walker
-            .next_header()?
-            .ok_or_else(|| crate::error::new_missing_header(input))?,
-    );
+    consume_leading_header(&mut walker, input)?;
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
@@ -494,11 +505,7 @@ pub(crate) fn build_classify_schedules_split(
 )> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
-    drop(
-        walker
-            .next_header()?
-            .ok_or_else(|| crate::error::new_missing_header(input))?,
-    );
+    consume_leading_header(&mut walker, input)?;
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");

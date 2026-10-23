@@ -621,6 +621,14 @@ fn worker_split_blob(
     compression: &Compression,
 ) -> crate::Result<WorkerOutput> {
     let cap = cap_nz.get();
+    // Trust: the schedule put this blob in this kind's phase because its
+    // indexdata names the kind, and only elements of that kind are counted and
+    // re-encoded below. Elements of any other kind in the blob (a mislabelled
+    // indexdata, or a valid multi-kind block indexed by another writer's rule)
+    // are dropped without a count or an error. Checking per element costs on a
+    // measured path, and a per-blob check here cannot tell such a blob from an
+    // unindexed one the schedule builder replicated into every kind's phase,
+    // where a no-match is correct. See reference/pipeline.md "Blob Filtering".
     let total = match kind {
         ElementKind::Node => block
             .elements()

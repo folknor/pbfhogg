@@ -470,7 +470,15 @@ fn check_index_inner(
     let mut found = Vec::new();
 
     crate::debug::emit_marker("CHECK_INDEX_START");
+    let mut first = true;
     while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, host, path)? {
+        // The header comes first or the file is not a PBF: a zero-byte or
+        // header-less file gets the one missing-header error, not a clean
+        // report over data blobs it cannot place.
+        if first && !matches!(frame.blob_type, BlobKind::OsmHeader) {
+            return Err(crate::error::new_missing_header(path));
+        }
+        first = false;
         if !matches!(frame.blob_type, BlobKind::OsmData) {
             continue;
         }
@@ -530,6 +538,9 @@ fn check_index_inner(
                 });
             }
         }
+    }
+    if first {
+        return Err(crate::error::new_missing_header(path));
     }
     crate::debug::emit_marker("CHECK_INDEX_END");
 

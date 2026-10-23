@@ -1256,6 +1256,9 @@ fn worker_decode_kind(
     drop: Option<&FxHashSet<i64>>,
 ) -> crate::Result<WorkerOutput> {
     let cap = cap_nz.get();
+    // Trust: elements of a kind other than the one this blob's indexdata
+    // claimed are dropped silently (see the same note in repack's
+    // worker_split_blob and reference/pipeline.md "Blob Filtering").
     // `element_matches_kind` already discriminates by `kind`, so the count is
     // identical for every kind - no per-kind match needed.
     let total = block

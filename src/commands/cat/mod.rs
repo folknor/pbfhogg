@@ -465,6 +465,9 @@ fn process_block(
     clean: &CleanAttrs,
     refs_buf: &mut Vec<i64>,
 ) -> crate::Result<u64> {
+    // Trust: the caller's per-kind phase scheduled this blob by its indexdata
+    // kind, so elements of an unclaimed kind are dropped silently (see
+    // reference/pipeline.md "Blob Filtering" and repack's worker_split_blob).
     let (filter_node, filter_way, filter_relation) = (tf.nodes, tf.ways, tf.relations);
     let mut count: u64 = 0;
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();

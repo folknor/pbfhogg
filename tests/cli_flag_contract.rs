@@ -877,6 +877,114 @@ fn every_command_with_force_refuses_unindexed_input_through_the_shared_gate() {
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
+/// The recipe a refusal prints: the first line of its stderr that starts with
+/// `pbfhogg`, as the arguments after the program name.
+fn printed_recipe(stderr: &str) -> Option<Vec<String>> {
+    stderr
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("pbfhogg "))
+        .map(|line| line.split_whitespace().skip(1).map(str::to_owned).collect())
+}
+
+/// The indexing recipe the gate prints works as written: run from an empty
+/// directory it writes an indexed file, which the refused command then
+/// accepts without `--force`. Also pins that the removed library advice, a
+/// bare `cat --clean`, is the usage error it was always going to be.
+#[test]
+fn the_printed_indexing_recipe_makes_the_refused_command_succeed() {
+    let fx = Fx::new();
+    let mut failures = Vec::new();
+    for (n, row) in FORCE.iter().enumerate() {
+        let label = row.words.join(" ");
+        let refused = run(&force_argv(&fx, row, n, false));
+        let stderr = refused.stderr_str();
+        let Some(recipe) = printed_recipe(&stderr) else {
+            failures.push(format!("[{label}] no recipe printed; stderr:\n{stderr}"));
+            continue;
+        };
+        let cwd = TempDir::new().unwrap();
+        let ran = CliInvoker::new()
+            .current_dir(cwd.path())
+            .args(&recipe)
+            .run();
+        if !ran.status.success() {
+            failures.push(format!(
+                "[{label}] the recipe {recipe:?} failed: exit {:?}; stderr:\n{}",
+                ran.status.code(),
+                ran.stderr_str()
+            ));
+            continue;
+        }
+        let indexed = cwd.path().join("indexed.osm.pbf");
+        let again: Vec<OsString> = row
+            .words
+            .iter()
+            .map(|word| match *word {
+                "U" | "G" => indexed.clone().into(),
+                "C" => fx.path("good.osc").into(),
+                "O" => fx.path(&format!("recipe-out-{n}")).into(),
+                other => OsString::from(other),
+            })
+            .collect();
+        let accepted = run(&again);
+        if !accepted.status.success() {
+            failures.push(format!(
+                "[{label}] the command still fails on the recipe's output: exit {:?}; stderr:\n{}",
+                accepted.status.code(),
+                accepted.stderr_str()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+
+    let out = CliInvoker::new()
+        .arg("cat")
+        .arg(fx.path("indexed.osm.pbf"))
+        .arg("--clean")
+        .arg("-o")
+        .arg(fx.path("clean-out"))
+        .run();
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr_str());
+}
+
+/// The sort recipe an unsorted-input refusal prints works as written.
+#[test]
+fn the_printed_sort_recipe_makes_the_refused_diff_succeed() {
+    let fx = Fx::new();
+    let unsorted = fx.path("unsorted.osm.pbf");
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(fx.path("indexed.osm.pbf"))
+        .arg("--unsort")
+        .arg("-o")
+        .arg(&unsorted)
+        .assert_success();
+    let refused = CliInvoker::new()
+        .arg("diff")
+        .arg(&unsorted)
+        .arg(fx.path("indexed.osm.pbf"))
+        .run();
+    let stderr = refused.stderr_str();
+    assert_eq!(refused.status.code(), Some(2), "{stderr}");
+    let recipe = printed_recipe(&stderr).unwrap_or_else(|| panic!("no recipe printed:\n{stderr}"));
+    let cwd = TempDir::new().unwrap();
+    CliInvoker::new()
+        .current_dir(cwd.path())
+        .args(&recipe)
+        .assert_success();
+    let accepted = CliInvoker::new()
+        .arg("diff")
+        .arg(cwd.path().join("sorted.osm.pbf"))
+        .arg(fx.path("indexed.osm.pbf"))
+        .run();
+    assert!(
+        accepted.status.code().is_some_and(|c| c <= 1),
+        "{}",
+        accepted.stderr_str()
+    );
+}
+
 /// The table covers exactly the commands whose `--help` offers `--force`:
 /// a command that gains the flag without refusing anything, or refuses
 /// without the flag being tested, fails here.

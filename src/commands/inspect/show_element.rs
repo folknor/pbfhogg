@@ -45,8 +45,16 @@ fn show_element_inner<W: Write>(
     // Decode the header blob once up front to establish the invariant.
     let mut is_sorted = false;
 
+    let mut first = true;
     for blob_result in &mut reader {
         let blob = blob_result?;
+        // The header comes first or the file is not a PBF: a zero-byte or
+        // header-less file gets the one missing-header error, not "not found"
+        // (or a hit in data blobs the header never described).
+        if first && blob.get_type() != crate::blob::BlobType::OsmHeader {
+            return Err(crate::error::new_missing_header(path));
+        }
+        first = false;
         match blob.get_type() {
             crate::blob::BlobType::OsmHeader => {
                 let header = blob.to_headerblock()?;
@@ -119,6 +127,9 @@ fn show_element_inner<W: Write>(
         }
     }
 
+    if first {
+        return Err(crate::error::new_missing_header(path));
+    }
     Ok(false)
 }
 

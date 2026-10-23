@@ -1012,6 +1012,12 @@
   shard (including a quiet diff without `-j 1`) still makes its directory at
   startup and fails there when the location is unusable. Library callers of
   `diff::diff` pass `None` for the scratch argument in the one-shard case.
+- **A file without a leading OSMHeader is the missing-header error in
+  `check --index`, `check --refs` and `inspect --show`.** `check --index`
+  reported a clean pass and `inspect --show` found or missed elements on
+  such a file, and `check --refs` (and any command on the shared per-kind
+  schedule scan) silently dropped a leading data blob and then reported
+  missing references.
 - **The unindexed-input refusal advises only a switch that works.** It no
   longer says `Or pass --force` for `add-locations-to-ways --index-type
   external` or `--inject-prepass` and `apply-changes --locations-on-ways`,

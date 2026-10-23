@@ -578,8 +578,11 @@ const AUTO_STORE_BUDGET_PCT: u64 = 80;
 
 /// Anon footprint a sparse run holds outside the mmap store (IdSet, decode
 /// buffers, writer queues): ~2-3 GB measured at europe. Subtracted from
-/// `MemAvailable` before applying [`AUTO_STORE_BUDGET_PCT`], so the budget
+/// available memory before applying [`AUTO_STORE_BUDGET_PCT`], so the budget
 /// reflects what the page cache can actually keep resident for the store.
+/// Keep this measured allowance fixed: indexed node count estimates the
+/// file-backed store, not the referenced-ID span or the decode/queue footprint.
+/// Scaling anon headroom from that count would assert an unmeasured relation.
 const AUTO_ANON_HEADROOM_BYTES: u64 = 3 << 30;
 
 // Auto-select: sparse unless the input qualifies for external (sorted +
@@ -595,15 +598,16 @@ fn auto_select_backend(
     let reader = crate::ElementReader::open_in(input, direct_io, host)?;
     let sorted = reader.header().is_sorted();
     drop(reader);
-    // Check indexdata presence without erroring (peek at first blob).
-    let has_index = (|| -> Option<bool> {
-        let mut r = crate::blob::BlobReader::open_in(input, direct_io, host).ok()?;
-        r.set_parse_indexdata(true);
-        r.next()?.ok()?; // skip header
-        let blob = r.next()?.ok()?;
-        Some(blob.index().is_some())
-    })()
-    .unwrap_or(false);
+    // Absence of indexdata permits sparse, but an unreadable or malformed
+    // blob is an input error, not evidence for a different backend.
+    let mut probe = crate::blob::BlobReader::open_in(input, direct_io, host)?;
+    probe.set_parse_indexdata(true);
+    probe.next().transpose()?; // header was validated by ElementReader
+    let has_index = probe
+        .next()
+        .transpose()?
+        .is_some_and(|blob| blob.index().is_some());
+    drop(probe);
 
     if !(sorted && has_index) {
         // External cannot run (it requires sorted + indexdata); no
@@ -659,7 +663,9 @@ fn auto_select_backend(
             Note,
             "altw.auto_select",
             "auto-selected --index-type {chosen} (sorted=true, indexed=true; \
-             store or budget estimate unavailable)"
+             store estimate available={}, memory budget available={})",
+            store.is_some(),
+            budget.is_some()
         );
     }
     Ok(chosen)
@@ -711,9 +717,13 @@ fn estimate_sparse_store_bytes(input: &Path, host: &crate::host::Host) -> Result
     Ok(Some(node_count.saturating_mul(8)))
 }
 
-/// Page-cache budget for the sparse store: `MemAvailable` minus the anon
-/// headroom the sparse run itself needs. `None` when `/proc/meminfo` is
-/// unavailable (non-Linux) or unparsable.
+/// Page-cache budget for the sparse store: the host's available memory
+/// (`MachineProbe`: `MemAvailable`, capped on Linux by visible cgroup v2
+/// headroom) minus the anon headroom the sparse run itself needs. The caller
+/// owns the memory facts: fixed resources can route on any platform without
+/// procfs. Unknown memory retains the conservative external fallback
+/// documented in reference/pipeline.md; small input alone cannot establish
+/// that its random-access store fits RAM.
 fn page_cache_budget_bytes(host: &crate::host::Host) -> Option<u64> {
     host.resources
         .memory_available()
@@ -1322,6 +1332,26 @@ mod tests {
             ResolvedBackend::External,
             "europe-shaped store must route external"
         );
+    }
+
+    #[test]
+    fn route_uses_injected_memory_budget() {
+        let mut host = crate::host::Host::for_tests();
+        for (memory, expected) in [
+            (Some(32 * GB), ResolvedBackend::Sparse),
+            (Some(8 * GB), ResolvedBackend::External),
+            (Some(0), ResolvedBackend::External),
+            (None, ResolvedBackend::External),
+        ] {
+            host.resources = std::sync::Arc::new(crate::host::Fixed {
+                parallelism: None,
+                memory_available: memory,
+            });
+            assert_eq!(
+                route_sorted_indexed(Some(18_750_000_000), super::page_cache_budget_bytes(&host)),
+                expected,
+            );
+        }
     }
 
     #[test]

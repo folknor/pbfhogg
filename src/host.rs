@@ -137,7 +137,10 @@ pub trait Resources: Send + Sync {
     fn parallelism(&self) -> Option<NonZeroUsize>;
     fn memory_available(&self) -> Option<u64>;
 }
-/// Probe the current machine.
+/// Probe the current machine. Linux memory availability is capped by visible
+/// cgroup v2 ancestor headroom (`memory.max - memory.current`). This treats
+/// charged page cache conservatively rather than assuming it is reclaimable.
+/// Cgroup v1 limits and ancestors hidden by a delegated mount are not observed.
 pub struct MachineProbe;
 impl Resources for MachineProbe {
     fn parallelism(&self) -> Option<NonZeroUsize> {
@@ -147,9 +150,100 @@ impl Resources for MachineProbe {
         let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
         let line = meminfo.lines().find(|l| l.starts_with("MemAvailable:"))?;
         let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-        Some(kb.saturating_mul(1024))
+        let available = kb.saturating_mul(1024);
+        #[cfg(target_os = "linux")]
+        let available = machine_memory_available(available)?;
+        Some(available)
     }
 }
+
+// Resolve the unified hierarchy in this process's mount namespace, including
+// delegated mounts whose root is below the hierarchy root. Check ancestors:
+// an unlimited leaf can still be constrained by its parent. Hidden ancestors
+// outside the mount namespace cannot be observed by this best-effort probe.
+#[cfg(target_os = "linux")]
+fn machine_memory_available(mut available: u64) -> Option<u64> {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let Some(group) = membership.lines().find_map(|line| line.strip_prefix("0::")) else {
+        return Some(available); // cgroup v1 has no unified memory controller
+    };
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mut found = false;
+    for line in mounts.lines() {
+        let Some((fields, fs)) = line.split_once(" - ") else {
+            continue;
+        };
+        if fs.split_whitespace().next() != Some("cgroup2") {
+            continue;
+        }
+        let fields: Vec<_> = fields.split_whitespace().collect();
+        let (Some(root), Some(mount)) = (fields.get(3), fields.get(4)) else {
+            continue;
+        };
+        use std::os::unix::ffi::OsStringExt;
+        let root = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            crate::process::decode_mountinfo_path(root.as_bytes()),
+        ));
+        let mount = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            crate::process::decode_mountinfo_path(mount.as_bytes()),
+        ));
+        let Ok(relative) = std::path::Path::new(group).strip_prefix(&root) else {
+            continue;
+        };
+        // A namespace-inaccessible membership (for example /../foo) must
+        // never escape the mounted controller when joined to its mountpoint.
+        if relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return None;
+        }
+        found = true;
+        available = cap_by_cgroup_ancestors(&mount, mount.join(relative), available)?;
+    }
+    // No visible unified mount means its limits cannot be established.
+    found.then_some(available)
+}
+
+/// Walk from `path` up to and including the mounted hierarchy root `mount`,
+/// capping `available` by each limited group's headroom.
+#[cfg(target_os = "linux")]
+fn cap_by_cgroup_ancestors(
+    mount: &std::path::Path,
+    mut path: std::path::PathBuf,
+    mut available: u64,
+) -> Option<u64> {
+    loop {
+        match std::fs::read_to_string(path.join("memory.max")) {
+            Ok(maximum) if maximum.trim() == "max" => {}
+            Ok(maximum) => {
+                let current = std::fs::read_to_string(path.join("memory.current")).ok()?;
+                available = cgroup_memory_available(available, &maximum, &current)?;
+            }
+            // The hierarchy root or a disabled memory controller has no
+            // memory.max. Other failures leave the budget unknown.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+        if path == mount {
+            return Some(available);
+        }
+        if !path.pop() {
+            return None;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_memory_available(available: u64, maximum: &str, current: &str) -> Option<u64> {
+    if maximum.trim() == "max" {
+        return Some(available);
+    }
+    let maximum: u64 = maximum.trim().parse().ok()?;
+    let current: u64 = current.trim().parse().ok()?;
+    Some(available.min(maximum.saturating_sub(current)))
+}
+
 /// Fixed resource values for isolated or reproducible runs.
 pub struct Fixed {
     pub parallelism: Option<NonZeroUsize>,
@@ -205,6 +299,19 @@ mod tests {
         let parent = output.parent().expect("bare filename has a parent");
         assert!(parent.as_os_str().is_empty());
         assert_eq!(host.scratch_parent_or(parent), std::path::Path::new("."));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_memory_budget_caps_host_and_parent_headroom() {
+        assert_eq!(cgroup_memory_available(256, "8", "3"), Some(5));
+        assert_eq!(cgroup_memory_available(4, "8", "3"), Some(4));
+        assert_eq!(cgroup_memory_available(256, "8", "9"), Some(0));
+        assert_eq!(cgroup_memory_available(256, "max", "unused"), Some(256));
+        assert_eq!(cgroup_memory_available(256, "bad", "3"), None);
+        assert_eq!(cgroup_memory_available(256, "8", "bad"), None);
+        let leaf = cgroup_memory_available(256, "max", "0").expect("leaf");
+        assert_eq!(cgroup_memory_available(leaf, "8", "3"), Some(5));
     }
 
     #[test]

@@ -1,11 +1,18 @@
 //! Interned string pool used by the builder.
 
-use rustc_hash::FxHashMap;
+use std::hash::{Hash, Hasher};
+
+use rustc_hash::{FxHashMap, FxHasher};
 
 pub(super) struct StringPool {
     overflowed: bool,
     pub(super) data: Vec<u8>,
-    pub(super) index: FxHashMap<String, u32>,
+    // Index string hashes to offsets into `data`; keep bytes in one place
+    // instead of owning a second String for every unique value.
+    index: FxHashMap<u64, u32>,
+    // Hash collisions are exceptional. Store extra offsets only for those
+    // hashes and compare the bytes before reusing an offset.
+    collisions: FxHashMap<u32, Vec<u32>>,
 }
 
 impl StringPool {
@@ -14,6 +21,7 @@ impl StringPool {
             overflowed: false,
             data: Vec::new(),
             index: FxHashMap::default(),
+            collisions: FxHashMap::default(),
         };
         // Offset 0 = empty string
         pool.data.push(0);
@@ -24,7 +32,13 @@ impl StringPool {
         if s.is_empty() {
             return 0;
         }
-        if let Some(&offset) = self.index.get(s) {
+        let mut hasher = FxHasher::default();
+        s.hash(&mut hasher);
+        self.intern_with_hash(s, hasher.finish())
+    }
+
+    fn intern_with_hash(&mut self, s: &str, hash: u64) -> u32 {
+        if let Some(offset) = self.find_with_hash(s, hash) {
             return offset;
         }
         // Latch failure so merge callbacks can drain their bounded channels
@@ -36,10 +50,48 @@ impl StringPool {
         if self.overflowed {
             return 0;
         }
-        self.index.insert(s.to_owned(), offset);
+        if let Some(&first_offset) = self.index.get(&hash) {
+            self.collisions
+                .entry(first_offset)
+                .or_default()
+                .push(offset);
+        } else {
+            self.index.insert(hash, offset);
+        }
         self.data.extend_from_slice(s.as_bytes());
         self.data.push(0);
         offset
+    }
+
+    fn find_with_hash(&self, s: &str, hash: u64) -> Option<u32> {
+        let first_offset = *self.index.get(&hash)?;
+        if self.matches_at(first_offset, s) {
+            return Some(first_offset);
+        }
+        self.collisions
+            .get(&first_offset)?
+            .iter()
+            .copied()
+            .find(|&offset| self.matches_at(offset, s))
+    }
+
+    // Compare exactly `s.len()` bytes plus the terminator rather than scanning
+    // for the first NUL: no per-candidate scan, and a string with an interior
+    // NUL still deduplicates against its own earlier copy, as the previous
+    // owned-String keys did.
+    fn matches_at(&self, offset: u32, s: &str) -> bool {
+        let Ok(start) = usize::try_from(offset) else {
+            return false;
+        };
+        let Some(end) = start.checked_add(s.len()) else {
+            return false;
+        };
+        self.data.get(start..end) == Some(s.as_bytes()) && self.data.get(end) == Some(&0)
+    }
+
+    #[cfg(feature = "hotpath")]
+    pub(super) fn unique_count(&self) -> usize {
+        self.index.len() + self.collisions.values().map(Vec::len).sum::<usize>()
     }
 
     pub(super) fn validate(&self) -> super::Result<()> {

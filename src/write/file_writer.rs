@@ -16,9 +16,12 @@ use super::metrics::WRITER_METRICS;
 /// A file writer that is either buffered (normal) or direct I/O (`O_DIRECT`).
 ///
 /// Implements [`Write`] by delegating to the active variant.
-// Not #[non_exhaustive] - variants are construction-controlled (users don't match on this).
+// Making these variants private would break callers that construct or match
+// them. Keep that API: generic `PbfWriter::new` accepts caller-owned writers,
+// while `PbfWriter::to_path_sync` is the separate path-owned API with a fixed
+// buffer and explicit sync-on-flush behavior.
 pub enum FileWriter {
-    /// Standard 256 KB `BufWriter<File>`.
+    /// Buffered output; `FileWriter::buffered` uses a 256 KiB buffer.
     Buffered(BufWriter<File>),
 
     /// O_DIRECT writer with page-aligned buffering.
@@ -77,7 +80,7 @@ impl FileWriter {
 /// `fsync` a buffered output, treating "this target does not support
 /// synchronization" as success. Only consulted after `sync_all` has already
 /// failed, so the regular-file success path is exactly one `fsync`.
-fn sync_file(file: &File) -> io::Result<()> {
+pub(super) fn sync_file(file: &File) -> io::Result<()> {
     match file.sync_all() {
         Err(e) if sync_unsupported(e.raw_os_error(), || file_type(file)) => Ok(()),
         other => other,

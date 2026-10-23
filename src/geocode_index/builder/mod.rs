@@ -35,6 +35,28 @@ use strings::StringPool;
 
 pub(super) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+const DIAGNOSTIC_ID_SAMPLE_LIMIT: usize = 16;
+
+/// Keep the lowest distinct IDs so parallel callers produce a stable, bounded
+/// sample regardless of worker completion order.
+pub(super) fn sample_id(sample: &mut Vec<i64>, id: i64) {
+    if sample.contains(&id) {
+        return;
+    }
+    if sample.len() == DIAGNOSTIC_ID_SAMPLE_LIMIT {
+        if sample.last().is_some_and(|&last| id >= last) {
+            return;
+        }
+        sample.pop();
+    }
+    sample.push(id);
+    sample.sort_unstable();
+}
+
+pub(super) fn counter_value(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 // ---------------------------------------------------------------------------
 // Build configuration
 // ---------------------------------------------------------------------------
@@ -122,6 +144,20 @@ impl BuildConfig {
     }
 }
 
+/// Result of the builder's query smoke test.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SmokeOutcome {
+    /// No address point was written, so there was no query coordinate.
+    #[default]
+    SkippedNoAddressPoints,
+    /// The query at the first address point found an address or a street.
+    Passed,
+    /// The query at the first address point found neither an address nor a
+    /// street. The coordinates are in decimicrodegrees (10^-7 degrees).
+    NoMatch { latitude_e7: i32, longitude_e7: i32 },
+}
+
 /// Build statistics.
 #[derive(Debug, Default)]
 pub struct BuildStats {
@@ -136,6 +172,8 @@ pub struct BuildStats {
     pub fine_cells: u64,
     pub coarse_cells: u64,
     pub admin_cells: u64,
+    /// Outcome of the reader query performed against the newly written index.
+    pub smoke_test: SmokeOutcome,
 }
 
 // ---------------------------------------------------------------------------
@@ -453,12 +491,14 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
     #[cfg(feature = "hotpath")]
     let pass2_start = std::time::Instant::now();
 
+    // `way_geom`, `admin_polygons`, `interp_ways`, and `admin_cell_entries`
+    // remain input-sized in-memory intermediates. They fit the documented
+    // regional-extract scope; externalizing them needs a coordinated streaming
+    // and external-merge design because later passes consume each collection.
     crate::debug::emit_marker("GEOCODE_PASS2_SCAN_START");
     let pass2::Pass2Output {
         addr_point_count,
         street_way_count,
-        first_addr_lat_e7,
-        first_addr_lon_e7,
         mut interp_ways,
         way_geom,
         street_ways_mmap,
@@ -485,7 +525,26 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
     crate::debug::emit_marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_START");
     let (admin_polygons, dropped_admin) =
         admin::assemble_admin_polygons(&admin_relations, &way_geom, config, &host.executor);
+    let missing_admin_geometry = admin::missing_admin_way_geometry(&admin_relations, &way_geom);
     let dropped_admin_relations = dropped_admin.total;
+    crate::debug::emit_counter(
+        "geocode_admin_relation_drops",
+        i64::try_from(dropped_admin_relations).unwrap_or(i64::MAX),
+    );
+    crate::debug::emit_counter(
+        "geocode_admin_way_member_refs_without_geometry",
+        counter_value(missing_admin_geometry.member_refs),
+    );
+    if missing_admin_geometry.member_refs > 0 {
+        crate::host::diag!(
+            host.diagnostics,
+            Warning,
+            "geocode.pass2.admin_way_geometry_missing",
+            "  {} admin way member refs have no geometry; way IDs (sample): {:?}",
+            missing_admin_geometry.member_refs,
+            missing_admin_geometry.sample_way_ids
+        );
+    }
     drop(way_geom);
     crate::host::diag!(
         host.diagnostics,
@@ -500,6 +559,15 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
         "geocode.pass2.admin_dropped",
         "  {dropped_admin_relations} admin relations dropped"
     );
+    if dropped_admin_relations > 0 {
+        crate::host::diag!(
+            host.diagnostics,
+            Warning,
+            "geocode.pass2.admin_dropped_ids",
+            "  {dropped_admin_relations} admin relations dropped; relation IDs (sample): {:?}",
+            dropped_admin.sample_relation_ids
+        );
+    }
     if dropped_admin.over_budget > 0 {
         crate::host::diag!(
             host.diagnostics,
@@ -542,6 +610,27 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
         config.street_level,
         &host.executor,
     );
+    let mut unresolved_interpolation_count = 0_u64;
+    let mut unresolved_interpolation_ids = Vec::new();
+    for way in &interp_ways {
+        if way.start_number == 0 || way.end_number == 0 {
+            unresolved_interpolation_count = unresolved_interpolation_count.saturating_add(1);
+            sample_id(&mut unresolved_interpolation_ids, way.way_id);
+        }
+    }
+    crate::debug::emit_counter(
+        "geocode_unresolved_interpolation_ways",
+        counter_value(unresolved_interpolation_count),
+    );
+    if unresolved_interpolation_count > 0 {
+        crate::host::diag!(
+            host.diagnostics,
+            Warning,
+            "geocode.pass2.interp_unresolved",
+            "  {unresolved_interpolation_count} interpolation ways have unresolved endpoints; \
+             way IDs (sample): {unresolved_interpolation_ids:?}"
+        );
+    }
     crate::host::diag!(
         host.diagnostics,
         Progress,
@@ -677,7 +766,24 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
     // pass on the files just written before querying the result. Its work is
     // part of the build wall time; skipping it would leave written output
     // unchecked by the reader path.
-    {
+    let first_addr_point = if addr_point_count > 0 {
+        let bytes = addr_points_mmap.get(..ADDR_POINT_SIZE).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "address point count is nonzero but addr_points.bin has no first record",
+            )
+        })?;
+        let record: &[u8; ADDR_POINT_SIZE] = bytes.try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "addr_points.bin first record has an invalid length",
+            )
+        })?;
+        Some(AddrPoint::from_bytes(record))
+    } else {
+        None
+    };
+    let smoke_test = {
         crate::host::diag!(
             host.diagnostics,
             Progress,
@@ -685,21 +791,37 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
             "  Running smoke test..."
         );
         let test_reader = super::reader::Reader::open(&config.output_dir)?;
-        if addr_point_count > 0 {
+        if let Some(first_addr_point) = first_addr_point {
             let result = test_reader.query(
-                e7_to_deg(first_addr_lat_e7 as f64),
-                e7_to_deg(first_addr_lon_e7 as f64),
+                e7_to_deg(f64::from(first_addr_point.lat_e7)),
+                e7_to_deg(f64::from(first_addr_point.lon_e7)),
             )?;
             if result.address.is_none() && result.street.is_none() {
                 crate::host::diag!(
                     host.diagnostics,
                     Warning,
                     "geocode.smoke_test.no_match",
-                    "  WARNING: smoke test query returned no address or street match"
+                    "  smoke test query at ({:.7}, {:.7}) in index {} returned no address \
+                     or street match",
+                    e7_to_deg(f64::from(first_addr_point.lat_e7)),
+                    e7_to_deg(f64::from(first_addr_point.lon_e7)),
+                    config.output_dir.display()
                 );
+                SmokeOutcome::NoMatch {
+                    latitude_e7: first_addr_point.lat_e7,
+                    longitude_e7: first_addr_point.lon_e7,
+                }
+            } else {
+                SmokeOutcome::Passed
             }
+        } else {
+            SmokeOutcome::SkippedNoAddressPoints
         }
-    }
+    };
+    crate::debug::emit_counter(
+        "geocode_smoke_test_no_match",
+        i64::from(matches!(smoke_test, SmokeOutcome::NoMatch { .. })),
+    );
 
     #[cfg(feature = "hotpath")]
     let pass4_ms = pass4_start.elapsed().as_millis();
@@ -770,7 +892,7 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
             Developer,
             "geocode.hotpath.strings_unique",
             "strings_unique={}",
-            strings.index.len()
+            strings.unique_count()
         );
     }
     crate::debug::emit_marker("GEOCODE_PASS3_END");
@@ -784,6 +906,7 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
         fine_cells: u64::from(fine_count),
         coarse_cells: u64::from(coarse_count),
         admin_cells: u64::from(admin_count),
+        smoke_test,
     })
 }
 

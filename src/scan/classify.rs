@@ -1031,7 +1031,10 @@ mod tests {
 
         let path = dir.join("many.osm.pbf");
         let file = std::fs::File::create(&path).unwrap();
-        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::None);
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::None,
+        );
         writer
             .write_header(&HeaderBuilder::new().build().unwrap())
             .unwrap();

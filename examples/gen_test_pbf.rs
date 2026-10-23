@@ -7,9 +7,7 @@ use std::path::Path;
 
 fn main() {
     let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/test.osm.pbf"));
-    let file = std::fs::File::create(path).expect("create file");
-    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
-    let mut writer = PbfWriter::new(buf, Compression::default());
+    let mut writer = PbfWriter::to_path_sync(path, Compression::default()).expect("create file");
 
     let header = block_builder::HeaderBuilder::new()
         .bbox(9.0, 54.0, 13.0, 58.0)

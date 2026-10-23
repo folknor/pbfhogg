@@ -565,6 +565,12 @@ pub(super) fn stage1_way_pass(
     // floor the worker count to what fits. The CLI raises the soft limit
     // to the hard cap; NoProcessActions only probes it. Report the outcome
     // through the caller's diagnostics.
+    // Do not restore the process limit here: ADR-0016 leaves mutation and
+    // its lifetime with the caller, and restoring a snapshot could undo a
+    // concurrent host adjustment. Fixed host grants also make this arithmetic
+    // exercisable without mutating the test process. Private per-worker shards
+    // keep pass A writes independent; shared appenders would add synchronization
+    // to the measured external pipeline, not merely remove a limit probe.
     let cpu_cap = crate::host::sized_workers(&*host.resources, 2, 1, 4);
     // Headroom for the descriptors this run opens beyond the shard fleet
     // after the allowance is taken: the input PBF, the sidecars and

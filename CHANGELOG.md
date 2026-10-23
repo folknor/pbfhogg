@@ -45,6 +45,12 @@
   cells on a large country: a hang and an OOM rather than a refusal. Levels
   above 10 are now refused before any output is created.
 
+- **`BuildStats` gains `smoke_test: SmokeOutcome`.** Callers can distinguish a
+  passing query, a query with no address or street match (including its
+  coordinate in decimicrodegrees), and a skipped query when the index has no
+  address points. Downstream `BuildStats` struct literals must provide the
+  new field.
+
 - **Multi-extract config paths no longer depend on the working directory.**
   A relative `"directory"` in the config resolves against the config file's
   directory, and `-d` rebases every output under its directory: outputs
@@ -510,6 +516,22 @@
 
 ### Added
 
+- **`PbfWriter::to_path_sync`: synchronous file output that syncs on
+  `flush()`.** It creates the file, owns a 256 KiB buffer and compresses on
+  the calling thread, and `flush()` syncs the file like every pipelined
+  path constructor. `multi-extract` now writes each region through it, so
+  its outputs are synced when the command finishes (they were not before)
+  and each output gets a 256 KiB buffer instead of 8 KiB; allow for that
+  buffer per region when extracting hundreds of regions at once.
+  `PbfWriter::new` is unchanged: it only calls the wrapped writer's `flush`.
+
+- **`build-geocode-index` reports the data it drops.** Way node references
+  with no coordinate (common at an extract's border), admin relation member
+  ways with no geometry, dropped admin relations, interpolation ways with
+  unresolved endpoints and negative node references each produce a warning
+  with a count and a bounded sample of the OSM IDs involved. The smoke-test
+  warning now names the queried coordinate and the index directory.
+
 - **`getid` and `getparents` accept named element IDs** (`node/123`,
   `way/456`, `relation/789`) alongside `n123` / `w456` / `r789`, on the
   command line and in `--id-file`, matching what `inspect --show` already
@@ -636,6 +658,29 @@
   makes the decision before the header is read.
 
 ### Fixed
+
+- **`apply-changes` no longer mislabels tags in rewritten blocks whose
+  string table repeats a string.** Rewritten elements copy the input block's
+  string indices, which assumed the output table matched the input slot for
+  slot; a duplicate entry, or an empty string after slot 0, shifted every
+  later index, so tags named the wrong strings with no error. Every input
+  slot is now preserved.
+
+- **`add-locations-to-ways --index-type auto` respects container memory
+  limits and refuses an unreadable first blob.** The page-cache budget is
+  capped by the cgroup v2 headroom (`memory.max - memory.current`) of the
+  process's group and its visible ancestors, so a memory-limited container
+  on a large host no longer routes a large input to sparse and thrashes.
+  When the limits cannot be read the budget is unknown and sorted, indexed
+  input routes external, as it already did without `/proc/meminfo`. A
+  first data blob that cannot be read or parsed is now an error instead of
+  routing sparse as "not indexed".
+
+- **`--io-uring` is refused when the kernel's opcode probe fails.** A failed
+  probe used to be treated as support; it is now the same
+  `platform feature io-uring unavailable` refusal (exit 3) as a probe that
+  reports no `WriteFixed`. Kernels 5.1 to 5.5, which predate the probe but
+  support `WriteFixed`, still run.
 
 - **Plain (non-dense) `Node` messages are read by every node pass.**
   `add-locations-to-ways` (both index backends), the external join and

@@ -28,6 +28,31 @@ pub(super) struct AssembledPolygon {
 pub(super) struct DroppedAdminRelations {
     pub(super) total: usize,
     pub(super) over_budget: usize,
+    pub(super) sample_relation_ids: Vec<i64>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct MissingAdminWayGeometry {
+    pub(super) member_refs: u64,
+    pub(super) sample_way_ids: Vec<i64>,
+}
+
+/// Count relation member references whose way geometry was not collected and
+/// retain a bounded, stable sample of the missing way IDs.
+pub(super) fn missing_admin_way_geometry(
+    relations: &[RawAdminRelation],
+    way_geom: &FxHashMap<i64, Vec<(i32, i32)>>,
+) -> MissingAdminWayGeometry {
+    let mut missing = MissingAdminWayGeometry::default();
+    for relation in relations {
+        for &way_id in relation.outer_way_ids.iter().chain(&relation.inner_way_ids) {
+            if !way_geom.contains_key(&way_id) {
+                missing.member_refs = missing.member_refs.saturating_add(1);
+                super::sample_id(&mut missing.sample_way_ids, way_id);
+            }
+        }
+    }
+    missing
 }
 
 #[hotpath::measure]
@@ -62,13 +87,17 @@ pub(super) fn assemble_admin_polygons(
         });
     let mut dropped = DroppedAdminRelations::default();
     let mut polygons = Vec::new();
-    for relation in per_relation {
+    for (rel, relation) in relations.iter().zip(per_relation) {
         match relation {
-            Ok(assembled) if assembled.is_empty() => dropped.total += 1,
+            Ok(assembled) if assembled.is_empty() => {
+                dropped.total += 1;
+                super::sample_id(&mut dropped.sample_relation_ids, rel.id);
+            }
             Ok(assembled) => polygons.extend(assembled),
             Err(RingSearchBudgetExceeded) => {
                 dropped.total += 1;
                 dropped.over_budget += 1;
+                super::sample_id(&mut dropped.sample_relation_ids, rel.id);
             }
         }
     }
@@ -390,6 +419,7 @@ mod tests {
 
     use super::{
         DroppedAdminRelations, admin_vertex_cap, assemble_admin_polygons, hole_inside_outer,
+        missing_admin_way_geometry,
     };
     use crate::geocode_index::builder::BuildConfig;
     use crate::geocode_index::builder::pass1::RawAdminRelation;
@@ -427,6 +457,7 @@ mod tests {
         let relations = vec![
             // Names a way that has no geometry: dropped.
             RawAdminRelation {
+                id: 1,
                 admin_level: 8,
                 name_offset: 1,
                 country_code_offset: 0,
@@ -435,6 +466,7 @@ mod tests {
             },
             // Names no ways at all: dropped.
             RawAdminRelation {
+                id: 2,
                 admin_level: 8,
                 name_offset: 2,
                 country_code_offset: 0,
@@ -443,6 +475,7 @@ mod tests {
             },
             // Closed ring: assembles, and must NOT be counted as dropped.
             RawAdminRelation {
+                id: 3,
                 admin_level: 8,
                 name_offset: 3,
                 country_code_offset: 0,
@@ -450,6 +483,13 @@ mod tests {
                 inner_way_ids: Vec::new(),
             },
         ];
+        assert_eq!(
+            missing_admin_way_geometry(&relations, &way_geom),
+            super::MissingAdminWayGeometry {
+                member_refs: 1,
+                sample_way_ids: vec![99],
+            }
+        );
         let (polygons, dropped) = assemble_admin_polygons(
             &relations,
             &way_geom,
@@ -462,7 +502,8 @@ mod tests {
             dropped,
             DroppedAdminRelations {
                 total: 2,
-                over_budget: 0
+                over_budget: 0,
+                sample_relation_ids: vec![1, 2],
             },
             "only the two geometry-less relations are dropped"
         );
@@ -498,6 +539,7 @@ mod tests {
 
         let relations = vec![
             RawAdminRelation {
+                id: 1,
                 admin_level: 8,
                 name_offset: 1,
                 country_code_offset: 0,
@@ -505,6 +547,7 @@ mod tests {
                 inner_way_ids: Vec::new(),
             },
             RawAdminRelation {
+                id: 2,
                 admin_level: 8,
                 name_offset: 2,
                 country_code_offset: 0,
@@ -524,7 +567,8 @@ mod tests {
             dropped,
             DroppedAdminRelations {
                 total: 1,
-                over_budget: 1
+                over_budget: 1,
+                sample_relation_ids: vec![1],
             }
         );
     }

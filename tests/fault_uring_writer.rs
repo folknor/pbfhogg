@@ -7,10 +7,11 @@
 //! `reference/testing.md` > "Conventions" (`static-test-hooks` + per-binary
 //! isolation).
 //!
-//! The test still skips cleanly on hosts where io_uring init fails
-//! due to environment constraints (low `RLIMIT_MEMLOCK`, old kernel,
-//! missing WriteFixed support); that is an environment skip, not
-//! the kind of `#[ignore]` the static-atomic story required.
+//! Ordinary profiles skip typed setup refusals on hosts where io_uring init
+//! fails due to environment constraints (low `RLIMIT_MEMLOCK`, old kernel,
+//! missing WriteFixed support). `BROKKR_TEST_PLATFORM=1` makes the shared
+//! helper fail instead, so the platform profile requires the feature. This is
+//! not the kind of `#[ignore]` the static-atomic story required.
 
 #![allow(clippy::unwrap_used)]
 

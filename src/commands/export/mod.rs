@@ -110,6 +110,13 @@ fn admits_ways(types: ExportTypes) -> bool {
     matches!(types, ExportTypes::All | ExportTypes::WaysOnly)
 }
 
+// All three call sites pass node_kind() or way_kind(), each exactly one kind.
+// With that invariant, the implication tests below mean that the expression
+// admits that kind; this is not a test for overlapping multi-kind filters.
+// Export's filter is optional: no expressions means accept, whereas the PBF
+// and OSC tags-filter predicates return false for an empty list. Clone the
+// borrowed tag iterator per applicable expression rather than collecting tags.
+// Parsing and individual tag semantics are shared through tag_expr.
 fn matches_expressions<'a, T>(expressions: &[Expression], tags: &T, kind: &TypeFilter) -> bool
 where
     T: Iterator<Item = (&'a str, &'a str)> + Clone,

@@ -525,7 +525,10 @@ mod tests {
         index_way_blob: bool,
     ) {
         let file = std::fs::File::create(path).expect("create fixture");
-        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::default(),
+        );
         writer
             .write_header(&HeaderBuilder::new().sorted().build().expect("header"))
             .expect("write header");
@@ -663,7 +666,10 @@ mod tests {
     ///   relation blob: rel 100 -> [node 1, way 10]; rel 101 -> [rel 100]
     fn write_rich_fixture(path: &std::path::Path) {
         let file = std::fs::File::create(path).expect("create fixture");
-        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::default(),
+        );
         writer
             .write_header(&HeaderBuilder::new().sorted().build().expect("header"))
             .expect("write header");

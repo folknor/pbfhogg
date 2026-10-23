@@ -20,6 +20,12 @@ use crate::osc::xml_parse::{
 };
 use crate::tag_expr::{Expression, parse_expressions, tag_matches};
 
+// The sole caller maps the exhaustive ElemKind variants to n/w/r, so the
+// fallback cannot silently drop a supported kind. This tag-first traversal
+// borrows owned OSC tags without building a temporary borrowed-tag vector.
+// It selects an entire create/modify element; deletes bypass this predicate.
+// An empty expression list matches nothing, unlike export's optional filter.
+// Single-tag wildcard and negation semantics remain owned by tag_matches.
 fn matches_any(expressions: &[Expression], tags: &[(String, String)], element_type: char) -> bool {
     for (key, value) in tags {
         for expr in expressions {

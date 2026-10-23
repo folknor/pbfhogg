@@ -137,8 +137,7 @@ pub(crate) fn is_mount_point(_path: &std::path::Path) -> std::io::Result<bool> {
 
 /// Undo the kernel's `\ooo` octal escaping of a mountinfo path field.
 #[cfg(target_os = "linux")]
-#[cfg_attr(not(feature = "commands"), allow(dead_code))]
-fn decode_mountinfo_path(path: &[u8]) -> Vec<u8> {
+pub(crate) fn decode_mountinfo_path(path: &[u8]) -> Vec<u8> {
     let mut decoded = Vec::with_capacity(path.len());
     let mut offset = 0;
     while offset < path.len() {
@@ -498,7 +497,17 @@ pub fn raise_nofile_to_hard_cap() -> FdAllowance {
                 };
                 let raise_ok = libc::setrlimit(libc::RLIMIT_NOFILE, &target) == 0;
                 if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
-                    (1024, FdAdjustment::ProbeFailed)
+                    // A successful setrlimit established the target even if
+                    // the follow-up observation failed. Do not replace that
+                    // known limit with the initial-probe fallback.
+                    if raise_ok {
+                        (
+                            hard.min(1 << 30),
+                            FdAdjustment::Raised { from: soft_before },
+                        )
+                    } else {
+                        (soft_before.min(1 << 30), FdAdjustment::RaiseFailed)
+                    }
                 } else if raise_ok {
                     (
                         rlim.rlim_cur.min(1 << 30),

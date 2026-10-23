@@ -15,37 +15,14 @@ use crate::read::wire_schema::{primitive_block, string_table};
 /// ## Why FxHashMap instead of std HashMap
 ///
 /// The `index` map uses `FxHashMap` (from `rustc-hash`) instead of the standard
-/// `HashMap` with `SipHash`. This is safe and beneficial here because:
+/// `HashMap` with `SipHash` for rewrite throughput.
 ///
-/// **Safety:** This is a write-side-only data structure. All strings inserted
-/// come from the caller's in-process data (tag keys, tag values, role strings,
-/// user names) - never from untrusted PBF input. There is no risk of
-/// HashDoS attacks, which is the sole reason the standard library defaults to
-/// the slower SipHash-1-3 hasher.
-///
-/// **Performance:** FxHash is a simple, non-cryptographic hash (multiply +
-/// rotate) that is substantially faster than SipHash for short strings - which
-/// is exactly what OSM tag keys/values are (typically 3-30 bytes: "name",
-/// "highway", "building", "residential", etc.). The string table is on the hot
-/// path of PBF writing: every tag on every element does a hash lookup + possible
-/// insert. In profiling, the hasher shows up as a measurable fraction of write
-/// time, so switching to FxHash gives a meaningful speedup.
-///
-/// **Where NOT to use FxHash:** On the *read* side (e.g. if you were building a
-/// lookup table from PBF data), strings come from untrusted input files that
-/// could be adversarially crafted. In that context, SipHash (or ahash, which
-/// also has DoS resistance) should be used to prevent O(n^2) hash collisions.
-///
-/// **Alternatives considered:**
-/// - `ahash`: Also fast and DoS-resistant, but the DoS resistance is
-///   unnecessary overhead here since we control the input. FxHash is simpler
-///   and marginally faster for the short-string workload.
-/// - `IndexMap`: Preserves insertion order (which we need via `self.strings`),
-///   but wrapping an IndexMap would still need a fast hasher, and we already
-///   maintain the ordered Vec separately. Switching would add a dependency for
-///   no net benefit.
-/// - Custom perfect hashing: Not viable because the string set is dynamic -
-///   we do not know all strings upfront.
+/// Strings include decoded PBF and OSC input, so FxHash does not provide
+/// collision-attack resistance here. It is retained for the measured rewrite
+/// hot path, where every tag performs a lookup. The element cap bounds normal
+/// batches, not adversarial string counts: a pre-seeded table copies every
+/// source slot, including unused entries. A hardened hasher would require
+/// measuring rewrite CPU and allocations on representative input.
 pub(super) struct StringTable {
     pub(super) strings: Vec<Rc<str>>,
     index: FxHashMap<Rc<str>, u32>,
@@ -60,6 +37,9 @@ impl StringTable {
             index: FxHashMap::with_capacity_and_hasher(256, Default::default()),
             empty: Rc::clone(&empty),
         };
+        // Slot zero is the dense-node end-of-tags marker, so it must not
+        // be returned by add("") for an explicit empty tag key. Interning
+        // an empty string deliberately creates a nonzero slot instead.
         st.strings.push(empty); // index 0 = empty string
         st
     }
@@ -97,11 +77,18 @@ impl StringTable {
     ///
     /// After pre-seeding, input index N maps to output index N (identity).
     /// Index 0 (empty string) is already present from `new()` and is skipped.
+    #[allow(clippy::cast_possible_truncation)]
     pub(super) fn pre_seed(&mut self, block: &PrimitiveBlock) {
+        debug_assert_eq!(self.strings.len(), 1, "pre-seed requires a fresh table");
         let len = block.string_table_len();
         for i in 1..len {
             if let Some(s) = block.string_table_entry(i) {
-                self.add(s);
+                // Raw rewrite fields retain source indices. Duplicate strings
+                // and empty strings outside slot zero must occupy their source
+                // slots too; interning them would shift every later index.
+                let rc: Rc<str> = Rc::from(s);
+                self.strings.push(Rc::clone(&rc));
+                self.index.entry(rc).or_insert(i as u32);
             }
         }
     }
@@ -109,6 +96,8 @@ impl StringTable {
     pub(super) fn clear(&mut self) {
         self.strings.clear();
         self.index.clear();
+        // As in new(), leave zero out of the lookup map: dense tag keys
+        // need a nonzero index even when their string is empty.
         self.strings.push(Rc::clone(&self.empty));
     }
 
@@ -121,5 +110,43 @@ impl StringTable {
             encode_bytes_field_always(scratch, string_table::STRINGS, s.as_bytes());
         }
         encode_bytes_field(buf, primitive_block::STRING_TABLE, scratch);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_seed_preserves_duplicate_and_empty_slots() {
+        let mut strings = Vec::new();
+        for s in ["", "key", "value", "key", "", "tail"] {
+            encode_bytes_field_always(&mut strings, string_table::STRINGS, s.as_bytes());
+        }
+        let mut bytes = Vec::new();
+        encode_bytes_field(&mut bytes, primitive_block::STRING_TABLE, &strings);
+        let block = PrimitiveBlock::from_vec(bytes).expect("valid string table");
+        let mut table = StringTable::new();
+        table.pre_seed(&block);
+        assert_eq!(table.strings.len(), block.string_table_len());
+        for (i, s) in table.strings.iter().enumerate() {
+            assert_eq!(Some(s.as_ref()), block.string_table_entry(i));
+        }
+        assert_eq!(table.add("key"), 1);
+        assert_eq!(table.add(""), 4);
+        assert_eq!(table.add("tail"), 5);
+        assert_eq!(table.add("new"), 6);
+    }
+
+    #[test]
+    fn explicit_empty_string_has_a_nonzero_slot_after_new_and_clear() {
+        let mut table = StringTable::new();
+        assert_eq!(table.add(""), 1);
+        assert_eq!(table.add(""), 1);
+        table.add("old");
+        table.clear();
+        assert_eq!(table.add(""), 1);
+        assert_eq!(table.add("new"), 2);
+        assert_eq!(table.strings.len(), 3);
     }
 }

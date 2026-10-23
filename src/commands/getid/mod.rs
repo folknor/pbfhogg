@@ -1479,7 +1479,10 @@ mod tests {
         index_way_blob: bool,
     ) {
         let file = std::fs::File::create(path).unwrap();
-        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::default(),
+        );
         writer
             .write_header(
                 &crate::block_builder::HeaderBuilder::new()

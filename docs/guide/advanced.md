@@ -43,7 +43,7 @@ The library never mutates process state, reads the environment or writes to stde
 | Field | What it decides | The CLI's choice |
 |-------|-----------------|------------------|
 | `process: Arc<dyn ProcessActions>` | Process-wide actions, invoked at the exact point a command needs them: `cross_thread_alloc_pool` before a pool that allocates on one thread and frees on another, `fd_allowance(wanted)` before a run that holds many descriptors, answering how many it may open on top of those already open (`FdAllowance::host_grant` for a share the host reserves across concurrent calls) | `cross_thread_alloc_pool` caps glibc's malloc arenas at 2 (`process::cap_malloc_arenas`); `fd_allowance` raises the soft `RLIMIT_NOFILE` to the hard cap and subtracts the descriptors already open (`process::raise_nofile_to_hard_cap`) |
-| `resources: Arc<dyn Resources>` | Thread counts and memory budgets, probed where each command sizes them | `MachineProbe` (`available_parallelism`, `MemAvailable` from `/proc/meminfo`) |
+| `resources: Arc<dyn Resources>` | Thread counts and memory budgets, probed where each command sizes them | `MachineProbe` (`available_parallelism`, `MemAvailable` from `/proc/meminfo`, on Linux capped by the visible cgroup v2 `memory.max - memory.current` headroom) |
 | `diagnostics: Diagnostics` | Where progress lines, warnings, notes and summaries go, one event per line | A sink that prints each event as one stderr line |
 | `page_cache: PageCachePolicy` | Whether commands drop their input files' pages behind the read head | `Evict` |
 | `executor: Executor` | Which rayon pool runs the library's parallel work and writer framing | `Ambient` |

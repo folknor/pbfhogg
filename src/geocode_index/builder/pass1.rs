@@ -10,6 +10,7 @@ use super::Result;
 use super::strings::StringPool;
 
 pub(super) struct RawAdminRelation {
+    pub(super) id: i64,
     pub(super) admin_level: u8,
     pub(super) name_offset: u32,
     pub(super) country_code_offset: u32,
@@ -120,6 +121,7 @@ pub(super) fn run_pass1(
                         }
 
                         admin_relations.push(RawAdminRelation {
+                            id: rel.id(),
                             admin_level,
                             name_offset,
                             country_code_offset: cc_offset,

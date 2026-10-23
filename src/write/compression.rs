@@ -3,6 +3,17 @@
 use std::str::FromStr;
 
 /// Compression algorithm for PBF output blobs.
+///
+/// Parsing validates the application's level ranges. Direct enum construction
+/// retains the public integer payloads for compatibility and delegates to the
+/// backend: flate2/zlib-rs accepts only 0-9 and panics on any other level when
+/// it builds the compressor for the first zlib blob (on the framing worker for
+/// pipelined writers); zstd clamps compression levels to its own supported
+/// range (which extends below the parser's -7 floor). Replacing
+/// these payloads with checked newtypes would break callers constructing or
+/// matching variants even though this enum is non-exhaustive. Such a migration
+/// must update the writer backends and callers together, rather than silently
+/// narrowing the existing direct-construction API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Compression {
@@ -11,7 +22,8 @@ pub enum Compression {
     /// Zlib compression at the given level (0-9).
     /// Level 6 matches osmium's default (`Z_DEFAULT_COMPRESSION`).
     Zlib(u32),
-    /// Zstd compression at the given level (1-22, default 3).
+    /// Zstd compression; parsed levels are -7 through 22, default 3.
+    /// Zero selects the backend default; negative levels favor speed.
     ///
     /// Zstd decompresses 3-5x faster than zlib at equivalent compression ratios,
     /// making it ideal for read-heavy workflows (planet imports, tile generation).
@@ -27,6 +39,10 @@ pub enum Compression {
 
 impl Default for Compression {
     fn default() -> Self {
+        // The parser's bare "zlib" resolves to this value, and every CLI
+        // compression default (bench-write included) is spelled "zlib", so
+        // the write benchmark measures the level commands write. OSC gzip
+        // uses a separate level-1 policy; it does not consume this setting.
         Compression::Zlib(6)
     }
 }
@@ -77,5 +93,51 @@ impl FromStr for Compression {
                 "unknown compression: {s} (expected none, zlib, zlib:LEVEL, zstd, zstd:LEVEL)"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parsed_defaults_and_level_boundaries() {
+        assert_eq!(
+            "zlib"
+                .parse::<Compression>()
+                .expect("valid compression spec"),
+            Compression::default(),
+        );
+        assert_eq!(
+            "zlib:6"
+                .parse::<Compression>()
+                .expect("valid compression spec"),
+            Compression::default(),
+        );
+        for level in [0, 9] {
+            assert_eq!(
+                format!("zlib:{level}")
+                    .parse::<Compression>()
+                    .expect("valid zlib level"),
+                Compression::Zlib(level),
+            );
+        }
+        for level in [-7, 0, 22] {
+            assert_eq!(
+                format!("zstd:{level}")
+                    .parse::<Compression>()
+                    .expect("valid zstd level"),
+                Compression::Zstd(level),
+            );
+        }
+        for invalid in ["zlib:-1", "zlib:10", "zstd:-8", "zstd:23"] {
+            assert!(invalid.parse::<Compression>().is_err(), "{invalid}");
+        }
+        assert_eq!(
+            "zstd"
+                .parse::<Compression>()
+                .expect("valid compression spec"),
+            Compression::Zstd(3),
+        );
     }
 }

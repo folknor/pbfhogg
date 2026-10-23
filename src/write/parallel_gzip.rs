@@ -126,7 +126,9 @@ const QUEUE_SLOTS_PER_WORKER: usize = 2;
 /// Compression level used for every gzip member. `Compression::fast`
 /// (DEFLATE level 1) matches what the serial `assemble_osc` path used
 /// to hand to `flate2::GzEncoder`, so compressed size is directly
-/// comparable in benches.
+/// comparable in benches. This is OSC gzip policy, independent of the PBF
+/// blob `Compression` setting; sharing that setting would also make raw/zstd
+/// PBF choices appear applicable to an inherently gzip stream.
 // merge_changes and tags-filter select `Compression::fast` at their own
 // writers. Moving this value alone would leave those paths with separate
 // owners and would imply a shared compression policy that the current tree

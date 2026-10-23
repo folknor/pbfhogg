@@ -9,7 +9,7 @@
 use std::os::unix::fs::FileExt as _;
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::Result;
 
@@ -76,7 +76,9 @@ fn record_way_refs(
     prealloc_max: i64,
     max_node_id: i64,
     refs: &[i64],
-) {
+    negative_node_ids: &mut Vec<i64>,
+) -> u64 {
+    let mut negative_count = 0_u64;
     for &r in refs {
         // Only refs in `0..=max_node_id`
         // can name a node Phase 2a will
@@ -97,11 +99,17 @@ fn record_way_refs(
         // the size-bounded dense range go to
         // this worker's overflow list instead
         // of extending `pre_allocate`.
-        if r < 0 || r > max_node_id {
+        if r < 0 {
+            negative_count = negative_count.saturating_add(1);
+            super::sample_id(negative_node_ids, r);
+            continue;
+        }
+        if r > max_node_id {
             continue;
         }
         record_referenced_node(referenced, overflow_nodes, prealloc_max, r);
     }
+    negative_count
 }
 
 /// Whether any worker has already reported an error.
@@ -131,6 +139,45 @@ fn push_overflow_list(lists: &Mutex<Vec<Vec<i64>>>, overflow_nodes: Vec<i64>) {
     }
 }
 
+/// Fold one worker's negative-ref tally and ID sample into the shared ones,
+/// once per worker after its scan loop.
+fn publish_negative_node_refs(
+    shared_count: &AtomicU64,
+    shared_sample: &Mutex<Vec<i64>>,
+    count: u64,
+    sample: Vec<i64>,
+) {
+    shared_count.fetch_add(count, Ordering::Relaxed);
+    let mut shared_sample = shared_sample
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for id in sample {
+        super::sample_id(&mut shared_sample, id);
+    }
+}
+
+/// Emit the negative-ref counter and, when any were skipped, a warning with
+/// the bounded ID sample.
+fn report_negative_node_refs(count: &AtomicU64, sample: Mutex<Vec<i64>>, host: &crate::host::Host) {
+    let negative_count = count.load(Ordering::Relaxed);
+    crate::debug::emit_counter(
+        "geocode_negative_node_refs",
+        super::counter_value(negative_count),
+    );
+    if negative_count > 0 {
+        let sample = sample
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::host::diag!(
+            host.diagnostics,
+            Warning,
+            "geocode.pass1_5.negative_node_refs",
+            "  skipped {negative_count} negative node refs; node IDs (sample): {sample:?}"
+        );
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub(super) fn run_pass1_5(
     way_schedule: &[(usize, u64, usize)],
@@ -178,6 +225,10 @@ pub(super) fn run_pass1_5(
         let first_err_ref = &first_err;
         let overflow_lists: Mutex<Vec<Vec<i64>>> = Mutex::new(Vec::new());
         let overflow_lists_ref = &overflow_lists;
+        let negative_node_ref_count = AtomicU64::new(0);
+        let negative_node_ref_count_ref = &negative_node_ref_count;
+        let negative_node_ids: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+        let negative_node_ids_ref = &negative_node_ids;
 
         let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
 
@@ -191,6 +242,8 @@ pub(super) fn run_pass1_5(
                     let mut group_starts: Vec<(usize, usize)> = Vec::new();
                     let mut overflow_nodes: Vec<i64> = Vec::new();
                     let mut overflow_compacted_len = 0_usize;
+                    let mut negative_node_ref_count = 0_u64;
+                    let mut negative_node_id_sample = Vec::new();
 
                     loop {
                         // Exit early if another worker has reported an error.
@@ -223,13 +276,15 @@ pub(super) fn run_pass1_5(
                                         || flags.is_interp
                                         || is_admin
                                     {
-                                        record_way_refs(
-                                            referenced_ref,
-                                            &mut overflow_nodes,
-                                            prealloc_max,
-                                            max_node_id,
-                                            refs,
-                                        );
+                                        negative_node_ref_count = negative_node_ref_count
+                                            .saturating_add(record_way_refs(
+                                                referenced_ref,
+                                                &mut overflow_nodes,
+                                                prealloc_max,
+                                                max_node_id,
+                                                refs,
+                                                &mut negative_node_id_sample,
+                                            ));
                                     }
                                 },
                             )
@@ -247,6 +302,12 @@ pub(super) fn run_pass1_5(
                         }
                     }
 
+                    publish_negative_node_refs(
+                        negative_node_ref_count_ref,
+                        negative_node_ids_ref,
+                        negative_node_ref_count,
+                        negative_node_id_sample,
+                    );
                     push_overflow_list(overflow_lists_ref, overflow_nodes);
                 });
             }
@@ -258,6 +319,8 @@ pub(super) fn run_pass1_5(
         {
             return Err(e.into());
         }
+
+        report_negative_node_refs(&negative_node_ref_count, negative_node_ids, host);
 
         insert_overflow_nodes(
             &mut referenced_nodes,

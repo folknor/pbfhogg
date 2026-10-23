@@ -598,6 +598,31 @@ pub(crate) fn uring_writer_thread(
     result
 }
 
+/// Refuse, as a typed platform refusal, a ring whose kernel cannot run
+/// `WriteFixed` or whose opcode probe fails for a reason other than age.
+fn require_write_fixed(ring: &IoUring) -> io::Result<()> {
+    let mut probe = io_uring::Probe::new();
+    match ring.submitter().register_probe(&mut probe) {
+        Ok(()) if probe.is_supported(opcode::WriteFixed::CODE) => Ok(()),
+        Ok(()) => Err(crate::error::platform_unsupported(
+            "io-uring",
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "kernel does not support io_uring WriteFixed (requires Linux 5.1+)",
+            ),
+        )),
+        // IORING_REGISTER_PROBE arrived in Linux 5.6, but WriteFixed has
+        // existed since io_uring itself (5.1). With the ring already set up,
+        // EINVAL here is a 5.1-5.5 kernel that supports WriteFixed and cannot
+        // say so; refusing it would reject a working host.
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        Err(e) => Err(crate::error::platform_unsupported(
+            "io-uring",
+            io::Error::new(e.kind(), format!("io_uring opcode probe failed: {e}")),
+        )),
+    }
+}
+
 /// Initialize the io_uring ring and run the writer loop.
 ///
 /// Separated from `uring_writer_thread` to keep the init error signaling
@@ -637,21 +662,7 @@ fn uring_init_and_run(
     })?;
 
     // Step 2b: Probe supported opcodes for clear error messages on old kernels.
-    // WriteFixed requires Linux 5.1+.
-    {
-        let mut probe = io_uring::Probe::new();
-        if ring.submitter().register_probe(&mut probe).is_ok()
-            && !probe.is_supported(opcode::WriteFixed::CODE)
-        {
-            return Err(crate::error::platform_unsupported(
-                "io-uring",
-                io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "kernel does not support io_uring WriteFixed (requires Linux 5.1+)",
-                ),
-            ));
-        }
-    }
+    require_write_fixed(&ring)?;
 
     // Step 3: Open file with O_DIRECT.
     let file = std::fs::OpenOptions::new()
@@ -675,6 +686,11 @@ fn uring_init_and_run(
             rlim_cur: 0,
             rlim_max: 0,
         };
+        // The threshold is the exact registered size, not an estimate: every
+        // buffer is whole page-aligned pages, and the kernel charges the
+        // pinned pages against RLIMIT_MEMLOCK (fewer when it coalesces huge
+        // pages, none with CAP_IPC_LOCK). A soft limit at or above it rules
+        // the limit out, so only a lower limit earns the ulimit advice.
         // Safety: limit is a valid writable rlimit for getrlimit.
         let limited = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } == 0
             && limit.rlim_cur < (u64::from(NUM_BUFS) * IO_BUF_BYTES as u64);

@@ -364,10 +364,14 @@ pub fn renumber_external(
         "Renumber assigns IDs by file position and resolves references by rank.",
     )?;
     super::warn_locations_on_ways_loss(&header, host);
-    // Default to zlib:1 for external renumber - the compression pipeline
-    // is on the critical path for pass 1 and stage 2d, and zlib:6 adds
-    // ~22 s of backpressure at planet scale for ~15% smaller output.
-    // Respect explicit caller overrides (e.g. --compression zlib:6).
+    // Preserve the external-renumber zlib:1 default documented in
+    // reference/performance.md. This legacy value-based API cannot distinguish
+    // omitted compression from an explicit Zlib(6): both arrive as the same
+    // Compression value and both select level 1 here. Other values pass through.
+    // Removing this branch would change the default on the measured write path.
+    // Honoring explicit level 6 while retaining the default requires carrying
+    // omission separately (for example Option<Compression>) from CLI parsing
+    // through this entry point and migrating its library callers together.
     let effective_compression = if compression == Compression::default() {
         Compression::Zlib(1)
     } else {

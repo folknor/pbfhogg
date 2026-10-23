@@ -411,7 +411,10 @@ mod tests {
 
     fn write_fixture(path: &std::path::Path, with_data: bool) {
         let file = std::fs::File::create(path).expect("create fixture");
-        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::default(),
+        );
         writer
             .write_header(&HeaderBuilder::new().build().expect("header"))
             .expect("write header");
@@ -548,7 +551,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mixed = dir.path().join("mixed.pbf");
         let file = std::fs::File::create(&mixed).expect("create fixture");
-        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::None);
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::None,
+        );
         writer
             .write_header(&HeaderBuilder::new().build().expect("header"))
             .expect("write header");

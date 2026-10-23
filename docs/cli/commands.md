@@ -75,6 +75,26 @@ Count tag key=value frequencies (subcommand of `inspect`).
 element-type prefixes. For example, `w/highway=primary` counts that match only
 on ways; `--type` adds an overall element-type restriction.
 
+Expressions select individual tags for counting. If a way has both
+`highway=primary` and `name=Main Street`, the expression `w/highway` counts
+only its highway tag. In `tags-filter` the same expression selects the whole
+way; export also selects whole elements and accepts an omitted expression
+filter as unrestricted.
+
+Counts are exact. Memory grows with the number of distinct selected key/value
+pairs and their string bytes, with no fixed byte cap or spill to disk. One
+global map stores one key string per distinct key and one value string and
+counter per distinct pair, plus hash-table capacity overhead. The blob
+schedule, decoded blobs and in-flight per-blob count maps add transient
+storage; input blobs are not limited to the writer's default element count.
+The sorted result reserves one entry per distinct pair before applying
+`--min-count` or `--max-count`, and retained entries each own a copy of the key.
+During conversion that allocation overlaps the remaining map storage.
+Consequently count thresholds do not bound memory, even when few rows are
+printed. Restrict element types and tag expressions to reduce the selected
+cardinality; neither a higher minimum count nor fewer workers bounds the
+global map. No approximate counts or silent truncation are used.
+
 ### check
 
 Validate PBF file integrity (IDs + referential integrity).
@@ -484,6 +504,14 @@ pbfhogg getid [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 | `--force` | Proceed even if input lacks indexdata |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
+
+`--verbose-ids` is an exhaustive diagnostic with no output cap. Requested
+IDs are space-separated on one line per kind; missing IDs are printed one
+per line. With `-I`, every ID from that input participates, so large inputs
+can produce very large stderr output. The missing-ID report also collects
+three vectors, one per kind, requiring O(M) additional ID storage for M
+missing objects. Omit `--verbose-ids` when that output and storage are unwanted;
+the normal command summary remains available.
 
 ### getparents
 

@@ -189,7 +189,7 @@ bb.add_node(1, 556_761_000, 125_683_000, [("name", "Copenhagen")], Some(&meta));
 
 ## PbfWriter
 
-`PbfWriter` handles blob framing, compression, and file output. It supports four modes.
+`PbfWriter` handles blob framing, compression, and file output. It has pipelined constructors (`to_path`, `to_path_direct`, `to_path_uring`) and synchronous ones (`to_path_sync`, `new`).
 
 ### to_path - pipelined parallel compression
 
@@ -223,11 +223,11 @@ writer.flush()?;
 # Ok::<(), std::io::Error>(())
 ```
 
-After successful writes, `flush()` checks completion and reports deferred errors. The file-backed pipelines also sync the file. A synchronous `PbfWriter::new` only calls the underlying `Write::flush`, which does not guarantee durability. Dropping a writer without flushing is cleanup only and reports nothing, including a missing tail.
+After successful writes, `flush()` checks completion and reports deferred errors. The file-backed pipelines and `to_path_sync` also sync the file. A synchronous `PbfWriter::new` only calls the underlying `Write::flush`, which does not guarantee durability. Dropping a writer without flushing is cleanup only and reports nothing, including a missing tail.
 
 ### Executor
 
-Every `to_path*` constructor takes an `Executor` (`pbfhogg::host::Executor`) naming where the framing and compression work runs. `Executor::Ambient` uses whatever rayon pool the calling thread is in, or rayon's global pool off any pool. `Executor::Pool(Arc<rayon::ThreadPool>)` confines the work to a pool you own:
+Every pipelined constructor (`to_path`, `to_path_direct`, `to_path_uring`) takes an `Executor` (`pbfhogg::host::Executor`) naming where the framing and compression work runs. `Executor::Ambient` uses whatever rayon pool the calling thread is in, or rayon's global pool off any pool. `Executor::Pool(Arc<rayon::ThreadPool>)` confines the work to a pool you own:
 
 ```rust
 use std::sync::Arc;
@@ -296,6 +296,22 @@ writer.flush()?;
 # Ok::<(), std::io::Error>(())
 ```
 
+### to_path_sync - synchronous file output
+
+Compresses and writes on the calling thread into a file it creates, through a 256 KiB buffer it owns. `flush()` writes out the buffer and syncs the file, like the pipelined constructors. Useful when one thread drives many outputs at once, where a pipeline per output would multiply threads. No background threads, no rayon.
+
+```rust
+use pbfhogg::write::block_builder::HeaderBuilder;
+use pbfhogg::write::writer::{PbfWriter, Compression};
+
+let header_bytes = HeaderBuilder::new().sorted().build()?;
+let mut writer = PbfWriter::to_path_sync("output.osm.pbf".as_ref(), Compression::default())?;
+writer.write_header(&header_bytes)?;
+// ... write blocks, then flush (which syncs the file)
+writer.flush()?;
+# Ok::<(), std::io::Error>(())
+```
+
 ### new - synchronous mode
 
 For tests, small PBFs, or any `Write` implementation (in-memory buffers, network streams). No background threads, no rayon.
@@ -321,7 +337,7 @@ println!("Wrote {} bytes", pbf_bytes.len());
 # Ok::<(), std::io::Error>(())
 ```
 
-Note: with `new()`, you must call `write_header()` explicitly before writing data blocks. The `to_path*` constructors write the header automatically.
+Note: with `new()` and `to_path_sync()`, you must call `write_header()` explicitly before writing data blocks. The pipelined constructors write the header automatically.
 
 ## Compression
 
@@ -343,7 +359,7 @@ Zlib uses `zlib-rs` (pure Rust, no C compiler needed).
 
 | Method | Description |
 |--------|-------------|
-| `write_header(&[u8])` | Write the OsmHeader blob (sync mode only; `to_path*` does this automatically) |
+| `write_header(&[u8])` | Write the OsmHeader blob (`new` and `to_path_sync` only; the pipelined constructors do this automatically) |
 | `write_primitive_block(&[u8])` | Write an OSMData blob from serialized `PrimitiveBlock` bytes |
 | `write_raw(&[u8])` | Write pre-framed raw bytes (for blob passthrough without re-compression) |
 | `flush()` | Drain the pipeline and finalize the file. Must be called before dropping the writer. |

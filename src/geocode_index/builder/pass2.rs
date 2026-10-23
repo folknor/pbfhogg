@@ -46,8 +46,8 @@ use super::super::format::*;
 // ---------------------------------------------------------------------------
 
 /// Slim interpolation metadata kept in memory during the build.
-/// Node coordinates are written directly to interp_nodes.bin;
-/// this struct stores only the file offset and count.
+/// Node coordinates are written directly to interp_nodes.bin; this struct
+/// keeps the source way ID, file offset, count, and endpoint metadata.
 ///
 /// Interpolation endpoints must have positive house numbers. Endpoint matching
 /// rejects parsed zero values; serialized zero marks unresolved ways, so a
@@ -56,9 +56,10 @@ use super::super::format::*;
 /// `resolved: bool` into [`crate::geocode_index::format::InterpWay`] and bump
 /// `FORMAT_VERSION`.
 pub(super) struct SlimInterpWay {
+    pub(super) way_id: i64,
+    pub(super) node_file_offset: u64,
     pub(super) street_offset: u32,
     pub(super) interpolation_type: u8,
-    pub(super) node_file_offset: u64,
     pub(super) node_count: u16,
     pub(super) start_number: u32,
     pub(super) end_number: u32,
@@ -190,6 +191,8 @@ struct WayBlobOut {
     building_addrs: Vec<PendingAddrPoint>,
     interps: Vec<PendingInterp>,
     admin_geoms: Vec<(i64, Vec<(i32, i32)>)>,
+    missing_node_ref_count: u64,
+    missing_ref_way_ids: Vec<i64>,
     error: Option<String>,
 }
 
@@ -199,6 +202,7 @@ struct PendingStreet {
 }
 
 struct PendingInterp {
+    way_id: i64,
     street: Box<str>,
     interpolation_type: u8,
     coords: Vec<(i32, i32)>,
@@ -277,15 +281,23 @@ fn classify_way_into(
     // separate case from a decoded node whose coordinate is outside the legal
     // geographic domain, which cannot safely participate in the index.
     let mut rank_outside_store: Option<u64> = None;
+    let mut missing_node_ref_count = 0_u64;
     let coords: Vec<(i32, i32)> = way
         .refs()
         .filter_map(|nid| {
-            let rank = referenced_nodes.rank_if_set(nid)?;
+            let Some(rank) = referenced_nodes.rank_if_set(nid) else {
+                missing_node_ref_count = missing_node_ref_count.saturating_add(1);
+                return None;
+            };
             let Some(slot) = coord_slot(coord_slots, rank) else {
                 rank_outside_store = Some(rank);
                 return None;
             };
-            unpack_coord(slot.load(Ordering::Relaxed))
+            let coord = unpack_coord(slot.load(Ordering::Relaxed));
+            if coord.is_none() {
+                missing_node_ref_count = missing_node_ref_count.saturating_add(1);
+            }
+            coord
         })
         .collect();
     if let Some(rank) = rank_outside_store {
@@ -295,6 +307,12 @@ fn classify_way_into(
             coord_slots.len()
         ));
         return;
+    }
+    if missing_node_ref_count > 0 {
+        state.missing_node_ref_count = state
+            .missing_node_ref_count
+            .saturating_add(missing_node_ref_count);
+        super::sample_id(&mut state.missing_ref_way_ids, way_id);
     }
     if coords.is_empty() {
         return;
@@ -329,6 +347,7 @@ fn classify_way_into(
                 return;
             }
             state.interps.push(PendingInterp {
+                way_id,
                 street: addr_st.unwrap_or("").into(),
                 interpolation_type: itype,
                 coords,
@@ -384,8 +403,6 @@ fn classify_way_into(
 pub(super) struct Pass2Output {
     pub(super) addr_point_count: u32,
     pub(super) street_way_count: u32,
-    pub(super) first_addr_lat_e7: i32,
-    pub(super) first_addr_lon_e7: i32,
     pub(super) interp_ways: Vec<SlimInterpWay>,
     pub(super) way_geom: FxHashMap<i64, Vec<(i32, i32)>>,
     pub(super) street_ways_mmap: memmap2::Mmap,
@@ -458,8 +475,6 @@ pub(super) fn run_pass2(
 
     // State that Phase 2a populates and Phase 2b carries forward.
     let mut addr_point_count: u32 = 0;
-    let mut first_addr_lat_e7: i32 = 0;
-    let mut first_addr_lon_e7: i32 = 0;
 
     // ---------------- Phase 2a: parallel node scan ----------------
     //
@@ -581,10 +596,6 @@ pub(super) fn run_pass2(
                         merge_err = Some(e);
                         return;
                     }
-                    if addr_point_count == 0 {
-                        first_addr_lat_e7 = pap.lat_e7;
-                        first_addr_lon_e7 = pap.lon_e7;
-                    }
                     let Some(next_count) = addr_point_count.checked_add(1) else {
                         semantic_err = Some(
                             "address point count exceeds u32::MAX; bump FORMAT_VERSION".into(),
@@ -616,6 +627,8 @@ pub(super) fn run_pass2(
     let mut street_node_offset: u64 = 0;
     let mut interp_node_offset: u64 = 0;
     let mut street_way_count: u32 = 0;
+    let mut missing_node_ref_count = 0_u64;
+    let mut missing_ref_way_ids = Vec::new();
 
     crate::debug::emit_marker("GEOCODE_PASS2B_START");
     {
@@ -651,6 +664,11 @@ pub(super) fn run_pass2(
                     merge_err = Some(err);
                     return;
                 }
+                missing_node_ref_count =
+                    missing_node_ref_count.saturating_add(out.missing_node_ref_count);
+                for &way_id in &out.missing_ref_way_ids {
+                    super::sample_id(&mut missing_ref_way_ids, way_id);
+                }
 
                 // Admin way geometries
                 for (way_id, coords) in out.admin_geoms {
@@ -671,9 +689,10 @@ pub(super) fn run_pass2(
                     };
                     let street_offset = strings.intern(&pi.street);
                     interp_ways.push(SlimInterpWay {
+                        way_id: pi.way_id,
+                        node_file_offset: interp_node_offset,
                         street_offset,
                         interpolation_type: pi.interpolation_type,
-                        node_file_offset: interp_node_offset,
                         node_count: nc,
                         // Zero marks endpoints that were not resolved.
                         start_number: 0,
@@ -709,10 +728,6 @@ pub(super) fn run_pass2(
                     if let Err(e) = addr_points_out.write_all(&ap.to_bytes()) {
                         merge_err = Some(e.to_string());
                         return;
-                    }
-                    if addr_point_count == 0 {
-                        first_addr_lat_e7 = pap.lat_e7;
-                        first_addr_lon_e7 = pap.lon_e7;
                     }
                     let Some(next_count) = addr_point_count.checked_add(1) else {
                         merge_err = Some(
@@ -774,6 +789,20 @@ pub(super) fn run_pass2(
     }
     crate::debug::emit_marker("GEOCODE_PASS2B_END");
 
+    crate::debug::emit_counter(
+        "geocode_way_refs_without_coordinates",
+        super::counter_value(missing_node_ref_count),
+    );
+    if missing_node_ref_count > 0 {
+        crate::host::diag!(
+            host.diagnostics,
+            Warning,
+            "geocode.pass2.missing_way_node_refs",
+            "  {missing_node_ref_count} geocode way node refs have no coordinate; \
+             way IDs (sample): {missing_ref_way_ids:?}"
+        );
+    }
+
     crate::debug::emit_marker("GEOCODE_PASS2_FLUSH_MMAP_START");
     // Flush and drop writers before mmap
     street_ways_out.flush()?;
@@ -810,8 +839,6 @@ pub(super) fn run_pass2(
     Ok(Pass2Output {
         addr_point_count,
         street_way_count,
-        first_addr_lat_e7,
-        first_addr_lon_e7,
         interp_ways,
         way_geom,
         street_ways_mmap,

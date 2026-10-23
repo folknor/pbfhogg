@@ -723,6 +723,12 @@ impl BlockBuilder {
 
         // Tags: write raw indices directly - no StringTable::add()
         for (key_sid, val_sid) in raw_tags {
+            debug_assert!(
+                usize::try_from(key_sid).is_ok_and(|sid| sid < self.string_table.strings.len())
+            );
+            debug_assert!(
+                usize::try_from(val_sid).is_ok_and(|sid| sid < self.string_table.strings.len())
+            );
             #[allow(clippy::cast_sign_loss)]
             self.tag_key_indices.insert(key_sid as u32);
             self.dense_keys_vals.push(key_sid);
@@ -734,6 +740,10 @@ impl BlockBuilder {
             if !self.has_dense_metadata && self.count > 0 {
                 self.backfill_default_dense_metadata();
             }
+            debug_assert!(
+                usize::try_from(meta.user_sid)
+                    .is_ok_and(|sid| sid < self.string_table.strings.len())
+            );
             self.add_dense_metadata_raw(meta);
         } else if self.has_dense_metadata {
             self.push_default_dense_metadata();
@@ -760,6 +770,8 @@ impl BlockBuilder {
             self.can_add_way(),
             "cannot add way: block full or wrong type"
         );
+        #[cfg(debug_assertions)]
+        self.debug_assert_raw_strings(keys_data, vals_data, &[], info_data);
         self.block_type = Some(BlockType::Ways);
         // Track tag key indices from raw packed varint keys
         collect_packed_varint_keys(keys_data, &mut self.tag_key_indices);
@@ -795,6 +807,8 @@ impl BlockBuilder {
             self.can_add_way(),
             "cannot add way: block full or wrong type"
         );
+        #[cfg(debug_assertions)]
+        self.debug_assert_raw_strings(keys_data, vals_data, &[], info_data);
         self.block_type = Some(BlockType::Ways);
         collect_packed_varint_keys(keys_data, &mut self.tag_key_indices);
         encode_way_raw_bytes_with_locations(
@@ -832,6 +846,8 @@ impl BlockBuilder {
             self.can_add_relation(),
             "cannot add relation: block full or wrong type"
         );
+        #[cfg(debug_assertions)]
+        self.debug_assert_raw_strings(keys_data, vals_data, roles_sid_data, info_data);
         self.block_type = Some(BlockType::Relations);
         // Track tag key indices from raw packed varint keys
         collect_packed_varint_keys(keys_data, &mut self.tag_key_indices);
@@ -848,6 +864,36 @@ impl BlockBuilder {
         );
         self.track_id(id);
         self.count += 1;
+    }
+
+    // Raw fields intentionally bypass interning and decoding in release builds.
+    // Check the source-table contract here in debug builds, including values,
+    // roles and users that are not represented in tag_key_indices.
+    #[cfg(debug_assertions)]
+    fn debug_assert_raw_strings(
+        &self,
+        keys: &[u8],
+        vals: &[u8],
+        roles: &[u8],
+        info: Option<&[u8]>,
+    ) {
+        for bytes in [keys, vals, roles] {
+            let mut cursor = crate::read::wire::Cursor::new(bytes);
+            while !cursor.is_empty() {
+                let sid = cursor.read_varint().expect("valid packed string index");
+                assert!(
+                    usize::try_from(sid).is_ok_and(|sid| sid < self.string_table.strings.len())
+                );
+            }
+        }
+        if let Some(info) = info {
+            let info = crate::read::wire::WireInfo::parse(info).expect("valid raw metadata");
+            if let Some(sid) = info.user_sid {
+                assert!(
+                    usize::try_from(sid).is_ok_and(|sid| sid < self.string_table.strings.len())
+                );
+            }
+        }
     }
 
     #[allow(clippy::cast_possible_wrap)]
@@ -887,6 +933,12 @@ impl BlockBuilder {
             Some(t) => t,
             None => return Ok(None),
         };
+
+        debug_assert!(
+            self.tag_key_indices
+                .iter()
+                .all(|&sid| (sid as usize) < self.string_table.strings.len())
+        );
 
         let kind = match block_type {
             BlockType::DenseNodes => ElemKind::Node,
@@ -956,6 +1008,14 @@ impl BlockBuilder {
                     .as_bytes()
                     .cmp(self.string_table.strings[b as usize].as_bytes())
             });
+            if self.pre_seeded {
+                // Identity-preserving source tables can hold the same key at
+                // multiple indices. Tagdata encodes a set of key strings,
+                // so collapse equal strings after sorting their source slots.
+                let strings = &self.string_table.strings;
+                self.tag_key_scratch
+                    .dedup_by(|a, b| strings[*a as usize] == strings[*b as usize]);
+            }
             crate::blob_meta::encode_tag_index(
                 self.tag_key_scratch
                     .iter()
@@ -1157,7 +1217,60 @@ impl BlockBuilder {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{BlockBuilder, MemberData, Metadata, RawMetadata};
-    use crate::{MemberId, MemberType};
+    use crate::{MemberId, MemberType, PrimitiveBlock};
+    use protohoggr::encode_bytes_field;
+
+    #[test]
+    fn raw_rewrites_preserve_duplicate_and_empty_source_strings() {
+        let mut strings = Vec::new();
+        for value in ["", "key", "value", "key", "", "tail"] {
+            protohoggr::encode_bytes_field_always(&mut strings, 1, value.as_bytes());
+        }
+        let mut bytes = Vec::new();
+        encode_bytes_field(&mut bytes, 1, &strings);
+        let source = PrimitiveBlock::from_vec(bytes).expect("valid source table");
+        for kind in 0..4 {
+            let mut bb = BlockBuilder::new();
+            bb.pre_seed_string_table(&source);
+            match kind {
+                0 => bb.add_node_raw(1, 0, 0, [(3, 5), (1, 4)].into_iter(), None),
+                1 => bb.add_way_raw_bytes(1, &[3, 1], &[5, 4], &[], None),
+                2 => bb.add_way_raw_bytes_with_locations(1, &[3, 1], &[5, 4], &[], &[], &[], None),
+                _ => bb.add_relation_raw_bytes(1, &[3, 1], &[5, 4], &[4], &[2], &[0], None),
+            }
+            let bytes = bb.take().expect("encode raw rewrite").expect("one block");
+            let output = PrimitiveBlock::from_vec(bytes.to_vec()).expect("valid output");
+            let tagdata = bb.last_tagdata.as_deref().expect("tag key index");
+            let tag_index =
+                crate::blob_meta::TagIndex::deserialize(tagdata).expect("valid tag key index");
+            assert_eq!(tag_index.keys().len(), 1);
+            assert_eq!(tag_index.keys()[0].as_ref(), b"key");
+            assert_eq!(output.string_table_len(), source.string_table_len());
+            for i in 0..source.string_table_len() {
+                assert_eq!(output.string_table_entry(i), source.string_table_entry(i));
+            }
+            let element = output.elements().next().expect("one element");
+            let tags: Vec<_> = match element {
+                crate::Element::DenseNode(node) => node.tags().collect(),
+                crate::Element::Way(way) => way.tags().collect(),
+                crate::Element::Relation(relation) => relation.tags().collect(),
+                crate::Element::Node(_) => panic!("expected dense node"),
+            };
+            assert_eq!(tags, [("key", "tail"), ("key", "")]);
+        }
+    }
+
+    #[test]
+    fn explicit_empty_dense_tag_key_round_trips() {
+        let mut bb = BlockBuilder::new();
+        bb.add_node(1, 0, 0, [("", "value")], None);
+        let bytes = bb.take().expect("encode node").expect("one block");
+        let output = PrimitiveBlock::from_vec(bytes.to_vec()).expect("valid dense tags");
+        let crate::Element::DenseNode(node) = output.elements().next().expect("one node") else {
+            panic!("expected dense node");
+        };
+        assert_eq!(node.tags().collect::<Vec<_>>(), [("", "value")]);
+    }
 
     /// A ref/location length mismatch must not reach the encoder.
     ///

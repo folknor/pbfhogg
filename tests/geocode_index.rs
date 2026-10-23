@@ -884,6 +884,10 @@ fn synthetic_build_query_matches_low_level_api() {
         stats.admin_polygons, 0,
         "synthetic fixture has no admin relations"
     );
+    assert_eq!(
+        stats.smoke_test,
+        pbfhogg::geocode_index::builder::SmokeOutcome::Passed
+    );
 
     let reader =
         pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("reader should open");
@@ -1870,6 +1874,10 @@ fn synthetic_admin_polygon_query_returns_country_match() {
     assert_eq!(
         stats.addr_points, 0,
         "admin-only fixture has no address points"
+    );
+    assert_eq!(
+        stats.smoke_test,
+        pbfhogg::geocode_index::builder::SmokeOutcome::SkippedNoAddressPoints
     );
     assert_eq!(
         stats.street_ways, 0,

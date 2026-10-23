@@ -16,7 +16,8 @@ use crate::error::panic_error;
 use crate::write::copy_range::copy_range;
 use crate::write::file_writer::FileWriter;
 use crate::write::metrics::WRITER_METRICS;
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::sync_channel;
@@ -72,6 +73,18 @@ fn pipeline_send_error(pipeline: &mut WritePipeline) -> io::Error {
         // and surfaced whatever it found.
         None => io::Error::other("writer thread terminated"),
     }
+}
+
+fn flush_wrapped_writer<W: Write>(writer: &mut W) -> io::Result<()> {
+    writer.flush()
+}
+
+fn sync_buffered_file(writer: &mut BufWriter<File>) -> io::Result<()> {
+    writer.flush()?;
+    let t_sync = std::time::Instant::now();
+    let result = crate::write::file_writer::sync_file(writer.get_ref());
+    WRITER_METRICS.record_sync_all(t_sync);
+    result
 }
 
 /// Take one dispatch permit, blocking until one is free, and return the guard
@@ -132,6 +145,9 @@ pub struct PbfWriter<W: Write> {
     writer: Option<W>,
     compression: Compression,
     pipeline: Option<WritePipeline>,
+    /// Final operation for the owned synchronous writer. Generic writers only
+    /// flush; the path-owned sync constructor also synchronizes the file.
+    finalize_writer: fn(&mut W) -> io::Result<()>,
     #[cfg(test)]
     /// Whether all successfully accepted writes have been explicitly flushed.
     finished: bool,
@@ -306,6 +322,7 @@ impl PbfWriter<FileWriter> {
             writer: None,
             compression,
             pipeline: Some(WritePipeline::new(tx, handle, expected, executor)),
+            finalize_writer: flush_wrapped_writer::<FileWriter>,
             #[cfg(test)]
             finished: false,
             scratch: FrameScratch::new(),
@@ -390,6 +407,7 @@ impl PbfWriter<FileWriter> {
             writer: None,
             compression,
             pipeline: Some(WritePipeline::new(tx, handle, expected, executor)),
+            finalize_writer: flush_wrapped_writer::<FileWriter>,
             #[cfg(test)]
             finished: false,
             scratch: FrameScratch::new(),
@@ -419,6 +437,7 @@ impl PbfWriter<FileWriter> {
             writer: None,
             compression,
             pipeline: Some(WritePipeline::new(tx, handle, expected, executor)),
+            finalize_writer: flush_wrapped_writer::<FileWriter>,
             #[cfg(test)]
             finished: false,
             scratch: FrameScratch::new(),
@@ -433,12 +452,20 @@ impl<W: Write> PbfWriter<W> {
     /// `BufWriter` with a 256 KiB capacity for best performance.
     /// PBF blobs are typically 16-64KB compressed, so the default 8KB
     /// `BufWriter` causes excessive write syscalls. See [`to_path`](Self::to_path)
-    /// which applies this automatically.
+    /// which applies this automatically. For synchronous file output that
+    /// owns this buffer and synchronizes it on `flush`, use
+    /// [`to_path_sync`](PbfWriter::to_path_sync).
+    ///
+    /// This constructor calls the supplied writer's ordinary `Write::flush`.
+    /// It accepts arbitrary writers, including non-file outputs, so file
+    /// durability is opt-in through [`to_path_sync`](PbfWriter::to_path_sync)
+    /// and generic callers do not incur an implicit `fsync`.
     pub fn new(writer: W, compression: Compression) -> Self {
         PbfWriter {
             writer: Some(writer),
             compression,
             pipeline: None,
+            finalize_writer: flush_wrapped_writer::<W>,
             #[cfg(test)]
             finished: true,
             scratch: FrameScratch::new(),
@@ -900,12 +927,13 @@ impl<W: Write> PbfWriter<W> {
     /// the output file". Calling `flush` twice is harmless.
     ///
     /// After successful writes, `flush` checks completion and reports deferred
-    /// errors. File-backed pipelines also sync the file (on Linux, a buffered
+    /// errors. File-backed pipelines and [`to_path_sync`](PbfWriter::to_path_sync)
+    /// also sync the file (on Linux, a buffered
     /// target that does not support `fsync` - a FIFO, socket or character
     /// device such as `/dev/null` - is not an error); a synchronous writer
     /// created with `new` only calls its underlying `Write::flush`, which does
-    /// not guarantee durability. Dropping without flushing performs cleanup but
-    /// cannot report errors or a missing tail.
+    /// not guarantee durability. Dropping without flushing performs cleanup
+    /// but cannot report errors or a missing tail.
     #[hotpath::measure]
     pub fn flush(&mut self) -> io::Result<()> {
         self.mark_finished();
@@ -932,7 +960,7 @@ impl<W: Write> PbfWriter<W> {
             }
         }
         if let Some(ref mut w) = self.writer {
-            w.flush()?;
+            (self.finalize_writer)(w)?;
         }
         WRITER_METRICS
             .flush_ns
@@ -1053,6 +1081,24 @@ impl<W: Write> PbfWriter<W> {
             .bytes_written
             .fetch_add(total_len as u64, Relaxed);
         Ok(())
+    }
+}
+
+impl PbfWriter<BufWriter<File>> {
+    /// Create a synchronous writer that owns a 256 KiB buffered output file.
+    ///
+    /// The returned writer has no header yet. Call
+    /// [`write_header`](Self::write_header), write its blocks, then call
+    /// [`flush`](Self::flush). `flush` pushes the buffered bytes onward and
+    /// synchronizes the file. Use [`PbfWriter::new`] when the caller owns an
+    /// arbitrary `Write` value and only needs its ordinary `Write::flush`
+    /// behavior.
+    pub fn to_path_sync(path: &Path, compression: Compression) -> io::Result<Self> {
+        let file = File::create(path)?;
+        let buffered = BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file);
+        let mut writer = Self::new(buffered, compression);
+        writer.finalize_writer = sync_buffered_file;
+        Ok(writer)
     }
 }
 
@@ -1228,6 +1274,7 @@ mod tests {
                 SeqTotal::new(),
                 Executor::Ambient,
             )),
+            finalize_writer: super::flush_wrapped_writer::<Vec<u8>>,
             #[cfg(test)]
             finished: false,
             scratch: FrameScratch::new(),

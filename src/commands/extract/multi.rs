@@ -107,8 +107,9 @@ pub(super) fn try_extract_multi_single_pass(
     };
     let spatial_filter = spatial_blob_filter(&union_bbox);
 
-    // Open N sync-mode writers. All N outputs are therefore compressed serially
-    // on the consumer thread. Switching to the parallel writer was tried and
+    // Open N sync-mode writers. Each owns a 256 KiB buffer and synchronizes
+    // its output at the final flush. All N outputs are compressed serially on
+    // the consumer thread. Switching to the parallel writer was tried and
     // reverted on 2026-08-20: two interleaved Denmark 5-region pairs came out
     // with opposite signs (parallel/sync 1200/1100 ms, then 501/1101 ms), which
     // is inconclusive, not evidence of a speedup. Do not re-attempt without a
@@ -126,11 +127,8 @@ pub(super) fn try_extract_multi_single_pass(
             };
             hb.sorted()
         })?;
-        let file = BufWriter::new(
-            std::fs::File::create(&slot.output)
-                .map_err(|e| format!("failed to create {}: {e}", display_path.display()))?,
-        );
-        let mut w = PbfWriter::new(file, compression);
+        let mut w = PbfWriter::to_path_sync(&slot.output, compression)
+            .map_err(|e| format!("failed to create {}: {e}", display_path.display()))?;
         w.write_header(&header_bytes)
             .map_err(|e| format!("failed to write header to {}: {e}", display_path.display()))?;
         writers.push(w);

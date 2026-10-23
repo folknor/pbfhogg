@@ -7,6 +7,9 @@ impl ProcessActions for LegacyProcessActions {
         pbfhogg::process::cap_malloc_arenas();
     }
     fn fd_allowance(&self, _wanted: u64) -> FdAllowance {
+        // CLI process policy: keep the raise for this command's lifetime.
+        // Embedded callers choose their own ProcessActions; the library must
+        // not restore this limit and race other process users (ADR-0016).
         pbfhogg::process::raise_nofile_to_hard_cap()
     }
 }

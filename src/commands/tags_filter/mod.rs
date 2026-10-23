@@ -108,6 +108,12 @@ fn trusted_blob_filter(
 }
 
 /// Check if an element's tags match any applicable expression (OR semantics).
+///
+/// Callers pass exactly one kind. Keep the expression-first traversal: it
+/// rejects an inapplicable kind before walking tags. Unlike tags-count this
+/// selects the whole element, and unlike export an empty list matches nothing.
+/// The shared `tag_matches` owns wildcard and negation semantics; this loop
+/// only supplies the element quantifier on the measured classify/write paths.
 fn element_matches(
     expressions: &[Expression],
     tags: &[(&str, &str)],
@@ -1450,7 +1456,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("input.pbf");
         let file = std::fs::File::create(&input).unwrap();
-        let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::default(),
+        );
         writer
             .write_header(&crate::block_builder::HeaderBuilder::new().build().unwrap())
             .unwrap();

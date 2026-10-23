@@ -66,12 +66,18 @@ Only the pipelined iteration methods honour it; the sequential `for_each` and
 | 1. Frame + compress | Rayon pool | Per-thread `FrameScratch` (reusable buffers + lazy-init compressors). Zlib/zstd/none. |
 | 2. Reorder + write | Dedicated writer thread | `ReorderBuffer` (32-slot write-ahead), writes to `FileWriter` |
 
-Every `to_path*` constructor takes a `host::Executor` naming the rayon pool that runs stage 1 (`Ambient` or a caller-owned `Pool`); a writer driven from a worker of that pool waits for permits cooperatively instead of blocking.
+Every pipelined constructor takes a `host::Executor` naming the rayon pool that runs stage 1 (`Ambient` or a caller-owned `Pool`); a writer driven from a worker of that pool waits for permits cooperatively instead of blocking.
 
 Output modes:
 - `PbfWriter::to_path()` - buffered I/O
 - `PbfWriter::to_path_direct()` - O_DIRECT (Linux, `linux-direct-io` feature)
 - `PbfWriter::to_path_uring()` - io_uring with registered buffers (Linux, `linux-io-uring` feature)
+
+Each syncs its output when `flush()` completes. `PbfWriter::to_path_sync()`
+is the synchronous counterpart: no pipeline and no executor, compression on
+the calling thread into a 256 KiB buffer it owns, and the same sync on
+`flush()`. Multi-extract uses it for every region output. `PbfWriter::new()`
+wraps a caller-owned `Write` and only calls its `flush`.
 
 Special: raw passthrough for unmodified blobs via `write_raw()` / `write_raw_chunks()` - zero decompression/recompression, uses `copy_file_range` on Linux.
 
@@ -242,11 +248,28 @@ input with indexdata.
 
 **Auto**: sparse is selected unless the input is sorted and indexed and the
 estimated sparse store (the per-blob indexed node count times 8 bytes) exceeds
-80 % of the page-cache budget. The budget is `MemAvailable` minus 3 GiB of
-anonymous-memory headroom. If the store or budget cannot be estimated, sorted
-and indexed inputs fall back to external; otherwise auto selects sparse.
-This runtime rule follows the measured store-versus-cache behavior documented
-in [performance.md](performance.md).
+80 % of the page-cache budget. The budget is the host's available memory
+minus 3 GiB of anonymous-memory headroom. Available memory comes from the
+caller's `host::Resources`: `Fixed` resources supply it directly on any
+platform, and the CLI's machine probe reads `MemAvailable` and, on Linux,
+caps it by the smallest `memory.max - memory.current` headroom of the
+process's cgroup v2 group and every ancestor visible through this mount
+namespace. Charged page cache counts against that headroom, so the cap is
+conservative. Cgroup v1 limits, `memory.high` and ancestors hidden above a
+delegated mount are not observed; a cgroup v1-only host uses `MemAvailable`
+alone.
+
+The budget is unknown when `/proc/meminfo` or `/proc/self/cgroup` cannot be
+read (every non-Linux target), when the process is in a unified hierarchy
+but no `cgroup2` mount covering its group is visible, or when a limited
+group's `memory.max` or `memory.current` cannot be read or parsed. The store
+estimate is unknown when any OsmData blob lacks indexdata. If either is
+unknown, sorted and indexed inputs fall back to external, and the auto-select
+note says which estimate was missing. Unsorted or unindexed inputs always
+select sparse, since external cannot run on them. Whether the input is
+indexed is read from the first data blob's indexdata; an unreadable or malformed blob there is an input error,
+not a reason to pick sparse. This runtime rule follows the measured
+store-versus-cache behavior documented in [performance.md](performance.md).
 
 ### renumber
 

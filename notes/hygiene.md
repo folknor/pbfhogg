@@ -1053,46 +1053,6 @@ disagree with each other ("Max 7 words scanned" vs "max 31 words"). Fix: an
 
 Reported by: altw and scanning, re-encoding.
 
-## HYG-043 - Altw raises `RLIMIT_NOFILE` from inside a library call and never restores it
-
-Anger: 7 - altw limits and routing.
-
-`raise_nofile_to_hard_cap` permanently raises the process soft limit as a side
-effect of a library function, with no opt-out; a host application relying on
-its own limit (some do, to bound sockets) finds it changed. It is narrated as a
-summary line but the library caller is never told. The fd arithmetic cannot be
-exercised without changing the test process's limits. The stage 1 fallback
-treats a failed `getrlimit` as 1024, and a second `getrlimit` failure after a
-successful `setrlimit` also reports `ProbeFailed` with 1024, under-reporting
-the limit it just raised. Stage 1's math assumes 256 shards per worker open at
-once by design of pass A; a per-bucket shared appender (stage 2's slot-bucket
-shape) removes that. Fix: raise it in the CLI, or restore it on exit from
-`external_join`, behind an option.
-
-Reported by: altw and scanning.
-
-## HYG-044 - Altw auto routing reads the host directly and misreads containers
-
-Anger: 7 - altw limits and routing.
-
-`page_cache_budget_bytes` reads `/proc/meminfo` inside the decision; the pure
-`route_sorted_indexed` is tested but the end-to-end decision can only be tested
-by owning a host with a given RAM. Under a cgroup memory limit `MemAvailable`
-is the host's figure, so a container with 8 GB on a 256 GB host routes europe
-to sparse and thrashes, the failure auto exists to prevent. The 3 GiB anon
-headroom was measured at europe on one host and should grow with the IdSet
-estimate. Off Linux the function returns `None`, so auto routes external for
-every sorted indexed input there, which is wrong for small inputs; the auto
-message should say the reason was "no /proc/meminfo". The `has_index` probe in
-`auto_select_index_type` turns every open, read or parse error into `false`, so
-a corrupt first blob routes sparse with "indexed=false" instead of being
-refused. `/proc/self/stat` is also read unconditionally even without a sidecar.
-Fix: a `HostFacts { mem_available, nofile, cpus, scratch_free }` handed to the
-plan (HYG-035), reading cgroup v2 `memory.max` / `memory.current` and taking the
-minimum; propagate probe errors.
-
-Reported by: altw and scanning.
-
 ## HYG-047 - Code aborts on caller-controlled input where a refusal was owed
 
 Anger: 9 - decode failures and aborts become errors: new refusals, Results on builder hot paths.
@@ -1134,44 +1094,6 @@ deltas).
 
 Reported by: write path, read path, CLI and plumbing, filtering and spatial,
 re-encoding, altw and scanning.
-
-## HYG-049 - Durability and buffering differ between the sync and pipelined writers
-
-Anger: 8 - sync writer fsync cost.
-
-Pipelined backends fsync at end of stream; `PbfWriter::new` (sync) never does,
-so multi-extract, every command on the sync writer and the library examples
-produce un-synced output while single-output commands produce synced output.
-`PbfWriter::new`'s doc says to wrap in a 256 KiB `BufWriter`; multi-extract
-wraps in a default 8 KiB `BufWriter::new`, as do the test helpers in getid,
-getparents, tags_filter and header_walker. `FileWriter` is a public enum with
-public variants, so library users can construct
-`FileWriter::Buffered(BufWriter::new(..))` with any capacity. Fix: decide
-durability once in the writer; a `PbfWriter::to_path_sync(path)` constructor
-that owns the buffer; private variants.
-
-Reported by: write path.
-
-## HYG-050 - Compression levels are validated in one place and defaulted in several
-
-Anger: 8 - compression level types.
-
-The `Zstd` doc says "1-22"; `FromStr` accepts `-7..=22`. `Zlib(u32)` is
-validated to `0..=9` only by `FromStr`, so a library caller's
-`Compression::Zlib(12)` goes straight to `flate2::Compression::new(12)`
-(backend-defined behaviour). An out-of-range `Zstd` level surfaces at the first
-blob on a rayon worker as an opaque `io::Error::other`. `parallel_gzip`
-ignores `Compression` and hardcodes `flate2::Compression::fast()`. Renumber
-does `if compression == Compression::default() { Zlib(1) }`, so a caller who
-explicitly asks for the default level cannot get it, though the comment says it
-respects explicit overrides. Every command defaults to `zlib` (library default
-level) while `bench-write` defaults to `zlib:6`, so the benchmark does not
-measure what commands do unless the library default is 6. Fix: private-field
-`ZlibLevel` / `ZstdLevel` newtypes with checked constructors (the enum is
-already `#[non_exhaustive]`), docs pulled from the same consts;
-`Option<Compression>` where `None` means the command's own default.
-
-Reported by: write path, re-encoding, CLI and plumbing.
 
 ## HYG-051 - Per-run metrics live in process-global statics
 
@@ -1362,22 +1284,6 @@ banning `static` inside `mod test_hooks`.
 Reported by: test harness, read path, write path, altw and scanning, geocode
 index, change application, CLI and plumbing.
 
-## HYG-063 - "Element matches any expression" is implemented four times
-
-Anger: 8 - element kinds, expression semantics.
-
-`tags_filter/mod.rs::element_matches` (bool triple), `tags_count` (same body),
-`tags_filter/osc.rs::matches_any` (a `char` with `_ => false`) and
-`export/mod.rs::matches_expressions` (a `TypeFilter` used as a kind, with
-"admitted" written as `!kind.x || expr.x`, a different formula that agrees only
-because callers pass single-kind filters). `tag_expr.rs` owns parsing and
-`tag_matches` but not the any-expression loop, so each consumer re-decides the
-type-gate semantics. Fix: `Expression::admits(ElementKind)` and
-`any_matches(exprs, kind, tags)` in `tag_expr.rs`; make `type_filter` and
-`matcher` private so no consumer can reimplement the loop.
-
-Reported by: filtering and spatial.
-
 ## HYG-064 - Page-fault counters still read a failed `/proc` sample as zero
 
 Anger: 7 - CLI behaviour.
@@ -1540,27 +1446,6 @@ drain's last node item.
 
 Reported by: change application.
 
-## HYG-088 - Geocode build drops data silently and its smoke test cannot be acted on
-
-Anger: 7 - geocode output.
-
-`classify_way_into` drops refs whose node is absent (`filter_map`), shortening
-streets and opening admin rings, with no counter or line; on an extract this is
-the common case at the border. Admin ways in `needed_admin_ways` but absent from
-`way_geom` surface only as a relation-level count. Dropped relations are counted
-but `RawAdminRelation` has no `id`, so "412 admin relations dropped" cannot be
-acted on; unresolved interpolation ways are a count only (no OSM way ID is kept
-past Pass 2); negative node refs are skipped in Pass 1.5 silently.
-`"WARNING: smoke test query returned no address or street match"` names no
-coordinate or index path and is a stderr line, not a `BuildStats` field, so the
-CLI cannot fail on it and tests cannot assert it. Fix: counters via
-`emit_counter`, a capped sample list of IDs, `BuildStats.smoke_test:
-SmokeOutcome`. The smoke test exists only to need `first_addr_lat_e7` /
-`first_addr_lon_e7`, threaded through both Pass 2 merge closures and
-`Pass2Output`; reading the first record from `addr_points_mmap` gives the same.
-
-Reported by: geocode index.
-
 ## HYG-091 - Significant fallbacks and events happen with no line or counter
 
 Anger: 8 - new diagnostic lines and wording.
@@ -1591,50 +1476,31 @@ key) and a counter.
 Reported by: re-encoding, filtering and spatial, read path, write path, change
 application.
 
-## HYG-094 - io_uring setup treats a failed probe as support
-
-Anger: 7 - CLI behaviour.
-
-`uring_init_and_run` refuses only when the probe succeeds and says WriteFixed
-is unsupported; a failed `register_probe` proceeds. The `RLIMIT_MEMLOCK`
-advice for a `register_buffers` failure is now given only when `getrlimit`
-shows the soft limit below the pool size; the pool size itself (16 MB of
-locked memory) is still assumed.
-
-Reported by: write path.
-
-## HYG-095 - Filtering, inspect and check memory grow without bound
+## HYG-095 - Multi-extract keeps 3N ID sets with no estimate or refusal
 
 Anger: 8 - memory bounds change algorithms and output.
 
-`inspect tags` (`tags_count`) accumulates a global
-`FxHashMap<String, FxHashMap<String, u64>>` over the whole file, filters by
-`--min-count` / `--max-count` afterwards and copies the key into every
-`TagCount`; at planet the distinct-value set is hundreds of millions of strings
-and `--min-count 1000` does not bound memory (a count-min sketch or two-pass
-approach, or at least a documented bound and an `--alloc` bench row).
+`inspect tags` documents its exact-count memory growth, and getid's
+exhaustive `--verbose-ids` output is documented as deliberate. Still open:
 `multi.rs` keeps `3 * N` `IdSet`s for up to 500 regions with no estimate or
-refusal. `print_requested_ids` / `print_missing_ids` print one ID per line with
-no cap, so `-I planet.pbf --verbose-ids` writes billions of lines.
-`parse_geojson`, configs and ID files are read with `read_to_string` of any
-size (acceptable for operator inputs, noted for completeness).
+refusal. `parse_geojson`, configs and ID files are read with
+`read_to_string` of any size (acceptable for operator inputs, noted for
+completeness).
 
 Reported by: CLI and plumbing, filtering and spatial.
 
-## HYG-096 - Geocode builder holds all intermediate state in RAM, some of it twice
+## HYG-096 - Altw holds the per-way sidecar in RAM, and the straddler bound is unchecked
 
-Anger: 7 - geocode output.
+Anger: 8 - altw internals.
 
-`way_geom` (every admin way's geometry), `admin_polygons`, `interp_ways`,
-`StringPool` and `admin_cell_entries` grow with input; the doc acknowledges
-planet limits. `StringPool` stores every string twice (bytes in `data` plus an
-owned `String` key per entry in the `FxHashMap`); hashing into `data` by offset
-is the cheap fix. Altw's `PerWayRcs` and `load_ref_count_sidecar` likewise hold
-the whole per-way sidecar in RAM, proportional to way count and absent from the
-memory accounting the docs quote; stage 4's straddler payloads are bounded by
-the two-piece straddler invariant, which `slot_bucket_count` arithmetic
-maintains and nothing checks at run time (`classify_blobs_in_bucket` errors
-only after the fact).
+The geocode builder's `StringPool` no longer stores strings twice, and why
+its other intermediates stay RAM-resident is recorded in `builder/mod.rs`.
+Left, in altw: `PerWayRcs` and `load_ref_count_sidecar` hold the whole
+per-way sidecar in RAM (encoded bytes plus offsets), proportional to way
+count and absent from the memory accounting the docs quote; stage 4's
+straddler payloads are bounded by the two-piece straddler invariant, which
+`slot_bucket_count` arithmetic maintains and nothing checks at run time
+(`classify_blobs_in_bucket` errors only after the fact).
 
 Reported by: geocode index, altw and scanning.
 

@@ -74,6 +74,13 @@ pub(crate) struct TagMatcher {
 }
 
 /// A parsed filter expression.
+///
+/// Parsing and single-tag semantics live here; consumers own the quantifier.
+/// `tags_count` selects individual tags, while `tags_filter` and export select
+/// whole elements. Export also accepts an empty expression list as unrestricted.
+/// The fields remain crate-visible because the conservative blob prescreen in
+/// `tags_filter::blob_filter_from_expressions` needs both kinds and key matcher
+/// structure, including wildcard forms that disable key-based skipping.
 #[derive(Clone, Debug)]
 pub(crate) struct Expression {
     pub(crate) type_filter: TypeFilter,

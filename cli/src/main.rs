@@ -1056,7 +1056,7 @@ enum Command {
         /// Input PBF file
         file: PathBuf,
         /// Compression spec (e.g. none, zlib:6, zstd:3)
-        #[arg(long, default_value = "zlib:6", value_parser = parse_compression)]
+        #[arg(long, default_value = "zlib", value_parser = parse_compression)]
         compression: Compression,
         /// Writer mode: sync or pipelined
         #[arg(long, default_value = "sync")]
@@ -2972,6 +2972,11 @@ fn resolve_ids(
     Ok(id_set)
 }
 
+// `--verbose-ids` is a deliberately exhaustive diagnostic: no output cap,
+// and `print_missing_ids` collects the missing IDs per kind before printing.
+// With `-I` every input ID participates, so output and storage scale with
+// the input. Both CLI references document this under getid; capping it
+// would make the listing incomplete without saying which IDs were cut.
 fn print_requested_ids(ids: &pbfhogg::getid::ElementIds) {
     output::cli_eprintln!("Requested IDs:");
     if ids.node_ids.has_any() {

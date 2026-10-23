@@ -77,39 +77,6 @@ untouched way, and on one that deletes such a node.
 
 Reported by: change application.
 
-## BUG-037 - `StringTable::pre_seed` identity mapping is not structural
-
-Anger: 9 - string-table remap in the rewrite hot path.
-
-`pre_seed` feeds input strings 1..len through `add`, which dedups. The
-`add_*_raw` / `add_way_raw_bytes*` paths then write the input block's raw
-string indices straight into the output, assuming input index N maps to
-output index N. That holds only if the input table has no duplicates and no
-empty string except at 0, which neither the format nor any check guarantees.
-A duplicate at index j makes `add` return i, the output table is one shorter,
-and every index after j names the wrong string: wrong tags, no error. Raw sids
-are never bounds-checked, and negative sids are cast with `as u32` into
-`tag_key_indices`.
-
-Fix: `pre_seed` pushes unconditionally and inserts into the index only if
-absent, so identity holds by construction; or return a remap table. Test:
-pre-seed from a block with a duplicate and an empty string, assert
-`strings.len() == input_len`; debug-assert every raw sid `< strings.len()` in
-`encode_block`.
-
-Related: the FxHash safety note in `string_table.rs` says every string comes
-from in-process data, never from untrusted PBF input. `pre_seed` and every
-rewrite command's `add` take strings decoded from input PBFs and OSC XML. The
-8000-element block bound may still make FxHash acceptable, but the stated
-reason is wrong.
-
-Also: the empty string sits at slot 0 of the output table but is not seeded
-into the lookup map, so the first `add("")` appends a second empty entry.
-Probably redundant rather than wrong today, but it is the same identity
-assumption `pre_seed` relies on.
-
-Reported by: write path.
-
 ## BUG-079 - The version gate refuses identical repeats from overlapping diffs
 
 Anger: 10 - the version-gate contract.
@@ -224,4 +191,19 @@ fix is HYG-071's shared scratch.
 
 Reported by: change application, filtering and spatial, read path, test
 harness.
+
+## BUG-108 - Raw string-table indices are unchecked in release, and the interner trusts FxHash on input strings
+
+Anger: 9 - string-table remap in the rewrite hot path.
+
+`StringTable::pre_seed` now preserves every source slot, and `BlockBuilder`
+checks raw sids against the table in debug builds only; a release build
+writes an out-of-range raw sid into the output unchecked. Separately, the
+interner hashes input-derived strings with FxHash, and the 8000-element
+block cap does not bound how many strings `pre_seed` inserts, so an
+adversarial string table can force collision-heavy interning. Decide
+whether the raw sid bound belongs in block validation (once per block) and
+whether a collision-resistant hasher is worth its cost on the rewrite path.
+
+Reported by: the wave-9 string-table fixer.
 

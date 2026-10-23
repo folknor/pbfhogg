@@ -968,7 +968,11 @@ PrimitiveBlock lifecycle per worker.
 ## Multi-extract
 
 Single-pass simple strategy on sorted input: read PBF once, classify each
-element against N regions, write to N sync-mode PbfWriters. 3-phase
+element against N regions, write to N sync-mode PbfWriters
+(`PbfWriter::to_path_sync`, each syncing its output at the final flush,
+after `MULTI_REL_WRITE_END`; the `writer_sync_all_ns` and
+`writer_sync_all_calls` counters attribute that cost). The rows below
+predate the per-output sync and the 256 KiB per-output buffer. 3-phase
 barrier (nodes → ways → relations) with per-region `IdSetDense` +
 `BlockBuilder`. 5 disjoint longitude strips per configured bench.
 

@@ -57,13 +57,24 @@ pub struct TagCountOptions<'a> {
 /// expression are counted (same syntax as `tags-filter`).
 ///
 /// Parallel workers via `parallel_classify_phase`: each worker emits a
-/// per-blob `CountMap` (bounded by the blob's ~8 000 elements); the
+/// per-blob `CountMap` (sized to that blob's distinct tags); the
 /// consumer thread merges per-blob maps into a single global. The
 /// accumulate-style alternative (per-worker map held across every
 /// blob a worker sees) hit 26.8 GB peak anon at planet because every
 /// worker held roughly the global cardinality by the end. Per-blob
-/// emission keeps peak anon at a small multiple of one blob's
-/// distinct tags (~few MB) plus the single global map.
+/// emission avoids retaining a whole-file map per worker. Transient map
+/// storage depends on blob contents and the number of in-flight maps;
+/// 8 000 elements is a writer default, not a bound on arbitrary input.
+///
+/// The global map is not bounded independently of input: for D distinct
+/// selected key/value pairs, K distinct keys, and S bytes of stored key/value
+/// strings, it needs O(D + K + S) space plus hash-table capacity overhead.
+/// The blob schedule and in-flight decode/per-blob maps add separate storage.
+/// `min_count` and `max_count` filter only after the exact totals are known;
+/// neither limits this map. Early eviction can lose a later threshold crossing,
+/// and a sketch would change the exact-count contract. Use type/expression
+/// restrictions to reduce cardinality, rather than treating thresholds as a
+/// memory budget. See reference/cli-reference.md, "inspect tags".
 #[hotpath::measure]
 pub fn tags_count(
     path: &Path,
@@ -155,6 +166,11 @@ pub fn tags_count(
         &*host.resources,
     )?;
 
+    // Reserve for all D pairs, even if thresholds retain fewer. While the map
+    // drains, this vector coexists with its remaining allocations; each retained
+    // pair also gets its own key String to satisfy the public TagCount shape.
+    // Values move into the result. Thresholds therefore do not bound even the
+    // result's reserved capacity, and key bytes may be repeated D times.
     let capacity: usize = counts.values().map(rustc_hash::FxHashMap::len).sum();
     let mut results: Vec<TagCount> = Vec::with_capacity(capacity);
     for (key, inner) in counts {
@@ -197,6 +213,11 @@ pub fn tags_count(
 }
 
 /// Check if a tag matches any expression (respecting the element's type).
+///
+/// This predicate is per tag, not per element: counting every tag on an
+/// element with one matching tag would inflate unrelated counts. Callers pass
+/// one kind from the exhaustive Element match below. Keep this quantifier
+/// separate from element filtering and use tag_matches for shared semantics.
 fn matches_expression(
     expressions: &[Expression],
     key: &str,

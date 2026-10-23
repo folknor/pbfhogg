@@ -566,11 +566,11 @@ impl Reader {
                 .into()
             });
 
-        let interpolation =
-            best.interp
-                .and_then(|(way_idx, seg_idx, snap_lat, snap_lon, dist_sq)| {
-                    self.resolve_interpolation(way_idx, seg_idx, snap_lat, snap_lon, dist_sq)
-                });
+        let interpolation = best.interp.and_then(
+            |(way_idx, seg_idx, snap_lat, snap_lon, dist_sq, total_len)| {
+                self.resolve_interpolation(way_idx, seg_idx, snap_lat, snap_lon, dist_sq, total_len)
+            },
+        );
 
         Ok(ReverseResult {
             address,
@@ -641,25 +641,21 @@ impl Reader {
         )
     }
 
-    /// Whether an interpolation way can ever yield a house number.
+    /// Return the total length for a way that has a usable house-number range.
     ///
-    /// This is the resolvability half of [`Self::interpolated_number`]: apart
-    /// from the segment bound, every reason that function returns `None` is a
-    /// property of the way, never of the snap point. The segment bound is not
-    /// repeated here because search only produces segments that belong to
-    /// their way; `interpolated_number` checks it for caller-built candidates,
-    /// whose fields are public. Search sinks use it so that "no interpolation
-    /// result" and "no interpolation candidate" mean the same thing - otherwise a
-    /// nearby but unresolvable fine segment both fails to produce a house
-    /// number and suppresses the coarse fallback that would have.
-    fn interpolation_resolvable(&self, way_index: u32) -> bool {
-        let Some(iw) = self.read_interp_way(way_index) else {
-            return false;
-        };
+    /// Keep this calculation candidate-driven. Building a table at open time
+    /// would walk every interpolation node even when a reader serves only a
+    /// small area. The ranked query retains the winning length, avoiding the
+    /// second walk when it computes that result. Search sinks use this check
+    /// before recording a hit so an unusable fine segment cannot suppress a
+    /// usable coarse fallback. The unranked candidate API still checks each
+    /// returned hit and avoids an eager all-ways cache at reader open.
+    fn interpolation_total_length(&self, iw: InterpWay) -> Option<f64> {
         if iw.start_number == 0 || iw.end_number == 0 {
-            return false;
+            return None;
         }
-        self.way_length_radians(&self.interp_nodes, iw.node_offset, iw.node_count) >= 1e-15
+        let total_len = self.way_length_radians(&self.interp_nodes, iw.node_offset, iw.node_count);
+        (total_len >= 1e-15).then_some(total_len)
     }
 
     fn interpolated_number(
@@ -671,15 +667,28 @@ impl Reader {
     ) -> Option<u32> {
         let iw = self.read_interp_way(way_index)?;
         // Candidates have public fields and may be constructed by callers.
-        // Bound the segment to its owning way before walking node storage.
+        // Reject an invalid segment before reading every node in its way.
         if u32::from(segment_index) + 1 >= u32::from(iw.node_count) {
             return None;
         }
-        if iw.start_number == 0 || iw.end_number == 0 {
+        let total_len = self.interpolation_total_length(iw)?;
+        self.interpolated_number_at_length(iw, segment_index, snap_lat_e7, snap_lon_e7, total_len)
+    }
+
+    fn interpolated_number_at_length(
+        &self,
+        iw: InterpWay,
+        segment_index: u16,
+        snap_lat_e7: i32,
+        snap_lon_e7: i32,
+        total_len: f64,
+    ) -> Option<u32> {
+        // Keep the segment bound at the calculation boundary as defense in
+        // depth; the public entry point checks it before reading the way.
+        if u32::from(segment_index) + 1 >= u32::from(iw.node_count) {
             return None;
         }
-        let total_len = self.way_length_radians(&self.interp_nodes, iw.node_offset, iw.node_count);
-        if total_len < 1e-15 {
+        if iw.start_number == 0 || iw.end_number == 0 || total_len < 1e-15 {
             return None;
         }
         let acc_len = self.accumulated_length_radians(
@@ -781,9 +790,10 @@ impl QueryContext {
 
 /// Tracks nearest candidate of each type for `query()` (allocation-free).
 struct BestTracker {
-    addr: Option<(u32, f64)>,                  // (index, dist_sq)
-    street: Option<(u32, i32, i32, f64)>,      // (way_idx, snap_lat, snap_lon, dist_sq)
-    interp: Option<(u32, u16, i32, i32, f64)>, // (way_idx, seg_idx, snap_lat, snap_lon, dist_sq)
+    addr: Option<(u32, f64)>,             // (index, dist_sq)
+    street: Option<(u32, i32, i32, f64)>, // (way_idx, snap_lat, snap_lon, dist_sq)
+    // (way_idx, seg_idx, snap_lat, snap_lon, dist_sq, total way length)
+    interp: Option<(u32, u16, i32, i32, f64, f64)>,
 }
 
 impl BestTracker {
@@ -876,16 +886,23 @@ impl SearchSink<'_> for BestTracker {
         snap_lon: i32,
         dist_sq: f64,
     ) {
-        if !reader.interpolation_resolvable(segment.way_index) {
-            return;
-        }
         if dist_sq < self.interp.map_or(f64::MAX, |best| best.4) {
+            let Some(way) = reader.read_interp_way(segment.way_index) else {
+                return;
+            };
+            // Only candidates that can improve the current result need a full
+            // way-length scan. Retain the winner's length to avoid scanning it
+            // again while assembling the final house number.
+            let Some(total_len) = reader.interpolation_total_length(way) else {
+                return;
+            };
             self.interp = Some((
                 segment.way_index,
                 segment.segment_index,
                 snap_lat,
                 snap_lon,
                 dist_sq,
+                total_len,
             ));
         }
     }
@@ -933,7 +950,9 @@ impl<'a> SearchSink<'a> for CandidateCollector<'a> {
         let Some(way) = reader.read_interp_way(segment.way_index) else {
             return;
         };
-        if !reader.interpolation_resolvable(segment.way_index) {
+        // This API returns every viable segment hit, so validate each one
+        // before it can make the fine-level candidate list nonempty.
+        if reader.interpolation_total_length(way).is_none() {
             return;
         }
         self.interpolations.push(InterpolationCandidate {
@@ -1457,9 +1476,11 @@ impl Reader {
         snap_lat: i32,
         snap_lon: i32,
         dist_sq: f64,
+        total_len: f64,
     ) -> Option<InterpolationMatch<'_>> {
         let iw = self.read_interp_way(way_idx)?;
-        let house_number = self.interpolated_number(way_idx, seg_idx, snap_lat, snap_lon)?;
+        let house_number =
+            self.interpolated_number_at_length(iw, seg_idx, snap_lat, snap_lon, total_len)?;
         Some(InterpolationMatch {
             street: self.read_string(iw.street_offset),
             house_number,

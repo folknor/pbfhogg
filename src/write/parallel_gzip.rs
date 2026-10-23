@@ -34,12 +34,13 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::panic::AssertUnwindSafe;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use flate2::write::GzEncoder;
 
+use crate::write::metrics::WRITER_METRICS;
 use crate::write::pool_failure::FirstFailure;
 
 // Fault-injection hooks for tests. Gated behind the `static-test-hooks`
@@ -169,7 +170,8 @@ enum Out {
 
 /// Writer that buffers bytes, dispatches chunks to a worker pool for
 /// gzip compression, and emits compressed chunks in order to an inner
-/// writer.
+/// writer. A sequence permit is held from dispatch until ordered drain, so a
+/// slow early chunk cannot make the pending map retain the rest of the stream.
 ///
 /// Call [`finish`](Self::finish) to flush the final partial chunk,
 /// join the workers + writer thread, and recover the inner writer
@@ -187,6 +189,7 @@ pub struct ParallelGzipWriter<W: Write + Send + 'static> {
     /// Whether `finish` has joined the workers and writer thread.
     finished: bool,
     raw_tx: Option<SyncSender<(u64, Job)>>,
+    reorder_permit_rx: Receiver<()>,
     writer_handle: Option<JoinHandle<Option<W>>>,
     worker_handles: Vec<JoinHandle<()>>,
     failure: Arc<FirstFailure>,
@@ -215,6 +218,18 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
         let worker_count = worker_count.max(1);
         let raw_cap = worker_count * QUEUE_SLOTS_PER_WORKER;
         let compressed_cap = worker_count * QUEUE_SLOTS_PER_WORKER;
+        // Bound dispatched sequence numbers to the combined queue and active
+        // worker capacity. The producer can additionally own its current
+        // chunk and one chunk waiting for admission. Queue capacities alone do
+        // not bound `pending`: writer_loop drains completed chunks out of the
+        // compressed queue while an earlier sequence is still running.
+        let reorder_window = raw_cap + worker_count + compressed_cap;
+        let (reorder_permit_tx, reorder_permit_rx) = sync_channel::<()>(reorder_window);
+        for _ in 0..reorder_window {
+            // The receiver is live and the channel capacity equals the number
+            // of initial permits, so every send fits without blocking.
+            reorder_permit_tx.send(()).ok();
+        }
         let (raw_tx, raw_rx) = sync_channel::<(u64, Job)>(raw_cap);
         let (compressed_tx, compressed_rx) = sync_channel::<(u64, Out)>(compressed_cap);
         let failure = Arc::new(FirstFailure::new());
@@ -259,7 +274,13 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
             // under `guarded`. The receiver is owned out here so it is only
             // dropped after a panic has been recorded.
             let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                writer_loop(inner, &compressed_rx, &writer_failure)
+                writer_loop(
+                    inner,
+                    &compressed_rx,
+                    &writer_failure,
+                    &reorder_permit_tx,
+                    reorder_window,
+                )
             }));
             let out = caught.unwrap_or_else(|payload| {
                 writer_failure.record_panic("parallel gzip writer thread", payload.as_ref());
@@ -286,6 +307,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
             #[cfg(test)]
             finished: false,
             raw_tx: Some(raw_tx),
+            reorder_permit_rx,
             writer_handle,
             worker_handles,
             failure,
@@ -301,6 +323,45 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
             .unwrap_or_else(|| io::Error::other(format!("ParallelGzipWriter: {fallback}")))
     }
 
+    /// Wait for room in the sequence window. A timeout only polls the shared
+    /// failure state; it does not reduce the window or add a delay when a
+    /// permit is already available. This also lets an unexpected worker exit
+    /// release the producer instead of leaving it parked behind a lost seq.
+    fn wait_for_reorder_permit(&self) -> io::Result<()> {
+        match self.reorder_permit_rx.try_recv() {
+            Ok(()) => return Ok(()),
+            Err(TryRecvError::Disconnected) => {
+                return Err(self.pool_error("writer stopped before releasing reorder capacity"));
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+
+        let start = std::time::Instant::now();
+        WRITER_METRICS
+            .parallel_gzip_reorder_blocked
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let result = loop {
+            if self.failure.stopped() {
+                break Err(self.pool_error("pool stopped while waiting for reorder capacity"));
+            }
+            match self
+                .reorder_permit_rx
+                .recv_timeout(std::time::Duration::from_millis(25))
+            {
+                Ok(()) => break Ok(()),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    break Err(self.pool_error("writer stopped before releasing reorder capacity"));
+                }
+            }
+        };
+        WRITER_METRICS.parallel_gzip_reorder_wait_ns.fetch_add(
+            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        result
+    }
+
     /// Send one job to the pool under the next sequence number.
     ///
     /// Fails fast once the pool has stopped, so a producer stops feeding a
@@ -309,12 +370,13 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
         if self.failure.stopped() {
             return Err(self.pool_error("pool stopped"));
         }
-        let seq = self.next_seq;
-        self.next_seq += 1;
         let tx = self
             .raw_tx
             .as_ref()
             .ok_or_else(|| io::Error::other("ParallelGzipWriter: already finished"))?;
+        self.wait_for_reorder_permit()?;
+        let seq = self.next_seq;
+        self.next_seq += 1;
         if tx.send((seq, job)).is_err() {
             return Err(self.pool_error("worker pool dropped"));
         }
@@ -610,12 +672,28 @@ fn writer_loop<W: Write>(
     mut inner: W,
     compressed_rx: &Receiver<(u64, Out)>,
     failure: &FirstFailure,
+    reorder_permit_tx: &SyncSender<()>,
+    reorder_window: usize,
 ) -> Option<W> {
     const WHO: &str = "parallel gzip writer thread";
     let mut pending: BTreeMap<u64, Out> = BTreeMap::new();
     let mut expected: u64 = 0;
     while let Ok((seq, out)) = compressed_rx.recv() {
+        if failure.stopped() {
+            for (_, pending_out) in std::mem::take(&mut pending) {
+                discard_failed_out(pending_out, failure, reorder_permit_tx);
+            }
+            discard_failed_out(out, failure, reorder_permit_tx);
+            continue;
+        }
         pending.insert(seq, out);
+        WRITER_METRICS
+            .parallel_gzip_reorder_high_water
+            .fetch_max(pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        debug_assert!(
+            pending.len() <= reorder_window,
+            "parallel gzip reorder map exceeded its admitted sequence window"
+        );
         while let Some(item) = pending.remove(&expected) {
             expected += 1;
             match item {
@@ -640,9 +718,13 @@ fn writer_loop<W: Write>(
                     drop(ack.send(reply));
                 }
             }
+            reorder_permit_tx.send(()).ok();
         }
     }
     if failure.stopped() {
+        for (_, pending_out) in std::mem::take(&mut pending) {
+            discard_failed_out(pending_out, failure, reorder_permit_tx);
+        }
         return None;
     }
     // Producer closed. `pending` should be empty if every seq arrived;
@@ -653,10 +735,28 @@ fn writer_loop<W: Write>(
             "parallel gzip writer: {} chunks missing at seq {expected}",
             pending.len()
         )));
+        for (_, pending_out) in std::mem::take(&mut pending) {
+            discard_failed_out(pending_out, failure, reorder_permit_tx);
+        }
         return None;
     }
     guarded(failure, WHO, || inner.flush())?;
     Some(inner)
+}
+
+/// Discard an output after the stream has failed, answer any flush barrier
+/// with the first error, and return its sequence permit. Once output is
+/// failing, ordered file contents no longer matter, but every waiting producer
+/// and barrier still needs to make progress.
+fn discard_failed_out(out: Out, failure: &FirstFailure, reorder_permit_tx: &SyncSender<()>) {
+    if let Out::Barrier(ack) = out {
+        let reply = match failure.restate() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        };
+        drop(ack.send(reply));
+    }
+    reorder_permit_tx.send(()).ok();
 }
 
 #[cfg(test)]

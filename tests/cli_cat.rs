@@ -1248,7 +1248,7 @@ mod platform {
 
         let out = run_cat(&[&input], &output, None, &[], true);
         if out.is_o_direct_unsupported() {
-            eprintln!("O_DIRECT not supported on this filesystem, skipping test");
+            crate::common::skip("O_DIRECT not supported on this filesystem");
             return;
         }
         assert!(

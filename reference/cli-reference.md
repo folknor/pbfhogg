@@ -64,7 +64,7 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 
 | Flag | Description |
 |------|-------------|
-| `--indexed` | Check if PBF has blob-level indexdata (exit code 0 = yes, 1 = no) |
+| `--indexed` | Check if PBF has blob-level indexdata (exit code 0 = yes, 1 = no). Reads the first data blob only; later blobs are not checked |
 | `--nodes` | Analyze node coordinate statistics for FOR compression sizing |
 | `-j, --jobs <N>` | Parallel worker count for `--nodes`. `0` auto-picks from `available_parallelism()`, `1` forces sequential, higher values cap the pool. **Requires `--nodes`**: no other inspect mode reads it, so passing it elsewhere is an error rather than a no-op. |
 | `--blocks [N]` | Show per-block distribution stats and optional block listing (N limits to first/last N blocks) |

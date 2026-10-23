@@ -50,6 +50,15 @@ fn push_attribute_escaped<'a>(elem: &mut BytesStart<'a>, key: &'a str, value: &s
 }
 
 // ---------------------------------------------------------------------------
+// Owned and borrowed element writers deliberately retain separate metadata
+// adapters: owned attributes preserve lexical timestamp/number/visible strings,
+// while borrowed Info uses typed, independently optional fields and DenseInfo
+// has a per-element absence sentinel. A common element trait must preserve
+// those distinctions, attribute order, empty-element shape and scratch reuse;
+// converting borrowed elements to owned strings would add per-element work to
+// the measured diff/derive output path. Share the tag event loop below without
+// changing either metadata representation or the emitted XML event sequence.
+//
 // Owned element types - Vec fields are not converted to Box<[T]> because these
 // are low-volume types (derive_changes/diff output), not hot-path allocations.
 // ---------------------------------------------------------------------------
@@ -267,13 +276,7 @@ pub(crate) fn write_tags_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     tags: &[(String, String)],
 ) -> crate::BoxResult<()> {
-    for (k, v) in tags {
-        let mut tag = BytesStart::new("tag");
-        push_attribute_escaped(&mut tag, "k", k.as_str());
-        push_attribute_escaped(&mut tag, "v", v.as_str());
-        writer.write_event(Event::Empty(tag))?;
-    }
-    Ok(())
+    write_borrowed_tags_xml(writer, tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
 }
 
 fn write_borrowed_tags_xml<'a, W: std::io::Write>(

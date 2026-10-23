@@ -12,10 +12,13 @@ use crate::commands::{ensure_node_capacity, flush_block};
 
 use super::Result;
 use super::diff_ranges::{DiffRanges, UpsertCursors};
-use super::element_writes::{write_osc_relation, write_osc_way};
+use super::element_writes::{add_osc_node, write_osc_relation, write_osc_way};
 use super::loc_mode::LocMode;
 use super::stats::MergeStats;
 
+// This dispatch submits capacity flushes directly to PbfWriter. Its local
+// counterpart in rewrite_block returns blocks to the ordered drain instead;
+// both share encoding without changing either path's flush/stat ownership.
 /// Emit a single create element via PbfWriter (for gap creates and trailing creates).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_create_for_output(
@@ -31,13 +34,7 @@ pub(super) fn emit_create_for_output(
         ElemKind::Node => {
             if let Some(osc) = diff.get_node(id) {
                 ensure_node_capacity(bb, writer)?;
-                bb.add_node(
-                    osc.id(),
-                    osc.decimicro_lat(),
-                    osc.decimicro_lon(),
-                    osc.tags(),
-                    osc.metadata().as_ref(),
-                );
+                add_osc_node(bb, &osc);
                 stats.diff_nodes += 1;
             }
         }

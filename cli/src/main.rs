@@ -815,19 +815,18 @@ enum Command {
         #[arg(long)]
         keep_untagged_nodes: bool,
         /// Node coordinate index type:
-        ///   auto     - route on scale (recommended): sparse unless the input is
-        ///              sorted + indexed (external's precondition) AND the estimated
-        ///              node store (8 bytes per node, from blob indexdata) exceeds
-        ///              ~80% of this host's available RAM, where sparse's random
-        ///              lookups start thrashing the page cache.
-        ///   sparse   - rank-indexed flat mmap array (~8 bytes per referenced node).
-        ///              Fast at small / medium scale; survives europe at ~6 minutes
-        ///              on a 27 GB-RAM host. Works on any PBF. Needs temp disk equal
-        ///              to referenced_nodes * 8 bytes.
-        ///   external - double radix permutation. Bounded memory (~8.7 GB planet),
-        ///              all sequential I/O. The only mode that survives at planet
-        ///              on memory-constrained hosts. Requires sorted PBF and
-        ///              indexdata. ~224 GB temp disk at planet.
+        ///   auto     - route by input eligibility and estimated node-store size:
+        ///              unsorted or unindexed input uses sparse; sorted, indexed
+        ///              input uses external when the estimate exceeds the
+        ///              fixed share of the page-cache budget. If either
+        ///              estimate is unavailable, sorted, indexed input uses
+        ///              external. See reference/pipeline.md.
+        ///   sparse   - rank-indexed flat mmap array, sized at 8 bytes per
+        ///              referenced node. Works on any PBF and needs temporary
+        ///              disk equal to referenced_nodes * 8 bytes. This is the default.
+        ///   external - double radix join with bounded working memory and
+        ///              sequential I/O. Requires sorted input with indexdata and
+        ///              has high temporary-disk demand. See reference/performance.md.
         #[arg(long, default_value = "sparse")]
         index_type: IndexTypeArg,
         /// Emit pbfhogg's opt-in WayMembers-v1 and SharedNodePins-v1 metadata.
@@ -871,7 +870,8 @@ enum Command {
         /// Input PBF file
         #[arg(required = true)]
         file: Option<PathBuf>,
-        /// Check if PBF has blob-level indexdata (exit code 0/1)
+        /// Check if PBF has blob-level indexdata (exit code 0/1). Reads the
+        /// first data blob only; later blobs are not checked.
         #[arg(long)]
         indexed: bool,
         /// Analyze node coordinate statistics for FOR compression sizing

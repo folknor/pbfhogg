@@ -71,19 +71,43 @@ These commands will error if the input PBF lacks indexdata:
 - `tags-filter` - skips blobs lacking required tag keys
 - `getid` - skips blobs whose ID range has no intersection with requested IDs
 - `cat --type` - skips non-matching blob types entirely
+- `cat --clean` and `cat --dedupe` - per-kind scheduling and merging
+- `repack` and `degrade` (except the metadata-only `--strip-indexdata` path) - per-kind blob schedules
 - `inspect tags --type` - type-filtered tag counting
 - `inspect --nodes` - node coordinate analysis
-- `build-geocode-index` - multi-pass pipeline with type filtering
+- `build-geocode-index` - multi-pass pipeline with type filtering (escape differs, see below)
+- `renumber` - per-blob element counts for ID assignment (no escape, see below)
+
+The escape, and whether a command refuses at all, is decided per command:
+
+- `build-geocode-index` refuses unindexed input unless `--allow-unindexed` is
+  passed. Its `--force` is a legacy shorthand that grants both
+  `--allow-unindexed` and `--overwrite`.
+- `renumber` has no escape. It reads each blob's element count from indexdata
+  to assign new IDs without a decode pass, so its header scan refuses the
+  input if any data blob lacks indexdata.
+- `getparents` and `check --ids` do not refuse: `getparents` uses indexdata
+  to choose a scan strategy, and `check --ids` warns that unindexed input
+  is scanned more slowly.
+- `tags-filter` asks for indexdata only when it would use it: not with
+  `--invert` or `--distrust-metadata`.
+
+Except for renumber's scan, the check reads only the first data blob's
+header. A file whose first data blob is indexed passes it even if later blobs
+are not; what happens on those later blobs depends on the command (some decode
+them on a fallback path, others stop with an error mid-run). It is not a
+whole-file validation.
 
 ## The --force flag
 
-Pass `--force` to any command to skip the indexdata check and proceed with a raw (non-indexed) PBF:
+For the other commands in the list above, pass `--force` to skip the indexdata
+check and proceed with a raw (non-indexed) PBF:
 
 ```sh
 pbfhogg sort raw-input.osm.pbf -o sorted.osm.pbf --force
 ```
 
-Commands will work but use slower fallback paths - they must decompress every blob to determine its contents instead of reading the blob header metadata.
+Commands will work but use slower fallback paths - they must decompress every blob to determine its contents instead of reading the blob header metadata. `--force` is not a universal escape: see the exceptions above.
 
 The recommended workflow is to generate an indexed PBF once with `pbfhogg cat`, then use it for all subsequent operations.
 
@@ -111,3 +135,7 @@ pbfhogg inspect --indexed denmark.osm.pbf
 ```
 
 Exit code 0 means indexed, exit code 1 means not indexed. This is useful in scripts to decide whether to run `cat` first.
+
+The answer comes from the first data blob only, the same probe the commands
+above use: a file whose first data blob carries indexdata reports indexed even
+if later blobs do not, and a file with no data blobs reports not indexed.

@@ -13,6 +13,7 @@ use std::cell::RefCell;
 use crate::error::{BlobError, ErrorKind, Result, new_blob_error, new_error};
 
 use super::blob_wire::{BlobData, MAX_BLOB_MESSAGE_SIZE, WireBlob};
+use super::pipeline_metrics::PIPELINE_METRICS;
 
 thread_local! {
     /// Per-thread reusable zlib decompressor state (~32 KB inflate tables).
@@ -33,6 +34,9 @@ const MAX_RETAINED_CAPACITY: usize = 4 * 1024 * 1024;
 /// Maximum number of buffers retained in the pool.
 /// Defense-in-depth: prevents unbounded pool growth if pipeline topology changes.
 const MAX_POOL_SIZE: usize = 64;
+
+// The retained payload capacity is at most 64 * 4 MiB = 256 MiB. Buffers
+// rejected by either limit are dropped and counted for the read sidecar.
 
 /// Thread-safe pool of decompression buffers for reuse across pipeline blobs.
 ///
@@ -73,14 +77,16 @@ impl DecompressPool {
     /// preventing outlier blobs from permanently inflating pool memory.
     /// Also enforces a count cap as defense-in-depth.
     fn put(&self, mut buf: Vec<u8>) {
-        if buf.capacity() > MAX_RETAINED_CAPACITY {
+        let capacity = buf.capacity();
+        if capacity > MAX_RETAINED_CAPACITY {
+            PIPELINE_METRICS.record_decompress_pool_oversize_drop(capacity);
             return;
         }
         buf.clear();
-        if let Ok(mut v) = self.buffers.lock()
-            && v.len() < MAX_POOL_SIZE
-        {
-            v.push(buf);
+        match self.buffers.lock() {
+            Ok(mut buffers) if buffers.len() < MAX_POOL_SIZE => buffers.push(buf),
+            Ok(_) => PIPELINE_METRICS.record_decompress_pool_full_drop(capacity),
+            Err(_) => PIPELINE_METRICS.record_decompress_pool_poisoned_drop(capacity),
         }
     }
 }

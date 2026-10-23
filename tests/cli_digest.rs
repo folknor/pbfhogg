@@ -666,7 +666,7 @@ fn osmium_reencodings_digest_equal() {
         .output()
         .is_err()
     {
-        eprintln!("osmium not found, skipping cross-validation");
+        crate::common::skip("osmium not found in PATH");
         return;
     }
     let dir = TempDir::new().expect("tempdir");

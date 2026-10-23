@@ -710,12 +710,11 @@ fn capture(s: &Scenario) -> Option<BTreeMap<&'static str, String>> {
         // Same environment skip every other uring test in the suite
         // makes: bygg's RLIMIT_MEMLOCK hard limit is 8 MB (the writer
         // registers 16 MB) and a seccomp sandbox denies io_uring_setup.
-        // Loud on purpose, so a gate log never reads as full coverage.
-        eprintln!(
-            "[host-identity] SKIPPED {}: io_uring unavailable on this host: {}",
+        crate::common::skip(format!(
+            "host-identity scenario {}: io_uring unavailable on this host: {}",
             s.name,
             output.stderr_str().lines().last().unwrap_or("")
-        );
+        ));
         return None;
     }
     if !output.status.success() && s.name.ends_with("_direct_io") {

@@ -5,6 +5,7 @@ use super::block::{HeaderBlock, PrimitiveBlock};
 use super::elements::Element;
 use super::file_reader::FileReader;
 use super::pipeline::PipelineConfig;
+use super::pipeline_metrics::PIPELINE_METRICS;
 use crate::blob_meta::BlobFilter;
 use crate::error::{ErrorKind, Result, new_error};
 use std::collections::VecDeque;
@@ -512,7 +513,7 @@ where
     let identity = &identity;
     let reduce_op = &reduce_op;
 
-    std::thread::scope(|scope| -> Result<T> {
+    let result = std::thread::scope(|scope| -> Result<T> {
         // Installed before the first worker spawns: if the calling thread
         // unwinds inside this scope - a `scope.spawn` failure, or a panicking
         // `R::read` inside the pump - this closes the queue and shuts the budget
@@ -579,7 +580,9 @@ where
             acc = reduce_op(acc, partial);
         }
         Ok(acc)
-    })
+    });
+    PIPELINE_METRICS.emit_decompress_pool_counters();
+    result
 }
 
 /// Total compressed bytes allowed in flight across the frame pump's queue and
@@ -867,6 +870,8 @@ impl BatchQueue {
 /// The frame pump is the sole acquirer; workers release as batches finish. A
 /// blob is admitted whenever it fits under the cap, or unconditionally when the
 /// budget is empty so a single legal blob larger than the cap cannot deadlock.
+/// This is the only case where `used` may exceed `cap`; while that blob is
+/// charged, every later acquire waits for its release.
 /// `shutdown` wakes a blocked pump so worker errors cancel the read promptly.
 struct ByteBudget {
     state: Mutex<ByteBudgetState>,
@@ -912,6 +917,11 @@ impl ByteBudget {
 
     fn release(&self, n: u64) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        debug_assert!(
+            state.used >= n,
+            "ByteBudget released {n} bytes with only {} admitted",
+            state.used
+        );
         state.used = state.used.saturating_sub(n);
         drop(state);
         self.cond.notify_one();

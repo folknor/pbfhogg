@@ -245,6 +245,23 @@ exception, not a tier - should not survive across many PRs.
   predicates `is_o_direct_unsupported`, `is_uring_unsupported`.
   Binary located via `BROKKR_TEST_BIN_DIR` (set per sweep) with
   fallback to `CARGO_TARGET_DIR + cfg!(debug_assertions)`.
+- **Dataset and scratch paths.** `tests/common/mod.rs` resolves the
+  dataset paths through `common::test_dataset_path`; the shared path helper
+  in `tests/common/scratch.rs` reads path overrides. The helpers resolve the
+  Denmark raw PBF from `PBFHOGG_TEST_PBF`, the indexed PBF from
+  `PBFHOGG_TEST_PBF_INDEXED`, the sequence 4705 OSC from
+  `PBFHOGG_TEST_OSC`, the data root from `PBFHOGG_TEST_DATA_DIR`, and the
+  test scratch root from `PBFHOGG_TEST_SCRATCH_DIR`. Without overrides, it
+  uses the repository data directory and the legacy Denmark filenames;
+  scratch falls under `test-scratch` in that data directory. Brokkr still
+  needs to export the resolved paths from the selected host configuration to
+  both `check` and `test` as absolute paths; until then, brokkr-launched tests
+  fall back to the repository paths.
+- **Skip markers.** `common::skip()` writes a `PBFHOGG_TEST_SKIP:` marker
+  with the reason. If `PBFHOGG_TEST_MUST_RUN` is set, the helper panics
+  instead of skipping. Brokkr still needs to set that variable for profiles
+  that require selected data or platform tests, and report marker counts for
+  ordinary runs that permit skips.
 - **Adversarial fixtures.** `tests/common/adversarial.rs` provides
   byte-level mutation primitives: `locate_blobs`,
   `mutate_blob_header_indexdata`, `mutate_blob_payload`,
@@ -255,7 +272,8 @@ exception, not a tier - should not survive across many PRs.
   `generate_relations_with_negatives` for mixed-sign fixtures (per
   `decisions/0002-negative-ids-rejected-project-wide.md`).
 - **Test scratch.** `tests/common/scratch.rs` owns random, RAII-cleaned
-  directories under `data/test-scratch/`. It is the one implementation
+  directories under the configured test scratch root (by default
+  `data/test-scratch/`). It is the one implementation
   for both harnesses: integration tests reach it as
   `common::test_scratch()`, and unit tests under `src/` as
   `path_guard::tests::scratch()`, which mounts the same file by `#[path]`

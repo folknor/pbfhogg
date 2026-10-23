@@ -81,13 +81,18 @@ pbfhogg add-locations-to-ways input.osm.pbf -o output.osm.pbf --index-type exter
 |------|--------|------|-----------------|----------|
 | `sparse` (default) | Depends on the referenced-node working set | `referenced_count * 8` bytes | no | When the working set fits available page cache; see `reference/performance.md` for measurements |
 | `external` | Bounded memory | High scratch-disk demand; see `reference/performance.md` for measurements | yes + indexdata | Sorted, indexed input when the sparse working set is too large |
-| `auto` | varies | varies | See `reference/pipeline.md` | Recommended default |
+| `auto` | Runtime routing by input eligibility and estimated store/page-cache budget | varies | no (unsorted or unindexed input routes to sparse) | Selects a backend at runtime |
 
 **sparse** is a rank-indexed flat mmap array (~8 bytes per referenced node). Builds a referenced-id IdSet in pass 1, then writes locations in pass 2 indexed by rank within that set. Works on any PBF.
 
 **external** uses a four-stage ID- and slot-position-bucketed join with bounded memory. Requires sorted input with indexdata. See `reference/performance.md` for measured scratch-disk needs.
 
-**auto** chooses a backend at runtime. Its routing rule and fallback behavior are documented in `reference/pipeline.md`; the selected backend is reported to stderr. Explicit `--index-type sparse|external` bypasses auto routing.
+**auto** uses sparse for unsorted or unindexed input. For sorted, indexed input,
+it uses external when the estimated store exceeds a fixed share of the
+page-cache budget; if either estimate is unavailable, it uses external. The
+full routing rule is documented in `reference/pipeline.md`; the selected
+backend is reported to stderr. Explicit `--index-type sparse|external`
+bypasses auto routing.
 
 A previous `dense` mode (a direct-mapped mmap array indexed by node ID) was removed. See `reference/performance.md` for measured comparisons.
 
@@ -131,9 +136,9 @@ Build a reverse geocoding index from a PBF file:
 pbfhogg build-geocode-index denmark.osm.pbf --output-dir geocode-index/
 ```
 
-This runs a 4-pass pipeline: admin boundary relations, referenced node collection, node+way fused scan, and bucketed S2 cell assignment. The output is a set of 19 memory-mappable binary files for fast reverse geocoding queries.
+This runs a 4-pass pipeline: admin boundary relations, referenced node collection, node+way fused scan, and bucketed S2 cell assignment. The output is a set of memory-mappable binary files for fast reverse geocoding queries.
 
-Europe: ~10 minutes, 7.5 GB RSS. Planet: ~22 minutes, 18 GB RSS.
+Build time and memory use depend on the input and host. See `reference/performance.md` for measurements.
 
 The index can be queried from Rust using the `geocode-reader` feature:
 

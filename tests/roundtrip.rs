@@ -605,7 +605,7 @@ fn roundtrip_direct_io() {
     let mut writer = match write_result {
         Ok(w) => w,
         Err(e) if crate::common::is_einval(&e) => {
-            eprintln!("O_DIRECT not supported on this filesystem, skipping test");
+            crate::common::skip(format!("O_DIRECT not supported on this filesystem: {e}"));
             return;
         }
         Err(e) => panic!("unexpected error opening with O_DIRECT: {e}"),
@@ -699,7 +699,7 @@ fn roundtrip_pipelined_direct_io() {
     let mut writer = match write_result {
         Ok(w) => w,
         Err(e) if crate::common::is_einval(&e) => {
-            eprintln!("O_DIRECT not supported on this filesystem, skipping test");
+            crate::common::skip(format!("O_DIRECT not supported on this filesystem: {e}"));
             return;
         }
         Err(e) => panic!("unexpected error opening with O_DIRECT: {e}"),
@@ -777,7 +777,7 @@ fn roundtrip_uring_tiny_output() {
     ) {
         Ok(w) => w,
         Err(e) if crate::common::is_uring_unavailable(&e) => {
-            eprintln!("io_uring not available, skipping: {e}");
+            crate::common::skip(format!("io_uring not available: {e}"));
             return;
         }
         Err(e) => panic!("unexpected io_uring open error: {e}"),
@@ -846,7 +846,7 @@ fn roundtrip_uring_small_size_sweep() {
         ) {
             Ok(w) => w,
             Err(e) if crate::common::is_uring_unavailable(&e) => {
-                eprintln!("io_uring not available, skipping: {e}");
+                crate::common::skip(format!("io_uring not available: {e}"));
                 return;
             }
             Err(e) => panic!("unexpected io_uring open error: {e}"),

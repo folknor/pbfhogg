@@ -358,6 +358,13 @@ fn classify_way_into(
 
     // Building addresses (centroid) - main thread interns + streams.
     if is_building_addr {
+        // This is the arithmetic mean of every resolved way coordinate. An
+        // explicitly closed way counts its first vertex twice, and the mean
+        // can fall outside a concave footprint. Replacing it with an area
+        // centroid or an interior point changes stored address coordinates
+        // and therefore query results; those methods also differ for concave
+        // or malformed geometry. Keep the current placement until the
+        // building-address point policy specifies which result is intended.
         let (sum_lat, sum_lon) = coords.iter().fold((0i64, 0i64), |acc, &(lat, lon)| {
             (acc.0 + i64::from(lat), acc.1 + i64::from(lon))
         });

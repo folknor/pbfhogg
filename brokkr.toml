@@ -192,6 +192,18 @@ exclude = ["cli/src/output.rs"]
 region = "code"
 message = "only cli/src/output.rs acquires stdout; use output::buffered, or have the library take an io::Write"
 
+# Test datasets and scratch resolve through tests/common (test_dataset_path,
+# test_scratch), which honour the PBFHOGG_TEST_* override variables. A literal
+# "data/..." path in a test bypasses those overrides, so on a host whose
+# datasets live elsewhere the test silently skips. `region = "string"` keeps
+# comments and docs free to name the default layout.
+[[textlint]]
+name = "test-data-paths-via-common"
+pattern = '\bdata/'
+paths = ["tests/**/*.rs", "cli/tests/**/*.rs"]
+region = "string"
+message = "Resolve data and scratch paths through tests/common helpers so brokkr overrides apply"
+
 [bin]
 default = "pbfhogg"
 install = ["pbfhogg-cli"]
@@ -1139,10 +1151,11 @@ message = "Library diagnostics must use the caller's Diagnostics handle; the CLI
 
 # Unit-test scratch under src/ comes from `path_guard::tests::scratch()`,
 # which mounts tests/common/scratch.rs: random directories under the
-# gitignored data/test-scratch/, removed when the guard drops. Fixed names in
-# the system temp dir let concurrent check sweeps delete each other's
-# fixtures. The `_in` forms (`tempfile_in`, `tempdir_in`, `TempDir::new_in`)
-# stay legal so a test can place a file inside its guard's directory.
+# gitignored test scratch root, removed when the guard drops. The default is
+# data/test-scratch/; PBFHOGG_TEST_SCRATCH_DIR overrides it. Fixed names in the
+# system temp dir let concurrent check sweeps delete each other's fixtures.
+# The `_in` forms (`tempfile_in`, `tempdir_in`, `TempDir::new_in`) stay legal
+# so a test can place a file inside its guard's directory.
 [[textlint]]
 name = "unit-test-scratch-via-path-guard"
 pattern = '\benv::temp_dir\b|\btempfile::(?:tempdir|tempfile|NamedTempFile|Builder)\b|\bTempDir::new\b'

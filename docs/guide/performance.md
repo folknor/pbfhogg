@@ -90,16 +90,9 @@ The `--locations-on-ways` flag replaces a two-step pipeline with a single comman
 
 ## Planet-scale pipeline
 
-The full production pipeline on the planet (87 GB, ~3.4B elements) runs on a 30 GB machine:
-
-| Step | Command | Time | Peak memory |
-|------|---------|------|-------------|
-| Generate indexdata | `cat` | ~8 min | minimal |
-| Add way-node coordinates | `add-locations-to-ways --index-type external` | ~24 min | ~17 GB |
-| Build geocode index | `build-geocode-index` | ~22 min | ~18 GB |
-| Apply daily diff | `apply-changes` | ~13 min | ~1.8 GB |
-
-Every command runs with bounded memory. No 128 GB server required.
+Runtime and resource use depend on the command, input snapshot, encoding, and
+host. See `reference/performance.md` for measured command runs and
+`reference/performance-history.md` for optimization history.
 
 ## Performance tips
 
@@ -115,11 +108,15 @@ Generate an indexed PBF once with `pbfhogg cat`, then use it for all subsequent 
 |------|----------|-----------|
 | `sparse` (default) | When the working set fits available page cache | Rank-indexed flat mmap (~8 bytes per referenced node); needs `referenced_count * 8` bytes of temp disk |
 | `external` | Sorted, indexed input when the sparse working set is too large | Bounded memory and sequential I/O; see `reference/performance.md` for measured scratch-disk needs |
-| `auto` | Recommended default | Runtime routing; see `reference/pipeline.md` |
+| `auto` | Runtime routing by input eligibility and estimated store/page-cache budget | See `reference/pipeline.md` |
 
 See `reference/performance.md` for measured comparisons between the sparse and external strategies and for the scale-specific behavior of earlier strategies.
 
-The `auto` routing rule and fallback behavior are documented in `reference/pipeline.md`.
+`auto` uses sparse for unsorted or unindexed input. For sorted, indexed input,
+it uses external when the estimated store exceeds a fixed share of the
+page-cache budget; if either estimate is unavailable, it uses external. The
+full routing rule and fallback behavior are documented in
+`reference/pipeline.md`.
 
 ### O_DIRECT for planet-scale I/O
 

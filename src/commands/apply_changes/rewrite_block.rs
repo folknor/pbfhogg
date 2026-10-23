@@ -4,7 +4,7 @@
 //! main thread to hand to the pipelined writer.
 
 use crate::blob_meta::ElemKind;
-use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::osc::CompactDiffOverlay;
 use crate::{Element, PrimitiveBlock};
 
@@ -12,8 +12,9 @@ use crate::commands::{ensure_node_capacity_local, ensure_relation_capacity_local
 
 use super::Result;
 use super::element_writes::{
-    write_base_dense_node_local, write_base_node_local, write_base_relation_local,
-    write_base_way_local, write_base_way_local_with_locations, write_osc_way_local,
+    add_osc_node, add_osc_relation, write_base_dense_node_local, write_base_node_local,
+    write_base_relation_local, write_base_way_local, write_base_way_local_with_locations,
+    write_osc_way_local,
 };
 use super::loc_mode::LocMode;
 use super::stats::MergeStats;
@@ -24,6 +25,9 @@ pub(super) struct RewriteOutput {
     pub(super) stats: MergeStats,
 }
 
+// The create dispatch mirrors stream_output, but capacity checks below must
+// flush into this worker's local blocks before stats advance. The shared
+// add_osc_* helpers own only encoding, not ordering or output submission.
 /// Emit a single create element into the local BlockBuilder.
 #[allow(clippy::too_many_arguments)]
 fn emit_create_local(
@@ -39,13 +43,7 @@ fn emit_create_local(
         ElemKind::Node => {
             if let Some(osc) = diff.get_node(id) {
                 ensure_node_capacity_local(bb, output)?;
-                bb.add_node(
-                    osc.id(),
-                    osc.decimicro_lat(),
-                    osc.decimicro_lon(),
-                    osc.tags(),
-                    osc.metadata().as_ref(),
-                );
+                add_osc_node(bb, &osc);
                 stats.diff_nodes += 1;
             }
         }
@@ -58,14 +56,7 @@ fn emit_create_local(
         ElemKind::Relation => {
             if let Some(osc) = diff.get_relation(id) {
                 ensure_relation_capacity_local(bb, output)?;
-                let members: Vec<MemberData<'_>> = osc
-                    .members()
-                    .map(|(mt, ref_id, role)| MemberData {
-                        id: crate::MemberId::from_id_and_type(ref_id, mt),
-                        role,
-                    })
-                    .collect();
-                bb.add_relation(osc.id(), osc.tags(), &members, osc.metadata().as_ref());
+                add_osc_relation(bb, &osc);
                 stats.diff_relations += 1;
             }
         }
@@ -136,13 +127,7 @@ pub(super) fn rewrite_block_parallel(
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_node(id) {
                     ensure_node_capacity_local(bb, &mut output)?;
-                    bb.add_node(
-                        osc.id(),
-                        osc.decimicro_lat(),
-                        osc.decimicro_lon(),
-                        osc.tags(),
-                        osc.metadata().as_ref(),
-                    );
+                    add_osc_node(bb, &osc);
 
                     stats.diff_nodes += 1;
                 } else {
@@ -159,13 +144,7 @@ pub(super) fn rewrite_block_parallel(
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_node(id) {
                     ensure_node_capacity_local(bb, &mut output)?;
-                    bb.add_node(
-                        osc.id(),
-                        osc.decimicro_lat(),
-                        osc.decimicro_lon(),
-                        osc.tags(),
-                        osc.metadata().as_ref(),
-                    );
+                    add_osc_node(bb, &osc);
 
                     stats.diff_nodes += 1;
                 } else {
@@ -201,14 +180,7 @@ pub(super) fn rewrite_block_parallel(
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_relation(id) {
                     ensure_relation_capacity_local(bb, &mut output)?;
-                    let members: Vec<MemberData<'_>> = osc
-                        .members()
-                        .map(|(mt, ref_id, role)| MemberData {
-                            id: crate::MemberId::from_id_and_type(ref_id, mt),
-                            role,
-                        })
-                        .collect();
-                    bb.add_relation(osc.id(), osc.tags(), &members, osc.metadata().as_ref());
+                    add_osc_relation(bb, &osc);
 
                     stats.diff_relations += 1;
                 } else {

@@ -27,7 +27,7 @@ pub mod adversarial;
 pub mod cli;
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -36,6 +36,38 @@ use pbfhogg::{BlobDecode, BlobReader, Element, ElementReader, MemberId};
 mod scratch;
 #[allow(unused_imports)]
 pub use scratch::test_scratch;
+
+#[derive(Clone, Copy)]
+pub enum TestDataset {
+    DenmarkRawPbf,
+    DenmarkIndexedPbf,
+    DenmarkOsc4705,
+}
+
+impl TestDataset {
+    const fn override_var(self) -> &'static str {
+        match self {
+            Self::DenmarkRawPbf => "PBFHOGG_TEST_PBF",
+            Self::DenmarkIndexedPbf => "PBFHOGG_TEST_PBF_INDEXED",
+            Self::DenmarkOsc4705 => "PBFHOGG_TEST_OSC",
+        }
+    }
+
+    const fn fallback_file(self) -> &'static str {
+        match self {
+            Self::DenmarkRawPbf => "denmark-20260220-seq4704.osm.pbf",
+            Self::DenmarkIndexedPbf => "denmark-20260220-seq4704-with-indexdata.osm.pbf",
+            Self::DenmarkOsc4705 => "denmark-20260221-seq4705.osc.gz",
+        }
+    }
+}
+
+/// Resolve a named test dataset: the dataset's override variable when set,
+/// else its legacy filename under the test data root.
+pub fn test_dataset_path(dataset: TestDataset) -> PathBuf {
+    scratch::path_override(dataset.override_var())
+        .unwrap_or_else(|| scratch::test_data_dir().join(dataset.fallback_file()))
+}
 
 /// Emit one machine-countable skip marker; required runs fail on a skip.
 pub fn skip(reason: impl std::fmt::Display) {

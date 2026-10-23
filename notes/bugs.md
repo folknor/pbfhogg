@@ -191,3 +191,17 @@ whether a collision-resistant hasher is worth its cost on the rewrite path.
 
 Reported by: the wave-9 string-table fixer.
 
+## BUG-109 - The writer can emit a blob its own reader refuses
+
+Anger: 9 - writer framing on a hot path.
+
+`encode_blob_body` records `raw_size` from the uncompressed block, while the
+writer's size guard caps only the encoded Blob body. A highly compressible
+block whose raw size exceeds the reader's 32 MiB limit can therefore be
+written with an in-limit encoded body and then refused on read. The block
+builder's element cap normally keeps raw size far below the limit; whether
+any producer (passthrough reframe, apply-changes, repack with a large
+`--elements-per-blob`) can reach it is unverified.
+
+Reported by: the wave-11 write-growth fixer.
+

@@ -1011,8 +1011,25 @@ impl<W: Write> PbfWriter<W> {
     }
 
     /// Encode, compress, and write a blob directly to the writer using reusable
-    /// scratch buffers. Eliminates all intermediate `Vec` allocations after warmup.
+    /// scratch buffers. Eliminates all intermediate `Vec` allocations after
+    /// warmup, except that a scratch buffer grown past the framing module's
+    /// 4 MiB retention limit is dropped after its blob and regrown on demand.
     fn write_framed_blob(
+        &mut self,
+        blob_type: &str,
+        uncompressed: &[u8],
+        indexdata: Option<&[u8]>,
+        tagdata: Option<&[u8]>,
+        way_members: Option<&[u8]>,
+    ) -> io::Result<()> {
+        self.scratch.trim_oversize_retained_buffers();
+        let result =
+            self.write_framed_blob_inner(blob_type, uncompressed, indexdata, tagdata, way_members);
+        self.scratch.trim_oversize_retained_buffers();
+        result
+    }
+
+    fn write_framed_blob_inner(
         &mut self,
         blob_type: &str,
         uncompressed: &[u8],

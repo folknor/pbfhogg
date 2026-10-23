@@ -50,8 +50,8 @@ mod uring_writer {
         ) {
             Ok(w) => w,
             Err(e) if crate::common::is_uring_unavailable(&e) => {
-                eprintln!("io_uring not available, skipping: {e}");
                 uring_hooks::reset();
+                crate::common::skip(format!("io_uring not available: {e}"));
                 return;
             }
             Err(e) => panic!("unexpected io_uring init error: {e}"),

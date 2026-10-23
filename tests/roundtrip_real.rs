@@ -1,6 +1,6 @@
 //! Real-data round-trip: read Denmark PBF → write back → read again → compare.
 //!
-//! Skipped if `data/denmark-20260220-seq4704.osm.pbf` doesn't exist.
+//! Skipped if the Denmark raw PBF configured for tests does not exist.
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -9,11 +9,7 @@ use std::io::BufReader;
 use std::path::Path;
 
 fn denmark_path() -> std::path::PathBuf {
-    // Use PBFHOGG_TEST_PBF env var if set, otherwise look next to the crate.
-    if let Ok(p) = std::env::var("PBFHOGG_TEST_PBF") {
-        return std::path::PathBuf::from(p);
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("data/denmark-20260220-seq4704.osm.pbf")
+    crate::common::test_dataset_path(crate::common::TestDataset::DenmarkRawPbf)
 }
 
 #[derive(Default, Debug)]

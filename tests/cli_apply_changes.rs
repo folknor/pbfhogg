@@ -2501,9 +2501,8 @@ fn compare_maps<V: std::fmt::Debug + PartialEq>(
 #[ignore = "external"]
 #[allow(clippy::cognitive_complexity)]
 fn merge_cross_validate_osmium() {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let base_pbf = manifest.join("data/denmark-20260220-seq4704.osm.pbf");
-    let osc = manifest.join("data/denmark-20260221-seq4705.osc.gz");
+    let base_pbf = crate::common::test_dataset_path(crate::common::TestDataset::DenmarkRawPbf);
+    let osc = crate::common::test_dataset_path(crate::common::TestDataset::DenmarkOsc4705);
 
     if !base_pbf.exists() {
         crate::common::skip(format!("{} not found", base_pbf.display()));

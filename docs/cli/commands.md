@@ -41,7 +41,7 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 
 | Flag | Description |
 |------|-------------|
-| `--indexed` | Check if PBF has blob-level indexdata (exit code 0 = yes, 1 = no) |
+| `--indexed` | Check if PBF has blob-level indexdata (exit code 0 = yes, 1 = no). Reads the first data blob only; later blobs are not checked |
 | `--nodes` | Analyze node coordinate statistics for FOR compression sizing |
 | `-j, --jobs <N>` | Parallel worker threads for `--nodes`. `0` (default) auto-picks from `available_parallelism()`, `1` forces sequential, higher values cap the pool. **Requires `--nodes`**: no other inspect mode reads it, so passing it elsewhere is an error rather than a no-op |
 | `--blocks [N]` | Show per-block distribution stats and optional block listing (N limits to first/last N blocks) |
@@ -434,7 +434,7 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `-q, --quiet` | Exit-code only, suppress output (text only) |
 | `-o, --output <FILE>` | Write output to file (required for `--format osc`) |
 | `-t, --type <TYPE>` | Filter by element type (text only) |
-| `-j, --jobs <N>` | Parallel shard count for the block-pair merge. `0` (default) auto-picks from available cores; `1` restores the sequential, scratch-free path; higher values partition the ID space across that many worker threads. Applies to both `--format text` and `osc`; requires both inputs indexed. **Rejected with `-v/--verbose`**, which is sequential-only - an explicit `-j` there used to be accepted and discarded. The parallel path writes shard temp files (planet scale: ~30 GB text, ~45 GB osc XML), removed on completion |
+| `-j, --jobs <N>` | Parallel shard count for the block-pair merge. `0` (default) auto-picks from available cores; `1` restores the sequential, scratch-free path; higher values partition the ID space across that many worker threads. Applies to both `--format text` and `osc`; requires both inputs indexed. **Rejected with `-v/--verbose`**, which is sequential-only - an explicit `-j` there used to be accepted and discarded. The parallel path writes shard temp files, removed on completion; scratch demand varies by input. See `reference/performance.md` for measurements |
 | `--increment-version` | Bump version of deleted elements by 1 (osc only) |
 | `--update-timestamp` | Set delete timestamp to current time (osc only) |
 | `--direct-io` | Use O_DIRECT to bypass page cache |

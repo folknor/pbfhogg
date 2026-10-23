@@ -1042,7 +1042,7 @@ mod platform {
         write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
         let out = run_altw(&input, &output, true, IndexBackend::Default, true);
         if out.is_o_direct_unsupported() {
-            eprintln!("O_DIRECT not supported on this filesystem, skipping test");
+            crate::common::skip("O_DIRECT not supported on this filesystem");
             return;
         }
         assert!(

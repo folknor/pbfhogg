@@ -244,6 +244,12 @@ fn find_endpoint_house_number_mmap(
     csr: &CellAddrCsr,
     street_level: u8,
 ) -> Option<u32> {
+    // Endpoint admission is currently cell-based: this scans the street-level
+    // cell and its eight neighbors, so its geographic reach changes with
+    // street_level. The configured fine search radius applies to Reader query
+    // matching, not to endpoint resolution. Reusing it here would change which
+    // endpoints are serialized and which interpolation answers exist; keep
+    // this policy unchanged until endpoint matching has its own stated radius.
     let (lat_e7, lon_e7) = endpoint;
     let ll = LatLng::from_degrees(e7_to_deg(lat_e7 as f64), e7_to_deg(lon_e7 as f64));
     let center = CellID::from(ll).parent(street_level as u64);

@@ -21,7 +21,21 @@ use super::loc_mode::{LocMap, LocMode};
 // Writing OSC elements (from diff, metadata carried from the OSC attributes)
 // ---------------------------------------------------------------------------
 
-// Callers own merge-stat accounting; these helpers only encode elements.
+// Callers own merge-stat accounting and select the capacity/flush operation.
+// Keep direct writer and worker-local output separate: a local flush returns
+// OwnedBlocks to the ordered drain, whereas a direct flush submits immediately
+// to PbfWriter. A common sink must not move flush boundaries, pre-seeding or
+// stats across those owners. Share only the post-capacity element encoding.
+
+pub(super) fn add_osc_node(bb: &mut BlockBuilder, node: &crate::osc::CompactNodeRef<'_>) {
+    bb.add_node(
+        node.id(),
+        node.decimicro_lat(),
+        node.decimicro_lon(),
+        node.tags(),
+        node.metadata().as_ref(),
+    );
+}
 
 pub(super) fn write_osc_way(
     bb: &mut BlockBuilder,
@@ -61,6 +75,11 @@ pub(super) fn write_osc_relation(
     rel: &crate::osc::CompactRelationRef<'_>,
 ) -> Result<()> {
     ensure_relation_capacity(bb, writer)?;
+    add_osc_relation(bb, rel);
+    Ok(())
+}
+
+pub(super) fn add_osc_relation(bb: &mut BlockBuilder, rel: &crate::osc::CompactRelationRef<'_>) {
     let members: Vec<MemberData<'_>> = rel
         .members()
         .map(|(mt, ref_id, role)| MemberData {
@@ -69,7 +88,6 @@ pub(super) fn write_osc_relation(
         })
         .collect();
     bb.add_relation(rel.id(), rel.tags(), &members, rel.metadata().as_ref());
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

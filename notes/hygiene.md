@@ -607,28 +607,6 @@ that fails when a `.rs` file under `src/write/` is missing from the funnel's
 
 Reported by: altw and scanning, write path.
 
-## HYG-027 - OSC and apply-changes element writers are duplicated
-
-Anger: 7 - OSC output bytes.
-
-`osc/write.rs` has owned writers (`write_node_xml`, `write_way_xml`,
-`write_relation_xml`) and borrowed ones (`write_dense_node_xml`,
-`write_borrowed_node_xml`, `write_borrowed_way_xml`,
-`write_borrowed_relation_xml`), each spelling the same element shape;
-`write_tags_xml` and `write_borrowed_tags_xml` differ only in iterator type;
-metadata is emitted by both `OwnedMetadata::push_attrs` (strings) and
-`push_info_attrs` (typed). Comments show the "presence, not truthiness" fix was
-repeated once already. In apply-changes `element_writes.rs`, `write_osc_way`
-and `write_osc_way_local` differ only in the capacity call; `write_osc_relation`
-and the inline relation code in `rewrite_block.rs` (twice) are the same;
-`stream_output::emit_create_for_output` and `rewrite_block::emit_create_local`
-are the same match; node creation is spelled four times and the `(0, 0)`
-missing-loc fallback twice. Fix: write each OSC element once over a small trait
-both owned and borrowed types implement; a `BlockSink` trait for
-`&mut PbfWriter` and `&mut Vec<OwnedBlock>`.
-
-Reported by: change application.
-
 ## HYG-028 - Where scratch goes is decided per command, with no override
 
 Anger: 9 - scratch location, a new --tmp-dir, reaping old scratch.
@@ -1010,30 +988,6 @@ meant to work, a `cargo check --target x86_64-pc-windows-gnu` sweep.
 Reported by: read path, write path, change application, re-encoding, filtering
 and spatial, altw and scanning, geocode index.
 
-## HYG-041 - Whether missing indexdata is an error, a warning or nothing is decided per command
-
-Anger: 7 - indexdata policy.
-
-`getid` and `removeid` refuse without indexdata unless `--force`, with two
-different hand-written messages; `getparents` calls `has_indexdata` only to
-pick an arm; `getid --add-referenced` calls `require_indexdata` and ignores the
-result; extract refuses for complete/smart only; renumber's schedule scan
-returns its own differently worded error and has no `--force` escape at all;
-sort, dedupe, cat (two variants) and repack each write their own "input PBF has
-no blob-level indexdata..." sentence (sort and dedupe identical); geocode has
-its own `--allow-unindexed` escape, with the legacy `--force` still meaning
-both that and `--overwrite`. The AGENTS.md
-list of commands requiring indexdata is a hand-maintained copy of these
-decisions. `has_indexdata` and `has_tagdata` in `commands/mod.rs` are the same
-header walk returning different fields, and both trust the first OsmData blob
-only, so `inspect --indexed` says yes for a file whose head is indexed and tail
-is not (the doc says so; the CLI help does not). Fix: a `NeedsIndexdata` error
-kind owned by `require_indexdata` with a per-command reason enum; a declarative
-per-command policy table read by commands and docs; one
-`probe_first_data_blob`.
-
-Reported by: filtering and spatial, re-encoding, CLI and plumbing.
-
 ## HYG-042 - `IdSet`'s rank index is a runtime state rather than a type
 
 Anger: 8 - IdSet typestate.
@@ -1149,36 +1103,6 @@ builder's Pass 2) hands out schedule positions only within a fixed window
 ahead of the merged head.
 
 Reported by: re-encoding, read path, filtering and spatial, altw and scanning.
-
-## HYG-054 - Read-path growth with no guard
-
-Anger: 8 - memory bounds change algorithms and output.
-
-`IndexedReader` keeps a `Vec<BlobInfo>` for the whole file and
-`read_ways_and_deps` collects referenced node IDs into a `BTreeSet<i64>`
-(documented as potentially billions), with no guard; at planet the failure is
-an OOM kill. `BatchQueue`'s `ByteBudget::acquire` admits unconditionally when
-`used == 0` and `release` uses `saturating_sub`, so an accounting bug degrades
-silently to "no budget"; a `debug_assert!(used >= n)` in `release` would catch
-it. `DecompressPool` dropping oversize buffers and refusing returns past
-`MAX_POOL_SIZE` is uncounted, so the pool's effectiveness is invisible to the
-sidecar.
-
-Reported by: read path.
-
-## HYG-055 - Write-path growth with no guard
-
-Anger: 8 - memory bounds change algorithms and output.
-
-`FrameScratch::take_with_capacity` reserves every replacement buffer to the
-high-water mark ever seen on that thread, so one oversize blob pins that
-capacity in every rayon thread's scratch for the process lifetime, bounded by
-`MAX_BLOB_DATASIZE` times thread count (gigabytes at planet core counts).
-`parallel_gzip::writer_loop`'s reorder `BTreeMap` is bounded only indirectly by
-channel capacity; a gap `DeathNotice` does not cover would grow it to stream
-end (not reachable today).
-
-Reported by: write path.
 
 ## HYG-056 - Change-application memory grows with the whole input
 
@@ -1317,31 +1241,6 @@ stale-binary class and the `minimal` sweep's cfg gates on CLI tests;
 `tests/common` becomes a shared path or dev-only
 crate. If the split stays, keep the rule in one place and treat empty as
 unset.
-
-Reported by: test harness, CLI and plumbing.
-
-## HYG-072 - Real-data tests hard-code dataset paths that `brokkr.toml` owns, and they have diverged
-
-Anger: 6 - needs brokkr changes.
-
-`data/denmark-20260220-seq4704.osm.pbf` appears in `tests/roundtrip_real.rs`
-and `tests/cli_apply_changes.rs`, `...-with-indexdata.osm.pbf` in
-`tests/geocode_index.rs`, `data/denmark-20260221-seq4705.osc.gz` in
-`cli_apply_changes.rs`. The `dm6` host's denmark is
-`denmark-20260415.osm.pbf`, so on dm6 every one of these tests prints
-"Skipping: not found" and passes. Override variables exist for two of four
-sites under two names (`PBFHOGG_TEST_PBF`, `PBFHOGG_TEST_PBF_INDEXED`), none
-for the OSC. `tests/geocode_index.rs::output_dir()` probes
-`data/scratch/geocode-denmark` "built by brokkr run", but every listed host
-sets `scratch = "data/bench-tmp"` (only unknown hosts fall back to
-`data/scratch`), so the probe never hits and the test always rebuilds. Tests
-assume `CARGO_MANIFEST_DIR/data` is the data root, while `brokkr.toml` allows a
-per-host `data =`. `capture_env = ["PBFHOGG*", ...]` captures variables no
-production code reads; only these two test overrides read any. Fix: brokkr
-resolves datasets and scratch for `brokkr test` / `check` and exports one set
-of variables; a missing variable under a profile that names the test is a
-failure, not a skip. Enforce with a text rule banning `"data/` literals in
-`tests/`.
 
 Reported by: test harness, CLI and plumbing.
 
@@ -1504,32 +1403,6 @@ straddler payloads are bounded by the two-piece straddler invariant, which
 
 Reported by: geocode index, altw and scanning.
 
-## HYG-097 - Geocode query behaviour depends on the cell level rather than distance
-
-Anger: 7 - geocode output.
-
-Interpolation endpoint matching scans the street-level cell and its 8
-neighbours: about 450 m at level 17, about 100 m at `--street-level 19`, where
-endpoints silently stop resolving; the search should be a radius.
-`interpolation_resolvable` walks the whole way per candidate inside the radius
-and the winner does it again in `interpolated_number`; resolvability could be
-precomputed. The building centroid is a vertex mean including the duplicated
-closing vertex, biased toward the first vertex and possibly outside concave
-buildings, the issue the admin seed fix addressed. Antimeridian handling was
-checked and is consistent across flood fill, reader and `hole_inside_outer`;
-recorded so the next pass does not re-check it.
-
-Reported by: geocode index.
-
-## HYG-105 - Geocode `BuildStats` repeats the header counts
-
-Anger: 4 - BuildStats API.
-
-`BuildStats` repeats the header counts; it could be derived from the header
-plus `dropped_admin_relations`.
-
-Reported by: geocode index.
-
 ## HYG-107 - Library-use survey follow-ups
 
 Anger: 3 - mostly observations.
@@ -1585,14 +1458,31 @@ was deliberately left alone. What remains is a CLI output change:
 Reported by: all nine scopes (split out of the library stderr item when the
 library stopped writing stderr).
 
+## HYG-054 - Decompress-pool drop counters are emitted only from two pipelines
+
+Anger: 8 - counter machinery and semantics.
+
+The read path's `ByteBudget` now debug-asserts its release, and every
+`DecompressPool` records buffers dropped for oversize, a full pool or a
+poisoned lock. Those `pipeline_decompress_pool_*` counters are emitted only
+from `run_pipeline` and `par_map_reduce`, so drops in the classify worker
+pools, extract, tags-filter and altw passthrough are invisible unless a
+pipeline also runs in the same process, and are then folded into its
+numbers. Emitting once at process exit, as `WRITER_METRICS` does, is the
+shape of a fix; it is an observability-contract change.
+
+Reported by: read path; narrowed by the wave-11 reconciler.
+
 ## HYG-068 - Nothing verifies the workspace MSRV
 
 Anger: 5 - toolchain install.
 
-`rust-version` is inherited from `[workspace.package]`, but no sweep checks
-the workspace builds on it. `cargo-msrv` is not installed and only a nightly
-toolchain is, so a sweep needs the pinned toolchain installed and either
-`cargo-msrv` or brokkr support for a toolchain-pinned sweep.
+`rust-version` is inherited from `[workspace.package]` (the Cargo.toml
+comment now says metadata alone verifies nothing), but no sweep checks the
+workspace builds on it. Only a nightly toolchain is installed. brokkr's
+per-sweep environment field can already set `RUSTUP_TOOLCHAIN`, so once the
+pinned toolchain is installed, a `[[check]]` sweep with that variable closes
+this.
 
 Reported by: CLI and plumbing.
 
@@ -1600,31 +1490,12 @@ Reported by: CLI and plumbing.
 
 Anger: 5 - CLI help text, and the "recommended" question.
 
-The durable docs are reworded and point at `reference/pipeline.md` (the altw
-auto rule) and `reference/performance.md` (measurements). Still hard-coded:
-the altw `--index-type` help in `cli/src/main.rs` (europe time, host RAM,
-8.7 GB, 224 GB, the auto threshold); the `Sparse`, `External` and `Auto` docs
-in `altw/mod.rs`; `<1 GB at every stage` and `~256 GB` in
-`altw/external/mod.rs`; "19 files" and "~19 GB at planet" in
-`geocode_index/builder/mod.rs`; README's claim that every command processes
-the planet on a 32 GB machine. The guides and CLI help call `auto`
-"recommended" while the default is `sparse`: whether that is intended needs
-the user's answer. `docs/.vitepress/dist/` is generated and still says 19
-files. The geocode builder's comment on planet-scale limits contradicts the
-planet builds on record in `reference/performance.md`.
+The CLI help, altw docs and runtime hint, geocode builder comments, README
+and guides now describe each choice without drifting figures and point at
+`reference/pipeline.md` and `reference/performance.md`. Open: whether `auto`
+should be recommended while the default is `sparse` needs the maintainer's
+answer; everything is neutral now. `docs/.vitepress/dist/` is generated and
+holds the old text until the site is rebuilt.
 
 Reported by: altw and scanning, geocode index, CLI and plumbing, test harness.
-
-## HYG-073 - Test skips outside the converted files still pass silently
-
-Anger: 6 - needs brokkr changes.
-
-`common::skip()` prints `PBFHOGG_TEST_SKIP:` and fails when
-`PBFHOGG_TEST_MUST_RUN` is set. Unconverted skip sites remain in
-`cli_digest.rs`, `cli_add_locations_to_ways.rs`, `cli_sort.rs`,
-`fault_uring_writer.rs`, `roundtrip.rs`, `cli_cat.rs` and
-`cli_host_identity.rs`. Brokkr does not yet count the markers or set
-`PBFHOGG_TEST_MUST_RUN` for profiles that must run.
-
-Reported by: test harness.
 

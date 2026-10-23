@@ -1,9 +1,11 @@
 //! Sidecar counters for the 3-stage pipelined PBF reader (`run_pipeline`).
 //!
 //! Mirrors `src/write/metrics.rs` for the read side. All counters are
-//! lightweight atomics; emitted once at the end of `run_pipeline` via
-//! [`PIPELINE_METRICS.emit()`]. The names track `pipeline_*` so they
-//! sort next to the writer's `writer_*` counters in `--counters` views.
+//! lightweight atomics; emitted at the end of `run_pipeline` via
+//! [`PIPELINE_METRICS.emit()`]. The decompression-pool drop counters are also
+//! emitted by `par_map_reduce`, which shares the pool without using that
+//! pipeline. Names track `pipeline_*` so they sort next to the writer's
+//! `writer_*` counters in `--counters` views.
 //!
 //! Bench scope: every command that consumes blocks via
 //! `for_each_pipelined` / `into_blocks_pipelined` gets these counters
@@ -58,6 +60,19 @@ pub(crate) struct PipelineMetrics {
     /// (e.g. `BlobFilter` rejects). Subtract from `decode_tasks` for
     /// actual decompression count.
     pub blobs_skipped_by_filter: AtomicU64,
+    /// Decompression buffers dropped because their capacity exceeded the
+    /// retained-buffer limit.
+    pub decompress_pool_oversize_drops: AtomicU64,
+    /// Sum of capacities of oversized decompression buffers dropped.
+    pub decompress_pool_oversize_drop_capacity_bytes: AtomicU64,
+    /// Decompression buffers dropped because the retained pool was full.
+    pub decompress_pool_full_drops: AtomicU64,
+    /// Sum of capacities of buffers dropped because the retained pool was full.
+    pub decompress_pool_full_drop_capacity_bytes: AtomicU64,
+    /// Decompression buffers dropped because the pool mutex was poisoned.
+    pub decompress_pool_poisoned_drops: AtomicU64,
+    /// Sum of capacities of buffers dropped after the pool mutex was poisoned.
+    pub decompress_pool_poisoned_drop_capacity_bytes: AtomicU64,
 }
 
 impl PipelineMetrics {
@@ -74,7 +89,45 @@ impl PipelineMetrics {
             scratch_gr_capacity_peak_bytes: AtomicU64::new(0),
             decode_tasks: AtomicU64::new(0),
             blobs_skipped_by_filter: AtomicU64::new(0),
+            decompress_pool_oversize_drops: AtomicU64::new(0),
+            decompress_pool_oversize_drop_capacity_bytes: AtomicU64::new(0),
+            decompress_pool_full_drops: AtomicU64::new(0),
+            decompress_pool_full_drop_capacity_bytes: AtomicU64::new(0),
+            decompress_pool_poisoned_drops: AtomicU64::new(0),
+            decompress_pool_poisoned_drop_capacity_bytes: AtomicU64::new(0),
         }
+    }
+
+    /// Record a decompression buffer that could not be retained by the pool.
+    /// These calls occur only on drop paths, so they add no atomic operation
+    /// to the normal buffer-reuse path.
+    fn record_decompress_pool_drop(count: &AtomicU64, bytes: &AtomicU64, capacity: usize) {
+        count.fetch_add(1, Relaxed);
+        bytes.fetch_add(u64::try_from(capacity).unwrap_or(u64::MAX), Relaxed);
+    }
+
+    pub fn record_decompress_pool_oversize_drop(&self, capacity: usize) {
+        Self::record_decompress_pool_drop(
+            &self.decompress_pool_oversize_drops,
+            &self.decompress_pool_oversize_drop_capacity_bytes,
+            capacity,
+        );
+    }
+
+    pub fn record_decompress_pool_full_drop(&self, capacity: usize) {
+        Self::record_decompress_pool_drop(
+            &self.decompress_pool_full_drops,
+            &self.decompress_pool_full_drop_capacity_bytes,
+            capacity,
+        );
+    }
+
+    pub fn record_decompress_pool_poisoned_drop(&self, capacity: usize) {
+        Self::record_decompress_pool_drop(
+            &self.decompress_pool_poisoned_drops,
+            &self.decompress_pool_poisoned_drop_capacity_bytes,
+            capacity,
+        );
     }
 
     /// Compare-and-swap maxima for reorder-buffer fill and window levels.
@@ -127,6 +180,44 @@ impl PipelineMetrics {
         );
         emit!("pipeline_decode_tasks", decode_tasks);
         emit!("pipeline_blobs_skipped_by_filter", blobs_skipped_by_filter);
+        self.emit_decompress_pool_counters();
+    }
+
+    /// Emit pool-drop counters from the `par_map_reduce` path, which uses the
+    /// shared decompression pool but does not run `run_pipeline`.
+    pub fn emit_decompress_pool_counters(&self) {
+        macro_rules! emit {
+            ($name:literal, $field:ident) => {
+                crate::debug::emit_counter(
+                    $name,
+                    i64::try_from(self.$field.load(Relaxed)).unwrap_or(i64::MAX),
+                );
+            };
+        }
+        emit!(
+            "pipeline_decompress_pool_oversize_drops",
+            decompress_pool_oversize_drops
+        );
+        emit!(
+            "pipeline_decompress_pool_oversize_drop_capacity_bytes",
+            decompress_pool_oversize_drop_capacity_bytes
+        );
+        emit!(
+            "pipeline_decompress_pool_full_drops",
+            decompress_pool_full_drops
+        );
+        emit!(
+            "pipeline_decompress_pool_full_drop_capacity_bytes",
+            decompress_pool_full_drop_capacity_bytes
+        );
+        emit!(
+            "pipeline_decompress_pool_poisoned_drops",
+            decompress_pool_poisoned_drops
+        );
+        emit!(
+            "pipeline_decompress_pool_poisoned_drop_capacity_bytes",
+            decompress_pool_poisoned_drop_capacity_bytes
+        );
     }
 }
 

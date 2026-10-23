@@ -470,6 +470,9 @@ fn getid_dispatched(
         host,
     )?;
 
+    // The indexdata result selects an arm only for the no-references path.
+    // add_referenced still shares the refusal above: --force explicitly opts
+    // into its slower unindexed scans even though it does not dispatch an arm.
     let (arm, result) = if opts.add_referenced {
         let stats = getid_with_refs(
             input,

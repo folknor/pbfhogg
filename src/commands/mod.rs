@@ -560,6 +560,11 @@ pub(crate) fn clean_metadata<'a>(
 /// The `reason` should be a complete sentence explaining why indexdata matters,
 /// e.g. "input PBF has no blob-level indexdata. Without indexdata, the type
 /// filter is a no-op - all blobs are decompressed (significantly slower)."
+// Call sites own acceptance policy and the reason: getparents can choose a
+// scan arm without refusing input, extract gates only complete/smart, and
+// renumber requires metadata in every scheduled blob with no force fallback.
+// Do not infer those decisions from this shared first-blob probe. Geocode
+// separately grants unindexed input via allow_unindexed without overwrite.
 pub(crate) fn require_indexdata(
     path: &Path,
     direct_io: bool,
@@ -637,26 +642,16 @@ pub(crate) fn dispatch_scan_arm(
 ///
 /// O(1) header-only probe: reads blob headers until the first OsmData
 /// blob and returns whether it carries indexdata. Returns false if the
-/// file has no data blobs. Trusts the first blob to be representative;
-/// partially-indexed PBFs surface as a mid-run error at the consuming
-/// site rather than being detected up front.
+/// file has no data blobs. Trusts the first blob to be representative; a
+/// partially-indexed PBF is not detected up front, and each consuming site
+/// decides what a later unindexed blob means (some decode it on a fallback
+/// path, some stop with an error mid-run).
 pub fn has_indexdata(
     path: &Path,
     direct_io: bool,
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<bool> {
-    let mut reader = FileReader::open(path, direct_io)?;
-    let mut offset = 0u64;
-    while let Some(info) =
-        crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset, diagnostics)?
-    {
-        if matches!(info.blob_type, BlobKind::OsmData) {
-            return Ok(info.index.is_some());
-        }
-        reader.skip(info.data_size as u64)?;
-        offset += info.data_size as u64;
-    }
-    Ok(false)
+    Ok(probe_first_data_blob(path, direct_io, diagnostics)?.0)
 }
 
 /// Check if the first OsmData blob in a PBF has tagdata (`BlobHeader`
@@ -671,18 +666,31 @@ pub fn has_tagdata(
     direct_io: bool,
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<bool> {
+    Ok(probe_first_data_blob(path, direct_io, diagnostics)?.1)
+}
+
+// This is a first-data-blob hint, not validation of every blob. Keep the
+// early return: an all-blob preflight previously caused a measured regression
+// across header-walking commands (reference/performance-history.md). Consumers
+// decide what absent metadata in later blobs means (fallback decode or a
+// mid-run error); `inspect --indexed` reports this same hint.
+fn probe_first_data_blob(
+    path: &Path,
+    direct_io: bool,
+    diagnostics: &crate::host::Diagnostics,
+) -> Result<(bool, bool)> {
     let mut reader = FileReader::open(path, direct_io)?;
     let mut offset = 0u64;
     while let Some(info) =
         crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset, diagnostics)?
     {
         if matches!(info.blob_type, BlobKind::OsmData) {
-            return Ok(info.has_tagdata);
+            return Ok((info.index.is_some(), info.has_tagdata));
         }
         reader.skip(info.data_size as u64)?;
         offset += info.data_size as u64;
     }
-    Ok(false)
+    Ok((false, false))
 }
 
 /// Format a Unix epoch timestamp (seconds) as ISO 8601 UTC string.

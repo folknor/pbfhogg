@@ -25,9 +25,26 @@ use crate::read::wire_schema::{BlobHeaderField, HeaderBlockField, blob, blob_hea
 use super::compression::Compression;
 use super::pipeline::{FramedBlobParts, elapsed_ns_u64};
 
+/// Retained per-thread scratch is kept at or below 4 MiB per buffer. Blocks
+/// built under the default 8000-element cap are normally below this (each of
+/// the three buffers is sized by the block's raw or framed bytes; the read
+/// side's `DecompressPool` uses the same 4 MiB retention limit on the same
+/// reasoning), so the cap only engages on outliers; larger buffers are handed
+/// to the writer or dropped, then the thread-local scratch is allowed to warm
+/// up again. A run whose blocks all exceed it (repack with a raised
+/// `--elements-per-blob`) pays a fresh allocation per buffer per block, which
+/// is small next to compressing a block of that size. On the pipelined path
+/// the blob and header buffers are handed off and replaced on every blob
+/// regardless, so only `compress_buf` loses cross-blob reuse there; the sync
+/// writer path writes from all three in place and loses reuse on each. The
+/// three scratch Vecs therefore retain at most 12 MiB per `FrameScratch`, in
+/// addition to the reused compressor state.
+const MAX_RETAINED_SCRATCH_CAPACITY: usize = 4 * 1024 * 1024;
+
 /// Per-thread reusable blob framing scratch: header/body/compression buffers
-/// plus lazy-initialized zlib/zstd compressors. Reused across blobs to keep
-/// steady-state allocation flat.
+/// plus lazy-initialized zlib/zstd compressors. Reused across ordinary blobs
+/// to keep steady-state allocation flat. An oversized buffer is not retained
+/// in a rayon thread for the process lifetime.
 pub(super) struct FrameScratch {
     /// Blob protobuf body (raw/compressed data fields).
     pub(super) blob_buf: Vec<u8>,
@@ -39,11 +56,11 @@ pub(super) struct FrameScratch {
     zlib_compressor: Option<(u32, Compress)>,
     /// Reusable zstd compressor (lazy-initialized on first zstd blob).
     zstd_compressor: Option<(i32, zstd::bulk::Compressor<'static>)>,
-    /// High-water capacity observed for `blob_buf`. `frame_blob_into` hands
-    /// the filled buffer to the caller and installs a replacement reserved to
-    /// this size, so the next blob does not re-grow from zero.
+    /// Reuse capacity target for `blob_buf`, capped at
+    /// `MAX_RETAINED_SCRATCH_CAPACITY`.
     blob_cap: usize,
-    /// High-water capacity observed for `header_buf`; see `blob_cap`.
+    /// Reuse capacity target for `header_buf`, capped at
+    /// `MAX_RETAINED_SCRATCH_CAPACITY`.
     header_cap: usize,
 }
 
@@ -60,16 +77,59 @@ impl FrameScratch {
         }
     }
 
-    /// Hand out `buf`'s contents and leave a replacement behind, reserved to
-    /// the high-water capacity recorded in `cap`.
+    /// Hand out `buf`'s contents and leave a replacement behind. Preserve the
+    /// high-water capacity for ordinary blocks, but do not pin an outlier
+    /// buffer in this thread's scratch for the process lifetime.
     ///
     /// This is the capacity-preserving alternative to `buf.clone()`: the
     /// caller receives the bytes without a copy, and the scratch slot keeps
-    /// its warmed-up capacity because the replacement is allocated at the
-    /// high-water mark rather than empty.
+    /// its warmed-up capacity for ordinary blocks. Buffers above the 4 MiB
+    /// retention limit are handed out with their contents and capacity intact,
+    /// while the scratch slot starts empty for its next frame.
     fn take_with_capacity(buf: &mut Vec<u8>, cap: &mut usize) -> Vec<u8> {
-        *cap = (*cap).max(buf.capacity());
+        let observed_capacity = buf.capacity();
+        if observed_capacity > MAX_RETAINED_SCRATCH_CAPACITY {
+            Self::record_capped_capacity(observed_capacity);
+            *cap = 0;
+            return std::mem::take(buf);
+        }
+        *cap = (*cap)
+            .max(observed_capacity)
+            .min(MAX_RETAINED_SCRATCH_CAPACITY);
         std::mem::replace(buf, Vec::with_capacity(*cap))
+    }
+
+    pub(super) fn trim_oversize_retained_buffers(&mut self) {
+        if self.blob_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
+            Self::record_capped_capacity(self.blob_buf.capacity());
+            self.blob_buf = Vec::new();
+            self.blob_cap = 0;
+        }
+        if self.header_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
+            Self::record_capped_capacity(self.header_buf.capacity());
+            self.header_buf = Vec::new();
+            self.header_cap = 0;
+        }
+        if self.compress_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
+            Self::record_capped_capacity(self.compress_buf.capacity());
+            self.compress_buf = Vec::new();
+        }
+    }
+
+    fn trim_oversize_compress_buffer(&mut self) {
+        if self.compress_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
+            Self::record_capped_capacity(self.compress_buf.capacity());
+            self.compress_buf = Vec::new();
+        }
+    }
+
+    fn record_capped_capacity(capacity: usize) {
+        WRITER_METRICS
+            .frame_scratch_capped_buffers
+            .fetch_add(1, Relaxed);
+        WRITER_METRICS
+            .frame_scratch_capped_capacity_bytes
+            .fetch_add(u64::try_from(capacity).unwrap_or(u64::MAX), Relaxed);
     }
 }
 
@@ -135,7 +195,9 @@ pub(crate) fn frame_blob_pipelined(
 /// # Per-call cost
 ///
 /// The compression scratch (`compress_buf`) and both compressors are reused
-/// across calls and allocate nothing after warmup. The two buffers that *are*
+/// across calls and allocate nothing after warmup, except that a
+/// `compress_buf` grown past `MAX_RETAINED_SCRATCH_CAPACITY` is dropped after
+/// its blob. The two buffers that *are*
 /// handed to the caller - the `BlobHeader` and the `Blob` body - are swapped
 /// out rather than copied out, so each call allocates exactly two
 /// `Vec<u8>`s - the replacements installed in the scratch - and performs zero
@@ -173,7 +235,11 @@ pub(super) fn frame_blob_into(
     scratch: &mut FrameScratch,
 ) -> io::Result<FramedBlobParts> {
     let t_compress = std::time::Instant::now();
-    encode_blob_body(uncompressed, compression, scratch)?;
+    scratch.trim_oversize_retained_buffers();
+    if let Err(error) = encode_blob_body(uncompressed, compression, scratch) {
+        scratch.trim_oversize_retained_buffers();
+        return Err(error);
+    }
     WRITER_METRICS
         .compress_ns
         .fetch_add(elapsed_ns_u64(t_compress), Relaxed);
@@ -187,11 +253,13 @@ pub(super) fn frame_blob_into(
     // 143 MB blob body and a PBF that pbfhogg itself refuses to open. Fail at
     // the point where the knob that caused it can still be named.
     if scratch.blob_buf.len() as u64 >= MAX_BLOB_DATASIZE {
-        return Err(io::Error::other(format!(
-            "blob body for {blob_type} is {} bytes, must be smaller than \
-             {MAX_BLOB_DATASIZE} (lower --elements-per-blob)",
-            scratch.blob_buf.len()
-        )));
+        let body_len = scratch.blob_buf.len();
+        let error = io::Error::other(format!(
+            "blob body for {blob_type} is {body_len} bytes, must be smaller than \
+             {MAX_BLOB_DATASIZE} (lower --elements-per-blob)"
+        ));
+        scratch.trim_oversize_retained_buffers();
+        return Err(error);
     }
     let datasize = i32::try_from(scratch.blob_buf.len()).map_err(|_| {
         io::Error::other(format!(
@@ -199,14 +267,21 @@ pub(super) fn frame_blob_into(
             scratch.blob_buf.len()
         ))
     })?;
-    encode_blob_header_into(
+    if let Err(error) = encode_blob_header_into(
         blob_type,
         datasize,
         indexdata,
         tagdata,
         way_members,
         &mut scratch.header_buf,
-    )?;
+    ) {
+        scratch.trim_oversize_retained_buffers();
+        return Err(error);
+    }
+    // `compress_buf` is not handed off, so drop an outlier before the next
+    // blob can reuse this thread-local scratch. If header encoding failed
+    // above, the next call's entry trim handles it instead.
+    scratch.trim_oversize_compress_buffer();
 
     let header_len = u32::try_from(scratch.header_buf.len()).map_err(|_| {
         io::Error::other(format!(
@@ -224,9 +299,9 @@ pub(super) fn frame_blob_into(
 
     // Swap out, do not clone. A plain `swap` would leave the scratch holding
     // empty Vecs that re-grow from zero on every subsequent blob, which is why
-    // this used to clone; `take_with_capacity` installs a replacement already
-    // reserved to the high-water mark, so the reuse invariant holds *and* the
-    // two per-blob memcpys are gone.
+    // this used to clone; `take_with_capacity` preserves the warmed capacity
+    // for ordinary blocks, while the retention cap lets outliers warm up again
+    // on demand. The two per-blob memcpys stay gone.
     let header = FrameScratch::take_with_capacity(&mut scratch.header_buf, &mut scratch.header_cap);
     let blob = FrameScratch::take_with_capacity(&mut scratch.blob_buf, &mut scratch.blob_cap);
     Ok(FramedBlobParts {

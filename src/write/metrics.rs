@@ -7,6 +7,14 @@ pub(crate) struct WriterMetrics {
     pub pipeline_send_wait_ns: AtomicU64,
     pub recv_wait_ns: AtomicU64,
     pub reorder_high_water: AtomicU64,
+    /// Time blocked waiting for a sequence permit in `ParallelGzipWriter`.
+    pub parallel_gzip_reorder_wait_ns: AtomicU64,
+    /// Number of `ParallelGzipWriter` dispatches that waited for a sequence permit.
+    pub parallel_gzip_reorder_blocked: AtomicU64,
+    /// Peak `ParallelGzipWriter` reorder-map length, in gzip chunks. Kept
+    /// apart from `reorder_high_water`, which counts PBF blobs in the
+    /// writer backends' reorder buffers.
+    pub parallel_gzip_reorder_high_water: AtomicU64,
     pub write_ns: AtomicU64,
     pub flush_ns: AtomicU64,
     pub bytes_framed: AtomicU64,
@@ -50,6 +58,12 @@ pub(crate) struct WriterMetrics {
     /// `encode_blob_header_into`.
     pub tagdata_dropped_oversize: AtomicU64,
 
+    /// Scratch buffers whose capacity exceeded the 4 MiB retention limit and
+    /// were handed off or dropped instead of retained by a worker thread.
+    pub frame_scratch_capped_buffers: AtomicU64,
+    /// Sum of the full capacities of buffers capped from thread-local scratch.
+    pub frame_scratch_capped_capacity_bytes: AtomicU64,
+
     /// Time a producer on a worker of the writer's executor pool spent in the
     /// cooperative permit wait (`pipeline::recv_permit`). Zero on every CLI
     /// path, which drives its writers off-worker; non-zero means a
@@ -70,6 +84,9 @@ impl WriterMetrics {
             pipeline_send_wait_ns: AtomicU64::new(0),
             recv_wait_ns: AtomicU64::new(0),
             reorder_high_water: AtomicU64::new(0),
+            parallel_gzip_reorder_wait_ns: AtomicU64::new(0),
+            parallel_gzip_reorder_blocked: AtomicU64::new(0),
+            parallel_gzip_reorder_high_water: AtomicU64::new(0),
             write_ns: AtomicU64::new(0),
             flush_ns: AtomicU64::new(0),
             bytes_framed: AtomicU64::new(0),
@@ -93,6 +110,8 @@ impl WriterMetrics {
             uring_submit_and_wait_calls: AtomicU64::new(0),
             uring_submit_and_wait_ns: AtomicU64::new(0),
             tagdata_dropped_oversize: AtomicU64::new(0),
+            frame_scratch_capped_buffers: AtomicU64::new(0),
+            frame_scratch_capped_capacity_bytes: AtomicU64::new(0),
             coop_wait_ns: AtomicU64::new(0),
             emitted: AtomicBool::new(false),
         }
@@ -185,6 +204,18 @@ impl WriterMetrics {
         emit!("writer_pipeline_send_wait_ns", pipeline_send_wait_ns);
         emit!("writer_recv_wait_ns", recv_wait_ns);
         emit!("writer_reorder_high_water", reorder_high_water);
+        emit!(
+            "writer_parallel_gzip_reorder_wait_ns",
+            parallel_gzip_reorder_wait_ns
+        );
+        emit!(
+            "writer_parallel_gzip_reorder_blocked",
+            parallel_gzip_reorder_blocked
+        );
+        emit!(
+            "writer_parallel_gzip_reorder_high_water",
+            parallel_gzip_reorder_high_water
+        );
         emit!("writer_write_ns", write_ns);
         emit!("writer_flush_ns", flush_ns);
         emit!("writer_bytes_framed", bytes_framed);
@@ -214,6 +245,14 @@ impl WriterMetrics {
         );
         emit!("writer_uring_submit_and_wait_ns", uring_submit_and_wait_ns);
         emit!("writer_tagdata_dropped_oversize", tagdata_dropped_oversize);
+        emit!(
+            "writer_frame_scratch_capped_buffers",
+            frame_scratch_capped_buffers
+        );
+        emit!(
+            "writer_frame_scratch_capped_capacity_bytes",
+            frame_scratch_capped_capacity_bytes
+        );
         emit!("writer_coop_wait_ns", coop_wait_ns);
 
         // An all-zero set means no writer ever ran in this process. Say

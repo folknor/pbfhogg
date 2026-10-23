@@ -1,14 +1,13 @@
 //! External join for add-locations-to-ways: bounded-memory coordinate resolution
 //! via double radix permutation.
 //!
-//! Instead of building a giant random-access node index (16 GB mmap at planet
-//! scale), this module pre-computes the way-node join using sequential I/O and
-//! bounded memory:
+//! Instead of building a large random-access node index, this module
+//! pre-computes the way-node join using sequential I/O and bounded memory:
 //!
 //! 1. **Way pass**: stream ways, emit `(node_id, slot_pos)` COO pairs into
 //!    256 node buckets partitioned by high bits of node_id.
-//! 2. **Node join**: per bucket, sort pairs by node_id in RAM (~500 MB),
-//!    merge-join with matching node stream, emit `(slot_pos, lat, lon)` into
+//! 2. **Node join**: per bucket, sort pairs by node_id in memory, merge-join
+//!    with matching node stream, emit `(slot_pos, lat, lon)` into
 //!    256 slot buckets partitioned by high bits of slot_pos.
 //! 3. **Slot reorder**: per bucket, sort by slot_pos, emit final blob-ordered
 //!    delta-varint `coord_payloads` (see `coord_payloads.rs`). The flat
@@ -16,7 +15,9 @@
 //! 4. **Assembly**: stream original PBF + per-blob coord_payloads preads,
 //!    emit enriched ways.
 //!
-//! Memory at every stage: <1 GB. All I/O sequential. No mmap, no random access.
+//! All I/O is sequential. Temporary-disk demand and peak memory depend on the
+//! input; see `reference/performance.md` for measurements. This path does not
+//! build a random-access node index.
 
 use std::path::Path;
 
@@ -639,8 +640,9 @@ pub(super) fn slot_bucket_bounds(
 
 /// Run the full external join pipeline for add-locations-to-ways.
 ///
-/// Bounded memory, all sequential I/O. Uses ~256 GB peak temp disk at
-/// planet scale. See module docs for the algorithm.
+/// Bounded working memory and sequential I/O. Temporary-disk demand depends
+/// on the input; see `reference/performance.md` for measured resource use and
+/// the module docs for the algorithm.
 #[allow(clippy::too_many_arguments)]
 pub fn external_join(
     input: &Path,
@@ -766,9 +768,8 @@ pub(crate) fn external_join_in(
     // #9 layer 2: relation member-id scan runs concurrently with stage 1.
     // The scan reads relation blobs only (via blob_meta) and shares no
     // state with stage 1 - both read from the same input PBF via pread
-    // (`File: Sync` on Unix) with no locking. On Europe the scan takes
-    // ~4 s; it fits entirely inside stage 1's ~43 s wall, so the serial
-    // gap the scan used to create between stage 2 and stage 4 goes away.
+    // (`File: Sync` on Unix) with no locking. Running it here avoids the
+    // former serial gap between stage 2 and stage 4.
     crate::debug::emit_marker("EXTJOIN_STAGE1_START");
     let (s1_minflt_before, s1_majflt_before) = crate::debug::read_page_faults();
 
@@ -824,13 +825,12 @@ pub(crate) fn external_join_in(
             // joining the relation-scan handle, but `thread::scope` still
             // waits for `rel_handle` to run to completion before the scope
             // returns. A stage-1 failure while the relation scan is
-            // running therefore delays error reporting by up to the
-            // scan's wall time (~4 s Europe, longer at planet). Accepted
-            // as diagnostic-quality: stage-1 failures are rare (only fire
-            // on adversarial or malformed input, mostly closed by the
-            // defensive-input checks in ADR-0004), and cancelling the
-            // relation scan would require plumbing a shutdown signal we
-            // don't otherwise need.
+            // running therefore delays error reporting until the relation
+            // scan completes. Accepted as diagnostic-quality: stage-1
+            // failures are rare (only fire on adversarial or malformed
+            // input, mostly closed by the defensive-input checks in
+            // ADR-0004), and cancelling the relation scan would require
+            // plumbing a shutdown signal we don't otherwise need.
             let s1_res = s1_handle.join().map_err(|payload| {
                 crate::error::panic_error("stage 1 thread", payload.as_ref()).to_string()
             })??;
@@ -959,9 +959,8 @@ pub(crate) fn external_join_in(
         (s2_minflt_before, s2_majflt_before),
         (s2_minflt_after, s2_majflt_after),
     );
-    // Reclaim id-shard scratch (workers × NUM_BUCKETS files;
-    // 80+ GB at planet) before the heavier stage 3/4 streaming
-    // handoff allocates its own tmp space.
+    // Reclaim id-shard scratch before the heavier stage 3/4 streaming
+    // handoff allocates its own temporary space.
     for worker_id in 0..num_shard_workers {
         for bucket_idx in 0..NUM_BUCKETS {
             let path = scratch_dir

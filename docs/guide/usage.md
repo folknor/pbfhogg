@@ -118,6 +118,8 @@ Commands that benefit from indexdata (`apply-changes`, `sort`, `extract`, `tags-
 pbfhogg sort raw-input.osm.pbf -o sorted.osm.pbf --force
 ```
 
+`renumber` has no such escape and `build-geocode-index` uses `--allow-unindexed`; see [Indexdata](./indexdata#which-commands-require-indexdata) for the per-command rules.
+
 The recommended workflow is to generate an indexed PBF once with `pbfhogg cat`, then use it for all subsequent operations.
 
 ## Common flags

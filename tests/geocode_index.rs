@@ -2799,11 +2799,7 @@ fn build_rejects_admin_entry_count_over_u16_max_for_one_cell() {
 }
 
 fn denmark_indexed_path() -> std::path::PathBuf {
-    if let Ok(p) = std::env::var("PBFHOGG_TEST_PBF_INDEXED") {
-        return std::path::PathBuf::from(p);
-    }
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("data/denmark-20260220-seq4704-with-indexdata.osm.pbf")
+    crate::common::test_dataset_path(crate::common::TestDataset::DenmarkIndexedPbf)
 }
 
 fn ensure_index_exists() -> Option<tempfile::TempDir> {

@@ -336,6 +336,41 @@ no-readahead trade multiplies synchronous fault round-trips (104 M vs
 win can invert; inputs whose store fits comfortably in RAM are
 unaffected either way.
 
+### Auto routing threshold: sparse store versus page-cache budget (plantasjen, commit `dcc445e`, 2026-07-14)
+
+The measurements behind `--index-type auto` and `AUTO_STORE_BUDGET_PCT`
+(the routing rule itself is in [pipeline.md](pipeline.md)). Sparse versus
+external walls:
+
+| Dataset | sparse store | sparse | external | winner |
+|---|---:|---:|---:|---|
+| germany | 3.32 GB | 25.7 s | 25.2 s | tie |
+| north-america | 18.75 GB | **116.4 s** | 158.3 s | sparse, -26 % |
+| europe | 28.94 GB | 363.1 s (`4ac11326`) | **285.7 s** (`cdfa9453`) | external |
+
+The germany and north-america rows are matched `--bench 1` pairs. The
+europe row is not matched (sparse `--bench 1`, external `--bench 3`), so
+its margin is overstated; the ordering is not in doubt. The walls are
+non-monotonic in store size, so the threshold is set from where sparse
+pass 2 goes nonlinear rather than from where the walls cross. Per-ref
+cost of sparse pass 2's random store lookups (`way_reframe_ms`
+cumulative over refs):
+
+| Dataset | store | refs | per ref |
+|---|---:|---:|---:|
+| north-america | 18.75 GB | 2.60 B | 0.145 us |
+| europe | 28.94 GB | 4.37 B | **0.772 us** |
+
+5.3x the per-ref cost for 1.68x the refs. With roughly 2-3 GB of anon
+held outside the store, the measuring host's page-cache budget was about
+25 GB: north-america's store sat near 75 % of it and stayed linear,
+europe's near 116 % and thrashed. These two points bracket the knee
+without locating it; 80 % is a choice inside the bracket biased toward
+external, because routing a smallish input to external wastes seconds
+while routing an oversized one to sparse costs minutes. The threshold is
+relative to runtime available memory, never a byte constant fitted to
+this host.
+
 ### Compression axis (Europe external, plantasjen, `--bench 1`)
 
 | Compression | Wall | Peak anon | UUID | Commit | Δ vs zlib:6 |

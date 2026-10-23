@@ -159,6 +159,13 @@ pub enum SmokeOutcome {
 }
 
 /// Build statistics.
+///
+/// The public count fields mirror counts stored in the index header. Keep
+/// those fields for API compatibility, but populate them from the header so
+/// the published index remains their single source of truth. Dropped admin
+/// relations are build-only diagnostics. The `smoke_test` field is a
+/// `SmokeOutcome` from querying the newly written index, so neither value can
+/// be derived from the header.
 #[derive(Debug, Default)]
 pub struct BuildStats {
     pub addr_points: u64,
@@ -184,9 +191,13 @@ pub struct BuildStats {
 ///
 /// # Known limitations
 ///
-/// - **Planet scale:** All intermediate data is held in RAM. Planet-scale builds
-///   (>>64 GB) require streaming to temp files and external merge sort. This
-///   implementation works for regional extracts (Denmark, Germany, etc.).
+/// - **Memory:** Pass 3's cell entries are bucketed through temp files, but
+///   the other intermediates (way geometry, admin polygons, interpolation
+///   ways, admin cell entries) are held in RAM and grow with the input, so
+///   peak memory scales with the extract. Planet builds have completed; their
+///   measured peak memory and host are recorded in `reference/performance.md`
+///   ("build-geocode-index"). A host with less memory than that record shows
+///   needs those intermediates moved to temp files.
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
 pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Result<BuildStats> {
@@ -436,9 +447,9 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
     //
     // Scan way blobs to collect node IDs referenced by geocode-relevant ways
     // (streets, building addresses, interpolation, admin members). The dense
-    // node index in pass 2 only populates entries for these nodes, reducing
-    // page cache working set from ~83 GB (all 10.4B nodes) to ~16 GB (~2B
-    // referenced). Same pattern as ALTW pass 0.
+    // node index in pass 2 only populates entries for these nodes, so its
+    // page-cache working set follows the referenced subset rather than every
+    // node in the file. Same pattern as ALTW pass 0.
     // -----------------------------------------------------------------------
     crate::debug::emit_marker("GEOCODE_PASS1_END");
 
@@ -492,9 +503,10 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
     let pass2_start = std::time::Instant::now();
 
     // `way_geom`, `admin_polygons`, `interp_ways`, and `admin_cell_entries`
-    // remain input-sized in-memory intermediates. They fit the documented
-    // regional-extract scope; externalizing them needs a coordinated streaming
-    // and external-merge design because later passes consume each collection.
+    // remain input-sized in-memory intermediates. Their measured planet
+    // footprint is in reference/performance.md; externalizing them needs a
+    // coordinated streaming and external-merge design because later passes
+    // consume each collection.
     crate::debug::emit_marker("GEOCODE_PASS2_SCAN_START");
     let pass2::Pass2Output {
         addr_point_count,
@@ -677,8 +689,8 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
     crate::debug::emit_marker("GEOCODE_PASS3_START");
     // Pass 3: Bucketed S2 cell assignment + write cell index files
     //
-    // Instead of accumulating all cell entries in RAM (~19 GB at planet),
-    // partition into 256 buckets by top 8 bits of cell_id. Write tagged
+    // Instead of accumulating all cell entries in RAM, where they grow with
+    // the input, partition into 256 buckets by top 8 bits of cell_id. Write tagged
     // entries to temp bucket files, then process one bucket at a time.
     // -----------------------------------------------------------------------
     crate::host::diag!(
@@ -898,14 +910,14 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
     crate::debug::emit_marker("GEOCODE_PASS3_END");
 
     Ok(BuildStats {
-        addr_points: u64::from(addr_point_count),
-        street_ways: u64::from(street_way_count),
-        interp_ways: interp_way_count as u64,
-        admin_polygons: admin_polygons.len() as u64,
+        addr_points: u64::from(header.addr_point_count),
+        street_ways: u64::from(header.street_way_count),
+        interp_ways: u64::from(header.interp_way_count),
+        admin_polygons: u64::from(header.admin_polygon_count),
         dropped_admin_relations: dropped_admin_relations as u64,
-        fine_cells: u64::from(fine_count),
-        coarse_cells: u64::from(coarse_count),
-        admin_cells: u64::from(admin_count),
+        fine_cells: u64::from(header.geo_cell_count),
+        coarse_cells: u64::from(header.coarse_cell_count),
+        admin_cells: u64::from(header.admin_cell_count),
         smoke_test,
     })
 }

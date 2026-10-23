@@ -2,7 +2,7 @@
 
 ## What is pbfhogg?
 
-pbfhogg is a Rust library and CLI toolkit for reading, writing, and transforming OpenStreetMap PBF files. It's designed for planet-scale operations (80+ GB files) on normal hardware (30 GB RAM).
+pbfhogg is a Rust library and CLI toolkit for reading, writing, and transforming OpenStreetMap PBF files. It supports planet-scale workflows; see `reference/performance.md` for measured inputs and resource use.
 
 ## Quick Start
 

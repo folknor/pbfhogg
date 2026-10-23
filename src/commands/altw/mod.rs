@@ -99,31 +99,25 @@ fn relation_member_ids(
 /// Strategy for storing node coordinates during add-locations-to-ways.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IndexType {
-    /// Rank-indexed flat sparse array. Pre-allocates
-    /// `referenced.total_count() * 8` bytes (~29 GB at europe, ~60 GB at
-    /// planet); workers store coords via relaxed `AtomicU64` mmap stores
-    /// at byte offset `IdSet::rank_if_set(node_id) << 3` (not pwrites -
-    /// no syscall per tuple; the distinction matters when evaluating
-    /// write-path alternatives). Fast at small / medium scale,
-    /// survives europe at ~6 minutes on a 27 GB-RAM host. Likely thrashes
-    /// at planet (working set exceeds free page cache); use `external`
-    /// for planet.
+    /// Rank-indexed flat sparse array, sized at `referenced.total_count() * 8`
+    /// bytes. Workers store coordinates with relaxed `AtomicU64` mmap stores
+    /// at byte offset `IdSet::rank_if_set(node_id) << 3` (not pwrites, so no
+    /// syscall per tuple). Works on any PBF. Runtime and page-cache behavior
+    /// depend on the input and host; see `reference/performance.md` for
+    /// measurements.
     #[default]
     Sparse,
-    /// External join via double radix permutation. Bounded memory
-    /// (~8.7 GB at planet), all sequential I/O. Uses ~224 GB temp disk at
-    /// planet scale. The only mode that survives at planet on a
-    /// memory-constrained host.
+    /// External join via double radix permutation. Uses bounded working
+    /// memory and sequential I/O, and requires sorted input with indexdata.
+    /// Its temporary-disk demand depends on the input; see
+    /// `reference/performance.md` for measurements.
     External,
-    /// Auto-select on scale. Sparse unless the input is sorted + indexed
-    /// (external's precondition) AND the estimated sparse store exceeds
-    /// the host's page-cache budget - the measured knee where sparse
-    /// pass 2 goes nonlinear (5.3x per-ref cost at 116 % of budget vs
-    /// linear at 75 %). Unsorted or unindexed inputs always route sparse;
-    /// when the store or budget cannot be estimated, sorted + indexed
-    /// inputs route external (the cheap direction to be wrong in:
-    /// misrouting a small input to external wastes seconds, an oversized
-    /// input on sparse costs minutes).
+    /// Selects a backend at runtime. Unsorted or unindexed input uses sparse.
+    /// For sorted, indexed input, external is selected when the estimated
+    /// sparse store exceeds a fixed share of the page-cache budget; if
+    /// either estimate is unavailable, external is selected. See
+    /// `reference/pipeline.md` for the routing rule and
+    /// `reference/performance.md` for measurements.
     Auto,
 }
 
@@ -365,9 +359,10 @@ pub fn add_locations_to_ways(
                 Note,
                 "altw.external_hint",
                 "hint: this sorted indexed PBF is eligible for --index-type external, \
-                 which uses bounded memory and sequential I/O. External wins at large \
-                 scale (europe and up) and is the only mode that survives at planet on \
-                 memory-constrained hosts; sparse is typically faster below that."
+                 which uses bounded working memory and sequential I/O. Sparse is faster \
+                 while its node store fits in the page cache; external avoids the \
+                 page-cache thrashing sparse hits when it does not. --index-type auto \
+                 chooses between them from the estimated store size."
             );
         }
     }
@@ -376,8 +371,9 @@ pub fn add_locations_to_ways(
     let scratch_dir = host.scratch_parent_or(output.parent().unwrap_or(Path::new(".")));
 
     // Pass 0: collect the set of node IDs referenced by ways. Only these
-    // nodes need coordinate lookups, so only these get indexed. At planet
-    // scale this reduces touched mmap pages from ~80 GB to ~16 GB.
+    // nodes need coordinate lookups, so only these get indexed. The store
+    // therefore follows the referenced-node working set rather than every
+    // node in the input; see `reference/performance.md` for measurements.
     crate::debug::emit_marker("ALTW_PASS0_START");
     let (referenced, shared) =
         collect_way_referenced_node_ids(input, options.direct_io, options.inject_prepass, host)?;
@@ -567,19 +563,16 @@ fn enforce_missing_locations_policy(stats: &Stats, ignore_missing_nodes: bool) -
 }
 
 /// Route to external when the estimated sparse store exceeds this many
-/// percent of the page-cache budget. The knee is bracketed, not
-/// pinpointed: north-america's 18.75 GB store (~75 % of the measuring
-/// host's ~25 GB budget) ran linear while europe's 28.94 GB (~116 %)
-/// thrashed at 5.3x the per-ref cost, and 80 % is the
-/// bias-toward-external choice inside that gap, not a measured optimum:
-/// routing a smallish input to external wastes seconds, routing an oversized
-/// one to sparse costs minutes.
+/// percent of the page-cache budget. This is a policy threshold selected
+/// from the measured store-versus-cache behavior, not a measured optimum;
+/// see `reference/performance.md` for the supporting measurements.
 const AUTO_STORE_BUDGET_PCT: u64 = 80;
 
 /// Anon footprint a sparse run holds outside the mmap store (IdSet, decode
-/// buffers, writer queues): ~2-3 GB measured at europe. Subtracted from
-/// available memory before applying [`AUTO_STORE_BUDGET_PCT`], so the budget
-/// reflects what the page cache can actually keep resident for the store.
+/// buffers, writer queues). Subtracted from available memory before applying
+/// [`AUTO_STORE_BUDGET_PCT`], so the budget reflects what the page cache can
+/// actually keep resident for the store. See `reference/performance.md` for
+/// measured resource use.
 /// Keep this measured allowance fixed: indexed node count estimates the
 /// file-backed store, not the referenced-ID span or the decode/queue footprint.
 /// Scaling anon headroom from that count would assert an unmeasured relation.
@@ -621,12 +614,9 @@ fn auto_select_backend(
         return Ok(ResolvedBackend::Sparse);
     }
 
-    // Both backends can run: route on scale. The walk is priced like any
-    // other header walk (~50 us/blob cold, ~free warm) and self-amortizes:
-    // whichever backend runs next starts with its own header walk, which
-    // now rides warm on this one, so the command's total cold-walk count
-    // does not increase: a walk only costs when something evicted the
-    // headers since the previous walk.
+    // Both backends can run: route on scale. The walk reads headers the
+    // selected backend will also need, so it can warm those pages for the
+    // following pass rather than adding another cold header walk.
     crate::debug::emit_marker("ALTW_AUTO_ESTIMATE_WALK_START");
     let store = estimate_sparse_store_bytes(input, host)?;
     crate::debug::emit_marker("ALTW_AUTO_ESTIMATE_WALK_END");
@@ -674,9 +664,10 @@ fn auto_select_backend(
 /// Pure routing decision for an input both backends can handle (sorted +
 /// indexed). External iff the estimated store exceeds
 /// [`AUTO_STORE_BUDGET_PCT`] of the page-cache budget. An unavailable
-/// store or budget estimate routes external - the pre-scale-aware
-/// behavior for these inputs, and the cheap direction to be wrong in
-/// (seconds wasted vs minutes of pass-2 thrash).
+/// store or budget estimate routes external, preserving a conservative
+/// choice when the sparse working set cannot be estimated: misrouting a
+/// small input to external costs less than running an oversized input on
+/// sparse into page-cache thrashing.
 fn route_sorted_indexed(store_bytes: Option<u64>, budget_bytes: Option<u64>) -> ResolvedBackend {
     match (store_bytes, budget_bytes) {
         (Some(store), Some(budget)) => {
@@ -693,9 +684,9 @@ fn route_sorted_indexed(store_bytes: Option<u64>, budget_bytes: Option<u64>) -> 
 /// Estimate the sparse store size for an indexed input: total node count
 /// from per-blob indexdata, times 8 bytes per rank slot. Total nodes is
 /// an upper bound on referenced nodes (the store is sized by
-/// way-referenced ids only) - tight where the knee lives (95-98 % of
-/// nodes are way-referenced at regional scale) and loose at planet
-/// (~69 %), which errs toward external, the cheap direction. Returns
+/// way-referenced ids only) - tight when most nodes are way-referenced and
+/// looser when that share is lower, which errs toward external, the cheap
+/// direction. Returns
 /// `None` when any OsmData blob lacks indexdata, since the sum would
 /// silently undercount.
 fn estimate_sparse_store_bytes(input: &Path, host: &crate::host::Host) -> Result<Option<u64>> {
@@ -742,7 +733,7 @@ fn page_cache_budget_bytes(host: &crate::host::Host) -> Option<u64> {
 /// reusable scratch, and publishes that tally into the run's atomics once
 /// per blob. This is the same blob-local pattern external stage 4 uses for
 /// its `WayReframeCounters`; the previous process-global statics took two
-/// contended atomic adds per pinned way (~535 M ways at planet).
+/// contended atomic adds per pinned way.
 pub(super) mod inject_metrics {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -897,11 +888,11 @@ fn emit_stats_counters(stats: &Stats) {
 /// `(u32, u32)` group_ranges allocation). The main thread unions
 /// per-blob `Vec<i64>`s into a single `IdSet`.
 ///
-/// At planet scale (~2 B unique node refs) the union bitset costs ~1.6 GB.
 /// Per-blob refs are emitted into fresh `Vec<i64>`s that the main thread
-/// consumes and drops immediately after the union, so the transient
-/// worker-side memory stays bounded to per-blob refs (~8 k ways × ~20
-/// refs each × 8 B = ~1.3 MB) regardless of how many blobs have completed.
+/// consumes and drops immediately after the union, so transient worker-side
+/// memory stays bounded to in-flight blob refs rather than all completed
+/// blobs. Store size and peak memory depend on the input; see
+/// `reference/performance.md` for measurements.
 ///
 /// `direct_io` is intentionally dropped on this path: the blob bodies are
 /// pread from the shared file handle on worker threads, which is
@@ -921,9 +912,9 @@ fn collect_way_referenced_node_ids(
     let mut referenced = IdSet::new();
     let mut shared = inject_prepass.then(IdSet::new);
     // Union-side attribution: the drain below runs on the main thread
-    // and is the suspected pass-0 wall at scale (~4.7 B set calls at
-    // europe). Timed per drained blob so `altw_pass0_union_ms` vs the
-    // phase wall separates serial-union cost from worker scan cost.
+    // and is a suspected pass-0 bottleneck at scale. Timed per drained
+    // blob so `altw_pass0_union_ms` vs the phase wall separates
+    // serial-union cost from worker scan cost.
     let mut union_ns: u64 = 0;
     let mut union_refs_total: u64 = 0;
     crate::scan::classify::parallel_scan_blobs_raw(
@@ -958,9 +949,9 @@ fn collect_way_referenced_node_ids(
             // Split on `shared` rather than branching per ref: the plain
             // path must not pay the shared-detection `get`, which only
             // exists to feed prepass injection. Branching inside the loop
-            // cost ~2.3 ns/ref on every ref regardless of the flag
-            // (union 6.6 ns/ref vs 4.3), since `get` is a real probe of a
-            // multi-GB set and the branch predictor cannot elide it.
+            // was measured at ~2.3 ns/ref on every ref regardless of the
+            // flag (union 6.6 ns/ref vs 4.3), since `get` is a real probe of
+            // a large set and the branch predictor cannot elide it.
             match &mut shared {
                 Some(shared) => {
                     for &node_id in &refs_vec {
@@ -1002,10 +993,10 @@ fn collect_way_referenced_node_ids(
 ///
 /// Per-blob node-id streaming via `parallel_classify_phase`: workers emit
 /// `Vec<i64>` of relation-member node ids per blob through the bounded
-/// 32-slot result channel; the main thread unions them into one shared
-/// `IdSet`. Memory is bounded to one IdSet plus per-blob transient vectors
-/// rather than N-workers x per-worker `IdSet` (the previous shape, which
-/// hit +9.7 GB anon at europe scale). Same
+/// result channel; the main thread unions them into one shared `IdSet`.
+/// Memory is bounded to one IdSet plus per-blob transient vectors rather
+/// than one `IdSet` per worker (the previous shape, which measured +9.7 GB
+/// anon at europe scale). Same
 /// migration template as `tags_filter::collect_way_node_dependencies`
 /// (commit `17b116c`). Set-union is commutative, so the worker-arrival
 /// order does not affect the final IdSet contents.
@@ -1315,10 +1306,10 @@ mod tests {
 
     const GB: u64 = 1_000_000_000;
 
-    /// The measured grid this routing rule was fitted to (plantasjen, all
-    /// at `dcc445e`): north-america's 18.75 GB store against the
-    /// measuring host's ~25 GB budget ran linear (sparse won by 26 %),
-    /// europe's 28.94 GB thrashed (external won by 21 %).
+    /// The store sizes and budget below are the measured pair the threshold
+    /// was chosen between: the smaller store ran linear on sparse, the larger
+    /// thrashed. The measurements live in `reference/performance.md`; these
+    /// values are fixed test inputs, not a claim about today's datasets.
     #[test]
     fn route_reproduces_the_measured_grid() {
         let budget = Some(25 * GB);
@@ -1370,9 +1361,9 @@ mod tests {
         );
     }
 
-    /// Unknown store or budget routes external: the pre-scale-aware
-    /// behavior for sorted + indexed inputs, and the direction where a
-    /// wrong guess costs seconds rather than minutes of pass-2 thrash.
+    /// Unknown store or budget routes external for sorted + indexed input,
+    /// since the sparse working set cannot be compared with the available
+    /// page-cache budget.
     #[test]
     fn route_unknowns_fall_back_to_external() {
         assert_eq!(

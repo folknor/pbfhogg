@@ -551,7 +551,7 @@ fn sort_cross_validate_osmium() {
         .arg("--version")
         .output();
     if osmium_check.is_err() {
-        eprintln!("osmium not found, skipping cross-validation");
+        crate::common::skip("osmium not found in PATH");
         return;
     }
 
@@ -1098,7 +1098,7 @@ mod platform {
             .run();
 
         if run.is_o_direct_unsupported() {
-            eprintln!("O_DIRECT not supported on this filesystem, skipping test");
+            crate::common::skip("O_DIRECT not supported on this filesystem");
             return;
         }
         assert!(
@@ -1147,7 +1147,7 @@ mod platform {
             .run();
 
         if run.is_uring_unsupported() {
-            eprintln!("io_uring not available, skipping test");
+            crate::common::skip("io_uring not available on this host");
             return;
         }
         assert!(

@@ -15,7 +15,9 @@ fn main() {
         .expect("build header");
     writer.write_header(&header).expect("write header");
 
-    // Three nodes (expected by indexed.rs doc tests)
+    // Three nodes, then one way and one relation, each kind in its own block.
+    // Doc examples and unit tests in `src/read/` open this fixture and count
+    // its elements and blocks, so changing this shape means updating them.
     let mut bb = BlockBuilder::new();
     let meta = Metadata {
         version: 1,
@@ -50,7 +52,7 @@ fn main() {
         writer.write_primitive_block(bytes).expect("write nodes");
     }
 
-    // One way with building=yes (expected by indexed.rs read_ways_and_deps doc test)
+    // One building=yes way over the three nodes.
     let mut bb = BlockBuilder::new();
     bb.add_way(
         1,

@@ -184,7 +184,7 @@ impl BucketLayout {
 fn max_node_id_from_blob_meta(blob_meta: &[blob_meta::BlobMeta]) -> Result<u64> {
     let mut max_id: i64 = 0;
     for meta in blob_meta {
-        if !matches!(meta.kind, crate::blob_meta::ElemKind::Node) {
+        if !matches!(meta.kind, crate::ElementKind::Node) {
             continue;
         }
         if meta.max_id < meta.min_id {
@@ -214,9 +214,9 @@ fn max_node_id_from_blob_meta(blob_meta: &[blob_meta::BlobMeta]) -> Result<u64> 
 #[cfg(test)]
 mod max_node_id_tests {
     use super::{blob_meta::BlobMeta, max_node_id_from_blob_meta};
-    use crate::blob_meta::ElemKind;
+    use crate::ElementKind;
 
-    fn meta(kind: ElemKind, min_id: i64, max_id: i64) -> BlobMeta {
+    fn meta(kind: ElementKind, min_id: i64, max_id: i64) -> BlobMeta {
         BlobMeta {
             frame_offset: 0,
             data_offset: 0,
@@ -237,31 +237,34 @@ mod max_node_id_tests {
 
     #[test]
     fn no_node_blobs_is_zero() {
-        let metas = [meta(ElemKind::Way, 1, 100), meta(ElemKind::Relation, 1, 50)];
+        let metas = [
+            meta(ElementKind::Way, 1, 100),
+            meta(ElementKind::Relation, 1, 50),
+        ];
         assert_eq!(max_node_id_from_blob_meta(&metas).expect("ok"), 0);
     }
 
     #[test]
     fn picks_max_across_node_blobs() {
         let metas = [
-            meta(ElemKind::Node, 1, 999),
-            meta(ElemKind::Way, 1, 5_000_000),
-            meta(ElemKind::Node, 1000, 12_345),
-            meta(ElemKind::Node, 12_346, 99_999),
+            meta(ElementKind::Node, 1, 999),
+            meta(ElementKind::Way, 1, 5_000_000),
+            meta(ElementKind::Node, 1000, 12_345),
+            meta(ElementKind::Node, 12_346, 99_999),
         ];
         assert_eq!(max_node_id_from_blob_meta(&metas).expect("ok"), 99_999);
     }
 
     #[test]
     fn errors_on_reversed_range() {
-        let metas = [meta(ElemKind::Node, 100, 50)];
+        let metas = [meta(ElementKind::Node, 100, 50)];
         let err = max_node_id_from_blob_meta(&metas).expect_err("reversed range");
         assert!(err.to_string().contains("reversed indexdata"));
     }
 
     #[test]
     fn errors_on_negative_max() {
-        let metas = [meta(ElemKind::Node, -10, -5)];
+        let metas = [meta(ElementKind::Node, -10, -5)];
         let err = max_node_id_from_blob_meta(&metas).expect_err("negative max");
         assert!(err.to_string().contains("negative max_id"));
     }

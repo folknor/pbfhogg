@@ -2,7 +2,7 @@
 //! and passthrough coalescing. The drain calls these while processing items
 //! in file order.
 
-use crate::blob_meta::ElemKind;
+use crate::ElementKind;
 use crate::block_builder::BlockBuilder;
 use crate::file_writer::FileWriter;
 use crate::osc::CompactDiffOverlay;
@@ -23,7 +23,7 @@ use super::stats::MergeStats;
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_create_for_output(
     id: i64,
-    kind: ElemKind,
+    kind: ElementKind,
     diff: &CompactDiffOverlay,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
@@ -31,20 +31,20 @@ pub(super) fn emit_create_for_output(
     loc: LocMode<'_>,
 ) -> Result<()> {
     match kind {
-        ElemKind::Node => {
+        ElementKind::Node => {
             if let Some(osc) = diff.get_node(id) {
                 ensure_node_capacity(bb, writer)?;
                 add_osc_node(bb, &osc);
                 stats.diff_nodes += 1;
             }
         }
-        ElemKind::Way => {
+        ElementKind::Way => {
             if let Some(osc) = diff.get_way(id) {
                 write_osc_way(bb, writer, &osc, loc)?;
                 stats.diff_ways += 1;
             }
         }
-        ElemKind::Relation => {
+        ElementKind::Relation => {
             if let Some(osc) = diff.get_relation(id) {
                 write_osc_relation(bb, writer, &osc)?;
                 stats.diff_relations += 1;
@@ -59,8 +59,8 @@ pub(super) fn emit_create_for_output(
 /// all Way upserts).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn flush_remaining_upserts(
-    prev: ElemKind,
-    next: ElemKind,
+    prev: ElementKind,
+    next: ElementKind,
     ranges: &DiffRanges,
     diff: &CompactDiffOverlay,
     cursors: &mut UpsertCursors,
@@ -78,12 +78,12 @@ pub(super) fn flush_remaining_upserts(
     flush_block(bb, writer)?;
 
     // Handle skipped type: Node -> Relation (flush all Way upserts)
-    if prev == ElemKind::Node && next == ElemKind::Relation {
-        let (cursor, upserts) = cursors.get_mut(ElemKind::Way, ranges);
+    if prev == ElementKind::Node && next == ElementKind::Relation {
+        let (cursor, upserts) = cursors.get_mut(ElementKind::Way, ranges);
         while *cursor < upserts.len() {
             emit_create_for_output(
                 upserts[*cursor],
-                ElemKind::Way,
+                ElementKind::Way,
                 diff,
                 bb,
                 writer,
@@ -101,7 +101,7 @@ pub(super) fn flush_remaining_upserts(
 /// Emit gap creates: upsert IDs of the current type that fall before a blob's min_id.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_gap_creates(
-    blob_kind: ElemKind,
+    blob_kind: ElementKind,
     min_id: i64,
     ranges: &DiffRanges,
     diff: &CompactDiffOverlay,
@@ -121,7 +121,7 @@ pub(super) fn emit_gap_creates(
 
 /// Check whether there are gap creates to emit before min_id (without mutating cursors).
 pub(super) fn has_gap_creates(
-    blob_kind: ElemKind,
+    blob_kind: ElementKind,
     min_id: i64,
     ranges: &DiffRanges,
     cursors: &UpsertCursors,

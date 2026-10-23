@@ -417,7 +417,7 @@ fn cat_passthrough(
 // ---------------------------------------------------------------------------
 
 /// Type-filtered cat via raw frame passthrough. Matching blobs (by indexdata
-/// ElemKind) are written as-is - zero decompression, zero re-encoding.
+/// ElementKind) are written as-is - zero decompression, zero re-encoding.
 /// Non-matching blobs are skipped. Blobs without indexdata fall back to full
 /// decode + re-encode.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
@@ -675,7 +675,7 @@ fn cat_filtered(
             let (b, e) = run_kind_phase(
                 &shared_file,
                 &node_schedule,
-                crate::blob_meta::ElemKind::Node,
+                crate::ElementKind::Node,
                 clean,
                 compression,
                 &mut writer,
@@ -690,7 +690,7 @@ fn cat_filtered(
             let (b, e) = run_kind_phase(
                 &shared_file,
                 &way_schedule,
-                crate::blob_meta::ElemKind::Way,
+                crate::ElementKind::Way,
                 clean,
                 compression,
                 &mut writer,
@@ -705,7 +705,7 @@ fn cat_filtered(
             let (b, e) = run_kind_phase(
                 &shared_file,
                 &rel_schedule,
-                crate::blob_meta::ElemKind::Relation,
+                crate::ElementKind::Relation,
                 clean,
                 compression,
                 &mut writer,
@@ -739,13 +739,13 @@ fn cat_filtered(
 fn run_kind_phase(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
-    kind: crate::blob_meta::ElemKind,
+    kind: crate::ElementKind,
     clean: &CleanAttrs,
     compression: Compression,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     host: &crate::host::Host,
 ) -> Result<(u64, u64)> {
-    use crate::blob_meta::ElemKind;
+    use crate::ElementKind;
     use crate::reorder_buffer::ReorderBuffer;
 
     if schedule.is_empty() {
@@ -753,9 +753,9 @@ fn run_kind_phase(
     }
 
     let kind_filter = TypeFilter {
-        nodes: kind == ElemKind::Node,
-        ways: kind == ElemKind::Way,
-        relations: kind == ElemKind::Relation,
+        nodes: kind == ElementKind::Node,
+        ways: kind == ElementKind::Way,
+        relations: kind == ElementKind::Relation,
     };
 
     type PhaseResult = std::result::Result<(Vec<Vec<u8>>, u64), String>;

@@ -27,7 +27,7 @@ use crate::owned::{
 use crate::reorder_buffer::ReorderBuffer;
 use crate::scan::classify::{build_classify_schedule, parallel_classify_phase};
 use crate::writer::{Compression, PbfWriter};
-use crate::{DenseNode, Element, ElementReader, Node, PrimitiveBlock, Relation, Way};
+use crate::{DenseNode, Element, ElementKind, ElementReader, Node, PrimitiveBlock, Relation, Way};
 
 /// Statistics from a `time-filter` snapshot operation.
 pub struct TimeFilterStats {
@@ -52,13 +52,6 @@ impl TimeFilterStats {
 
         Ok(())
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ElementKind {
-    Node,
-    Way,
-    Relation,
 }
 
 struct PendingGroup {
@@ -685,18 +678,13 @@ fn write_owned_element(
 fn element_identity_and_timestamp(
     element: &Element<'_>,
 ) -> std::result::Result<(ElementKind, i64, i64), String> {
-    let (kind, id, kind_name, ts) = match element {
-        Element::DenseNode(dn) => (ElementKind::Node, dn.id(), "node", dense_timestamp(dn)),
-        Element::Node(n) => (ElementKind::Node, n.id(), "node", node_timestamp(n)),
-        Element::Way(w) => (ElementKind::Way, w.id(), "way", way_timestamp(w)),
-        Element::Relation(r) => (
-            ElementKind::Relation,
-            r.id(),
-            "relation",
-            relation_timestamp(r),
-        ),
+    let (kind, id, ts) = match element {
+        Element::DenseNode(dn) => (ElementKind::Node, dn.id(), dense_timestamp(dn)),
+        Element::Node(n) => (ElementKind::Node, n.id(), node_timestamp(n)),
+        Element::Way(w) => (ElementKind::Way, w.id(), way_timestamp(w)),
+        Element::Relation(r) => (ElementKind::Relation, r.id(), relation_timestamp(r)),
     };
-    Ok((kind, id, require_timestamp(ts, kind_name, id)?))
+    Ok((kind, id, require_timestamp(ts, kind.as_str(), id)?))
 }
 
 // ---------------------------------------------------------------------------

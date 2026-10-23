@@ -49,7 +49,7 @@ Skips entire blobs before decompression using metadata embedded in `BlobHeader`:
 
 | Filter | Source | Effect |
 |--------|--------|--------|
-| Element type | `BlobIndex::ElemKind` (indexdata) | Skip blobs with wrong type (~85% reduction for single-type queries) |
+| Element type | `BlobIndex::kind` (`ElementKind`) (indexdata) | Skip blobs with wrong type (~85% reduction for single-type queries) |
 | Tag key/prefix | Tagdata (BlobHeader field 4) | Skip blobs without required tag keys |
 | Spatial bbox | Coordinate bounds in indexdata | Skip blobs outside bounding box (nodes only) |
 

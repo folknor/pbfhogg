@@ -9,8 +9,9 @@
 //! Callers that choose a different cap also provide a bound on pre-allocation
 //! through [`BlockBuilder::with_element_cap_prealloc`].
 
+use crate::ElementKind;
 use crate::PrimitiveBlock;
-use crate::blob_meta::{BlobIndex, ElemKind};
+use crate::blob_meta::BlobIndex;
 use rustc_hash::FxHashSet;
 use std::io;
 
@@ -950,11 +951,11 @@ impl BlockBuilder {
         );
 
         let kind = match block_type {
-            BlockType::DenseNodes => ElemKind::Node,
-            BlockType::Ways => ElemKind::Way,
-            BlockType::Relations => ElemKind::Relation,
+            BlockType::DenseNodes => ElementKind::Node,
+            BlockType::Ways => ElementKind::Way,
+            BlockType::Relations => ElementKind::Relation,
         };
-        let bbox = if kind == ElemKind::Node && self.min_lat <= self.max_lat {
+        let bbox = if kind == ElementKind::Node && self.min_lat <= self.max_lat {
             Some(crate::blob_meta::BlobBbox::new(
                 self.min_lat,
                 self.max_lat,

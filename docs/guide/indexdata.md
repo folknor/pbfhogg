@@ -10,7 +10,7 @@ There are two types of embedded metadata:
 
 A 42-byte fixed-size blob per BlobHeader containing:
 
-- **Element type** (`ElemKind`) - whether the blob contains nodes, ways, or relations
+- **Element type** (`ElementKind`) - whether the blob contains nodes, ways, or relations
 - **ID range** - minimum and maximum element ID in the blob
 - **Spatial bounding box** - min/max latitude and longitude in decimicrodegrees (`i32` coordinates)
 

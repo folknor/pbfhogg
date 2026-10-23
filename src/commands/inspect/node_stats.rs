@@ -263,7 +263,7 @@ pub fn node_stats(
 
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         path,
-        Some(crate::blob_meta::ElemKind::Node),
+        Some(crate::ElementKind::Node),
         &host.diagnostics,
     )?;
 

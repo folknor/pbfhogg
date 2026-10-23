@@ -9,33 +9,26 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 
 use crate::BoxResult as Result;
-use crate::MemberId;
 use crate::osc::write::{
     OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, write_delete_xml,
     write_node_xml, write_relation_xml, write_way_xml,
 };
 use crate::osc::xml_parse::{
-    ElemKind, OscAction, OscSink, coord_to_decimicro, parse_i64_attr, parse_member_type,
-    parse_osc_path, parse_owned_metadata, parse_str_attr, parse_str_attr_optional,
+    OscAction, OscSink, coord_to_decimicro, parse_i64_attr, parse_member_type, parse_osc_path,
+    parse_owned_metadata, parse_str_attr, parse_str_attr_optional,
 };
 use crate::tag_expr::{Expression, parse_expressions, tag_matches};
+use crate::{ElementKind, MemberId};
 
-// The sole caller maps the exhaustive ElemKind variants to n/w/r, so the
-// fallback cannot silently drop a supported kind. This tag-first traversal
-// borrows owned OSC tags without building a temporary borrowed-tag vector.
+// This tag-first traversal borrows owned OSC tags without building a
+// temporary borrowed-tag vector.
 // It selects an entire create/modify element; deletes bypass this predicate.
 // An empty expression list matches nothing, unlike export's optional filter.
 // Single-tag wildcard and negation semantics remain owned by tag_matches.
-fn matches_any(expressions: &[Expression], tags: &[(String, String)], element_type: char) -> bool {
+fn matches_any(expressions: &[Expression], tags: &[(String, String)], kind: ElementKind) -> bool {
     for (key, value) in tags {
         for expr in expressions {
-            let type_ok = match element_type {
-                'n' => expr.type_filter.nodes,
-                'w' => expr.type_filter.ways,
-                'r' => expr.type_filter.relations,
-                _ => false,
-            };
-            if type_ok && tag_matches(&expr.matcher, key, value) {
+            if expr.type_filter.admits(kind) && tag_matches(&expr.matcher, key, value) {
                 return true;
             }
         }
@@ -48,7 +41,7 @@ fn matches_any(expressions: &[Expression], tags: &[(String, String)], element_ty
 // ---------------------------------------------------------------------------
 
 /// This command speaks the shared parser's vocabulary. It used to carry
-/// its own `Section` and `ElemKind` around a third hand-rolled copy of
+/// its own `Section` and `ElementKind` around a third hand-rolled copy of
 /// the OSC state machine - one the change-stream bug hunt did not even
 /// find, and which had drifted the same way the other two had: node
 /// coordinates defaulting to 0/0 in the Gulf of Guinea, a
@@ -58,7 +51,7 @@ fn matches_any(expressions: &[Expression], tags: &[(String, String)], element_ty
 type Section = OscAction;
 
 struct CurrentElem {
-    kind: ElemKind,
+    kind: ElementKind,
     id: i64,
     decimicro_lat: i32,
     decimicro_lon: i32,
@@ -79,7 +72,7 @@ struct CurrentElem {
 }
 
 impl CurrentElem {
-    fn new(kind: ElemKind, id: i64, metadata: Option<crate::osc::write::OwnedMetadata>) -> Self {
+    fn new(kind: ElementKind, id: i64, metadata: Option<crate::osc::write::OwnedMetadata>) -> Self {
         Self {
             kind,
             id,
@@ -215,7 +208,12 @@ struct FilterSink<'a> {
 }
 
 impl OscSink for FilterSink<'_> {
-    fn begin_element(&mut self, action: Section, kind: ElemKind, e: &BytesStart<'_>) -> Result<()> {
+    fn begin_element(
+        &mut self,
+        action: Section,
+        kind: ElementKind,
+        e: &BytesStart<'_>,
+    ) -> Result<()> {
         let id = parse_i64_attr(e, "id")?;
         self.section = action;
         // Read on every action, delete included: a `<delete>` carries
@@ -229,9 +227,9 @@ impl OscSink for FilterSink<'_> {
             self.stats.deletes_in += 1;
             self.stats.deletes_out += 1;
             match kind {
-                ElemKind::Node => self.filtered.delete_node_ids.push((id, metadata)),
-                ElemKind::Way => self.filtered.delete_way_ids.push((id, metadata)),
-                ElemKind::Relation => self.filtered.delete_relation_ids.push((id, metadata)),
+                ElementKind::Node => self.filtered.delete_node_ids.push((id, metadata)),
+                ElementKind::Way => self.filtered.delete_way_ids.push((id, metadata)),
+                ElementKind::Relation => self.filtered.delete_relation_ids.push((id, metadata)),
             }
             self.current = None;
             return Ok(());
@@ -243,7 +241,7 @@ impl OscSink for FilterSink<'_> {
         }
 
         let mut cur = CurrentElem::new(kind, id, metadata);
-        if kind == ElemKind::Node {
+        if kind == ElementKind::Node {
             cur.decimicro_lat = coord_to_decimicro(e, "lat", id)?;
             cur.decimicro_lon = coord_to_decimicro(e, "lon", id)?;
         }
@@ -320,17 +318,12 @@ fn finalize_current(
     let Some(cur) = current.take() else {
         return;
     };
-    let type_char = match cur.kind {
-        ElemKind::Node => 'n',
-        ElemKind::Way => 'w',
-        ElemKind::Relation => 'r',
-    };
-    if !matches_any(expressions, &cur.tags, type_char) {
+    if !matches_any(expressions, &cur.tags, cur.kind) {
         return;
     }
 
     match (section, cur.kind) {
-        (Section::Create, ElemKind::Node) => {
+        (Section::Create, ElementKind::Node) => {
             stats.creates_out += 1;
             filtered.create_nodes.push(OwnedNode {
                 id: cur.id,
@@ -340,7 +333,7 @@ fn finalize_current(
                 metadata: cur.metadata,
             });
         }
-        (Section::Create, ElemKind::Way) => {
+        (Section::Create, ElementKind::Way) => {
             stats.creates_out += 1;
             filtered.create_ways.push(OwnedWay {
                 id: cur.id,
@@ -349,7 +342,7 @@ fn finalize_current(
                 metadata: cur.metadata,
             });
         }
-        (Section::Create, ElemKind::Relation) => {
+        (Section::Create, ElementKind::Relation) => {
             stats.creates_out += 1;
             filtered.create_relations.push(OwnedRelation {
                 id: cur.id,
@@ -358,7 +351,7 @@ fn finalize_current(
                 metadata: cur.metadata,
             });
         }
-        (Section::Modify, ElemKind::Node) => {
+        (Section::Modify, ElementKind::Node) => {
             stats.modifies_out += 1;
             filtered.modify_nodes.push(OwnedNode {
                 id: cur.id,
@@ -368,7 +361,7 @@ fn finalize_current(
                 metadata: cur.metadata,
             });
         }
-        (Section::Modify, ElemKind::Way) => {
+        (Section::Modify, ElementKind::Way) => {
             stats.modifies_out += 1;
             filtered.modify_ways.push(OwnedWay {
                 id: cur.id,
@@ -377,7 +370,7 @@ fn finalize_current(
                 metadata: cur.metadata,
             });
         }
-        (Section::Modify, ElemKind::Relation) => {
+        (Section::Modify, ElementKind::Relation) => {
             stats.modifies_out += 1;
             filtered.modify_relations.push(OwnedRelation {
                 id: cur.id,
@@ -442,13 +435,13 @@ fn write_filtered_osc(output: &Path, filtered: &FilteredOsc) -> Result<()> {
     {
         writer.write_event(Event::Start(BytesStart::new("delete")))?;
         for (id, meta) in &filtered.delete_node_ids {
-            write_delete_xml(&mut writer, "node", *id, meta.as_ref())?;
+            write_delete_xml(&mut writer, ElementKind::Node, *id, meta.as_ref())?;
         }
         for (id, meta) in &filtered.delete_way_ids {
-            write_delete_xml(&mut writer, "way", *id, meta.as_ref())?;
+            write_delete_xml(&mut writer, ElementKind::Way, *id, meta.as_ref())?;
         }
         for (id, meta) in &filtered.delete_relation_ids {
-            write_delete_xml(&mut writer, "relation", *id, meta.as_ref())?;
+            write_delete_xml(&mut writer, ElementKind::Relation, *id, meta.as_ref())?;
         }
         writer.write_event(Event::End(BytesEnd::new("delete")))?;
     }

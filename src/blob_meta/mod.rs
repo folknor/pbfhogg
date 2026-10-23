@@ -18,6 +18,8 @@
 //! exactly 42. A field whose length disagrees with its version byte is not an
 //! index of either shape and is refused - see [`classify_wire_indexdata`].
 
+use crate::ElementKind;
+
 mod scan;
 mod tag_index;
 
@@ -60,14 +62,6 @@ pub(crate) fn scan_block_ids_and_tags(
     let (index, tags) = try_scan_block_ids_and_tags(raw)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok((index.map(|(index, _sorted)| index), tags))
-}
-
-/// Element type stored in a blob index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ElemKind {
-    Node,
-    Way,
-    Relation,
 }
 
 /// Spatial bounding box in decimicrodegrees (10⁻⁷ degrees).
@@ -117,7 +111,7 @@ impl BlobBbox {
 /// or deserialized from BlobHeader `indexdata`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BlobIndex {
-    pub kind: ElemKind,
+    pub kind: ElementKind,
     pub min_id: i64,
     pub max_id: i64,
     pub count: u64,
@@ -227,11 +221,7 @@ impl BlobIndex {
     pub fn serialize(&self) -> [u8; INDEX_SIZE] {
         let mut buf = [0u8; INDEX_SIZE];
         buf[0] = INDEX_VERSION;
-        buf[1] = match self.kind {
-            ElemKind::Node => 0,
-            ElemKind::Way => 1,
-            ElemKind::Relation => 2,
-        };
+        buf[1] = self.kind.ordinal();
         buf[2..10].copy_from_slice(&self.min_id.to_le_bytes());
         buf[10..18].copy_from_slice(&self.max_id.to_le_bytes());
         buf[18..26].copy_from_slice(&self.count.to_le_bytes());
@@ -268,12 +258,7 @@ impl BlobIndex {
         if data.len() != declared && data.len() != INDEX_SIZE {
             return None;
         }
-        let kind = match data[1] {
-            0 => ElemKind::Node,
-            1 => ElemKind::Way,
-            2 => ElemKind::Relation,
-            _ => return None,
-        };
+        let kind = ElementKind::from_ordinal(data[1])?;
         let min_id = i64::from_le_bytes(data[2..10].try_into().ok()?);
         let max_id = i64::from_le_bytes(data[10..18].try_into().ok()?);
         let count = u64::from_le_bytes(data[18..26].try_into().ok()?);
@@ -284,7 +269,7 @@ impl BlobIndex {
         // v2/v3: parse the spatial bbox for node blobs. Keyed on the declared
         // size, never on the slice length: a carrier holding a v1 index is 42
         // bytes long and its last 16 are padding.
-        let bbox = if declared == INDEX_SIZE && kind == ElemKind::Node {
+        let bbox = if declared == INDEX_SIZE && kind == ElementKind::Node {
             let min_lat = i32::from_le_bytes(data[26..30].try_into().ok()?);
             let max_lat = i32::from_le_bytes(data[30..34].try_into().ok()?);
             let min_lon = i32::from_le_bytes(data[34..38].try_into().ok()?);
@@ -396,11 +381,11 @@ impl BlobFilter {
     }
 
     /// Returns true if the filter accepts blobs of the given element kind.
-    pub(crate) fn wants(&self, kind: ElemKind) -> bool {
+    pub(crate) fn wants(&self, kind: ElementKind) -> bool {
         match kind {
-            ElemKind::Node => self.want_nodes,
-            ElemKind::Way => self.want_ways,
-            ElemKind::Relation => self.want_relations,
+            ElementKind::Node => self.want_nodes,
+            ElementKind::Way => self.want_ways,
+            ElementKind::Relation => self.want_relations,
         }
     }
 
@@ -422,7 +407,7 @@ impl BlobFilter {
         }
         // Spatial check for node blobs only
         if let Some(ref filter_bbox) = self.node_bbox
-            && index.kind == ElemKind::Node
+            && index.kind == ElementKind::Node
             && let Some(ref blob_bbox) = index.bbox
         {
             return filter_bbox.intersects(blob_bbox);
@@ -507,7 +492,7 @@ mod tests {
     #[test]
     fn roundtrip_v2_way_no_bbox() {
         let index = BlobIndex {
-            kind: ElemKind::Way,
+            kind: ElementKind::Way,
             min_id: 100,
             max_id: 9999,
             count: 42,
@@ -517,7 +502,7 @@ mod tests {
         assert_eq!(bytes.len(), INDEX_SIZE);
         assert_eq!(bytes[0], INDEX_VERSION);
         let recovered = BlobIndex::deserialize(&bytes).expect("deserialize should succeed");
-        assert_eq!(recovered.kind, ElemKind::Way);
+        assert_eq!(recovered.kind, ElementKind::Way);
         assert_eq!(recovered.min_id, 100);
         assert_eq!(recovered.max_id, 9999);
         assert_eq!(recovered.count, 42);
@@ -527,7 +512,7 @@ mod tests {
     #[test]
     fn roundtrip_v2_node_with_bbox() {
         let index = BlobIndex {
-            kind: ElemKind::Node,
+            kind: ElementKind::Node,
             min_id: 1,
             max_id: 8000,
             count: 8000,
@@ -540,7 +525,7 @@ mod tests {
         };
         let bytes = index.serialize();
         let recovered = BlobIndex::deserialize(&bytes).expect("deserialize should succeed");
-        assert_eq!(recovered.kind, ElemKind::Node);
+        assert_eq!(recovered.kind, ElementKind::Node);
         assert_eq!(recovered.min_id, 1);
         assert_eq!(recovered.max_id, 8000);
         assert_eq!(recovered.count, 8000);
@@ -555,7 +540,7 @@ mod tests {
     fn v1_backward_compat() {
         // Simulate v1 data: 26 bytes with version 0x01
         let v1_index = BlobIndex {
-            kind: ElemKind::Node,
+            kind: ElementKind::Node,
             min_id: 1,
             max_id: 100,
             count: 100,
@@ -569,7 +554,7 @@ mod tests {
         v1_bytes[18..26].copy_from_slice(&v1_index.count.to_le_bytes());
 
         let recovered = BlobIndex::deserialize(&v1_bytes).expect("v1 should deserialize");
-        assert_eq!(recovered.kind, ElemKind::Node);
+        assert_eq!(recovered.kind, ElementKind::Node);
         assert_eq!(recovered.min_id, 1);
         assert_eq!(recovered.max_id, 100);
         assert_eq!(recovered.count, 100);
@@ -583,7 +568,7 @@ mod tests {
     #[test]
     fn a_real_bbox_at_null_island_survives_the_roundtrip() {
         let index = BlobIndex {
-            kind: ElemKind::Node,
+            kind: ElementKind::Node,
             min_id: 1,
             max_id: 1,
             count: 1,
@@ -626,7 +611,7 @@ mod tests {
     #[test]
     fn v2_still_reads_all_zero_as_absence() {
         let mut bytes = BlobIndex {
-            kind: ElemKind::Node,
+            kind: ElementKind::Node,
             min_id: 1,
             max_id: 1,
             count: 1,
@@ -645,7 +630,7 @@ mod tests {
 
         // Counterpart: a v2 index with a real box still reads it.
         let mut bytes = BlobIndex {
-            kind: ElemKind::Node,
+            kind: ElementKind::Node,
             min_id: 1,
             max_id: 1,
             count: 1,
@@ -664,7 +649,7 @@ mod tests {
     #[test]
     fn deserialize_rejects_bad_version() {
         let mut bytes = BlobIndex {
-            kind: ElemKind::Node,
+            kind: ElementKind::Node,
             min_id: 0,
             max_id: 0,
             count: 0,
@@ -683,7 +668,7 @@ mod tests {
     #[test]
     fn deserialize_rejects_bad_type() {
         let mut bytes = BlobIndex {
-            kind: ElemKind::Node,
+            kind: ElementKind::Node,
             min_id: 0,
             max_id: 0,
             count: 0,
@@ -771,7 +756,7 @@ mod tests {
     #[test]
     fn roundtrip_negative_ids() {
         let index = BlobIndex {
-            kind: ElemKind::Node,
+            kind: ElementKind::Node,
             min_id: -100,
             max_id: -1,
             count: 100,
@@ -821,7 +806,7 @@ mod tests {
 
         // Node blob inside filter bbox → accepted
         let inside = BlobIndex {
-            kind: ElemKind::Node,
+            kind: ElementKind::Node,
             min_id: 1,
             max_id: 100,
             count: 100,
@@ -836,7 +821,7 @@ mod tests {
 
         // Node blob outside filter bbox → rejected
         let outside = BlobIndex {
-            kind: ElemKind::Node,
+            kind: ElementKind::Node,
             min_id: 200,
             max_id: 300,
             count: 100,
@@ -851,7 +836,7 @@ mod tests {
 
         // Node blob without bbox (v1 data) → accepted (conservative)
         let no_bbox = BlobIndex {
-            kind: ElemKind::Node,
+            kind: ElementKind::Node,
             min_id: 400,
             max_id: 500,
             count: 100,
@@ -861,7 +846,7 @@ mod tests {
 
         // Way blob → always accepted (no spatial filtering)
         let way = BlobIndex {
-            kind: ElemKind::Way,
+            kind: ElementKind::Way,
             min_id: 1,
             max_id: 100,
             count: 100,

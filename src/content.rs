@@ -29,7 +29,7 @@
 //! Changing what is content, or how [`write_record`] serializes it, changes
 //! what `digest` prints: bump `digest::CANONICAL_VERSION` with it.
 
-use crate::blob_meta::ElemKind;
+use crate::ElementKind;
 use crate::error::Result;
 use crate::osc::write::{OwnedNode, OwnedRelation, OwnedWay};
 use crate::{Element, MemberId};
@@ -55,7 +55,7 @@ pub(crate) enum Token<'a> {
 /// Something with element content: a borrowed [`Element`] or an owned
 /// element from the merge-join's buffers.
 pub(crate) trait Content {
-    fn content_kind(&self) -> ElemKind;
+    fn content_kind(&self) -> ElementKind;
     fn content_tokens(&self) -> impl Iterator<Item = Result<Token<'_>>>;
 }
 
@@ -79,11 +79,11 @@ pub(crate) fn content_equal(a: &impl Content, b: &impl Content) -> bool {
 }
 
 impl Content for Element<'_> {
-    fn content_kind(&self) -> ElemKind {
+    fn content_kind(&self) -> ElementKind {
         match self {
-            Element::DenseNode(_) | Element::Node(_) => ElemKind::Node,
-            Element::Way(_) => ElemKind::Way,
-            Element::Relation(_) => ElemKind::Relation,
+            Element::DenseNode(_) | Element::Node(_) => ElementKind::Node,
+            Element::Way(_) => ElementKind::Way,
+            Element::Relation(_) => ElementKind::Relation,
         }
     }
 
@@ -180,8 +180,8 @@ impl<'a> Iterator for ElementTokens<'a> {
 }
 
 impl Content for OwnedNode {
-    fn content_kind(&self) -> ElemKind {
-        ElemKind::Node
+    fn content_kind(&self) -> ElementKind {
+        ElementKind::Node
     }
 
     fn content_tokens(&self) -> impl Iterator<Item = Result<Token<'_>>> {
@@ -195,8 +195,8 @@ impl Content for OwnedNode {
 }
 
 impl Content for OwnedWay {
-    fn content_kind(&self) -> ElemKind {
-        ElemKind::Way
+    fn content_kind(&self) -> ElementKind {
+        ElementKind::Way
     }
 
     fn content_tokens(&self) -> impl Iterator<Item = Result<Token<'_>>> {
@@ -207,8 +207,8 @@ impl Content for OwnedWay {
 }
 
 impl Content for OwnedRelation {
-    fn content_kind(&self) -> ElemKind {
-        ElemKind::Relation
+    fn content_kind(&self) -> ElementKind {
+        ElementKind::Relation
     }
 
     fn content_tokens(&self) -> impl Iterator<Item = Result<Token<'_>>> {
@@ -253,9 +253,9 @@ const MEMBER_UNKNOWN: u8 = 0x03;
 /// the caller discards it.
 pub(crate) fn write_record(element: &Element<'_>, id: i64, out: &mut Vec<u8>) -> Result<()> {
     out.push(match element.content_kind() {
-        ElemKind::Node => KIND_NODE,
-        ElemKind::Way => KIND_WAY,
-        ElemKind::Relation => KIND_RELATION,
+        ElementKind::Node => KIND_NODE,
+        ElementKind::Way => KIND_WAY,
+        ElementKind::Relation => KIND_RELATION,
     });
     out.extend_from_slice(&id.to_le_bytes());
     for token in element.content_tokens() {

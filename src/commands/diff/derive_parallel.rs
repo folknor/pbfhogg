@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use quick_xml::Writer;
 
-use crate::blob_meta::{BlobIndex, ElemKind};
+use crate::ElementKind;
+use crate::blob_meta::BlobIndex;
 use crate::error::Result;
 use crate::osc::merge_join::element_id;
 use crate::osc::write::{OwnedMetadata, write_element_xml};
@@ -90,15 +91,15 @@ fn process_scratch_tag() -> &'static str {
 fn shard_xml_paths(
     scratch_dir: &Path,
     suffix: &str,
-    kind: ElemKind,
+    kind: ElementKind,
     shard_idx: usize,
 ) -> (PathBuf, PathBuf, PathBuf) {
     let pid = std::process::id();
     let tag = process_scratch_tag();
     let kind_tag = match kind {
-        ElemKind::Node => "n",
-        ElemKind::Way => "w",
-        ElemKind::Relation => "r",
+        ElementKind::Node => "n",
+        ElementKind::Way => "w",
+        ElementKind::Relation => "r",
     };
     (
         scratch_dir.join(format!(
@@ -143,7 +144,7 @@ fn run_shard(
     new_descs: &[BlobDesc],
     old_file: &File,
     new_file: &File,
-    kind: ElemKind,
+    kind: ElementKind,
     scratch_dir: &Path,
     scratch_suffix: &str,
     increment_version: bool,
@@ -331,7 +332,7 @@ fn run_shard(
 fn merge_overlapping_pair<W: Write>(
     old_decoded: &mut Option<Side>,
     new_decoded: &mut Option<Side>,
-    kind: ElemKind,
+    kind: ElementKind,
     t_low: i64,
     t_high: i64,
     creates_w: &mut Writer<W>,
@@ -386,7 +387,7 @@ fn element_merge<W: Write>(
     new_skip: usize,
     merge_up_to: i64,
     t_low: i64,
-    kind: ElemKind,
+    kind: ElementKind,
     creates_w: &mut Writer<W>,
     modifies_w: &mut Writer<W>,
     deletes_w: &mut Writer<W>,
@@ -492,7 +493,7 @@ fn emit_create<W: Write>(
 fn emit_delete<W: Write>(
     writer: &mut Writer<W>,
     elem: &Element<'_>,
-    kind: ElemKind,
+    kind: ElementKind,
     increment_version: bool,
     timestamp: Option<u64>,
 ) -> Result<()> {
@@ -505,10 +506,10 @@ fn emit_delete<W: Write>(
 
 fn extract_delete_info(
     elem: &Element<'_>,
-    kind: ElemKind,
+    kind: ElementKind,
 ) -> Option<(&'static str, i64, Option<OwnedMetadata>)> {
     match (kind, elem) {
-        (ElemKind::Node, Element::DenseNode(dn)) => Some((
+        (ElementKind::Node, Element::DenseNode(dn)) => Some((
             "node",
             dn.id(),
             dn.info()
@@ -516,17 +517,17 @@ fn extract_delete_info(
                 .filter(|&v| v != -1)
                 .map(OwnedMetadata::version_only),
         )),
-        (ElemKind::Node, Element::Node(n)) => Some((
+        (ElementKind::Node, Element::Node(n)) => Some((
             "node",
             n.id(),
             n.info().version().map(OwnedMetadata::version_only),
         )),
-        (ElemKind::Way, Element::Way(w)) => Some((
+        (ElementKind::Way, Element::Way(w)) => Some((
             "way",
             w.id(),
             w.info().version().map(OwnedMetadata::version_only),
         )),
-        (ElemKind::Relation, Element::Relation(r)) => Some((
+        (ElementKind::Relation, Element::Relation(r)) => Some((
             "relation",
             r.id(),
             r.info().version().map(OwnedMetadata::version_only),
@@ -647,26 +648,26 @@ pub(crate) fn derive_changes_parallel(
     let outer_deletes_guard = crate::path_guard::PathGuard::file(outer_deletes.clone());
 
     struct PhaseSlot<'a> {
-        kind: ElemKind,
+        kind: ElementKind,
         tag: &'static str,
         old: &'a [BlobDesc],
         new: &'a [BlobDesc],
     }
     let phases = [
         PhaseSlot {
-            kind: ElemKind::Node,
+            kind: ElementKind::Node,
             tag: "NODE",
             old: &old.nodes,
             new: &new.nodes,
         },
         PhaseSlot {
-            kind: ElemKind::Way,
+            kind: ElementKind::Way,
             tag: "WAY",
             old: &old.ways,
             new: &new.ways,
         },
         PhaseSlot {
-            kind: ElemKind::Relation,
+            kind: ElementKind::Relation,
             tag: "REL",
             old: &old.relations,
             new: &new.relations,

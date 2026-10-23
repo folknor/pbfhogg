@@ -53,7 +53,7 @@
 
 use protohoggr::Cursor;
 
-use super::{BlobBbox, BlobIndex, ElemKind, TagIndex};
+use super::{BlobBbox, BlobIndex, ElementKind, TagIndex};
 use crate::error::{ErrorKind, Result, new_error, new_wire_error};
 use crate::read::wire::{
     WIRE_LEN, WIRE_VARINT, WireDenseNodes, WireNode, WireRelation, WireWay, read_int32,
@@ -121,7 +121,7 @@ struct Walk<'a> {
     lon_offset: i64,
     groups: usize,
 
-    kind: Option<ElemKind>,
+    kind: Option<ElementKind>,
     kinds_differ: bool,
     unsupported_group: bool,
     count: u64,
@@ -233,7 +233,7 @@ impl<'a> Walk<'a> {
                     let node = WireNode::parse(cur.read_len_delimited()?)?;
                     self.packed_keys(node.keys_data, node.vals_data)?;
                     self.coordinate(node.lat, node.lon);
-                    self.element(ElemKind::Node, node.id);
+                    self.element(ElementKind::Node, node.id);
                 }
                 (2, WIRE_LEN) => {
                     // Protobuf would merge a repeated DenseNodes; the decoder
@@ -249,12 +249,12 @@ impl<'a> Walk<'a> {
                 (3, WIRE_LEN) => {
                     let way = WireWay::parse(cur.read_len_delimited()?)?;
                     self.packed_keys(way.keys_data, way.vals_data)?;
-                    self.element(ElemKind::Way, way.id);
+                    self.element(ElementKind::Way, way.id);
                 }
                 (4, WIRE_LEN) => {
                     let rel = WireRelation::parse(cur.read_len_delimited()?)?;
                     self.packed_keys(rel.keys_data, rel.vals_data)?;
-                    self.element(ElemKind::Relation, rel.id);
+                    self.element(ElementKind::Relation, rel.id);
                 }
                 _ => {
                     cur.skip_field(wire_type)?;
@@ -275,7 +275,7 @@ impl<'a> Walk<'a> {
     }
 
     /// Record one element's kind and ID.
-    fn element(&mut self, kind: ElemKind, id: i64) {
+    fn element(&mut self, kind: ElementKind, id: i64) {
         match self.kind {
             None => self.kind = Some(kind),
             // Mixed-kind blobs cannot be indexed: the fast paths (raw
@@ -408,7 +408,7 @@ impl<'a> Walk<'a> {
             lat = lat.wrapping_add(dlat);
             lon = lon.wrapping_add(dlon);
             self.coordinate(lat, lon);
-            self.element(ElemKind::Node, id);
+            self.element(ElementKind::Node, id);
             nodes += 1;
         }
         if !lats.is_empty() || !lons.is_empty() {
@@ -462,8 +462,8 @@ impl<'a> Walk<'a> {
 
     /// The blob's bbox in decimicrodegrees, or `None` when it has none or the
     /// extent cannot be scaled into decimicrodegrees.
-    fn bbox(&self, kind: ElemKind) -> Option<BlobBbox> {
-        if kind != ElemKind::Node {
+    fn bbox(&self, kind: ElementKind) -> Option<BlobBbox> {
+        if kind != ElementKind::Node {
             return None;
         }
         let e = self.extent?;
@@ -678,7 +678,7 @@ mod tests {
         let block = block_from_groups(&[&a, &b]);
         let (index, sorted) = scan_block_ids_checked(&block).unwrap();
         assert!(sorted, "two ascending same-kind groups must be sorted");
-        assert_eq!(index.kind, ElemKind::Node);
+        assert_eq!(index.kind, ElementKind::Node);
         assert_eq!(index.min_id, 1);
         assert_eq!(index.max_id, 4);
         assert_eq!(index.count, 4);
@@ -752,7 +752,7 @@ mod tests {
         let block = block_from_groups(&[&g]);
         let (index, sorted) = scan_block_ids_checked(&block).unwrap();
         assert!(sorted);
-        assert_eq!(index.kind, ElemKind::Way);
+        assert_eq!(index.kind, ElementKind::Way);
         assert_eq!((index.min_id, index.max_id, index.count), (1, 3, 3));
         assert!(index.bbox.is_none(), "ways carry no bbox");
     }
@@ -763,7 +763,7 @@ mod tests {
         let block = block_from_groups(&[&g]);
         let (index, sorted) = scan_block_ids_checked(&block).unwrap();
         assert!(!sorted);
-        assert_eq!(index.kind, ElemKind::Way);
+        assert_eq!(index.kind, ElementKind::Way);
     }
 
     #[test]
@@ -772,7 +772,7 @@ mod tests {
         let block = block_from_groups(&[&g]);
         let (index, sorted) = scan_block_ids_checked(&block).unwrap();
         assert!(!sorted);
-        assert_eq!(index.kind, ElemKind::Relation);
+        assert_eq!(index.kind, ElementKind::Relation);
     }
 
     #[test]
@@ -781,7 +781,7 @@ mod tests {
         let block = block_from_groups(&[&g]);
         let (index, sorted) = scan_block_ids_checked(&block).unwrap();
         assert!(!sorted);
-        assert_eq!(index.kind, ElemKind::Node);
+        assert_eq!(index.kind, ElementKind::Node);
     }
 
     /// `Node.id` is `sint64`, so its wire value is zigzag-encoded. The old
@@ -836,7 +836,7 @@ mod tests {
             .expect("an unpacked DenseNodes.id array must still produce a BlobIndex");
         assert_eq!(
             (index.kind, index.count, index.min_id),
-            (ElemKind::Node, 1, 7)
+            (ElementKind::Node, 1, 7)
         );
 
         let packed = block_from_groups(&[&dense_group_body(&[7])]);
@@ -899,7 +899,7 @@ mod tests {
         let (index, sorted) = scan_block_ids_checked(&block)
             .expect("two single-kind way groups must still be indexable");
         assert!(sorted);
-        assert_eq!((index.kind, index.count), (ElemKind::Way, 4));
+        assert_eq!((index.kind, index.count), (ElementKind::Way, 4));
     }
 
     #[test]

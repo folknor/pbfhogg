@@ -417,7 +417,7 @@ mod tests {
             shared
         });
         let index = crate::blob_meta::BlobIndex {
-            kind: crate::blob_meta::ElemKind::Node,
+            kind: crate::ElementKind::Node,
             min_id: 1,
             max_id: 1,
             count: 1,

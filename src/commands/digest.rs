@@ -64,10 +64,10 @@ use std::path::Path;
 
 use xxhash_rust::xxh3::Xxh3;
 
-use crate::blob_meta::{BlobIndex, ElemKind};
+use crate::blob_meta::BlobIndex;
 use crate::content::write_record;
 use crate::read::header_walker::HeaderWalker;
-use crate::{BlockType, Element, ElementReader, PrimitiveBlock};
+use crate::{BlockType, Element, ElementKind, ElementReader, PrimitiveBlock};
 
 use super::Result;
 
@@ -177,7 +177,7 @@ struct BlockSummary {
 }
 
 struct BlockContent {
-    kind: ElemKind,
+    kind: ElementKind,
     /// First and last element ID in file (and therefore canonical) order.
     first_id: i64,
     last_id: i64,
@@ -189,19 +189,19 @@ struct BlockContent {
     records: Vec<u8>,
 }
 
-fn element_kind(element: &Element<'_>) -> ElemKind {
+fn element_kind(element: &Element<'_>) -> ElementKind {
     match element {
-        Element::DenseNode(_) | Element::Node(_) => ElemKind::Node,
-        Element::Way(_) => ElemKind::Way,
-        Element::Relation(_) => ElemKind::Relation,
+        Element::DenseNode(_) | Element::Node(_) => ElementKind::Node,
+        Element::Way(_) => ElementKind::Way,
+        Element::Relation(_) => ElementKind::Relation,
     }
 }
 
-fn block_kind(block_type: BlockType) -> std::result::Result<Option<ElemKind>, String> {
+fn block_kind(block_type: BlockType) -> std::result::Result<Option<ElementKind>, String> {
     match block_type {
-        BlockType::DenseNodes | BlockType::Nodes => Ok(Some(ElemKind::Node)),
-        BlockType::Ways => Ok(Some(ElemKind::Way)),
-        BlockType::Relations => Ok(Some(ElemKind::Relation)),
+        BlockType::DenseNodes | BlockType::Nodes => Ok(Some(ElementKind::Node)),
+        BlockType::Ways => Ok(Some(ElementKind::Way)),
+        BlockType::Relations => Ok(Some(ElementKind::Relation)),
         BlockType::Empty => Ok(None),
         BlockType::Mixed => Err("a data block mixes element kinds (or carries an unknown \
                                  group field); diff's streaming merge rejects such blocks"
@@ -222,12 +222,12 @@ fn summarize_block(block: PrimitiveBlock) -> std::result::Result<BlockSummary, S
             return Err(format!(
                 "a data block classified as {} holds a {} element; diff's streaming merge \
                  would misroute it",
-                classified.map_or("empty", kind_name),
-                kind_name(kind),
+                classified.map_or("empty", ElementKind::as_str),
+                kind.as_str(),
             ));
         }
         let id = crate::osc::merge_join::element_id(&element);
-        check_user(&element).map_err(|e| format!("{} {id}: {e}", kind_name(kind)))?;
+        check_user(&element).map_err(|e| format!("{} {id}: {e}", kind.as_str()))?;
         let c = content.get_or_insert_with(|| BlockContent {
             kind,
             first_id: id,
@@ -240,13 +240,13 @@ fn summarize_block(block: PrimitiveBlock) -> std::result::Result<BlockSummary, S
         if c.count > 0 && crate::osm_id::osm_id_cmp(c.last_id, id).is_ge() {
             return Err(format!(
                 "{} {id} follows {} {} in the same block; IDs must strictly ascend",
-                kind_name(kind),
-                kind_name(kind),
+                kind.as_str(),
+                kind.as_str(),
                 c.last_id,
             ));
         }
         write_record(&element, id, &mut c.records)
-            .map_err(|e| format!("{} {id}: {e}", kind_name(kind)))?;
+            .map_err(|e| format!("{} {id}: {e}", kind.as_str()))?;
         c.last_id = id;
         c.min_id = c.min_id.min(id);
         c.max_id = c.max_id.max(id);
@@ -276,22 +276,6 @@ fn check_user(element: &Element<'_>) -> crate::error::Result<()> {
     Ok(())
 }
 
-fn kind_name(kind: ElemKind) -> &'static str {
-    match kind {
-        ElemKind::Node => "node",
-        ElemKind::Way => "way",
-        ElemKind::Relation => "relation",
-    }
-}
-
-fn kind_order(kind: ElemKind) -> u8 {
-    match kind {
-        ElemKind::Node => 0,
-        ElemKind::Way => 1,
-        ElemKind::Relation => 2,
-    }
-}
-
 /// The in-order consumer: cross-block checks (domain rules 2 and 3) and the
 /// streaming hash states. Nothing leaves it until [`Self::finish`], so a
 /// refusal anywhere in the file prints no digest at all.
@@ -300,7 +284,7 @@ struct DigestState {
     /// Whether the data blobs carry indexdata, fixed by the first one.
     indexed: Option<bool>,
     /// Kind and ID of the last element seen.
-    last: Option<(ElemKind, i64)>,
+    last: Option<(ElementKind, i64)>,
     all: Xxh3,
     kinds: [(u64, Xxh3); 3],
 }
@@ -328,27 +312,27 @@ impl DigestState {
             return Ok(());
         };
         if let Some((last_kind, last_id)) = self.last {
-            let (this, prev) = (kind_order(content.kind), kind_order(last_kind));
+            let (this, prev) = (content.kind, last_kind);
             if this < prev {
                 return Err(format!(
                     "a {} block follows {} elements; kinds must appear nodes, ways, relations",
-                    kind_name(content.kind),
-                    kind_name(last_kind),
+                    content.kind.as_str(),
+                    last_kind.as_str(),
                 ));
             }
             if this == prev && crate::osm_id::osm_id_cmp(last_id, content.first_id).is_ge() {
                 return Err(format!(
                     "{} {} follows {} {} in an earlier block; IDs must strictly ascend",
-                    kind_name(content.kind),
+                    content.kind.as_str(),
                     content.first_id,
-                    kind_name(last_kind),
+                    last_kind.as_str(),
                     last_id,
                 ));
             }
         }
         self.last = Some((content.kind, content.last_id));
         self.all.update(&content.records);
-        let (count, hasher) = &mut self.kinds[usize::from(kind_order(content.kind))];
+        let (count, hasher) = &mut self.kinds[usize::from(content.kind.ordinal())];
         *count += content.count;
         hasher.update(&content.records);
         Ok(())
@@ -383,8 +367,8 @@ impl DigestState {
             return Err(format!(
                 "a {} blob's indexdata claims kind {}, ids {}..={}, count {}, but the block \
                  holds ids {}..={}, count {}; diff trusts these claims",
-                kind_name(c.kind),
-                kind_name(index.kind),
+                c.kind.as_str(),
+                index.kind.as_str(),
                 index.min_id,
                 index.max_id,
                 index.count,

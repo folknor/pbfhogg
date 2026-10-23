@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use crate::blob_meta::ElemKind;
+use crate::ElementKind;
 
 use super::super::Result;
 
@@ -14,7 +14,7 @@ pub(super) struct BlobMeta {
     pub frame_offset: u64,
     pub data_offset: u64,
     pub data_size: usize,
-    pub kind: ElemKind,
+    pub kind: ElementKind,
     pub min_id: i64,
     pub max_id: i64,
     pub count: u64,
@@ -65,9 +65,9 @@ pub(super) fn scan_blob_metadata(
             false
         };
         match idx.kind {
-            ElemKind::Node => node_blobs += 1,
-            ElemKind::Way => way_blobs += 1,
-            ElemKind::Relation => relation_blobs += 1,
+            ElementKind::Node => node_blobs += 1,
+            ElementKind::Way => way_blobs += 1,
+            ElementKind::Relation => relation_blobs += 1,
         }
         metas.push(BlobMeta {
             frame_offset: meta.frame_start,

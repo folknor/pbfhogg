@@ -45,7 +45,7 @@ struct BlobDescriptor {
     /// Ways never qualify (they need coord_payloads splicing).
     is_passthrough: bool,
     /// Blob kind from indexdata. External join requires indexdata.
-    kind: crate::blob_meta::ElemKind,
+    kind: crate::ElementKind,
     /// Element count from indexdata, used to populate Stats on the
     /// passthrough path (no decode available for a live count).
     count: u64,
@@ -158,13 +158,13 @@ pub(super) fn stage4_assembly(
     for meta in blob_meta {
         // Count blob types for diagnostics.
         match meta.kind {
-            crate::blob_meta::ElemKind::Node => s4_node_blobs_total += 1,
-            crate::blob_meta::ElemKind::Way => s4_way_blobs += 1,
-            crate::blob_meta::ElemKind::Relation => s4_relation_blobs += 1,
+            crate::ElementKind::Node => s4_node_blobs_total += 1,
+            crate::ElementKind::Way => s4_way_blobs += 1,
+            crate::ElementKind::Relation => s4_relation_blobs += 1,
         }
 
         // P1b: skip node blobs with only untagged non-member nodes.
-        if !keep_untagged_nodes && matches!(meta.kind, crate::blob_meta::ElemKind::Node) {
+        if !keep_untagged_nodes && matches!(meta.kind, crate::ElementKind::Node) {
             if !meta.has_tagindex {
                 s4_node_blobs_no_tagindex += 1;
             } else if !meta.has_tags {
@@ -186,7 +186,7 @@ pub(super) fn stage4_assembly(
         }
 
         // Way blobs consume one sidecar entry each.
-        let way_blob_idx = if matches!(meta.kind, crate::blob_meta::ElemKind::Way) {
+        let way_blob_idx = if matches!(meta.kind, crate::ElementKind::Way) {
             if way_sidecar_idx >= way_slot_starts.len() {
                 return Err("ref count sidecar has fewer entries than way blobs in PBF".into());
             }
@@ -197,7 +197,7 @@ pub(super) fn stage4_assembly(
             0
         };
 
-        let is_way_blob = matches!(meta.kind, crate::blob_meta::ElemKind::Way);
+        let is_way_blob = matches!(meta.kind, crate::ElementKind::Way);
         let is_passthrough =
             super::super::blob_is_passthrough(Some(meta.kind), keep_untagged_nodes);
 
@@ -470,7 +470,7 @@ pub(super) fn stage4_assembly(
                             })?;
 
                             let index = crate::blob_meta::BlobIndex {
-                                kind: crate::blob_meta::ElemKind::Way,
+                                kind: crate::ElementKind::Way,
                                 min_id,
                                 max_id,
                                 count: way_count,
@@ -628,7 +628,7 @@ pub(super) fn stage4_assembly(
                 frame_offset: u64,
                 frame_size: usize,
                 count: u64,
-                kind: crate::blob_meta::ElemKind,
+                kind: crate::ElementKind,
             },
         }
 
@@ -728,14 +728,14 @@ pub(super) fn stage4_assembly(
                         *s4_passthrough_blobs += 1;
                         total_stats.blobs_passthrough += 1;
                         match kind {
-                            crate::blob_meta::ElemKind::Node => {
+                            crate::ElementKind::Node => {
                                 total_stats.nodes_read += count;
                                 total_stats.nodes_written += count;
                             }
-                            crate::blob_meta::ElemKind::Relation => {
+                            crate::ElementKind::Relation => {
                                 total_stats.relations_written += count;
                             }
-                            crate::blob_meta::ElemKind::Way => {
+                            crate::ElementKind::Way => {
                                 // Ways never pass through (they need
                                 // coord_payloads splicing). Fall through
                                 // without touching stats; unreachable in

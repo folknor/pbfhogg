@@ -286,20 +286,20 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         });
         if let Some(idx) = idx {
             // Build full_way_schedule unconditionally for way blobs.
-            if matches!(idx.kind, crate::blob_meta::ElemKind::Way) {
+            if matches!(idx.kind, crate::ElementKind::Way) {
                 full_way_schedule.push((seq, meta.data_offset, meta.data_size));
             }
             if !filter.wants_index(idx) {
                 continue;
             }
             match idx.kind {
-                crate::blob_meta::ElemKind::Node => {
+                crate::ElementKind::Node => {
                     node_schedule.push((seq, meta.data_offset, meta.data_size));
                 }
-                crate::blob_meta::ElemKind::Way => {
+                crate::ElementKind::Way => {
                     way_schedule.push((seq, meta.data_offset, meta.data_size));
                 }
-                crate::blob_meta::ElemKind::Relation => {
+                crate::ElementKind::Relation => {
                     relation_schedule.push((seq, meta.data_offset, meta.data_size));
                 }
             }
@@ -530,7 +530,7 @@ pub(super) fn extract_smart(
         let (way_schedule, shared_file) = if pass1_way_schedule.is_empty() {
             crate::scan::classify::build_classify_schedule(
                 input,
-                Some(crate::blob_meta::ElemKind::Way),
+                Some(crate::ElementKind::Way),
                 &host.diagnostics,
             )?
         } else {

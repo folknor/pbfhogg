@@ -6,10 +6,11 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use pbfhogg::ElementKind;
 use pbfhogg::altw::IndexType;
 use pbfhogg::cat::CleanAttrs;
 use pbfhogg::geocode_index::builder::BuildConfig as GeocodeBuildConfig;
-use pbfhogg::getid::{ElemKindTag, ElementRef};
+use pbfhogg::getid::ElementRef;
 use pbfhogg::tags_count::TagCountSort;
 use pbfhogg::writer::Compression;
 use pbfhogg::{HeaderOverrides, TypeFilter};
@@ -219,6 +220,16 @@ enum DefaultTypeArg {
     Relation,
 }
 
+impl From<DefaultTypeArg> for ElementKind {
+    fn from(arg: DefaultTypeArg) -> Self {
+        match arg {
+            DefaultTypeArg::Node => Self::Node,
+            DefaultTypeArg::Way => Self::Way,
+            DefaultTypeArg::Relation => Self::Relation,
+        }
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum ExportFormatArg {
     Geojsonseq,
@@ -229,6 +240,15 @@ enum ExportFormatArg {
 enum ExportTypeArg {
     Node,
     Way,
+}
+
+impl From<ExportTypeArg> for pbfhogg::export::ExportTypes {
+    fn from(arg: ExportTypeArg) -> Self {
+        match arg {
+            ExportTypeArg::Node => Self::NodesOnly,
+            ExportTypeArg::Way => Self::WaysOnly,
+        }
+    }
 }
 
 /// Metadata attribute accepted by `--clean`. The set is closed, so it is
@@ -2908,11 +2928,10 @@ fn run_export(
         ExportFormatArg::Geojsonseq => pbfhogg::export::ExportFormat::GeoJsonSeq,
         ExportFormatArg::Geojson => pbfhogg::export::ExportFormat::GeoJson,
     };
-    let types = match type_filter {
-        None => pbfhogg::export::ExportTypes::All,
-        Some(ExportTypeArg::Node) => pbfhogg::export::ExportTypes::NodesOnly,
-        Some(ExportTypeArg::Way) => pbfhogg::export::ExportTypes::WaysOnly,
-    };
+    let types = type_filter.map_or(
+        pbfhogg::export::ExportTypes::All,
+        pbfhogg::export::ExportTypes::from,
+    );
     let options = pbfhogg::export::ExportOptions::new(
         format,
         types,
@@ -2953,11 +2972,7 @@ fn resolve_ids(
     direct_io: bool,
     host: &pbfhogg::host::Host,
 ) -> Result<pbfhogg::getid::ElementIds, Box<dyn std::error::Error>> {
-    let default_type = default_type.map(|kind| match kind {
-        DefaultTypeArg::Node => pbfhogg::getid::DefaultType::Node,
-        DefaultTypeArg::Way => pbfhogg::getid::DefaultType::Way,
-        DefaultTypeArg::Relation => pbfhogg::getid::DefaultType::Relation,
-    });
+    let default_type = default_type.map(ElementKind::from);
     // Start with CLI positional IDs
     let mut id_set = pbfhogg::getid::parse_ids_with_default_type(ids, default_type)?;
     // Merge IDs from text file
@@ -3525,15 +3540,10 @@ fn run_show_element(
     direct_io: bool,
     host: &pbfhogg::host::Host,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
-    let elem_type = match element_ref.kind {
-        ElemKindTag::Node => pbfhogg::inspect::ShowElementType::Node,
-        ElemKindTag::Way => pbfhogg::inspect::ShowElementType::Way,
-        ElemKindTag::Relation => pbfhogg::inspect::ShowElementType::Relation,
-    };
     let mut out = output::buffered();
     let found = pbfhogg::inspect::show_element_to(
         path,
-        elem_type,
+        element_ref.kind,
         element_ref.id,
         direct_io,
         &mut out,

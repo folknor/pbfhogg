@@ -162,6 +162,7 @@ pub(crate) mod coord_pack;
 // FIFO through `debug::initialize_marker_fifo`; the library never reads
 // `BROKKR_MARKER_FIFO` itself.
 pub mod debug;
+mod element_kind;
 mod error;
 pub mod geo;
 pub mod geocode_index; // format is always available; reader requires geocode-reader feature
@@ -202,6 +203,7 @@ pub(crate) type BoxResult<T> = std::result::Result<T, Box<dyn std::error::Error>
 
 // Explicit re-exports: flat public API (`pbfhogg::Element`, `pbfhogg::BlobReader`, etc.)
 pub use blob_meta::{BlobBbox, BlobFilter};
+pub use element_kind::ElementKind;
 pub use error::{BlobError, Error, ErrorKind, Result};
 pub use owned::{ParseTypeFilterError, TypeFilter};
 pub use read::blob::{

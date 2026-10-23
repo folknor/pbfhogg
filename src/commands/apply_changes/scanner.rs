@@ -26,8 +26,8 @@
 use std::path::Path;
 use std::sync::mpsc;
 
+use crate::ElementKind;
 use crate::blob::BlobKind;
-use crate::blob_meta::ElemKind;
 use crate::error::Result;
 use crate::read::header_walker::HeaderWalker;
 
@@ -139,7 +139,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         // decompress + scan.
         let (kind, id_range, has_indexdata) = match meta.index.as_ref() {
             Some(idx) => (idx.kind, Some((idx.min_id, idx.max_id)), true),
-            None => (ElemKind::Node, None, false), // kind placeholder - workers correct it
+            None => (ElementKind::Node, None, false), // kind placeholder - workers correct it
         };
 
         let blob_offset = usize::try_from(meta.data_offset - meta.frame_start).map_err(|_| {
@@ -182,7 +182,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         // Keep that a deliberate indexdata trust-policy change: the measured
         // descriptor-first path avoids reading/decompressing those bodies,
         // and kind verification alone would still trust forged ID ranges.
-        let low_node_must_decompress = locations_on_ways && matches!(kind, ElemKind::Node);
+        let low_node_must_decompress = locations_on_ways && matches!(kind, ElementKind::Node);
         let is_fastpath = has_indexdata
             && use_copy_range
             && !low_node_must_decompress
@@ -226,7 +226,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         // Node→way barrier. Under --locations-on-ways, way/relation
         // descriptors are buffered once seen until the drain signals
         // loc_map ready. Node descriptors always emit immediately.
-        if !barrier_open && matches!(kind, ElemKind::Way | ElemKind::Relation) {
+        if !barrier_open && matches!(kind, ElementKind::Way | ElementKind::Relation) {
             // First non-Node descriptor: tell the drain how many Node
             // outputs to expect before it merges CoordSlots and signals
             // back. Send happens before the buffer push so the drain
@@ -245,7 +245,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         // Track the seq of every dispatched Node descriptor (including
         // those routed through the worker pool and those emitted on the
         // splice fast-path) so we can report `last_node_seq` to the drain.
-        if matches!(kind, ElemKind::Node) {
+        if matches!(kind, ElementKind::Node) {
             last_node_seq = Some(seq);
         }
 

@@ -14,7 +14,7 @@ use crate::owned::{dense_node_metadata, element_metadata};
 use crate::read::header_walker::ScanArm;
 use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
+use crate::{BlobFilter, Element, ElementKind, ElementReader, PrimitiveBlock};
 
 use super::Result;
 
@@ -47,66 +47,29 @@ impl ElementIds {
         !self.node_ids.has_any() && !self.way_ids.has_any() && !self.relation_ids.has_any()
     }
 
-    fn insert(&mut self, kind: ElemKindTag, id: i64) {
+    fn insert(&mut self, kind: ElementKind, id: i64) {
         match kind {
-            ElemKindTag::Node => self.node_ids.set(id),
-            ElemKindTag::Way => self.way_ids.set(id),
-            ElemKindTag::Relation => self.relation_ids.set(id),
+            ElementKind::Node => self.node_ids.set(id),
+            ElementKind::Way => self.way_ids.set(id),
+            ElementKind::Relation => self.relation_ids.set(id),
         }
     }
 }
 
-/// An element kind as getid names it: which of the three `ElementIds` sets a
-/// collected ID belongs to, and the kind half of a parsed [`ElementRef`].
+/// What one `process_block` call emitted.
 ///
 /// `process_block` runs on decode-worker threads, so it cannot write
 /// into a shared `ElementIds`; it hands back a small owned list instead
 /// and the sequential consumer merges. The list stays empty unless the
 /// caller asked for found-ID reporting, so the parallel path pays
 /// nothing when `--verbose-ids` is off.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ElemKindTag {
-    Node,
-    Way,
-    Relation,
-}
-
-/// What one `process_block` call emitted.
 struct BlockOutcome {
     nodes: u64,
     ways: u64,
     relations: u64,
     /// Requested IDs that were actually written. Empty unless the caller
     /// set `GetidOptions::report_found`.
-    found: Vec<(ElemKindTag, i64)>,
-}
-
-/// Element type used as default when parsing bare numeric IDs.
-#[derive(Clone, Copy)]
-pub enum DefaultType {
-    Node,
-    Way,
-    Relation,
-}
-
-impl DefaultType {
-    fn prefix(self) -> char {
-        match self {
-            Self::Node => 'n',
-            Self::Way => 'w',
-            Self::Relation => 'r',
-        }
-    }
-}
-
-impl ElemKindTag {
-    fn prefix(self) -> char {
-        match self {
-            Self::Node => 'n',
-            Self::Way => 'w',
-            Self::Relation => 'r',
-        }
-    }
+    found: Vec<(ElementKind, i64)>,
 }
 
 /// A typed element reference accepted by `getid`, `getparents` and
@@ -119,7 +82,7 @@ impl ElemKindTag {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ElementRef {
     /// The referenced OSM element kind.
-    pub kind: ElemKindTag,
+    pub kind: ElementKind,
     /// The signed OSM element ID.
     pub id: i64,
 }
@@ -129,17 +92,17 @@ impl std::str::FromStr for ElementRef {
 
     fn from_str(spec: &str) -> std::result::Result<Self, Self::Err> {
         let (kind, id_str) = if let Some(id) = spec.strip_prefix("node/") {
-            (ElemKindTag::Node, id)
+            (ElementKind::Node, id)
         } else if let Some(id) = spec.strip_prefix("way/") {
-            (ElemKindTag::Way, id)
+            (ElementKind::Way, id)
         } else if let Some(id) = spec.strip_prefix("relation/") {
-            (ElemKindTag::Relation, id)
+            (ElementKind::Relation, id)
         } else if let Some(id) = spec.strip_prefix('n') {
-            (ElemKindTag::Node, id)
+            (ElementKind::Node, id)
         } else if let Some(id) = spec.strip_prefix('w') {
-            (ElemKindTag::Way, id)
+            (ElementKind::Way, id)
         } else if let Some(id) = spec.strip_prefix('r') {
-            (ElemKindTag::Relation, id)
+            (ElementKind::Relation, id)
         } else {
             return Err(format!(
                 "invalid element spec '{spec}': expected n<id>, w<id>, r<id>, \
@@ -157,15 +120,10 @@ impl std::str::FromStr for ElementRef {
 /// Parse an ID spec like "n123", "w456", "r789".
 // String errors are intentional - shows the bad input value, which is more helpful
 // for CLI users than the underlying ParseIntError.
-fn parse_id_spec(spec: &str, default_type: Option<DefaultType>) -> Result<(char, i64)> {
-    let (prefix, id) = parse_id_spec_inner(spec, default_type)?;
+fn parse_id_spec(spec: &str, default_type: Option<ElementKind>) -> Result<(ElementKind, i64)> {
+    let (kind, id) = parse_id_spec_inner(spec, default_type)?;
     if id < 0 {
-        let kind = match prefix {
-            'n' => "node",
-            'w' => "way",
-            'r' => "relation",
-            _ => unreachable!(),
-        };
+        let kind = kind.as_str();
         return Err(format!(
             "getid requires non-negative input ids. \
              Input contains {kind} id {id}. \
@@ -174,10 +132,13 @@ fn parse_id_spec(spec: &str, default_type: Option<DefaultType>) -> Result<(char,
         )
         .into());
     }
-    Ok((prefix, id))
+    Ok((kind, id))
 }
 
-fn parse_id_spec_inner(spec: &str, default_type: Option<DefaultType>) -> Result<(char, i64)> {
+fn parse_id_spec_inner(
+    spec: &str,
+    default_type: Option<ElementKind>,
+) -> Result<(ElementKind, i64)> {
     // The optional default is deliberate: unlike osmium's implicit node
     // default, pbfhogg requires an explicit --default-type for bare numbers.
     if spec.len() < 2 {
@@ -185,7 +146,7 @@ fn parse_id_spec_inner(spec: &str, default_type: Option<DefaultType>) -> Result<
             let id: i64 = spec
                 .parse()
                 .map_err(|_| format!("invalid ID spec: {spec:?} (bad number)"))?;
-            return Ok((default.prefix(), id));
+            return Ok((default, id));
         }
         return Err(format!("invalid ID spec: {spec:?} (expected n/w/r prefix + number)").into());
     }
@@ -194,13 +155,13 @@ fn parse_id_spec_inner(spec: &str, default_type: Option<DefaultType>) -> Result<
         let element_ref: ElementRef = spec
             .parse()
             .map_err(|error| format!("invalid ID spec: {spec:?} ({error})"))?;
-        return Ok((element_ref.kind.prefix(), element_ref.id));
+        return Ok((element_ref.kind, element_ref.id));
     }
     if let Some(default) = default_type {
         let id: i64 = spec
             .parse()
             .map_err(|_| format!("invalid ID spec: {spec:?} (bad number)"))?;
-        return Ok((default.prefix(), id));
+        return Ok((default, id));
     }
     Err(format!("invalid ID spec: {spec:?} (expected prefix 'n', 'w', or 'r')").into())
 }
@@ -214,17 +175,12 @@ pub fn parse_ids(specs: &[String]) -> Result<ElementIds> {
 /// Parse ID specs from command-line arguments with optional default element type for bare IDs.
 pub fn parse_ids_with_default_type(
     specs: &[String],
-    default_type: Option<DefaultType>,
+    default_type: Option<ElementKind>,
 ) -> Result<ElementIds> {
     let mut set = ElementIds::empty();
     for spec in specs {
-        let (prefix, id) = parse_id_spec(spec, default_type)?;
-        match prefix {
-            'n' => set.node_ids.set(id),
-            'w' => set.way_ids.set(id),
-            'r' => set.relation_ids.set(id),
-            _ => unreachable!(),
-        }
+        let (kind, id) = parse_id_spec(spec, default_type)?;
+        set.insert(kind, id);
     }
     Ok(set)
 }
@@ -256,7 +212,7 @@ pub fn parse_ids_from_file(path: &Path) -> Result<ElementIds> {
 /// removes the `\r`); a line ending should not decide that.
 pub fn parse_ids_from_file_with_default_type(
     path: &Path,
-    default_type: Option<DefaultType>,
+    default_type: Option<ElementKind>,
 ) -> Result<ElementIds> {
     let contents = std::fs::read_to_string(path)?;
     let specs: Vec<String> = contents
@@ -685,13 +641,11 @@ fn filter_by_id_walker(
 
                 if let Some(ref idx) = meta.index {
                     let has_match = match idx.kind {
-                        crate::blob_meta::ElemKind::Node => {
+                        crate::ElementKind::Node => {
                             ids.node_ids.any_in_range(idx.min_id, idx.max_id)
                         }
-                        crate::blob_meta::ElemKind::Way => {
-                            ids.way_ids.any_in_range(idx.min_id, idx.max_id)
-                        }
-                        crate::blob_meta::ElemKind::Relation => {
+                        crate::ElementKind::Way => ids.way_ids.any_in_range(idx.min_id, idx.max_id),
+                        crate::ElementKind::Relation => {
                             ids.relation_ids.any_in_range(idx.min_id, idx.max_id)
                         }
                     };
@@ -871,13 +825,11 @@ fn filter_by_id_streaming(
                     .ok_or("no OSMHeader blob found before OsmData")?;
                 if let Some(ref idx) = frame.index {
                     let has_match = match idx.kind {
-                        crate::blob_meta::ElemKind::Node => {
+                        crate::ElementKind::Node => {
                             ids.node_ids.any_in_range(idx.min_id, idx.max_id)
                         }
-                        crate::blob_meta::ElemKind::Way => {
-                            ids.way_ids.any_in_range(idx.min_id, idx.max_id)
-                        }
-                        crate::blob_meta::ElemKind::Relation => {
+                        crate::ElementKind::Way => ids.way_ids.any_in_range(idx.min_id, idx.max_id),
+                        crate::ElementKind::Relation => {
                             ids.relation_ids.any_in_range(idx.min_id, idx.max_id)
                         }
                     };
@@ -991,7 +943,7 @@ fn getid_with_refs(
         // way IDs and collect their node refs.
         let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
             input,
-            Some(crate::blob_meta::ElemKind::Way),
+            Some(crate::ElementKind::Way),
             &host.diagnostics,
         )?;
 
@@ -1143,16 +1095,16 @@ fn is_dominated(
 /// "did not find" list go silent on genuine misses. Ways and relations
 /// reach the write path in include mode only when they matched
 /// directly, so they need no such guard.
-fn record_found(found: &mut Vec<(ElemKindTag, i64)>, ids: &ElementIds, element: &Element<'_>) {
+fn record_found(found: &mut Vec<(ElementKind, i64)>, ids: &ElementIds, element: &Element<'_>) {
     match element {
         Element::DenseNode(dn) if ids.node_ids.get(dn.id()) => {
-            found.push((ElemKindTag::Node, dn.id()));
+            found.push((ElementKind::Node, dn.id()));
         }
         Element::Node(n) if ids.node_ids.get(n.id()) => {
-            found.push((ElemKindTag::Node, n.id()));
+            found.push((ElementKind::Node, n.id()));
         }
-        Element::Way(w) => found.push((ElemKindTag::Way, w.id())),
-        Element::Relation(r) => found.push((ElemKindTag::Relation, r.id())),
+        Element::Way(w) => found.push((ElementKind::Way, w.id())),
+        Element::Relation(r) => found.push((ElementKind::Relation, r.id())),
         _ => {}
     }
 }
@@ -1176,7 +1128,7 @@ fn process_block(
     let mut nodes: u64 = 0;
     let mut ways: u64 = 0;
     let mut relations: u64 = 0;
-    let mut found: Vec<(ElemKindTag, i64)> = Vec::new();
+    let mut found: Vec<(ElementKind, i64)> = Vec::new();
 
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
@@ -1292,34 +1244,34 @@ mod tests {
     #[test]
     fn parse_node_id() {
         let (prefix, id) = parse_id_spec("n123", None).unwrap();
-        assert_eq!(prefix, 'n');
+        assert_eq!(prefix, ElementKind::Node);
         assert_eq!(id, 123);
     }
 
     #[test]
     fn parse_way_id() {
         let (prefix, id) = parse_id_spec("w456", None).unwrap();
-        assert_eq!(prefix, 'w');
+        assert_eq!(prefix, ElementKind::Way);
         assert_eq!(id, 456);
     }
 
     #[test]
     fn parse_relation_id() {
         let (prefix, id) = parse_id_spec("r789", None).unwrap();
-        assert_eq!(prefix, 'r');
+        assert_eq!(prefix, ElementKind::Relation);
         assert_eq!(id, 789);
     }
 
     #[test]
     fn element_ref_parser_accepts_short_and_named_types() {
         for (spec, kind, id) in [
-            ("n123", ElemKindTag::Node, 123),
-            ("node/123", ElemKindTag::Node, 123),
-            ("w456", ElemKindTag::Way, 456),
-            ("way/456", ElemKindTag::Way, 456),
-            ("r789", ElemKindTag::Relation, 789),
-            ("relation/789", ElemKindTag::Relation, 789),
-            ("node/-5", ElemKindTag::Node, -5),
+            ("n123", ElementKind::Node, 123),
+            ("node/123", ElementKind::Node, 123),
+            ("w456", ElementKind::Way, 456),
+            ("way/456", ElementKind::Way, 456),
+            ("r789", ElementKind::Relation, 789),
+            ("relation/789", ElementKind::Relation, 789),
+            ("node/-5", ElementKind::Node, -5),
         ] {
             let element_ref = spec.parse::<ElementRef>().unwrap();
             assert_eq!(element_ref.kind, kind);
@@ -1330,7 +1282,7 @@ mod tests {
     #[test]
     fn parse_large_id() {
         let (prefix, id) = parse_id_spec("n9876543210", None).unwrap();
-        assert_eq!(prefix, 'n');
+        assert_eq!(prefix, ElementKind::Node);
         assert_eq!(id, 9_876_543_210);
     }
 
@@ -1430,8 +1382,8 @@ mod tests {
 
     #[test]
     fn parse_bare_id_with_default_type_node() {
-        let (prefix, id) = parse_id_spec("42", Some(DefaultType::Node)).unwrap();
-        assert_eq!(prefix, 'n');
+        let (prefix, id) = parse_id_spec("42", Some(ElementKind::Node)).unwrap();
+        assert_eq!(prefix, ElementKind::Node);
         assert_eq!(id, 42);
     }
 
@@ -1441,7 +1393,7 @@ mod tests {
             .into_iter()
             .map(ToString::to_string)
             .collect();
-        let set = parse_ids_with_default_type(&specs, Some(DefaultType::Way)).unwrap();
+        let set = parse_ids_with_default_type(&specs, Some(ElementKind::Way)).unwrap();
         assert!(!set.node_ids.has_any());
         assert!(set.way_ids.get(1));
         assert!(set.way_ids.get(2));
@@ -1468,7 +1420,7 @@ mod tests {
         assert!(err.contains("relation id -7"), "{err}");
 
         // Bare negative number with default type must also reject.
-        let err = parse_id_spec("-5", Some(DefaultType::Node))
+        let err = parse_id_spec("-5", Some(ElementKind::Node))
             .unwrap_err()
             .to_string();
         assert!(err.contains("node id -5"), "{err}");

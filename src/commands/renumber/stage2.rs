@@ -83,7 +83,7 @@ pub(super) fn stage2d_parallel_way_assembly(
             } else {
                 let bytes = std::mem::take(&mut w.reframe_buf);
                 w.reframe_buf.reserve(bytes.len());
-                let index = blob_index(crate::blob_meta::ElemKind::Way, base, outcome.count, None)?;
+                let index = blob_index(crate::ElementKind::Way, base, outcome.count, None)?;
                 Some((bytes, index))
             };
             Ok(Rewritten {

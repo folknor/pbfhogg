@@ -348,7 +348,7 @@ fn extract_simple_single_pass(
         .iter()
         .filter(|d| {
             match d.kind {
-                Some(crate::blob_meta::ElemKind::Node) => {
+                Some(crate::ElementKind::Node) => {
                     // Apply spatial bbox filter to skip node blobs outside extract region.
                     if let Some(ref filter_bbox) = spatial_filter.node_bbox {
                         match d.bbox {
@@ -372,11 +372,11 @@ fn extract_simple_single_pass(
     // path) always have kind set and this path is only reachable via --force.
     let way_schedule: Vec<&BlobDesc> = full_schedule
         .iter()
-        .filter(|d| matches!(d.kind, Some(crate::blob_meta::ElemKind::Way) | None))
+        .filter(|d| matches!(d.kind, Some(crate::ElementKind::Way) | None))
         .collect();
     let relation_schedule: Vec<&BlobDesc> = full_schedule
         .iter()
-        .filter(|d| matches!(d.kind, Some(crate::blob_meta::ElemKind::Relation) | None))
+        .filter(|d| matches!(d.kind, Some(crate::ElementKind::Relation) | None))
         .collect();
 
     // Open writer.
@@ -565,7 +565,7 @@ fn extract_simple_single_pass(
                     block,
                     &ids,
                     clean,
-                    Some(crate::blob_meta::ElemKind::Node),
+                    Some(crate::ElementKind::Node),
                     bb,
                     output,
                 )?;
@@ -708,7 +708,7 @@ fn extract_simple_single_pass(
                     block,
                     &ids,
                     clean,
-                    Some(crate::blob_meta::ElemKind::Way),
+                    Some(crate::ElementKind::Way),
                     bb,
                     output,
                 )?;
@@ -776,7 +776,7 @@ fn extract_simple_single_pass(
                     block,
                     &ids,
                     clean,
-                    Some(crate::blob_meta::ElemKind::Relation),
+                    Some(crate::ElementKind::Relation),
                     bb,
                     output,
                 )?;

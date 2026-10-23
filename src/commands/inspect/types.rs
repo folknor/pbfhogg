@@ -2,7 +2,7 @@
 //! submodules.
 
 use crate::Element;
-use crate::blob_meta::ElemKind;
+use crate::ElementKind;
 
 // ---------------------------------------------------------------------------
 // Block type classification
@@ -35,11 +35,11 @@ impl BlockKind {
         }
     }
 
-    pub(super) fn from_elem_kind(kind: ElemKind) -> Self {
+    pub(super) fn from_elem_kind(kind: ElementKind) -> Self {
         match kind {
-            ElemKind::Node => Self::Nodes,
-            ElemKind::Way => Self::Ways,
-            ElemKind::Relation => Self::Relations,
+            ElementKind::Node => Self::Nodes,
+            ElementKind::Way => Self::Ways,
+            ElementKind::Relation => Self::Relations,
         }
     }
 

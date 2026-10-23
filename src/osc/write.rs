@@ -12,8 +12,8 @@
 use quick_xml::Writer;
 use quick_xml::events::{BytesEnd, BytesStart, Event};
 
-use crate::MemberId;
 use crate::coord_fmt::{format_coord, from_decimicro};
+use crate::{ElementKind, MemberId};
 
 /// Push an attribute whose value is OSM user data (tag key/value, member
 /// role, user name) and may therefore contain control characters.
@@ -159,9 +159,9 @@ pub(crate) struct OwnedRelation {
 /// takes the same answer: refuse to write it.
 pub(crate) fn member_type_str(id: MemberId, relation_id: i64) -> crate::BoxResult<&'static str> {
     match id {
-        MemberId::Node(_) => Ok("node"),
-        MemberId::Way(_) => Ok("way"),
-        MemberId::Relation(_) => Ok("relation"),
+        MemberId::Node(_) => Ok(ElementKind::Node.as_str()),
+        MemberId::Way(_) => Ok(ElementKind::Way.as_str()),
+        MemberId::Relation(_) => Ok(ElementKind::Relation.as_str()),
         MemberId::Unknown(member_id, type_value) => Err(format!(
             "relation {relation_id} has a member (ref {member_id}) with unknown type value \
              {type_value}; OSC has no spelling for it, and writing it as a node member would \
@@ -175,7 +175,7 @@ pub(crate) fn write_node_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     node: &OwnedNode,
 ) -> crate::BoxResult<()> {
-    let mut elem = BytesStart::new("node");
+    let mut elem = BytesStart::new(ElementKind::Node.as_str());
     let id_str = node.id.to_string();
     let mut coord_buf = String::new();
     format_coord(&mut coord_buf, from_decimicro(node.decimicro_lat));
@@ -193,7 +193,7 @@ pub(crate) fn write_node_xml<W: std::io::Write>(
     } else {
         writer.write_event(Event::Start(elem))?;
         write_tags_xml(writer, &node.tags)?;
-        writer.write_event(Event::End(BytesEnd::new("node")))?;
+        writer.write_event(Event::End(BytesEnd::new(ElementKind::Node.as_str())))?;
     }
     Ok(())
 }
@@ -202,7 +202,7 @@ pub(crate) fn write_way_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     way: &OwnedWay,
 ) -> crate::BoxResult<()> {
-    let mut elem = BytesStart::new("way");
+    let mut elem = BytesStart::new(ElementKind::Way.as_str());
     let id_str = way.id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
     if let Some(meta) = &way.metadata {
@@ -220,7 +220,7 @@ pub(crate) fn write_way_xml<W: std::io::Write>(
             writer.write_event(Event::Empty(nd))?;
         }
         write_tags_xml(writer, &way.tags)?;
-        writer.write_event(Event::End(BytesEnd::new("way")))?;
+        writer.write_event(Event::End(BytesEnd::new(ElementKind::Way.as_str())))?;
     }
     Ok(())
 }
@@ -229,7 +229,7 @@ pub(crate) fn write_relation_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     rel: &OwnedRelation,
 ) -> crate::BoxResult<()> {
-    let mut elem = BytesStart::new("relation");
+    let mut elem = BytesStart::new(ElementKind::Relation.as_str());
     let id_str = rel.id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
     if let Some(meta) = &rel.metadata {
@@ -250,7 +250,7 @@ pub(crate) fn write_relation_xml<W: std::io::Write>(
             writer.write_event(Event::Empty(member))?;
         }
         write_tags_xml(writer, &rel.tags)?;
-        writer.write_event(Event::End(BytesEnd::new("relation")))?;
+        writer.write_event(Event::End(BytesEnd::new(ElementKind::Relation.as_str())))?;
     }
     Ok(())
 }
@@ -258,11 +258,11 @@ pub(crate) fn write_relation_xml<W: std::io::Write>(
 /// Write an element as a delete entry (id + metadata only, no content).
 pub(crate) fn write_delete_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
-    tag_name: &str,
+    kind: ElementKind,
     id: i64,
     metadata: Option<&OwnedMetadata>,
 ) -> crate::BoxResult<()> {
-    let mut elem = BytesStart::new(tag_name);
+    let mut elem = BytesStart::new(kind.as_str());
     let id_str = id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
     if let Some(meta) = metadata {
@@ -366,7 +366,7 @@ fn write_dense_node_xml<W: std::io::Write>(
     node: &crate::dense::DenseNode<'_>,
     coord_buf: &mut String,
 ) -> crate::BoxResult<()> {
-    let mut elem = BytesStart::new("node");
+    let mut elem = BytesStart::new(ElementKind::Node.as_str());
     let id_str = node.id().to_string();
     format_coord(coord_buf, from_decimicro(node.decimicro_lat()));
     let lat_str = coord_buf.clone();
@@ -397,7 +397,7 @@ fn write_dense_node_xml<W: std::io::Write>(
     } else {
         writer.write_event(Event::Start(elem))?;
         write_borrowed_tags_xml(writer, tags)?;
-        writer.write_event(Event::End(BytesEnd::new("node")))?;
+        writer.write_event(Event::End(BytesEnd::new(ElementKind::Node.as_str())))?;
     }
     Ok(())
 }
@@ -407,7 +407,7 @@ fn write_borrowed_node_xml<W: std::io::Write>(
     node: &crate::elements::Node<'_>,
     coord_buf: &mut String,
 ) -> crate::BoxResult<()> {
-    let mut elem = BytesStart::new("node");
+    let mut elem = BytesStart::new(ElementKind::Node.as_str());
     let id_str = node.id().to_string();
     format_coord(coord_buf, from_decimicro(node.decimicro_lat()));
     let lat_str = coord_buf.clone();
@@ -436,7 +436,7 @@ fn write_borrowed_node_xml<W: std::io::Write>(
     } else {
         writer.write_event(Event::Start(elem))?;
         write_borrowed_tags_xml(writer, tags)?;
-        writer.write_event(Event::End(BytesEnd::new("node")))?;
+        writer.write_event(Event::End(BytesEnd::new(ElementKind::Node.as_str())))?;
     }
     Ok(())
 }
@@ -445,7 +445,7 @@ fn write_borrowed_way_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     way: &crate::elements::Way<'_>,
 ) -> crate::BoxResult<()> {
-    let mut elem = BytesStart::new("way");
+    let mut elem = BytesStart::new(ElementKind::Way.as_str());
     let id_str = way.id().to_string();
     elem.push_attribute(("id", id_str.as_str()));
     let info = way.info();
@@ -473,7 +473,7 @@ fn write_borrowed_way_xml<W: std::io::Write>(
             writer.write_event(Event::Empty(nd))?;
         }
         write_borrowed_tags_xml(writer, tags)?;
-        writer.write_event(Event::End(BytesEnd::new("way")))?;
+        writer.write_event(Event::End(BytesEnd::new(ElementKind::Way.as_str())))?;
     }
     Ok(())
 }
@@ -482,7 +482,7 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     rel: &crate::elements::Relation<'_>,
 ) -> crate::BoxResult<()> {
-    let mut elem = BytesStart::new("relation");
+    let mut elem = BytesStart::new(ElementKind::Relation.as_str());
     let id_str = rel.id().to_string();
     elem.push_attribute(("id", id_str.as_str()));
     let info = rel.info();
@@ -513,7 +513,7 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
             writer.write_event(Event::Empty(member))?;
         }
         write_borrowed_tags_xml(writer, tags)?;
-        writer.write_event(Event::End(BytesEnd::new("relation")))?;
+        writer.write_event(Event::End(BytesEnd::new(ElementKind::Relation.as_str())))?;
     }
     Ok(())
 }

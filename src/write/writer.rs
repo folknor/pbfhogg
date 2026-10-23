@@ -1526,7 +1526,7 @@ mod tests {
     fn every_primitive_block_variant_stops_once_the_writer_thread_is_dead() {
         let block = [0x12u8, 0x00];
         let index = crate::blob_meta::BlobIndex {
-            kind: crate::blob_meta::ElemKind::Node,
+            kind: crate::ElementKind::Node,
             min_id: 0,
             max_id: 0,
             count: 0,
@@ -1584,7 +1584,7 @@ mod tests {
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
         let block = [0x12u8, 0x00];
         let index = crate::blob_meta::BlobIndex {
-            kind: crate::blob_meta::ElemKind::Node,
+            kind: crate::ElementKind::Node,
             min_id: 0,
             max_id: 0,
             count: 0,

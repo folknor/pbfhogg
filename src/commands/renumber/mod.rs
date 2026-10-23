@@ -255,7 +255,7 @@ fn positional_bases(start: i64, schedule: &[BlobTask], kind: &str) -> Result<Vec
 
 /// The output `BlobIndex` for a non-empty, positionally numbered blob.
 fn blob_index(
-    kind: crate::blob_meta::ElemKind,
+    kind: crate::ElementKind,
     base: i64,
     count: u64,
     bbox: Option<crate::blob_meta::BlobBbox>,

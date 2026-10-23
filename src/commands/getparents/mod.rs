@@ -17,8 +17,8 @@ use super::{
     HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
     ensure_way_capacity_local, flush_local, writer_from_header_bytes,
 };
+use crate::ElementKind;
 use crate::blob::{BlobKind, decode_blob_to_headerblock};
-use crate::blob_meta::ElemKind;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::owned::{dense_node_metadata, element_metadata};
 use crate::read::header_walker::{HeaderWalker, ScanArm};
@@ -228,9 +228,9 @@ fn getparents_walker(
                     walker.observe_filter_index(meta.index.as_ref());
                 }
                 let keep = match meta.index.as_ref().map(|i| i.kind) {
-                    Some(ElemKind::Node) => need_node_blobs,
-                    Some(ElemKind::Way) => need_way_blobs,
-                    Some(ElemKind::Relation) => need_relation_blobs,
+                    Some(ElementKind::Node) => need_node_blobs,
+                    Some(ElementKind::Way) => need_way_blobs,
+                    Some(ElementKind::Relation) => need_relation_blobs,
                     // Unindexed blob: include conservatively since we don't
                     // know its kind without decoding.
                     None => true,

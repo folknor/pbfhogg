@@ -879,7 +879,7 @@ fn both_version_gates_let_the_later_equal_claim_win() {
         pbfhogg::osc::parse_osc_file_into(input, &mut overlay).unwrap();
     }
     assert!(!overlay.has_node(1));
-    assert!(overlay.is_deleted(pbfhogg::osc::OscElementKind::Node, 1));
+    assert!(overlay.is_deleted(pbfhogg::ElementKind::Node, 1));
     simplify_sequence_verdict(&inputs, &out).unwrap();
     let xml = read_gz(&out);
     assert!(

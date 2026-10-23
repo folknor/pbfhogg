@@ -15,7 +15,7 @@
 //!
 //! # Known limitations
 //!
-//! - **Sorted PBF assumption.** The indexdata-based blob skip (`ElemKind::Node` check)
+//! - **Sorted PBF assumption.** The indexdata-based blob skip (`ElementKind::Node` check)
 //!   relies on each blob containing exactly one element type, which is guaranteed by
 //!   `Sort.Type_then_ID`. Mixed-type blobs in unsorted PBFs could be mislabeled by
 //!   indexdata, causing nodes in a mislabeled blob to be skipped.

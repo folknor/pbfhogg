@@ -15,16 +15,16 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 use rayon::prelude::*;
 
 use super::Result;
-use crate::MemberId;
 use crate::osc::version_floor::{VersionFloor, regression_message};
 use crate::osc::write::{
     OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, write_delete_xml,
     write_node_xml, write_relation_xml, write_way_xml,
 };
 use crate::osc::xml_parse::{
-    ElemKind, OscAction, OscSink, coord_to_decimicro, parse_i64_attr, parse_member_type,
-    parse_osc_path, parse_owned_metadata, parse_str_attr, parse_str_attr_optional,
+    OscAction, OscSink, coord_to_decimicro, parse_i64_attr, parse_member_type, parse_osc_path,
+    parse_owned_metadata, parse_str_attr, parse_str_attr_optional,
 };
+use crate::{ElementKind, MemberId};
 
 /// `merge-changes` speaks the same three actions as the shared parser.
 type Action = OscAction;
@@ -37,11 +37,11 @@ enum ChangeElement {
 }
 
 impl ChangeElement {
-    fn key(&self) -> (u8, i64) {
+    fn key(&self) -> (ElementKind, i64) {
         match self {
-            Self::Node(n) => (0, n.id),
-            Self::Way(w) => (1, w.id),
-            Self::Relation(r) => (2, r.id),
+            Self::Node(n) => (ElementKind::Node, n.id),
+            Self::Way(w) => (ElementKind::Way, w.id),
+            Self::Relation(r) => (ElementKind::Relation, r.id),
         }
     }
 }
@@ -92,7 +92,7 @@ impl MergeChangesStats {
 }
 
 struct CurrentElem {
-    kind: ElemKind,
+    kind: ElementKind,
     id: i64,
     decimicro_lat: i32,
     decimicro_lon: i32,
@@ -103,7 +103,7 @@ struct CurrentElem {
 }
 
 impl CurrentElem {
-    fn new(kind: ElemKind, id: i64, metadata: Option<OwnedMetadata>) -> Self {
+    fn new(kind: ElementKind, id: i64, metadata: Option<OwnedMetadata>) -> Self {
         Self {
             kind,
             id,
@@ -118,20 +118,20 @@ impl CurrentElem {
 
     fn into_change_element(self) -> ChangeElement {
         match self.kind {
-            ElemKind::Node => ChangeElement::Node(OwnedNode {
+            ElementKind::Node => ChangeElement::Node(OwnedNode {
                 id: self.id,
                 decimicro_lat: self.decimicro_lat,
                 decimicro_lon: self.decimicro_lon,
                 tags: self.tags,
                 metadata: self.metadata,
             }),
-            ElemKind::Way => ChangeElement::Way(OwnedWay {
+            ElementKind::Way => ChangeElement::Way(OwnedWay {
                 id: self.id,
                 refs: self.refs,
                 tags: self.tags,
                 metadata: self.metadata,
             }),
-            ElemKind::Relation => ChangeElement::Relation(OwnedRelation {
+            ElementKind::Relation => ChangeElement::Relation(OwnedRelation {
                 id: self.id,
                 members: self.members,
                 tags: self.tags,
@@ -415,7 +415,7 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
     fn begin_element(
         &mut self,
         action: Action,
-        kind: ElemKind,
+        kind: ElementKind,
         e: &BytesStart<'_>,
     ) -> crate::BoxResult<()> {
         let id = parse_i64_attr(e, "id")?;
@@ -429,7 +429,7 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
         // the Gulf of Guinea and clamped `lat="1e30"` to `i32::MAX`.
         // Same rule as the overlay parser now, because it is the same
         // function.
-        if kind == ElemKind::Node && action != Action::Delete {
+        if kind == ElementKind::Node && action != Action::Delete {
             elem.decimicro_lat = coord_to_decimicro(e, "lat", id)?;
             elem.decimicro_lon = coord_to_decimicro(e, "lon", id)?;
         }
@@ -890,13 +890,13 @@ fn check_version_advance(floor: &mut VersionFloor, incoming: &Change) -> Result<
         && let Err(held) = floor.admit(claim)
     {
         let (kind, id) = match &incoming.element {
-            ChangeElement::Node(n) => ("node", n.id),
-            ChangeElement::Way(w) => ("way", w.id),
-            ChangeElement::Relation(r) => ("relation", r.id),
+            ChangeElement::Node(n) => (ElementKind::Node, n.id),
+            ChangeElement::Way(w) => (ElementKind::Way, w.id),
+            ChangeElement::Relation(r) => (ElementKind::Relation, r.id),
         };
         return Err(regression_message(
             "merge-changes --simplify",
-            kind,
+            kind.as_str(),
             id,
             version,
             held,
@@ -929,7 +929,7 @@ fn write_simplified(
     // (kind, ID) order that defines group chunking and gzip member bytes. Keep
     // this measured path until a replacement demonstrates lower peak RSS and
     // equivalent bytes; disk spooling would add another full payload write/read.
-    let mut last_by_object: BTreeMap<(u8, i64), (Change, VersionFloor)> = BTreeMap::new();
+    let mut last_by_object: BTreeMap<(ElementKind, i64), (Change, VersionFloor)> = BTreeMap::new();
     for change in stream.changes {
         let key = change.element.key();
         if allow_version_regression {
@@ -1052,12 +1052,12 @@ fn write_change_element<W: Write>(
     delete: bool,
 ) -> Result<()> {
     if delete {
-        let (tag, id, meta) = match element {
-            ChangeElement::Node(n) => ("node", n.id, n.metadata.as_ref()),
-            ChangeElement::Way(w) => ("way", w.id, w.metadata.as_ref()),
-            ChangeElement::Relation(r) => ("relation", r.id, r.metadata.as_ref()),
+        let (kind, id, meta) = match element {
+            ChangeElement::Node(n) => (ElementKind::Node, n.id, n.metadata.as_ref()),
+            ChangeElement::Way(w) => (ElementKind::Way, w.id, w.metadata.as_ref()),
+            ChangeElement::Relation(r) => (ElementKind::Relation, r.id, r.metadata.as_ref()),
         };
-        write_delete_xml(writer, tag, id, meta)
+        write_delete_xml(writer, kind, id, meta)
     } else {
         match element {
             ChangeElement::Node(node) => write_node_xml(writer, node),

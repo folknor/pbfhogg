@@ -62,9 +62,9 @@ pub(super) fn build_all_blob_schedules(
             );
         };
         let sched = match idx.kind {
-            crate::blob_meta::ElemKind::Node => &mut nodes,
-            crate::blob_meta::ElemKind::Way => &mut ways,
-            crate::blob_meta::ElemKind::Relation => &mut relations,
+            crate::ElementKind::Node => &mut nodes,
+            crate::ElementKind::Way => &mut ways,
+            crate::ElementKind::Relation => &mut relations,
         };
         sched.push(BlobTask {
             data_offset: meta.data_offset,

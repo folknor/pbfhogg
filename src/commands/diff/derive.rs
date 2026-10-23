@@ -13,7 +13,7 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 
 use crate::BoxResult as Result;
-use crate::blob_meta::ElemKind;
+use crate::ElementKind;
 use crate::osc::merge_join::{
     BlockMergeAction, BlockPairMergeState, MergeJoinAction, StreamingBlocks,
     block_pair_merge_phase, merge_join_phase,
@@ -249,7 +249,7 @@ impl ChangeSink {
         Ok(())
     }
 
-    fn write_delete(&mut self, elem: &crate::Element<'_>, kind: ElemKind) -> Result<()> {
+    fn write_delete(&mut self, elem: &crate::Element<'_>, kind: ElementKind) -> Result<()> {
         if let Some((tag, id, meta)) = extract_delete_info(elem, kind) {
             write_delete_element(
                 &mut self.deletes,
@@ -284,10 +284,10 @@ impl ChangeSink {
 /// Avoids full owned conversion (no tag/ref cloning - deletes only need id + version).
 fn extract_delete_info(
     elem: &crate::Element<'_>,
-    kind: ElemKind,
+    kind: ElementKind,
 ) -> Option<(&'static str, i64, Option<OwnedMetadata>)> {
     match (kind, elem) {
-        (ElemKind::Node, crate::Element::DenseNode(dn)) => Some((
+        (ElementKind::Node, crate::Element::DenseNode(dn)) => Some((
             "node",
             dn.id(),
             dn.info()
@@ -295,17 +295,17 @@ fn extract_delete_info(
                 .filter(|&v| v != -1)
                 .map(OwnedMetadata::version_only),
         )),
-        (ElemKind::Node, crate::Element::Node(n)) => Some((
+        (ElementKind::Node, crate::Element::Node(n)) => Some((
             "node",
             n.id(),
             n.info().version().map(OwnedMetadata::version_only),
         )),
-        (ElemKind::Way, crate::Element::Way(w)) => Some((
+        (ElementKind::Way, crate::Element::Way(w)) => Some((
             "way",
             w.id(),
             w.info().version().map(OwnedMetadata::version_only),
         )),
-        (ElemKind::Relation, crate::Element::Relation(r)) => Some((
+        (ElementKind::Relation, crate::Element::Relation(r)) => Some((
             "relation",
             r.id(),
             r.info().version().map(OwnedMetadata::version_only),
@@ -341,15 +341,15 @@ fn derive_changes_block_pair(
     let mut merge = BlockPairMergeState::new(old_reader, new_reader);
 
     crate::debug::emit_marker("DERIVECHANGES_PHASE_NODE_START");
-    collect_phase_block_pair(&mut merge, ElemKind::Node, sink)?;
+    collect_phase_block_pair(&mut merge, ElementKind::Node, sink)?;
     crate::debug::emit_marker("DERIVECHANGES_PHASE_NODE_END");
 
     crate::debug::emit_marker("DERIVECHANGES_PHASE_WAY_START");
-    collect_phase_block_pair(&mut merge, ElemKind::Way, sink)?;
+    collect_phase_block_pair(&mut merge, ElementKind::Way, sink)?;
     crate::debug::emit_marker("DERIVECHANGES_PHASE_WAY_END");
 
     crate::debug::emit_marker("DERIVECHANGES_PHASE_REL_START");
-    collect_phase_block_pair(&mut merge, ElemKind::Relation, sink)?;
+    collect_phase_block_pair(&mut merge, ElementKind::Relation, sink)?;
     crate::debug::emit_marker("DERIVECHANGES_PHASE_REL_END");
 
     emit_merge_stats_counters(&merge.stats);
@@ -393,7 +393,7 @@ fn emit_merge_stats_counters(s: &crate::osc::merge_join::BlockPairMergeStats) {
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn collect_phase_block_pair(
     merge: &mut BlockPairMergeState,
-    kind: ElemKind,
+    kind: ElementKind,
     sink: &mut ChangeSink,
 ) -> Result<()> {
     block_pair_merge_phase(merge, kind, true, &mut |action| {

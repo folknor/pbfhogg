@@ -54,13 +54,23 @@ impl TypeFilter {
         usize::from(self.nodes) + usize::from(self.ways) + usize::from(self.relations)
     }
 
+    /// Whether this filter admits the given element kind.
+    #[must_use]
+    pub fn admits(self, kind: crate::ElementKind) -> bool {
+        match kind {
+            crate::ElementKind::Node => self.nodes,
+            crate::ElementKind::Way => self.ways,
+            crate::ElementKind::Relation => self.relations,
+        }
+    }
+
     /// The filter's sole element kind, when it admits exactly one.
     /// Drives the blob-level classify schedule.
-    pub(crate) fn single_kind(self) -> Option<crate::blob_meta::ElemKind> {
+    pub(crate) fn single_kind(self) -> Option<crate::ElementKind> {
         match (self.nodes, self.ways, self.relations) {
-            (true, false, false) => Some(crate::blob_meta::ElemKind::Node),
-            (false, true, false) => Some(crate::blob_meta::ElemKind::Way),
-            (false, false, true) => Some(crate::blob_meta::ElemKind::Relation),
+            (true, false, false) => Some(crate::ElementKind::Node),
+            (false, true, false) => Some(crate::ElementKind::Way),
+            (false, false, true) => Some(crate::ElementKind::Relation),
             _ => None,
         }
     }

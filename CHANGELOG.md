@@ -4,6 +4,16 @@
 
 ### Breaking
 
+- **One element-kind type, `pbfhogg::ElementKind`.** `osc::OscElementKind`
+  and `getid::ElemKindTag` are replaced by `pbfhogg::ElementKind { Node, Way,
+  Relation }` (ordered node < way < relation, with `as_str`, `ordinal`,
+  `type_char` and `FromStr`). `CompactDiffOverlay::deleted_ids` and
+  `is_deleted`, and the kind of `getid::ElementRef`, take it; so do
+  `getid::parse_ids_with_default_type` and
+  `parse_ids_from_file_with_default_type` (replacing `getid::DefaultType`) and
+  `inspect::show_element_to` (replacing `inspect::ShowElementType`). Rename
+  the old variants one for one; CLI behavior and output are unchanged.
+
 - **`HeaderBuilder::optional_feature` takes `impl Into<Feature>`** instead of
   `&str`. `&str` and the new `pbfhogg::block::Feature` constants
   (`HeaderBlock::LOCATIONS_ON_WAYS` and friends) work unchanged; a `&String`

@@ -376,16 +376,16 @@ pub(super) fn build_pass2_schedules(
             continue;
         };
         match idx.kind {
-            crate::blob_meta::ElemKind::Node => {
+            crate::ElementKind::Node => {
                 if idx.max_id > max_node_id {
                     max_node_id = idx.max_id;
                 }
                 node_schedule.push((0, meta.data_offset, meta.data_size));
             }
-            crate::blob_meta::ElemKind::Way => {
+            crate::ElementKind::Way => {
                 way_schedule.push((0, meta.data_offset, meta.data_size));
             }
-            crate::blob_meta::ElemKind::Relation => {}
+            crate::ElementKind::Relation => {}
         }
     }
 

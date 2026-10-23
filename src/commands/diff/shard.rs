@@ -33,7 +33,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::blob_meta::{BlobIndex, ElemKind};
+use crate::ElementKind;
+use crate::blob_meta::BlobIndex;
 use crate::error::Result;
 use crate::read::header_walker::HeaderWalker;
 
@@ -130,9 +131,9 @@ impl RawWalk {
         for desc in self.in_file_order {
             order.observe(&desc.index).map_err(io_error)?;
             match desc.index.kind {
-                ElemKind::Node => nodes.push(desc),
-                ElemKind::Way => ways.push(desc),
-                ElemKind::Relation => relations.push(desc),
+                ElementKind::Node => nodes.push(desc),
+                ElementKind::Way => ways.push(desc),
+                ElementKind::Relation => relations.push(desc),
             }
         }
         Ok(WalkedFile {

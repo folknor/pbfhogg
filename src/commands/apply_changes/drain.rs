@@ -46,7 +46,7 @@ use std::sync::{Arc, OnceLock, mpsc};
 
 use rustc_hash::FxHashMap;
 
-use crate::blob_meta::ElemKind;
+use crate::ElementKind;
 use crate::block_builder::BlockBuilder;
 use crate::commands::{flush_block, flush_passthrough_buf};
 use crate::error::{Error, ErrorKind, Result, new_error};
@@ -415,9 +415,11 @@ pub(super) fn run_drain(
     // for any kinds whose blobs we never saw (or saw and finished).
     crate::debug::emit_marker("MERGE_TRAILING_CREATES_START");
     let types_to_flush = match state.last_type {
-        None | Some(ElemKind::Node) => &[ElemKind::Node, ElemKind::Way, ElemKind::Relation][..],
-        Some(ElemKind::Way) => &[ElemKind::Way, ElemKind::Relation][..],
-        Some(ElemKind::Relation) => &[ElemKind::Relation][..],
+        None | Some(ElementKind::Node) => {
+            &[ElementKind::Node, ElementKind::Way, ElementKind::Relation][..]
+        }
+        Some(ElementKind::Way) => &[ElementKind::Way, ElementKind::Relation][..],
+        Some(ElementKind::Relation) => &[ElementKind::Relation][..],
     };
     // Cloned rather than borrowed from `state`: the trailing loop now takes
     // `&mut state` for the sortedness guard, so an outstanding `&state`
@@ -470,7 +472,7 @@ struct DrainState {
     /// Next seq the drain expects to process (monotonically increasing).
     next_seq: u64,
     /// Last item kind processed. Drives type transitions.
-    last_type: Option<ElemKind>,
+    last_type: Option<ElementKind>,
     cursors: UpsertCursors,
     /// Builder used for gap-create + trailing-create elements only.
     /// Rewrite blocks bypass this path entirely (drain forwards them
@@ -513,26 +515,6 @@ impl DrainState {
     }
 }
 
-/// Ordinal of an element kind in canonical OSM order (nodes, then ways,
-/// then relations). `ElemKind` deliberately does not derive `Ord`, so the
-/// ordering used for the output-sortedness guard is spelled out here
-/// rather than inherited from a derive that could be reordered.
-fn kind_ordinal(kind: ElemKind) -> u8 {
-    match kind {
-        ElemKind::Node => 0,
-        ElemKind::Way => 1,
-        ElemKind::Relation => 2,
-    }
-}
-
-fn kind_name(kind: ElemKind) -> &'static str {
-    match kind {
-        ElemKind::Node => "node",
-        ElemKind::Way => "way",
-        ElemKind::Relation => "relation",
-    }
-}
-
 /// Refuse to emit an out-of-order blob into a file whose header stamps
 /// `Sort.Type_then_ID`.
 ///
@@ -557,25 +539,22 @@ fn kind_name(kind: ElemKind) -> &'static str {
 /// problem, not an ordering one, and is not this guard's business.
 fn check_output_order(
     state: &mut DrainState,
-    kind: ElemKind,
+    kind: ElementKind,
     min_id: i64,
     max_id: i64,
 ) -> Result<()> {
     if let Err((previous_kind, previous_id)) =
         state
             .order_watermark
-            .observe(kind_ordinal(kind), min_id, max_id)
+            .observe(kind.ordinal(), min_id, max_id)
     {
         return Err(new_error(ErrorKind::Io(std::io::Error::other(format!(
             "apply-changes: refusing to write an unsorted PBF under a Sort.Type_then_ID \
              header - a {} blob starting at id {} follows {} output \
              already reaching id {previous_id}; re-sort the base with `pbfhogg sort`.",
-            kind_name(kind),
+            kind.as_str(),
             crate::osm_id::blob_osm_first_id(min_id, max_id),
-            ["node", "way", "relation"]
-                .get(usize::from(previous_kind))
-                .copied()
-                .unwrap_or("unknown"),
+            ElementKind::from_ordinal(previous_kind).map_or("unknown", ElementKind::as_str),
         )))));
     }
     Ok(())
@@ -586,8 +565,8 @@ fn check_output_order(
 /// emits any remaining upserts of the previous kind.
 #[allow(clippy::too_many_arguments)]
 fn handle_type_transition(
-    prev: ElemKind,
-    item_kind: ElemKind,
+    prev: ElementKind,
+    item_kind: ElementKind,
     cfg: &DrainConfig<'_>,
     state: &mut DrainState,
     writer: &mut PbfWriter<FileWriter>,
@@ -605,8 +584,8 @@ fn handle_type_transition(
 
     if cfg.locations_on_ways
         && !state.barrier_done
-        && prev == ElemKind::Node
-        && matches!(item_kind, ElemKind::Way | ElemKind::Relation)
+        && prev == ElementKind::Node
+        && matches!(item_kind, ElementKind::Way | ElementKind::Relation)
     {
         barrier_publish_loc_map(cfg, state, counters)?;
     }
@@ -629,7 +608,7 @@ fn handle_type_transition(
 /// Emit gap creates for the current blob's kind: upserts whose ID
 /// precedes `osm_first` in OSM order. Flushes coalescers first.
 fn handle_gap_creates(
-    item_kind: ElemKind,
+    item_kind: ElementKind,
     osm_first: i64,
     cfg: &DrainConfig<'_>,
     state: &mut DrainState,
@@ -755,9 +734,9 @@ fn dispatch_variant(
             #[allow(clippy::cast_possible_truncation)]
             stats.blob_sizes.push(frame_len as u32);
             match kind {
-                ElemKind::Node => stats.base_nodes += index.count,
-                ElemKind::Way => stats.base_ways += index.count,
-                ElemKind::Relation => stats.base_relations += index.count,
+                ElementKind::Node => stats.base_nodes += index.count,
+                ElementKind::Way => stats.base_ways += index.count,
+                ElementKind::Relation => stats.base_relations += index.count,
             }
         }
         DrainItem::OwnedBytes {
@@ -787,9 +766,9 @@ fn dispatch_variant(
             // passthrough portion even though the output contained the
             // elements correctly.
             match kind {
-                ElemKind::Node => stats.base_nodes += count,
-                ElemKind::Way => stats.base_ways += count,
-                ElemKind::Relation => stats.base_relations += count,
+                ElementKind::Node => stats.base_nodes += count,
+                ElementKind::Way => stats.base_ways += count,
+                ElementKind::Relation => stats.base_relations += count,
             }
         }
         DrainItem::Rewritten {

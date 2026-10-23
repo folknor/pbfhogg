@@ -13,10 +13,11 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::Element;
+use crate::ElementKind;
 use crate::blob::{
     BlobKind, decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
 };
-use crate::blob_meta::{BlobIndex, ElemKind, scan_block_ids_checked};
+use crate::blob_meta::{BlobIndex, scan_block_ids_checked};
 use crate::block_builder::BlockBuilder;
 use crate::file_writer::FileWriter;
 use crate::read::header_walker::HeaderWalker;
@@ -292,7 +293,7 @@ pub fn sort(
     // `cat::dedupe::merge_pbf` bugfix in 486d4d1 - handing mixed-kind
     // entries to a kind-gated sweep would silently drop off-kind
     // elements.
-    let overlap_runs: Vec<(usize, usize, ElemKind)> = collect_overlap_runs(&entries, &overlaps);
+    let overlap_runs: Vec<(usize, usize, ElementKind)> = collect_overlap_runs(&entries, &overlaps);
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("sort_overlap_runs", overlap_runs.len() as i64);
 
@@ -564,11 +565,11 @@ fn scan_payload_checked(
 // Sort + overlap detection
 // ---------------------------------------------------------------------------
 
-fn type_order(kind: ElemKind) -> u8 {
+fn type_order(kind: ElementKind) -> u8 {
     match kind {
-        ElemKind::Node => 0,
-        ElemKind::Way => 1,
-        ElemKind::Relation => 2,
+        ElementKind::Node => 0,
+        ElementKind::Way => 1,
+        ElementKind::Relation => 2,
     }
 }
 
@@ -795,9 +796,9 @@ fn count_entry(entry: &BlobEntry, stats: &mut SortStats) {
         return;
     }
     match entry.index.kind {
-        ElemKind::Node => stats.nodes += entry.index.count,
-        ElemKind::Way => stats.ways += entry.index.count,
-        ElemKind::Relation => stats.relations += entry.index.count,
+        ElementKind::Node => stats.nodes += entry.index.count,
+        ElementKind::Way => stats.ways += entry.index.count,
+        ElementKind::Relation => stats.relations += entry.index.count,
     }
 }
 
@@ -822,7 +823,10 @@ struct OverlapCounts {
 /// kind-gated sweep handed the combined slice would silently drop
 /// off-kind elements (same pattern as `cat::dedupe::merge_pbf` in
 /// 486d4d1).
-fn collect_overlap_runs(entries: &[BlobEntry], overlaps: &[bool]) -> Vec<(usize, usize, ElemKind)> {
+fn collect_overlap_runs(
+    entries: &[BlobEntry],
+    overlaps: &[bool],
+) -> Vec<(usize, usize, ElementKind)> {
     let mut runs = Vec::new();
     let mut i = 0;
     while i < entries.len() {
@@ -846,7 +850,7 @@ fn collect_overlap_runs(entries: &[BlobEntry], overlaps: &[bool]) -> Vec<(usize,
 /// and drained in input order.
 fn compute_overlap_run_local(
     entries: &[BlobEntry],
-    kind: ElemKind,
+    kind: ElementKind,
     input_path: &Path,
     host: &crate::host::Host,
 ) -> std::result::Result<(Vec<OwnedBlock>, OverlapCounts), String> {
@@ -855,7 +859,7 @@ fn compute_overlap_run_local(
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut counts = OverlapCounts::default();
     match kind {
-        ElemKind::Node => {
+        ElementKind::Node => {
             counts.nodes = sweep_merge_local(
                 entries,
                 &mut input_file,
@@ -870,7 +874,7 @@ fn compute_overlap_run_local(
                 host,
             )?;
         }
-        ElemKind::Way => {
+        ElementKind::Way => {
             counts.ways = sweep_merge_local(
                 entries,
                 &mut input_file,
@@ -885,7 +889,7 @@ fn compute_overlap_run_local(
                 host,
             )?;
         }
-        ElemKind::Relation => {
+        ElementKind::Relation => {
             counts.relations = sweep_merge_local(
                 entries,
                 &mut input_file,
@@ -996,7 +1000,7 @@ impl HasId for OwnedRelation {
 mod tests {
     use super::*;
 
-    fn entry(kind: ElemKind, min_id: i64, max_id: i64) -> BlobEntry {
+    fn entry(kind: ElementKind, min_id: i64, max_id: i64) -> BlobEntry {
         BlobEntry {
             file_offset: 0,
             frame_len: 0,
@@ -1025,9 +1029,9 @@ mod tests {
     #[test]
     fn overlap_runs_are_transitive_not_pairwise() {
         let entries = vec![
-            entry(ElemKind::Node, 1, 1000),
-            entry(ElemKind::Node, 2, 3),
-            entry(ElemKind::Node, 500, 600),
+            entry(ElementKind::Node, 1, 1000),
+            entry(ElementKind::Node, 2, 3),
+            entry(ElementKind::Node, 500, 600),
         ];
         assert_eq!(
             detect_overlaps(&entries),
@@ -1042,9 +1046,9 @@ mod tests {
     #[test]
     fn disjoint_blobs_are_not_flagged_as_overlapping() {
         let entries = vec![
-            entry(ElemKind::Node, 1, 10),
-            entry(ElemKind::Node, 11, 20),
-            entry(ElemKind::Node, 21, 30),
+            entry(ElementKind::Node, 1, 10),
+            entry(ElementKind::Node, 11, 20),
+            entry(ElementKind::Node, 21, 30),
         ];
         assert_eq!(detect_overlaps(&entries), vec![false, false, false]);
     }
@@ -1054,9 +1058,9 @@ mod tests {
     #[test]
     fn a_run_never_crosses_a_kind_boundary() {
         let entries = vec![
-            entry(ElemKind::Node, 1, 1000),
-            entry(ElemKind::Node, 2, 3),
-            entry(ElemKind::Way, 5, 6),
+            entry(ElementKind::Node, 1, 1000),
+            entry(ElementKind::Node, 2, 3),
+            entry(ElementKind::Way, 5, 6),
         ];
         assert_eq!(
             detect_overlaps(&entries),
@@ -1070,17 +1074,17 @@ mod tests {
     #[test]
     fn a_new_run_starts_after_the_previous_one_ends() {
         let entries = vec![
-            entry(ElemKind::Node, 1, 100),
-            entry(ElemKind::Node, 50, 60),
-            entry(ElemKind::Node, 200, 300),
-            entry(ElemKind::Node, 250, 260),
+            entry(ElementKind::Node, 1, 100),
+            entry(ElementKind::Node, 50, 60),
+            entry(ElementKind::Node, 200, 300),
+            entry(ElementKind::Node, 250, 260),
         ];
         assert_eq!(detect_overlaps(&entries), vec![true, true, true, true]);
 
         let entries = vec![
-            entry(ElemKind::Node, 1, 100),
-            entry(ElemKind::Node, 50, 60),
-            entry(ElemKind::Node, 200, 300),
+            entry(ElementKind::Node, 1, 100),
+            entry(ElementKind::Node, 50, 60),
+            entry(ElementKind::Node, 200, 300),
         ];
         assert_eq!(
             detect_overlaps(&entries),

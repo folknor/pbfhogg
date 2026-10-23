@@ -11,7 +11,7 @@
 //!
 //! - **Way groups only.** Parses PrimitiveGroup field 3 (Way). Other element
 //!   types (nodes, relations) in the same group are skipped.
-//! - **Sorted PBF assumption.** Relies on indexdata `ElemKind::Way` for blob
+//! - **Sorted PBF assumption.** Relies on indexdata `ElementKind::Way` for blob
 //!   filtering. Mixed-type blobs in unsorted PBFs could be mislabeled.
 
 use crate::error::Result;

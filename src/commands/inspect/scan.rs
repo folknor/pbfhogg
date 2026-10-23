@@ -8,8 +8,8 @@ use super::types::{
     BlockAccum, BlockInfo, BlockKind, HeaderMeta, InspectReport, OrderingSegment, ScanState,
     classify_block, is_standard_ordering, update_extended_for_element,
 };
+use crate::ElementKind;
 use crate::blob::{BlobKind, decode_blob_to_headerblock, decompress_blob_data_into};
-use crate::blob_meta::ElemKind;
 use crate::file_reader::FileReader;
 use crate::read::header_walker::HeaderWalker;
 use crate::read::raw_frame::read_raw_frame;
@@ -180,16 +180,16 @@ fn accumulate_from_index(
 
     // Element counts
     match index.kind {
-        ElemKind::Node => state.node_count += index.count,
-        ElemKind::Way => state.way_count += index.count,
-        ElemKind::Relation => state.relation_count += index.count,
+        ElementKind::Node => state.node_count += index.count,
+        ElementKind::Way => state.way_count += index.count,
+        ElementKind::Relation => state.relation_count += index.count,
     }
 
     // ID ranges (inter-blob monotonicity)
     let ids = match index.kind {
-        ElemKind::Node => &mut state.node_ids,
-        ElemKind::Way => &mut state.way_ids,
-        ElemKind::Relation => &mut state.relation_ids,
+        ElementKind::Node => &mut state.node_ids,
+        ElementKind::Way => &mut state.way_ids,
+        ElementKind::Relation => &mut state.relation_ids,
     };
     if let Some(ids) = ids {
         ids.update_from_blob(index.min_id, index.max_id, index.count);

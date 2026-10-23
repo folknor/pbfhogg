@@ -18,8 +18,9 @@ use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::ElementKind;
 use crate::PrimitiveBlock;
-use crate::blob_meta::{BlobIndex, ElemKind};
+use crate::blob_meta::BlobIndex;
 use crate::error::Result;
 use crate::owned::TypeFilter;
 
@@ -105,7 +106,7 @@ fn run_shard(
     new_descs: &[BlobDesc],
     old_file: &std::fs::File,
     new_file: &std::fs::File,
-    kind: ElemKind,
+    kind: ElementKind,
     options: &DiffOptions,
     scratch_dir: &Path,
     scratch_suffix: &str,
@@ -123,7 +124,7 @@ fn run_shard(
         }
     }
 
-    let type_char = kind_type_char(kind);
+    let type_char = kind.type_char();
     let text_path = shard_text_path(scratch_dir, scratch_suffix, kind, shard_idx);
     let file = crate::scratch::create_file(&text_path).map_err(io_err)?;
     let mut out = BufWriter::new(file);
@@ -388,23 +389,16 @@ fn element_merge(
     Ok((old_consumed, new_consumed))
 }
 
-fn kind_type_char(kind: ElemKind) -> char {
-    match kind {
-        ElemKind::Node => 'n',
-        ElemKind::Way => 'w',
-        ElemKind::Relation => 'r',
-    }
-}
-
 /// A shard's scratch text file. `suffix` is the run token's
 /// ([`crate::scratch::RunToken::suffix`]), so two runs in one process name and
 /// clean up disjoint files.
-fn shard_text_path(scratch_dir: &Path, suffix: &str, kind: ElemKind, shard_idx: usize) -> PathBuf {
-    let kind_tag = match kind {
-        ElemKind::Node => "n",
-        ElemKind::Way => "w",
-        ElemKind::Relation => "r",
-    };
+fn shard_text_path(
+    scratch_dir: &Path,
+    suffix: &str,
+    kind: ElementKind,
+    shard_idx: usize,
+) -> PathBuf {
+    let kind_tag = kind.type_char();
     let pid = std::process::id();
     scratch_dir.join(format!(
         "diff-par-{pid}{suffix}-{kind_tag}-{shard_idx}.txt.tmp"
@@ -502,7 +496,7 @@ pub(crate) fn diff_block_pair_parallel(
     let mut total = DiffStats::default();
 
     struct PhaseSlot<'a> {
-        kind: ElemKind,
+        kind: ElementKind,
         enabled: bool,
         tag: &'static str,
         old: &'a [BlobDesc],
@@ -510,21 +504,21 @@ pub(crate) fn diff_block_pair_parallel(
     }
     let phases = [
         PhaseSlot {
-            kind: ElemKind::Node,
+            kind: ElementKind::Node,
             enabled: filter.nodes,
             tag: "NODE",
             old: &old.nodes,
             new: &new.nodes,
         },
         PhaseSlot {
-            kind: ElemKind::Way,
+            kind: ElementKind::Way,
             enabled: filter.ways,
             tag: "WAY",
             old: &old.ways,
             new: &new.ways,
         },
         PhaseSlot {
-            kind: ElemKind::Relation,
+            kind: ElementKind::Relation,
             enabled: filter.relations,
             tag: "REL",
             old: &old.relations,

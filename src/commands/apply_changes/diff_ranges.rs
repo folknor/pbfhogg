@@ -1,6 +1,6 @@
 //! Diff ID ranges for fast overlap checking and per-type upsert cursor tracking.
 
-use crate::blob_meta::ElemKind;
+use crate::ElementKind;
 use crate::osc::CompactDiffOverlay;
 
 /// Pre-computed sorted ID vectors from the diff, for fast overlap checks.
@@ -29,7 +29,7 @@ impl DiffRanges {
     pub(super) fn from_diff(diff: &CompactDiffOverlay) -> Self {
         let mut node_ids: Vec<i64> = diff
             .node_ids()
-            .chain(diff.deleted_ids(crate::osc::OscElementKind::Node).iter())
+            .chain(diff.deleted_ids(crate::ElementKind::Node).iter())
             .copied()
             .collect();
         node_ids.sort_unstable_by(|a, b| crate::osm_id::osm_id_cmp(*a, *b));
@@ -37,7 +37,7 @@ impl DiffRanges {
 
         let mut way_ids: Vec<i64> = diff
             .way_ids()
-            .chain(diff.deleted_ids(crate::osc::OscElementKind::Way).iter())
+            .chain(diff.deleted_ids(crate::ElementKind::Way).iter())
             .copied()
             .collect();
         way_ids.sort_unstable_by(|a, b| crate::osm_id::osm_id_cmp(*a, *b));
@@ -45,10 +45,7 @@ impl DiffRanges {
 
         let mut rel_ids: Vec<i64> = diff
             .relation_ids()
-            .chain(
-                diff.deleted_ids(crate::osc::OscElementKind::Relation)
-                    .iter(),
-            )
+            .chain(diff.deleted_ids(crate::ElementKind::Relation).iter())
             .copied()
             .collect();
         rel_ids.sort_unstable_by(|a, b| crate::osm_id::osm_id_cmp(*a, *b));
@@ -82,11 +79,11 @@ impl DiffRanges {
     /// result means the blob *might* need rewriting - it still gets a secondary
     /// check via `block_overlaps_diff` after full parsing. A false result means
     /// the blob is safe for raw passthrough (no diff IDs in its range at all).
-    pub(super) fn range_overlaps(&self, kind: ElemKind, min_id: i64, max_id: i64) -> bool {
+    pub(super) fn range_overlaps(&self, kind: ElementKind, min_id: i64, max_id: i64) -> bool {
         let ids = match kind {
-            ElemKind::Node => &self.node_ids,
-            ElemKind::Way => &self.way_ids,
-            ElemKind::Relation => &self.rel_ids,
+            ElementKind::Node => &self.node_ids,
+            ElementKind::Way => &self.way_ids,
+            ElementKind::Relation => &self.rel_ids,
         };
         if ids.is_empty() {
             return false;
@@ -99,11 +96,11 @@ impl DiffRanges {
     }
 
     /// Return the sorted upsert (create/modify) IDs for a given element kind.
-    pub(super) fn upserts(&self, kind: ElemKind) -> &[i64] {
+    pub(super) fn upserts(&self, kind: ElementKind) -> &[i64] {
         match kind {
-            ElemKind::Node => &self.node_upserts,
-            ElemKind::Way => &self.way_upserts,
-            ElemKind::Relation => &self.rel_upserts,
+            ElementKind::Node => &self.node_upserts,
+            ElementKind::Way => &self.way_upserts,
+            ElementKind::Relation => &self.rel_upserts,
         }
     }
 }
@@ -128,22 +125,22 @@ impl UpsertCursors {
     /// Mutable cursor + upsert slice for the given element kind.
     pub(super) fn get_mut<'a>(
         &mut self,
-        kind: ElemKind,
+        kind: ElementKind,
         ranges: &'a DiffRanges,
     ) -> (&mut usize, &'a [i64]) {
         match kind {
-            ElemKind::Node => (&mut self.node, ranges.upserts(ElemKind::Node)),
-            ElemKind::Way => (&mut self.way, ranges.upserts(ElemKind::Way)),
-            ElemKind::Relation => (&mut self.rel, ranges.upserts(ElemKind::Relation)),
+            ElementKind::Node => (&mut self.node, ranges.upserts(ElementKind::Node)),
+            ElementKind::Way => (&mut self.way, ranges.upserts(ElementKind::Way)),
+            ElementKind::Relation => (&mut self.rel, ranges.upserts(ElementKind::Relation)),
         }
     }
 
     /// Immutable cursor value + upsert slice for the given element kind.
-    pub(super) fn get<'a>(&self, kind: ElemKind, ranges: &'a DiffRanges) -> (usize, &'a [i64]) {
+    pub(super) fn get<'a>(&self, kind: ElementKind, ranges: &'a DiffRanges) -> (usize, &'a [i64]) {
         match kind {
-            ElemKind::Node => (self.node, ranges.upserts(ElemKind::Node)),
-            ElemKind::Way => (self.way, ranges.upserts(ElemKind::Way)),
-            ElemKind::Relation => (self.rel, ranges.upserts(ElemKind::Relation)),
+            ElementKind::Node => (self.node, ranges.upserts(ElementKind::Node)),
+            ElementKind::Way => (self.way, ranges.upserts(ElementKind::Way)),
+            ElementKind::Relation => (self.rel, ranges.upserts(ElementKind::Relation)),
         }
     }
 }

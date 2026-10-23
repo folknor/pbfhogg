@@ -81,8 +81,8 @@ use super::{
     ensure_relation_capacity_local, ensure_way_capacity_local, flush_local, require_indexdata,
     writer_from_header_bytes,
 };
+use crate::ElementKind;
 use crate::blob::BlobKind;
-use crate::blob_meta::ElemKind;
 /// Compatibility alias for [`crate::block_builder::DEFAULT_ELEMENT_CAP`].
 pub use crate::block_builder::DEFAULT_ELEMENT_CAP as DEFAULT_BLOCK_CAP;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
@@ -101,20 +101,20 @@ use crate::{Element, ElementReader};
 
 use crate::tunables::{CORRUPT_INDEXDATA_INFLATION, FRAME_BATCH};
 
-/// Reproducibility contract: map an `ElemKind` to the byte that feeds
+/// Reproducibility contract: map an `ElementKind` to the byte that feeds
 /// `--drop-ids` selection. The exact values (Node=0, Way=1, Relation=2)
 /// are load-bearing - `drop_hash` mixes this byte numerically into the
 /// splitmix64 finalizer and `DropKey` orders on it, so the same
 /// `--drop-ids N:SEED` must drop the byte-identical element set across
-/// builds. `ElemKind` carries no `repr(u8)` and no `Ord`, so this
+/// builds. `ElementKind` carries no `repr(u8)` and no `Ord`, so this
 /// explicit match is the only sanctioned bridge from the kind enum into
 /// the numeric selection domain; never route around it. The golden
 /// vectors in this module's tests pin these values.
-fn hash_kind(kind: ElemKind) -> u8 {
+fn hash_kind(kind: ElementKind) -> u8 {
     match kind {
-        ElemKind::Node => 0,
-        ElemKind::Way => 1,
-        ElemKind::Relation => 2,
+        ElementKind::Node => 0,
+        ElementKind::Way => 1,
+        ElementKind::Relation => 2,
     }
 }
 
@@ -177,22 +177,22 @@ struct DropSets {
 }
 
 impl DropSets {
-    fn for_kind(&self, kind: ElemKind) -> &FxHashSet<i64> {
+    fn for_kind(&self, kind: ElementKind) -> &FxHashSet<i64> {
         match kind {
-            ElemKind::Node => &self.nodes,
-            ElemKind::Way => &self.ways,
-            ElemKind::Relation => &self.relations,
+            ElementKind::Node => &self.nodes,
+            ElementKind::Way => &self.ways,
+            ElementKind::Relation => &self.relations,
         }
     }
 
     fn insert(&mut self, key: DropKey) {
         // `key.kind` is the `hash_kind()` selection byte (the domain
-        // `DropKey` orders on; `ElemKind` has no `Ord`). Route to the
+        // `DropKey` orders on; `ElementKind` has no `Ord`). Route to the
         // matching set through the same boundary so the byte mapping lives
         // in exactly one place.
-        let set = if key.kind == hash_kind(ElemKind::Node) {
+        let set = if key.kind == hash_kind(ElementKind::Node) {
             &mut self.nodes
-        } else if key.kind == hash_kind(ElemKind::Way) {
+        } else if key.kind == hash_kind(ElementKind::Way) {
             &mut self.ways
         } else {
             &mut self.relations
@@ -711,9 +711,9 @@ fn corrupted_index(
     }
     if flags.corrupt_indexdata_kind {
         index.kind = match index.kind {
-            crate::blob_meta::ElemKind::Node => crate::blob_meta::ElemKind::Way,
-            crate::blob_meta::ElemKind::Way => crate::blob_meta::ElemKind::Relation,
-            crate::blob_meta::ElemKind::Relation => crate::blob_meta::ElemKind::Node,
+            crate::ElementKind::Node => crate::ElementKind::Way,
+            crate::ElementKind::Way => crate::ElementKind::Relation,
+            crate::ElementKind::Relation => crate::ElementKind::Node,
         };
     }
     Some(index)
@@ -934,12 +934,14 @@ fn degrade_decode_path(
     let s = run_kind_phase(
         &shared_file,
         &node_schedule,
-        ElemKind::Node,
+        ElementKind::Node,
         block_cap,
         prealloc_bound,
         flags,
         compression,
-        drop_sets.as_ref().map(|sets| sets.for_kind(ElemKind::Node)),
+        drop_sets
+            .as_ref()
+            .map(|sets| sets.for_kind(ElementKind::Node)),
         &mut writer,
         host,
     )?;
@@ -952,12 +954,14 @@ fn degrade_decode_path(
     let s = run_kind_phase(
         &shared_file,
         &way_schedule,
-        ElemKind::Way,
+        ElementKind::Way,
         block_cap,
         prealloc_bound,
         flags,
         compression,
-        drop_sets.as_ref().map(|sets| sets.for_kind(ElemKind::Way)),
+        drop_sets
+            .as_ref()
+            .map(|sets| sets.for_kind(ElementKind::Way)),
         &mut writer,
         host,
     )?;
@@ -970,14 +974,14 @@ fn degrade_decode_path(
     let s = run_kind_phase(
         &shared_file,
         &rel_schedule,
-        ElemKind::Relation,
+        ElementKind::Relation,
         block_cap,
         prealloc_bound,
         flags,
         compression,
         drop_sets
             .as_ref()
-            .map(|sets| sets.for_kind(ElemKind::Relation)),
+            .map(|sets| sets.for_kind(ElementKind::Relation)),
         &mut writer,
         host,
     )?;
@@ -1016,9 +1020,9 @@ fn select_drop_sets(
     let mut total = 0_u64;
     let mut heap = BinaryHeap::new();
     for (kind, schedule) in [
-        (ElemKind::Node, node_schedule),
-        (ElemKind::Way, way_schedule),
-        (ElemKind::Relation, relation_schedule),
+        (ElementKind::Node, node_schedule),
+        (ElementKind::Way, way_schedule),
+        (ElementKind::Relation, relation_schedule),
     ] {
         crate::scan::classify::parallel_classify_phase(
             shared_file,
@@ -1049,7 +1053,11 @@ fn select_drop_sets(
     Ok(sets)
 }
 
-fn select_block_keys(block: &crate::PrimitiveBlock, kind: ElemKind, spec: DropSpec) -> BlockDrop {
+fn select_block_keys(
+    block: &crate::PrimitiveBlock,
+    kind: ElementKind,
+    spec: DropSpec,
+) -> BlockDrop {
     // Cross the reproducibility boundary once: everything downstream (the
     // hash input and the DropKey ordering) uses this byte, not the enum.
     let kind_byte = hash_kind(kind);
@@ -1057,10 +1065,10 @@ fn select_block_keys(block: &crate::PrimitiveBlock, kind: ElemKind, spec: DropSp
     let mut heap = BinaryHeap::new();
     for element in block.elements() {
         let id = match (&element, kind) {
-            (Element::DenseNode(node), ElemKind::Node) => node.id(),
-            (Element::Node(node), ElemKind::Node) => node.id(),
-            (Element::Way(way), ElemKind::Way) => way.id(),
-            (Element::Relation(relation), ElemKind::Relation) => relation.id(),
+            (Element::DenseNode(node), ElementKind::Node) => node.id(),
+            (Element::Node(node), ElementKind::Node) => node.id(),
+            (Element::Way(way), ElementKind::Way) => way.id(),
+            (Element::Relation(relation), ElementKind::Relation) => relation.id(),
             _ => continue,
         };
         matched += 1;
@@ -1101,7 +1109,7 @@ struct PhaseStats {
 fn run_kind_phase(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
-    kind: ElemKind,
+    kind: ElementKind,
     block_cap: usize,
     prealloc_bound: usize,
     flags: DegradeFlags,
@@ -1292,7 +1300,7 @@ fn run_kind_phase(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn worker_decode_kind(
     block: &crate::PrimitiveBlock,
-    kind: ElemKind,
+    kind: ElementKind,
     cap: usize,
     flags: DegradeFlags,
     compression: &Compression,
@@ -1318,9 +1326,9 @@ fn worker_decode_kind(
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut full_framed: Vec<Vec<u8>> = Vec::new();
     let mut tail: KindPayload = match kind {
-        ElemKind::Node => KindPayload::Nodes(Vec::with_capacity(tail_size)),
-        ElemKind::Way => KindPayload::Ways(Vec::with_capacity(tail_size)),
-        ElemKind::Relation => KindPayload::Relations(Vec::with_capacity(tail_size)),
+        ElementKind::Node => KindPayload::Nodes(Vec::with_capacity(tail_size)),
+        ElementKind::Way => KindPayload::Ways(Vec::with_capacity(tail_size)),
+        ElementKind::Relation => KindPayload::Relations(Vec::with_capacity(tail_size)),
     };
 
     let mut idx: usize = 0;
@@ -1333,7 +1341,7 @@ fn worker_decode_kind(
 
         if idx < full_count {
             match (&element, kind) {
-                (Element::DenseNode(dn), ElemKind::Node) => {
+                (Element::DenseNode(dn), ElementKind::Node) => {
                     ensure_node_capacity_local(&mut bb, &mut output)?;
                     let meta = dense_node_metadata(dn);
                     bb.add_node(
@@ -1344,7 +1352,7 @@ fn worker_decode_kind(
                         meta.as_ref(),
                     );
                 }
-                (Element::Node(n), ElemKind::Node) => {
+                (Element::Node(n), ElementKind::Node) => {
                     ensure_node_capacity_local(&mut bb, &mut output)?;
                     let meta = element_metadata(&n.info());
                     bb.add_node(
@@ -1355,7 +1363,7 @@ fn worker_decode_kind(
                         meta.as_ref(),
                     );
                 }
-                (Element::Way(w), ElemKind::Way) => {
+                (Element::Way(w), ElementKind::Way) => {
                     ensure_way_capacity_local(&mut bb, &mut output)?;
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
@@ -1365,7 +1373,7 @@ fn worker_decode_kind(
                     // --strip-locations.
                     bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
                 }
-                (Element::Relation(r), ElemKind::Relation) => {
+                (Element::Relation(r), ElementKind::Relation) => {
                     ensure_relation_capacity_local(&mut bb, &mut output)?;
                     members_buf.clear();
                     members_buf.extend(r.members().map(|m| MemberData {
@@ -1413,14 +1421,14 @@ fn worker_decode_kind(
 
 fn element_matches_kind(
     element: &Element<'_>,
-    kind: ElemKind,
+    kind: ElementKind,
     drop: Option<&FxHashSet<i64>>,
 ) -> bool {
     let id = match (element, kind) {
-        (Element::DenseNode(node), ElemKind::Node) => node.id(),
-        (Element::Node(node), ElemKind::Node) => node.id(),
-        (Element::Way(way), ElemKind::Way) => way.id(),
-        (Element::Relation(relation), ElemKind::Relation) => relation.id(),
+        (Element::DenseNode(node), ElementKind::Node) => node.id(),
+        (Element::Node(node), ElementKind::Node) => node.id(),
+        (Element::Way(way), ElementKind::Way) => way.id(),
+        (Element::Relation(relation), ElementKind::Relation) => relation.id(),
         _ => return false,
     };
     drop.is_none_or(|ids| !ids.contains(&id))
@@ -1624,7 +1632,7 @@ fn frame_and_write_batch(
 #[cfg(test)]
 mod tests {
     use super::{DropKey, drop_hash, hash_kind, keep_smallest, mix64};
-    use crate::blob_meta::ElemKind;
+    use crate::ElementKind;
     use std::collections::BinaryHeap;
 
     #[test]
@@ -1686,7 +1694,7 @@ mod tests {
         ]
     }
 
-    /// Pins the `ElemKind` -> byte bridge itself. The golden vectors below
+    /// Pins the `ElementKind` -> byte bridge itself. The golden vectors below
     /// are expressed as bare literals (0/1/2) for historical/readability
     /// reasons, but this assertion is what actually guarantees those
     /// literals still match what `hash_kind` produces - an accidental
@@ -1694,9 +1702,9 @@ mod tests {
     /// though the bare-literal vectors alone could not detect it.
     #[test]
     fn hash_kind_matches_pinned_bytes() {
-        assert_eq!(hash_kind(ElemKind::Node), 0);
-        assert_eq!(hash_kind(ElemKind::Way), 1);
-        assert_eq!(hash_kind(ElemKind::Relation), 2);
+        assert_eq!(hash_kind(ElementKind::Node), 0);
+        assert_eq!(hash_kind(ElementKind::Way), 1);
+        assert_eq!(hash_kind(ElementKind::Relation), 2);
     }
 
     #[test]
@@ -1715,18 +1723,18 @@ mod tests {
         );
 
         // Same golden vectors, but routed through `hash_kind` so this test
-        // fails if the ElemKind-to-byte bridge ever drifts from the
+        // fails if the ElementKind-to-byte bridge ever drifts from the
         // reproducibility contract, not just if `drop_hash` itself changes.
         assert_eq!(
-            drop_hash(hash_kind(ElemKind::Node), 1, 0),
+            drop_hash(hash_kind(ElementKind::Node), 1, 0),
             0xe220_a839_7b1d_cdaf
         );
         assert_eq!(
-            drop_hash(hash_kind(ElemKind::Way), 1, 0),
+            drop_hash(hash_kind(ElementKind::Way), 1, 0),
             0xd28f_0491_68bd_d34c
         );
         assert_eq!(
-            drop_hash(hash_kind(ElemKind::Relation), 42, 0),
+            drop_hash(hash_kind(ElementKind::Relation), 42, 0),
             0x454c_0046_9e53_63e2
         );
     }

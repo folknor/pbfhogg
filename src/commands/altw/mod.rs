@@ -85,13 +85,10 @@ fn altw_header_features<'a>(
 
 /// Relations need no edits; nodes can bypass filtering only when all are kept.
 /// Unknown kinds must decode, and ways always need location splicing.
-fn blob_is_passthrough(
-    kind: Option<crate::blob_meta::ElemKind>,
-    keep_untagged_nodes: bool,
-) -> bool {
-    use crate::blob_meta::ElemKind;
-    matches!(kind, Some(ElemKind::Relation))
-        || matches!(kind, Some(ElemKind::Node) if keep_untagged_nodes)
+fn blob_is_passthrough(kind: Option<crate::ElementKind>, keep_untagged_nodes: bool) -> bool {
+    use crate::ElementKind;
+    matches!(kind, Some(ElementKind::Relation))
+        || matches!(kind, Some(ElementKind::Node) if keep_untagged_nodes)
 }
 
 /// Select relation dependencies without owning their accumulation strategy.
@@ -716,7 +713,7 @@ fn estimate_sparse_store_bytes(input: &Path, host: &crate::host::Host) -> Result
         }
         match meta.index.as_ref() {
             Some(idx) => {
-                if idx.kind == crate::blob_meta::ElemKind::Node {
+                if idx.kind == crate::ElementKind::Node {
                     node_count = node_count.saturating_add(idx.count);
                 }
             }
@@ -924,7 +921,7 @@ fn collect_way_referenced_node_ids(
 ) -> Result<(IdSet, Option<IdSet>)> {
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
-        Some(crate::blob_meta::ElemKind::Way),
+        Some(crate::ElementKind::Way),
         &host.diagnostics,
     )?;
     let mut referenced = IdSet::new();
@@ -1042,7 +1039,7 @@ pub(crate) fn collect_relation_member_ids(
 ) -> Result<(Option<IdSet>, Option<IdSet>)> {
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
-        Some(crate::blob_meta::ElemKind::Relation),
+        Some(crate::ElementKind::Relation),
         &host.diagnostics,
     )?;
     let mut member_node_ids = want_nodes.then(IdSet::new);

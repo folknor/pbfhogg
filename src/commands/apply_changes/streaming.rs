@@ -44,8 +44,8 @@ use std::sync::{Arc, Mutex, mpsc};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::ElementKind;
 use crate::blob::decompress_blob_raw;
-use crate::blob_meta::ElemKind;
 use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::error::{Error, ErrorKind, Result, new_error};
 use crate::writer::{Compression, frame_blob_pipelined};
@@ -487,7 +487,7 @@ fn handle_candidate(
         .decompress_ns
         .fetch_add(elapsed_ns(t_decompress), Ordering::Relaxed);
 
-    if locations_on_ways && desc.kind == ElemKind::Node {
+    if locations_on_ways && desc.kind == ElementKind::Node {
         let t_extract = std::time::Instant::now();
         let mut hits = 0u64;
         // Every node is decoded and validated; only the ones an OSC way
@@ -689,26 +689,26 @@ fn count_block_elements(block: &crate::PrimitiveBlock) -> u64 {
 /// ignored by the range, leaving their upserts to the drain's
 /// trailing-creates path. Empty blocks return a degenerate sentinel
 /// range that the upsert cursor computation treats as "no range".
-fn infer_kind_and_range(block: &crate::PrimitiveBlock) -> (ElemKind, i64, i64) {
+fn infer_kind_and_range(block: &crate::PrimitiveBlock) -> (ElementKind, i64, i64) {
     use crate::{BlockType, Element};
 
     let primary = match block.block_type() {
-        BlockType::DenseNodes | BlockType::Nodes => Some(ElemKind::Node),
-        BlockType::Ways => Some(ElemKind::Way),
-        BlockType::Relations => Some(ElemKind::Relation),
+        BlockType::DenseNodes | BlockType::Nodes => Some(ElementKind::Node),
+        BlockType::Ways => Some(ElementKind::Way),
+        BlockType::Relations => Some(ElementKind::Relation),
         BlockType::Mixed | BlockType::Empty => None,
     };
 
-    let mut kind: Option<ElemKind> = primary;
+    let mut kind: Option<ElementKind> = primary;
     let mut min_id = i64::MAX;
     let mut max_id = i64::MIN;
 
     for element in block.elements_skip_metadata() {
         let (elem_kind, id) = match &element {
-            Element::DenseNode(dn) => (ElemKind::Node, dn.id()),
-            Element::Node(n) => (ElemKind::Node, n.id()),
-            Element::Way(w) => (ElemKind::Way, w.id()),
-            Element::Relation(r) => (ElemKind::Relation, r.id()),
+            Element::DenseNode(dn) => (ElementKind::Node, dn.id()),
+            Element::Node(n) => (ElementKind::Node, n.id()),
+            Element::Way(w) => (ElementKind::Way, w.id()),
+            Element::Relation(r) => (ElementKind::Relation, r.id()),
         };
         match kind {
             Some(k) if k == elem_kind => {
@@ -739,7 +739,7 @@ fn infer_kind_and_range(block: &crate::PrimitiveBlock) -> (ElemKind, i64, i64) {
         // `blob_osm_first_id` would return `i64::MAX` and gap-creates
         // would fire for every remaining upsert of `kind`. Any upserts
         // of any kind get trailing-created.
-        None => (ElemKind::Node, i64::MAX, i64::MIN),
+        None => (ElementKind::Node, i64::MAX, i64::MIN),
     }
 }
 
@@ -761,7 +761,7 @@ fn handle_owned_passthrough(
     counters: &WorkerCounters,
     read_buf: &mut Vec<u8>,
     count: u64,
-    override_kind_range: Option<(ElemKind, (i64, i64))>,
+    override_kind_range: Option<(ElementKind, (i64, i64))>,
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
     counters
@@ -801,7 +801,7 @@ fn pread_into(
 
 /// Compute the inline-upsert slice for one blob: upserts whose OSM ID
 /// key falls in `[blob_osm_first(min,max), blob_osm_last(min,max)]`.
-fn upsert_slice(ranges: &DiffRanges, kind: ElemKind, min_id: i64, max_id: i64) -> &[i64] {
+fn upsert_slice(ranges: &DiffRanges, kind: ElementKind, min_id: i64, max_id: i64) -> &[i64] {
     let upserts = ranges.upserts(kind);
     let first = crate::osm_id::blob_osm_first_key(min_id, max_id);
     let last = crate::osm_id::blob_osm_last_key(min_id, max_id);

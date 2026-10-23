@@ -211,13 +211,13 @@ pub(crate) fn blob_filter_check(
     if let Some(idx) = index {
         let dominated = matches!(
             idx.kind,
-            crate::blob_meta::ElemKind::Node if !filter.want_nodes
+            crate::ElementKind::Node if !filter.want_nodes
         ) || matches!(
             idx.kind,
-            crate::blob_meta::ElemKind::Way if !filter.want_ways
+            crate::ElementKind::Way if !filter.want_ways
         ) || matches!(
             idx.kind,
-            crate::blob_meta::ElemKind::Relation if !filter.want_relations
+            crate::ElementKind::Relation if !filter.want_relations
         );
         if dominated {
             return (true, false);
@@ -248,7 +248,7 @@ pub(crate) fn blob_filter_check(
 /// reused to avoid a second `open` at scan end.
 pub(crate) fn build_classify_schedule(
     input: &std::path::Path,
-    kind_filter: Option<crate::blob_meta::ElemKind>,
+    kind_filter: Option<crate::ElementKind>,
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<(Vec<ScheduleEntry>, std::sync::Arc<std::fs::File>)> {
     let (schedule, file, _skipped) =
@@ -269,7 +269,7 @@ pub(crate) fn build_classify_schedule(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn build_classify_schedule_blob_filtered(
     input: &std::path::Path,
-    kind_filter: Option<crate::blob_meta::ElemKind>,
+    kind_filter: Option<crate::ElementKind>,
     blob_filter: Option<&crate::blob_meta::BlobFilter>,
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<(Vec<ScheduleEntry>, std::sync::Arc<std::fs::File>, u64)> {
@@ -411,15 +411,15 @@ pub(crate) fn build_classify_schedules_split(
         }
         let reported_max = meta.index.as_ref().map_or(0, |i| i.max_id);
         match meta.index.as_ref().map(|i| i.kind) {
-            Some(crate::blob_meta::ElemKind::Node) => {
+            Some(crate::ElementKind::Node) => {
                 max_ids[0] = max_ids[0].max(reported_max);
                 nodes.push((nodes.len(), meta.data_offset, meta.data_size));
             }
-            Some(crate::blob_meta::ElemKind::Way) => {
+            Some(crate::ElementKind::Way) => {
                 max_ids[1] = max_ids[1].max(reported_max);
                 ways.push((ways.len(), meta.data_offset, meta.data_size));
             }
-            Some(crate::blob_meta::ElemKind::Relation) => {
+            Some(crate::ElementKind::Relation) => {
                 max_ids[2] = max_ids[2].max(reported_max);
                 rels.push((rels.len(), meta.data_offset, meta.data_size));
             }

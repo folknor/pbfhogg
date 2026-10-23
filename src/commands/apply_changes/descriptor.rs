@@ -16,7 +16,8 @@
 //! passthrough stream + worker outputs merged into an unbounded reorder
 //! buffer keyed by global seq) and produces the output PBF in file order.
 
-use crate::blob_meta::{BlobIndex, ElemKind};
+use crate::ElementKind;
+use crate::blob_meta::BlobIndex;
 
 /// Per-blob metadata produced by the scanner from a single `HeaderWalker`
 /// probe. Workers pread the compressed body from
@@ -45,7 +46,7 @@ pub(super) struct BlobDescriptor {
     pub data_size: usize,
     /// Element kind from indexdata (or inferred post-decompress under
     /// `--force`).
-    pub kind: ElemKind,
+    pub kind: ElementKind,
     /// Inclusive `(min_id, max_id)` from indexdata. `None` under
     /// `--force` / unindexed inputs; workers fill it in after scan.
     pub id_range: Option<(i64, i64)>,
@@ -92,7 +93,7 @@ pub(super) enum DrainItem {
         seq: u64,
         frame_start: u64,
         frame_len: usize,
-        kind: ElemKind,
+        kind: ElementKind,
         id_range: (i64, i64),
         /// Indexdata for the output blob. Preserved byte-for-byte from
         /// the input BlobHeader indexdata field.
@@ -110,7 +111,7 @@ pub(super) enum DrainItem {
     OwnedBytes {
         seq: u64,
         frame_bytes: Vec<u8>,
-        kind: ElemKind,
+        kind: ElementKind,
         id_range: (i64, i64),
         count: u64,
     },
@@ -123,7 +124,7 @@ pub(super) enum DrainItem {
     Rewritten {
         seq: u64,
         framed_chunks: Vec<Vec<u8>>,
-        kind: ElemKind,
+        kind: ElementKind,
         id_range: (i64, i64),
         stats: super::stats::MergeStats,
     },
@@ -195,7 +196,7 @@ impl DrainItem {
     /// The element kind of this blob - drain uses this for type-transition
     /// detection (Node → Way → Relation boundaries drive flushes of
     /// pending upserts).
-    pub(super) fn kind(&self) -> ElemKind {
+    pub(super) fn kind(&self) -> ElementKind {
         match self {
             DrainItem::CopyRange { kind, .. }
             | DrainItem::OwnedBytes { kind, .. }

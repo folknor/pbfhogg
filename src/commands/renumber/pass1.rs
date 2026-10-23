@@ -87,12 +87,7 @@ pub(super) fn pass1_parallel_scan(
             } else {
                 let bytes = std::mem::take(&mut w.reframe_buf);
                 w.reframe_buf.reserve(bytes.len());
-                let index = blob_index(
-                    crate::blob_meta::ElemKind::Node,
-                    base,
-                    outcome.count,
-                    task.bbox,
-                )?;
+                let index = blob_index(crate::ElementKind::Node, base, outcome.count, task.bbox)?;
                 Some((bytes, index))
             };
             Ok(Rewritten {

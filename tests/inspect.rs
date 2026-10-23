@@ -655,11 +655,12 @@ fn show_element_unsorted_pbf_finds_target_in_later_blob() {
     ];
     crate::common::write_test_pbf_impl(&input, &nodes, &[], &[], false, Some(2));
 
-    use pbfhogg::inspect::{ShowElementType, show_element_to};
+    use pbfhogg::ElementKind;
+    use pbfhogg::inspect::show_element_to;
     let mut out: Vec<u8> = Vec::new();
     let found = show_element_to(
         &input,
-        ShowElementType::Node,
+        ElementKind::Node,
         51,
         false,
         &mut out,
@@ -677,7 +678,7 @@ fn show_element_unsorted_pbf_finds_target_in_later_blob() {
     let mut out100: Vec<u8> = Vec::new();
     let found100 = show_element_to(
         &input,
-        ShowElementType::Node,
+        ElementKind::Node,
         100,
         false,
         &mut out100,
@@ -695,7 +696,7 @@ fn show_element_unsorted_pbf_finds_target_in_later_blob() {
     let mut out_miss: Vec<u8> = Vec::new();
     let miss = show_element_to(
         &input,
-        ShowElementType::Node,
+        ElementKind::Node,
         999,
         false,
         &mut out_miss,

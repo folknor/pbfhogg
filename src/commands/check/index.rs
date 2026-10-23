@@ -81,7 +81,7 @@ use std::path::Path;
 
 use crate::BoxResult as Result;
 use crate::blob::BlobKind;
-use crate::blob_meta::{BlobBbox, BlobIndex, ElemKind, scan_block_tags};
+use crate::blob_meta::{BlobBbox, BlobIndex, scan_block_tags};
 use crate::file_reader::FileReader;
 use crate::read::decompress::decompress_blob_data_into;
 use crate::read::raw_frame::read_raw_frame;
@@ -318,14 +318,6 @@ impl IndexReport {
     }
 }
 
-fn kind_name(kind: ElemKind) -> &'static str {
-    match kind {
-        ElemKind::Node => "node",
-        ElemKind::Way => "way",
-        ElemKind::Relation => "relation",
-    }
-}
-
 fn bbox_array(b: &BlobBbox) -> [i32; 4] {
     [b.min_lat, b.max_lat, b.min_lon, b.max_lon]
 }
@@ -358,8 +350,8 @@ fn diff_blob(
     };
     if stored.kind != observed.kind {
         out.push(IndexViolationKind::Kind {
-            claimed: kind_name(stored.kind),
-            observed: kind_name(observed.kind),
+            claimed: stored.kind.as_str(),
+            observed: observed.kind.as_str(),
         });
     }
     if stored.count != observed.count {
@@ -535,8 +527,9 @@ pub fn check_index(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::ElementKind;
 
-    fn idx(kind: ElemKind, min_id: i64, max_id: i64, count: u64) -> BlobIndex {
+    fn idx(kind: ElementKind, min_id: i64, max_id: i64, count: u64) -> BlobIndex {
         BlobIndex {
             kind,
             min_id,
@@ -551,8 +544,8 @@ mod tests {
         // The passing counterpart every rejection below is paired against: if
         // `diff_blob` regressed into reporting something unconditionally, this
         // is the test that catches it.
-        let stored = idx(ElemKind::Way, 10, 20, 5);
-        let observed = idx(ElemKind::Way, 10, 20, 5);
+        let stored = idx(ElementKind::Way, 10, 20, 5);
+        let observed = idx(ElementKind::Way, 10, 20, 5);
         let mut out = Vec::new();
         diff_blob(Some(&stored), true, Some(&observed), &mut out);
         assert!(
@@ -566,7 +559,7 @@ mod tests {
         // A blob with no indexdata is legal and extremely common (any
         // third-party PBF). Reporting it would make `check --index` fail on
         // every osmium-written file.
-        let observed = idx(ElemKind::Node, 1, 2, 2);
+        let observed = idx(ElementKind::Node, 1, 2, 2);
         let mut out = Vec::new();
         diff_blob(None, false, Some(&observed), &mut out);
         assert!(out.is_empty());
@@ -576,8 +569,8 @@ mod tests {
     fn an_inflated_count_and_max_id_are_both_reported() {
         // Exactly the shape `degrade --corrupt-indexdata` writes: count and
         // max_id each overstated by CORRUPT_INDEXDATA_INFLATION.
-        let stored = idx(ElemKind::Way, 10, 1_000_020, 1_000_005);
-        let observed = idx(ElemKind::Way, 10, 20, 5);
+        let stored = idx(ElementKind::Way, 10, 1_000_020, 1_000_005);
+        let observed = idx(ElementKind::Way, 10, 20, 5);
         let mut out = Vec::new();
         diff_blob(Some(&stored), true, Some(&observed), &mut out);
         assert!(out.contains(&IndexViolationKind::Count {
@@ -600,8 +593,8 @@ mod tests {
     fn a_rotated_kind_is_reported() {
         // `degrade --corrupt-indexdata-kind` rotates node->way->relation->node
         // and leaves every other field honest.
-        let stored = idx(ElemKind::Relation, 10, 20, 5);
-        let observed = idx(ElemKind::Way, 10, 20, 5);
+        let stored = idx(ElementKind::Relation, 10, 20, 5);
+        let observed = idx(ElementKind::Way, 10, 20, 5);
         let mut out = Vec::new();
         diff_blob(Some(&stored), true, Some(&observed), &mut out);
         assert_eq!(
@@ -616,7 +609,7 @@ mod tests {
 
     #[test]
     fn an_index_on_an_unindexable_blob_is_reported() {
-        let stored = idx(ElemKind::Way, 10, 20, 5);
+        let stored = idx(ElementKind::Way, 10, 20, 5);
         let mut out = Vec::new();
         diff_blob(Some(&stored), true, None, &mut out);
         assert_eq!(out, vec![IndexViolationKind::IndexOnUnindexableBlob]);
@@ -630,13 +623,13 @@ mod tests {
 
     #[test]
     fn the_bbox_test_is_containment_not_equality() {
-        let mut stored = idx(ElemKind::Node, 1, 2, 2);
+        let mut stored = idx(ElementKind::Node, 1, 2, 2);
         stored.bbox = Some(BlobBbox::new(0, 100, 0, 100));
 
         // Wider stored box: sound, and the case a non-default granularity or a
         // conservatively-rounded scan produces. Must NOT be reported, or every
         // honest third-party file fails.
-        let mut observed = idx(ElemKind::Node, 1, 2, 2);
+        let mut observed = idx(ElementKind::Node, 1, 2, 2);
         observed.bbox = Some(BlobBbox::new(10, 90, 10, 90));
         let mut out = Vec::new();
         diff_blob(Some(&stored), true, Some(&observed), &mut out);
@@ -667,9 +660,9 @@ mod tests {
         // Absence is not a false claim: `BlobFilter::wants_index` reads a
         // missing bbox as "no spatial information" and lets the blob through,
         // so it cannot cause a wrong answer.
-        let stored = idx(ElemKind::Node, 1, 2, 2);
+        let stored = idx(ElementKind::Node, 1, 2, 2);
         assert!(stored.bbox.is_none());
-        let mut observed = idx(ElemKind::Node, 1, 2, 2);
+        let mut observed = idx(ElementKind::Node, 1, 2, 2);
         observed.bbox = Some(BlobBbox::new(10, 90, 10, 90));
         let mut out = Vec::new();
         diff_blob(Some(&stored), true, Some(&observed), &mut out);
@@ -680,7 +673,7 @@ mod tests {
 
         // Paired counterpart so this is not satisfied by "never report a bbox
         // violation": a bbox that IS present and IS too small must still fire.
-        let mut narrow = idx(ElemKind::Node, 1, 2, 2);
+        let mut narrow = idx(ElementKind::Node, 1, 2, 2);
         narrow.bbox = Some(BlobBbox::new(20, 90, 10, 90));
         let mut out = Vec::new();
         diff_blob(Some(&narrow), true, Some(&observed), &mut out);
@@ -714,7 +707,7 @@ mod tests {
     /// obviously broken input it can be handed.
     #[test]
     fn malformed_indexdata_is_reported_rather_than_read_as_absent() {
-        let observed = idx(ElemKind::Node, 1, 2, 2);
+        let observed = idx(ElementKind::Node, 1, 2, 2);
         let mut out = Vec::new();
         diff_blob(None, true, Some(&observed), &mut out);
         assert_eq!(
@@ -736,7 +729,7 @@ mod tests {
 
         // And a readable index still gets compared field by field rather than
         // short-circuiting on the presence flag.
-        let stored = idx(ElemKind::Way, 10, 20, 5);
+        let stored = idx(ElementKind::Way, 10, 20, 5);
         let mut out = Vec::new();
         diff_blob(Some(&stored), true, Some(&stored), &mut out);
         assert!(out.is_empty());

@@ -30,7 +30,7 @@ pub mod derive_parallel_test_hooks {
 }
 
 use super::Result;
-use crate::blob_meta::ElemKind;
+use crate::ElementKind;
 use crate::coord_fmt::{format_coord, from_decimicro};
 use crate::osc::merge_join::{
     BlockMergeAction, BlockPairMergeState, MergeJoinAction, MergeJoinElement, StreamingBlocks,
@@ -325,10 +325,10 @@ fn diff_block_pair(
 
     let mut stats = DiffStats::default();
 
-    let phases: [(ElemKind, bool, &str); 3] = [
-        (ElemKind::Node, filter.nodes, "NODE"),
-        (ElemKind::Way, filter.ways, "WAY"),
-        (ElemKind::Relation, filter.relations, "REL"),
+    let phases: [(ElementKind, bool, &str); 3] = [
+        (ElementKind::Node, filter.nodes, "NODE"),
+        (ElementKind::Way, filter.ways, "WAY"),
+        (ElementKind::Relation, filter.relations, "REL"),
     ];
 
     for (kind, enabled, tag) in phases {
@@ -346,7 +346,7 @@ fn diff_block_pair(
                     stats.common += count;
                 }
                 BlockMergeAction::BlobOldOnly { block, count, skip } => {
-                    let type_char = crate::osc::merge_join::kind_type_char(kind);
+                    let type_char = kind.type_char();
                     for elem in block.elements().skip(skip) {
                         let id = crate::osc::merge_join::element_id(&elem);
                         let ver = crate::osc::merge_join::element_version(&elem);
@@ -355,7 +355,7 @@ fn diff_block_pair(
                     stats.deleted += count;
                 }
                 BlockMergeAction::BlobNewOnly { block, count, skip } => {
-                    let type_char = crate::osc::merge_join::kind_type_char(kind);
+                    let type_char = kind.type_char();
                     for elem in block.elements().skip(skip) {
                         let id = crate::osc::merge_join::element_id(&elem);
                         let ver = crate::osc::merge_join::element_version(&elem);
@@ -374,7 +374,7 @@ fn diff_block_pair(
                     stats.common += 1;
                 }
                 BlockMergeAction::ElementModified { old, new } => {
-                    let type_char = crate::osc::merge_join::kind_type_char(kind);
+                    let type_char = kind.type_char();
                     let id = crate::osc::merge_join::element_id(old);
                     let old_ver = crate::osc::merge_join::element_version(old);
                     let new_ver = crate::osc::merge_join::element_version(new);
@@ -385,14 +385,14 @@ fn diff_block_pair(
                     stats.modified += 1;
                 }
                 BlockMergeAction::ElementOldOnly(o) => {
-                    let type_char = crate::osc::merge_join::kind_type_char(kind);
+                    let type_char = kind.type_char();
                     let id = crate::osc::merge_join::element_id(o);
                     let ver = crate::osc::merge_join::element_version(o);
                     write_compact_line(output, '-', type_char, id, ver)?;
                     stats.deleted += 1;
                 }
                 BlockMergeAction::ElementNewOnly(n) => {
-                    let type_char = crate::osc::merge_join::kind_type_char(kind);
+                    let type_char = kind.type_char();
                     let id = crate::osc::merge_join::element_id(n);
                     let ver = crate::osc::merge_join::element_version(n);
                     write_compact_line(output, '+', type_char, id, ver)?;

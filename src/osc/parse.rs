@@ -9,6 +9,8 @@ use std::path::Path;
 
 use rustc_hash::FxHashMap;
 
+use crate::ElementKind;
+
 use super::ParseResult;
 use super::compact::{
     ArenaMeta, NODE_META_OFF, RELATION_META_OFF, WAY_META_OFF, arena_append_node,
@@ -26,14 +28,6 @@ pub use super::compact::{
 // ---------------------------------------------------------------------------
 // CompactDiffOverlay
 // ---------------------------------------------------------------------------
-
-/// OSM object kind for overlay deletion queries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OscElementKind {
-    Node,
-    Way,
-    Relation,
-}
 
 /// Arena-packed diff overlay for OSC change files.
 ///
@@ -195,7 +189,7 @@ impl CompactDiffOverlay {
     /// this function did the unwrapping.
     fn check_version_advance(
         &self,
-        kind: &str,
+        kind: ElementKind,
         id: i64,
         store: KindStore<'_>,
         incoming_version: i32,
@@ -209,7 +203,7 @@ impl CompactDiffOverlay {
         };
         Err(regression_message(
             "OSC change overlay",
-            kind,
+            kind.as_str(),
             id,
             incoming_version,
             stored,
@@ -342,16 +336,16 @@ impl CompactDiffOverlay {
     }
 
     /// Deleted IDs by OSM object kind, without mutable access to overlay state.
-    pub fn deleted_ids(&self, kind: OscElementKind) -> &HashSet<i64> {
+    pub fn deleted_ids(&self, kind: ElementKind) -> &HashSet<i64> {
         match kind {
-            OscElementKind::Node => &self.deleted_nodes,
-            OscElementKind::Way => &self.deleted_ways,
-            OscElementKind::Relation => &self.deleted_relations,
+            ElementKind::Node => &self.deleted_nodes,
+            ElementKind::Way => &self.deleted_ways,
+            ElementKind::Relation => &self.deleted_relations,
         }
     }
 
     /// Whether the final change for an object deletes it.
-    pub fn is_deleted(&self, kind: OscElementKind, id: i64) -> bool {
+    pub fn is_deleted(&self, kind: ElementKind, id: i64) -> bool {
         self.deleted_ids(kind).contains(&id)
     }
 
@@ -409,7 +403,7 @@ impl CompactDiffOverlay {
         meta: &ArenaMeta,
     ) -> ParseResult<()> {
         if let Some(claim) = meta.version_claim() {
-            self.check_version_advance("node", id, self.node_store(), claim)?;
+            self.check_version_advance(ElementKind::Node, id, self.node_store(), claim)?;
         } else if !self.allow_version_regression {
             let carried = self.node_store().stored_version(id);
             Self::raise_floor(&mut self.node_version_floors, id, carried, meta);
@@ -430,7 +424,7 @@ impl CompactDiffOverlay {
         meta: &ArenaMeta,
     ) -> ParseResult<()> {
         if let Some(claim) = meta.version_claim() {
-            self.check_version_advance("way", id, self.way_store(), claim)?;
+            self.check_version_advance(ElementKind::Way, id, self.way_store(), claim)?;
         } else if !self.allow_version_regression {
             let carried = self.way_store().stored_version(id);
             Self::raise_floor(&mut self.way_version_floors, id, carried, meta);
@@ -451,7 +445,7 @@ impl CompactDiffOverlay {
         meta: &ArenaMeta,
     ) -> ParseResult<()> {
         if let Some(claim) = meta.version_claim() {
-            self.check_version_advance("relation", id, self.relation_store(), claim)?;
+            self.check_version_advance(ElementKind::Relation, id, self.relation_store(), claim)?;
         } else if !self.allow_version_regression {
             let carried = self.relation_store().stored_version(id);
             Self::raise_floor(&mut self.relation_version_floors, id, carried, meta);
@@ -470,7 +464,7 @@ impl CompactDiffOverlay {
     #[inline]
     pub(super) fn delete_node(&mut self, id: i64, meta: &ArenaMeta) -> ParseResult<()> {
         if let Some(claim) = meta.version_claim() {
-            self.check_version_advance("node", id, self.node_store(), claim)?;
+            self.check_version_advance(ElementKind::Node, id, self.node_store(), claim)?;
         }
         let carried = self.node_store().stored_version(id);
         Self::raise_floor(&mut self.node_version_floors, id, carried, meta);
@@ -483,7 +477,7 @@ impl CompactDiffOverlay {
     #[inline]
     pub(super) fn delete_way(&mut self, id: i64, meta: &ArenaMeta) -> ParseResult<()> {
         if let Some(claim) = meta.version_claim() {
-            self.check_version_advance("way", id, self.way_store(), claim)?;
+            self.check_version_advance(ElementKind::Way, id, self.way_store(), claim)?;
         }
         let carried = self.way_store().stored_version(id);
         Self::raise_floor(&mut self.way_version_floors, id, carried, meta);
@@ -496,7 +490,7 @@ impl CompactDiffOverlay {
     #[inline]
     pub(super) fn delete_relation(&mut self, id: i64, meta: &ArenaMeta) -> ParseResult<()> {
         if let Some(claim) = meta.version_claim() {
-            self.check_version_advance("relation", id, self.relation_store(), claim)?;
+            self.check_version_advance(ElementKind::Relation, id, self.relation_store(), claim)?;
         }
         let carried = self.relation_store().stored_version(id);
         Self::raise_floor(&mut self.relation_version_floors, id, carried, meta);
@@ -1298,7 +1292,7 @@ mod tests {
             ("delete", r#"id="1" version="12""#),
         ])?;
         assert!(!overlay.has_node(1));
-        assert!(overlay.is_deleted(OscElementKind::Node, 1));
+        assert!(overlay.is_deleted(ElementKind::Node, 1));
 
         // A repeated delete, and re-entry at the deleted version.
         let overlay = accumulate(&[
@@ -1307,7 +1301,7 @@ mod tests {
             ("create", r#"id="1" lat="1.0" lon="2.0" version="12""#),
         ])?;
         assert!(overlay.has_node(1));
-        assert!(!overlay.is_deleted(OscElementKind::Node, 1));
+        assert!(!overlay.is_deleted(ElementKind::Node, 1));
 
         // Admitting an equal claim never lowers the floor: a lower claim
         // after it is still refused against the same version.

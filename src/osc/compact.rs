@@ -3,6 +3,7 @@
 //! roles are stored as u32 intern IDs into the `StringInterner` owned by the
 //! enclosing [`super::parse::CompactDiffOverlay`].
 
+use crate::ElementKind;
 use crate::read::elements::MemberType;
 
 use super::ParseResult;
@@ -194,9 +195,9 @@ pub(super) fn arena_append_node(
     arena.extend_from_slice(&id.to_le_bytes());
     arena.extend_from_slice(&lat.to_le_bytes());
     arena.extend_from_slice(&lon.to_le_bytes());
-    arena.extend_from_slice(&count_u32(tags.len(), "tags", "node", id)?.to_le_bytes());
+    arena.extend_from_slice(&count_u32(tags.len(), "tags", ElementKind::Node, id)?.to_le_bytes());
     arena_append_meta(arena, meta);
-    append_tags(arena, tags, "node", id)?;
+    append_tags(arena, tags, ElementKind::Node, id)?;
     Ok(offset)
 }
 
@@ -204,7 +205,7 @@ pub(super) fn arena_append_node(
 /// error naming what overflowed. These counts are `u32` in the on-disk
 /// record shape; a silent `as u32` here would make the reader walk the
 /// wrong number of items and read a neighbouring record's bytes.
-fn count_u32(len: usize, what: &str, kind: &str, id: i64) -> ParseResult<u32> {
+fn count_u32(len: usize, what: &str, kind: ElementKind, id: i64) -> ParseResult<u32> {
     u32::try_from(len).map_err(|_| -> Box<dyn std::error::Error> {
         format!("OSC {kind} {id} has {len} {what}, which exceeds the {} the compact overlay can address", u32::MAX).into()
     })
@@ -212,7 +213,12 @@ fn count_u32(len: usize, what: &str, kind: &str, id: i64) -> ParseResult<u32> {
 
 /// Append the shared `[key_intern_id:u32][value_len:u32][value_bytes]`
 /// tag section used identically by all three record kinds.
-fn append_tags(arena: &mut Vec<u8>, tags: &[(u32, &str)], kind: &str, id: i64) -> ParseResult<()> {
+fn append_tags(
+    arena: &mut Vec<u8>,
+    tags: &[(u32, &str)],
+    kind: ElementKind,
+    id: i64,
+) -> ParseResult<()> {
     for &(key_id, value) in tags {
         arena.extend_from_slice(&key_id.to_le_bytes());
         arena
@@ -235,8 +241,8 @@ pub(super) fn arena_append_way(
     tags: &[(u32, &str)],
     meta: &ArenaMeta,
 ) -> ParseResult<usize> {
-    let ref_count = count_u32(refs.len(), "node refs", "way", id)?;
-    let tag_count = count_u32(tags.len(), "tags", "way", id)?;
+    let ref_count = count_u32(refs.len(), "node refs", ElementKind::Way, id)?;
+    let tag_count = count_u32(tags.len(), "tags", ElementKind::Way, id)?;
     let offset = arena.len();
     arena.extend_from_slice(&id.to_le_bytes());
     arena.extend_from_slice(&ref_count.to_le_bytes());
@@ -245,7 +251,7 @@ pub(super) fn arena_append_way(
     for &r in refs {
         arena.extend_from_slice(&r.to_le_bytes());
     }
-    append_tags(arena, tags, "way", id)?;
+    append_tags(arena, tags, ElementKind::Way, id)?;
     Ok(offset)
 }
 
@@ -263,8 +269,8 @@ pub(super) fn arena_append_relation(
     tags: &[(u32, &str)],
     meta: &ArenaMeta,
 ) -> ParseResult<usize> {
-    let member_count = count_u32(members.len(), "members", "relation", id)?;
-    let tag_count = count_u32(tags.len(), "tags", "relation", id)?;
+    let member_count = count_u32(members.len(), "members", ElementKind::Relation, id)?;
+    let tag_count = count_u32(tags.len(), "tags", ElementKind::Relation, id)?;
     let offset = arena.len();
     arena.extend_from_slice(&id.to_le_bytes());
     arena.extend_from_slice(&member_count.to_le_bytes());
@@ -275,7 +281,7 @@ pub(super) fn arena_append_relation(
         arena.push(type_byte);
         arena.extend_from_slice(&role_id.to_le_bytes());
     }
-    append_tags(arena, tags, "relation", id)?;
+    append_tags(arena, tags, ElementKind::Relation, id)?;
     Ok(offset)
 }
 

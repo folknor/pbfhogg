@@ -204,7 +204,7 @@ pub(super) fn try_extract_multi_single_pass(
                 continue;
             }
             match idx.kind {
-                crate::blob_meta::ElemKind::Node => {
+                crate::ElementKind::Node => {
                     // Raw passthrough is only sound for bbox regions - polygon
                     // regions can exclude nodes inside the bbox but outside the
                     // polygon boundary or inside holes - and only when the
@@ -230,10 +230,10 @@ pub(super) fn try_extract_multi_single_pass(
                     });
                     node_schedule.push((seq, meta.data_offset, meta.data_size));
                 }
-                crate::blob_meta::ElemKind::Way => {
+                crate::ElementKind::Way => {
                     way_schedule.push((seq, meta.data_offset, meta.data_size));
                 }
-                crate::blob_meta::ElemKind::Relation => {
+                crate::ElementKind::Relation => {
                     relation_schedule.push((seq, meta.data_offset, meta.data_size));
                 }
             }

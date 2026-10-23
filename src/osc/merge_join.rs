@@ -5,7 +5,7 @@
 //! transparently. [`merge_join_phase`] runs a generic two-pointer merge-join
 //! over two cursors, used by `diff` and `derive_changes`.
 
-use crate::blob_meta::ElemKind;
+use crate::ElementKind;
 use crate::{BlockType, Element, PrimitiveBlock};
 
 use super::write::{OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay};
@@ -487,7 +487,7 @@ struct PendingBlob {
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn next_blob_for_kind(
     reader: &mut crate::blob::BlobReader<crate::file_reader::FileReader>,
-    kind: ElemKind,
+    kind: ElementKind,
     stash: &mut Option<crate::blob::Blob>,
 ) -> BoxResult<Option<PendingBlob>> {
     loop {
@@ -510,7 +510,7 @@ fn next_blob_for_kind(
             }
         };
         if index.kind != kind {
-            if kind_order(index.kind) > kind_order(kind) {
+            if index.kind > kind {
                 *stash = Some(blob);
                 return Ok(None);
             }
@@ -526,8 +526,8 @@ fn next_blob_for_kind(
                 "block-pair merge: found a {} blob during the {} phase. The input's header \
                  claims Sort.Type_then_ID but its blobs are not in canonical order \
                  (nodes, then ways, then relations); re-sort it first with `pbfhogg sort`.",
-                kind_name(index.kind),
-                kind_name(kind),
+                index.kind.as_str(),
+                kind.as_str(),
             )
             .into());
         }
@@ -551,24 +551,6 @@ fn decode_pending(
         skip_count: 0,
         index: pending.index,
     })
-}
-
-/// Canonical order: nodes (0) → ways (1) → relations (2).
-fn kind_order(kind: ElemKind) -> u8 {
-    match kind {
-        ElemKind::Node => 0,
-        ElemKind::Way => 1,
-        ElemKind::Relation => 2,
-    }
-}
-
-/// Human-readable name for an `ElemKind`, for error messages.
-fn kind_name(kind: ElemKind) -> &'static str {
-    match kind {
-        ElemKind::Node => "node",
-        ElemKind::Way => "way",
-        ElemKind::Relation => "relation",
-    }
 }
 
 /// Running canonical-order check over one file's blob sequence, in FILE
@@ -606,31 +588,19 @@ impl BlobOrderGuard {
     pub(crate) fn observe(&mut self, index: &crate::blob_meta::BlobIndex) -> Result<(), String> {
         if let Err((previous_kind, previous_id)) =
             self.watermark
-                .observe(kind_order(index.kind), index.min_id, index.max_id)
+                .observe(index.kind.ordinal(), index.min_id, index.max_id)
         {
             return Err(format!(
                 "block-pair merge: a {} blob starting at id {} follows {} \
                  output already reaching id {previous_id}. The input's header claims \
                  Sort.Type_then_ID but its blobs are not in canonical order; re-sort it \
                  first with `pbfhogg sort`.",
-                kind_name(index.kind),
+                index.kind.as_str(),
                 crate::osm_id::blob_osm_first_id(index.min_id, index.max_id),
-                ["node", "way", "relation"]
-                    .get(usize::from(previous_kind))
-                    .copied()
-                    .unwrap_or("unknown"),
+                ElementKind::from_ordinal(previous_kind).map_or("unknown", ElementKind::as_str),
             ));
         }
         Ok(())
-    }
-}
-
-/// Type char for an ElemKind.
-pub(crate) fn kind_type_char(kind: ElemKind) -> char {
-    match kind {
-        ElemKind::Node => 'n',
-        ElemKind::Way => 'w',
-        ElemKind::Relation => 'r',
     }
 }
 
@@ -705,7 +675,7 @@ fn next_decoded_block(
     buf: &mut Vec<u8>,
     st: &mut Vec<(u32, u32)>,
     gr: &mut Vec<(u32, u32)>,
-    kind: ElemKind,
+    kind: ElementKind,
     stash: &mut Option<crate::blob::Blob>,
 ) -> BoxResult<Option<BlockState>> {
     match next_blob_for_kind(reader, kind, stash)? {
@@ -718,7 +688,7 @@ fn next_decoded_block(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn drain_remaining(
     state: &mut BlockPairMergeState,
-    kind: ElemKind,
+    kind: ElementKind,
     is_old: bool,
     on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> BoxResult<()>,
 ) -> BoxResult<()> {
@@ -893,11 +863,11 @@ fn check_claimed_max(
 #[allow(clippy::too_many_lines)]
 pub(crate) fn block_pair_merge_phase(
     state: &mut BlockPairMergeState,
-    kind: ElemKind,
+    kind: ElementKind,
     skip_equal_blobs: bool,
     on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> BoxResult<()>,
 ) -> BoxResult<()> {
-    let type_char = kind_type_char(kind);
+    let type_char = kind.type_char();
     let mut old_decoded: Option<BlockState> = None;
     let mut new_decoded: Option<BlockState> = None;
 

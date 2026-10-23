@@ -20,10 +20,11 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::Element;
+use crate::ElementKind;
 use crate::blob::{
     BlobKind, decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
 };
-use crate::blob_meta::{BlobIndex, ElemKind, scan_block_ids};
+use crate::blob_meta::{BlobIndex, scan_block_ids};
 use crate::block_builder::BlockBuilder;
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
@@ -465,11 +466,11 @@ fn index_input(
 // Sort + overlap detection
 // ---------------------------------------------------------------------------
 
-fn type_order(kind: ElemKind) -> u8 {
+fn type_order(kind: ElementKind) -> u8 {
     match kind {
-        ElemKind::Node => 0,
-        ElemKind::Way => 1,
-        ElemKind::Relation => 2,
+        ElementKind::Node => 0,
+        ElementKind::Way => 1,
+        ElementKind::Relation => 2,
     }
 }
 
@@ -578,9 +579,9 @@ fn count_entry(entry: &BlobEntry, stats: &mut MergePbfStats) {
         return;
     }
     match entry.index.kind {
-        ElemKind::Node => stats.nodes += entry.index.count,
-        ElemKind::Way => stats.ways += entry.index.count,
-        ElemKind::Relation => stats.relations += entry.index.count,
+        ElementKind::Node => stats.nodes += entry.index.count,
+        ElementKind::Way => stats.ways += entry.index.count,
+        ElementKind::Relation => stats.relations += entry.index.count,
     }
 }
 
@@ -598,7 +599,7 @@ fn write_overlap_run(
 ) -> Result<()> {
     let kind = entries[0].index.kind;
     match kind {
-        ElemKind::Node => {
+        ElementKind::Node => {
             let (c, d) = sweep_merge_dedup(
                 entries,
                 files,
@@ -615,7 +616,7 @@ fn write_overlap_run(
             stats.nodes += c;
             stats.duplicates_removed += d;
         }
-        ElemKind::Way => {
+        ElementKind::Way => {
             let (c, d) = sweep_merge_dedup(
                 entries,
                 files,
@@ -632,7 +633,7 @@ fn write_overlap_run(
             stats.ways += c;
             stats.duplicates_removed += d;
         }
-        ElemKind::Relation => {
+        ElementKind::Relation => {
             let (c, d) = sweep_merge_dedup(
                 entries,
                 files,
@@ -747,7 +748,7 @@ fn flush_heap_below_dedup<T: Ord + HasId>(
 mod tests {
     use super::*;
 
-    fn entry(kind: ElemKind, min_id: i64, max_id: i64) -> BlobEntry {
+    fn entry(kind: ElementKind, min_id: i64, max_id: i64) -> BlobEntry {
         BlobEntry {
             file_offset: 0,
             frame_len: 0,
@@ -775,9 +776,9 @@ mod tests {
     #[test]
     fn overlap_runs_are_transitive_not_pairwise() {
         let entries = vec![
-            entry(ElemKind::Node, 1, 1000),
-            entry(ElemKind::Node, 2, 3),
-            entry(ElemKind::Node, 500, 600),
+            entry(ElementKind::Node, 1, 1000),
+            entry(ElementKind::Node, 2, 3),
+            entry(ElementKind::Node, 500, 600),
         ];
         assert_eq!(
             detect_overlaps(&entries),
@@ -792,9 +793,9 @@ mod tests {
     #[test]
     fn disjoint_blobs_are_not_flagged_as_overlapping() {
         let entries = vec![
-            entry(ElemKind::Node, 1, 10),
-            entry(ElemKind::Node, 11, 20),
-            entry(ElemKind::Node, 21, 30),
+            entry(ElementKind::Node, 1, 10),
+            entry(ElementKind::Node, 11, 20),
+            entry(ElementKind::Node, 21, 30),
         ];
         assert_eq!(detect_overlaps(&entries), vec![false, false, false]);
     }
@@ -802,9 +803,9 @@ mod tests {
     #[test]
     fn a_run_never_crosses_a_kind_boundary() {
         let entries = vec![
-            entry(ElemKind::Node, 1, 1000),
-            entry(ElemKind::Node, 2, 3),
-            entry(ElemKind::Way, 5, 6),
+            entry(ElementKind::Node, 1, 1000),
+            entry(ElementKind::Node, 2, 3),
+            entry(ElementKind::Way, 5, 6),
         ];
         assert_eq!(
             detect_overlaps(&entries),
@@ -829,13 +830,13 @@ mod tests {
             blobs_total: 0,
             duplicates_removed: 0,
         };
-        let mut claimed = entry(ElemKind::Node, 1, 10);
+        let mut claimed = entry(ElementKind::Node, 1, 10);
         claimed.index.count = 1_000_000;
         count_entry(&claimed, &mut stats);
         assert_eq!(stats.nodes, 0, "an indexdata claim is not an observation");
         assert_eq!(stats.passthrough_claimed, 1_000_000);
 
-        let mut scanned = entry(ElemKind::Way, 1, 10);
+        let mut scanned = entry(ElementKind::Way, 1, 10);
         scanned.has_indexdata = false;
         scanned.index.count = 7;
         count_entry(&scanned, &mut stats);
@@ -846,9 +847,9 @@ mod tests {
     #[test]
     fn a_new_run_starts_after_the_previous_one_ends() {
         let entries = vec![
-            entry(ElemKind::Node, 1, 100),
-            entry(ElemKind::Node, 50, 60),
-            entry(ElemKind::Node, 200, 300),
+            entry(ElementKind::Node, 1, 100),
+            entry(ElementKind::Node, 50, 60),
+            entry(ElementKind::Node, 200, 300),
         ];
         assert_eq!(
             detect_overlaps(&entries),

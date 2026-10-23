@@ -3,7 +3,7 @@
 //! their sorted positions, and flushes the results into owned blocks for the
 //! main thread to hand to the pipelined writer.
 
-use crate::blob_meta::ElemKind;
+use crate::ElementKind;
 use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::osc::CompactDiffOverlay;
 use crate::{Element, PrimitiveBlock};
@@ -32,7 +32,7 @@ pub(super) struct RewriteOutput {
 #[allow(clippy::too_many_arguments)]
 fn emit_create_local(
     id: i64,
-    kind: ElemKind,
+    kind: ElementKind,
     diff: &CompactDiffOverlay,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
@@ -40,20 +40,20 @@ fn emit_create_local(
     loc: LocMode<'_>,
 ) -> Result<()> {
     match kind {
-        ElemKind::Node => {
+        ElementKind::Node => {
             if let Some(osc) = diff.get_node(id) {
                 ensure_node_capacity_local(bb, output)?;
                 add_osc_node(bb, &osc);
                 stats.diff_nodes += 1;
             }
         }
-        ElemKind::Way => {
+        ElementKind::Way => {
             if let Some(osc) = diff.get_way(id) {
                 write_osc_way_local(bb, output, &osc, loc)?;
                 stats.diff_ways += 1;
             }
         }
-        ElemKind::Relation => {
+        ElementKind::Relation => {
             if let Some(osc) = diff.get_relation(id) {
                 ensure_relation_capacity_local(bb, output)?;
                 add_osc_relation(bb, &osc);
@@ -80,7 +80,7 @@ pub(super) fn rewrite_block_parallel(
     diff: &CompactDiffOverlay,
     bb: &mut BlockBuilder,
     inline_upserts: &[i64],
-    kind: ElemKind,
+    kind: ElementKind,
     loc: LocMode<'_>,
 ) -> Result<RewriteOutput> {
     let mut output: Vec<OwnedBlock> = Vec::new();
@@ -120,10 +120,7 @@ pub(super) fn rewrite_block_parallel(
         match &element {
             Element::DenseNode(dn) => {
                 let id = dn.id();
-                if diff
-                    .deleted_ids(crate::osc::OscElementKind::Node)
-                    .contains(&id)
-                {
+                if diff.deleted_ids(crate::ElementKind::Node).contains(&id) {
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_node(id) {
                     ensure_node_capacity_local(bb, &mut output)?;
@@ -137,10 +134,7 @@ pub(super) fn rewrite_block_parallel(
             }
             Element::Node(n) => {
                 let id = n.id();
-                if diff
-                    .deleted_ids(crate::osc::OscElementKind::Node)
-                    .contains(&id)
-                {
+                if diff.deleted_ids(crate::ElementKind::Node).contains(&id) {
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_node(id) {
                     ensure_node_capacity_local(bb, &mut output)?;
@@ -154,10 +148,7 @@ pub(super) fn rewrite_block_parallel(
             }
             Element::Way(w) => {
                 let id = w.id();
-                if diff
-                    .deleted_ids(crate::osc::OscElementKind::Way)
-                    .contains(&id)
-                {
+                if diff.deleted_ids(crate::ElementKind::Way).contains(&id) {
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_way(id) {
                     write_osc_way_local(bb, &mut output, &osc, loc)?;
@@ -173,10 +164,7 @@ pub(super) fn rewrite_block_parallel(
             }
             Element::Relation(r) => {
                 let id = r.id();
-                if diff
-                    .deleted_ids(crate::osc::OscElementKind::Relation)
-                    .contains(&id)
-                {
+                if diff.deleted_ids(crate::ElementKind::Relation).contains(&id) {
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_relation(id) {
                     ensure_relation_capacity_local(bb, &mut output)?;

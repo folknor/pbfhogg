@@ -27,8 +27,9 @@ use std::os::unix::fs::FileExt as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 
+use crate::ElementKind;
 use crate::blob::{BlobKind, DecompressPool, decompress_blob_raw};
-use crate::blob_meta::{BlobIndex, ElemKind};
+use crate::blob_meta::BlobIndex;
 use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::idset::IdSet;
 use crate::read::header_walker::HeaderWalker;
@@ -74,7 +75,7 @@ struct BlobDescriptor {
     /// indexdata header (only reachable on `--force` non-indexed
     /// input). Both decode and passthrough branches treat `None` as
     /// "decode" to preserve correctness.
-    kind: Option<ElemKind>,
+    kind: Option<ElementKind>,
     /// Element count from indexdata. Used to populate stats on the
     /// passthrough path (no decode available for a live count).
     count: u64,
@@ -141,7 +142,7 @@ fn build_schedule(
                 let kind = meta.index.as_ref().map(|idx| idx.kind);
                 let count = meta.index.as_ref().map_or(0, |idx| idx.count);
 
-                let is_way_blob = matches!(kind, Some(ElemKind::Way));
+                let is_way_blob = matches!(kind, Some(ElementKind::Way));
                 let is_passthrough = super::blob_is_passthrough(kind, keep_untagged_nodes);
 
                 schedule.push(BlobDescriptor {
@@ -253,7 +254,7 @@ fn decode_one(
             inject_prepass,
         )?;
         let index = BlobIndex {
-            kind: ElemKind::Way,
+            kind: ElementKind::Way,
             min_id: stats.min_way_id,
             max_id: stats.max_way_id,
             count: stats.way_count,
@@ -387,9 +388,9 @@ pub(super) fn write_output_passthrough(
         let (mut way_blobs, mut node_blobs, mut relation_blobs): (i64, i64, i64) = (0, 0, 0);
         for d in &schedule {
             match d.kind {
-                Some(ElemKind::Way) => way_blobs += 1,
-                Some(ElemKind::Node) => node_blobs += 1,
-                Some(ElemKind::Relation) => relation_blobs += 1,
+                Some(ElementKind::Way) => way_blobs += 1,
+                Some(ElementKind::Node) => node_blobs += 1,
+                Some(ElementKind::Relation) => relation_blobs += 1,
                 None => {}
             }
         }
@@ -514,7 +515,7 @@ pub(super) fn write_output_passthrough(
                 frame_offset: u64,
                 frame_size: usize,
                 count: u64,
-                kind: Option<ElemKind>,
+                kind: Option<ElementKind>,
             },
         }
 
@@ -603,14 +604,14 @@ pub(super) fn write_output_passthrough(
                         }
                         total_stats.blobs_passthrough += 1;
                         match kind {
-                            Some(ElemKind::Node) => {
+                            Some(ElementKind::Node) => {
                                 total_stats.nodes_read += count;
                                 total_stats.nodes_written += count;
                             }
-                            Some(ElemKind::Relation) => {
+                            Some(ElementKind::Relation) => {
                                 total_stats.relations_written += count;
                             }
-                            Some(ElemKind::Way) | None => {
+                            Some(ElementKind::Way) | None => {
                                 // Ways never pass through (they need
                                 // location splicing). `None` means a
                                 // blob with no indexdata reached the

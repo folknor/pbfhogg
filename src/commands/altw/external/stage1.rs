@@ -85,7 +85,7 @@ pub(super) fn build_way_schedule(blob_meta: &[BlobMeta]) -> Vec<WayBlobTask> {
     let mut schedule: Vec<WayBlobTask> = Vec::new();
     let mut seq: u32 = 0;
     for meta in blob_meta {
-        if !matches!(meta.kind, crate::blob_meta::ElemKind::Way) {
+        if !matches!(meta.kind, crate::ElementKind::Way) {
             continue;
         }
         schedule.push(WayBlobTask {
@@ -498,7 +498,7 @@ pub(super) fn build_node_blob_mapping(blob_meta: &[BlobMeta]) -> Result<Vec<Node
     let mut mapping: Vec<NodeBlobInfo> = Vec::new();
 
     for meta in blob_meta {
-        if !matches!(meta.kind, crate::blob_meta::ElemKind::Node) {
+        if !matches!(meta.kind, crate::ElementKind::Node) {
             continue;
         }
         // Reject malformed indexdata at the trust boundary - a blob

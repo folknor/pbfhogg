@@ -44,7 +44,7 @@ use super::{
     HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
     ensure_way_capacity_local, flush_local, require_indexdata, writer_from_header,
 };
-use crate::blob_meta::ElemKind;
+use crate::ElementKind;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::owned::{
     OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata, read_dense_node,
@@ -229,7 +229,7 @@ pub fn repack(
     let node_stats = run_kind_phase(
         &shared_file,
         &node_schedule,
-        ElemKind::Node,
+        ElementKind::Node,
         elements_per_blob,
         prealloc_bound,
         compression,
@@ -250,7 +250,7 @@ pub fn repack(
     let way_stats = run_kind_phase(
         &shared_file,
         &way_schedule,
-        ElemKind::Way,
+        ElementKind::Way,
         elements_per_blob,
         prealloc_bound,
         compression,
@@ -271,7 +271,7 @@ pub fn repack(
     let rel_stats = run_kind_phase(
         &shared_file,
         &rel_schedule,
-        ElemKind::Relation,
+        ElementKind::Relation,
         elements_per_blob,
         prealloc_bound,
         compression,
@@ -372,7 +372,7 @@ fn emit_phase_counters(kind: &str, s: &PhaseStats) {
 fn run_kind_phase(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
-    kind: ElemKind,
+    kind: ElementKind,
     elements_per_blob: usize,
     prealloc_bound: usize,
     compression: Compression,
@@ -635,21 +635,21 @@ fn encode_way_full_block(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn worker_split_blob(
     block: &crate::PrimitiveBlock,
-    kind: ElemKind,
+    kind: ElementKind,
     cap: usize,
     preserve_locations: bool,
     compression: &Compression,
 ) -> std::result::Result<WorkerOutput, String> {
     let total = match kind {
-        ElemKind::Node => block
+        ElementKind::Node => block
             .elements()
             .filter(|e| matches!(e, Element::DenseNode(_) | Element::Node(_)))
             .count(),
-        ElemKind::Way => block
+        ElementKind::Way => block
             .elements()
             .filter(|e| matches!(e, Element::Way(_)))
             .count(),
-        ElemKind::Relation => block
+        ElementKind::Relation => block
             .elements()
             .filter(|e| matches!(e, Element::Relation(_)))
             .count(),
@@ -665,9 +665,9 @@ fn worker_split_blob(
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut full_framed: Vec<Vec<u8>> = Vec::new();
     let mut tail: KindPayload = match kind {
-        ElemKind::Node => KindPayload::Nodes(Vec::with_capacity(tail_size)),
-        ElemKind::Way => KindPayload::Ways(Vec::with_capacity(tail_size)),
-        ElemKind::Relation => KindPayload::Relations(Vec::with_capacity(tail_size)),
+        ElementKind::Node => KindPayload::Nodes(Vec::with_capacity(tail_size)),
+        ElementKind::Way => KindPayload::Ways(Vec::with_capacity(tail_size)),
+        ElementKind::Relation => KindPayload::Relations(Vec::with_capacity(tail_size)),
     };
 
     let mut idx: usize = 0;
@@ -677,9 +677,9 @@ fn worker_split_blob(
     for element in block.elements() {
         let is_match = matches!(
             (&element, kind),
-            (Element::DenseNode(_) | Element::Node(_), ElemKind::Node)
-                | (Element::Way(_), ElemKind::Way)
-                | (Element::Relation(_), ElemKind::Relation)
+            (Element::DenseNode(_) | Element::Node(_), ElementKind::Node)
+                | (Element::Way(_), ElementKind::Way)
+                | (Element::Relation(_), ElementKind::Relation)
         );
         if !is_match {
             continue;
@@ -689,7 +689,7 @@ fn worker_split_blob(
             // Full-block path: re-encode through the per-worker builder
             // exactly like v1. Frame any output produced by `ensure_*`.
             match (&element, kind) {
-                (Element::DenseNode(dn), ElemKind::Node) => {
+                (Element::DenseNode(dn), ElementKind::Node) => {
                     ensure_node_capacity_local(&mut bb, &mut output)?;
                     let meta = dense_node_metadata(dn);
                     bb.add_node(
@@ -700,7 +700,7 @@ fn worker_split_blob(
                         meta.as_ref(),
                     );
                 }
-                (Element::Node(n), ElemKind::Node) => {
+                (Element::Node(n), ElementKind::Node) => {
                     ensure_node_capacity_local(&mut bb, &mut output)?;
                     let meta = element_metadata(&n.info());
                     bb.add_node(
@@ -711,7 +711,7 @@ fn worker_split_blob(
                         meta.as_ref(),
                     );
                 }
-                (Element::Way(w), ElemKind::Way) => {
+                (Element::Way(w), ElementKind::Way) => {
                     ensure_way_capacity_local(&mut bb, &mut output)?;
                     encode_way_full_block(
                         &mut bb,
@@ -721,7 +721,7 @@ fn worker_split_blob(
                         preserve_locations,
                     );
                 }
-                (Element::Relation(r), ElemKind::Relation) => {
+                (Element::Relation(r), ElementKind::Relation) => {
                     ensure_relation_capacity_local(&mut bb, &mut output)?;
                     members_buf.clear();
                     members_buf.extend(r.members().map(|m| MemberData {

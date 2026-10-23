@@ -75,7 +75,7 @@ pub(super) struct BlobDesc {
     pub(super) frame_size: usize,
     pub(super) offset: u64,
     pub(super) size: usize,
-    pub(super) kind: Option<crate::blob_meta::ElemKind>,
+    pub(super) kind: Option<crate::ElementKind>,
     /// Spatial bbox from indexdata (node blobs only, v2 format).
     pub(super) bbox: Option<crate::BlobBbox>,
     /// Raw-passthrough state. See [`Passthrough`].
@@ -219,7 +219,7 @@ pub(super) fn build_blob_schedule_with_passthrough(
         // extract bbox. Only a nomination: see `Passthrough`.
         let candidate = extract_bbox.is_some_and(|ebbox| {
             idx.is_some_and(|i| {
-                matches!(i.kind, crate::blob_meta::ElemKind::Node)
+                matches!(i.kind, crate::ElementKind::Node)
                     && i.bbox.as_ref().is_some_and(|bb| ebbox.contains(bb))
             })
         });
@@ -611,7 +611,7 @@ pub(super) fn extract_block_pass2(
     block: &PrimitiveBlock,
     ids: &ExtractPass2IdSets<'_>,
     clean: &CleanAttrs,
-    phase_kind: Option<crate::blob_meta::ElemKind>,
+    phase_kind: Option<crate::ElementKind>,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
 ) -> std::result::Result<ExtractStats, String> {
@@ -627,9 +627,9 @@ pub(super) fn extract_block_pass2(
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
-    let emit_nodes = phase_kind.is_none_or(|k| matches!(k, crate::blob_meta::ElemKind::Node));
-    let emit_ways = phase_kind.is_none_or(|k| matches!(k, crate::blob_meta::ElemKind::Way));
-    let emit_rels = phase_kind.is_none_or(|k| matches!(k, crate::blob_meta::ElemKind::Relation));
+    let emit_nodes = phase_kind.is_none_or(|k| matches!(k, crate::ElementKind::Node));
+    let emit_ways = phase_kind.is_none_or(|k| matches!(k, crate::ElementKind::Way));
+    let emit_rels = phase_kind.is_none_or(|k| matches!(k, crate::ElementKind::Relation));
 
     for element in block.elements() {
         match &element {

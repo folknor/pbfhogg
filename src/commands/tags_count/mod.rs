@@ -7,7 +7,7 @@ use rustc_hash::FxHashMap;
 use super::require_indexdata;
 use crate::owned::TypeFilter;
 use crate::tag_expr::{Expression, parse_expressions, tag_matches};
-use crate::{Element, PrimitiveBlock};
+use crate::{Element, ElementKind, PrimitiveBlock};
 
 use super::Result;
 type CountMap = FxHashMap<String, FxHashMap<String, u64>>;
@@ -150,14 +150,7 @@ pub fn tags_count(
         || (),
         |block, _s| {
             let mut local: CountMap = FxHashMap::default();
-            count_block_tags(
-                &mut local,
-                block,
-                tf.nodes,
-                tf.ways,
-                tf.relations,
-                &expressions,
-            );
+            count_block_tags(&mut local, block, tf, &expressions);
             local
         },
         |_seq, per_blob| {
@@ -222,15 +215,10 @@ fn matches_expression(
     expressions: &[Expression],
     key: &str,
     value: &str,
-    is_node: bool,
-    is_way: bool,
-    is_relation: bool,
+    kind: ElementKind,
 ) -> bool {
     for expr in expressions {
-        let type_ok = (is_node && expr.type_filter.nodes)
-            || (is_way && expr.type_filter.ways)
-            || (is_relation && expr.type_filter.relations);
-        if type_ok && tag_matches(&expr.matcher, key, value) {
+        if expr.type_filter.admits(kind) && tag_matches(&expr.matcher, key, value) {
             return true;
         }
     }
@@ -241,18 +229,16 @@ fn matches_expression(
 fn count_block_tags(
     counts: &mut CountMap,
     block: &PrimitiveBlock,
-    filter_node: bool,
-    filter_way: bool,
-    filter_relation: bool,
+    type_filter: TypeFilter,
     expressions: &Option<Vec<Expression>>,
 ) {
     for element in block.elements_skip_metadata() {
-        let (dominated, is_node, is_way, is_relation) = match &element {
-            Element::DenseNode(_) | Element::Node(_) => (filter_node, true, false, false),
-            Element::Way(_) => (filter_way, false, true, false),
-            Element::Relation(_) => (filter_relation, false, false, true),
+        let kind = match &element {
+            Element::DenseNode(_) | Element::Node(_) => ElementKind::Node,
+            Element::Way(_) => ElementKind::Way,
+            Element::Relation(_) => ElementKind::Relation,
         };
-        if !dominated {
+        if !type_filter.admits(kind) {
             continue;
         }
 
@@ -261,7 +247,7 @@ fn count_block_tags(
                 for (k, v) in dn.tags() {
                     if expressions
                         .as_ref()
-                        .is_none_or(|e| matches_expression(e, k, v, is_node, is_way, is_relation))
+                        .is_none_or(|e| matches_expression(e, k, v, kind))
                     {
                         increment_tag(counts, k, v);
                     }
@@ -271,7 +257,7 @@ fn count_block_tags(
                 for (k, v) in n.tags() {
                     if expressions
                         .as_ref()
-                        .is_none_or(|e| matches_expression(e, k, v, is_node, is_way, is_relation))
+                        .is_none_or(|e| matches_expression(e, k, v, kind))
                     {
                         increment_tag(counts, k, v);
                     }
@@ -281,7 +267,7 @@ fn count_block_tags(
                 for (k, v) in w.tags() {
                     if expressions
                         .as_ref()
-                        .is_none_or(|e| matches_expression(e, k, v, is_node, is_way, is_relation))
+                        .is_none_or(|e| matches_expression(e, k, v, kind))
                     {
                         increment_tag(counts, k, v);
                     }
@@ -291,7 +277,7 @@ fn count_block_tags(
                 for (k, v) in r.tags() {
                     if expressions
                         .as_ref()
-                        .is_none_or(|e| matches_expression(e, k, v, is_node, is_way, is_relation))
+                        .is_none_or(|e| matches_expression(e, k, v, kind))
                     {
                         increment_tag(counts, k, v);
                     }

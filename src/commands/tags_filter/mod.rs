@@ -117,15 +117,10 @@ fn trusted_blob_filter(
 fn element_matches(
     expressions: &[Expression],
     tags: &[(&str, &str)],
-    is_node: bool,
-    is_way: bool,
-    is_relation: bool,
+    kind: crate::ElementKind,
 ) -> bool {
     for expr in expressions {
-        let type_ok = (is_node && expr.type_filter.nodes)
-            || (is_way && expr.type_filter.ways)
-            || (is_relation && expr.type_filter.relations);
-        if !type_ok {
+        if !expr.type_filter.admits(kind) {
             continue;
         }
         for &(key, value) in tags {
@@ -353,7 +348,7 @@ fn filter_block_parallel(
             Element::DenseNode(dn) => {
                 tags_buf.clear();
                 tags_buf.extend(dn.tags());
-                if element_matches(expressions, &tags_buf, true, false, false) != invert {
+                if element_matches(expressions, &tags_buf, crate::ElementKind::Node) != invert {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = dense_node_metadata(dn);
                     bb.add_node(
@@ -369,7 +364,7 @@ fn filter_block_parallel(
             Element::Node(n) => {
                 tags_buf.clear();
                 tags_buf.extend(n.tags());
-                if element_matches(expressions, &tags_buf, true, false, false) != invert {
+                if element_matches(expressions, &tags_buf, crate::ElementKind::Node) != invert {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = element_metadata(&n.info());
                     bb.add_node(
@@ -385,7 +380,7 @@ fn filter_block_parallel(
             Element::Way(w) => {
                 tags_buf.clear();
                 tags_buf.extend(w.tags());
-                if element_matches(expressions, &tags_buf, false, true, false) != invert {
+                if element_matches(expressions, &tags_buf, crate::ElementKind::Way) != invert {
                     ensure_way_capacity_local(bb, output)?;
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
@@ -397,7 +392,7 @@ fn filter_block_parallel(
             Element::Relation(r) => {
                 tags_buf.clear();
                 tags_buf.extend(r.tags());
-                if element_matches(expressions, &tags_buf, false, false, true) != invert {
+                if element_matches(expressions, &tags_buf, crate::ElementKind::Relation) != invert {
                     ensure_relation_capacity_local(bb, output)?;
                     members_buf.clear();
                     members_buf.extend(r.members().map(|m| MemberData {
@@ -786,7 +781,8 @@ fn tags_filter_two_pass(
                         Element::DenseNode(dn) => {
                             tags_buf.clear();
                             tags_buf.extend(dn.tags());
-                            if element_matches(expressions, &tags_buf, true, false, false) != invert
+                            if element_matches(expressions, &tags_buf, crate::ElementKind::Node)
+                                != invert
                             {
                                 result.matched_nodes.push(dn.id());
                             }
@@ -794,7 +790,8 @@ fn tags_filter_two_pass(
                         Element::Node(n) => {
                             tags_buf.clear();
                             tags_buf.extend(n.tags());
-                            if element_matches(expressions, &tags_buf, true, false, false) != invert
+                            if element_matches(expressions, &tags_buf, crate::ElementKind::Node)
+                                != invert
                             {
                                 result.matched_nodes.push(n.id());
                             }
@@ -802,7 +799,8 @@ fn tags_filter_two_pass(
                         Element::Way(w) => {
                             tags_buf.clear();
                             tags_buf.extend(w.tags());
-                            if element_matches(expressions, &tags_buf, false, true, false) != invert
+                            if element_matches(expressions, &tags_buf, crate::ElementKind::Way)
+                                != invert
                             {
                                 let refs: Vec<i64> = w.refs().collect();
                                 result.matched_ways.push((w.id(), refs));
@@ -811,7 +809,8 @@ fn tags_filter_two_pass(
                         Element::Relation(r) => {
                             tags_buf.clear();
                             tags_buf.extend(r.tags());
-                            if element_matches(expressions, &tags_buf, false, false, true) != invert
+                            if element_matches(expressions, &tags_buf, crate::ElementKind::Relation)
+                                != invert
                             {
                                 result.matched_relations.push(r.id());
                             }
@@ -1218,7 +1217,7 @@ fn collect_relation_member_closure(
     // Build schedule once - reused across convergence iterations.
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
-        kind_schedule_filter(crate::blob_meta::ElemKind::Relation, distrust_metadata),
+        kind_schedule_filter(crate::ElementKind::Relation, distrust_metadata),
         &host.diagnostics,
     )?;
 
@@ -1315,9 +1314,9 @@ fn collect_relation_member_closure(
 /// `Element::Relation(_)` match inside each scan does the kind selection from
 /// decoded data instead.
 fn kind_schedule_filter(
-    kind: crate::blob_meta::ElemKind,
+    kind: crate::ElementKind,
     distrust_metadata: bool,
-) -> Option<crate::blob_meta::ElemKind> {
+) -> Option<crate::ElementKind> {
     if distrust_metadata { None } else { Some(kind) }
 }
 
@@ -1339,7 +1338,7 @@ fn collect_way_node_dependencies(
 ) -> Result<()> {
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
-        kind_schedule_filter(crate::blob_meta::ElemKind::Way, distrust_metadata),
+        kind_schedule_filter(crate::ElementKind::Way, distrust_metadata),
         &host.diagnostics,
     )?;
 
@@ -1402,6 +1401,7 @@ fn collect_way_node_dependencies(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::ElementKind;
     use crate::owned::TypeFilter;
     use crate::writer::PbfWriter;
 
@@ -1533,27 +1533,10 @@ mod tests {
                 .matcher,
         };
         let tags = [("highway", "primary")];
-        assert!(!element_matches(
-            std::slice::from_ref(&expr),
-            &tags,
-            true,
-            false,
-            false
-        ));
-        assert!(element_matches(
-            std::slice::from_ref(&expr),
-            &tags,
-            false,
-            true,
-            false
-        ));
-        assert!(!element_matches(
-            std::slice::from_ref(&expr),
-            &tags,
-            false,
-            false,
-            true
-        ));
+        let one = std::slice::from_ref(&expr);
+        assert!(!element_matches(one, &tags, ElementKind::Node));
+        assert!(element_matches(one, &tags, ElementKind::Way));
+        assert!(!element_matches(one, &tags, ElementKind::Relation));
     }
 
     #[test]
@@ -1575,23 +1558,17 @@ mod tests {
         assert!(element_matches(
             &exprs,
             &[("amenity", "bench")],
-            true,
-            false,
-            false
+            ElementKind::Node
         ));
         assert!(element_matches(
             &exprs,
             &[("highway", "primary")],
-            false,
-            true,
-            false
+            ElementKind::Way
         ));
         assert!(!element_matches(
             &exprs,
             &[("name", "foo")],
-            true,
-            false,
-            false
+            ElementKind::Node
         ));
     }
 }

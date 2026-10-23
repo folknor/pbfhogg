@@ -6,15 +6,7 @@ use std::path::Path;
 
 use super::super::Result;
 use crate::Element;
-use crate::blob_meta::ElemKind;
-
-/// Element type filter for `show_element_to`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ShowElementType {
-    Node,
-    Way,
-    Relation,
-}
+use crate::ElementKind;
 
 /// Look up a single element by type and ID and write all its metadata,
 /// tags and refs/members to `out`. Returns whether the element was found;
@@ -23,7 +15,7 @@ pub enum ShowElementType {
 /// past the target ID range.
 pub fn show_element_to<W: Write>(
     path: &Path,
-    elem_type: ShowElementType,
+    target_kind: ElementKind,
     target_id: i64,
     direct_io: bool,
     out: &mut W,
@@ -34,12 +26,6 @@ pub fn show_element_to<W: Write>(
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-
-    let target_kind = match elem_type {
-        ShowElementType::Node => ElemKind::Node,
-        ShowElementType::Way => ElemKind::Way,
-        ShowElementType::Relation => ElemKind::Relation,
-    };
 
     // The `min_id > target_id` early-exit below is only sound when the
     // PBF declares `Sort.Type_then_ID`; on an unsorted PBF a later
@@ -85,22 +71,22 @@ pub fn show_element_to<W: Write>(
         )?;
 
         for element in block.elements() {
-            match (&element, elem_type) {
-                (Element::DenseNode(dn), ShowElementType::Node) if dn.id() == target_id => {
+            match (&element, target_kind) {
+                (Element::DenseNode(dn), ElementKind::Node) if dn.id() == target_id => {
                     write_node_header(out, target_id, dn.lat(), dn.lon())?;
                     write_dense_node_info(out, dn)?;
                     write_tags_dense(out, dn)?;
                     out.flush()?;
                     return Ok(true);
                 }
-                (Element::Node(n), ShowElementType::Node) if n.id() == target_id => {
+                (Element::Node(n), ElementKind::Node) if n.id() == target_id => {
                     write_node_header(out, target_id, n.lat(), n.lon())?;
                     write_info(out, &n.info())?;
                     write_tags(out, n)?;
                     out.flush()?;
                     return Ok(true);
                 }
-                (Element::Way(w), ShowElementType::Way) if w.id() == target_id => {
+                (Element::Way(w), ElementKind::Way) if w.id() == target_id => {
                     writeln!(out, "way/{target_id}")?;
                     write_info(out, &w.info())?;
                     write_tags(out, w)?;
@@ -108,7 +94,7 @@ pub fn show_element_to<W: Write>(
                     out.flush()?;
                     return Ok(true);
                 }
-                (Element::Relation(r), ShowElementType::Relation) if r.id() == target_id => {
+                (Element::Relation(r), ElementKind::Relation) if r.id() == target_id => {
                     writeln!(out, "relation/{target_id}")?;
                     write_info(out, &r.info())?;
                     write_tags(out, r)?;

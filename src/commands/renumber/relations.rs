@@ -176,7 +176,7 @@ pub(super) fn relation_r2d_assembly(
                     let bytes = std::mem::take(&mut w.reframe_buf);
                     w.reframe_buf.reserve(bytes.len());
                     let index = crate::blob_meta::BlobIndex {
-                        kind: crate::blob_meta::ElemKind::Relation,
+                        kind: crate::ElementKind::Relation,
                         min_id,
                         max_id,
                         count: outcome.count,

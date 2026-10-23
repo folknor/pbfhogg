@@ -66,43 +66,6 @@ documented in `reference/`.
 
 Reported by: all nine scopes.
 
-## HYG-007 - "Node, way or relation" has a dozen encodings
-
-Anger: 8 - element kinds, expression semantics.
-
-- Two enums named `ElemKind`: `crate::blob_meta::ElemKind` (apply-changes,
-  merge_join) and `crate::osc::xml_parse::ElemKind` (merge-changes, tags-filter
-  OSC), same variants, not convertible.
-- `getid::ElemKindTag` (public), now also the kind of the shared
-  `getid::ElementRef`, whose `FromStr` accepts both `n123` and `node/123`
-  forms and is a ready seed for the single `ElementKind` `FromStr`.
-- `time_filter::ElementKind` (private), and `TypeFilter` used as an element
-  kind in export.
-- CLI enums `ShowElementType`, `DefaultType`, `DefaultTypeArg`,
-  `ExportTypeArg`, each with a hand-written conversion in `main.rs`.
-- `char` 'n'/'w'/'r' in `getid::parse_id_spec` (then `unreachable!()` twice)
-  and `tags_filter/osc.rs::matches_any` (with a `_ => false` arm);
-  `merge_join::kind_type_char`.
-- Bool triples in `tags_filter::element_matches` and `tags_count`.
-- Kind to string: `xml_parse::ElemKind::tag`, `drain::kind_name`,
-  `merge_join::kind_name`, inline matches in
-  `merge_changes::check_version_advance` and `write_change_element`, string
-  literals passed as `kind: &str` to `CompactDiffOverlay::push_*` and
-  `delete_*`, `compact.rs::arena_append_*`, `osc/write.rs::member_type_str` and
-  the `BytesStart::new("node")` writers; reverse direction in
-  `xml_parse::kind_for` and `parse_member_type`.
-- Kind to ordinal: `drain::kind_ordinal`, `merge_join::kind_order`,
-  `ChangeElement::key` (`(0, id)`...), `compact.rs` member-type bytes 0/1/2.
-
-The drain comment says its kind deliberately does not derive `Ord` so the
-order cannot be silently reordered; a unit test pinning the order does that
-better than three hand-written copies. Fix: one public `ElementKind` with
-`as_str`, `ordinal`, `FromStr` and a CLI-side `ValueEnum` newtype; delete
-`osc::xml_parse::ElemKind`. The type removes the `unreachable!()`s and
-`_ => false` arms.
-
-Reported by: change application, filtering and spatial, CLI and plumbing.
-
 ## HYG-010 - The read engine's ordered pipeline exists twice and has drifted
 
 Anger: 10 - unifies the read engine and the blob pools; the batched-pipeline rebuild was already measured and reverted.

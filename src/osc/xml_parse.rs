@@ -27,6 +27,7 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use quick_xml::events::attributes::Attribute;
 
+use crate::ElementKind;
 use crate::coord_fmt::deg_to_e7;
 use crate::coord_pack::{validate_lat, validate_lon};
 use crate::read::elements::MemberType;
@@ -60,24 +61,6 @@ impl OscAction {
     }
 }
 
-/// Which OSM object kind an element describes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ElemKind {
-    Node,
-    Way,
-    Relation,
-}
-
-impl ElemKind {
-    pub(crate) fn tag(self) -> &'static str {
-        match self {
-            Self::Node => "node",
-            Self::Way => "way",
-            Self::Relation => "relation",
-        }
-    }
-}
-
 /// Where a driven OSC document's elements go.
 ///
 /// The driver guarantees the call sequence: exactly one `begin_element`
@@ -89,7 +72,7 @@ pub(crate) trait OscSink {
     fn begin_element(
         &mut self,
         action: OscAction,
-        kind: ElemKind,
+        kind: ElementKind,
         e: &quick_xml::events::BytesStart<'_>,
     ) -> ParseResult<()>;
     fn tag(&mut self, e: &quick_xml::events::BytesStart<'_>) -> ParseResult<()>;
@@ -158,11 +141,11 @@ pub(crate) fn parse_str_attr_optional(
 
 /// Convert an OSC XML member type string to the crate's `MemberType`.
 pub(crate) fn parse_member_type(s: &str) -> ParseResult<MemberType> {
-    match s {
-        "node" => Ok(MemberType::Node),
-        "way" => Ok(MemberType::Way),
-        "relation" => Ok(MemberType::Relation),
-        other => Err(format!("unknown relation member type: '{other}'").into()),
+    match ElementKind::from_name(s) {
+        Some(ElementKind::Node) => Ok(MemberType::Node),
+        Some(ElementKind::Way) => Ok(MemberType::Way),
+        Some(ElementKind::Relation) => Ok(MemberType::Relation),
+        None => Err(format!("unknown relation member type: '{s}'").into()),
     }
 }
 
@@ -349,18 +332,9 @@ fn action_for(name: &str) -> Option<OscAction> {
     }
 }
 
-fn kind_for(name: &str) -> Option<ElemKind> {
-    match name {
-        "node" => Some(ElemKind::Node),
-        "way" => Some(ElemKind::Way),
-        "relation" => Some(ElemKind::Relation),
-        _ => None,
-    }
-}
-
 struct DriveState {
     section: Option<OscAction>,
-    open: Option<ElemKind>,
+    open: Option<ElementKind>,
     saw_root_end: bool,
 }
 
@@ -379,8 +353,8 @@ fn route_child<S: OscSink>(
     };
     match name {
         "tag" => sink.tag(e),
-        "nd" if kind == ElemKind::Way => sink.nd(e),
-        "member" if kind == ElemKind::Relation => sink.member(e),
+        "nd" if kind == ElementKind::Way => sink.nd(e),
+        "member" if kind == ElementKind::Relation => sink.member(e),
         _ => Ok(()),
     }
 }
@@ -409,7 +383,7 @@ fn handle_open<S: OscSink>(
         return Ok(());
     }
 
-    if let Some(kind) = kind_for(name) {
+    if let Some(kind) = ElementKind::from_name(name) {
         // An element outside a section is malformed OSC. The compact
         // parser used to treat it as a create and put it in the overlay;
         // merge-changes errored for self-closing elements and silently
@@ -420,7 +394,7 @@ fn handle_open<S: OscSink>(
             format!(
                 "OSC {} {} appears outside any <create>, <modify> or <delete> section; \
                  refusing to guess which change it was meant to be",
-                kind.tag(),
+                kind.as_str(),
                 parse_i64_attr(e, "id").map_or_else(|_| "(no id)".to_string(), |id| id.to_string())
             )
             .into()
@@ -458,7 +432,7 @@ pub(crate) fn drive_osc<R: io::BufRead, S: OscSink>(
                 let name = name.as_ref();
                 if action_for(name).is_some() {
                     state.section = None;
-                } else if kind_for(name).is_some() && state.open.is_some() {
+                } else if ElementKind::from_name(name).is_some() && state.open.is_some() {
                     sink.end_element()?;
                     state.open = None;
                 } else if name == ROOT {
@@ -681,7 +655,7 @@ pub(crate) struct CompactSink<'a> {
 }
 
 struct Staging {
-    kind: ElemKind,
+    kind: ElementKind,
     id: i64,
     lat: i32,
     lon: i32,
@@ -705,7 +679,7 @@ impl OscSink for CompactSink<'_> {
     fn begin_element(
         &mut self,
         action: OscAction,
-        kind: ElemKind,
+        kind: ElementKind,
         e: &quick_xml::events::BytesStart<'_>,
     ) -> ParseResult<()> {
         let id = parse_i64_attr(e, "id")?;
@@ -719,9 +693,9 @@ impl OscSink for CompactSink<'_> {
             // index removal used to leave.
             let meta = arena_meta(e, self.overlay)?;
             match kind {
-                ElemKind::Node => self.overlay.delete_node(id, &meta)?,
-                ElemKind::Way => self.overlay.delete_way(id, &meta)?,
-                ElemKind::Relation => self.overlay.delete_relation(id, &meta)?,
+                ElementKind::Node => self.overlay.delete_node(id, &meta)?,
+                ElementKind::Way => self.overlay.delete_way(id, &meta)?,
+                ElementKind::Relation => self.overlay.delete_relation(id, &meta)?,
             }
             self.staging = None;
             return Ok(());
@@ -730,7 +704,7 @@ impl OscSink for CompactSink<'_> {
         // Deliberately leave the delete pending until insertion succeeds. Clearing it
         // here would let a rejected stale re-create erase the accepted deletion.
         let meta = arena_meta(e, self.overlay)?;
-        let (lat, lon) = if kind == ElemKind::Node {
+        let (lat, lon) = if kind == ElementKind::Node {
             (
                 coord_to_decimicro(e, "lat", id)?,
                 coord_to_decimicro(e, "lon", id)?,
@@ -803,13 +777,14 @@ impl OscSink for CompactSink<'_> {
             .map(|(&k, v)| (k, v.as_str()))
             .collect();
         match st.kind {
-            ElemKind::Node => self
+            ElementKind::Node => self
                 .overlay
                 .push_node(st.id, st.lat, st.lon, &tags, &st.meta),
-            ElemKind::Way => self.overlay.push_way(st.id, &st.refs, &tags, &st.meta),
-            ElemKind::Relation => self
-                .overlay
-                .push_relation(st.id, &st.members, &tags, &st.meta),
+            ElementKind::Way => self.overlay.push_way(st.id, &st.refs, &tags, &st.meta),
+            ElementKind::Relation => {
+                self.overlay
+                    .push_relation(st.id, &st.members, &tags, &st.meta)
+            }
         }
     }
 }
@@ -865,13 +840,12 @@ mod tests {
 
     #[test]
     fn failed_recreation_keeps_delete_and_success_clears_it() -> crate::BoxResult<()> {
-        use crate::osc::OscElementKind;
         let mut overlay = CompactDiffOverlay::new();
         let deletion =
             quick_xml::events::BytesStart::from_content("node id=\"7\" version=\"5\"", 4);
         CompactSink::new(&mut overlay).begin_element(
             OscAction::Delete,
-            ElemKind::Node,
+            ElementKind::Node,
             &deletion,
         )?;
         let stale = quick_xml::events::BytesStart::from_content(
@@ -879,18 +853,18 @@ mod tests {
             4,
         );
         let mut sink = CompactSink::new(&mut overlay);
-        sink.begin_element(OscAction::Create, ElemKind::Node, &stale)?;
+        sink.begin_element(OscAction::Create, ElementKind::Node, &stale)?;
         assert!(sink.end_element().is_err());
-        assert!(overlay.is_deleted(OscElementKind::Node, 7));
+        assert!(overlay.is_deleted(ElementKind::Node, 7));
         assert!(!overlay.has_node(7));
         let current = quick_xml::events::BytesStart::from_content(
             "node id=\"7\" version=\"6\" lat=\"1\" lon=\"2\"",
             4,
         );
         let mut sink = CompactSink::new(&mut overlay);
-        sink.begin_element(OscAction::Create, ElemKind::Node, &current)?;
+        sink.begin_element(OscAction::Create, ElementKind::Node, &current)?;
         sink.end_element()?;
-        assert!(!overlay.is_deleted(OscElementKind::Node, 7));
+        assert!(!overlay.is_deleted(ElementKind::Node, 7));
         assert!(overlay.has_node(7));
         Ok(())
     }

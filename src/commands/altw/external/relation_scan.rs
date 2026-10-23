@@ -8,7 +8,7 @@ use std::os::unix::fs::FileExt as _;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::blob_meta::ElemKind;
+use crate::ElementKind;
 use crate::block::PrimitiveBlock;
 
 use super::super::Result;
@@ -40,7 +40,7 @@ pub(super) fn collect_relation_member_ids_indexed(
 
     for meta in blob_meta
         .iter()
-        .filter(|m| matches!(m.kind, ElemKind::Relation))
+        .filter(|m| matches!(m.kind, ElementKind::Relation))
     {
         read_buf.resize(meta.data_size, 0);
         file.read_exact_at(&mut read_buf, meta.data_offset)

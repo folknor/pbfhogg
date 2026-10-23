@@ -181,8 +181,10 @@ check, export, digest, build-geocode-index) size them themselves and have no
 
 **A command that would refuse unindexed input proceeds with the slower
 fallback.** Only commands that refuse unindexed input have the flag, and each
-refuses through the same gate, whose error ends with `Generate an indexed PBF
-first ... Or pass --force to proceed anyway.`
+refuses through the same gate, whose error says `Generate an indexed PBF
+first ...`. The CLI then adds `Or pass --force to proceed anyway.` only where
+`--force` is accepted: modes that need indexdata whatever `--force` says get
+no such line, and `build-geocode-index` names `--allow-unindexed` instead.
 
 | Command | Refuses unindexed input on | `--force` refused with |
 |---------|----------------------------|------------------------|

@@ -542,17 +542,9 @@ fn jobs_is_accepted_or_refused_per_command_and_value() {
                 .collect();
             let out = run(&argv(dir.path(), &words));
             // Accepted: the run went past argument handling and failed on the
-            // missing input, which is an `Error:` line, never clap's
-            // lowercase `error:` usage format. (merge-changes' missing-input
-            // error does not name the file, so the input's name cannot be
-            // the test here.)
+            // missing input, which it names.
             let verdict = if accepts {
-                let stderr = out.stderr_str();
-                if stderr.lines().any(|l| l.starts_with("error:")) {
-                    Err(format!("refused as a usage error; stderr:\n{stderr}"))
-                } else {
-                    Ok(())
-                }
+                reached_input(&out)
             } else {
                 refused_before_input(&out, "")
             };
@@ -742,6 +734,110 @@ fn force_argv(fx: &Fx, row: &ForceRow, n: usize, force: bool) -> Vec<OsString> {
         args.push("--force".into());
     }
     args
+}
+
+/// The advice a refusal ends with, per switch.
+const FORCE_ADVICE: &str = "Or pass --force";
+const ALLOW_ADVICE: &str = "Or pass --allow-unindexed";
+
+/// The modes whose `--force` is refused (they need indexdata whatever
+/// `--force` says) must not advise it when they refuse unindexed input.
+#[test]
+fn the_gate_advises_only_a_switch_the_mode_accepts() {
+    let fx = Fx::new();
+    let u = fx.path("unindexed.osm.pbf");
+    let g = fx.path("geo.osm.pbf");
+    let osc = fx.path("good.osc");
+    let out = |n: &str| fx.path(n);
+    let cases: Vec<(&str, Vec<OsString>, Option<&str>)> = vec![
+        (
+            "altw external",
+            vec![
+                "add-locations-to-ways".into(),
+                u.clone().into(),
+                "--index-type".into(),
+                "external".into(),
+                "-o".into(),
+                out("o1").into(),
+            ],
+            None,
+        ),
+        (
+            "altw --inject-prepass",
+            vec![
+                "add-locations-to-ways".into(),
+                u.clone().into(),
+                "--inject-prepass".into(),
+                "-o".into(),
+                out("o2").into(),
+            ],
+            None,
+        ),
+        (
+            "apply-changes --locations-on-ways",
+            vec![
+                "apply-changes".into(),
+                u.clone().into(),
+                osc.clone().into(),
+                "--locations-on-ways".into(),
+                "-o".into(),
+                out("o3").into(),
+            ],
+            None,
+        ),
+        (
+            "sort",
+            vec![
+                "sort".into(),
+                u.clone().into(),
+                "-o".into(),
+                out("o4").into(),
+            ],
+            Some(FORCE_ADVICE),
+        ),
+        (
+            "build-geocode-index",
+            vec![
+                "build-geocode-index".into(),
+                g.into(),
+                "-o".into(),
+                out("o5").into(),
+            ],
+            Some(ALLOW_ADVICE),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (label, args, advice) in cases {
+        let refused = run(&args);
+        let stderr = refused.stderr_str();
+        if refused.status.code() != Some(2) || !stderr.contains(GATE) {
+            failures.push(format!(
+                "[{label}] exit {:?}, wanted the gate's refusal; stderr:\n{stderr}",
+                refused.status.code()
+            ));
+            continue;
+        }
+        for (name, text) in [
+            ("--force", FORCE_ADVICE),
+            ("--allow-unindexed", ALLOW_ADVICE),
+        ] {
+            let wanted = advice == Some(text);
+            if stderr.contains(text) != wanted {
+                failures.push(format!(
+                    "[{label}] advice for {name}: wanted {wanted}; stderr:\n{stderr}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// `merge-changes` names an input OSC it cannot open.
+#[test]
+fn merge_changes_names_a_missing_input() {
+    let dir = TempDir::new().unwrap();
+    let out = run(&argv(dir.path(), &["merge-changes", "OSC", "-o", "OUT"]));
+    reached_input(&out).unwrap_or_else(|why| panic!("{why}"));
 }
 
 /// Every command with `--force` refuses unindexed input through the shared

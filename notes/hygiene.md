@@ -1073,24 +1073,6 @@ spelling.
 
 Reported by: the command-matrix audit.
 
-## HYG-127 - The indexdata gate advises `--force` where `--force` is refused
-
-Anger: 5 - error text, contained.
-
-`require_indexdata` ends every refusal with "Or pass --force to proceed
-anyway." On the paths that need indexdata whatever `--force` says, that
-advice now leads straight to a usage error: `add-locations-to-ways
---index-type external` and `--inject-prepass` (the external join's own
-refusal and the sparse probe both go through the gate), and `apply-changes
---locations-on-ways` on an unindexed base. `build-geocode-index` gets the same
-sentence although its switch is `--allow-unindexed`. Fix: let the caller say
-whether a fallback exists (and which flag grants it), so the gate's advice
-names `--force`, `--allow-unindexed` or nothing. Enforce in
-`tests/cli_flag_contract.rs`: a command whose `--force` is refused with a
-mode must not print the advice in that mode.
-
-Reported by: the CLI flag consistency batch.
-
 ## HYG-121 - apply-changes carries the base's replication state onto a newer output
 
 Anger: 8 - apply-changes output contract; nidhogg reads replication state

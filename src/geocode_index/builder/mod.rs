@@ -336,8 +336,7 @@ fn build_generation(
         config.direct_io,
         config.allow_unindexed,
         "input PBF has no blob-level indexdata. Without indexdata, \
-         every blob must be decompressed (significantly slower). \
-         --allow-unindexed accepts it without also granting --overwrite.",
+         every blob must be decompressed (significantly slower).",
         host,
     )?;
 

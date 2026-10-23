@@ -2084,6 +2084,38 @@ fn combine_expressions(
     Ok(all)
 }
 
+/// The advice after an indexdata refusal: names only the switch this command
+/// line could have used. A mode that needs indexdata whatever `--force` says
+/// (`add-locations-to-ways --inject-prepass` or `--index-type external`,
+/// `apply-changes --locations-on-ways`) gets none, since `--force` is refused
+/// there. `build-geocode-index` takes `--allow-unindexed`. Every other command
+/// that offers `--force` gets it.
+fn indexdata_advice(command: &Command, matches: &clap::ArgMatches) -> Option<&'static str> {
+    match command {
+        Command::BuildGeocodeIndex { .. } => {
+            Some("\n\nOr pass --allow-unindexed to proceed anyway.")
+        }
+        Command::AddLocationsToWays {
+            inject_prepass,
+            index_type,
+            ..
+        } if *inject_prepass || index_type.resolve().ok() == Some(IndexType::External) => None,
+        Command::ApplyChanges {
+            locations_on_ways: true,
+            ..
+        } => None,
+        _ => {
+            let mut leaf = matches;
+            while let Some((_, sub)) = leaf.subcommand() {
+                leaf = sub;
+            }
+            leaf.try_contains_id("force")
+                .unwrap_or(false)
+                .then_some("\n\nOr pass --force to proceed anyway.")
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() -> process::ExitCode {
     // First, before any thread exists: SIGINT and SIGTERM become a
@@ -2128,6 +2160,7 @@ fn main() -> process::ExitCode {
         Err(err) => return clap_exit(&err),
     };
 
+    let indexdata_advice = indexdata_advice(&cli.command, &matches);
     let mut outcome = Outcome::Positive;
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         // Every flag rule clap cannot express, before anything else looks at
@@ -2950,7 +2983,7 @@ fn main() -> process::ExitCode {
                 output::cli_eprintln!(
                     "Error: {}{}",
                     error_report(e.as_ref()),
-                    output_hint(e.as_ref()).unwrap_or_default()
+                    output_hint(e.as_ref(), indexdata_advice).unwrap_or_default()
                 );
                 let status = if is_platform_unsupported(e.as_ref()) {
                     ExitStatus::PlatformUnsupported

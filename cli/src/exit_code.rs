@@ -114,11 +114,19 @@ pub fn error_report(err: &(dyn std::error::Error + 'static)) -> String {
 /// refused. The library error names no flag; this front end does. Walks the
 /// chain the way [`is_platform_unsupported`] does, so a refusal raised at
 /// publication inside a command is found too.
-pub fn output_hint(err: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+///
+/// `indexdata_advice` is what the invoked command and mode can actually
+/// accept for unindexed input (`--force`, `--allow-unindexed`, or nothing),
+/// printed after a missing-indexdata refusal.
+pub fn output_hint(
+    err: &(dyn std::error::Error + 'static),
+    indexdata_advice: Option<&'static str>,
+) -> Option<&'static str> {
     let mut current = Some(err);
     while let Some(error) = current {
         current = if let Some(error) = error.downcast_ref::<pbfhogg::Error>() {
             match error.kind() {
+                pbfhogg::ErrorKind::MissingIndexdata { .. } => return indexdata_advice,
                 pbfhogg::ErrorKind::Output(pbfhogg::OutputError::Exists { .. }) => {
                     return Some("; pass --overwrite (-O) to replace it");
                 }

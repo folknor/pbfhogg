@@ -465,12 +465,7 @@ pub(crate) fn require_indexdata(
 ) -> Result<bool> {
     let present = has_indexdata(path, direct_io, &host.diagnostics)?;
     if !force && !present {
-        return Err(Error::invalid_data(format!(
-            "{reason}\n\n\
-             Generate an indexed PBF first:\n\n\
-             \x20 pbfhogg cat input.osm.pbf -o indexed.osm.pbf\n\n\
-             Or pass --force to proceed anyway."
-        )));
+        return Err(crate::error::new_missing_indexdata(reason));
     }
     Ok(present)
 }

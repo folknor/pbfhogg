@@ -327,7 +327,7 @@ pub(crate) fn open_osc_reader(
     path: &Path,
     cancel: &crate::host::Cancel,
 ) -> ParseResult<(OscReader, Rc<Cell<Duration>>)> {
-    let mut file = File::open(path)?;
+    let mut file = File::open(path).map_err(|e| crate::file_reader::open_error(path, e))?;
     // A file shorter than two bytes cannot be gzip and cannot be XML
     // either; read what is there and let the XML parser produce the
     // complaint, rather than failing here with an EOF error that names

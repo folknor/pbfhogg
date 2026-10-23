@@ -84,6 +84,13 @@ pub(crate) fn new_missing_feature(feature: &'static str) -> Error {
 }
 
 #[cold]
+pub(crate) fn new_missing_indexdata(reason: &str) -> Error {
+    new_error(ErrorKind::MissingIndexdata {
+        reason: Cow::Owned(reason.to_owned()),
+    })
+}
+
+#[cold]
 pub(crate) fn new_stringtable_utf8(err: Utf8Error, index: usize) -> Error {
     new_error(ErrorKind::StringtableUtf8 { err, index })
 }
@@ -373,6 +380,7 @@ impl Error {
             | ErrorKind::WireFormat { .. }
             | ErrorKind::MissingHeader
             | ErrorKind::MissingFeature(_)
+            | ErrorKind::MissingIndexdata { .. }
             | ErrorKind::Cancelled => None,
         }
     }
@@ -480,6 +488,11 @@ pub enum ErrorKind {
     MissingHeader,
     /// The input header does not declare a feature required by the operation.
     MissingFeature(&'static str),
+    /// The input has no blob-level indexdata and the operation refuses to
+    /// run without it. `reason` is a complete sentence saying why it
+    /// matters. Whether the caller can grant a slower fallback, and how, is
+    /// the caller's business: the text names no flag.
+    MissingIndexdata { reason: Cow<'static, str> },
     /// The caller's request is invalid: arguments, configuration, or call
     /// order (such as writing after a writer completed).
     InvalidArgument {
@@ -765,7 +778,9 @@ impl From<Error> for io::Error {
         let kind = match err.kind() {
             ErrorKind::Io(inner) => inner.kind(),
             ErrorKind::PlatformUnsupported { .. } => io::ErrorKind::Unsupported,
-            ErrorKind::InvalidData { .. } => io::ErrorKind::InvalidData,
+            ErrorKind::InvalidData { .. } | ErrorKind::MissingIndexdata { .. } => {
+                io::ErrorKind::InvalidData
+            }
             ErrorKind::InvalidArgument { .. } => io::ErrorKind::InvalidInput,
             ErrorKind::Output(OutputError::Exists { .. } | OutputError::Collision { .. }) => {
                 io::ErrorKind::AlreadyExists
@@ -848,6 +863,12 @@ impl fmt::Display for Message<'_> {
             | ErrorKind::InvalidData { ref msg, .. }
             | ErrorKind::Internal { ref msg, .. }
             | ErrorKind::External { ref msg, .. } => f.write_str(msg),
+            ErrorKind::MissingIndexdata { ref reason } => write!(
+                f,
+                "{reason}\n\n\
+                 Generate an indexed PBF first:\n\n\
+                 \x20 pbfhogg cat input.osm.pbf -o indexed.osm.pbf"
+            ),
             ErrorKind::Output(ref output) => fmt::Display::fmt(output, f),
             ErrorKind::StringtableUtf8 { index, .. } => {
                 write!(f, "invalid UTF-8 at string table index {index}")

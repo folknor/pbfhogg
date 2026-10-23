@@ -956,6 +956,13 @@
 
 ### Fixed
 
+- **The unindexed-input refusal advises only a switch that works.** It no
+  longer says `Or pass --force` for `add-locations-to-ways --index-type
+  external` or `--inject-prepass` and `apply-changes --locations-on-ways`,
+  where `--force` is refused, and `build-geocode-index` names
+  `--allow-unindexed`. The library error itself no longer names any flag.
+- **`merge-changes` and `apply-changes` name an OSC they cannot open**,
+  instead of a bare `No such file or directory`.
 - **`add-locations-to-ways` can no longer hang when its output write
   fails.** The in-memory backends' rewrite pass over indexed input and the external backend's
   final stage kept the decoded-block channel open after the writer

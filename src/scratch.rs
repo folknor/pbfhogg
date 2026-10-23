@@ -405,6 +405,14 @@ pub(crate) fn create_file(path: &ScratchPath) -> crate::Result<File> {
     })
 }
 
+/// Open a scratch file the run wrote, for reading back. The caller names
+/// the path in its error (it knows what the file holds); a `NotFound` stays
+/// matchable for the scratch a stage may legitimately not have written.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn open(path: &ScratchPath) -> io::Result<File> {
+    File::open(&path.path)
+}
+
 /// Open a scratch file for reading and writing, truncating it, or creating it
 /// exclusively when `exclusive` is set. Scratch only, as for [`create`].
 pub(crate) fn create_read_write(path: &ScratchPath, exclusive: bool) -> io::Result<File> {

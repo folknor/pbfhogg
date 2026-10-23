@@ -112,8 +112,8 @@ pub(crate) fn cat_to(
             "input PBF has no blob-level indexdata. Without indexdata, the type \
              filter is a no-op - all blobs are decompressed (significantly slower)."
         } else {
-            "input PBF has no blob-level indexdata. Without indexdata, --clean \
-             decompresses every blob three times - once per element kind - \
+            "input PBF has no blob-level indexdata. Without indexdata, cleaning \
+             metadata decompresses every blob three times - once per element kind - \
              because an unindexed blob has to be scheduled as all three."
         };
         for file in files {
@@ -653,8 +653,8 @@ fn cat_filtered(
 /// decode-thread count (~24 on a 24-thread host), bounding peak RSS to
 /// ~50 MB of framed bytes per phase regardless of input size.
 fn run_kind_phase(
-    shared_file: &std::sync::Arc<std::fs::File>,
-    schedule: &[(usize, u64, usize)],
+    input: &crate::read::input::InputFile,
+    schedule: &[crate::scan::classify::ScheduledBlob],
     kind: crate::ElementKind,
     clean: &CleanAttrs,
     compression: Compression,
@@ -675,19 +675,19 @@ fn run_kind_phase(
     };
 
     type PhaseResult = crate::Result<(Vec<Vec<u8>>, u64)>;
-    let mut reorder: ReorderBuffer<PhaseResult> =
+    let mut reorder: ReorderBuffer<(Vec<Vec<u8>>, u64)> =
         ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY_WIDE);
     let mut total_blobs: u64 = 0;
     let mut total_elements: u64 = 0;
     let mut write_error: Option<Error> = None;
-    let mut classify_error: Option<Error> = None;
 
     // BlockBuilder contains `Rc<str>` (string interning) which is not Send,
     // so it can't ride the `S: Send` worker-state slot. Per-blob alloc inside
     // the closure is cheap (BlockBuilder::new is just a few empty Vec/HashMap
-    // initialisers; no heap reservation until elements are added).
+    // initialisers; no heap reservation until elements are added). A failed
+    // blob ends the pool, located with its input and ordinal.
     let pool_result = crate::scan::classify::parallel_classify_phase(
-        shared_file,
+        input,
         schedule,
         None,
         || (),
@@ -732,41 +732,29 @@ fn run_kind_phase(
             reorder.push(seq, r);
             // Drain everything ready from the front. Once we hit a hole
             // (next seq not yet delivered), stop and wait for the next
-            // merge call. Errors are captured into local Option slots and
+            // merge call. A write error is captured into a local slot and
             // propagated after parallel_classify_phase returns; further
             // ready items are still drained so the buffer doesn't grow.
-            while let Some(r) = reorder.pop_ready() {
-                match r {
-                    Ok((framed, count)) => {
-                        if write_error.is_some() {
-                            continue;
-                        }
-                        for blob in framed {
-                            if let Err(e) = writer.write_raw_owned(blob) {
-                                write_error = Some(e);
-                                break;
-                            }
-                            total_blobs += 1;
-                        }
-                        total_elements += count;
-                    }
-                    Err(e) => {
-                        if classify_error.is_none() {
-                            classify_error = Some(e);
-                        }
-                    }
+            while let Some((framed, count)) = reorder.pop_ready() {
+                if write_error.is_some() {
+                    continue;
                 }
+                for blob in framed {
+                    if let Err(e) = writer.write_raw_owned(blob) {
+                        write_error = Some(e);
+                        break;
+                    }
+                    total_blobs += 1;
+                }
+                total_elements += count;
             }
         },
         host,
     );
 
-    // Errors the merge recorded came first: the pool's own (a cancellation
+    // An error the merge recorded came first: the pool's own (a cancellation
     // observed at a later receive included) is the later one.
     if let Some(e) = write_error {
-        return Err(e);
-    }
-    if let Some(e) = classify_error {
         return Err(e);
     }
     pool_result?;

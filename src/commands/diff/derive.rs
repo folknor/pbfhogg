@@ -13,7 +13,7 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 
 use crate::ElementKind;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::osc::merge_join::{
     BlockMergeAction, BlockPairMergeState, MergeJoinAction, StreamingBlocks,
     block_pair_merge_phase, merge_join_phase,
@@ -667,8 +667,9 @@ fn copy_section<W: Write>(
     // Flush the XML writer's internal buffer before raw byte copy
     writer.get_mut().flush()?;
     // Copy raw XML fragment bytes directly to the underlying writer
-    let mut tmp = io::BufReader::new(File::open(path)?);
-    io::copy(&mut tmp, writer.get_mut())?;
+    let mut tmp = io::BufReader::new(crate::read::input::open(path)?);
+    io::copy(&mut tmp, writer.get_mut())
+        .map_err(|e| Error::from(e).context(format!("failed to copy {}", path.display())))?;
     writer.write_event(Event::End(BytesEnd::new(tag)))?;
     Ok(())
 }

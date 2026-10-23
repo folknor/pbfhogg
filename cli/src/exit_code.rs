@@ -110,31 +110,92 @@ pub fn error_report(err: &(dyn std::error::Error + 'static)) -> String {
     err.to_string()
 }
 
-/// Advice for an output refusal, naming the flag that grants what was
-/// refused. The library error names no flag; this front end does. Walks the
-/// chain the way [`is_platform_unsupported`] does, so a refusal raised at
-/// publication inside a command is found too.
-///
-/// `indexdata_advice` is what the invoked command and mode can actually
-/// accept for unindexed input (`--force`, `--allow-unindexed`, or nothing),
-/// printed after a missing-indexdata refusal.
-pub fn output_hint(
-    err: &(dyn std::error::Error + 'static),
-    indexdata_advice: Option<&'static str>,
-) -> Option<&'static str> {
+/// What the invoked command line can be advised to do after a typed library
+/// refusal: each field is the switch this command and mode actually offer
+/// (and do not already have set), or nothing. Computed by `main` from the
+/// parsed command and its matches; the library names no flag and no command.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Advice {
+    /// What the command accepts for unindexed input (`--force`,
+    /// `--allow-unindexed`), printed after the indexing recipe.
+    pub indexdata: Option<&'static str>,
+    /// The element-cap flag that shrinks an oversized blob
+    /// (`--elements-per-blob`, `--block-cap`).
+    pub element_cap: Option<&'static str>,
+    /// Whether `--allow-version-regression` is on offer.
+    pub allow_version_regression: bool,
+    /// Whether `--ignore-missing-nodes` is on offer.
+    pub ignore_missing_nodes: bool,
+}
+
+/// `path` as a shell word: bare when it is plain, single-quoted otherwise.
+fn shell_word(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '+' | ':'));
+    if plain {
+        text
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
+/// The input an error names, as a shell word, or a placeholder.
+fn input_word(error: &pbfhogg::Error, placeholder: &str) -> String {
+    error
+        .source_path()
+        .map_or_else(|| placeholder.to_owned(), shell_word)
+}
+
+/// The advice for one typed error, if this front end has any for it.
+fn hint_for(error: &pbfhogg::Error, advice: &Advice) -> Option<String> {
+    use pbfhogg::ErrorKind;
+    match error.kind() {
+        ErrorKind::MissingIndexdata { .. } => Some(format!(
+            "\n\nGenerate an indexed PBF first:\n\n  pbfhogg cat {} -o indexed.osm.pbf{}",
+            input_word(error, "input.osm.pbf"),
+            advice.indexdata.unwrap_or("")
+        )),
+        ErrorKind::Unsorted { .. } => Some(format!(
+            "\n\nSort the input first:\n\n  pbfhogg sort {} -o sorted.osm.pbf",
+            input_word(error, "input.osm.pbf")
+        )),
+        ErrorKind::IndexdataMismatch { .. } => Some(format!(
+            "; `pbfhogg check --index {}` reports which blobs disagree with their contents",
+            input_word(error, "input.osm.pbf")
+        )),
+        ErrorKind::MissingNodeLocations { .. } if advice.ignore_missing_nodes => {
+            Some("; pass --ignore-missing-nodes to write them as (0, 0)".to_owned())
+        }
+        ErrorKind::BlobTooLarge { .. } => advice.element_cap.map(|flag| format!("; lower {flag}")),
+        ErrorKind::VersionRegression { .. } if advice.allow_version_regression => {
+            Some("; pass --allow-version-regression to permit lower-version changes".to_owned())
+        }
+        ErrorKind::Output(pbfhogg::OutputError::Exists { .. }) => {
+            Some("; pass --overwrite (-O) to replace it".to_owned())
+        }
+        ErrorKind::Output(pbfhogg::OutputError::ExclusivePublishUnsupported { .. }) => {
+            Some("; pass --overwrite (-O) to publish without the exclusive check".to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Advice for a typed refusal, naming the flag or command that addresses it.
+/// The library error names neither; this front end does. Walks the chain the
+/// way [`is_platform_unsupported`] does, so a refusal raised deep inside a
+/// command (at publication, inside a worker) is found too, and a path in the
+/// advice is the one the matching error names.
+pub fn output_hint(err: &(dyn std::error::Error + 'static), advice: &Advice) -> Option<String> {
     let mut current = Some(err);
     while let Some(error) = current {
         current = if let Some(error) = error.downcast_ref::<pbfhogg::Error>() {
+            if let Some(hint) = hint_for(error, advice) {
+                return Some(hint);
+            }
             match error.kind() {
-                pbfhogg::ErrorKind::MissingIndexdata { .. } => return indexdata_advice,
-                pbfhogg::ErrorKind::Output(pbfhogg::OutputError::Exists { .. }) => {
-                    return Some("; pass --overwrite (-O) to replace it");
-                }
-                pbfhogg::ErrorKind::Output(pbfhogg::OutputError::ExclusivePublishUnsupported {
-                    ..
-                }) => {
-                    return Some("; pass --overwrite (-O) to publish without the exclusive check");
-                }
                 pbfhogg::ErrorKind::Io(io) => io
                     .get_ref()
                     .map(|inner| inner as &(dyn std::error::Error + 'static)),

@@ -28,7 +28,7 @@
 //! overlaps classification. Duplicate admin ways use the last file
 //! occurrence; conflicting coordinates for a referenced node fail the build.
 
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustc_hash::FxHashMap;
@@ -425,9 +425,9 @@ pub(super) struct Pass2Output {
 #[hotpath::measure]
 pub(super) fn run_pass2(
     output_dir: &std::path::Path,
-    node_schedule: &[(usize, u64, usize)],
-    way_schedule: &[(usize, u64, usize)],
-    shared_file: &std::sync::Arc<std::fs::File>,
+    node_schedule: &[crate::scan::classify::ScheduledBlob],
+    way_schedule: &[crate::scan::classify::ScheduledBlob],
+    shared_file: &crate::read::input::InputFile,
     max_node_id: i64,
     needed_admin_ways: crate::idset::IdSet,
     referenced_nodes: crate::idset::IdSet,
@@ -471,14 +471,10 @@ pub(super) fn run_pass2(
 
     // Streaming output: write data files directly during the merge instead
     // of accumulating Vecs. Running counters track offsets and record counts.
-    let mut street_ways_out =
-        BufWriter::new(std::fs::File::create(output_dir.join(FILE_STREET_WAYS))?);
-    let mut street_nodes_out =
-        BufWriter::new(std::fs::File::create(output_dir.join(FILE_STREET_NODES))?);
-    let mut addr_points_out =
-        BufWriter::new(std::fs::File::create(output_dir.join(FILE_ADDR_POINTS))?);
-    let mut interp_nodes_out =
-        BufWriter::new(std::fs::File::create(output_dir.join(FILE_INTERP_NODES))?);
+    let mut street_ways_out = super::create_data_file(&output_dir.join(FILE_STREET_WAYS))?;
+    let mut street_nodes_out = super::create_data_file(&output_dir.join(FILE_STREET_NODES))?;
+    let mut addr_points_out = super::create_data_file(&output_dir.join(FILE_ADDR_POINTS))?;
+    let mut interp_nodes_out = super::create_data_file(&output_dir.join(FILE_INTERP_NODES))?;
 
     // State that Phase 2a populates and Phase 2b carries forward.
     let mut addr_point_count: u32 = 0;
@@ -499,7 +495,7 @@ pub(super) fn run_pass2(
             None,
             GEOCODE_MERGE_WINDOW_BLOBS,
             NodeBlobOut::default,
-            |block, state: &mut NodeBlobOut| -> NodeBlobOut {
+            |block, state: &mut NodeBlobOut| -> Result<NodeBlobOut> {
                 for element in block.elements_skip_metadata() {
                     macro_rules! process_node {
                         ($node:expr) => {{
@@ -511,12 +507,11 @@ pub(super) fn run_pass2(
                             // every decoded node - before any other test can
                             // skip it - rather than trust the claim.
                             if node_id > max_node_id {
-                                state.error = Some(Error::invalid_data(format!(
+                                state.error = Some(crate::error::new_indexdata_mismatch(format!(
                                     "node {node_id} exceeds the node-ID bound {max_node_id} derived \
                                      from the blob metadata (the largest indexdata max_id over node \
                                      blobs, widened by any blob without indexdata). Some blob's \
-                                     indexdata understates its ID range; regenerate it with \
-                                     `pbfhogg cat`."
+                                     indexdata understates its ID range."
                                 )));
                                 continue;
                             }
@@ -578,14 +573,16 @@ pub(super) fn run_pass2(
                         _ => {}
                     }
                 }
-                std::mem::take(state)
+                // A failure found in this blob ends the pool, located with
+                // the blob it was found in.
+                let mut out = std::mem::take(state);
+                match out.error.take() {
+                    Some(error) => Err(error),
+                    None => Ok(out),
+                }
             },
             |_seq, out| {
                 if merge_err.is_some() || semantic_err.is_some() {
-                    return;
-                }
-                if let Some(error) = out.error {
-                    semantic_err = Some(error);
                     return;
                 }
                 for pap in out.addr_points {
@@ -653,7 +650,7 @@ pub(super) fn run_pass2(
             None,
             GEOCODE_MERGE_WINDOW_BLOBS,
             WayBlobOut::default,
-            |block, state: &mut WayBlobOut| -> WayBlobOut {
+            |block, state: &mut WayBlobOut| -> Result<WayBlobOut> {
                 for element in block.elements_skip_metadata() {
                     if let Element::Way(way) = element {
                         classify_way_into(
@@ -665,14 +662,14 @@ pub(super) fn run_pass2(
                         );
                     }
                 }
-                std::mem::take(state)
+                let mut out = std::mem::take(state);
+                match out.error.take() {
+                    Some(error) => Err(error),
+                    None => Ok(out),
+                }
             },
             |_seq, out| {
                 if merge_err.is_some() {
-                    return;
-                }
-                if let Some(err) = out.error {
-                    merge_err = Some(err);
                     return;
                 }
                 missing_node_ref_count =

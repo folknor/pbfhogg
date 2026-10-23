@@ -319,10 +319,9 @@ fn time_filter_snapshot(
     }
 
     type PhaseResult = crate::Result<(Vec<Vec<u8>>, TimeFilterStats)>;
-    let mut reorder: ReorderBuffer<PhaseResult> =
+    let mut reorder: ReorderBuffer<(Vec<Vec<u8>>, TimeFilterStats)> =
         ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY_WIDE);
     let mut write_error: Option<crate::Error> = None;
-    let mut classify_error: Option<crate::Error> = None;
 
     // BlockBuilder contains `Rc<str>` (string interning) which is not
     // Send, so it can't ride the `S: Send` worker-state slot. Per-blob
@@ -367,33 +366,23 @@ fn time_filter_snapshot(
             reorder.push(seq, r);
             // Drain everything ready from the front. Once we hit a
             // hole (next seq not yet delivered), stop and wait for the
-            // next merge call. Errors are captured into local Option
-            // slots and propagated after parallel_classify_phase
-            // returns; further ready items are still drained so the
-            // buffer doesn't grow.
-            while let Some(r) = reorder.pop_ready() {
-                match r {
-                    Ok((framed, block_stats)) => {
-                        if write_error.is_some() {
-                            continue;
-                        }
-                        stats.versions_seen += block_stats.versions_seen;
-                        stats.versions_before_cutoff += block_stats.versions_before_cutoff;
-                        stats.elements_written += block_stats.elements_written;
-                        stats.dropped_deleted += block_stats.dropped_deleted;
-                        stats.dropped_no_snapshot_version +=
-                            block_stats.dropped_no_snapshot_version;
-                        for blob in framed {
-                            if let Err(e) = writer.write_raw_owned(blob) {
-                                write_error = Some(e);
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        if classify_error.is_none() {
-                            classify_error = Some(e);
-                        }
+            // next merge call. A write error is captured into a local slot
+            // and propagated after parallel_classify_phase returns;
+            // further ready items are still drained so the buffer doesn't
+            // grow. A failed blob ends the pool, located with its input.
+            while let Some((framed, block_stats)) = reorder.pop_ready() {
+                if write_error.is_some() {
+                    continue;
+                }
+                stats.versions_seen += block_stats.versions_seen;
+                stats.versions_before_cutoff += block_stats.versions_before_cutoff;
+                stats.elements_written += block_stats.elements_written;
+                stats.dropped_deleted += block_stats.dropped_deleted;
+                stats.dropped_no_snapshot_version += block_stats.dropped_no_snapshot_version;
+                for blob in framed {
+                    if let Err(e) = writer.write_raw_owned(blob) {
+                        write_error = Some(e);
+                        break;
                     }
                 }
             }
@@ -401,12 +390,9 @@ fn time_filter_snapshot(
         host,
     );
 
-    // Errors the merge recorded came first: the pool's own (a cancellation
+    // An error the merge recorded came first: the pool's own (a cancellation
     // observed at a later receive included) is the later one.
     if let Some(e) = write_error {
-        return Err(e);
-    }
-    if let Some(e) = classify_error {
         return Err(e);
     }
     pool_result?;

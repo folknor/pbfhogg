@@ -66,16 +66,61 @@ fn diagnostic_prefix(kind: EventKind) -> Option<&'static str> {
     }
 }
 
+/// Advice this front end appends to a library diagnostic, keyed on the
+/// diagnostic's key. The library's text names no flag and no command; the
+/// switch or command that acts on what it reports is named here.
+fn diagnostic_hint(key: &str) -> &'static str {
+    match key {
+        "altw.external_hint" => {
+            " Pass --index-type external to use it, or --index-type auto to choose."
+        }
+        "extract.passthrough_demoted" => " `pbfhogg check --index` checks it.",
+        "check.ids.unindexed_triple_scan" => {
+            " `pbfhogg cat input.osm.pbf -o indexed.osm.pbf` writes an indexed copy."
+        }
+        _ => "",
+    }
+}
+
 impl pbfhogg::host::DiagnosticSink for StderrSink {
     /// The one place a diagnostic becomes stderr text. Library text carries no
     /// kind prefix of its own, so the kind alone decides the rendering; a
     /// `--quiet` kind filter or a `--json` sink (serializing kind, key and the
     /// formatted arguments) belongs here and nowhere in the library.
     fn event(&self, event: &pbfhogg::host::Event<'_>) {
+        let hint = diagnostic_hint(event.key);
         match diagnostic_prefix(event.kind) {
-            Some(prefix) => crate::output::stderr_line(format_args!("{prefix}{}", event.args)),
-            None => crate::output::stderr_line(event.args),
+            Some(prefix) => {
+                crate::output::stderr_line(format_args!("{prefix}{}{hint}", event.args));
+            }
+            None => crate::output::stderr_line(format_args!("{}{hint}", event.args)),
         }
+    }
+}
+
+/// Report a note the CLI itself raises, through the same sink and prefix as
+/// the library's notes.
+pub(crate) fn cli_note(key: &'static str, args: std::fmt::Arguments<'_>) {
+    use pbfhogg::host::DiagnosticSink as _;
+    StderrSink.event(&Event {
+        kind: EventKind::Note,
+        key,
+        args,
+    });
+}
+
+/// The pointer a summary that counted elements from unverified indexdata
+/// claims gets: the library reports the claim, this front end names the
+/// command that checks it.
+pub(crate) fn note_unverified_claims(claimed: u64) {
+    if claimed > 0 {
+        cli_note(
+            "cli.unverified_indexdata",
+            format_args!(
+                "counts marked unverified come from blob indexdata; `pbfhogg check --index` \
+                 checks it"
+            ),
+        );
     }
 }
 

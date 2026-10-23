@@ -78,9 +78,9 @@ pub(super) fn build_all_blob_schedules(
         let Some(idx) = &meta.index else {
             return Err(walker.locate_meta(
                 &meta,
-                crate::Error::invalid_data(
-                    "renumber requires an indexed PBF - run `pbfhogg cat` to add \
-                     indexdata or use the indexed variant",
+                crate::error::new_missing_indexdata(
+                    "renumber requires indexdata on every OsmData blob: each blob's new \
+                     ids are precomputed from its indexdata element count",
                 ),
             ));
         };

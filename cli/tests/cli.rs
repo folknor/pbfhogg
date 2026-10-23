@@ -107,13 +107,14 @@ mod exit_code_walker {
             refused.kind(),
             pbfhogg::ErrorKind::Output(pbfhogg::OutputError::Exists { .. })
         ));
+        let advice = super::exit_code::Advice::default();
         assert_eq!(
-            output_hint(&refused, None),
+            output_hint(&refused, &advice).as_deref(),
             Some("; pass --overwrite (-O) to replace it")
         );
         let carried = io::Error::from(refused.context("publishing"));
-        assert!(output_hint(&carried, None).is_some());
-        assert_eq!(output_hint(&platform(), None), None);
+        assert!(output_hint(&carried, &advice).is_some());
+        assert_eq!(output_hint(&platform(), &advice), None);
     }
 
     /// A cancellation earns the interrupted status as the error itself or

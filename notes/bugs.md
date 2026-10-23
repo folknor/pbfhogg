@@ -94,3 +94,43 @@ during decode.
 
 Reported by: the extract passthrough fix.
 
+## BUG-111 - repack drops a blob's elements of any kind its indexdata does not claim
+
+Anger: 8 - verifying the kind costs a check per decoded element, on a measured path.
+
+`build_classify_schedules_split` puts an indexed blob into the one schedule
+its `BlobHeader.indexdata` kind names. `repack`'s `worker_split_blob` then
+counts and re-encodes only the elements of that kind and `continue`s past
+the rest, with no count and no error. A blob whose indexdata says `way` but
+which holds nodes (a mislabelled kind, or a valid multi-kind block indexed
+by another writer's rule) loses those nodes from the output, and the run
+reports success. `degrade`'s decode path and `cat --clean` / `cat --type`
+use the same per-kind schedule plus kind-filtered workers and likely have
+the same shape; not run. The trust model is HYG-061's; the minimum is a
+counter of skipped elements per blob that turns nonzero into
+`IndexdataMismatch`, which costs nothing when the claim is true.
+
+Reported by: the library error-text cleanup.
+
+## BUG-112 - The removed re-encode and re-index advice did not work as written
+
+Anger: 3 - advice text, contained.
+
+The library used to tell operators to "re-encode the input first, e.g.
+`pbfhogg cat --clean`" (renumber's unpacked and split-field refusals) and to
+"run `pbfhogg cat` to add indexdata" (renumber's schedule scan). The first is
+a usage error: `--clean` takes an attribute name, so the recipe as printed
+is refused before it runs, and with an attribute it strips metadata. The
+second does not repair what it claims to: passthrough `cat` copies a blob
+that already carries indexdata verbatim, so it cannot correct wrong
+indexdata, and a blob whose block the index scan cannot classify is passed
+through still unindexed. Both texts are gone from the library (it names no
+command now); the CLI's replacement advice for `MissingIndexdata` is the
+same `pbfhogg cat <input> -o indexed.osm.pbf` recipe, which is right for an
+unindexed input and inherits the second caveat. What is open: a re-encode
+recipe that is lossless (`repack`, subject to BUG-111) for renumber's
+wire-form refusals, if the CLI should advise one, and whether `cat` should
+refuse or re-index a blob it cannot classify.
+
+Reported by: the library error-text cleanup.
+

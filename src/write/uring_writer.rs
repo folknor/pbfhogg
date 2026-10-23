@@ -513,11 +513,13 @@ const fn round_up_to_page(n: usize) -> usize {
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn handle_copy_range_uring(
     state: &mut UringState,
-    in_fd: std::os::unix::io::RawFd,
+    input: &crate::read::input::InputFile,
     mut src_offset: u64,
     mut remaining: u64,
     cancel: &crate::host::Cancel,
 ) -> Result<()> {
+    use std::os::unix::io::AsRawFd as _;
+    let in_fd = input.file().as_raw_fd();
     while remaining > 0 {
         // Once per registered buffer filled (each a `pread` syscall): a
         // coalesced splice can span the whole input, and this is where a
@@ -545,12 +547,20 @@ fn handle_copy_range_uring(
         // readable file descriptor passed in from the caller.
         let n = unsafe { libc::pread(in_fd, dst.cast::<libc::c_void>(), chunk, src_offset as i64) };
         if n < 0 {
-            return Err(io::Error::last_os_error().into());
+            return Err(super::copy_range::read_error(
+                io::Error::last_os_error(),
+                input,
+                src_offset,
+            ));
         }
         if n.cast_unsigned() != chunk {
-            return Err(Error::io_kind(
-                io::ErrorKind::UnexpectedEof,
-                format!("io_uring CopyRange pread short: expected {chunk}, got {n}"),
+            return Err(super::copy_range::read_error(
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("io_uring CopyRange pread short: expected {chunk}, got {n}"),
+                ),
+                input,
+                src_offset,
             ));
         }
 
@@ -828,9 +838,8 @@ fn uring_main_loop(
                     offset,
                     len,
                 } => {
-                    use std::os::unix::io::AsRawFd;
                     let t_write = std::time::Instant::now();
-                    handle_copy_range_uring(state, in_file.as_raw_fd(), offset, len, cancel)?;
+                    handle_copy_range_uring(state, &in_file, offset, len, cancel)?;
                     // The Arc keeps the input open across the pread loop.
                     drop(in_file);
                     WRITER_METRICS

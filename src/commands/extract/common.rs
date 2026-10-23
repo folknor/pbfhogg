@@ -175,8 +175,7 @@ pub(super) fn warn_passthrough_demotions(verified: u64, demoted: u64, host: &cra
             "extract.passthrough_demoted",
             "{demoted} node blob(s) whose indexdata bbox lies inside the region \
              hold out-of-region nodes or content other than DenseNodes, so they were \
-             filtered instead of copied raw. The input's indexdata may be wrong \
-             (`pbfhogg check --index` checks it)."
+             filtered instead of copied raw. The input's indexdata may be wrong."
         );
     }
 }
@@ -298,9 +297,7 @@ where
     // 1-5 us per open, 3-15 us total per run - invisible against the ~tens of
     // seconds of pread+decode work. Hoisting to the caller is possible but
     // buys nothing measurable; the local-scope Arc keeps the API simple.
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input).map_err(|e| crate::file_reader::open_error(input, e))?,
-    );
+    let shared_file = std::sync::Arc::new(crate::read::input::open(input)?);
     // The input's identity, captured once; each worker borrows it to locate a
     // failure with the frame offset the schedule handed it.
     let source: std::sync::Arc<Path> = std::sync::Arc::from(input);

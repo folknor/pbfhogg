@@ -397,8 +397,7 @@ pub(crate) fn renumber_external_to(
     )?;
 
     // Single shared input fd for all phases - pread is concurrent-safe.
-    let shared_file = std::fs::File::open(input)
-        .map_err(|e| Error::from(e).context(format!("failed to open {}", input.display())))?;
+    let shared_file = crate::read::input::open(input)?;
     // The path every worker locates its errors against, captured once.
     let source: std::sync::Arc<Path> = std::sync::Arc::from(input);
     let file_len = shared_file

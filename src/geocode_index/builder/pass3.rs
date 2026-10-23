@@ -302,7 +302,7 @@ fn ensure_bucket_writer(
 ) -> Result<()> {
     if writers[bucket].is_none() {
         let path = bucket_dir.join(format!("{bucket:03}"));
-        writers[bucket] = Some(BufWriter::new(std::fs::File::create(path)?));
+        writers[bucket] = Some(super::create_data_file(&path)?);
     }
     Ok(())
 }
@@ -821,12 +821,10 @@ fn run_stage_b(
 ) -> Result<u32> {
     use rayon::prelude::*;
 
-    let mut cells_out = BufWriter::new(std::fs::File::create(output_dir.join(cells_file))?);
-    let mut street_out =
-        BufWriter::new(std::fs::File::create(output_dir.join(street_entries_file))?);
-    let mut addr_out = BufWriter::new(std::fs::File::create(output_dir.join(addr_entries_file))?);
-    let mut interp_out =
-        BufWriter::new(std::fs::File::create(output_dir.join(interp_entries_file))?);
+    let mut cells_out = super::create_data_file(&output_dir.join(cells_file))?;
+    let mut street_out = super::create_data_file(&output_dir.join(street_entries_file))?;
+    let mut addr_out = super::create_data_file(&output_dir.join(addr_entries_file))?;
+    let mut interp_out = super::create_data_file(&output_dir.join(interp_entries_file))?;
 
     let mut street_byte_offset: u64 = 0;
     let mut addr_byte_offset: u64 = 0;
@@ -848,7 +846,7 @@ fn run_stage_b(
                     if !bucket_path.exists() {
                         return Ok(Vec::new());
                     }
-                    let data = std::fs::read(&bucket_path)?;
+                    let data = crate::read::input::read(&bucket_path)?;
                     std::fs::remove_file(&bucket_path)?;
                     if data.is_empty() {
                         return Ok(Vec::new());

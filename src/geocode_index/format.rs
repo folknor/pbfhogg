@@ -580,8 +580,7 @@ pub const FILE_STRINGS: &str = "strings.bin";
 #[cfg(feature = "geocode-reader")]
 pub(crate) fn mmap_or_empty(path: &std::path::Path) -> crate::Result<memmap2::Mmap> {
     use crate::error::Error;
-    let file = std::fs::File::open(path)
-        .map_err(|e| Error::from(e).context(format!("failed to open {}", path.display())))?;
+    let file = crate::read::input::open(path)?;
     let len = file
         .metadata()
         .map_err(|e| Error::from(e).context(format!("failed to stat {}", path.display())))?

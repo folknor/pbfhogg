@@ -10,6 +10,7 @@ pub mod elements;
 pub mod file_reader;
 pub(crate) mod frame;
 pub(crate) mod header_walker;
+pub mod input;
 pub(crate) mod pipeline;
 pub(crate) mod pipeline_metrics;
 pub(crate) mod raw_frame;

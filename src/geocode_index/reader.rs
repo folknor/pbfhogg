@@ -222,6 +222,12 @@ fn corrupt(msg: impl Into<std::borrow::Cow<'static, str>>) -> crate::Error {
     crate::Error::invalid_data(msg)
 }
 
+/// A validation failure while checking record `index` of `file`.
+#[cold]
+fn in_record(err: crate::Error, file: &str, index: usize) -> crate::Error {
+    err.context(format!("{file} record {index}"))
+}
+
 impl Reader {
     /// Open an index directory. Memory-maps all files.
     ///
@@ -240,17 +246,30 @@ impl Reader {
     /// reopens an index it has just built or checksummed pays this pass again
     /// (a content checksum would not avoid it, since verifying one reads every
     /// byte).
+    ///
+    /// # Errors
+    /// A file is missing, unreadable or malformed; the error names the
+    /// index directory, and the file (and record) where one is at fault.
     pub fn open(dir: &Path) -> Result<Self> {
-        let header_bytes = std::fs::read(dir.join(format::FILE_HEADER))?;
+        Self::open_in(dir).map_err(|e| e.locate(crate::error::Location::in_file(dir)))
+    }
+
+    fn open_in(dir: &Path) -> Result<Self> {
+        let header_path = dir.join(format::FILE_HEADER);
+        let header_bytes = crate::read::input::read(&header_path)?;
+        let in_header = |e: crate::Error| e.locate(crate::error::Location::in_file(&header_path));
         if header_bytes.len() < HEADER_SIZE {
-            return Err(corrupt("geocode header too short"));
+            return Err(in_header(corrupt(format!(
+                "geocode header too short: {} bytes, expected {HEADER_SIZE}",
+                header_bytes.len()
+            ))));
         }
         let header = Header::from_bytes(
             header_bytes[..HEADER_SIZE]
                 .try_into()
-                .map_err(|_| corrupt("header size mismatch"))?,
+                .map_err(|_| in_header(corrupt("header size mismatch")))?,
         )
-        .map_err(crate::Error::invalid_data_from)?;
+        .map_err(|e| in_header(crate::Error::invalid_data_from(e)))?;
 
         let mmap = |name: &str| format::mmap_or_empty(&dir.join(name));
 
@@ -359,12 +378,14 @@ impl Reader {
         )?;
 
         self.validate_geo_tree(
+            format::FILE_GEO_CELLS,
             &self.geo_cells,
             &self.street_entries,
             &self.addr_entries,
             &self.interp_entries,
         )?;
         self.validate_geo_tree(
+            format::FILE_COARSE_GEO_CELLS,
             &self.coarse_geo_cells,
             &self.coarse_street_entries,
             &self.coarse_addr_entries,
@@ -384,10 +405,14 @@ impl Reader {
     /// a genuinely empty one.
     fn validate_admin_tree(&self) -> Result<()> {
         for index in 0..self.admin_cells.len() / ADMIN_CELL_SIZE {
-            let rec = read_record::<ADMIN_CELL_SIZE>(&self.admin_cells, index * ADMIN_CELL_SIZE)
-                .ok_or_else(|| corrupt("invalid admin cell record"))?;
-            let cell = AdminCell::from_bytes(rec);
-            validate_list(cell.entries_offset, &self.admin_entries, 4, "admin entry")?;
+            (|| -> Result<()> {
+                let rec =
+                    read_record::<ADMIN_CELL_SIZE>(&self.admin_cells, index * ADMIN_CELL_SIZE)
+                        .ok_or_else(|| corrupt("invalid admin cell record"))?;
+                let cell = AdminCell::from_bytes(rec);
+                validate_list(cell.entries_offset, &self.admin_entries, 4, "admin entry")
+            })()
+            .map_err(|e| in_record(e, format::FILE_ADMIN_CELLS, index))?;
         }
         Ok(())
     }
@@ -413,63 +438,85 @@ impl Reader {
     /// invalid offset, missing terminator, or invalid UTF-8.
     fn validate_way_geometry(&self) -> Result<()> {
         for index in 0..self.street_ways.len() / STREET_WAY_SIZE {
-            let rec = read_record::<STREET_WAY_SIZE>(&self.street_ways, index * STREET_WAY_SIZE)
-                .ok_or_else(|| corrupt("invalid street way record"))?;
-            let way = StreetWay::from_bytes(rec);
-            validate_span(
-                way.node_offset,
-                u64::from(way.node_count),
-                NODE_COORD_SIZE,
-                &self.street_nodes,
-                "street way node",
-            )?;
-            validate_string_offset(way.name_offset, &self.strings, "street way name")?;
+            (|| -> Result<()> {
+                let rec =
+                    read_record::<STREET_WAY_SIZE>(&self.street_ways, index * STREET_WAY_SIZE)
+                        .ok_or_else(|| corrupt("invalid street way record"))?;
+                let way = StreetWay::from_bytes(rec);
+                validate_span(
+                    way.node_offset,
+                    u64::from(way.node_count),
+                    NODE_COORD_SIZE,
+                    &self.street_nodes,
+                    "street way node",
+                )?;
+                validate_string_offset(way.name_offset, &self.strings, "street way name")
+            })()
+            .map_err(|e| in_record(e, format::FILE_STREET_WAYS, index))?;
         }
         for index in 0..self.interp_ways.len() / INTERP_WAY_SIZE {
-            let rec = read_record::<INTERP_WAY_SIZE>(&self.interp_ways, index * INTERP_WAY_SIZE)
-                .ok_or_else(|| corrupt("invalid interpolation way record"))?;
-            let way = InterpWay::from_bytes(rec);
-            InterpolationType::try_from(way.interpolation_type)
-                .map_err(crate::Error::invalid_data_from)?;
-            validate_span(
-                way.node_offset,
-                u64::from(way.node_count),
-                NODE_COORD_SIZE,
-                &self.interp_nodes,
-                "interpolation way node",
-            )?;
-            validate_string_offset(way.street_offset, &self.strings, "interpolation way street")?;
+            (|| -> Result<()> {
+                let rec =
+                    read_record::<INTERP_WAY_SIZE>(&self.interp_ways, index * INTERP_WAY_SIZE)
+                        .ok_or_else(|| corrupt("invalid interpolation way record"))?;
+                let way = InterpWay::from_bytes(rec);
+                InterpolationType::try_from(way.interpolation_type)
+                    .map_err(crate::Error::invalid_data_from)?;
+                validate_span(
+                    way.node_offset,
+                    u64::from(way.node_count),
+                    NODE_COORD_SIZE,
+                    &self.interp_nodes,
+                    "interpolation way node",
+                )?;
+                validate_string_offset(way.street_offset, &self.strings, "interpolation way street")
+            })()
+            .map_err(|e| in_record(e, format::FILE_INTERP_WAYS, index))?;
         }
         for index in 0..self.admin_polygons.len() / ADMIN_POLYGON_SIZE {
-            let rec =
-                read_record::<ADMIN_POLYGON_SIZE>(&self.admin_polygons, index * ADMIN_POLYGON_SIZE)
-                    .ok_or_else(|| corrupt("invalid admin polygon record"))?;
-            let poly = AdminPolygon::from_bytes(rec);
-            // Producer rings repeat their first vertex: assemble_rings keeps
-            // only closed rings and simplify_ring preserves both endpoints.
-            // Do not scan every vertex here solely to recertify closure; that
-            // would add coordinate-page reads to metadata validation at open.
-            validate_span(
-                poly.vertex_offset,
-                u64::from(poly.vertex_count),
-                NODE_COORD_SIZE,
-                &self.admin_vertices,
-                "admin polygon vertex",
-            )?;
-            validate_string_offset(poly.name_offset, &self.strings, "admin polygon name")?;
-            validate_string_offset(
-                poly.country_code_offset,
-                &self.strings,
-                "admin polygon country code",
-            )?;
+            (|| -> Result<()> {
+                let rec = read_record::<ADMIN_POLYGON_SIZE>(
+                    &self.admin_polygons,
+                    index * ADMIN_POLYGON_SIZE,
+                )
+                .ok_or_else(|| corrupt("invalid admin polygon record"))?;
+                let poly = AdminPolygon::from_bytes(rec);
+                // Producer rings repeat their first vertex: assemble_rings
+                // keeps only closed rings and simplify_ring preserves both
+                // endpoints. Do not scan every vertex here solely to
+                // recertify closure; that would add coordinate-page reads to
+                // metadata validation at open.
+                validate_span(
+                    poly.vertex_offset,
+                    u64::from(poly.vertex_count),
+                    NODE_COORD_SIZE,
+                    &self.admin_vertices,
+                    "admin polygon vertex",
+                )?;
+                validate_string_offset(poly.name_offset, &self.strings, "admin polygon name")?;
+                validate_string_offset(
+                    poly.country_code_offset,
+                    &self.strings,
+                    "admin polygon country code",
+                )
+            })()
+            .map_err(|e| in_record(e, format::FILE_ADMIN_POLYGONS, index))?;
         }
         for index in 0..self.addr_points.len() / ADDR_POINT_SIZE {
-            let rec = read_record::<ADDR_POINT_SIZE>(&self.addr_points, index * ADDR_POINT_SIZE)
-                .ok_or_else(|| corrupt("invalid address point record"))?;
-            let pt = AddrPoint::from_bytes(rec);
-            validate_string_offset(pt.housenumber_offset, &self.strings, "address housenumber")?;
-            validate_string_offset(pt.street_offset, &self.strings, "address street")?;
-            validate_string_offset(pt.postcode_offset, &self.strings, "address postcode")?;
+            (|| -> Result<()> {
+                let rec =
+                    read_record::<ADDR_POINT_SIZE>(&self.addr_points, index * ADDR_POINT_SIZE)
+                        .ok_or_else(|| corrupt("invalid address point record"))?;
+                let pt = AddrPoint::from_bytes(rec);
+                validate_string_offset(
+                    pt.housenumber_offset,
+                    &self.strings,
+                    "address housenumber",
+                )?;
+                validate_string_offset(pt.street_offset, &self.strings, "address street")?;
+                validate_string_offset(pt.postcode_offset, &self.strings, "address postcode")
+            })()
+            .map_err(|e| in_record(e, format::FILE_ADDR_POINTS, index))?;
         }
         Ok(())
     }
@@ -478,28 +525,32 @@ impl Reader {
     // the two call sites; a filename bundle cannot certify mmap provenance.
     fn validate_geo_tree(
         &self,
+        cells_file: &'static str,
         cells: &[u8],
         streets: &[u8],
         addrs: &[u8],
         interps: &[u8],
     ) -> Result<()> {
         for index in 0..cells.len() / GEO_CELL_SIZE {
-            let rec = read_record::<GEO_CELL_SIZE>(cells, index * GEO_CELL_SIZE)
-                .ok_or_else(|| corrupt("invalid geo cell record"))?;
-            let cell = GeoCell::from_bytes(rec);
-            validate_list(cell.addr_offset, addrs, 4, "address entry")?;
-            validate_list(
-                cell.street_offset,
-                streets,
-                SEGMENT_REF_SIZE,
-                "street entry",
-            )?;
-            validate_list(
-                cell.interp_offset,
-                interps,
-                SEGMENT_REF_SIZE,
-                "interpolation entry",
-            )?;
+            (|| -> Result<()> {
+                let rec = read_record::<GEO_CELL_SIZE>(cells, index * GEO_CELL_SIZE)
+                    .ok_or_else(|| corrupt("invalid geo cell record"))?;
+                let cell = GeoCell::from_bytes(rec);
+                validate_list(cell.addr_offset, addrs, 4, "address entry")?;
+                validate_list(
+                    cell.street_offset,
+                    streets,
+                    SEGMENT_REF_SIZE,
+                    "street entry",
+                )?;
+                validate_list(
+                    cell.interp_offset,
+                    interps,
+                    SEGMENT_REF_SIZE,
+                    "interpolation entry",
+                )
+            })()
+            .map_err(|e| in_record(e, cells_file, index))?;
         }
         Ok(())
     }

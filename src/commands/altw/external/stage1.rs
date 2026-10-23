@@ -79,6 +79,23 @@ pub(super) struct Stage1Output {
     pub node_blob_mapping: Vec<NodeBlobInfo>,
 }
 
+/// A failed write or flush of one id shard, naming the shard file (its path
+/// is recomputed here, on the error path only).
+#[cold]
+fn shard_error(
+    err: std::io::Error,
+    what: &str,
+    scratch: &RunScratch,
+    worker_id: usize,
+    bucket_idx: usize,
+) -> Error {
+    let shard = super::radix::id_shard_path(scratch, worker_id, bucket_idx).map_or_else(
+        |_| format!("worker {worker_id} bucket {bucket_idx}"),
+        |path| path.display().to_string(),
+    );
+    Error::from(err).context(format!("failed to {what} id shard {shard}"))
+}
+
 /// Build the way-blob schedule from the shared blob metadata scan.
 pub(super) fn build_way_schedule(blob_meta: &[BlobMeta]) -> Vec<WayBlobTask> {
     crate::debug::emit_marker("EXTJOIN_S1_WAY_SCHEDULE_START");
@@ -129,10 +146,7 @@ pub(super) fn stage1_pass_a(
 ) -> Result<(u64, Vec<u64>)> {
     use std::os::unix::fs::FileExt as _;
 
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| Error::from(e).context(format!("failed to open {}", input.display())))?,
-    );
+    let shared_file = std::sync::Arc::new(crate::read::input::open(input)?);
 
     crate::debug::emit_marker("EXTJOIN_S1_PASS_A_START");
 
@@ -214,12 +228,21 @@ pub(super) fn stage1_pass_a(
                             break;
                         }
                         let task = &schedule_ref[idx];
+                        // A failure reading this blob is about the input:
+                        // located with its path and the blob's payload
+                        // offset (cold). Scratch failures name their shard.
+                        let in_input = |e: Error| {
+                            e.locate_blob(crate::error::Location::at_offset(
+                                input,
+                                task.data_offset,
+                            ))
+                        };
 
                         let result: crate::Result<(u64, Vec<u32>)> = (|| {
                             let t0 = std::time::Instant::now();
                             read_buf.resize(task.data_size, 0);
                             file.read_exact_at(&mut read_buf, task.data_offset)
-                                .map_err(|e| Error::from(e).context("pass A pread"))?;
+                                .map_err(|e| in_input(Error::from(e).context("pass A pread")))?;
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
                             s1a_bytes_ref.fetch_add(task.data_size as u64, Relaxed);
@@ -227,7 +250,7 @@ pub(super) fn stage1_pass_a(
 
                             let t1 = std::time::Instant::now();
                             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
-                                .map_err(|e| e.context("pass A decompress"))?;
+                                .map_err(|e| in_input(e.context("pass A decompress")))?;
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
 
@@ -257,7 +280,8 @@ pub(super) fn stage1_pass_a(
                                     #[allow(clippy::cast_possible_truncation)]
                                     per_way_rcs.push(refs.len() as u32);
                                 },
-                            )?;
+                            )
+                            .map_err(in_input)?;
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_scan_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
 
@@ -320,8 +344,7 @@ pub(super) fn stage1_pass_a(
                                         .as_mut()
                                         .expect("shard writer initialised");
                                     writer.write_all(&id_rec_buf).map_err(|e| {
-                                        Error::from(e)
-                                            .context(format!("write id shard W{worker_id}"))
+                                        shard_error(e, "write", scratch_ref, worker_id, bucket_idx)
                                     })?;
                                     id_bucket_local_counts[bucket_idx] += 1;
                                     blob_emitted += 1;
@@ -349,15 +372,20 @@ pub(super) fn stage1_pass_a(
                     // so do it explicitly and surface any failure via
                     // the shared mutex; the orchestrator checks after
                     // the scope joins.
-                    for w in id_shard_writers.iter_mut().flatten() {
+                    for (bucket_idx, w) in id_shard_writers.iter_mut().enumerate() {
+                        let Some(w) = w else { continue };
                         if let Err(e) = w.flush() {
                             let mut slot = s1a_id_flush_err_ref
                                 .lock()
                                 .expect("id shard flush error mutex");
                             if slot.is_none() {
-                                *slot = Some(
-                                    Error::from(e).context(format!("flush id shard W{worker_id}")),
-                                );
+                                *slot = Some(shard_error(
+                                    e,
+                                    "flush",
+                                    scratch_ref,
+                                    worker_id,
+                                    bucket_idx,
+                                ));
                             }
                             break;
                         }
@@ -375,13 +403,11 @@ pub(super) fn stage1_pass_a(
 
             let mut sidecar_writer = BufWriter::with_capacity(
                 REF_COUNT_SIDECAR_BUF_BYTES,
-                crate::scratch::create(ref_count_sidecar)
-                    .map_err(|e| Error::from(e).context("create sidecar"))?,
+                crate::scratch::create_file(ref_count_sidecar)?,
             );
             let mut per_way_writer = BufWriter::with_capacity(
                 PER_WAY_REFCOUNT_SIDECAR_BUF_BYTES,
-                crate::scratch::create(per_way_refcount_sidecar)
-                    .map_err(|e| Error::from(e).context("create per-way sidecar"))?,
+                crate::scratch::create_file(per_way_refcount_sidecar)?,
             );
             let mut varint_buf: Vec<u8> = Vec::with_capacity(STAGE1_VARINT_BUF_CAPACITY);
             let mut reorder: crate::reorder_buffer::ReorderBuffer<crate::Result<(u64, Vec<u32>)>> =

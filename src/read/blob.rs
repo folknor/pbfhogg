@@ -776,7 +776,8 @@ impl BlobReader<FileReader> {
     /// If there are no errors, each blob will have a valid ([`Some`]) offset.
     ///
     /// # Errors
-    /// Returns the same errors that `std::fs::File::open` returns.
+    /// The open failure (the `io::Error` of `std::fs::File::open`, with the
+    /// path as context).
     ///
     /// # Example
     /// ```
@@ -1082,8 +1083,19 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
             }
             Err(e) => {
                 self.offset = None;
-                Err(e.into())
+                Err(self.seek_error(e, Some(pos)))
             }
+        }
+    }
+
+    /// A failed seek, located in this reader's file (when it knows it) at
+    /// the target offset (when the target was absolute).
+    #[cold]
+    fn seek_error(&self, err: std::io::Error, target: Option<ByteOffset>) -> Error {
+        let err = Error::from(err);
+        match &self.source {
+            Some(path) => err.locate(crate::error::Location::new(Some(path), None, target)),
+            None => err,
         }
     }
 
@@ -1109,7 +1121,11 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
             }
             Err(e) => {
                 self.offset = None;
-                Err(e.into())
+                let target = match pos {
+                    SeekFrom::Start(offset) => Some(ByteOffset(offset)),
+                    SeekFrom::End(_) | SeekFrom::Current(_) => None,
+                };
+                Err(self.seek_error(e, target))
             }
         }
     }
@@ -1242,7 +1258,8 @@ impl BlobReader<BufReader<File>> {
     /// # foo().unwrap();
     /// ```
     pub fn seekable_from_path<P: AsRef<Path>>(path: P) -> Result<BlobReader<BufReader<File>>> {
-        let f = File::open(path.as_ref())?;
+        let path = path.as_ref();
+        let f = crate::read::input::open(path)?;
         // Use a 256KB BufReader for the same reasons as from_path above:
         // PBF blobs are 16-32KB compressed, so the default 8KB buffer causes 2-4
         // syscalls per blob. 256KB fits several blobs per read and dramatically
@@ -1252,10 +1269,11 @@ impl BlobReader<BufReader<File>> {
         // for sequential iteration with occasional seek-back, where the large
         // buffer is still beneficial.
         let buf_reader = BufReader::with_capacity(crate::write::IO_BUF_BYTES, f);
-        let mut reader = Self::new_seekable(buf_reader)?;
+        let mut reader = Self::new_seekable(buf_reader)
+            .map_err(|e| e.locate(crate::error::Location::in_file(path)))?;
         // `new_seekable` is generic and cannot know the path; this entry
         // point does, so it fills the input identity back in.
-        reader.source = Some(std::sync::Arc::from(path.as_ref()));
+        reader.source = Some(std::sync::Arc::from(path));
         Ok(reader)
     }
 }

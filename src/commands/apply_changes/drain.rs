@@ -90,7 +90,7 @@ pub(super) struct DrainConfig<'a> {
     /// queued into the writer thread and runs later, so the descriptor has
     /// to be owned for that long rather than merely happening to still be
     /// open.
-    pub route: Route<std::sync::Arc<std::fs::File>>,
+    pub route: Route<crate::read::input::InputFile>,
     /// `--locations-on-ways` mode is on. Drain merges `CoordSlots` at
     /// the node→way barrier and signals the scanner.
     pub locations_on_ways: bool,
@@ -549,10 +549,11 @@ fn check_output_order(
             .order_watermark
             .observe(kind.ordinal(), min_id, max_id)
     {
-        return Err(Error::invalid_data(format!(
+        return Err(crate::error::new_unsorted(format!(
             "apply-changes: refusing to write an unsorted PBF under a Sort.Type_then_ID \
              header - a {} blob starting at id {} follows {} output \
-             already reaching id {previous_id}; re-sort the base with `pbfhogg sort`.",
+             already reaching id {previous_id}; the base is not in the order its header \
+             declares.",
             kind.as_str(),
             crate::osm_id::blob_osm_first_id(min_id, max_id),
             ElementKind::from_ordinal(previous_kind).map_or("unknown", ElementKind::as_str),

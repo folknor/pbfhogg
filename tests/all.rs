@@ -40,6 +40,8 @@ mod check;
 #[cfg(feature = "commands")]
 mod cli_check_index;
 #[cfg(feature = "commands")]
+mod cli_error_naming;
+#[cfg(feature = "commands")]
 mod cli_export;
 #[cfg(feature = "commands")]
 mod cli_extract;

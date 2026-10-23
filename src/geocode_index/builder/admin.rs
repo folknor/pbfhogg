@@ -1,6 +1,6 @@
 //! Admin polygon assembly and on-disk writing.
 
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::Path;
 
 use crate::coord_fmt::{deg_to_e7, e7_to_deg};
@@ -284,8 +284,8 @@ fn assemble_one_relation(
 
 #[hotpath::measure]
 pub(super) fn write_admin_data(dir: &Path, polygons: &[AssembledPolygon]) -> Result<()> {
-    let mut poly_out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADMIN_POLYGONS))?);
-    let mut vert_out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADMIN_VERTICES))?);
+    let mut poly_out = super::create_data_file(&dir.join(FILE_ADMIN_POLYGONS))?;
+    let mut vert_out = super::create_data_file(&dir.join(FILE_ADMIN_VERTICES))?;
     let mut offset: u64 = 0;
     // assemble_admin_polygons obtains only explicitly closed rings from
     // assemble_rings. simplify_ring preserves both endpoints and conversion
@@ -337,8 +337,8 @@ pub(super) fn write_admin_index(
     cell_ids.sort_unstable();
     cell_ids.dedup();
 
-    let mut entries_out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADMIN_ENTRIES))?);
-    let mut cells_out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADMIN_CELLS))?);
+    let mut entries_out = super::create_data_file(&dir.join(FILE_ADMIN_ENTRIES))?;
+    let mut cells_out = super::create_data_file(&dir.join(FILE_ADMIN_CELLS))?;
     let mut byte_off: u64 = 0;
     let mut i = 0;
 

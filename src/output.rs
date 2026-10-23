@@ -196,12 +196,23 @@ enum Session {
 ///
 /// Transitions are checked under a lock: `Reserved -> Writing -> Finished`,
 /// and `Failed` is terminal, so a later success can never overwrite it.
+///
+/// It also carries the destination's path: the one owner of the output's
+/// identity, so every writer filling it names the same file in an error.
 #[derive(Clone, Debug)]
-pub(crate) struct Completion(Arc<Mutex<Session>>);
+pub(crate) struct Completion(Arc<Mutex<Session>>, Arc<Path>);
 
 impl Completion {
-    fn new() -> Self {
-        Self(Arc::new(Mutex::new(Session::Reserved)))
+    fn new(destination: &Path) -> Self {
+        Self(
+            Arc::new(Mutex::new(Session::Reserved)),
+            Arc::from(destination),
+        )
+    }
+
+    /// The path the caller named for this output.
+    pub(crate) fn destination(&self) -> &Arc<Path> {
+        &self.1
     }
 
     fn state(&self) -> Session {
@@ -339,14 +350,26 @@ impl Write for CancellableFile {
 
 impl OutputWriter {
     /// Fail the session on any error but a retryable interruption, which
-    /// wrote nothing.
+    /// wrote nothing, and name the output in it: a bare "No space left on
+    /// device" does not say which of a run's files filled the disk. The
+    /// error keeps its `io::ErrorKind`; the name rides inside it.
     fn checked<T>(&self, result: io::Result<T>) -> io::Result<T> {
-        if let Err(e) = &result
-            && e.kind() != io::ErrorKind::Interrupted
-        {
-            self.completion.fail();
+        match result {
+            Err(e) if e.kind() != io::ErrorKind::Interrupted => {
+                self.completion.fail();
+                Err(io::Error::from(
+                    Error::from(e).writing(self.completion.destination()),
+                ))
+            }
+            other => other,
         }
-        result
+    }
+
+    fn finished_error() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "output writer already finished",
+        )
     }
 }
 
@@ -354,10 +377,28 @@ impl Write for OutputWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let result = match self.inner.as_mut() {
             Some(inner) => inner.write(buf),
-            None => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "output writer already finished",
-            )),
+            None => Err(Self::finished_error()),
+        };
+        self.checked(result)
+    }
+
+    /// Overridden so an error `write_all` makes up itself (a `WriteZero`)
+    /// fails the session and names the output too, not only one `write`
+    /// passes up.
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        let result = match self.inner.as_mut() {
+            Some(inner) => inner.write_all(buf),
+            None => Err(Self::finished_error()),
+        };
+        self.checked(result)
+    }
+
+    /// Overridden for the same reason as `write_all`: a `Display` that fails
+    /// makes the default `write_fmt` invent an error no `write` returned.
+    fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
+        let result = match self.inner.as_mut() {
+            Some(inner) => inner.write_fmt(args),
+            None => Err(Self::finished_error()),
         };
         self.checked(result)
     }
@@ -396,7 +437,7 @@ impl OutputWriter {
             }
             Err(e) => {
                 self.completion.fail();
-                Err(Error::from(e.into_error()))
+                Err(Error::from(e.into_error()).writing(self.completion.destination()))
             }
         }
     }
@@ -865,6 +906,7 @@ impl Target {
                 .ok()
                 .and_then(|meta| identity_of(&meta)),
         };
+        let session = Completion::new(&dest);
         Ok(Self {
             shape,
             dest,
@@ -874,7 +916,7 @@ impl Target {
             validator,
             state: State::Staged,
             linked: false,
-            session: Completion::new(),
+            session,
             handle,
             dir_identity,
             hooks: Vec::new(),
@@ -1638,7 +1680,8 @@ impl Output {
                 #[cfg(not(feature = "linux-io-uring"))]
                 {
                     Err(Error::invalid_argument(
-                        "--io-uring requires the linux-io-uring feature",
+                        "the io_uring output backend needs the linux-io-uring feature, \
+                         which this build was compiled without",
                     ))
                 }
             }
@@ -1658,7 +1701,8 @@ impl Output {
                 #[cfg(not(feature = "linux-direct-io"))]
                 {
                     Err(Error::invalid_argument(
-                        "--direct-io requires the linux-direct-io feature",
+                        "the O_DIRECT output backend needs the linux-direct-io feature, \
+                         which this build was compiled without",
                     ))
                 }
             }
@@ -1681,7 +1725,12 @@ impl Output {
                 host.cancel.clone(),
             ),
         };
-        let writer = writer.inspect_err(|_| completion.fail())?;
+        // A constructor failure (the staging file, the writer thread's
+        // start, the header write) names the output like every later one.
+        let writer = writer.map_err(|e| {
+            completion.fail();
+            e.writing(completion.destination())
+        })?;
         Ok(writer.with_completion(completion))
     }
 

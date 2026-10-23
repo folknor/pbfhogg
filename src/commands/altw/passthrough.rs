@@ -325,9 +325,9 @@ fn decode_one(
             .elements_skip_metadata()
             .any(|e| matches!(e, crate::Element::Way(_)))
     {
-        return Err(crate::error::Error::invalid_data(format!(
-            "--inject-prepass: blob {} classified as non-way contains a Way element; \
-             refusing to emit unenriched ways",
+        return Err(crate::error::new_indexdata_mismatch(format!(
+            "inject_prepass: blob {} classified as non-way by its indexdata contains a Way \
+             element; refusing to emit unenriched ways",
             desc.blob_index,
         )));
     }

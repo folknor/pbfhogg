@@ -9,7 +9,7 @@
 
 use std::cell::RefCell;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, OversizePart, Result};
 use flate2::Compress;
 use flate2::Compression as FlateCompression;
 use flate2::FlushCompress;
@@ -237,13 +237,12 @@ pub(super) fn frame_blob_into(
     // the check fired only when someone later tried to *read* the file - found
     // by repacking Denmark at `--elements-per-blob 20000000`, which produced a
     // 143 MB blob body and a PBF that pbfhogg itself refuses to open. Fail at
-    // the point where the knob that caused it can still be named.
+    // the write, with a typed error a front end can answer with the knob
+    // that caused it.
     if scratch.blob_buf.len() as u64 >= MAX_BLOB_DATASIZE {
-        let body_len = scratch.blob_buf.len();
-        let error = Error::invalid_argument(format!(
-            "blob body for {blob_type} is {body_len} bytes, must be smaller than \
-             {MAX_BLOB_DATASIZE} (lower --elements-per-blob)"
-        ));
+        let body_len = scratch.blob_buf.len() as u64;
+        let error =
+            crate::error::new_blob_too_large(OversizePart::Body, body_len, MAX_BLOB_DATASIZE);
         scratch.trim_oversize_retained_buffers();
         return Err(error);
     }
@@ -330,11 +329,11 @@ pub(super) fn encode_blob_body(
     // Both sync and pipelined framing use this encoder. Exactly the raw limit
     // is legal; the separate encoded-body limit can still reject its framing.
     if uncompressed.len() as u64 > MAX_BLOB_MESSAGE_SIZE {
-        return Err(Error::invalid_argument(format!(
-            "uncompressed blob payload is {} bytes, must be at most \
-             {MAX_BLOB_MESSAGE_SIZE} (lower --elements-per-blob or reduce element size)",
-            uncompressed.len()
-        )));
+        return Err(crate::error::new_blob_too_large(
+            OversizePart::Payload,
+            uncompressed.len() as u64,
+            MAX_BLOB_MESSAGE_SIZE,
+        ));
     }
     match compression {
         Compression::None => {
@@ -488,17 +487,16 @@ pub(crate) fn encode_blob_header_into(
             return Ok(());
         }
     }
-    let culprit = if way_members.is_some_and(|d| d.len() > 1024) {
-        " (the WayMembers-v1 bitmap, which cannot be dropped without \
-          misreporting way-member nodes; lower --elements-per-blob)"
+    let part = if way_members.is_some_and(|d| d.len() > 1024) {
+        OversizePart::HeaderWayMembers
     } else {
-        " (lower --elements-per-blob)"
+        OversizePart::Header
     };
-    Err(Error::invalid_argument(format!(
-        "BlobHeader for {blob_type} is {} bytes, must be smaller than \
-         {MAX_BLOB_HEADER_SIZE}{culprit}",
-        buf.len()
-    )))
+    Err(crate::error::new_blob_too_large(
+        part,
+        buf.len() as u64,
+        MAX_BLOB_HEADER_SIZE,
+    ))
 }
 
 /// Serialize the `BlobHeader` fields into `buf` with no size policy applied.
@@ -1294,9 +1292,10 @@ mod tests {
     /// a *reader* - `pbfhogg sort` on a Denmark repacked at
     /// `--elements-per-blob 20000000` died with "blob header declares datasize
     /// too big: 143773494 bytes", pointing at the file rather than at the flag
-    /// that made it. The writer knows both.
+    /// that made it. The writer refuses with a typed error a front end answers
+    /// with its own knob.
     #[test]
-    fn an_oversize_blob_body_fails_at_write_time_naming_the_knob() {
+    fn an_oversize_blob_body_fails_at_write_time_with_a_typed_error() {
         let cap = usize::try_from(MAX_BLOB_DATASIZE).unwrap_or(usize::MAX);
         // Incompressible payload, so `Compression::None` keeps the body size.
         let body = vec![0x5Au8; cap + 1];
@@ -1313,12 +1312,17 @@ mod tests {
         let Err(err) = result else {
             panic!("a blob body past the datasize cap must not be written");
         };
-        let msg = err.to_string();
         assert!(
-            (msg.contains("blob body for OSMData") || msg.contains("uncompressed blob payload"))
-                && msg.contains("--elements-per-blob"),
-            "the writer must name the cap and the knob, got: {msg}"
+            matches!(
+                err.kind(),
+                crate::ErrorKind::BlobTooLarge {
+                    part: OversizePart::Body | OversizePart::Payload,
+                    ..
+                }
+            ),
+            "the writer must refuse with BlobTooLarge, got: {err}"
         );
+        assert!(err.to_string().contains("fewer elements per blob"), "{err}");
     }
 
     /// An oversize `WayMembers-v1` bitmap is a hard error, and the message
@@ -1341,7 +1345,7 @@ mod tests {
         .expect_err("an oversize WayMembers bitmap must not be silently dropped");
         let msg = err.to_string();
         assert!(
-            msg.contains("WayMembers-v1 bitmap, which cannot be dropped"),
+            msg.contains("WayMembers-v1 bitmap cannot be dropped"),
             "the error must name the undroppable field, got: {msg}"
         );
     }

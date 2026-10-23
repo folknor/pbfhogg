@@ -153,10 +153,16 @@ use crate::geo::ring_crosses_antimeridian;
 /// - A bare Geometry with type "Polygon" or "MultiPolygon"
 /// - A Feature with a Polygon/MultiPolygon geometry
 /// - A FeatureCollection whose Polygon/MultiPolygon features are all included
+///
+/// A failure to read or parse the file names it.
 pub fn parse_geojson(path: &Path) -> Result<Region> {
-    let data = std::fs::read_to_string(path)?;
+    let data = crate::read::input::read_to_string(path)?;
+    parse_geojson_text(&data).map_err(|e| e.locate(crate::error::Location::in_file(path)))
+}
+
+fn parse_geojson_text(data: &str) -> Result<Region> {
     let value: serde_json::Value =
-        serde_json::from_str(&data).map_err(|e| Error::invalid_data_with("invalid GeoJSON", e))?;
+        serde_json::from_str(data).map_err(|e| Error::invalid_data_with("invalid GeoJSON", e))?;
     let geometries = extract_geometries(&value)?;
     let mut polygons = Vec::new();
     for geometry in geometries {
@@ -409,12 +415,24 @@ pub fn parse_extract_config(
 
 /// Parse a multi-extract config, optionally rebasing its outputs under a CLI
 /// output-directory override.
+///
+/// A failure names the file it is about: the config itself, or the polygon
+/// file an entry names.
 pub fn parse_extract_config_with_output_directory(
     config_path: &Path,
     directory_override: Option<&Path>,
 ) -> Result<(Option<PathBuf>, Vec<ExtractSlot>)> {
-    let data = std::fs::read_to_string(config_path)?;
-    let value: serde_json::Value = serde_json::from_str(&data)
+    let data = crate::read::input::read_to_string(config_path)?;
+    parse_extract_config_text(&data, config_path, directory_override)
+        .map_err(|e| e.locate(crate::error::Location::in_file(config_path)))
+}
+
+fn parse_extract_config_text(
+    data: &str,
+    config_path: &Path,
+    directory_override: Option<&Path>,
+) -> Result<(Option<PathBuf>, Vec<ExtractSlot>)> {
+    let value: serde_json::Value = serde_json::from_str(data)
         .map_err(|e| Error::invalid_data_with("invalid extract config JSON", e))?;
 
     let directory = value

@@ -5,6 +5,8 @@
 
 mod exit_code;
 mod host;
+#[cfg(test)]
+mod library_text_rule;
 mod output;
 mod signals;
 
@@ -417,7 +419,7 @@ fn validate_command(
             unsort_intra,
             block_cap,
             ..
-        } if *unsort_intra && *block_cap < 2 => Err(usage(
+        } if *unsort_intra && block_cap.get() < 2 => Err(usage(
             &["degrade"],
             "--unsort-intra needs --block-cap >= 2: an intra-blob inversion requires at least \
              two same-kind elements inside one output block",
@@ -644,10 +646,11 @@ fn parse_bbox(value: &str) -> Result<pbfhogg::extract::Bbox, String> {
     pbfhogg::extract::parse_bbox(value).map_err(|e| e.to_string())
 }
 
-fn parse_block_cap(value: &str) -> Result<usize, String> {
+/// An element cap (`--elements-per-blob`, `--block-cap`): non-zero by type in
+/// the library, so zero is refused here, where the flag can be named.
+fn parse_element_cap(value: &str) -> Result<std::num::NonZeroUsize, String> {
     match value.parse::<usize>() {
-        Ok(0) => Err("must be > 0".to_owned()),
-        Ok(cap) => Ok(cap),
+        Ok(cap) => std::num::NonZeroUsize::new(cap).ok_or_else(|| "must be > 0".to_owned()),
         Err(_) => Err(format!("'{value}' is not an element count")),
     }
 }
@@ -1080,9 +1083,10 @@ enum Command {
         /// packed input (~228 k/blob) produces a Geofabrik-style packing.
         #[arg(
             long = "elements-per-blob",
-            default_value_t = pbfhogg::block_builder::DEFAULT_ELEMENT_CAP
+            default_value_t = pbfhogg::block_builder::DEFAULT_ELEMENT_CAP,
+            value_parser = parse_element_cap
         )]
-        elements_per_blob: usize,
+        elements_per_blob: std::num::NonZeroUsize,
         #[command(flatten)]
         compression: CompressionArg,
         #[command(flatten)]
@@ -1192,10 +1196,10 @@ enum Command {
         #[arg(
             long = "block-cap",
             default_value_t = pbfhogg::block_builder::DEFAULT_ELEMENT_CAP,
-            value_parser = parse_block_cap,
+            value_parser = parse_element_cap,
             hide = true
         )]
-        block_cap: usize,
+        block_cap: std::num::NonZeroUsize,
         /// Proceed on input without blob-level indexdata, which the decode
         /// path (--unsort, --unsort-intra, --strip-locations, --drop-ids)
         /// would otherwise refuse; it falls back to scanning every blob for
@@ -2043,9 +2047,19 @@ fn detect_input_kind(path: &std::path::Path) -> InputKind {
     }
 }
 
+/// `File::open` of an input this front end reads itself, naming `path` in a
+/// failure (the library's opens do the same): a bare "No such file or
+/// directory" does not say which input it was. The `io::ErrorKind` is kept.
+#[allow(clippy::disallowed_methods)]
+fn open_input(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path).map_err(|e| {
+        std::io::Error::new(e.kind(), format!("failed to open {}: {e}", path.display()))
+    })
+}
+
 fn sniff_input_kind(path: &std::path::Path) -> std::io::Result<InputKind> {
     use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
+    let mut file = open_input(path)?;
     let mut buf = [0u8; 4];
     match file.read_exact(&mut buf) {
         Ok(()) => {}
@@ -2090,7 +2104,7 @@ fn combine_expressions(
 /// `apply-changes --locations-on-ways`) gets none, since `--force` is refused
 /// there. `build-geocode-index` takes `--allow-unindexed`. Every other command
 /// that offers `--force` gets it.
-fn indexdata_advice(command: &Command, matches: &clap::ArgMatches) -> Option<&'static str> {
+fn indexdata_advice(command: &Command, leaf: &clap::ArgMatches) -> Option<&'static str> {
     match command {
         Command::BuildGeocodeIndex { .. } => {
             Some("\n\nOr pass --allow-unindexed to proceed anyway.")
@@ -2104,15 +2118,47 @@ fn indexdata_advice(command: &Command, matches: &clap::ArgMatches) -> Option<&'s
             locations_on_ways: true,
             ..
         } => None,
-        _ => {
-            let mut leaf = matches;
-            while let Some((_, sub)) = leaf.subcommand() {
-                leaf = sub;
-            }
-            leaf.try_contains_id("force")
-                .unwrap_or(false)
-                .then_some("\n\nOr pass --force to proceed anyway.")
-        }
+        _ => leaf
+            .try_contains_id("force")
+            .unwrap_or(false)
+            .then_some("\n\nOr pass --force to proceed anyway."),
+    }
+}
+
+/// The matches of the subcommand actually invoked.
+fn leaf_matches(matches: &clap::ArgMatches) -> &clap::ArgMatches {
+    let mut leaf = matches;
+    while let Some((_, sub)) = leaf.subcommand() {
+        leaf = sub;
+    }
+    leaf
+}
+
+/// Whether the invoked subcommand defines the boolean switch `id` and it was
+/// left off: only then is naming it advice the operator can act on.
+fn switch_on_offer(leaf: &clap::ArgMatches, id: &str) -> bool {
+    leaf.try_get_one::<bool>(id)
+        .ok()
+        .flatten()
+        .is_some_and(|on| !*on)
+}
+
+/// What this command line can be advised to do after a typed refusal; see
+/// [`exit_code::Advice`].
+fn advice(command: &Command, matches: &clap::ArgMatches) -> exit_code::Advice {
+    let leaf = leaf_matches(matches);
+    let element_cap = if leaf.try_contains_id("elements_per_blob").unwrap_or(false) {
+        Some("--elements-per-blob")
+    } else if leaf.try_contains_id("block_cap").unwrap_or(false) {
+        Some("--block-cap")
+    } else {
+        None
+    };
+    exit_code::Advice {
+        indexdata: indexdata_advice(command, leaf),
+        element_cap,
+        allow_version_regression: switch_on_offer(leaf, "allow_version_regression"),
+        ignore_missing_nodes: switch_on_offer(leaf, "ignore_missing_nodes"),
     }
 }
 
@@ -2160,7 +2206,7 @@ fn main() -> process::ExitCode {
         Err(err) => return clap_exit(&err),
     };
 
-    let indexdata_advice = indexdata_advice(&cli.command, &matches);
+    let advice = advice(&cli.command, &matches);
     let mut outcome = Outcome::Positive;
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         // Every flag rule clap cannot express, before anything else looks at
@@ -2990,7 +3036,7 @@ fn main() -> process::ExitCode {
                 output::cli_eprintln!(
                     "Error: {}{}",
                     error_report(e.as_ref()),
-                    output_hint(e.as_ref(), indexdata_advice).unwrap_or_default()
+                    output_hint(e.as_ref(), &advice).unwrap_or_default()
                 );
                 let status = if is_platform_unsupported(e.as_ref()) {
                     ExitStatus::PlatformUnsupported
@@ -3188,6 +3234,12 @@ fn run_check(
                     writeln!(out, "\n---\n")?;
                 }
                 report.write_human(&mut out, &file_name)?;
+                if report.total_violations > report.violations.len() as u64 {
+                    host::cli_note(
+                        "cli.check_index_capped",
+                        format_args!("raise --max-errors to see every violation"),
+                    );
+                }
             }
             if let Some(ref result) = refs_result {
                 if show_ids {
@@ -3350,13 +3402,14 @@ fn run_sort(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stats = pbfhogg::sort::sort(file, output, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("sort.summary"))?;
+    host::note_unverified_claims(stats.passthrough_claimed);
     Ok(())
 }
 
 fn run_repack(
     file: &std::path::Path,
     output: pbfhogg::Output,
-    elements_per_blob: usize,
+    elements_per_blob: std::num::NonZeroUsize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
@@ -3370,7 +3423,7 @@ fn run_degrade(
     file: &std::path::Path,
     output: pbfhogg::Output,
     flags: pbfhogg::degrade::DegradeFlags,
-    block_cap: usize,
+    block_cap: std::num::NonZeroUsize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
@@ -4057,6 +4110,7 @@ fn run_getid(
     };
     let stats = pbfhogg::getid::getid(file, output, &id_set, &opts, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("getid.summary"))?;
+    host::note_unverified_claims(stats.passthrough_claimed);
 
     if let Some(found) = stats.found.as_ref() {
         print_missing_ids(&id_set, found);
@@ -4100,6 +4154,7 @@ fn run_removeid(
     let id_set = sources.resolve(write.direct_reads, host)?;
     let stats = pbfhogg::getid::removeid(file, output, &id_set, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("getid.summary"))?;
+    host::note_unverified_claims(stats.passthrough_claimed);
     Ok(())
 }
 
@@ -4542,6 +4597,7 @@ fn run_merge_pbf(
     let paths: Vec<&std::path::Path> = inputs.iter().map(AsRef::as_ref).collect();
     let stats = pbfhogg::cat::dedupe::merge_pbf(&paths, output, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("cat.dedupe.summary"))?;
+    host::note_unverified_claims(stats.passthrough_claimed);
     Ok(())
 }
 
@@ -4674,7 +4730,7 @@ fn bench_write_loop<W: std::io::Write>(
     // The leading OsmHeader is required like everywhere else: a zero-byte or
     // header-less file is the one missing-header error, not an empty run.
     drop(pbfhogg::ElementReader::open(path, false)?);
-    let reader = pbfhogg::BlobReader::new(BufReader::new(std::fs::File::open(path)?))
+    let reader = pbfhogg::BlobReader::new(BufReader::new(open_input(path)?))
         .diagnostics(host.diagnostics.clone())
         .cancel(host.cancel.clone());
     let mut bb = BlockBuilder::new();
@@ -5034,6 +5090,7 @@ mod short_flag_tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // reads a repository document, not an operator input
     fn the_reference_table_is_the_vocabulary() {
         let doc = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),

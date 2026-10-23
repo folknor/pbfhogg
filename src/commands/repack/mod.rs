@@ -111,7 +111,7 @@ struct WorkerOutput {
 pub fn repack(
     input: &Path,
     output: crate::output::Output,
-    elements_per_blob: usize,
+    elements_per_blob: std::num::NonZeroUsize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
@@ -128,7 +128,7 @@ pub fn repack(
 pub(crate) fn repack_to(
     input: &Path,
     output: &crate::output::Output,
-    elements_per_blob: usize,
+    cap: std::num::NonZeroUsize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
@@ -139,9 +139,7 @@ pub(crate) fn repack_to(
         direct_reads: direct_io,
         force,
     } = *write;
-    if elements_per_blob == 0 {
-        return Err(Error::invalid_argument("--elements-per-blob must be > 0"));
-    }
+    let elements_per_blob = cap.get();
 
     require_indexdata(
         input,
@@ -218,7 +216,7 @@ pub(crate) fn repack_to(
         &shared_file,
         &node_schedule,
         ElementKind::Node,
-        elements_per_blob,
+        cap,
         prealloc_bound,
         compression,
         preserve_locations,
@@ -239,7 +237,7 @@ pub(crate) fn repack_to(
         &shared_file,
         &way_schedule,
         ElementKind::Way,
-        elements_per_blob,
+        cap,
         prealloc_bound,
         compression,
         preserve_locations,
@@ -260,7 +258,7 @@ pub(crate) fn repack_to(
         &shared_file,
         &rel_schedule,
         ElementKind::Relation,
-        elements_per_blob,
+        cap,
         prealloc_bound,
         compression,
         preserve_locations,
@@ -300,7 +298,7 @@ pub(crate) fn repack_to(
             host.diagnostics,
             Warning,
             "repack.cap_never_fired",
-            "--elements-per-blob {elements_per_blob} never fired; \
+            "the element cap of {elements_per_blob} per blob never fired; \
              every per-kind element count fits in a single output blob, \
              so the output is one blob per kind."
         );
@@ -358,10 +356,10 @@ fn emit_phase_counters(kind: &str, s: &PhaseStats) {
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn run_kind_phase(
-    shared_file: &std::sync::Arc<std::fs::File>,
-    schedule: &[(usize, u64, usize)],
+    shared_file: &crate::read::input::InputFile,
+    schedule: &[crate::scan::classify::ScheduledBlob],
     kind: ElementKind,
-    elements_per_blob: usize,
+    cap: std::num::NonZeroUsize,
     prealloc_bound: usize,
     compression: Compression,
     preserve_locations: bool,
@@ -369,6 +367,7 @@ fn run_kind_phase(
     host: &crate::host::Host,
 ) -> Result<PhaseStats> {
     use crate::reorder_buffer::ReorderBuffer;
+    let elements_per_blob = cap.get();
 
     if schedule.is_empty() {
         return Ok(PhaseStats {
@@ -384,7 +383,7 @@ fn run_kind_phase(
     type PhaseResult = crate::Result<WorkerOutput>;
     // Reorder buffer depth: enough to absorb decode-thread variance
     // without holding too many decoded payloads in flight.
-    let mut reorder: ReorderBuffer<PhaseResult> =
+    let mut reorder: ReorderBuffer<WorkerOutput> =
         ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY);
 
     // Same bound as the workers', derived from the input instead of a block:
@@ -392,7 +391,7 @@ fn run_kind_phase(
     // needs at least one byte on the wire). Undershooting only costs a vector
     // growth that in practice never happens; not bounding it at all let a
     // single CLI integer request an unbounded allocation.
-    let mut bb = BlockBuilder::with_element_cap_prealloc(elements_per_blob, prealloc_bound);
+    let mut bb = BlockBuilder::with_element_cap_prealloc(cap, prealloc_bound);
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut pending: Vec<OwnedBlock> = Vec::with_capacity(FRAME_BATCH);
     let mut blobs: u64 = 0;
@@ -409,13 +408,7 @@ fn run_kind_phase(
         None,
         || (),
         |block, _state| -> PhaseResult {
-            worker_split_blob(
-                block,
-                kind,
-                elements_per_blob,
-                preserve_locations,
-                &compression,
-            )
+            worker_split_blob(block, kind, cap, preserve_locations, &compression)
         },
         |seq, r| {
             reorder.push(seq, r);
@@ -423,9 +416,9 @@ fn run_kind_phase(
                 if write_error.is_some() {
                     continue;
                 }
-                match item {
-                    Ok(out) => {
-                        let WorkerOutput { full_framed, tail } = out;
+                {
+                    {
+                        let WorkerOutput { full_framed, tail } = item;
                         let full_count = full_framed.len() as u64 * elements_per_blob as u64;
                         let tail_n = tail.len();
 
@@ -535,9 +528,6 @@ fn run_kind_phase(
                         }
                         elements += full_count + tail_n;
                     }
-                    Err(e) => {
-                        classify_error.get_or_insert(e);
-                    }
                 }
             }
         },
@@ -626,10 +616,11 @@ fn encode_way_full_block(
 fn worker_split_blob(
     block: &crate::PrimitiveBlock,
     kind: ElementKind,
-    cap: usize,
+    cap_nz: std::num::NonZeroUsize,
     preserve_locations: bool,
     compression: &Compression,
 ) -> crate::Result<WorkerOutput> {
+    let cap = cap_nz.get();
     let total = match kind {
         ElementKind::Node => block
             .elements()
@@ -651,7 +642,7 @@ fn worker_split_blob(
     // can never fill more than `total` slots, so that is the honest
     // pre-allocation bound - `repack --elements-per-blob 9000000000000000000`
     // must not ask for a 9-exabyte vector per worker.
-    let mut bb = BlockBuilder::with_element_cap_prealloc(cap, total);
+    let mut bb = BlockBuilder::with_element_cap_prealloc(cap_nz, total);
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut full_framed: Vec<Vec<u8>> = Vec::new();
     let mut tail: KindPayload = match kind {

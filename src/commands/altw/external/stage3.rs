@@ -270,14 +270,19 @@ pub(super) fn stage3_slot_reorder(
 
                         let t_open = std::time::Instant::now();
                         data_buf.clear();
-                        let bucket_file = std::fs::File::open(&paths[bucket_idx])
-                            .map_err(|e| Error::from(e).context("open slot bucket"))?;
+                        let bucket_file = crate::read::input::open(&paths[bucket_idx])?;
                         #[allow(clippy::cast_possible_truncation)]
                         s3_open_ref.fetch_add(t_open.elapsed().as_millis() as u64, Relaxed);
 
                         let t_read = std::time::Instant::now();
-                        std::io::Read::read_to_end(&mut &bucket_file, &mut data_buf)
-                            .map_err(|e| Error::from(e).context("read slot bucket"))?;
+                        std::io::Read::read_to_end(&mut &bucket_file, &mut data_buf).map_err(
+                            |e| {
+                                Error::from(e).context(format!(
+                                    "failed to read slot bucket {}",
+                                    paths[bucket_idx].display()
+                                ))
+                            },
+                        )?;
                         #[cfg(feature = "linux-direct-io")]
                         {
                             s3_fadvise_calls_ref.fetch_add(1, Relaxed);
@@ -488,7 +493,10 @@ fn emit_integrated_intersections(
                 tmp_file
                     .write_all_at(encode_scratch, byte_offset)
                     .map_err(|e| {
-                        Error::from(e).context(format!("write worker tmp blob {blob_idx}"))
+                        Error::from(e).context(format!(
+                            "failed to write way blob {blob_idx}'s payload to {}",
+                            router.worker_path(worker_id as usize).display()
+                        ))
                     })?;
                 #[allow(clippy::cast_possible_truncation)]
                 s3_tmp_pwrite_ns_ref.fetch_add(t_pw.elapsed().as_nanos() as u64, Relaxed);
@@ -568,9 +576,13 @@ mod tests {
     fn empty_bucket_error_aborts_router_with_the_actual_error() {
         let per_way_rcs = parse_per_way_refcount_sidecar_bytes(&[1, 1], 1).expect("sidecar");
         let temp = crate::path_guard::tests::scratch();
-        let worker_file = std::fs::File::create(temp.path().join("worker")).expect("worker file");
-        let router = ConcurrentBlobLocationRouter::new(&per_way_rcs, vec![Arc::new(worker_file)])
-            .expect("router");
+        let worker_path = temp.path().join("worker");
+        let worker_file = std::fs::File::create(&worker_path).expect("worker file");
+        let worker = crate::read::input::InputFile::from_parts(
+            Arc::new(worker_file),
+            Arc::from(worker_path.as_path()),
+        );
+        let router = ConcurrentBlobLocationRouter::new(&per_way_rcs, vec![worker]).expect("router");
         let way_slot_starts = [0];
         let integrated = IntegratedInputs {
             way_slot_starts: &way_slot_starts,

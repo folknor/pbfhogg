@@ -155,9 +155,9 @@ fn run_shard(
 
     let (cp, mp, dp) = shard_xml_paths(scratch, kind, shard_idx)?;
 
-    let mut creates_w = Writer::new(BufWriter::new(crate::scratch::create(&cp)?));
-    let mut modifies_w = Writer::new(BufWriter::new(crate::scratch::create(&mp)?));
-    let mut deletes_w = Writer::new(BufWriter::new(crate::scratch::create(&dp)?));
+    let mut creates_w = Writer::new(BufWriter::new(crate::scratch::create_file(&cp)?));
+    let mut modifies_w = Writer::new(BufWriter::new(crate::scratch::create_file(&mp)?));
+    let mut deletes_w = Writer::new(BufWriter::new(crate::scratch::create_file(&dp)?));
     let mut coord_buf = String::new();
 
     let old_slice = &old_descs[shard.old_start..shard.old_end];
@@ -844,7 +844,13 @@ fn append_and_cleanup(
     src: &crate::scratch::ScratchPath,
     scratch: &crate::scratch::RunScratch,
 ) -> Result<()> {
-    let copied = File::open(src).and_then(|mut f| io::copy(&mut f, out));
+    // Named: a bare "Permission denied" for a scratch file the user never
+    // chose says nothing about where to look.
+    let copied = crate::scratch::open(src)
+        .and_then(|mut f| io::copy(&mut f, out))
+        .map_err(|e| {
+            crate::Error::from(e).context(format!("failed to copy scratch file {}", src.display()))
+        });
     scratch.remove(src);
-    Ok(copied.map(drop)?)
+    copied.map(drop)
 }

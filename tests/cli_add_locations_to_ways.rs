@@ -879,7 +879,7 @@ fn auto_on_sorted_indexed_input_reports_its_choice() {
     );
     let stderr = out.stderr_str();
     assert!(
-        stderr.contains("auto-selected --index-type"),
+        stderr.contains("auto-selected index type"),
         "auto must report its choice; stderr:\n{stderr}",
     );
     assert!(
@@ -907,7 +907,7 @@ fn auto_routes_non_indexed_input_to_sparse_without_estimate() {
     );
     let stderr = out.stderr_str();
     assert!(
-        stderr.contains("auto-selected --index-type sparse (sorted="),
+        stderr.contains("auto-selected index type sparse (sorted="),
         "non-indexed input must route sparse via eligibility; stderr:\n{stderr}",
     );
     assert!(
@@ -1269,8 +1269,8 @@ fn way_ref_near_i64_max_is_a_missing_location_not_an_abort() {
 /// The external backend sizes its id buckets from the node blobs'
 /// indexdata `max_id`, and used to assert (panic) when that exceeded what its
 /// 31-bit bucket-local ids can encode (2^38 with 256 buckets). It is now an
-/// error that points at `--index-type sparse` - and that pointer must be
-/// true, so the same file has to succeed under sparse.
+/// error that points at the sparse index - and that pointer must be true, so
+/// the same file has to succeed under sparse.
 #[test]
 fn node_id_beyond_external_encoding_limit_is_an_error_and_sparse_handles_it() {
     let big = 1_i64 << 39;
@@ -1310,7 +1310,7 @@ fn node_id_beyond_external_encoding_limit_is_an_error_and_sparse_handles_it() {
     );
     let stderr = out.stderr_str();
     assert!(
-        stderr.contains("--index-type sparse") && !stderr.contains("panicked"),
+        stderr.contains("the sparse index has no such limit") && !stderr.contains("panicked"),
         "expected the encoding-limit error, not a panic; stderr:\n{stderr}",
     );
     assert!(

@@ -287,7 +287,7 @@ fn check_refs_inner(
             &node_schedule,
             None,
             || (),
-            |block, &mut ()| -> (u64, u64, Vec<i64>) {
+            |block, &mut ()| -> crate::Result<(u64, u64, Vec<i64>)> {
                 let mut count: u64 = 0;
                 let mut untrackable: u64 = 0;
                 let mut overflow = Vec::new();
@@ -306,7 +306,7 @@ fn check_refs_inner(
                     }
                     count += 1;
                 }
-                (count, untrackable, overflow)
+                Ok((count, untrackable, overflow))
             },
             |_seq, (count, untrackable, overflow)| {
                 overflow_ids.extend(overflow);
@@ -338,7 +338,7 @@ fn check_refs_inner(
             &way_schedule,
             None,
             || (),
-            |block, &mut ()| -> WayBlobResult {
+            |block, &mut ()| -> crate::Result<WayBlobResult> {
                 let mut r = WayBlobResult::default();
                 for el in block.elements_skip_metadata() {
                     if let Element::Way(w) = el {
@@ -369,7 +369,7 @@ fn check_refs_inner(
                         }
                     }
                 }
-                r
+                Ok(r)
             },
             |_seq, r| {
                 overflow_ids.extend(r.overflow_ids);
@@ -413,7 +413,7 @@ fn check_refs_inner(
                 &rel_schedule,
                 None,
                 || (),
-                |block, &mut ()| -> RelBlobResult {
+                |block, &mut ()| -> crate::Result<RelBlobResult> {
                     let mut r = RelBlobResult::default();
                     for el in block.elements_skip_metadata() {
                         if let Element::Relation(rel) = el {
@@ -481,7 +481,7 @@ fn check_refs_inner(
                             }
                         }
                     }
-                    r
+                    Ok(r)
                 },
                 |_seq, r| {
                     overflow_ids.extend(r.overflow_ids);

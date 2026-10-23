@@ -59,7 +59,8 @@ fn unpacked_field_error(message: &str, field: &str) -> Error {
         "renumber: {message}.{field} is written in the unpacked wire form \
          (individually tagged varints). That encoding is spec-legal but the \
          renumber wire-splice rewriter can only patch the length-delimited \
-         packed form. Re-encode the input first, e.g. `pbfhogg cat --clean`."
+         packed form. Re-encoding the input through a full decode writes the \
+         packed form when the field holds a single value."
     ))
 }
 
@@ -87,8 +88,7 @@ fn repeated_field_error(message: &str, field: &str) -> Error {
         "renumber: {message}.{field} appears twice with data; packed field split \
          across segments. Protobuf concatenates such segments, which a byte-level \
          splice cannot express as one contiguous range - the earlier segment would \
-         be copied through unrenumbered. Re-encode the input first, e.g. \
-         `pbfhogg cat --clean`."
+         be copied through unrenumbered."
     ))
 }
 
@@ -101,7 +101,7 @@ fn repeated_message_field_error(message: &str, field: &str) -> Error {
     Error::invalid_data(format!(
         "renumber: {message} carries {field} more than once. Protobuf merges or \
          overrides repeated occurrences, which the wire-splice rewriter does not \
-         reproduce. Re-encode the input first, e.g. `pbfhogg cat --clean`."
+         reproduce."
     ))
 }
 
@@ -130,13 +130,22 @@ pub(super) fn order_error(kind: &str, prev: i64, id: i64) -> Error {
     } else {
         "comes after a larger id"
     };
-    Error::invalid_data(format!(
+    let text = format!(
         "renumber requires {kind} ids to strictly increase in file order, but \
          {kind} {id} {what} ({kind} {prev} precedes it). New ids are assigned by \
          position and references resolved by rank, which agree only on sorted, \
-         duplicate-free input; a Sort.Type_then_ID header claim is not checked. \
-         Sort the input (pbfhogg sort) and remove duplicate ids before renumbering."
-    ))
+         duplicate-free input; a Sort.Type_then_ID header claim is not checked."
+    );
+    // A descent is an ordering fault that sorting cures; a repeated id is
+    // not, so only the former is `Unsorted` (which front ends answer with
+    // sorting advice).
+    if id == prev {
+        Error::invalid_data(format!(
+            "{text} Remove the duplicate ids before renumbering."
+        ))
+    } else {
+        crate::error::new_unsorted(text)
+    }
 }
 
 // The decoder reconstructs deltas modulo 2^64 (the writer encodes them that

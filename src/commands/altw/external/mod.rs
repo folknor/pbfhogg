@@ -127,13 +127,13 @@ impl BucketLayout {
         let max_local = (bw - 1).max(max_node_id.saturating_sub(last_lo));
         if bw > MAX_BUCKET_WIDTH || max_local > u64::from(LOCAL_ID_MASK) {
             return Err(crate::Error::invalid_data(format!(
-                "add-locations-to-ways --index-type external: the input's node \
+                "add-locations-to-ways, external index: the input's node \
                  indexdata advertises max_id {max_node_id}, above the {} this \
                  backend can encode ({num_buckets} buckets of at most {} ids). \
-                 If the input really has node ids that large, use \
-                 --index-type sparse, which has no such limit; if it does not, \
-                 the indexdata is wrong, and `pbfhogg check --index` reports \
-                 which blobs disagree with their contents.",
+                 If the input really has node ids that large, the sparse index \
+                 has no such limit; if it does not, the indexdata is wrong, and \
+                 checking the file's blob metadata reports which blobs disagree \
+                 with their contents.",
                 (num_buckets as u64).saturating_mul(MAX_BUCKET_WIDTH),
                 MAX_BUCKET_WIDTH,
             )));
@@ -393,8 +393,8 @@ mod bucket_math_tests {
             .err()
             .expect("2^38 + 1 must be refused");
         let msg = err.to_string();
-        assert!(msg.contains("--index-type sparse"), "{msg}");
-        assert!(msg.contains("check --index"), "{msg}");
+        assert!(msg.contains("sparse index"), "{msg}");
+        assert!(msg.contains("max_id 274877906945"), "{msg}");
         assert!(BucketLayout::new(u64::MAX, 256).is_err());
         assert!(BucketLayout::new(u64::MAX >> 1, 256).is_err());
     }
@@ -762,16 +762,12 @@ pub(crate) fn external_join_in(
     // indexdata" message. Reject the combination up front with a
     // clear migration hint.
     if !has_indexdata {
-        return Err(crate::Error::invalid_argument(
-            "add-locations-to-ways --index-type external requires indexed input; \
-             --force is not supported on this path because the ID bucket \
-             ranges depend on per-blob indexdata.\n\n\
-             Generate an indexed PBF first:\n\n\
-             \x20 pbfhogg cat <input.osm.pbf> -o indexed.osm.pbf\n\n\
-             Then run add-locations-to-ways against the indexed output, or use \
-             --index-type sparse (which decodes every blob anyway and \
-             therefore tolerates --force).",
-        ));
+        return Err(crate::error::new_missing_indexdata(
+            "add-locations-to-ways with the external index requires indexed input, \
+             even when forced: its ID bucket ranges come from per-blob indexdata. \
+             The sparse index decodes every blob and runs without it.",
+        )
+        .locate(crate::error::Location::in_file(input)));
     }
 
     {
@@ -998,10 +994,7 @@ pub(crate) fn external_join_in(
     crate::debug::emit_marker("EXTJOIN_STAGE2_START");
     let s2_faults_before = crate::debug::read_page_faults();
     let slot_buckets = SlotBuckets::create(scratch, slot_bucket_count)?;
-    let input_pbf = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| crate::Error::from(e).context("open input pbf for stage 2"))?,
-    );
+    let input_pbf = crate::read::input::InputFile::open(input)?;
     let resolved_count = stage2_node_join(
         scratch,
         &id_bucket_counts,
@@ -1054,12 +1047,22 @@ pub(crate) fn external_join_in(
     let worker_tmp_paths: Vec<crate::scratch::ScratchPath> = (0..num_workers)
         .map(|i| radix::payload_path(scratch, i))
         .collect::<crate::Result<_>>()?;
-    let worker_files: Vec<std::sync::Arc<std::fs::File>> = worker_tmp_paths
+    let worker_files: Vec<crate::read::input::InputFile> = worker_tmp_paths
         .iter()
         .map(|p| {
             crate::scratch::create_read_write(p, false)
-                .map(std::sync::Arc::new)
-                .map_err(|e| crate::Error::from(e).context(format!("open worker tmp {p:?}")))
+                .map(|file| {
+                    crate::read::input::InputFile::from_parts(
+                        std::sync::Arc::new(file),
+                        std::sync::Arc::from(p.as_ref()),
+                    )
+                })
+                .map_err(|e| {
+                    crate::Error::from(e).context(format!(
+                        "failed to create stage 3 payload file {}",
+                        p.display()
+                    ))
+                })
         })
         .collect::<crate::Result<_>>()?;
 

@@ -230,8 +230,11 @@ const _: () = assert!(IO_BUF_BYTES.is_multiple_of(crate::write::PAGE_SIZE));
 
 /// Default per-block element cap used by `BlockBuilder::new`.
 ///
-/// Matches the common PBF packing convention used by osmium.
-pub const DEFAULT_ELEMENT_CAP: usize = 8000;
+/// Matches the common PBF packing convention used by osmium. Non-zero by
+/// type, like every element cap: a zero cap is unrepresentable rather than
+/// checked.
+pub const DEFAULT_ELEMENT_CAP: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::MIN.saturating_add(7999);
 
 /// Number of worker threads doing `pwrite`s / `copy_file_range`s in
 /// parallel. 16 is the empirical planet-bench value (commit `80b37dfb`,

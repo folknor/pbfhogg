@@ -64,7 +64,7 @@ impl SortStats {
             writeln!(
                 w,
                 "  plus {} elements in blobs copied through without decoding, per \
-                 their indexdata (unverified - `pbfhogg check --index` checks it)",
+                 their indexdata (unverified)",
                 self.passthrough_claimed,
             )?;
         }
@@ -278,14 +278,17 @@ pub(crate) fn sort_to(
     crate::debug::emit_marker("SORT_WRITER_SETUP_END");
 
     // Open input for random-access reads
-    let mut input_file = File::open(input)?;
+    let mut input_file = crate::read::input::open(input)?;
 
     // copy_file_range / CopyRange setup. The writer thread splices from this
     // handle asynchronously, so it gets its own `dup`ed descriptor owned by an
     // `Arc` that outlives every queued CopyRange - see
     // `PbfWriter::write_raw_copy`. `input_file` stays untouched for the
     // random-access reads below.
-    let input_shared = std::sync::Arc::new(input_file.try_clone()?);
+    let input_shared = crate::read::input::InputFile::from_parts(
+        std::sync::Arc::new(input_file.try_clone()?),
+        std::sync::Arc::from(input),
+    );
     // Buffered output splices with copy_file_range; the io_uring writer
     // services a CopyRange with a pread into a registered buffer followed by
     // a plain write (the linked ReadFixed+WriteFixed chain was removed).
@@ -404,7 +407,13 @@ pub(crate) fn sort_to(
                         &input_shared,
                         &mut copy_run_calls,
                     )?;
-                    write_passthrough_blob(entry, &mut input_file, &mut writer, &mut frame_buf)?;
+                    write_passthrough_blob(
+                        entry,
+                        input,
+                        &mut input_file,
+                        &mut writer,
+                        &mut frame_buf,
+                    )?;
                 }
             }
             count_entry(entry, &mut stats);
@@ -687,22 +696,27 @@ fn detect_overlaps(entries: &[BlobEntry]) -> Vec<bool> {
 #[hotpath::measure]
 fn write_passthrough_blob(
     entry: &BlobEntry,
+    input: &Path,
     input_file: &mut File,
     writer: &mut PbfWriter<FileWriter>,
     frame_buf: &mut Vec<u8>,
 ) -> Result<()> {
+    // Reading and reframing the blob are about the input: located with its
+    // path and the frame offset (cold). The write names the output itself.
+    let in_input = |e: Error| e.locate(crate::error::Location::at_offset(input, entry.file_offset));
     if entry.has_indexdata {
-        read_frame_into(input_file, entry, frame_buf)?;
+        read_frame_into(input_file, entry, frame_buf).map_err(|e| in_input(e.into()))?;
         writer.write_raw(frame_buf)?;
     } else {
         // Reframe with indexdata before writing.
-        read_frame_into(input_file, entry, frame_buf)?;
-        let blob_bytes = extract_blob_bytes(frame_buf)?;
+        read_frame_into(input_file, entry, frame_buf).map_err(|e| in_input(e.into()))?;
+        let blob_bytes = extract_blob_bytes(frame_buf).map_err(in_input)?;
         let reframed = reframe_raw_with_index(
             blob_bytes,
             &entry.index.serialize(),
             entry.tagdata.as_deref(),
-        )?;
+        )
+        .map_err(in_input)?;
         writer.write_raw(&reframed)?;
     }
     Ok(())
@@ -727,7 +741,7 @@ fn try_extend_copy_run(
     entry: &BlobEntry,
     use_copy_range: bool,
     writer: &mut PbfWriter<FileWriter>,
-    input: &std::sync::Arc<std::fs::File>,
+    input: &crate::read::input::InputFile,
     calls: &mut u64,
 ) -> Result<CopyRunStep> {
     if !(entry.has_indexdata && use_copy_range) {
@@ -757,7 +771,7 @@ fn try_extend_copy_run(
 fn flush_copy_run(
     run: &mut Option<(u64, u64)>,
     writer: &mut PbfWriter<FileWriter>,
-    input: &std::sync::Arc<std::fs::File>,
+    input: &crate::read::input::InputFile,
     calls: &mut u64,
 ) -> Result<()> {
     if let Some((start, end)) = run.take() {
@@ -773,7 +787,7 @@ fn flush_copy_run(
 fn flush_copy_run(
     run: &mut Option<(u64, u64)>,
     _writer: &mut PbfWriter<FileWriter>,
-    _input: &std::sync::Arc<std::fs::File>,
+    _input: &crate::read::input::InputFile,
     _calls: &mut u64,
 ) -> Result<()> {
     debug_assert!(
@@ -879,8 +893,7 @@ fn compute_overlap_run_local(
     input_path: &Path,
     cancel: &crate::host::Cancel,
 ) -> crate::Result<(Vec<OwnedBlock>, OverlapCounts)> {
-    let mut input_file =
-        File::open(input_path).map_err(|e| crate::file_reader::open_error(input_path, e))?;
+    let mut input_file = crate::read::input::open(input_path)?;
     let mut bb = BlockBuilder::new();
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut counts = OverlapCounts::default();

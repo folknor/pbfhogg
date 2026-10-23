@@ -297,81 +297,28 @@ elsewhere.
 
 Reported by: write path.
 
-## HYG-020 - Library error text names CLI flags and commands
-
-Anger: 9 - error kinds and texts: API and output.
-
-`require_indexdata` tells the user to run `pbfhogg cat input.osm.pbf -o
-indexed.osm.pbf` and to pass `--force`; `require_sorted*` says `pbfhogg sort`;
-`verify_ids` repeats the cat recipe; renumber suggests `pbfhogg cat --clean`
-and its schedule scan says "run `pbfhogg cat` to add indexdata"; the writer
-constructors say `--io-uring requires ...`; `inspect`'s scan says
-`--direct-io not used...`; `repack` says "--elements-per-blob must be > 0" and
-`BlockBuilder::with_element_cap_prealloc` asserts the same thing with the same
-flag name; framing errors and the WayMembers message name
-`--elements-per-blob`, which altw, apply-changes and extract never had;
-degrade names `--block-cap` and `--unsort`; `HeaderOverrides::parse` names
-`--output-header`; `Output::pbf_writer` and `FileReader::open` say
-`--io-uring` and `--direct-io requires the ... feature`. `error.rs` explicitly refuses to
-name CLI flags ("made the library a dependency of the CLI's argument surface")
-and `export_error` moved one hint to the CLI; the rule is applied in one place
-and broken in about ten. Fix: typed errors (`MissingIndexdata { path }`,
-`Unsorted { path, role }`, `FeatureNotCompiled(&'static str)`,
-`BlobTooLarge { field, size, limit }`) with advice mapped in the CLI;
-`NonZeroUsize` for caps removes the second validation. Enforce with a text rule
-rejecting `pbfhogg ` and `--` flag names in string literals under `src/`, tests
-exempt. The alternative is to accept CLI-first wording and say so in
-`LIBRARY.md`.
-
-Reported by: CLI and plumbing, write path, re-encoding.
-
 ## HYG-022 - Errors that reach the operator name no file, offset or subject
 
 Anger: 7 - message content.
 
-Partly addressed by the typed-error rework: `main` prints `Error: {report}`
-with the whole chain, walker-owned pools (sort, cat, dedupe, altw passthrough,
-renumber, apply-changes, diff shards, the read pipeline's decode tasks) locate
-errors with the true file, blob and offset through `Error::locate`, and the
-read-path decode panic is located. Re-verify each bullet below against the
-code before acting. New gap: the pread-schedule pools carry no blob ordinal,
-so their errors can name at most a frame offset: `scan/classify.rs`
-`parallel_classify_*`, tags-filter pass 2, `extract/multi.rs`, geocode passes
-1.5 and 2, and most of `check/`. Their schedules are `(seq, offset, size)`
-tuples used in about 67 places across 13 files.
+Inputs open and read through `read::input` (path-naming), pread pools locate
+failures with file, blob ordinal and offset, writers name their output
+(`writing <path>`), and `tests/cli_error_naming.rs` forces an open failure
+per input kind and a write failure per writer family. What remains:
 
-- No write-path error names the output file: `check_stream_complete` names a
-  backend but not the path; ENOSPC reaches the operator as "No space left on
-  device"; `parallel_writer` attaches `create {path}` to the copy on `init_tx`
-  but returns the bare `e` from the thread, so init and join results disagree.
-  `multi-extract` is the one caller that wraps with the path, by hand.
-- Open and create failures: `FileReader::open`, `canonicalize` in the alias check (which also aborts on a
-  permission error that has nothing to do with aliasing), `parse_ids_from_file`,
-  `parse_geojson` and `parse_extract_config` (a config with 30 polygon files
-  says "expected value at line 1 column 1"; `read_expressions_file` does name
-  its path), diff and derive scratch creates and `append_and_cleanup` (a bare
-  "Permission denied" for a scratch file the user did not choose), and in
-  geocode `run_stage_b`, `write_admin_data`, every `File::create(...)?`, and
-  `Reader::open`'s header read (the other 18 opens add the path; the header, the
-  most likely missing one, does not; "geocode header too short" likewise).
-- Pread and decode errors: altw `pass A pread: {e}`, `stage2 node pread: {e}`,
-  `relation scan pread: {e}`, `router pread worker {id} blob {idx}`, `open id
-  shard`, `read id shard`, `stat id shard`, `open slot bucket` (though
-  `prepare_bucket` holds the path), `write id shard W{worker_id}` (no bucket),
-  the external metadata scan's "OsmData blob missing indexdata" (no offset);
-  geocode pass 1.5 "pread at {offset}" (no path) and decompression errors (no
-  offset); renumber stage 2d and R2d errors (pass 1 does name `task.seq`);
-  dedupe's "failed to scan block IDs"; the read-path decode-panic error, which
-  holds `blob.offset()` and the path and names neither, on a 2.5 M-blob
-  planet; geocode reader validation errors (no record index or directory).
-
-Fix: the writer owns its `PathBuf` and wraps every escaping error once
-(`WriteError { path, backend, source }`); `open_input(path)` /
-`create_output(path)` wrappers; workers wrap at the boundary with
-`BlobError { path, seq, offset, kind }`; `main` prints the whole chain. Enforce
-with `disallowed-methods` on `File::open`, `File::create` and
-`fs::read_to_string` in `src/` outside the wrappers, and an ENOSPC or forced
-error test asserting the path appears.
+- `path_guard::same_file` (the input/output alias check) now names the path
+  it could not resolve, but still aborts the run on a permission error that
+  has nothing to do with aliasing; whether it should treat that as "not the
+  same file" and let the real open report it is undecided.
+- The `disallowed-methods` entries for `File::open`, `fs::read` and
+  `fs::read_to_string` are denied only in `src/commands/` and the CLI, the
+  same scope as the write-side entries. The library modules outside it that
+  open caller-named inputs (`read/`, `osc/`, `geocode_index/`,
+  `tag_expr.rs`) were converted by hand and nothing keeps them so.
+- No test forces a failure in `cat --dedupe`'s second pass (it re-reads
+  frames pass 1 indexed, so the file would have to change between passes);
+  its read and decode errors are located at the frame offset by inspection
+  only.
 
 Reported by: write path, CLI and plumbing, altw and scanning, geocode index,
 re-encoding, filtering and spatial, read path.
@@ -822,7 +769,7 @@ Reported by: test harness, CLI and plumbing.
 Anger: 8 - clippy.toml with expect_used denied means hundreds of edits.
 
 `clippy.toml` exists but carries only the filesystem choke points for
-output publication and run scratch (`disallowed-methods`, allowed
+output publication, run scratch and path-naming input opens (`disallowed-methods`, allowed
 workspace-wide and denied in `src/commands/` and the CLI);
 `disallowed-types` and `disallowed-macros` are unused; `expect_used`, `print_stderr`, `print_stdout`,
 `arithmetic_side_effects`, `panic`, `unreachable` and `exit` are not enabled;

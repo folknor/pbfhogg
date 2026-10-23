@@ -755,9 +755,8 @@ fn tags_filter_two_pass(
 
         let expr_filter = trusted_blob_filter(expressions, invert, distrust_metadata);
 
-        let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
+        let mut schedule: Vec<crate::scan::classify::ScheduledBlob> = Vec::new();
         let mut blobs_skipped_by_tag: u64 = 0;
-        let mut seq: usize = 0;
         while let Some(meta) = walker.next_header()? {
             if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
                 continue;
@@ -778,8 +777,7 @@ fn tags_filter_two_pass(
                 }
                 continue;
             }
-            schedule.push((seq, meta.data_offset, meta.data_size));
-            seq += 1;
+            schedule.push(crate::scan::classify::ScheduledBlob::from_meta(&meta)?);
         }
         if blobs_skipped_by_tag > 0 {
             crate::host::diag!(
@@ -803,7 +801,7 @@ fn tags_filter_two_pass(
             );
         }
 
-        let shared_file = std::sync::Arc::clone(walker.shared_file());
+        let shared_file = walker.input();
         drop(walker);
 
         /// Per-blob classification result from a worker.
@@ -866,7 +864,7 @@ fn tags_filter_two_pass(
                         }
                     }
                 }
-                result
+                Ok(result)
             },
             |_seq, cr| {
                 for id in cr.matched_nodes {
@@ -970,7 +968,7 @@ fn tags_filter_two_pass(
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input))?;
 
-    let mut schedule: Vec<(u64, usize)> = Vec::new(); // (data_offset, data_size)
+    let mut schedule: Vec<crate::scan::classify::ScheduledBlob> = Vec::new();
     let mut blobs_skipped: u64 = 0;
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
@@ -1000,8 +998,9 @@ fn tags_filter_two_pass(
             continue;
         }
 
-        schedule.push((meta.data_offset, meta.data_size));
+        schedule.push(crate::scan::classify::ScheduledBlob::from_meta(&meta)?);
     }
+    let input_file = walker.input();
     drop(walker);
     crate::debug::emit_marker("TAGSFILTER_PASS2_SCHEDULE_SCAN_END");
 
@@ -1064,9 +1063,10 @@ fn tags_filter_two_pass(
     {
         use std::os::unix::fs::FileExt as _;
 
-        let shared_file = std::sync::Arc::new(
-            std::fs::File::open(input).map_err(|e| crate::file_reader::open_error(input, e))?,
-        );
+        // The walker's own handle and path: a failed blob is located with
+        // the input, its ordinal and its frame offset.
+        let input_ref = &input_file;
+        let shared_file = input_file.file();
 
         // A fixed parallelism caps this pool too, not only the classify
         // passes; `Auto` keeps the decode pool's host-derived sizing.
@@ -1079,31 +1079,25 @@ fn tags_filter_two_pass(
             )
         });
 
-        let decode_items: Vec<(usize, u64, usize)> = schedule
-            .iter()
-            .enumerate()
-            .map(|(i, &(data_offset, data_size))| (i, data_offset, data_size))
-            .collect();
-        let mut willneed = crate::scan::classify::WillneedPrefetch::new(&decode_items);
+        let mut willneed = crate::scan::classify::WillneedPrefetch::new(&schedule);
+        let schedule_ref = &schedule;
 
         type WorkerResult = (
             usize,
             crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats)>,
         );
-        let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(
-            crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
-        );
+        let (desc_tx, desc_rx) =
+            std::sync::mpsc::sync_channel::<usize>(crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH);
         let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
         let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WorkerResult>(
             crate::tunables::POOL_RESULT_CHANNEL_DEPTH,
         );
-        let prefetch_file = std::sync::Arc::clone(&shared_file);
 
         std::thread::scope(|scope| -> Result<()> {
             scope.spawn(move || {
-                for item in decode_items {
-                    willneed.before_dispatch(&prefetch_file, item);
-                    if desc_tx.send(item).is_err() {
+                for (position, entry) in schedule_ref.iter().enumerate() {
+                    willneed.before_dispatch(shared_file, entry);
+                    if desc_tx.send(position).is_err() {
                         break;
                     }
                 }
@@ -1112,7 +1106,7 @@ fn tags_filter_two_pass(
             for _ in 0..decode_threads {
                 let rx = std::sync::Arc::clone(&desc_rx);
                 let tx = result_tx.clone();
-                let file = std::sync::Arc::clone(&shared_file);
+                let file = std::sync::Arc::clone(shared_file);
                 let ids_ref = &id_sets;
                 scope.spawn(move || {
                     let mut read_buf: Vec<u8> = Vec::new();
@@ -1123,7 +1117,7 @@ fn tags_filter_two_pass(
                     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
                     loop {
-                        let (s, data_offset, data_size) = {
+                        let s = {
                             let guard =
                                 rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             match guard.recv() {
@@ -1131,13 +1125,14 @@ fn tags_filter_two_pass(
                                 Err(_) => break,
                             }
                         };
+                        let entry = &schedule_ref[s];
 
                         let r: crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats)> = (|| {
-                            read_buf.resize(data_size, 0);
-                            file.read_exact_at(&mut read_buf, data_offset)?;
+                            read_buf.resize(entry.data_size(), 0);
+                            file.read_exact_at(&mut read_buf, entry.data_offset())?;
                             let mut buf = crate::blob::pool_get(
                                 Some(&worker_pool),
-                                data_size * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
+                                entry.data_size() * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
                             );
                             crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                             let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
@@ -1157,7 +1152,8 @@ fn tags_filter_two_pass(
                             flush_local(&mut bb, &mut output_blocks)?;
                             Ok((std::mem::take(&mut output_blocks), block_stats))
                         })(
-                        );
+                        )
+                        .map_err(|e| input_ref.locate_blob(entry, e));
                         if tx.send((s, r)).is_err() {
                             break;
                         }
@@ -1308,6 +1304,7 @@ fn collect_relation_member_closure(
                         }
                     }
                 }
+                Ok(())
             },
             |cr| results.push(cr),
             host,
@@ -1415,7 +1412,7 @@ fn collect_way_node_dependencies(
                     }
                 }
             }
-            node_ids
+            Ok(node_ids)
         },
         |_seq, node_ids| {
             for id in node_ids {

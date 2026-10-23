@@ -111,8 +111,7 @@ impl MergeOptions {
             return Err(crate::Error::invalid_argument(
                 "apply-changes: force has no effect with locations_on_ways, which \
                  requires an indexed base (an unindexed base would silently lose \
-                 LocationsOnWays on base ways). Generate an indexed PBF first:\n\n\
-                 \x20 pbfhogg cat <input.osm.pbf> -o indexed.osm.pbf",
+                 LocationsOnWays on base ways)",
             ));
         }
         Ok(())
@@ -147,7 +146,7 @@ fn build_header_bytes(
     // general path silently dropped creates on malformed unsorted
     // input.
     if !header.is_sorted() {
-        return Err(crate::Error::invalid_data(
+        return Err(crate::error::new_unsorted(
             "apply-changes requires a sorted base PBF (Sort.Type_then_ID). \
              All nodes must precede all ways, and elements within a kind \
              must be ordered by ID.",
@@ -155,7 +154,7 @@ fn build_header_bytes(
     }
     if locations_on_ways && !header.has_locations_on_ways() {
         return Err(crate::Error::invalid_data(
-            "merge --locations-on-ways requires the base PBF to have LocationsOnWays. \
+            "apply-changes with locations_on_ways requires the base PBF to have LocationsOnWays. \
              Run add-locations-to-ways first to bootstrap coordinates.",
         ));
     }
@@ -189,6 +188,7 @@ fn read_header(
         Some(frame) if frame.blob_type == BlobKind::OsmHeader => {
             let header = decode_blob_to_headerblock(frame.blob_bytes())?;
             build_header_bytes(&header, locations_on_ways, overrides, host)
+                .map_err(|e| e.locate(crate::error::Location::in_file(base_pbf)))
         }
         _ => Err(crate::error::new_missing_header(base_pbf)),
     }
@@ -373,7 +373,7 @@ pub(crate) fn merge_to(
             host.diagnostics,
             Progress,
             "apply_changes.low_needed",
-            "  --locations-on-ways: {total_needed} node IDs needed, {seeded} from diff, {still_needed} from base"
+            "  locations on ways: {total_needed} node IDs needed, {seeded} from diff, {still_needed} from base"
         );
         (
             Some(idx.locations),
@@ -402,7 +402,7 @@ pub(crate) fn merge_to(
     // the input has to stay open past the point this function returns from the
     // call. This used to be a bare `RawFd` kept alive by a `_copy_fd_file`
     // binding whose only job was to not be dropped.
-    let input_file = std::sync::Arc::new(std::fs::File::open(base_pbf)?);
+    let input_file = crate::read::input::InputFile::open(base_pbf)?;
     let splice = backend.supports_copy_range();
 
     // Worker count: a fixed parallelism if supplied, else the default
@@ -618,10 +618,9 @@ pub(crate) fn merge_to(
     }
 
     if locations_on_ways && final_stats.loc_missing != 0 && !ignore_missing_nodes {
-        return Err(crate::Error::invalid_data(format!(
-            "cannot write LocationsOnWays: {} referenced node(s) could not be resolved; use --ignore-missing-nodes to retain the legacy (0,0) fallback",
-            final_stats.loc_missing
-        )));
+        return Err(crate::error::new_missing_node_locations(
+            final_stats.loc_missing,
+        ));
     }
 
     // No summary here: the caller renders the returned stats, as for every

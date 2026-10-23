@@ -7,32 +7,52 @@
 //!
 //! Cross-device copies (EXDEV) fall back to `pread` + `write` in userspace.
 //! Requires the `linux-direct-io` feature.
+//!
+//! Errors name what they can: a failed `copy_file_range` names the input and
+//! the byte range (the syscall does not say which end failed; the writer adds
+//! the output's name outside it), a failed fallback read is located in the
+//! input at its offset, and a failed fallback write is left to the writer,
+//! which names the output.
 
 use std::io;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd as _, RawFd};
 
-/// Copy `len` bytes between file descriptors using `copy_file_range(2)`.
+use crate::error::{Error, Location, Result};
+use crate::read::input::InputFile;
+
+/// A failed `copy_file_range` of `start..end` from `input`.
+#[cold]
+fn copy_error(err: io::Error, input: &InputFile, start: u64, end: u64) -> Error {
+    Error::from(err).context(format!(
+        "failed to copy bytes {start}..{end} of {}",
+        input.path().display()
+    ))
+}
+
+/// Copy `len` bytes from `input` at `offset` to `out_fd` using
+/// `copy_file_range(2)`.
 ///
-/// Uses an explicit input offset (does not change `in_fd`'s file position),
-/// safe when `in_fd` is wrapped in a `BufReader` or `DirectReader`.
-/// Output uses the fd's current position (sequential write).
+/// Uses an explicit input offset (does not change the input's file
+/// position), safe when the input is also read through a `BufReader` or
+/// `DirectReader`. Output uses the fd's current position (sequential write).
 ///
 /// `cancel` is checked before every `copy_file_range` call: a coalesced
 /// passthrough run can span the whole input (sort of an already-sorted
 /// planet is one range), and the kernel copies at most about 2 GiB per call,
 /// so this is the point where a cancelled run stops splicing. The error is
-/// `ErrorKind::Cancelled` carried in an `io::Error` of kind `Other`, which no
-/// `Write` layer retries.
+/// `ErrorKind::Cancelled`.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub(crate) fn copy_range(
-    in_fd: RawFd,
+    input: &InputFile,
     out_fd: RawFd,
     mut offset: u64,
     mut len: u64,
     cancel: &crate::host::Cancel,
-) -> io::Result<()> {
+) -> Result<()> {
+    let in_fd = input.file().as_raw_fd();
+    let (start, end) = (offset, offset.saturating_add(len));
     while len > 0 {
-        cancel.check().map_err(io::Error::from)?;
+        cancel.check()?;
         let mut off_in = offset as i64;
         // Safety: fds are valid and open. off_in is explicit (doesn't change
         // in_fd position). off_out is NULL (uses out_fd's current position).
@@ -50,14 +70,16 @@ pub(crate) fn copy_range(
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EXDEV) {
                 // Cross-device: fall back to pread+write.
-                return copy_range_fallback(in_fd, out_fd, offset, len, cancel);
+                return copy_range_fallback(input, out_fd, offset, len, cancel);
             }
-            return Err(err);
+            return Err(copy_error(err, input, start, end));
         }
         if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "copy_file_range returned 0",
+            return Err(copy_error(
+                io::Error::new(io::ErrorKind::UnexpectedEof, "copy_file_range returned 0"),
+                input,
+                start,
+                end,
             ));
         }
         let n = n.cast_unsigned() as u64;
@@ -67,7 +89,8 @@ pub(crate) fn copy_range(
     Ok(())
 }
 
-/// Fallback for cross-device copies: pread from `in_fd` at `offset`, write to `out_fd`.
+/// Fallback for cross-device copies: pread from `input` at `offset`, write
+/// to `out_fd`.
 ///
 /// **Single-threaded output only.** Uses position-based `write_all`, which
 /// advances `out_fd`'s file position. Parallel writers that call
@@ -78,30 +101,35 @@ pub(crate) fn copy_range(
 /// primitive rather than reaching for this one.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn copy_range_fallback(
-    in_fd: RawFd,
+    input: &InputFile,
     out_fd: RawFd,
     mut offset: u64,
     mut len: u64,
     cancel: &crate::host::Cancel,
-) -> io::Result<()> {
+) -> Result<()> {
     use std::io::Write;
     use std::os::unix::io::FromRawFd;
 
+    let in_fd = input.file().as_raw_fd();
     let mut buf = vec![0u8; crate::write::IO_BUF_BYTES];
     // Wrap in ManuallyDrop so we don't close the fd when done - caller owns it.
     let mut out = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(out_fd) });
     // Read from in_fd using pread (doesn't change file position).
     while len > 0 {
-        cancel.check().map_err(io::Error::from)?;
+        cancel.check()?;
         let chunk = buf.len().min(len as usize);
         let n = unsafe { libc::pread(in_fd, buf.as_mut_ptr().cast(), chunk, offset as i64) };
         if n < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(read_error(io::Error::last_os_error(), input, offset));
         }
         if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "pread returned 0 during cross-device copy",
+            return Err(read_error(
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "pread returned 0 during cross-device copy",
+                ),
+                input,
+                offset,
             ));
         }
         let n = n.cast_unsigned();
@@ -110,4 +138,10 @@ fn copy_range_fallback(
         len -= n as u64;
     }
     Ok(())
+}
+
+/// A failed read of `input` at `offset` during a cross-device copy.
+#[cold]
+pub(crate) fn read_error(err: io::Error, input: &InputFile, offset: u64) -> Error {
+    Error::from(err).locate(Location::at_offset(input.path(), offset))
 }

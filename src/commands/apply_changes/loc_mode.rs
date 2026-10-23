@@ -49,7 +49,7 @@ impl<'a> LocMode<'a> {
             Self::Off => Ok(None),
             Self::Required(map) => Ok(Some(map)),
             Self::Pending => Err(crate::Error::internal(format!(
-                "apply-changes --locations-on-ways: way {way_id} reached the writer before \
+                "apply-changes with locations_on_ways: way {way_id} reached the writer before \
                  the node coordinate map was published; refusing to write it without its \
                  LocationsOnWays coordinates"
             ))),

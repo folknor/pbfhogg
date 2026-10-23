@@ -221,7 +221,7 @@ impl BlockBuilder {
     /// Equivalent to `BlockBuilder::with_element_cap_prealloc(
     /// DEFAULT_ELEMENT_CAP, DEFAULT_ELEMENT_CAP)`.
     pub fn new() -> Self {
-        Self::with_element_cap_prealloc(DEFAULT_ELEMENT_CAP, DEFAULT_ELEMENT_CAP)
+        Self::with_element_cap_prealloc(DEFAULT_ELEMENT_CAP, DEFAULT_ELEMENT_CAP.get())
     }
 
     /// Create a new, empty block builder with a caller-supplied per-block
@@ -242,15 +242,11 @@ impl BlockBuilder {
     /// Compressed input may contain more elements than bytes; the vectors can
     /// still grow beyond the budget, and `cap` remains the flush threshold.
     ///
-    /// # Panics
-    ///
-    /// Panics if `cap == 0`. The `repack` and `degrade` command paths validate
-    /// their caller-supplied caps before calling this low-level constructor.
-    pub fn with_element_cap_prealloc(cap: usize, prealloc_bound: usize) -> Self {
-        assert!(
-            cap > 0,
-            "BlockBuilder::with_element_cap_prealloc: cap must be > 0"
-        );
+    /// A zero cap is unrepresentable (`NonZeroUsize`), so neither this
+    /// constructor nor the commands that take a cap from their caller check
+    /// for one.
+    pub fn with_element_cap_prealloc(cap: std::num::NonZeroUsize, prealloc_bound: usize) -> Self {
+        let cap = cap.get();
         let prealloc = cap.min(prealloc_bound.max(1));
         // dense_keys_vals carries 2*N entries on average for tagless nodes
         // (one key/val pair plus a 0 delimiter is more typical, but the
@@ -1454,10 +1450,14 @@ mod tests {
     /// different size than the caller asked for, on some inputs and not
     /// others. The split shipped with no test at all, which is how a
     /// conflation would have reached a release unnoticed.
+    fn cap(n: usize) -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(n).expect("test caps are non-zero")
+    }
+
     #[test]
     fn the_prealloc_bound_clamps_allocation_without_moving_the_cap() {
         // Bound far below the cap: the flush point must still be the cap.
-        let mut bb = BlockBuilder::with_element_cap_prealloc(5, 1);
+        let mut bb = BlockBuilder::with_element_cap_prealloc(cap(5), 1);
         for id in 1..=5 {
             assert!(
                 !bb.should_flush(),
@@ -1470,8 +1470,8 @@ mod tests {
         assert!(bb.should_flush(), "a cap of 5 must flush at 5 elements");
 
         // A bound of zero is still a legal request and must not panic or
-        // collapse the cap - only `cap == 0` is rejected.
-        let mut bb = BlockBuilder::with_element_cap_prealloc(2, 0);
+        // collapse the cap.
+        let mut bb = BlockBuilder::with_element_cap_prealloc(cap(2), 0);
         bb.add_node(1, 0, 0, [("k", "v")], None);
         assert!(!bb.should_flush());
         bb.add_node(2, 0, 0, [("k", "v")], None);
@@ -1480,7 +1480,7 @@ mod tests {
         // Paired counterpart: a bound above the cap changes nothing, so the
         // assertions above are about the clamp rather than about the cap
         // having been broken generally.
-        let mut bb = BlockBuilder::with_element_cap_prealloc(5, usize::MAX);
+        let mut bb = BlockBuilder::with_element_cap_prealloc(cap(5), usize::MAX);
         for id in 1..=4 {
             bb.add_node(id, 0, 0, [("k", "v")], None);
         }
@@ -1498,7 +1498,7 @@ mod tests {
     /// used to abort the process and asserts the builder is merely empty.
     #[test]
     fn an_absurd_cap_does_not_allocate_absurdly() {
-        let bb = BlockBuilder::with_element_cap_prealloc(usize::MAX / 2, 64);
+        let bb = BlockBuilder::with_element_cap_prealloc(cap(usize::MAX / 2), 64);
         assert!(
             !bb.should_flush(),
             "a fresh builder holds nothing regardless of its cap"

@@ -150,11 +150,11 @@ fn fill_buffer<T>(
         // precondition of this merge, so a mixed block means the input does
         // not meet it - say so rather than quietly dropping elements.
         if wrong_type_seen {
-            return Err(Error::invalid_data(
+            return Err(crate::error::new_unsorted(
                 "streaming merge-join: input contains a mixed-type block, so elements \
                  of a later type would be consumed and discarded by an earlier phase. \
                  This merge requires Sort.Type_then_ID input with one element type per \
-                 block; re-sort the file first with `pbfhogg sort`.",
+                 block.",
             ));
         }
 
@@ -527,10 +527,10 @@ fn next_blob_for_kind(
             // exactly what `degrade --unsort` produces. This used to
             // `continue`, which discarded the blob and every element in it
             // for the rest of the run, with no error and no count anomaly.
-            return Err(Error::invalid_data(format!(
+            return Err(crate::error::new_unsorted(format!(
                 "block-pair merge: found a {} blob during the {} phase. The input's header \
                  claims Sort.Type_then_ID but its blobs are not in canonical order \
-                 (nodes, then ways, then relations); re-sort it first with `pbfhogg sort`.",
+                 (nodes, then ways, then relations).",
                 index.kind.as_str(),
                 kind.as_str(),
             )));
@@ -594,11 +594,10 @@ impl BlobOrderGuard {
             self.watermark
                 .observe(index.kind.ordinal(), index.min_id, index.max_id)
         {
-            return Err(Error::invalid_data(format!(
+            return Err(crate::error::new_unsorted(format!(
                 "block-pair merge: a {} blob starting at id {} follows {} \
                  output already reaching id {previous_id}. The input's header claims \
-                 Sort.Type_then_ID but its blobs are not in canonical order; re-sort it \
-                 first with `pbfhogg sort`.",
+                 Sort.Type_then_ID but its blobs are not in canonical order.",
                 index.kind.as_str(),
                 crate::osm_id::blob_osm_first_id(index.min_id, index.max_id),
                 ElementKind::from_ordinal(previous_kind).map_or("unknown", ElementKind::as_str),
@@ -842,11 +841,10 @@ fn check_claimed_max(
     }
     let claimed_last = blob_last(index);
     if crate::osm_id::osm_id_cmp(claimed_last, merge_up_to).is_le() {
-        return Err(Error::invalid_data(format!(
+        return Err(crate::error::new_indexdata_mismatch(format!(
             "block-pair merge: the {side} blob's indexdata claims its last ID is \
              {claimed_last}, but the block still holds elements past the merge boundary \
-             {merge_up_to}. The stored blob metadata does not match the blob's contents; \
-             re-generate the file's indexdata (for example with `pbfhogg cat`)."
+             {merge_up_to}. The stored blob metadata does not match the blob's contents."
         )));
     }
     Ok(())

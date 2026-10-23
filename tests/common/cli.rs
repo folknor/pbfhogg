@@ -189,6 +189,36 @@ impl CliInvoker {
         self
     }
 
+    /// Cap the size of any file the child writes at `bytes` (`RLIMIT_FSIZE`),
+    /// with `SIGXFSZ` ignored, so a write that would extend a file past it
+    /// fails with `EFBIG` ("File too large") instead of killing the child: a
+    /// forced write failure on any filesystem, for tests of how one is
+    /// reported. Pipes (stdout, stderr) are not files and are not capped.
+    #[cfg(target_os = "linux")]
+    pub fn file_size_limit(mut self, bytes: u64) -> Self {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: the closure runs between fork and exec and calls only
+        // async-signal-safe functions (`signal`, `setrlimit`).
+        unsafe {
+            self.cmd.pre_exec(move || {
+                if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut limit: libc::rlimit = std::mem::zeroed();
+                if libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // The soft limit only: the hard one stays where it is.
+                limit.rlim_cur = bytes.min(limit.rlim_max);
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        self
+    }
+
     /// Set bytes to feed on the binary's stdin.
     pub fn stdin_bytes(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.stdin = Some(bytes.into());

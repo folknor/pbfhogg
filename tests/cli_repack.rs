@@ -233,7 +233,7 @@ fn repack_grow_collapses_to_one_blob_per_kind() {
     // Cap >> per-kind totals (60 nodes, 12 ways, 3 rels): no mid-stream
     // flush, one output blob per kind.
     let out = run_repack(&input, &output, 8000);
-    out.assert_stderr_contains("--elements-per-blob 8000 never fired");
+    out.assert_stderr_contains("element cap of 8000 per blob never fired");
 
     let original = read_normalized(&input);
     let repacked = read_normalized(&output);

@@ -353,9 +353,8 @@ fn warn_unindexed_triple_scan(indexed: bool, host: &crate::host::Host) {
             "check.ids.unindexed_triple_scan",
             "input has no blob-level indexdata, so every blob is \
              decompressed three times - once per element kind, because an \
-             unindexed blob has to be scheduled as all three. Generate an \
-             indexed copy with `pbfhogg cat input.osm.pbf -o indexed.osm.pbf` \
-             to check it in a single pass."
+             unindexed blob has to be scheduled as all three. An indexed copy \
+             is checked in a single pass."
         );
         // The schedule walker would add its unindexed-filter note for the
         // same condition; this warning already says it.
@@ -489,8 +488,8 @@ fn verify_ids_streaming_parallel(
 /// the merge skips the duplicate translation step.
 #[allow(clippy::type_complexity)]
 fn verify_single_kind_streaming(
-    shared_file: &std::sync::Arc<std::fs::File>,
-    schedule: &[(usize, u64, usize)],
+    shared_file: &crate::read::input::InputFile,
+    schedule: &[crate::scan::classify::ScheduledBlob],
     elem_type: &'static str,
     max_errors_remaining: Option<usize>,
     extract_id: impl Fn(&crate::Element) -> Option<i64> + Send + Sync,
@@ -508,7 +507,7 @@ fn verify_single_kind_streaming(
         schedule,
         None,
         || (),
-        |block, _state| -> BlobVerifyResult {
+        |block, _state| -> Result<BlobVerifyResult> {
             let mut r = BlobVerifyResult::empty();
             let mut prev: Option<i64> = None;
             for el in block.elements_skip_metadata() {
@@ -530,7 +529,7 @@ fn verify_single_kind_streaming(
                     prev = Some(id);
                 }
             }
-            r
+            Ok(r)
         },
         |seq, r| {
             per_blob[seq] = Some(r);
@@ -804,8 +803,8 @@ fn verify_ids_full_parallel(
 /// cross-blob monotonicity, duplicate violation translation, count sum.
 #[allow(clippy::type_complexity)]
 fn verify_single_kind_parallel(
-    shared_file: &std::sync::Arc<std::fs::File>,
-    schedule: &[(usize, u64, usize)],
+    shared_file: &crate::read::input::InputFile,
+    schedule: &[crate::scan::classify::ScheduledBlob],
     id_set: &mut IdSet,
     elem_type: &'static str,
     max_errors_remaining: Option<usize>,
@@ -825,7 +824,7 @@ fn verify_single_kind_parallel(
         schedule,
         None,
         || (),
-        |block, _state| -> BlobVerifyResult {
+        |block, _state| -> Result<BlobVerifyResult> {
             let mut r = BlobVerifyResult::empty();
             let mut prev: Option<i64> = None;
             for el in block.elements_skip_metadata() {
@@ -855,7 +854,7 @@ fn verify_single_kind_parallel(
                     }
                 }
             }
-            r
+            Ok(r)
         },
         |seq, r| {
             per_blob[seq] = Some(r);
@@ -925,9 +924,9 @@ fn verify_single_kind_parallel(
 /// Emits one `TypeOrder` violation per inversion found (bounded at three:
 /// node→way, node→relation, way→relation).
 fn check_type_order(
-    node_sched: &[(usize, u64, usize)],
-    way_sched: &[(usize, u64, usize)],
-    rel_sched: &[(usize, u64, usize)],
+    node_sched: &[crate::scan::classify::ScheduledBlob],
+    way_sched: &[crate::scan::classify::ScheduledBlob],
+    rel_sched: &[crate::scan::classify::ScheduledBlob],
     violations: &mut Vec<IdViolation>,
     total_violations: &mut u64,
     max_errors: Option<usize>,
@@ -946,10 +945,11 @@ fn check_type_order(
     // pairwise checks below are sufficient: node<way and way<rel give
     // node<rel transitively. A third (max_rel vs min_node) would fire on
     // every correctly-ordered file.
-    let max_node = node_sched.iter().map(|(_, o, _)| *o).max();
-    let min_way = way_sched.iter().map(|(_, o, _)| *o).min();
-    let max_way = way_sched.iter().map(|(_, o, _)| *o).max();
-    let min_rel = rel_sched.iter().map(|(_, o, _)| *o).min();
+    let offset = crate::scan::classify::ScheduledBlob::frame_start;
+    let max_node = node_sched.iter().map(offset).max();
+    let min_way = way_sched.iter().map(offset).min();
+    let max_way = way_sched.iter().map(offset).max();
+    let min_rel = rel_sched.iter().map(offset).min();
 
     if let (Some(mn), Some(mw)) = (max_node, min_way)
         && mn > mw

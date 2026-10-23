@@ -57,9 +57,13 @@ struct BlobDescriptor {
 
 /// Load the ref-count sidecar and compute prefix sums for slot_start values.
 pub(super) fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
+    load_ref_count_sidecar_in(path, total_slots)
+        .map_err(|e| e.locate(crate::error::Location::in_file(path)))
+}
+
+fn load_ref_count_sidecar_in(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
     use std::io::Read as _;
-    let file = std::fs::File::open(path)
-        .map_err(|e| Error::from(e).context("failed to open ref count sidecar"))?;
+    let file = crate::read::input::open(path)?;
     let bytes = file.metadata()?.len();
     if bytes < 8 {
         return Err(Error::internal("ref count sidecar is too small"));
@@ -234,10 +238,7 @@ pub(super) fn stage4_assembly(
     crate::debug::emit_marker("EXTJOIN_S4_SCHEDULE_END");
 
     // Open shared file for worker pread.
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| Error::from(e).context(format!("failed to open {}", input.display())))?,
-    );
+    let shared_file = std::sync::Arc::new(crate::read::input::open(input)?);
 
     let mut writer = writer_from_header(
         output,
@@ -709,7 +710,12 @@ pub(super) fn stage4_assembly(
                     } => {
                         let t_pread = std::time::Instant::now();
                         frame_read_buf.resize(frame_size, 0);
-                        shared_file.read_exact_at(&mut frame_read_buf, frame_offset)?;
+                        shared_file
+                            .read_exact_at(&mut frame_read_buf, frame_offset)
+                            .map_err(|e| {
+                                Error::from(e)
+                                    .locate(crate::error::Location::at_offset(input, frame_offset))
+                            })?;
                         #[allow(clippy::cast_possible_truncation)]
                         {
                             *s4_passthrough_pread_ms += t_pread.elapsed().as_millis() as u64;

@@ -4,6 +4,41 @@
 
 ### Breaking
 
+- **Element caps are `NonZeroUsize`.** `repack::repack`'s
+  `elements_per_blob`, `degrade::degrade`'s `block_cap`,
+  `BlockBuilder::with_element_cap_prealloc` and
+  `block_builder::DEFAULT_ELEMENT_CAP` take or are a `NonZeroUsize`, so a
+  zero cap cannot be passed rather than being refused at run time.
+
+- **`PbfWriter::write_raw_copy` takes a `&read::input::InputFile`** (an open
+  file together with the path it came from, `InputFile::open(path)`) instead
+  of an `&Arc<File>`, so a failed copy names the input and the byte range.
+
+- **Library errors name no CLI command or flag.** Refusals that used to
+  carry `pbfhogg ...` recipes or `--flag` advice in their text are typed
+  instead, and a front end adds its own advice: new `ErrorKind::Unsorted`,
+  `IndexdataMismatch`, `MissingNodeLocations`, `BlobTooLarge` (with the new
+  `OversizePart`) and `VersionRegression`. `MissingIndexdata`'s text no
+  longer includes the `pbfhogg cat` recipe. Code that matched on error text
+  should match on the kind. The `pbfhogg` CLI prints the same advice as
+  before, now naming the actual input.
+
+- **Errors name their files.** A failed open or read of an input (PBF, OSC,
+  ID list, GeoJSON, extract config, expressions file, geocode index file)
+  says `failed to open <path>` or is located `(in <path>, ...)`; a failed
+  pread in a parallel scan names the file, blob and byte offset; a failed
+  write says `writing <output>: ...` (an `ENOSPC` used to arrive as a bare
+  "No space left on device"). An `io::Error` returned by an `Output` writer
+  now carries the library error inside it, so its `raw_os_error()` is
+  `None`; the original OS error is reachable through
+  `pbfhogg::Error::from(err).kind()`.
+
+- **Diagnostic wording changes:** `add-locations-to-ways`' automatic choice
+  reads `auto-selected index type <type> (...)` (was `--index-type`),
+  `repack`'s unused-cap note reads `the element cap of N per blob never
+  fired`, and `degrade`'s summary lists the transformations applied by name
+  (`applied: unsort strip_locations`, was `--unsort --strip-locations`).
+
 - **`HeaderBuilder::from_header` is removed.** Build the header from the
   fields you want it to declare (`bbox`, `source`, the replication setters,
   `historical`, `sorted`). To carry an input header's bounding box as it was

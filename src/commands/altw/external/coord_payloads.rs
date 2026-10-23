@@ -95,7 +95,9 @@ enum StraddlerPartial {
 /// Blob-ordered concurrent router. Stage 3 producers publish; stage 4
 /// consumers wait.
 pub(super) struct ConcurrentBlobLocationRouter {
-    worker_files: Vec<std::sync::Arc<std::fs::File>>,
+    /// Each stage-3 worker's payload file and its path (for naming it in a
+    /// failed read or write).
+    worker_files: Vec<crate::read::input::InputFile>,
     slots: Vec<std::sync::Mutex<Option<BlobLocation>>>,
     // Partial-straddler staging. Only way-blob indices that actually
     // straddle a slot-bucket boundary appear in this map (a few hundred
@@ -143,7 +145,7 @@ impl ConcurrentBlobLocationRouter {
     /// `mark_producer_done` after stage 3 joins.
     pub(super) fn new(
         per_way_rcs: &PerWayRcs,
-        worker_files: Vec<std::sync::Arc<std::fs::File>>,
+        worker_files: Vec<crate::read::input::InputFile>,
     ) -> Result<Self> {
         let num_way_blobs = per_way_rcs.num_blobs();
         let mut slots: Vec<std::sync::Mutex<Option<BlobLocation>>> =
@@ -186,7 +188,13 @@ impl ConcurrentBlobLocationRouter {
     /// workers call `write_all_at` on this; stage 4 workers' preads
     /// come through `pread_blob_payload` on the same `&File`.
     pub(super) fn worker_file(&self, worker_id: usize) -> &std::sync::Arc<std::fs::File> {
-        &self.worker_files[worker_id]
+        self.worker_files[worker_id].file()
+    }
+
+    /// The path of a stage-3 worker's payload file, for naming it in an
+    /// error.
+    pub(super) fn worker_path(&self, worker_id: usize) -> &std::path::Path {
+        self.worker_files[worker_id].path()
     }
 
     /// Publish a fully-contained blob's payload location. Called by
@@ -437,12 +445,14 @@ impl ConcurrentBlobLocationRouter {
                 let len = byte_length as usize;
                 buf.resize(len, 0);
                 if len > 0 {
-                    self.worker_files[worker_id as usize]
-                        .read_exact_at(buf, byte_offset)
-                        .map_err(|e| {
-                            Error::from(e)
-                                .context(format!("router pread worker {worker_id} blob {blob_idx}"))
-                        })?;
+                    let worker = &self.worker_files[worker_id as usize];
+                    worker.file().read_exact_at(buf, byte_offset).map_err(|e| {
+                        Error::from(e).context(format!(
+                            "failed to read way blob {blob_idx}'s payload at byte offset \
+                             {byte_offset} of {}",
+                            worker.path().display()
+                        ))
+                    })?;
                 }
             }
             BlobLocation::Straddler { bytes } => {
@@ -664,8 +674,12 @@ pub(super) fn load_per_way_refcount_sidecar_indexed(
     path: &Path,
     num_way_blobs: usize,
 ) -> Result<PerWayRcs> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| Error::from(e).context("open per-way refcount sidecar"))?;
+    load_per_way_refcount_sidecar_in(path, num_way_blobs)
+        .map_err(|e| e.locate(crate::error::Location::in_file(path)))
+}
+
+fn load_per_way_refcount_sidecar_in(path: &Path, num_way_blobs: usize) -> Result<PerWayRcs> {
+    let file = crate::read::input::open(path)?;
     let data = if file.metadata()?.len() == 0 {
         RefCountBytes::Empty
     } else {

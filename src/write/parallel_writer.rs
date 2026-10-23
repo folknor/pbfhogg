@@ -46,8 +46,6 @@ use std::fs::File;
 #[cfg(feature = "linux-direct-io")]
 use std::io;
 use std::os::unix::fs::FileExt;
-#[cfg(feature = "linux-direct-io")]
-use std::os::unix::io::RawFd;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -70,13 +68,14 @@ enum WriteOp {
     /// Kernel-space `copy_file_range` from `(in_file, src_offset)` to
     /// `(out_fd, out_offset)` for `len` bytes.
     ///
-    /// Holds the input as an `Arc<File>` rather than a `RawFd` so the
+    /// Holds the input as an owned handle rather than a `RawFd` so the
     /// descriptor cannot be closed - or recycled onto an unrelated file - by
-    /// the producer while this op sits in a pool worker's queue.
+    /// the producer while this op sits in a pool worker's queue, and with
+    /// its path, so a failed read or splice names the file.
     #[cfg(feature = "linux-direct-io")]
     CopyRange {
         out_offset: u64,
-        in_file: std::sync::Arc<std::fs::File>,
+        in_file: crate::read::input::InputFile,
         src_offset: u64,
         len: u64,
     },
@@ -595,15 +594,7 @@ fn worker_loop(
                 src_offset,
                 len,
             } => {
-                use std::os::unix::io::AsRawFd;
-                let r = copy_range_to_fd(
-                    file,
-                    in_file.as_raw_fd(),
-                    src_offset,
-                    out_offset,
-                    len,
-                    cancel,
-                );
+                let r = copy_range_to_fd(file, &in_file, src_offset, out_offset, len, cancel);
                 // The Arc is held across the splice, so the input cannot be
                 // closed out from under the kernel copy.
                 drop(in_file);
@@ -631,7 +622,7 @@ fn worker_loop(
 )]
 fn copy_range_to_fd(
     out: &File,
-    in_fd: RawFd,
+    input: &crate::read::input::InputFile,
     mut src_offset: u64,
     mut out_offset: u64,
     mut remaining: u64,
@@ -639,6 +630,16 @@ fn copy_range_to_fd(
 ) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     let out_fd = out.as_raw_fd();
+    let in_fd = input.file().as_raw_fd();
+    let (start, end) = (src_offset, src_offset.saturating_add(remaining));
+    // The syscall does not say which end failed: name the input and the
+    // range here, and the writer names the output outside it.
+    let copy_error = |err: Error| {
+        err.context(format!(
+            "failed to copy bytes {start}..{end} of {}",
+            input.path().display()
+        ))
+    };
     while remaining > 0 {
         // Between kernel calls (each at most about 2 GiB): a cancelled run
         // stops a long splice here; see `copy_range::copy_range`.
@@ -666,16 +667,16 @@ fn copy_range_to_fd(
                 // range, using explicit offsets so parallel workers
                 // don't race on the output fd's position.
                 return copy_range_fallback_pwrite(
-                    out, in_fd, src_offset, out_offset, remaining, cancel,
+                    out, input, src_offset, out_offset, remaining, cancel,
                 );
             }
-            return Err(err.into());
+            return Err(copy_error(err.into()));
         }
         if ret == 0 {
-            return Err(Error::io_kind(
+            return Err(copy_error(Error::io_kind(
                 io::ErrorKind::UnexpectedEof,
                 "copy_file_range returned 0 before completing",
-            ));
+            )));
         }
         let advanced = u64::try_from(ret)
             .map_err(|_| Error::internal("copy_file_range returned negative advance"))?;
@@ -697,12 +698,14 @@ fn copy_range_to_fd(
 )]
 fn copy_range_fallback_pwrite(
     out: &File,
-    in_fd: RawFd,
+    input: &crate::read::input::InputFile,
     mut src_offset: u64,
     mut out_offset: u64,
     mut remaining: u64,
     cancel: &crate::host::Cancel,
 ) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let in_fd = input.file().as_raw_fd();
     let mut buf = vec![0u8; crate::write::IO_BUF_BYTES];
     while remaining > 0 {
         cancel.check()?;
@@ -715,14 +718,18 @@ fn copy_range_fallback_pwrite(
                 if err.raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
-                return Err(err.into());
+                return Err(super::copy_range::read_error(err, input, src_offset));
             }
             break ret;
         };
         if n == 0 {
-            return Err(Error::io_kind(
-                io::ErrorKind::UnexpectedEof,
-                "pread returned 0 during cross-device copy",
+            return Err(super::copy_range::read_error(
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "pread returned 0 during cross-device copy",
+                ),
+                input,
+                src_offset,
             ));
         }
         let n_u = usize::try_from(n).map_err(|_| Error::internal("pread returned negative"))?;

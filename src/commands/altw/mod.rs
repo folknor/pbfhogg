@@ -193,8 +193,7 @@ impl AltwOptions {
             return Err(Error::invalid_argument(
                 "add-locations-to-ways: force has no effect with the external index, \
                  which requires indexed input because its ID bucket ranges come from \
-                 per-blob indexdata. Generate an indexed PBF first:\n\n\
-                 \x20 pbfhogg cat <input.osm.pbf> -o indexed.osm.pbf",
+                 per-blob indexdata",
             ));
         }
         if self.inject_prepass {
@@ -434,11 +433,11 @@ pub(crate) fn add_locations_to_ways_to(
                 host.diagnostics,
                 Note,
                 "altw.external_hint",
-                "this sorted indexed PBF is eligible for --index-type external, \
+                "this sorted indexed PBF is eligible for the external index, \
                  which uses bounded working memory and sequential I/O. Sparse is faster \
                  while its node store fits in the page cache; external avoids the \
-                 page-cache thrashing sparse hits when it does not. --index-type auto \
-                 chooses between them from the estimated store size."
+                 page-cache thrashing sparse hits when it does not. The automatic \
+                 choice picks between them from the estimated store size."
             );
         }
     }
@@ -544,20 +543,16 @@ pub(crate) fn add_locations_to_ways_to(
 /// caller is left holding a file of fabricated coordinates.
 ///
 /// The message deliberately does not name the output path: nothing is
-/// published, so there is no output to point at.
+/// published, so there is no output to point at. The error is the typed
+/// [`ErrorKind::MissingNodeLocations`](crate::ErrorKind::MissingNodeLocations);
+/// how to allow the placeholders is the front end's advice.
 fn enforce_missing_locations_policy(stats: &Stats, ignore_missing_nodes: bool) -> Result<()> {
     if stats.missing_locations == 0 || ignore_missing_nodes {
         return Ok(());
     }
-    Err(Error::invalid_data(format!(
-        "{} way node references could not be resolved to a node location. \
-         Those vertices can only be written as (0, 0), which is a real \
-         coordinate off the coast of Ghana and cannot be told apart from \
-         genuine data by any reader, so no output was written. Supply a \
-         complete input, or pass --ignore-missing-nodes to accept the \
-         placeholder coordinates.",
+    Err(crate::error::new_missing_node_locations(
         stats.missing_locations,
-    )))
+    ))
 }
 
 // Auto-select: sparse unless the input qualifies for external (sorted +
@@ -591,7 +586,7 @@ fn auto_select_backend(
             host.diagnostics,
             Note,
             "altw.auto_select",
-            "auto-selected --index-type sparse (sorted={sorted}, indexed={has_index})"
+            "auto-selected index type sparse (sorted={sorted}, indexed={has_index})"
         );
         return Ok(ResolvedBackend::Sparse);
     }
@@ -624,7 +619,7 @@ fn auto_select_backend(
             host.diagnostics,
             Note,
             "altw.auto_select",
-            "auto-selected --index-type {chosen} (store estimate {:.1} GB {rel} \
+            "auto-selected index type {chosen} (store estimate {:.1} GB {rel} \
              {AUTO_STORE_BUDGET_PCT} % of {:.1} GB page-cache budget)",
             store as f64 / 1e9,
             budget as f64 / 1e9,
@@ -634,7 +629,7 @@ fn auto_select_backend(
             host.diagnostics,
             Note,
             "altw.auto_select",
-            "auto-selected --index-type {chosen} (sorted=true, indexed=true; \
+            "auto-selected index type {chosen} (sorted=true, indexed=true; \
              store estimate available={}, memory budget available={})",
             store.is_some(),
             budget.is_some()
@@ -1018,7 +1013,7 @@ pub(crate) fn collect_relation_member_ids(
             relation_member_ids(block, want_nodes, want_ways, |way, id| {
                 ids.push((way, id));
             });
-            ids
+            Ok(ids)
         },
         |_seq, ids| {
             for (way, id) in ids {
@@ -1059,9 +1054,11 @@ fn write_output_checked(
     // probe before pass 0. Kept so the decode-all writer can never be asked
     // for metadata it cannot attach.
     if inject_prepass && !indexdata_present {
-        return Err(Error::invalid_argument(
-            "--inject-prepass requires blob-level indexdata; --force cannot enable the decode-all fallback because it cannot attach per-blob WayMembers metadata",
-        ));
+        return Err(crate::error::new_missing_indexdata(
+            "add-locations-to-ways with inject_prepass requires blob-level indexdata, even \
+             when forced: the decode-all fallback cannot attach per-blob WayMembers metadata",
+        )
+        .locate(crate::error::Location::in_file(input)));
     }
     if indexdata_present {
         write_output_passthrough(

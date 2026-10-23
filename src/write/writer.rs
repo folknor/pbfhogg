@@ -164,6 +164,11 @@ pub struct PbfWriter<W: Write> {
     /// The writing session of the [`Output`](crate::Output) this writer
     /// fills, if any; see [`PbfWriter::with_completion`].
     completion: Option<Completion>,
+    /// The file this writer fills, named in every error it returns: the
+    /// output's destination when it fills an `Output` (taken from its
+    /// [`Completion`]), else the path a path constructor was given. `None`
+    /// for a writer over an arbitrary `Write`.
+    output_name: Option<std::sync::Arc<Path>>,
     /// The invocation's cancellation token (a fresh, never-tripped one for
     /// the public constructors). Checked before every block a write method
     /// accepts, and by the writer thread between `copy_file_range` calls, so
@@ -193,14 +198,17 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
     ) -> Result<Self> {
-        Self::to_path_in(
+        named_path(
             path,
-            compression,
-            header_block_bytes,
-            executor,
-            Diagnostics::discard(),
-            Finish::Durable,
-            crate::host::Cancel::new(),
+            Self::to_path_in(
+                path,
+                compression,
+                header_block_bytes,
+                executor,
+                Diagnostics::discard(),
+                Finish::Durable,
+                crate::host::Cancel::new(),
+            ),
         )
     }
 
@@ -238,14 +246,17 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
     ) -> Result<Self> {
-        Self::to_path_direct_in(
+        named_path(
             path,
-            compression,
-            header_block_bytes,
-            executor,
-            Diagnostics::discard(),
-            Finish::Durable,
-            crate::host::Cancel::new(),
+            Self::to_path_direct_in(
+                path,
+                compression,
+                header_block_bytes,
+                executor,
+                Diagnostics::discard(),
+                Finish::Durable,
+                crate::host::Cancel::new(),
+            ),
         )
     }
 
@@ -298,14 +309,17 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
     ) -> Result<Self> {
-        Self::to_path_uring_in(
+        named_path(
             path,
-            compression,
-            header_block_bytes,
-            executor,
-            Diagnostics::discard(),
-            Finish::Durable,
-            crate::host::Cancel::new(),
+            Self::to_path_uring_in(
+                path,
+                compression,
+                header_block_bytes,
+                executor,
+                Diagnostics::discard(),
+                Finish::Durable,
+                crate::host::Cancel::new(),
+            ),
         )
     }
 
@@ -375,6 +389,7 @@ impl PbfWriter<FileWriter> {
             finished: false,
             scratch: FrameScratch::new(),
             completion: None,
+            output_name: None,
             cancel,
         })
     }
@@ -395,14 +410,17 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
     ) -> Result<Self> {
-        Self::to_path_parallel_in(
+        named_path(
             path,
-            compression,
-            header_block_bytes,
-            executor,
-            Diagnostics::discard(),
-            Finish::Durable,
-            crate::host::Cancel::new(),
+            Self::to_path_parallel_in(
+                path,
+                compression,
+                header_block_bytes,
+                executor,
+                Diagnostics::discard(),
+                Finish::Durable,
+                crate::host::Cancel::new(),
+            ),
         )
     }
 
@@ -470,6 +488,7 @@ impl PbfWriter<FileWriter> {
             finished: false,
             scratch: FrameScratch::new(),
             completion: None,
+            output_name: None,
             cancel,
         })
     }
@@ -503,6 +522,7 @@ impl PbfWriter<FileWriter> {
             finished: false,
             scratch: FrameScratch::new(),
             completion: None,
+            output_name: None,
             cancel,
         })
     }
@@ -533,6 +553,7 @@ impl<W: Write> PbfWriter<W> {
             finished: true,
             scratch: FrameScratch::new(),
             completion: None,
+            output_name: None,
             cancel: crate::host::Cancel::new(),
         }
     }
@@ -578,22 +599,34 @@ impl<W: Write> PbfWriter<W> {
         if let Some(pipeline) = self.pipeline.as_mut() {
             pipeline.completion = Some(completion.clone());
         }
+        self.output_name = Some(std::sync::Arc::clone(completion.destination()));
         self.completion = Some(completion);
         self
+    }
+
+    /// Name this writer's output in `err` (once, however many layers pass
+    /// it up). Cold: only a failure builds the name.
+    #[cold]
+    fn name_output(&self, err: Error) -> Error {
+        match &self.output_name {
+            Some(name) => err.writing(name),
+            None => err,
+        }
     }
 
     /// Fail the output's session on any error a write reports, from wherever
     /// in the method it came (a scan, a permit, framing, the write itself):
     /// a caller that carries on past a lost blob must not be able to certify
     /// the output with a later successful `flush`. A write after a successful
-    /// `flush` fails too, and fails the session with it.
+    /// `flush` fails too, and fails the session with it. The error names the
+    /// output: a bare "No space left on device" does not say which file.
     fn poison_on_error<T>(&self, result: Result<T>) -> Result<T> {
-        if result.is_err()
-            && let Some(completion) = &self.completion
-        {
-            completion.fail();
-        }
-        result
+        result.map_err(|e| {
+            if let Some(completion) = &self.completion {
+                completion.fail();
+            }
+            self.name_output(e)
+        })
     }
 
     /// The token this writer observes, for a stage that feeds it and checks
@@ -1107,7 +1140,7 @@ impl<W: Write> PbfWriter<W> {
                 completion.fail();
             }
         }
-        result
+        result.map_err(|e| self.name_output(e))
     }
 
     fn flush_inner(&mut self) -> Result<()> {
@@ -1228,12 +1261,11 @@ impl<W: Write> PbfWriter<W> {
         // path must refuse here too or a `PbfWriter::new` writer emits a file
         // that only fails when somebody tries to read it.
         if self.scratch.blob_buf.len() as u64 >= crate::read::blob_wire::MAX_BLOB_DATASIZE {
-            return Err(Error::invalid_argument(format!(
-                "blob body for {blob_type} is {} bytes, must be smaller than \
-                 {} (lower --elements-per-blob)",
-                self.scratch.blob_buf.len(),
-                crate::read::blob_wire::MAX_BLOB_DATASIZE
-            )));
+            return Err(crate::error::new_blob_too_large(
+                crate::OversizePart::Body,
+                self.scratch.blob_buf.len() as u64,
+                crate::read::blob_wire::MAX_BLOB_DATASIZE,
+            ));
         }
         let datasize = i32::try_from(self.scratch.blob_buf.len()).map_err(|_| {
             Error::internal(format!(
@@ -1300,11 +1332,24 @@ impl PbfWriter<BufWriter<File>> {
     /// arbitrary `Write` value and only needs its ordinary `Write::flush`
     /// behavior.
     pub fn to_path_sync(path: &Path, compression: Compression) -> Result<Self> {
-        let file = File::create(path)?;
+        let file = File::create(path).map_err(|e| Error::from(e).writing(path))?;
         let buffered = BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file);
         let mut writer = Self::new(buffered, compression);
         writer.finalize_writer = sync_buffered_file;
+        writer.output_name = Some(std::sync::Arc::from(path));
         Ok(writer)
+    }
+}
+
+/// A path constructor's result, named for `path`: its errors, and every
+/// error the writer returns afterwards.
+fn named_path(path: &Path, result: Result<PbfWriter<FileWriter>>) -> Result<PbfWriter<FileWriter>> {
+    match result {
+        Ok(mut writer) => {
+            writer.output_name = Some(std::sync::Arc::from(path));
+            Ok(writer)
+        }
+        Err(e) => Err(e.writing(path)),
     }
 }
 
@@ -1360,11 +1405,12 @@ impl PbfWriter<FileWriter> {
     /// to copy directly between file descriptors. On filesystems with reflink
     /// support (btrfs, xfs), this is a metadata-only operation.
     ///
-    /// `in_file` is the open input PBF, shared rather than borrowed: the
-    /// pipelined path queues this request into the writer thread and returns
-    /// immediately, so the input has to stay open until the splice actually
-    /// runs. Passing a bare `RawFd` could not express that - see
-    /// [`OutputChunk::CopyRange`](crate::write::pipeline::OutputChunk).
+    /// `in_file` is the open input PBF and its path, shared rather than
+    /// borrowed: the pipelined path queues this request into the writer
+    /// thread and returns immediately, so the input has to stay open until
+    /// the splice actually runs. Passing a bare `RawFd` could not express
+    /// that - see [`OutputChunk::CopyRange`](crate::write::pipeline::OutputChunk).
+    /// The path names the input when the read or splice fails.
     /// `offset` and `len` describe the framed blob's position in the input file.
     ///
     /// Callers must not use this when the output writer is O_DIRECT - use
@@ -1375,7 +1421,7 @@ impl PbfWriter<FileWriter> {
     /// for a direct library caller, not where a flag combination is checked.
     pub fn write_raw_copy(
         &mut self,
-        in_file: &std::sync::Arc<std::fs::File>,
+        in_file: &crate::read::input::InputFile,
         offset: u64,
         len: u64,
     ) -> Result<()> {
@@ -1387,11 +1433,10 @@ impl PbfWriter<FileWriter> {
 
     fn write_raw_copy_unchecked(
         &mut self,
-        in_file: &std::sync::Arc<std::fs::File>,
+        in_file: &crate::read::input::InputFile,
         offset: u64,
         len: u64,
     ) -> Result<()> {
-        use std::os::unix::io::AsRawFd;
         if let Some(ref mut pipeline) = self.pipeline {
             // Hold a dispatch permit across the send so raw writes share the
             // dispatch bound with framing tasks. The send can still block;
@@ -1409,7 +1454,7 @@ impl PbfWriter<FileWriter> {
             let sent = pipeline.tx.send(PipelineItem {
                 seq,
                 data: Ok(OutputChunk::CopyRange {
-                    in_file: std::sync::Arc::clone(in_file),
+                    in_file: in_file.clone(),
                     offset,
                     len,
                 }),
@@ -1433,11 +1478,11 @@ impl PbfWriter<FileWriter> {
                 })?;
             // `copy_range` decides on the original errno (EXDEV) before
             // anything converts it.
-            let result = copy_range(in_file.as_raw_fd(), out_fd, offset, len, &self.cancel);
+            let result = copy_range(in_file, out_fd, offset, len, &self.cancel);
             if result.is_ok() {
                 self.mark_pending();
             }
-            Ok(result?)
+            result
         }
     }
 }
@@ -1513,6 +1558,7 @@ mod tests {
             finished: false,
             scratch: FrameScratch::new(),
             completion: None,
+            output_name: None,
             cancel: crate::host::Cancel::new(),
         }
     }
@@ -1632,11 +1678,9 @@ mod tests {
         let err = w
             .write_header(&body)
             .expect_err("a blob body past the datasize cap must not be written by the sync path");
-        let msg = err.to_string();
         assert!(
-            (msg.contains("blob body for OSMHeader") || msg.contains("uncompressed blob payload"))
-                && msg.contains("--elements-per-blob"),
-            "the sync path must name the cap and the knob, got: {msg}"
+            matches!(err.kind(), ErrorKind::BlobTooLarge { .. }),
+            "the sync path must refuse with BlobTooLarge, got: {err}"
         );
         w.flush().unwrap();
     }
@@ -1675,7 +1719,10 @@ mod tests {
         let mut w =
             PbfWriter::to_path(&out_path, Compression::None, &header, Executor::Ambient).unwrap();
 
-        let input = Arc::new(std::fs::File::open(&input_path).unwrap());
+        let input = crate::read::input::InputFile::from_parts(
+            Arc::new(std::fs::File::open(&input_path).unwrap()),
+            Arc::from(input_path.as_path()),
+        );
         w.write_raw_copy(&input, 0, payload.len() as u64).unwrap();
 
         // The caller is done with its handle. The writer thread has not

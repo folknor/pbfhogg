@@ -28,10 +28,7 @@ pub(super) fn collect_relation_member_ids_indexed(
     want_ways: bool,
     cancel: &crate::host::Cancel,
 ) -> Result<RelationScanOutput> {
-    let file = Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| crate::Error::from(e).context("open pbf for relation scan"))?,
-    );
+    let file = Arc::new(crate::read::input::open(input)?);
     // Errors are located against the input once, not per blob.
     let source: Arc<Path> = Arc::from(input);
 

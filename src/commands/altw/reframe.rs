@@ -199,8 +199,8 @@ pub(in crate::commands::altw) fn check_default_coord_framing(
         "reframe: PrimitiveBlock.{name} is {value}, not the default {default}. \
          add-locations-to-ways writes way coordinates in decimicrodegrees and \
          cannot honour a non-default coordinate framing on this path; the \
-         output would be silently wrong. Re-encode the input first, e.g. \
-         `pbfhogg cat --clean`."
+         output would be silently wrong. Re-encoding the input through a full \
+         decode and encode writes the default framing."
     )))
 }
 
@@ -322,8 +322,8 @@ fn splice_way_locations(
                         // it, matching `src/read/wire.rs::take_packed`.
                         return Err(crate::Error::invalid_data(
                             "reframe: Way.refs appears twice with data - a packed field \
-                             split across segments, or more than one unpacked value. Re-encode \
-                             the input first, e.g. `pbfhogg cat --clean`.",
+                             split across segments, or more than one unpacked value - which \
+                             this splice cannot express as one contiguous range.",
                         ));
                     }
                     have_refs = true;

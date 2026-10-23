@@ -383,9 +383,7 @@ fn extract_simple_single_pass(
 
         // node_schedule already filtered to node blobs.
 
-        let classify_file = std::sync::Arc::new(
-            std::fs::File::open(input).map_err(|e| crate::file_reader::open_error(input, e))?,
-        );
+        let classify_file = std::sync::Arc::new(crate::read::input::open(input)?);
         // The input's identity, captured once; each worker borrows it.
         let source: std::sync::Arc<Path> = std::sync::Arc::from(input);
         let source = &source;
@@ -548,9 +546,7 @@ fn extract_simple_single_pass(
     {
         use std::os::unix::fs::FileExt as _;
 
-        let classify_file = std::sync::Arc::new(
-            std::fs::File::open(input).map_err(|e| crate::file_reader::open_error(input, e))?,
-        );
+        let classify_file = std::sync::Arc::new(crate::read::input::open(input)?);
         // The input's identity, captured once; each worker borrows it.
         let source: std::sync::Arc<Path> = std::sync::Arc::from(input);
         let source = &source;
@@ -695,12 +691,17 @@ fn extract_simple_single_pass(
     crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_START");
     let mut matched_relation_ids = IdSet::new();
     {
-        let rel_classify_schedule: Vec<_> = relation_schedule
+        let rel_classify_schedule = relation_schedule
             .iter()
-            .enumerate()
-            .map(|(seq, desc)| (seq, desc.offset, desc.size))
-            .collect();
-        let rel_classify_file = std::sync::Arc::new(std::fs::File::open(input)?);
+            .map(|desc| {
+                crate::scan::classify::ScheduledBlob::at_frame(
+                    desc.frame_offset,
+                    desc.offset,
+                    desc.size,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let rel_classify_file = crate::read::input::InputFile::open(input)?;
         crate::scan::classify::parallel_classify_accumulate(
             &rel_classify_file,
             &rel_classify_schedule,
@@ -714,6 +715,7 @@ fn extract_simple_single_pass(
                         ids.set(r.id());
                     }
                 }
+                Ok(())
             },
             |worker_ids| {
                 matched_relation_ids.merge(worker_ids);

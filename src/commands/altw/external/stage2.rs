@@ -92,26 +92,26 @@ fn prepare_bucket(
 
     for worker_id in 0..num_shard_workers {
         let path = super::radix::id_shard_path(scratch, worker_id, bucket_idx)?;
-        let file = match std::fs::File::open(&path) {
+        let named = |what: &str, e: std::io::Error| {
+            Error::from(e).context(format!("failed to {what} id shard {}", path.display()))
+        };
+        let file = match crate::scratch::open(&path) {
             Ok(f) => {
                 open_calls += 1;
                 f
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(Error::from(e).context("open id shard")),
+            Err(e) => return Err(named("open", e)),
         };
         stat_calls += 1;
-        let len = file
-            .metadata()
-            .map_err(|e| Error::from(e).context("stat id shard"))?
-            .len() as usize;
+        let len = file.metadata().map_err(|e| named("stat", e))?.len() as usize;
         if len == 0 {
             continue;
         }
         let start = loader.data_buf.len();
         loader.data_buf.resize(start + len, 0);
         std::io::Read::read_exact(&mut &file, &mut loader.data_buf[start..])
-            .map_err(|e| Error::from(e).context("read id shard"))?;
+            .map_err(|e| named("read", e))?;
         #[cfg(feature = "linux-direct-io")]
         {
             fadvise_calls += 1;
@@ -167,12 +167,15 @@ fn prepare_bucket(
 pub(super) struct SharedSlotBuckets {
     writers: Vec<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
     entry_counts: Vec<std::sync::atomic::AtomicU64>,
+    /// Each bucket's file, for naming it in a failed write.
+    paths: Vec<crate::scratch::ScratchPath>,
 }
 
 impl SharedSlotBuckets {
     pub(super) fn create(scratch: &RunScratch, slot_bucket_count: usize) -> Result<Self> {
         let mut writers = Vec::with_capacity(slot_bucket_count);
         let mut entry_counts = Vec::with_capacity(slot_bucket_count);
+        let mut paths = Vec::with_capacity(slot_bucket_count);
 
         for i in 0..slot_bucket_count {
             let path = super::radix::slot_bucket_path(scratch, i)?;
@@ -184,20 +187,32 @@ impl SharedSlotBuckets {
                 file,
             )));
             entry_counts.push(std::sync::atomic::AtomicU64::new(0));
+            paths.push(path);
         }
 
         Ok(Self {
             writers,
             entry_counts,
+            paths,
         })
     }
 
+    /// A failed write to bucket `bucket`, naming its file.
+    #[cold]
+    fn write_error(&self, bucket: usize, err: std::io::Error) -> Error {
+        let path = self
+            .paths
+            .get(bucket)
+            .map_or_else(|| format!("{bucket}"), |p| p.display().to_string());
+        Error::from(err).context(format!("failed to write slot bucket {path}"))
+    }
+
     pub(super) fn finish(&self) -> Result<()> {
-        for writer_mutex in &self.writers {
+        for (bucket, writer_mutex) in self.writers.iter().enumerate() {
             let mut w = writer_mutex
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            w.flush()?;
+            w.flush().map_err(|e| self.write_error(bucket, e))?;
             #[cfg(feature = "linux-direct-io")]
             {
                 use std::os::unix::io::AsRawFd;
@@ -235,7 +250,7 @@ pub(super) fn stage2_node_join(
     slot_buckets: &SharedSlotBuckets,
     slot_bucket_count: usize,
     total_slots: u64,
-    input_pbf: &Arc<std::fs::File>,
+    input_pbf: &crate::read::input::InputFile,
     node_blob_mapping: &[NodeBlobInfo],
     inject_prepass: bool,
     host: &crate::host::Host,
@@ -328,7 +343,7 @@ pub(super) fn stage2_node_join(
 
     std::thread::scope(|scope| {
         for _ in 0..num_workers {
-            let pbf_file = Arc::clone(input_pbf);
+            let pbf_file = Arc::clone(input_pbf.file());
             scope.spawn(move || {
                 use std::sync::atomic::Ordering::Relaxed;
 
@@ -426,8 +441,12 @@ pub(super) fn stage2_node_join(
                             // pread + decompress + extract.
                             let t_pr = std::time::Instant::now();
                             node_read_buf.resize(blob.data_size, 0);
+                            // Input failures are located with the input and
+                            // the blob's payload offset (cold).
+                            let in_input =
+                                |e: Error| input_pbf.locate_at(blob.data_offset, e);
                             pbf_file.read_exact_at(&mut node_read_buf, blob.data_offset)
-                                .map_err(|e| Error::from(e).context("stage2 node pread"))?;
+                                .map_err(|e| in_input(Error::from(e).context("stage2 node pread")))?;
                             #[allow(clippy::cast_possible_truncation)]
                             node_pread_ref.fetch_add(
                                 t_pr.elapsed().as_millis() as u64, Relaxed,
@@ -441,7 +460,7 @@ pub(super) fn stage2_node_join(
                             let t_dc = std::time::Instant::now();
                             crate::blob::decompress_blob_raw(
                                 &node_read_buf, &mut node_decompress_buf,
-                            ).map_err(|e| e.context("stage2 node decompress"))?;
+                            ).map_err(|e| in_input(e.context("stage2 node decompress")))?;
                             #[allow(clippy::cast_possible_truncation)]
                             node_decompress_ref.fetch_add(
                                 t_dc.elapsed().as_millis() as u64, Relaxed,
@@ -455,7 +474,7 @@ pub(super) fn stage2_node_join(
                             node_tuples.clear();
                             extract_node_tuples(
                                 &node_decompress_buf, &mut node_tuples, &mut node_group_starts,
-                            ).map_err(|e| e.context("stage2 node extract"))?;
+                            ).map_err(|e| in_input(e.context("stage2 node extract")))?;
                             #[allow(clippy::cast_possible_truncation)]
                             node_extract_ref.fetch_add(
                                 t_ex.elapsed().as_millis() as u64, Relaxed,
@@ -630,7 +649,7 @@ pub(super) fn stage2_node_join(
                                         let t_wr = std::time::Instant::now();
                                         let flush_bytes = slot_bufs[bucket].len() as u64;
                                         w.write_all(&slot_bufs[bucket])
-                                            .map_err(|e| Error::from(e).context("write slot bucket"))?;
+                                            .map_err(|e| slot_buckets.write_error(bucket, e))?;
                                         drop(w);
                                         #[allow(clippy::cast_possible_truncation)]
                                         flush_write_ref.fetch_add(
@@ -720,7 +739,7 @@ pub(super) fn stage2_node_join(
                             let t_wr = std::time::Instant::now();
                             let flush_bytes = slot_bufs[sb].len() as u64;
                             w.write_all(&slot_bufs[sb])
-                                .map_err(|e| Error::from(e).context("write slot bucket"))?;
+                                .map_err(|e| slot_buckets.write_error(sb, e))?;
                             drop(w);
                             #[allow(clippy::cast_possible_truncation)]
                             flush_write_ref.fetch_add(

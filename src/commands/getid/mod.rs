@@ -222,7 +222,7 @@ pub fn parse_ids_from_file_with_default_type(
     path: &Path,
     default_type: Option<ElementKind>,
 ) -> Result<ElementIds> {
-    let contents = std::fs::read_to_string(path)?;
+    let contents = crate::read::input::read_to_string(path)?;
     let specs: Vec<String> = contents
         .split('\n')
         .filter_map(id_file_token)
@@ -285,7 +285,7 @@ pub fn parse_ids_from_pbf(
                     Element::Relation(r) => batch.relation_ids.push(r.id()),
                 }
             }
-            batch
+            Ok(batch)
         },
         |_seq, batch| {
             for id in batch.node_ids {
@@ -366,7 +366,7 @@ impl GetidStats {
             writeln!(
                 w,
                 "Plus {} elements in raw-passthrough blobs, per their indexdata \
-                 (unverified - run `pbfhogg check --index` to check it)",
+                 (unverified)",
                 self.passthrough_claimed,
             )?;
         }
@@ -1027,6 +1027,7 @@ fn getid_with_refs(
                         }
                     }
                 }
+                Ok(())
             },
             |worker_node_ids| {
                 if worker_node_ids.has_any() {

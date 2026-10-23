@@ -297,7 +297,7 @@ impl IndexReport {
         if self.total_violations > self.violations.len() as u64 {
             writeln!(
                 out,
-                "... {} further violation(s) not shown (raise --max-errors)",
+                "... {} further violation(s) not shown (the report cap was reached)",
                 self.total_violations - self.violations.len() as u64
             )?;
         }

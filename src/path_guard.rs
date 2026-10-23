@@ -93,10 +93,18 @@ impl Drop for PathGuard {
 /// Returns any canonicalization or metadata error other than not-found.
 #[doc(hidden)]
 pub fn same_file(a: &Path, b: &Path) -> std::io::Result<bool> {
+    // Named: this runs on every input/output pair of a command line, and a
+    // bare "Permission denied" does not say which of them it was.
+    let named = |what: &str, path: &Path, e: std::io::Error| {
+        std::io::Error::new(
+            e.kind(),
+            format!("failed to {what} {}: {e}", path.display()),
+        )
+    };
     let canonical = |path: &Path| match fs::canonicalize(path) {
         Ok(path) => Ok(Some(path)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+        Err(e) => Err(named("resolve", path, e)),
     };
     let Some(a) = canonical(a)? else {
         return Ok(false);
@@ -110,8 +118,8 @@ pub fn same_file(a: &Path, b: &Path) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let a_meta = fs::metadata(&a)?;
-        let b_meta = fs::metadata(&b)?;
+        let a_meta = fs::metadata(&a).map_err(|e| named("stat", &a, e))?;
+        let b_meta = fs::metadata(&b).map_err(|e| named("stat", &b, e))?;
         Ok(a_meta.dev() == b_meta.dev() && a_meta.ino() == b_meta.ino())
     }
     #[cfg(not(unix))]

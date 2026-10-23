@@ -90,6 +90,50 @@ pub(crate) fn new_missing_indexdata(reason: &str) -> Error {
     })
 }
 
+/// The input is not in the order the operation requires; `reason` says what
+/// was found and why the order matters.
+#[cold]
+pub(crate) fn new_unsorted(reason: impl Into<Cow<'static, str>>) -> Error {
+    new_error(ErrorKind::Unsorted {
+        reason: reason.into(),
+    })
+}
+
+/// A blob's indexdata disagrees with what the blob holds.
+#[cold]
+pub(crate) fn new_indexdata_mismatch(reason: impl Into<Cow<'static, str>>) -> Error {
+    new_error(ErrorKind::IndexdataMismatch {
+        reason: reason.into(),
+    })
+}
+
+#[cold]
+pub(crate) fn new_missing_node_locations(count: u64) -> Error {
+    new_error(ErrorKind::MissingNodeLocations { count })
+}
+
+#[cold]
+pub(crate) fn new_blob_too_large(part: OversizePart, size: u64, limit: u64) -> Error {
+    new_error(ErrorKind::BlobTooLarge { part, size, limit })
+}
+
+#[cold]
+pub(crate) fn new_version_regression(
+    consumer: &'static str,
+    kind: crate::ElementKind,
+    id: i64,
+    version: i32,
+    held: i32,
+) -> Error {
+    new_error(ErrorKind::VersionRegression {
+        consumer,
+        kind,
+        id,
+        version,
+        held,
+    })
+}
+
 #[cold]
 pub(crate) fn new_stringtable_utf8(err: Utf8Error, index: usize) -> Error {
     new_error(ErrorKind::StringtableUtf8 { err, index })
@@ -131,6 +175,29 @@ impl Location {
             file: file.map(Arc::clone),
             blob,
             offset,
+        }
+    }
+
+    /// A location naming only the file: an error about the input as a
+    /// whole (a missing feature, an order its header does not declare, a
+    /// parse failure of a config or region file).
+    #[cold]
+    pub(crate) fn in_file(path: &Path) -> Location {
+        Location {
+            file: Some(Arc::from(path)),
+            blob: None,
+            offset: None,
+        }
+    }
+
+    /// A location naming the file and a byte offset in it, with no blob
+    /// ordinal (a pread at a known offset, a record in a non-PBF file).
+    #[cold]
+    pub(crate) fn at_offset(path: &Path, offset: u64) -> Location {
+        Location {
+            file: Some(Arc::from(path)),
+            blob: None,
+            offset: Some(ByteOffset(offset)),
         }
     }
 
@@ -381,6 +448,11 @@ impl Error {
             | ErrorKind::MissingHeader
             | ErrorKind::MissingFeature(_)
             | ErrorKind::MissingIndexdata { .. }
+            | ErrorKind::Unsorted { .. }
+            | ErrorKind::IndexdataMismatch { .. }
+            | ErrorKind::MissingNodeLocations { .. }
+            | ErrorKind::BlobTooLarge { .. }
+            | ErrorKind::VersionRegression { .. }
             | ErrorKind::Cancelled => None,
         }
     }
@@ -410,6 +482,34 @@ impl Error {
             self.0.location = Some(location);
         }
         self
+    }
+
+    /// [`locate`](Self::locate) for a failure of the work on one input
+    /// blob: a cancellation is not a fault of the input and stays
+    /// unlocated, and a location already attached (another file a callback
+    /// read, say) is kept.
+    #[cold]
+    #[must_use]
+    pub(crate) fn locate_blob(self, location: Location) -> Error {
+        if self.is_cancelled() {
+            self
+        } else {
+            self.locate(location)
+        }
+    }
+
+    /// Name the output a write failed on: `writing <destination>` as
+    /// context, added once however many layers pass the error up. Never
+    /// touches the location, which names an input.
+    #[cold]
+    #[must_use]
+    pub(crate) fn writing(self, destination: &Path) -> Error {
+        let text = format!("writing {}", destination.display());
+        if self.0.context.iter().any(|c| *c == text) {
+            self
+        } else {
+            self.context(text)
+        }
     }
 
     /// This error as an `io::Error` for an `io::Result` boundary. A bare
@@ -491,8 +591,36 @@ pub enum ErrorKind {
     /// The input has no blob-level indexdata and the operation refuses to
     /// run without it. `reason` is a complete sentence saying why it
     /// matters. Whether the caller can grant a slower fallback, and how, is
-    /// the caller's business: the text names no flag.
+    /// the caller's business: the text names no flag and no command.
     MissingIndexdata { reason: Cow<'static, str> },
+    /// The input is not in `Sort.Type_then_ID` order (its header does not
+    /// declare it, or its blobs or elements contradict the declaration) and
+    /// the operation needs that order. `reason` says what was found.
+    Unsorted { reason: Cow<'static, str> },
+    /// A blob's indexdata (the `BlobHeader` element-kind and ID-range
+    /// claim) disagrees with what the blob holds. `reason` says how.
+    IndexdataMismatch { reason: Cow<'static, str> },
+    /// `count` way node references could not be resolved to a location,
+    /// and writing a `(0, 0)` placeholder for them was not allowed. Nothing
+    /// was published.
+    MissingNodeLocations { count: u64 },
+    /// A blob being written exceeds a PBF format limit: `part` is `size`
+    /// bytes against a `limit` it must stay under.
+    BlobTooLarge {
+        part: OversizePart,
+        size: u64,
+        limit: u64,
+    },
+    /// A change claims `version` for an object a change read earlier already
+    /// claimed `held` for, and lower-version changes were not allowed.
+    /// `consumer` names the operation that refused it.
+    VersionRegression {
+        consumer: &'static str,
+        kind: crate::ElementKind,
+        id: i64,
+        version: i32,
+        held: i32,
+    },
     /// The caller's request is invalid: arguments, configuration, or call
     /// order (such as writing after a writer completed).
     InvalidArgument {
@@ -523,6 +651,52 @@ pub enum ErrorKind {
     /// because it was asked to, every guard dropped (scratch and output
     /// staging removed) and nothing was published.
     Cancelled,
+}
+
+/// Which part of a blob being written is over its format limit
+/// ([`ErrorKind::BlobTooLarge`]).
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OversizePart {
+    /// The `BlobHeader`, even with its droppable tag index removed.
+    Header,
+    /// The `BlobHeader`, dominated by the `WayMembers-v1` bitmap, which
+    /// cannot be dropped without misreporting way-member nodes.
+    HeaderWayMembers,
+    /// The encoded `Blob` message.
+    Body,
+    /// The uncompressed `PrimitiveBlock`. Element counts do not bound it:
+    /// one element with a very large tag value can exceed it alone.
+    Payload,
+}
+
+impl OversizePart {
+    /// The [`ErrorKind::BlobTooLarge`] message for this part.
+    fn describe(self, f: &mut fmt::Formatter, size: u64, limit: u64) -> fmt::Result {
+        match self {
+            OversizePart::Header => write!(
+                f,
+                "BlobHeader is {size} bytes, must be smaller than {limit} even without \
+                 its tag index; fewer elements per blob shrink it"
+            ),
+            OversizePart::HeaderWayMembers => write!(
+                f,
+                "BlobHeader is {size} bytes, must be smaller than {limit}: the \
+                 WayMembers-v1 bitmap cannot be dropped without misreporting way-member \
+                 nodes; fewer elements per blob shrink it"
+            ),
+            OversizePart::Body => write!(
+                f,
+                "blob body is {size} bytes, must be smaller than {limit}; fewer elements \
+                 per blob shrink it"
+            ),
+            OversizePart::Payload => write!(
+                f,
+                "uncompressed blob payload is {size} bytes, must be at most {limit}; \
+                 fewer elements per blob shrink it unless single elements are this large"
+            ),
+        }
+    }
 }
 
 /// Why an output was refused or could not be published.
@@ -778,10 +952,15 @@ impl From<Error> for io::Error {
         let kind = match err.kind() {
             ErrorKind::Io(inner) => inner.kind(),
             ErrorKind::PlatformUnsupported { .. } => io::ErrorKind::Unsupported,
-            ErrorKind::InvalidData { .. } | ErrorKind::MissingIndexdata { .. } => {
-                io::ErrorKind::InvalidData
+            ErrorKind::InvalidData { .. }
+            | ErrorKind::MissingIndexdata { .. }
+            | ErrorKind::Unsorted { .. }
+            | ErrorKind::IndexdataMismatch { .. }
+            | ErrorKind::MissingNodeLocations { .. }
+            | ErrorKind::VersionRegression { .. } => io::ErrorKind::InvalidData,
+            ErrorKind::InvalidArgument { .. } | ErrorKind::BlobTooLarge { .. } => {
+                io::ErrorKind::InvalidInput
             }
-            ErrorKind::InvalidArgument { .. } => io::ErrorKind::InvalidInput,
             ErrorKind::Output(OutputError::Exists { .. } | OutputError::Collision { .. }) => {
                 io::ErrorKind::AlreadyExists
             }
@@ -863,11 +1042,36 @@ impl fmt::Display for Message<'_> {
             | ErrorKind::InvalidData { ref msg, .. }
             | ErrorKind::Internal { ref msg, .. }
             | ErrorKind::External { ref msg, .. } => f.write_str(msg),
-            ErrorKind::MissingIndexdata { ref reason } => write!(
+            // These name no command and no flag: how to index, sort or
+            // check a file, and which switch grants what, is the front end's
+            // advice to give (the CLI maps each kind to its own).
+            ErrorKind::MissingIndexdata { ref reason }
+            | ErrorKind::Unsorted { ref reason }
+            | ErrorKind::IndexdataMismatch { ref reason } => f.write_str(reason),
+            ErrorKind::MissingNodeLocations { count } => write!(
                 f,
-                "{reason}\n\n\
-                 Generate an indexed PBF first:\n\n\
-                 \x20 pbfhogg cat input.osm.pbf -o indexed.osm.pbf"
+                "{count} way node references could not be resolved to a node location. \
+                 Those vertices can only be written as (0, 0), which is a real coordinate \
+                 off the coast of Ghana and cannot be told apart from genuine data by any \
+                 reader, so no output was written. Supply a complete input, or allow the \
+                 placeholder coordinates"
+            ),
+            ErrorKind::BlobTooLarge { part, size, limit } => part.describe(f, size, limit),
+            ErrorKind::VersionRegression {
+                consumer,
+                kind,
+                id,
+                version,
+                held,
+            } => write!(
+                f,
+                "{consumer}: {} {id} carries version {version}, which is lower than version \
+                 {held} already claimed for it in the changes read so far (deletes included). \
+                 Accepting it would let an older version replace a newer one and report \
+                 success. The OSC inputs may be listed out of sequence order, or come from \
+                 inconsistent diff series. Check their order and provenance, or allow \
+                 lower-version changes",
+                kind.as_str()
             ),
             ErrorKind::Output(ref output) => fmt::Display::fmt(output, f),
             ErrorKind::StringtableUtf8 { index, .. } => {

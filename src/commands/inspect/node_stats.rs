@@ -316,6 +316,7 @@ fn node_stats_inner(
                     accum.lon_block.clear();
                 }
             }
+            Ok(())
         },
         |mut worker| {
             worker.finalize();

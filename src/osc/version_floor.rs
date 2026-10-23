@@ -71,26 +71,9 @@ impl VersionFloor {
     }
 }
 
-/// The refusal both consumers report, so the same input fails with the
-/// same explanation whichever command read it. `consumer` names who
-/// refused; `remedy` is how that consumer's caller opts out, phrased to
-/// follow "or".
-pub(crate) fn regression_message(
-    consumer: &str,
-    kind: &str,
-    id: i64,
-    claim: i32,
-    floor: i32,
-    remedy: &str,
-) -> String {
-    format!(
-        "{consumer}: {kind} {id} carries version {claim}, which is lower than version {floor} \
-         already claimed for it in the changes read so far (deletes included). Accepting it \
-         would let an older version replace a newer one and report success. The OSC inputs \
-         may be listed out of sequence order, or come from inconsistent diff series. Check \
-         their order and provenance, or {remedy} to permit lower-version changes."
-    )
-}
+// Both consumers refuse with `ErrorKind::VersionRegression`, so the same
+// input fails with the same explanation whichever command read it; how a
+// caller opts out is the front end's advice to give.
 
 #[cfg(test)]
 mod tests {

@@ -11,7 +11,9 @@ use super::super::{
     ensure_way_capacity_local, flush_local,
 };
 use crate::idset::IdSet;
+use crate::read::input::InputFile;
 use crate::read::region_grid::RegionGrid;
+use crate::scan::classify::ScheduledBlob;
 
 use super::common::{
     BboxInt, Passthrough, dense_only_payload, relation_has_matched_member, spatial_blob_filter,
@@ -143,12 +145,8 @@ pub(super) fn try_extract_multi_single_pass(
         let mut w = PbfWriter::to_staged_file(output.path(), compression)
             .map_err(|e| e.context(format!("failed to create {}", display_path.display())))?
             .with_completion(completion);
-        w.write_header(&header_bytes).map_err(|e| {
-            e.context(format!(
-                "failed to write header to {}",
-                display_path.display()
-            ))
-        })?;
+        // The writer names its output in any error it returns.
+        w.write_header(&header_bytes)?;
         writers.push(w);
     }
 
@@ -193,17 +191,17 @@ pub(super) fn try_extract_multi_single_pass(
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input))?;
 
-    let mut node_schedule: Vec<(usize, u64, usize)> = Vec::new();
-    let mut way_schedule: Vec<(usize, u64, usize)> = Vec::new();
-    let mut relation_schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut node_schedule: Vec<ScheduledBlob> = Vec::new();
+    let mut way_schedule: Vec<ScheduledBlob> = Vec::new();
+    let mut relation_schedule: Vec<ScheduledBlob> = Vec::new();
     // Per-node-blob passthrough metadata.
     let mut node_blob_info: Vec<NodeBlobInfo> = Vec::new();
-    let mut seq: usize = 0;
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
         }
         walker.observe_filter_index(meta.index.as_ref());
+        let entry = ScheduledBlob::from_meta(&meta)?;
         if let Some(idx) = meta.index.as_ref() {
             if !spatial_filter.wants_index(idx) {
                 continue;
@@ -236,14 +234,10 @@ pub(super) fn try_extract_multi_single_pass(
                         frame_offset: meta.frame_start,
                         frame_size: meta.frame_size,
                     });
-                    node_schedule.push((seq, meta.data_offset, meta.data_size));
+                    node_schedule.push(entry);
                 }
-                crate::ElementKind::Way => {
-                    way_schedule.push((seq, meta.data_offset, meta.data_size));
-                }
-                crate::ElementKind::Relation => {
-                    relation_schedule.push((seq, meta.data_offset, meta.data_size));
-                }
+                crate::ElementKind::Way => way_schedule.push(entry),
+                crate::ElementKind::Relation => relation_schedule.push(entry),
             }
         } else {
             // No indexdata - include in all schedules (conservative).
@@ -252,11 +246,10 @@ pub(super) fn try_extract_multi_single_pass(
                 frame_offset: meta.frame_start,
                 frame_size: 0,
             });
-            node_schedule.push((seq, meta.data_offset, meta.data_size));
-            way_schedule.push((seq, meta.data_offset, meta.data_size));
-            relation_schedule.push((seq, meta.data_offset, meta.data_size));
+            node_schedule.push(entry);
+            way_schedule.push(entry);
+            relation_schedule.push(entry);
         }
-        seq += 1;
     }
     crate::debug::emit_marker("MULTI_SCHEDULE_SCAN_END");
 
@@ -299,7 +292,7 @@ pub(super) fn try_extract_multi_single_pass(
     // precedent: shadow measurement produced zero, reverted, leave the
     // pin as the block against re-attempting).
 
-    let shared_file = std::sync::Arc::clone(walker.shared_file());
+    let shared_file = walker.input();
     drop(walker);
 
     // Phase 1: Parallel node classification → N bbox_node_ids.
@@ -342,7 +335,7 @@ pub(super) fn try_extract_multi_single_pass(
         let classify_columns = |block: &PrimitiveBlock,
                                 columns: &mut crate::read::columnar::DenseNodeColumns,
                                 scratch: &mut Vec<Vec<i64>>|
-         -> Vec<Vec<i64>> {
+         -> crate::Result<Vec<Vec<i64>>> {
             block.decode_dense_columns(columns);
             for v in scratch.iter_mut() {
                 v.clear();
@@ -367,7 +360,7 @@ pub(super) fn try_extract_multi_single_pass(
                     }
                 }
             }
-            scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>()
+            Ok(scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>())
         };
         let worker_init = || {
             (
@@ -377,14 +370,21 @@ pub(super) fn try_extract_multi_single_pass(
         };
 
         // Passthrough candidates are classified from the raw bytes, so the
-        // structural check in `dense_only_payload` can see them. Both
-        // subsets carry the node-schedule position as their sequence number;
-        // the write phase below keeps the original node_schedule order.
-        let (candidate_schedule, other_schedule): (Vec<_>, Vec<_>) = node_schedule
+        // structural check in `dense_only_payload` can see them. The pools
+        // report positions within each subset; `candidate_positions` maps a
+        // candidate's back to its node-schedule position, which the write
+        // phase below keys on.
+        let (candidate_positions, other_positions): (Vec<usize>, Vec<usize>) = (0..node_schedule
+            .len())
+            .partition(|&pos| node_blob_info[pos].passthrough == Passthrough::Candidate);
+        let candidate_schedule: Vec<ScheduledBlob> = candidate_positions
             .iter()
-            .enumerate()
-            .map(|(pos, &(_seq, offset, size))| (pos, offset, size))
-            .partition(|&(pos, _, _)| node_blob_info[pos].passthrough == Passthrough::Candidate);
+            .map(|&pos| node_schedule[pos])
+            .collect();
+        let other_schedule: Vec<ScheduledBlob> = other_positions
+            .iter()
+            .map(|&pos| node_schedule[pos])
+            .collect();
 
         crate::scan::classify::parallel_classify_phase(
             &shared_file,
@@ -405,7 +405,7 @@ pub(super) fn try_extract_multi_single_pass(
                 // What the decode path would do with this blob; a block it
                 // rejects must not be copied raw.
                 let block = PrimitiveBlock::from_vec(bytes.to_vec())?;
-                let region_ids = classify_columns(&block, columns, scratch);
+                let region_ids = classify_columns(&block, columns, scratch)?;
                 // Occurrence counts, not set sizes: a duplicate id counts
                 // every time it is copied.
                 let observed = columns.len();
@@ -415,7 +415,7 @@ pub(super) fn try_extract_multi_single_pass(
             },
             |pos, (region_ids, verified): (Vec<Vec<i64>>, Option<u64>)| {
                 merge_region_ids(&mut bbox_node_ids, region_ids);
-                verified_nodes[pos] = verified;
+                verified_nodes[candidate_positions[pos]] = verified;
             },
             host,
         )?;
@@ -459,7 +459,7 @@ pub(super) fn try_extract_multi_single_pass(
                         }
                     }
                 }
-                scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>()
+                Ok(scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>())
             },
             |_seq, region_ids: Vec<Vec<i64>>| merge_region_ids(&mut bbox_node_ids, region_ids),
             host,
@@ -587,7 +587,7 @@ pub(super) fn try_extract_multi_single_pass(
                     }
                 }
             }
-            scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>()
+            Ok(scratch.iter_mut().map(std::mem::take).collect::<Vec<_>>())
         },
         |_seq, region_ids| {
             for (i, ids) in region_ids.into_iter().enumerate() {
@@ -652,6 +652,7 @@ pub(super) fn try_extract_multi_single_pass(
                     }
                 }
             }
+            Ok(())
         },
         |region_ids| {
             for (i, worker_set) in region_ids.into_iter().enumerate() {
@@ -766,8 +767,8 @@ fn merge_region_ids(bbox_node_ids: &mut [IdSet], region_ids: Vec<Vec<i64>>) {
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 fn multi_extract_pread_write_nodes<F>(
-    shared_file: &std::sync::Arc<std::fs::File>,
-    schedule: &[(usize, u64, usize)],
+    input: &InputFile,
+    schedule: &[ScheduledBlob],
     blob_info: &[NodeBlobInfo],
     n: usize,
     block_fn: F,
@@ -790,19 +791,19 @@ where
     if schedule.is_empty() {
         return Ok(());
     }
+    let shared_file = input.file();
 
     // Blobs verified as fully contained in ALL N regions skip decode
     // entirely - write raw frame to all N writers. Other blobs, including any
-    // unsettled candidate, go through parallel decode workers.
-    let mut decode_items: Vec<(usize, u64, usize)> = Vec::new();
+    // unsettled candidate, go through parallel decode workers. Both are
+    // keyed by their schedule position.
+    let mut decode_items: Vec<usize> = Vec::new();
     let mut passthrough_items: Vec<(usize, u64, usize, u64)> = Vec::new();
-    for (local_seq, ((_global_seq, data_offset, data_size), info)) in
-        schedule.iter().zip(blob_info.iter()).enumerate()
-    {
+    for (position, info) in blob_info.iter().enumerate().take(schedule.len()) {
         if let Passthrough::Verified { nodes } = info.passthrough {
-            passthrough_items.push((local_seq, info.frame_offset, info.frame_size, nodes));
+            passthrough_items.push((position, info.frame_offset, info.frame_size, nodes));
         } else {
-            decode_items.push((local_seq, *data_offset, *data_size));
+            decode_items.push(position);
         }
     }
 
@@ -822,7 +823,9 @@ where
         let mut frame_buf: Vec<u8> = Vec::new();
         for &(_, frame_offset, frame_size, count) in &passthrough_items {
             frame_buf.resize(frame_size, 0);
-            shared_file.read_exact_at(&mut frame_buf, frame_offset)?;
+            shared_file
+                .read_exact_at(&mut frame_buf, frame_offset)
+                .map_err(|e| input.locate_at(frame_offset, e.into()))?;
             for i in 0..n {
                 writers[i].write_raw(&frame_buf)?;
                 stats[i].nodes_in_bbox += count;
@@ -840,9 +843,8 @@ where
 
     type WorkerResult = crate::error::Result<(Vec<Vec<OwnedBlock>>, Vec<u64>)>;
 
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(
-        crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
-    );
+    let (desc_tx, desc_rx) =
+        std::sync::mpsc::sync_channel::<usize>(crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, MultiNodeCI)>(
         crate::tunables::POOL_RESULT_CHANNEL_DEPTH,
@@ -850,8 +852,8 @@ where
 
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
-            for item in decode_items {
-                if desc_tx.send(item).is_err() {
+            for position in decode_items {
+                if desc_tx.send(position).is_err() {
                     break;
                 }
             }
@@ -872,20 +874,21 @@ where
                 let mut i64_scratch: Vec<i64> = Vec::new();
 
                 loop {
-                    let (s, data_offset, data_size) = {
+                    let s = {
                         let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         match guard.recv() {
                             Ok(d) => d,
                             Err(_) => break,
                         }
                     };
+                    let entry = &schedule[s];
 
                     let r: WorkerResult = (|| {
-                        read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)?;
+                        read_buf.resize(entry.data_size(), 0);
+                        file.read_exact_at(&mut read_buf, entry.data_offset())?;
                         let mut buf = crate::blob::pool_get(
                             Some(&worker_pool),
-                            data_size * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
+                            entry.data_size() * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
                         );
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = PrimitiveBlock::from_vec_pooled_with_scratch(
@@ -904,7 +907,8 @@ where
                         let taken: Vec<Vec<OwnedBlock>> =
                             output.iter_mut().map(std::mem::take).collect();
                         Ok((taken, counts))
-                    })();
+                    })()
+                    .map_err(|e| input.locate_blob(entry, e));
                     if tx.send((s, MultiNodeCI::Decoded(r))).is_err() {
                         break;
                     }
@@ -934,12 +938,12 @@ where
             host.cancel.check()?;
             reorder.push(s, item);
             while let Some(ci) = reorder.pop_ready() {
-                write_consumer_item(ci, n, shared_file, &mut frame_buf, writers, stats)?;
+                write_consumer_item(ci, n, input, &mut frame_buf, writers, stats)?;
             }
         }
         host.cancel.check()?;
         while let Some(ci) = reorder.pop_ready() {
-            write_consumer_item(ci, n, shared_file, &mut frame_buf, writers, stats)?;
+            write_consumer_item(ci, n, input, &mut frame_buf, writers, stats)?;
         }
         Ok(())
     })?;
@@ -951,7 +955,7 @@ where
 fn write_consumer_item(
     item: MultiNodeCI,
     n: usize,
-    shared_file: &std::sync::Arc<std::fs::File>,
+    input: &InputFile,
     frame_buf: &mut Vec<u8>,
     writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
     stats: &mut [ExtractStats],
@@ -980,7 +984,10 @@ fn write_consumer_item(
         }
         MultiNodeCI::Passthrough(frame_offset, frame_size, count) => {
             frame_buf.resize(frame_size, 0);
-            shared_file.read_exact_at(frame_buf, frame_offset)?;
+            input
+                .file()
+                .read_exact_at(frame_buf, frame_offset)
+                .map_err(|e| input.locate_at(frame_offset, e.into()))?;
             for i in 0..n {
                 writers[i].write_raw(frame_buf)?;
                 stats[i].nodes_in_bbox += count;
@@ -1005,8 +1012,8 @@ enum MultiNodeCI {
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 fn multi_extract_pread_write<F>(
-    shared_file: &std::sync::Arc<std::fs::File>,
-    schedule: &[(usize, u64, usize)],
+    input: &InputFile,
+    schedule: &[ScheduledBlob],
     n: usize,
     block_fn: F,
     writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
@@ -1040,19 +1047,19 @@ where
     // Worker result: per-region OwnedBlocks + per-region counts.
     type WorkerResult = crate::error::Result<(Vec<Vec<OwnedBlock>>, Vec<u64>)>;
 
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(
-        crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
-    );
+    let (desc_tx, desc_rx) =
+        std::sync::mpsc::sync_channel::<usize>(crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, WorkerResult)>(
         crate::tunables::POOL_RESULT_CHANNEL_DEPTH,
     );
+    let shared_file = input.file();
 
     std::thread::scope(|scope| -> Result<()> {
-        // Dispatcher: feed schedule items to workers with local sequence index.
+        // Dispatcher: feed schedule positions to workers.
         scope.spawn(move || {
-            for (local_seq, &(_global_seq, data_offset, data_size)) in schedule.iter().enumerate() {
-                if desc_tx.send((local_seq, data_offset, data_size)).is_err() {
+            for position in 0..schedule.len() {
+                if desc_tx.send(position).is_err() {
                     break;
                 }
             }
@@ -1074,20 +1081,21 @@ where
                 let mut i64_scratch: Vec<i64> = Vec::new();
 
                 loop {
-                    let (s, data_offset, data_size) = {
+                    let s = {
                         let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         match guard.recv() {
                             Ok(d) => d,
                             Err(_) => break,
                         }
                     };
+                    let entry = &schedule[s];
 
                     let r: WorkerResult = (|| {
-                        read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)?;
+                        read_buf.resize(entry.data_size(), 0);
+                        file.read_exact_at(&mut read_buf, entry.data_offset())?;
                         let mut buf = crate::blob::pool_get(
                             Some(&worker_pool),
-                            data_size * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
+                            entry.data_size() * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
                         );
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = PrimitiveBlock::from_vec_pooled_with_scratch(
@@ -1107,7 +1115,8 @@ where
                         let taken: Vec<Vec<OwnedBlock>> =
                             output.iter_mut().map(std::mem::take).collect();
                         Ok((taken, counts))
-                    })();
+                    })()
+                    .map_err(|e| input.locate_blob(entry, e));
                     if tx.send((s, r)).is_err() {
                         break;
                     }

@@ -1353,6 +1353,47 @@ fn reader_rejects_every_out_of_bounds_offset_kind() {
     }
 }
 
+/// A missing index, and an index missing one data file, fail open naming
+/// the file that is not there: a bare "No such file or directory" does not
+/// say which of the index's files it was.
+#[test]
+fn reader_open_failure_names_the_missing_file() {
+    let dir = crate::common::test_scratch();
+    let missing = dir.path().join("no-such-index");
+    let err = pbfhogg::geocode_index::reader::Reader::open(&missing)
+        .err()
+        .expect("a missing index must fail open");
+    let report = err.report();
+    assert!(
+        report.contains(&missing.display().to_string()),
+        "the error must name the missing index's header: {report}"
+    );
+
+    let input = dir.path().join("input.osm.pbf");
+    let index_dir = dir.path().join("index");
+    write_all_record_kinds_input(&input);
+    build_index(
+        &pbfhogg::geocode_index::builder::BuildConfig {
+            input_path: input,
+            ..Default::default()
+        },
+        &index_dir,
+        false,
+        &crate::common::test_host(),
+    )
+    .expect("build index");
+    let strings = index_dir.join("strings.bin");
+    std::fs::remove_file(&strings).expect("remove a data file");
+    let err = pbfhogg::geocode_index::reader::Reader::open(&index_dir)
+        .err()
+        .expect("an index missing a data file must fail open");
+    let report = err.report();
+    assert!(
+        report.contains(&strings.display().to_string()),
+        "the error must name the missing data file: {report}"
+    );
+}
+
 /// One input that populates every record kind at once: address points,
 /// street ways, interpolation ways and admin polygons. The offset-validation
 /// test needs all four non-empty, or its cases are vacuous.

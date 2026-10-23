@@ -16,7 +16,7 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::Element;
@@ -85,7 +85,7 @@ impl MergePbfStats {
             writeln!(
                 w,
                 "  plus {} elements in blobs copied through without decoding, per \
-                 their indexdata (unverified - `pbfhogg check --index` checks it)",
+                 their indexdata (unverified)",
                 self.passthrough_claimed,
             )?;
         }
@@ -259,8 +259,17 @@ pub(crate) fn merge_pbf_to(
     let mut writer =
         writer_from_header_bytes(output, opts.compression, &header.bytes, opts.backend, host)?;
 
-    // Open all input files for random access
-    let mut files: Vec<File> = inputs.iter().map(File::open).collect::<io::Result<_>>()?;
+    // Open all input files for random access, each with its path so a
+    // failed read or decode in this pass names the file.
+    let mut files: Vec<Source<'_>> = inputs
+        .iter()
+        .map(|path| {
+            Ok(Source {
+                file: crate::read::input::open(path)?,
+                path,
+            })
+        })
+        .collect::<Result<_>>()?;
 
     let mut stats = MergePbfStats {
         nodes: 0,
@@ -539,35 +548,56 @@ fn detect_overlaps(entries: &[BlobEntry]) -> Vec<bool> {
 // Pass 2: Passthrough write
 // ---------------------------------------------------------------------------
 
+/// One input of the second pass: its open file and the path it came from.
+struct Source<'a> {
+    file: File,
+    path: &'a Path,
+}
+
+impl Source<'_> {
+    /// Locate a failure on `entry`'s frame in this input. Cold: built only
+    /// on the error path.
+    #[cold]
+    fn locate(&self, entry: &BlobEntry, err: Error) -> Error {
+        err.locate_blob(crate::error::Location::at_offset(
+            self.path,
+            entry.file_offset,
+        ))
+    }
+}
+
 fn write_passthrough_blob(
     entry: &BlobEntry,
-    file: &mut File,
+    source: &mut Source<'_>,
     writer: &mut PbfWriter<FileWriter>,
     frame_buf: &mut Vec<u8>,
 ) -> Result<()> {
-    read_frame_into(file, entry, frame_buf)?;
+    read_frame_into(source, entry, frame_buf)?;
     if entry.has_indexdata {
         writer.write_raw(frame_buf)?;
     } else {
-        let blob_bytes = extract_blob_bytes(frame_buf)?;
+        let blob_bytes = extract_blob_bytes(frame_buf).map_err(|e| source.locate(entry, e))?;
         let reframed = reframe_raw_with_index(
             blob_bytes,
             &entry.index.serialize(),
             entry.tagdata.as_deref(),
-        )?;
+        )
+        .map_err(|e| source.locate(entry, e))?;
         writer.write_raw(&reframed)?;
     }
     Ok(())
 }
 
-fn read_frame_into(file: &mut File, entry: &BlobEntry, buf: &mut Vec<u8>) -> io::Result<()> {
-    file.seek(SeekFrom::Start(entry.file_offset))?;
+fn read_frame_into(source: &mut Source<'_>, entry: &BlobEntry, buf: &mut Vec<u8>) -> Result<()> {
     #[allow(clippy::cast_possible_truncation)]
     let len = entry.frame_len as usize;
     buf.clear();
     buf.resize(len, 0);
-    file.read_exact(buf)?;
-    Ok(())
+    source
+        .file
+        .seek(SeekFrom::Start(entry.file_offset))
+        .and_then(|_| source.file.read_exact(buf))
+        .map_err(|e| source.locate(entry, Error::from(e)))
 }
 
 fn extract_blob_bytes(frame: &[u8]) -> Result<&[u8]> {
@@ -605,7 +635,7 @@ fn count_entry(entry: &BlobEntry, stats: &mut MergePbfStats) {
 
 fn write_overlap_run(
     entries: &[BlobEntry],
-    files: &mut [File],
+    files: &mut [Source<'_>],
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergePbfStats,
@@ -679,7 +709,7 @@ fn write_overlap_run(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn sweep_merge_dedup<T: Ord + HasId>(
     entries: &[BlobEntry],
-    files: &mut [File],
+    files: &mut [Source<'_>],
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     mut extract: impl FnMut(&Element<'_>, &mut BinaryHeap<Reverse<T>>),
@@ -706,9 +736,11 @@ fn sweep_merge_dedup<T: Ord + HasId>(
             },
         )?;
 
-        read_frame_into(&mut files[entry.file_index], entry, &mut frame_buf)?;
-        let blob_bytes = extract_blob_bytes(&frame_buf)?;
-        let block = decode_blob_to_primitiveblock(blob_bytes)?;
+        let source = &mut files[entry.file_index];
+        read_frame_into(source, entry, &mut frame_buf)?;
+        let block = extract_blob_bytes(&frame_buf)
+            .and_then(decode_blob_to_primitiveblock)
+            .map_err(|e| source.locate(entry, e))?;
         for element in block.elements() {
             extract(&element, &mut heap);
         }

@@ -31,12 +31,125 @@
 //! [`build_classify_schedules_split`].
 
 use crate::error::{Error, Result};
+use crate::read::input::InputFile;
 
-/// One entry in a classification schedule: `(seq, data_offset, data_size)`.
-/// `seq` is an ordering key supplied by the schedule builder; it may be
-/// sparse. `data_offset` and `data_size` address the blob's payload in the
-/// input PBF.
-pub(crate) type ScheduleEntry = (usize, u64, usize);
+/// One blob of a pread schedule: where its frame starts, which blob of the
+/// file it is, and how to reach its payload. Carries the same location the
+/// header walker stamps on its own errors, so a pool that fails on this
+/// blob names the file, the blob ordinal and the frame offset.
+///
+/// 24 bytes, the size of the `(seq, offset, size)` tuple it replaced: the
+/// ordering key the tuple carried is the entry's position in its schedule,
+/// which the pools pass to their merge instead of storing it. `data_size`
+/// fits `u32` because the header parse refuses a datasize at or above
+/// `MAX_BLOB_DATASIZE` (32 MiB), and the header length because
+/// `check_header_len` refuses 64 KiB and above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScheduledBlob {
+    frame_start: u64,
+    blob: u64,
+    data_size: u32,
+    header_len: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<ScheduledBlob>() == 24);
+
+impl ScheduledBlob {
+    /// The schedule entry for the blob a header walk returned.
+    pub(crate) fn from_meta(meta: &crate::read::header_walker::BlobHeaderMeta) -> Result<Self> {
+        let header_len = meta
+            .data_offset
+            .checked_sub(meta.frame_start + 4)
+            .and_then(|len| u32::try_from(len).ok());
+        let data_size = u32::try_from(meta.data_size).ok();
+        match (header_len, data_size) {
+            (Some(header_len), Some(data_size)) => Ok(Self {
+                frame_start: meta.frame_start,
+                blob: meta.blob_index,
+                data_size,
+                header_len,
+            }),
+            _ => Err(Error::internal(format!(
+                "blob {} at offset {} has a header length or datasize the walker should have \
+                 refused",
+                meta.blob_index, meta.frame_start
+            ))),
+        }
+    }
+
+    /// An entry for a blob known by its frame and payload position but not
+    /// its ordinal (a schedule of extract `BlobDesc`s): its failures are
+    /// located with the file and the frame offset only.
+    pub(crate) fn at_frame(frame_start: u64, data_offset: u64, data_size: usize) -> Result<Self> {
+        let header_len = data_offset
+            .checked_sub(frame_start + 4)
+            .and_then(|len| u32::try_from(len).ok());
+        match (header_len, u32::try_from(data_size).ok()) {
+            (Some(header_len), Some(data_size)) => Ok(Self {
+                frame_start,
+                blob: Self::UNKNOWN_ORDINAL,
+                data_size,
+                header_len,
+            }),
+            _ => Err(Error::internal(format!(
+                "blob at offset {frame_start} has a header length or datasize the walker \
+                 should have refused"
+            ))),
+        }
+    }
+
+    /// The ordinal of an entry built without one.
+    const UNKNOWN_ORDINAL: u64 = u64::MAX;
+
+    /// Byte offset of the blob's `Blob` message (its payload).
+    #[inline]
+    pub(crate) fn data_offset(&self) -> u64 {
+        self.frame_start + 4 + u64::from(self.header_len)
+    }
+
+    /// Length of the blob's payload.
+    #[inline]
+    pub(crate) fn data_size(&self) -> usize {
+        self.data_size as usize
+    }
+
+    /// Byte offset of the blob's frame (its length prefix).
+    #[inline]
+    pub(crate) fn frame_start(&self) -> u64 {
+        self.frame_start
+    }
+
+    /// 0-based ordinal of the blob in its file, when the schedule knew it.
+    #[inline]
+    pub(crate) fn blob_index(&self) -> Option<u64> {
+        (self.blob != Self::UNKNOWN_ORDINAL).then_some(self.blob)
+    }
+
+    /// An entry whose payload is `data_size` bytes at `data_offset`, with a
+    /// zero-length header (tests of the prefetch arithmetic).
+    #[cfg(test)]
+    fn at(data_offset: u64, data_size: u32) -> Self {
+        Self {
+            frame_start: data_offset - 4,
+            blob: 0,
+            data_size,
+            header_len: 0,
+        }
+    }
+
+    /// This blob's location in `path`, for an error about it.
+    #[cold]
+    pub(crate) fn location(
+        &self,
+        path: &std::sync::Arc<std::path::Path>,
+    ) -> crate::error::Location {
+        crate::error::Location::new(
+            Some(path),
+            self.blob_index(),
+            Some(crate::ByteOffset(self.frame_start)),
+        )
+    }
+}
 
 use crate::tunables::{
     DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN, DECODE_WORKERS_RESERVED,
@@ -54,10 +167,10 @@ fn blob_body_within_file(data_offset: u64, data_size: usize, file_size: u64) -> 
 /// file order, so bodies separated by up to a BlobHeader-sized gap are joined.
 /// A zero-sized body has no range to advise: passing length zero to
 /// `posix_fadvise` would instead mean through EOF.
-fn coalesce_willneed_ranges(schedule: &[ScheduleEntry]) -> Vec<(u64, u64)> {
+fn coalesce_willneed_ranges(schedule: &[ScheduledBlob]) -> Vec<(u64, u64)> {
     let mut ranges: Vec<(u64, u64)> = Vec::new();
-    for &(_, offset, size) in schedule {
-        let size = size as u64;
+    for entry in schedule {
+        let (offset, size) = (entry.data_offset(), entry.data_size() as u64);
         if size == 0 {
             continue;
         }
@@ -93,7 +206,7 @@ pub(crate) struct WillneedPrefetch {
 impl WillneedPrefetch {
     /// Prepare unconditional sliding WILLNEED prefetching for a dispatch
     /// schedule.
-    pub(crate) fn new(schedule: &[ScheduleEntry]) -> Self {
+    pub(crate) fn new(schedule: &[ScheduledBlob]) -> Self {
         Self {
             ranges: coalesce_willneed_ranges(schedule),
             next_range: 0,
@@ -105,11 +218,11 @@ impl WillneedPrefetch {
     pub(crate) fn before_dispatch(
         &mut self,
         shared_file: &std::sync::Arc<std::fs::File>,
-        entry: ScheduleEntry,
+        entry: &ScheduledBlob,
     ) {
         let Some(window_end) = entry
-            .1
-            .checked_add(entry.2 as u64)
+            .data_offset()
+            .checked_add(entry.data_size() as u64)
             .and_then(|end| end.checked_add(WILLNEED_WINDOW_BYTES))
         else {
             return;
@@ -243,14 +356,14 @@ pub(crate) fn blob_filter_check(
 ///
 /// Walks headers via [`HeaderWalker`](crate::read::header_walker::HeaderWalker)
 /// so blob bodies are not dragged into the page cache during the scan. The
-/// shared `Arc<File>` handed back for `pread`-based body reads is the
-/// walker's own file handle (opened with `posix_fadvise(RANDOM)`),
-/// reused to avoid a second `open` at scan end.
+/// [`InputFile`] handed back for `pread`-based body reads is the walker's own
+/// file handle (opened with `posix_fadvise(RANDOM)`) and path, reused to
+/// avoid a second `open` at scan end.
 pub(crate) fn build_classify_schedule(
     input: &std::path::Path,
     kind_filter: Option<crate::ElementKind>,
     host: &crate::host::Host,
-) -> Result<(Vec<ScheduleEntry>, std::sync::Arc<std::fs::File>)> {
+) -> Result<(Vec<ScheduledBlob>, InputFile)> {
     let (schedule, file, _skipped) =
         build_classify_schedule_blob_filtered(input, kind_filter, None, host)?;
     Ok((schedule, file))
@@ -272,7 +385,7 @@ pub(crate) fn build_classify_schedule_blob_filtered(
     kind_filter: Option<crate::ElementKind>,
     blob_filter: Option<&crate::blob_meta::BlobFilter>,
     host: &crate::host::Host,
-) -> Result<(Vec<ScheduleEntry>, std::sync::Arc<std::fs::File>, u64)> {
+) -> Result<(Vec<ScheduledBlob>, InputFile, u64)> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     // Consume the first blob (expected OSMHeader): on an empty file return
@@ -290,8 +403,7 @@ pub(crate) fn build_classify_schedule_blob_filtered(
 
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
     let file_size = walker.file_size();
-    let mut schedule: Vec<ScheduleEntry> = Vec::new();
-    let mut seq: usize = 0;
+    let mut schedule: Vec<ScheduledBlob> = Vec::new();
     let mut blobs_skipped_by_tag: u64 = 0;
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
@@ -334,13 +446,12 @@ pub(crate) fn build_classify_schedule_blob_filtered(
                 )),
             ));
         }
-        schedule.push((seq, meta.data_offset, meta.data_size));
-        seq += 1;
+        schedule.push(ScheduledBlob::from_meta(&meta)?);
     }
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_END");
 
     crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_START");
-    let shared_file = std::sync::Arc::clone(walker.shared_file());
+    let shared_file = walker.input();
     drop(walker);
     crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_END");
 
@@ -359,8 +470,8 @@ pub(crate) fn build_classify_schedule_blob_filtered(
 /// Blobs lacking indexdata are included in all three schedules (matching
 /// the per-kind behaviour of `build_classify_schedule(.., Some(kind))`,
 /// which only skips blobs whose indexdata reports a mismatched kind).
-/// Each schedule's `seq` is local to that schedule (so each is a valid
-/// contiguous 0..n range ready for `parallel_classify_phase`).
+/// Positions are local to each schedule (each is a contiguous 0..n range
+/// for `parallel_classify_phase`).
 ///
 /// The fifth return value is the highest `max_id` indexdata reports per kind,
 /// indexed `[node, way, relation]`, or 0 for a kind whose blobs carry no
@@ -375,10 +486,10 @@ pub(crate) fn build_classify_schedules_split(
     input: &std::path::Path,
     host: &crate::host::Host,
 ) -> Result<(
-    Vec<ScheduleEntry>,
-    Vec<ScheduleEntry>,
-    Vec<ScheduleEntry>,
-    std::sync::Arc<std::fs::File>,
+    Vec<ScheduledBlob>,
+    Vec<ScheduledBlob>,
+    Vec<ScheduledBlob>,
+    InputFile,
     [i64; 3],
 )> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
@@ -392,9 +503,9 @@ pub(crate) fn build_classify_schedules_split(
 
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
     let file_size = walker.file_size();
-    let mut nodes: Vec<ScheduleEntry> = Vec::new();
-    let mut ways: Vec<ScheduleEntry> = Vec::new();
-    let mut rels: Vec<ScheduleEntry> = Vec::new();
+    let mut nodes: Vec<ScheduledBlob> = Vec::new();
+    let mut ways: Vec<ScheduledBlob> = Vec::new();
+    let mut rels: Vec<ScheduledBlob> = Vec::new();
     let mut max_ids: [i64; 3] = [0; 3];
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
@@ -414,33 +525,34 @@ pub(crate) fn build_classify_schedules_split(
             ));
         }
         let reported_max = meta.index.as_ref().map_or(0, |i| i.max_id);
+        let entry = ScheduledBlob::from_meta(&meta)?;
         match meta.index.as_ref().map(|i| i.kind) {
             Some(crate::ElementKind::Node) => {
                 max_ids[0] = max_ids[0].max(reported_max);
-                nodes.push((nodes.len(), meta.data_offset, meta.data_size));
+                nodes.push(entry);
             }
             Some(crate::ElementKind::Way) => {
                 max_ids[1] = max_ids[1].max(reported_max);
-                ways.push((ways.len(), meta.data_offset, meta.data_size));
+                ways.push(entry);
             }
             Some(crate::ElementKind::Relation) => {
                 max_ids[2] = max_ids[2].max(reported_max);
-                rels.push((rels.len(), meta.data_offset, meta.data_size));
+                rels.push(entry);
             }
             None => {
                 walker.observe_filter_index(None);
                 // Unindexed: visible to every kind filter in the legacy path,
                 // so replicate to all three schedules here.
-                nodes.push((nodes.len(), meta.data_offset, meta.data_size));
-                ways.push((ways.len(), meta.data_offset, meta.data_size));
-                rels.push((rels.len(), meta.data_offset, meta.data_size));
+                nodes.push(entry);
+                ways.push(entry);
+                rels.push(entry);
             }
         }
     }
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_END");
 
     crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_START");
-    let shared_file = std::sync::Arc::clone(walker.shared_file());
+    let shared_file = walker.input();
     drop(walker);
     crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_END");
 
@@ -456,16 +568,21 @@ pub(crate) fn build_classify_schedules_split(
 /// Run a parallel classification phase: pread workers decompress and classify
 /// blobs, sending compact results to a consumer that merges them into ID sets.
 ///
-/// Each entry in `schedule` is `(seq, data_offset, data_size)`. Workers pread
-/// the compressed blob data, decompress, build a `PrimitiveBlock`, run the
-/// `classify` closure, and send the result. The consumer calls `merge(seq, r)`
-/// for each result, forwarding the blob's schedule-order sequence number so
-/// callers that care (e.g. `verify_ids`, which needs cross-blob monotonicity)
-/// can reorder via `ReorderBuffer` or similar. Callers that don't care ignore
-/// the seq argument.
+/// Workers pread each scheduled blob's compressed data, decompress, build a
+/// `PrimitiveBlock`, run the `classify` closure, and send the result. The
+/// consumer calls `merge(position, r)` for each result, forwarding the blob's
+/// position in `schedule` so callers that care (e.g. `verify_ids`, which
+/// needs cross-blob monotonicity) can reorder via `ReorderBuffer` or
+/// similar. Callers that don't care ignore it.
+///
+/// `classify` is fallible: a failure of the work on one blob - the pread, the
+/// decompression, the decode or the callback itself - is located with the
+/// input, the blob ordinal and its frame offset (cold, only on the error
+/// path) and ends the phase. A callback that read another file locates its
+/// own error; that location is kept.
 ///
 /// **Note:** `merge` is called in arbitrary worker-completion order, not blob
-/// file order. Callers that need file-order processing must buffer by seq.
+/// file order. Callers that need file-order processing must buffer by position.
 /// Per-blob streaming classify: workers send `R` per blob, keep `S` for scratch.
 ///
 /// Use for dense/hot paths (node classify, way classify) where per-worker
@@ -477,16 +594,16 @@ pub(crate) fn build_classify_schedules_split(
 /// [`parallel_classify_accumulate`].
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
-    shared_file: &std::sync::Arc<std::fs::File>,
-    schedule: &[ScheduleEntry],
+    input: &InputFile,
+    schedule: &[ScheduledBlob],
     threads: Option<usize>,
     worker_init: impl Fn() -> S + Send + Sync,
-    classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
+    classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> Result<R> + Send + Sync,
     mut merge: impl FnMut(usize, R),
     host: &crate::host::Host,
 ) -> Result<()> {
     parallel_classify_phase_abortable(
-        shared_file,
+        input,
         schedule,
         threads,
         worker_init,
@@ -537,11 +654,11 @@ fn recv_checked<T>(
 /// caller remains responsible for reporting why it stopped.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
-    shared_file: &std::sync::Arc<std::fs::File>,
-    schedule: &[ScheduleEntry],
+    input: &InputFile,
+    schedule: &[ScheduledBlob],
     threads: Option<usize>,
     worker_init: impl Fn() -> S + Send + Sync,
-    classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
+    classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> Result<R> + Send + Sync,
     mut merge: impl FnMut(usize, R) -> std::ops::ControlFlow<()>,
     host: &crate::host::Host,
 ) -> Result<()> {
@@ -555,18 +672,18 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
 
     let decode_threads = resolve_thread_count(threads, &*host.resources);
 
-    let (desc_tx, desc_rx) =
-        std::sync::mpsc::sync_channel::<ScheduleEntry>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<usize>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(
         POOL_RESULT_CHANNEL_DEPTH,
     );
+    let shared_file = input.file();
 
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
-            for &item in schedule {
-                willneed.before_dispatch(shared_file, item);
-                if desc_tx.send(item).is_err() {
+            for (position, entry) in schedule.iter().enumerate() {
+                willneed.before_dispatch(shared_file, entry);
+                if desc_tx.send(position).is_err() {
                     break;
                 }
             }
@@ -586,20 +703,21 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
                 let mut state = worker_init_ref();
 
                 loop {
-                    let (s, data_offset, data_size) = {
+                    let position = {
                         let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         match guard.recv() {
                             Ok(d) => d,
                             Err(_) => break,
                         }
                     };
+                    let entry = &schedule[position];
 
                     let r: crate::error::Result<R> = (|| {
-                        read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)?;
+                        read_buf.resize(entry.data_size(), 0);
+                        file.read_exact_at(&mut read_buf, entry.data_offset())?;
                         let mut buf = crate::blob::pool_get(
                             Some(&worker_pool),
-                            data_size * DECOMPRESS_EXPANSION_GUESS,
+                            entry.data_size() * DECOMPRESS_EXPANSION_GUESS,
                         );
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
@@ -608,9 +726,10 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
                             &mut st_scratch,
                             &mut gr_scratch,
                         )?;
-                        Ok(classify_ref(&block, &mut state))
-                    })();
-                    if tx.send((s, r)).is_err() {
+                        classify_ref(&block, &mut state)
+                    })()
+                    .map_err(|e| input.locate_blob(entry, e));
+                    if tx.send((position, r)).is_err() {
                         break;
                     }
                 }
@@ -708,17 +827,17 @@ impl Drop for CloseOnDrop<'_> {
 /// slowest blob of each batch and serialize the merge behind the workers,
 /// which matters on merge-heavy phases.
 ///
-/// `merge` receives the entry's own `seq`, which may be sparse; ordering is
-/// by schedule position.
+/// `merge` receives each entry's position in `schedule`, in order. Failures
+/// are located as in [`parallel_classify_phase`].
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn parallel_classify_phase_ordered<S: Send, R: Send>(
-    shared_file: &std::sync::Arc<std::fs::File>,
-    schedule: &[ScheduleEntry],
+    input: &InputFile,
+    schedule: &[ScheduledBlob],
     threads: Option<usize>,
     window: usize,
     worker_init: impl Fn() -> S + Send + Sync,
-    classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
+    classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> Result<R> + Send + Sync,
     mut merge: impl FnMut(usize, R),
     host: &crate::host::Host,
 ) -> Result<()> {
@@ -733,23 +852,22 @@ pub(crate) fn parallel_classify_phase_ordered<S: Send, R: Send>(
     let decode_threads = resolve_thread_count(threads, &*host.resources);
 
     let credit: OrderedCredit = (std::sync::Mutex::new((0, false)), std::sync::Condvar::new());
-    let (desc_tx, desc_rx) =
-        std::sync::mpsc::sync_channel::<(usize, ScheduleEntry)>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<usize>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (result_tx, result_rx) =
-        std::sync::mpsc::sync_channel::<(usize, usize, crate::error::Result<R>)>(
-            POOL_RESULT_CHANNEL_DEPTH,
-        );
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(
+        POOL_RESULT_CHANNEL_DEPTH,
+    );
+    let shared_file = input.file();
 
     std::thread::scope(|scope| -> Result<()> {
         let credit_ref = &credit;
         scope.spawn(move || {
-            for (position, &item) in schedule.iter().enumerate() {
+            for (position, entry) in schedule.iter().enumerate() {
                 if !wait_for_credit(credit_ref, position, window) {
                     break;
                 }
-                willneed.before_dispatch(shared_file, item);
-                if desc_tx.send((position, item)).is_err() {
+                willneed.before_dispatch(shared_file, entry);
+                if desc_tx.send(position).is_err() {
                     break;
                 }
             }
@@ -773,20 +891,21 @@ pub(crate) fn parallel_classify_phase_ordered<S: Send, R: Send>(
                 let mut state = worker_init_ref();
 
                 loop {
-                    let (position, (s, data_offset, data_size)) = {
+                    let position = {
                         let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         match guard.recv() {
                             Ok(d) => d,
                             Err(_) => break,
                         }
                     };
+                    let entry = &schedule[position];
 
                     let r: crate::error::Result<R> = (|| {
-                        read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)?;
+                        read_buf.resize(entry.data_size(), 0);
+                        file.read_exact_at(&mut read_buf, entry.data_offset())?;
                         let mut buf = crate::blob::pool_get(
                             Some(&worker_pool),
-                            data_size * DECOMPRESS_EXPANSION_GUESS,
+                            entry.data_size() * DECOMPRESS_EXPANSION_GUESS,
                         );
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
@@ -795,9 +914,10 @@ pub(crate) fn parallel_classify_phase_ordered<S: Send, R: Send>(
                             &mut st_scratch,
                             &mut gr_scratch,
                         )?;
-                        Ok(classify_ref(&block, &mut state))
-                    })();
-                    if tx.send((position, s, r)).is_err() {
+                        classify_ref(&block, &mut state)
+                    })()
+                    .map_err(|e| input.locate_blob(entry, e));
+                    if tx.send((position, r)).is_err() {
                         break;
                     }
                 }
@@ -819,11 +939,11 @@ pub(crate) fn parallel_classify_phase_ordered<S: Send, R: Send>(
         // wakes a dispatcher parked on credit, and the receiver (moved into
         // this closure for that reason), which fails the workers' sends.
         let result_rx = result_rx;
-        while let Some((position, seq, result)) = recv_checked(&result_rx, &host.cancel)? {
-            pending[position % ring] = Some((seq, result?));
+        while let Some((position, result)) = recv_checked(&result_rx, &host.cancel)? {
+            pending[position % ring] = Some((position, result?));
             let before = next;
-            while let Some((seq, out)) = pending[next % ring].take() {
-                merge(seq, out);
+            while let Some((position, out)) = pending[next % ring].take() {
+                merge(position, out);
                 next += 1;
             }
             if next != before {
@@ -854,8 +974,8 @@ pub(crate) fn parallel_classify_phase_ordered<S: Send, R: Send>(
 /// allocations onto the hot path for nothing.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
-    shared_file: &std::sync::Arc<std::fs::File>,
-    schedule: &[ScheduleEntry],
+    input: &InputFile,
+    schedule: &[ScheduledBlob],
     threads: Option<usize>,
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&[u8], &mut S) -> crate::error::Result<R> + Send + Sync,
@@ -872,18 +992,18 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
 
     let decode_threads = resolve_thread_count(threads, &*host.resources);
 
-    let (desc_tx, desc_rx) =
-        std::sync::mpsc::sync_channel::<ScheduleEntry>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<usize>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(
         POOL_RESULT_CHANNEL_DEPTH,
     );
+    let shared_file = input.file();
 
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
-            for &item in schedule {
-                willneed.before_dispatch(shared_file, item);
-                if desc_tx.send(item).is_err() {
+            for (position, entry) in schedule.iter().enumerate() {
+                willneed.before_dispatch(shared_file, entry);
+                if desc_tx.send(position).is_err() {
                     break;
                 }
             }
@@ -901,21 +1021,23 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
                 let mut state = worker_init_ref();
 
                 loop {
-                    let (s, data_offset, data_size) = {
+                    let position = {
                         let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         match guard.recv() {
                             Ok(d) => d,
                             Err(_) => break,
                         }
                     };
+                    let entry = &schedule[position];
 
                     let r: crate::error::Result<R> = (|| {
-                        read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)?;
+                        read_buf.resize(entry.data_size(), 0);
+                        file.read_exact_at(&mut read_buf, entry.data_offset())?;
                         crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
                         classify_ref(&decompress_buf, &mut state)
-                    })();
-                    if tx.send((s, r)).is_err() {
+                    })()
+                    .map_err(|e| input.locate_blob(entry, e));
+                    if tx.send((position, r)).is_err() {
                         break;
                     }
                 }
@@ -998,11 +1120,11 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
 /// geocode Pass 1.5 call site and the TODO item tracking it.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn parallel_classify_accumulate<S: Send>(
-    shared_file: &std::sync::Arc<std::fs::File>,
-    schedule: &[ScheduleEntry],
+    input: &InputFile,
+    schedule: &[ScheduledBlob],
     threads: Option<usize>,
     worker_init: impl Fn() -> S + Send + Sync,
-    classify: impl Fn(&crate::PrimitiveBlock, &mut S) + Send + Sync,
+    classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> Result<()> + Send + Sync,
     mut merge: impl FnMut(S),
     host: &crate::host::Host,
 ) -> Result<()> {
@@ -1017,17 +1139,17 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
     let decode_threads = resolve_thread_count(threads, &*host.resources);
     let cancel = &host.cancel;
 
-    let (desc_tx, desc_rx) =
-        std::sync::mpsc::sync_channel::<ScheduleEntry>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<usize>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (result_tx, result_rx) =
         std::sync::mpsc::sync_channel::<crate::error::Result<S>>(decode_threads);
+    let shared_file = input.file();
 
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
-            for &item in schedule {
-                willneed.before_dispatch(shared_file, item);
-                if desc_tx.send(item).is_err() {
+            for (position, entry) in schedule.iter().enumerate() {
+                willneed.before_dispatch(shared_file, entry);
+                if desc_tx.send(position).is_err() {
                     break;
                 }
             }
@@ -1054,7 +1176,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
                 let result: crate::error::Result<()> = (|| {
                     loop {
                         cancel.check()?;
-                        let (_s, data_offset, data_size) = {
+                        let position = {
                             let guard =
                                 rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             match guard.recv() {
@@ -1062,21 +1184,25 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
                                 Err(_) => return Ok(()),
                             }
                         };
+                        let entry = &schedule[position];
 
-                        read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)?;
-                        let mut buf = crate::blob::pool_get(
-                            Some(&worker_pool),
-                            data_size * DECOMPRESS_EXPANSION_GUESS,
-                        );
-                        crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
-                        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
-                            buf,
-                            &worker_pool,
-                            &mut st_scratch,
-                            &mut gr_scratch,
-                        )?;
-                        classify_ref(&block, &mut state);
+                        (|| -> crate::error::Result<()> {
+                            read_buf.resize(entry.data_size(), 0);
+                            file.read_exact_at(&mut read_buf, entry.data_offset())?;
+                            let mut buf = crate::blob::pool_get(
+                                Some(&worker_pool),
+                                entry.data_size() * DECOMPRESS_EXPANSION_GUESS,
+                            );
+                            crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
+                            let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+                                buf,
+                                &worker_pool,
+                                &mut st_scratch,
+                                &mut gr_scratch,
+                            )?;
+                            classify_ref(&block, &mut state)
+                        })()
+                        .map_err(|e| input.locate_blob(entry, e))?;
                     }
                 })();
 
@@ -1105,7 +1231,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{ScheduleEntry, WillneedPrefetch, blob_body_within_file, coalesce_willneed_ranges};
+    use super::{ScheduledBlob, WillneedPrefetch, blob_body_within_file, coalesce_willneed_ranges};
 
     /// Write a PBF with `blobs` single-node OSMData blobs and return its path.
     fn write_many_blob_pbf(dir: &std::path::Path, blobs: usize) -> std::path::PathBuf {
@@ -1164,8 +1290,9 @@ mod tests {
             || (),
             |_block, ()| {
                 classified.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
             },
-            |_seq, ()| {
+            |_position, ()| {
                 merged += 1;
                 std::ops::ControlFlow::Break(())
             },
@@ -1194,8 +1321,8 @@ mod tests {
             &schedule,
             Some(2),
             || (),
-            |_block, ()| {},
-            |_seq, ()| {
+            |_block, ()| Ok(()),
+            |_position, ()| {
                 all.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
             &crate::host::Host::for_tests(),
@@ -1205,8 +1332,8 @@ mod tests {
     }
 
     /// The ordered phase merges in schedule order whatever the completion
-    /// order, passes each entry's own (here sparse) `seq` through, and never
-    /// lets classification run more than `window` blobs past the earliest
+    /// order, passes each entry's position through, and never lets
+    /// classification run more than `window` blobs past the earliest
     /// unmerged one.
     #[test]
     fn ordered_phase_merges_in_schedule_order_within_its_window() {
@@ -1216,12 +1343,9 @@ mod tests {
         const BLOBS: usize = 40;
         const WINDOW: usize = 4;
         let path = write_many_blob_pbf(dir.path(), BLOBS);
-        let (mut schedule, shared_file) =
+        let (schedule, shared_file) =
             super::build_classify_schedule(&path, None, &crate::host::Host::for_tests()).unwrap();
         assert_eq!(schedule.len(), BLOBS);
-        for entry in &mut schedule {
-            entry.0 *= 2;
-        }
 
         let classified = AtomicUsize::new(0);
         let mut merged = Vec::new();
@@ -1233,6 +1357,7 @@ mod tests {
             || (),
             |_block, ()| {
                 classified.fetch_add(1, Ordering::Relaxed);
+                Ok(())
             },
             |seq, ()| {
                 // Every classified blob was admitted while fewer than
@@ -1248,12 +1373,142 @@ mod tests {
             &crate::host::Host::for_tests(),
         )
         .unwrap();
-        assert_eq!(merged, (0..BLOBS).map(|n| n * 2).collect::<Vec<_>>());
+        assert_eq!(merged, (0..BLOBS).collect::<Vec<_>>());
+    }
+
+    /// Every pool of this module locates a failure of the work on one blob
+    /// with the input's path, the blob's ordinal in the file and its frame
+    /// offset - the location the header walker stamps - and leaves a
+    /// cancellation unlocated.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one case per pool, each with its own setup
+    fn every_pool_locates_a_blob_failure_with_file_ordinal_and_offset() {
+        let dir = crate::path_guard::tests::scratch();
+        const BLOBS: usize = 6;
+        let path = write_many_blob_pbf(dir.path(), BLOBS);
+        let host = crate::host::Host::for_tests();
+        let (schedule, input) = super::build_classify_schedule(&path, None, &host).unwrap();
+        assert_eq!(schedule.len(), BLOBS);
+        // Fail on the blob holding node 4: schedule position 3, file blob 4
+        // (blob 0 is the OSMHeader).
+        let target = schedule[3];
+        assert_eq!(target.blob_index(), Some(4));
+        let fails_on_target = |block: &crate::PrimitiveBlock| -> crate::Result<()> {
+            let hit = block.elements_skip_metadata().any(|e| match e {
+                crate::Element::Node(n) => n.id() == 4,
+                crate::Element::DenseNode(n) => n.id() == 4,
+                _ => false,
+            });
+            if hit {
+                Err(crate::Error::invalid_data("forced failure"))
+            } else {
+                Ok(())
+            }
+        };
+        let check = |name: &str, err: crate::Error| {
+            assert_eq!(err.source_path(), Some(path.as_path()), "{name}: {err}");
+            assert_eq!(err.blob_index(), Some(4), "{name}: {err}");
+            assert_eq!(
+                err.byte_offset().map(|o| o.0),
+                Some(target.frame_start()),
+                "{name}: {err}"
+            );
+            let text = err.report();
+            assert!(
+                text.contains(&path.display().to_string()) && text.contains("blob 4"),
+                "{name}: {text}"
+            );
+        };
+
+        let err = super::parallel_classify_phase(
+            &input,
+            &schedule,
+            Some(2),
+            || (),
+            |block, ()| fails_on_target(block),
+            |_, ()| {},
+            &host,
+        )
+        .unwrap_err();
+        check("phase", err);
+
+        let err = super::parallel_classify_phase_ordered(
+            &input,
+            &schedule,
+            Some(2),
+            2,
+            || (),
+            |block, ()| fails_on_target(block),
+            |_, ()| {},
+            &host,
+        )
+        .unwrap_err();
+        check("ordered", err);
+
+        let err = super::parallel_classify_accumulate(
+            &input,
+            &schedule,
+            Some(2),
+            || (),
+            |block, ()| fails_on_target(block),
+            |()| {},
+            &host,
+        )
+        .unwrap_err();
+        check("accumulate", err);
+
+        // The raw pool hands over bytes; fail on the target's position by
+        // the payload length the schedule recorded for it.
+        let err = super::parallel_scan_blobs_raw(
+            &input,
+            &schedule[3..4],
+            Some(1),
+            || (),
+            |_bytes, ()| -> crate::Result<()> { Err(crate::Error::invalid_data("forced failure")) },
+            |_, ()| {},
+            &host,
+        )
+        .unwrap_err();
+        check("raw", err);
+
+        // A failed pread of a payload that is not there: the I/O error is
+        // located the same way.
+        let missing = [ScheduledBlob::at(1 << 40, 16)];
+        let err = super::parallel_classify_phase(
+            &input,
+            &missing,
+            Some(1),
+            || (),
+            |_block, ()| Ok(()),
+            |_, ()| {},
+            &host,
+        )
+        .unwrap_err();
+        assert_eq!(err.source_path(), Some(path.as_path()), "{err}");
+        assert_eq!(err.byte_offset().map(|o| o.0), Some((1 << 40) - 4), "{err}");
+
+        // A cancellation is not a fault of the input.
+        let cancelled = crate::host::Host::for_tests();
+        let err = super::parallel_classify_phase(
+            &input,
+            &schedule,
+            Some(1),
+            || (),
+            |_block, ()| -> crate::Result<()> {
+                cancelled.cancel.cancel();
+                cancelled.cancel.check()
+            },
+            |_, ()| {},
+            &host,
+        )
+        .unwrap_err();
+        assert!(err.is_cancelled());
+        assert_eq!(err.source_path(), None, "{err}");
     }
 
     #[test]
     fn willneed_prefetch_defaults_to_coalesced_schedule() {
-        let schedule: [ScheduleEntry; 2] = [(0, 100, 20), (1, 144, 5)];
+        let schedule = [ScheduledBlob::at(100, 20), ScheduledBlob::at(144, 5)];
 
         let prefetch = WillneedPrefetch::new(&schedule);
 
@@ -1264,7 +1519,11 @@ mod tests {
 
     #[test]
     fn willneed_ranges_coalesce_abutting_body_ranges() {
-        let schedule: [ScheduleEntry; 3] = [(0, 100, 20), (1, 120, 30), (2, 5_000, 5)];
+        let schedule = [
+            ScheduledBlob::at(100, 20),
+            ScheduledBlob::at(120, 30),
+            ScheduledBlob::at(5_000, 5),
+        ];
 
         assert_eq!(
             coalesce_willneed_ranges(&schedule),
@@ -1274,14 +1533,14 @@ mod tests {
 
     #[test]
     fn willneed_ranges_coalesce_realistic_blob_header_gaps() {
-        let schedule: [ScheduleEntry; 4] = [
-            (0, 100, 20),
+        let schedule = [
+            ScheduledBlob::at(100, 20),
             // Real PBF payloads have a four-byte header length plus the
             // BlobHeader between bodies. These represent 24- and 4096-byte
             // gaps, both intentionally bridged by the prefetch range.
-            (1, 144, 5),
-            (2, 4_245, 10),
-            (3, 8_352, 10),
+            ScheduledBlob::at(144, 5),
+            ScheduledBlob::at(4_245, 10),
+            ScheduledBlob::at(8_352, 10),
         ];
 
         assert_eq!(

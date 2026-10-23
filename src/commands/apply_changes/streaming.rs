@@ -262,12 +262,10 @@ pub(super) fn run_workers(
 
     crate::debug::emit_marker("MERGE_STREAMING_START");
 
-    let shared_file = match std::fs::File::open(&*base_pbf) {
+    let shared_file = match crate::read::input::open(&base_pbf) {
         Ok(file) => file,
         Err(e) => {
-            failure.publish(
-                Error::from(e).context(format!("streaming: failed to open {}", base_pbf.display())),
-            );
+            failure.publish(e);
             return;
         }
     };

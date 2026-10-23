@@ -7,7 +7,7 @@
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("the geocode index builder requires 64-bit pointers");
 
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 use crate::ElementReader;
@@ -224,12 +224,36 @@ fn build_geocode_index_to(
     // and the previous index survives every failure. The writer is finished
     // only once the build returned with every file it wrote closed.
     let writer = output.0.writer()?;
-    let stats = build_generation(config, writer.path(), host, &scratch)?;
+    // Every failure of the build names the index it was building; a file
+    // the failure is about is named beneath this.
+    let stats = build_generation(config, writer.path(), host, &scratch).map_err(|e| {
+        e.context(format!(
+            "building geocode index {}",
+            output.destination().display()
+        ))
+    })?;
     writer.finish();
     // The run scratch goes before publication: its removal is the run's
     // cleanup, and publication only syncs and renames the index.
     drop(scratch);
     Ok(stats)
+}
+
+/// Create (or truncate) one of the build's data files, buffered, naming the
+/// file in a failure: a bare "Permission denied" or "No space left on
+/// device" does not say which of the index's files it was.
+pub(super) fn create_data_file(
+    path: &std::path::Path,
+) -> Result<std::io::BufWriter<std::fs::File>> {
+    std::fs::File::create(path)
+        .map(std::io::BufWriter::new)
+        .map_err(|e| Error::from(e).context(format!("failed to create {}", path.display())))
+}
+
+/// Write a whole data file, naming it in a failure.
+pub(super) fn write_data_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes)
+        .map_err(|e| Error::from(e).context(format!("failed to write {}", path.display())))
 }
 
 /// The output directory of a geocode index: an
@@ -610,7 +634,7 @@ fn build_generation(
     // Write interp_ways.bin now (after resolution has set start/end numbers)
     crate::debug::emit_marker("GEOCODE_PASS2_WRITE_START");
     {
-        let mut iw_out = BufWriter::new(std::fs::File::create(output_dir.join(FILE_INTERP_WAYS))?);
+        let mut iw_out = create_data_file(&output_dir.join(FILE_INTERP_WAYS))?;
         for iw in &interp_ways {
             let rec = InterpWay {
                 node_offset: iw.node_file_offset,
@@ -633,7 +657,7 @@ fn build_generation(
         ));
     }
     admin::write_admin_data(output_dir, &admin_polygons)?;
-    std::fs::write(output_dir.join(FILE_STRINGS), &strings.data)?;
+    write_data_file(&output_dir.join(FILE_STRINGS), &strings.data)?;
     crate::debug::emit_marker("GEOCODE_PASS2_WRITE_END");
 
     // -----------------------------------------------------------------------
@@ -728,7 +752,7 @@ fn build_generation(
         coarse_cell_count: coarse_count,
         admin_cell_count: admin_count,
     };
-    std::fs::write(output_dir.join(FILE_HEADER), header.to_bytes())?;
+    write_data_file(&output_dir.join(FILE_HEADER), &header.to_bytes())?;
 
     // `Reader::open` runs the same record and string validation described on
     // its public API, so this smoke test intentionally repeats that structural

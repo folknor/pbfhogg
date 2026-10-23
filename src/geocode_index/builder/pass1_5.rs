@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::Result;
 use crate::error::Error;
+use crate::read::input::InputFile;
+use crate::scan::classify::ScheduledBlob;
 
 use crate::tunables::{NODE_PREALLOC_IDS_PER_BYTE, OVERFLOW_COMPACT_MIN};
 
@@ -164,12 +166,13 @@ fn report_negative_node_refs(count: &AtomicU64, sample: Mutex<Vec<i64>>, host: &
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub(super) fn run_pass1_5(
-    way_schedule: &[(usize, u64, usize)],
+    way_schedule: &[ScheduledBlob],
     max_node_id: i64,
-    shared_file: &std::sync::Arc<std::fs::File>,
+    input: &InputFile,
     needed_admin_ways: &crate::idset::IdSet,
     host: &crate::host::Host,
 ) -> Result<crate::idset::IdSet> {
+    let shared_file = input.file();
     let file_len = shared_file.metadata()?.len();
     let prealloc_max =
         crate::idset::IdSet::file_bounded_max_id(max_node_id, file_len, NODE_PREALLOC_IDS_PER_BYTE);
@@ -244,17 +247,15 @@ pub(super) fn run_pass1_5(
                         if idx >= way_schedule.len() {
                             break;
                         }
-                        let (_seq, offset, size) = way_schedule[idx];
+                        let entry = &way_schedule[idx];
 
                         let result = (|| -> Result<()> {
                             // Per way blob; a cancellation leaves through the
                             // first-error slot like any blob failure (this
                             // pool has no consumer, and no sequence to keep).
                             host.cancel.check()?;
-                            read_buf.resize(size, 0);
-                            file.read_exact_at(&mut read_buf, offset).map_err(|e| {
-                                Error::from(e).context(format!("pread at {offset}"))
-                            })?;
+                            read_buf.resize(entry.data_size(), 0);
+                            file.read_exact_at(&mut read_buf, entry.data_offset())?;
                             decompress_buf.clear();
                             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
                             crate::scan::way::scan_way_geocode_tagged_refs(
@@ -289,7 +290,7 @@ pub(super) fn run_pass1_5(
                         })();
 
                         if let Err(e) = result {
-                            store_first_err(first_err_ref, e);
+                            store_first_err(first_err_ref, input.locate_blob(entry, e));
                             return;
                         }
                     }
@@ -353,30 +354,31 @@ pub(super) fn build_pass2_schedules(
     input_path: &Path,
     host: &crate::host::Host,
 ) -> Result<(
-    Vec<(usize, u64, usize)>, // node_schedule
-    Vec<(usize, u64, usize)>, // way_schedule
-    i64,                      // max_node_id
-    std::sync::Arc<std::fs::File>,
+    Vec<ScheduledBlob>, // node_schedule
+    Vec<ScheduledBlob>, // way_schedule
+    i64,                // max_node_id
+    InputFile,
 )> {
     let mut walker = crate::read::header_walker::HeaderWalker::open(input_path, host)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input_path))?;
 
-    // Entries are `(seq, offset, size)`; `seq` is assigned once both
-    // schedules are complete (see `renumber` below).
-    let mut node_schedule: Vec<(usize, u64, usize)> = Vec::new();
-    let mut way_schedule: Vec<(usize, u64, usize)> = Vec::new();
+    // Each schedule is put into file order once both are complete (see
+    // `into_file_order` below).
+    let mut node_schedule: Vec<ScheduledBlob> = Vec::new();
+    let mut way_schedule: Vec<ScheduledBlob> = Vec::new();
     // OsmData blobs without indexdata (a `--force` run). Their kinds and
     // node-ID range are established by decoding them, below.
-    let mut unindexed: Vec<(usize, u64, usize)> = Vec::new();
+    let mut unindexed: Vec<ScheduledBlob> = Vec::new();
     let mut max_node_id: i64 = 0;
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
         }
+        let entry = ScheduledBlob::from_meta(&meta)?;
         let Some(idx) = meta.index.as_ref() else {
-            unindexed.push((unindexed.len(), meta.data_offset, meta.data_size));
+            unindexed.push(entry);
             continue;
         };
         match idx.kind {
@@ -384,16 +386,14 @@ pub(super) fn build_pass2_schedules(
                 if idx.max_id > max_node_id {
                     max_node_id = idx.max_id;
                 }
-                node_schedule.push((0, meta.data_offset, meta.data_size));
+                node_schedule.push(entry);
             }
-            crate::ElementKind::Way => {
-                way_schedule.push((0, meta.data_offset, meta.data_size));
-            }
+            crate::ElementKind::Way => way_schedule.push(entry),
             crate::ElementKind::Relation => {}
         }
     }
 
-    let shared_file = std::sync::Arc::clone(walker.shared_file());
+    let shared_file = walker.input();
     drop(walker);
 
     // `max_node_id` must bound every node ID Phase 2a will see: Pass 1.5
@@ -426,32 +426,33 @@ pub(super) fn build_pass2_schedules(
                     kinds.has_nodes = true;
                     kinds.max_node_id = kinds.max_node_id.max(node_id);
                 }
-                kinds
+                Ok(kinds)
             },
-            |seq, kinds| {
-                if let Some(slot) = found.get_mut(seq) {
+            |position, kinds| {
+                if let Some(slot) = found.get_mut(position) {
                     *slot = Some(kinds);
                 }
             },
             host,
         )?;
-        for (&(seq, offset, size), kinds) in unindexed.iter().zip(found) {
+        for (entry, kinds) in unindexed.iter().zip(found) {
             let kinds = kinds.ok_or_else(|| {
                 Error::internal(format!(
-                    "unindexed blob {seq} at offset {offset} was never decoded"
+                    "unindexed blob at offset {} was never decoded",
+                    entry.frame_start()
                 ))
             })?;
             if kinds.has_nodes {
                 max_node_id = max_node_id.max(kinds.max_node_id);
-                node_schedule.push((0, offset, size));
+                node_schedule.push(*entry);
             }
             if kinds.has_ways {
-                way_schedule.push((0, offset, size));
+                way_schedule.push(*entry);
             }
         }
     }
-    renumber(&mut node_schedule);
-    renumber(&mut way_schedule);
+    into_file_order(&mut node_schedule);
+    into_file_order(&mut way_schedule);
 
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -472,12 +473,9 @@ struct UnindexedBlobKinds {
     max_node_id: i64,
 }
 
-/// Put a schedule into file order and number it `0..len`.
-fn renumber(schedule: &mut [(usize, u64, usize)]) {
-    schedule.sort_unstable_by_key(|&(_, offset, _)| offset);
-    for (seq, entry) in schedule.iter_mut().enumerate() {
-        entry.0 = seq;
-    }
+/// Put a schedule into file order; its positions are then its order.
+fn into_file_order(schedule: &mut [ScheduledBlob]) {
+    schedule.sort_unstable_by_key(ScheduledBlob::frame_start);
 }
 
 #[cfg(test)]

@@ -10,7 +10,6 @@
 //! query is empty of node/way/relation IDs.
 
 use std::path::Path;
-use std::sync::Arc;
 
 use super::getid::ElementIds;
 use super::{
@@ -202,7 +201,7 @@ fn getparents_walker(
     let file_size = walker.file_size();
     let mut header_buf: Vec<u8> = Vec::new();
     let mut header_block: Option<crate::HeaderBlock> = None;
-    let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut schedule: Vec<crate::scan::classify::ScheduledBlob> = Vec::new();
     let mut blobs_skipped: u64 = 0;
 
     while let Some(meta) = walker.next_header()? {
@@ -239,7 +238,7 @@ fn getparents_walker(
                             )),
                         ));
                     }
-                    schedule.push((schedule.len(), meta.data_offset, meta.data_size));
+                    schedule.push(crate::scan::classify::ScheduledBlob::from_meta(&meta)?);
                 } else {
                     blobs_skipped += 1;
                 }
@@ -255,7 +254,7 @@ fn getparents_walker(
             .saturating_add(i64::try_from(blobs_skipped).unwrap_or(i64::MAX)),
     );
 
-    let shared_file = Arc::clone(walker.shared_file());
+    let shared_file = walker.input();
     drop(walker);
 
     let header = header_block.ok_or_else(|| crate::error::new_missing_header(input))?;
@@ -290,7 +289,7 @@ fn getparents_walker(
 
     crate::debug::emit_marker("GETPARENTS_DECODE_START");
     type ClassifyResult = crate::Result<(Vec<OwnedBlock>, (u64, u64, u64))>;
-    let mut reorder: ReorderBuffer<ClassifyResult> =
+    let mut reorder: ReorderBuffer<(Vec<OwnedBlock>, (u64, u64, u64))> =
         ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY);
     // Captured write error: `parallel_classify_phase`'s `merge` is `FnMut(usize, R)`
     // and cannot return a Result. Capture the first error here and bail out
@@ -325,35 +324,27 @@ fn getparents_walker(
                 return ControlFlow::Break(());
             }
             reorder.push(seq, result);
-            while let Some(item) = reorder.pop_ready() {
-                match item {
-                    Ok((blocks, (n, w, r))) => {
-                        for OwnedBlock {
-                            bytes: block_bytes,
-                            index,
-                            tagdata,
-                            way_members,
-                        } in blocks
-                        {
-                            if let Err(e) = writer.write_primitive_block_owned(
-                                block_bytes,
-                                index,
-                                tagdata.as_deref(),
-                                way_members.as_deref(),
-                            ) {
-                                write_err = Some(e);
-                                return ControlFlow::Break(());
-                            }
-                        }
-                        stats.nodes_written += n;
-                        stats.ways_written += w;
-                        stats.relations_written += r;
-                    }
-                    Err(e) => {
+            while let Some((blocks, (n, w, r))) = reorder.pop_ready() {
+                for OwnedBlock {
+                    bytes: block_bytes,
+                    index,
+                    tagdata,
+                    way_members,
+                } in blocks
+                {
+                    if let Err(e) = writer.write_primitive_block_owned(
+                        block_bytes,
+                        index,
+                        tagdata.as_deref(),
+                        way_members.as_deref(),
+                    ) {
                         write_err = Some(e);
                         return ControlFlow::Break(());
                     }
                 }
+                stats.nodes_written += n;
+                stats.ways_written += w;
+                stats.relations_written += r;
             }
             ControlFlow::Continue(())
         },

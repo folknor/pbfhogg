@@ -161,7 +161,7 @@ fn tags_count_inner(
         |block, _s| {
             let mut local: CountMap = FxHashMap::default();
             count_block_tags(&mut local, block, tf, &expressions);
-            local
+            Ok(local)
         },
         |_seq, per_blob| {
             merge_counts(&mut counts, per_blob);

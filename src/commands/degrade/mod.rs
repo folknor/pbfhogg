@@ -127,22 +127,22 @@ impl DropSpec {
     pub fn parse(s: &str) -> Result<Self> {
         let (n_str, seed_str) = s.split_once(':').ok_or_else(|| {
             Error::invalid_argument(
-                "--drop-ids expects N:SEED (e.g. 5000:42); the ':' separator is required",
+                "a drop spec is N:SEED (e.g. 5000:42); the ':' separator is required",
             )
         })?;
         let n = n_str.trim().parse().map_err(|_| {
             Error::invalid_argument(format!(
-                "--drop-ids: N must be a non-negative integer, got {n_str:?}"
+                "drop spec: N must be a non-negative integer, got {n_str:?}"
             ))
         })?;
         let seed = seed_str.trim().parse().map_err(|_| {
             Error::invalid_argument(format!(
-                "--drop-ids: SEED must be a non-negative integer, got {seed_str:?}"
+                "drop spec: SEED must be a non-negative integer, got {seed_str:?}"
             ))
         })?;
         if n == 0 {
             return Err(Error::invalid_argument(
-                "--drop-ids: N must be >= 1 (dropping zero elements is a no-op)",
+                "drop spec: N must be >= 1 (dropping zero elements is a no-op)",
             ));
         }
         Ok(Self { n, seed })
@@ -293,20 +293,18 @@ pub struct DegradeFlags {
 impl DegradeFlags {
     fn flag_states(self) -> [(bool, &'static str, bool); 10] {
         [
-            (self.unsort, "--unsort", true),
-            (self.unsort_intra, "--unsort-intra", true),
-            (self.strip_locations, "--strip-locations", true),
-            (self.strip_indexdata, "--strip-indexdata", false),
-            (self.strip_tagdata, "--strip-tagdata", false),
-            (self.corrupt_tagdata, "--corrupt-tagdata", false),
-            (self.corrupt_indexdata, "--corrupt-indexdata", false),
-            (
-                self.corrupt_indexdata_kind,
-                "--corrupt-indexdata-kind",
-                false,
-            ),
-            (self.strip_bbox, "--strip-bbox", false),
-            (self.drop_ids.is_some(), "--drop-ids", true),
+            // Named as the `DegradeFlags` fields are: the library's own
+            // vocabulary, not a front end's flag spelling.
+            (self.unsort, "unsort", true),
+            (self.unsort_intra, "unsort_intra", true),
+            (self.strip_locations, "strip_locations", true),
+            (self.strip_indexdata, "strip_indexdata", false),
+            (self.strip_tagdata, "strip_tagdata", false),
+            (self.corrupt_tagdata, "corrupt_tagdata", false),
+            (self.corrupt_indexdata, "corrupt_indexdata", false),
+            (self.corrupt_indexdata_kind, "corrupt_indexdata_kind", false),
+            (self.strip_bbox, "strip_bbox", false),
+            (self.drop_ids.is_some(), "drop_ids", true),
         ]
     }
 
@@ -396,7 +394,7 @@ pub fn degrade(
     input: &Path,
     output: crate::output::Output,
     flags: DegradeFlags,
-    block_cap: usize,
+    block_cap: std::num::NonZeroUsize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
@@ -414,7 +412,7 @@ pub(crate) fn degrade_to(
     input: &Path,
     output: &crate::output::Output,
     flags: DegradeFlags,
-    block_cap: usize,
+    block_cap: std::num::NonZeroUsize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
@@ -432,47 +430,44 @@ pub(crate) fn degrade_to(
         && flags.needs_decode()
     {
         return Err(Error::invalid_argument(
-            "--corrupt-tagdata, --corrupt-indexdata and --corrupt-indexdata-kind are \
+            "corrupt_tagdata, corrupt_indexdata and corrupt_indexdata_kind are \
              header-only rewrites and cannot be combined with a transformation \
              that re-encodes blobs \
-             (--unsort, --unsort-intra, --strip-locations, --drop-ids), which \
+             (unsort, unsort_intra, strip_locations, drop_ids), which \
              would rebuild the hint correctly",
         ));
     }
     if flags.strip_tagdata && flags.corrupt_tagdata {
         return Err(Error::invalid_argument(
-            "--strip-tagdata and --corrupt-tagdata are mutually exclusive: \
+            "strip_tagdata and corrupt_tagdata are mutually exclusive: \
              both rewrite BlobHeader field 4, one to nothing and one to a \
              deliberately wrong index",
         ));
     }
     if flags.strip_indexdata && (flags.corrupt_indexdata || flags.corrupt_indexdata_kind) {
         return Err(Error::invalid_argument(
-            "--strip-indexdata is mutually exclusive with --corrupt-indexdata and \
-             --corrupt-indexdata-kind: all three rewrite BlobHeader field 2, \
+            "strip_indexdata is mutually exclusive with corrupt_indexdata and \
+             corrupt_indexdata_kind: all three rewrite BlobHeader field 2, \
              one to nothing and the others to a deliberately wrong index",
         ));
     }
     if flags.unsort && flags.unsort_intra {
         return Err(Error::invalid_argument(
-            "--unsort and --unsort-intra are mutually exclusive: --unsort \
-             produces cross-blob ID-range overlap, --unsort-intra produces \
+            "unsort and unsort_intra are mutually exclusive: unsort \
+             produces cross-blob ID-range overlap, unsort_intra produces \
              an intra-blob inversion",
         ));
-    }
-    if block_cap == 0 {
-        return Err(Error::invalid_argument("--block-cap must be > 0"));
     }
     // An intra-blob inversion needs two same-kind elements sitting inside
     // one output block. A cap of 1 puts every element in its own block, so
     // the requested shape is impossible - reject it rather than silently
     // clearing Sort.Type_then_ID and emitting an untouched (still-monotone)
-    // stream. `--unsort` (cross-blob overlap) IS achievable at cap 1: two
-    // adjacent single-element blobs with a descending step overlap, so it
-    // stays supported.
-    if flags.unsort_intra && block_cap < 2 {
+    // stream. Cross-blob `unsort` IS achievable at cap 1: two adjacent
+    // single-element blobs with a descending step overlap, so it stays
+    // supported.
+    if flags.unsort_intra && block_cap.get() < 2 {
         return Err(Error::invalid_argument(
-            "--unsort-intra needs --block-cap >= 2: an intra-blob \
+            "unsort_intra needs a block cap of at least 2: an intra-blob \
              inversion requires at least two same-kind elements inside \
              one output block, which a cap of 1 cannot hold",
         ));
@@ -500,7 +495,7 @@ pub(crate) fn degrade_to(
             crate::debug::emit_counter("degrade_drop_n", spec.n as i64);
             crate::debug::emit_counter("degrade_drop_seed", spec.seed as i64);
         }
-        crate::debug::emit_counter("degrade_block_cap", block_cap as i64);
+        crate::debug::emit_counter("degrade_block_cap", block_cap.get() as i64);
     }
 
     let stats = if flags.needs_decode() {
@@ -809,7 +804,7 @@ fn degrade_decode_path(
     input: &Path,
     output: &crate::output::Output,
     flags: DegradeFlags,
-    block_cap: usize,
+    block_cap: std::num::NonZeroUsize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
@@ -842,7 +837,8 @@ fn degrade_decode_path(
     // Use the input size as a preallocation budget for the caller-supplied
     // cap. Compressed input can expand to more elements than bytes; the
     // vectors grow as needed without changing the requested block cap.
-    let prealloc_bound = usize::try_from(shared_file.metadata()?.len()).unwrap_or(usize::MAX);
+    let prealloc_bound =
+        usize::try_from(shared_file.file().metadata()?.len()).unwrap_or(usize::MAX);
 
     // Selection must finish before opening the writer: an over-large N must
     // not leave a header-only output behind.
@@ -968,10 +964,10 @@ fn degrade_decode_path(
 }
 
 fn select_drop_sets(
-    shared_file: &std::sync::Arc<std::fs::File>,
-    node_schedule: &[crate::scan::classify::ScheduleEntry],
-    way_schedule: &[crate::scan::classify::ScheduleEntry],
-    relation_schedule: &[crate::scan::classify::ScheduleEntry],
+    shared_file: &crate::read::input::InputFile,
+    node_schedule: &[crate::scan::classify::ScheduledBlob],
+    way_schedule: &[crate::scan::classify::ScheduledBlob],
+    relation_schedule: &[crate::scan::classify::ScheduledBlob],
     spec: DropSpec,
     host: &crate::host::Host,
 ) -> Result<DropSets> {
@@ -987,7 +983,7 @@ fn select_drop_sets(
             schedule,
             None,
             || (),
-            |block, _| select_block_keys(block, kind, spec),
+            |block, _| Ok(select_block_keys(block, kind, spec)),
             |_seq, block_drop| {
                 total += block_drop.matched;
                 for key in block_drop.smallest {
@@ -999,7 +995,7 @@ fn select_drop_sets(
     }
     if spec.n > total {
         return Err(Error::invalid_argument(format!(
-            "--drop-ids: cannot drop {} elements, input has only {}",
+            "drop_ids: cannot drop {} elements, input has only {}",
             spec.n, total,
         )));
     }
@@ -1064,10 +1060,10 @@ struct PhaseStats {
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn run_kind_phase(
-    shared_file: &std::sync::Arc<std::fs::File>,
-    schedule: &[(usize, u64, usize)],
+    shared_file: &crate::read::input::InputFile,
+    schedule: &[crate::scan::classify::ScheduledBlob],
     kind: ElementKind,
-    block_cap: usize,
+    cap: std::num::NonZeroUsize,
     prealloc_bound: usize,
     flags: DegradeFlags,
     compression: Compression,
@@ -1076,6 +1072,7 @@ fn run_kind_phase(
     host: &crate::host::Host,
 ) -> Result<PhaseStats> {
     use crate::reorder_buffer::ReorderBuffer;
+    let block_cap = cap.get();
 
     if schedule.is_empty() {
         return Ok(PhaseStats {
@@ -1086,10 +1083,10 @@ fn run_kind_phase(
     }
 
     type PhaseResult = crate::Result<WorkerOutput>;
-    let mut reorder: ReorderBuffer<PhaseResult> =
+    let mut reorder: ReorderBuffer<WorkerOutput> =
         ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY);
 
-    let mut bb = BlockBuilder::with_element_cap_prealloc(block_cap, prealloc_bound);
+    let mut bb = BlockBuilder::with_element_cap_prealloc(cap, prealloc_bound);
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut pending: Vec<OwnedBlock> = Vec::with_capacity(FRAME_BATCH);
     let mut unsort = UnsortKindState::new(flags, block_cap);
@@ -1105,21 +1102,14 @@ fn run_kind_phase(
         None,
         || (),
         |block, _state| -> PhaseResult {
-            worker_decode_kind(block, kind, block_cap, flags, &compression, drop)
+            worker_decode_kind(block, kind, cap, flags, &compression, drop)
         },
         |seq, r| {
             reorder.push(seq, r);
-            while let Some(item) = reorder.pop_ready() {
+            while let Some(out) = reorder.pop_ready() {
                 if write_error.is_some() {
                     continue;
                 }
-                let out = match item {
-                    Ok(out) => out,
-                    Err(e) => {
-                        classify_error.get_or_insert(e);
-                        continue;
-                    }
-                };
 
                 // Sort preservation: flush central BB before writing this
                 // input blob's worker frames. Anything left in central
@@ -1260,11 +1250,12 @@ fn run_kind_phase(
 fn worker_decode_kind(
     block: &crate::PrimitiveBlock,
     kind: ElementKind,
-    cap: usize,
+    cap_nz: std::num::NonZeroUsize,
     flags: DegradeFlags,
     compression: &Compression,
     drop: Option<&FxHashSet<i64>>,
 ) -> crate::Result<WorkerOutput> {
+    let cap = cap_nz.get();
     // `element_matches_kind` already discriminates by `kind`, so the count is
     // identical for every kind - no per-kind match needed.
     let total = block
@@ -1281,7 +1272,7 @@ fn worker_decode_kind(
         (total - tail, tail)
     };
 
-    let mut bb = BlockBuilder::with_element_cap_prealloc(cap, total);
+    let mut bb = BlockBuilder::with_element_cap_prealloc(cap_nz, total);
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut full_framed: Vec<Vec<u8>> = Vec::new();
     let mut tail: KindPayload = match kind {

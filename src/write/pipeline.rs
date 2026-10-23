@@ -40,9 +40,12 @@ pub(crate) enum OutputChunk {
     /// path whose whole point is byte-exact passthrough. Every in-tree caller
     /// happened to keep its input alive, but nothing made them. An `Arc` costs
     /// one refcount per passthrough run and makes the guarantee structural.
+    ///
+    /// The input travels with its path ([`InputFile`](crate::read::input::InputFile)),
+    /// so a failed read or splice names the file and the byte range.
     #[cfg(feature = "linux-direct-io")]
     CopyRange {
-        in_file: std::sync::Arc<std::fs::File>,
+        in_file: crate::read::input::InputFile,
         offset: u64,
         len: u64,
     },
@@ -165,13 +168,11 @@ impl OutputSink for FileOutputSink {
                 offset,
                 len,
             } => {
-                use std::os::unix::io::AsRawFd;
-                let in_fd = in_file.as_raw_fd();
                 let t_write = std::time::Instant::now();
                 let out_fd = self.writer.flush_and_raw_fd()?.ok_or_else(|| {
                     Error::invalid_argument("copy_file_range incompatible with O_DIRECT output")
                 })?;
-                super::copy_range::copy_range(in_fd, out_fd, offset, len, &self.cancel)?;
+                super::copy_range::copy_range(&in_file, out_fd, offset, len, &self.cancel)?;
                 // Hold the input open until the splice has actually happened.
                 drop(in_file);
                 WRITER_METRICS

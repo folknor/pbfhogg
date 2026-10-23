@@ -104,7 +104,7 @@ fn resources_provider_is_consulted() {
     pbfhogg::repack::repack(
         &base,
         crate::common::out(dir.path().join("repack.pbf")),
-        8000,
+        pbfhogg::block_builder::DEFAULT_ELEMENT_CAP,
         &Default::default(),
         &Default::default(),
         &host,
@@ -480,7 +480,7 @@ fn fixed_memory_routes_auto() {
             crate::common::scratch_in(dir.path()),
         )
         .expect("auto");
-        let prefix = format!("auto-selected --index-type {backend} (store estimate");
+        let prefix = format!("auto-selected index type {backend} (store estimate");
         assert!(
             sink.0
                 .lock()

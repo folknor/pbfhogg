@@ -274,11 +274,14 @@ impl std::str::FromStr for OutputHeaderEntry {
     fn from_str(entry: &str) -> Result<Self> {
         let (key, value) = entry.split_once('=').ok_or_else(|| {
             Error::invalid_argument(format!(
-                "invalid --output-header format: '{entry}' (expected key=value)"
+                "invalid output header entry: '{entry}' (expected key=value)"
             ))
         })?;
         let key = HeaderOverrideKey::parse(key).ok_or_else(|| {
-            Error::invalid_argument(format!("unknown --output-header key: '{key}'"))
+            Error::invalid_argument(format!(
+                "unknown output header key: '{key}' (supported: {})",
+                HeaderOverrideKey::help_list()
+            ))
         })?;
         Ok(match key.kind {
             // Integer seconds or RFC 3339, the same two spellings
@@ -465,7 +468,8 @@ pub(crate) fn require_indexdata(
 ) -> Result<bool> {
     let present = has_indexdata(path, direct_io, &host.diagnostics)?;
     if !force && !present {
-        return Err(crate::error::new_missing_indexdata(reason));
+        return Err(crate::error::new_missing_indexdata(reason)
+            .locate(crate::error::Location::in_file(path)));
     }
     Ok(present)
 }
@@ -473,7 +477,10 @@ pub(crate) fn require_indexdata(
 /// Check that a PBF file declares `Sort.Type_then_ID`.
 ///
 /// `context` identifies the file role, and `reason` explains why this command
-/// requires sorted input.
+/// requires sorted input. The error is [`ErrorKind::Unsorted`] located at
+/// `path`; how to sort the file is the front end's advice.
+///
+/// [`ErrorKind::Unsorted`]: crate::ErrorKind::Unsorted
 pub(crate) fn require_sorted(
     is_sorted: bool,
     path: &Path,
@@ -481,15 +488,10 @@ pub(crate) fn require_sorted(
     reason: &str,
 ) -> Result<()> {
     if !is_sorted {
-        return Err(Error::invalid_data(format!(
-            "{context} is not sorted (missing Sort.Type_then_ID optional feature).\n\
-             File: {}\n\n\
-             Sort the input file first:\n\n\
-             \x20 pbfhogg sort {} -o sorted.osm.pbf\n\n\
-             {reason}",
-            path.display(),
-            path.display(),
-        )));
+        return Err(crate::error::new_unsorted(format!(
+            "{context} is not sorted (missing Sort.Type_then_ID optional feature). {reason}"
+        ))
+        .locate(crate::error::Location::in_file(path)));
     }
     Ok(())
 }

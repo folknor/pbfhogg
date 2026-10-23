@@ -17,7 +17,7 @@ use super::compact::{
     arena_append_relation, arena_append_way, version_at,
 };
 use super::interner::StringInterner;
-use super::version_floor::{VersionFloor, regression_message};
+use super::version_floor::VersionFloor;
 use super::xml_parse::{CompactSink, parse_osc_path};
 
 pub use super::compact::{
@@ -201,15 +201,13 @@ impl CompactDiffOverlay {
         else {
             return Ok(());
         };
-        Err(crate::Error::invalid_data(regression_message(
+        Err(crate::error::new_version_regression(
             "OSC change overlay",
-            kind.as_str(),
+            kind,
             id,
             incoming_version,
             stored,
-            "pass apply-changes --allow-version-regression \
-             (`CompactDiffOverlay::allow_version_regression(true)` from the library)",
-        )))
+        ))
     }
 
     /// Returns true if the overlay contains no data at all.

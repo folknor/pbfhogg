@@ -117,13 +117,13 @@ fn try_index_only_scan(
             host.diagnostics,
             Note,
             "inspect.direct_io_ignored",
-            "--direct-io not used on the index-only fast path; \
+            "direct I/O is not used on the index-only fast path; \
              HeaderWalker avoids page-cache pollution via \
              posix_fadvise(POSIX_FADV_RANDOM). If any blob lacks indexdata \
-             this scan falls back to full decode and honours --direct-io there."
+             this scan falls back to full decode and uses direct I/O there."
         );
     }
-    let meta = std::fs::metadata(path)?;
+    let meta = crate::read::input::metadata(path)?;
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -275,7 +275,7 @@ fn full_decode_scan(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<InspectReport> {
-    let meta = std::fs::metadata(path)?;
+    let meta = crate::read::input::metadata(path)?;
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())

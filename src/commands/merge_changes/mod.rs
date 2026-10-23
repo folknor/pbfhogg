@@ -14,7 +14,7 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 use rayon::prelude::*;
 
 use super::Result;
-use crate::osc::version_floor::{VersionFloor, regression_message};
+use crate::osc::version_floor::VersionFloor;
 use crate::osc::write::{
     OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, write_delete_xml,
     write_node_xml, write_relation_xml, write_way_xml,
@@ -351,6 +351,11 @@ fn parse_one_into_stream(
 
 /// Where a finished change goes.
 trait ChangeDest {
+    /// Whether `accept` emits the change (serializes it toward the output),
+    /// so that its failure is the output's, not a fault of the input; see
+    /// `OscSink::END_ELEMENT_EMITS`.
+    const EMITS: bool;
+
     fn accept(&mut self, change: Change) -> Result<()>;
 }
 
@@ -359,6 +364,8 @@ struct StreamDest<'a> {
 }
 
 impl ChangeDest for StreamDest<'_> {
+    const EMITS: bool = false;
+
     fn accept(&mut self, change: Change) -> Result<()> {
         self.stream.push(change.action, change.element);
         Ok(())
@@ -372,6 +379,8 @@ struct WriterDest<'a, W: io::Write> {
 }
 
 impl<W: io::Write> ChangeDest for WriterDest<'_, W> {
+    const EMITS: bool = true;
+
     fn accept(&mut self, change: Change) -> Result<()> {
         emit_change(self.writer, self.open_action, &change)?;
         *self.count += 1;
@@ -396,6 +405,8 @@ impl<D: ChangeDest> OwnedSink<D> {
 }
 
 impl<D: ChangeDest> OscSink for OwnedSink<D> {
+    const END_ELEMENT_EMITS: bool = D::EMITS;
+
     fn begin_element(
         &mut self,
         action: Action,
@@ -892,14 +903,13 @@ fn check_version_advance(floor: &mut VersionFloor, incoming: &Change) -> Result<
             ChangeElement::Way(w) => (ElementKind::Way, w.id),
             ChangeElement::Relation(r) => (ElementKind::Relation, r.id),
         };
-        return Err(crate::Error::invalid_data(regression_message(
-            "merge-changes --simplify",
-            kind.as_str(),
+        return Err(crate::error::new_version_regression(
+            "merge-changes simplification",
+            kind,
             id,
             version,
             held,
-            "pass --allow-version-regression",
-        )));
+        ));
     }
     floor.raise(claim);
     Ok(())

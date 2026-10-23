@@ -31,8 +31,10 @@ pub enum FileReader {
 ///
 /// A bare `No such file or directory (os error 2)` is what a user saw for
 /// a mistyped input path: true, and useless on a command with several
-/// inputs. The path is known here and nowhere below here.
-pub(crate) fn open_error(path: &Path, err: impl Into<Error>) -> Error {
+/// inputs. The path is known here and nowhere below here. The same text as
+/// [`crate::read::input::open`], which the buffered open goes through.
+#[cfg(feature = "linux-direct-io")]
+fn open_error(path: &Path, err: impl Into<Error>) -> Error {
     err.into()
         .context(format!("failed to open {}", path.display()))
 }
@@ -67,7 +69,7 @@ impl FileReader {
     /// On Linux, advises the kernel for sequential readahead via
     /// `posix_fadvise(POSIX_FADV_SEQUENTIAL)`.
     pub fn buffered(path: &Path) -> Result<Self> {
-        let f = File::open(path).map_err(|e| open_error(path, e))?;
+        let f = crate::read::input::open(path)?;
         #[cfg(all(
             target_os = "linux",
             any(feature = "linux-direct-io", feature = "linux-io-uring")
@@ -111,7 +113,8 @@ impl FileReader {
             #[cfg(not(feature = "linux-direct-io"))]
             {
                 return Err(Error::invalid_argument(
-                    "--direct-io requires the linux-direct-io feature",
+                    "O_DIRECT reads need the linux-direct-io feature, which this build \
+                     was compiled without",
                 ));
             }
         }

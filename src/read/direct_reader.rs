@@ -193,7 +193,12 @@ impl DirectReader {
             .custom_flags(libc::O_DIRECT)
             .open(path)
             .map_err(|e| crate::error::direct_io_open_error_at(path, e))?;
-        let file_len = file.metadata()?.len();
+        let file_len = file
+            .metadata()
+            .map_err(|e| {
+                crate::Error::from(e).context(format!("failed to stat {}", path.display()))
+            })?
+            .len();
         let buf = AlignedReadBuffer::new(IO_BUF_BYTES)?;
         Ok(Self {
             file,

@@ -674,11 +674,16 @@ fn append_and_cleanup(
 ) -> Result<()> {
     // The copy checks the token at every read of the shard file (a shard
     // can hold gigabytes of text, and stdout is not cancellation-aware).
-    let copied = std::fs::File::open(src)
+    let copied = crate::scratch::open(src)
         .and_then(|f| io::copy(&mut crate::host::CancellableRead::new(f, cancel), out));
     scratch.remove(src);
     match copied {
         Ok(_) => Ok(()),
-        Err(e) => Err(e.into()),
+        // A cancellation is not a failure of this file: left as it is.
+        Err(e) if crate::error::io_carries_cancellation(&e) => Err(e.into()),
+        Err(e) => {
+            Err(crate::Error::from(e)
+                .context(format!("failed to copy scratch file {}", src.display())))
+        }
     }
 }

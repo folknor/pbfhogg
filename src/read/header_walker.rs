@@ -185,9 +185,13 @@ impl HeaderWalker {
     /// `shared_file()`, rather than flowing `--direct-io` through
     /// this helper.
     pub(crate) fn open(path: &Path, host: &crate::host::Host) -> Result<Self> {
-        let file =
-            std::fs::File::open(path).map_err(|e| super::file_reader::open_error(path, e))?;
-        let file_size = file.metadata()?.len();
+        let file = crate::read::input::open(path)?;
+        let file_size = file
+            .metadata()
+            .map_err(|e| {
+                crate::Error::from(e).context(format!("failed to stat {}", path.display()))
+            })?
+            .len();
         // POSIX_FADV_RANDOM: suppresses readahead. Our pread pattern is
         // header-at-a-time (tiny reads) with big gaps, plus occasional
         // full-blob body preads that are also not in a sequential stream
@@ -268,6 +272,12 @@ impl HeaderWalker {
             Some(meta.blob_index),
             Some(crate::ByteOffset(meta.frame_start)),
         ))
+    }
+
+    /// The walker's file handle and path, for the pools that pread the blobs
+    /// this walk scheduled and locate their failures in this input.
+    pub(crate) fn input(&self) -> crate::read::input::InputFile {
+        crate::read::input::InputFile::from_parts(Arc::clone(&self.file), Arc::clone(&self.path))
     }
 
     /// Shared `Arc<File>` for worker threads to `pread` data bodies.

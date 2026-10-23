@@ -127,11 +127,11 @@ fn digest_inner(path: &Path, direct_io: bool, host: &crate::host::Host) -> Resul
 
     let reader = ElementReader::open_in(path, direct_io, host)?;
     if !reader.header().is_sorted() {
-        return Err(Error::invalid_data(format!(
-            "{}: the header does not claim Sort.Type_then_ID; digest covers sorted input only, \
-             as diff does. Sort it first with `pbfhogg sort`.",
-            path.display()
-        )));
+        return Err(crate::error::new_unsorted(
+            "the header does not claim Sort.Type_then_ID; digest covers sorted input only, \
+             as diff does.",
+        )
+        .locate(crate::error::Location::in_file(path)));
     }
 
     crate::debug::emit_marker("DIGEST_SCAN_START");

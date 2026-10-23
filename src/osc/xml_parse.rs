@@ -16,7 +16,6 @@
 //! what an element turns into once the framing has identified it.
 
 use std::cell::Cell;
-use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
 use std::path::Path;
 use std::rc::Rc;
@@ -70,6 +69,12 @@ impl OscAction {
 /// exactly one `end_element`. A self-closing element gets `begin_element`
 /// immediately followed by `end_element`.
 pub(crate) trait OscSink {
+    /// Whether `end_element` emits the finished element (serializes or
+    /// writes it), so that a failure there is the output's and not a fault
+    /// of the input. Every other callback only interprets the input, and
+    /// the driver locates its failures with the input file.
+    const END_ELEMENT_EMITS: bool = false;
+
     fn begin_element(
         &mut self,
         action: OscAction,
@@ -327,20 +332,24 @@ pub(crate) fn open_osc_reader(
     path: &Path,
     cancel: &crate::host::Cancel,
 ) -> ParseResult<(OscReader, Rc<Cell<Duration>>)> {
-    let mut file = File::open(path).map_err(|e| crate::file_reader::open_error(path, e))?;
+    let mut file = crate::read::input::open(path)?;
     // A file shorter than two bytes cannot be gzip and cannot be XML
     // either; read what is there and let the XML parser produce the
     // complaint, rather than failing here with an EOF error that names
     // nothing.
+    let read_error =
+        |e: io::Error| Error::from(e).context(format!("failed to read {}", path.display()));
     let mut magic = [0u8; 2];
     let mut got = 0usize;
     while got < 2 {
-        match file.read(&mut magic[got..])? {
-            0 => break,
-            n => got += n,
+        match file.read(&mut magic[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(read_error(e)),
         }
     }
-    file.seek(io::SeekFrom::Start(0))?;
+    file.seek(io::SeekFrom::Start(0)).map_err(read_error)?;
 
     let total = Rc::new(Cell::new(Duration::ZERO));
     let inner: Box<dyn io::Read> = if got == 2 && magic == [0x1f, 0x8b] {
@@ -401,11 +410,32 @@ fn route_child<S: OscSink>(
     }
 }
 
+/// Locate a failure of reading or interpreting the OSC input at `path`. A
+/// cancellation stays unlocated, as does an error that already names a
+/// location. There is no byte offset: the parser's position counts
+/// decompressed bytes of a `.osc.gz`, not bytes of the file.
+#[cold]
+fn input_fault(path: &Path, err: Error) -> Error {
+    err.locate_blob(crate::error::Location::in_file(path))
+}
+
+/// `sink.end_element()`, its failure located in the input unless the sink
+/// emits the finished element there (see [`OscSink::END_ELEMENT_EMITS`]).
+fn end_element<S: OscSink>(sink: &mut S, path: &Path) -> ParseResult<()> {
+    let result = sink.end_element();
+    if S::END_ELEMENT_EMITS {
+        result
+    } else {
+        result.map_err(|e| input_fault(path, e))
+    }
+}
+
 fn handle_open<S: OscSink>(
     e: &quick_xml::events::BytesStart<'_>,
     is_empty: bool,
     state: &mut DriveState,
     sink: &mut S,
+    path: &Path,
 ) -> ParseResult<()> {
     let name = e.name();
     let name = name.as_ref();
@@ -432,30 +462,40 @@ fn handle_open<S: OscSink>(
         // dropped non-self-closing ones. All three answers were
         // different, and only refusing is defensible - we cannot know
         // whether the producer meant to create, modify or delete it.
-        let action = state.section.ok_or_else(|| {
-            Error::invalid_data(format!(
-                "OSC {} {} appears outside any <create>, <modify> or <delete> section; \
+        let action = state
+            .section
+            .ok_or_else(|| {
+                Error::invalid_data(format!(
+                    "OSC {} {} appears outside any <create>, <modify> or <delete> section; \
                  refusing to guess which change it was meant to be",
-                kind.as_str(),
-                parse_i64_attr(e, "id").map_or_else(|_| "(no id)".to_string(), |id| id.to_string())
-            ))
-        })?;
-        sink.begin_element(action, kind, e)?;
+                    kind.as_str(),
+                    parse_i64_attr(e, "id")
+                        .map_or_else(|_| "(no id)".to_string(), |id| id.to_string())
+                ))
+            })
+            .map_err(|e| input_fault(path, e))?;
+        sink.begin_element(action, kind, e)
+            .map_err(|e| input_fault(path, e))?;
         if is_empty {
-            sink.end_element()?;
+            end_element(sink, path)?;
         } else {
             state.open = Some(kind);
         }
         return Ok(());
     }
 
-    route_child(name, e, state, sink)
+    route_child(name, e, state, sink).map_err(|e| input_fault(path, e))
 }
 
-/// Drive one OSC document from `reader` into `sink`.
-pub(crate) fn drive_osc<R: io::BufRead, S: OscSink>(
+/// Drive one OSC document read from `path` through `reader` into `sink`.
+///
+/// Every failure of reading or interpreting the input is located with
+/// `path`; a failure the sink raises while emitting a finished element is
+/// output's, and passes through unlocated (it names its own destination).
+fn drive_osc<R: io::BufRead, S: OscSink>(
     reader: &mut Reader<R>,
     sink: &mut S,
+    path: &Path,
 ) -> ParseResult<()> {
     let mut state = DriveState {
         section: None,
@@ -466,15 +506,15 @@ pub(crate) fn drive_osc<R: io::BufRead, S: OscSink>(
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => handle_open(e, false, &mut state, sink)?,
-            Ok(Event::Empty(ref e)) => handle_open(e, true, &mut state, sink)?,
+            Ok(Event::Start(ref e)) => handle_open(e, false, &mut state, sink, path)?,
+            Ok(Event::Empty(ref e)) => handle_open(e, true, &mut state, sink, path)?,
             Ok(Event::End(ref e)) => {
                 let name = e.name();
                 let name = name.as_ref();
                 if action_for(name).is_some() {
                     state.section = None;
                 } else if ElementKind::from_name(name).is_some() && state.open.is_some() {
-                    sink.end_element()?;
+                    end_element(sink, path)?;
                     state.open = None;
                 } else if name == ROOT {
                     state.saw_root_end = true;
@@ -495,7 +535,7 @@ pub(crate) fn drive_osc<R: io::BufRead, S: OscSink>(
                 {
                     return Err(crate::error::new_cancelled());
                 }
-                return Err(xml_read_err(e));
+                return Err(input_fault(path, xml_read_err(e)));
             }
         }
         buf.clear();
@@ -507,11 +547,14 @@ pub(crate) fn drive_osc<R: io::BufRead, S: OscSink>(
     // wrote a partially-applied PBF and reported success. Only the
     // closing tag proves the document is whole.
     if !state.saw_root_end {
-        return Err(Error::invalid_data(
-            "OSC input ended without a closing </osmChange> tag: the file is \
-             truncated (a .osc.gz cut at a gzip member boundary decompresses \
-             cleanly, so this is the only way to notice). Applying it would \
-             produce a partially-applied result reported as success.",
+        return Err(input_fault(
+            path,
+            Error::invalid_data(
+                "OSC input ended without a closing </osmChange> tag: the file is \
+                 truncated (a .osc.gz cut at a gzip member boundary decompresses \
+                 cleanly, so this is the only way to notice). Applying it would \
+                 produce a partially-applied result reported as success.",
+            ),
         ));
     }
 
@@ -527,7 +570,7 @@ pub(crate) fn parse_osc_path<S: OscSink>(
     cancel: &crate::host::Cancel,
 ) -> ParseResult<()> {
     let (mut reader, decompress_total) = open_osc_reader(path, cancel)?;
-    let result = drive_osc(&mut reader, sink);
+    let result = drive_osc(&mut reader, sink, path);
     // Deliberately emit this historical name once per file, without accumulation,
     // from every sink. Changing attribution or totals breaks brokkr run comparisons.
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]

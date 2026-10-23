@@ -34,7 +34,7 @@ Override the writing program name in the output header:
 pbfhogg sort input.osm.pbf -o sorted.osm.pbf --generator "my-pipeline/1.0"
 ```
 
-By default, the output header identifies `pbfhogg` as the writing program.
+By default, the output header names `pbfhogg/<version>` as the writing program, so a file can be traced to the release that wrote it. An empty `--generator ""` is written as an empty writing program; it does not remove the field.
 
 ### Replication metadata
 

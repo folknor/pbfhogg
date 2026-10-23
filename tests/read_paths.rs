@@ -901,8 +901,11 @@ fn header_accessor() {
     assert!((bbox.left - 9.0).abs() < 1e-6);
     assert!((bbox.bottom - 54.0).abs() < 1e-6);
 
-    // writing_program is "pbfhogg"
-    assert_eq!(header.writing_program(), Some("pbfhogg"));
+    // writing_program is "pbfhogg/<version>"
+    assert_eq!(
+        header.writing_program(),
+        Some(concat!("pbfhogg/", env!("CARGO_PKG_VERSION")))
+    );
 }
 
 /// header().is_sorted() returns true when Sort.Type_then_ID is set.

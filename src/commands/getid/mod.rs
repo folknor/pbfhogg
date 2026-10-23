@@ -655,9 +655,8 @@ fn filter_by_id_walker(
         // the blob index and frame start it handed out.
         let locate = |e: Error| walker.locate_meta(&meta, e);
         match meta.blob_type {
-            // The first header sets the output's; a later one is ignored,
-            // as on the streaming arm.
-            BlobKind::OsmHeader if writer.is_none() => {
+            // The walker refuses a second OSMHeader, so this is the only one.
+            BlobKind::OsmHeader => {
                 walker
                     .pread_data(meta.data_offset, meta.data_size, &mut data_buf)
                     .map_err(locate)?;
@@ -863,7 +862,9 @@ fn filter_by_id_streaming(
         // The frame loop owns the provenance of failures on this frame.
         let locate = |e: Error| e.locate(frame_location(input, frame.file_offset));
         match frame.blob_type {
-            BlobKind::OsmHeader if writer.is_none() => {
+            // `read_raw_frame` refuses a second OSMHeader, so this is the
+            // only one.
+            BlobKind::OsmHeader => {
                 let header = decode_blob_to_headerblock(frame.blob_bytes()).map_err(locate)?;
                 let header_bytes = super::output_header::build_one(
                     &header,

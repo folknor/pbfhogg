@@ -5,14 +5,20 @@ use crate::read::wire_schema::{header_bbox, header_block};
 
 use crate::error::{Error, Result};
 
-use protohoggr::{encode_bytes_field, encode_int64_field_always, encode_sint64_field_always};
+use protohoggr::{
+    encode_bytes_field, encode_bytes_field_always, encode_int64_field_always,
+    encode_sint64_field_always,
+};
+
+/// The writing program a header names unless the caller sets its own: this
+/// library's package version, as osmium writes `osmium/<version>`.
+const DEFAULT_WRITING_PROGRAM: &str = concat!("pbfhogg/", env!("CARGO_PKG_VERSION"));
 
 /// Builder for constructing the `OSMHeader` blob that starts every PBF file.
 ///
-/// Use [`new`](Self::new) for a blank header, or [`from_header`](Self::from_header)
-/// to copy bbox and replication metadata from an existing [`HeaderBlock`].
-///
-/// [`HeaderBlock`]: crate::HeaderBlock
+/// Start from [`new`](Self::new) and set what the output should declare. A
+/// command that derives its header from input files goes through the output
+/// header policy instead, which decides what each field may claim.
 ///
 /// # Examples
 ///
@@ -56,7 +62,8 @@ impl Default for HeaderBuilder<'_> {
 impl<'a> HeaderBuilder<'a> {
     /// Create a blank header builder.
     ///
-    /// The writing program defaults to `"pbfhogg"`. Required features
+    /// The writing program defaults to `pbfhogg/<version>`, the library
+    /// crate's own package version. Required features
     /// (`OsmSchema-V0.6`, `DenseNodes`) are always included.
     #[must_use]
     pub fn new() -> Self {
@@ -70,41 +77,17 @@ impl<'a> HeaderBuilder<'a> {
             optional_features: Vec::new(),
             historical_information: false,
             sorted: false,
-            writing_program: "pbfhogg",
+            writing_program: DEFAULT_WRITING_PROGRAM,
         }
-    }
-
-    /// Create a header builder pre-populated with bbox, `source`, and
-    /// replication metadata from an existing [`HeaderBlock`].
-    ///
-    /// Optional features (including `Sort.Type_then_ID`) are **not** copied -
-    /// call [`.sorted()`](Self::sorted) explicitly if the output should declare
-    /// sorted order. This is deliberate hygiene: a command that rewrites way
-    /// payloads or way-blob headers without maintaining WayMembers-v1 and
-    /// SharedNodePins-v1 must not preserve their feature declarations.
-    ///
-    /// [`HeaderBlock`]: crate::HeaderBlock
-    #[must_use]
-    pub fn from_header(header: &'a crate::HeaderBlock) -> Self {
-        let mut hb = Self::new();
-        if let Some(b) = header.bbox() {
-            hb = hb.input_bbox(b.left, b.bottom, b.right, b.top);
-        }
-        hb.replication_timestamp = header.osmosis_replication_timestamp();
-        hb.replication_sequence_number = header.osmosis_replication_sequence_number();
-        hb.replication_base_url = header.osmosis_replication_base_url();
-        hb.source = header.source();
-        hb.historical_information = header.has_historical_information();
-        hb
     }
 
     /// Set the bounding box (left/bottom/right/top in degrees).
     ///
     /// [`build`](Self::build) returns `InvalidArgument` if a coordinate is
     /// non-finite, outside the usual longitude/latitude bounds, or if either
-    /// minimum is greater than its maximum. A box copied by
-    /// [`from_header`](Self::from_header) is re-serialized as read instead;
-    /// calling this replaces it and subjects the new box to the checks.
+    /// minimum is greater than its maximum. To carry the box of an input
+    /// file as it was read, use [`input_bbox`](Self::input_bbox); calling
+    /// this replaces it and subjects the new box to the checks.
     #[must_use]
     pub fn bbox(mut self, left: f64, bottom: f64, right: f64, top: f64) -> Self {
         self.bbox = Some((left, bottom, right, top));
@@ -112,19 +95,23 @@ impl<'a> HeaderBuilder<'a> {
         self
     }
 
-    /// Set a bounding box derived from input headers (a copy or a union of
-    /// them). [`build`](Self::build) still refuses a non-finite coordinate,
-    /// but serializes an out-of-range or inverted box as given: refusing an
-    /// input file for its header extent would turn a passthrough into a
-    /// failure on data the command did not author.
+    /// Set the bounding box from a header you read rather than one you
+    /// author (a copy of an input file's box, or a union of several).
+    /// [`build`](Self::build) still refuses a non-finite coordinate, but
+    /// serializes an out-of-range or inverted box as given, where
+    /// [`bbox`](Self::bbox) would refuse it: refusing an input file for its
+    /// header extent would turn a passthrough into a failure on data the
+    /// caller did not author. Use [`bbox`](Self::bbox) for a box you compute
+    /// yourself, so that a mistake is caught. Whichever of the two is called
+    /// last wins.
     #[must_use]
-    pub(crate) fn input_bbox(mut self, left: f64, bottom: f64, right: f64, top: f64) -> Self {
+    pub fn input_bbox(mut self, left: f64, bottom: f64, right: f64, top: f64) -> Self {
         self.bbox = Some((left, bottom, right, top));
         self.bbox_from_input = true;
         self
     }
 
-    /// Clear any bounding box carried over from [`from_header`](Self::from_header).
+    /// Clear any bounding box set so far.
     ///
     /// The built header omits field 1 entirely, so a consumer sees a file
     /// with no declared bbox. Used by `degrade --strip-bbox` to produce an
@@ -156,7 +143,7 @@ impl<'a> HeaderBuilder<'a> {
         self
     }
 
-    /// Clear any `source` carried over from [`from_header`](Self::from_header).
+    /// Clear any `source` set so far.
     #[must_use]
     pub fn without_source(mut self) -> Self {
         self.source = None;
@@ -197,7 +184,7 @@ impl<'a> HeaderBuilder<'a> {
         self
     }
 
-    /// Override the writing program name (default: `"pbfhogg"`).
+    /// Override the writing program name (default: `pbfhogg/<version>`).
     #[must_use]
     pub fn writing_program(mut self, program: &'a str) -> Self {
         self.writing_program = program;
@@ -308,16 +295,18 @@ impl<'a> HeaderBuilder<'a> {
             );
         }
 
-        // Field 16: writingprogram (string)
-        encode_bytes_field(
+        // Field 16: writingprogram (string). `_always`, like the other
+        // string fields: an empty override is a present, empty value.
+        encode_bytes_field_always(
             &mut buf,
             header_block::WRITING_PROGRAM,
             self.writing_program.as_bytes(),
         );
 
         // Field 17: source (string)
+        // `_always`: an empty string is a present value, distinct from absent.
         if let Some(source) = self.source {
-            encode_bytes_field(&mut buf, header_block::SOURCE, source.as_bytes());
+            encode_bytes_field_always(&mut buf, header_block::SOURCE, source.as_bytes());
         }
 
         // Fields 32/33: replication timestamp and sequence number (int64).
@@ -335,7 +324,7 @@ impl<'a> HeaderBuilder<'a> {
 
         // Field 34: osmosis_replication_base_url (string)
         if let Some(url) = self.replication_base_url {
-            encode_bytes_field(&mut buf, header_block::REPLICATION_BASE_URL, url.as_bytes());
+            encode_bytes_field_always(&mut buf, header_block::REPLICATION_BASE_URL, url.as_bytes());
         }
 
         Ok(buf)
@@ -345,9 +334,7 @@ impl<'a> HeaderBuilder<'a> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{
-        HeaderBuilder, encode_bytes_field, encode_sint64_field_always, header_bbox, header_block,
-    };
+    use super::HeaderBuilder;
 
     /// Minimal protobuf field walker, written from the wire format rather
     /// than built on this crate's reader.
@@ -430,35 +417,51 @@ mod tests {
         );
     }
 
-    /// `from_header` must carry `source` across a header rewrite.
-    ///
-    /// This is the path every command that rebuilds a header takes, and it
-    /// copied bbox / replication / historical but not field 17.
+    /// An empty `source` or base URL is a present value, distinct from
+    /// absent, and must survive a build and a parse.
     #[test]
-    fn from_header_carries_source_across_a_rewrite() {
-        let original = HeaderBuilder::new()
-            .source("geofabrik.de")
-            .replication_sequence_number(0)
+    fn empty_source_and_base_url_round_trip() {
+        let bytes = HeaderBuilder::new()
+            .source("")
+            .replication_base_url("")
             .build()
             .unwrap();
-        let parsed = crate::HeaderBlock::parse_from_bytes(&original).unwrap();
-        let rebuilt = HeaderBuilder::from_header(&parsed).build().unwrap();
-        assert_eq!(
-            field_bytes(&rebuilt, 17).as_deref(),
-            Some(b"geofabrik.de".as_slice()),
-            "a header rewritten through from_header must keep its source"
-        );
-        assert_eq!(
-            field_bytes(&rebuilt, 33).as_deref(),
-            Some(0u64.to_le_bytes().as_slice()),
-            "and must keep replication sequence number 0"
-        );
+        assert_eq!(field_bytes(&bytes, 17).as_deref(), Some(b"".as_slice()));
+        assert_eq!(field_bytes(&bytes, 34).as_deref(), Some(b"".as_slice()));
+        let parsed = crate::HeaderBlock::parse_from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.source(), Some(""));
+        assert_eq!(parsed.osmosis_replication_base_url(), Some(""));
+
         // `without_source` is the opt-out, and must actually opt out.
-        let stripped = HeaderBuilder::from_header(&parsed)
+        let stripped = HeaderBuilder::new()
+            .source("geofabrik.de")
             .without_source()
             .build()
             .unwrap();
         assert!(field_bytes(&stripped, 17).is_none());
+    }
+
+    /// The default writing program names the release that wrote the file.
+    #[test]
+    fn default_writing_program_carries_the_version() {
+        let bytes = HeaderBuilder::new().build().unwrap();
+        let want = format!("pbfhogg/{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            field_bytes(&bytes, 16).as_deref(),
+            Some(want.as_bytes()),
+            "field 16 must be pbfhogg/<version>"
+        );
+        let custom = HeaderBuilder::new()
+            .writing_program("mine")
+            .build()
+            .unwrap();
+        assert_eq!(
+            field_bytes(&custom, 16).as_deref(),
+            Some(b"mine".as_slice())
+        );
+        // An empty program is a present, empty field like an empty source.
+        let empty = HeaderBuilder::new().writing_program("").build().unwrap();
+        assert_eq!(field_bytes(&empty, 16).as_deref(), Some(b"".as_slice()));
     }
 
     /// Replication sequence number 0 is a real sequence number.
@@ -535,16 +538,8 @@ mod tests {
     /// command that copies the header.
     #[test]
     fn rebuilding_preserves_an_out_of_range_bbox_from_an_input_header() {
-        let mut bbox = Vec::new();
-        encode_sint64_field_always(&mut bbox, header_bbox::LEFT, 2_000_000_000);
-        encode_sint64_field_always(&mut bbox, header_bbox::RIGHT, 1_000_000_000);
-        encode_sint64_field_always(&mut bbox, header_bbox::TOP, 91_000_000_000);
-        encode_sint64_field_always(&mut bbox, header_bbox::BOTTOM, 0);
-
-        let mut header_bytes = Vec::new();
-        encode_bytes_field(&mut header_bytes, header_block::BBOX, &bbox);
-        let parsed = crate::HeaderBlock::parse_from_bytes(&header_bytes).unwrap();
-        let rebuilt = HeaderBuilder::from_header(&parsed)
+        let rebuilt = HeaderBuilder::new()
+            .input_bbox(2.0, 0.0, 1.0, 91.0)
             .build()
             .expect("an input bbox is re-serialized as read");
         let reparsed = crate::HeaderBlock::parse_from_bytes(&rebuilt).unwrap();
@@ -552,7 +547,8 @@ mod tests {
         assert_eq!((b.left, b.bottom, b.right, b.top), (2.0, 0.0, 1.0, 91.0));
 
         // Replacing it through `bbox` subjects the new box to the checks.
-        let err = HeaderBuilder::from_header(&parsed)
+        let err = HeaderBuilder::new()
+            .input_bbox(2.0, 0.0, 1.0, 91.0)
             .bbox(0.0, 0.0, 1.0, 91.0)
             .build()
             .expect_err("a caller-set out-of-range bbox must be refused");

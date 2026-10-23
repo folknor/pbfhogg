@@ -64,6 +64,10 @@ impl Fx {
         let blobs = crate::common::adversarial::locate_blobs(&bytes);
         assert!(blobs.len() >= 2, "fixture must hold a header and data");
         std::fs::write(p.join("headerless.osm.pbf"), &bytes[blobs[1].frame_start..]).unwrap();
+        // The same file with its header frame repeated: a second OSMHeader.
+        let mut twice = bytes[..blobs[0].blob_end].to_vec();
+        twice.extend_from_slice(&bytes);
+        std::fs::write(p.join("two-headers.osm.pbf"), twice).unwrap();
         std::fs::write(
             p.join("good.osc"),
             b"<osmChange version=\"0.6\"><create>\
@@ -776,6 +780,47 @@ fn a_zero_byte_file_is_the_missing_header_error_in_every_command() {
 #[test]
 fn a_file_without_a_leading_header_is_the_missing_header_error_in_every_command() {
     run_property(Prop::Headerless, headerless_is_missing_header);
+}
+
+/// The frame decoder owns the one-header policy, so the commands that walk
+/// frames themselves carry no guard of their own (getid's walker, altw's
+/// schedule build, apply-changes' header read). This is the proof they still
+/// refuse a second OSMHeader: exit 2, the one error, and no output published.
+#[test]
+fn a_second_header_is_refused_by_the_commands_that_walk_frames_themselves() {
+    let fx = Fx::new();
+    let mut failures = Vec::new();
+    for row in ROWS.iter().filter(|row| {
+        matches!(
+            row.label,
+            "getid" | "apply-changes" | "altw" | "altw external"
+        )
+    }) {
+        let dir = TempDir::new().unwrap();
+        let out = run(&built(
+            &fx,
+            row,
+            dir.path(),
+            &fx.path("two-headers.osm.pbf"),
+        ));
+        let stderr = out.stderr_str();
+        if out.status.code() != Some(2) || !stderr.contains("a second OSMHeader blob") {
+            failures.push(format!(
+                "[{}] exit {:?}; stderr:\n{stderr}",
+                row.label,
+                out.status.code()
+            ));
+        }
+        if out_pbf(&Ctx {
+            fx: &fx,
+            out: dir.path(),
+        })
+        .exists()
+        {
+            failures.push(format!("[{}] published an output", row.label));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
 #[test]

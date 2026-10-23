@@ -254,11 +254,14 @@ header follows from them.
   input's timestamp is known and not after the cutoff.
 - **`source`** is kept when every input agrees; **`HistoricalInformation`**
   when any input declares it.
-- **Writing program**: `pbfhogg`.
+- **Writing program**: `pbfhogg/<version>`, the library's package version.
 - Optional features pbfhogg does not know are not carried: nothing can vouch
   for them after a rewrite.
 - **`--generator` / `--output-header`** apply last, and each replaces only
-  the field it names.
+  the field it names. An empty value is a value: `--generator ""` writes an
+  empty writing program and `--output-header osmosis_replication_base_url=`
+  an empty base URL, both as present, empty fields. Neither removes the
+  field; no flag removes a field the policy would write.
 
 The exception is degrade's header-only passthrough (`--strip-indexdata`,
 `--strip-tagdata`, `--strip-bbox`, `--corrupt-*`), which copies every blob
@@ -311,6 +314,12 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   target. An existing directory (or device, FIFO) where a file output is
   named, or a non-directory where a directory output is named, is refused
   the same way.
+- **Whether an OSC output is gzipped depends on the command, not only the
+  name.** `merge-changes` gzips exactly when the output name is UTF-8 and
+  ends in `.gz` (`merged.osc.gz` is gzip; `merged.osc` and `merged.osc.gzip` are plain XML).
+  `tags-filter --input-kind osc` and `diff --format osc` always gzip, whatever
+  the name, so `-o changes.osc` holds gzip bytes there. Every OSC reader here
+  sniffs the gzip magic, so either form is read back.
 - **Nothing appears under the output name until the run has succeeded.**
   The command writes a hidden staging file beside the output
   (`.pbfhogg-tmp-<pid>-<n>.<name>`), syncs it and renames it into place after
@@ -344,12 +353,15 @@ scratch: disposable files that can be very large (hundreds of GB for `add-locati
 --index-type external` at planet scale). Each run makes **one** hidden directory,
 `.pbfhogg-run-<pid>-<random>`, holds everything it writes in there and removes it when it ends,
 whether it succeeded, failed or was interrupted. If the directory cannot be removed the run
-says where the leftover is.
+says where the leftover is. The directory is made at startup, before any input is opened, by
+every run that may need scratch. A run whose command line guarantees it writes none (text
+`diff -j 1`, and text `diff -v`) makes no directory and needs no writable location; a quiet
+`diff` is not among them, because it shards like any other text diff unless `-j 1` is given.
 
 - `--tmp-dir <DIR>` chooses the directory the run directory is made in. It must exist and be
   writable, and it is checked before any input is opened, so a bad value fails at once. Without
-  it the scratch goes in the output's directory (`diff` text to stdout, or with `--quiet`:
-  the current directory). `build-geocode-index` refuses a `--tmp-dir` inside the index
+  it the scratch goes in the output's directory (the current directory for `diff` text to
+  stdout or with `--quiet`, and for an output name with no directory part). `build-geocode-index` refuses a `--tmp-dir` inside the index
   directory it replaces.
 - An output's own staging file (`.pbfhogg-tmp-*`) and a replaced output's backup
   (`.pbfhogg-backup-*`) stay beside the output whatever `--tmp-dir` says: publication is a

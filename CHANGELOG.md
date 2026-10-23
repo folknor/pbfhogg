@@ -4,6 +4,20 @@
 
 ### Breaking
 
+- **`HeaderBuilder::from_header` is removed.** Build the header from the
+  fields you want it to declare (`bbox`, `source`, the replication setters,
+  `historical`, `sorted`). To carry an input header's bounding box as it was
+  read, use the new public `HeaderBuilder::input_bbox`: unlike `bbox`, it
+  does not refuse an inverted or out-of-range box. The commands derive
+  theirs through one output header policy that is not public API.
+
+- **The writing program is now `pbfhogg/<version>`** (the library's package
+  version), as osmium writes `osmium/<version>`; it was `pbfhogg`.
+  `HeaderBuilder::writing_program` and `--generator` still override it.
+  An empty `source`, replication base URL or writing program (`--generator
+  ""`, `--output-header osmosis_replication_base_url=`) is now written as a
+  present, empty field and kept, not dropped.
+
 - **Every short flag now has one meaning across all subcommands.** Shorts
   that meant something else on one command are long-only there:
   `cat --clean` (was `-c`), `extract --config` (was `-c`) and `--simple`
@@ -956,6 +970,13 @@
 
 ### Fixed
 
+- **`diff -j 1` and `diff -v` no longer need a writable current
+  directory.** A text diff whose command line guarantees the sequential path
+  makes no scratch directory, so it runs from a read-only directory and no
+  longer creates and removes a `.pbfhogg-run-*` there. Every run that may
+  shard (including a quiet diff without `-j 1`) still makes its directory at
+  startup and fails there when the location is unusable. Library callers of
+  `diff::diff` pass `None` for the scratch argument in the one-shard case.
 - **The unindexed-input refusal advises only a switch that works.** It no
   longer says `Or pass --force` for `add-locations-to-ways --index-type
   external` or `--inject-prepass` and `apply-changes --locations-on-ways`,

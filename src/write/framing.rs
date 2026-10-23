@@ -585,7 +585,8 @@ pub(crate) fn strip_blob_header_fields(
 /// fields whose wire type this can skip (see the wire-type coverage note
 /// on [`strip_blob_header_fields`]). `HeaderBuilder` carries the fields it
 /// models, but it cannot model unknown/extension fields, and it drops the
-/// optional-feature list by design (`from_header` does not copy field 5).
+/// optional-feature list by design (the output-header policy declares only
+/// features it can vouch for).
 /// This preserves everything.
 pub(crate) fn strip_header_block_fields(
     header_block_bytes: &[u8],
@@ -1009,7 +1010,7 @@ mod tests {
     /// the optional-feature list (5, including custom extension features),
     /// the osmosis replication metadata (32/33/34), and any unknown field
     /// pbfhogg does not model all survive exactly - precisely the fields a
-    /// `HeaderBuilder::from_header` rebuild would silently drop.
+    /// `HeaderBuilder` rebuild would silently drop.
     #[test]
     fn strip_header_block_fields_preserves_untargeted_fields_verbatim() {
         use protohoggr::{encode_bytes_field, encode_int64_field, encode_varint_field};

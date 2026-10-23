@@ -106,7 +106,10 @@ fn roundtrip_dense_nodes_with_metadata() {
         header.osmosis_replication_base_url(),
         Some("https://example.com/replication")
     );
-    assert_eq!(header.writing_program(), Some("pbfhogg"));
+    assert_eq!(
+        header.writing_program(),
+        Some(concat!("pbfhogg/", env!("CARGO_PKG_VERSION")))
+    );
 
     let features: Vec<&str> = header
         .required_features()

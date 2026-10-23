@@ -53,6 +53,8 @@ macro_rules! ensure {
 // ---------------------------------------------------------------------------
 
 const PROGRAM: &str = "fixture-writer";
+/// What pbfhogg itself writes: its package name and version.
+const OWN_PROGRAM: &str = concat!("pbfhogg/", env!("CARGO_PKG_VERSION"));
 const REPLICATION_TS: i64 = 1000;
 const REPLICATION_SEQ: i64 = 7;
 const REPLICATION_URL: &str = "https://replication.invalid/minute";
@@ -87,10 +89,11 @@ impl Fixture {
     fn prepass(self) -> bool {
         self == Self::Prepass
     }
-    /// add-locations-to-ways writes `pbfhogg` as the program, so only the
+    /// add-locations-to-ways writes its own program and version
+    /// ([`OWN_PROGRAM`]), so only the
     /// two hand-written fixtures carry [`PROGRAM`].
     fn program(self) -> &'static str {
-        if self.low() { "pbfhogg" } else { PROGRAM }
+        if self.low() { OWN_PROGRAM } else { PROGRAM }
     }
 }
 
@@ -288,7 +291,7 @@ impl Exp {
             low: false,
             prepass: false,
             bbox: BboxExp::Input,
-            program: Some("pbfhogg"),
+            program: Some(OWN_PROGRAM),
             seq: Some(REPLICATION_SEQ),
         }
     }

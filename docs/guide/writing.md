@@ -27,25 +27,15 @@ let header_bytes = HeaderBuilder::new()
 | Method | Description |
 |--------|-------------|
 | `new()` | Create a blank header builder |
-| `bbox(left, bottom, right, top)` | Set the bounding box (f64 degrees) |
+| `bbox(left, bottom, right, top)` | Set the bounding box (f64 degrees); `build()` refuses an inverted, out-of-range or non-finite box |
+| `input_bbox(left, bottom, right, top)` | Set the bounding box from a header you read (an input file's box), serialized as read: only a non-finite coordinate is refused, so a passthrough does not fail on data you did not author |
 | `sorted()` | Declare elements are sorted by type then ID |
 | `source(s)` | Set `source` (field 17), e.g. the URL the data came from |
-| `without_source()` | Clear a `source` carried over by `from_header` |
-| `from_header(&existing_header)` | Copy bbox, `source`, and replication metadata from an existing `HeaderBlock` |
+| `without_source()` | Clear a `source` set earlier on the builder |
+| `writing_program(s)` | Override the writing program (default `pbfhogg/<version>`, the library's package version) |
 | `build()` | Serialize to protobuf bytes |
 
-`from_header` is useful for commands that transform data while preserving metadata. It copies bbox, `source`, replication timestamp / sequence number / base URL, and the historical-information flag. It does **not** copy the optional-feature list (call `.sorted()` explicitly if the output is sorted) and it cannot carry unknown or extension fields - a rebuild through `HeaderBuilder` keeps only what the builder models.
-
-```rust
-use pbfhogg::ElementReader;
-use pbfhogg::write::block_builder::HeaderBuilder;
-
-let reader = ElementReader::from_path("tests/test.osm.pbf")?;
-let header_bytes = HeaderBuilder::from_header(reader.header())
-    .sorted()
-    .build()?;
-# Ok::<(), std::io::Error>(())
-```
+A header that carries metadata over from an input file is built by setting each field explicitly (`input_bbox` for the box as read, or `bbox` for one you compute; `source`, `replication_timestamp`, `replication_sequence_number`, `replication_base_url`, `historical`, and `sorted` when the output is sorted). The builder models only those fields and cannot carry unknown or extension fields. An empty `source` or base URL is written as a present, empty field.
 
 ## BlockBuilder
 
@@ -403,9 +393,11 @@ use pbfhogg::host::Executor;
 
 let reader = ElementReader::from_path("tests/test.osm.pbf")?;
 
-let header_bytes = HeaderBuilder::from_header(reader.header())
-    .sorted()
-    .build()?;
+let mut header = HeaderBuilder::new().sorted();
+if let Some(b) = reader.header().bbox() {
+    header = header.input_bbox(b.left, b.bottom, b.right, b.top);
+}
+let header_bytes = header.build()?;
 
 let mut writer = PbfWriter::to_path(
     "highways.osm.pbf".as_ref(),

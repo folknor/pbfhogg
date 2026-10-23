@@ -2462,9 +2462,16 @@ fn main() -> process::ExitCode {
                             pbfhogg::Output::new(path, overwrite.intent(), &host.diagnostics)
                         })
                         .transpose()?;
-                    // A quiet diff writes no output file (clap refuses -o
-                    // with -q).
-                    let scratch = run_scratch(&tmp, output.as_deref(), &host)?;
+                    // The sequential path writes no scratch: `-j 1`, and
+                    // `--verbose`, which is sequential-only. Any other text
+                    // diff may shard, so it gets its directory now, before
+                    // any input is opened. A quiet diff writes no output file
+                    // (clap refuses -o with -q) but shards like any other.
+                    let scratch = if verbose || jobs.fixed() == Some(1) {
+                        None
+                    } else {
+                        Some(run_scratch(&tmp, output.as_deref(), &host)?)
+                    };
                     let output = output_handle;
                     accept_outcome(
                         &mut outcome,
@@ -3494,9 +3501,11 @@ fn reject_aliases(
 }
 
 /// The run's scratch directory, made before any input is opened so that a
-/// missing or unwritable `--tmp-dir` fails first. `output` is the file the
-/// command writes, when it writes one: the default scratch location is its
-/// directory.
+/// missing or unwritable `--tmp-dir` fails first (ADR-0018). A run whose
+/// command line guarantees it needs no scratch must not call this at all.
+/// `output` is the file the command writes, when it writes one: the default
+/// scratch location is its directory, and the current directory when the
+/// output name has no directory part or there is no output.
 fn run_scratch(
     tmp: &TmpDirArg,
     output: Option<&std::path::Path>,
@@ -3933,7 +3942,7 @@ fn run_diff(
     parallelism: pbfhogg::Parallelism,
     direct_io: bool,
     host: &pbfhogg::host::Host,
-    scratch: pbfhogg::scratch::RunScratch,
+    scratch: Option<pbfhogg::scratch::RunScratch>,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
     let DiffFlags {
         suppress_common,
@@ -5093,15 +5102,32 @@ mod scratch_location_tests {
         };
         let scratch = run_scratch(&explicit, Some(&output), &host).unwrap();
         assert_eq!(scratch.path().parent(), Some(tmp.as_path()));
+        // Made at startup, not at first use, and the only entry there.
+        assert!(scratch.path().is_dir());
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 1);
         drop(scratch);
+        assert!(std::fs::read_dir(&tmp).unwrap().next().is_none());
 
         let default = TmpDirArg { tmp_dir: None };
         let scratch = run_scratch(&default, Some(&output), &host).unwrap();
         assert_eq!(scratch.path().parent(), Some(out_dir.as_path()));
+        assert!(scratch.path().is_dir());
+        assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 1);
         drop(scratch);
-
-        assert!(std::fs::read_dir(&tmp).unwrap().next().is_none());
         assert!(std::fs::read_dir(&out_dir).unwrap().next().is_none());
+    }
+
+    /// An output name with no directory part, and no output at all, both
+    /// place scratch in the current directory.
+    #[test]
+    fn a_bare_output_name_or_none_places_scratch_in_the_current_directory() {
+        let host = host::cli_host(pbfhogg::host::Cancel::new());
+        let default = TmpDirArg { tmp_dir: None };
+        for output in [Some(std::path::Path::new("out.pbf")), None] {
+            let scratch = run_scratch(&default, output, &host).unwrap();
+            assert_eq!(scratch.path().parent(), Some(std::path::Path::new(".")));
+            assert!(scratch.path().is_dir());
+        }
     }
 
     #[test]

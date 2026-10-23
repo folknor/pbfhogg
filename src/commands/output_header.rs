@@ -336,7 +336,7 @@ pub(crate) fn verbatim(
     overrides: &HeaderOverrides,
 ) -> Result<Vec<u8>> {
     use crate::read::wire_schema::header_block as field;
-    use protohoggr::{encode_bytes_field, encode_int64_field_always};
+    use protohoggr::{encode_bytes_field_always, encode_int64_field_always};
 
     let mut strip = Vec::with_capacity(5);
     if strip_bbox {
@@ -360,7 +360,7 @@ pub(crate) fn verbatim(
     let mut out = Vec::with_capacity(header_block.len());
     crate::writer::strip_header_block_fields(header_block, &strip, &mut out)?;
     if let Some(program) = &overrides.generator {
-        encode_bytes_field(&mut out, field::WRITING_PROGRAM, program.as_bytes());
+        encode_bytes_field_always(&mut out, field::WRITING_PROGRAM, program.as_bytes());
     }
     if let Some(ts) = overrides.replication_timestamp {
         encode_int64_field_always(&mut out, field::REPLICATION_TIMESTAMP, ts);
@@ -369,7 +369,7 @@ pub(crate) fn verbatim(
         encode_int64_field_always(&mut out, field::REPLICATION_SEQUENCE_NUMBER, seq);
     }
     if let Some(url) = &overrides.replication_base_url {
-        encode_bytes_field(&mut out, field::REPLICATION_BASE_URL, url.as_bytes());
+        encode_bytes_field_always(&mut out, field::REPLICATION_BASE_URL, url.as_bytes());
     }
     Ok(out)
 }
@@ -683,7 +683,19 @@ mod tests {
         );
         assert_eq!(h.source(), Some("geofabrik.de"));
         assert!(h.has_historical_information());
-        assert_eq!(h.writing_program(), Some("pbfhogg"));
+        assert_eq!(
+            h.writing_program(),
+            Some(concat!("pbfhogg/", env!("CARGO_PKG_VERSION")))
+        );
+    }
+
+    /// Empty `source` and base URL survive the policy as present values.
+    #[test]
+    fn empty_source_and_base_url_are_carried() {
+        let input = header(HeaderBuilder::new().source("").replication_base_url(""));
+        let h = built(&[input], &OutputFacts::carry(Ways::Reencoded));
+        assert_eq!(h.source(), Some(""));
+        assert_eq!(h.osmosis_replication_base_url(), Some(""));
     }
 
     /// An empty input slice is an error, not a panic and not a NaN bbox.

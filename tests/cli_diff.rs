@@ -1703,3 +1703,67 @@ fn diff_rejects_explicit_jobs_with_verbose() {
         out.stderr_str(),
     );
 }
+
+/// `-j 1` is the scratch-free path: it must run, to stdout, from a current
+/// directory the process cannot write, and leave no run directory anywhere.
+#[test]
+fn diff_single_job_needs_no_writable_current_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    write_test_pbf_sorted(&old, &generate_nodes(4, 1), &[], &[]);
+    write_test_pbf_sorted(&new, &generate_nodes(4, 1), &[], &[]);
+    let cwd = dir.path().join("readonly");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let out = CliInvoker::new()
+        .arg("diff")
+        .arg(&old)
+        .arg(&new)
+        .arg("-j")
+        .arg("1")
+        .current_dir(&cwd)
+        .run();
+    std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        out.status.success(),
+        "diff -j 1 failed in a read-only current directory; stderr:\n{}",
+        out.stderr_str(),
+    );
+    assert_eq!(
+        std::fs::read_dir(&cwd).unwrap().count(),
+        0,
+        "diff -j 1 left something in the current directory"
+    );
+}
+
+/// `diff --format osc` gzips whatever the output is named.
+#[test]
+fn diff_osc_output_is_gzip_whatever_its_name() {
+    let dir = TempDir::new().unwrap();
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    write_test_pbf_sorted(&old, &generate_nodes(4, 1), &[], &[]);
+    write_test_pbf_sorted(&new, &generate_nodes(5, 1), &[], &[]);
+    for name in ["x.osc", "x.osc.gz"] {
+        let dest = dir.path().join(name);
+        CliInvoker::new()
+            .arg("diff")
+            .arg(&old)
+            .arg(&new)
+            .arg("--format")
+            .arg("osc")
+            .arg("-o")
+            .arg(&dest)
+            .assert_success();
+        let bytes = std::fs::read(&dest).unwrap();
+        assert_eq!(
+            bytes.get(..2),
+            Some(&[0x1f, 0x8b][..]),
+            "{name} is not gzip"
+        );
+    }
+}

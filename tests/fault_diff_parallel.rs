@@ -66,7 +66,7 @@ mod diff_parallel {
             &options,
             false,
             &host,
-            crate::common::scratch_in(&scratch),
+            Some(crate::common::scratch_in(&scratch)),
         )
         .unwrap();
         assert!(snapshot_dir(&scratch).is_empty());
@@ -91,7 +91,7 @@ mod diff_parallel {
                 &opts,
                 false,
                 &host,
-                crate::common::scratch_in(&scratch),
+                Some(crate::common::scratch_in(&scratch)),
             )
         }));
 

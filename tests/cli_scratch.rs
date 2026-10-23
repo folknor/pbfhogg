@@ -177,6 +177,99 @@ fn a_failed_run_leaves_no_scratch_in_the_tmp_dir_or_beside_the_output() {
     }
 }
 
+/// The altw case above can fail before a scratch file exists. A sharded diff
+/// cannot: each shard creates its scratch text file before it decodes
+/// anything, so a last blob that is valid framing around an undecodable
+/// payload fails the run with scratch files already on disk.
+#[test]
+fn a_run_that_fails_after_writing_scratch_leaves_none_behind() {
+    let dir = TempDir::new().unwrap();
+    let work = dir.path().join("work");
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir(&work).unwrap();
+    std::fs::create_dir(&tmp).unwrap();
+    let old = work.join("old.osm.pbf");
+    let new = work.join("new.osm.pbf");
+    crate::common::write_base_pbf(&old);
+    crate::common::write_changed_pbf(&new);
+    let bytes = std::fs::read(&new).unwrap();
+    let last = crate::common::adversarial::locate_blobs(&bytes).len() - 1;
+    let corrupt = crate::common::adversarial::mutate_blob_payload(&bytes, last, |payload| {
+        *payload = vec![0xff; 16];
+    });
+    std::fs::write(&new, corrupt).unwrap();
+    let output = work.join("out.txt");
+
+    for tmp_args in [vec![], vec!["--tmp-dir", tmp.to_str().unwrap()]] {
+        let mut args = vec![
+            "diff",
+            "-j",
+            "2",
+            old.to_str().unwrap(),
+            new.to_str().unwrap(),
+            "-o",
+            output.to_str().unwrap(),
+        ];
+        args.extend(tmp_args);
+        let out = CliInvoker::new().args(&args).run();
+        assert_eq!(out.status.code(), Some(2), "{}", out.stderr_str());
+        assert!(names(&tmp).is_empty(), "{:?}", names(&tmp));
+        assert_eq!(
+            names(&work),
+            ["new.osm.pbf", "old.osm.pbf"],
+            "nothing may be left beside the output"
+        );
+    }
+}
+
+/// A run whose command line guarantees no scratch makes no run directory, so
+/// a current directory it cannot write is not an obstacle (`diff -j 1`).
+#[test]
+fn a_scratch_free_diff_needs_no_writable_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    // Root writes anywhere, so the read-only directory proves nothing there.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    crate::common::write_base_pbf(&old);
+    crate::common::write_changed_pbf(&new);
+    let cwd = dir.path().join("cwd");
+    std::fs::create_dir(&cwd).unwrap();
+    std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o500)).unwrap();
+    for args in [vec!["-j", "1"], vec!["-j", "1", "-q"], vec!["-v"]] {
+        let out = CliInvoker::new()
+            .current_dir(&cwd)
+            .args(
+                ["diff"]
+                    .into_iter()
+                    .chain(args)
+                    .chain([old.to_str().unwrap(), new.to_str().unwrap()]),
+            )
+            .run();
+        assert!(
+            out.status.code().is_some_and(|c| c <= 1),
+            "{}",
+            out.stderr_str()
+        );
+    }
+    // A run that may shard still fails at startup, naming the problem.
+    let out = CliInvoker::new()
+        .current_dir(&cwd)
+        .args([
+            "diff",
+            "-j",
+            "2",
+            old.to_str().unwrap(),
+            new.to_str().unwrap(),
+        ])
+        .run();
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr_str());
+    std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 #[test]
 fn successful_runs_clean_up_after_themselves() {
     let dir = TempDir::new().unwrap();

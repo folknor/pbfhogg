@@ -152,7 +152,9 @@ pub(crate) fn cat_to(
 // Output header
 // ---------------------------------------------------------------------------
 
-/// Read one file's `OSMHeader` block.
+/// Read one file's `OSMHeader` block. The header is the first frame; a file
+/// that starts with anything else has none (a later one is refused by the
+/// frame decoder).
 fn read_header(
     file: &Path,
     direct_io: bool,
@@ -160,13 +162,13 @@ fn read_header(
 ) -> Result<crate::HeaderBlock> {
     let mut reader = FileReader::open(file, direct_io)?;
     let mut file_offset: u64 = 0;
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, host, file)? {
-        if frame.blob_type == BlobKind::OsmHeader {
-            return decode_blob_to_headerblock(frame.blob_bytes())
-                .map_err(|e| e.locate(frame_location(file, frame.file_offset)));
+    match read_raw_frame(&mut reader, &mut file_offset, host, file)? {
+        Some(frame) if frame.blob_type == BlobKind::OsmHeader => {
+            decode_blob_to_headerblock(frame.blob_bytes())
+                .map_err(|e| e.locate(frame_location(file, frame.file_offset)))
         }
+        _ => Err(crate::error::new_missing_header(file)),
     }
-    Err(crate::error::new_missing_header(file))
 }
 
 /// Read every input's `OSMHeader`, one per input, in input order.

@@ -127,8 +127,6 @@ writer.flush()?;
 
 `for_each_block_pipelined` and `into_blocks_pipelined` deliver owned `PrimitiveBlock`s that can be sent to other threads, enabling overlapped I/O + decode + consumer parallelism. `into_blocks_pipelined` requires `R: 'static` (`ElementReader<FileReader>` satisfies this).
 
-`HeaderBuilder::from_header(&existing_header)` copies bbox and replication metadata from an existing PBF header - useful for transforms that preserve metadata.
-
 ## Features
 
 | Feature | Description |

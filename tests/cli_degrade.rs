@@ -56,7 +56,7 @@ const FIXTURE_BBOX: (f64, f64, f64, f64) = (0.0, 0.0, 0.01, 0.01);
 // Rich HeaderBlock metadata the bbox fixture carries beyond the bbox. A
 // header rebuilt by the output-header policy would drop or replace several of
 // these (custom optional features are never carried; the writingprogram is
-// reset to "pbfhogg"), so asserting they SURVIVE `--strip-bbox` pins that the
+// reset to pbfhogg's own program and version), so asserting they SURVIVE `--strip-bbox` pins that the
 // passthrough path forwards the input HeaderBlock payload verbatim.
 const FIXTURE_WRITING_PROGRAM: &str = "degrade-test-writer/3.1";
 const FIXTURE_SOURCE: &str = "survey-import-2019";
@@ -199,7 +199,7 @@ fn assert_rich_header_fields_survived(path: &Path) {
     assert_eq!(
         h.writing_program(),
         Some(FIXTURE_WRITING_PROGRAM),
-        "writingprogram must survive (a HeaderBuilder rebuild would reset it to pbfhogg)"
+        "writingprogram must survive (a HeaderBuilder rebuild would reset it to pbfhogg/<version>)"
     );
     assert_eq!(
         h.source(),

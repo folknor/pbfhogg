@@ -1028,6 +1028,51 @@ mod tests {
         assert_eq!(fs::read_dir(parent.path()).expect("dir").count(), 0);
     }
 
+    /// The directory exists, locked and marked ready, from the moment
+    /// `create` returns (ADR-0018: a bad location fails at startup, not
+    /// mid-run), whether or not a file is ever made in it, and a run that
+    /// used none still removes it.
+    #[test]
+    fn the_directory_exists_from_creation_and_is_removed_even_when_unused() {
+        let parent = crate::path_guard::tests::scratch();
+        let run = RunScratch::create(parent.path(), &host()).expect("run");
+        let path = run.path().to_path_buf();
+        assert!(path.is_dir());
+        assert!(path.join(LOCK_NAME).is_file());
+        assert!(path.join(READY_NAME).is_file());
+        assert_eq!(fs::read_dir(parent.path()).expect("dir").count(), 1);
+        drop(run);
+        assert!(!path.exists());
+        assert_eq!(fs::read_dir(parent.path()).expect("dir").count(), 0);
+    }
+
+    /// A parent that cannot be written is refused by `create` itself.
+    #[test]
+    fn a_read_only_parent_is_refused_at_creation() {
+        // Root passes the access check on anything.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let parent = crate::path_guard::tests::scratch();
+        fs::set_permissions(
+            parent.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o500),
+        )
+        .expect("chmod");
+        let err = RunScratch::create(parent.path(), &host()).expect_err("read-only");
+        assert!(
+            err.to_string()
+                .contains(&parent.path().display().to_string()),
+            "{err}"
+        );
+        assert_eq!(fs::read_dir(parent.path()).expect("dir").count(), 0);
+        fs::set_permissions(
+            parent.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("chmod back");
+    }
+
     #[test]
     fn an_unusable_parent_is_refused_and_creates_nothing() {
         let parent = crate::path_guard::tests::scratch();

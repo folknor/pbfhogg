@@ -563,7 +563,7 @@ fn diff_blob_layout_independence() {
             &opts,
             false,
             &crate::common::test_host(),
-            crate::common::scratch_in(dir.path()),
+            Some(crate::common::scratch_in(dir.path())),
         )
         .expect("diff")
     };

@@ -184,15 +184,13 @@ fn read_header(
 ) -> Result<Vec<u8>> {
     let mut reader = FileReader::open(base_pbf, direct_io)?;
     let mut offset: u64 = 0;
-    loop {
-        match read_raw_frame(&mut reader, &mut offset, host, base_pbf)? {
-            Some(frame) if frame.blob_type == BlobKind::OsmHeader => {
-                let header = decode_blob_to_headerblock(frame.blob_bytes())?;
-                return build_header_bytes(&header, locations_on_ways, overrides, host);
-            }
-            Some(_) => {}
-            None => return Err(crate::error::new_missing_header(base_pbf)),
+    // The header is the first frame; a later one is refused by the decoder.
+    match read_raw_frame(&mut reader, &mut offset, host, base_pbf)? {
+        Some(frame) if frame.blob_type == BlobKind::OsmHeader => {
+            let header = decode_blob_to_headerblock(frame.blob_bytes())?;
+            build_header_bytes(&header, locations_on_ways, overrides, host)
         }
+        _ => Err(crate::error::new_missing_header(base_pbf)),
     }
 }
 

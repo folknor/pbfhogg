@@ -89,7 +89,10 @@ A command's output header never claims more than its output contains:
   declares the region.
 - The input's replication state; `time-filter` lowers the timestamp to its
   cutoff when the cutoff is earlier, and then drops the sequence number.
-- Writing program `pbfhogg`, unless `--generator` says otherwise.
+- Writing program `pbfhogg/<version>` (the release that wrote the file),
+  unless `--generator` says otherwise.
+- An empty `--generator ""` or `--output-header osmosis_replication_base_url=`
+  value is written as a present, empty field. No flag removes a field.
 
 `degrade`'s header-only flags forward the input header field for field
 instead. The full rule is in `reference/cli-reference.md` "Output header".
@@ -115,6 +118,12 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   target. An existing directory (or device, FIFO) where a file output is
   named, or a non-directory where a directory output is named, is refused
   the same way.
+- **Whether an OSC output is gzipped depends on the command, not only the
+  name.** `merge-changes` gzips exactly when the output name is UTF-8 and
+  ends in `.gz` (`merged.osc.gz` is gzip; `merged.osc` and `merged.osc.gzip` are plain XML).
+  `tags-filter --input-kind osc` and `diff --format osc` always gzip, whatever
+  the name, so `-o changes.osc` holds gzip bytes there. Every OSC reader here
+  sniffs the gzip magic, so either form is read back.
 - **Nothing appears under the output name until the run has succeeded.**
   The command writes a hidden staging file beside the output
   (`.pbfhogg-tmp-<pid>-<n>.<name>`), syncs it and renames it into place after its

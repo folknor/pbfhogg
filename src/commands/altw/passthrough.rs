@@ -97,8 +97,8 @@ struct Pass2Counters {
     nonway_blobs: AtomicU64,
 }
 
-/// Walk all blob headers and build the schedule. The first OsmHeader
-/// blob is consumed and used to build the output header bytes.
+/// Walk all blob headers and build the schedule. The OsmHeader blob (the
+/// walker refuses a second one) is used to build the output header bytes.
 ///
 /// This is the fourth header walk on the sparse path, and the marker pair
 /// exists because its cost is invisible otherwise and swings enormously:

@@ -523,6 +523,38 @@ fn scratch_backends_use_the_given_directory_and_leave_nothing() {
     }
 }
 
+/// A diff that runs one shard writes no scratch and takes `None`; one that may
+/// run several refuses `None` before reading anything.
+#[test]
+fn diff_without_scratch_needs_a_single_shard() {
+    let dir = tempfile::tempdir().expect("directory");
+    let base = input(dir.path());
+    let changed = dir.path().join("changed.osm.pbf");
+    crate::common::write_changed_pbf(&changed);
+    let run = |verbose: bool, jobs: usize| {
+        let options = pbfhogg::diff::DiffOptions {
+            suppress_common: false,
+            verbose,
+            summary: false,
+            type_filter: None,
+            parallelism: pbfhogg::Parallelism::from_jobs(jobs),
+        };
+        pbfhogg::diff::diff(
+            &base,
+            &changed,
+            &mut Vec::new(),
+            &options,
+            false,
+            &crate::common::test_host(),
+            None,
+        )
+    };
+    assert!(run(false, 1).is_ok());
+    assert!(run(true, 0).is_ok());
+    let err = run(false, 2).expect_err("two shards need scratch");
+    assert!(err.to_string().contains("scratch directory"), "{err}");
+}
+
 /// The backends write their scratch into the run directory they are given
 /// and nowhere else. A run directory that cannot be written to makes each
 /// fail naming a path inside it, which a backend creating its files beside
@@ -588,7 +620,7 @@ fn run_scratch_backend(
                 &options,
                 false,
                 host,
-                scratch,
+                Some(scratch),
             )
             .map(drop)
             .map_err(|e| e.to_string())

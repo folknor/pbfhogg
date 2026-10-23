@@ -922,53 +922,21 @@ inherit all of it.
 
 Reported by: split out of the diagnostic-wording item.
 
-## HYG-110 - The one-header policy is owned by the frame decoder, but callers still carry dead per-command policies
+## HYG-114 - OSC output is gzipped by two different rules, and no test covers every producer
 
-Anger: 3 - comments and dead branches, no behaviour change.
+Anger: 6 - CLI behaviour; likely ends as a test.
 
-A PBF with more than one OSMHeader blob is malformed. The policy is now
-`read/frame.rs::check_header_position`, applied once per frame by
-`BlobReader`, `read_raw_frame`, `read_blob_header_only`, `HeaderWalker` and the
-`cat --dedupe` frame loop: an OSMHeader anywhere but the first frame is
-refused ("a second OSMHeader blob follows the first frame"). Tests pin it for
-the readers, cat, sort and digest. What is left is the callers that still
-describe or implement a policy the decoder makes unreachable: getid's two
-header walks (`BlobKind::OsmHeader if writer.is_none()`, whose comment says
-"a later one is ignored, as on the streaming arm"), altw's
-`passthrough::build_schedule` (documents that the first header is consumed,
-overwrites `header_bytes` on every header), and the loops in cat's
-`read_header` and apply-changes' `read_header` that skip any non-header frame
-looking for one. Fix: delete the branches and comments, or make the first
-header a typed result of the walker (`Header` then `Data` items) so a caller
-cannot ask for a second one; keep a two-header test through each command that
-builds an output header (cat, sort and digest have one; the others go through
-the same decoder but have no test of their own, which the contract test table
-covers).
-
-Reported by: the output-publication review fixes; the command-matrix audit
-found the decoder now owns the policy.
-
-## HYG-114 - OSC output is gzipped by three different rules, and no user document says which
-
-Anger: 6 - CLI behaviour; likely ends as documentation.
-
-`merge-changes` gzips when the destination name ends `.gz` (a UTF-8 name
-test on the destination, never the staging name); `tags-filter --input-kind
-osc` always gzips, whatever the name, with the fast level; `diff --format osc`
-always gzips through the parallel gzip writer. Each site carries a
-"Deliberately ..." comment saying the contract is historical and framing has
-no shared owner (`osc/write.rs`, `tags_filter/osc.rs`, `diff/derive.rs`,
-`merge_changes`). The readers sniff gzip magic, so either is read back. But
-`docs/cli/commands.md` and `reference/cli-reference.md` call every one of these
-"Output file", so `tags-filter -o changes.osc` writes gzip bytes into a file
-named `.osc`, and `merge-changes -o merged.osc.xml.gz` is gzip while
-`merge-changes -o merged.osc.gzip` is not.
-
-Fix: per rule 3 the comments exist and the `Output files` section of both
-references owes the three rules (or one new rule: gzip unless the name ends
-`.osc`, which would change two outputs). Enforce with a contract test writing
-each OSC producer to `x.osc` and `x.osc.gz` and asserting the magic bytes
-against one table.
+The rules are documented in the "Output files" section of both CLI
+references: `merge-changes` gzips exactly when the UTF-8 output name ends
+`.gz`; `tags-filter --input-kind osc` and `diff --format osc` always gzip,
+whatever the name. Each site carries a "Deliberately ..." comment saying the
+contract is historical and framing has no shared owner (`osc/write.rs`,
+`tags_filter/osc.rs`, `diff/derive.rs`, `merge_changes`). What is open: no
+test writes every OSC producer to `x.osc` and `x.osc.gz` and asserts the gzip
+magic against one table (only `diff --format osc` is pinned), and the two
+rules remain two. Choosing one new rule (gzip unless the name ends `.osc`)
+would change two outputs; it is a decision for the maintainer, and without it
+the entry ends as the table test.
 
 Reported by: the command-matrix audit.
 
@@ -999,35 +967,29 @@ produce different blob compression, once the Option exists.
 
 Reported by: the command-matrix audit.
 
-## HYG-116 - Run scratch is made eagerly, at a different point per command, and sized by hand
+## HYG-116 - Run scratch is placed and sized by hand, per command
 
 Anger: 6 - CLI behaviour, small.
 
-- `run_scratch` creates the run directory unconditionally for `diff` (text
-  and osc), also on the paths that never write scratch: `diff -j 1`, which
-  the docs call the "scratch-free" path, and the sequential fallback for
-  unindexed input. So `diff -j 1 old new` to stdout, or with `-q`, fails in a
-  read-only current directory and creates and removes a `.pbfhogg-run-*`
-  there.
-- Where the directory goes: the output's directory (altw, geocode, `diff -o`),
-  the current directory (`diff` to stdout or `-q`), or `--tmp-dir`, which
-  exists on exactly those three commands.
-- Free-space preflight: altw sparse (`insufficient free space for sparse
-  node index`) and altw external (`space::precheck`) have one; diff and derive
-  deliberately have none (a comment in `derive.rs` explains); the geocode
-  builder has none, though its `.buckets-level*` trees are hundreds of GB at
-  planet scale.
+- Per-command placement: where the directory goes is decided at each
+  `run_scratch` call site (the output's directory for altw, geocode and
+  `diff -o`; the current directory for `diff` to stdout or `-q`; `--tmp-dir`,
+  which exists on exactly those three commands), and whether a diff run needs
+  scratch at all is a separate hand-written condition at the diff call site.
+  Neither is derived from one place.
+- Geocode free-space preflight: altw sparse and altw external have one;
+  diff and derive deliberately have none (a comment in `derive.rs` explains);
+  the geocode builder has none, though its `.buckets-level*` trees are
+  hundreds of GB at planet scale.
 - `leftover_dirs` in `main.rs` is a hand-kept per-command list of where
   leftovers may be, ending in `_ => {}`, beside `validate_input_output_aliases`
   (which is exhaustive) and the clap structs; a command that gains scratch
   compiles without being scanned.
 
-Fix: make `RunScratch` lazy (the directory appears at the first
-`file()` or `create_subdir()`), give `Command` accessors for its outputs,
-inputs and scratch parent used by the alias check, the leftover scan and
-`run_scratch` alike, and make `leftover_dirs` exhaustive. Enforce with
-`clippy::wildcard_enum_match_arm` on that function and a test that `diff -j 1`
-runs in a read-only directory.
+Fix: give `Command` accessors for its outputs, inputs and scratch parent
+used by the alias check, the leftover scan and `run_scratch` alike, and make
+`leftover_dirs` exhaustive, enforced with `clippy::wildcard_enum_match_arm`
+on that function. The run directory stays eager (ADR-0018).
 
 Reported by: the command-matrix audit.
 
@@ -1090,33 +1052,6 @@ honest options are to drop the timestamp and sequence number (osmium) or keep
 them and document them as the base's; which one depends on how nidhogg's
 `update.rs` reads them, which the maintainer has to check. bench-merge shares
 the path.
-
-Reported by: the output-header policy work.
-
-## HYG-122 - The writing program carries no version
-
-Anger: 7 - output header contents.
-
-Every output header says `writingprogram = "pbfhogg"` (the `HeaderBuilder`
-default, which the output-header policy always applies). osmium writes
-`osmium/<version>`, so a file in the wild can be traced to the release that
-made it; a pbfhogg file cannot, which matters when a header-policy or encoding
-bug is found later and the question is which files are affected. Fix: the CLI
-supplies `pbfhogg/<version>` from its own package version; library callers
-keep choosing their own. Tests that assert the exact string need updating.
-
-Reported by: the output-header policy work.
-
-## HYG-123 - `HeaderBuilder::from_header` survives only as public API
-
-Anger: 3 - unused public surface.
-
-No command calls `HeaderBuilder::from_header` any more; output headers come
-from `src/commands/output_header.rs`. Its doc still explains which features it
-deliberately does not copy and why, which is now the policy module's job, so
-the two statements can drift. Decide whether it stays public library API, in
-which case its doc should defer to the policy and a test should keep it
-working, or goes, since the crate is pre-1.0.
 
 Reported by: the output-header policy work.
 
@@ -1193,4 +1128,44 @@ spread of 64 beyond, and only for the commands it lists. Fix: run every ordinal 
 profile (the table already knows the count), keeping the tier-1 sampling.
 
 Reported by: the cancellation work.
+
+## HYG-130 - A quiet diff shards through scratch to discard the text
+
+Anger: 4 - CLI behaviour, small.
+
+`diff -q` hands the library a sink, so a quiet diff of indexed inputs still
+runs the parallel path, which writes each shard's text to scratch and then
+copies it into the sink. Planet scale that is tens of GB of disk written and
+read to produce a verdict and counts. A quiet run therefore needs a writable
+scratch location unless `-j 1` is given, which the `--tmp-dir` refusal and the
+scratch-free rule do not say for `-q`. Fix, if wanted: let the shard workers
+count without formatting when the caller discards the text (an option on
+`DiffOptions`), which would also make `-q` scratch-free; it touches the diff
+core (anger 9 territory), so it needs measuring first.
+
+Reported by: the scratch-lifecycle review fixes.
+
+## HYG-128 - No flag clears a header field
+
+Anger: 3 - CLI behaviour, small.
+
+`--generator` and `--output-header` can only set a value; an empty value
+writes a present, empty field. Nothing removes `source`, the replication base
+URL or the writing program from an output header (`degrade --strip-bbox` is
+the only removal, and only of the bbox). Whether removal is wanted, and with
+what spelling, is the maintainer's call; no syntax is reserved today.
+
+Reported by: the scratch-lifecycle review fixes.
+
+## HYG-129 - The one-header guard of getid's streaming arm has no CLI case
+
+Anger: 2 - test coverage.
+
+`tests/cli_input_contract.rs` runs a two-OSMHeader file through getid's
+indexed walker arm, apply-changes and altw (sparse and external). getid's
+streaming full-scan arm, which reads frames through its own loop, needs
+unindexed input and `--force` to be reached from the CLI and has no
+two-header case; the library-level reader tests cover the decoder it shares.
+
+Reported by: the scratch-lifecycle review fixes.
 

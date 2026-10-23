@@ -177,7 +177,7 @@ fn diff_parallel(
         },
         false,
         host,
-        pbfhogg::scratch::RunScratch::create(scratch, host)?,
+        Some(pbfhogg::scratch::RunScratch::create(scratch, host)?),
     )
     .map(drop)
 }

@@ -216,7 +216,10 @@ impl DiffMeta for OwnedRelation {
 /// `Sort.Type_then_ID` - returns an actionable error if either is unsorted.
 ///
 /// `scratch` is the run's scratch directory, used by the parallel path for
-/// its shard files and removed when the call returns.
+/// its shard files and removed when the call returns. A caller whose options
+/// run one shard (`Fixed(1)`, or `verbose`, which is sequential-only) writes
+/// no scratch and passes `None`; `None` with more than one shard is refused,
+/// before any input is read.
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub fn diff(
@@ -226,7 +229,7 @@ pub fn diff(
     options: &DiffOptions,
     direct_io: bool,
     host: &crate::host::Host,
-    scratch: crate::scratch::RunScratch,
+    scratch: Option<crate::scratch::RunScratch>,
 ) -> Result<DiffStats> {
     host.cancel.check()?;
     if options.verbose && options.parallelism.fixed().is_some_and(|n| n > 1) {
@@ -236,6 +239,12 @@ pub fn diff(
         ));
     }
     let jobs = options.shards(host);
+    if jobs > 1 && scratch.is_none() {
+        return Err(crate::Error::invalid_argument(
+            "diff: a run that may use more than one shard needs a scratch directory; \
+             without one it must run a single shard",
+        ));
+    }
     let filter = TypeFilter::or_all(options.type_filter);
 
     // Single-pass: check sorted headers + indexdata from one file open each.
@@ -272,12 +281,11 @@ pub fn diff(
     // would be worse than the wall-time cost of a sequential verbose
     // diff. Verbose is a human-inspection mode; the parallel default
     // serves the common non-verbose case.
-    let parallel_stats = if both_indexed && jobs > 1 {
-        parallel::diff_block_pair_parallel(
-            old_path, new_path, output, options, direct_io, &filter, jobs, host, &scratch,
-        )?
-    } else {
-        None
+    let parallel_stats = match &scratch {
+        Some(scratch) if both_indexed && jobs > 1 => parallel::diff_block_pair_parallel(
+            old_path, new_path, output, options, direct_io, &filter, jobs, host, scratch,
+        )?,
+        _ => None,
     };
     let stats = if let Some(stats) = parallel_stats {
         stats

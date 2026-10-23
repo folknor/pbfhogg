@@ -79,10 +79,10 @@ pub(super) struct OrderingSegment {
 // Per-block info (--blocks)
 // ---------------------------------------------------------------------------
 
-const ANOMALY_SMALL_NUMERATOR: u64 = 1;
-const ANOMALY_SMALL_DENOMINATOR: u64 = 2;
-const ANOMALY_LARGE_NUMERATOR: u64 = 3;
-const ANOMALY_LARGE_DENOMINATOR: u64 = 2;
+use crate::tunables::{
+    ANOMALY_LARGE_DENOMINATOR, ANOMALY_LARGE_NUMERATOR, ANOMALY_SMALL_DENOMINATOR,
+    ANOMALY_SMALL_NUMERATOR,
+};
 
 /// Describe the thresholds used by `inspect --anomalies`.
 #[must_use]

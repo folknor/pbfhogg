@@ -35,11 +35,6 @@ fn check_source(path: &Path) -> std::io::Result<()> {
             .collect();
         // The larger scan/cache budgets are not transfer buffers.
         let compact = compact.replace(&budget, "SCAN_BUDGET");
-        if path.file_name().is_some_and(|name| name == "mod.rs")
-            && compact.starts_with("pub(crate)constIOBUFBYTES:usize=")
-        {
-            continue;
-        }
         assert!(
             !compact.contains(&product) && !compact.contains(&decimal),
             "{} duplicates the I/O transfer size; use IO_BUF_BYTES",

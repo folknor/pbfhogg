@@ -25,21 +25,7 @@ use crate::read::wire_schema::{BlobHeaderField, HeaderBlockField, blob, blob_hea
 use super::compression::Compression;
 use super::pipeline::{FramedBlobParts, elapsed_ns_u64};
 
-/// Retained per-thread scratch is kept at or below 4 MiB per buffer. Blocks
-/// built under the default 8000-element cap are normally below this (each of
-/// the three buffers is sized by the block's raw or framed bytes; the read
-/// side's `DecompressPool` uses the same 4 MiB retention limit on the same
-/// reasoning), so the cap only engages on outliers; larger buffers are handed
-/// to the writer or dropped, then the thread-local scratch is allowed to warm
-/// up again. A run whose blocks all exceed it (repack with a raised
-/// `--elements-per-blob`) pays a fresh allocation per buffer per block, which
-/// is small next to compressing a block of that size. On the pipelined path
-/// the blob and header buffers are handed off and replaced on every blob
-/// regardless, so only `compress_buf` loses cross-blob reuse there; the sync
-/// writer path writes from all three in place and loses reuse on each. The
-/// three scratch Vecs therefore retain at most 12 MiB per `FrameScratch`, in
-/// addition to the reused compressor state.
-const MAX_RETAINED_SCRATCH_CAPACITY: usize = 4 * 1024 * 1024;
+use crate::tunables::{MAX_RETAINED_SCRATCH_CAPACITY, ZLIB_RESERVE_SHIFT, ZLIB_RESERVE_SLACK};
 
 /// Per-thread reusable blob framing scratch: header/body/compression buffers
 /// plus lazy-initialized zlib/zstd compressors. Reused across ordinary blobs
@@ -407,9 +393,9 @@ fn compress_zlib(uncompressed: &[u8], level: u32, scratch: &mut FrameScratch) ->
     let (_, compressor) = scratch.zlib_compressor.as_mut().expect("just initialized");
     scratch.compress_buf.clear();
     // Zlib worst-case bound: input + ~0.1% + header/trailer.
-    scratch
-        .compress_buf
-        .reserve(uncompressed.len() + (uncompressed.len() >> 10) + 64);
+    scratch.compress_buf.reserve(
+        uncompressed.len() + (uncompressed.len() >> ZLIB_RESERVE_SHIFT) + ZLIB_RESERVE_SLACK,
+    );
     let status = compressor
         .compress_vec(
             uncompressed,

@@ -33,14 +33,7 @@ pub struct CheckOptions {
 // the file while retaining a minimum range for small files. A file-derived
 // ceiling below caps indexdata-driven allocation above those per-kind floors.
 
-/// Minimum node ID-space allocation used by check commands.
-pub(super) const NODE_ID_FLOOR: i64 = 14_000_000_000;
-
-/// Minimum way ID-space allocation used by check commands.
-pub(super) const WAY_ID_FLOOR: i64 = 2_000_000_000;
-
-/// Minimum relation ID-space allocation used by check commands.
-pub(super) const RELATION_ID_FLOOR: i64 = 25_000_000;
+use crate::tunables::CHECK_IDS_PER_BYTE;
 
 /// Choose the `IdSet::pre_allocate` argument for one element kind.
 ///
@@ -74,13 +67,10 @@ pub(super) fn id_alloc_bound(indexdata_max: i64, floor: i64, file_len: u64) -> i
     crate::idset::IdSet::file_bounded_max_id(indexdata_max, file_len, CHECK_IDS_PER_BYTE).max(floor)
 }
 
-/// IDs of range per input byte that `id_alloc_bound` allows above the floor:
-/// at one bit per ID, a bitset no larger than the input file.
-const CHECK_IDS_PER_BYTE: u64 = 8;
-
 #[cfg(test)]
 mod tests {
-    use super::{NODE_ID_FLOOR, RELATION_ID_FLOOR, WAY_ID_FLOOR, id_alloc_bound};
+    use super::id_alloc_bound;
+    use crate::tunables::{NODE_ID_FLOOR, RELATION_ID_FLOOR, WAY_ID_FLOOR};
 
     #[test]
     fn an_overstated_indexdata_max_id_cannot_request_an_unbounded_allocation() {

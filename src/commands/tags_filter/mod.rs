@@ -1025,7 +1025,12 @@ fn tags_filter_two_pass(
                 .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
         );
 
-        let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
+        let decode_threads = crate::host::sized_workers(
+            &*host.resources,
+            crate::tunables::DECODE_WORKERS_RESERVED,
+            crate::tunables::DECODE_WORKERS_MIN,
+            crate::tunables::DECODE_WORKERS_FALLBACK,
+        );
 
         let decode_items: Vec<(usize, u64, usize)> = schedule
             .iter()
@@ -1038,9 +1043,13 @@ fn tags_filter_two_pass(
             usize,
             crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats)>,
         );
-        let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+        let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(
+            crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
+        );
         let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WorkerResult>(32);
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WorkerResult>(
+            crate::tunables::POOL_RESULT_CHANNEL_DEPTH,
+        );
         let prefetch_file = std::sync::Arc::clone(&shared_file);
 
         std::thread::scope(|scope| -> Result<()> {
@@ -1082,7 +1091,10 @@ fn tags_filter_two_pass(
                                 .map_err(|e| {
                                     crate::error::new_error(crate::error::ErrorKind::Io(e))
                                 })?;
-                            let mut buf = crate::blob::pool_get(Some(&worker_pool), data_size * 4);
+                            let mut buf = crate::blob::pool_get(
+                                Some(&worker_pool),
+                                data_size * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
+                            );
                             crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                             let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
                                 buf,
@@ -1123,7 +1135,9 @@ fn tags_filter_two_pass(
             // Consumer: merge results via reorder buffer for file-order output.
             let mut reorder: crate::reorder_buffer::ReorderBuffer<
                 crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats)>,
-            > = crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+            > = crate::reorder_buffer::ReorderBuffer::with_capacity(
+                crate::tunables::POOL_REORDER_CAPACITY,
+            );
 
             let mut drain_ready =
                 |reorder: &mut crate::reorder_buffer::ReorderBuffer<_>| -> Result<()> {

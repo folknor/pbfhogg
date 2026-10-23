@@ -10,8 +10,9 @@ use super::super::Result;
 use super::pool::{Rewritten, run_rewrite_stage};
 use super::schedule::BlobTask;
 use super::wire_rewrite::{Scratch, reframe_dense_with_new_ids};
-use super::{BlobBuffers, PASS1_WORKERS, StageCounters, add_ns, blob_index, positional_bases};
+use super::{BlobBuffers, StageCounters, add_ns, blob_index, positional_bases};
 use crate::idset::IdSet;
+use crate::tunables::RENUMBER_PASS1_WORKERS;
 
 /// Per-worker state: I/O and rewrite buffers plus the IDs this worker could
 /// not record in the shared set.
@@ -40,7 +41,7 @@ pub(super) fn pass1_parallel_scan(
 ) -> Result<Pass1Result> {
     let bases = positional_bases(start_node_id, schedule, "node")?;
     let counters = StageCounters::new();
-    let mut workers: Vec<Pass1Worker> = (0..PASS1_WORKERS)
+    let mut workers: Vec<Pass1Worker> = (0..RENUMBER_PASS1_WORKERS)
         .map(|_| Pass1Worker {
             buffers: BlobBuffers::default(),
             scratch: Scratch::default(),

@@ -85,7 +85,10 @@ pub(super) fn run_pass1(
                         let admin_level = if is_admin {
                             let Some(ls) = level_str else { continue };
                             let Ok(l) = ls.parse::<u8>() else { continue };
-                            if !(2..=super::super::format::MAX_ADMIN_LEVEL).contains(&l) {
+                            if !(crate::tunables::GEOCODE_ADMIN_LEVEL_MIN
+                                ..=super::super::format::MAX_ADMIN_LEVEL)
+                                .contains(&l)
+                            {
                                 continue;
                             }
                             l
@@ -101,11 +104,12 @@ pub(super) fn run_pass1(
                         let Some(ns) = name_str else { continue };
 
                         let name_offset = strings.intern(ns);
-                        let cc_offset = if admin_level == 2 {
-                            cc.map_or(0, |c| strings.intern(c))
-                        } else {
-                            0
-                        };
+                        let cc_offset =
+                            if admin_level == crate::tunables::GEOCODE_COUNTRY_ADMIN_LEVEL {
+                                cc.map_or(0, |c| strings.intern(c))
+                            } else {
+                                0
+                            };
 
                         let mut outer = Vec::new();
                         let mut inner = Vec::new();

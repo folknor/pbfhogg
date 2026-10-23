@@ -570,7 +570,7 @@ fn simplify_refuses_a_version_regression() {
     // position and downgrade node 1 from version 9 to version 8.
     let stderr = merge_changes_failure(&[&newer, &older], &out, &["--simplify"]);
     assert!(
-        stderr.contains("does not advance past version 9"),
+        stderr.contains("is lower than version 9"),
         "error must name the regression; stderr:\n{stderr}"
     );
 
@@ -598,6 +598,100 @@ fn simplify_refuses_a_version_regression() {
     assert!(
         xml.contains(r#"version="8""#),
         "--allow-version-regression must restore the positional rule; output was:\n{xml}"
+    );
+}
+
+/// Consecutive diffs that share versions are merged, not refused, and
+/// the later change wins by position. The real shape: germany seq 4705
+/// modifies node 135379864 at version 12 and seq 4706 deletes it at
+/// version 12 (a regional extract deletes an object leaving the region
+/// at the version it already had), and overlapping diffs repeat a
+/// boundary change verbatim. The gate refused every equal version, so
+/// every germany range starting at 4705 failed. A lower version after
+/// them is still refused, and `--allow-version-regression` still admits
+/// it.
+#[test]
+fn simplify_admits_equal_versions_from_overlapping_diffs() {
+    let dir = TempDir::new().expect("tempdir");
+    let first = dir.path().join("4705.osc.gz");
+    let second = dir.path().join("4706.osc.gz");
+    let out = dir.path().join("out.osc.gz");
+
+    write_osc_gz(
+        &first,
+        r#"<?xml version="1.0"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="1" lat="50.6575433" lon="9.511884" version="12" timestamp="2026-02-24T21:21:17Z"/>
+    <node id="2" lat="1.0" lon="1.0" version="3" timestamp="2026-02-24T10:00:00Z"/>
+    <way id="5" version="4"><nd ref="1"/><nd ref="2"/><tag k="highway" v="track"/></way>
+  </modify>
+</osmChange>"#,
+    );
+    write_osc_gz(
+        &second,
+        r#"<?xml version="1.0"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="2" lat="1.0" lon="1.0" version="3" timestamp="2026-02-24T10:00:00Z"/>
+    <way id="5" version="4"><nd ref="1"/><nd ref="2"/><tag k="highway" v="path"/></way>
+  </modify>
+  <delete>
+    <node id="1" lat="50.6575433" lon="9.511884" version="12" timestamp="2026-02-24T21:21:17Z"/>
+  </delete>
+</osmChange>"#,
+    );
+
+    let stderr = run_merge_changes(&[&first, &second], &out, true);
+    assert!(
+        stderr.contains("6 input changes -> 3 output changes (simplified)"),
+        "stats line unexpected; stderr:\n{stderr}"
+    );
+    let xml = read_osc_gz(&out);
+    let delete = xml
+        .split("<delete>")
+        .nth(1)
+        .unwrap_or_else(|| panic!("the equal-version delete must win; output was:\n{xml}"));
+    assert!(
+        delete.contains(r#"<node id="1""#),
+        "node 1 must be emitted as the delete; output was:\n{xml}"
+    );
+    assert!(
+        xml.contains(r#"v="path""#) && !xml.contains(r#"v="track""#),
+        "an equal version with different content is won by the later change; output was:\n{xml}"
+    );
+    assert!(xml.contains(r#"<node id="2""#));
+
+    // Equality never lowers the floor: a lower claim after the equal
+    // ones is refused against the same version, and the escape hatch
+    // still admits it.
+    let stale = dir.path().join("stale.osc.gz");
+    write_osc_gz(
+        &stale,
+        r#"<?xml version="1.0"?>
+<osmChange version="0.6">
+  <modify><node id="1" lat="1.0" lon="1.0" version="11"/></modify>
+</osmChange>"#,
+    );
+    let stderr = merge_changes_failure(&[&first, &second, &stale], &out, &["--simplify"]);
+    assert!(
+        stderr.contains("is lower than version 12"),
+        "a lower claim after equal ones must be refused; stderr:\n{stderr}"
+    );
+    CliInvoker::new()
+        .arg("merge-changes")
+        .arg(&first)
+        .arg(&second)
+        .arg(&stale)
+        .arg("-o")
+        .arg(&out)
+        .arg("--simplify")
+        .arg("--allow-version-regression")
+        .assert_success();
+    let xml = read_osc_gz(&out);
+    assert!(
+        xml.contains(r#"version="11""#),
+        "--allow-version-regression must still let the lower claim win; output was:\n{xml}"
     );
 }
 
@@ -655,7 +749,7 @@ fn simplify_gates_a_stale_change_after_a_delete() {
     );
     let stderr = merge_changes_failure(&[&one_file], &out, &["--simplify"]);
     assert!(
-        stderr.contains("does not advance past version 9"),
+        stderr.contains("is lower than version 9"),
         "a stale modify after a delete in one OSC must be refused; stderr:\n{stderr}"
     );
 
@@ -677,7 +771,7 @@ fn simplify_gates_a_stale_change_after_a_delete() {
     );
     let stderr = merge_changes_failure(&[&del, &stale], &out, &["--simplify"]);
     assert!(
-        stderr.contains("does not advance past version 9"),
+        stderr.contains("is lower than version 9"),
         "a stale modify in a later file must be refused; stderr:\n{stderr}"
     );
 
@@ -743,7 +837,7 @@ fn simplify_floor_survives_an_unversioned_change() {
         );
         let stderr = merge_changes_failure(&[&a, &b, &c], &out, &["--simplify"]);
         assert!(
-            stderr.contains("does not advance past version 9"),
+            stderr.contains("is lower than version 9"),
             "{case}: the unversioned change must not reset the floor; stderr:\n{stderr}"
         );
 

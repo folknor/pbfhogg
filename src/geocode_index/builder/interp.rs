@@ -274,7 +274,8 @@ fn find_endpoint_house_number_mmap(
             let dlon =
                 crate::geo::wrapped_longitude_delta_e7(i64::from(pt.lon_e7) - i64::from(lon_e7));
             let dist_sq = dlat * dlat + dlon * dlon;
-            let is_exact = dlat.abs() <= 1 && dlon.abs() <= 1;
+            let is_exact = dlat.abs() <= crate::tunables::INTERP_ENDPOINT_EXACT_TOLERANCE_E7
+                && dlon.abs() <= crate::tunables::INTERP_ENDPOINT_EXACT_TOLERANCE_E7;
 
             if is_exact && !found_exact {
                 found_exact = true;

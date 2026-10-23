@@ -132,7 +132,13 @@ pub(super) fn relation_r2d_assembly(
     ids: &RelationIdSpaces<'_>,
     host: &crate::host::Host,
 ) -> Result<R2dResult> {
-    let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4).min(6);
+    let decode_threads = crate::host::sized_workers(
+        &*host.resources,
+        crate::tunables::DECODE_WORKERS_RESERVED,
+        crate::tunables::DECODE_WORKERS_MIN,
+        crate::tunables::DECODE_WORKERS_FALLBACK,
+    )
+    .min(crate::tunables::RENUMBER_RELATIONS_WORKERS_CAP);
     let counters = StageCounters::new();
     let mut workers: Vec<R2dWorker> = (0..decode_threads.max(1))
         .map(|_| R2dWorker {

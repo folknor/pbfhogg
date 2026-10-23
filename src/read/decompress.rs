@@ -11,6 +11,9 @@ use flate2::Decompress;
 use std::cell::RefCell;
 
 use crate::error::{BlobError, ErrorKind, Result, new_blob_error, new_error};
+use crate::tunables::{
+    DECOMPRESS_EXPANSION_GUESS, DECOMPRESS_POOL_MAX_BUFFERS, DECOMPRESS_POOL_MAX_RETAINED_CAPACITY,
+};
 
 use super::blob_wire::{BlobData, MAX_BLOB_MESSAGE_SIZE, WireBlob};
 use super::pipeline_metrics::PIPELINE_METRICS;
@@ -22,21 +25,8 @@ thread_local! {
     static ZLIB_DECOMPRESS: RefCell<Decompress> = RefCell::new(Decompress::new(true));
 }
 
-/// Maximum capacity (bytes) of a buffer retained in the pool.
-/// Buffers larger than this are dropped on return instead of recycled.
-/// This prevents outlier blobs (up to 32 MB decompressed) from permanently
-/// inflating the pool's retained memory.
-///
-/// Set to 4 MB: covers >99% of real-world PBF blocks (8000 elements at
-/// typical sizes) while dropping the long tail of outlier blocks.
-const MAX_RETAINED_CAPACITY: usize = 4 * 1024 * 1024;
-
-/// Maximum number of buffers retained in the pool.
-/// Defense-in-depth: prevents unbounded pool growth if pipeline topology changes.
-const MAX_POOL_SIZE: usize = 64;
-
-// The retained payload capacity is at most 64 * 4 MiB = 256 MiB. Buffers
-// rejected by either limit are dropped and counted for the read sidecar.
+// Buffers rejected by either pool limit (`DECOMPRESS_POOL_MAX_RETAINED_CAPACITY`,
+// `DECOMPRESS_POOL_MAX_BUFFERS`) are dropped and counted for the read sidecar.
 
 /// Thread-safe pool of decompression buffers for reuse across pipeline blobs.
 ///
@@ -78,13 +68,13 @@ impl DecompressPool {
     /// Also enforces a count cap as defense-in-depth.
     fn put(&self, mut buf: Vec<u8>) {
         let capacity = buf.capacity();
-        if capacity > MAX_RETAINED_CAPACITY {
+        if capacity > DECOMPRESS_POOL_MAX_RETAINED_CAPACITY {
             PIPELINE_METRICS.record_decompress_pool_oversize_drop(capacity);
             return;
         }
         buf.clear();
         match self.buffers.lock() {
-            Ok(mut buffers) if buffers.len() < MAX_POOL_SIZE => buffers.push(buf),
+            Ok(mut buffers) if buffers.len() < DECOMPRESS_POOL_MAX_BUFFERS => buffers.push(buf),
             Ok(_) => PIPELINE_METRICS.record_decompress_pool_full_drop(capacity),
             Err(_) => PIPELINE_METRICS.record_decompress_pool_poisoned_drop(capacity),
         }
@@ -458,7 +448,7 @@ fn decompress_blob_body(blob: &WireBlob, pool: Option<&Arc<DecompressPool>>) -> 
             let capacity = if est > 0 {
                 est
             } else {
-                clamp_capacity_hint(bytes.len().saturating_mul(4))
+                clamp_capacity_hint(bytes.len().saturating_mul(DECOMPRESS_EXPANSION_GUESS))
             };
             let mut decoded_bytes = pool_get(pool, capacity);
             zlib_decompress_into(bytes, &mut decoded_bytes)?;
@@ -469,7 +459,7 @@ fn decompress_blob_body(blob: &WireBlob, pool: Option<&Arc<DecompressPool>>) -> 
             let capacity = if est > 0 {
                 est
             } else {
-                clamp_capacity_hint(bytes.len().saturating_mul(4))
+                clamp_capacity_hint(bytes.len().saturating_mul(DECOMPRESS_EXPANSION_GUESS))
             };
             let mut decoded_bytes = pool_get(pool, capacity);
             zstd_decompress_into(bytes, &mut decoded_bytes)?;

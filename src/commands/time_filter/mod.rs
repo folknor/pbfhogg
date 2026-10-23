@@ -306,7 +306,8 @@ fn time_filter_snapshot(
     }
 
     type PhaseResult = std::result::Result<(Vec<Vec<u8>>, TimeFilterStats), String>;
-    let mut reorder: ReorderBuffer<PhaseResult> = ReorderBuffer::with_capacity(64);
+    let mut reorder: ReorderBuffer<PhaseResult> =
+        ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY_WIDE);
     let mut write_error: Option<Box<dyn std::error::Error>> = None;
     let mut classify_error: Option<String> = None;
 

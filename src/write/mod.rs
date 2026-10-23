@@ -104,9 +104,9 @@ pub mod writer;
 /// Page size for alignment. 4096 is universally safe across Linux filesystems.
 pub(crate) const PAGE_SIZE: usize = 4096;
 
-/// Shared buffered and aligned I/O transfer size.
-pub(crate) const IO_BUF_BYTES: usize = 256 * 1024;
-const _: () = assert!(IO_BUF_BYTES.is_multiple_of(PAGE_SIZE));
+/// Shared buffered and aligned I/O transfer size; owned by `tunables`
+/// (which also asserts it is a multiple of [`PAGE_SIZE`]).
+pub(crate) use crate::tunables::IO_BUF_BYTES;
 
 /// Allocate `size` bytes aligned to `PAGE_SIZE`. Returns the pointer and layout
 /// (needed for deallocation). Centralizes the unsafe page-aligned allocation

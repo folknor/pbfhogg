@@ -248,7 +248,12 @@ pub(super) fn stage4_assembly(
         host,
     )?;
 
-    let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
+    let decode_threads = crate::host::sized_workers(
+        &*host.resources,
+        crate::tunables::DECODE_WORKERS_RESERVED,
+        crate::tunables::DECODE_WORKERS_MIN,
+        crate::tunables::DECODE_WORKERS_FALLBACK,
+    );
     // Pre-streaming baseline had no cap (ran 22 threads on a 24-core
     // host); the initial Commit B run capped at .min(4) and measured a
     // +11.5% Europe regression because stage 4 decode throughput fell
@@ -268,13 +273,14 @@ pub(super) fn stage4_assembly(
         schedule.into_iter().partition(|d| !d.is_passthrough);
 
     type DecodedItem = (usize, crate::error::Result<(Vec<OwnedBlock>, Stats)>);
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(16);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(
+        crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
+    );
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    // Channel capacity 32 - the 256-depth A/B probe confirmed that
-    // `s4_send_ms` pressure is steady-state consumer/compression
-    // saturation, not burst absorption. A deeper channel just moves
-    // the wait into the writer pipeline with no wall change.
-    let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
+    // Result channel depth: see `POOL_RESULT_CHANNEL_DEPTH` for why 32 is
+    // right here.
+    let (decoded_tx, decoded_rx) =
+        std::sync::mpsc::sync_channel::<DecodedItem>(crate::tunables::POOL_RESULT_CHANNEL_DEPTH);
 
     let mut total_stats = Stats::default();
 

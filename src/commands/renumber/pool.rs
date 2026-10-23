@@ -34,11 +34,7 @@ use super::super::Result;
 use super::{StageCounters, add_ns};
 use crate::blob_meta::BlobIndex;
 
-/// Result window per worker. Large enough that a worker is never parked
-/// behind a slightly slow neighbour, small enough that the buffered
-/// rewritten blobs stay a few hundred MB at worst.
-const WINDOW_PER_WORKER: usize = 8;
-const WINDOW_MIN: usize = 32;
+use crate::tunables::{RENUMBER_WINDOW_MIN, RENUMBER_WINDOW_PER_WORKER};
 
 /// The admission gate: the window position and the cancellation flag, both
 /// under one mutex so a waiter's predicate check and the update that wakes
@@ -156,8 +152,8 @@ where
     }
     let window = states
         .len()
-        .saturating_mul(WINDOW_PER_WORKER)
-        .max(WINDOW_MIN);
+        .saturating_mul(RENUMBER_WINDOW_PER_WORKER)
+        .max(RENUMBER_WINDOW_MIN);
     let gate = Gate::new();
     let next = AtomicUsize::new(0);
 
@@ -476,7 +472,7 @@ mod tests {
         });
         // The gate admits `i < consumed + window`; the test's own `consumed`
         // is bumped just after the pool publishes its, so it may lag by one.
-        let window = WINDOW_MIN.max(4 * WINDOW_PER_WORKER);
+        let window = RENUMBER_WINDOW_MIN.max(4 * RENUMBER_WINDOW_PER_WORKER);
         assert!(
             peak <= window,
             "a worker ran {peak} blobs ahead of the consumer; the window ({window}) must bound it"

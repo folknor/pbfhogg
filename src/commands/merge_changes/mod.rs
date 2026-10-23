@@ -156,7 +156,12 @@ pub fn merge_changes(
 
     let worker_count = match jobs {
         Some(n) if n > 0 => n,
-        _ => crate::host::sized_workers(&*host.resources, 0, 1, 8),
+        _ => crate::host::sized_workers(
+            &*host.resources,
+            crate::tunables::MERGE_CHANGES_WORKERS_RESERVED,
+            crate::tunables::MERGE_CHANGES_WORKERS_MIN,
+            crate::tunables::MERGE_CHANGES_WORKERS_FALLBACK,
+        ),
     };
 
     crate::debug::emit_marker("MERGECHANGES_START");
@@ -787,7 +792,7 @@ fn recv_member(
             Err(TryRecvError::Empty) => match executor.yield_now() {
                 Some(rayon::Yield::Executed) => {}
                 Some(rayon::Yield::Idle) => {
-                    match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+                    match rx.recv_timeout(crate::tunables::EXECUTOR_IDLE_RECV_TIMEOUT) {
                         Ok(item) => return Ok(item),
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => return Err(LOST.into()),
@@ -863,8 +868,10 @@ fn change_version(change: &Change) -> Option<i32> {
     meta.and_then(|m| m.version)
 }
 
-/// Refuse a `--simplify` dedupe in which the incoming change does not
-/// advance the object's version, then fold its claim into the floor.
+/// Refuse a `--simplify` dedupe in which the incoming change claims a
+/// lower version than the object already had, then fold its claim into
+/// the floor. An equal claim is admitted and wins by position, like any
+/// admitted change; [`VersionFloor`] explains why.
 ///
 /// `--simplify` keeps the last change per `(kind, id)` in **input**
 /// order, so listing the inputs out of sequence order - which `brokkr`'s
@@ -893,7 +900,7 @@ fn check_version_advance(floor: &mut VersionFloor, incoming: &Change) -> Result<
             id,
             version,
             held,
-            "pass --allow-version-regression to restore the positional rule",
+            "pass --allow-version-regression",
         )
         .into());
     }
@@ -984,6 +991,9 @@ fn write_simplified(
         if group.is_empty() {
             continue;
         }
+        // One chunk per worker, each its own `<action>` section, so the
+        // output bytes depend on the worker count (and through `-j 0` on
+        // the host's core count) while the changes and their order do not.
         let chunk_len = group.len().div_ceil(worker_count).max(1);
         let chunks: std::result::Result<Vec<Vec<u8>>, String> = group
             .par_chunks(chunk_len)

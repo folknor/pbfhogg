@@ -601,7 +601,12 @@ pub(crate) fn assemble_osc_from_paths(
     // thread; 4 when the host reports none), not from `-j`: `-j` gates and
     // sizes the shard comparison, and this assembler runs after it has
     // finished. A `-j 1` run therefore still compresses on every thread.
-    let worker_count = crate::host::sized_workers(&*host.resources, 0, 1, 4);
+    let worker_count = crate::host::sized_workers(
+        &*host.resources,
+        crate::tunables::DERIVE_GZIP_WORKERS_RESERVED,
+        crate::tunables::DERIVE_GZIP_WORKERS_MIN,
+        crate::tunables::DERIVE_GZIP_WORKERS_FALLBACK,
+    );
     let gz = ParallelGzipWriter::new(buf, DEFAULT_CHUNK_SIZE, worker_count);
     let mut writer = Writer::new_with_indent(gz, b' ', 2);
 

@@ -307,7 +307,12 @@ where
             .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
     );
 
-    let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
+    let decode_threads = crate::host::sized_workers(
+        &*host.resources,
+        crate::tunables::DECODE_WORKERS_RESERVED,
+        crate::tunables::DECODE_WORKERS_MIN,
+        crate::tunables::DECODE_WORKERS_FALLBACK,
+    );
 
     type WorkerResult = (usize, crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>);
 
@@ -327,9 +332,12 @@ where
         }
     }
 
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(
+        crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
+    );
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WorkerResult>(32);
+    let (result_tx, result_rx) =
+        std::sync::mpsc::sync_channel::<WorkerResult>(crate::tunables::POOL_RESULT_CHANNEL_DEPTH);
 
     std::thread::scope(|scope| -> Result<()> {
         // Dispatcher: feed decode-only blobs to workers.
@@ -371,7 +379,10 @@ where
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
 
                         // Decode path: full PrimitiveBlock → extract → OwnedBlocks.
-                        let mut buf = crate::blob::pool_get(Some(&worker_pool), data_size * 4);
+                        let mut buf = crate::blob::pool_get(
+                            Some(&worker_pool),
+                            data_size * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
+                        );
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = PrimitiveBlock::from_vec_pooled_with_scratch(
                             buf,
@@ -415,7 +426,9 @@ where
         }
 
         let mut reorder: crate::reorder_buffer::ReorderBuffer<ConsumerItem> =
-            crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+            crate::reorder_buffer::ReorderBuffer::with_capacity(
+                crate::tunables::POOL_REORDER_CAPACITY,
+            );
 
         // Pre-insert passthrough items into the reorder buffer.
         for &(seq, frame_offset, frame_size, count) in &passthrough_items {

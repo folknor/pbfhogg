@@ -19,9 +19,7 @@ use super::common::{
 };
 use super::{ExtractStats, Region};
 
-/// Number of decoded blocks collected before unsorted pass-2 dispatches them
-/// to rayon.
-const BATCH_SIZE: usize = 64;
+use crate::tunables::EXTRACT_SIMPLE_BATCH_SIZE;
 
 /// Which element kind a classification sweep is resolving.
 ///
@@ -267,7 +265,7 @@ fn extract_simple_two_pass(
     };
 
     let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(EXTRACT_SIMPLE_BATCH_SIZE);
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
@@ -276,7 +274,7 @@ fn extract_simple_two_pass(
         blob.decompress_into(&mut decompress_buf)?;
         let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
         batch.push(block);
-        if batch.len() >= BATCH_SIZE {
+        if batch.len() >= EXTRACT_SIMPLE_BATCH_SIZE {
             process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats, host)?;
             batch.clear();
         }
@@ -430,14 +428,23 @@ fn extract_simple_single_pass(
                 .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
         );
 
-        let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
+        let decode_threads = crate::host::sized_workers(
+            &*host.resources,
+            crate::tunables::DECODE_WORKERS_RESERVED,
+            crate::tunables::DECODE_WORKERS_MIN,
+            crate::tunables::DECODE_WORKERS_FALLBACK,
+        );
 
         // Per blob: the matching node ids, plus - for a passthrough candidate
         // - the observed node count if the blob verified (see `Passthrough`).
         type ClassifyResult = (usize, crate::error::Result<(Vec<i64>, Option<u64>)>);
-        let (cls_tx, cls_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize, bool)>(16);
+        let (cls_tx, cls_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize, bool)>(
+            crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
+        );
         let cls_rx = std::sync::Arc::new(std::sync::Mutex::new(cls_rx));
-        let (ids_tx, ids_rx) = std::sync::mpsc::sync_channel::<ClassifyResult>(32);
+        let (ids_tx, ids_rx) = std::sync::mpsc::sync_channel::<ClassifyResult>(
+            crate::tunables::POOL_RESULT_CHANNEL_DEPTH,
+        );
 
         std::thread::scope(|scope| -> Result<()> {
             // Dispatcher: send node blob descriptors.
@@ -579,12 +586,21 @@ fn extract_simple_single_pass(
             std::fs::File::open(input)
                 .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
         );
-        let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
+        let decode_threads = crate::host::sized_workers(
+            &*host.resources,
+            crate::tunables::DECODE_WORKERS_RESERVED,
+            crate::tunables::DECODE_WORKERS_MIN,
+            crate::tunables::DECODE_WORKERS_FALLBACK,
+        );
 
         type WayClassifyResult = (usize, crate::error::Result<Vec<i64>>);
-        let (cls_tx, cls_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+        let (cls_tx, cls_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(
+            crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
+        );
         let cls_rx = std::sync::Arc::new(std::sync::Mutex::new(cls_rx));
-        let (ids_tx, ids_rx) = std::sync::mpsc::sync_channel::<WayClassifyResult>(32);
+        let (ids_tx, ids_rx) = std::sync::mpsc::sync_channel::<WayClassifyResult>(
+            crate::tunables::POOL_RESULT_CHANNEL_DEPTH,
+        );
 
         std::thread::scope(|scope| -> Result<()> {
             let descs: Vec<(usize, u64, usize)> = way_schedule

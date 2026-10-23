@@ -18,18 +18,14 @@ use std::path::Path;
 
 use super::super::Result;
 use super::blob_meta::BlobMeta;
-use super::radix::{NUM_BUCKETS, ScratchDir};
+use super::radix::ScratchDir;
 use super::{BucketLayout, ID_RECORD_SIZE, IdRecord, NodeBlobInfo};
-
-// Stage-1 blob-level count stream: one u64 per way blob plus the total. This
-// sidecar batching capacity is distinct from the PBF writer transfer size in
-// `crate::write::IO_BUF_BYTES`.
-const REF_COUNT_SIDECAR_BUF_BYTES: usize = 64 * 1024;
-
-// Stage-1 per-way stream: each blob's way count and each way's refcount as
-// varints. This sidecar batching capacity is distinct from the PBF writer
-// transfer size in `crate::write::IO_BUF_BYTES`, despite having the same value.
-const PER_WAY_REFCOUNT_SIDECAR_BUF_BYTES: usize = 256 * 1024;
+use crate::tunables::{
+    BUCKET_BUF_SIZE, DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN, DECODE_WORKERS_RESERVED,
+    NUM_BUCKETS, PER_WAY_REFCOUNT_SIDECAR_BUF_BYTES, POOL_REORDER_CAPACITY_WIDE,
+    POOL_RESULT_CHANNEL_DEPTH, REF_COUNT_SIDECAR_BUF_BYTES, STAGE1_HEADROOM_FDS,
+    STAGE1_VARINT_BUF_CAPACITY,
+};
 
 /// `io::Write` shim between the id-shard `BufWriter`s and their files
 /// that attributes real write calls (BufWriter buffer drains, 256 KB
@@ -172,7 +168,7 @@ pub(super) fn stage1_pass_a(
         std::sync::Mutex::new(Vec::new());
     {
         type PassAItem = (u32, std::result::Result<(u64, Vec<u32>), String>);
-        let (tx, rx) = std::sync::mpsc::sync_channel::<PassAItem>(32);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<PassAItem>(POOL_RESULT_CHANNEL_DEPTH);
         let schedule_ref = schedule;
         let next_ref = &next_idx;
         let s1a_pread_ref = &s1a_pread_ms;
@@ -280,7 +276,7 @@ pub(super) fn stage1_pass_a(
                                         format!("create id shard {}: {e}", path.display(),)
                                     })?;
                                     id_shard_writers.push(Some(BufWriter::with_capacity(
-                                        super::radix::BUCKET_BUF_SIZE,
+                                        BUCKET_BUF_SIZE,
                                         TimedShardWriter {
                                             file: f,
                                             write_ns: s1a_id_shard_write_ns_ref,
@@ -379,10 +375,10 @@ pub(super) fn stage1_pass_a(
                 std::fs::File::create(per_way_refcount_sidecar)
                     .map_err(|e| format!("create per-way sidecar: {e}"))?,
             );
-            let mut varint_buf: Vec<u8> = Vec::with_capacity(1024);
+            let mut varint_buf: Vec<u8> = Vec::with_capacity(STAGE1_VARINT_BUF_CAPACITY);
             let mut reorder: crate::reorder_buffer::ReorderBuffer<
                 std::result::Result<(u64, Vec<u32>), String>,
-            > = crate::reorder_buffer::ReorderBuffer::with_capacity(64);
+            > = crate::reorder_buffer::ReorderBuffer::with_capacity(POOL_REORDER_CAPACITY_WIDE);
 
             for (seq_num, item) in rx {
                 reorder.push(seq_num as usize, item);
@@ -571,14 +567,15 @@ pub(super) fn stage1_way_pass(
     // exercisable without mutating the test process. Private per-worker shards
     // keep pass A writes independent; shared appenders would add synchronization
     // to the measured external pipeline, not merely remove a limit probe.
-    let cpu_cap = crate::host::sized_workers(&*host.resources, 2, 1, 4);
-    // Headroom for the descriptors this run opens beyond the shard fleet
-    // after the allowance is taken: the input PBF, the sidecars and
-    // whatever the reader and writer stages open.
-    const HEADROOM_FDS: u64 = 64;
+    let cpu_cap = crate::host::sized_workers(
+        &*host.resources,
+        DECODE_WORKERS_RESERVED,
+        DECODE_WORKERS_MIN,
+        DECODE_WORKERS_FALLBACK,
+    );
     let fd_budget = host
         .process
-        .fd_allowance(cpu_cap as u64 * NUM_BUCKETS as u64 + HEADROOM_FDS);
+        .fd_allowance(cpu_cap as u64 * NUM_BUCKETS as u64 + STAGE1_HEADROOM_FDS);
     crate::host::diag!(
         host.diagnostics,
         Developer,
@@ -587,12 +584,12 @@ pub(super) fn stage1_way_pass(
     );
     let available = fd_budget.descriptors;
     let buckets_per_worker = NUM_BUCKETS as u64;
-    let min_needed = HEADROOM_FDS + buckets_per_worker;
+    let min_needed = STAGE1_HEADROOM_FDS + buckets_per_worker;
     if available < min_needed {
         return Err(fd_allowance_too_low(&fd_budget, min_needed).into());
     }
     #[allow(clippy::cast_possible_truncation)]
-    let fd_cap = ((available - HEADROOM_FDS) / buckets_per_worker) as usize;
+    let fd_cap = ((available - STAGE1_HEADROOM_FDS) / buckets_per_worker) as usize;
     let num_workers = cpu_cap.min(fd_cap).max(1);
     if num_workers < cpu_cap {
         crate::host::diag!(

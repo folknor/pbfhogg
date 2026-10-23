@@ -17,6 +17,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::tunables::{AUTO_ANON_HEADROOM_BYTES, AUTO_STORE_BUDGET_PCT};
 use crate::writer::Compression;
 use crate::{Element, ElementReader, MemberId, PrimitiveBlock};
 
@@ -123,6 +124,13 @@ fn relation_member_ids(
 // ---------------------------------------------------------------------------
 
 /// Strategy for storing node coordinates during add-locations-to-ways.
+///
+/// `Sparse` is the default, and the docs recommend no backend over it.
+/// Sparse took the default when `dense` was removed; `Auto` stays opt-in
+/// because its threshold is bracketed by only two measured inputs on one
+/// host, and when an estimate is unavailable (every non-Linux target among
+/// others) it routes sorted, indexed input to external, whose scratch-disk
+/// demand a user who never asked for external would not expect.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IndexType {
     /// Rank-indexed flat sparse array, sized at `referenced.total_count() * 8`
@@ -587,22 +595,6 @@ fn enforce_missing_locations_policy(stats: &Stats, ignore_missing_nodes: bool) -
     )
     .into())
 }
-
-/// Route to external when the estimated sparse store exceeds this many
-/// percent of the page-cache budget. This is a policy threshold selected
-/// from the measured store-versus-cache behavior, not a measured optimum;
-/// see `reference/performance.md` for the supporting measurements.
-const AUTO_STORE_BUDGET_PCT: u64 = 80;
-
-/// Anon footprint a sparse run holds outside the mmap store (IdSet, decode
-/// buffers, writer queues). Subtracted from available memory before applying
-/// [`AUTO_STORE_BUDGET_PCT`], so the budget reflects what the page cache can
-/// actually keep resident for the store. See `reference/performance.md` for
-/// measured resource use.
-/// Keep this measured allowance fixed: indexed node count estimates the
-/// file-backed store, not the referenced-ID span or the decode/queue footprint.
-/// Scaling anon headroom from that count would assert an unmeasured relation.
-const AUTO_ANON_HEADROOM_BYTES: u64 = 3 << 30;
 
 // Auto-select: sparse unless the input qualifies for external (sorted +
 // indexed) AND the estimated sparse store exceeds the page-cache budget.

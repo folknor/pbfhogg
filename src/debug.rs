@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
+use crate::tunables::PIPE_BUF;
+
 static ARMED: AtomicBool = AtomicBool::new(false);
 
 type MarkerState = (std::fs::File, std::time::Instant, u64);
@@ -118,28 +120,40 @@ pub fn emit_mallinfo2(prefix: &str) {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 pub fn emit_mallinfo2(_prefix: &str) {}
 
-/// Read cumulative (minor, major) page faults for the active sidecar run.
-///
-/// The external ALTW stages publish numeric `s1_`, `s2_` and `s3_` fault
-/// counters consumed by brokkr. Keep this compatibility boundary numeric;
-/// the underlying procfs reader returns `Option`, and this adapter uses zero
-/// when a sample is unavailable so the counter names and line format remain
-/// stable. A failed sample therefore reads as zero and can distort one
-/// stage's delta (`page_fault_deltas` saturates rather than underflowing);
-/// carrying the `Option` through the stage callers would let them omit the
-/// counter instead.
-pub fn read_page_faults() -> (u64, u64) {
+/// Read cumulative (minor, major) page faults for the active sidecar run;
+/// `None` when no sidecar is armed or the procfs sample is unavailable.
+pub fn read_page_faults() -> Option<(u64, u64)> {
     if !ARMED.load(Relaxed) {
-        return (0, 0);
+        return None;
     }
-    crate::process::read_page_faults().unwrap_or((0, 0))
+    crate::process::read_page_faults()
 }
 
-pub(crate) fn page_fault_deltas(before: (u64, u64), after: (u64, u64)) -> (u64, u64) {
-    (
+/// The (minor, major) fault deltas between two samples, or `None` when
+/// either is missing: a failed sample omits the stage's counters rather
+/// than publishing a delta against zero.
+pub(crate) fn page_fault_deltas(
+    before: Option<(u64, u64)>,
+    after: Option<(u64, u64)>,
+) -> Option<(u64, u64)> {
+    let (before, after) = (before?, after?);
+    Some((
         after.0.saturating_sub(before.0),
         after.1.saturating_sub(before.1),
-    )
+    ))
+}
+
+/// Publish a stage's fault deltas under the two counter names, or nothing
+/// when either sample is missing.
+pub(crate) fn emit_page_fault_deltas(
+    names: (&str, &str),
+    before: Option<(u64, u64)>,
+    after: Option<(u64, u64)>,
+) {
+    if let Some((minor, major)) = page_fault_deltas(before, after) {
+        emit_counter(names.0, i64::try_from(minor).unwrap_or(i64::MAX));
+        emit_counter(names.1, i64::try_from(major).unwrap_or(i64::MAX));
+    }
 }
 
 /// A protocol line assembled on the stack.
@@ -152,8 +166,6 @@ pub(crate) fn page_fault_deltas(before: (u64, u64), after: (u64, u64)) -> (u64, 
 /// emits with a single `write` whose short/failed result drops the marker
 /// rather than resuming it. Assembling into a fixed array also keeps the hot
 /// path allocation-free (the previous code did one `format!` per marker).
-const PIPE_BUF: usize = 512; // POSIX minimum; Linux is 4096.
-
 struct Line {
     buf: [u8; PIPE_BUF],
     len: usize,
@@ -230,8 +242,18 @@ mod tests {
     use super::{Line, PIPE_BUF};
 
     #[test]
-    fn page_fault_deltas_saturate_when_a_read_fails() {
-        assert_eq!(super::page_fault_deltas((8, 20), (15, 3)), (7, 0));
+    fn page_fault_deltas_are_omitted_when_a_sample_is_missing() {
+        assert_eq!(
+            super::page_fault_deltas(Some((8, 20)), Some((15, 23))),
+            Some((7, 3))
+        );
+        assert_eq!(super::page_fault_deltas(None, Some((15, 23))), None);
+        assert_eq!(super::page_fault_deltas(Some((8, 20)), None), None);
+        assert_eq!(
+            super::page_fault_deltas(Some((8, 20)), Some((15, 3))),
+            Some((7, 0)),
+            "a counter that moves backwards saturates rather than underflowing"
+        );
     }
 
     #[test]

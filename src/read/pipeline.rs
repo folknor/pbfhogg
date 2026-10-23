@@ -9,6 +9,10 @@ use super::pipeline_metrics::{PIPELINE_METRICS, elapsed_ns_u64};
 use crate::blob_meta::BlobFilter;
 use crate::error::Result;
 use crate::reorder_buffer::ReorderBuffer;
+use crate::tunables::{
+    DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN, DECODE_WORKERS_RESERVED, DEFAULT_DECODE_AHEAD,
+    DEFAULT_READ_AHEAD,
+};
 use std::cell::RefCell;
 use std::io::Read;
 use std::num::NonZeroUsize;
@@ -85,12 +89,6 @@ fn should_skip_blob(filter: &BlobFilter, blob: &super::blob::Blob) -> bool {
     }
     false
 }
-
-/// Number of raw blobs the I/O thread can read ahead.
-pub(crate) const DEFAULT_READ_AHEAD: usize = 16;
-
-/// Number of decoded blocks that can be in-flight before backpressure stalls decode.
-pub(crate) const DEFAULT_DECODE_AHEAD: usize = 32;
 
 /// Bounds decode items admitted but not yet delivered from the reorder buffer.
 ///
@@ -598,9 +596,9 @@ where
                         &crate::host::MachineProbe as &dyn crate::host::Resources,
                         |r| &*r.0,
                     ),
-                    2,
-                    1,
-                    4,
+                    DECODE_WORKERS_RESERVED,
+                    DECODE_WORKERS_MIN,
+                    DECODE_WORKERS_FALLBACK,
                 )
             });
             let decode_pool = match rayon::ThreadPoolBuilder::new()
@@ -737,7 +735,7 @@ where
         let dispatch_tx = decoded_tx.clone();
         scope.spawn(move || {
             let threads = decode_thread_count.unwrap_or_else(|| {
-                crate::host::sized_workers(resources.as_ref().map_or(&crate::host::MachineProbe as &dyn crate::host::Resources, |r| &*r.0), 2, 1, 4)
+                crate::host::sized_workers(resources.as_ref().map_or(&crate::host::MachineProbe as &dyn crate::host::Resources, |r| &*r.0), DECODE_WORKERS_RESERVED, DECODE_WORKERS_MIN, DECODE_WORKERS_FALLBACK)
             });
             let pool = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
                 Ok(pool) => pool,

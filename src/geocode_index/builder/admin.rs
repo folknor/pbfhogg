@@ -11,6 +11,11 @@ use super::BuildConfig;
 use super::Result;
 use super::pass1::RawAdminRelation;
 use crate::geo::RingSearchBudgetExceeded;
+use crate::tunables::{
+    ADMIN_VERTEX_MULTIPLIER_DEFAULT, ADMIN_VERTEX_MULTIPLIER_LEVEL_3,
+    ADMIN_VERTEX_MULTIPLIER_LEVEL_4, ADMIN_VERTEX_MULTIPLIER_LEVEL_5,
+    ADMIN_VERTEX_MULTIPLIER_LEVELS_0_TO_2,
+};
 
 use super::super::format::*;
 
@@ -115,11 +120,11 @@ fn admin_vertex_cap(admin_level: u8, base: usize) -> usize {
         return 0;
     }
     let multiplier = match admin_level {
-        0..=2 => 16,
-        3 => 8,
-        4 => 4,
-        5 => 2,
-        _ => 1,
+        0..=2 => ADMIN_VERTEX_MULTIPLIER_LEVELS_0_TO_2,
+        3 => ADMIN_VERTEX_MULTIPLIER_LEVEL_3,
+        4 => ADMIN_VERTEX_MULTIPLIER_LEVEL_4,
+        5 => ADMIN_VERTEX_MULTIPLIER_LEVEL_5,
+        _ => ADMIN_VERTEX_MULTIPLIER_DEFAULT,
     };
     base.saturating_mul(multiplier)
 }
@@ -144,11 +149,11 @@ fn admin_vertex_cap(admin_level: u8, base: usize) -> usize {
 ///    centroid: the centroid of a non-convex hole can fall outside both the
 ///    hole and its outer.
 fn hole_inside_outer(hole: &[(i32, i32)], outer_f64: &[(f64, f64)]) -> bool {
-    const SAMPLES: usize = 5;
-    let step = (hole.len() / SAMPLES).max(1);
+    use crate::tunables::HOLE_OWNERSHIP_SAMPLES;
+    let step = (hole.len() / HOLE_OWNERSHIP_SAMPLES).max(1);
     let mut inside = 0_usize;
     let mut tested = 0_usize;
-    for &(lat, lon) in hole.iter().step_by(step).take(SAMPLES) {
+    for &(lat, lon) in hole.iter().step_by(step).take(HOLE_OWNERSHIP_SAMPLES) {
         tested += 1;
         if crate::geo::point_in_ring_with_antimeridian(
             e7_to_deg(lon as f64),

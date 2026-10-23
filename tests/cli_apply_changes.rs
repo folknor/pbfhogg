@@ -2082,7 +2082,7 @@ fn merge_refuses_a_version_regression_and_honours_the_escape_hatch() {
         "a stale change after a delete must be refused"
     );
     assert!(
-        out.stderr_str().contains("does not advance past version 9"),
+        out.stderr_str().contains("is lower than version 9"),
         "error must name the regression; stderr:\n{}",
         out.stderr_str()
     );
@@ -2114,6 +2114,141 @@ fn merge_refuses_a_version_regression_and_honours_the_escape_hatch() {
 </osmChange>"#,
     );
     run_apply_ok(&base, &forward, &output);
+}
+
+/// Two overlapping diffs, concatenated by `merge-changes` in its default
+/// full-stream mode and applied in one run: equal versions are admitted
+/// and the later change wins. The overlap is the real germany 4705/4706
+/// shape - a node modified at version 12, then deleted at version 12 as
+/// it leaves the extract - plus a verbatim repeat and an equal version
+/// with different content. Each used to fail the whole apply.
+#[test]
+fn merge_admits_equal_versions_from_overlapping_diffs() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let first = dir.path().join("4705.osc.gz");
+    let second = dir.path().join("4706.osc.gz");
+    let combined = dir.path().join("combined.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &base,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 100_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 200_000_000,
+                lon: 200_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 300_000_000,
+                lon: 300_000_000,
+                tags: vec![],
+                meta: None,
+            },
+        ],
+        &[],
+        &[],
+    );
+    write_osc(
+        &first,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="1" lat="50.6575433" lon="9.511884" version="12" timestamp="2026-02-24T21:21:17Z"/>
+    <node id="2" lat="21.0" lon="21.0" version="3"/>
+    <node id="3" lat="31.0" lon="31.0" version="5"/>
+  </modify>
+</osmChange>"#,
+    );
+    write_osc(
+        &second,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="2" lat="21.0" lon="21.0" version="3"/>
+    <node id="3" lat="32.0" lon="32.0" version="5"/>
+  </modify>
+  <delete>
+    <node id="1" lat="50.6575433" lon="9.511884" version="12" timestamp="2026-02-24T21:21:17Z"/>
+  </delete>
+</osmChange>"#,
+    );
+    CliInvoker::new()
+        .arg("merge-changes")
+        .arg(&first)
+        .arg(&second)
+        .arg("-o")
+        .arg(&combined)
+        .assert_success();
+
+    run_apply_ok(&base, &combined, &output);
+    let c = read_all_elements(&output);
+    assert_eq!(
+        node_ids(&c),
+        vec![2, 3],
+        "the equal-version delete must win"
+    );
+    assert_eq!(
+        c.nodes[0].1, 210_000_000,
+        "the verbatim repeat applies once"
+    );
+    assert_eq!(
+        c.nodes[1].1, 320_000_000,
+        "an equal version with different content is won by the later change"
+    );
+
+    // A lower version after the equal ones is still refused, and the
+    // escape hatch still admits it.
+    let stale = dir.path().join("stale.osc.gz");
+    write_osc(
+        &stale,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify><node id="3" lat="33.0" lon="33.0" version="4"/></modify>
+</osmChange>"#,
+    );
+    let combined_stale = dir.path().join("combined-stale.osc.gz");
+    CliInvoker::new()
+        .arg("merge-changes")
+        .arg(&first)
+        .arg(&second)
+        .arg(&stale)
+        .arg("-o")
+        .arg(&combined_stale)
+        .assert_success();
+    let out = run_apply_changes(&base, &combined_stale, &output, ApplyOpts::default());
+    assert!(!out.status.success(), "a lower claim must still be refused");
+    assert!(
+        out.stderr_str().contains("is lower than version 5"),
+        "error must name the regression; stderr:\n{}",
+        out.stderr_str()
+    );
+    let out = CliInvoker::new()
+        .arg("apply-changes")
+        .arg(&base)
+        .arg(&combined_stale)
+        .arg("-o")
+        .arg(&output)
+        .arg("--allow-version-regression")
+        .arg("--force")
+        .run();
+    assert!(
+        out.status.success(),
+        "--allow-version-regression must accept it; stderr:\n{}",
+        out.stderr_str()
+    );
+    let c = read_all_elements(&output);
+    assert_eq!(c.nodes[1].1, 330_000_000, "the escape hatch is positional");
 }
 
 /// Regression: `apply-changes --force --locations-on-ways` against a

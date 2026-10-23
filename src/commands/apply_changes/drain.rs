@@ -251,12 +251,8 @@ pub(super) fn run_drain(
     // timeout breaks the cycle by letting drain re-poll `last_node_seq`
     // and fire the barrier from idle.
     //
-    // 25 ms is a tradeoff: tighter polling adds CPU at very small
-    // dataset sizes; looser polling adds latency at the moment of
-    // node→way transition. At planet, the transition fires once per
-    // run, so even 100 ms total polling latency is invisible against
-    // ~100 s wall.
-    let recv_timeout = std::time::Duration::from_millis(25);
+    // The 25 ms tradeoff is recorded on `crate::tunables::DRAIN_RECV_TIMEOUT`.
+    let recv_timeout = crate::tunables::DRAIN_RECV_TIMEOUT;
 
     // This reorder map has no admission budget: bytes_in_buffer is only
     // high-water telemetry. Do not stop receiving at a byte threshold when

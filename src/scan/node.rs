@@ -124,7 +124,7 @@ pub(crate) fn extract_node_coords(
                          got a value that is zero, negative, or too large",
                     )
                 })?;
-                if granularity > 1_000_000_000 {
+                if granularity > crate::tunables::MAX_NODE_GRANULARITY {
                     return Err(crate::error::new_wire_error(
                         "PrimitiveBlock.granularity exceeds one degree per unit \
                          (1e9 nanodegrees); refusing to decode coordinates from it",

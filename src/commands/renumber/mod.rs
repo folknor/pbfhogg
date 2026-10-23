@@ -117,13 +117,7 @@ use schedule::{BlobTask, build_all_blob_schedules};
 use stage2::stage2d_parallel_way_assembly;
 use wire_rewrite::IdSpace;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-const PASS1_WORKERS: usize = 4;
-/// Parallel way-assembly workers in stage 2d, one `IdSet` shard each.
-const STAGE2D_WORKERS: usize = 6;
+use crate::tunables::{RENUMBER_PREALLOC_IDS_PER_BYTE, RENUMBER_STAGE2D_WORKERS};
 
 // ---------------------------------------------------------------------------
 // Shared instrumentation counters
@@ -300,23 +294,6 @@ fn validate_start_ids(opts: &RenumberOptions) -> Result<()> {
     Ok(())
 }
 
-/// IDs the pass 1 node pre-allocation may cover per input byte, passed to
-/// `IdSet::file_bounded_max_id` with the schedule's claimed highest node ID.
-///
-/// Unlike `check`'s `id_alloc_bound` there is no live-OSM floor, because
-/// nothing depends on the bound covering every ID: pass 1 hands an ID
-/// outside the pre-allocation back as overflow and inserts it after the
-/// pass, where `IdSet` memory follows the number of distinct IDs. A small
-/// extract carrying real ~1e10 node IDs therefore costs memory in proportion
-/// to its nodes, not to its largest ID, and is not refused. The overflow path
-/// is serial (~3.7 ns per ID on bygg), and honest files gain nothing from a
-/// tight bound: their set ends as the same bitmaps either way. At 8 per
-/// byte, denmark (highest node ID about 29 times its size in bytes) sent 37
-/// of its 52 M nodes through overflow, 137 ms of a 0.85 s run; at 64 every
-/// country-sized extract stays on the parallel path, and only small files
-/// with high IDs, whose overflow is small, take it.
-const PREALLOC_IDS_PER_BYTE: u64 = 64;
-
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -420,11 +397,14 @@ pub fn renumber_external(
     // One shared IdSet, pre-allocated so workers can `set_atomic_checked`
     // through `&self`. The whole schedule is scanned for the claimed max
     // rather than trusting the last blob; the claim is then bounded by the
-    // file size (see `PREALLOC_IDS_PER_BYTE`).
+    // file size (see `RENUMBER_PREALLOC_IDS_PER_BYTE`).
     let mut node_id_set = crate::idset::IdSet::new();
     if let Some(claimed_max) = pass1_schedule.iter().map(|t| t.max_id).max() {
-        let bound =
-            crate::idset::IdSet::file_bounded_max_id(claimed_max, file_len, PREALLOC_IDS_PER_BYTE);
+        let bound = crate::idset::IdSet::file_bounded_max_id(
+            claimed_max,
+            file_len,
+            RENUMBER_PREALLOC_IDS_PER_BYTE,
+        );
         if bound >= 0 {
             node_id_set.pre_allocate(bound);
         }
@@ -470,7 +450,7 @@ pub fn renumber_external(
 
     // ---- Stage 2d: fused way resolve + rewrite (single pass) ----
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_START");
-    let mut way_id_sets: Vec<crate::idset::IdSet> = (0..STAGE2D_WORKERS)
+    let mut way_id_sets: Vec<crate::idset::IdSet> = (0..RENUMBER_STAGE2D_WORKERS)
         .map(|_| crate::idset::IdSet::new())
         .collect();
     let stage2d = stage2d_parallel_way_assembly(
@@ -631,7 +611,11 @@ mod tests {
     #[test]
     fn the_node_preallocation_is_bounded_by_the_file() {
         let bound = |claimed, file_len| {
-            crate::idset::IdSet::file_bounded_max_id(claimed, file_len, PREALLOC_IDS_PER_BYTE)
+            crate::idset::IdSet::file_bounded_max_id(
+                claimed,
+                file_len,
+                RENUMBER_PREALLOC_IDS_PER_BYTE,
+            )
         };
         assert_eq!(bound(i64::MAX, 4096), 262_144);
         let planet = 80_u64 * 1024 * 1024 * 1024;

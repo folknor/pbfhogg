@@ -281,6 +281,12 @@ indexed is read from the first data blob's indexdata; an unreadable or malformed
 not a reason to pick sparse. This runtime rule follows the measured
 store-versus-cache behavior documented in [performance.md](performance.md).
 
+Sparse, not auto, is the default, and the docs recommend neither over the
+other. The 80 % threshold is bracketed by two measured inputs on a single
+host rather than fitted, and the unknown-estimate fallback sends sorted,
+indexed input to external and its scratch-disk demand. Auto becoming the
+default needs that calibration first.
+
 ### renumber
 
 Multi-stage parallel rewrite using rank-indexed `IdSet` bitsets (not hashmaps) for old→new ID mapping (`src/commands/renumber/`):

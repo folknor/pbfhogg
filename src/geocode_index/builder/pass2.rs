@@ -23,7 +23,7 @@
 //!
 //! Both merges run in blob (file) order through
 //! `parallel_classify_phase_ordered`, which holds dispatch at most
-//! `MERGE_WINDOW_BLOBS` ahead of the earliest unmerged blob, so a slow head
+//! `GEOCODE_MERGE_WINDOW_BLOBS` ahead of the earliest unmerged blob, so a slow head
 //! cannot grow the reorder buffer across the whole input, while merge still
 //! overlaps classification. Duplicate admin ways use the last file
 //! occurrence; conflicting coordinates for a referenced node fail the build.
@@ -166,13 +166,7 @@ fn install_coord(slot: &AtomicU64, packed: u64) -> bool {
     }
 }
 
-/// How far Pass 2 classification may run ahead of the earliest unmerged blob.
-/// Both merges must see blobs in file order (record order, string offsets and
-/// the surviving duplicate admin way depend on it), and this bounds the
-/// results held for reordering to this many per-blob outputs, each bounded by
-/// one input blob's contents. Wide enough that a slow blob at the head rarely
-/// parks the workers.
-const MERGE_WINDOW_BLOBS: usize = 256;
+use crate::tunables::GEOCODE_MERGE_WINDOW_BLOBS;
 
 // ---------------------------------------------------------------------------
 // Phase 2b: parallel way scan
@@ -263,7 +257,7 @@ fn classify_way_into(
         highway.is_some(),
         name.is_some(),
         highway.is_some_and(|value| {
-            crate::scan::way::GEOCODE_EXCLUDED_HIGHWAYS.contains(&value.as_bytes())
+            crate::tunables::GEOCODE_EXCLUDED_HIGHWAYS.contains(&value.as_bytes())
         }),
         building,
         hn.is_some(),
@@ -497,7 +491,7 @@ pub(super) fn run_pass2(
             shared_file,
             node_schedule,
             None,
-            MERGE_WINDOW_BLOBS,
+            GEOCODE_MERGE_WINDOW_BLOBS,
             NodeBlobOut::default,
             |block, state: &mut NodeBlobOut| -> NodeBlobOut {
                 for element in block.elements_skip_metadata() {
@@ -647,7 +641,7 @@ pub(super) fn run_pass2(
             shared_file,
             way_schedule,
             None,
-            MERGE_WINDOW_BLOBS,
+            GEOCODE_MERGE_WINDOW_BLOBS,
             WayBlobOut::default,
             |block, state: &mut WayBlobOut| -> WayBlobOut {
                 for element in block.elements_skip_metadata() {

@@ -1,6 +1,10 @@
 /*!
 A fast reader and writer for the OpenStreetMap PBF file format (\*.osm.pbf).
 
+Unix only. Positional reads go through `std::os::unix::fs::FileExt` and
+resource limits through `libc` without a platform shim, so non-Unix targets
+do not build; no port is planned.
+
 ## Usage
 
 Add this to your `Cargo.toml`:
@@ -173,6 +177,9 @@ pub(crate) mod scan;
 pub(crate) mod scratch;
 #[doc(hidden)]
 pub mod tag_expr;
+// Every performance and behaviour tunable lives here; public ones are
+// re-exported from the paths they were public at.
+pub(crate) mod tunables;
 pub mod write;
 
 /// Boxed-error Result alias used by command implementations and lifted

@@ -27,14 +27,18 @@ use std::io::Write as _;
 use std::sync::Arc;
 
 use super::super::Result;
+use super::radix::ScratchDir;
 #[cfg(feature = "linux-direct-io")]
 use super::radix::advise_dontneed_file;
-use super::radix::{BUCKET_BUF_SIZE, NUM_BUCKETS, ScratchDir};
 use super::{
     BucketLayout, CLOSURE_FLAG, ID_RECORD_SIZE, IdRecord, LOCAL_ID_MASK, NodeBlobInfo,
     RESOLVED_ENTRY_SIZE, ResolvedEntry, slot_bucket_bounds,
 };
 use crate::scan::node::{NodeTuple, extract_node_tuples};
+use crate::tunables::{
+    ALTW_STAGE2_WORKERS_CAP, BUCKET_BUF_SIZE, DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN,
+    DECODE_WORKERS_RESERVED, NUM_BUCKETS, STAGE2_FLUSH_THRESHOLD,
+};
 
 // ---------------------------------------------------------------------------
 // Stage 2: Parallel node join - id-bucket merge walk
@@ -234,7 +238,13 @@ pub(super) fn stage2_node_join(
     inject_prepass: bool,
     host: &crate::host::Host,
 ) -> Result<u64> {
-    let num_workers = crate::host::sized_workers(&*host.resources, 2, 1, 4).min(6);
+    let num_workers = crate::host::sized_workers(
+        &*host.resources,
+        DECODE_WORKERS_RESERVED,
+        DECODE_WORKERS_MIN,
+        DECODE_WORKERS_FALLBACK,
+    )
+    .min(ALTW_STAGE2_WORKERS_CAP);
 
     use std::os::unix::fs::FileExt as _;
 
@@ -329,10 +339,8 @@ pub(super) fn stage2_node_join(
                 let mut local_resolved: u64 = 0;
 
                 // Per-slot-bucket local buffers. Flushed when any buffer
-                // exceeds FLUSH_THRESHOLD, and at the end of each id bucket.
-                // This worker-local batch size controls mutex/write batching;
-                // it is separate from the shared file BufWriter capacity.
-                const FLUSH_THRESHOLD: usize = 256 * 1024;
+                // exceeds STAGE2_FLUSH_THRESHOLD, and at the end of each id
+                // bucket.
                 let mut slot_bufs: Vec<Vec<u8>> =
                     (0..slot_bucket_count).map(|_| Vec::new()).collect();
                 let mut slot_counts: Vec<u64> = vec![0; slot_bucket_count];
@@ -603,7 +611,7 @@ pub(super) fn stage2_node_join(
                                     // sparse one about the same input. Absent
                                     // is not zero.
                                     local_resolved += 1;
-                                    if slot_bufs[bucket].len() >= FLUSH_THRESHOLD {
+                                    if slot_bufs[bucket].len() >= STAGE2_FLUSH_THRESHOLD {
                                         let t_lock = std::time::Instant::now();
                                         let mut w = slot_buckets.writers[bucket]
                                             .lock()

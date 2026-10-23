@@ -15,6 +15,11 @@ use s2::latlng::LatLng;
 use s2::metric::MIN_WIDTHMETRIC;
 
 use crate::geo;
+use crate::tunables::{
+    ADMIN_CELL_COUNT_BUDGET, GEOCODE_ADDR_CHUNK, GEOCODE_INTERP_CHUNK, GEOCODE_NUM_BUCKETS,
+    GEOCODE_STAGE_B_SORT_WINDOW, GEOCODE_STREET_CHUNK, MAX_SEGMENT_SAMPLES, MAX_SEGMENT_SPAN_DEG,
+    SEGMENT_STEP_WIDTH_FACTOR,
+};
 
 use super::Result;
 use super::admin::AssembledPolygon;
@@ -94,29 +99,9 @@ pub(super) struct AdminCellEntry {
 // currently uses bounded segment sampling.
 // ---------------------------------------------------------------------------
 
-/// Per-segment sampling budget: 2^24 points. In the pathological case that
-/// is roughly 270 MB of dedup set on one rayon worker and a few seconds; in
-/// every real case - OSM segments are a small fraction of a degree - it is a
-/// handful of samples and the budget never comes near being spent.
-const MAX_SEGMENT_SAMPLES: f64 = 16_777_216.0;
-
-/// Largest separation two legal coordinates can have in the flat degree
-/// metric `cover_segment` measures with: `hypot(180, 360)` = 402.5, rounded
-/// up. Latitude spans at most 180 degrees and longitude at most 360.
-const MAX_SEGMENT_SPAN_DEG: f64 = 405.0;
-
-/// Highest S2 level accepted for the segment-sampled street and coarse cells.
-///
-/// Pinned to `MAX_SEGMENT_SAMPLES` by `level_exceeds_sampling_budget` and by
-/// the unit test below, which walks every level and asserts this is exactly
-/// the boundary - raising the constant without raising the budget fails the
-/// test rather than reintroducing the hang.
-pub(in crate::geocode_index) const MAX_BUILD_S2_LEVEL: u8 = 19;
-const _: () = assert!(MAX_BUILD_S2_LEVEL <= super::super::format::S2_MAX_LEVEL);
-
-/// Maximum number of S2 cells the admin flood fill may visit for one polygon.
-/// This is the full sphere's cell count at level 10: six faces times 4^10.
-const ADMIN_CELL_COUNT_BUDGET: u64 = 6_291_456;
+// The sampling and flood-fill budgets (`MAX_SEGMENT_SAMPLES`,
+// `MAX_SEGMENT_SPAN_DEG`, `MAX_BUILD_S2_LEVEL`, `ADMIN_CELL_COUNT_BUDGET`)
+// live in `crate::tunables`.
 
 const fn max_admin_s2_level_for_cell_budget() -> u8 {
     let mut level = 0;
@@ -154,7 +139,7 @@ pub(in crate::geocode_index) fn admin_level_exceeds_cell_budget(level: u8) -> bo
 /// Sampling step for `level`, in degrees: a little under half the globally
 /// smallest S2 cell width at that level, so no cell can be stepped over.
 fn segment_step_degrees(level: u8) -> f64 {
-    MIN_WIDTHMETRIC.value(level).to_degrees() * 0.4
+    MIN_WIDTHMETRIC.value(level).to_degrees() * SEGMENT_STEP_WIDTH_FACTOR
 }
 
 /// Fold a possibly-unwrapped longitude in degrees back into (-180, 180].
@@ -296,12 +281,6 @@ fn cover_segment_fused(
 // ---------------------------------------------------------------------------
 // Bucketed cell assignment
 // ---------------------------------------------------------------------------
-
-const NUM_BUCKETS: usize = 256;
-const STREET_CHUNK: u32 = 100_000;
-const ADDR_CHUNK: usize = 500_000;
-const INTERP_CHUNK: usize = 100_000;
-const STAGE_B_SORT_WINDOW: usize = 8;
 
 /// Tagged bucket record: 15 bytes on disk.
 /// cell_id (8) + entry_type (1) + way_or_addr_index (4) + segment_index (2)
@@ -492,9 +471,9 @@ pub(super) fn bucketed_cell_assignment_fused(
 
     // Two sets of bucket writers (lazy).
     let mut fine_writers: Vec<Option<BufWriter<std::fs::File>>> =
-        (0..NUM_BUCKETS).map(|_| None).collect();
+        (0..GEOCODE_NUM_BUCKETS).map(|_| None).collect();
     let mut coarse_writers: Vec<Option<BufWriter<std::fs::File>>> =
-        (0..NUM_BUCKETS).map(|_| None).collect();
+        (0..GEOCODE_NUM_BUCKETS).map(|_| None).collect();
 
     // Stage A: Chunked parallel compute at the FINE level; every emitted
     // fine cell derives its coarse parent via S2 `parent()` and
@@ -515,7 +494,7 @@ pub(super) fn bucketed_cell_assignment_fused(
     let mut chunk_start = 0u32;
     while chunk_start < street_way_count {
         let chunk_end = chunk_start
-            .saturating_add(STREET_CHUNK)
+            .saturating_add(GEOCODE_STREET_CHUNK)
             .min(street_way_count);
         #[allow(clippy::type_complexity)]
         let entries: Vec<(u64, Option<u64>, u32, u16)> = executor.install(|| {
@@ -628,7 +607,7 @@ pub(super) fn bucketed_cell_assignment_fused(
     let addr_count = addr_point_count as usize;
     let mut chunk_start = 0usize;
     while chunk_start < addr_count {
-        let chunk_end = (chunk_start + ADDR_CHUNK).min(addr_count);
+        let chunk_end = (chunk_start + GEOCODE_ADDR_CHUNK).min(addr_count);
         let addr_entries: Vec<(u64, u64, u32)> = executor.install(|| {
             (chunk_start..chunk_end)
                 .into_par_iter()
@@ -690,7 +669,7 @@ pub(super) fn bucketed_cell_assignment_fused(
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_INTERP_START");
     let mut interp_chunk_start = 0usize;
     while interp_chunk_start < interp_ways.len() {
-        let interp_chunk_end = (interp_chunk_start + INTERP_CHUNK).min(interp_ways.len());
+        let interp_chunk_end = (interp_chunk_start + GEOCODE_INTERP_CHUNK).min(interp_ways.len());
         #[allow(clippy::type_complexity)]
         let interp_entries: Vec<(u64, Option<u64>, u32, u16)> = executor.install(|| {
             (interp_chunk_start..interp_chunk_end)
@@ -855,8 +834,8 @@ fn run_stage_b(
     // Bound the parse/sort lookahead. Keeping every sorted bucket alive here
     // defeats the external bucketing and costs more RAM than the 15-byte
     // scratch records because ParsedBucketEntry is padded to 16 bytes.
-    for window_start in (0..NUM_BUCKETS).step_by(STAGE_B_SORT_WINDOW) {
-        let window_end = (window_start + STAGE_B_SORT_WINDOW).min(NUM_BUCKETS);
+    for window_start in (0..GEOCODE_NUM_BUCKETS).step_by(GEOCODE_STAGE_B_SORT_WINDOW) {
+        let window_end = (window_start + GEOCODE_STAGE_B_SORT_WINDOW).min(GEOCODE_NUM_BUCKETS);
         let sorted_buckets: Vec<Vec<ParsedBucketEntry>> = executor.install(|| {
             (window_start..window_end)
                 .into_par_iter()
@@ -1164,20 +1143,21 @@ fn admin_cells_for_polygon(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tunables::MAX_BUILD_S2_LEVEL;
 
     #[test]
     fn stage_b_retains_at_most_eight_sorted_buckets() {
-        let window = std::hint::black_box(STAGE_B_SORT_WINDOW);
+        let window = std::hint::black_box(GEOCODE_STAGE_B_SORT_WINDOW);
         assert!(window > 0);
         assert!(window <= 8);
-        assert!(window < NUM_BUCKETS);
+        assert!(window < GEOCODE_NUM_BUCKETS);
     }
 
     #[test]
     fn interpolation_stage_a_has_a_finite_chunk_bound() {
-        let chunk = std::hint::black_box(INTERP_CHUNK);
+        let chunk = std::hint::black_box(GEOCODE_INTERP_CHUNK);
         assert!(chunk > 0);
-        assert!(chunk <= ADDR_CHUNK);
+        assert!(chunk <= GEOCODE_ADDR_CHUNK);
     }
 
     #[test]

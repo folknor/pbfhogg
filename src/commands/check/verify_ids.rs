@@ -658,21 +658,21 @@ fn verify_ids_full_parallel(
     if type_filter.nodes {
         node_ids.pre_allocate(super::id_alloc_bound(
             max_ids[0],
-            super::NODE_ID_FLOOR,
+            crate::tunables::NODE_ID_FLOOR,
             file_len,
         ));
     }
     if type_filter.ways {
         way_ids.pre_allocate(super::id_alloc_bound(
             max_ids[1],
-            super::WAY_ID_FLOOR,
+            crate::tunables::WAY_ID_FLOOR,
             file_len,
         ));
     }
     if type_filter.relations {
         relation_ids.pre_allocate(super::id_alloc_bound(
             max_ids[2],
-            super::RELATION_ID_FLOOR,
+            crate::tunables::RELATION_ID_FLOOR,
             file_len,
         ));
     }

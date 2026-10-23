@@ -120,19 +120,37 @@ It answers "did anything actually change?" rather than "which version is newer?"
 
 **osmium behavior:** `osmium apply-changes` and `osmium merge-changes`
 resolve conflicts positionally - the last change seen for an object wins,
-whatever version it claims. Feeding the same diff twice, or feeding diffs
-out of sequence order, downgrades objects to an older state and exits 0.
-osmium offers no check and no warning.
+whatever version it claims. Feeding diffs out of sequence order downgrades
+objects to an older state and exits 0. osmium offers no check and no
+warning.
 
-**pbfhogg behavior:** An incoming change whose `version` is not strictly
-greater than the highest version ever claimed for that object, by any create,
-modify or delete read earlier in the same run (across all input files), is a
-hard error naming both versions. This applies to `CompactDiffOverlay`
+**pbfhogg behavior:** An incoming change whose `version` is lower than the
+highest version ever claimed for that object, by any create, modify or
+delete read earlier in the same run (across all input files), is a hard
+error naming both versions. This applies to `CompactDiffOverlay`
 accumulation (so `apply-changes` and `osc::load_all_diffs`) and to
 `merge-changes --simplify`, which share the rule and its error text. A change
 that carries no `version` makes no claim: it is always admitted, and neither
 raises nor resets the floor, so an unversioned change between v9 and v8 does
 not let the v8 through.
+
+A change whose `version` equals that highest claim is admitted, and the
+later change wins by position, as in osmium; the floor does not move, so a
+lower claim after it is still refused. Equal versions are ordinary input,
+not a symptom: overlapping replication diffs repeat boundary changes, and
+regional extract diffs (Geofabrik's, and `diff --format osc` without
+`--increment-version`) delete an object leaving the region at the version
+it already had, so `modify v12` in one diff and `delete v12` in the next is
+a normal sequence, as is the object re-entering unchanged as `create v12`.
+Version alone cannot order changes that share a number, and comparing their
+content cannot either - a leaving delete may carry the full metadata or the
+version alone - so the gate protects numerical version precedence and
+leaves ordering within one version to input order. Two consequences follow:
+an equal-version conflict (two different `v12` payloads) is resolved by
+position rather than refused, and inputs listed backwards across a pair of
+diffs that differ only in equal-version changes (`delete v12` then
+`modify v12`) are not detected; a real backwards listing is still refused by
+every object whose version advanced between the two diffs.
 The default `merge-changes` mode is untouched - it preserves the full
 change stream in input order by design and resolves nothing, so there is
 nothing to regress.
@@ -226,10 +244,12 @@ Two refs to the same orphan stay equal, the old id is recoverable as
 output. Relation members of an unknown type (anything but node, way or
 relation once the type is read as int32) keep their id unchanged.
 
-**Cross-validation:** the differences from osmium are confined to orphan refs,
-which in a Geofabrik-style extract are the members of cross-border relations
-(admin boundaries, routes, TMC segments); no node, way, or other relation
-field differs.
+**Cross-validation:** `brokkr verify renumber` on a Geofabrik-style extract
+finds equal element counts and no node or way that differs; every difference
+is in a relation. Those are attributed to orphan member refs - the members of
+cross-border relations (admin boundaries, routes, TMC segments) - but the
+harness counts relation diffs against a sanity threshold rather than checking
+each one is an orphan ref.
 
 **Rationale:** Passing orphans through with their old id, the earlier policy,
 let an old id equal the new id of a different element, so a reference

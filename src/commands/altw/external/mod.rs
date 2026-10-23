@@ -47,7 +47,11 @@ pub mod test_hooks {
     pub use super::stage3::test_hooks as stage3;
 }
 
-use radix::{NUM_BUCKETS, ScratchDir};
+use crate::tunables::{
+    ALTW_STAGE3_WORKERS_CAP, DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN, DECODE_WORKERS_RESERVED,
+    MAX_BUCKET_WIDTH, NUM_BUCKETS,
+};
+use radix::ScratchDir;
 
 use stage1::stage1_way_pass;
 use stage2::{SlotBuckets, stage2_node_join};
@@ -101,12 +105,6 @@ pub(super) struct BucketLayout {
     pub(super) bucket_width: u64,
     pub(super) num_buckets: usize,
 }
-
-/// Widest bucket the record encoding accepts. A bucket-local id must fit in
-/// [`LOCAL_ID_MASK`] (31 bits; the top bit is [`CLOSURE_FLAG`]), and the last
-/// bucket can extend one full width past its nominal end, so a width of 2^30
-/// keeps every local id at or below 2^30 with margin to spare.
-const MAX_BUCKET_WIDTH: u64 = 1 << 30;
 
 impl BucketLayout {
     /// Build the layout for node ids `0..=max_node_id`.
@@ -827,7 +825,7 @@ pub(crate) fn external_join_in(
     // (`File: Sync` on Unix) with no locking. Running it here avoids the
     // former serial gap between stage 2 and stage 4.
     crate::debug::emit_marker("EXTJOIN_STAGE1_START");
-    let (s1_minflt_before, s1_majflt_before) = crate::debug::read_page_faults();
+    let s1_faults_before = crate::debug::read_page_faults();
 
     let input_ref_parallel: &Path = input;
     let blob_meta_ref_parallel = &blob_meta;
@@ -901,11 +899,7 @@ pub(crate) fn external_join_in(
     )
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    let (s1_minflt_after, s1_majflt_after) = crate::debug::read_page_faults();
-    let (s1_minflt_delta, s1_majflt_delta) = crate::debug::page_fault_deltas(
-        (s1_minflt_before, s1_majflt_before),
-        (s1_minflt_after, s1_majflt_after),
-    );
+    let s1_faults_after = crate::debug::read_page_faults();
     let total_id_records: u64 = stage1_out.id_bucket_counts.iter().sum();
     // Partition-balance diagnostics (max/min-per-shard convention, cf.
     // derivepar_*_shard_max/min): min is taken over nonempty buckets so
@@ -942,9 +936,12 @@ pub(crate) fn external_join_in(
             id_bucket_min_records as i64,
         );
         crate::debug::emit_counter("extjoin_id_buckets_nonempty", id_buckets_nonempty as i64);
-        crate::debug::emit_counter("s1_minflt_delta", s1_minflt_delta as i64);
-        crate::debug::emit_counter("s1_majflt_delta", s1_majflt_delta as i64);
     }
+    crate::debug::emit_page_fault_deltas(
+        ("s1_minflt_delta", "s1_majflt_delta"),
+        s1_faults_before,
+        s1_faults_after,
+    );
     crate::debug::emit_marker("EXTJOIN_STAGE1_END");
 
     let total_slots = stage1_out.total_slots;
@@ -980,13 +977,16 @@ pub(crate) fn external_join_in(
         .map(|n| n.max(1).min(NUM_BUCKETS as u64) as usize)
         .unwrap_or(NUM_BUCKETS);
     validate_slot_layout(&way_slot_starts, total_slots, slot_bucket_count)?;
-    // Worker count: back off from the pre-streaming `.min(6)` because
-    // stage 3 and stage 4 worker buffers are now both resident at the
-    // same time (streaming stage 3 -> 4 landed in `beb7838` + `f93d896`
-    // + `eecb46c`).
+    // Worker count: see `ALTW_STAGE3_WORKERS_CAP` for why it is capped.
     // The stage 3 worker pool and its router backing files share this count;
     // the scratch precheck counts one payload file per worker.
-    let num_workers = crate::host::sized_workers(&*host.resources, 2, 1, 4).min(4);
+    let num_workers = crate::host::sized_workers(
+        &*host.resources,
+        DECODE_WORKERS_RESERVED,
+        DECODE_WORKERS_MIN,
+        DECODE_WORKERS_FALLBACK,
+    )
+    .min(ALTW_STAGE3_WORKERS_CAP);
     // Stage 1's exact ref count is the first point at which stage 2-4
     // scratch can be sized without an extra input pass; see `space`.
     space::precheck(
@@ -1006,7 +1006,7 @@ pub(crate) fn external_join_in(
     }
 
     crate::debug::emit_marker("EXTJOIN_STAGE2_START");
-    let (s2_minflt_before, s2_majflt_before) = crate::debug::read_page_faults();
+    let s2_faults_before = crate::debug::read_page_faults();
     let slot_buckets = SlotBuckets::create(&scratch_dir, slot_bucket_count)?;
     let input_pbf = std::sync::Arc::new(
         std::fs::File::open(input).map_err(|e| format!("open input pbf for stage 2: {e}"))?,
@@ -1026,11 +1026,7 @@ pub(crate) fn external_join_in(
         host,
     )?;
     slot_buckets.finish()?;
-    let (s2_minflt_after, s2_majflt_after) = crate::debug::read_page_faults();
-    let (s2_minflt_delta, s2_majflt_delta) = crate::debug::page_fault_deltas(
-        (s2_minflt_before, s2_majflt_before),
-        (s2_minflt_after, s2_majflt_after),
-    );
+    let s2_faults_after = crate::debug::read_page_faults();
     // Reclaim id-shard scratch before the heavier stage 3/4 streaming
     // handoff allocates its own temporary space.
     for worker_id in 0..num_shard_workers {
@@ -1044,9 +1040,12 @@ pub(crate) fn external_join_in(
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("extjoin_resolved_count", resolved_count as i64);
-        crate::debug::emit_counter("s2_minflt_delta", s2_minflt_delta as i64);
-        crate::debug::emit_counter("s2_majflt_delta", s2_majflt_delta as i64);
     }
+    crate::debug::emit_page_fault_deltas(
+        ("s2_minflt_delta", "s2_majflt_delta"),
+        s2_faults_before,
+        s2_faults_after,
+    );
     crate::debug::emit_marker("EXTJOIN_STAGE2_END");
 
     // Free the per-blob mapping - it was a stage 2 input only.
@@ -1133,7 +1132,7 @@ pub(crate) fn external_join_in(
     crate::debug::emit_marker("EXTJOIN_STREAMING_START");
     crate::debug::emit_marker("EXTJOIN_STAGE3_START");
     crate::debug::emit_marker("EXTJOIN_STAGE4_START");
-    let (s3_minflt_before, s3_majflt_before) = crate::debug::read_page_faults();
+    let s3_faults_before = crate::debug::read_page_faults();
 
     let router_ref = &router;
     let per_way_rcs_ref = &per_way_rcs;
@@ -1213,19 +1212,15 @@ pub(crate) fn external_join_in(
     })
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    let (s3_minflt_after, s3_majflt_after) = crate::debug::read_page_faults();
-    let (s3_minflt_delta, s3_majflt_delta) = crate::debug::page_fault_deltas(
-        (s3_minflt_before, s3_majflt_before),
-        (s3_minflt_after, s3_majflt_after),
-    );
+    let s3_faults_after = crate::debug::read_page_faults();
     for i in 0..slot_bucket_count {
         drop(std::fs::remove_file(scratch_dir.bucket_path("slot", i)));
     }
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("s3_minflt_delta", s3_minflt_delta as i64);
-        crate::debug::emit_counter("s3_majflt_delta", s3_majflt_delta as i64);
-    }
+    crate::debug::emit_page_fault_deltas(
+        ("s3_minflt_delta", "s3_majflt_delta"),
+        s3_faults_before,
+        s3_faults_after,
+    );
     crate::debug::emit_marker("EXTJOIN_STAGE4_END");
     crate::debug::emit_marker("EXTJOIN_STAGE3_END");
     crate::debug::emit_marker("EXTJOIN_STREAMING_END");

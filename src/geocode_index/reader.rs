@@ -655,7 +655,7 @@ impl Reader {
             return None;
         }
         let total_len = self.way_length_radians(&self.interp_nodes, iw.node_offset, iw.node_count);
-        (total_len >= 1e-15).then_some(total_len)
+        (total_len >= crate::tunables::INTERP_MIN_TOTAL_LEN).then_some(total_len)
     }
 
     fn interpolated_number(
@@ -688,7 +688,10 @@ impl Reader {
         if u32::from(segment_index) + 1 >= u32::from(iw.node_count) {
             return None;
         }
-        if iw.start_number == 0 || iw.end_number == 0 || total_len < 1e-15 {
+        if iw.start_number == 0
+            || iw.end_number == 0
+            || total_len < crate::tunables::INTERP_MIN_TOTAL_LEN
+        {
             return None;
         }
         let acc_len = self.accumulated_length_radians(

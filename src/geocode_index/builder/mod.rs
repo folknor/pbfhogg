@@ -35,7 +35,7 @@ use strings::StringPool;
 
 pub(super) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-const DIAGNOSTIC_ID_SAMPLE_LIMIT: usize = 16;
+use crate::tunables::DIAGNOSTIC_ID_SAMPLE_LIMIT;
 
 /// Keep the lowest distinct IDs so parallel callers produce a stable, bounded
 /// sample regardless of worker completion order.
@@ -89,12 +89,12 @@ impl Default for BuildConfig {
             force: false,
             overwrite: false,
             allow_unindexed: false,
-            street_level: 17,
-            coarse_level: 14,
-            admin_level: 10,
-            max_admin_vertices: 500,
-            fine_search_radius_m: 75.0,
-            coarse_search_radius_m: 1000.0,
+            street_level: crate::tunables::GEOCODE_DEFAULT_STREET_LEVEL,
+            coarse_level: crate::tunables::GEOCODE_DEFAULT_COARSE_LEVEL,
+            admin_level: crate::tunables::GEOCODE_DEFAULT_ADMIN_LEVEL,
+            max_admin_vertices: crate::tunables::GEOCODE_DEFAULT_MAX_ADMIN_VERTICES,
+            fine_search_radius_m: crate::tunables::GEOCODE_DEFAULT_FINE_SEARCH_RADIUS_M,
+            coarse_search_radius_m: crate::tunables::GEOCODE_DEFAULT_COARSE_SEARCH_RADIUS_M,
             direct_io: false,
         }
     }
@@ -107,7 +107,7 @@ impl BuildConfig {
         // a fraction of the cell width, so per-segment work doubles with every
         // level. Reject before reading input so a long or antimeridian-crossing
         // segment cannot turn a build into an unbounded walk.
-        let max_level = pass3::MAX_BUILD_S2_LEVEL;
+        let max_level = crate::tunables::MAX_BUILD_S2_LEVEL;
         for (name, level) in [("street", self.street_level), ("coarse", self.coarse_level)] {
             if level > max_level {
                 return Err(format!(

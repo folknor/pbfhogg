@@ -7,15 +7,16 @@ use super::file_reader::FileReader;
 use super::pipeline::PipelineConfig;
 use crate::blob_meta::BlobFilter;
 use crate::error::{ErrorKind, Result, new_error};
+use crate::tunables::{
+    BLOCK_QUEUE, PAR_BATCH_MAX_BLOBS, PAR_BATCH_MAX_BYTES, PAR_INFLIGHT_BUDGET,
+    PAR_READER_WORKERS_FALLBACK, PAR_READER_WORKERS_MIN, PAR_READER_WORKERS_RESERVED,
+};
 use std::collections::VecDeque;
 use std::io::Read;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
-
-/// Number of decoded blocks buffered between the pipeline and the consumer iterator.
-const BLOCK_QUEUE: usize = 8;
 
 /// A reader for PBF files that gives access to the stored elements: nodes, ways and relations.
 ///
@@ -452,9 +453,9 @@ impl<R: Read + Send> ElementReader<R> {
                     &crate::host::MachineProbe as &dyn crate::host::Resources,
                     |r| &*r.0,
                 ),
-                1,
-                1,
-                3,
+                PAR_READER_WORKERS_RESERVED,
+                PAR_READER_WORKERS_MIN,
+                PAR_READER_WORKERS_FALLBACK,
             )
         });
 
@@ -588,20 +589,6 @@ where
         Ok(acc)
     })
 }
-
-/// Total compressed bytes allowed in flight across the frame pump's queue and
-/// the decode workers. Bounds the reader working set independent of file size.
-const PAR_INFLIGHT_BUDGET: u64 = 256 * 1024 * 1024;
-
-/// Maximum number of compressed blobs gathered into one batch handed to a
-/// worker. Amortizes queue synchronization without starving load balancing.
-const PAR_BATCH_MAX_BLOBS: usize = 64;
-
-/// Byte target that flushes a batch: the pump flushes the current batch before
-/// admitting a blob that would carry its retained weight past this, so a batch
-/// exceeds it only when a lone blob larger than the whole target forms its own
-/// one-element batch (blobs are never split).
-const PAR_BATCH_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// A count- and byte-bounded run of compressed OsmData blobs handed to a worker.
 struct Batch {

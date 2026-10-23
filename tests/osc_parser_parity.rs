@@ -545,8 +545,8 @@ fn simplify_sequence_verdict(inputs: &[PathBuf], out: &Path) -> Verdict {
 fn refusal_core(err: &str) -> &str {
     let start = err.find("carries version").unwrap_or(0);
     let end = err
-        .find("correct their order")
-        .map_or(err.len(), |i| i + "correct their order".len());
+        .find("order and provenance")
+        .map_or(err.len(), |i| i + "order and provenance".len());
     &err[start..end]
 }
 
@@ -617,7 +617,7 @@ const REFUSED: &[(&str, &[&str], i32)] = &[
             r#"<create><node id="1" lat="9.0" lon="9.0" version="9"/></create>"#,
             UNVERSIONED_NODE,
             UNVERSIONED_NODE,
-            r#"<modify><node id="1" lat="8.0" lon="8.0" version="9"/></modify>"#,
+            r#"<modify><node id="1" lat="8.0" lon="8.0" version="8"/></modify>"#,
         ],
         9,
     ),
@@ -637,15 +637,6 @@ const REFUSED: &[(&str, &[&str], i32)] = &[
             r#"<modify><node id="1" lat="5.0" lon="5.0"/></modify>"#,
             r#"<modify><node id="1" lat="8.0" lon="8.0" version="8"/></modify>"#,
         )],
-        9,
-    ),
-    (
-        "bug017-equal-claim",
-        &[
-            r#"<delete><node id="1" version="9"/></delete>"#,
-            UNVERSIONED_NODE,
-            r#"<create><node id="1" lat="8.0" lon="8.0" version="9"/></create>"#,
-        ],
         9,
     ),
     (
@@ -676,10 +667,12 @@ const REFUSED: &[(&str, &[&str], i32)] = &[
         4,
     ),
     (
-        "repeated-claim",
+        "lower-after-equal-claims",
         &[
             r#"<modify><node id="1" lat="9.0" lon="9.0" version="9"/></modify>"#,
-            r#"<modify><node id="1" lat="9.0" lon="9.0" version="9"/></modify>"#,
+            r#"<delete><node id="1" version="9"/></delete>"#,
+            r#"<create><node id="1" lat="9.0" lon="9.0" version="9"/></create>"#,
+            r#"<modify><node id="1" lat="8.0" lon="8.0" version="8"/></modify>"#,
         ],
         9,
     ),
@@ -687,9 +680,10 @@ const REFUSED: &[(&str, &[&str], i32)] = &[
 
 /// apply-changes and `merge-changes --simplify` both keep the last change
 /// per object by position, so both gate version precedence, and they must
-/// gate it by the same rule: an incoming version claim must exceed the
-/// highest version ever claimed for the object, deletes included, and a
-/// change that claims no version neither raises nor resets that floor.
+/// gate it by the same rule: an incoming version claim may not be lower
+/// than the highest version ever claimed for the object, deletes
+/// included, and a change that claims no version neither raises nor
+/// resets that floor.
 ///
 /// The divergence that was real: `--simplify` compared only against the
 /// previous change, so `delete v9`, an unversioned `modify`, then
@@ -716,7 +710,7 @@ fn both_version_gates_refuse_a_claim_below_the_highest_ever_made() {
         let Err(simplify) = simplify_sequence_verdict(&inputs, &out) else {
             panic!("{case}: merge-changes --simplify accepted a stale claim");
         };
-        let needle = format!("does not advance past version {floor}");
+        let needle = format!("is lower than version {floor}");
         for (name, err) in [
             ("overlay", overlay.as_str()),
             ("simplify", simplify.as_str()),
@@ -776,6 +770,56 @@ const ACCEPTED: &[(&str, &[&str])] = &[
             r#"<modify><node id="1" lat="2.0" lon="2.0" version="0"/></modify>"#,
         ],
     ),
+    // Equal claims: admitted, the later change wins by position.
+    // Overlapping replication diffs repeat boundary changes verbatim.
+    (
+        "repeated-claim",
+        &[
+            r#"<modify><node id="1" lat="9.0" lon="9.0" version="9"/></modify>"#,
+            r#"<modify><node id="1" lat="9.0" lon="9.0" version="9"/></modify>"#,
+        ],
+    ),
+    // The germany seq 4705/4706 shape: a regional extract deletes an
+    // object leaving the region at the version it already had.
+    (
+        "regional-delete-at-the-held-version",
+        &[
+            r#"<modify><node id="1" lat="50.6575433" lon="9.511884" version="12" timestamp="2026-02-24T21:21:17Z"/></modify>"#,
+            r#"<delete><node id="1" lat="50.6575433" lon="9.511884" version="12" timestamp="2026-02-24T21:21:17Z"/></delete>"#,
+        ],
+    ),
+    // ... and `diff --format osc` without `--increment-version` emits that
+    // delete carrying the version alone.
+    (
+        "regional-delete-version-only",
+        &[
+            r#"<modify><way id="7" version="4" timestamp="2026-02-24T21:21:17Z" uid="3" user="m"><nd ref="1"/></way></modify>"#,
+            r#"<delete><way id="7" version="4"/></delete>"#,
+        ],
+    ),
+    (
+        "repeated-delete-and-unchanged-reentry",
+        &[
+            r#"<delete><relation id="7" version="4"/></delete>"#,
+            r#"<delete><relation id="7" version="4"/></delete>"#,
+            r#"<create><relation id="7" version="4"><member type="node" ref="1" role=""/></relation></create>"#,
+        ],
+    ),
+    (
+        "equal-claim-different-content",
+        &[
+            r#"<modify><node id="1" lat="9.0" lon="9.0" version="9"/></modify>"#,
+            r#"<modify><node id="1" lat="8.0" lon="8.0" version="9"/></modify>"#,
+        ],
+    ),
+    (
+        "equal-claim-after-delete-floor",
+        &[
+            r#"<delete><node id="1" version="9"/></delete>"#,
+            UNVERSIONED_NODE,
+            r#"<create><node id="1" lat="8.0" lon="8.0" version="9"/></create>"#,
+        ],
+    ),
 ];
 
 #[test]
@@ -791,4 +835,55 @@ fn both_version_gates_admit_a_claim_above_the_highest_ever_made() {
             panic!("{case}: merge-changes --simplify refused an advancing sequence: {e}");
         }
     }
+}
+
+/// Admitting an equal claim is not enough: both consumers must also keep
+/// the same winner, the later change by position. Checked on what each
+/// one holds afterwards - the overlay's live record or delete, and the
+/// change `--simplify` emits.
+#[test]
+fn both_version_gates_let_the_later_equal_claim_win() {
+    let dir = TempDir::new().unwrap();
+    let out = dir.path().join("simplify-out.osc.gz");
+
+    let inputs = write_sequence(
+        dir.path(),
+        "equal-content-wins",
+        &[
+            r#"<modify><node id="1" lat="9.0" lon="9.0" version="9"/></modify>"#,
+            r#"<modify><node id="1" lat="8.0" lon="8.0" version="9"/></modify>"#,
+        ],
+    );
+    let mut overlay = pbfhogg::osc::CompactDiffOverlay::new();
+    for input in &inputs {
+        pbfhogg::osc::parse_osc_file_into(input, &mut overlay).unwrap();
+    }
+    assert_eq!(overlay.get_node(1).unwrap().decimicro_lat(), 80_000_000);
+    simplify_sequence_verdict(&inputs, &out).unwrap();
+    let xml = read_gz(&out);
+    assert!(
+        xml.contains(r#"lat="8""#) && !xml.contains(r#"lat="9""#),
+        "simplify must keep the later equal claim; output was:\n{xml}"
+    );
+
+    let inputs = write_sequence(
+        dir.path(),
+        "equal-delete-wins",
+        &[
+            r#"<modify><node id="1" lat="9.0" lon="9.0" version="12"/></modify>"#,
+            r#"<delete><node id="1" version="12"/></delete>"#,
+        ],
+    );
+    let mut overlay = pbfhogg::osc::CompactDiffOverlay::new();
+    for input in &inputs {
+        pbfhogg::osc::parse_osc_file_into(input, &mut overlay).unwrap();
+    }
+    assert!(!overlay.has_node(1));
+    assert!(overlay.is_deleted(pbfhogg::osc::OscElementKind::Node, 1));
+    simplify_sequence_verdict(&inputs, &out).unwrap();
+    let xml = read_gz(&out);
+    assert!(
+        xml.contains("<delete>") && !xml.contains("<modify>"),
+        "simplify must keep the later equal-version delete; output was:\n{xml}"
+    );
 }

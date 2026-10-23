@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use crate::tunables::DEFAULT_MAX_WINDOW;
+
 /// Sequence-number reorder buffer for out-of-order producer results.
 ///
 /// Accepts items tagged with monotonic sequence numbers and yields only the
@@ -10,24 +12,6 @@ pub(crate) struct ReorderBuffer<T> {
     max_window: usize,
     pending: VecDeque<Option<T>>,
 }
-
-/// Slots ahead of `next_seq` a buffer will grow to before it calls the
-/// producer a runaway.
-///
-/// `push` sizes `pending` from the sequence number it is handed, so before
-/// this bound existed a producer that ran away from a stalled slot could
-/// grow the buffer to an arbitrary size and the only thing stopping it was
-/// permit accounting in the caller - an invariant that lived nowhere near
-/// the code that depended on it, and that every one of the twenty call
-/// sites had to re-establish for itself.
-///
-/// The default is deliberately far above any real pipeline window (the
-/// largest caller asks for a few hundred slots) so it never fires on a
-/// working configuration: it converts an unbounded memory-exhaustion vector
-/// into a localised panic that names the buffer. Callers that know their
-/// exact permit count can pin it with
-/// [`ReorderBuffer::with_max_window`].
-pub(crate) const DEFAULT_MAX_WINDOW: usize = 65_536;
 
 impl<T> ReorderBuffer<T> {
     pub(crate) fn with_capacity(capacity: usize) -> Self {

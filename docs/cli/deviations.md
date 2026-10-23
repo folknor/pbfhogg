@@ -131,8 +131,8 @@ subtraction, and an orphan id never names an element in the output. (Passing
 orphans through unchanged, the earlier policy, let an old id collide with a
 new one.)
 
-**Cross-validation:** the differences from osmium are confined to orphan refs
-in relation member lists.
+**Cross-validation:** element counts match osmium and no node or way differs;
+every difference is in a relation, attributed to orphan member refs.
 
 **Impact:** Downstream tools that assume output ids are contiguous in
 `[start_id, start_id + N)` must tolerate orphan refs above that range.

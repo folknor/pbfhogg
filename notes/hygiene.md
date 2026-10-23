@@ -27,6 +27,9 @@ found on the way are in `notes/bugs.md`.
    touching code under a higher-index entry, read
    `reference/performance-history.md` and `reference/performance.md`. The
    current code is likely not an accident.
+8. Nothing is measured - no benchmark, A/B, planet run or profiling cell -
+   until this document and `notes/bugs.md` are both drained. An entry whose
+   only remaining work is a measurement is removed, not kept waiting.
 ```
 
 Each entry carries an `Anger:` rating from 0 to 10: how likely resolving it
@@ -38,128 +41,28 @@ behaviour; below that the work is progressively more contained.
 
 ---
 
-## HYG-001 - Worker-count policy is spelled at about twenty sites and the copies have diverged
-
-Anger: 10 - worker counts for every command.
-
-The rule "how many threads by default" is reimplemented wherever a pool is
-built:
-
-- `read/pipeline.rs` `run_pipeline` and `run_pipeline_fused`:
-  `available_parallelism() - 2`, min 1, fallback 4.
-- `read/reader.rs` `par_map_reduce`: `- 1`, min 1, fallback 3.
-- `scan/classify.rs::resolve_thread_count` (documented as the owner):
-  `- 2`, fallback 4.
-- Hand copies of the same formula: `extract/common.rs`, `extract/simple.rs`
-  (twice), `extract/multi.rs` (twice), `tags_filter/mod.rs`,
-  `geocode_index/builder/pass1_5.rs`, `altw/passthrough.rs`,
-  `altw/external/{mod,stage1,stage2,stage3,stage4}.rs` (uncapped, `.min(6)`,
-  `.min(4)`, `.min(4)`), `renumber/relations.rs` (capped at 6),
-  `apply_changes/rewrite.rs` (`- 2`, min 2, fallback 4, `Some(1)` refused),
-  `merge_changes/mod.rs` (no reserve, fallback 8), `diff/derive.rs` gzip
-  workers (no reserve, fallback 4).
-- Fixed counts: `renumber::PASS1_WORKERS = 4`, `STAGE2D_WORKERS = 6` (its
-  comment notes `>= 1` is load-bearing because of `remove(0)`); neither is
-  reachable from `-j`.
-- Rayon's global pool (all cores) for sort, repack, degrade, `cat --clean`,
-  geocode pass 3 and admin assembly.
-- The CLI `-j/--jobs 0` resolution: `run_diff` and `run_derive_changes`
-  resolve `0` to `available_parallelism().unwrap_or(1)` (two copies, fallback
-  1); `tags-filter`, `apply-changes`, `merge-changes` map `0` to `None` (three
-  copies) and the library picks; `inspect --nodes` and `inspect tags` pass the
-  raw `usize` and `tags_count` does `(jobs > 0).then_some(jobs)`. The library
-  `jobs` type is `usize` in some options structs and `Option<usize>` in
-  others.
-
-Divergence is fact: reserve 2 vs reserve 1 vs none, fallback 4 vs 3 vs 8 vs 1.
-One `tags-filter` run uses two rules in two passes and `--jobs` reaches only
-one. On a host where `available_parallelism` fails, commands disagree by 4x.
-"Auto" is nproc or nproc-2 depending on the command. A cgroup-limited
-container reporting host cores gets more threads than it can run, undetected.
-Merge-changes `write_simplified` chunks by `div_ceil(worker_count)`, and chunk
-boundaries become extra `<create>` sections, so its output bytes differ
-between hosts with different core counts; byte-comparing tests flake across
-machines. Tests cannot force single- or many-worker interleavings anywhere.
-
-Fix: a `Jobs` type (`Auto | Fixed(NonZeroUsize)`) parsed by clap and carried in
-every options struct, and one `resolve_workers(Jobs, reserve)` in the library
-that owns the nproc read and the fallback; `NonZeroUsize` also deletes the
-`STAGE2D_WORKERS >= 1` comment. Enforce with `clippy.toml`
-`disallowed-methods = ["std::thread::available_parallelism"]` and one allow at
-the owner. Every hunter proposed the same lint independently.
-
-Reported by: all nine scopes.
-
-## HYG-002 - No scope has an answer to "what are the tunables"
+## HYG-002 - Tunables are centralized but not injectable
 
 Anger: 10 - tunables, including POOL_SIZE, which was measured at 16.
 
-Every scope's knobs live wherever they were first needed, mostly private, with
-no injection point:
-
-- Read: `DEFAULT_READ_AHEAD`, `DEFAULT_DECODE_AHEAD`, `BLOCK_QUEUE`,
-  `PAR_INFLIGHT_BUDGET`, `PAR_BATCH_MAX_BLOBS`, `PAR_BATCH_MAX_BYTES`,
-  `MAX_RETAINED_CAPACITY` and `MAX_POOL_SIZE` (decompress), `HEADER_PROBE_SIZE`,
-  `SAMPLE_CAP`, `FULL_SCAN_ARM_MIN_BLOBS`, `DEFAULT_MAX_WINDOW`,
-  `GRID_MAX_INDEX_BYTES`, across six files. `ElementReader` exposes
-  `read_ahead`, `decode_ahead`, `decode_threads`; `par_fold_blobs` takes the
-  budget and batch sizes as parameters but the public method passes the
-  constants, and `BLOCK_QUEUE` for `into_blocks_pipelined` is fixed.
-- Write: `PIPELINE_DISPATCH_PERMITS`, `WRITE_AHEAD`,
-  `parallel_writer::POOL_SIZE` (16, "could become a CLI flag later"),
-  `PER_WORKER_CAPACITY`, `uring_writer::NUM_BUFS` and `BUF_SIZE`,
-  `direct_writer::BUF_CAPACITY`, `parallel_gzip::DEFAULT_CHUNK_SIZE`,
-  `QUEUE_SLOTS_PER_WORKER`, the zlib reserve slack. Every parallel-writer test
-  spawns 16 OS threads and every uring test pins 16 MB of `RLIMIT_MEMLOCK`.
-  The `PER_WORKER_CAPACITY` memory budget doc multiplies two constants from
-  two places and nothing checks it. `POOL_SIZE = 16` ignores core count and
-  device.
-- Apply-changes: `DRAIN_CHANNEL_CAPACITY`, `CANDIDATE_CHANNEL_CAPACITY`, the
-  25 ms drain `recv_timeout` (an inline literal), `DESCRIPTOR_OVERHEAD` (two
-  files). Merge-changes: the chunking rule and the `inputs.len() <= 1` switch
-  between streaming and buffered strategies (different gzip member layouts).
-- Altw: `NUM_BUCKETS` (256), `BUCKET_BUF_SIZE`, stage 2 `FLUSH_THRESHOLD`,
-  stage 1 `HEADROOM_FDS` (a function-local const), the `1 << 30` RLIMIT clamp
-  and 1024 fallback (each twice), `AUTO_STORE_BUDGET_PCT`,
-  `AUTO_ANON_HEADROOM_BYTES`, `WILLNEED_WINDOW_BYTES`,
-  `WILLNEED_COALESCE_GAP_BYTES`, the worker caps, `BucketLayout`'s width
-  ceiling, the `granularity > 1e9` refusal, 8 bytes per slot. Small fixtures
-  always run 256 buckets times N workers' shard files, which is why tiny tests
-  create thousands of files.
-- Re-encoding: `FRAME_BATCH = 32` (twice), `CORRUPT_INDEXDATA_INFLATION`,
-  `DEFAULT_BLOCK_CAP`, the worker counts of HYG-001.
-- Filtering: the multi-extract 500-extract limit (a literal twice in one line,
-  undocumented in `reference/cli-reference.md`), `GRID_REGION_THRESHOLD = 16`
-  declared inside a function body, `extract/simple.rs::BATCH_SIZE`, the
-  `pool_get_pub(.., data_size * 4)` decompression guess (four times),
-  `geo.rs`'s `1e-30` degenerate-segment epsilon (twice in production, again in
-  a test that reimplements the formula).
-- Geocode: excluded highway classes (`pass2::EXCLUDED_HIGHWAYS`), accepted
-  admin levels `2..=10`, per-level vertex multipliers 16/8/4/2/1, hole
-  ownership samples 5, interp endpoint tolerance and search scope, bucket
-  count, chunk sizes 100k/500k/100k, Stage B window 8, per-segment sample
-  budget 2^24. The first group is policy (what counts as a street or an admin
-  boundary) and belongs in `BuildConfig` or a `GeocodePolicy`; the second is
-  mechanism.
-- CLI: clap defaults in `main.rs`, `check`'s ID floors, `debug::PIPE_BUF`.
-- Channel depths `sync_channel(16)` / `(32)` and reorder capacities 32 / 64 at
-  every hand-rolled pool (HYG-011); stage 4 records why 32 is right, the
-  others inherit the number without the reason.
-
-The in-repo precedent for doing it right is `FULL_SCAN_ARM_MIN_BLOBS`: one
-owner, injected into `getid` and `getparents` as `min_blobs` so tests drive
-both arms. Even that one is half done: `getparents_with_min_blobs` is a
-`#[doc(hidden)] pub` "test instrument" that the CLI calls for a hidden
-`--full-scan-min-blobs` flag, while other `dispatch_scan_arm` users have no
-override.
+Every tunable now lives in `src/tunables.rs`, grouped by scope with its
+rationale, values unchanged; format and protocol constants (field numbers,
+record layouts, spec limits) stay where they are. What remains is the second
+half: the engines still read the constants directly, so nothing but a code
+edit changes a knob, and a test cannot drive a pool at one worker or a tiny
+bucket count (small fixtures still create 256 buckets times N workers' shard
+files). `ElementReader` exposes `read_ahead`, `decode_ahead` and
+`decode_threads`; `par_fold_blobs` takes the budget and batch sizes as
+parameters but the public method passes the constants, and `BLOCK_QUEUE` for
+`into_blocks_pipelined` is fixed. The one injected knob,
+`FULL_SCAN_ARM_MIN_BLOBS`, reaches `getparents` through a `#[doc(hidden)] pub`
+"test instrument" the CLI calls for a hidden `--full-scan-min-blobs` flag,
+while other `dispatch_scan_arm` users have no override.
 
 Fix: per-scope tuning structs (`ReadTuning`, `WriterConfig`, a
 `PipelineTuning` on `MergeOptions`, an altw `Tuning`, a `GeocodePolicy`)
-defaulted in one place, passed in rather than read as constants, documented in
-`reference/`. Enforce structurally (engines take the struct, so a new knob has
-nowhere else to live), with const asserts for cross-constant invariants, a test
-that renders the defaults against a checked-in snapshot, and a text rule
-rejecting `const` items declared inside `fn` bodies under `src/commands/`.
+defaulted from `src/tunables.rs`, passed in rather than read as constants,
+documented in `reference/`.
 
 Reported by: all nine scopes.
 
@@ -740,31 +643,6 @@ packed structs, so a layout mismatch is a type error; a generic
 
 Reported by: change application, altw and scanning, geocode index.
 
-## HYG-033 - The CLI's arena cap is process-global and depends on which command ran
-
-Anger: 7 - RSS.
-
-The library no longer calls `mallopt`: `check_refs`, `verify_ids`, `cat`
-(`cat_filtered`), `repack`, `degrade` (`degrade_decode_path`), `renumber`,
-`time_filter` and the geocode builder call the host's
-`ProcessActions::cross_thread_alloc_pool` hook, and only the CLI's hook
-(`process::cap_malloc_arenas`, `mallopt(M_ARENA_MAX, 2)`) does anything
-(ADR-0016). The glibc calls live in `src/process.rs` and `src/debug.rs`, gated
-on `target_os = "linux"` plus `target_env = "gnu"` with a no-op fallback, and a
-textlint rule in `brokkr.toml` keeps raw `libc::mallopt` and friends out of
-every other file, so musl builds.
-What remains: `mallopt` is process-global and never restored, so in the CLI the
-setting depends on which command ran (an embedding caller that installs the same
-hook keeps two arenas for life). `time_filter`'s comment documents a path that
-regresses under it. With jemalloc/mimalloc as the global allocator it silently
-does nothing and the documented RSS difference reappears. `brokkr.toml`
-captures `MALLOC*` env vars, suggesting `MALLOC_ARENA_MAX` was once the knob.
-Fix: allocator tuning belongs to `cli/src/main.rs`, per subcommand if needed,
-rather than a hook at command level. The `musl` check sweep builds and runs
-the suite for `x86_64-unknown-linux-musl`, so the musl half is enforced.
-
-Reported by: re-encoding, geocode index, CLI and plumbing.
-
 ## HYG-034 - Decode failures are turned into plausible default values
 
 Anger: 9 - decode failures and aborts become errors: new refusals, Results on builder hot paths.
@@ -951,27 +829,6 @@ with 4096 as fallback; one `open_direct_for_write`; a text rule on
 `custom_flags(libc::O_DIRECT)` outside it.
 
 Reported by: read path, write path.
-
-## HYG-040 - Unix-only APIs are used without the crate saying it is Unix-only
-
-Anger: 7 - Unix-only decision.
-
-`std::os::unix::fs::FileExt` is imported unconditionally in
-`read/header_walker.rs`, `write/parallel_writer.rs` (compiled unconditionally,
-`to_path_parallel` is public API), `apply_changes/streaming.rs`, renumber, both
-parallel diff modules, extract's `pread_execute` and multi workers, altw
-`external/*` and geocode `pass1_5.rs`. Altw also calls `libc::getrlimit` /
-`setrlimit` ungated and assumes `rlim_t == u64`. AGENTS.md says `apply_changes`
-compiles in a no-features build and the `minimal` sweep checks it, but only on
-Linux; on a non-Unix target the whole crate fails to build. `sparse.rs` does
-gate `statvfs` / `posix_fallocate` and falls back to `set_len`, which skips the
-free-space check, so a full disk on macOS surfaces as SIGBUS on the mmap store.
-Fix: decide. Declare the crate Unix-only in `Cargo.toml` and README (or a
-`compile_error!`), or put pread behind a small platform shim; if non-Unix is
-meant to work, a `cargo check --target x86_64-pc-windows-gnu` sweep.
-
-Reported by: read path, write path, change application, re-encoding, filtering
-and spatial, altw and scanning, geocode index.
 
 ## HYG-042 - `IdSet`'s rank index is a runtime state rather than a type
 
@@ -1160,18 +1017,6 @@ banning `static` inside `mod test_hooks`.
 Reported by: test harness, read path, write path, altw and scanning, geocode
 index, change application, CLI and plumbing.
 
-## HYG-064 - Page-fault counters still read a failed `/proc` sample as zero
-
-Anger: 7 - CLI behaviour.
-
-The `/proc` readers now live in `src/process.rs` and return `Option`; the
-CLI and the debug layer call them. `debug::read_page_faults` still maps a
-missing sample to zero for its six altw call sites, which publish the
-numbers for brokkr, so one failed sample distorts a delta. Fix: carry the
-`Option` through those call sites and skip the counter when absent.
-
-Reported by: CLI and plumbing, altw and scanning.
-
 ## HYG-070 - CLI-driving tests live in the library crate, so binary resolution is restated and guessed
 
 Anger: 8 - moves every CLI test.
@@ -1303,17 +1148,4 @@ leads stay). What remains:
 
 Reported by: all nine scopes (split out of the library stderr item when the
 library stopped writing stderr).
-
-## HYG-069 - Code comments and help text still hard-code drifting figures
-
-Anger: 5 - CLI help text, and the "recommended" question.
-
-The CLI help, altw docs and runtime hint, geocode builder comments, README
-and guides now describe each choice without drifting figures and point at
-`reference/pipeline.md` and `reference/performance.md`. Open: whether `auto`
-should be recommended while the default is `sparse` needs the maintainer's
-answer; everything is neutral now. `docs/.vitepress/dist/` is generated and
-holds the old text until the site is rebuilt.
-
-Reported by: altw and scanning, geocode index, CLI and plumbing, test harness.
 

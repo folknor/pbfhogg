@@ -11,7 +11,8 @@ use super::{
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_writer::FileWriter;
 use crate::owned::{dense_node_metadata, element_metadata};
-use crate::read::header_walker::{FULL_SCAN_ARM_MIN_BLOBS, ScanArm};
+use crate::read::header_walker::ScanArm;
+use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 

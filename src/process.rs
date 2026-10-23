@@ -6,6 +6,8 @@
 //! because its caller refuses work on the answer and must not mistake an
 //! unreadable mount table for "not a mount point".
 
+use crate::tunables::{NOFILE_PROBE_FAILED_ASSUMED_SOFT, NOFILE_SOFT_LIMIT_CLAMP};
+
 /// Read cumulative minor and major page faults from `/proc/self/stat`.
 ///
 /// Returns `None` when procfs is unavailable or the process-stat record is
@@ -482,14 +484,17 @@ pub fn raise_nofile_to_hard_cap() -> FdAllowance {
             rlim_max: 0,
         };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) != 0 {
-            (1024, FdAdjustment::ProbeFailed)
+            (NOFILE_PROBE_FAILED_ASSUMED_SOFT, FdAdjustment::ProbeFailed)
         } else {
             let soft_before: u64 = rlim.rlim_cur;
             let hard: u64 = rlim.rlim_max;
             if soft_before >= hard {
                 // `rlim_cur` can be `RLIM_INFINITY` (= `u64::MAX` on
                 // Linux); clamp so downstream arithmetic doesn't overflow.
-                (soft_before.min(1 << 30), FdAdjustment::AlreadyAtCap)
+                (
+                    soft_before.min(NOFILE_SOFT_LIMIT_CLAMP),
+                    FdAdjustment::AlreadyAtCap,
+                )
             } else {
                 let target = libc::rlimit {
                     rlim_cur: hard,
@@ -502,19 +507,25 @@ pub fn raise_nofile_to_hard_cap() -> FdAllowance {
                     // known limit with the initial-probe fallback.
                     if raise_ok {
                         (
-                            hard.min(1 << 30),
+                            hard.min(NOFILE_SOFT_LIMIT_CLAMP),
                             FdAdjustment::Raised { from: soft_before },
                         )
                     } else {
-                        (soft_before.min(1 << 30), FdAdjustment::RaiseFailed)
+                        (
+                            soft_before.min(NOFILE_SOFT_LIMIT_CLAMP),
+                            FdAdjustment::RaiseFailed,
+                        )
                     }
                 } else if raise_ok {
                     (
-                        rlim.rlim_cur.min(1 << 30),
+                        rlim.rlim_cur.min(NOFILE_SOFT_LIMIT_CLAMP),
                         FdAdjustment::Raised { from: soft_before },
                     )
                 } else {
-                    (rlim.rlim_cur.min(1 << 30), FdAdjustment::RaiseFailed)
+                    (
+                        rlim.rlim_cur.min(NOFILE_SOFT_LIMIT_CLAMP),
+                        FdAdjustment::RaiseFailed,
+                    )
                 }
             }
         }
@@ -534,11 +545,14 @@ pub fn current_nofile() -> FdAllowance {
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
             None
         } else {
-            Some(limit.rlim_cur.min(1 << 30))
+            Some(limit.rlim_cur.min(NOFILE_SOFT_LIMIT_CLAMP))
         }
     };
     match soft {
         Some(soft) => probed(soft, None),
-        None => probed(1024, Some(FdAdjustment::ProbeFailed)),
+        None => probed(
+            NOFILE_PROBE_FAILED_ASSUMED_SOFT,
+            Some(FdAdjustment::ProbeFailed),
+        ),
     }
 }

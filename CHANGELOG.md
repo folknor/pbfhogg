@@ -659,6 +659,21 @@
 
 ### Fixed
 
+- **Overlapping and regional diffs merge and apply instead of failing the
+  version gate.** `apply-changes` and `merge-changes --simplify` refused any
+  change whose version did not exceed the highest already seen for the
+  object, so an equal version aborted the whole command. Equal versions are
+  normal input: overlapping replication diffs repeat boundary changes, and
+  regional extract diffs (Geofabrik's, or `diff --format osc` without
+  `--increment-version`) delete an object leaving the region at the version
+  it already had - Geofabrik germany seq 4705 modifies a node at version 12
+  and seq 4706 deletes it at version 12, so every range spanning them
+  failed. An equal version is now admitted and the later change wins by
+  position; only a lower version is refused, and its error names the
+  likely causes (inputs out of sequence order, inconsistent diff series)
+  instead of "applying the same diff twice". `--allow-version-regression`
+  is unchanged.
+
 - **`apply-changes` no longer mislabels tags in rewritten blocks whose
   string table repeats a string.** Rewritten elements copy the input block's
   string indices, which assumed the output table matched the input slot for

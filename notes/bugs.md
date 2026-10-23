@@ -25,6 +25,9 @@ are marked "likely" by the hunter who found them.
    touching code under a higher-index entry, read
    `reference/performance-history.md` and `reference/performance.md`. The
    current code is likely not an accident.
+8. Nothing is measured - no benchmark, A/B, planet run or profiling cell -
+   until this document and `notes/hygiene.md` are both drained. An entry
+   whose only remaining work is a measurement is removed, not kept waiting.
 ```
 
 Each entry carries an `Anger:` rating from 0 to 10: how likely resolving it
@@ -77,29 +80,6 @@ untouched way, and on one that deletes such a node.
 
 Reported by: change application.
 
-## BUG-079 - The version gate refuses identical repeats from overlapping diffs
-
-Anger: 10 - the version-gate contract.
-
-The version rule refuses any change whose version is not strictly greater
-than the highest claimed so far, so an identical change appearing twice is
-refused. Consecutive replication diffs overlap at their boundaries: bygg's
-germany seq 4705 and 4706 both carry node 135379864 at version 12 with the
-same timestamp and coordinates, and `merge-changes --simplify` refuses every
-germany range starting at 4705, at 3a664c7b as at HEAD. Applying an
-identical change twice is a no-op, so refusing it protects nothing. The
-documented promise that applying the same OSC twice is refused (DEVIATIONS.md,
-"Change stream: version precedence is enforced") is the same behaviour.
-
-Options: admit an equal version (a conflicting equal version then also
-passes, last wins); admit it only when the content is identical too (a
-cold-path comparison against the stored record or change); or keep it and
-document `--allow-version-regression` for overlapping diffs. Needs the user's
-call, since it changes a documented contract. Blocks benchmarking the
-merge-changes floor on real data.
-
-Reported by: the version-floor A/B on germany.
-
 ## BUG-081 - Extract still trusts indexdata on the paths verification does not cover
 
 Anger: 9 - verifying indexdata costs a per-blob decode.
@@ -113,35 +93,4 @@ building a `PrimitiveBlock` validates, not metadata arithmetic done later
 during decode.
 
 Reported by: the extract passthrough fix.
-
-## BUG-083 - Measured figures in comments from the 2026-10-22 fixes
-
-Anger: 1 - nothing to do until the figures drift.
-
-Several comments written in that round carry measured figures (the IdSet
-`set` fast path's per-ref cost, `SPARSE_MAX`'s copy volume, renumber's
-`PREALLOC_IDS_PER_BYTE` denmark numbers). They are measurement provenance
-today and will drift; reword when they do.
-
-Reported by: the 2026-10-22 fix round.
-
-## BUG-084 - Claims and paths from the 2026-10-22 round that nobody has verified
-
-Anger: 9 - planet runs and verifies on the maintainer's hardware.
-
-- DEVIATIONS.md's renumber cross-validation now says the differences from
-  osmium are confined to orphan refs in relation member lists. That was true
-  under the old pass-through policy; it has not been re-run under the orphan
-  shift. Run `brokkr verify renumber --dataset denmark` and reword to match.
-- Unmeasured after this round: extract's passthrough verification (germany's
-  indexdata nominated no candidates, so the A/B never exercised it; needs an
-  input whose node blobs carry v3 bboxes), apply-changes
-  `--locations-on-ways` (the new checked coordinate extractor runs per node
-  blob), and the `merge-changes --simplify` version floor (blocked by
-  BUG-079 on every germany range).
-- `IdSet`'s array-chunk representation was benchmarked only through altw,
-  tags-filter, extract and renumber on germany and denmark; a planet altw
-  cell has not been run.
-
-Reported by: the 2026-10-22 fix round.
 

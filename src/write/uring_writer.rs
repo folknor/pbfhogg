@@ -15,9 +15,8 @@ use super::IO_BUF_BYTES;
 use std::collections::VecDeque;
 
 use crate::reorder_buffer::ReorderBuffer;
-use crate::write::pipeline::{
-    OutputChunk, PipelineItem, SeqTotal, WRITE_AHEAD, check_stream_complete,
-};
+use crate::tunables::{NUM_BUFS, WRITE_AHEAD};
+use crate::write::pipeline::{OutputChunk, PipelineItem, SeqTotal, check_stream_complete};
 use io_uring::IoUring;
 use io_uring::opcode;
 use io_uring::types::Fixed;
@@ -83,20 +82,8 @@ const fn ud_expected_len(ud: u64) -> u32 {
     (ud >> 16) as u32
 }
 
-/// Number of registered buffers. 64 × 256 KB = 16 MB total.
-/// Charged against `RLIMIT_MEMLOCK`.
-const NUM_BUFS: u16 = 64;
-
-/// `user_data` packs `buf_idx` into the low 16 bits, but [`ud_buf_idx`] masks
-/// `0x3F` - six bits. The two disagree for any `NUM_BUFS` above 64, and the
-/// disagreement is silent: a CQE for buffer 64 returns index 0 to the free
-/// list, so two writers end up filling the same registered buffer and the
-/// output is corrupt with nothing reported. Widening the pool means widening
-/// the mask.
-const _: () = assert!(
-    NUM_BUFS <= 64,
-    "NUM_BUFS exceeds the 6-bit mask in ud_buf_idx; widen the mask first"
-);
+// `NUM_BUFS` (in `crate::tunables`) is asserted there to fit the 6-bit mask in
+// [`ud_buf_idx`]; widening the pool means widening that mask.
 
 // ---------------------------------------------------------------------------
 // AlignedBufferPool - contiguous page-aligned allocation with free-list

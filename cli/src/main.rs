@@ -959,10 +959,11 @@ enum Command {
         /// Permit unresolved references to use the legacy (0,0) fallback.
         #[arg(long, requires = "locations_on_ways")]
         ignore_missing_nodes: bool,
-        /// Accept a change whose version does not advance past the one
-        /// already held for that object. Off by default: a repeated or
-        /// out-of-order diff otherwise downgrades objects to an older
-        /// state and reports success.
+        /// Accept a change whose version is lower than the one already
+        /// held for that object. Off by default: an out-of-order diff
+        /// otherwise downgrades objects to an older state and reports
+        /// success. An equal version is always accepted; the later
+        /// change wins.
         #[arg(long)]
         allow_version_regression: bool,
         /// Worker-pool size for the descriptor-first pipeline.
@@ -986,9 +987,10 @@ enum Command {
         /// Keep only the last change per object (type + id)
         #[arg(long)]
         simplify: bool,
-        /// Accept an incoming change whose version does not advance past
-        /// the highest version already claimed for that object, deletes
-        /// included. Off by default: --simplify keeps the LAST
+        /// Accept an incoming change whose version is lower than the
+        /// highest version already claimed for that object, deletes
+        /// included. An equal version is always accepted, and the later
+        /// change wins. Off by default: --simplify keeps the LAST
         /// change per object by input position, so inputs listed out of
         /// sequence order otherwise downgrade objects to older versions
         /// and report success. Requires --simplify: without it every change
@@ -3062,9 +3064,9 @@ fn run_diff(
     } = flags;
 
     let jobs_resolved = if jobs == 0 {
-        std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1)
+        host.resources
+            .parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
     } else {
         jobs
     };
@@ -3122,9 +3124,9 @@ fn run_derive_changes(
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let jobs_resolved = if jobs == 0 {
-        std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(1)
+        host.resources
+            .parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
     } else {
         jobs
     };

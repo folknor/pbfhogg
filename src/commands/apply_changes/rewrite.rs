@@ -28,16 +28,10 @@ use super::streaming::{self, CoordSlots, StreamingChannels, StreamingConfig, Wor
 
 use super::Result;
 
-/// Channel capacity for the unified DrainItem stream from scanner +
-/// workers. Sized for ~16 in-flight items per worker plus headroom; the
-/// drain's reorder buffer absorbs out-of-order arrivals beyond this.
-const DRAIN_CHANNEL_CAPACITY: usize = 256;
-
-/// Channel capacity for the scanner→workers candidate dispatch. Workers
-/// pull at decompress + parse pace (ms per blob); the producer (scanner)
-/// runs at header-walk pace (~µs per blob), so a moderate buffer keeps
-/// workers fed during scanner pauses.
-const CANDIDATE_CHANNEL_CAPACITY: usize = 64;
+use crate::tunables::{
+    APPLY_CHANGES_WORKERS_FALLBACK, APPLY_CHANGES_WORKERS_MIN, APPLY_CHANGES_WORKERS_RESERVED,
+    CANDIDATE_CHANNEL_CAPACITY, DRAIN_CHANNEL_CAPACITY,
+};
 
 /// Public command options.
 pub struct MergeOptions {
@@ -57,8 +51,8 @@ pub struct MergeOptions {
     /// and its failure shutdown. This is a supported-configuration limit,
     /// not a claim that a single worker necessarily deadlocks.
     pub jobs: Option<usize>,
-    /// Accept a change whose `version` does not advance past the version
-    /// already held for that object in the overlay. Off by default; see
+    /// Accept a change whose `version` is lower than the version already
+    /// held for that object in the overlay. Off by default; see
     /// [`crate::osc::CompactDiffOverlay::allow_version_regression`].
     pub allow_version_regression: bool,
     /// Test-only: panic in the worker loop when a blob with this seq
@@ -407,7 +401,12 @@ pub fn merge(
                 .into());
         }
         Some(n) if n > 1 => n,
-        _ => crate::host::sized_workers(&*host.resources, 2, 2, 4),
+        _ => crate::host::sized_workers(
+            &*host.resources,
+            APPLY_CHANGES_WORKERS_RESERVED,
+            APPLY_CHANGES_WORKERS_MIN,
+            APPLY_CHANGES_WORKERS_FALLBACK,
+        ),
     };
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("merge_worker_count", worker_count as i64);

@@ -89,9 +89,9 @@ pub struct CompactDiffOverlay {
     way_version_floors: FxHashMap<i64, i32>,
     relation_version_floors: FxHashMap<i64, i32>,
     interner: StringInterner,
-    /// When false (the default), an incoming change whose `version` is at
-    /// or below the highest version already claimed for the id is a hard
-    /// error. See [`CompactDiffOverlay::allow_version_regression`].
+    /// When false (the default), an incoming change whose `version` is
+    /// lower than the highest version already claimed for the id is a
+    /// hard error. See [`CompactDiffOverlay::allow_version_regression`].
     allow_version_regression: bool,
 }
 
@@ -150,11 +150,15 @@ impl CompactDiffOverlay {
     /// The overlay's conflict rule is purely positional: the last change
     /// parsed into it wins, whatever version it claims. That is fine when
     /// the changes arrive in order and is silent data corruption when
-    /// they do not - applying the same OSC twice, or an older one after a
-    /// newer one, downgrades objects to earlier versions and reports
-    /// success. The overlay already stores the version, so by default it
-    /// refuses: an incoming change that would replace a record with a
-    /// version at or below the stored one is an error naming both.
+    /// they do not - an older OSC after a newer one downgrades objects to
+    /// earlier versions and reports success. The overlay already stores
+    /// the version, so by default it refuses: an incoming change whose
+    /// version is lower than the highest one held for the object is an
+    /// error naming both. An equal version is admitted and wins by
+    /// position: regional extract diffs delete an object leaving the
+    /// region at the version it already had, and overlapping diffs repeat
+    /// boundary changes, so equal versions are normal input and carry no
+    /// ordering of their own.
     ///
     /// Set this to restore the old positional behaviour, for the case
     /// where a caller genuinely intends to replay history backwards.
@@ -177,7 +181,7 @@ impl CompactDiffOverlay {
     /// Both sides must claim a version for the comparison to mean
     /// anything: a change with no `version` attribute makes no claim, and
     /// neither does a stored record that had none. Only an actual
-    /// backwards or repeated claim is refused.
+    /// backwards claim is refused; an equal one is admitted.
     ///
     /// "Stored" spans both the live index and the version floor map, so
     /// a delete is as much a version claim as a create is, and an
@@ -547,7 +551,7 @@ impl Default for CompactDiffOverlay {
 ///
 /// This is the streaming entry point: call it multiple times with the same
 /// overlay to accumulate multiple diff files. Later diffs win for
-/// conflicts, but only when they actually move the object forward: see
+/// conflicts, but only when they do not move the object backwards: see
 /// [`CompactDiffOverlay::allow_version_regression`].
 pub fn parse_osc_file_into(path: &Path, overlay: &mut CompactDiffOverlay) -> ParseResult<()> {
     let mut sink = CompactSink::new(overlay);
@@ -1226,20 +1230,12 @@ mod tests {
         Ok(overlay)
     }
 
-    /// Applying the same diff twice, or an older one after a newer one,
-    /// used to silently downgrade the object and report success. The
-    /// overlay already stored the version; now it compares it.
+    /// An older diff after a newer one used to silently downgrade the
+    /// object and report success. The overlay already stored the
+    /// version; now it compares it.
     #[test]
     fn test_version_regression_is_refused() {
         for (suffix, files) in [
-            // The same OSC applied twice: equal version, no advance.
-            (
-                "same_twice",
-                [
-                    ("modify", r#"id="1" lat="1.0" lon="2.0" version="7""#),
-                    ("modify", r#"id="1" lat="1.0" lon="2.0" version="7""#),
-                ],
-            ),
             // Out-of-sequence: an older diff after a newer one.
             (
                 "backwards",
@@ -1262,10 +1258,72 @@ mod tests {
                 .unwrap_or_else(|| panic!("{suffix}: version regression must be refused"));
             let text = err.to_string();
             assert!(
-                text.contains("does not advance past version"),
+                text.contains("is lower than version"),
                 "{suffix}: error must name the regression; got: {text}"
             );
         }
+    }
+
+    /// Equal versions are admitted and the later change wins by position.
+    /// Overlapping replication diffs repeat boundary changes, and regional
+    /// extract diffs delete an object leaving the region at the version
+    /// it already had (germany seq 4705 modifies node 135379864 at
+    /// version 12, seq 4706 deletes it at version 12). Both used to be
+    /// refused, failing every range that spanned them.
+    #[test]
+    fn test_equal_version_is_admitted_and_later_wins() -> ParseResult<()> {
+        // An identical repeat.
+        let overlay = accumulate(&[
+            ("modify", r#"id="1" lat="1.0" lon="2.0" version="7""#),
+            ("modify", r#"id="1" lat="1.0" lon="2.0" version="7""#),
+        ])?;
+        assert_eq!(
+            overlay.get_node(1).ok_or("node 1 missing")?.decimicro_lat(),
+            10_000_000
+        );
+
+        // An equal version with different content: position decides.
+        let overlay = accumulate(&[
+            ("modify", r#"id="1" lat="1.0" lon="2.0" version="7""#),
+            ("modify", r#"id="1" lat="3.0" lon="4.0" version="7""#),
+        ])?;
+        assert_eq!(
+            overlay.get_node(1).ok_or("node 1 missing")?.decimicro_lat(),
+            30_000_000
+        );
+
+        // The regional-extract shape: a delete at the version just modified.
+        let overlay = accumulate(&[
+            ("modify", r#"id="1" lat="1.0" lon="2.0" version="12""#),
+            ("delete", r#"id="1" version="12""#),
+        ])?;
+        assert!(!overlay.has_node(1));
+        assert!(overlay.is_deleted(OscElementKind::Node, 1));
+
+        // A repeated delete, and re-entry at the deleted version.
+        let overlay = accumulate(&[
+            ("delete", r#"id="1" version="12""#),
+            ("delete", r#"id="1" version="12""#),
+            ("create", r#"id="1" lat="1.0" lon="2.0" version="12""#),
+        ])?;
+        assert!(overlay.has_node(1));
+        assert!(!overlay.is_deleted(OscElementKind::Node, 1));
+
+        // Admitting an equal claim never lowers the floor: a lower claim
+        // after it is still refused against the same version.
+        let err = accumulate(&[
+            ("modify", r#"id="1" lat="1.0" lon="2.0" version="12""#),
+            ("delete", r#"id="1" version="12""#),
+            ("create", r#"id="1" lat="1.0" lon="2.0" version="12""#),
+            ("modify", r#"id="1" lat="1.0" lon="2.0" version="11""#),
+        ])
+        .err()
+        .ok_or("a lower claim after equal ones must be refused")?;
+        assert!(
+            err.to_string().contains("is lower than version 12"),
+            "got: {err}"
+        );
+        Ok(())
     }
 
     /// The counterparts that stop the gate from being satisfied by
@@ -1343,18 +1401,18 @@ mod tests {
         .err()
         .expect("a stale modify after a delete must be refused");
         assert!(
-            err.to_string().contains("does not advance past version 9"),
+            err.to_string().contains("is lower than version 9"),
             "error must name the deleted version as the floor; got: {err}"
         );
 
         // A stale create is the same hole wearing a different action.
         let err = parse_one_xml(
             "  <delete>\n    <node id=\"1\" version=\"9\"/>\n  </delete>\n  \
-             <create>\n    <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"9\"/>\n  </create>",
+             <create>\n    <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"8\"/>\n  </create>",
         )
         .err()
         .expect("a stale create after a delete must be refused");
-        assert!(err.to_string().contains("does not advance past version 9"));
+        assert!(err.to_string().contains("is lower than version 9"));
 
         // And a second delete may not walk the version backwards either.
         let err = parse_one_xml(
@@ -1363,7 +1421,7 @@ mod tests {
         )
         .err()
         .expect("a stale delete after a delete must be refused");
-        assert!(err.to_string().contains("does not advance past version 9"));
+        assert!(err.to_string().contains("is lower than version 9"));
 
         // Across files: the multi-file overlay accumulation.
         let err = accumulate(&[
@@ -1372,18 +1430,18 @@ mod tests {
         ])
         .err()
         .expect("a stale modify in a later file must be refused");
-        assert!(err.to_string().contains("does not advance past version 9"));
+        assert!(err.to_string().contains("is lower than version 9"));
 
         // A delete carrying no version of its own still cannot erase the
         // version the live record held: the tombstone carries it forward.
         let err = parse_one_xml(
             "  <create>\n    <node id=\"1\" lat=\"1.0\" lon=\"2.0\" version=\"9\"/>\n  \
              </create>\n  <delete>\n    <node id=\"1\"/>\n  </delete>\n  \
-             <modify>\n    <node id=\"1\" lat=\"3.0\" lon=\"4.0\" version=\"9\"/>\n  </modify>",
+             <modify>\n    <node id=\"1\" lat=\"3.0\" lon=\"4.0\" version=\"8\"/>\n  </modify>",
         )
         .err()
         .expect("an unversioned delete must not discard the live version");
-        assert!(err.to_string().contains("does not advance past version 9"));
+        assert!(err.to_string().contains("is lower than version 9"));
     }
 
     /// The counterparts, so the tombstone is not satisfied by refusing
@@ -1444,7 +1502,7 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("{suffix}: stale change after delete must be refused"));
             assert!(
-                err.to_string().contains("does not advance past version 4"),
+                err.to_string().contains("is lower than version 4"),
                 "{suffix}: error must name the deleted version; got: {err}"
             );
         }

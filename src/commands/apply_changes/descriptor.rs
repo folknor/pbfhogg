@@ -219,7 +219,7 @@ impl DrainItem {
     /// the full re-encoded payload; OwnedBytes carries the compressed
     /// frame.
     pub(super) fn byte_cost(&self) -> usize {
-        const DESCRIPTOR_OVERHEAD: usize = 64;
+        use crate::tunables::DESCRIPTOR_OVERHEAD;
         match self {
             DrainItem::CopyRange { tagdata, .. } => {
                 DESCRIPTOR_OVERHEAD + tagdata.as_ref().map_or(0, |t| t.len())

@@ -45,10 +45,9 @@ use super::string_table::StringTable;
 // Preserve the public builder import path for downstream callers.
 pub use crate::write::header_builder::HeaderBuilder;
 
-/// Default per-block element cap used by [`BlockBuilder::new`].
-///
-/// Matches the common PBF packing convention used by osmium.
-pub const DEFAULT_ELEMENT_CAP: usize = 8000;
+/// Default per-block element cap used by [`BlockBuilder::new`]; owned by
+/// `crate::tunables`, re-exported here so the public path is unchanged.
+pub use crate::tunables::DEFAULT_ELEMENT_CAP;
 
 // ---------------------------------------------------------------------------
 // Public types

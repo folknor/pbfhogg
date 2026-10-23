@@ -13,24 +13,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::Result;
 
-/// IDs the dense node-ID bitmap may cover per input byte, passed to
-/// `IdSet::file_bounded_max_id` because `max_node_id` can come from
-/// unverified indexdata. References above the resulting bound are collected
-/// as plain per-worker ID lists and inserted with `IdSet::set` after the
-/// parallel scan, as in external renumber, so an honest high-ID extract is
-/// not rejected or silently dropped. Same factor as renumber's, for the same
-/// reason: country-sized extracts stay on the parallel path.
-///
-/// The lists are deliberately not per-worker `IdSet`s: every worker that
-/// sees more IDs in a 2^25-ID chunk than an array chunk holds would promote
-/// its own 4 MiB copy of that chunk, multiplying the overflow range's bitmap by the
-/// worker count - the per-worker accumulation shape this pass was moved off.
-const NODE_PREALLOC_IDS_PER_BYTE: u64 = 64;
-
-/// A worker's overflow list is sorted and deduplicated whenever it has
-/// doubled since its last compaction and holds at least this many IDs, so
-/// refs repeated across blobs cannot grow it far past its distinct count.
-const OVERFLOW_COMPACT_MIN: usize = 1 << 20;
+use crate::tunables::{NODE_PREALLOC_IDS_PER_BYTE, OVERFLOW_COMPACT_MIN};
 
 /// Record one accepted node ref: through `set_atomic` when it falls inside
 /// the pre-allocated range, otherwise onto this worker's overflow list.
@@ -230,7 +213,12 @@ pub(super) fn run_pass1_5(
         let negative_node_ids: Mutex<Vec<i64>> = Mutex::new(Vec::new());
         let negative_node_ids_ref = &negative_node_ids;
 
-        let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
+        let decode_threads = crate::host::sized_workers(
+            &*host.resources,
+            crate::tunables::DECODE_WORKERS_RESERVED,
+            crate::tunables::DECODE_WORKERS_MIN,
+            crate::tunables::DECODE_WORKERS_FALLBACK,
+        );
 
         std::thread::scope(|scope| {
             for _ in 0..decode_threads {

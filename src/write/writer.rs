@@ -36,10 +36,11 @@ pub(crate) use super::framing::{
 // Pipeline plumbing (ordered channel items, sink trait, permit pool, writer
 // thread) lives in the sibling `pipeline` module.
 use super::pipeline::{
-    FileOutputSink, OutputChunk, PermitGuard, PipelineItem, SeqTotal, WRITE_AHEAD, WritePipeline,
-    drain_permits, elapsed_ns_u64, record_send_wait, recv_permit, writer_thread,
+    FileOutputSink, OutputChunk, PermitGuard, PipelineItem, SeqTotal, WritePipeline, drain_permits,
+    elapsed_ns_u64, record_send_wait, recv_permit, writer_thread,
 };
 use crate::host::{Diagnostics, Executor};
+use crate::tunables::WRITE_AHEAD;
 
 /// Returned when a write is attempted on a `PbfWriter` whose inner writer was
 /// moved into a pipeline writer thread (every pipelined constructor, and every

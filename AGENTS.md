@@ -182,6 +182,7 @@ CLI-driven integration tests live in `tests/cli_*.rs` and drive the compiled `pb
 - Library code never mutates process state, reads the environment or writes stderr; see ADR-0016.
 - Performance numbers in markdown must include commit hash and hostname. Results auto-stored in `.brokkr/results.db`.
 - Strict clippy: `unwrap_used = "deny"`, `cognitive_complexity = "deny"`.
+- Tunables (sizes, depths, worker counts and caps, channel and reorder capacities, timeouts, thresholds, geocode policy values) live in `src/tunables.rs`, grouped by scope with their rationale. A new tunable goes there, not in a local `const` or an inline literal. Format and protocol constants (field numbers, record layouts, spec limits) stay with the code that owns the format.
 - Coordinates: decimicrodegrees (10^-7 degrees) for node I/O.
 - Tests never read downloaded datasets (Denmark, planet, OSC diffs) - every test builds its own input in scratch, and the suite must pass with an empty `data/`. Real-data coverage belongs to `brokkr verify` and `brokkr bench`.
 - Tests never depend on the specifics of a host: no goldens blessed on one machine, no core-count, memory or rlimit preconditions. Library tests get a fixed machine from `common::test_host()` and unit tests from `Host::for_tests()` (both `host::Fixed`). Fixture PBFs are built at test time by the `tests/common` writers and generators, never checked in. A test whose feature the host lacks (O_DIRECT, io_uring, osmium) skips and passes - that is harmless, and nothing turns such a skip into a failure.

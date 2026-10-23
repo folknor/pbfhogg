@@ -21,8 +21,9 @@ use crate::blob::{BlobKind, decode_blob_to_headerblock};
 use crate::blob_meta::ElemKind;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::owned::{dense_node_metadata, element_metadata};
-use crate::read::header_walker::{FULL_SCAN_ARM_MIN_BLOBS, HeaderWalker, ScanArm};
+use crate::read::header_walker::{HeaderWalker, ScanArm};
 use crate::reorder_buffer::ReorderBuffer;
+use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
 use crate::writer::Compression;
 use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
 
@@ -284,7 +285,8 @@ fn getparents_walker(
 
     crate::debug::emit_marker("GETPARENTS_DECODE_START");
     type ClassifyResult = std::result::Result<(Vec<OwnedBlock>, (u64, u64, u64)), String>;
-    let mut reorder: ReorderBuffer<ClassifyResult> = ReorderBuffer::with_capacity(32);
+    let mut reorder: ReorderBuffer<ClassifyResult> =
+        ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY);
     // Captured write error: `parallel_classify_phase`'s `merge` is `FnMut(usize, R)`
     // and cannot return a Result. Capture the first error here and bail out
     // at the end of the phase.

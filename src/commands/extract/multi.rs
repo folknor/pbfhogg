@@ -299,7 +299,7 @@ pub(super) fn try_extract_multi_single_pass(
     // contiguous arrays) with single-pass multi-region classification.
     // Polygon regions fall back to element-by-element iteration.
     let all_bbox = slots.iter().all(|s| matches!(s.region, Region::Bbox(_)));
-    const GRID_REGION_THRESHOLD: usize = 16;
+    use crate::tunables::GRID_REGION_THRESHOLD;
     let region_bboxes: Vec<(i32, i32, i32, i32)> = inside_bbox_ints
         .iter()
         .map(|bi| (bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon))
@@ -829,13 +829,22 @@ where
         return Ok(());
     }
 
-    let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
+    let decode_threads = crate::host::sized_workers(
+        &*host.resources,
+        crate::tunables::DECODE_WORKERS_RESERVED,
+        crate::tunables::DECODE_WORKERS_MIN,
+        crate::tunables::DECODE_WORKERS_FALLBACK,
+    );
 
     type WorkerResult = crate::error::Result<(Vec<Vec<OwnedBlock>>, Vec<u64>)>;
 
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(
+        crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
+    );
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, MultiNodeCI)>(32);
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, MultiNodeCI)>(
+        crate::tunables::POOL_RESULT_CHANNEL_DEPTH,
+    );
 
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
@@ -873,7 +882,10 @@ where
                         read_buf.resize(data_size, 0);
                         file.read_exact_at(&mut read_buf, data_offset)
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-                        let mut buf = crate::blob::pool_get(Some(&worker_pool), data_size * 4);
+                        let mut buf = crate::blob::pool_get(
+                            Some(&worker_pool),
+                            data_size * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
+                        );
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = PrimitiveBlock::from_vec_pooled_with_scratch(
                             buf,
@@ -912,7 +924,9 @@ where
 
         // Pre-insert passthrough items into the reorder buffer.
         let mut reorder: crate::reorder_buffer::ReorderBuffer<MultiNodeCI> =
-            crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+            crate::reorder_buffer::ReorderBuffer::with_capacity(
+                crate::tunables::POOL_REORDER_CAPACITY,
+            );
         for &(local_seq, frame_offset, frame_size, count) in &passthrough_items {
             reorder.push(
                 local_seq,
@@ -1021,14 +1035,23 @@ where
         return Ok(());
     }
 
-    let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
+    let decode_threads = crate::host::sized_workers(
+        &*host.resources,
+        crate::tunables::DECODE_WORKERS_RESERVED,
+        crate::tunables::DECODE_WORKERS_MIN,
+        crate::tunables::DECODE_WORKERS_FALLBACK,
+    );
 
     // Worker result: per-region OwnedBlocks + per-region counts.
     type WorkerResult = crate::error::Result<(Vec<Vec<OwnedBlock>>, Vec<u64>)>;
 
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(
+        crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
+    );
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, WorkerResult)>(32);
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, WorkerResult)>(
+        crate::tunables::POOL_RESULT_CHANNEL_DEPTH,
+    );
 
     std::thread::scope(|scope| -> Result<()> {
         // Dispatcher: feed schedule items to workers with local sequence index.
@@ -1068,7 +1091,10 @@ where
                         read_buf.resize(data_size, 0);
                         file.read_exact_at(&mut read_buf, data_offset)
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-                        let mut buf = crate::blob::pool_get(Some(&worker_pool), data_size * 4);
+                        let mut buf = crate::blob::pool_get(
+                            Some(&worker_pool),
+                            data_size * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
+                        );
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = PrimitiveBlock::from_vec_pooled_with_scratch(
                             buf,
@@ -1108,7 +1134,9 @@ where
 
         // Consumer: receive N-region results in order, write to N writers.
         let mut reorder: crate::reorder_buffer::ReorderBuffer<WorkerResult> =
-            crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+            crate::reorder_buffer::ReorderBuffer::with_capacity(
+                crate::tunables::POOL_REORDER_CAPACITY,
+            );
 
         for (s, item) in result_rx {
             reorder.push(s, item);

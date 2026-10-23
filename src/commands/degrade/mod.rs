@@ -99,8 +99,7 @@ use crate::writer::{
 };
 use crate::{Element, ElementReader};
 
-/// Batch size for the parallel-framing fan-out on the merge thread.
-const FRAME_BATCH: usize = 32;
+use crate::tunables::{CORRUPT_INDEXDATA_INFLATION, FRAME_BATCH};
 
 /// Reproducibility contract: map an `ElemKind` to the byte that feeds
 /// `--drop-ids` selection. The exact values (Node=0, Way=1, Relation=2)
@@ -687,10 +686,6 @@ fn degrade_passthrough(
 /// written on purpose.
 const CORRUPT_TAGDATA_KEY: &[u8] = b"pbfhogg:degrade:no-such-key";
 
-/// How far a `--corrupt-indexdata` index overstates the blob it describes.
-/// Large enough that no honest count could coincide with it.
-const CORRUPT_INDEXDATA_INFLATION: i64 = 1_000_000;
-
 /// The lying `BlobIndex` to write for one blob, or `None` when no
 /// index-corrupting flag is active.
 ///
@@ -1126,7 +1121,8 @@ fn run_kind_phase(
     }
 
     type PhaseResult = std::result::Result<WorkerOutput, String>;
-    let mut reorder: ReorderBuffer<PhaseResult> = ReorderBuffer::with_capacity(32);
+    let mut reorder: ReorderBuffer<PhaseResult> =
+        ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY);
 
     let mut bb = BlockBuilder::with_element_cap_prealloc(block_cap, prealloc_bound);
     let mut output: Vec<OwnedBlock> = Vec::new();

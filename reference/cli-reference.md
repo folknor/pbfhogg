@@ -674,7 +674,7 @@ pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O |
 | `--force` | Proceed even if input lacks indexdata |
-| `--allow-version-regression` | Accept a change whose `version` does not advance past the version already held for that object. Off by default: precedence is by version, not by position, so applying the same OSC twice or feeding diffs out of sequence order is an error naming both versions rather than a silent downgrade. Deletes count -- a delete leaves a versioned tombstone, so a later stale create or modify is refused too. Elements claiming no `version` are unaffected. See DEVIATIONS.md. |
+| `--allow-version-regression` | Accept a change whose `version` is lower than the version already held for that object. Off by default: precedence is by version, not by position, so feeding diffs out of sequence order is an error naming both versions rather than a silent downgrade. An equal version is always accepted and the later change wins by position (overlapping diffs, regional-extract deletes at the held version). Deletes count -- a delete leaves a versioned tombstone, so a later stale create or modify is refused too. Elements claiming no `version` are unaffected. See DEVIATIONS.md. |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
@@ -690,7 +690,7 @@ pbfhogg merge-changes [OPTIONS] --output <OUTPUT> <CHANGES>...
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `--simplify` | Keep only the last change per object (type + id) |
-| `--allow-version-regression` | Requires `--simplify`, which is the mode that resolves conflicts; passing it alone is a usage error. Accepts a later change whose `version` does not advance past one seen earlier in input order. Off by default, so listing the inputs out of sequence order is an error rather than a silent downgrade. Default (non-simplify) mode preserves the full stream in input order and resolves nothing, so there is nothing for the flag to allow. See DEVIATIONS.md. |
+| `--allow-version-regression` | Requires `--simplify`, which is the mode that resolves conflicts; passing it alone is a usage error. Accepts a later change whose `version` is lower than one seen earlier in input order. Off by default, so listing the inputs out of sequence order is an error rather than a silent downgrade. An equal version is always accepted and the later change wins. Default (non-simplify) mode preserves the full stream in input order and resolves nothing, so there is nothing for the flag to allow. See DEVIATIONS.md. |
 | `-j, --jobs <N>` | Parallel worker threads. `1` forces sequential, `0` (default) auto-picks from `available_parallelism()`, higher values cap the pool. Affects both the per-input parse fan-out (capped by input count) and the simplify path's chunk fan-out. |
 
 ### build-geocode-index

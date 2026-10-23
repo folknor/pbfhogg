@@ -38,8 +38,11 @@ use crate::BoxResult as Result;
 /// input PBF.
 pub(crate) type ScheduleEntry = (usize, u64, usize);
 
-const WILLNEED_COALESCE_GAP_BYTES: u64 = 4 * 1024;
-const WILLNEED_WINDOW_BYTES: u64 = 256 * 1024 * 1024;
+use crate::tunables::{
+    DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN, DECODE_WORKERS_RESERVED,
+    DECOMPRESS_EXPANSION_GUESS, POOL_DESCRIPTOR_CHANNEL_DEPTH, POOL_RESULT_CHANNEL_DEPTH,
+    WILLNEED_COALESCE_GAP_BYTES, WILLNEED_WINDOW_BYTES,
+};
 
 fn blob_body_within_file(data_offset: u64, data_size: usize, file_size: u64) -> bool {
     data_offset
@@ -174,7 +177,12 @@ impl WillneedPrefetch {
 fn resolve_thread_count(threads: Option<usize>, resources: &dyn crate::host::Resources) -> usize {
     match threads {
         Some(n) if n > 0 => n,
-        _ => crate::host::sized_workers(resources, 2, 1, 4),
+        _ => crate::host::sized_workers(
+            resources,
+            DECODE_WORKERS_RESERVED,
+            DECODE_WORKERS_MIN,
+            DECODE_WORKERS_FALLBACK,
+        ),
     }
 }
 
@@ -518,10 +526,12 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
 
     let decode_threads = resolve_thread_count(threads, resources);
 
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<ScheduleEntry>(16);
+    let (desc_tx, desc_rx) =
+        std::sync::mpsc::sync_channel::<ScheduleEntry>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (result_tx, result_rx) =
-        std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(32);
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(
+        POOL_RESULT_CHANNEL_DEPTH,
+    );
 
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
@@ -559,7 +569,10 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
                         read_buf.resize(data_size, 0);
                         file.read_exact_at(&mut read_buf, data_offset)
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-                        let mut buf = crate::blob::pool_get(Some(&worker_pool), data_size * 4);
+                        let mut buf = crate::blob::pool_get(
+                            Some(&worker_pool),
+                            data_size * DECOMPRESS_EXPANSION_GUESS,
+                        );
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
                             buf,
@@ -687,10 +700,13 @@ pub(crate) fn parallel_classify_phase_ordered<S: Send, R: Send>(
     let decode_threads = resolve_thread_count(threads, resources);
 
     let credit: OrderedCredit = (std::sync::Mutex::new((0, false)), std::sync::Condvar::new());
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, ScheduleEntry)>(16);
+    let (desc_tx, desc_rx) =
+        std::sync::mpsc::sync_channel::<(usize, ScheduleEntry)>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (result_tx, result_rx) =
-        std::sync::mpsc::sync_channel::<(usize, usize, crate::error::Result<R>)>(32);
+        std::sync::mpsc::sync_channel::<(usize, usize, crate::error::Result<R>)>(
+            POOL_RESULT_CHANNEL_DEPTH,
+        );
 
     std::thread::scope(|scope| -> Result<()> {
         let credit_ref = &credit;
@@ -736,7 +752,10 @@ pub(crate) fn parallel_classify_phase_ordered<S: Send, R: Send>(
                         read_buf.resize(data_size, 0);
                         file.read_exact_at(&mut read_buf, data_offset)
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-                        let mut buf = crate::blob::pool_get(Some(&worker_pool), data_size * 4);
+                        let mut buf = crate::blob::pool_get(
+                            Some(&worker_pool),
+                            data_size * DECOMPRESS_EXPANSION_GUESS,
+                        );
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
                             buf,
@@ -816,10 +835,12 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
 
     let decode_threads = resolve_thread_count(threads, resources);
 
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<ScheduleEntry>(16);
+    let (desc_tx, desc_rx) =
+        std::sync::mpsc::sync_channel::<ScheduleEntry>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (result_tx, result_rx) =
-        std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(32);
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(
+        POOL_RESULT_CHANNEL_DEPTH,
+    );
 
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
@@ -954,7 +975,8 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
 
     let decode_threads = resolve_thread_count(threads, resources);
 
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<ScheduleEntry>(16);
+    let (desc_tx, desc_rx) =
+        std::sync::mpsc::sync_channel::<ScheduleEntry>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (result_tx, result_rx) =
         std::sync::mpsc::sync_channel::<crate::error::Result<S>>(decode_threads);
@@ -996,7 +1018,10 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
                         read_buf.resize(data_size, 0);
                         file.read_exact_at(&mut read_buf, data_offset)
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-                        let mut buf = crate::blob::pool_get(Some(&worker_pool), data_size * 4);
+                        let mut buf = crate::blob::pool_get(
+                            Some(&worker_pool),
+                            data_size * DECOMPRESS_EXPANSION_GUESS,
+                        );
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
                             buf,

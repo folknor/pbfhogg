@@ -5,10 +5,10 @@ use std::time::Instant;
 
 use crate::{Element, MemberId};
 
-use super::{NODE_ID_FLOOR, RELATION_ID_FLOOR, WAY_ID_FLOOR};
 use crate::BoxResult as Result;
 use crate::idset::IdSet;
 use crate::scan::classify::{build_classify_schedules_split, parallel_classify_phase};
+use crate::tunables::{NODE_ID_FLOOR, RELATION_ID_FLOOR, WAY_ID_FLOOR};
 
 /// A single missing reference entry (populated when `show_ids` is true).
 pub struct MissingRef {

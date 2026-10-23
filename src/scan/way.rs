@@ -26,18 +26,7 @@ pub(crate) struct WayGeocodeFlags {
     pub(crate) is_interp: bool,
 }
 
-/// Shared vocabulary for the wire scanner and decoded-way classifier.
-pub(crate) const GEOCODE_EXCLUDED_HIGHWAYS: [&[u8]; 9] = [
-    b"footway",
-    b"path",
-    b"track",
-    b"steps",
-    b"cycleway",
-    b"service",
-    b"pedestrian",
-    b"bridleway",
-    b"construction",
-];
+use crate::tunables::GEOCODE_EXCLUDED_HIGHWAYS;
 
 impl WayGeocodeFlags {
     /// Both passes supply presence bits; only the representation-specific

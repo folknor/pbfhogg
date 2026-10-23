@@ -759,7 +759,8 @@ fn run_kind_phase(
     };
 
     type PhaseResult = std::result::Result<(Vec<Vec<u8>>, u64), String>;
-    let mut reorder: ReorderBuffer<PhaseResult> = ReorderBuffer::with_capacity(64);
+    let mut reorder: ReorderBuffer<PhaseResult> =
+        ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY_WIDE);
     let mut total_blobs: u64 = 0;
     let mut total_elements: u64 = 0;
     let mut write_error: Option<Box<dyn std::error::Error>> = None;

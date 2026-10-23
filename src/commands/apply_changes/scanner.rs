@@ -374,7 +374,7 @@ fn dispatch_item(
 
 /// Rough byte cost of a `ScannerEmit` for high-water accounting.
 fn scanner_emit_cost(item: &ScannerEmit) -> usize {
-    const DESCRIPTOR_OVERHEAD: usize = 64;
+    use crate::tunables::DESCRIPTOR_OVERHEAD;
     match item {
         ScannerEmit::Drain(d) => d.byte_cost(),
         ScannerEmit::Candidate(ScannedBlob::Passthrough(d) | ScannedBlob::Candidate(d)) => {

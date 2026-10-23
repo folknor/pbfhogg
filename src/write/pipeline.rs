@@ -7,54 +7,13 @@
 //! module is part of the public library API.
 
 use crate::reorder_buffer::ReorderBuffer;
+use crate::tunables::{EXECUTOR_IDLE_RECV_TIMEOUT, PIPELINE_DISPATCH_PERMITS, WRITE_AHEAD};
 use crate::write::file_writer::FileWriter;
 use crate::write::metrics::WRITER_METRICS;
 use std::io::{self, Write};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
-
-/// Capacity of the ordered channel between producers and the writer thread.
-///
-/// # Why this equals [`PIPELINE_DISPATCH_PERMITS`]
-///
-/// The channel has room for one full batch of dispatches. Permits bound tasks
-/// dispatched but not yet sent: each sender returns its permit after sending,
-/// even while its item is still buffered. They therefore do not bound channel
-/// occupancy together with active tasks, or items held in the reorder buffer.
-///
-/// A send can block on a full channel while the writer is inside `write_chunk`.
-/// This cannot create a scheduling deadlock with framing: the writer uses a
-/// dedicated OS thread and receives items into its `ReorderBuffer` without
-/// waiting for a particular seq. It can drain the channel even when all rayon
-/// workers are blocked in sends. Only writing ready items is ordered by seq.
-///
-/// Backpressure comes from both the producer's permit wait and channel sends.
-pub(crate) const WRITE_AHEAD: usize = PIPELINE_DISPATCH_PERMITS;
-
-/// Maximum number of in-flight rayon dispatches in the pipelined writer.
-///
-/// Counting-semaphore cap that bounds how many uncompressed block `Vec<u8>`s
-/// can be owned by rayon closures simultaneously (queued, being compressed,
-/// or waiting on the bounded output channel). Without this, `rayon::spawn`'s
-/// unbounded internal task queue grows without limit when the producer side
-/// out-runs compression throughput - exactly what happened in commit
-/// `e7219f0` on planet when parallel pass 1 / stage 2a / stage 2d started
-/// emitting blocks faster than zlib:6 could drain them, killing pbfhogg via
-/// OOM at 26 GB anon RSS.
-///
-/// Memory bound: `PIPELINE_DISPATCH_PERMITS × max_block_size`. At ~4 MB per
-/// uncompressed block and 64 permits that's ~256 MB worst case, small
-/// compared to the 2.79 GB stage-2b peak.
-pub(crate) const PIPELINE_DISPATCH_PERMITS: usize = 64;
-
-/// Keep room for a full batch of dispatches when changing either capacity.
-/// This is a buffering choice; liveness comes from the writer's independent,
-/// unordered receive loop, as described in [`WRITE_AHEAD`].
-const _: () = assert!(
-    WRITE_AHEAD >= PIPELINE_DISPATCH_PERMITS,
-    "WRITE_AHEAD must have room for a full batch of dispatches"
-);
 
 /// One unit of output the writer thread can consume, independent of backend.
 ///
@@ -301,13 +260,11 @@ pub(super) fn recv_permit(
             Err(TryRecvError::Disconnected) => break Err(RecvError),
             Err(TryRecvError::Empty) => match executor.yield_now() {
                 Some(rayon::Yield::Executed) => {}
-                Some(rayon::Yield::Idle) => {
-                    match rx.recv_timeout(std::time::Duration::from_millis(1)) {
-                        Ok(()) => break Ok(()),
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => break Err(RecvError),
-                    }
-                }
+                Some(rayon::Yield::Idle) => match rx.recv_timeout(EXECUTOR_IDLE_RECV_TIMEOUT) {
+                    Ok(()) => break Ok(()),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break Err(RecvError),
+                },
                 None => break rx.recv(),
             },
         }

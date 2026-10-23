@@ -54,11 +54,7 @@ use crate::owned::{
 use crate::writer::{Compression, PbfWriter, frame_blob_pipelined};
 use crate::{Element, ElementReader};
 
-/// Batch size for the parallel-framing fan-out on the merge thread. The
-/// merge thread accumulates `OwnedBlock`s in seq order as the central
-/// builder flushes; once a batch is full it is framed in parallel via
-/// rayon and the framed bytes are written in seq order.
-const FRAME_BATCH: usize = 32;
+use crate::tunables::FRAME_BATCH;
 
 /// Per-run statistics from a repack operation.
 pub struct RepackStats {
@@ -400,7 +396,8 @@ fn run_kind_phase(
     type PhaseResult = std::result::Result<WorkerOutput, String>;
     // Reorder buffer depth: enough to absorb decode-thread variance
     // without holding too many decoded payloads in flight.
-    let mut reorder: ReorderBuffer<PhaseResult> = ReorderBuffer::with_capacity(32);
+    let mut reorder: ReorderBuffer<PhaseResult> =
+        ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY);
 
     // Same bound as the workers', derived from the input instead of a block:
     // the file cannot deliver more elements than it has bytes (an element

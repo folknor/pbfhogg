@@ -28,15 +28,7 @@ use std::sync::Arc;
 use crate::blob::{BlobKind, parse_blob_header_with_index};
 use crate::blob_meta::BlobIndex;
 use crate::error::Result;
-
-/// Size of the initial header probe `pread` per blob. One page covers the
-/// 4-byte length prefix plus the header bytes for essentially every blob
-/// in real PBFs; the fallback path in `next_header` handles the rare
-/// exception where a blob's header exceeds the probe window.
-const HEADER_PROBE_SIZE: usize = 4096;
-
-/// Number of leading frames sampled when estimating a file's blob count.
-const SAMPLE_CAP: usize = 1_000;
+use crate::tunables::{HEADER_PROBE_SIZE, SAMPLE_CAP};
 
 /// Estimate of the OSMData blob count of a PBF, from a bounded probe walk of
 /// leading blob headers.
@@ -59,9 +51,6 @@ pub(crate) enum ScanArm {
     Walker,
     FullScan,
 }
-
-/// Blob-count policy boundary measured in `reference/blob-density.md`.
-pub(crate) const FULL_SCAN_ARM_MIN_BLOBS: u64 = 150_000;
 
 /// Estimate the number of OSMData frames using a bounded header-only probe.
 ///
@@ -127,7 +116,7 @@ pub(crate) fn estimate_blob_count(
 }
 
 /// Pure policy: pipelined at or above `min_blobs`, walker below. Callers pass
-/// [`FULL_SCAN_ARM_MIN_BLOBS`]; tests inject a threshold a small fixture can
+/// [`crate::tunables::FULL_SCAN_ARM_MIN_BLOBS`]; tests inject a threshold a small fixture can
 /// cross.
 pub(crate) fn choose_scan_arm_at(estimate: &BlobCountEstimate, min_blobs: u64) -> ScanArm {
     if estimate.osmdata_blobs >= min_blobs {
@@ -404,11 +393,9 @@ impl HeaderWalker {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BlobCountEstimate, FULL_SCAN_ARM_MIN_BLOBS, SAMPLE_CAP, ScanArm, choose_scan_arm_at,
-        estimate_blob_count,
-    };
+    use super::{BlobCountEstimate, SAMPLE_CAP, ScanArm, choose_scan_arm_at, estimate_blob_count};
     use crate::block_builder::{BlockBuilder, HeaderBuilder};
+    use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
     use crate::writer::{Compression, PbfWriter};
 
     #[test]

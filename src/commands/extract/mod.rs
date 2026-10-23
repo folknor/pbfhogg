@@ -402,8 +402,13 @@ pub fn parse_extract_config_with_output_directory(
     if extracts_arr.is_empty() {
         return Err("'extracts' array must not be empty".into());
     }
-    if extracts_arr.len() > 500 {
-        return Err(format!("too many extracts: {} (max 500)", extracts_arr.len()).into());
+    if extracts_arr.len() > crate::tunables::MAX_EXTRACTS {
+        return Err(format!(
+            "too many extracts: {} (max {})",
+            extracts_arr.len(),
+            crate::tunables::MAX_EXTRACTS
+        )
+        .into());
     }
 
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));

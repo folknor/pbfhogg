@@ -40,6 +40,8 @@ use std::thread::JoinHandle;
 
 use flate2::write::GzEncoder;
 
+pub use crate::tunables::DEFAULT_CHUNK_SIZE;
+use crate::tunables::{GZIP_REORDER_PERMIT_POLL, QUEUE_SLOTS_PER_WORKER};
 use crate::write::metrics::WRITER_METRICS;
 use crate::write::pool_failure::FirstFailure;
 
@@ -110,19 +112,6 @@ pub mod test_hooks {
         BARRIERS_QUEUED.fetch_add(1, Ordering::SeqCst);
     }
 }
-
-/// Default chunk size: 2 MB uncompressed per gzip member. Larger chunks
-/// amortize the 18-byte per-member framing and let DEFLATE find more
-/// cross-sequence matches; smaller chunks expose more parallelism at
-/// the worker pool. 2 MB is the `pigz` default and matches reviewer
-/// consensus for typical text-like workloads.
-pub const DEFAULT_CHUNK_SIZE: usize = 2 * 1024 * 1024;
-
-/// Bounded channel depth for both raw-in and compressed-out queues.
-/// Sized at `2 * worker_count` so a full queue on either side
-/// backpressures the producer thread naturally without starving the
-/// pool.
-const QUEUE_SLOTS_PER_WORKER: usize = 2;
 
 /// Compression level used for every gzip member. `Compression::fast`
 /// (DEFLATE level 1) matches what the serial `assemble_osc` path used
@@ -346,7 +335,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
             }
             match self
                 .reorder_permit_rx
-                .recv_timeout(std::time::Duration::from_millis(25))
+                .recv_timeout(GZIP_REORDER_PERMIT_POLL)
             {
                 Ok(()) => break Ok(()),
                 Err(RecvTimeoutError::Timeout) => {}

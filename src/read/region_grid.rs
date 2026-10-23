@@ -12,8 +12,7 @@ const LON_MAX_CELL: i64 = 3599;
 const LAT_MAX_CELL: i64 = 1799;
 const LON_OFFSET_DMD: i64 = 1_800_000_000;
 const LAT_OFFSET_DMD: i64 = 900_000_000;
-const GRID_MAX_INDEX_BYTES: u64 = 256 * 1024 * 1024;
-const GRID_MAX_PAIRS: u64 = GRID_MAX_INDEX_BYTES / 4;
+use crate::tunables::GRID_MAX_PAIRS;
 
 /// A compressed sparse row grid of region bounding-box coverage.
 ///

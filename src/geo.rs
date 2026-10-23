@@ -361,7 +361,7 @@ pub fn point_to_segment_distance_sq(
     let dy = by - ay;
     let len_sq = dx * dx + dy * dy;
 
-    let t = if len_sq < 1e-30 {
+    let t = if len_sq < crate::tunables::DEGENERATE_SEGMENT_EPSILON {
         0.0
     } else {
         let dot = ((px - ax) * cos_lat) * dx + (py - ay) * dy;
@@ -476,7 +476,7 @@ fn dp_split(pts: &[(f64, f64)], start: usize, end: usize, epsilon_sq: f64) -> Op
     for (i, &(px, py)) in pts.iter().enumerate().skip(start + 1).take(end - start - 1) {
         let rx = px - ax;
         let ry = py - ay;
-        let dist = if len_sq < 1e-30 {
+        let dist = if len_sq < crate::tunables::DEGENERATE_SEGMENT_EPSILON {
             rx * rx + ry * ry
         } else {
             let t = ((rx * dx + ry * dy) / len_sq).clamp(0.0, 1.0);
@@ -528,10 +528,8 @@ pub fn assemble_rings(segments: &[&[(i32, i32)]]) -> Vec<Vec<(i32, i32)>> {
     assemble_rings_search(segments, None).unwrap_or_default()
 }
 
-/// Headroom, in segment placements, that [`ring_search_budget`] grants on top
-/// of its quadratic allowance. It is spent only at branching endpoints.
 #[cfg(feature = "commands")]
-pub(crate) const RING_SEARCH_EXTRA_STEPS: u64 = 1 << 20;
+use crate::tunables::RING_SEARCH_EXTRA_STEPS;
 
 /// Step budget for [`assemble_rings_bounded`] over `segment_count` segments.
 ///
@@ -986,7 +984,7 @@ mod tests {
         for (i, pt) in pts.iter().enumerate().take(end).skip(start + 1) {
             let px = pt.0 - ax;
             let py = pt.1 - ay;
-            let dist = if len_sq < 1e-30 {
+            let dist = if len_sq < crate::tunables::DEGENERATE_SEGMENT_EPSILON {
                 (px * px + py * py).sqrt()
             } else {
                 let t = ((px * dx + py * dy) / len_sq).clamp(0.0, 1.0);

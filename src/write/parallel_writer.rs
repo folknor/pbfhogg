@@ -54,29 +54,10 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{Scope, ScopedJoinHandle};
 
 use crate::reorder_buffer::ReorderBuffer;
+use crate::tunables::{PER_WORKER_CAPACITY, POOL_SIZE, WRITE_AHEAD};
 use crate::write::metrics::WRITER_METRICS;
-use crate::write::pipeline::{
-    OutputChunk, PipelineItem, SeqTotal, WRITE_AHEAD, check_stream_complete,
-};
+use crate::write::pipeline::{OutputChunk, PipelineItem, SeqTotal, check_stream_complete};
 use crate::write::pool_failure::FirstFailure;
-
-/// Number of worker threads doing `pwrite`s / `copy_file_range`s in
-/// parallel. 16 is the empirical planet-bench value (commit `80b37dfb`,
-/// 2026-04-21, raising it from 4); the smaller settings leave disk
-/// bandwidth on the table. Could become a CLI flag later.
-///
-/// The doc here used to justify 8 while the constant read 16, because
-/// that commit changed the number and rewrote the prose around a value
-/// it did not use.
-pub(crate) const POOL_SIZE: usize = 16;
-
-/// Per-worker channel capacity. Kept small so the writer thread's
-/// dispatch doesn't outrun the pool; each WriteOp holds a full owned
-/// `Vec<u8>` (~800 KB for the rewrite path), so
-/// `PER_WORKER_CAPACITY` × `POOL_SIZE` × 800 KB ≈ 100 MB buffered
-/// across the pool at the current 8 × 16 - within the pipeline's
-/// existing memory budget, but note it scales with `POOL_SIZE`.
-pub(crate) const PER_WORKER_CAPACITY: usize = 8;
 
 /// One unit of work dispatched from the writer-thread to the pool.
 /// Carries the pre-computed output offset; workers do not compute or

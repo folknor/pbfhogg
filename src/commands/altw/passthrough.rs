@@ -375,7 +375,12 @@ pub(super) fn write_output_passthrough(
         host,
     )?;
 
-    let decode_threads = crate::host::sized_workers(&*host.resources, 2, 1, 4);
+    let decode_threads = crate::host::sized_workers(
+        &*host.resources,
+        crate::tunables::DECODE_WORKERS_RESERVED,
+        crate::tunables::DECODE_WORKERS_MIN,
+        crate::tunables::DECODE_WORKERS_FALLBACK,
+    );
 
     // Schedule composition diagnostics.
     {
@@ -427,9 +432,12 @@ pub(super) fn write_output_passthrough(
     let mut p2_pt_blobs: u64 = 0;
 
     type DecodedItem = (usize, std::result::Result<(Vec<OwnedBlock>, Stats), String>);
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(16);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(
+        crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
+    );
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
+    let (decoded_tx, decoded_rx) =
+        std::sync::mpsc::sync_channel::<DecodedItem>(crate::tunables::POOL_RESULT_CHANNEL_DEPTH);
 
     let batches_dispatched = AtomicI64::new(0);
 

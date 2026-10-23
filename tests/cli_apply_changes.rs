@@ -23,16 +23,12 @@
 //! Where a stats assertion is redundant with an element-set
 //! assertion it is dropped.
 //!
-//! `merge_cross_validate_osmium` keeps `#[ignore = "external"]` per
-//! the in-tree escape-hatch convention (reference/testing.md >
-//! "External cross-validation"). brokkr's `verify_merge` already
-//! applies the same delete-set tolerance, so it is a retirement
-//! candidate.
+//! Cross-validation against osmium on real data is `brokkr verify
+//! merge`, not a test here.
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::too_many_lines)]
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -46,7 +42,7 @@ use crate::common::{
 use flate2::write::GzEncoder;
 use pbfhogg::block_builder::{self, BlockBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};
-use pbfhogg::{BlobDecode, BlobReader, Element, MemberId, MemberType};
+use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -132,7 +128,6 @@ struct ApplyOpts {
     jobs: Option<usize>,
     direct_io: bool,
     io_uring: bool,
-    timeout: Option<std::time::Duration>,
 }
 
 fn run_apply_changes(base: &Path, osc: &Path, output: &Path, opts: ApplyOpts) -> CliOutput {
@@ -142,9 +137,6 @@ fn run_apply_changes(base: &Path, osc: &Path, output: &Path, opts: ApplyOpts) ->
         .arg(osc)
         .arg("-o")
         .arg(output);
-    if let Some(timeout) = opts.timeout {
-        cli = cli.timeout(timeout);
-    }
     if opts.locations_on_ways {
         cli = cli.arg("--locations-on-ways");
     }
@@ -2342,295 +2334,4 @@ mod platform {
             out.stderr_str(),
         );
     }
-}
-
-// ---------------------------------------------------------------------------
-// External cross-validation (escape hatch; redundant with brokkr verify)
-// ---------------------------------------------------------------------------
-//
-// brokkr's verify_merge applies the same delete-set tolerance
-// (osmium-only IDs in the input OSC delete set are expected, because
-// osmium deletes version-conditionally while pbfhogg deletes
-// unconditionally), so this test is redundant with
-// `brokkr verify merge` and survives only as an
-// `#[ignore = "external"]` escape hatch.
-
-#[derive(Debug, PartialEq)]
-struct CmpNode {
-    lat: i32,
-    lon: i32,
-    tags: Vec<(String, String)>,
-}
-
-#[derive(Debug, PartialEq)]
-struct CmpWay {
-    refs: Vec<i64>,
-    tags: Vec<(String, String)>,
-}
-
-#[derive(Debug, PartialEq)]
-struct CmpRelation {
-    members: Vec<(i64, String, String)>,
-    tags: Vec<(String, String)>,
-}
-
-struct CmpContents {
-    nodes: HashMap<i64, CmpNode>,
-    ways: HashMap<i64, CmpWay>,
-    relations: HashMap<i64, CmpRelation>,
-}
-
-fn read_all_for_comparison(path: &Path) -> CmpContents {
-    let reader = BlobReader::from_path(path).expect("open pbf");
-    let mut contents = CmpContents {
-        nodes: HashMap::new(),
-        ways: HashMap::new(),
-        relations: HashMap::new(),
-    };
-    for blob in reader {
-        let blob = blob.expect("read blob");
-        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
-            for element in block.elements() {
-                match element {
-                    Element::DenseNode(dn) => {
-                        let mut tags: Vec<(String, String)> = dn
-                            .tags()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect();
-                        tags.sort();
-                        contents.nodes.insert(
-                            dn.id(),
-                            CmpNode {
-                                lat: dn.decimicro_lat(),
-                                lon: dn.decimicro_lon(),
-                                tags,
-                            },
-                        );
-                    }
-                    Element::Node(n) => {
-                        let mut tags: Vec<(String, String)> = n
-                            .tags()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect();
-                        tags.sort();
-                        contents.nodes.insert(
-                            n.id(),
-                            CmpNode {
-                                lat: n.decimicro_lat(),
-                                lon: n.decimicro_lon(),
-                                tags,
-                            },
-                        );
-                    }
-                    Element::Way(w) => {
-                        let refs: Vec<i64> = w.refs().collect();
-                        let mut tags: Vec<(String, String)> = w
-                            .tags()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect();
-                        tags.sort();
-                        contents.ways.insert(w.id(), CmpWay { refs, tags });
-                    }
-                    Element::Relation(r) => {
-                        let members: Vec<(i64, String, String)> = r
-                            .members()
-                            .map(|m| {
-                                let type_str = match m.id.member_type() {
-                                    MemberType::Node => "node",
-                                    MemberType::Way => "way",
-                                    MemberType::Relation => "relation",
-                                    MemberType::Unknown(_) => "unknown",
-                                    _ => "unknown",
-                                };
-                                (
-                                    m.id.id(),
-                                    type_str.to_string(),
-                                    m.role().unwrap_or("").to_string(),
-                                )
-                            })
-                            .collect();
-                        let mut tags: Vec<(String, String)> = r
-                            .tags()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect();
-                        tags.sort();
-                        contents
-                            .relations
-                            .insert(r.id(), CmpRelation { members, tags });
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    contents
-}
-
-fn compare_maps<V: std::fmt::Debug + PartialEq>(
-    label: &str,
-    ours: &HashMap<i64, V>,
-    theirs: &HashMap<i64, V>,
-) -> (u64, Vec<i64>, Vec<i64>) {
-    let mut mismatches = 0u64;
-    for (id, ours_val) in ours {
-        if let Some(theirs_val) = theirs.get(id)
-            && ours_val != theirs_val
-        {
-            if mismatches < 5 {
-                eprintln!(
-                    "{label} {id} mismatch:\n  ours:   {ours_val:?}\n  theirs: {theirs_val:?}"
-                );
-            }
-            mismatches += 1;
-        }
-    }
-    let extra: Vec<i64> = ours
-        .keys()
-        .filter(|id| !theirs.contains_key(id))
-        .copied()
-        .collect();
-    let missing: Vec<i64> = theirs
-        .keys()
-        .filter(|id| !ours.contains_key(id))
-        .copied()
-        .collect();
-    (mismatches, extra, missing)
-}
-
-#[test]
-#[ignore = "external"]
-#[allow(clippy::cognitive_complexity)]
-fn merge_cross_validate_osmium() {
-    let base_pbf = crate::common::test_dataset_path(crate::common::TestDataset::DenmarkRawPbf);
-    let osc = crate::common::test_dataset_path(crate::common::TestDataset::DenmarkOsc4705);
-
-    if !base_pbf.exists() {
-        crate::common::skip(format!("{} not found", base_pbf.display()));
-        return;
-    }
-    if !osc.exists() {
-        crate::common::skip(format!("{} not found", osc.display()));
-        return;
-    }
-
-    let osmium_ok = std::process::Command::new("osmium")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !osmium_ok {
-        crate::common::skip("osmium not found in PATH");
-        return;
-    }
-
-    let scratch = crate::common::test_scratch();
-    let target_dir = scratch.path();
-    let pbfhogg_out = target_dir.join("merge-xval-pbfhogg.osm.pbf");
-    let osmium_out = target_dir.join("merge-xval-osmium.osm.pbf");
-
-    use pbfhogg::osc::OscElementKind;
-    let diff = pbfhogg::osc::parse_osc_file(&osc).expect("parse osc");
-
-    eprintln!("Running pbfhogg apply-changes...");
-    let out = run_apply_changes(
-        &base_pbf,
-        &osc,
-        &pbfhogg_out,
-        ApplyOpts {
-            timeout: Some(std::time::Duration::from_secs(110)),
-            ..ApplyOpts::default()
-        },
-    );
-    assert!(
-        out.status.success(),
-        "apply-changes failed: {}",
-        out.stderr_str()
-    );
-
-    eprintln!("Running osmium apply-changes...");
-    let osmium_result = std::process::Command::new("osmium")
-        .args([
-            "apply-changes",
-            &base_pbf.to_string_lossy(),
-            &osc.to_string_lossy(),
-            "-o",
-            &osmium_out.to_string_lossy(),
-            "-O",
-            "--no-progress",
-        ])
-        .output()
-        .expect("run osmium");
-    assert!(
-        osmium_result.status.success(),
-        "osmium apply-changes failed: {}",
-        String::from_utf8_lossy(&osmium_result.stderr)
-    );
-
-    eprintln!("Reading pbfhogg output...");
-    let ours = read_all_for_comparison(&pbfhogg_out);
-    eprintln!("Reading osmium output...");
-    let theirs = read_all_for_comparison(&osmium_out);
-
-    eprintln!(
-        "pbfhogg: {} nodes, {} ways, {} relations",
-        ours.nodes.len(),
-        ours.ways.len(),
-        ours.relations.len()
-    );
-    eprintln!(
-        "osmium:  {} nodes, {} ways, {} relations",
-        theirs.nodes.len(),
-        theirs.ways.len(),
-        theirs.relations.len()
-    );
-
-    let (node_mm, extra_n, missing_n) = compare_maps("node", &ours.nodes, &theirs.nodes);
-    let (way_mm, extra_w, missing_w) = compare_maps("way", &ours.ways, &theirs.ways);
-    let (rel_mm, extra_r, missing_r) = compare_maps("relation", &ours.relations, &theirs.relations);
-
-    let mut failures = node_mm + way_mm + rel_mm;
-    failures += extra_n.len() as u64 + extra_w.len() as u64 + extra_r.len() as u64;
-
-    if !extra_n.is_empty() {
-        eprintln!("FAIL: {} extra nodes in pbfhogg", extra_n.len());
-    }
-    if !extra_w.is_empty() {
-        eprintln!("FAIL: {} extra ways in pbfhogg", extra_w.len());
-    }
-    if !extra_r.is_empty() {
-        eprintln!("FAIL: {} extra relations in pbfhogg", extra_r.len());
-    }
-
-    eprintln!(
-        "Delete difference: {} nodes, {} ways, {} rels (OSC: {}, {}, {})",
-        missing_n.len(),
-        missing_w.len(),
-        missing_r.len(),
-        diff.deleted_ids(OscElementKind::Node).len(),
-        diff.deleted_ids(OscElementKind::Way).len(),
-        diff.deleted_ids(OscElementKind::Relation).len(),
-    );
-    for id in &missing_n {
-        if !diff.is_deleted(OscElementKind::Node, *id) {
-            eprintln!("FAIL: node {id} missing but NOT in delete set");
-            failures += 1;
-        }
-    }
-    for id in &missing_w {
-        if !diff.is_deleted(OscElementKind::Way, *id) {
-            eprintln!("FAIL: way {id} missing but NOT in delete set");
-            failures += 1;
-        }
-    }
-    for id in &missing_r {
-        if !diff.is_deleted(OscElementKind::Relation, *id) {
-            eprintln!("FAIL: relation {id} missing but NOT in delete set");
-            failures += 1;
-        }
-    }
-
-    assert_eq!(failures, 0, "{failures} total failures");
-    eprintln!("Cross-validation passed.");
-
-    drop(std::fs::remove_file(&pbfhogg_out));
-    drop(std::fs::remove_file(&osmium_out));
 }

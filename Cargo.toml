@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli", "tools/process-trace-shim"]
+members = ["cli"]
 exclude = ["bench/osmpbf-baseline"]
 
 [workspace.dependencies]

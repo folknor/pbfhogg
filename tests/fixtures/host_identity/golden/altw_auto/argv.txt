@@ -1,6 +1,0 @@
-add-locations-to-ways
-<DIR>/inputs/base.osm.pbf
---index-type
-auto
--o
-<DIR>/output

@@ -1,3 +1,0 @@
-inspect
-<DIR>/inputs/base.osm.pbf
---nodes

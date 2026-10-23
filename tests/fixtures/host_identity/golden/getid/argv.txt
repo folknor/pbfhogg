@@ -1,7 +1,0 @@
-getid
-<DIR>/inputs/base.osm.pbf
-n10
-w3
-r1
--o
-<DIR>/output

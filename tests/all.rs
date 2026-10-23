@@ -100,13 +100,8 @@ mod read_paths;
 mod renumber_external;
 mod roundtrip;
 mod roundtrip_invariants;
-mod roundtrip_real;
 #[cfg(feature = "commands")]
 mod tags_count;
 mod tags_filter_osc;
-
-#[cfg(all(feature = "commands", target_os = "linux", target_env = "gnu"))]
-#[cfg(feature = "commands")]
-mod cli_host_identity;
 
 mod host_contract;

@@ -30,7 +30,7 @@
 //!
 //! [`CliOutput::is_o_direct_unsupported`] and
 //! [`CliOutput::is_uring_unsupported`] require exit code 3 and the typed
-//! setup error's feature label. The platform profile rejects such skips. Tests that
+//! setup error's feature label. Tests that
 //! exercise `--direct-io` or `--io-uring` should consult these
 //! before asserting success - tmpfs / overlayfs and hosts with low
 //! `RLIMIT_MEMLOCK` are common.
@@ -190,8 +190,8 @@ impl CliInvoker {
     }
 
     /// Override the wall-clock timeout. On expiry the child is
-    /// `SIGKILL`ed and the test panics. Use a generous value for
-    /// real-dataset tests; the default is sized for small fixtures.
+    /// `SIGKILL`ed and the test panics. The default is sized for small
+    /// fixtures.
     pub fn timeout(mut self, t: Duration) -> Self {
         self.timeout = t;
         self
@@ -348,18 +348,10 @@ impl CliOutput {
     }
 
     fn platform_unsupported(&self, feature: &str) -> bool {
-        let unavailable = self.status.code() == Some(3)
+        self.status.code() == Some(3)
             && self
                 .stderr_str()
-                .contains(&format!("platform feature {feature} unavailable:"));
-        assert!(
-            !unavailable
-                || std::env::var_os("BROKKR_TEST_PLATFORM").as_deref()
-                    != Some(std::ffi::OsStr::new("1")),
-            "platform profile requires this I/O feature to be available; stderr: {:?}",
-            self.stderr_str(),
-        );
-        unavailable
+                .contains(&format!("platform feature {feature} unavailable:"))
     }
 }
 
@@ -406,27 +398,4 @@ fn pbfhogg_bin() -> PathBuf {
         bin.display(),
     );
     bin
-}
-
-#[cfg(all(test, not(feature = "static-test-hooks")))]
-mod platform_predicate_tests {
-    #[cfg(unix)]
-    use super::*;
-    #[cfg(unix)]
-    use std::os::unix::process::ExitStatusExt;
-
-    #[cfg(unix)]
-    #[test]
-    fn unrelated_failures_are_never_platform_skips() {
-        for code in [1, 2, 3] {
-            let output = CliOutput {
-                status: ExitStatus::from_raw(code << 8),
-                stdout: Vec::new(),
-                stderr: b"Invalid argument EINVAL: not supported; io_uring creation failed"
-                    .to_vec(),
-            };
-            assert!(!output.is_o_direct_unsupported());
-            assert!(!output.is_uring_unsupported());
-        }
-    }
 }

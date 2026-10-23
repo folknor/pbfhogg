@@ -1,1 +1,0 @@
-Degraded 345 elements across 5 blobs (applied: --strip-locations)

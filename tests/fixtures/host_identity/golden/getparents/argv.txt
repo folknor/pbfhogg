@@ -1,5 +1,0 @@
-getparents
-<DIR>/inputs/base.osm.pbf
-n1
--o
-<DIR>/output

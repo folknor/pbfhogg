@@ -1,6 +1,0 @@
-extract
-<DIR>/inputs/base.osm.pbf
--c
-<DIR>/inputs/extract.json
--d
-<DIR>/output

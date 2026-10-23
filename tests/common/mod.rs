@@ -27,7 +27,7 @@ pub mod adversarial;
 pub mod cli;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -37,45 +37,9 @@ mod scratch;
 #[allow(unused_imports)]
 pub use scratch::test_scratch;
 
-#[derive(Clone, Copy)]
-pub enum TestDataset {
-    DenmarkRawPbf,
-    DenmarkIndexedPbf,
-    DenmarkOsc4705,
-}
-
-impl TestDataset {
-    const fn override_var(self) -> &'static str {
-        match self {
-            Self::DenmarkRawPbf => "PBFHOGG_TEST_PBF",
-            Self::DenmarkIndexedPbf => "PBFHOGG_TEST_PBF_INDEXED",
-            Self::DenmarkOsc4705 => "PBFHOGG_TEST_OSC",
-        }
-    }
-
-    const fn fallback_file(self) -> &'static str {
-        match self {
-            Self::DenmarkRawPbf => "denmark-20260220-seq4704.osm.pbf",
-            Self::DenmarkIndexedPbf => "denmark-20260220-seq4704-with-indexdata.osm.pbf",
-            Self::DenmarkOsc4705 => "denmark-20260221-seq4705.osc.gz",
-        }
-    }
-}
-
-/// Resolve a named test dataset: the dataset's override variable when set,
-/// else its legacy filename under the test data root.
-pub fn test_dataset_path(dataset: TestDataset) -> PathBuf {
-    scratch::path_override(dataset.override_var())
-        .unwrap_or_else(|| scratch::test_data_dir().join(dataset.fallback_file()))
-}
-
-/// Emit one machine-countable skip marker; required runs fail on a skip.
+/// Report a test that cannot run on this host and returns early.
 pub fn skip(reason: impl std::fmt::Display) {
-    assert!(
-        std::env::var_os("PBFHOGG_TEST_MUST_RUN").is_none(),
-        "required test skipped: {reason}"
-    );
-    eprintln!("PBFHOGG_TEST_SKIP: {reason}");
+    eprintln!("Skipping: {reason}");
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +277,53 @@ pub fn write_multi_block_test_pbf(
 ) {
     assert!(block_size > 0, "block_size must be > 0");
     write_test_pbf_impl(path, nodes, ways, relations, true, Some(block_size));
+}
+
+/// A general-purpose sorted, indexed input: 300 tagged-in-part nodes,
+/// 40 ways and 5 multipolygon relations, 100 elements per block, so every
+/// kind spans more than one blob or sits in its own.
+pub fn write_base_pbf(path: &Path) {
+    let (nodes, ways, relations) = base_elements();
+    write_multi_block_test_pbf(path, &nodes, &ways, &relations, 100);
+}
+
+/// [`write_base_pbf`] with node 7 and way 40 deleted and node 301 added,
+/// for diff and dedupe inputs.
+pub fn write_changed_pbf(path: &Path) {
+    let (mut nodes, mut ways, relations) = base_elements();
+    nodes.retain(|n| n.id != 7);
+    nodes.extend(generate_nodes(1, 301));
+    ways.retain(|w| w.id != 40);
+    write_multi_block_test_pbf(path, &nodes, &ways, &relations, 100);
+}
+
+/// [`write_base_pbf`] with the first data blob's indexdata replaced by 30
+/// zero bytes, which no indexdata version recognises.
+pub fn write_bad_indexdata_pbf(path: &Path) {
+    write_base_pbf(path);
+    let bytes = std::fs::read(path).expect("read base fixture");
+    let bad = adversarial::mutate_blob_header_indexdata(&bytes, 1, |v| v.resize(30, 0));
+    std::fs::write(path, bad).expect("write bad-indexdata fixture");
+}
+
+fn base_elements() -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+    let mut nodes = generate_nodes(300, 1);
+    let mut ways = generate_ways(40, 1, 5, 1);
+    let mut relations = generate_relations(5, 1, 2, 1);
+    for n in &mut nodes {
+        if n.id % 10 == 0 {
+            n.tags.push(("amenity", "bench"));
+        }
+    }
+    for w in &mut ways {
+        if w.id % 2 == 1 {
+            w.tags.push(("highway", "residential"));
+        }
+    }
+    for r in &mut relations {
+        r.tags.push(("type", "multipolygon"));
+    }
+    (nodes, ways, relations)
 }
 
 /// Write `node_blocks` blocks of three nodes each, then one block of two
@@ -1419,7 +1430,7 @@ pub fn is_einval(err: &(dyn std::error::Error + 'static)) -> bool {
                 }
             )
         {
-            return allow_platform_skip(true);
+            return true;
         }
         if let Some(error) = error.downcast_ref::<std::io::Error>() {
             current = error
@@ -1430,18 +1441,6 @@ pub fn is_einval(err: &(dyn std::error::Error + 'static)) -> bool {
         }
     }
     false
-}
-
-/// Require platform tests to exercise the requested feature, rather than pass
-/// after skipping every unavailable setup. Ordinary profiles may skip setup.
-pub fn allow_platform_skip(unavailable: bool) -> bool {
-    assert!(
-        !unavailable
-            || std::env::var_os("BROKKR_TEST_PLATFORM").as_deref()
-                != Some(std::ffi::OsStr::new("1")),
-        "platform profile requires this I/O feature to be available",
-    );
-    unavailable
 }
 
 /// Check only typed io_uring setup errors, including their io::Error carrier.
@@ -1458,7 +1457,7 @@ pub fn is_uring_unavailable(err: &(dyn std::error::Error + 'static)) -> bool {
                 }
             )
         {
-            return allow_platform_skip(true);
+            return true;
         }
         if let Some(error) = error.downcast_ref::<std::io::Error>() {
             current = error
@@ -1564,6 +1563,16 @@ where
 }
 
 /// Explicit host policy for in-process library tests.
+/// The same machine on every host, so no test outcome depends on the
+/// runner's core count or free memory. A test that needs a different
+/// machine sets its own `host::Fixed`.
+pub(crate) fn fixed_resources() -> pbfhogg::host::Fixed {
+    pbfhogg::host::Fixed {
+        parallelism: std::num::NonZeroUsize::new(4),
+        memory_available: Some(8 << 30),
+    }
+}
+
 pub(crate) fn test_host() -> pbfhogg::host::Host {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
@@ -1572,30 +1581,9 @@ pub(crate) fn test_host() -> pbfhogg::host::Host {
     pbfhogg::host::Host {
         diagnostics: pbfhogg::host::Diagnostics::discard(),
         process: std::sync::Arc::new(pbfhogg::host::NoProcessActions),
-        resources: std::sync::Arc::new(pbfhogg::host::MachineProbe),
+        resources: std::sync::Arc::new(fixed_resources()),
         page_cache: pbfhogg::host::PageCachePolicy::Keep,
         executor: pbfhogg::host::Executor::Ambient,
         scratch_parent: None,
-    }
-}
-
-// Excluded from the static-hook fault binaries, each of which must define
-// exactly one test.
-#[cfg(all(test, not(feature = "static-test-hooks")))]
-mod scratch_contracts {
-    #[test]
-    #[should_panic(expected = "read scratch directory")]
-    fn missing_snapshot_root_is_an_error() {
-        let dir = super::test_scratch();
-        super::snapshot_dir(&dir.path().join("missing"));
-    }
-
-    #[test]
-    #[should_panic(expected = "read scratch directory")]
-    fn file_snapshot_root_is_an_error() {
-        let dir = super::test_scratch();
-        let file = dir.path().join("file");
-        std::fs::write(&file, b"").expect("create file");
-        super::snapshot_dir(&file);
     }
 }

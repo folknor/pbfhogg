@@ -1,4 +1,0 @@
-inspect
-<DIR>/inputs/base.osm.pbf
---get
-header.writing_program

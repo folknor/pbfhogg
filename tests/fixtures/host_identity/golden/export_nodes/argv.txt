@@ -1,6 +1,0 @@
-export
-<DIR>/inputs/base.osm.pbf
---type
-node
--o
-<DIR>/output

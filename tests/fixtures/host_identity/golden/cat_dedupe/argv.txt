@@ -1,6 +1,0 @@
-cat
-<DIR>/inputs/base.osm.pbf
-<DIR>/inputs/changed.osm.pbf
---dedupe
--o
-<DIR>/output

@@ -1,2 +1,0 @@
-Warning: BlobHeader.indexdata has an unrecognised length (30 bytes; expected 26 or 42) - blob index ignored, reads fall back to full decode. Further occurrences are not reported.
-Decoded 1 blobs, wrote 0 elements

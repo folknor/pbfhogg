@@ -1,7 +1,0 @@
-tags-filter
-<DIR>/inputs/apply.osc.gz
---input-kind
-osc
-name
--o
-<DIR>/output.osc.gz

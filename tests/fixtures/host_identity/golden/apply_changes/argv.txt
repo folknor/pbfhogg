@@ -1,6 +1,0 @@
-apply-changes
-<DIR>/inputs/apply-base.osm.pbf
-<DIR>/inputs/apply.osc.gz
--o
-<DIR>/output
---force

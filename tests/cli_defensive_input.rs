@@ -485,7 +485,10 @@ fn getparents_rejects_zero_full_scan_min_blobs() {
 /// commands that construct their readers through the host.
 #[test]
 fn bench_commands_report_unrecognised_indexdata() {
-    let input = "tests/fixtures/host_identity/inputs/bad-indexdata.osm.pbf";
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().join("bad-indexdata.osm.pbf");
+    crate::common::write_bad_indexdata_pbf(&path);
+    let input = path.to_str().expect("utf-8 scratch path");
     // Parallel map/reduce and the unfiltered pipeline have always skipped
     // indexdata parsing. Keep that fast path, including its lack of a warning.
     for (mode, warnings) in [

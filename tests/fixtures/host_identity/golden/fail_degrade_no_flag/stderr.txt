@@ -1,1 +1,0 @@
-Error: degrade requires at least one transformation flag (--unsort, --unsort-intra, --strip-locations, --strip-indexdata, --strip-tagdata, --corrupt-tagdata, --corrupt-indexdata, --corrupt-indexdata-kind, --strip-bbox)

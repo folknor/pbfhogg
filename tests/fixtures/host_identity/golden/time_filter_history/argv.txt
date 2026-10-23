@@ -1,5 +1,0 @@
-time-filter
-<DIR>/inputs/history.osm.pbf
--o
-<DIR>/output
-250

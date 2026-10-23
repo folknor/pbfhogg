@@ -1,4 +1,0 @@
-inspect
-<DIR>/inputs/base.osm.pbf
---show
-w3

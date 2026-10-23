@@ -1198,8 +1198,7 @@ fn cat_dedupe_counts_decoded_overlap_runs_as_observed() {
 //
 // `--direct-io` on a filesystem that supports O_DIRECT must produce
 // identical output to the default path. Wrapped in `mod platform` so
-// the brokkr platform profile (T11) can target it via
-// `cargo test platform::`.
+// the brokkr platform profile can target it.
 
 #[cfg(feature = "linux-direct-io")]
 mod platform {

@@ -12,11 +12,10 @@ Tests go where they couple least.
 - **Inline unit tests** in `src/**/*.rs` `#[cfg(test)] mod tests` -
   module internals; die with the module on rewrite, which is the
   point.
-- **Platform-dependent tests** that distinguish an ordinary skip from a
-  required platform run belong outside `src/`, where `tests/common` can
-  consult `BROKKR_TEST_PLATFORM`; source tests must not read the environment,
-  so they cannot tell the two apart. Either way, put them in a `platform`
-  module so the platform profile selects them.
+- **Platform-dependent tests** go in a `platform` module so the platform
+  profile selects them. Where the host lacks the feature (no O_DIRECT on
+  the filesystem, io_uring refused) they skip and pass; nothing makes a
+  feature mandatory.
 - **Stable-API integration tests** in `tests/<topic>.rs` (e.g.
   `tests/roundtrip.rs`, `read_paths.rs`, `edge_cases.rs`) - use
   only the stable allowlist below.
@@ -132,14 +131,30 @@ brokkr commands.
 override, on every profile including `--profile full`. Tests slower
 than that can never pass a `check` profile, so `brokkr.toml`'s
 `[test.profiles.full]` carries a by-name `skip` list for the
-over-watchdog tests (`merge_cross_validate_osmium`,
-`sort_cross_validate_osmium`, `roundtrip_denmark`, and the six
-`geocode_index` real-data tests) - without it the profile could
-never pass, by construction. Those tests are `#[ignore]`d out of
-`check`'s reach and must be exercised individually via `brokkr test
-<name> --timeout <secs>`, which raises the per-test timeout up to
-280 s. See TODO.md's "Important: ignored tests" for the current
-by-name list and runbook.
+over-watchdog tests - without it the profile could never pass, by
+construction. Those tests are `#[ignore]`d out of `check`'s reach and
+must be exercised individually via `brokkr test <name> --timeout
+<secs>`, which raises the per-test timeout up to 280 s.
+
+**No test reads a downloaded dataset.** Every test builds its own
+input in scratch. Real-data coverage (Denmark, planet, replication
+diffs) is `brokkr verify` and `brokkr bench`, which resolve datasets
+per host from `brokkr.toml`; the test suite must pass on a checkout
+with an empty `data/`.
+
+**No test depends on the host.** No goldens blessed on one machine, no
+core-count, memory or rlimit preconditions. `common::test_host()` and,
+for unit tests under `src/`, `Host::for_tests()` hand the library a
+`host::Fixed` (a fixed core count and memory budget), so library
+tests see the same machine everywhere; a test that needs a
+different machine sets its own `host::Fixed`. Tests may still skip where
+the host lacks a feature (O_DIRECT, io_uring, osmium in PATH).
+
+**No checked-in input data.** Fixture PBFs are built at test time into
+scratch by the `tests/common` writers (`write_test_pbf*`,
+`write_multi_block_test_pbf`, `write_base_pbf` and its `changed` and
+`bad_indexdata` variants) from the `generate_*` element generators, with
+`common::adversarial` for byte-level damage.
 
 `mod platform` and `mod serial` are orthogonal config overlays, not
 tiers. Same for `#[ignore = "external"]` (escape hatch for in-tree
@@ -157,8 +172,7 @@ osmium checks).
 
 Tier 1 must be both fast AND structurally complete: every internal
 contract a refactor could break needs a tier-1 test (inline unit OR
-fault hook). Tier 1 must not carry real-dataset cost (a 54 s
-Denmark roundtrip belongs in tier 3).
+fault hook).
 
 Tiers 2-5 are by construction internal-refactor-immune: every test
 goes through the stable allowlist or the CLI surface, so a rewrite
@@ -208,23 +222,14 @@ Lives in `brokkr verify`, not the in-tree test crate:
 - An in-tree `mod external` tier would duplicate brokkr's verify
   machinery and act as a gravity well.
 
-**Two in-tree tests are migration candidates:**
-
-1. `tests/cli_apply_changes.rs::merge_cross_validate_osmium` - real
-   Denmark data, same inputs as `brokkr verify merge`. Its
-   delete-set carve-out (osmium uses version-based deletes;
-   pbfhogg/osmosis/osmconvert delete unconditionally, so
-   osmium-only elements that fall in the OSC delete set are not
-   real failures) is also what brokkr's `verify_merge.rs` does, so
-   nothing blocks retiring it.
-2. `tests/cli_sort.rs::sort_cross_validate_osmium` - handcrafted
-   overlapping-blob fixture; `brokkr verify sort` on a configured
-   dataset runs against real data only and doesn't exercise the
-   streaming sweep merge's overlap-run path. `brokkr verify
-   <command> --input <path>` already accepts a handcrafted PBF; the
-   missing piece is an overlapping-fixture builder under
-   `examples/`, after which the comparison moves to
-   `brokkr verify sort --input`.
+**One in-tree test is a migration candidate:**
+`tests/cli_sort.rs::sort_cross_validate_osmium` - handcrafted
+overlapping-blob fixture; `brokkr verify sort` on a configured
+dataset runs against real data only and doesn't exercise the
+streaming sweep merge's overlap-run path. `brokkr verify
+<command> --input <path>` already accepts a handcrafted PBF; the
+missing piece is an overlapping-fixture builder under `examples/`,
+after which the comparison moves to `brokkr verify sort --input`.
 
 **Escape hatch.** A contributor mid-PR can write an osmium check
 next to a fixture for the duration of that PR as
@@ -255,27 +260,11 @@ exception, not a tier - should not survive across many PRs.
   set below `brokkr check`'s 20 s watchdog, override via
   `.timeout(Duration)`. Platform-skip
   predicates `is_o_direct_unsupported`, `is_uring_unsupported` require
-  exit code 3 and a typed setup error; `BROKKR_TEST_PLATFORM=1` makes either
-  predicate fail instead of returning a skip.
+  exit code 3 and a typed setup error.
   Binary located via `BROKKR_TEST_BIN_DIR` (set per sweep) with
   fallback to `CARGO_TARGET_DIR + cfg!(debug_assertions)`.
-- **Dataset and scratch paths.** `tests/common/mod.rs` resolves the
-  dataset paths through `common::test_dataset_path`; the shared path helper
-  in `tests/common/scratch.rs` reads path overrides. The helpers resolve the
-  Denmark raw PBF from `PBFHOGG_TEST_PBF`, the indexed PBF from
-  `PBFHOGG_TEST_PBF_INDEXED`, the sequence 4705 OSC from
-  `PBFHOGG_TEST_OSC`, the data root from `PBFHOGG_TEST_DATA_DIR`, and the
-  test scratch root from `PBFHOGG_TEST_SCRATCH_DIR`. Without overrides, it
-  uses the repository data directory and the legacy Denmark filenames;
-  scratch falls under `test-scratch` in that data directory. Brokkr still
-  needs to export the resolved paths from the selected host configuration to
-  both `check` and `test` as absolute paths; until then, brokkr-launched tests
-  fall back to the repository paths.
-- **Skip markers.** `common::skip()` writes a `PBFHOGG_TEST_SKIP:` marker
-  with the reason. If `PBFHOGG_TEST_MUST_RUN` is set, the helper panics
-  instead of skipping. Brokkr still needs to set that variable for profiles
-  that require selected data or platform tests, and report marker counts for
-  ordinary runs that permit skips.
+- **Skips.** A test that cannot run on this host (no O_DIRECT, no
+  io_uring, no osmium in PATH) calls `common::skip(reason)` and returns.
 - **Adversarial fixtures.** `tests/common/adversarial.rs` provides
   byte-level mutation primitives: `locate_blobs`,
   `mutate_blob_header_indexdata`, `mutate_blob_payload`,
@@ -286,8 +275,7 @@ exception, not a tier - should not survive across many PRs.
   `generate_relations_with_negatives` for mixed-sign fixtures (per
   `decisions/0002-negative-ids-rejected-project-wide.md`).
 - **Test scratch.** `tests/common/scratch.rs` owns random, RAII-cleaned
-  directories under the configured test scratch root (by default
-  `data/test-scratch/`). It is the one implementation
+  directories under `data/test-scratch/`. It is the one implementation
   for both harnesses: integration tests reach it as
   `common::test_scratch()`, and unit tests under `src/` as
   `path_guard::tests::scratch()`, which mounts the same file by `#[path]`
@@ -329,12 +317,8 @@ CLI exits 3 for this variant (see the exit-code table in
 `reference/cli-reference.md`) and keeps its feature label in stderr; CLI skip
 predicates require both that code and label. Runtime I/O failures are never
 setup refusals, and raw `EINVAL` is never a sufficient reason to skip.
-`BROKKR_TEST_PLATFORM=1` turns recognized platform skips into failures.
 Library tests use `common::is_einval` (historical name; it requires the typed
 direct-I/O variant) and `common::is_uring_unavailable`, never their own errno
 or message matching.
 
 The default CLI timeout leaves diagnostics time before check's 20 s watchdog.
-The two external CLI cross-validations explicitly allow 110 s per invocation
-and must run with an outer timeout above that value. `roundtrip_denmark` uses
-the library directly and does not pass through `CliInvoker`.

@@ -1,6 +1,6 @@
 //! In-process host isolation has no CLI expression, so these tests call the
 //! hidden command entries as well as the public host API.
-use pbfhogg::host::{MachineProbe, ProcessActions, Resources};
+use pbfhogg::host::{ProcessActions, Resources};
 use pbfhogg::process::FdAllowance;
 use std::sync::{
     Arc,
@@ -21,12 +21,15 @@ impl ProcessActions for Actions {
         pbfhogg::process::current_nofile()
     }
 }
-fn input() -> &'static std::path::Path {
-    std::path::Path::new("tests/fixtures/host_identity/inputs/base.osm.pbf")
+fn input(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("base.osm.pbf");
+    crate::common::write_base_pbf(&path);
+    path
 }
 #[test]
 fn process_actions_fire_once_at_each_hook_site() {
     let dir = tempfile::tempdir().expect("directory");
+    let base = input(dir.path());
     let actions = Arc::new(Actions::default());
     let mut host = crate::common::test_host();
     host.process = Arc::clone(&actions) as Arc<dyn ProcessActions>;
@@ -36,7 +39,7 @@ fn process_actions_fire_once_at_each_hook_site() {
         ..Default::default()
     };
     pbfhogg::cat::cat(
-        &[input()],
+        &[&base],
         &dir.path().join("clean.pbf"),
         None,
         &clean,
@@ -53,7 +56,7 @@ fn process_actions_fire_once_at_each_hook_site() {
     );
     actions.alloc.store(0, Relaxed);
     pbfhogg::altw::external::external_join(
-        input(),
+        &base,
         &dir.path().join("external.pbf"),
         true,
         Default::default(),
@@ -70,7 +73,7 @@ fn process_actions_fire_once_at_each_hook_site() {
     );
     actions.fd.store(0, Relaxed);
     pbfhogg::cat::cat(
-        &[input()],
+        &[&base],
         &dir.path().join("cat.pbf"),
         None,
         &Default::default(),
@@ -90,20 +93,21 @@ struct CountingResources(AtomicUsize);
 impl Resources for CountingResources {
     fn parallelism(&self) -> Option<std::num::NonZeroUsize> {
         self.0.fetch_add(1, Relaxed);
-        MachineProbe.parallelism()
+        crate::common::fixed_resources().parallelism()
     }
     fn memory_available(&self) -> Option<u64> {
-        MachineProbe.memory_available()
+        crate::common::fixed_resources().memory_available()
     }
 }
 #[test]
 fn resources_provider_is_consulted() {
     let dir = tempfile::tempdir().expect("directory");
+    let base = input(dir.path());
     let resources = Arc::new(CountingResources(AtomicUsize::new(0)));
     let mut host = crate::common::test_host();
     host.resources = Arc::clone(&resources) as Arc<dyn Resources>;
     pbfhogg::repack::repack(
-        input(),
+        &base,
         &dir.path().join("repack.pbf"),
         8000,
         Default::default(),
@@ -198,12 +202,13 @@ fn unrecognised_indexdata_warning_is_per_handle() {
     let second = pbfhogg::host::Diagnostics::new(
         Arc::clone(&sink) as Arc<dyn pbfhogg::host::DiagnosticSink>
     );
+    let dir = tempfile::tempdir().expect("directory");
+    let bad = dir.path().join("bad-indexdata.osm.pbf");
+    crate::common::write_bad_indexdata_pbf(&bad);
     for (diagnostics, expected) in [(first.clone(), 1), (second, 2), (first, 2)] {
-        let reader = pbfhogg::BlobReader::from_path(
-            "tests/fixtures/host_identity/inputs/bad-indexdata.osm.pbf",
-        )
-        .expect("reader")
-        .diagnostics(diagnostics);
+        let reader = pbfhogg::BlobReader::from_path(&bad)
+            .expect("reader")
+            .diagnostics(diagnostics);
         for blob in reader {
             blob.expect("blob");
         }
@@ -376,9 +381,13 @@ fn swallowed_framing_panics_on_one_worker_fail_flush() {
         "every panic reaches the caller's handler"
     );
 }
-fn run_external_join(output: &std::path::Path, host: &pbfhogg::host::Host) -> Result<(), String> {
+fn run_external_join(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    host: &pbfhogg::host::Host,
+) -> Result<(), String> {
     pbfhogg::altw::external::external_join(
-        input(),
+        input,
         output,
         true,
         Default::default(),
@@ -394,9 +403,10 @@ fn run_external_join(output: &std::path::Path, host: &pbfhogg::host::Host) -> Re
 #[test]
 fn concurrent_external_joins_use_distinct_scratch() {
     let dir = tempfile::tempdir().expect("directory");
+    let base = input(dir.path());
     let host = crate::common::test_host();
     let reference = dir.path().join("reference.pbf");
-    run_external_join(&reference, &host).expect("sequential external join");
+    run_external_join(&base, &reference, &host).expect("sequential external join");
     // Both outputs share one parent, so both runs place their scratch
     // directory beside each other under the same pid.
     let outputs = [dir.path().join("a.pbf"), dir.path().join("b.pbf")];
@@ -413,7 +423,7 @@ fn concurrent_external_joins_use_distinct_scratch() {
     std::thread::scope(|scope| {
         let handles: Vec<_> = outputs
             .iter()
-            .map(|output| scope.spawn(|| run_external_join(output, &host)))
+            .map(|output| scope.spawn(|| run_external_join(&base, output, &host)))
             .collect();
         for handle in handles {
             handle
@@ -433,10 +443,11 @@ fn concurrent_external_joins_use_distinct_scratch() {
 #[test]
 fn scratch_parent_override_is_honoured() {
     let dir = tempfile::tempdir().expect("directory");
+    let base = input(dir.path());
     let missing = dir.path().join("missing");
     let mut host = crate::common::test_host();
     host.scratch_parent = Some(missing.clone());
-    let err = run_external_join(&dir.path().join("out.pbf"), &host)
+    let err = run_external_join(&base, &dir.path().join("out.pbf"), &host)
         .expect_err("a missing scratch parent must fail the run");
     assert!(
         err.contains(&missing.display().to_string()),
@@ -444,43 +455,50 @@ fn scratch_parent_override_is_honoured() {
     );
     assert!(!missing.exists(), "the scratch parent must not be created");
 }
+/// Auto routes a sorted, indexed input on the memory the host supplies:
+/// plenty routes its small store to sparse, none leaves no page-cache
+/// budget and routes external.
 #[test]
-fn fixed_memory_routes_auto_to_external() {
+fn fixed_memory_routes_auto() {
     let dir = tempfile::tempdir().expect("directory");
-    let sink = Arc::new(Recording::default());
-    let mut host = crate::common::test_host();
-    host.diagnostics = pbfhogg::host::Diagnostics::new(
-        Arc::clone(&sink) as Arc<dyn pbfhogg::host::DiagnosticSink>
-    );
-    host.resources = Arc::new(pbfhogg::host::Fixed {
-        parallelism: std::num::NonZeroUsize::new(4),
-        memory_available: Some(0),
-    });
-    let opts = pbfhogg::altw::AltwOptions {
-        keep_untagged_nodes: true,
-        compression: Default::default(),
-        direct_io: false,
-        force: false,
-        index_type: pbfhogg::altw::IndexType::Auto,
-        inject_prepass: false,
-        ignore_missing_nodes: false,
-    };
-    pbfhogg::altw::add_locations_to_ways(
-        input(),
-        &dir.path().join("auto.pbf"),
-        &opts,
-        &Default::default(),
-        &host,
-    )
-    .expect("auto");
-    assert!(
-        sink.0
-            .lock()
-            .expect("sink")
-            .iter()
-            .any(|(key, text)| key == "altw.auto_select"
-                && text.starts_with("auto-selected --index-type external"))
-    );
+    let base = input(dir.path());
+    for (memory, backend) in [(8 << 30, "sparse"), (0, "external")] {
+        let sink = Arc::new(Recording::default());
+        let mut host = crate::common::test_host();
+        host.diagnostics = pbfhogg::host::Diagnostics::new(
+            Arc::clone(&sink) as Arc<dyn pbfhogg::host::DiagnosticSink>
+        );
+        host.resources = Arc::new(pbfhogg::host::Fixed {
+            parallelism: std::num::NonZeroUsize::new(4),
+            memory_available: Some(memory),
+        });
+        let opts = pbfhogg::altw::AltwOptions {
+            keep_untagged_nodes: true,
+            compression: Default::default(),
+            direct_io: false,
+            force: false,
+            index_type: pbfhogg::altw::IndexType::Auto,
+            inject_prepass: false,
+            ignore_missing_nodes: false,
+        };
+        pbfhogg::altw::add_locations_to_ways(
+            &base,
+            &dir.path().join(format!("auto-{backend}.pbf")),
+            &opts,
+            &Default::default(),
+            &host,
+        )
+        .expect("auto");
+        let prefix = format!("auto-selected --index-type {backend} (store estimate");
+        assert!(
+            sink.0
+                .lock()
+                .expect("sink")
+                .iter()
+                .any(|(key, text)| key == "altw.auto_select" && text.starts_with(&prefix)),
+            "{memory} bytes must route {backend}"
+        );
+    }
 }
 
 /// The override must reach every scratch-producing backend, including both
@@ -491,12 +509,15 @@ fn scratch_parent_override_reaches_sparse_diff_and_derive() {
     let scratch = dir.path().join("scratch");
     let missing = dir.path().join("missing");
     std::fs::create_dir(&scratch).expect("scratch directory");
+    let base = input(dir.path());
+    let changed = dir.path().join("changed.osm.pbf");
+    crate::common::write_changed_pbf(&changed);
     for (command, jobs) in [("sparse", 1), ("text", 2), ("osc", 1), ("osc", 2)] {
         let output = dir.path().join(format!("{command}-{jobs}.out"));
         let mut host = crate::common::test_host();
         for parent in [&missing, &scratch] {
             host.scratch_parent = Some(parent.clone());
-            let result = run_scratch_backend(command, jobs, &output, &host);
+            let result = run_scratch_backend(command, jobs, &base, &changed, &output, &host);
             if parent == &missing {
                 let err = result.expect_err("the scratch parent must exist");
                 assert!(
@@ -519,10 +540,11 @@ fn scratch_parent_override_reaches_sparse_diff_and_derive() {
 fn run_scratch_backend(
     command: &str,
     jobs: usize,
+    base: &std::path::Path,
+    changed: &std::path::Path,
     output: &std::path::Path,
     host: &pbfhogg::host::Host,
 ) -> Result<(), String> {
-    let changed = std::path::Path::new("tests/fixtures/host_identity/inputs/changed.osm.pbf");
     match command {
         "text" => {
             let options = pbfhogg::diff::DiffOptions {
@@ -532,19 +554,12 @@ fn run_scratch_backend(
                 type_filter: None,
                 jobs,
             };
-            pbfhogg::diff::diff(input(), changed, &mut Vec::new(), &options, false, host)
+            pbfhogg::diff::diff(base, changed, &mut Vec::new(), &options, false, host)
                 .map(drop)
                 .map_err(|e| e.to_string())
         }
         "osc" => pbfhogg::diff::derive::derive_changes(
-            input(),
-            changed,
-            output,
-            false,
-            false,
-            None,
-            jobs,
-            host,
+            base, changed, output, false, false, None, jobs, host,
         )
         .map(drop)
         .map_err(|e| e.to_string()),
@@ -558,15 +573,9 @@ fn run_scratch_backend(
                 inject_prepass: false,
                 ignore_missing_nodes: false,
             };
-            pbfhogg::altw::add_locations_to_ways(
-                input(),
-                output,
-                &options,
-                &Default::default(),
-                host,
-            )
-            .map(drop)
-            .map_err(|e| e.to_string())
+            pbfhogg::altw::add_locations_to_ways(base, output, &options, &Default::default(), host)
+                .map(drop)
+                .map_err(|e| e.to_string())
         }
         _ => unreachable!("test backend"),
     }
@@ -629,14 +638,23 @@ mod platform {
                 Err(error) if common::is_einval(&*error) => return,
                 Err(error) => error,
             };
-        let error = error
-            .downcast_ref::<pbfhogg::Error>()
-            .expect("pbfhogg error");
-        assert!(matches!(
-            error.kind(),
-            pbfhogg::ErrorKind::Io(source)
-                if source.kind() == std::io::ErrorKind::UnexpectedEof
-        ));
+        assert_unexpected_eof(&*error);
+    }
+
+    /// The skip error reaches the caller as a bare `io::Error` or wrapped in
+    /// the crate error; either way it must be `UnexpectedEof`.
+    fn assert_unexpected_eof(error: &(dyn std::error::Error + 'static)) {
+        let kind = match error.downcast_ref::<pbfhogg::Error>() {
+            Some(error) => match error.kind() {
+                pbfhogg::ErrorKind::Io(source) => source.kind(),
+                other => panic!("expected an I/O error, got {other:?}"),
+            },
+            None => error
+                .downcast_ref::<std::io::Error>()
+                .unwrap_or_else(|| panic!("expected an I/O error, got {error}"))
+                .kind(),
+        };
+        assert_eq!(kind, std::io::ErrorKind::UnexpectedEof, "{error}");
     }
 
     /// The direct reader's page-aligned skip branch: seeking succeeds past
@@ -662,13 +680,6 @@ mod platform {
                 Err(error) if common::is_einval(&*error) => return,
                 Err(error) => error,
             };
-        let error = error
-            .downcast_ref::<pbfhogg::Error>()
-            .expect("pbfhogg error");
-        assert!(matches!(
-            error.kind(),
-            pbfhogg::ErrorKind::Io(source)
-                if source.kind() == std::io::ErrorKind::UnexpectedEof
-        ));
+        assert_unexpected_eof(&*error);
     }
 }

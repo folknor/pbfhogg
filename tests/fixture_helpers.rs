@@ -209,3 +209,86 @@ fn cli_invoker_runs_version_command() {
         .assert_success();
     out.assert_stdout_contains("pbfhogg");
 }
+
+#[cfg(all(unix, feature = "commands"))]
+#[test]
+fn unrelated_failures_are_never_platform_skips() {
+    use crate::common::cli::CliOutput;
+    use std::os::unix::process::ExitStatusExt;
+    for code in [1, 2, 3] {
+        let output = CliOutput {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: b"Invalid argument EINVAL: not supported; io_uring creation failed".to_vec(),
+        };
+        assert!(!output.is_o_direct_unsupported());
+        assert!(!output.is_uring_unsupported());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Base fixture family
+// ---------------------------------------------------------------------------
+
+/// `write_base_pbf` is sorted and indexed; `write_changed_pbf` differs from
+/// it by exactly the documented edits.
+#[test]
+fn base_and_changed_fixtures_differ_by_the_documented_edits() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let changed = dir.path().join("changed.osm.pbf");
+    crate::common::write_base_pbf(&base);
+    crate::common::write_changed_pbf(&changed);
+    crate::common::assert_indexed(&base);
+    crate::common::assert_sorted_file(&base);
+    let base = crate::common::read_all_elements_id_only(&base);
+    let changed = crate::common::read_all_elements_id_only(&changed);
+    let mut nodes = crate::common::node_ids_id_only(&base);
+    nodes.retain(|&id| id != 7);
+    nodes.push(301);
+    assert_eq!(crate::common::node_ids_id_only(&changed), nodes);
+    let mut ways = crate::common::way_ids_id_only(&base);
+    ways.retain(|&id| id != 40);
+    assert_eq!(crate::common::way_ids_id_only(&changed), ways);
+}
+
+// ---------------------------------------------------------------------------
+// Scratch and adversarial helpers
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "read scratch directory")]
+fn missing_snapshot_root_is_an_error() {
+    let dir = crate::common::test_scratch();
+    crate::common::snapshot_dir(&dir.path().join("missing"));
+}
+
+#[test]
+#[should_panic(expected = "read scratch directory")]
+fn file_snapshot_root_is_an_error() {
+    let dir = crate::common::test_scratch();
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"").expect("create file");
+    crate::common::snapshot_dir(&file);
+}
+
+#[test]
+fn varint_roundtrip() {
+    use crate::common::adversarial::{read_varint, write_varint};
+    for &v in &[0_u64, 1, 127, 128, 255, 16_384, 1_u64 << 32, u64::MAX] {
+        let mut buf = Vec::new();
+        write_varint(&mut buf, v);
+        let (got, n) = read_varint(&buf).expect("decode");
+        assert_eq!(got, v);
+        assert_eq!(n, buf.len());
+    }
+}
+
+#[test]
+fn truncate_to_caps_to_len() {
+    use crate::common::adversarial::truncate_to;
+    let bytes = vec![1, 2, 3, 4, 5];
+    assert_eq!(truncate_to(&bytes, 3), vec![1, 2, 3]);
+    assert_eq!(truncate_to(&bytes, 99), bytes);
+    assert_eq!(truncate_to(&bytes, 0), Vec::<u8>::new());
+}

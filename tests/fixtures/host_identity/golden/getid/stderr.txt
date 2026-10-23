@@ -1,2 +1,0 @@
-Note: 2 blobs skipped by ID range filter
-Wrote 3 elements: 1 nodes, 1 ways, 1 relations

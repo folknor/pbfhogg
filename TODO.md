@@ -464,8 +464,9 @@ Two things would close it, and they are independent:
   oracle adjudicates both. This is the higher-value half: it turns "the two
   paths agree" from a unit-test assertion into a real-data one.
 - **pbfhogg side.** Nothing is blocked on brokkr. A tier-2 test that runs
-  both paths over the Denmark fixture and asserts byte-identical output
-  would cover most of the same ground without touching another repo.
+  both paths over a synthetic fixture with non-canonically-ordered blobs
+  and asserts byte-identical output would cover most of the same ground
+  without touching another repo.
 
 Until one of them lands, treat a green `brokkr verify all` as evidence about
 the parallel diff path only.
@@ -515,8 +516,7 @@ What brokkr would have to ship: register a small dataset that genuinely
 crosses +/-180 - Geofabrik's `australia-oceania/fiji` is the natural pick
 (tens of MB, real admin boundaries and addresses straddling the seam) - and
 let `brokkr build-geocode-index --dataset fiji` plus a handful of pinned
-query values join the release-gate list the way `build_denmark_index` /
-`query_copenhagen` do. Until then, treat every green real-data gate as
+query values join the release gate. Until then, treat every green real-data gate as
 evidence about the non-wrapping hemisphere of the code only.
 
 ## Bug-hunt carry-over (hunt 2026-08-12, closed out 2026-08-20)
@@ -802,28 +802,6 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
 Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (or add unconditional `*_ms` counters) to ground-truth the inferred per-phase breakdowns before committing to the order of landing items within a plan.
 
 ## Important: ignored tests
-
-The CLI process-policy identity instrument's ignored tests are
-`host_identity_bless_goldens` and `host_identity_matches_goldens`. Run each
-explicitly with `brokkr test <name> --sweep all --timeout 280`. Bless only
-against an unchanged baseline product; compare after any change that could
-move a process mutation, probe, reader or stderr line. The two
-`_uring` scenarios skip on this host for the same `RLIMIT_MEMLOCK` reason as
-every other uring test (see the release-gate entry below); both tests name
-the skipped scenarios on stderr.
-
-`roundtrip_denmark` in `tests/roundtrip_real.rs` is `#[ignore]` - it roundtrips the entire
-Denmark PBF (~54s) and is too slow for the normal edit-test cycle. **Must be run before any
-release and after completing major work** (especially changes to reader, writer, block_builder,
-or BlockBuilder/PbfWriter APIs). It is over the 20 s check watchdog, so it runs by name:
-
-    brokkr test roundtrip_denmark --timeout 280
-
-`tests/geocode_index.rs` has 6 `#[ignore]` tests - they build a geocode index from the
-Denmark PBF and query it. ~154s in release mode. They are on the `full` profile's
-skip list (over the 20 s watchdog), so run each by name:
-
-    brokkr test <name> --timeout 280
 
 `sorted_flag_but_unsorted_nodes_panics` in `tests/read_paths.rs` is `#[ignore]` - it
 verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Type_then_ID`

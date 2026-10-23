@@ -1,3 +1,0 @@
-Note: 4 blobs skipped by tag index
-Note: pass 2: 1 blobs skipped by type/tag index
-Wrote 25 elements: 5 nodes (0 direct + 5 from ways + 0 from relations), 20 ways (20 direct + 0 from relations), 0 relations (0 direct + 0 from relations)

@@ -1,1 +1,0 @@
-time-filter: 4 versions scanned, 3 <= cutoff, 2 elements written (0 deleted at cutoff, 0 without version <= cutoff)

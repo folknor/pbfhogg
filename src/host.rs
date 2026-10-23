@@ -288,11 +288,16 @@ impl std::fmt::Debug for ResourcesHandle {
 }
 #[cfg(test)]
 impl Host {
+    /// Fixed resources: the same machine on every host, so no unit-test
+    /// outcome depends on the runner's core count or free memory.
     pub(crate) fn for_tests() -> Self {
         Self {
             diagnostics: Diagnostics::discard(),
             process: Arc::new(NoProcessActions),
-            resources: Arc::new(MachineProbe),
+            resources: Arc::new(Fixed {
+                parallelism: NonZeroUsize::new(4),
+                memory_available: Some(8 << 30),
+            }),
             page_cache: PageCachePolicy::Keep,
             executor: Executor::Ambient,
             scratch_parent: None,

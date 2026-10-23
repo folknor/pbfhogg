@@ -852,15 +852,11 @@ fn zero_ref_ways_survive_sparse_and_external_assembly() {
     }
 }
 
-/// Scale-aware auto routing: sorted + indexed no
-/// longer implies external. A small input's estimated node store sits
-/// far below any real host's page-cache budget, so auto must route it
-/// to sparse and say why on stderr. Reads `/proc/meminfo`, hence
-/// Linux-gated: elsewhere the budget probe returns unavailable and
-/// auto deliberately falls back to external.
+/// Auto on a sorted + indexed input runs and names the backend it chose.
+/// Which backend depends on the runner's memory, so that choice is pinned
+/// by `host_contract::fixed_memory_routes_auto`, which supplies the memory.
 #[test]
-#[cfg(target_os = "linux")]
-fn auto_routes_small_sorted_indexed_input_to_sparse() {
+fn auto_on_sorted_indexed_input_reports_its_choice() {
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -875,17 +871,12 @@ fn auto_routes_small_sorted_indexed_input_to_sparse() {
     );
     let stderr = out.stderr_str();
     assert!(
-        stderr.contains("auto-selected --index-type sparse"),
-        "small sorted+indexed input must route to sparse; stderr:\n{stderr}",
-    );
-    assert!(
-        stderr.contains("store estimate") && stderr.contains("page-cache budget"),
-        "routing must go through the scale estimate, not the \
-         eligibility fallback; stderr:\n{stderr}",
+        stderr.contains("auto-selected --index-type"),
+        "auto must report its choice; stderr:\n{stderr}",
     );
     assert!(
         !stderr.contains("Note: this sorted indexed PBF is eligible"),
-        "auto-resolved sparse must not be second-guessed by the \
+        "an auto-resolved backend must not be second-guessed by the \
          explicit-sparse hint; stderr:\n{stderr}",
     );
 }

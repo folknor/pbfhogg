@@ -1,4 +1,0 @@
-elapsed_ms=<T>
-nodes=300
-ways=40
-relations=5

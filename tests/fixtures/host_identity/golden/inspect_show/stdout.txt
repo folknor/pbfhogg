@@ -1,9 +1,0 @@
-way/3
-  tags:
-    highway = residential
-  refs: (5 nodes)
-    1
-    2
-    3
-    4
-    5

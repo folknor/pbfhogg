@@ -1,6 +1,0 @@
-getid
-<DIR>/inputs/base.osm.pbf
---invert
-n10
--o
-<DIR>/output

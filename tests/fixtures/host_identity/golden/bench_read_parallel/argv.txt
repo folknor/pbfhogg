@@ -1,4 +1,0 @@
-bench-read
-<DIR>/inputs/base.osm.pbf
---mode
-parallel

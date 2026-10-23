@@ -1,7 +1,0 @@
-cat
-<DIR>/inputs/bad-indexdata.osm.pbf
---type
-way
---force
--o
-<DIR>/output

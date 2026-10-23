@@ -1,9 +1,15 @@
 //! Own process: this test deliberately lowers its soft descriptor limit.
 //! The scenarios share that process-wide limit, so they run in sequence
 //! inside one test function rather than as concurrent libtest tests.
-fn external_join(host: &pbfhogg::host::Host, output: &std::path::Path) -> Result<(), String> {
+mod common;
+
+fn external_join(
+    host: &pbfhogg::host::Host,
+    input: &std::path::Path,
+    output: &std::path::Path,
+) -> Result<(), String> {
     pbfhogg::altw::external::external_join(
-        std::path::Path::new("tests/fixtures/host_identity/inputs/base.osm.pbf"),
+        input,
         output,
         true,
         Default::default(),
@@ -19,13 +25,17 @@ fn external_join(host: &pbfhogg::host::Host, output: &std::path::Path) -> Result
 
 #[test]
 fn no_process_actions_leave_rlimit_nofile_unchanged() {
-    use pbfhogg::host::{Host, MachineProbe, NoProcessActions};
+    use pbfhogg::host::{Host, NoProcessActions};
     use std::sync::Arc;
     let dir = tempfile::tempdir().expect("directory");
+    let input = dir.path().join("base.osm.pbf");
+    common::write_base_pbf(&input);
+    // Not common::test_host(): that raises the descriptor limit this test
+    // must see unraised.
     let host = Host {
         diagnostics: pbfhogg::host::Diagnostics::discard(),
         process: Arc::new(NoProcessActions),
-        resources: Arc::new(MachineProbe),
+        resources: Arc::new(common::fixed_resources()),
         page_cache: pbfhogg::host::PageCachePolicy::Keep,
         executor: pbfhogg::host::Executor::Ambient,
         scratch_parent: None,
@@ -38,7 +48,6 @@ fn no_process_actions_leave_rlimit_nofile_unchanged() {
                 rlim_max: 0,
             };
             assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
-            assert!(limit.rlim_max > 1024, "hard RLIMIT_NOFILE must exceed 1024");
             limit.rlim_cur = soft;
             assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
             limit.rlim_max
@@ -56,6 +65,11 @@ fn no_process_actions_leave_rlimit_nofile_unchanged() {
         );
         (after.rlim_cur, after.rlim_max)
     };
+    // The scenarios set soft limits up to 1024.
+    if get().1 < 1024 {
+        eprintln!("Skipping: hard RLIMIT_NOFILE below 1024");
+        return;
+    }
 
     // Scenario 0: only descriptors numbered below the cutoff are counted.
     // Descriptors are allocated lowest-free-first and nothing else in this
@@ -93,7 +107,7 @@ fn no_process_actions_leave_rlimit_nofile_unchanged() {
 
     // Scenario 1: the run probes the limit and leaves it as it found it.
     let hard = set_soft(1024);
-    external_join(&host, &dir.path().join("external.pbf")).expect("external");
+    external_join(&host, &input, &dir.path().join("external.pbf")).expect("external");
     assert_eq!(get(), (1024, hard));
 
     // Scenario 2: descriptors the process already holds come out of the
@@ -107,7 +121,7 @@ fn no_process_actions_leave_rlimit_nofile_unchanged() {
         let held: Vec<std::fs::File> = (0..400)
             .map(|_| std::fs::File::open("/dev/null").expect("open /dev/null"))
             .collect();
-        let err = external_join(&host, &dir.path().join("held.pbf"))
+        let err = external_join(&host, &input, &dir.path().join("held.pbf"))
             .expect_err("400 held descriptors leave no room for a shard worker");
         assert!(
             err.contains("file descriptor limit too low") && err.contains("already open"),

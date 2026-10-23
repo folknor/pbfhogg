@@ -1,1 +1,0 @@
-Renumbered 345 elements: 300 nodes, 40 ways, 5 relations

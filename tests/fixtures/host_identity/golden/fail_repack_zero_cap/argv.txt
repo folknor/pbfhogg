@@ -1,6 +1,0 @@
-repack
-<DIR>/inputs/base.osm.pbf
---elements-per-blob
-0
--o
-<DIR>/output

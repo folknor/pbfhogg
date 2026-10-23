@@ -1,3 +1,0 @@
-30	amenity	bench
-20	highway	residential
-5	type	multipolygon

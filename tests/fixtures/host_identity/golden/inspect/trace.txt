@@ -1,1 +1,0 @@
-0 F <DIR>/inputs/base.osm.pbf 0 0 1 0

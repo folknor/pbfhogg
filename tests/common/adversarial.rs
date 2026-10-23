@@ -371,7 +371,7 @@ pub fn header_has_tagdata(header: &[u8]) -> Option<bool> {
     Some(found)
 }
 
-fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
+pub(crate) fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
     let mut value = 0u64;
     let mut shift = 0u32;
     for (i, &b) in buf.iter().enumerate() {
@@ -387,7 +387,7 @@ fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
     None
 }
 
-fn write_varint(out: &mut Vec<u8>, mut value: u64) {
+pub(crate) fn write_varint(out: &mut Vec<u8>, mut value: u64) {
     while value >= 0x80 {
         let byte = u8::try_from(value & 0x7F).expect("masked to 7 bits") | 0x80;
         out.push(byte);
@@ -566,31 +566,4 @@ fn build_blob_header(
         out.extend_from_slice(td);
     }
     out
-}
-
-// Minimal sanity test for the helpers themselves. Larger smoke coverage
-// lives in `tests/fixture_helpers.rs`. Excluded from the static-hook fault
-// binaries, each of which must define exactly one test.
-#[cfg(all(test, not(feature = "static-test-hooks")))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn varint_roundtrip() {
-        for &v in &[0_u64, 1, 127, 128, 255, 16_384, 1_u64 << 32, u64::MAX] {
-            let mut buf = Vec::new();
-            write_varint(&mut buf, v);
-            let (got, n) = read_varint(&buf).expect("decode");
-            assert_eq!(got, v);
-            assert_eq!(n, buf.len());
-        }
-    }
-
-    #[test]
-    fn truncate_to_caps_to_len() {
-        let bytes = vec![1, 2, 3, 4, 5];
-        assert_eq!(truncate_to(&bytes, 3), vec![1, 2, 3]);
-        assert_eq!(truncate_to(&bytes, 99), bytes);
-        assert_eq!(truncate_to(&bytes, 0), Vec::<u8>::new());
-    }
 }

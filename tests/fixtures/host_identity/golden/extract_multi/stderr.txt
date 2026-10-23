@@ -1,5 +1,0 @@
-Multi-extract: 2 extracts from config
-[1/2] Extracting to <DIR>/output/.pbfhogg-tmp-<PID>-0.a.osm.pbf
-[2/2] Extracting to <DIR>/output/.pbfhogg-tmp-<PID>-1.b.osm.pbf
-  [1] <DIR>/output/a.osm.pbf - Extract (complete_ways): 150 nodes (150 in bbox, 0 from ways), 40 ways, 5 relations
-  [2] <DIR>/output/b.osm.pbf - Extract (complete_ways): 151 nodes (151 in bbox, 0 from ways), 0 ways, 0 relations

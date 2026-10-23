@@ -1,4 +1,0 @@
-diff
-<DIR>/inputs/base.osm.pbf
-<DIR>/inputs/changed.osm.pbf
--c

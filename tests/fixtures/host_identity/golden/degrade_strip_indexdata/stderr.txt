@@ -1,1 +1,0 @@
-Degraded 0 elements across 5 blobs (applied: --strip-indexdata)

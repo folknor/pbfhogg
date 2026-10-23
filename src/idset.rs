@@ -45,22 +45,36 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// their maximum. Sparse chunks store offsets and promote to bit arrays after
 /// [`SPARSE_MAX`] members; the direct directory is bounded by
 /// [`DIRECT_CHUNKS`]. A promotion temporarily holds both representations.
-/// See `reference/performance.md` for measured memory use on real workloads.
 ///
 /// The exception is [`Self::pre_allocate`], which creates empty bit-array
 /// chunks for a whole ID range on request; its argument is the caller's
 /// responsibility (see its docs), and merging a pre-allocated set carries those
 /// chunks along.
+///
+/// # Rank queries
+///
+/// An `IdSet` answers membership only. Rank queries live on
+/// [`RankedIdSet`], produced by [`Self::into_ranked`] once population is
+/// complete; a rank query on a set that is still being built does not
+/// compile.
 pub struct IdSet {
     /// Chunks with chunk id below `DIRECT_CHUNKS`, indexed by chunk id.
     chunks: Vec<Option<Chunk>>,
     /// Chunks with chunk id at or above `DIRECT_CHUNKS`, keyed by chunk id.
     /// Every ID here is above every ID in `chunks`.
     overflow: BTreeMap<u64, Chunk>,
-    /// Rank index for O(1) (direct) / O(log n) (overflow) rank queries. Built
-    /// on demand via `build_rank_index()`, dropped as one unit by every
-    /// mutation through `&mut self`.
-    rank: Option<RankIndex>,
+}
+
+/// A completed [`IdSet`] plus its rank index, for O(1) (direct range) /
+/// O(log n) (overflow range) rank queries.
+///
+/// Both fields are private and no accessor hands out the inner set, not even
+/// as `&IdSet`: the atomic setters write through a shared reference, so any
+/// path to `&IdSet` would let members change under a built index and leave
+/// its prefixes stale. Membership is forwarded explicitly via [`Self::get`].
+pub struct RankedIdSet {
+    set: IdSet,
+    rank: RankIndex,
 }
 
 /// Bytes in one bit-array chunk (4 MiB).
@@ -78,8 +92,7 @@ const DIRECT_CHUNKS: u64 = 1 << 18;
 /// Largest member count of an array chunk. The insertion of member
 /// `SPARSE_MAX + 1` promotes the chunk to a bit array. Inserting in random
 /// order can move up to roughly `SPARSE_MAX^2` bytes per chunk before
-/// promotion, so the threshold trades insertion work against memory. See
-/// `reference/performance.md` for measured tuning results.
+/// promotion, so the threshold trades insertion work against memory.
 const SPARSE_MAX: usize = 1024;
 
 /// Rank block: 64 bytes = 8 words = 512 bits. At most 7 words scanned per
@@ -453,7 +466,6 @@ impl IdSet {
         Self {
             chunks: Vec::new(),
             overflow: BTreeMap::new(),
-            rank: None,
         }
     }
 
@@ -511,7 +523,6 @@ impl IdSet {
         let Some((cid, off)) = split(id) else {
             return;
         };
-        self.rank = None;
         // Fast path: an existing bit-array chunk in the direct directory,
         // the steady state for real OSM data. A plain OR, as the bitmap-only
         // set had; routing every call through `set_if_new`'s chunk-kind
@@ -536,7 +547,6 @@ impl IdSet {
         let Some((cid, off)) = split(id) else {
             return false;
         };
-        self.rank = None;
         self.chunk_entry(cid).insert(off)
     }
 
@@ -573,7 +583,6 @@ impl IdSet {
         let Some((max_cid, _)) = split(max_id) else {
             return;
         };
-        self.rank = None;
         let direct_end = max_cid.min(DIRECT_CHUNKS - 1) as usize;
         if direct_end >= self.chunks.len() {
             self.chunks.resize_with(direct_end + 1, || None);
@@ -618,7 +627,8 @@ impl IdSet {
     /// Atomically set a bit. Requires `pre_allocate()` to have been called
     /// with a `max_id` >= `id`. Safe for concurrent use from multiple threads
     /// via `&self` (no `&mut` needed). Uses `Relaxed` ordering - callers must
-    /// synchronize (e.g. thread join) before reading via `get()` or `rank()`.
+    /// synchronize (e.g. thread join) before reading via `get()` or ranking
+    /// via `into_ranked()`.
     ///
     /// # Panics
     ///
@@ -836,7 +846,6 @@ impl IdSet {
 
     /// Merge all set bits from `other` into `self` (union).
     pub fn merge_from(&mut self, other: &IdSet) {
-        self.rank = None;
         if other.chunks.len() > self.chunks.len() {
             self.chunks.resize_with(other.chunks.len(), || None);
         }
@@ -864,7 +873,6 @@ impl IdSet {
     /// processes a contiguous ID range), chunks are moved with zero copying.
     /// For overlapping chunks, the members are unioned.
     pub fn merge(&mut self, other: Self) {
-        self.rank = None;
         if other.chunks.len() > self.chunks.len() {
             self.chunks.resize_with(other.chunks.len(), || None);
         }
@@ -889,14 +897,15 @@ impl IdSet {
         }
     }
 
-    /// Build the prefix-sum index for `rank()` queries (O(1) on the direct
-    /// range, O(log n) above it).
-    /// Must be called after all `set()` calls are complete.
-    /// Invalidated by subsequent `set()` or `merge()` calls.
-    pub fn build_rank_index(&mut self) {
-        // Free the previous index before building its replacement.
-        self.rank = None;
-
+    /// Freeze the set and build the prefix-sum index behind its rank queries
+    /// (O(1) on the direct range, O(log n) above it).
+    ///
+    /// Taking `self` by value is the point: no `set` or merge can follow, and
+    /// a set populated through the atomic setters can only get here once
+    /// every borrow the writer threads held has ended. The chunks are moved,
+    /// not copied; the index is built while they are borrowed, so peak
+    /// memory is the set plus the index.
+    pub fn into_ranked(self) -> RankedIdSet {
         let mut chunk_prefix = Vec::with_capacity(self.chunks.len() + 1);
         let mut block_prefix = Vec::with_capacity(self.chunks.len());
         let mut cumulative: u64 = 0;
@@ -925,101 +934,16 @@ impl IdSet {
         }
         ov_prefix.push(cumulative);
 
-        self.rank = Some(RankIndex {
-            chunk_prefix,
-            block_prefix,
-            ov_keys,
-            ov_prefix,
-            ov_block,
-        });
-    }
-
-    /// Rank of member offset `off` in the present chunk `chunk` (chunk id
-    /// `cid`, found at `slot`): set IDs strictly below it.
-    #[inline]
-    fn rank_in_chunk(idx: &RankIndex, slot: Slot, cid: u64, chunk: &Chunk, off: u32) -> u64 {
-        match slot {
-            Slot::Direct(i) => {
-                idx.chunk_prefix[i] + chunk.rank_within(off, idx.block_prefix[i].as_deref())
-            }
-            Slot::Overflow => {
-                let i = idx.ov_keys.partition_point(|&k| k < cid);
-                idx.ov_prefix[i] + chunk.rank_within(off, idx.ov_block[i].as_deref())
-            }
+        RankedIdSet {
+            set: self,
+            rank: RankIndex {
+                chunk_prefix,
+                block_prefix,
+                ov_keys,
+                ov_prefix,
+                ov_block,
+            },
         }
-    }
-
-    /// Returns the rank (0-based position among all set IDs) of `id`: the
-    /// number of set IDs strictly below it. Defined for every `i64`, whether
-    /// or not `id` is set: arguments at or below zero return 0, arguments
-    /// past the highest chunk return `total_count()`.
-    ///
-    /// Requires `build_rank_index()` to have been called first (panics
-    /// otherwise, except for `id <= 0`, which needs no index).
-    pub fn rank(&self, id: i64) -> u64 {
-        if id <= 0 {
-            return 0;
-        }
-        let idx = self
-            .rank
-            .as_ref()
-            .expect("rank() called without build_rank_index()");
-        let Some((cid, off)) = split(id) else {
-            return 0;
-        };
-        if cid < DIRECT_CHUNKS {
-            let i = cid as usize;
-            if i >= self.chunks.len() {
-                // Past every direct chunk; every overflow ID is larger.
-                return idx.chunk_prefix[self.chunks.len()];
-            }
-            match &self.chunks[i] {
-                Some(chunk) => Self::rank_in_chunk(idx, Slot::Direct(i), cid, chunk, off),
-                None => idx.chunk_prefix[i],
-            }
-        } else {
-            let i = idx.ov_keys.partition_point(|&k| k < cid);
-            let mut r = idx.ov_prefix[i];
-            if idx.ov_keys.get(i) == Some(&cid)
-                && let Some(chunk) = self.overflow.get(&cid)
-            {
-                r += chunk.rank_within(off, idx.ov_block[i].as_deref());
-            }
-            r
-        }
-    }
-
-    /// Combined get + rank in a single lookup. Returns `Some(rank)` if `id`
-    /// is set, `None` if not. Avoids the double chunk lookup of separate
-    /// `get()` + `rank()` calls. Returns `None` without `build_rank_index()`.
-    #[inline]
-    pub fn rank_if_set(&self, id: i64) -> Option<u64> {
-        let (cid, off) = split(id)?;
-        let (slot, chunk) = self.chunk(cid)?;
-        if !chunk.contains(off) {
-            return None;
-        }
-        let idx = self.rank.as_ref()?;
-        Some(Self::rank_in_chunk(idx, slot, cid, chunk, off))
-    }
-
-    /// Drop the rank index built by `build_rank_index()`. After this call,
-    /// indexed rank queries and `total_count()` are unavailable, and
-    /// `rank_if_set()` returns `None`. The members themselves are retained -
-    /// `get()`, `set()`, and `has_any()` still work.
-    ///
-    /// Call this when rank queries are complete and releasing the rank
-    /// metadata is useful.
-    pub fn drop_rank_index(&mut self) {
-        self.rank = None;
-    }
-
-    /// Returns the total number of set IDs. Requires `build_rank_index()`.
-    pub fn total_count(&self) -> u64 {
-        self.rank
-            .as_ref()
-            .expect("total_count() called without build_rank_index()")
-            .total()
     }
 
     /// Total number of set IDs without a rank index (walks every chunk).
@@ -1031,6 +955,88 @@ impl IdSet {
             .chain(self.overflow.values())
             .map(Chunk::count)
             .sum()
+    }
+}
+
+/// Rank of member offset `off` in the present chunk `chunk` (chunk id `cid`,
+/// found at `slot`): set IDs strictly below it.
+#[inline]
+fn rank_in_chunk(idx: &RankIndex, slot: Slot, cid: u64, chunk: &Chunk, off: u32) -> u64 {
+    match slot {
+        Slot::Direct(i) => {
+            idx.chunk_prefix[i] + chunk.rank_within(off, idx.block_prefix[i].as_deref())
+        }
+        Slot::Overflow => {
+            let i = idx.ov_keys.partition_point(|&k| k < cid);
+            idx.ov_prefix[i] + chunk.rank_within(off, idx.ov_block[i].as_deref())
+        }
+    }
+}
+
+impl RankedIdSet {
+    #[inline]
+    pub fn get(&self, id: i64) -> bool {
+        self.set.get(id)
+    }
+
+    /// Returns the rank (0-based position among all set IDs) of `id`: the
+    /// number of set IDs strictly below it. Defined for every `i64`, whether
+    /// or not `id` is set: arguments at or below zero return 0, arguments
+    /// past the highest chunk return `total_count()`.
+    pub fn rank(&self, id: i64) -> u64 {
+        if id <= 0 {
+            return 0;
+        }
+        let idx = &self.rank;
+        let Some((cid, off)) = split(id) else {
+            return 0;
+        };
+        let chunks = &self.set.chunks;
+        if cid < DIRECT_CHUNKS {
+            let i = cid as usize;
+            if i >= chunks.len() {
+                // Past every direct chunk; every overflow ID is larger.
+                return idx.chunk_prefix[chunks.len()];
+            }
+            match &chunks[i] {
+                Some(chunk) => rank_in_chunk(idx, Slot::Direct(i), cid, chunk, off),
+                None => idx.chunk_prefix[i],
+            }
+        } else {
+            let i = idx.ov_keys.partition_point(|&k| k < cid);
+            let mut r = idx.ov_prefix[i];
+            if idx.ov_keys.get(i) == Some(&cid)
+                && let Some(chunk) = self.set.overflow.get(&cid)
+            {
+                r += chunk.rank_within(off, idx.ov_block[i].as_deref());
+            }
+            r
+        }
+    }
+
+    /// Combined get + rank in a single lookup. Returns `Some(rank)` if `id`
+    /// is set, `None` if not. Avoids the double chunk lookup of separate
+    /// `get()` + `rank()` calls.
+    #[inline]
+    pub fn rank_if_set(&self, id: i64) -> Option<u64> {
+        let (cid, off) = split(id)?;
+        let (slot, chunk) = self.set.chunk(cid)?;
+        if !chunk.contains(off) {
+            return None;
+        }
+        Some(rank_in_chunk(&self.rank, slot, cid, chunk, off))
+    }
+
+    /// Returns the total number of set IDs.
+    pub fn total_count(&self) -> u64 {
+        self.rank.total()
+    }
+
+    /// Discard the rank index and hand the set back for further mutation.
+    /// Consuming, so no ranked view of the set can outlive the change.
+    #[cfg(test)]
+    fn into_inner(self) -> IdSet {
+        self.set
     }
 }
 
@@ -1180,11 +1186,11 @@ mod tests {
             s.iter().collect::<Vec<_>>(),
             vec![7, 1_i64 << 50, i64::MAX - 1, i64::MAX]
         );
-        s.build_rank_index();
+        assert!(s.any_in_range(i64::MAX, i64::MAX));
+        let s = s.into_ranked();
         assert_eq!(s.total_count(), 4);
         assert_eq!(s.rank(i64::MAX), 3);
         assert_eq!(s.rank_if_set(i64::MAX - 1), Some(2));
-        assert!(s.any_in_range(i64::MAX, i64::MAX));
     }
 
     #[test]
@@ -1206,7 +1212,7 @@ mod tests {
         }
         assert!(s.get(1));
         assert!(!s.get(2));
-        s.build_rank_index();
+        let s = s.into_ranked();
         assert_eq!(s.total_count(), SPARSE_MAX as u64 + 1);
         assert_eq!(s.rank(3), 2); // 0 and 1 are below 3
     }
@@ -1218,7 +1224,7 @@ mod tests {
         let mut s = IdSet::new();
         s.set(5);
         s.set(10);
-        s.build_rank_index();
+        let s = s.into_ranked();
         assert_eq!(s.rank(-1), 0);
         assert_eq!(s.rank(i64::MIN), 0);
         assert_eq!(s.rank(0), 0);
@@ -1226,8 +1232,7 @@ mod tests {
         assert_eq!(s.rank(1_000_000_000_000), 2);
         assert_eq!(s.rank(i64::MAX), 2);
 
-        let mut empty = IdSet::new();
-        empty.build_rank_index();
+        let empty = IdSet::new().into_ranked();
         assert_eq!(empty.total_count(), 0);
         assert_eq!(empty.rank(i64::MAX), 0);
         assert_eq!(empty.rank(12_345), 0);
@@ -1327,7 +1332,7 @@ mod tests {
         s.set(10);
         s.set(15);
         s.set(20);
-        s.build_rank_index();
+        let s = s.into_ranked();
 
         assert_eq!(s.total_count(), 4);
         // rank(id) = number of set bits before id
@@ -1354,7 +1359,7 @@ mod tests {
         for &id in &ids {
             s.set(id);
         }
-        s.build_rank_index();
+        let s = s.into_ranked();
 
         // Set IDs: rank_if_set should return Some(rank) matching rank()
         for &id in &ids {
@@ -1371,64 +1376,22 @@ mod tests {
     }
 
     #[test]
-    fn drop_rank_index_frees_metadata_but_keeps_members() {
-        let mut s = IdSet::new();
-        s.set(5);
-        s.set(10);
-        s.build_rank_index();
-        assert_eq!(s.rank_if_set(5), Some(0));
-        s.drop_rank_index();
-        assert!(s.get(5));
-        assert!(s.get(10));
-        assert!(!s.get(7));
-        assert_eq!(s.rank_if_set(5), None);
-    }
-
-    #[test]
-    fn rank_if_set_without_rank_index_returns_none() {
-        let mut s = IdSet::new();
-        s.set(42);
-        assert_eq!(s.rank_if_set(42), None);
-    }
-
-    #[test]
-    fn set_invalidates_rank_index() {
+    fn re_ranking_after_mutation_sees_the_new_members() {
         let mut s = IdSet::new();
         s.set(10);
-        s.build_rank_index();
+        let ranked = s.into_ranked();
+        assert_eq!(ranked.rank_if_set(10), Some(0));
+        let mut s = ranked.into_inner();
         s.set(5);
-        assert_eq!(s.rank_if_set(10), None);
-        s.build_rank_index();
-        assert_eq!(s.rank_if_set(10), Some(1));
-    }
-
-    // Kept as two tests rather than one: a single test asserting after both
-    // merges only ever proves the first mutator invalidates, because it
-    // panics before reaching the second assertion.
-    #[test]
-    fn merge_from_invalidates_rank_index() {
-        let mut left = IdSet::new();
-        left.set(10);
-        left.build_rank_index();
         let mut borrowed = IdSet::new();
-        borrowed.set(5);
-        left.merge_from(&borrowed);
-        assert_eq!(left.rank_if_set(10), None);
-        left.build_rank_index();
-        assert_eq!(left.rank_if_set(10), Some(1));
-    }
-
-    #[test]
-    fn merge_invalidates_rank_index() {
-        let mut left = IdSet::new();
-        left.set(10);
-        left.build_rank_index();
+        borrowed.set(3);
+        s.merge_from(&borrowed);
         let mut owned = IdSet::new();
-        owned.set(3);
-        left.merge(owned);
-        assert_eq!(left.rank_if_set(10), None);
-        left.build_rank_index();
-        assert_eq!(left.rank_if_set(10), Some(1));
+        owned.set(1);
+        s.merge(owned);
+        let ranked = s.into_ranked();
+        assert_eq!(ranked.rank_if_set(10), Some(3));
+        assert_eq!(ranked.total_count(), 4);
     }
 
     #[test]
@@ -1449,8 +1412,7 @@ mod tests {
                 });
             }
         });
-        s.build_rank_index();
-        assert_eq!(s.total_count(), 10_000);
+        assert_eq!(s.into_ranked().total_count(), 10_000);
     }
 
     // --- Differential test against an ordered reference set --------------
@@ -1490,14 +1452,16 @@ mod tests {
         }
     }
 
-    fn assert_matches_reference(s: &mut IdSet, reference: &std::collections::BTreeSet<i64>) {
+    /// Check `s` against `reference`, then hand it back unranked so the
+    /// caller can keep mutating it.
+    fn assert_matches_reference(s: IdSet, reference: &std::collections::BTreeSet<i64>) -> IdSet {
         assert_eq!(
             s.iter().collect::<Vec<_>>(),
             reference.iter().copied().collect::<Vec<_>>(),
             "iter order and contents"
         );
         assert_eq!(s.count_slow(), reference.len() as u64);
-        s.build_rank_index();
+        let s = s.into_ranked();
         assert_eq!(s.total_count(), reference.len() as u64);
 
         let sorted: Vec<i64> = reference.iter().copied().collect();
@@ -1513,6 +1477,7 @@ mod tests {
             let expected_rank = reference.contains(&p).then_some(below);
             assert_eq!(s.rank_if_set(p), expected_rank, "rank_if_set({p})");
         }
+        let s = s.into_inner();
         for _ in 0..400 {
             let a = interesting_id(&mut rng);
             let b = interesting_id(&mut rng);
@@ -1520,6 +1485,7 @@ mod tests {
             let hit = reference.range(lo..=hi).next().is_some();
             assert_eq!(s.any_in_range(lo, hi), hit, "any_in_range({lo}, {hi})");
         }
+        s
     }
 
     /// Push one direct and one overflow chunk over the promotion threshold.
@@ -1570,7 +1536,7 @@ mod tests {
             } else {
                 s.merge_from(&other);
             }
-            assert_matches_reference(&mut s, &reference);
+            s = assert_matches_reference(s, &reference);
         }
 
         // Duplicate-only merges change nothing.
@@ -1580,7 +1546,7 @@ mod tests {
         }
         s.merge_from(&dup);
         s.merge(dup);
-        assert_matches_reference(&mut s, &reference);
+        assert_matches_reference(s, &reference);
     }
 
     #[test]
@@ -1620,7 +1586,6 @@ mod tests {
         assert!(matches!(y.chunks[0], Some(Chunk::Sparse(_))));
         x.merge_from(&y);
         assert!(matches!(x.chunks[0], Some(Chunk::Dense(_))));
-        x.build_rank_index();
-        assert_eq!(x.total_count(), 2 * SPARSE_MAX as u64 - 1);
+        assert_eq!(x.into_ranked().total_count(), 2 * SPARSE_MAX as u64 - 1);
     }
 }

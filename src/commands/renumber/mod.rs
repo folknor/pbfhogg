@@ -454,7 +454,7 @@ pub fn renumber_external(
 
     // ---- Build rank index ----
     let t_rank = Instant::now();
-    node_id_set.build_rank_index();
+    let node_id_set = node_id_set.into_ranked();
     emit_elapsed_ms("renumber_ext_node_rank_ms", t_rank);
     emit_count("renumber_ext_node_map_entries", node_id_set.total_count());
     set_matches_written("node", node_id_set.total_count(), pass1.nodes_written)?;
@@ -482,7 +482,7 @@ pub fn renumber_external(
     for other in way_id_sets {
         way_id_set.merge(other);
     }
-    way_id_set.build_rank_index();
+    let way_id_set = way_id_set.into_ranked();
     emit_elapsed_ms("renumber_ext_way_merge_rank_ms", t_way_merge);
     emit_count("renumber_ext_way_map_entries", way_id_set.total_count());
     set_matches_written("way", way_id_set.total_count(), stage2d.ways_written)?;
@@ -490,7 +490,7 @@ pub fn renumber_external(
     let mut relation_id_set = crate::idset::IdSet::new();
     relation_r1_collect_ids(&shared_file, &relation_schedule, &mut relation_id_set)?;
     let t_rel_rank = Instant::now();
-    relation_id_set.build_rank_index();
+    let relation_id_set = relation_id_set.into_ranked();
     emit_elapsed_ms("renumber_ext_rel_rank_ms", t_rel_rank);
     let relation_count = relation_id_set.total_count();
     emit_count("renumber_ext_relation_map_entries", relation_count);

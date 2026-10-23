@@ -215,7 +215,7 @@ struct PendingInterp {
 fn classify_way_into(
     way: &crate::elements::Way<'_>,
     state: &mut WayBlobOut,
-    referenced_nodes: &crate::idset::IdSet,
+    referenced_nodes: &crate::idset::RankedIdSet,
     coord_slots: &[AtomicU64],
     needed_admin_ways: &crate::idset::IdSet,
 ) {
@@ -425,7 +425,7 @@ pub(super) fn run_pass2(
     shared_file: &std::sync::Arc<std::fs::File>,
     max_node_id: i64,
     needed_admin_ways: crate::idset::IdSet,
-    mut referenced_nodes: crate::idset::IdSet,
+    referenced_nodes: crate::idset::IdSet,
     strings: &mut StringPool,
     host: &crate::host::Host,
 ) -> Result<Pass2Output> {
@@ -436,7 +436,7 @@ pub(super) fn run_pass2(
     // during way processing have good locality (contiguous pages, not scattered).
     // Planet: ~16 GB contiguous vs ~83 GB scattered page cache.
     crate::debug::emit_marker("GEOCODE_PASS2_RANK_INDEX_START");
-    referenced_nodes.build_rank_index();
+    let referenced_nodes = referenced_nodes.into_ranked();
     crate::debug::emit_marker("GEOCODE_PASS2_RANK_INDEX_END");
     let referenced_count = referenced_nodes.total_count();
     crate::host::diag!(

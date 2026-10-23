@@ -29,7 +29,7 @@
 
 use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
 
-use crate::idset::IdSet;
+use crate::idset::{IdSet, RankedIdSet};
 
 /// Error text for a packed field this rewriter cannot splice.
 ///
@@ -195,16 +195,14 @@ fn inc(n: u64) -> Result<u64, String> {
 #[derive(Clone, Copy)]
 pub(super) struct IdSpace<'a> {
     kind: &'static str,
-    set: &'a IdSet,
+    set: &'a RankedIdSet,
     start: i64,
     orphan_base: i128,
 }
 
 impl<'a> IdSpace<'a> {
-    /// `set` must be complete and carry its rank index (`total_count` and
-    /// `rank_if_set` read it), so build this only once every ID of `kind`
-    /// has been recorded.
-    pub(super) fn new(kind: &'static str, set: &'a IdSet, start: i64) -> Self {
+    /// `set` is ranked, so every ID of `kind` has already been recorded.
+    pub(super) fn new(kind: &'static str, set: &'a RankedIdSet, start: i64) -> Self {
         let orphan_base = i128::from(start).saturating_add(i128::from(set.total_count()));
         Self {
             kind,
@@ -1051,12 +1049,11 @@ mod tests {
     fn run(block: &[u8]) -> Result<Outcome, String> {
         let mut node_ids = IdSet::new();
         node_ids.set(7);
-        node_ids.build_rank_index();
+        let node_ids = node_ids.into_ranked();
         let mut rel_ids = IdSet::new();
         rel_ids.set(5);
-        rel_ids.build_rank_index();
-        let mut way_ids = IdSet::new();
-        way_ids.build_rank_index();
+        let rel_ids = rel_ids.into_ranked();
+        let way_ids = IdSet::new().into_ranked();
         let ids = RelationIdSpaces {
             relations: IdSpace::new("relation", &rel_ids, 1_000),
             nodes: IdSpace::new("node", &node_ids, 100),
@@ -1139,7 +1136,7 @@ mod tests {
     fn run_ways(block: &[u8]) -> Result<Outcome, String> {
         let mut node_ids = IdSet::new();
         node_ids.set(7);
-        node_ids.build_rank_index();
+        let node_ids = node_ids.into_ranked();
         let mut way_ids = IdSet::new();
         let mut out = Vec::new();
         reframe_ways_with_new_ids(
@@ -1529,13 +1526,12 @@ mod tests {
         assert_eq!(outcome.new_range, Some((1_000, 1_000)));
     }
 
-    fn ranked(ids: &[i64]) -> IdSet {
+    fn ranked(ids: &[i64]) -> RankedIdSet {
         let mut set = IdSet::new();
         for &id in ids {
             set.set(id);
         }
-        set.build_rank_index();
-        set
+        set.into_ranked()
     }
 
     /// The orphan/new-id collision: old ids 1 and 2 are orphans here and

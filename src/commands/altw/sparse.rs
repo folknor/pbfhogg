@@ -40,7 +40,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::idset::IdSet;
+use crate::idset::{IdSet, RankedIdSet};
 
 use super::Result;
 
@@ -149,10 +149,10 @@ use crate::coord_pack::{pack, unpack};
 
 /// Rank-indexed flat node coordinate store.
 pub(super) struct SparseArrayIndex {
-    /// Carries the `referenced` IdSet plus its rank index. `get` does
+    /// Carries the `referenced` set with its rank index. `get` does
     /// `rank_if_set(node_id) -> Some(rank)` then an `AtomicU64::load`
     /// at `rank * 8`.
-    referenced: IdSet,
+    referenced: RankedIdSet,
     mmap: memmap2::MmapMut,
     _file: std::fs::File,
 }
@@ -236,7 +236,8 @@ impl<'a> SharedSparseWriter<'a> {
 /// Build the rank-indexed flat sparse array index from node blobs.
 ///
 /// Steps:
-///   1. `referenced.build_rank_index()` (~100 MB at planet).
+///   1. `referenced.into_ranked()` builds the rank index (~100 MB at
+///      planet) and freezes the set.
 ///   2. Pre-allocate a `total * 8`-byte temp file via `set_len`,
 ///      mmap it `MmapMut`.
 ///   3. `parallel_scan_blobs_raw` over node blobs: workers extract
@@ -244,7 +245,8 @@ impl<'a> SharedSparseWriter<'a> {
 ///      (wire-only, no `PrimitiveBlock`). Each worker stores 8 bytes
 ///      into the mmap at `referenced.rank_if_set(id) << 3` for every
 ///      referenced id, via `AtomicU64::store(Relaxed)`. Workers do
-///      not coordinate beyond the shared `&IdSet` and `SharedSparseWriter`.
+///      not coordinate beyond the shared `&RankedIdSet` and
+///      `SharedSparseWriter`.
 ///      Duplicate node IDs can touch the same rank more than once; atomic
 ///      stores keep those writes race-free.
 ///   4. Wrap the mmap into `SparseArrayIndex`, return.
@@ -262,12 +264,12 @@ pub(super) fn build_node_index_sparse(
     input: &Path,
     _direct_io: bool,
     scratch_dir: &Path,
-    mut referenced: IdSet,
+    referenced: IdSet,
     host: &crate::host::Host,
     token: &crate::scratch::RunToken,
 ) -> Result<SparseArrayIndex> {
     let t_rank = std::time::Instant::now();
-    referenced.build_rank_index();
+    let referenced = referenced.into_ranked();
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     crate::debug::emit_counter(
         "altw_pass1_rank_index_ms",

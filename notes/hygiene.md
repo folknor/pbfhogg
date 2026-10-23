@@ -759,25 +759,6 @@ with 4096 as fallback; one `open_direct_for_write`; a text rule on
 
 Reported by: read path, write path.
 
-## HYG-042 - `IdSet`'s rank index is a runtime state rather than a type
-
-Anger: 8 - IdSet typestate.
-
-`rank`, `resolve` and `total_count` `expect` a built rank index, while
-`rank_if_set` returns `None` when it is absent, which sparse altw reads as
-"node missing"; forgetting `build_rank_index()` shows up as every coordinate
-missing and the missing-locations refusal, not a panic naming the cause.
-Renumber's shared `IdSet` written with `set_atomic` is correct for reads only
-because `build_rank_index` runs after the scope joins, which code order
-guarantees and the type does not; stage 2d's per-worker merge relies on
-`remove(0)` on a vec a comment says is non-empty. The `rank` doc comments
-disagree with each other ("Max 7 words scanned" vs "max 31 words"). Fix: an
-`IdSetBuilder` (atomic, no rank) frozen into a `RankedIdSet` via
-`into_ranked()`, so a rank query on an unranked set cannot compile and
-`drop_rank_index` and the `Option` fields go away.
-
-Reported by: altw and scanning, re-encoding.
-
 ## HYG-047 - Code aborts on caller-controlled input where a refusal was owed
 
 Anger: 9 - decode failures and aborts become errors: new refusals, Results on builder hot paths.

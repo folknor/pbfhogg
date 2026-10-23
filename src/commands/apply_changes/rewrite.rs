@@ -8,14 +8,14 @@ use rustc_hash::FxHashMap;
 
 use crate::blob::{BlobKind, decode_blob_to_headerblock};
 use crate::file_reader::FileReader;
-use crate::writer::Compression;
+use crate::write::WriteOptions;
 
 use crate::commands::{
-    HeaderOverrides, build_output_header, require_indexdata, writer_from_header_bytes_parallel,
+    HeaderOverrides, build_output_header, require_indexdata, writer_from_header_bytes,
 };
 use crate::read::raw_frame::read_raw_frame;
 
-use super::descriptor::DrainItem;
+use super::descriptor::{DrainItem, Route};
 use super::diff_ranges::DiffRanges;
 use super::drain::{
     self, DrainChannels, DrainConfig, DrainCounters, LocMapHandle, SeededLocations,
@@ -35,10 +35,10 @@ use crate::tunables::{
 
 /// Public command options.
 pub struct MergeOptions {
-    pub compression: Compression,
-    pub direct_io: bool,
-    pub io_uring: bool,
-    pub force: bool,
+    /// Output compression, backend and the shared input flags. The parallel
+    /// writer is this command's default backend, so a `Buffered` backend
+    /// here builds `PbfWriter::to_path_parallel`.
+    pub write: WriteOptions,
     pub locations_on_ways: bool,
     /// Permit unresolved way-node references to retain the legacy `(0, 0)`
     /// fallback under `--locations-on-ways`.
@@ -75,10 +75,7 @@ pub struct MergeOptions {
 impl Default for MergeOptions {
     fn default() -> Self {
         Self {
-            compression: Compression::default(),
-            direct_io: false,
-            io_uring: false,
-            force: false,
+            write: WriteOptions::default(),
             locations_on_ways: false,
             ignore_missing_nodes: false,
             jobs: None,
@@ -214,10 +211,13 @@ pub fn merge(
     }
 
     let MergeOptions {
-        compression,
-        direct_io,
-        io_uring,
-        force,
+        write:
+            WriteOptions {
+                compression,
+                backend,
+                direct_reads: direct_io,
+                force,
+            },
         locations_on_ways,
         ignore_missing_nodes,
         jobs,
@@ -345,14 +345,11 @@ pub fn merge(
         .unwrap_or(i64::MAX);
 
     let writer_setup_start = std::time::Instant::now();
-    let mut writer = writer_from_header_bytes_parallel(
-        output_pbf,
-        compression,
-        &header_bytes,
-        direct_io,
-        io_uring,
-        host,
-    )?;
+    // Apply-changes' output pass is writer-bound at default compression, so
+    // an unspecified (buffered) backend becomes the parallel writer.
+    let backend = backend.parallel_by_default();
+    let mut writer =
+        writer_from_header_bytes(output_pbf, compression, &header_bytes, backend, host)?;
     let writer_setup_ms = writer_setup_start
         .elapsed()
         .as_millis()
@@ -366,10 +363,7 @@ pub fn merge(
     // call. This used to be a bare `RawFd` kept alive by a `_copy_fd_file`
     // binding whose only job was to not be dropped.
     let input_file = std::sync::Arc::new(std::fs::File::open(base_pbf)?);
-    #[cfg(feature = "linux-direct-io")]
-    let use_copy_range = io_uring || !direct_io;
-    #[cfg(not(feature = "linux-direct-io"))]
-    let use_copy_range = false;
+    let splice = backend.supports_copy_range();
 
     // Worker count: `-j N` override if supplied (non-zero), else the
     // default `nproc - 2` heuristic (leaves two cores for the scanner
@@ -415,15 +409,21 @@ pub fn merge(
     let (drain_tx, drain_rx) = mpsc::sync_channel::<DrainItem>(DRAIN_CHANNEL_CAPACITY);
     let (candidate_tx, candidate_rx) =
         mpsc::sync_channel::<super::descriptor::ScannedBlob>(CANDIDATE_CHANNEL_CAPACITY);
-    // Only clone for the scanner if we're going to use it (splice path).
-    // Otherwise the unused clone keeps `drain_rx` alive past worker exit
-    // and the drain thread deadlocks waiting for a sender that will
-    // never drop until merge() returns - which only happens after the
-    // drain joins.
-    let drain_tx_for_scanner = if use_copy_range {
-        Some(drain_tx.clone())
+    // One decision, three views of it: the scanner holds a drain sender only
+    // on the splice route, the workers learn which route false positives
+    // take, and the drain gets the input file to splice from. Only clone the
+    // sender for the scanner if we're going to use it: otherwise the unused
+    // clone keeps `drain_rx` alive past worker exit and the drain thread
+    // deadlocks waiting for a sender that will never drop until merge()
+    // returns - which only happens after the drain joins.
+    let (scanner_route, worker_route, drain_route) = if splice {
+        (
+            Route::Splice(drain_tx.clone()),
+            Route::Splice(()),
+            Route::Splice(input_file),
+        )
     } else {
-        None
+        (Route::Owned, Route::Owned, Route::Owned)
     };
 
     // --locations-on-ways barrier wiring.
@@ -458,11 +458,10 @@ pub fn merge(
     let scanner_cfg = ScannerConfig {
         base_pbf,
         ranges: &ranges,
-        use_copy_range,
         locations_on_ways,
         channels: ScannerChannels {
             candidate_tx,
-            drain_tx: drain_tx_for_scanner,
+            route: scanner_route,
         },
         barrier_rx: barrier_rx_opt,
         last_node_seq_tx: last_node_tx_opt,
@@ -480,7 +479,7 @@ pub fn merge(
         loc_map_handle: loc_map_handle.as_ref().map(Arc::clone),
         needed_set: needed_set.as_ref().map(Arc::clone),
         compression,
-        use_copy_range,
+        route: worker_route,
         failure: Arc::clone(&failure),
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq,
@@ -493,8 +492,7 @@ pub fn merge(
     let drain_cfg = DrainConfig {
         ranges: &ranges,
         diff: &diff,
-        use_copy_range,
-        input_file,
+        route: drain_route,
         locations_on_ways,
         coord_slots,
         barrier_tx: barrier_tx_opt,

@@ -21,6 +21,7 @@ mod apply_changes {
     use flate2::write::GzEncoder;
     use pbfhogg::apply_changes::{MergeOptions, merge};
     use pbfhogg::block_builder::{self, BlockBuilder};
+    use pbfhogg::write::WriteOptions;
     use pbfhogg::writer::{Compression, PbfWriter};
     use tempfile::TempDir;
 
@@ -113,10 +114,10 @@ mod apply_changes {
         // `Some(1)` remains rejected up front by `merge()`; see
         // `merge_rejects_jobs_equal_one`.
         let opts = MergeOptions {
-            compression: Compression::default(),
-            direct_io: false,
-            io_uring: false,
-            force: true,
+            write: WriteOptions {
+                force: true,
+                ..WriteOptions::default()
+            },
             locations_on_ways,
             ignore_missing_nodes: false,
             jobs: Some(2),

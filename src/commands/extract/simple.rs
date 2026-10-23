@@ -6,7 +6,8 @@ use rayon::prelude::*;
 
 use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::cat::CleanAttrs;
-use crate::writer::{Compression, PbfWriter};
+use crate::write::WriteOptions;
+use crate::writer::PbfWriter;
 use crate::{BlockType, Element, PrimitiveBlock};
 
 use super::super::{HeaderOverrides, Result, drain_batch_results, flush_local, writer_from_header};
@@ -102,8 +103,7 @@ pub(super) fn extract_simple(
     region: &Region,
     set_bounds: bool,
     clean: &CleanAttrs,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<ExtractStats> {
@@ -111,7 +111,7 @@ pub(super) fn extract_simple(
     // We need a quick header check without keeping the reader open. Use BlobReader
     // to read just the first blob (header).
     let is_sorted = {
-        let mut br = crate::BlobReader::open_in(input, direct_io, host)?;
+        let mut br = crate::BlobReader::open_in(input, write.direct_reads, host)?;
         match br.next() {
             Some(Ok(blob)) => match blob.decode()? {
                 crate::blob::BlobDecode::OsmHeader(h) => {
@@ -126,28 +126,12 @@ pub(super) fn extract_simple(
 
     if is_sorted {
         return extract_simple_single_pass(
-            input,
-            output,
-            region,
-            set_bounds,
-            clean,
-            compression,
-            direct_io,
-            overrides,
-            host,
+            input, output, region, set_bounds, clean, write, overrides, host,
         );
     }
 
     extract_simple_two_pass(
-        input,
-        output,
-        region,
-        set_bounds,
-        clean,
-        compression,
-        direct_io,
-        overrides,
-        host,
+        input, output, region, set_bounds, clean, write, overrides, host,
     )
 }
 
@@ -159,11 +143,16 @@ fn extract_simple_two_pass(
     region: &Region,
     set_bounds: bool,
     clean: &CleanAttrs,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<ExtractStats> {
+    let WriteOptions {
+        compression,
+        backend,
+        direct_reads: direct_io,
+        ..
+    } = *write;
     crate::debug::emit_marker("SIMPLE_UNSORTED_PASS1_START");
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
@@ -252,8 +241,7 @@ fn extract_simple_two_pass(
             };
             hb.sorted()
         },
-        direct_io,
-        false,
+        backend,
         host,
     )?;
 
@@ -310,11 +298,16 @@ fn extract_simple_single_pass(
     region: &Region,
     set_bounds: bool,
     clean: &CleanAttrs,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<ExtractStats> {
+    let WriteOptions {
+        compression,
+        backend,
+        direct_reads: direct_io,
+        ..
+    } = *write;
     crate::debug::emit_marker("EXTRACT_SCAN_START");
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
@@ -402,8 +395,7 @@ fn extract_simple_single_pass(
             };
             hb.sorted()
         },
-        direct_io,
-        false,
+        backend,
         host,
     )?;
 

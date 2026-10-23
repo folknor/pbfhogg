@@ -54,7 +54,7 @@ use crate::file_writer::FileWriter;
 use crate::osc::CompactDiffOverlay;
 use crate::writer::PbfWriter;
 
-use super::descriptor::DrainItem;
+use super::descriptor::{DrainItem, Route};
 use super::diff_ranges::{DiffRanges, UpsertCursors};
 use super::failure::FailureSlot;
 use super::loc_mode::LocMode;
@@ -80,18 +80,17 @@ pub(super) type SeededLocations = std::sync::Mutex<Option<FxHashMap<i64, (i32, i
 pub(super) struct DrainConfig<'a> {
     pub ranges: &'a DiffRanges,
     pub diff: &'a CompactDiffOverlay,
-    /// Output backend supports kernel-space `copy_file_range`.
-    /// `false` under `--direct-io`; in that case the drain only ever
-    /// sees `OwnedBytes` for passthroughs (workers preread the frame).
-    pub use_copy_range: bool,
-    /// The open input PBF, spliced from by `write_raw_copy`. Ignored when
-    /// `use_copy_range == false`.
+    /// `Splice` when the output backend supports kernel-space
+    /// `copy_file_range`, carrying the open input PBF that `write_raw_copy`
+    /// splices from. `Owned` under `--direct-io`: the drain only ever sees
+    /// `OwnedBytes` for passthroughs (workers preread the frame), and has no
+    /// input file to splice from.
     ///
-    /// An `Arc<File>` rather than a `RawFd`: the splice is queued into the
-    /// writer thread and runs later, so the descriptor has to be owned for
-    /// that long rather than merely happening to still be open.
-    #[cfg_attr(not(feature = "linux-direct-io"), allow(dead_code))]
-    pub input_file: std::sync::Arc<std::fs::File>,
+    /// The input is an `Arc<File>` rather than a `RawFd`: the splice is
+    /// queued into the writer thread and runs later, so the descriptor has
+    /// to be owned for that long rather than merely happening to still be
+    /// open.
+    pub route: Route<std::sync::Arc<std::fs::File>>,
     /// `--locations-on-ways` mode is on. Drain merges `CoordSlots` at
     /// the node→way barrier and signals the scanner.
     pub locations_on_ways: bool,
@@ -704,9 +703,9 @@ fn dispatch_variant(
             index,
             tagdata: _,
         } => {
-            if !cfg.use_copy_range {
+            if !cfg.route.is_splice() {
                 return Err(new_error(ErrorKind::Io(std::io::Error::other(
-                    "drain: received CopyRange item but use_copy_range is false",
+                    "drain: received CopyRange item on the owned route",
                 ))));
             }
             flush_passthrough_buf(&mut state.passthrough_chunks, writer).map_err(io_err)?;
@@ -761,7 +760,7 @@ fn dispatch_variant(
             // above does. Before this line `OwnedBytes` dropped per-kind
             // counts entirely, so any merge that routed passthroughs
             // through this arm (consumer build, `--direct-io`, or a
-            // false-positive under `use_copy_range=false`) reported
+            // false-positive on `Route::Owned`) reported
             // `base_nodes=base_ways=base_relations=0` for the
             // passthrough portion even though the output contained the
             // elements correctly.
@@ -817,9 +816,9 @@ fn dispatch_variant(
 }
 
 /// Flush the in-flight contiguous `copy_file_range` run as a single
-/// `write_raw_copy(&input_file, start, len)` call. Only callable when
-/// `cfg.use_copy_range` is true (which itself requires the
-/// `linux-direct-io` feature in the binding at `rewrite.rs`).
+/// `write_raw_copy(&input_file, start, len)` call. A run only exists on the
+/// `Route::Splice` route, which `merge()` selects only when the
+/// `linux-direct-io` feature is compiled.
 #[cfg(feature = "linux-direct-io")]
 fn flush_copy_range(
     state: &mut DrainState,
@@ -830,19 +829,24 @@ fn flush_copy_range(
     let Some((start, end)) = state.copy_range_run.take() else {
         return Ok(());
     };
+    let Route::Splice(input_file) = &cfg.route else {
+        return Err(new_error(ErrorKind::Io(std::io::Error::other(
+            "drain: copy range run pending on the owned route",
+        ))));
+    };
     let len = end - start;
     writer
-        .write_raw_copy(&cfg.input_file, start, len)
+        .write_raw_copy(input_file, start, len)
         .map_err(io_err)?;
     counters.copy_range_calls.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
 /// No-op variant under non-Linux / no-`linux-direct-io` builds. The
-/// CopyRange branch in `dispatch_variant` only fires under
-/// `cfg.use_copy_range == true`, which itself only ever becomes true
-/// when the feature is enabled - so this body is unreachable at
-/// runtime, but the symbol must compile so the call sites do.
+/// CopyRange branch in `dispatch_variant` only fires on
+/// `Route::Splice`, which `merge()` only ever selects when the feature is
+/// enabled - so this body is unreachable at runtime, but the symbol must
+/// compile so the call sites do.
 #[cfg(not(feature = "linux-direct-io"))]
 fn flush_copy_range(
     state: &mut DrainState,

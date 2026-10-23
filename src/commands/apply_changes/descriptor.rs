@@ -19,6 +19,32 @@
 use crate::ElementKind;
 use crate::blob_meta::BlobIndex;
 
+/// How untouched (non-overlapping) blobs travel from the input to the output.
+///
+/// Decided once in `merge()` from the output backend's
+/// `supports_copy_range()` and handed to the scanner, the worker pool and the
+/// drain, so the three cannot disagree. `T` is whatever the stage needs on the
+/// splice route: the scanner's `drain_tx` sender, the drain's input file, or
+/// `()` for the workers, which only need to know which route they are on.
+#[derive(Clone, Copy)]
+pub(super) enum Route<T> {
+    /// Kernel-space splice: the scanner sends `DrainItem::CopyRange` straight
+    /// to the drain, and the drain coalesces adjacent ranges into
+    /// `write_raw_copy` calls.
+    Splice(T),
+    /// Owned bytes: backends that cannot splice (`--direct-io`, or a build
+    /// without `linux-direct-io`). Passthroughs go through the worker pool,
+    /// which preads the full frame and emits `DrainItem::OwnedBytes`.
+    Owned,
+}
+
+impl<T> Route<T> {
+    /// True on the splice route.
+    pub(super) fn is_splice(&self) -> bool {
+        matches!(self, Self::Splice(_))
+    }
+}
+
 /// Per-blob metadata produced by the scanner from a single `HeaderWalker`
 /// probe. Workers pread the compressed body from
 /// `(frame_start + blob_offset, data_size)` only for `Candidate`
@@ -103,8 +129,7 @@ pub(super) enum DrainItem {
     /// Owned frame bytes from a passthrough pread. Drain writes via
     /// `write_raw_owned`, no re-framing needed. Emitted by the scanner
     /// passthrough path under `--direct-io` and (since 2026-04-23) by
-    /// the consumer-build false-positive path where `use_copy_range`
-    /// is false. `count` is the element count the blob contributes to
+    /// the consumer-build false-positive path on the `Route::Owned` route. `count` is the element count the blob contributes to
     /// the output - the drain credits it to `base_<kind>` so merge
     /// stats match all-features parity regardless of which
     /// passthrough path the blob took.

@@ -7,9 +7,18 @@ use crate::common::{
     write_test_pbf,
 };
 use pbfhogg::getid::{GetidOptions, getid, parse_ids, removeid};
-use pbfhogg::writer::Compression;
+use pbfhogg::write::WriteOptions;
 use pbfhogg::{BlobDecode, BlobReader, Element};
 use tempfile::TempDir;
+
+/// Default compression and backend with `force` set: the fixtures here are
+/// written without indexdata.
+fn forced_write_options() -> WriteOptions {
+    WriteOptions {
+        force: true,
+        ..WriteOptions::default()
+    }
+}
 
 fn ids(strs: &[&str]) -> Vec<String> {
     strs.iter().map(ToString::to_string).collect()
@@ -168,9 +177,7 @@ fn getid_reports_found_ids_without_rereading_output() {
         &output,
         &id_set,
         &default_opts(),
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -192,9 +199,7 @@ fn getid_reports_found_ids_without_rereading_output() {
         &output,
         &id_set,
         &opts,
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -256,9 +261,7 @@ fn getid_found_ids_exclude_referenced_pull_ins() {
         &output,
         &id_set,
         &opts,
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -319,9 +322,7 @@ fn getid_nodes() {
         &output,
         &id_set,
         &default_opts(),
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -384,9 +385,7 @@ fn getid_mixed_types() {
         &output,
         &id_set,
         &default_opts(),
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -455,9 +454,7 @@ fn getid_add_referenced() {
         &output,
         &id_set,
         &default_opts(),
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -475,9 +472,7 @@ fn getid_add_referenced() {
         &output2,
         &id_set,
         &add_ref_opts(),
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -529,9 +524,7 @@ fn removeid_nodes() {
         &input,
         &output,
         &id_set,
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -601,9 +594,7 @@ fn removeid_mixed_types() {
         &input,
         &output,
         &id_set,
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -643,9 +634,7 @@ fn getid_empty_result() {
         &output,
         &id_set,
         &default_opts(),
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -690,9 +679,7 @@ fn getid_preserves_tags() {
         &output,
         &id_set,
         &default_opts(),
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -743,9 +730,7 @@ fn getid_normalizes_dense_node_version_minus_one_to_absent_metadata() {
         &output,
         &id_set,
         &default_opts(),
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -798,9 +783,7 @@ fn getid_normalizes_dense_node_changeset_minus_one_to_zero() {
         &output,
         &id_set,
         &default_opts(),
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -867,9 +850,7 @@ fn getid_normalizes_way_version_minus_one_to_absent_metadata() {
         &output,
         &id_set,
         &default_opts(),
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -936,9 +917,7 @@ fn getid_normalizes_way_changeset_minus_one_to_zero() {
         &output,
         &id_set,
         &default_opts(),
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -1008,9 +987,7 @@ fn getid_from_id_file() {
         &output,
         &id_set,
         &default_opts(),
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -1077,9 +1054,7 @@ fn getid_add_referenced_plus_direct_node() {
         &output,
         &id_set,
         &add_ref_opts(),
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -1146,9 +1121,7 @@ fn getid_remove_tags_strips_referenced_nodes() {
         &output,
         &id_set,
         &opts,
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -1225,9 +1198,7 @@ fn removeid_multi_blob_passthrough() {
         &input,
         &output,
         &id_set,
-        Compression::default(),
-        false,
-        true,
+        &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )

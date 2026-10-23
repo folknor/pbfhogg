@@ -12,7 +12,7 @@ use crate::common::{
 };
 use pbfhogg::MemberId;
 use pbfhogg::renumber::{RenumberOptions, RenumberStats, renumber_external};
-use pbfhogg::writer::Compression;
+use pbfhogg::write::WriteOptions;
 use tempfile::TempDir;
 
 fn default_opts() -> RenumberOptions {
@@ -68,8 +68,7 @@ fn renumber_nodes_sequentially() {
         &input,
         &output,
         &default_opts(),
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -130,8 +129,7 @@ fn renumber_custom_start_node_id() {
         &input,
         &output,
         &opts,
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -214,8 +212,7 @@ fn renumber_preserves_sorted_header_and_type_order() {
         &input,
         &output,
         &default_opts(),
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -297,8 +294,7 @@ fn renumber_relations_end_to_end() {
         &input,
         &output,
         &default_opts(),
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -381,8 +377,7 @@ fn renumber_relation_forward_ref() {
         &input,
         &output,
         &default_opts(),
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -422,8 +417,7 @@ fn renumber_relation_self_reference() {
         &input,
         &output,
         &default_opts(),
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -538,8 +532,7 @@ fn renumber_relation_mixed_member_types_interleaved() {
         &input,
         &output,
         &default_opts(),
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -630,8 +623,7 @@ fn renumber_nodes_and_ways_end_to_end() {
         &input,
         &output,
         &default_opts(),
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -710,8 +702,7 @@ fn renumber_custom_start_ids() {
         &input,
         &output,
         &opts,
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -754,8 +745,7 @@ fn renumber_rejects_negative_node_id() {
         &input,
         &output,
         &default_opts(),
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -809,8 +799,7 @@ fn renumber_rejects_negative_way_ref() {
         &input,
         &output,
         &default_opts(),
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -870,8 +859,7 @@ fn renumber_orphan_way_ref_is_shifted_past_the_new_range() {
         &input,
         &output,
         &default_opts(),
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -957,8 +945,7 @@ fn renumber_orphan_relation_members_are_shifted_past_the_new_range() {
         &input,
         &output,
         &default_opts(),
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -1184,8 +1171,7 @@ fn renumber_rejects_negative_relation_member_ref() {
         &input,
         &output,
         &default_opts(),
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -1215,8 +1201,7 @@ fn run_renumber(
         input,
         output,
         opts,
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )

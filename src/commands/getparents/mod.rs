@@ -24,7 +24,7 @@ use crate::owned::{dense_node_metadata, element_metadata};
 use crate::read::header_walker::{HeaderWalker, ScanArm};
 use crate::reorder_buffer::ReorderBuffer;
 use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
-use crate::writer::Compression;
+use crate::write::WriteOptions;
 use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
 
 use super::Result;
@@ -57,14 +57,12 @@ impl GetparentsStats {
 
 /// Find parent ways/relations referencing the given IDs.
 #[hotpath::measure]
-#[allow(clippy::too_many_arguments)]
 pub fn getparents(
     input: &Path,
     output: &Path,
     ids: &ElementIds,
     opts: &GetparentsOptions,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
@@ -73,8 +71,7 @@ pub fn getparents(
         output,
         ids,
         opts,
-        compression,
-        direct_io,
+        write,
         overrides,
         FULL_SCAN_ARM_MIN_BLOBS,
         host,
@@ -90,24 +87,13 @@ pub fn getparents_with_min_blobs(
     output: &Path,
     ids: &ElementIds,
     opts: &GetparentsOptions,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     min_blobs: u64,
     host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
-    getparents_dispatched(
-        input,
-        output,
-        ids,
-        opts,
-        compression,
-        direct_io,
-        overrides,
-        min_blobs,
-        host,
-    )
-    .map(|(_, stats)| stats)
+    getparents_dispatched(input, output, ids, opts, write, overrides, min_blobs, host)
+        .map(|(_, stats)| stats)
 }
 
 /// Dispatch on the blob-count estimate, then run the selected arm. Returns
@@ -119,29 +105,18 @@ fn getparents_dispatched(
     output: &Path,
     ids: &ElementIds,
     opts: &GetparentsOptions,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     min_blobs: u64,
     host: &crate::host::Host,
 ) -> Result<(ScanArm, GetparentsStats)> {
     let arm = super::dispatch_scan_arm(
         input,
-        super::has_indexdata(input, direct_io, &host.diagnostics)?,
+        super::has_indexdata(input, write.direct_reads, &host.diagnostics)?,
         min_blobs,
         host,
     )?;
-    let stats = getparents_with_arm(
-        input,
-        output,
-        ids,
-        opts,
-        compression,
-        direct_io,
-        overrides,
-        arm,
-        host,
-    )?;
+    let stats = getparents_with_arm(input, output, ids, opts, write, overrides, arm, host)?;
     Ok((arm, stats))
 }
 
@@ -151,33 +126,14 @@ pub(crate) fn getparents_with_arm(
     output: &Path,
     ids: &ElementIds,
     opts: &GetparentsOptions,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     arm: ScanArm,
     host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
     match arm {
-        ScanArm::Walker => getparents_walker(
-            input,
-            output,
-            ids,
-            opts,
-            compression,
-            direct_io,
-            overrides,
-            host,
-        ),
-        ScanArm::FullScan => getparents_pipelined(
-            input,
-            output,
-            ids,
-            opts,
-            compression,
-            direct_io,
-            overrides,
-            host,
-        ),
+        ScanArm::Walker => getparents_walker(input, output, ids, opts, write, overrides, host),
+        ScanArm::FullScan => getparents_pipelined(input, output, ids, opts, write, overrides, host),
     }
 }
 
@@ -194,15 +150,13 @@ fn needed_blob_kinds(ids: &ElementIds, opts: &GetparentsOptions) -> (bool, bool,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 fn getparents_walker(
     input: &Path,
     output: &Path,
     ids: &ElementIds,
     opts: &GetparentsOptions,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
@@ -274,8 +228,13 @@ fn getparents_walker(
 
     super::warn_locations_on_ways_loss(&header, host);
     let header_bytes = super::build_output_header(&header, true, overrides, |hb| hb)?;
-    let mut writer =
-        writer_from_header_bytes(output, compression, &header_bytes, direct_io, false, host)?;
+    let mut writer = writer_from_header_bytes(
+        output,
+        write.compression,
+        &header_bytes,
+        write.backend,
+        host,
+    )?;
 
     let mut stats = GetparentsStats {
         nodes_written: 0,
@@ -364,27 +323,28 @@ fn getparents_walker(
     Ok(stats)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn getparents_pipelined(
     input: &Path,
     output: &Path,
     ids: &ElementIds,
     opts: &GetparentsOptions,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetparentsStats> {
     let (need_node_blobs, need_way_blobs, need_relation_blobs) = needed_blob_kinds(ids, opts);
-    let reader = ElementReader::open_in(input, direct_io, host)?.with_blob_filter(BlobFilter::new(
-        need_node_blobs,
-        need_way_blobs,
-        need_relation_blobs,
-    ));
+    let reader = ElementReader::open_in(input, write.direct_reads, host)?.with_blob_filter(
+        BlobFilter::new(need_node_blobs, need_way_blobs, need_relation_blobs),
+    );
     super::warn_locations_on_ways_loss(reader.header(), host);
     let header_bytes = super::build_output_header(reader.header(), true, overrides, |hb| hb)?;
-    let mut writer =
-        writer_from_header_bytes(output, compression, &header_bytes, direct_io, false, host)?;
+    let mut writer = writer_from_header_bytes(
+        output,
+        write.compression,
+        &header_bytes,
+        write.backend,
+        host,
+    )?;
     let mut stats = GetparentsStats {
         nodes_written: 0,
         ways_written: 0,
@@ -519,6 +479,7 @@ mod tests {
     };
     use crate::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
     use crate::commands::getid::parse_ids;
+    use crate::write::WriteOptions;
     use crate::writer::{Compression, PbfWriter};
     use crate::{Element, ElementReader, HeaderOverrides, MemberId};
 
@@ -591,8 +552,7 @@ mod tests {
             &output,
             &query,
             &opts,
-            Compression::default(),
-            false,
+            &WriteOptions::default(),
             &HeaderOverrides::default(),
             ScanArm::FullScan,
             &crate::host::Host::for_tests(),
@@ -616,8 +576,7 @@ mod tests {
                 output,
                 &query,
                 &opts,
-                Compression::default(),
-                false,
+                &WriteOptions::default(),
                 &HeaderOverrides::default(),
                 arm,
                 &crate::host::Host::for_tests(),
@@ -777,8 +736,7 @@ mod tests {
                 &output,
                 &query,
                 &opts,
-                Compression::default(),
-                false,
+                &WriteOptions::default(),
                 &HeaderOverrides::default(),
                 min_blobs,
                 &crate::host::Host::for_tests(),

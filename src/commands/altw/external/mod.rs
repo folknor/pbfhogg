@@ -22,7 +22,7 @@
 use std::path::Path;
 
 use crate::ElementReader;
-use crate::writer::Compression;
+use crate::write::WriteOptions;
 
 use super::Stats;
 use crate::BoxResult as Result;
@@ -662,14 +662,11 @@ pub(super) fn slot_bucket_bounds(
 /// Bounded working memory and sequential I/O. Temporary-disk demand depends
 /// on the input; see `reference/performance.md` for measured resource use and
 /// the module docs for the algorithm.
-#[allow(clippy::too_many_arguments)]
 pub fn external_join(
     input: &Path,
     output: &Path,
     keep_untagged_nodes: bool,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     inject_prepass: bool,
     host: &crate::host::Host,
@@ -679,9 +676,7 @@ pub fn external_join(
         input,
         output,
         keep_untagged_nodes,
-        compression,
-        direct_io,
-        force,
+        write,
         overrides,
         inject_prepass,
         host,
@@ -736,14 +731,13 @@ pub(crate) fn external_join_in(
     input: &Path,
     output: &Path,
     keep_untagged_nodes: bool,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     inject_prepass: bool,
     host: &crate::host::Host,
     token: &crate::scratch::RunToken,
 ) -> Result<Stats> {
+    let (direct_io, force) = (write.direct_reads, write.force);
     let has_indexdata = require_indexdata(
         input,
         direct_io,
@@ -1192,8 +1186,7 @@ pub(crate) fn external_join_in(
                 member_way_ids_ref,
                 inject_prepass,
                 inject_metrics_ref,
-                compression,
-                direct_io,
+                write,
                 overrides,
                 host,
             )

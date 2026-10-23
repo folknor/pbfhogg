@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
-use crate::writer::Compression;
+use crate::write::WriteOptions;
 use crate::{Element, PrimitiveBlock};
 
 use super::super::Stats;
@@ -123,12 +123,17 @@ pub(super) fn stage4_assembly(
     // coord_payloads already decoded ResolvedEntry before publishing bytes.
     inject_prepass: bool,
     inject_metrics: &InjectMetrics,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<Stats> {
     use std::os::unix::fs::FileExt;
+    let WriteOptions {
+        compression,
+        backend,
+        direct_reads: direct_io,
+        ..
+    } = *write;
     // Build the blob schedule from the shared metadata scan.
     crate::debug::emit_marker("EXTJOIN_S4_SCHEDULE_START");
     let t_schedule = std::time::Instant::now();
@@ -243,8 +248,7 @@ pub(super) fn stage4_assembly(
         true,
         overrides,
         |hb| super::super::altw_header_features(hb, inject_prepass),
-        direct_io,
-        false,
+        backend,
         host,
     )?;
 

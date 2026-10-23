@@ -18,12 +18,12 @@ use std::str::FromStr;
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::tunables::{AUTO_ANON_HEADROOM_BYTES, AUTO_STORE_BUDGET_PCT};
-use crate::writer::Compression;
+use crate::write::WriteOptions;
 use crate::{Element, ElementReader, MemberId, PrimitiveBlock};
 
 use super::{
     HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
-    ensure_way_capacity_local, require_indexdata, writer_from_header, writer_from_header_parallel,
+    ensure_way_capacity_local, require_indexdata, writer_from_header,
 };
 use crate::idset::IdSet;
 
@@ -156,9 +156,11 @@ pub enum IndexType {
 #[derive(Clone, Copy, Debug)]
 pub struct AltwOptions {
     pub keep_untagged_nodes: bool,
-    pub compression: Compression,
-    pub direct_io: bool,
-    pub force: bool,
+    /// Output compression, backend and the shared input flags. The sparse
+    /// path's output pass prefers the parallel writer, so a `Buffered`
+    /// backend builds `PbfWriter::to_path_parallel` there; the external
+    /// join's final stage uses the backend as given.
+    pub write: WriteOptions,
     pub index_type: IndexType,
     /// Emit the private WayMembers-v1 and SharedNodePins-v1 prepass metadata.
     pub inject_prepass: bool,
@@ -346,7 +348,7 @@ pub fn add_locations_to_ways(
     let backend = match options.index_type {
         IndexType::Sparse => ResolvedBackend::Sparse,
         IndexType::External => ResolvedBackend::External,
-        IndexType::Auto => auto_select_backend(input, options.direct_io, host)?,
+        IndexType::Auto => auto_select_backend(input, options.write.direct_reads, host)?,
     };
 
     // External join has its own pipeline - dispatch early.
@@ -356,9 +358,7 @@ pub fn add_locations_to_ways(
             input,
             dest.path(),
             options.keep_untagged_nodes,
-            options.compression,
-            options.direct_io,
-            options.force,
+            &options.write,
             overrides,
             options.inject_prepass,
             host,
@@ -371,8 +371,8 @@ pub fn add_locations_to_ways(
 
     let indexdata_present = require_indexdata(
         input,
-        options.direct_io,
-        options.force,
+        options.write.direct_reads,
+        options.write.force,
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed and re-encoded (significantly slower).",
         host,
@@ -383,7 +383,7 @@ pub fn add_locations_to_ways(
     // store fits the page-cache budget; hinting external there would
     // contradict the routing it just explained on stderr.
     if options.index_type == IndexType::Sparse && indexdata_present {
-        let reader = crate::ElementReader::open_in(input, options.direct_io, host)?;
+        let reader = crate::ElementReader::open_in(input, options.write.direct_reads, host)?;
         if reader.header().is_sorted() {
             crate::host::diag!(
                 host.diagnostics,
@@ -406,8 +406,12 @@ pub fn add_locations_to_ways(
     // therefore follows the referenced-node working set rather than every
     // node in the input; see `reference/performance.md` for measurements.
     crate::debug::emit_marker("ALTW_PASS0_START");
-    let (referenced, shared) =
-        collect_way_referenced_node_ids(input, options.direct_io, options.inject_prepass, host)?;
+    let (referenced, shared) = collect_way_referenced_node_ids(
+        input,
+        options.write.direct_reads,
+        options.inject_prepass,
+        host,
+    )?;
     crate::debug::emit_marker("ALTW_PASS0_END");
     // Cheap one-shot iter().count(); surfaces the way-ref IdSet size before
     // the index build so the counter survives SIGKILL during pass 1.
@@ -423,7 +427,7 @@ pub fn add_locations_to_ways(
     crate::debug::emit_marker("ALTW_PASS1_START");
     let index = build_node_index_sparse(
         input,
-        options.direct_io,
+        options.write.direct_reads,
         scratch_dir,
         referenced,
         host,
@@ -439,7 +443,7 @@ pub fn add_locations_to_ways(
         crate::debug::emit_marker("ALTW_REL_MEMBER_SCAN_START");
         let ids = collect_relation_member_ids(
             input,
-            options.direct_io,
+            options.write.direct_reads,
             !options.keep_untagged_nodes,
             options.inject_prepass,
             host,
@@ -467,8 +471,7 @@ pub fn add_locations_to_ways(
         shared.as_ref(),
         options.inject_prepass,
         &inject_metrics,
-        options.compression,
-        options.direct_io,
+        &options.write,
         indexdata_present,
         overrides,
         host,
@@ -1085,8 +1088,7 @@ fn write_output_checked(
     shared_node_ids: Option<&IdSet>,
     inject_prepass: bool,
     inject_metrics: &inject_metrics::InjectMetrics,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     indexdata_present: bool,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
@@ -1105,8 +1107,7 @@ fn write_output_checked(
             shared_node_ids,
             inject_prepass,
             inject_metrics,
-            compression,
-            direct_io,
+            write,
             overrides,
             host,
         )
@@ -1117,8 +1118,7 @@ fn write_output_checked(
             index,
             keep_untagged_nodes,
             relation_member_node_ids,
-            compression,
-            direct_io,
+            write,
             overrides,
             host,
         )
@@ -1137,23 +1137,21 @@ fn write_output_decode_all(
     index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<Stats> {
     let mut stats = Stats::default();
 
-    let reader = ElementReader::open_in(input, direct_io, host)?;
-    let mut writer = writer_from_header_parallel(
+    let reader = ElementReader::open_in(input, write.direct_reads, host)?;
+    let mut writer = writer_from_header(
         output,
-        compression,
+        write.compression,
         reader.header(),
         true,
         overrides,
         |hb| altw_header_features(hb, false),
-        direct_io,
-        false,
+        write.backend.parallel_by_default(),
         host,
     )?;
 

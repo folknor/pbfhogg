@@ -51,7 +51,7 @@ use crate::error::{Error, ErrorKind, Result, new_error};
 use crate::writer::{Compression, frame_blob_pipelined};
 
 use super::classify::block_overlaps_diff;
-use super::descriptor::{BlobDescriptor, DrainItem, ScannedBlob};
+use super::descriptor::{BlobDescriptor, DrainItem, Route, ScannedBlob};
 use super::diff_ranges::DiffRanges;
 use super::drain::LocMapHandle;
 use super::failure::FailureSlot;
@@ -102,13 +102,13 @@ pub(super) struct StreamingConfig {
     /// `frame_blob_pipelined` so the drain side avoids the writer's
     /// `rayon::spawn`-per-block dispatch (P1.5).
     pub compression: Compression,
-    /// True when the output backend supports `copy_file_range` (so the
-    /// drain accepts `DrainItem::CopyRange`). When false (consumer
+    /// `Splice` when the output backend supports `copy_file_range` (so the
+    /// drain accepts `DrainItem::CopyRange`). On `Owned` (consumer
     /// build without the `linux-direct-io` feature, or when
     /// `--direct-io` is selected), false-positive candidates must be
     /// routed through the owned-passthrough path instead - the drain
     /// rejects `CopyRange` items up front.
-    pub use_copy_range: bool,
+    pub route: Route<()>,
     /// Shared with the drain; see the module doc's "Failure" section.
     pub failure: Arc<FailureSlot>,
     /// Test-only: panic in the worker loop when the dequeued blob's
@@ -238,7 +238,7 @@ pub(super) fn run_workers(
         loc_map_handle,
         needed_set,
         compression,
-        use_copy_range,
+        route,
         failure,
         #[cfg(feature = "test-hooks")]
         panic_at_blob_seq,
@@ -306,7 +306,7 @@ pub(super) fn run_workers(
                         loc_map_handle.as_ref(),
                         needed_set.as_deref(),
                         &compression,
-                        use_copy_range,
+                        route,
                         #[cfg(feature = "test-hooks")]
                         panic_at_blob_seq,
                     )
@@ -347,7 +347,7 @@ fn worker_loop(
     loc_map_handle: Option<&LocMapHandle>,
     needed_set: Option<&FxHashSet<i64>>,
     compression: &Compression,
-    use_copy_range: bool,
+    route: Route<()>,
     #[cfg(feature = "test-hooks")] panic_at_blob_seq: Option<u64>,
 ) -> Result<()> {
     let mut read_buf: Vec<u8> = Vec::new();
@@ -408,7 +408,7 @@ fn worker_loop(
                     loc_map_handle,
                     needed_set,
                     compression,
-                    use_copy_range,
+                    route,
                 )
                 .map_err(|e| blob_err(&desc, &e))?;
             }
@@ -474,7 +474,7 @@ fn handle_candidate(
     loc_map_handle: Option<&LocMapHandle>,
     needed_set: Option<&FxHashSet<i64>>,
     compression: &Compression,
-    use_copy_range: bool,
+    route: Route<()>,
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
 
@@ -580,7 +580,7 @@ fn handle_candidate(
             .as_ref()
             .map_or_else(|| count_block_elements(&block), |i| i.count);
         let effective_id_range = (effective_min_id, effective_max_id);
-        if use_copy_range {
+        if route.is_splice() {
             desc.kind = effective_kind;
             desc.id_range = Some(effective_id_range);
             return send_drain(drain_tx, desc.take_drain_item(blob_count));

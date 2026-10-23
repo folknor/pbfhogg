@@ -29,7 +29,8 @@ use crate::block_builder::BlockBuilder;
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::frame::read_frame_header;
-use crate::writer::{Compression, PbfWriter, reframe_raw_with_index};
+use crate::write::WriteOptions;
+use crate::writer::{PbfWriter, reframe_raw_with_index};
 
 use crate::BoxResult as Result;
 use crate::commands::{
@@ -90,14 +91,6 @@ impl MergePbfStats {
 
         Ok(())
     }
-}
-
-/// Options for the multi-PBF merge command.
-pub struct MergePbfOptions {
-    pub compression: Compression,
-    pub direct_io: bool,
-    pub io_uring: bool,
-    pub force: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +155,7 @@ impl HasId for OwnedRelation {
 pub fn merge_pbf(
     inputs: &[&Path],
     output: &Path,
-    opts: &MergePbfOptions,
+    opts: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<MergePbfStats> {
@@ -174,7 +167,7 @@ pub fn merge_pbf(
     for input in inputs {
         require_indexdata(
             input,
-            opts.direct_io,
+            opts.direct_reads,
             opts.force,
             "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
              decompressed to scan element IDs (significantly slower).",
@@ -190,7 +183,7 @@ pub fn merge_pbf(
         "cat.dedupe.pass1",
         "Pass 1: indexing blobs..."
     );
-    let (headers, mut entries) = build_blob_index(inputs, opts.direct_io, host)?;
+    let (headers, mut entries) = build_blob_index(inputs, opts.direct_reads, host)?;
     crate::host::diag!(
         host.diagnostics,
         Progress,
@@ -231,14 +224,8 @@ pub fn merge_pbf(
     // header has to describe the merge. Always stamped sorted - every input
     // passed `require_sorted` and the sweep emits in type-then-ID order.
     let header_bytes = super::output_header_bytes(inputs, &headers, true, overrides, host)?;
-    let mut writer = writer_from_header_bytes(
-        output,
-        opts.compression,
-        &header_bytes,
-        opts.direct_io,
-        opts.io_uring,
-        host,
-    )?;
+    let mut writer =
+        writer_from_header_bytes(output, opts.compression, &header_bytes, opts.backend, host)?;
 
     // Open all input files for random access
     let mut files: Vec<File> = inputs.iter().map(File::open).collect::<io::Result<_>>()?;

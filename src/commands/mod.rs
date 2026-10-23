@@ -29,6 +29,7 @@ use crate::blob::BlobKind;
 use crate::block_builder::{BlockBuilder, HeaderBuilder, Metadata, OwnedBlock};
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
+use crate::write::OutputBackend;
 use crate::writer::{Compression, PbfWriter};
 
 // Alias for crate::BoxResult kept for short `super::Result` imports inside command
@@ -393,7 +394,7 @@ pub(crate) fn build_output_header(
 /// Open a pipelined writer from an input header.
 ///
 /// Supports O_DIRECT and io_uring when the corresponding features are compiled
-/// in and the flags are set. Pass `false, false` for default buffered I/O.
+/// in and `backend` asks for them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn writer_from_header(
     output: &Path,
@@ -402,155 +403,76 @@ pub(crate) fn writer_from_header(
     preserve_sorted: bool,
     overrides: &HeaderOverrides,
     configure: impl FnOnce(HeaderBuilder) -> HeaderBuilder,
-    direct_io: bool,
-    io_uring: bool,
+    backend: OutputBackend,
     host: &crate::host::Host,
 ) -> Result<PbfWriter<FileWriter>> {
     let header_bytes = build_output_header(header, preserve_sorted, overrides, configure)?;
-    writer_from_header_bytes(
-        output,
-        compression,
-        &header_bytes,
-        direct_io,
-        io_uring,
-        host,
-    )
+    writer_from_header_bytes(output, compression, &header_bytes, backend, host)
 }
 
-/// Open an output writer from prebuilt header bytes with optional direct-io/io_uring modes.
+/// Open an output writer from prebuilt header bytes on the given backend.
+///
+/// The one place the backend is turned into a `PbfWriter`, and so the one
+/// place that refuses a backend whose feature is not compiled. A command whose
+/// output pass is writer-bound at default `zlib:6` compression (apply-changes,
+/// ALTW pass 2) passes `backend.parallel_by_default()` to get
+/// `PbfWriter::to_path_parallel`, which lifts the ~1.5 GB/s NVMe single-thread
+/// write ceiling.
 pub(crate) fn writer_from_header_bytes(
     output: &Path,
     compression: Compression,
     header_bytes: &[u8],
-    direct_io: bool,
-    io_uring: bool,
+    backend: OutputBackend,
     host: &crate::host::Host,
 ) -> Result<PbfWriter<FileWriter>> {
-    if io_uring {
-        #[cfg(feature = "linux-io-uring")]
-        {
-            Ok(PbfWriter::to_path_uring_in(
-                output,
-                compression,
-                header_bytes,
-                host.executor.clone(),
-                host.diagnostics.clone(),
-            )?)
+    match backend {
+        OutputBackend::Uring => {
+            #[cfg(feature = "linux-io-uring")]
+            {
+                Ok(PbfWriter::to_path_uring_in(
+                    output,
+                    compression,
+                    header_bytes,
+                    host.executor.clone(),
+                    host.diagnostics.clone(),
+                )?)
+            }
+            #[cfg(not(feature = "linux-io-uring"))]
+            {
+                Err("--io-uring requires the linux-io-uring feature".into())
+            }
         }
-        #[cfg(not(feature = "linux-io-uring"))]
-        {
-            Err("--io-uring requires the linux-io-uring feature".into())
+        OutputBackend::Direct => {
+            #[cfg(feature = "linux-direct-io")]
+            {
+                Ok(PbfWriter::to_path_direct_in(
+                    output,
+                    compression,
+                    header_bytes,
+                    host.executor.clone(),
+                    host.diagnostics.clone(),
+                )?)
+            }
+            #[cfg(not(feature = "linux-direct-io"))]
+            {
+                Err("--direct-io requires the linux-direct-io feature".into())
+            }
         }
-    } else if direct_io {
-        #[cfg(feature = "linux-direct-io")]
-        {
-            Ok(PbfWriter::to_path_direct_in(
-                output,
-                compression,
-                header_bytes,
-                host.executor.clone(),
-                host.diagnostics.clone(),
-            )?)
-        }
-        #[cfg(not(feature = "linux-direct-io"))]
-        {
-            Err("--direct-io requires the linux-direct-io feature".into())
-        }
-    } else {
-        Ok(PbfWriter::to_path_in(
+        OutputBackend::Parallel => Ok(PbfWriter::to_path_parallel_in(
             output,
             compression,
             header_bytes,
             host.executor.clone(),
             host.diagnostics.clone(),
-        )?)
-    }
-}
-
-/// Same as [`writer_from_header_bytes`] but uses the parallel writer
-/// (`PbfWriter::to_path_parallel`) instead of the single-thread
-/// `to_path` writer for the default (non-`--direct-io`,
-/// non-`--io-uring`) branch. Lifts the ~1.5 GB/s NVMe single-thread
-/// write ceiling.
-///
-/// Used by commands whose pass-2 is writer-bound at default `zlib:6`
-/// compression: apply-changes (winning across the writer-backend
-/// matrix at germany / europe / planet) and ALTW pass 2 (CPU savings
-/// from wire-format reframe were getting absorbed by the serial
-/// writer queue).
-pub(crate) fn writer_from_header_bytes_parallel(
-    output: &Path,
-    compression: Compression,
-    header_bytes: &[u8],
-    direct_io: bool,
-    io_uring: bool,
-    host: &crate::host::Host,
-) -> Result<PbfWriter<FileWriter>> {
-    if io_uring {
-        #[cfg(feature = "linux-io-uring")]
-        {
-            Ok(PbfWriter::to_path_uring_in(
-                output,
-                compression,
-                header_bytes,
-                host.executor.clone(),
-                host.diagnostics.clone(),
-            )?)
-        }
-        #[cfg(not(feature = "linux-io-uring"))]
-        {
-            Err("--io-uring requires the linux-io-uring feature".into())
-        }
-    } else if direct_io {
-        #[cfg(feature = "linux-direct-io")]
-        {
-            Ok(PbfWriter::to_path_direct_in(
-                output,
-                compression,
-                header_bytes,
-                host.executor.clone(),
-                host.diagnostics.clone(),
-            )?)
-        }
-        #[cfg(not(feature = "linux-direct-io"))]
-        {
-            Err("--direct-io requires the linux-direct-io feature".into())
-        }
-    } else {
-        Ok(PbfWriter::to_path_parallel_in(
+        )?),
+        OutputBackend::Buffered => Ok(PbfWriter::to_path_in(
             output,
             compression,
             header_bytes,
             host.executor.clone(),
             host.diagnostics.clone(),
-        )?)
+        )?),
     }
-}
-
-/// Same as [`writer_from_header`] but uses the parallel writer for the
-/// default branch. See [`writer_from_header_bytes_parallel`] for the
-/// rationale.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn writer_from_header_parallel(
-    output: &Path,
-    compression: Compression,
-    header: &crate::HeaderBlock,
-    preserve_sorted: bool,
-    overrides: &HeaderOverrides,
-    configure: impl FnOnce(HeaderBuilder) -> HeaderBuilder,
-    direct_io: bool,
-    io_uring: bool,
-    host: &crate::host::Host,
-) -> Result<PbfWriter<FileWriter>> {
-    let header_bytes = build_output_header(header, preserve_sorted, overrides, configure)?;
-    writer_from_header_bytes_parallel(
-        output,
-        compression,
-        &header_bytes,
-        direct_io,
-        io_uring,
-        host,
-    )
 }
 
 /// Apply per-attribute cleaning to metadata. Returns `None` if all attributes

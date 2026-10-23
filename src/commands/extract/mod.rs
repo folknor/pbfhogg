@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cat::CleanAttrs;
 use crate::coord_fmt::e7_to_deg;
-use crate::writer::Compression;
+use crate::write::WriteOptions;
 
 use super::{HeaderOverrides, Result, require_indexdata};
 
@@ -568,24 +568,12 @@ pub fn extract_multi(
     strategy: ExtractStrategy,
     set_bounds: bool,
     clean: &CleanAttrs,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<Vec<ExtractStats>> {
     extract_multi_inner(
-        input,
-        slots,
-        None,
-        strategy,
-        set_bounds,
-        clean,
-        compression,
-        direct_io,
-        force,
-        overrides,
-        host,
+        input, slots, None, strategy, set_bounds, clean, write, overrides, host,
     )
 }
 
@@ -599,9 +587,7 @@ pub fn extract_multi_with_display_paths(
     strategy: ExtractStrategy,
     set_bounds: bool,
     clean: &CleanAttrs,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<Vec<ExtractStats>> {
@@ -621,9 +607,7 @@ pub fn extract_multi_with_display_paths(
         strategy,
         set_bounds,
         clean,
-        compression,
-        direct_io,
-        force,
+        write,
         overrides,
         host,
     )
@@ -637,13 +621,13 @@ fn extract_multi_inner(
     strategy: ExtractStrategy,
     set_bounds: bool,
     clean: &CleanAttrs,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<Vec<ExtractStats>> {
-    // Try single-pass multi-extract for simple strategy on sorted input.
+    // Try single-pass multi-extract for simple strategy on sorted input. It
+    // writes through the synchronous writer whatever the backend, so only the
+    // compression and the input-side direct-IO flag reach it.
     if matches!(strategy, ExtractStrategy::Simple)
         && !clean.any()
         && let Some(stats) = multi::try_extract_multi_single_pass(
@@ -651,8 +635,8 @@ fn extract_multi_inner(
             slots,
             display_paths,
             set_bounds,
-            compression,
-            direct_io,
+            write.compression,
+            write.direct_reads,
             overrides,
             host,
         )?
@@ -693,9 +677,7 @@ fn extract_multi_inner(
             strategy,
             set_bounds,
             clean,
-            compression,
-            direct_io,
-            force,
+            write,
             overrides,
             host,
         )?;
@@ -785,17 +767,15 @@ pub fn extract(
     strategy: ExtractStrategy,
     set_bounds: bool,
     clean: &CleanAttrs,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<ExtractStats> {
     if !matches!(strategy, ExtractStrategy::Simple) {
         require_indexdata(
             input,
-            direct_io,
-            force,
+            write.direct_reads,
+            write.force,
             "input PBF has no blob-level indexdata. Without indexdata, the spatial bbox \
              filter is a no-op - all blobs are decompressed (significantly slower).",
             host,
@@ -803,37 +783,13 @@ pub fn extract(
     }
     let result = match strategy {
         ExtractStrategy::Simple => simple::extract_simple(
-            input,
-            output,
-            region,
-            set_bounds,
-            clean,
-            compression,
-            direct_io,
-            overrides,
-            host,
+            input, output, region, set_bounds, clean, write, overrides, host,
         ),
         ExtractStrategy::CompleteWays => complete::extract_complete_ways(
-            input,
-            output,
-            region,
-            set_bounds,
-            clean,
-            compression,
-            direct_io,
-            overrides,
-            host,
+            input, output, region, set_bounds, clean, write, overrides, host,
         ),
         ExtractStrategy::Smart => smart::extract_smart(
-            input,
-            output,
-            region,
-            set_bounds,
-            clean,
-            compression,
-            direct_io,
-            overrides,
-            host,
+            input, output, region, set_bounds, clean, write, overrides, host,
         ),
     }?;
     #[allow(clippy::cast_possible_wrap)]

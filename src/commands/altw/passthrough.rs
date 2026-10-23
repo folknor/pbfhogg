@@ -34,10 +34,11 @@ use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::idset::IdSet;
 use crate::read::header_walker::HeaderWalker;
 use crate::reorder_buffer::ReorderBuffer;
-use crate::writer::{Compression, PbfWriter};
+use crate::write::WriteOptions;
+use crate::writer::PbfWriter;
 
 use crate::commands::{
-    HeaderOverrides, build_output_header, flush_local, writer_from_header_bytes_parallel,
+    HeaderOverrides, build_output_header, flush_local, writer_from_header_bytes,
 };
 
 use super::Result;
@@ -359,20 +360,18 @@ pub(super) fn write_output_passthrough(
     shared_node_ids: Option<&IdSet>,
     inject_prepass: bool,
     inject_metrics: &InjectMetrics,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<Stats> {
     let (schedule, header_bytes, shared_file) =
         build_schedule(input, overrides, keep_untagged_nodes, inject_prepass, host)?;
 
-    let mut writer = writer_from_header_bytes_parallel(
+    let mut writer = writer_from_header_bytes(
         output,
-        compression,
+        write.compression,
         &header_bytes,
-        direct_io,
-        false,
+        write.backend.parallel_by_default(),
         host,
     )?;
 

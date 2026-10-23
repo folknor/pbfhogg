@@ -93,6 +93,7 @@ use crate::owned::{
     read_dense_node, read_node, read_relation, read_way,
 };
 use crate::read::raw_frame::read_raw_frame;
+use crate::write::WriteOptions;
 use crate::writer::{
     Compression, PbfWriter, frame_blob_pipelined, strip_blob_header_fields,
     strip_header_block_fields,
@@ -388,17 +389,14 @@ impl DegradeStats {
 ///
 /// `force` skips the indexdata precondition required by the decode path's
 /// per-kind classify pipeline. Has no effect on the passthrough path.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn degrade(
     input: &Path,
     output: &Path,
     flags: DegradeFlags,
     block_cap: usize,
-    compression: Compression,
-    direct_io: bool,
-    io_uring: bool,
-    force: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<DegradeStats> {
@@ -490,29 +488,9 @@ pub fn degrade(
     }
 
     let stats = if flags.needs_decode() {
-        degrade_decode_path(
-            input,
-            output,
-            flags,
-            block_cap,
-            compression,
-            direct_io,
-            io_uring,
-            force,
-            overrides,
-            host,
-        )?
+        degrade_decode_path(input, output, flags, block_cap, write, overrides, host)?
     } else {
-        degrade_passthrough(
-            input,
-            output,
-            flags,
-            compression,
-            direct_io,
-            io_uring,
-            overrides,
-            host,
-        )?
+        degrade_passthrough(input, output, flags, write, overrides, host)?
     };
 
     #[allow(clippy::cast_possible_wrap)]
@@ -615,25 +593,22 @@ fn passthrough_header_bytes(
 }
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-#[allow(clippy::too_many_arguments)]
 fn degrade_passthrough(
     input: &Path,
     output: &Path,
     flags: DegradeFlags,
-    compression: Compression,
-    direct_io: bool,
-    io_uring: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<DegradeStats> {
+    let direct_io = write.direct_reads;
     let header_bytes = passthrough_header_bytes(input, flags, overrides, direct_io, host)?;
 
     let mut writer = writer_from_header_bytes(
         output,
-        compression,
+        write.compression,
         &header_bytes,
-        direct_io,
-        io_uring,
+        write.backend,
         host,
     )?;
 
@@ -847,20 +822,23 @@ impl UnsortKindState {
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn degrade_decode_path(
     input: &Path,
     output: &Path,
     flags: DegradeFlags,
     block_cap: usize,
-    compression: Compression,
-    direct_io: bool,
-    io_uring: bool,
-    force: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<DegradeStats> {
+    let WriteOptions {
+        compression,
+        backend,
+        direct_reads: direct_io,
+        force,
+    } = *write;
     require_indexdata(
         input,
         direct_io,
@@ -918,14 +896,7 @@ fn degrade_decode_path(
             hb
         }
     })?;
-    let mut writer = writer_from_header_bytes(
-        output,
-        compression,
-        &header_bytes,
-        direct_io,
-        io_uring,
-        host,
-    )?;
+    let mut writer = writer_from_header_bytes(output, compression, &header_bytes, backend, host)?;
 
     let mut blobs_written: u64 = 0;
     let mut elements_written: u64 = 0;

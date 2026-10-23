@@ -51,6 +51,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
 use super::{HeaderOverrides, Result, require_sorted, writer_from_header};
+use crate::write::WriteOptions;
 use crate::writer::Compression;
 
 // ---------------------------------------------------------------------------
@@ -321,11 +322,16 @@ pub fn renumber_external(
     input: &Path,
     output: &Path,
     opts: &RenumberOptions,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<RenumberStats> {
+    let WriteOptions {
+        compression,
+        backend,
+        direct_reads: direct_io,
+        ..
+    } = *write;
     validate_start_ids(opts)?;
 
     // OwnedBlock Vec<u8>s are allocated on pass1/stage2d worker threads
@@ -375,8 +381,7 @@ pub fn renumber_external(
         overrides,
         #[allow(clippy::redundant_closure_for_method_calls)]
         |hb| hb.sorted(),
-        direct_io,
-        false,
+        backend,
         host,
     )?;
 

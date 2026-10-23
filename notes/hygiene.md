@@ -290,34 +290,6 @@ elsewhere.
 
 Reported by: write path.
 
-## HYG-018 - Output backend choice is two bools, decided in four functions and re-derived by commands
-
-Anger: 9 - output backend enum: API, plus copy-range behaviour.
-
-`commands/mod.rs::writer_from_header_bytes` and
-`writer_from_header_bytes_parallel` are the same 30 lines except the default
-branch, each with its own copy of the "--io-uring requires the linux-io-uring
-feature" / "--direct-io requires..." strings; `writer_from_header` and
-`_parallel` wrap them again. Backend is `(direct_io: bool, io_uring: bool)`, so
-`true, true` is representable and silently means uring. Commands re-derive
-capability: `sort` computes
-`use_copy_range = io_uring || (!direct_io && cfg!(feature = "linux-direct-io"))`,
-`apply_changes/rewrite.rs` computes `io_uring || !direct_io` without the
-`cfg!`, which has diverged. The sort comment justifying it ("io_uring uses
-linked ReadFixed+WriteFixed for CopyRange") is stale; the uring module doc
-records that chain was removed for producing mid-file zero gaps. The parallel
-backend cannot be chosen by an operator; it is picked per command. In
-apply-changes, `ScannerChannels` holds `drain_tx: Option<_>` and
-`use_copy_range: bool`, two values that must agree, which is why "drain:
-received CopyRange item but use_copy_range is false" and the non-feature
-`flush_copy_range` stub exist. Fix: `enum OutputBackend { Buffered, Parallel,
-Direct, Uring }` parsed once with conflicts refused, `PbfWriter::open(path,
-backend, compression, header)`, `PbfWriter::supports_copy_range()` as the only
-capability query, and a `Route::Splice { drain_tx } | Route::Owned` enum in
-apply-changes.
-
-Reported by: write path, change application, re-encoding, CLI and plumbing.
-
 ## HYG-020 - Library error text names CLI flags and commands
 
 Anger: 9 - error kinds and texts: API and output.
@@ -699,23 +671,17 @@ silently). Ignored: `--direct-io` on `check`, `getid -I` and many pipeline
 passes (HYG-037), `--jobs` with `-R` in the tags-filter library. Validation is
 split between clap attributes and about sixteen hand-written
 `if x { return Err(...) }` lines in `main`, which exit 2 with a different
-message format from clap's. Fourteen dispatch arms build `WriteOpts` and
-`HeaderOverrides` with the same four lines; the library functions (`cat::cat`,
-`repack::repack`, `degrade::degrade`, `getid::getid`, `extract::extract`...)
-still take `compression, direct_io, io_uring, force` positionally, so
-`WriteOpts` is unpacked back into adjacent bools one hop later. The CLI builds
-`MergeOptions` field by field twice instead of `..Default::default()`.
-`too_many_arguments` is denied workspace-wide and `#[allow]`ed on roughly
-fifteen functions in filtering, nine in apply-changes (`worker_loop` has 15
-parameters, `handle_candidate` 20), nearly every big altw function and 28 times
-in re-encoding; `too_many_lines` likewise. A denied lint with that many local
-exemptions does not enforce anything. Fix: one policy (refuse) expressed in
-clap (`conflicts_with`, `requires`, `ArgGroup`) or one validation function per
-command; consider splitting modal commands (`diff text` / `diff osc`,
-`tags-filter pbf` / `osc`, `cat` / `cat dedupe`) so invalid combinations stop
-existing; a `#[command(flatten)] WriteArgs` producing a library-level
-`WriteOptions` or `RunContext` taken by every command, then remove the
-`allow`s and let the lint hold.
+message format from clap's. The library now takes one `WriteOptions`
+(compression, `OutputBackend`, direct reads, force) instead of the positional
+bools, but `too_many_arguments` is still `#[allow]`ed on the extract entry
+points, `writer_from_header`, `getid_dispatched`, `filter_by_id`, the
+getparents dispatchers, altw's `write_output_*`, `tags_filter_*`, apply-changes'
+`worker_loop` and `handle_candidate`, and more; `too_many_lines` likewise. A
+denied lint with that many local exemptions does not enforce anything. Fix:
+one policy (refuse) expressed in clap (`conflicts_with`, `requires`,
+`ArgGroup`) or one validation function per command; consider splitting modal
+commands (`diff text` / `diff osc`, `tags-filter pbf` / `osc`, `cat` /
+`cat dedupe`) so invalid combinations stop existing.
 
 Reported by: CLI and plumbing, filtering and spatial, change application, altw
 and scanning, re-encoding.

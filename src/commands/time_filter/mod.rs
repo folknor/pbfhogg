@@ -26,6 +26,7 @@ use crate::owned::{
 };
 use crate::reorder_buffer::ReorderBuffer;
 use crate::scan::classify::{build_classify_schedule, parallel_classify_phase};
+use crate::write::WriteOptions;
 use crate::writer::{Compression, PbfWriter};
 use crate::{DenseNode, Element, ElementKind, ElementReader, Node, PrimitiveBlock, Relation, Way};
 
@@ -69,11 +70,16 @@ pub fn time_filter(
     input: &Path,
     output: &Path,
     cutoff_timestamp: i64,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<TimeFilterStats> {
+    let WriteOptions {
+        compression,
+        backend,
+        direct_reads: direct_io,
+        ..
+    } = *write;
     // History path: no arena-cap hook. Snapshot path: invokes the
     // host's `cross_thread_alloc_pool` hook - see the in-function
     // comment in time_filter_snapshot.
@@ -94,8 +100,7 @@ pub fn time_filter(
         true,
         overrides,
         |hb| hb.replication_timestamp(cutoff_timestamp),
-        direct_io,
-        false,
+        backend,
         host,
     )?;
 

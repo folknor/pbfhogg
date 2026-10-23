@@ -31,33 +31,29 @@ use crate::blob::BlobKind;
 use crate::error::Result;
 use crate::read::header_walker::HeaderWalker;
 
-use super::descriptor::{BlobDescriptor, DrainItem, ScannedBlob};
+use super::descriptor::{BlobDescriptor, DrainItem, Route, ScannedBlob};
 use super::diff_ranges::DiffRanges;
 
 /// Scanner channel configuration. Which channels are populated depends
-/// on the output backend: `drain_tx` (splice-capable backends) receives
-/// fast-path `DrainItem::CopyRange` directly; under `--direct-io` every
-/// passthrough descriptor routes through `candidate_tx` to a pread
-/// helper instead.
+/// on the output backend: on the `Route::Splice` route (splice-capable
+/// backends) the drain sender receives fast-path `DrainItem::CopyRange`
+/// directly; on `Route::Owned` (`--direct-io`) every passthrough descriptor
+/// routes through `candidate_tx` to a pread helper instead.
 pub(super) struct ScannerChannels {
     /// Candidate descriptors (overlap candidates requiring worker
     /// decompress + precise check, plus passthrough descriptors under
     /// `--direct-io` where workers pread the full frame).
     pub candidate_tx: mpsc::SyncSender<ScannedBlob>,
-    /// Fast-path drain items for splice-capable backends. `None` under
-    /// `--direct-io` output; all passthroughs route through
-    /// `candidate_tx` in that case.
-    pub drain_tx: Option<mpsc::SyncSender<DrainItem>>,
+    /// Where untouched blobs go. `Splice` carries the fast-path drain
+    /// sender; `Owned` has none, and all passthroughs route through
+    /// `candidate_tx`.
+    pub route: Route<mpsc::SyncSender<DrainItem>>,
 }
 
 /// Scanner configuration + I/O channels.
 pub(super) struct ScannerConfig<'a> {
     pub base_pbf: &'a Path,
     pub ranges: &'a DiffRanges,
-    /// True when the output backend supports `copy_file_range` (buffered
-    /// and io_uring paths). Under `--direct-io`, false, and all
-    /// passthrough routing goes through `candidate_tx`.
-    pub use_copy_range: bool,
     /// True when `--locations-on-ways` is active. Enables the node→way
     /// barrier: scanner buffers way/relation descriptors after the first
     /// way descriptor is seen, waits on `barrier_rx` for the drain's
@@ -92,12 +88,18 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
     let ScannerConfig {
         base_pbf,
         ranges,
-        use_copy_range,
         locations_on_ways,
         channels,
         barrier_rx,
         last_node_seq_tx,
     } = cfg;
+    // The fast-path sender, present exactly on the splice route. Borrowed by
+    // each `ScannerEmit::Drain` so an item can only be built where there is a
+    // drain channel to send it on.
+    let splice_tx = match &channels.route {
+        Route::Splice(drain_tx) => Some(drain_tx),
+        Route::Owned => None,
+    };
 
     crate::debug::emit_marker("MERGE_SCANNER_START");
 
@@ -117,7 +119,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
     // the drain's late-boundary idle-fire path and producer-failure shutdown
     // preserved and validated. That needs an explicit barrier change; do not
     // disguise it as a channel-capacity or telemetry adjustment here.
-    let mut pending_post_barrier: Vec<ScannerEmit> = Vec::new();
+    let mut pending_post_barrier: Vec<ScannerEmit<'_>> = Vec::new();
     let mut barrier_open = !locations_on_ways; // open by default when not --locations-on-ways
     let mut max_item_bytes_fastpath: usize = 0;
     let mut max_item_bytes_slowpath: usize = 0;
@@ -183,25 +185,26 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         // descriptor-first path avoids reading/decompressing those bodies,
         // and kind verification alone would still trust forged ID ranges.
         let low_node_must_decompress = locations_on_ways && matches!(kind, ElementKind::Node);
-        let is_fastpath = has_indexdata
-            && use_copy_range
+        let item = if let Some(drain_tx) = splice_tx
+            && has_indexdata
             && !low_node_must_decompress
             && !ranges.range_overlaps(
                 kind,
                 id_range.map_or(0, |r| r.0),
                 id_range.map_or(0, |r| r.1),
-            );
-
-        let item = if is_fastpath {
+            ) {
             // Convert directly to a DrainItem for the splice channel.
             // `into_drain_copy_range` requires indexdata, which we just
             // verified.
-            ScannerEmit::Drain(descriptor.into_drain_copy_range().ok_or_else(|| {
-                crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
-                    "scanner: fast-path descriptor missing indexdata - \
+            ScannerEmit::Drain(
+                drain_tx,
+                descriptor.into_drain_copy_range().ok_or_else(|| {
+                    crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
+                        "scanner: fast-path descriptor missing indexdata - \
                                  should be unreachable",
-                )))
-            })?)
+                    )))
+                })?,
+            )
         } else if !low_node_must_decompress
             && has_indexdata
             && !ranges.range_overlaps(
@@ -337,10 +340,10 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
 /// What the scanner is about to emit. Splits the dispatch shape from
 /// the routing shape so `dispatch_item` doesn't need to re-derive
 /// `is_fastpath` from the variant.
-enum ScannerEmit {
+enum ScannerEmit<'a> {
     /// Splice-capable fast-path: send `DrainItem::CopyRange` straight to
-    /// the drain.
-    Drain(DrainItem),
+    /// the drain over the borrowed splice-route sender.
+    Drain(&'a mpsc::SyncSender<DrainItem>, DrainItem),
     /// Slow-path or `--direct-io` passthrough: route through the worker
     /// pool as a `ScannedBlob`.
     Candidate(ScannedBlob),
@@ -349,18 +352,13 @@ enum ScannerEmit {
 /// Dispatch a single `ScannerEmit` to the correct channel.
 fn dispatch_item(
     channels: &ScannerChannels,
-    item: ScannerEmit,
+    item: ScannerEmit<'_>,
     max_item_bytes_fast: &mut usize,
     max_item_bytes_slow: &mut usize,
     approx_cost: usize,
 ) -> Result<()> {
     match item {
-        ScannerEmit::Drain(drain_item) => {
-            let tx = channels.drain_tx.as_ref().ok_or_else(|| {
-                crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
-                    "scanner: fast-path emitted but drain_tx is None - misconfigured channels",
-                )))
-            })?;
+        ScannerEmit::Drain(tx, drain_item) => {
             *max_item_bytes_fast = (*max_item_bytes_fast).max(approx_cost);
             tx.send(drain_item).map_err(send_err)?;
         }
@@ -373,10 +371,10 @@ fn dispatch_item(
 }
 
 /// Rough byte cost of a `ScannerEmit` for high-water accounting.
-fn scanner_emit_cost(item: &ScannerEmit) -> usize {
+fn scanner_emit_cost(item: &ScannerEmit<'_>) -> usize {
     use crate::tunables::DESCRIPTOR_OVERHEAD;
     match item {
-        ScannerEmit::Drain(d) => d.byte_cost(),
+        ScannerEmit::Drain(_, d) => d.byte_cost(),
         ScannerEmit::Candidate(ScannedBlob::Passthrough(d) | ScannedBlob::Candidate(d)) => {
             DESCRIPTOR_OVERHEAD + d.tagdata.as_ref().map_or(0, |t| t.len())
         }

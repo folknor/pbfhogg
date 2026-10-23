@@ -133,10 +133,7 @@ fn inspect_distrust_metadata_measures_instead_of_quoting_the_index() {
             ..Default::default()
         },
         pbfhogg::degrade::DEFAULT_BLOCK_CAP,
-        Compression::default(),
-        false,
-        false,
-        false,
+        &pbfhogg::write::WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )

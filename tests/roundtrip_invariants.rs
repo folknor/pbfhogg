@@ -13,9 +13,19 @@ use crate::common::{
     generate_relations, generate_ways, write_multi_block_test_pbf, write_test_pbf_sorted,
 };
 use pbfhogg::MemberId;
+use pbfhogg::write::WriteOptions;
 use pbfhogg::writer::Compression;
 use std::path::Path;
 use tempfile::TempDir;
+
+/// Default backend with `force` set, at the given compression.
+fn forced(compression: Compression) -> WriteOptions {
+    WriteOptions {
+        compression,
+        force: true,
+        ..WriteOptions::default()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared fixture
@@ -63,12 +73,7 @@ fn sort_idempotence() {
     let twice = dir.path().join("twice.osm.pbf");
     sample_fixture(&input);
 
-    let opts = pbfhogg::sort::SortOptions {
-        compression: Compression::default(),
-        direct_io: false,
-        io_uring: false,
-        force: true,
-    };
+    let opts = forced(Compression::default());
     pbfhogg::commands::sort::sort(
         &input,
         &once,
@@ -117,9 +122,7 @@ fn extract_simple_idempotence() {
             pbfhogg::commands::extract::ExtractStrategy::Simple,
             true,
             &pbfhogg::cat::CleanAttrs::default(),
-            Compression::default(),
-            false,
-            true,
+            &forced(Compression::default()),
             &pbfhogg::HeaderOverrides::default(),
             &crate::common::test_host(),
         )
@@ -210,10 +213,7 @@ fn derive_then_apply_roundtrip() {
 
     // apply_changes(base, delta) -> reconstructed
     let opts = pbfhogg::apply_changes::MergeOptions {
-        compression: Compression::default(),
-        direct_io: false,
-        io_uring: false,
-        force: true,
+        write: forced(Compression::default()),
         locations_on_ways: false,
         ignore_missing_nodes: false,
         jobs: None,
@@ -341,10 +341,7 @@ fn derive_then_apply_preserves_metadata() {
     );
 
     let opts = pbfhogg::apply_changes::MergeOptions {
-        compression: Compression::default(),
-        direct_io: false,
-        io_uring: false,
-        force: true,
+        write: forced(Compression::default()),
         locations_on_ways: false,
         ignore_missing_nodes: false,
         jobs: None,
@@ -405,9 +402,7 @@ fn tags_filter_idempotence() {
         omit_referenced: true,
         invert: false,
         remove_tags: false,
-        compression: Compression::default(),
-        direct_io: false,
-        force: true,
+        write: forced(Compression::default()),
         jobs: None,
     };
 
@@ -501,9 +496,7 @@ fn tags_filter_blob_layout_independence() {
         omit_referenced: false,
         invert: false,
         remove_tags: false,
-        compression: Compression::default(),
-        direct_io: false,
-        force: true,
+        write: forced(Compression::default()),
         jobs: None,
     };
     pbfhogg::tags_filter::tags_filter(
@@ -638,12 +631,7 @@ fn sort_compression_level_parity() {
     ];
 
     for (_label, compression, path) in &outputs {
-        let opts = pbfhogg::sort::SortOptions {
-            compression: *compression,
-            direct_io: false,
-            io_uring: false,
-            force: true,
-        };
+        let opts = forced(*compression);
         pbfhogg::commands::sort::sort(
             &input,
             path,
@@ -687,9 +675,7 @@ fn tags_filter_compression_level_parity() {
             omit_referenced: false,
             invert: false,
             remove_tags: false,
-            compression: *compression,
-            direct_io: false,
-            force: true,
+            write: forced(*compression),
             jobs: None,
         };
         pbfhogg::tags_filter::tags_filter(
@@ -722,12 +708,7 @@ fn none_compression_reads_back_identical() {
         (Compression::None, &out_none),
         (Compression::Zlib(6), &out_zlib),
     ] {
-        let opts = pbfhogg::sort::SortOptions {
-            compression,
-            direct_io: false,
-            io_uring: false,
-            force: true,
-        };
+        let opts = forced(compression);
         pbfhogg::commands::sort::sort(
             &input,
             output,

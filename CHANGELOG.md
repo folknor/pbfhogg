@@ -4,6 +4,24 @@
 
 ### Breaking
 
+- **Library write entry points take `WriteOptions`, and the output backend is
+  an `OutputBackend`.** The positional `compression, direct_io, io_uring,
+  force` tail is replaced by one `&pbfhogg::write::WriteOptions { compression,
+  backend, direct_reads, force }`, and the `(direct_io, io_uring)` bool pair by
+  `pbfhogg::write::OutputBackend { Buffered, Parallel, Direct, Uring }`
+  (`OutputBackend::from_flags(direct_io, io_uring)` keeps the old rule that
+  both flags together mean io_uring; `direct_reads` is the input-side
+  `--direct-io`, which stays independent of the backend). Changed signatures:
+  `cat::cat`, `getid::getid` and `removeid`, `getparents::getparents`,
+  `repack::repack`, `degrade::degrade`, `extract::extract`, `extract_multi`
+  and `extract_multi_with_display_paths`, `time_filter::time_filter`,
+  `renumber::renumber_external`, `sort::sort` (now takes `&WriteOptions`;
+  `SortOptions` is gone), `cat::dedupe::merge_pbf` (likewise;
+  `MergePbfOptions` is gone) and `altw::external::external_join`. The option
+  structs `apply_changes::MergeOptions`, `tags_filter::TagsFilterOptions` and
+  `altw::AltwOptions` replace their `compression`, `direct_io`, `io_uring` and
+  `force` fields with one `write: WriteOptions`. CLI behavior is unchanged.
+
 - **One element-kind type, `pbfhogg::ElementKind`.** `osc::OscElementKind`
   and `getid::ElemKindTag` are replaced by `pbfhogg::ElementKind { Node, Way,
   Relation }` (ordered node < way < relation, with `as_str`, `ordinal`,

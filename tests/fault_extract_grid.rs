@@ -27,7 +27,7 @@ mod grid_parity {
         Bbox, ExtractSlot, ExtractStrategy, PolygonRings, Region, extract_multi, parse_bbox,
     };
     use pbfhogg::read::region_grid_test_hooks as grid_hooks;
-    use pbfhogg::writer::Compression;
+    use pbfhogg::write::WriteOptions;
     use tempfile::TempDir;
 
     use crate::common::{TestMember, TestNode, TestRelation, TestWay, write_indexed_pbf};
@@ -137,9 +137,10 @@ mod grid_parity {
             ExtractStrategy::Simple,
             true,
             &CleanAttrs::default(),
-            Compression::default(),
-            false,
-            true,
+            &WriteOptions {
+                force: true,
+                ..WriteOptions::default()
+            },
             &pbfhogg::HeaderOverrides::default(),
             &crate::common::test_host(),
         )

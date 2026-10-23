@@ -402,7 +402,7 @@ The two downstream consumers are:
   - File: `~/Programs/nidhogg/src/ingest/mod.rs:72-324`
 - **Merge path**: delegates entirely to `pbfhogg::apply_changes::merge(base, osc, output, &MergeOptions { .. })`
   - File: `~/Programs/nidhogg/src/merge.rs:6`
-  - Currently: zlib compression, no direct_io/io_uring, no locations_on_ways
+  - Currently: zlib compression, the default `WriteOptions` (no direct I/O or io_uring), no locations_on_ways
   - `locations_on_ways` stays `false` by design: the ratified steady
     state re-runs `add-locations-to-ways` after each merge instead of
     maintaining coordinates through the diff (the earlier TODO to enable

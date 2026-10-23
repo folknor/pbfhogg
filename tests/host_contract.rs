@@ -43,9 +43,7 @@ fn process_actions_fire_once_at_each_hook_site() {
         &dir.path().join("clean.pbf"),
         None,
         &clean,
-        Default::default(),
-        false,
-        false,
+        &Default::default(),
         &overrides,
         &host,
     )
@@ -59,9 +57,7 @@ fn process_actions_fire_once_at_each_hook_site() {
         &base,
         &dir.path().join("external.pbf"),
         true,
-        Default::default(),
-        false,
-        false,
+        &Default::default(),
         &overrides,
         false,
         &host,
@@ -77,9 +73,7 @@ fn process_actions_fire_once_at_each_hook_site() {
         &dir.path().join("cat.pbf"),
         None,
         &Default::default(),
-        Default::default(),
-        false,
-        false,
+        &Default::default(),
         &overrides,
         &host,
     )
@@ -110,10 +104,7 @@ fn resources_provider_is_consulted() {
         &base,
         &dir.path().join("repack.pbf"),
         8000,
-        Default::default(),
-        false,
-        false,
-        false,
+        &Default::default(),
         &Default::default(),
         &host,
     )
@@ -155,9 +146,7 @@ fn diagnostics_are_per_run() {
                     &indexed,
                     None,
                     &Default::default(),
-                    Default::default(),
-                    false,
-                    false,
+                    &Default::default(),
                     &Default::default(),
                     &host,
                 )
@@ -166,16 +155,10 @@ fn diagnostics_are_per_run() {
                 host.diagnostics = pbfhogg::host::Diagnostics::new(
                     Arc::clone(&sink) as Arc<dyn pbfhogg::host::DiagnosticSink>
                 );
-                let opts = pbfhogg::sort::SortOptions {
-                    compression: Default::default(),
-                    direct_io: false,
-                    io_uring: false,
-                    force: false,
-                };
                 pbfhogg::sort::sort(
                     &indexed,
                     &dir.path().join("sorted.pbf"),
-                    &opts,
+                    &Default::default(),
                     &Default::default(),
                     &host,
                 )
@@ -390,9 +373,7 @@ fn run_external_join(
         input,
         output,
         true,
-        Default::default(),
-        false,
-        false,
+        &Default::default(),
         &Default::default(),
         false,
         host,
@@ -474,9 +455,7 @@ fn fixed_memory_routes_auto() {
         });
         let opts = pbfhogg::altw::AltwOptions {
             keep_untagged_nodes: true,
-            compression: Default::default(),
-            direct_io: false,
-            force: false,
+            write: Default::default(),
             index_type: pbfhogg::altw::IndexType::Auto,
             inject_prepass: false,
             ignore_missing_nodes: false,
@@ -566,9 +545,7 @@ fn run_scratch_backend(
         "sparse" => {
             let options = pbfhogg::altw::AltwOptions {
                 keep_untagged_nodes: true,
-                compression: Default::default(),
-                direct_io: false,
-                force: false,
+                write: Default::default(),
                 index_type: pbfhogg::altw::IndexType::Sparse,
                 inject_prepass: false,
                 ignore_missing_nodes: false,

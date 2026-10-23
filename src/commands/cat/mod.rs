@@ -13,6 +13,7 @@ use crate::blob_meta::scan_block_ids_and_tags;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
 use crate::owned::{TypeFilter, dense_node_metadata, element_metadata};
+use crate::write::WriteOptions;
 use crate::writer::{Compression, PbfWriter, reframe_raw_with_index};
 use crate::{BlobFilter, Element, PrimitiveBlock};
 
@@ -65,19 +66,17 @@ impl CatStats {
 /// If `type_filter` is set, only elements of matching types are included
 /// (requires full decode). Without a filter, blobs are passed through as
 /// raw bytes (zero decode).
-#[allow(clippy::too_many_arguments)]
 #[hotpath::measure]
 pub fn cat(
     files: &[&Path],
     output: &Path,
     type_filter: Option<TypeFilter>,
     clean: &CleanAttrs,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<CatStats> {
+    let (direct_io, force) = (write.direct_reads, write.force);
     if files.is_empty() {
         return Err("no input files specified".into());
     }
@@ -106,36 +105,20 @@ pub fn cat(
 
     crate::debug::emit_marker("CAT_SCAN_START");
     let result = match (type_filter, clean.any()) {
-        (None, false) => cat_passthrough(files, output, compression, direct_io, overrides, host),
+        (None, false) => cat_passthrough(files, output, write, overrides, host),
         (None, true) => cat_filtered(
             files,
             output,
             TypeFilter::all(),
             clean,
-            compression,
-            direct_io,
+            write,
             overrides,
             host,
         ),
-        (Some(filter), false) => cat_type_passthrough(
-            files,
-            output,
-            filter,
-            compression,
-            direct_io,
-            overrides,
-            host,
-        ),
-        (Some(filter), true) => cat_filtered(
-            files,
-            output,
-            filter,
-            clean,
-            compression,
-            direct_io,
-            overrides,
-            host,
-        ),
+        (Some(filter), false) => {
+            cat_type_passthrough(files, output, filter, write, overrides, host)
+        }
+        (Some(filter), true) => cat_filtered(files, output, filter, clean, write, overrides, host),
     }?;
     crate::debug::emit_marker("CAT_SCAN_END");
     #[allow(clippy::cast_possible_wrap)]
@@ -332,19 +315,18 @@ fn agreed<'a, T: PartialEq + Copy>(
 fn cat_passthrough(
     files: &[&Path],
     output: &Path,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<CatStats> {
+    let direct_io = write.direct_reads;
     let header_bytes = cat_output_header_bytes(files, direct_io, overrides, host)?;
 
     let mut writer = super::writer_from_header_bytes(
         output,
-        compression,
+        write.compression,
         &header_bytes,
-        direct_io,
-        false,
+        write.backend,
         host,
     )?;
     let mut blobs: u64 = 0;
@@ -427,21 +409,20 @@ fn cat_type_passthrough(
     files: &[&Path],
     output: &Path,
     tf: TypeFilter,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<CatStats> {
     let blob_filter = BlobFilter::new(tf.nodes, tf.ways, tf.relations);
+    let direct_io = write.direct_reads;
 
     let header_bytes = cat_output_header_bytes(files, direct_io, overrides, host)?;
 
     let mut writer = super::writer_from_header_bytes(
         output,
-        compression,
+        write.compression,
         &header_bytes,
-        direct_io,
-        false,
+        write.backend,
         host,
     )?;
     let mut blobs_passthrough: u64 = 0;
@@ -632,17 +613,17 @@ use super::clean_metadata;
 /// blobs (rare in practice; PBFs conventionally have one kind per block),
 /// each kind is emitted in its own phase, splitting one input blob into up
 /// to three smaller output blobs.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 fn cat_filtered(
     files: &[&Path],
     output: &Path,
     tf: TypeFilter,
     clean: &CleanAttrs,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<CatStats> {
+    let (compression, direct_io) = (write.compression, write.direct_reads);
     // Per-blob worker pool; same precedent as check --refs / verify_ids.
     // The workers do BlockBuilder re-encode (allocation-heavy) but each
     // blob's alloc/free cycle is confined to a single worker thread, so
@@ -654,14 +635,8 @@ fn cat_filtered(
     // Output header: reconciled across every input (see `cat_output_header_bytes`)
     // -----------------------------------------------------------------------
     let header_bytes = cat_output_header_bytes(files, direct_io, overrides, host)?;
-    let mut writer = super::writer_from_header_bytes(
-        output,
-        compression,
-        &header_bytes,
-        direct_io,
-        false,
-        host,
-    )?;
+    let mut writer =
+        super::writer_from_header_bytes(output, compression, &header_bytes, write.backend, host)?;
 
     let mut blobs_decoded: u64 = 0;
     let mut elements: u64 = 0;

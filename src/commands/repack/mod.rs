@@ -51,6 +51,7 @@ use crate::owned::{
     read_node, read_relation, read_way, read_way_with_locations, write_single_node_local,
     write_single_relation_local, write_single_way_local,
 };
+use crate::write::WriteOptions;
 use crate::writer::{Compression, PbfWriter, frame_blob_pipelined};
 use crate::{Element, ElementReader};
 
@@ -123,19 +124,22 @@ fn warn_way_metadata_loss(header: &crate::HeaderBlock, host: &crate::host::Host)
 /// round-trips with its tags, refs, members, metadata, and DenseNodes
 /// encoding. Output is type-sorted (nodes, then ways, then relations);
 /// the `Sort.Type_then_ID` flag is propagated when the input has it.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn repack(
     input: &Path,
     output: &Path,
     elements_per_blob: usize,
-    compression: Compression,
-    direct_io: bool,
-    io_uring: bool,
-    force: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<RepackStats> {
+    let WriteOptions {
+        compression,
+        backend,
+        direct_reads: direct_io,
+        force,
+    } = *write;
     if elements_per_blob == 0 {
         return Err("--elements-per-blob must be > 0".into());
     }
@@ -187,8 +191,7 @@ pub fn repack(
                 hb
             }
         },
-        direct_io,
-        io_uring,
+        backend,
         host,
     )?;
 

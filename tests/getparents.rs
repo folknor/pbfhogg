@@ -8,7 +8,7 @@ use crate::common::{
 use pbfhogg::MemberId;
 use pbfhogg::getid::parse_ids;
 use pbfhogg::getparents::{GetparentsOptions, getparents};
-use pbfhogg::writer::Compression;
+use pbfhogg::write::WriteOptions;
 use tempfile::TempDir;
 
 fn ids(strs: &[&str]) -> Vec<String> {
@@ -84,8 +84,7 @@ fn ways_referencing_node() {
         &output,
         &id_set,
         &default_opts(),
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -151,8 +150,7 @@ fn relations_referencing_way() {
         &output,
         &id_set,
         &default_opts(),
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -205,8 +203,7 @@ fn add_self_includes_queried_objects() {
         &output,
         &id_set,
         &opts,
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -260,8 +257,7 @@ fn no_transitive_relations() {
         &output,
         &id_set,
         &default_opts(),
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -305,8 +301,7 @@ fn empty_result() {
         &output,
         &id_set,
         &default_opts(),
-        Compression::default(),
-        false,
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )

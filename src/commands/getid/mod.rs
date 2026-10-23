@@ -13,7 +13,8 @@ use crate::file_writer::FileWriter;
 use crate::owned::{dense_node_metadata, element_metadata};
 use crate::read::header_walker::ScanArm;
 use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
-use crate::writer::{Compression, PbfWriter};
+use crate::write::WriteOptions;
+use crate::writer::PbfWriter;
 use crate::{BlobFilter, Element, ElementKind, ElementReader, PrimitiveBlock};
 
 use super::Result;
@@ -372,16 +373,13 @@ impl GetidStats {
 ///
 /// If `opts.add_referenced` is true, referenced nodes of matching ways are also
 /// included (two-pass). Otherwise, only exact ID matches are output.
-#[allow(clippy::too_many_arguments)]
 #[hotpath::measure]
 pub fn getid(
     input: &Path,
     output: &Path,
     ids: &ElementIds,
     opts: &GetidOptions,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetidStats> {
@@ -390,9 +388,7 @@ pub fn getid(
         output,
         ids,
         opts,
-        compression,
-        direct_io,
-        force,
+        write,
         overrides,
         FULL_SCAN_ARM_MIN_BLOBS,
         host,
@@ -410,17 +406,15 @@ fn getid_dispatched(
     output: &Path,
     ids: &ElementIds,
     opts: &GetidOptions,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     min_blobs: u64,
     host: &crate::host::Host,
 ) -> Result<(Option<ScanArm>, GetidStats)> {
     let has_indexdata = require_indexdata(
         input,
-        direct_io,
-        force,
+        write.direct_reads,
+        write.force,
         "input PBF has no blob-level indexdata. Without indexdata, the type filter \
          based on requested ID types is a no-op - all blobs are decompressed \
          (significantly slower).",
@@ -431,16 +425,7 @@ fn getid_dispatched(
     // add_referenced still shares the refusal above: --force explicitly opts
     // into its slower unindexed scans even though it does not dispatch an arm.
     let (arm, result) = if opts.add_referenced {
-        let stats = getid_with_refs(
-            input,
-            output,
-            ids,
-            opts,
-            compression,
-            direct_io,
-            overrides,
-            host,
-        )?;
+        let stats = getid_with_refs(input, output, ids, opts, write, overrides, host)?;
         (None, stats)
     } else {
         let arm = super::dispatch_scan_arm(input, has_indexdata, min_blobs, host)?;
@@ -449,8 +434,7 @@ fn getid_dispatched(
             output,
             ids,
             true,
-            compression,
-            direct_io,
+            write,
             overrides,
             arm,
             opts.report_found,
@@ -473,23 +457,20 @@ fn getid_dispatched(
 /// path at `filter_by_id` can skip re-encoding non-matching blobs. On a
 /// non-indexed PBF the fast path is unreachable and every blob would
 /// decode-and-re-encode silently; `--force` overrides.
-#[allow(clippy::too_many_arguments)]
 #[hotpath::measure]
 pub fn removeid(
     input: &Path,
     output: &Path,
     ids: &ElementIds,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetidStats> {
     let _ = host;
     require_indexdata(
         input,
-        direct_io,
-        force,
+        write.direct_reads,
+        write.force,
         "input PBF has no blob-level indexdata. Without indexdata, the \
          invert-mode raw-passthrough fast path is unreachable and every \
          blob is decompressed and re-encoded (significantly slower).",
@@ -503,8 +484,7 @@ pub fn removeid(
         output,
         ids,
         false,
-        compression,
-        direct_io,
+        write,
         overrides,
         ScanArm::Walker,
         false,
@@ -526,8 +506,7 @@ fn filter_by_id(
     output: &Path,
     ids: &ElementIds,
     include: bool,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     arm: ScanArm,
     report_found: bool,
@@ -539,8 +518,7 @@ fn filter_by_id(
             output,
             ids,
             include,
-            compression,
-            direct_io,
+            write,
             overrides,
             report_found,
             host,
@@ -551,16 +529,7 @@ fn filter_by_id(
                 "the streaming full-scan arm implements include mode only; \
                  removeid is pinned to ScanArm::Walker"
             );
-            filter_by_id_streaming(
-                input,
-                output,
-                ids,
-                compression,
-                direct_io,
-                overrides,
-                report_found,
-                host,
-            )
+            filter_by_id_streaming(input, output, ids, write, overrides, report_found, host)
         }
     }
 }
@@ -572,8 +541,7 @@ fn filter_by_id_walker(
     output: &Path,
     ids: &ElementIds,
     include: bool,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     report_found: bool,
     host: &crate::host::Host,
@@ -626,10 +594,9 @@ fn filter_by_id_walker(
                 let header_bytes = super::build_output_header(&header, true, overrides, |hb| hb)?;
                 writer = Some(super::writer_from_header_bytes(
                     output,
-                    compression,
+                    write.compression,
                     &header_bytes,
-                    direct_io,
-                    false,
+                    write.backend,
                     host,
                 )?);
             }
@@ -762,13 +729,11 @@ fn filter_by_id_walker(
 /// (permit accounting, rayon dispatch, channel hops) times millions of
 /// small blobs loses to a plain sequential read loop.
 #[allow(clippy::too_many_lines)]
-#[allow(clippy::too_many_arguments)]
 fn filter_by_id_streaming(
     input: &Path,
     output: &Path,
     ids: &ElementIds,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     report_found: bool,
     host: &crate::host::Host,
@@ -795,7 +760,7 @@ fn filter_by_id_streaming(
     let mut blobs_skipped: u64 = 0;
     let mut osmdata_blobs: u64 = 0;
 
-    let mut reader = FileReader::open(input, direct_io)?;
+    let mut reader = FileReader::open(input, write.direct_reads)?;
     let mut file_offset: u64 = 0;
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut bb = BlockBuilder::new();
@@ -812,10 +777,9 @@ fn filter_by_id_streaming(
                 let header_bytes = super::build_output_header(&header, true, overrides, |hb| hb)?;
                 writer = Some(super::writer_from_header_bytes(
                     output,
-                    compression,
+                    write.compression,
                     &header_bytes,
-                    direct_io,
-                    false,
+                    write.backend,
                     host,
                 )?);
             }
@@ -914,14 +878,13 @@ fn filter_by_id_streaming(
 // Two-pass getid with --add-referenced
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 fn getid_with_refs(
     input: &Path,
     output: &Path,
     ids: &ElementIds,
     opts: &GetidOptions,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetidStats> {
@@ -990,7 +953,7 @@ fn getid_with_refs(
     // Pass 2: Write matching elements + dependent nodes (transform fused into
     // the decode workers).
     crate::debug::emit_marker("GETID_PASS2_START");
-    let reader = ElementReader::open_in(input, direct_io, host)?;
+    let reader = ElementReader::open_in(input, write.direct_reads, host)?;
     super::warn_locations_on_ways_loss(reader.header(), host);
     // Skip blob types not needed: nodes if no node IDs and no dependent nodes,
     // ways always needed (add-referenced mode), relations if no relation IDs.
@@ -1001,13 +964,12 @@ fn getid_with_refs(
     ));
     let mut writer = writer_from_header(
         output,
-        compression,
+        write.compression,
         reader.header(),
         true,
         overrides,
         |hb| hb,
-        direct_io,
-        false,
+        write.backend,
         host,
     )?;
 
@@ -1241,6 +1203,7 @@ fn process_block(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::writer::Compression;
 
     #[test]
     fn parse_node_id() {
@@ -1499,8 +1462,7 @@ mod tests {
             &output,
             &ids,
             &opts,
-            Compression::default(),
-            false,
+            &WriteOptions::default(),
             &HeaderOverrides::default(),
             &crate::host::Host::for_tests(),
         )
@@ -1525,8 +1487,7 @@ mod tests {
                 output,
                 &query,
                 true,
-                Compression::default(),
-                false,
+                &WriteOptions::default(),
                 &HeaderOverrides::default(),
                 arm,
                 false,
@@ -1601,9 +1562,7 @@ mod tests {
                 &output,
                 &query,
                 &opts,
-                Compression::default(),
-                false,
-                false,
+                &WriteOptions::default(),
                 &HeaderOverrides::default(),
                 min_blobs,
                 &crate::host::Host::for_tests(),

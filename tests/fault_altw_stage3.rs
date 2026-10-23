@@ -16,7 +16,7 @@ mod altw_external_stage3 {
     use pbfhogg::altw::{
         AltwOptions, IndexType, add_locations_to_ways, external_test_hooks as altw_hooks,
     };
-    use pbfhogg::writer::Compression;
+    use pbfhogg::write::WriteOptions;
 
     use crate::common::{
         TestNode, TestWay, generate_nodes, generate_ways, snapshot_dir, write_multi_block_test_pbf,
@@ -54,9 +54,10 @@ mod altw_external_stage3 {
                 &output,
                 &AltwOptions {
                     keep_untagged_nodes: false,
-                    compression: Compression::default(),
-                    direct_io: false,
-                    force: true,
+                    write: WriteOptions {
+                        force: true,
+                        ..WriteOptions::default()
+                    },
                     index_type: IndexType::External,
                     inject_prepass: false,
                     ignore_missing_nodes: true,

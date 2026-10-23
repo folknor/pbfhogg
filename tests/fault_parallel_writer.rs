@@ -34,8 +34,8 @@ mod parallel_writer {
 
     use flate2::write::GzEncoder;
     use pbfhogg::apply_changes::{MergeOptions, merge};
+    use pbfhogg::write::WriteOptions;
     use pbfhogg::write::parallel_writer_test_hooks as pw_hooks;
-    use pbfhogg::writer::Compression;
     use tempfile::TempDir;
 
     use crate::common::{self, generate_nodes, write_multi_block_test_pbf};
@@ -102,10 +102,10 @@ mod parallel_writer {
                 &osc,
                 &output,
                 &MergeOptions {
-                    compression: Compression::default(),
-                    direct_io: false,
-                    io_uring: false,
-                    force: true,
+                    write: WriteOptions {
+                        force: true,
+                        ..WriteOptions::default()
+                    },
                     locations_on_ways: false,
                     ignore_missing_nodes: false,
                     jobs: Some(2),

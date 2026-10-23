@@ -74,11 +74,9 @@ fn empty_pbf_survives_sort() {
     let output = dir.path().join("sorted.osm.pbf");
     write_empty_pbf(&input);
 
-    let opts = pbfhogg::sort::SortOptions {
-        compression: Compression::default(),
-        direct_io: false,
-        io_uring: false,
+    let opts = pbfhogg::write::WriteOptions {
         force: true,
+        ..Default::default()
     };
     pbfhogg::commands::sort::sort(
         &input,
@@ -386,9 +384,10 @@ fn write_unresolvable_way_pbf(path: &std::path::Path) {
 fn altw_options() -> pbfhogg::altw::AltwOptions {
     pbfhogg::altw::AltwOptions {
         keep_untagged_nodes: true,
-        compression: Compression::default(),
-        direct_io: false,
-        force: true,
+        write: pbfhogg::write::WriteOptions {
+            force: true,
+            ..Default::default()
+        },
         index_type: pbfhogg::altw::IndexType::Sparse,
         inject_prepass: false,
         ignore_missing_nodes: false,

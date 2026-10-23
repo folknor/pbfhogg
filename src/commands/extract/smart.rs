@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::cat::CleanAttrs;
-use crate::writer::Compression;
+use crate::write::WriteOptions;
 use crate::{Element, MemberId, PrimitiveBlock};
 
 use super::super::{
@@ -488,11 +488,16 @@ pub(super) fn extract_smart(
     region: &Region,
     set_bounds: bool,
     clean: &CleanAttrs,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<ExtractStats> {
+    let WriteOptions {
+        compression,
+        backend,
+        direct_reads: direct_io,
+        ..
+    } = *write;
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -610,8 +615,7 @@ pub(super) fn extract_smart(
             };
             hb.sorted()
         },
-        direct_io,
-        false,
+        backend,
         host,
     )?;
 

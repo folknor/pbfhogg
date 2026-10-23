@@ -394,9 +394,7 @@ fn cat_rejects_oversized_header_length() {
         &output,
         None,
         &pbfhogg::cat::CleanAttrs::default(),
-        Compression::default(),
-        false,
-        false,
+        &pbfhogg::write::WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     );
@@ -602,9 +600,7 @@ fn cat_rejects_oversized_datasize() {
         &output,
         None,
         &pbfhogg::cat::CleanAttrs::default(),
-        Compression::default(),
-        false,
-        false,
+        &pbfhogg::write::WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     );

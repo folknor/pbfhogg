@@ -6,16 +6,14 @@ use crate::common::{
     way_ids_id_only as way_ids, write_test_pbf_sorted,
 };
 use pbfhogg::MemberId;
-use pbfhogg::cat::dedupe::{MergePbfOptions, merge_pbf};
-use pbfhogg::writer::Compression;
+use pbfhogg::cat::dedupe::merge_pbf;
+use pbfhogg::write::WriteOptions;
 use tempfile::TempDir;
 
-fn default_opts() -> MergePbfOptions {
-    MergePbfOptions {
-        compression: Compression::default(),
-        direct_io: false,
-        io_uring: false,
+fn default_opts() -> WriteOptions {
+    WriteOptions {
         force: true,
+        ..WriteOptions::default()
     }
 }
 

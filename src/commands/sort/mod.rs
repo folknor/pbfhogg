@@ -21,7 +21,8 @@ use crate::blob_meta::{BlobIndex, scan_block_ids_checked};
 use crate::block_builder::BlockBuilder;
 use crate::file_writer::FileWriter;
 use crate::read::header_walker::HeaderWalker;
-use crate::writer::{Compression, PbfWriter, reframe_raw_with_index};
+use crate::write::WriteOptions;
+use crate::writer::{PbfWriter, reframe_raw_with_index};
 
 use super::{
     HeaderOverrides, Result, build_output_header, require_indexdata, writer_from_header_bytes,
@@ -113,14 +114,6 @@ struct BlobEntry {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Options controlling sort I/O and compression behavior.
-pub struct SortOptions {
-    pub compression: Compression,
-    pub direct_io: bool,
-    pub io_uring: bool,
-    pub force: bool,
-}
-
 /// Sort a PBF file into standard order (nodes -> ways -> relations, by ID).
 ///
 /// Uses blob-level permutation sort: O(num_blobs) memory. Non-overlapping
@@ -131,14 +124,14 @@ pub struct SortOptions {
 pub fn sort(
     input: &Path,
     output: &Path,
-    opts: &SortOptions,
+    opts: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<SortStats> {
-    let SortOptions {
+    let WriteOptions {
         compression,
-        direct_io,
-        io_uring,
+        backend,
+        direct_reads: direct_io,
         force,
     } = *opts;
     let indexed = require_indexdata(
@@ -249,14 +242,7 @@ pub fn sort(
     crate::debug::emit_marker("SORT_WRITER_SETUP_START");
     #[allow(clippy::redundant_closure_for_method_calls)]
     let header_bytes = build_output_header(&header, false, overrides, |hb| hb.sorted())?;
-    let mut writer = writer_from_header_bytes(
-        output,
-        compression,
-        &header_bytes,
-        direct_io,
-        io_uring,
-        host,
-    )?;
+    let mut writer = writer_from_header_bytes(output, compression, &header_bytes, backend, host)?;
     crate::debug::emit_marker("SORT_WRITER_SETUP_END");
 
     // Open input for random-access reads
@@ -268,9 +254,11 @@ pub fn sort(
     // `PbfWriter::write_raw_copy`. `input_file` stays untouched for the
     // random-access reads below.
     let input_shared = std::sync::Arc::new(input_file.try_clone()?);
-    // io_uring uses linked ReadFixed+WriteFixed for CopyRange.
-    // Buffered output supports copy_file_range. O_DIRECT cannot.
-    let use_copy_range = io_uring || (!direct_io && cfg!(feature = "linux-direct-io"));
+    // Buffered output splices with copy_file_range; the io_uring writer
+    // services a CopyRange with a pread into a registered buffer followed by
+    // a plain write (the linked ReadFixed+WriteFixed chain was removed).
+    // O_DIRECT cannot take either.
+    let use_copy_range = backend.supports_copy_range();
 
     let mut stats = SortStats {
         nodes: 0,

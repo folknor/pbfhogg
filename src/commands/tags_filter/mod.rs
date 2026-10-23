@@ -12,7 +12,7 @@ use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::idset::IdSet;
 use crate::owned::{dense_node_metadata, element_metadata};
 use crate::tag_expr::{Expression, StringMatcher, parse_expressions, tag_matches};
-use crate::writer::Compression;
+use crate::write::WriteOptions;
 use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
 
 use super::Result;
@@ -195,9 +195,8 @@ pub struct TagsFilterOptions<'a> {
     /// Strip tags from referenced objects not directly matched by expressions.
     /// Only meaningful without `-R` (two-pass mode with reference expansion).
     pub remove_tags: bool,
-    pub compression: Compression,
-    pub direct_io: bool,
-    pub force: bool,
+    /// Output compression, backend and the shared input flags.
+    pub write: WriteOptions,
     /// Override the worker-pool size for the parallel classify passes
     /// in two-pass mode (`parallel_classify_phase` for blob scanning
     /// plus two `parallel_classify_accumulate` calls for relation
@@ -241,8 +240,8 @@ pub fn tags_filter(
     if !opts.invert && !opts.distrust_metadata {
         require_indexdata(
             input,
-            opts.direct_io,
-            opts.force,
+            opts.write.direct_reads,
+            opts.write.force,
             "input PBF has no blob-level indexdata. Without indexdata, type and tag key \
              filters are no-ops - all blobs are decompressed (significantly slower).",
             host,
@@ -262,8 +261,7 @@ pub fn tags_filter(
             &expressions,
             opts.invert,
             opts.distrust_metadata,
-            opts.compression,
-            opts.direct_io,
+            &opts.write,
             overrides,
             host,
         )?;
@@ -285,8 +283,7 @@ pub fn tags_filter(
             opts.invert,
             opts.distrust_metadata,
             opts.remove_tags,
-            opts.compression,
-            opts.direct_io,
+            &opts.write,
             opts.jobs,
             overrides,
             host,
@@ -422,11 +419,16 @@ fn tags_filter_single_pass(
     expressions: &[Expression],
     invert: bool,
     distrust_metadata: bool,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<TagsFilterStats> {
+    let WriteOptions {
+        compression,
+        backend,
+        direct_reads: direct_io,
+        ..
+    } = *write;
     crate::debug::emit_marker("TAGSFILTER_SCAN_START");
     let reader = ElementReader::open_in(input, direct_io, host)?;
     super::warn_locations_on_ways_loss(reader.header(), host);
@@ -442,8 +444,7 @@ fn tags_filter_single_pass(
         true,
         overrides,
         |hb| hb,
-        direct_io,
-        false,
+        backend,
         host,
     )?;
     let mut stats = TagsFilterStats {
@@ -650,12 +651,17 @@ fn tags_filter_two_pass(
     invert: bool,
     distrust_metadata: bool,
     remove_tags: bool,
-    compression: Compression,
-    direct_io: bool,
+    write: &WriteOptions,
     jobs: Option<usize>,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<TagsFilterStats> {
+    let WriteOptions {
+        compression,
+        backend,
+        direct_reads: direct_io,
+        ..
+    } = *write;
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
         nodes_from_ways: 0,
@@ -898,8 +904,7 @@ fn tags_filter_two_pass(
         true,
         overrides,
         |hb| hb,
-        direct_io,
-        false,
+        backend,
         host,
     )?;
 
@@ -1403,7 +1408,7 @@ mod tests {
     use super::*;
     use crate::ElementKind;
     use crate::owned::TypeFilter;
-    use crate::writer::PbfWriter;
+    use crate::writer::{Compression, PbfWriter};
 
     fn filter_for(expressions: &[&str]) -> Option<BlobFilter> {
         let strs: Vec<String> = expressions.iter().map(|s| (*s).to_string()).collect();
@@ -1501,8 +1506,7 @@ mod tests {
             &expressions,
             false,
             false,
-            Compression::default(),
-            false,
+            &WriteOptions::default(),
             &HeaderOverrides::default(),
             &crate::host::Host::for_tests(),
         )

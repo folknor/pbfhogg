@@ -97,9 +97,12 @@ pub fn report_writer_index_loss(diagnostics: &crate::host::Diagnostics) {
         );
     }
 }
+pub mod options;
 #[cfg(feature = "linux-io-uring")]
 pub mod uring_writer;
 pub mod writer;
+
+pub use options::{OutputBackend, WriteOptions};
 
 /// Page size for alignment. 4096 is universally safe across Linux filesystems.
 pub(crate) const PAGE_SIZE: usize = 4096;

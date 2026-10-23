@@ -24,11 +24,20 @@ use crate::common::{
     write_test_pbf_sorted,
 };
 use pbfhogg::MemberId;
-use pbfhogg::writer::Compression;
+use pbfhogg::write::WriteOptions;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use tempfile::TempDir;
+
+/// Default compression and backend with `force` set: these tests feed the
+/// commands non-indexed input on purpose.
+fn forced() -> WriteOptions {
+    WriteOptions {
+        force: true,
+        ..WriteOptions::default()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared fixture: a small sorted PBF suitable for every command under test.
@@ -183,12 +192,7 @@ fn sort_non_indexed_parity() {
     let out_non = dir.path().join("out_non.osm.pbf");
     write_both(&in_idx, &in_non);
 
-    let opts = pbfhogg::sort::SortOptions {
-        compression: Compression::default(),
-        direct_io: false,
-        io_uring: false,
-        force: true,
-    };
+    let opts = forced();
     pbfhogg::commands::sort::sort(
         &in_idx,
         &out_idx,
@@ -229,9 +233,7 @@ fn tags_filter_non_indexed_parity() {
         omit_referenced: false,
         invert: false,
         remove_tags: false,
-        compression: Compression::default(),
-        direct_io: false,
-        force: true,
+        write: forced(),
         jobs: None,
     };
     pbfhogg::tags_filter::tags_filter(
@@ -290,9 +292,7 @@ fn extract_simple_non_indexed_parity() {
             pbfhogg::commands::extract::ExtractStrategy::Simple,
             true,
             &pbfhogg::cat::CleanAttrs::default(),
-            Compression::default(),
-            false,
-            true,
+            &forced(),
             &pbfhogg::HeaderOverrides::default(),
             &crate::common::test_host(),
         )
@@ -327,7 +327,7 @@ fn getid_include_non_indexed_parity() {
         remove_tags: false,
         report_found: false,
     };
-    let compression = Compression::default();
+    let write = forced();
     let hdr = pbfhogg::HeaderOverrides::default();
 
     pbfhogg::getid::getid(
@@ -335,9 +335,7 @@ fn getid_include_non_indexed_parity() {
         &out_idx,
         &id_set,
         &opts,
-        compression,
-        false,
-        true,
+        &write,
         &hdr,
         &crate::common::test_host(),
     )
@@ -347,9 +345,7 @@ fn getid_include_non_indexed_parity() {
         &out_non,
         &id_set,
         &opts,
-        compression,
-        false,
-        true,
+        &write,
         &hdr,
         &crate::common::test_host(),
     )
@@ -408,10 +404,7 @@ fn apply_changes_non_indexed_parity() {
     );
 
     let opts = pbfhogg::apply_changes::MergeOptions {
-        compression: Compression::default(),
-        direct_io: false,
-        io_uring: false,
-        force: true,
+        write: forced(),
         locations_on_ways: false,
         ignore_missing_nodes: false,
         jobs: None,
@@ -727,8 +720,7 @@ fn renumber_external_rejects_non_indexed() {
         &in_idx,
         &out_idx,
         &opts,
-        Compression::default(),
-        false,
+        &pbfhogg::write::WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -743,8 +735,7 @@ fn renumber_external_rejects_non_indexed() {
         &in_non,
         &out_non,
         &opts,
-        Compression::default(),
-        false,
+        &pbfhogg::write::WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -804,9 +795,7 @@ fn extract_multi_complete_ways_non_indexed_parity() {
         pbfhogg::commands::extract::ExtractStrategy::CompleteWays,
         true,
         &pbfhogg::cat::CleanAttrs::default(),
-        Compression::default(),
-        false,
-        true,
+        &forced(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -817,9 +806,7 @@ fn extract_multi_complete_ways_non_indexed_parity() {
         pbfhogg::commands::extract::ExtractStrategy::CompleteWays,
         true,
         &pbfhogg::cat::CleanAttrs::default(),
-        Compression::default(),
-        false,
-        true,
+        &forced(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -854,9 +841,7 @@ fn extract_smart_non_indexed_parity() {
         pbfhogg::commands::extract::ExtractStrategy::Smart,
         true,
         &pbfhogg::cat::CleanAttrs::default(),
-        Compression::default(),
-        false,
-        true,
+        &forced(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -868,9 +853,7 @@ fn extract_smart_non_indexed_parity() {
         pbfhogg::commands::extract::ExtractStrategy::Smart,
         true,
         &pbfhogg::cat::CleanAttrs::default(),
-        Compression::default(),
-        false,
-        true,
+        &forced(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )
@@ -1003,11 +986,9 @@ fn merge_pbf_non_indexed_parity() {
     let out_idx = dir.path().join("out_idx.osm.pbf");
     let out_non = dir.path().join("out_non.osm.pbf");
 
-    let opts = pbfhogg::cat::dedupe::MergePbfOptions {
-        compression: Compression::default(),
-        direct_io: false,
-        io_uring: false,
+    let opts = pbfhogg::write::WriteOptions {
         force: true,
+        ..Default::default()
     };
     let stats_idx = pbfhogg::cat::dedupe::merge_pbf(
         &[&a_idx, &b_idx],

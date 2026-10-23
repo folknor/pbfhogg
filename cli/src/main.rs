@@ -12,6 +12,7 @@ use pbfhogg::cat::CleanAttrs;
 use pbfhogg::geocode_index::builder::BuildConfig as GeocodeBuildConfig;
 use pbfhogg::getid::ElementRef;
 use pbfhogg::tags_count::TagCountSort;
+use pbfhogg::write::{OutputBackend, WriteOptions};
 use pbfhogg::writer::Compression;
 use pbfhogg::{HeaderOverrides, TypeFilter};
 
@@ -1194,25 +1195,8 @@ enum InspectCommand {
     },
 }
 
-/// Write-side flags shared by every command that produces an output file.
-///
-/// These four travelled as four positional parameters through twenty `run_*`
-/// functions, three of them adjacent `bool`s: transposing `direct_io` and
-/// `force` at a call site compiled silently and changed what the command
-/// did. As a struct they are written by field name at the one place that
-/// knows their values, and the compiler catches a missing one.
-///
-/// Commands whose clap surface has no `--io-uring` or `--force` set the
-/// corresponding field to `false` explicitly at the dispatch site.
-#[derive(Clone, Copy)]
-struct WriteOpts {
-    compression: Compression,
-    direct_io: bool,
-    io_uring: bool,
-    force: bool,
-}
-
-/// `getid`'s three independent booleans, same hazard as [`WriteOpts`].
+/// `getid`'s three independent booleans: adjacent `bool`s that transpose
+/// silently at a call site, so they are written by field name.
 #[derive(Clone, Copy)]
 struct GetidFlags {
     add_referenced: bool,
@@ -1383,10 +1367,10 @@ fn main() -> process::ExitCode {
                 header,
             } => {
                 let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
-                let write = WriteOpts {
+                let write = WriteOptions {
                     compression: compression.compression,
-                    direct_io: io.direct_io,
-                    io_uring: uring.io_uring,
+                    backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
+                    direct_reads: io.direct_io,
                     force: force.force,
                 };
                 if dedupe {
@@ -1426,10 +1410,10 @@ fn main() -> process::ExitCode {
                 header,
             } => {
                 let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
-                let write = WriteOpts {
+                let write = WriteOptions {
                     compression: compression.compression,
-                    direct_io: io.direct_io,
-                    io_uring: uring.io_uring,
+                    backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
+                    direct_reads: io.direct_io,
                     force: force.force,
                 };
                 guarded_output(&output.output, |out| {
@@ -1447,10 +1431,10 @@ fn main() -> process::ExitCode {
                 header,
             } => {
                 let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
-                let write = WriteOpts {
+                let write = WriteOptions {
                     compression: compression.compression,
-                    direct_io: io.direct_io,
-                    io_uring: uring.io_uring,
+                    backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
+                    direct_reads: io.direct_io,
                     force: force.force,
                 };
                 guarded_output(&output.output, |out| {
@@ -1478,10 +1462,10 @@ fn main() -> process::ExitCode {
                 header,
             } => {
                 let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
-                let write = WriteOpts {
+                let write = WriteOptions {
                     compression: compression.compression,
-                    direct_io: io.direct_io,
-                    io_uring: uring.io_uring,
+                    backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
+                    direct_reads: io.direct_io,
                     force,
                 };
                 // Six adjacent `bool`s used to be six positional arguments
@@ -1515,10 +1499,10 @@ fn main() -> process::ExitCode {
                 header,
             } => {
                 let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
-                let write = WriteOpts {
+                let write = WriteOptions {
                     compression: compression.compression,
-                    direct_io: io.direct_io,
-                    io_uring: false,
+                    backend: OutputBackend::from_flags(io.direct_io, false),
+                    direct_reads: io.direct_io,
                     force: false,
                 };
                 guarded_output(&output.output, |out| {
@@ -1575,10 +1559,10 @@ fn main() -> process::ExitCode {
                 InputKind::Pbf => {
                     let overrides =
                         HeaderOverrides::parse(header.generator, &header.output_headers)?;
-                    let write = WriteOpts {
+                    let write = WriteOptions {
                         compression: compression.compression,
-                        direct_io: io.direct_io,
-                        io_uring: false,
+                        backend: OutputBackend::from_flags(io.direct_io, false),
+                        direct_reads: io.direct_io,
                         force: force.force,
                     };
                     let flags = TagsFilterFlags {
@@ -1740,10 +1724,10 @@ fn main() -> process::ExitCode {
                 header,
             } => {
                 let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
-                let write = WriteOpts {
+                let write = WriteOptions {
                     compression: compression.compression,
-                    direct_io: io.direct_io,
-                    io_uring: false,
+                    backend: OutputBackend::from_flags(io.direct_io, false),
+                    direct_reads: io.direct_io,
                     force: force.force,
                 };
                 if invert {
@@ -1796,10 +1780,10 @@ fn main() -> process::ExitCode {
                 header,
             } => {
                 let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
-                let write = WriteOpts {
+                let write = WriteOptions {
                     compression: compression.compression,
-                    direct_io: io.direct_io,
-                    io_uring: false,
+                    backend: OutputBackend::from_flags(io.direct_io, false),
+                    direct_reads: io.direct_io,
                     force: false,
                 };
                 guarded_output(&output.output, |out| {
@@ -1835,10 +1819,10 @@ fn main() -> process::ExitCode {
                 header,
             } => {
                 let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
-                let write = WriteOpts {
+                let write = WriteOptions {
                     compression: compression.compression,
-                    direct_io: io.direct_io,
-                    io_uring: false,
+                    backend: OutputBackend::from_flags(io.direct_io, false),
+                    direct_reads: io.direct_io,
                     force: force.force,
                 };
                 if let Some(config_path) = config.as_deref() {
@@ -1886,17 +1870,15 @@ fn main() -> process::ExitCode {
             } => {
                 let index_type = index_type.resolve()?;
                 let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
-                let write = WriteOpts {
+                let write = WriteOptions {
                     compression: compression.compression,
-                    direct_io: io.direct_io,
-                    io_uring: false,
+                    backend: OutputBackend::from_flags(io.direct_io, false),
+                    direct_reads: io.direct_io,
                     force: force.force,
                 };
                 let options = pbfhogg::altw::AltwOptions {
                     keep_untagged_nodes,
-                    compression: write.compression,
-                    direct_io: write.direct_io,
-                    force: write.force,
+                    write,
                     index_type,
                     inject_prepass,
                     ignore_missing_nodes,
@@ -1914,10 +1896,10 @@ fn main() -> process::ExitCode {
                 header,
             } => {
                 let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
-                let write = WriteOpts {
+                let write = WriteOptions {
                     compression: compression.compression,
-                    direct_io: io.direct_io,
-                    io_uring: false,
+                    backend: OutputBackend::from_flags(io.direct_io, false),
+                    direct_reads: io.direct_io,
                     force: false,
                 };
                 guarded_output(&output.output, |out| {
@@ -2015,17 +1997,14 @@ fn main() -> process::ExitCode {
                 header,
             } => {
                 let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
-                let write = WriteOpts {
+                let write = WriteOptions {
                     compression: compression.compression,
-                    direct_io: io.direct_io,
-                    io_uring: uring.io_uring,
+                    backend: OutputBackend::from_flags(io.direct_io, uring.io_uring),
+                    direct_reads: io.direct_io,
                     force: force.force,
                 };
                 let opts = pbfhogg::apply_changes::MergeOptions {
-                    compression: write.compression,
-                    direct_io: write.direct_io,
-                    io_uring: write.io_uring,
-                    force: write.force,
+                    write,
                     locations_on_ways,
                     ignore_missing_nodes,
                     jobs: if jobs == 0 { None } else { Some(jobs) },
@@ -2504,22 +2483,12 @@ fn run_cat(
     output: &std::path::Path,
     type_filter: Option<TypeFilter>,
     clean: &CleanAttrs,
-    write: &WriteOpts,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let paths: Vec<&std::path::Path> = files.iter().map(AsRef::as_ref).collect();
-    let stats = pbfhogg::cat::cat(
-        &paths,
-        output,
-        type_filter,
-        clean,
-        write.compression,
-        write.direct_io,
-        write.force,
-        overrides,
-        host,
-    )?;
+    let stats = pbfhogg::cat::cat(&paths, output, type_filter, clean, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("cat.summary"))?;
     Ok(())
 }
@@ -2527,17 +2496,11 @@ fn run_cat(
 fn run_sort(
     file: &std::path::Path,
     output: &std::path::Path,
-    write: &WriteOpts,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let opts = pbfhogg::sort::SortOptions {
-        compression: write.compression,
-        direct_io: write.direct_io,
-        io_uring: write.io_uring,
-        force: write.force,
-    };
-    let stats = pbfhogg::sort::sort(file, output, &opts, overrides, host)?;
+    let stats = pbfhogg::sort::sort(file, output, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("sort.summary"))?;
     Ok(())
 }
@@ -2546,21 +2509,11 @@ fn run_repack(
     file: &std::path::Path,
     output: &std::path::Path,
     elements_per_blob: usize,
-    write: &WriteOpts,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::repack::repack(
-        file,
-        output,
-        elements_per_blob,
-        write.compression,
-        write.direct_io,
-        write.io_uring,
-        write.force,
-        overrides,
-        host,
-    )?;
+    let stats = pbfhogg::repack::repack(file, output, elements_per_blob, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("repack.summary"))?;
     Ok(())
 }
@@ -2570,22 +2523,11 @@ fn run_degrade(
     output: &std::path::Path,
     flags: pbfhogg::degrade::DegradeFlags,
     block_cap: usize,
-    write: &WriteOpts,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::degrade::degrade(
-        file,
-        output,
-        flags,
-        block_cap,
-        write.compression,
-        write.direct_io,
-        write.io_uring,
-        write.force,
-        overrides,
-        host,
-    )?;
+    let stats = pbfhogg::degrade::degrade(file, output, flags, block_cap, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("degrade.summary"))?;
     Ok(())
 }
@@ -2594,7 +2536,7 @@ fn run_renumber(
     file: &std::path::Path,
     output: &std::path::Path,
     start_id: &str,
-    write: &WriteOpts,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2636,15 +2578,7 @@ fn run_renumber(
                     .into(),
             ),
         };
-    let stats = pbfhogg::renumber::renumber_external(
-        file,
-        output,
-        &opts,
-        write.compression,
-        write.direct_io,
-        overrides,
-        host,
-    )?;
+    let stats = pbfhogg::renumber::renumber_external(file, output, &opts, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("renumber.summary"))?;
     stats.report_warnings(&host.diagnostics);
     Ok(())
@@ -2657,7 +2591,7 @@ fn run_tags_filter(
     expressions_file: Option<&std::path::Path>,
     expressions: &[String],
     flags: TagsFilterFlags,
-    write: &WriteOpts,
+    write: &WriteOptions,
     jobs: usize,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
@@ -2683,9 +2617,7 @@ fn run_tags_filter(
         omit_referenced,
         invert: invert_match,
         remove_tags,
-        compression: write.compression,
-        direct_io: write.direct_io,
-        force: write.force,
+        write: *write,
         jobs: if jobs == 0 { None } else { Some(jobs) },
         distrust_metadata,
     };
@@ -3169,7 +3101,7 @@ fn run_getid(
     id_osm_file: Option<&std::path::Path>,
     default_type: Option<DefaultTypeArg>,
     ids: &[String],
-    write: &WriteOpts,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -3183,7 +3115,7 @@ fn run_getid(
         id_osm_file,
         default_type,
         ids,
-        write.direct_io,
+        write.direct_reads,
         host,
     )?;
 
@@ -3205,17 +3137,7 @@ fn run_getid(
         remove_tags,
         report_found: verbose_ids,
     };
-    let stats = pbfhogg::getid::getid(
-        file,
-        output,
-        &id_set,
-        &opts,
-        write.compression,
-        write.direct_io,
-        write.force,
-        overrides,
-        host,
-    )?;
+    let stats = pbfhogg::getid::getid(file, output, &id_set, &opts, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("getid.summary"))?;
 
     if let Some(found) = stats.found.as_ref() {
@@ -3234,7 +3156,7 @@ fn run_getparents(
     id_osm_file: Option<&std::path::Path>,
     default_type: Option<DefaultTypeArg>,
     ids: &[String],
-    write: &WriteOpts,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     full_scan_min_blobs: Option<u64>,
     host: &pbfhogg::host::Host,
@@ -3244,33 +3166,16 @@ fn run_getparents(
         id_osm_file,
         default_type,
         ids,
-        write.direct_io,
+        write.direct_reads,
         host,
     )?;
     let opts = pbfhogg::getparents::GetparentsOptions { add_self };
     let stats = if let Some(min_blobs) = full_scan_min_blobs {
         pbfhogg::getparents::getparents_with_min_blobs(
-            file,
-            output,
-            &id_set,
-            &opts,
-            write.compression,
-            write.direct_io,
-            overrides,
-            min_blobs,
-            host,
+            file, output, &id_set, &opts, write, overrides, min_blobs, host,
         )?
     } else {
-        pbfhogg::getparents::getparents(
-            file,
-            output,
-            &id_set,
-            &opts,
-            write.compression,
-            write.direct_io,
-            overrides,
-            host,
-        )?
+        pbfhogg::getparents::getparents(file, output, &id_set, &opts, write, overrides, host)?
     };
     stats.write_summary(&mut host.diagnostics.summary_writer("getparents.summary"))?;
     Ok(())
@@ -3284,7 +3189,7 @@ fn run_removeid(
     id_osm_file: Option<&std::path::Path>,
     default_type: Option<DefaultTypeArg>,
     ids: &[String],
-    write: &WriteOpts,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -3293,19 +3198,10 @@ fn run_removeid(
         id_osm_file,
         default_type,
         ids,
-        write.direct_io,
+        write.direct_reads,
         host,
     )?;
-    let stats = pbfhogg::getid::removeid(
-        file,
-        output,
-        &id_set,
-        write.compression,
-        write.direct_io,
-        write.force,
-        overrides,
-        host,
-    )?;
+    let stats = pbfhogg::getid::removeid(file, output, &id_set, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("getid.summary"))?;
     Ok(())
 }
@@ -3329,7 +3225,7 @@ fn run_extract(
     strategy: pbfhogg::extract::ExtractStrategy,
     set_bounds: bool,
     clean: &CleanAttrs,
-    write: &WriteOpts,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -3343,17 +3239,7 @@ fn run_extract(
         (Some(_), Some(_)) => return Err("--bbox and --polygon are mutually exclusive".into()),
     };
     let stats = pbfhogg::extract::extract(
-        file,
-        output,
-        &region,
-        strategy,
-        set_bounds,
-        clean,
-        write.compression,
-        write.direct_io,
-        write.force,
-        overrides,
-        host,
+        file, output, &region, strategy, set_bounds, clean, write, overrides, host,
     )?;
     stats.write_summary(&mut host.diagnostics.summary_writer("extract.summary"))?;
     Ok(())
@@ -3407,7 +3293,7 @@ fn run_extract_config(
     strategy: pbfhogg::extract::ExtractStrategy,
     set_bounds: bool,
     clean: &CleanAttrs,
-    write: &WriteOpts,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -3459,9 +3345,7 @@ fn run_extract_config(
         strategy,
         set_bounds,
         clean,
-        write.compression,
-        write.direct_io,
-        write.force,
+        write,
         overrides,
         host,
     )?;
@@ -3504,20 +3388,12 @@ fn run_time_filter(
     file: &std::path::Path,
     output: &std::path::Path,
     timestamp: &str,
-    write: &WriteOpts,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let cutoff = parse_timestamp(timestamp)?;
-    let stats = pbfhogg::time_filter::time_filter(
-        file,
-        output,
-        cutoff,
-        write.compression,
-        write.direct_io,
-        overrides,
-        host,
-    )?;
+    let stats = pbfhogg::time_filter::time_filter(file, output, cutoff, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("time_filter.summary"))?;
     Ok(())
 }
@@ -3832,18 +3708,12 @@ fn run_apply_changes(
 fn run_merge_pbf(
     inputs: &[PathBuf],
     output: &std::path::Path,
-    write: &WriteOpts,
+    write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let paths: Vec<&std::path::Path> = inputs.iter().map(AsRef::as_ref).collect();
-    let opts = pbfhogg::cat::dedupe::MergePbfOptions {
-        compression: write.compression,
-        direct_io: write.direct_io,
-        io_uring: write.io_uring,
-        force: write.force,
-    };
-    let stats = pbfhogg::cat::dedupe::merge_pbf(&paths, output, &opts, overrides, host)?;
+    let stats = pbfhogg::cat::dedupe::merge_pbf(&paths, output, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("cat.dedupe.summary"))?;
     Ok(())
 }
@@ -4110,14 +3980,16 @@ fn run_bench_merge(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Instant;
 
-    let io_uring = matches!(io_mode, BenchIoMode::Uring);
+    let backend = OutputBackend::from_flags(false, matches!(io_mode, BenchIoMode::Uring));
 
     let start = Instant::now();
     let opts = pbfhogg::apply_changes::MergeOptions {
-        compression,
-        direct_io: false,
-        io_uring,
-        force: true,
+        write: WriteOptions {
+            compression,
+            backend,
+            direct_reads: false,
+            force: true,
+        },
         locations_on_ways: false,
         ignore_missing_nodes: false,
         jobs: None,

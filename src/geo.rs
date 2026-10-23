@@ -19,29 +19,26 @@ pub struct Bbox {
 
 impl Bbox {
     /// Construct a finite, ordered bounding box within the WGS84 domain.
-    pub fn try_new(
-        min_lon: f64,
-        min_lat: f64,
-        max_lon: f64,
-        max_lat: f64,
-    ) -> crate::BoxResult<Self> {
+    pub fn try_new(min_lon: f64, min_lat: f64, max_lon: f64, max_lat: f64) -> crate::Result<Self> {
+        use crate::error::Error;
         // Domain checks precede ordering: ordered values outside WGS84 are still
         // invalid, even when an integer conversion could clamp them into range.
+        // The caller supplied these numbers, so a bad one is an invalid argument.
         for (name, value) in [("min_lat", min_lat), ("max_lat", max_lat)] {
-            crate::coord_pack::validate_lat(name, value)?;
+            crate::coord_pack::validate_lat(name, value).map_err(Error::invalid_argument_from)?;
         }
         for (name, value) in [("min_lon", min_lon), ("max_lon", max_lon)] {
-            crate::coord_pack::validate_lon(name, value)?;
+            crate::coord_pack::validate_lon(name, value).map_err(Error::invalid_argument_from)?;
         }
         if min_lon >= max_lon {
-            return Err(
-                format!("min_lon ({min_lon}) must be less than max_lon ({max_lon})").into(),
-            );
+            return Err(Error::invalid_argument(format!(
+                "min_lon ({min_lon}) must be less than max_lon ({max_lon})"
+            )));
         }
         if min_lat >= max_lat {
-            return Err(
-                format!("min_lat ({min_lat}) must be less than max_lat ({max_lat})").into(),
-            );
+            return Err(Error::invalid_argument(format!(
+                "min_lat ({min_lat}) must be less than max_lat ({max_lat})"
+            )));
         }
         Ok(Self {
             min_lon,

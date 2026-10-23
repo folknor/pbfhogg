@@ -1,9 +1,12 @@
+use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
+use std::path::Path;
 use std::result;
 use std::str;
 use std::str::Utf8Error;
+use std::sync::Arc;
 
 use crate::read::blob::ByteOffset;
 
@@ -20,10 +23,13 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     }
 }
 
-/// `"<who> panicked: <payload>"` as an `io::Error`: the one wording every
-/// join and `catch_unwind` site uses to surface a caught panic as a failure.
-pub(crate) fn panic_error(who: &str, payload: &(dyn std::any::Any + Send)) -> io::Error {
-    io::Error::other(format!("{who} panicked: {}", panic_message(payload)))
+/// `"<who> panicked: <payload>"` as an `Internal` error: the one wording
+/// every join and `catch_unwind` site uses to surface a caught panic as a
+/// failure. The payload text is the one place a message is extracted from a
+/// foreign value, because a panic payload is not an error.
+#[cold]
+pub(crate) fn panic_error(who: &str, payload: &(dyn std::any::Any + Send)) -> Error {
+    Error::internal(format!("{who} panicked: {}", panic_message(payload)))
 }
 
 // Error data structures are modeled on the `csv` crate by BurntSushi.
@@ -33,10 +39,9 @@ pub(crate) fn panic_error(who: &str, payload: &(dyn std::any::Any + Send)) -> io
 #[cold]
 pub(crate) fn new_error(kind: ErrorKind) -> Error {
     Error(Box::new(Inner {
-        kind,
-        at: None,
-        file: None,
-        blob: None,
+        kind: Arc::new(kind),
+        context: Vec::new(),
+        location: None,
     }))
 }
 
@@ -50,23 +55,98 @@ pub(crate) fn new_wire_error(msg: &'static str) -> Error {
     new_error(ErrorKind::WireFormat { msg })
 }
 
+#[cold]
+pub(crate) fn new_missing_header() -> Error {
+    new_error(ErrorKind::MissingHeader)
+}
+
+#[cold]
+pub(crate) fn new_missing_feature(feature: &'static str) -> Error {
+    new_error(ErrorKind::MissingFeature(feature))
+}
+
+#[cold]
+pub(crate) fn new_stringtable_utf8(err: Utf8Error, index: usize) -> Error {
+    new_error(ErrorKind::StringtableUtf8 { err, index })
+}
+
+#[cold]
+pub(crate) fn new_stringtable_index_out_of_bounds(index: usize) -> Error {
+    new_error(ErrorKind::StringtableIndexOutOfBounds { index })
+}
+
 /// A type alias for `Result<T, pbfhogg::Error>`.
 pub type Result<T> = result::Result<T, Error>;
 
-#[derive(Debug)]
-struct Inner {
-    kind: ErrorKind,
-    at: Option<ByteOffset>,
+/// Where in the input an error was detected: which input, which blob, which
+/// byte. Applied to an error as a unit ([`Error::locate`]); an all-empty
+/// `Location` is the same as no location.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Location {
     /// The input this error came from, when the reader was opened from a
     /// path. `BlobReader::new` is handed an arbitrary `Read` and has no
     /// path to record, so it leaves this `None` rather than inventing one.
-    file: Option<std::sync::Arc<std::path::Path>>,
+    pub(crate) file: Option<Arc<Path>>,
     /// 0-based index of the blob being read when the error was detected.
-    blob: Option<u64>,
+    pub(crate) blob: Option<u64>,
+    /// Byte offset into the input stream.
+    pub(crate) offset: Option<ByteOffset>,
+}
+
+impl Location {
+    /// A location naming `file`, blob `blob` and byte `offset`, each only
+    /// when known. Cold: only built when an error is being reported.
+    #[cold]
+    pub(crate) fn new(
+        file: Option<&Arc<Path>>,
+        blob: Option<u64>,
+        offset: Option<ByteOffset>,
+    ) -> Location {
+        Location {
+            file: file.map(Arc::clone),
+            blob,
+            offset,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.file.is_none() && self.blob.is_none() && self.offset.is_none()
+    }
+}
+
+impl fmt::Display for Location {
+    /// `in <file>, blob <n>, at byte offset <n>`, each part only when known.
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let mut sep = "";
+        if let Some(path) = self.file.as_deref() {
+            write!(f, "in {}", path.display())?;
+            sep = ", ";
+        }
+        if let Some(blob) = self.blob {
+            write!(f, "{sep}blob {blob}")?;
+            sep = ", ";
+        }
+        if let Some(at) = self.offset {
+            write!(f, "{sep}at byte offset {}", at.0)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Inner {
+    /// Shared so that `Error: Clone` copies a pointer, not the kind (which
+    /// holds a non-`Clone` `io::Error`).
+    kind: Arc<ErrorKind>,
+    /// Context added by [`Error::context`], outermost first.
+    context: Vec<Cow<'static, str>>,
+    location: Option<Location>,
 }
 
 /// An error that can occur when reading or writing PBF files.
-#[derive(Debug)]
+///
+/// One thin pointer, and `Clone` (the kind is shared).
+#[derive(Clone, Debug)]
 pub struct Error(Box<Inner>);
 
 impl Error {
@@ -76,13 +156,232 @@ impl Error {
         &self.0.kind
     }
 
-    /// Unwrap this error into its underlying type.
+    /// Prefix this error with `msg`. Never changes the kind or the
+    /// location; repeated calls nest, the latest call being outermost.
+    #[cold]
+    #[must_use]
+    pub fn context(mut self, msg: impl Into<Cow<'static, str>>) -> Error {
+        self.0.context.insert(0, msg.into());
+        self
+    }
+
+    /// The caller's request is invalid: arguments, configuration or call
+    /// order.
+    #[cold]
+    #[must_use]
+    pub(crate) fn invalid_argument(msg: impl Into<Cow<'static, str>>) -> Error {
+        new_error(ErrorKind::InvalidArgument {
+            msg: msg.into(),
+            source: None,
+        })
+    }
+
+    /// Input content is malformed or out of range beyond PBF framing.
+    #[cold]
+    #[must_use]
+    pub(crate) fn invalid_data(msg: impl Into<Cow<'static, str>>) -> Error {
+        new_error(ErrorKind::InvalidData {
+            msg: msg.into(),
+            source: None,
+        })
+    }
+
+    /// [`Error::invalid_data`] with a typed cause.
+    #[cold]
+    #[must_use]
+    pub(crate) fn invalid_data_with(
+        msg: impl Into<Cow<'static, str>>,
+        source: impl StdError + Send + Sync + 'static,
+    ) -> Error {
+        new_error(ErrorKind::InvalidData {
+            msg: msg.into(),
+            source: Some(Arc::new(source)),
+        })
+    }
+
+    /// Classify a crate-owned leaf error (no cause of its own, its `Display`
+    /// is the whole message, such as a range check) as an invalid argument.
+    /// A leaf with a cause, or a foreign error, keeps that cause reachable
+    /// through `source()` by being attached when the kind is built.
+    #[cold]
+    #[must_use]
+    pub(crate) fn invalid_argument_from(leaf: impl StdError) -> Error {
+        debug_assert!(leaf.source().is_none(), "a leaf has no cause");
+        Error::invalid_argument(leaf.to_string())
+    }
+
+    /// [`Error::invalid_argument_from`] for invalid input content.
+    #[cold]
+    #[must_use]
+    pub(crate) fn invalid_data_from(leaf: impl StdError) -> Error {
+        debug_assert!(leaf.source().is_none(), "a leaf has no cause");
+        Error::invalid_data(leaf.to_string())
+    }
+
+    /// A broken internal invariant or a caught panic.
+    #[cold]
+    #[must_use]
+    pub(crate) fn internal(msg: impl Into<Cow<'static, str>>) -> Error {
+        new_error(ErrorKind::Internal {
+            msg: msg.into(),
+            source: None,
+        })
+    }
+
+    /// [`Error::internal`] with a typed cause.
+    #[cold]
+    #[must_use]
+    pub(crate) fn internal_with(
+        msg: impl Into<Cow<'static, str>>,
+        source: impl StdError + Send + Sync + 'static,
+    ) -> Error {
+        new_error(ErrorKind::Internal {
+            msg: msg.into(),
+            source: Some(Arc::new(source)),
+        })
+    }
+
+    /// A thread pool that could not be built. The pool error stays the
+    /// payload inside the `io::Error`, reached through
+    /// `ErrorKind::Io(e).get_ref()`.
+    #[cold]
+    #[must_use]
+    pub(crate) fn pool_build(what: &str, source: rayon::ThreadPoolBuildError) -> Error {
+        Error::from(io::Error::other(source)).context(format!("failed to build {what}"))
+    }
+
+    /// An `Io` error that has a kind and a message but no OS cause: a sink
+    /// or resource failed in a way that has no errno.
+    #[cold]
+    #[must_use]
+    pub(crate) fn io_kind(kind: io::ErrorKind, msg: impl Into<Cow<'static, str>>) -> Error {
+        let msg: Cow<'static, str> = msg.into();
+        Error::from(io::Error::new(kind, msg.into_owned()))
+    }
+
+    /// Wrap an error returned by a caller-supplied callback. The wrapped
+    /// error stays reachable through [`std::error::Error::source`].
+    #[cold]
+    #[must_use]
+    pub fn external(source: impl StdError + Send + Sync + 'static) -> Error {
+        new_error(ErrorKind::External {
+            msg: Cow::Borrowed("callback error"),
+            source: Some(Arc::new(source)),
+        })
+    }
+
+    /// A platform setup refusal. Doc-hidden: for tests of exit-code
+    /// handling, which cannot otherwise construct one from outside the crate.
+    #[doc(hidden)]
+    #[cold]
+    #[must_use]
+    pub fn platform_unsupported(feature: &'static str, source: io::Error) -> Error {
+        new_error(ErrorKind::PlatformUnsupported { feature, source })
+    }
+
+    /// The complete human-readable text of this error and its causes.
     ///
-    /// Note that this discards the byte offset; use [`Error::byte_offset`]
-    /// first if the location matters.
-    #[inline]
-    pub fn into_kind(self) -> ErrorKind {
-        self.0.kind
+    /// [`Display`](fmt::Display) shows only this error's own context,
+    /// message and location; this walks the causes. Each error's own text is
+    /// joined with `": "`, then every location is appended at the end,
+    /// outermost first, a repeated location printed once. An `io::Error`
+    /// carrying a `pbfhogg::Error` is transparent. The walk stops at the
+    /// first foreign error, whose own text is printed.
+    #[cold]
+    #[must_use]
+    pub fn report(&self) -> String {
+        let mut texts: Vec<String> = Vec::new();
+        let mut locations: Vec<String> = Vec::new();
+        let mut current: &(dyn StdError + 'static) = self;
+        loop {
+            let Some(err) = current.downcast_ref::<Error>() else {
+                if let Some(carried) = current.downcast_ref::<io::Error>().and_then(carried_error) {
+                    current = carried;
+                    continue;
+                }
+                texts.push(current.to_string());
+                break;
+            };
+            texts.extend(err.0.context.iter().map(ToString::to_string));
+            if let Some(location) = err.0.location.as_ref().filter(|l| !l.is_empty()) {
+                let text = location.to_string();
+                if !locations.contains(&text) {
+                    locations.push(text);
+                }
+            }
+            if let ErrorKind::Io(io) = err.kind() {
+                if let Some(carried) = carried_error(io) {
+                    current = carried;
+                    continue;
+                }
+                texts.push(io.to_string());
+                break;
+            }
+            texts.push(Message(err).to_string());
+            match err.structural_source() {
+                Some(next) => current = next,
+                None => break,
+            }
+        }
+        let mut out = texts.join(": ");
+        for location in &locations {
+            out.push_str(" (");
+            out.push_str(location);
+            out.push(')');
+        }
+        out
+    }
+
+    /// The cause this kind wraps, including an `io::Error` held directly.
+    fn structural_source(&self) -> Option<&(dyn StdError + 'static)> {
+        match &*self.0.kind {
+            ErrorKind::Io(err) => Some(err),
+            ErrorKind::PlatformUnsupported { source, .. } => Some(source),
+            ErrorKind::StringtableUtf8 { err, .. } => Some(err),
+            ErrorKind::InvalidArgument { source, .. }
+            | ErrorKind::InvalidData { source, .. }
+            | ErrorKind::Internal { source, .. }
+            | ErrorKind::External { source, .. } => {
+                source.as_deref().map(|s| s as &(dyn StdError + 'static))
+            }
+            ErrorKind::StringtableIndexOutOfBounds { .. }
+            | ErrorKind::Blob(_)
+            | ErrorKind::WireFormat { .. }
+            | ErrorKind::MissingHeader
+            | ErrorKind::MissingFeature(_) => None,
+        }
+    }
+
+    /// Attach `location`, unless this error already has one. The location
+    /// is applied as a unit, never field by field, and an all-empty one
+    /// counts as none.
+    #[cold]
+    #[must_use]
+    pub(crate) fn locate(mut self, location: Location) -> Error {
+        if self.0.location.as_ref().is_none_or(Location::is_empty) && !location.is_empty() {
+            self.0.location = Some(location);
+        }
+        self
+    }
+
+    /// This error as an `io::Error` for an `io::Result` boundary. A bare
+    /// `Io` error (no context, no location, kind not shared) gives back the
+    /// original `io::Error`, keeping its OS error; anything else is carried
+    /// whole, per `From<Error> for io::Error`.
+    pub(crate) fn into_io(self) -> io::Error {
+        if self.0.context.is_empty() && self.0.location.is_none() {
+            let Inner { kind, .. } = *self.0;
+            return match Arc::try_unwrap(kind) {
+                Ok(ErrorKind::Io(err)) => err,
+                Ok(kind) => io::Error::from(new_error(kind)),
+                Err(shared) => io::Error::from(Error(Box::new(Inner {
+                    kind: shared,
+                    context: Vec::new(),
+                    location: None,
+                }))),
+            };
+        }
+        io::Error::from(self)
     }
 
     /// Byte offset into the input stream at which the error was detected,
@@ -94,20 +393,7 @@ impl Error {
     /// not know their own position and report `None`.
     #[inline]
     pub fn byte_offset(&self) -> Option<ByteOffset> {
-        self.0.at
-    }
-
-    /// Attach the byte offset at which this error was detected. Called by
-    /// the framing layer, which is the lowest layer that knows the position.
-    /// An offset already attached by an inner layer wins - the innermost
-    /// frame is the more precise one.
-    #[cold]
-    #[must_use]
-    pub(crate) fn at(mut self, offset: ByteOffset) -> Error {
-        if self.0.at.is_none() {
-            self.0.at = Some(offset);
-        }
-        self
+        self.0.location.as_ref().and_then(|l| l.offset)
     }
 
     /// The input file this error came from, when the reader knew one.
@@ -118,39 +404,14 @@ impl Error {
     /// the reader was constructed from a bare `Read` and genuinely has no
     /// path, never that the path was unavailable at the reporting site.
     #[inline]
-    pub fn source_path(&self) -> Option<&std::path::Path> {
-        self.0.file.as_deref()
+    pub fn source_path(&self) -> Option<&Path> {
+        self.0.location.as_ref().and_then(|l| l.file.as_deref())
     }
 
     /// 0-based index of the blob being read when the error was detected.
     #[inline]
     pub fn blob_index(&self) -> Option<u64> {
-        self.0.blob
-    }
-
-    /// Attach the input file and blob index. Same innermost-wins rule as
-    /// [`Error::at`]: an inner reader that already named its own input is
-    /// the more precise attribution, and an outer one must not overwrite
-    /// it with the file *it* happens to be reading.
-    #[cold]
-    #[must_use]
-    pub(crate) fn in_input(
-        mut self,
-        file: Option<&std::sync::Arc<std::path::Path>>,
-        blob: Option<u64>,
-    ) -> Error {
-        // Stamped as a pair, never field by field: a file from one reader
-        // and a blob index from another would read as a precise location
-        // and point nowhere. Either field being present means an inner
-        // reader already stamped, so the whole pair is left alone - a
-        // reader that seeked away from the stream start has a file but no
-        // trustworthy blob count, and an outer stamp must not "complete"
-        // it with a count from a different stream.
-        if self.0.blob.is_none() && self.0.file.is_none() {
-            self.0.blob = blob;
-            self.0.file = file.map(std::sync::Arc::clone);
-        }
-        self
+        self.0.location.as_ref().and_then(|l| l.blob)
     }
 }
 
@@ -179,6 +440,28 @@ pub enum ErrorKind {
     MissingHeader,
     /// The input header does not declare a feature required by the operation.
     MissingFeature(&'static str),
+    /// The caller's request is invalid: arguments, configuration, or call
+    /// order (such as writing after a writer completed).
+    InvalidArgument {
+        msg: Cow<'static, str>,
+        source: Option<Arc<dyn StdError + Send + Sync>>,
+    },
+    /// Input content is malformed or out of range beyond PBF framing.
+    InvalidData {
+        msg: Cow<'static, str>,
+        source: Option<Arc<dyn StdError + Send + Sync>>,
+    },
+    /// A broken internal invariant or a caught panic.
+    Internal {
+        msg: Cow<'static, str>,
+        source: Option<Arc<dyn StdError + Send + Sync>>,
+    },
+    /// An error returned by a caller-supplied callback; see
+    /// [`Error::external`].
+    External {
+        msg: Cow<'static, str>,
+        source: Option<Arc<dyn StdError + Send + Sync>>,
+    },
 }
 
 /// An error that occurs when decoding a blob.
@@ -242,12 +525,37 @@ impl From<protohoggr::WireError> for Error {
 
 impl From<Error> for io::Error {
     fn from(err: Error) -> io::Error {
-        // Keep the concrete error in the io::Error payload. The CLI follows
-        // this chain to distinguish setup refusals from ordinary failures;
-        // converting it to display text would erase that distinction.
-        io::Error::other(err)
+        // The full error rides inside the io::Error, so it round trips
+        // exactly through `From<io::Error> for Error`. Only the outer
+        // `io::ErrorKind` is derived, so `Write` layers keep reporting
+        // StorageFull, Interrupted and BrokenPipe for an `Io` error. The
+        // outer error has no raw OS error: decisions on errno must look at
+        // the original syscall error before converting.
+        let kind = match err.kind() {
+            ErrorKind::Io(inner) => inner.kind(),
+            ErrorKind::PlatformUnsupported { .. } => io::ErrorKind::Unsupported,
+            ErrorKind::InvalidData { .. } => io::ErrorKind::InvalidData,
+            ErrorKind::InvalidArgument { .. } => io::ErrorKind::InvalidInput,
+            _ => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, err)
     }
 }
+
+/// The `pbfhogg::Error` an `io::Error` carries as its payload, if any, seen
+/// through any number of `io::Error` layers wrapped around it.
+fn carried_error(err: &io::Error) -> Option<&Error> {
+    let mut payload: &(dyn StdError + 'static) = err.get_ref()?;
+    loop {
+        if let Some(error) = payload.downcast_ref::<Error>() {
+            return Some(error);
+        }
+        payload = payload.downcast_ref::<io::Error>()?.get_ref()?;
+    }
+}
+
+/// An error's own message, without context, location or causes.
+struct Message<'a>(&'a Error);
 
 // Removed deprecated `description()` (deprecated since Rust 1.42) and `cause()` (deprecated
 // since Rust 1.33). Callers should use the `Display` impl (below) for human-readable error
@@ -256,55 +564,44 @@ impl From<Error> for io::Error {
 // so they return None.
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self.0.kind {
-            ErrorKind::Io(ref err) => Some(err),
-            ErrorKind::PlatformUnsupported { ref source, .. } => Some(source),
-            ErrorKind::StringtableUtf8 { ref err, .. } => Some(err),
-            ErrorKind::StringtableIndexOutOfBounds { .. } => None,
-            ErrorKind::Blob(_) => None,
-            ErrorKind::WireFormat { .. } => None,
-            ErrorKind::MissingHeader => None,
-            ErrorKind::MissingFeature(_) => None,
+        match *self.0.kind {
+            // Like std's `io::Error`: the payload is not a separate link.
+            // The CLI exit-code walker inspects the `io::Error` directly.
+            ErrorKind::Io(ref err) => err.source(),
+            _ => self.structural_source(),
         }
     }
 }
 
 impl fmt::Display for Error {
+    /// This error's own context, message and location. The text of its
+    /// source is never included; see [`Error::report`].
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.fmt_kind(f)?;
-        // The "where": which input, which blob, which byte. Only the
-        // framing layer knows any of it, so an error raised below that
-        // layer still prints exactly as it did before this was added.
-        let mut sep = " (";
-        if let Some(path) = self.0.file.as_deref() {
-            write!(f, "{sep}in {}", path.display())?;
-            sep = ", ";
+        for context in &self.0.context {
+            write!(f, "{context}: ")?;
         }
-        if let Some(blob) = self.0.blob {
-            write!(f, "{sep}blob {blob}")?;
-            sep = ", ";
-        }
-        if let Some(at) = self.0.at {
-            write!(f, "{sep}at byte offset {})", at.0)?;
-        } else if sep == ", " {
-            write!(f, ")")?;
+        fmt::Display::fmt(&Message(self), f)?;
+        // The "where": which input, which blob, which byte.
+        if let Some(location) = self.0.location.as_ref().filter(|l| !l.is_empty()) {
+            write!(f, " ({location})")?;
         }
         Ok(())
     }
 }
 
-impl Error {
-    fn fmt_kind(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.0.kind {
+impl fmt::Display for Message<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self.0.0.kind {
             ErrorKind::Io(ref err) => fmt::Display::fmt(err, f),
-            ErrorKind::PlatformUnsupported {
-                feature,
-                ref source,
-            } => {
-                write!(f, "platform feature {feature} unavailable: {source}")
+            ErrorKind::PlatformUnsupported { feature, .. } => {
+                write!(f, "platform feature {feature} unavailable")
             }
-            ErrorKind::StringtableUtf8 { ref err, index } => {
-                write!(f, "invalid UTF-8 at string table index {index}: {err}")
+            ErrorKind::InvalidArgument { ref msg, .. }
+            | ErrorKind::InvalidData { ref msg, .. }
+            | ErrorKind::Internal { ref msg, .. }
+            | ErrorKind::External { ref msg, .. } => f.write_str(msg),
+            ErrorKind::StringtableUtf8 { index, .. } => {
+                write!(f, "invalid UTF-8 at string table index {index}")
             }
             ErrorKind::StringtableIndexOutOfBounds { index } => {
                 write!(f, "stringtable index out of bounds: {index}")
@@ -360,60 +657,62 @@ impl Error {
     }
 }
 
-/// Carry a setup refusal through APIs whose public result is `io::Result`.
-#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
-pub(crate) fn platform_unsupported(feature: &'static str, source: io::Error) -> io::Error {
-    io::Error::other(new_error(ErrorKind::PlatformUnsupported {
-        feature,
-        source,
-    }))
-}
-
 /// Classify a failed `open(2)` with `O_DIRECT`. `EINVAL` and `EOPNOTSUPP`
 /// at open are the filesystem refusing direct I/O (tmpfs, some overlay and
 /// network filesystems); every other errno stays an ordinary I/O failure.
 /// Only the open is classified this way: an `EINVAL` from a later read or
 /// write is an alignment bug, never a platform refusal.
 #[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
-pub(crate) fn direct_io_open_error(error: io::Error) -> io::Error {
+pub(crate) fn direct_io_open_error(error: io::Error) -> Error {
     if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {
-        platform_unsupported("direct-io", error)
+        Error::platform_unsupported("direct-io", error)
     } else {
-        error
+        Error::from(error)
     }
 }
 
-/// The feature label of a setup refusal carried by `error`, if it carries one.
+/// A failed open of `path`, rendered as the file it was about. The original
+/// `io::Error` stays the cause.
 #[cfg(feature = "linux-direct-io")]
-pub(crate) fn carried_platform_feature(error: &io::Error) -> Option<&'static str> {
-    match error.get_ref()?.downcast_ref::<Error>()?.kind() {
-        ErrorKind::PlatformUnsupported { feature, .. } => Some(*feature),
-        _ => None,
+#[derive(Debug)]
+struct OpenFailed {
+    path: String,
+    source: io::Error,
+}
+
+#[cfg(feature = "linux-direct-io")]
+impl fmt::Display for OpenFailed {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "failed to open {}: {}", self.path, self.source)
     }
 }
 
-/// Apply `map` (typically adding context such as the path) to an I/O error
-/// without losing a carried setup refusal: a carrier has `map` applied to its
-/// source and is re-carried, anything else is mapped directly. Context that
-/// rebuilds the error from its message alone would otherwise turn a platform
-/// refusal back into a plain I/O failure.
 #[cfg(feature = "linux-direct-io")]
-pub(crate) fn map_io_preserving_platform(
-    error: io::Error,
-    map: impl FnOnce(io::Error) -> io::Error,
-) -> io::Error {
-    if carried_platform_feature(&error).is_none() {
-        return map(error);
+impl StdError for OpenFailed {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
     }
-    match error
-        .into_inner()
-        .and_then(|inner| inner.downcast::<Error>().ok())
-        .map(|inner| (*inner).into_kind())
-    {
-        Some(ErrorKind::PlatformUnsupported { feature, source }) => {
-            platform_unsupported(feature, map(source))
-        }
-        _ => unreachable!("checked PlatformUnsupported payload"),
+}
+
+/// [`direct_io_open_error`] for a read-side open of `path`. A platform
+/// refusal renders as `platform feature direct-io unavailable: failed to
+/// open <path>: <os text>`: the path rides inside the refusal's source, so
+/// the refusal stays the outermost text. Any other failure is an ordinary
+/// `Io` error without the path; the caller adds it as context.
+#[cfg(feature = "linux-direct-io")]
+pub(crate) fn direct_io_open_error_at(path: &Path, error: io::Error) -> Error {
+    if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {
+        let kind = error.kind();
+        let named = io::Error::new(
+            kind,
+            OpenFailed {
+                path: path.display().to_string(),
+                source: error,
+            },
+        );
+        Error::platform_unsupported("direct-io", named)
+    } else {
+        Error::from(error)
     }
 }
 
@@ -421,12 +720,36 @@ pub(crate) fn map_io_preserving_platform(
 mod platform_tests {
     use super::*;
 
+    #[cfg(feature = "linux-direct-io")]
+    #[test]
+    fn read_side_refusal_renders_in_the_documented_order() {
+        let refused = direct_io_open_error_at(
+            Path::new("/some/in.osm.pbf"),
+            io::Error::from_raw_os_error(libc::EINVAL),
+        );
+        assert!(matches!(
+            refused.kind(),
+            ErrorKind::PlatformUnsupported {
+                feature: "direct-io",
+                ..
+            }
+        ));
+        let os_text = io::Error::from_raw_os_error(libc::EINVAL).to_string();
+        assert_eq!(
+            refused.report(),
+            format!(
+                "platform feature direct-io unavailable: failed to open /some/in.osm.pbf: {os_text}"
+            )
+        );
+    }
+
     #[test]
     fn setup_error_survives_io_result_carrier() {
-        let error = Error::from(platform_unsupported(
+        let carried = io::Error::from(Error::platform_unsupported(
             "io-uring",
             io::Error::from_raw_os_error(libc::EPERM),
         ));
+        let error = Error::from(carried);
         assert!(
             matches!(error.kind(), ErrorKind::PlatformUnsupported { feature: "io-uring", source }
             if source.raw_os_error() == Some(libc::EPERM))
@@ -445,17 +768,226 @@ mod platform_tests {
 
     #[cfg(feature = "linux-direct-io")]
     #[test]
-    fn context_mapping_keeps_the_platform_refusal() {
+    fn context_keeps_the_platform_refusal() {
         let refused = direct_io_open_error(io::Error::from_raw_os_error(libc::EINVAL));
-        let named = map_io_preserving_platform(refused, |source| {
-            io::Error::new(source.kind(), format!("failed to open x: {source}"))
-        });
-        assert_eq!(carried_platform_feature(&named), Some("direct-io"));
-        assert!(named.to_string().contains("failed to open x"));
+        let named = refused.context("failed to open x");
+        assert!(matches!(
+            named.kind(),
+            ErrorKind::PlatformUnsupported {
+                feature: "direct-io",
+                ..
+            }
+        ));
+        // Display no longer includes the source's text; `report()` does.
+        assert!(named.report().contains("failed to open x"));
 
         let plain = direct_io_open_error(io::Error::from_raw_os_error(libc::ENOENT));
-        assert_eq!(carried_platform_feature(&plain), None);
-        assert_eq!(plain.raw_os_error(), Some(libc::ENOENT));
+        assert!(matches!(plain.kind(), ErrorKind::Io(e)
+            if e.raw_os_error() == Some(libc::ENOENT)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn invalid_data(msg: &'static str) -> Error {
+        new_error(ErrorKind::InvalidData {
+            msg: Cow::Borrowed(msg),
+            source: None,
+        })
+    }
+
+    fn location(file: &str, blob: u64, offset: u64) -> Location {
+        Location {
+            file: Some(Arc::from(Path::new(file))),
+            blob: Some(blob),
+            offset: Some(ByteOffset(offset)),
+        }
+    }
+
+    #[test]
+    fn display_is_own_context_message_and_location_only() {
+        let err = Error::from(io::Error::other("disk gone"))
+            .context("writing")
+            .context("pass 2")
+            .locate(Location {
+                file: Some(Arc::from(Path::new("a.pbf"))),
+                blob: Some(3),
+                offset: None,
+            });
+        assert_eq!(
+            err.to_string(),
+            "pass 2: writing: disk gone (in a.pbf, blob 3)"
+        );
+
+        let wrapped = new_error(ErrorKind::InvalidArgument {
+            msg: Cow::Borrowed("bad bbox"),
+            source: Some(Arc::new(invalid_data("lat out of range"))),
+        });
+        assert_eq!(wrapped.to_string(), "bad bbox");
+        assert_eq!(wrapped.report(), "bad bbox: lat out of range");
+    }
+
+    #[test]
+    fn report_places_location_last_and_prints_duplicates_once() {
+        let inner = invalid_data("bad tag").locate(location("a.pbf", 7, 99));
+        let outer = new_error(ErrorKind::Internal {
+            msg: Cow::Borrowed("worker failed"),
+            source: Some(Arc::new(inner)),
+        })
+        .context("decode")
+        .locate(location("a.pbf", 7, 99));
+        assert_eq!(
+            outer.report(),
+            "decode: worker failed: bad tag (in a.pbf, blob 7, at byte offset 99)"
+        );
+
+        let other = new_error(ErrorKind::Internal {
+            msg: Cow::Borrowed("outer"),
+            source: Some(Arc::new(
+                invalid_data("inner").locate(location("b.pbf", 1, 2)),
+            )),
+        })
+        .locate(location("a.pbf", 7, 99));
+        assert_eq!(
+            other.report(),
+            "outer: inner (in a.pbf, blob 7, at byte offset 99) (in b.pbf, blob 1, at byte offset 2)"
+        );
+    }
+
+    #[test]
+    fn report_reproduces_todays_text() {
+        let utf8 = String::from_utf8(vec![0xff])
+            .expect_err("invalid")
+            .utf8_error();
+        let err = new_error(ErrorKind::StringtableUtf8 {
+            err: utf8,
+            index: 4,
+        })
+        .locate(Location {
+            offset: Some(ByteOffset(10)),
+            ..Location::default()
+        });
+        assert_eq!(
+            err.report(),
+            format!("invalid UTF-8 at string table index 4: {utf8} (at byte offset 10)")
+        );
+        let platform = Error::platform_unsupported("direct-io", io::Error::other("nope"));
+        assert_eq!(
+            platform.report(),
+            "platform feature direct-io unavailable: nope"
+        );
+        assert_eq!(
+            platform.to_string(),
+            "platform feature direct-io unavailable"
+        );
+    }
+
+    #[test]
+    fn report_sees_through_an_io_carrier_and_stops_at_foreign_errors() {
+        let inner = invalid_data("bad")
+            .context("ctx")
+            .locate(location("a.pbf", 1, 2));
+        let carried = Error::from(io::Error::from(inner));
+        assert_eq!(
+            carried.report(),
+            "ctx: bad (in a.pbf, blob 1, at byte offset 2)"
+        );
+
+        let foreign = io::Error::other(ForeignWithSource);
+        assert_eq!(Error::from(foreign).report(), "foreign");
+        let external = Error::external(ForeignWithSource);
+        assert_eq!(external.report(), "callback error: foreign");
+    }
+
+    #[test]
+    fn report_sees_through_nested_io_carriers() {
+        let inner = invalid_data("bad").context("ctx");
+        let double = io::Error::other(io::Error::from(inner));
+        assert_eq!(Error::from(double).report(), "ctx: bad");
+    }
+
+    #[derive(Debug)]
+    struct ForeignWithSource;
+    impl fmt::Display for ForeignWithSource {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("foreign")
+        }
+    }
+    impl StdError for ForeignWithSource {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            Some(&FOREIGN_ROOT)
+        }
+    }
+    #[derive(Debug)]
+    struct ForeignRoot;
+    impl fmt::Display for ForeignRoot {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("must not be printed")
+        }
+    }
+    impl StdError for ForeignRoot {}
+    static FOREIGN_ROOT: ForeignRoot = ForeignRoot;
+
+    #[test]
+    fn locate_applies_as_a_unit_and_empty_counts_as_none() {
+        let err = invalid_data("x").locate(Location::default());
+        assert!(err.0.location.is_none());
+        let err = err.locate(location("a.pbf", 1, 2));
+        let err = err.locate(Location {
+            file: Some(Arc::from(Path::new("b.pbf"))),
+            ..Location::default()
+        });
+        assert_eq!(err.source_path(), Some(Path::new("a.pbf")));
+        assert_eq!(err.blob_index(), Some(1));
+        assert_eq!(err.byte_offset().map(|o| o.0), Some(2));
+    }
+
+    #[test]
+    fn clone_shares_the_kind() {
+        let err = invalid_data("x").context("c");
+        let copy = err.clone();
+        assert!(Arc::ptr_eq(&err.0.kind, &copy.0.kind));
+        assert_eq!(err.report(), copy.report());
+    }
+
+    #[test]
+    fn io_round_trip_is_exact_and_maps_kinds() {
+        let cases = [
+            (
+                Error::from(io::Error::from(io::ErrorKind::StorageFull)),
+                io::ErrorKind::StorageFull,
+            ),
+            (
+                Error::platform_unsupported("x", io::Error::other("e")),
+                io::ErrorKind::Unsupported,
+            ),
+            (invalid_data("d"), io::ErrorKind::InvalidData),
+            (
+                new_error(ErrorKind::InvalidArgument {
+                    msg: Cow::Borrowed("a"),
+                    source: None,
+                }),
+                io::ErrorKind::InvalidInput,
+            ),
+            (
+                new_error(ErrorKind::Internal {
+                    msg: Cow::Borrowed("i"),
+                    source: None,
+                }),
+                io::ErrorKind::Other,
+            ),
+            (Error::external(ForeignRoot), io::ErrorKind::Other),
+        ];
+        for (err, expected) in cases {
+            let original = err.clone();
+            let carrier = io::Error::from(err);
+            assert_eq!(carrier.kind(), expected);
+            assert_eq!(carrier.raw_os_error(), None);
+            let back = Error::from(carrier);
+            assert!(Arc::ptr_eq(&original.0.kind, &back.0.kind));
+        }
     }
 }
 

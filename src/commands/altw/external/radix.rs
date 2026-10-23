@@ -43,9 +43,10 @@ impl ScratchDir {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
             Err(e) => {
-                return Err(
-                    format!("failed to create scratch directory {}: {e}", path.display()).into(),
-                );
+                return Err(crate::Error::from(e).context(format!(
+                    "failed to create scratch directory {}",
+                    path.display()
+                )));
             }
         }
         Ok(Self { path })

@@ -32,14 +32,15 @@ use crate::frame::read_frame_header;
 use crate::write::WriteOptions;
 use crate::writer::{PbfWriter, reframe_raw_with_index};
 
-use crate::BoxResult as Result;
 use crate::commands::{
     HeaderOverrides, flush_block, require_indexdata, require_sorted, writer_from_header_bytes,
 };
+use crate::error::{Error, Result};
 use crate::owned::{
     OwnedNode, OwnedRelation, OwnedWay, read_dense_node, read_node, read_relation, read_way,
     write_single_node, write_single_relation, write_single_way,
 };
+use crate::read::raw_frame::frame_location;
 
 /// Statistics from a multi-PBF merge operation.
 ///
@@ -160,7 +161,7 @@ pub fn merge_pbf(
     host: &crate::host::Host,
 ) -> Result<MergePbfStats> {
     if inputs.is_empty() {
-        return Err("no input files specified".into());
+        return Err(Error::invalid_argument("no input files specified"));
     }
 
     // Validate inputs have indexdata
@@ -339,16 +340,12 @@ struct IndexScratch {
 }
 
 /// An input whose blob sequence is not "one OSMHeader, then data".
-fn frame_order_error(input: &Path, what: &str) -> Box<dyn std::error::Error> {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!(
-            "input file {}: {what}; a PBF file carries exactly one OSMHeader blob, \
-             as its first blob",
-            input.display()
-        ),
-    )
-    .into()
+fn frame_order_error(input: &Path, what: &str) -> Error {
+    Error::invalid_data(format!(
+        "input file {}: {what}; a PBF file carries exactly one OSMHeader blob, \
+         as its first blob",
+        input.display()
+    ))
 }
 
 /// Pass 1 over one input: append its OSMData blobs to `entries` and return
@@ -372,6 +369,9 @@ fn index_input(
 
     loop {
         let frame_start = file_offset;
+        // This loop walks the input, so it owns the provenance of every
+        // failure in the frame it is on.
+        let locate = |e: Error| e.locate(frame_location(input, frame_start));
 
         // Prefix, EOF policy, the zero-length and MAX_BLOB_HEADER_SIZE guards,
         // and the header parse all come from `read::frame`. This loop
@@ -388,10 +388,7 @@ fn index_input(
             &host.diagnostics,
             Some(input),
         )
-        .map_err(|err| {
-            err.at(crate::ByteOffset(frame_start))
-                .in_input(Some(&std::sync::Arc::<Path>::from(input)), None)
-        })?
+        .map_err(locate)?
         else {
             break;
         };
@@ -406,34 +403,36 @@ fn index_input(
         match (&frame.blob_type, header.is_some()) {
             (BlobKind::OsmHeader, _) => {
                 blob_buf.resize(data_size, 0);
-                reader.read_exact(blob_buf)?;
-                let hdr = decode_blob_to_headerblock(blob_buf)?;
+                reader.read_exact(blob_buf).map_err(|e| locate(e.into()))?;
+                let hdr = decode_blob_to_headerblock(blob_buf).map_err(locate)?;
                 require_sorted(
                     hdr.is_sorted(),
                     input,
                     &format!("Input file {}", input.display()),
                     "Cat dedupe requires sorted inputs so it can merge them in type-then-ID order.",
-                )?;
+                )
+                .map_err(locate)?;
                 header = Some(hdr);
             }
             (_, false) => {
-                return Err(frame_order_error(
+                return Err(locate(frame_order_error(
                     input,
                     "the first blob is not an OSMHeader",
-                ));
+                )));
             }
             (BlobKind::OsmData, true) => {
                 let has_indexdata = raw_index.is_some();
                 let index = if let Some(index) = raw_index {
-                    reader.skip(data_size as u64)?;
+                    reader
+                        .skip(data_size as u64)
+                        .map_err(|e| locate(e.into()))?;
                     index
                 } else {
                     blob_buf.resize(data_size, 0);
-                    reader.read_exact(blob_buf)?;
-                    decompress_blob_data_into(blob_buf, decompress_buf)?;
-                    scan_block_ids(decompress_buf).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "failed to scan block IDs")
-                    })?
+                    reader.read_exact(blob_buf).map_err(|e| locate(e.into()))?;
+                    decompress_blob_data_into(blob_buf, decompress_buf).map_err(locate)?;
+                    scan_block_ids(decompress_buf)
+                        .ok_or_else(|| locate(Error::invalid_data("failed to scan block IDs")))?
                 };
                 entries.push(BlobEntry {
                     file_offset: frame_start,
@@ -445,7 +444,9 @@ fn index_input(
                 });
             }
             (_, true) => {
-                reader.skip(data_size as u64)?;
+                reader
+                    .skip(data_size as u64)
+                    .map_err(|e| locate(e.into()))?;
             }
         }
     }
@@ -549,13 +550,13 @@ fn read_frame_into(file: &mut File, entry: &BlobEntry, buf: &mut Vec<u8>) -> io:
 
 fn extract_blob_bytes(frame: &[u8]) -> Result<&[u8]> {
     if frame.len() < 4 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too short").into());
+        return Err(Error::invalid_data("frame too short"));
     }
     #[allow(clippy::cast_possible_truncation)]
     let header_len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
     let blob_start = 4 + header_len;
     if blob_start > frame.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid header length").into());
+        return Err(Error::invalid_data("invalid header length"));
     }
     Ok(&frame[blob_start..])
 }

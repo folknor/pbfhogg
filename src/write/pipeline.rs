@@ -6,11 +6,12 @@
 //! All items here are internal wiring for the write path; nothing in this
 //! module is part of the public library API.
 
+use crate::error::{Error, Result};
 use crate::reorder_buffer::ReorderBuffer;
 use crate::tunables::{EXECUTOR_IDLE_RECV_TIMEOUT, PIPELINE_DISPATCH_PERMITS, WRITE_AHEAD};
 use crate::write::file_writer::FileWriter;
 use crate::write::metrics::WRITER_METRICS;
-use std::io::{self, Write};
+use std::io::Write;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
@@ -79,12 +80,12 @@ impl FramedBlobParts {
 
 /// A chunk with its sequence number, ready for the writer thread.
 ///
-/// `data` is `io::Result<OutputChunk>` because framing runs on rayon workers
+/// `data` is `Result<OutputChunk>` because framing runs on rayon workers
 /// and may fail asynchronously - the error is propagated in order via the
 /// reorder buffer so the writer thread surfaces it at the correct position.
 pub(crate) struct PipelineItem {
     pub(crate) seq: usize,
-    pub(crate) data: io::Result<OutputChunk>,
+    pub(crate) data: Result<OutputChunk>,
 }
 
 /// A sink that consumes ordered [`OutputChunk`]s and writes them to a backend.
@@ -92,8 +93,8 @@ pub(crate) struct PipelineItem {
 /// Each backend is free to flatten, batch, or scatter-gather as it sees fit -
 /// the pipeline machinery only cares about ordering and error propagation.
 pub(crate) trait OutputSink {
-    fn write_chunk(&mut self, chunk: OutputChunk) -> io::Result<()>;
-    fn flush(&mut self) -> io::Result<()>;
+    fn write_chunk(&mut self, chunk: OutputChunk) -> Result<()>;
+    fn flush(&mut self) -> Result<()>;
 }
 
 /// Default sink that wraps a [`FileWriter`] (buffered or O_DIRECT).
@@ -111,7 +112,7 @@ impl FileOutputSink {
 }
 
 impl OutputSink for FileOutputSink {
-    fn write_chunk(&mut self, chunk: OutputChunk) -> io::Result<()> {
+    fn write_chunk(&mut self, chunk: OutputChunk) -> Result<()> {
         match chunk {
             OutputChunk::Framed(parts) => {
                 let len = parts.total_len();
@@ -156,10 +157,7 @@ impl OutputSink for FileOutputSink {
                 let in_fd = in_file.as_raw_fd();
                 let t_write = std::time::Instant::now();
                 let out_fd = self.writer.flush_and_raw_fd()?.ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "copy_file_range incompatible with O_DIRECT output",
-                    )
+                    Error::invalid_argument("copy_file_range incompatible with O_DIRECT output")
                 })?;
                 super::copy_range::copy_range(in_fd, out_fd, offset, len)?;
                 // Hold the input open until the splice has actually happened.
@@ -180,7 +178,7 @@ impl OutputSink for FileOutputSink {
     /// to be the same method on [`FileWriter`], which meant every incidental
     /// `flush()` anywhere bought an `fsync`; the sibling uring and parallel
     /// backends already `sync_all` by name at this point.
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(&mut self) -> Result<()> {
         self.writer.sync()
     }
 }
@@ -189,7 +187,7 @@ impl OutputSink for FileOutputSink {
 pub(super) struct WritePipeline {
     pub(super) tx: SyncSender<PipelineItem>,
     pub(super) seq: usize,
-    pub(super) join_handle: Option<JoinHandle<io::Result<()>>>,
+    pub(super) join_handle: Option<JoinHandle<Result<()>>>,
     /// Counting-semaphore permit pool bounding in-flight rayon dispatches.
     /// The producer takes a permit ([`recv_permit`]) before spawning on the
     /// executor; the framing closure `send()`s it back when its work
@@ -215,7 +213,7 @@ impl WritePipeline {
     /// pool and nothing sent yet.
     pub(super) fn new(
         tx: SyncSender<PipelineItem>,
-        join_handle: JoinHandle<io::Result<()>>,
+        join_handle: JoinHandle<Result<()>>,
         expected: SeqTotal,
         executor: crate::host::Executor,
     ) -> Self {
@@ -248,7 +246,7 @@ impl WritePipeline {
 pub(super) fn recv_permit(
     rx: &Receiver<()>,
     executor: &crate::host::Executor,
-) -> Result<(), std::sync::mpsc::RecvError> {
+) -> std::result::Result<(), std::sync::mpsc::RecvError> {
     use std::sync::mpsc::{RecvError, RecvTimeoutError, TryRecvError};
     if !executor.on_worker() {
         return rx.recv();
@@ -444,9 +442,9 @@ pub(crate) fn check_stream_complete(
     pending_len: usize,
     delivered: usize,
     expected: &SeqTotal,
-) -> io::Result<()> {
+) -> Result<()> {
     if pending_len > 0 {
-        return Err(io::Error::other(format!(
+        return Err(Error::internal(format!(
             "{backend}: channel closed with {pending_len} item(s) still in reorder buffer; \
              an upstream framer dropped without sending an earlier seq"
         )));
@@ -454,7 +452,7 @@ pub(crate) fn check_stream_complete(
     if let Some(total) = expected.announced()
         && delivered < total
     {
-        return Err(io::Error::other(format!(
+        return Err(Error::internal(format!(
             "{backend}: channel closed after {delivered} of {total} blob(s); \
              an upstream framer dropped without sending the final seq(s)"
         )));
@@ -477,15 +475,14 @@ pub(crate) fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
 ///
 /// Uses a shared sequence-number reorder buffer to handle out-of-order
 /// arrivals from parallel rayon tasks. Framing errors produced on rayon
-/// workers are propagated in order via `io::Result<OutputChunk>`.
+/// workers are propagated in order via `Result<OutputChunk>`.
 #[allow(clippy::needless_pass_by_value)] // Thread entry point owns the sink moved into std::thread::spawn.
 pub(super) fn writer_thread<S: OutputSink>(
     rx: std::sync::mpsc::Receiver<PipelineItem>,
     mut sink: S,
     expected: &SeqTotal,
-) -> io::Result<()> {
-    let mut pending: ReorderBuffer<io::Result<OutputChunk>> =
-        ReorderBuffer::with_capacity(WRITE_AHEAD);
+) -> Result<()> {
+    let mut pending: ReorderBuffer<Result<OutputChunk>> = ReorderBuffer::with_capacity(WRITE_AHEAD);
 
     loop {
         let t_recv = std::time::Instant::now();
@@ -534,7 +531,7 @@ pub(super) fn writer_thread<S: OutputSink>(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{OutputChunk, OutputSink, PipelineItem, SeqTotal, WRITE_AHEAD, writer_thread};
-    use std::io;
+    use crate::error::Result;
     use std::sync::mpsc::sync_channel;
 
     /// Records what actually reached the backend, and whether it was flushed.
@@ -544,7 +541,7 @@ mod tests {
     }
 
     impl OutputSink for RecordingSink {
-        fn write_chunk(&mut self, chunk: OutputChunk) -> io::Result<()> {
+        fn write_chunk(&mut self, chunk: OutputChunk) -> Result<()> {
             match chunk {
                 OutputChunk::Raw(bytes) => self.written.push(bytes),
                 _ => panic!("test fixture only sends Raw chunks"),
@@ -552,7 +549,7 @@ mod tests {
             Ok(())
         }
 
-        fn flush(&mut self) -> io::Result<()> {
+        fn flush(&mut self) -> Result<()> {
             self.flushed = true;
             Ok(())
         }
@@ -562,7 +559,7 @@ mod tests {
     /// count the way `PbfWriter::flush` does before dropping its sender.
     ///
     /// `announce: None` models the `Drop` path, which never announces.
-    fn run(seqs: &[usize], announce: Option<usize>) -> (io::Result<()>, Vec<Vec<u8>>, bool) {
+    fn run(seqs: &[usize], announce: Option<usize>) -> (Result<()>, Vec<Vec<u8>>, bool) {
         let (tx, rx) = sync_channel::<PipelineItem>(WRITE_AHEAD);
         for &seq in seqs {
             tx.send(PipelineItem {
@@ -592,10 +589,10 @@ mod tests {
     struct SinkHandle<'a>(&'a mut RecordingSink);
 
     impl OutputSink for SinkHandle<'_> {
-        fn write_chunk(&mut self, chunk: OutputChunk) -> io::Result<()> {
+        fn write_chunk(&mut self, chunk: OutputChunk) -> Result<()> {
             self.0.write_chunk(chunk)
         }
-        fn flush(&mut self) -> io::Result<()> {
+        fn flush(&mut self) -> Result<()> {
             self.0.flush()
         }
     }

@@ -18,8 +18,8 @@ pub(crate) mod version_floor;
 pub(crate) mod write;
 pub(crate) mod xml_parse;
 
-// Box<dyn Error> is intentional - OSC parsing is CLI-internal, callers only
-// display errors. String errors include the missing attribute name for context.
-type ParseResult<T> = Result<T, Box<dyn std::error::Error>>;
+// OSC parsing reports typed `pbfhogg::Error`s: malformed OSC content is
+// `InvalidData`, a failing read is `Io`.
+type ParseResult<T> = crate::Result<T>;
 
 pub use parse::*;

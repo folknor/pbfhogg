@@ -145,13 +145,17 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         };
 
         let blob_offset = usize::try_from(meta.data_offset - meta.frame_start).map_err(|_| {
-            crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
-                "blob header too large to fit in usize - malformed PBF?",
-            )))
+            walker.locate_meta(
+                &meta,
+                crate::Error::invalid_data(
+                    "blob header too large to fit in usize - malformed PBF?",
+                ),
+            )
         })?;
 
         let descriptor = BlobDescriptor {
             seq,
+            blob_index: meta.blob_index,
             frame_start: meta.frame_start,
             frame_len: meta.frame_size,
             blob_offset,
@@ -199,10 +203,10 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
             ScannerEmit::Drain(
                 drain_tx,
                 descriptor.into_drain_copy_range().ok_or_else(|| {
-                    crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
+                    crate::Error::internal(
                         "scanner: fast-path descriptor missing indexdata - \
-                                 should be unreachable",
-                    )))
+                         should be unreachable",
+                    )
                 })?,
             )
         } else if !low_node_must_decompress
@@ -299,9 +303,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
     if !barrier_open && let Some(ref rx) = barrier_rx {
         crate::debug::emit_marker("MERGE_SCANNER_BARRIER_WAIT_START");
         rx.recv().map_err(|_| {
-            crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
-                "drain closed barrier channel before signalling loc_map ready",
-            )))
+            crate::Error::internal("drain closed barrier channel before signalling loc_map ready")
         })?;
         crate::debug::emit_marker("MERGE_SCANNER_BARRIER_WAIT_END");
     }
@@ -384,7 +386,5 @@ fn scanner_emit_cost(item: &ScannerEmit<'_>) -> usize {
 fn send_err<T>(_: mpsc::SendError<T>) -> crate::error::Error {
     // Return a channel-closure error so merge can propagate it if the
     // drain has not already returned its own error.
-    crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
-        "scanner dispatch channel closed by downstream",
-    )))
+    crate::Error::internal("scanner dispatch channel closed by downstream")
 }

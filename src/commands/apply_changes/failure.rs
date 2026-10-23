@@ -19,7 +19,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::error::{Error, ErrorKind, new_error, panic_error};
+use crate::error::{Error, panic_error};
 
 pub(super) struct FailureSlot {
     /// Set once by the first publication and never cleared, so "a producer
@@ -50,7 +50,7 @@ impl FailureSlot {
 
     /// Preserve a thread's panic message as an ordinary pipeline failure.
     pub(super) fn publish_panic(&self, owner: &str, payload: &(dyn std::any::Any + Send)) {
-        self.publish(new_error(ErrorKind::Io(panic_error(owner, payload))));
+        self.publish(panic_error(owner, payload));
     }
 
     /// True once any failure has been published.

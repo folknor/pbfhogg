@@ -157,24 +157,23 @@ pub(crate) struct OwnedRelation {
 /// derived change stream silently corrupts referential integrity. This is
 /// the OSC-side twin of the `BlockBuilder` poison flag on the PBF side, and
 /// takes the same answer: refuse to write it.
-pub(crate) fn member_type_str(id: MemberId, relation_id: i64) -> crate::BoxResult<&'static str> {
+pub(crate) fn member_type_str(id: MemberId, relation_id: i64) -> crate::Result<&'static str> {
     match id {
         MemberId::Node(_) => Ok(ElementKind::Node.as_str()),
         MemberId::Way(_) => Ok(ElementKind::Way.as_str()),
         MemberId::Relation(_) => Ok(ElementKind::Relation.as_str()),
-        MemberId::Unknown(member_id, type_value) => Err(format!(
+        MemberId::Unknown(member_id, type_value) => Err(crate::Error::invalid_data(format!(
             "relation {relation_id} has a member (ref {member_id}) with unknown type value \
              {type_value}; OSC has no spelling for it, and writing it as a node member would \
              silently repoint the member at an unrelated object"
-        )
-        .into()),
+        ))),
     }
 }
 
 pub(crate) fn write_node_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     node: &OwnedNode,
-) -> crate::BoxResult<()> {
+) -> crate::Result<()> {
     let mut elem = BytesStart::new(ElementKind::Node.as_str());
     let id_str = node.id.to_string();
     let mut coord_buf = String::new();
@@ -201,7 +200,7 @@ pub(crate) fn write_node_xml<W: std::io::Write>(
 pub(crate) fn write_way_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     way: &OwnedWay,
-) -> crate::BoxResult<()> {
+) -> crate::Result<()> {
     let mut elem = BytesStart::new(ElementKind::Way.as_str());
     let id_str = way.id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
@@ -228,7 +227,7 @@ pub(crate) fn write_way_xml<W: std::io::Write>(
 pub(crate) fn write_relation_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     rel: &OwnedRelation,
-) -> crate::BoxResult<()> {
+) -> crate::Result<()> {
     let mut elem = BytesStart::new(ElementKind::Relation.as_str());
     let id_str = rel.id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
@@ -261,7 +260,7 @@ pub(crate) fn write_delete_xml<W: std::io::Write>(
     kind: ElementKind,
     id: i64,
     metadata: Option<&OwnedMetadata>,
-) -> crate::BoxResult<()> {
+) -> crate::Result<()> {
     let mut elem = BytesStart::new(kind.as_str());
     let id_str = id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
@@ -275,14 +274,14 @@ pub(crate) fn write_delete_xml<W: std::io::Write>(
 pub(crate) fn write_tags_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     tags: &[(String, String)],
-) -> crate::BoxResult<()> {
+) -> crate::Result<()> {
     write_borrowed_tags_xml(writer, tags.iter().map(|(k, v)| (k.as_str(), v.as_str())))
 }
 
 fn write_borrowed_tags_xml<'a, W: std::io::Write>(
     writer: &mut Writer<W>,
     tags: impl Iterator<Item = (&'a str, &'a str)>,
-) -> crate::BoxResult<()> {
+) -> crate::Result<()> {
     for (k, v) in tags {
         let mut tag = BytesStart::new("tag");
         push_attribute_escaped(&mut tag, "k", k);
@@ -352,7 +351,7 @@ pub(crate) fn write_element_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     elem: &crate::Element<'_>,
     coord_buf: &mut String,
-) -> crate::BoxResult<()> {
+) -> crate::Result<()> {
     match elem {
         crate::Element::DenseNode(dn) => write_dense_node_xml(writer, dn, coord_buf),
         crate::Element::Node(n) => write_borrowed_node_xml(writer, n, coord_buf),
@@ -365,7 +364,7 @@ fn write_dense_node_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     node: &crate::dense::DenseNode<'_>,
     coord_buf: &mut String,
-) -> crate::BoxResult<()> {
+) -> crate::Result<()> {
     let mut elem = BytesStart::new(ElementKind::Node.as_str());
     let id_str = node.id().to_string();
     format_coord(coord_buf, from_decimicro(node.decimicro_lat()));
@@ -406,7 +405,7 @@ fn write_borrowed_node_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     node: &crate::elements::Node<'_>,
     coord_buf: &mut String,
-) -> crate::BoxResult<()> {
+) -> crate::Result<()> {
     let mut elem = BytesStart::new(ElementKind::Node.as_str());
     let id_str = node.id().to_string();
     format_coord(coord_buf, from_decimicro(node.decimicro_lat()));
@@ -444,7 +443,7 @@ fn write_borrowed_node_xml<W: std::io::Write>(
 fn write_borrowed_way_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     way: &crate::elements::Way<'_>,
-) -> crate::BoxResult<()> {
+) -> crate::Result<()> {
     let mut elem = BytesStart::new(ElementKind::Way.as_str());
     let id_str = way.id().to_string();
     elem.push_attribute(("id", id_str.as_str()));
@@ -481,7 +480,7 @@ fn write_borrowed_way_xml<W: std::io::Write>(
 fn write_borrowed_relation_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     rel: &crate::elements::Relation<'_>,
-) -> crate::BoxResult<()> {
+) -> crate::Result<()> {
     let mut elem = BytesStart::new(ElementKind::Relation.as_str());
     let id_str = rel.id().to_string();
     elem.push_attribute(("id", id_str.as_str()));
@@ -528,7 +527,7 @@ mod tests {
     use std::io::Write as IoWrite;
     use std::path::{Path, PathBuf};
 
-    fn write_osc_gz(dir: &Path, filename: &str, xml: &[u8]) -> crate::BoxResult<PathBuf> {
+    fn write_osc_gz(dir: &Path, filename: &str, xml: &[u8]) -> crate::Result<PathBuf> {
         let path = dir.join(filename);
         let file = File::create(&path)?;
         let mut enc = GzEncoder::new(file, Compression::fast());
@@ -544,7 +543,7 @@ mod tests {
     /// a derived OSC turned multi-line `inscription` values into
     /// space-separated ones.
     #[test]
-    fn control_chars_in_tag_values_roundtrip() -> crate::BoxResult<()> {
+    fn control_chars_in_tag_values_roundtrip() -> crate::Result<()> {
         let value = "MINDESTEN\n1864 -1920\ttabbed\rcr &<>\"' end";
         let node = OwnedNode {
             id: 100,
@@ -565,7 +564,7 @@ mod tests {
         // Writer-side mechanism: the emitted document must carry character
         // references and no raw control bytes (the Writer emits no
         // indentation, so any raw control byte would be inside an attribute).
-        let xml_str = std::str::from_utf8(&xml)?;
+        let xml_str = std::str::from_utf8(&xml).map_err(crate::Error::invalid_data_from)?;
         assert!(xml_str.contains("&#10;"), "newline not escaped: {xml_str}");
         assert!(xml_str.contains("&#9;"), "tab not escaped: {xml_str}");
         assert!(xml_str.contains("&#13;"), "CR not escaped: {xml_str}");
@@ -577,7 +576,9 @@ mod tests {
         let scratch = crate::path_guard::tests::scratch();
         let path = write_osc_gz(scratch.path(), "roundtrip.osc.gz", &xml)?;
         let overlay = parse_osc_file(&path)?;
-        let parsed = overlay.get_node(100).ok_or("node 100 missing")?;
+        let parsed = overlay
+            .get_node(100)
+            .ok_or_else(|| crate::Error::internal("node 100 missing"))?;
         let tags: Vec<(&str, &str)> = parsed.tags().collect();
         assert_eq!(tags, vec![("inscription", value)]);
         Ok(())
@@ -586,7 +587,7 @@ mod tests {
     /// Same guarantee for relation member roles (the other user-data
     /// attribute), via the owned-relation writer.
     #[test]
-    fn control_chars_in_member_roles_roundtrip() -> crate::BoxResult<()> {
+    fn control_chars_in_member_roles_roundtrip() -> crate::Result<()> {
         let role = "outer\nline2";
         let rel = OwnedRelation {
             id: 200,
@@ -606,14 +607,16 @@ mod tests {
         writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
         let xml = writer.into_inner();
 
-        let xml_str = std::str::from_utf8(&xml)?;
+        let xml_str = std::str::from_utf8(&xml).map_err(crate::Error::invalid_data_from)?;
         assert!(xml_str.contains("&#10;"), "newline not escaped: {xml_str}");
         assert!(!xml_str.contains('\n'), "raw newline in output: {xml_str}");
 
         let scratch = crate::path_guard::tests::scratch();
         let path = write_osc_gz(scratch.path(), "roundtrip.osc.gz", &xml)?;
         let overlay = parse_osc_file(&path)?;
-        let parsed = overlay.get_relation(200).ok_or("relation 200 missing")?;
+        let parsed = overlay
+            .get_relation(200)
+            .ok_or_else(|| crate::Error::internal("relation 200 missing"))?;
         let members: Vec<_> = parsed.members().collect();
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].2, role);
@@ -659,14 +662,12 @@ mod tests {
     /// borrowed element to `write_element_xml`, returning the emitted XML.
     /// Goes through the borrowed writers, which is where `push_info_attrs`
     /// lives; the owned writers use `OwnedMetadata::push_attrs` instead.
-    fn borrowed_way_xml(
-        meta: &crate::write::block_builder::Metadata<'_>,
-    ) -> crate::BoxResult<String> {
+    fn borrowed_way_xml(meta: &crate::write::block_builder::Metadata<'_>) -> crate::Result<String> {
         let mut bb = crate::write::block_builder::BlockBuilder::new();
         bb.add_way(7, [("highway", "residential")], &[1, 2], Some(meta));
         let bytes = bb
             .take()?
-            .ok_or("block builder produced no block")?
+            .ok_or_else(|| crate::Error::internal("block builder produced no block"))?
             .to_vec();
         let block = crate::PrimitiveBlock::from_vec(bytes)?;
 
@@ -675,7 +676,7 @@ mod tests {
         for element in block.elements() {
             write_element_xml(&mut writer, &element, &mut coord_buf)?;
         }
-        Ok(String::from_utf8(writer.into_inner())?)
+        String::from_utf8(writer.into_inner()).map_err(crate::Error::invalid_data_from)
     }
 
     /// Zero-valued metadata is legitimate - `uid="0"` is the anonymous mapper
@@ -686,7 +687,7 @@ mod tests {
     /// present and apply-changes wrote the element without an info block,
     /// breaking the documented lossless `--format osc` roundtrip.
     #[test]
-    fn zero_valued_metadata_is_emitted_not_dropped() -> crate::BoxResult<()> {
+    fn zero_valued_metadata_is_emitted_not_dropped() -> crate::Result<()> {
         let xml = borrowed_way_xml(&crate::write::block_builder::Metadata {
             version: 1,
             timestamp: 0,
@@ -723,7 +724,7 @@ mod tests {
     /// not satisfied by a writer that emits every attribute unconditionally
     /// with a wrong value.
     #[test]
-    fn nonzero_metadata_still_roundtrips_through_the_writer() -> crate::BoxResult<()> {
+    fn nonzero_metadata_still_roundtrips_through_the_writer() -> crate::Result<()> {
         let xml = borrowed_way_xml(&crate::write::block_builder::Metadata {
             version: 7,
             // `Metadata::timestamp` is epoch SECONDS; the reader scales by the
@@ -835,7 +836,7 @@ mod tests {
         timestamp: Option<i64>,
         changeset: Option<i64>,
         uid: Option<i32>,
-    ) -> crate::BoxResult<String> {
+    ) -> crate::Result<String> {
         let block = crate::PrimitiveBlock::from_vec(handmade_way_block(
             version, timestamp, changeset, uid,
         ))?;
@@ -844,14 +845,14 @@ mod tests {
         for element in block.elements() {
             write_element_xml(&mut writer, &element, &mut coord_buf)?;
         }
-        Ok(String::from_utf8(writer.into_inner())?)
+        String::from_utf8(writer.into_inner()).map_err(crate::Error::invalid_data_from)
     }
 
     /// The emitter itself must be able to produce the ordinary shape, or the
     /// absence test below would be satisfied by a fixture that decodes to
     /// nothing at all.
     #[test]
-    fn handmade_emitter_produces_a_readable_way_with_full_metadata() -> crate::BoxResult<()> {
+    fn handmade_emitter_produces_a_readable_way_with_full_metadata() -> crate::Result<()> {
         let xml = handmade_way_xml(Some(3), Some(86), Some(555), Some(9))?;
         assert!(xml.contains("id=\"7\""), "got: {xml}");
         assert!(xml.contains("version=\"3\""), "got: {xml}");
@@ -872,7 +873,7 @@ mod tests {
     /// `push_info_attrs` was rewritten to fix, one layer up at the call
     /// sites.
     #[test]
-    fn metadata_without_version_is_not_discarded() -> crate::BoxResult<()> {
+    fn metadata_without_version_is_not_discarded() -> crate::Result<()> {
         let xml = handmade_way_xml(None, Some(86), Some(555), Some(9))?;
         // Assert on the emitted bytes rather than round-tripping through our
         // own parser: the previous output was well-formed OSC that our
@@ -901,7 +902,7 @@ mod tests {
     /// attributes at all. Without this, the test above is satisfied by a
     /// writer that emits defaults for everything.
     #[test]
-    fn empty_info_emits_no_metadata_attributes() -> crate::BoxResult<()> {
+    fn empty_info_emits_no_metadata_attributes() -> crate::Result<()> {
         let xml = handmade_way_xml(None, None, None, None)?;
         for attr in ["version=", "timestamp=", "changeset=", "uid=", "user="] {
             assert!(

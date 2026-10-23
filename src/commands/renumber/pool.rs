@@ -33,6 +33,7 @@ use std::time::Instant;
 use super::super::Result;
 use super::{StageCounters, add_ns};
 use crate::blob_meta::BlobIndex;
+use crate::error::Error;
 
 use crate::tunables::{RENUMBER_WINDOW_MIN, RENUMBER_WINDOW_PER_WORKER};
 
@@ -141,14 +142,16 @@ pub(super) fn run_ordered<S, T, W, C>(
 where
     S: Send,
     T: Send,
-    W: Fn(&mut S, usize) -> std::result::Result<T, String> + Sync,
+    W: Fn(&mut S, usize) -> crate::Result<T> + Sync,
     C: FnMut(T) -> Result<()>,
 {
     if n_tasks == 0 {
         return Ok(());
     }
     if states.is_empty() {
-        return Err("renumber: worker pool started with no workers".into());
+        return Err(Error::internal(
+            "renumber: worker pool started with no workers",
+        ));
     }
     let window = states
         .len()
@@ -160,8 +163,7 @@ where
     std::thread::scope(|scope| -> Result<()> {
         // Created inside the scope: the receiver is a local of this closure,
         // so it is dropped on every return path before the scope joins.
-        let (tx, rx) =
-            std::sync::mpsc::sync_channel::<(usize, std::result::Result<T, String>)>(window);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, crate::Result<T>)>(window);
         // Installed before the first spawn, so even a failed `scope.spawn`
         // (thread creation panics) wakes the workers already parked in the
         // window gate. Declared after `rx`, so it drops first: workers are
@@ -209,18 +211,16 @@ where
             reorder.push(idx, item);
             while let Some(item) = reorder.pop_ready() {
                 gate.advance(reorder.next_seq());
-                let value = item.map_err(Box::<dyn std::error::Error>::from)?;
-                consume(value)?;
+                consume(item?)?;
             }
         }
         if reorder.next_seq() != n_tasks {
             // Only a worker that died without sending gets here; its panic
             // takes precedence when the scope joins.
-            return Err(format!(
+            return Err(Error::internal(format!(
                 "renumber: a worker exited without delivering blob {} of {n_tasks}",
                 reorder.next_seq()
-            )
-            .into());
+            )));
         }
         Ok(())
     })
@@ -228,6 +228,11 @@ where
 
 /// One rewritten blob, as a parallel stage's worker hands it to the writer.
 pub(super) struct Rewritten {
+    /// File-wide ordinal and frame start of the blob this was rewritten from.
+    /// Plain integers: the consumer turns them into a location with the
+    /// stage's single captured path, only if an order error needs one.
+    pub(super) blob_index: u64,
+    pub(super) frame_offset: u64,
     /// The block to write, or `None` for a blob that holds no elements.
     pub(super) block: Option<(Vec<u8>, BlobIndex)>,
     /// First and last *input* ID the blob held, `None` when empty.
@@ -262,14 +267,14 @@ impl StrictOrder {
         Self { kind, last: None }
     }
 
-    pub(super) fn admit(&mut self, span: Option<(i64, i64)>) -> Result<()> {
+    pub(super) fn admit(&mut self, span: Option<(i64, i64)>) -> std::result::Result<(), Error> {
         let Some((first, last)) = span else {
             return Ok(());
         };
         if let Some(prev) = self.last
             && first <= prev
         {
-            return Err(super::wire_rewrite::order_error(self.kind, prev, first).into());
+            return Err(super::wire_rewrite::order_error(self.kind, prev, first));
         }
         self.last = Some(last);
         Ok(())
@@ -279,9 +284,11 @@ impl StrictOrder {
 /// Run one parallel rewrite stage: `work` rewrites blob `idx` on a worker,
 /// and the calling thread checks cross-blob order and writes the results in
 /// schedule order. Counters are emitted under `prefix` once the stage ends.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run_rewrite_stage<S, W>(
     kind: &'static str,
     prefix: &str,
+    source: &std::sync::Arc<std::path::Path>,
     n_tasks: usize,
     states: &mut [S],
     counters: &StageCounters,
@@ -290,7 +297,7 @@ pub(super) fn run_rewrite_stage<S, W>(
 ) -> Result<StageTotals>
 where
     S: Send,
-    W: Fn(&mut S, usize) -> std::result::Result<Rewritten, String> + Sync,
+    W: Fn(&mut S, usize) -> crate::Result<Rewritten> + Sync,
 {
     let mut order = StrictOrder::new(kind);
     let mut totals = StageTotals {
@@ -298,7 +305,13 @@ where
         orphans: 0,
     };
     run_ordered(n_tasks, states, counters, work, |item: Rewritten| {
-        order.admit(item.span)?;
+        order.admit(item.span).map_err(|e| {
+            e.locate(crate::error::Location::new(
+                Some(source),
+                Some(item.blob_index),
+                Some(crate::ByteOffset(item.frame_offset)),
+            ))
+        })?;
         if let Some((bytes, index)) = item.block {
             let t = Instant::now();
             // Deliberately write no tagdata: terminal renumber output is not
@@ -339,13 +352,12 @@ mod tests {
     fn run(
         n: usize,
         workers: usize,
-        work: impl Fn(usize) -> std::result::Result<usize, String> + Sync,
+        work: impl Fn(usize) -> crate::Result<usize> + Sync,
         consume: impl FnMut(usize) -> Result<()>,
-    ) -> std::result::Result<(), String> {
+    ) -> crate::Result<()> {
         let counters = StageCounters::new();
         let mut states = vec![(); workers];
         run_ordered(n, &mut states, &counters, |_, idx| work(idx), consume)
-            .map_err(|e| e.to_string())
     }
 
     #[test]
@@ -377,7 +389,7 @@ mod tests {
                 4,
                 |i| {
                     if i == 700 {
-                        Err(format!("bad blob {i}"))
+                        Err(Error::internal(format!("bad blob {i}")))
                     } else {
                         Ok(i)
                     }
@@ -386,7 +398,7 @@ mod tests {
             )
             .unwrap_err()
         });
-        assert_eq!(err, "bad blob 700");
+        assert_eq!(err.to_string(), "bad blob 700");
     }
 
     /// Several failures: the reported one is the lowest index, every time.
@@ -399,7 +411,7 @@ mod tests {
                     6,
                     |i| {
                         if i == 300 || i == 301 || i == 2_000 {
-                            Err(format!("bad blob {i}"))
+                            Err(Error::internal(format!("bad blob {i}")))
                         } else {
                             Ok(i)
                         }
@@ -408,7 +420,7 @@ mod tests {
                 )
                 .unwrap_err()
             });
-            assert_eq!(err, "bad blob 300");
+            assert_eq!(err.to_string(), "bad blob 300");
         }
     }
 
@@ -419,14 +431,14 @@ mod tests {
         let err = within_deadline(|| {
             run(20_000, 4, Ok, |v| {
                 if v == 50 {
-                    Err("disk full".into())
+                    Err(Error::internal("disk full"))
                 } else {
                     Ok(())
                 }
             })
             .unwrap_err()
         });
-        assert_eq!(err, "disk full");
+        assert_eq!(err.to_string(), "disk full");
     }
 
     #[test]
@@ -435,12 +447,18 @@ mod tests {
             run(
                 1_000,
                 4,
-                |i| if i == 999 { Err("last".into()) } else { Ok(i) },
+                |i| {
+                    if i == 999 {
+                        Err(Error::internal("last"))
+                    } else {
+                        Ok(i)
+                    }
+                },
                 |_| Ok(()),
             )
             .unwrap_err()
         });
-        assert_eq!(err, "last");
+        assert_eq!(err.to_string(), "last");
     }
 
     /// One slow blob while the others race ahead. Without the window the

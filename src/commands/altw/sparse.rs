@@ -43,6 +43,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::idset::{IdSet, RankedIdSet};
 
 use super::Result;
+use crate::error::Error;
 
 #[cfg(target_os = "linux")]
 fn preallocate_sparse_file(file: &std::fs::File, scratch_dir: &Path, bytes: u64) -> Result<()> {
@@ -50,31 +51,34 @@ fn preallocate_sparse_file(file: &std::fs::File, scratch_dir: &Path, bytes: u64)
 
     let available = super::filesystem_available_bytes(scratch_dir, "sparse index")?;
     if available < bytes {
-        return Err(format!(
-            "insufficient free space for sparse node index: need {bytes} bytes, have {available} bytes in {}",
-            scratch_dir.display()
-        )
-        .into());
+        return Err(Error::io_kind(
+            std::io::ErrorKind::StorageFull,
+            format!(
+                "insufficient free space for sparse node index: need {bytes} bytes, have {available} bytes in {}",
+                scratch_dir.display()
+            ),
+        ));
     }
-    let length: libc::off_t = bytes
-        .try_into()
-        .map_err(|_| "sparse index size does not fit the platform file-offset type")?;
+    let length: libc::off_t = bytes.try_into().map_err(|_| {
+        Error::internal("sparse index size does not fit the platform file-offset type")
+    })?;
     // Safety: `file` owns a valid writable descriptor and length is nonnegative.
     let rc = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, length) };
     if rc != 0 {
-        return Err(format!(
-            "failed to allocate {bytes} bytes for sparse node index: {}",
-            std::io::Error::from_raw_os_error(rc)
-        )
-        .into());
+        return Err(
+            Error::from(std::io::Error::from_raw_os_error(rc)).context(format!(
+                "failed to allocate {bytes} bytes for sparse node index"
+            )),
+        );
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
 fn preallocate_sparse_file(file: &std::fs::File, _scratch_dir: &Path, bytes: u64) -> Result<()> {
-    file.set_len(bytes)
-        .map_err(|e| format!("failed to size sparse index file ({bytes} bytes): {e}").into())
+    file.set_len(bytes).map_err(|e| {
+        Error::from(e).context(format!("failed to size sparse index file ({bytes} bytes)"))
+    })
 }
 
 /// Create, preallocate and immediately unlink the sparse node store, handing
@@ -110,11 +114,10 @@ fn open_anonymous_sparse_file(
         ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            return Err(format!(
-                "failed to remove stale sparse index temp file {}: {e}",
+            return Err(Error::from(e).context(format!(
+                "failed to remove stale sparse index temp file {}",
                 temp_path.display()
-            )
-            .into());
+            )));
         }
     }
     let file = std::fs::OpenOptions::new()
@@ -123,18 +126,18 @@ fn open_anonymous_sparse_file(
         .create_new(true)
         .open(&temp_path)
         .map_err(|e| {
-            format!(
-                "failed to create sparse index temp file {}: {e}",
+            Error::from(e).context(format!(
+                "failed to create sparse index temp file {}",
                 temp_path.display()
-            )
+            ))
         })?;
     let guard = crate::path_guard::PathGuard::file(temp_path.clone());
     preallocate_sparse_file(&file, scratch_dir, total_bytes)?;
     std::fs::remove_file(&temp_path).map_err(|e| {
-        format!(
-            "failed to unlink sparse index temp file {} after allocation: {e}",
+        Error::from(e).context(format!(
+            "failed to unlink sparse index temp file {} after allocation",
             temp_path.display()
-        )
+        ))
     })?;
     drop(guard.commit());
     Ok(file)
@@ -215,11 +218,8 @@ impl<'a> SharedSparseWriter<'a> {
     /// would put the node somewhere else on Earth without saying so.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn insert(&self, node_id: i64, rank: u64, lat: i32, lon: i32) -> crate::error::Result<()> {
-        let packed = pack(lat, lon).ok_or_else(|| {
-            crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
-                super::node_coordinate_domain_error(node_id, lat, lon),
-            )))
-        })?;
+        let packed =
+            pack(lat, lon).ok_or_else(|| super::node_coordinate_domain_error(node_id, lat, lon))?;
         let slot = self.slots.get(rank as usize).unwrap_or_else(|| {
             panic!(
                 "sparse index rank {rank} is outside the {} slot store built from \
@@ -287,11 +287,11 @@ pub(super) fn build_node_index_sparse(
     // SAFETY: file is exclusively owned, opened read+write, sized to total_bytes.
     let mut mmap = unsafe {
         memmap2::MmapMut::map_mut(&file)
-            .map_err(|e| format!("failed to mmap sparse index values: {e}"))?
+            .map_err(|e| Error::from(e).context("failed to mmap sparse index values"))?
     };
 
     let capacity_bytes = usize::try_from(total_bytes)
-        .map_err(|_| "sparse index total_bytes does not fit in usize")?;
+        .map_err(|_| Error::internal("sparse index total_bytes does not fit in usize"))?;
     let writer = SharedSparseWriter::new(&mut mmap, capacity_bytes);
 
     let (schedule, shared_input) = crate::scan::classify::build_classify_schedule(

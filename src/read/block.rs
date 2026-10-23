@@ -7,7 +7,9 @@ use super::wire::{
     WireRelation, WireWay,
 };
 use super::wire_schema::{header_bbox, header_block};
-use crate::error::{ErrorKind, Result, new_error, new_wire_error};
+use crate::error::{
+    Result, new_stringtable_index_out_of_bounds, new_stringtable_utf8, new_wire_error,
+};
 use bytes::Bytes;
 use std;
 
@@ -462,8 +464,7 @@ impl PrimitiveBlock {
         // Validate every stringtable entry once at construction time.
         for index in 0..block.stringtable.len() {
             if let Some(raw) = block.stringtable.get(index) {
-                std::str::from_utf8(raw)
-                    .map_err(|err| new_error(ErrorKind::StringtableUtf8 { err, index }))?;
+                std::str::from_utf8(raw).map_err(|err| new_stringtable_utf8(err, index))?;
             }
         }
 
@@ -1402,7 +1403,7 @@ pub(crate) fn str_from_stringtable<'a>(block: &'a WireBlock<'_>, index: usize) -
         // construction.
         Ok(unsafe { std::str::from_utf8_unchecked(bytes) })
     } else {
-        Err(new_error(ErrorKind::StringtableIndexOutOfBounds { index }))
+        Err(new_stringtable_index_out_of_bounds(index))
     }
 }
 

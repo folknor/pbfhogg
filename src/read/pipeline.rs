@@ -16,6 +16,7 @@ use crate::tunables::{
 use std::cell::RefCell;
 use std::io::Read;
 use std::num::NonZeroUsize;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -364,7 +365,7 @@ fn send_direct_error(tx: &SyncSender<DecodedItem>, seq: usize, e: crate::error::
     sent
 }
 
-struct DecodeTask {
+struct DecodeTask<'scope> {
     seq: usize,
     blob: crate::blob::Blob,
     tx: SyncSender<DecodedItem>,
@@ -372,9 +373,13 @@ struct DecodeTask {
     blob_filter: Option<Arc<BlobFilter>>,
     permit: Permit,
     shutdown: Arc<AtomicBool>,
+    /// The path of the reader the blob came from, borrowed from the
+    /// dispatcher (captured once per pipeline, no per-blob refcounting) so a
+    /// decode failure can be located with the blob's true provenance.
+    source: Option<&'scope Arc<Path>>,
 }
 
-fn spawn_decode_task(decode_pool: &rayon::ThreadPool, task: DecodeTask) {
+fn spawn_decode_task<'scope>(scope: &rayon::Scope<'scope>, task: DecodeTask<'scope>) {
     let DecodeTask {
         seq,
         blob,
@@ -383,8 +388,9 @@ fn spawn_decode_task(decode_pool: &rayon::ThreadPool, task: DecodeTask) {
         blob_filter,
         permit,
         shutdown,
+        source,
     } = task;
-    decode_pool.spawn(move || {
+    scope.spawn(move |_| {
         // Thread-local scratch buffers for parse_and_inline. Avoids allocating
         // fresh Vec<(u32, u32)> per blob.
         thread_local! {
@@ -427,10 +433,15 @@ fn spawn_decode_task(decode_pool: &rayon::ThreadPool, task: DecodeTask) {
         }));
         let item = match item {
             Ok(item) => item,
-            Err(payload) => Some(Err(crate::error::new_error(crate::error::ErrorKind::Io(
-                crate::error::panic_error("decode task", payload.as_ref()),
-            )))),
+            Err(payload) => Some(Err(crate::error::panic_error(
+                "decode task",
+                payload.as_ref(),
+            ))),
         };
+        // Cold: only a failure pays for the location. The blob carries its
+        // true index and offset; `seq` is a pipeline-internal ordering key
+        // and is never reported as a location.
+        let item = item.map(|r| r.map_err(|e| blob.locate_error(source, e)));
         let t_send = Instant::now();
         if tx.send((seq, item, Some(permit))).is_err() {
             shutdown.store(true, Relaxed);
@@ -541,6 +552,7 @@ where
     blob_reader.set_parse_tagdata(has_tag_filter);
     blob_reader.set_parse_indexdata(blob_filter.is_some());
     let blob_filter = blob_filter.map(Arc::new);
+    let source = blob_reader.source().cloned();
     let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead.get());
     let (decoded_tx, decoded_rx) = sync_channel::<DecodedItem>(pipeline_config.decode_ahead.get());
 
@@ -607,9 +619,7 @@ where
             {
                 Ok(pool) => pool,
                 Err(e) => {
-                    let err = crate::error::new_error(crate::error::ErrorKind::Io(
-                        std::io::Error::other(format!("failed to build decode pool: {e}")),
-                    ));
+                    let err = crate::error::Error::pool_build("decode pool", e);
                     // Seq 0 is correct here, not a magic value that can collide
                     // with a real item: the pool is built before the loop over
                     // `raw_rx` below, so nothing has been dispatched yet and 0
@@ -622,42 +632,48 @@ where
             let buffer_pool = DecompressPool::new();
             let gate = Arc::new(AdmissionGate::new(pipeline_config.decode_ahead));
             let shutdown = Arc::new(AtomicBool::new(false));
-            for (seq, blob_result) in raw_rx {
-                if shutdown.load(Relaxed) {
-                    break;
-                }
-                match blob_result {
-                    Ok(blob) => {
-                        let t_admit = Instant::now();
-                        let blocked = gate.acquire();
-                        PIPELINE_METRICS
-                            .decode_admit_wait_ns
-                            .fetch_add(elapsed_ns_u64(t_admit), Relaxed);
-                        if blocked {
-                            PIPELINE_METRICS.decode_admit_blocked.fetch_add(1, Relaxed);
-                        }
-                        let permit = Permit(Arc::clone(&gate));
-                        PIPELINE_METRICS.decode_tasks.fetch_add(1, Relaxed);
-                        spawn_decode_task(
-                            &decode_pool,
-                            DecodeTask {
-                                seq,
-                                blob,
-                                tx: dispatch_tx.clone(),
-                                buffer_pool: Arc::clone(&buffer_pool),
-                                blob_filter: blob_filter.clone(),
-                                permit,
-                                shutdown: Arc::clone(&shutdown),
-                            },
-                        );
+            // Tasks borrow the reader's path from this scope: one capture per
+            // pipeline, no refcounting per blob.
+            let source = source.as_ref();
+            decode_pool.in_place_scope(|task_scope| {
+                for (seq, blob_result) in raw_rx {
+                    if shutdown.load(Relaxed) {
+                        break;
                     }
-                    Err(e) => {
-                        if !send_direct_error(&dispatch_tx, seq, e) {
-                            break;
+                    match blob_result {
+                        Ok(blob) => {
+                            let t_admit = Instant::now();
+                            let blocked = gate.acquire();
+                            PIPELINE_METRICS
+                                .decode_admit_wait_ns
+                                .fetch_add(elapsed_ns_u64(t_admit), Relaxed);
+                            if blocked {
+                                PIPELINE_METRICS.decode_admit_blocked.fetch_add(1, Relaxed);
+                            }
+                            let permit = Permit(Arc::clone(&gate));
+                            PIPELINE_METRICS.decode_tasks.fetch_add(1, Relaxed);
+                            spawn_decode_task(
+                                task_scope,
+                                DecodeTask {
+                                    seq,
+                                    blob,
+                                    tx: dispatch_tx.clone(),
+                                    buffer_pool: Arc::clone(&buffer_pool),
+                                    blob_filter: blob_filter.clone(),
+                                    permit,
+                                    shutdown: Arc::clone(&shutdown),
+                                    source,
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            if !send_direct_error(&dispatch_tx, seq, e) {
+                                break;
+                            }
                         }
                     }
                 }
-            }
+            });
             // dispatch_tx clone drops here
         });
 
@@ -703,7 +719,7 @@ pub(crate) fn run_pipeline_fused<R, T, X, F>(
 where
     R: Read + Send,
     T: Send,
-    X: Fn(PrimitiveBlock) -> std::result::Result<T, String> + Sync,
+    X: Fn(PrimitiveBlock) -> Result<T> + Sync,
     F: FnMut(T) -> Result<()>,
 {
     let mut unindexed = UnindexedFilterNote::new(blob_filter.as_ref());
@@ -711,6 +727,7 @@ where
     blob_reader.set_parse_tagdata(has_tag_filter);
     blob_reader.set_parse_indexdata(blob_filter.is_some());
     let blob_filter = blob_filter.map(Arc::new);
+    let source = blob_reader.source().cloned();
     let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead.get());
     type FusedPayload<T> = Option<crate::error::Result<T>>;
     let (decoded_tx, decoded_rx) = sync_channel::<(usize, FusedPayload<T>, Option<Permit>)>(
@@ -740,9 +757,7 @@ where
             let pool = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
                 Ok(pool) => pool,
                 Err(e) => {
-                    let error = crate::error::new_error(crate::error::ErrorKind::Io(
-                        std::io::Error::other(format!("failed to build decode pool: {e}")),
-                    ));
+                    let error = crate::error::Error::pool_build("decode pool", e);
                     // Seq 0 is correct here for the same reason as in the
                     // block-oriented variant above: the pool is built before
                     // the loop over `raw_rx`, so no item has been dispatched
@@ -754,6 +769,9 @@ where
             let buffer_pool = DecompressPool::new();
             let gate = Arc::new(AdmissionGate::new(pipeline_config.decode_ahead));
             let shutdown = Arc::new(AtomicBool::new(false));
+            // Tasks borrow the reader's path from this scope: one capture per
+            // pipeline, no refcounting per blob.
+            let source = source.as_ref();
             pool.in_place_scope(|task_scope| {
                 for (seq, blob_result) in raw_rx {
                     if shutdown.load(Relaxed) {
@@ -799,17 +817,7 @@ where
                                             GR_SCRATCH.with_borrow_mut(|gr| {
                                                 let result = blob
                                                     .to_primitiveblock_inline_with_scratch(&pool, st, gr)
-                                                    .and_then(
-                                                |block| {
-                                                    transform(block).map_err(|error| {
-                                                        crate::error::new_error(
-                                                            crate::error::ErrorKind::Io(
-                                                                std::io::Error::other(error),
-                                                            ),
-                                                        )
-                                                    })
-                                                },
-                                            );
+                                                    .and_then(transform);
                                                 PIPELINE_METRICS.record_scratch_capacity(
                                                     st.capacity().saturating_mul(8),
                                                     gr.capacity().saturating_mul(8),
@@ -820,13 +828,16 @@ where
                                     }));
                                 let item = match item {
                                     Ok(item) => item,
-                                    Err(payload) => Some(Err(crate::error::new_error(
-                                        crate::error::ErrorKind::Io(crate::error::panic_error(
-                                            "decode task",
-                                            payload.as_ref(),
-                                        )),
+                                    Err(payload) => Some(Err(crate::error::panic_error(
+                                        "decode task",
+                                        payload.as_ref(),
                                     ))),
                                 };
+                                // Cold: only a failure pays for the location.
+                                // `seq` is a pipeline ordering key, never a
+                                // location.
+                                let item =
+                                    item.map(|r| r.map_err(|e| blob.locate_error(source, e)));
                                 let start = Instant::now();
                                 if tx.send((seq, item, Some(permit))).is_err() {
                                     shutdown.store(true, Relaxed);
@@ -980,7 +991,7 @@ mod tests {
     fn fused_counts(reader: ElementReader<Cursor<Vec<u8>>>) -> Result<Vec<usize>> {
         let mut counts = Vec::new();
         reader.for_each_fused_block(
-            |block| Ok::<_, String>(block.elements().count()),
+            |block| Ok::<_, crate::Error>(block.elements().count()),
             |count| {
                 counts.push(count);
                 Ok(())
@@ -1021,7 +1032,7 @@ mod tests {
                         crate::Element::Relation(relation) => relation.id(),
                     };
                     if id == 2 {
-                        Err("transform failure".to_owned())
+                        Err(crate::Error::internal("transform failure"))
                     } else {
                         Ok(id)
                     }
@@ -1046,7 +1057,7 @@ mod tests {
             ElementReader::new(Cursor::new(fused_pbf(1)))
                 .unwrap()
                 .for_each_fused_block(
-                    |_| -> std::result::Result<(), String> { panic!("test panic") },
+                    |_| -> crate::Result<()> { panic!("test panic") },
                     |_| Ok(()),
                 )
         });
@@ -1066,12 +1077,8 @@ mod tests {
         let result = ElementReader::new(CountingRead::new(bytes, Arc::clone(&bytes_read)))
             .unwrap()
             .for_each_fused_block(
-                |_| Ok::<_, String>(()),
-                |_| {
-                    Err(crate::error::new_error(crate::error::ErrorKind::Io(
-                        std::io::Error::other("stop"),
-                    )))
-                },
+                |_| Ok::<_, crate::Error>(()),
+                |_| Err(crate::Error::internal("stop")),
             );
         assert!(result.unwrap_err().to_string().contains("stop"));
         assert!(bytes_read.load(Ordering::Relaxed) < full_len);
@@ -1117,7 +1124,7 @@ mod tests {
                                 std::thread::yield_now();
                             }
                         }
-                        Ok::<_, String>(id)
+                        Ok::<_, crate::Error>(id)
                     },
                     |id| {
                         ids.push(id);

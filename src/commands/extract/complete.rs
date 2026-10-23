@@ -57,7 +57,7 @@ pub(super) fn extract_complete_ways(
     let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     let header_blob = header_reader
         .next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        .ok_or_else(crate::error::new_missing_header)??;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
     super::super::warn_locations_on_ways_loss(&header, host);

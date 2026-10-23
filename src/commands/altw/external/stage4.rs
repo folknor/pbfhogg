@@ -17,6 +17,7 @@ use super::super::{
     HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
     flush_local, writer_from_header,
 };
+use crate::error::Error;
 use crate::idset::IdSet;
 use crate::owned::{dense_node_metadata, element_metadata};
 
@@ -57,18 +58,18 @@ struct BlobDescriptor {
 /// Load the ref-count sidecar and compute prefix sums for slot_start values.
 pub(super) fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
     use std::io::Read as _;
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("failed to open ref count sidecar: {e}"))?;
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::from(e).context("failed to open ref count sidecar"))?;
     let bytes = file.metadata()?.len();
     if bytes < 8 {
-        return Err("ref count sidecar is too small".into());
+        return Err(Error::internal("ref count sidecar is too small"));
     }
     if bytes % 8 != 0 {
-        return Err("ref count sidecar has non-aligned entries".into());
+        return Err(Error::internal("ref count sidecar has non-aligned entries"));
     }
     let num_entries: usize = (bytes / 8 - 1)
         .try_into()
-        .map_err(|_| "ref count sidecar has too many entries")?;
+        .map_err(|_| Error::internal("ref count sidecar has too many entries"))?;
     // Only the prefix vector must survive: stages 2/3 use it for random
     // blob-to-slot lookup. Stream the counts instead of holding a second,
     // equally large encoded byte vector during prefix construction.
@@ -81,21 +82,19 @@ pub(super) fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Ve
         slot_starts.push(cumulative);
         cumulative = cumulative
             .checked_add(u64::from_le_bytes(chunk))
-            .ok_or("ref count sidecar cumulative count overflow")?;
+            .ok_or_else(|| Error::internal("ref count sidecar cumulative count overflow"))?;
     }
     reader.read_exact(&mut chunk)?;
     let trailer_total = u64::from_le_bytes(chunk);
     if trailer_total != total_slots {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "ref count sidecar total ({trailer_total}) != stage 1 total_slots ({total_slots})"
-        )
-        .into());
+        )));
     }
     if cumulative != total_slots {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "ref count sidecar cumulative ({cumulative}) != total_slots ({total_slots})"
-        )
-        .into());
+        )));
     }
     Ok(slot_starts)
 }
@@ -142,7 +141,7 @@ pub(super) fn stage4_assembly(
     let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     let header_blob = header_reader
         .next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        .ok_or_else(crate::error::new_missing_header)??;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
 
@@ -193,7 +192,9 @@ pub(super) fn stage4_assembly(
         // Way blobs consume one sidecar entry each.
         let way_blob_idx = if matches!(meta.kind, crate::ElementKind::Way) {
             if way_sidecar_idx >= way_slot_starts.len() {
-                return Err("ref count sidecar has fewer entries than way blobs in PBF".into());
+                return Err(Error::internal(
+                    "ref count sidecar has fewer entries than way blobs in PBF",
+                ));
             }
             let this_way_blob_idx = way_sidecar_idx;
             way_sidecar_idx += 1;
@@ -226,19 +227,18 @@ pub(super) fn stage4_assembly(
 
     // Verify all sidecar entries were consumed.
     if way_sidecar_idx != way_slot_starts.len() {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "ref count sidecar has {} entries but only {} way blobs seen in PBF",
             way_slot_starts.len(),
             way_sidecar_idx,
-        )
-        .into());
+        )));
     }
     crate::debug::emit_marker("EXTJOIN_S4_SCHEDULE_END");
 
     // Open shared file for worker pread.
     let shared_file = std::sync::Arc::new(
         std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+            .map_err(|e| Error::from(e).context(format!("failed to open {}", input.display())))?,
     );
 
     let mut writer = writer_from_header(
@@ -357,6 +357,10 @@ pub(super) fn stage4_assembly(
     let mut s4_bytes_written: u64 = 0;
     let mut s4_write_calls: u64 = 0;
 
+    // Worker errors are located against the input once per worker pool, not
+    // per blob.
+    let source_arc: std::sync::Arc<Path> = std::sync::Arc::from(input);
+    let source = &source_arc;
     std::thread::scope(|scope| -> Result<()> {
         // Dispatcher: feed only decode-eligible blobs into the worker
         // channel. Passthrough blobs bypass workers entirely (see
@@ -396,165 +400,160 @@ pub(super) fn stage4_assembly(
                         }
                     };
 
-                    let result: crate::error::Result<(Vec<OwnedBlock>, Stats)> = (|| {
-                        // For way blobs: block on the router's readiness
-                        // BEFORE the input pread/decompress so a stalled
-                        // decode thread never holds an already-expanded
-                        // block + StringTable resident. Non-way blobs skip
-                        // this entirely - they never consume a coord payload.
-                        if desc.is_way_blob {
-                            let t_wait = std::time::Instant::now();
-                            coord_payloads_reader
-                                .wait_ready(desc.way_blob_idx)
-                                .map_err(|e| {
-                                    crate::error::new_error(crate::error::ErrorKind::Io(
-                                        std::io::Error::other(e.to_string()),
-                                    ))
-                                })?;
-                            #[allow(clippy::cast_possible_truncation)]
-                            let wait_ns = t_wait.elapsed().as_nanos() as u64;
-                            if wait_ns > 0 {
-                                s4_readiness_wait_ns_ref.fetch_add(wait_ns, Relaxed);
-                                s4_readiness_wait_blobs_ref.fetch_add(1, Relaxed);
-                                s4_readiness_wait_max_ns_ref.fetch_max(wait_ns, Relaxed);
+                    // Only errors about the input frame itself are located
+                    // there. A router abort or a read of a worker scratch
+                    // file says nothing about this input blob and stays
+                    // unlocated.
+                    let at_frame = |e: Error| {
+                        e.locate(crate::error::Location::new(
+                            Some(source),
+                            None,
+                            Some(crate::ByteOffset(desc.frame_offset)),
+                        ))
+                    };
+                    let result: crate::error::Result<(Vec<OwnedBlock>, Stats)> =
+                        (|| -> crate::error::Result<(Vec<OwnedBlock>, Stats)> {
+                            // For way blobs: block on the router's readiness
+                            // BEFORE the input pread/decompress so a stalled
+                            // decode thread never holds an already-expanded
+                            // block + StringTable resident. Non-way blobs skip
+                            // this entirely - they never consume a coord payload.
+                            if desc.is_way_blob {
+                                let t_wait = std::time::Instant::now();
+                                coord_payloads_reader.wait_ready(desc.way_blob_idx)?;
+                                #[allow(clippy::cast_possible_truncation)]
+                                let wait_ns = t_wait.elapsed().as_nanos() as u64;
+                                if wait_ns > 0 {
+                                    s4_readiness_wait_ns_ref.fetch_add(wait_ns, Relaxed);
+                                    s4_readiness_wait_blobs_ref.fetch_add(1, Relaxed);
+                                    s4_readiness_wait_max_ns_ref.fetch_max(wait_ns, Relaxed);
+                                }
                             }
-                        }
 
-                        let t0 = std::time::Instant::now();
-                        read_buf.resize(desc.data_size, 0);
-                        file.read_exact_at(&mut read_buf, desc.data_offset)
-                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-                        #[allow(clippy::cast_possible_truncation)]
-                        s4_pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
-                        s4_bytes_read_ref.fetch_add(desc.data_size as u64, Relaxed);
-                        s4_pread_calls_ref.fetch_add(1, Relaxed);
-
-                        let t1 = std::time::Instant::now();
-                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
-                        #[allow(clippy::cast_possible_truncation)]
-                        s4_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
-
-                        let t2 = std::time::Instant::now();
-                        output_blocks.clear();
-
-                        if desc.is_way_blob {
-                            // Read this blob's coord_payloads payload into a
-                            // worker-local buffer before reframe.
-                            let t_cpread = std::time::Instant::now();
-                            coord_payloads_reader
-                                .pread_blob_payload(desc.way_blob_idx, &mut coord_payload_buf)
-                                .map_err(|e| {
-                                    crate::error::new_error(crate::error::ErrorKind::Io(
-                                        std::io::Error::other(e.to_string()),
-                                    ))
-                                })?;
+                            let t0 = std::time::Instant::now();
+                            read_buf.resize(desc.data_size, 0);
+                            file.read_exact_at(&mut read_buf, desc.data_offset)
+                                .map_err(|e| at_frame(Error::from(e)))?;
                             #[allow(clippy::cast_possible_truncation)]
-                            s4_coord_payload_pread_ref
-                                .fetch_add(t_cpread.elapsed().as_millis() as u64, Relaxed);
-                            s4_coord_payload_bytes_ref
-                                .fetch_add(coord_payload_buf.len() as u64, Relaxed);
+                            s4_pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
+                            s4_bytes_read_ref.fetch_add(desc.data_size as u64, Relaxed);
+                            s4_pread_calls_ref.fetch_add(1, Relaxed);
 
-                            // Wire-format reframe: splice locations without
-                            // full PrimitiveBlock decode or BlockBuilder.
-                            let (way_count, min_id, max_id) = reframe_way_blob_with_locations(
-                                &decompress_buf,
-                                &coord_payload_buf,
-                                per_way_rcs.blob_record(desc.way_blob_idx),
-                                desc.way_blob_idx,
-                                &mut reframe_output,
-                                &mut way_reframe_scratch,
-                                way_reframe_cref,
-                                member_way_ids,
-                                inject_prepass,
-                            )
-                            .map_err(|e| {
-                                crate::error::new_error(crate::error::ErrorKind::Io(
-                                    std::io::Error::other(e),
-                                ))
-                            })?;
+                            let t1 = std::time::Instant::now();
+                            crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
+                                .map_err(at_frame)?;
+                            #[allow(clippy::cast_possible_truncation)]
+                            s4_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
 
-                            let index = crate::blob_meta::BlobIndex {
-                                kind: crate::ElementKind::Way,
-                                min_id,
-                                max_id,
-                                count: way_count,
-                                bbox: None,
-                            };
-                            let taken = std::mem::take(&mut reframe_output);
-                            reframe_output.reserve(taken.len());
-                            output_blocks.push(OwnedBlock {
-                                bytes: taken,
-                                index,
-                                tagdata: None,
-                                way_members: inject_prepass.then(|| {
-                                    let payload =
-                                        crate::commands::altw::reframe::way_members_payload(
-                                            way_count,
-                                            &way_reframe_scratch.member_ways,
+                            let t2 = std::time::Instant::now();
+                            output_blocks.clear();
+
+                            if desc.is_way_blob {
+                                // Read this blob's coord_payloads payload into a
+                                // worker-local buffer before reframe.
+                                let t_cpread = std::time::Instant::now();
+                                coord_payloads_reader.pread_blob_payload(
+                                    desc.way_blob_idx,
+                                    &mut coord_payload_buf,
+                                )?;
+                                #[allow(clippy::cast_possible_truncation)]
+                                s4_coord_payload_pread_ref
+                                    .fetch_add(t_cpread.elapsed().as_millis() as u64, Relaxed);
+                                s4_coord_payload_bytes_ref
+                                    .fetch_add(coord_payload_buf.len() as u64, Relaxed);
+
+                                // Wire-format reframe: splice locations without
+                                // full PrimitiveBlock decode or BlockBuilder.
+                                let (way_count, min_id, max_id) = reframe_way_blob_with_locations(
+                                    &decompress_buf,
+                                    &coord_payload_buf,
+                                    per_way_rcs.blob_record(desc.way_blob_idx),
+                                    desc.way_blob_idx,
+                                    &mut reframe_output,
+                                    &mut way_reframe_scratch,
+                                    way_reframe_cref,
+                                    member_way_ids,
+                                    inject_prepass,
+                                )
+                                .map_err(at_frame)?;
+
+                                let index = crate::blob_meta::BlobIndex {
+                                    kind: crate::ElementKind::Way,
+                                    min_id,
+                                    max_id,
+                                    count: way_count,
+                                    bbox: None,
+                                };
+                                let taken = std::mem::take(&mut reframe_output);
+                                reframe_output.reserve(taken.len());
+                                output_blocks.push(OwnedBlock {
+                                    bytes: taken,
+                                    index,
+                                    tagdata: None,
+                                    way_members: inject_prepass.then(|| {
+                                        let payload =
+                                            crate::commands::altw::reframe::way_members_payload(
+                                                way_count,
+                                                &way_reframe_scratch.member_ways,
+                                            );
+                                        inject_metrics.record_blob(
+                                            way_reframe_scratch.pin_tally,
+                                            payload.len(),
                                         );
-                                    inject_metrics
-                                        .record_blob(way_reframe_scratch.pin_tally, payload.len());
-                                    payload
-                                }),
-                            });
+                                        payload
+                                    }),
+                                });
 
-                            let block_stats = Stats {
-                                ways_written: way_count,
-                                blobs_decoded: 1,
-                                ..Stats::default()
-                            };
+                                let block_stats = Stats {
+                                    ways_written: way_count,
+                                    blobs_decoded: 1,
+                                    ..Stats::default()
+                                };
+                                #[allow(clippy::cast_possible_truncation)]
+                                {
+                                    let elapsed = t2.elapsed().as_millis() as u64;
+                                    s4_assemble_ref.fetch_add(elapsed, Relaxed);
+                                    s4_way_reframe_ref.fetch_add(elapsed, Relaxed);
+                                }
+                                s4_blobs_ref.fetch_add(1, Relaxed);
+                                s4_way_blobs_ref.fetch_add(1, Relaxed);
+                                return Ok((std::mem::take(&mut output_blocks), block_stats));
+                            }
+
+                            // Non-way blobs: full PrimitiveBlock decode + BlockBuilder.
+                            // `decompress_buf` is already an owned, unshared Vec, so
+                            // parse it in place with `from_vec`; the old
+                            // `PrimitiveBlock::new(Bytes::from(vec))` wrapped it as
+                            // Bytes only to copy it straight back out via `to_vec()`.
+                            let block =
+                                PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))
+                                    .map_err(at_frame)?;
+                            let mut block_stats = assemble_block(
+                                &block,
+                                &mut bb,
+                                &mut output_blocks,
+                                keep_untagged_nodes,
+                                relation_member_node_ids,
+                            )
+                            .map_err(at_frame)?;
+                            block_stats.blobs_decoded = 1;
+                            flush_local(&mut bb, &mut output_blocks).map_err(at_frame)?;
                             #[allow(clippy::cast_possible_truncation)]
                             {
                                 let elapsed = t2.elapsed().as_millis() as u64;
                                 s4_assemble_ref.fetch_add(elapsed, Relaxed);
-                                s4_way_reframe_ref.fetch_add(elapsed, Relaxed);
+                                s4_nonway_assemble_ref.fetch_add(elapsed, Relaxed);
                             }
+                            s4_nonway_blobs_ref.fetch_add(1, Relaxed);
+
+                            if decompress_buf.capacity() == 0 {
+                                decompress_buf = Vec::new();
+                            }
+
                             s4_blobs_ref.fetch_add(1, Relaxed);
-                            s4_way_blobs_ref.fetch_add(1, Relaxed);
-                            return Ok((std::mem::take(&mut output_blocks), block_stats));
-                        }
 
-                        // Non-way blobs: full PrimitiveBlock decode + BlockBuilder.
-                        // `decompress_buf` is already an owned, unshared Vec, so
-                        // parse it in place with `from_vec`; the old
-                        // `PrimitiveBlock::new(Bytes::from(vec))` wrapped it as
-                        // Bytes only to copy it straight back out via `to_vec()`.
-                        let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
-                        let mut block_stats = assemble_block(
-                            &block,
-                            &mut bb,
-                            &mut output_blocks,
-                            keep_untagged_nodes,
-                            relation_member_node_ids,
-                        )
-                        .map_err(|e| {
-                            crate::error::new_error(crate::error::ErrorKind::Io(
-                                std::io::Error::other(e),
-                            ))
-                        })?;
-                        block_stats.blobs_decoded = 1;
-                        flush_local(&mut bb, &mut output_blocks).map_err(|e| {
-                            crate::error::new_error(crate::error::ErrorKind::Io(
-                                std::io::Error::other(e),
-                            ))
-                        })?;
-                        #[allow(clippy::cast_possible_truncation)]
-                        {
-                            let elapsed = t2.elapsed().as_millis() as u64;
-                            s4_assemble_ref.fetch_add(elapsed, Relaxed);
-                            s4_nonway_assemble_ref.fetch_add(elapsed, Relaxed);
-                        }
-                        s4_nonway_blobs_ref.fetch_add(1, Relaxed);
-
-                        if decompress_buf.capacity() == 0 {
-                            decompress_buf = Vec::new();
-                        }
-
-                        s4_blobs_ref.fetch_add(1, Relaxed);
-
-                        Ok((std::mem::take(&mut output_blocks), block_stats))
-                    })(
-                    );
+                            Ok((std::mem::take(&mut output_blocks), block_stats))
+                        })();
 
                     // Track max live buffer bytes for this worker.
                     {
@@ -708,9 +707,7 @@ pub(super) fn stage4_assembly(
                     } => {
                         let t_pread = std::time::Instant::now();
                         frame_read_buf.resize(frame_size, 0);
-                        shared_file
-                            .read_exact_at(&mut frame_read_buf, frame_offset)
-                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        shared_file.read_exact_at(&mut frame_read_buf, frame_offset)?;
                         #[allow(clippy::cast_possible_truncation)]
                         {
                             *s4_passthrough_pread_ms += t_pread.elapsed().as_millis() as u64;
@@ -823,7 +820,7 @@ pub(super) fn stage4_assembly(
     #[allow(clippy::cast_possible_truncation)]
     let s4_flush_ms: u64 = t_flush.elapsed().as_millis() as u64;
     let s4_output_bytes = std::fs::metadata(output)
-        .map_err(|e| format!("stat output {}: {e}", output.display()))?
+        .map_err(|e| Error::from(e).context(format!("stat output {}", output.display())))?
         .len();
 
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
@@ -947,7 +944,7 @@ fn assemble_block(
     output: &mut Vec<OwnedBlock>,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
-) -> std::result::Result<Stats, String> {
+) -> crate::Result<Stats> {
     let mut stats = Stats::default();
 
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
@@ -1005,12 +1002,12 @@ fn assemble_block(
                 // path produces coord_payloads keyed by way-blob index only,
                 // so there is no coordinate source for an out-of-band way -
                 // error out rather than silently emit (0,0).
-                return Err(format!(
+                return Err(Error::invalid_data(format!(
                     "way {} appeared in a non-way-indexed blob; ALTW external \
                      index requires sorted + indexed PBF where ways are confined \
                      to Way-indexed blobs",
                     w.id(),
-                ));
+                )));
             }
             Element::Relation(r) => {
                 ensure_relation_capacity_local(bb, output)?;
@@ -1172,7 +1169,7 @@ fn reframe_way_blob_with_locations(
     counters: &WayReframeCounters,
     member_way_ids: Option<&IdSet>,
     inject_prepass: bool,
-) -> std::result::Result<(u64, i64, i64), String> {
+) -> crate::Result<(u64, i64, i64)> {
     use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
     use std::sync::atomic::Ordering::Relaxed;
 
@@ -1189,27 +1186,27 @@ fn reframe_way_blob_with_locations(
     let mut cursor = Cursor::new(decompressed);
     while let Some((field, wire_type)) = cursor
         .read_tag()
-        .map_err(|e| format!("reframe block: {e}"))?
+        .map_err(|e| Error::from(e).context("reframe block"))?
     {
         match (field, wire_type) {
             (1, WIRE_LEN) => {
                 let data = cursor
                     .read_len_delimited()
-                    .map_err(|e| format!("reframe st: {e}"))?;
+                    .map_err(|e| Error::from(e).context("reframe st"))?;
                 let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
                 stringtable_range = Some((offset, data.len()));
             }
             (2, WIRE_LEN) => {
                 let data = cursor
                     .read_len_delimited()
-                    .map_err(|e| format!("reframe group: {e}"))?;
+                    .map_err(|e| Error::from(e).context("reframe group"))?;
                 let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
                 scratch.group_ranges.push((offset, data.len()));
             }
             (17..=20, WIRE_VARINT) => {
                 let raw = cursor
                     .read_raw_field(wire_type)
-                    .map_err(|e| format!("reframe scalar: {e}"))?;
+                    .map_err(|e| Error::from(e).context("reframe scalar"))?;
                 // Same coordinate-framing refusal as the sparse arm; see
                 // `altw::reframe::check_default_coord_framing`. This path
                 // appends decimicrodegree fields 9 / 10 alongside a copied
@@ -1220,12 +1217,12 @@ fn reframe_way_blob_with_locations(
             }
             _ => cursor
                 .skip_field(wire_type)
-                .map_err(|e| format!("reframe skip: {e}"))?,
+                .map_err(|e| Error::from(e).context("reframe skip"))?,
         }
     }
 
-    let (st_offset, st_len) =
-        stringtable_range.ok_or("reframe: no StringTable in PrimitiveBlock")?;
+    let (st_offset, st_len) = stringtable_range
+        .ok_or_else(|| Error::invalid_data("reframe: no StringTable in PrimitiveBlock"))?;
     let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
 
     #[allow(clippy::cast_possible_truncation)]
@@ -1234,9 +1231,9 @@ fn reframe_way_blob_with_locations(
         .fetch_add(t_block.elapsed().as_nanos() as u64, Relaxed);
 
     let mut refcount_cursor = Cursor::new(per_way_refcount_record);
-    let expected_ways = refcount_cursor
-        .read_varint()
-        .map_err(|e| format!("per-way sidecar blob {way_blob_idx} num_ways: {e}"))?;
+    let expected_ways = refcount_cursor.read_varint().map_err(|e| {
+        Error::from(e).context(format!("per-way sidecar blob {way_blob_idx} num_ways"))
+    })?;
     #[allow(clippy::cast_possible_truncation)]
     let expected_ways_usize = expected_ways as usize;
     let mut sidecar_way_idx: usize = 0;
@@ -1270,21 +1267,23 @@ fn reframe_way_blob_with_locations(
         let mut gr_cursor = Cursor::new(group_bytes);
         while let Some((field, wire_type)) = gr_cursor
             .read_tag()
-            .map_err(|e| format!("reframe gfield: {e}"))?
+            .map_err(|e| Error::from(e).context("reframe gfield"))?
         {
             if field == 3 && wire_type == WIRE_LEN {
                 // Way submessage - splice locations.
                 let way_bytes = gr_cursor
                     .read_len_delimited()
-                    .map_err(|e| format!("reframe way: {e}"))?;
+                    .map_err(|e| Error::from(e).context("reframe way"))?;
 
                 if sidecar_way_idx >= expected_ways_usize {
-                    return Err(format!(
+                    return Err(Error::internal(format!(
                         "blob {way_blob_idx}: encountered more way messages than the per-way sidecar record declares ({expected_ways_usize})"
-                    ));
+                    )));
                 }
                 let ref_count = refcount_cursor.read_varint().map_err(|e| {
-                    format!("per-way sidecar blob {way_blob_idx} way {sidecar_way_idx}: {e}")
+                    Error::from(e).context(format!(
+                        "per-way sidecar blob {way_blob_idx} way {sidecar_way_idx}"
+                    ))
                 })?;
                 sidecar_way_idx += 1;
 
@@ -1294,24 +1293,24 @@ fn reframe_way_blob_with_locations(
                 let mut way_cursor = Cursor::new(way_bytes);
                 while let Some((wf, wt)) = way_cursor
                     .read_tag()
-                    .map_err(|e| format!("reframe wfield: {e}"))?
+                    .map_err(|e| Error::from(e).context("reframe wfield"))?
                 {
                     match (wf, wt) {
                         (1, WIRE_VARINT) => {
                             way_id = way_cursor
                                 .read_varint_i64()
-                                .map_err(|e| format!("reframe id: {e}"))?;
+                                .map_err(|e| Error::from(e).context("reframe id"))?;
                         }
                         (9 | 10 | 20, WIRE_LEN) => {
                             has_existing_way_locations = true;
                             way_cursor
                                 .skip_field(wt)
-                                .map_err(|e| format!("reframe wskip: {e}"))?;
+                                .map_err(|e| Error::from(e).context("reframe wskip"))?;
                         }
                         _ => {
                             way_cursor
                                 .skip_field(wt)
-                                .map_err(|e| format!("reframe wskip: {e}"))?;
+                                .map_err(|e| Error::from(e).context("reframe wskip"))?;
                         }
                     }
                 }
@@ -1341,7 +1340,7 @@ fn reframe_way_blob_with_locations(
                         payload_pos += 1;
                     }
                     if payload_pos >= coord_payload.len() {
-                        return Err("coord_payload: truncated lat varint".into());
+                        return Err(Error::internal("coord_payload: truncated lat varint"));
                     }
                     payload_pos += 1;
                     scratch
@@ -1354,7 +1353,7 @@ fn reframe_way_blob_with_locations(
                         payload_pos += 1;
                     }
                     if payload_pos >= coord_payload.len() {
-                        return Err("coord_payload: truncated lon varint".into());
+                        return Err(Error::internal("coord_payload: truncated lon varint"));
                     }
                     payload_pos += 1;
                     scratch
@@ -1363,10 +1362,10 @@ fn reframe_way_blob_with_locations(
                 }
                 if inject_prepass {
                     let pin_ref_count = usize::try_from(ref_count)
-                        .map_err(|_| "coord_payload: ref count exceeds usize")?;
+                        .map_err(|_| Error::internal("coord_payload: ref count exceeds usize"))?;
                     let pin_bytes = pin_ref_count.div_ceil(8);
                     if payload_pos + pin_bytes > coord_payload.len() {
-                        return Err("coord_payload: truncated pin bitmap".into());
+                        return Err(Error::internal("coord_payload: truncated pin bitmap"));
                     }
                     scratch
                         .pins
@@ -1390,11 +1389,11 @@ fn reframe_way_blob_with_locations(
                     let mut copy_cursor = Cursor::new(way_bytes);
                     while let Some((wf, wt)) = copy_cursor
                         .read_tag()
-                        .map_err(|e| format!("reframe copy tag: {e}"))?
+                        .map_err(|e| Error::from(e).context("reframe copy tag"))?
                     {
                         let raw = copy_cursor
                             .read_raw_field(wt)
-                            .map_err(|e| format!("reframe copy field: {e}"))?;
+                            .map_err(|e| Error::from(e).context("reframe copy field"))?;
                         if !matches!((wf, wt), (9 | 10 | 20, WIRE_LEN)) {
                             protohoggr::encode_tag(&mut scratch.reframed_way, wf, wt);
                             scratch.reframed_way.extend_from_slice(raw);
@@ -1430,7 +1429,7 @@ fn reframe_way_blob_with_locations(
                 let t_copy = std::time::Instant::now();
                 let raw = gr_cursor
                     .read_raw_field(wire_type)
-                    .map_err(|e| format!("reframe gskip: {e}"))?;
+                    .map_err(|e| Error::from(e).context("reframe gskip"))?;
                 protohoggr::encode_tag(&mut scratch.group_out, field, wire_type);
                 scratch.group_out.extend_from_slice(raw);
                 #[allow(clippy::cast_possible_truncation)]
@@ -1452,15 +1451,15 @@ fn reframe_way_blob_with_locations(
     output.extend_from_slice(&scratch.scalar_fields);
 
     if sidecar_way_idx != expected_ways_usize {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "blob {way_blob_idx}: per-way sidecar record declared {expected_ways_usize} ways but the blob contained {sidecar_way_idx}"
-        ));
+        )));
     }
     if refcount_cursor.remaining() != 0 {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "per-way sidecar blob {way_blob_idx} has {} trailing bytes",
             refcount_cursor.remaining()
-        ));
+        )));
     }
 
     // Publish blob-local counter accumulators (one fetch_add each
@@ -1488,10 +1487,10 @@ fn reframe_way_blob_with_locations(
     }
 
     if payload_pos != coord_payload.len() {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "coord_payload: consumed {payload_pos} of {} bytes (trailing bytes indicate stage 3 over-production or version skew)",
             coord_payload.len()
-        ));
+        )));
     }
 
     Ok((total_ways, min_way_id, max_way_id))

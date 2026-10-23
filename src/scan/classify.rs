@@ -30,7 +30,7 @@
 //! Schedule construction lives in [`build_classify_schedule`] and
 //! [`build_classify_schedules_split`].
 
-use crate::BoxResult as Result;
+use crate::error::{Error, Result};
 
 /// One entry in a classification schedule: `(seq, data_offset, data_size)`.
 /// `seq` is an ordering key supplied by the schedule builder; it may be
@@ -284,7 +284,7 @@ pub(crate) fn build_classify_schedule_blob_filtered(
     drop(
         walker
             .next_header()?
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?,
+            .ok_or_else(crate::error::new_missing_header)?,
     );
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
@@ -326,11 +326,13 @@ pub(crate) fn build_classify_schedule_blob_filtered(
         // workers have already accepted the schedule. Cheap integer
         // check here catches the whole family.
         if !blob_body_within_file(meta.data_offset, meta.data_size, file_size) {
-            return Err(format!(
-                "blob at offset {} claims data_size {} but file is only {} bytes",
-                meta.data_offset, meta.data_size, file_size,
-            )
-            .into());
+            return Err(walker.locate_meta(
+                &meta,
+                Error::invalid_data(format!(
+                    "blob at offset {} claims data_size {} but file is only {} bytes",
+                    meta.data_offset, meta.data_size, file_size,
+                )),
+            ));
         }
         schedule.push((seq, meta.data_offset, meta.data_size));
         seq += 1;
@@ -384,7 +386,7 @@ pub(crate) fn build_classify_schedules_split(
     drop(
         walker
             .next_header()?
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?,
+            .ok_or_else(crate::error::new_missing_header)?,
     );
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
@@ -403,11 +405,13 @@ pub(crate) fn build_classify_schedules_split(
         // workers. Replicated across both schedule builders since they
         // share the same downstream consumer pattern.
         if !blob_body_within_file(meta.data_offset, meta.data_size, file_size) {
-            return Err(format!(
-                "blob at offset {} claims data_size {} but file is only {} bytes",
-                meta.data_offset, meta.data_size, file_size,
-            )
-            .into());
+            return Err(walker.locate_meta(
+                &meta,
+                Error::invalid_data(format!(
+                    "blob at offset {} claims data_size {} but file is only {} bytes",
+                    meta.data_offset, meta.data_size, file_size,
+                )),
+            ));
         }
         let reported_max = meta.index.as_ref().map_or(0, |i| i.max_id);
         match meta.index.as_ref().map(|i| i.kind) {
@@ -567,8 +571,7 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
 
                     let r: crate::error::Result<R> = (|| {
                         read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)
-                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        file.read_exact_at(&mut read_buf, data_offset)?;
                         let mut buf = crate::blob::pool_get(
                             Some(&worker_pool),
                             data_size * DECOMPRESS_EXPANSION_GUESS,
@@ -750,8 +753,7 @@ pub(crate) fn parallel_classify_phase_ordered<S: Send, R: Send>(
 
                     let r: crate::error::Result<R> = (|| {
                         read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)
-                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        file.read_exact_at(&mut read_buf, data_offset)?;
                         let mut buf = crate::blob::pool_get(
                             Some(&worker_pool),
                             data_size * DECOMPRESS_EXPANSION_GUESS,
@@ -874,8 +876,7 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
 
                     let r: crate::error::Result<R> = (|| {
                         read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)
-                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        file.read_exact_at(&mut read_buf, data_offset)?;
                         crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
                         classify_ref(&decompress_buf, &mut state)
                     })();
@@ -1016,8 +1017,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
                         };
 
                         read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)
-                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        file.read_exact_at(&mut read_buf, data_offset)?;
                         let mut buf = crate::blob::pool_get(
                             Some(&worker_pool),
                             data_size * DECOMPRESS_EXPANSION_GUESS,

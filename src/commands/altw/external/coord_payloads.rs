@@ -40,6 +40,7 @@ use std::path::Path;
 
 use super::super::Result;
 use super::COORD_SLOT_SIZE;
+use crate::error::Error;
 
 // ---------------------------------------------------------------------------
 // Integrated path types
@@ -114,7 +115,7 @@ pub(super) struct ConcurrentBlobLocationRouter {
     notify_mu: std::sync::Mutex<()>,
     aborted: std::sync::atomic::AtomicBool,
     producer_done: std::sync::atomic::AtomicBool,
-    abort_error: std::sync::Mutex<Option<String>>,
+    abort_error: std::sync::Mutex<Option<Error>>,
     // Depth-gated WAIT span for stage-4 threads waiting in `wait_ready`
     // (stage 3 behind stage 4). Its marker pair appears in
     // `brokkr sidecar --durations`; `--stalls` reads `*_wait_ns` counters.
@@ -201,11 +202,10 @@ impl ConcurrentBlobLocationRouter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.is_some() {
-            return Err(format!(
+            return Err(Error::internal(format!(
                 "router publish_worker: blob {blob_idx} already has a location \
                  (likely duplicate emission across workers)"
-            )
-            .into());
+            )));
         }
         *guard = Some(BlobLocation::Worker {
             worker_id,
@@ -254,14 +254,14 @@ impl ConcurrentBlobLocationRouter {
             (Some(StraddlerPartial::Left(left)), StraddlerSide::Right) => (left, raw_bytes),
             (Some(StraddlerPartial::Right(right)), StraddlerSide::Left) => (raw_bytes, right),
             (Some(StraddlerPartial::Left(_)), StraddlerSide::Left) => {
-                return Err(
-                    format!("router straddler blob {blob_idx}: duplicate left half").into(),
-                );
+                return Err(Error::internal(format!(
+                    "router straddler blob {blob_idx}: duplicate left half"
+                )));
             }
             (Some(StraddlerPartial::Right(_)), StraddlerSide::Right) => {
-                return Err(
-                    format!("router straddler blob {blob_idx}: duplicate right half").into(),
-                );
+                return Err(Error::internal(format!(
+                    "router straddler blob {blob_idx}: duplicate right half"
+                )));
             }
         };
         // Both halves present - encode inline and publish.
@@ -277,7 +277,7 @@ impl ConcurrentBlobLocationRouter {
             inject_prepass,
             encode_scratch,
         )
-        .map_err(|e| format!("router straddler encode blob {blob_idx}: {e}"))?;
+        .map_err(|e| e.context(format!("router straddler encode blob {blob_idx}")))?;
         #[allow(clippy::cast_possible_truncation)]
         let encode_ns = t_enc.elapsed().as_nanos() as u64;
         let bytes = std::mem::take(encode_scratch);
@@ -286,10 +286,9 @@ impl ConcurrentBlobLocationRouter {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot_guard.is_some() {
-            return Err(format!(
+            return Err(Error::internal(format!(
                 "router straddler blob {blob_idx}: slot already populated at encode time"
-            )
-            .into());
+            )));
         }
         *slot_guard = Some(BlobLocation::Straddler { bytes });
         drop(slot_guard);
@@ -329,14 +328,14 @@ impl ConcurrentBlobLocationRouter {
 
     /// Signal a terminal failure. Wakes all waiters; subsequent waits and
     /// preads observe the recorded error.
-    pub(super) fn abort(&self, msg: String) {
+    pub(super) fn abort(&self, error: Error) {
         {
             let mut guard = self
                 .abort_error
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if guard.is_none() {
-                *guard = Some(msg);
+                *guard = Some(error);
             }
         }
         self.aborted
@@ -381,8 +380,8 @@ impl ConcurrentBlobLocationRouter {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone()
-                    .unwrap_or_else(|| "router aborted (no message recorded)".to_string());
-                return Err(err.into());
+                    .unwrap_or_else(|| Error::internal("router aborted (no message recorded)"));
+                return Err(err);
             }
             {
                 let guard = self.slots[blob_idx]
@@ -392,10 +391,9 @@ impl ConcurrentBlobLocationRouter {
                     return Ok(());
                 }
                 if self.producer_done.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err(format!(
+                    return Err(Error::internal(format!(
                         "router: no publication for blob {blob_idx} after producer finished"
-                    )
-                    .into());
+                    )));
                 }
             }
             drop(
@@ -423,10 +421,9 @@ impl ConcurrentBlobLocationRouter {
             match &*guard {
                 Some(loc) => loc.clone(),
                 None => {
-                    return Err(format!(
+                    return Err(Error::internal(format!(
                         "router pread_blob_payload: slot {blob_idx} empty after wait_ready"
-                    )
-                    .into());
+                    )));
                 }
             }
         };
@@ -443,7 +440,8 @@ impl ConcurrentBlobLocationRouter {
                     self.worker_files[worker_id as usize]
                         .read_exact_at(buf, byte_offset)
                         .map_err(|e| {
-                            format!("router pread worker {worker_id} blob {blob_idx}: {e}")
+                            Error::from(e)
+                                .context(format!("router pread worker {worker_id} blob {blob_idx}"))
                         })?;
                 }
             }
@@ -506,8 +504,10 @@ impl<'a> AbortOnDrop<'a> {
 impl Drop for AbortOnDrop<'_> {
     fn drop(&mut self) {
         if self.armed.get() {
-            self.router
-                .abort(format!("{} panicked (AbortOnDrop guard fired)", self.label));
+            self.router.abort(Error::internal(format!(
+                "{} panicked (AbortOnDrop guard fired)",
+                self.label
+            )));
         }
     }
 }
@@ -568,13 +568,13 @@ impl PerWayRcs {
 fn scan_blob_record(cursor: &mut protohoggr::Cursor<'_>, blob_idx: usize) -> Result<()> {
     let num_ways = cursor
         .read_varint()
-        .map_err(|e| format!("per-way sidecar blob {blob_idx} num_ways: {e}"))?;
+        .map_err(|e| Error::from(e).context(format!("per-way sidecar blob {blob_idx} num_ways")))?;
     #[allow(clippy::cast_possible_truncation)]
     let num_ways_usize = num_ways as usize;
     for way_idx in 0..num_ways_usize {
-        cursor
-            .read_varint()
-            .map_err(|e| format!("per-way sidecar blob {blob_idx} way {way_idx}: {e}"))?;
+        cursor.read_varint().map_err(|e| {
+            Error::from(e).context(format!("per-way sidecar blob {blob_idx} way {way_idx}"))
+        })?;
     }
     Ok(())
 }
@@ -584,24 +584,23 @@ fn decode_blob_record_into(record: &[u8], blob_idx: usize, scratch: &mut Vec<u32
     let mut cursor = protohoggr::Cursor::new(record);
     let num_ways = cursor
         .read_varint()
-        .map_err(|e| format!("per-way sidecar blob {blob_idx} num_ways: {e}"))?;
+        .map_err(|e| Error::from(e).context(format!("per-way sidecar blob {blob_idx} num_ways")))?;
     #[allow(clippy::cast_possible_truncation)]
     let num_ways_usize = num_ways as usize;
     scratch.clear();
     scratch.reserve(num_ways_usize);
     for way_idx in 0..num_ways_usize {
-        let rc = cursor
-            .read_varint()
-            .map_err(|e| format!("per-way sidecar blob {blob_idx} way {way_idx}: {e}"))?;
+        let rc = cursor.read_varint().map_err(|e| {
+            Error::from(e).context(format!("per-way sidecar blob {blob_idx} way {way_idx}"))
+        })?;
         #[allow(clippy::cast_possible_truncation)]
         scratch.push(rc as u32);
     }
     if cursor.remaining() != 0 {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "per-way sidecar blob {blob_idx} has {} trailing bytes",
             cursor.remaining()
-        )
-        .into());
+        )));
     }
     Ok(())
 }
@@ -610,23 +609,22 @@ fn blob_record_has_nonzero_refs(record: &[u8], blob_idx: usize) -> Result<bool> 
     let mut cursor = protohoggr::Cursor::new(record);
     let num_ways = cursor
         .read_varint()
-        .map_err(|e| format!("per-way sidecar blob {blob_idx} num_ways: {e}"))?;
+        .map_err(|e| Error::from(e).context(format!("per-way sidecar blob {blob_idx} num_ways")))?;
     #[allow(clippy::cast_possible_truncation)]
     let num_ways_usize = num_ways as usize;
     for way_idx in 0..num_ways_usize {
-        let rc = cursor
-            .read_varint()
-            .map_err(|e| format!("per-way sidecar blob {blob_idx} way {way_idx}: {e}"))?;
+        let rc = cursor.read_varint().map_err(|e| {
+            Error::from(e).context(format!("per-way sidecar blob {blob_idx} way {way_idx}"))
+        })?;
         if rc != 0 {
             return Ok(true);
         }
     }
     if cursor.remaining() != 0 {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "per-way sidecar blob {blob_idx} has {} trailing bytes",
             cursor.remaining()
-        )
-        .into());
+        )));
     }
     Ok(false)
 }
@@ -643,11 +641,10 @@ fn build_per_way_refcount_index(data: RefCountBytes, num_way_blobs: usize) -> Re
     }
 
     if cursor.remaining() != 0 {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "per-way refcount sidecar has {} trailing bytes",
             cursor.remaining()
-        )
-        .into());
+        )));
     }
 
     Ok(PerWayRcs { data, offsets })
@@ -667,8 +664,8 @@ pub(super) fn load_per_way_refcount_sidecar_indexed(
     path: &Path,
     num_way_blobs: usize,
 ) -> Result<PerWayRcs> {
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("open per-way refcount sidecar: {e}"))?;
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::from(e).context("open per-way refcount sidecar"))?;
     let data = if file.metadata()?.len() == 0 {
         RefCountBytes::Empty
     } else {
@@ -681,7 +678,7 @@ pub(super) fn load_per_way_refcount_sidecar_indexed(
         // offsets avoids a seek/read or reparsing preceding ways per blob.
         RefCountBytes::Mapped(
             unsafe { memmap2::Mmap::map(&file) }
-                .map_err(|e| format!("map per-way refcount sidecar: {e}"))?,
+                .map_err(|e| Error::from(e).context("map per-way refcount sidecar"))?,
         )
     };
     build_per_way_refcount_index(data, num_way_blobs)
@@ -699,14 +696,14 @@ pub(super) fn encode_blob_payload(
     coord_bytes: &[u8],
     per_way_rcs: &[u32],
     output: &mut Vec<u8>,
-) -> std::result::Result<(), String> {
+) -> crate::Result<()> {
     let expected_bytes: u64 = per_way_rcs.iter().map(|&r| u64::from(r)).sum::<u64>() * 8;
     if coord_bytes.len() as u64 != expected_bytes {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "coord_bytes length mismatch: got {} bytes, expected {} (8 * sum(per_way_rcs))",
             coord_bytes.len(),
             expected_bytes
-        ));
+        )));
     }
     let mut cursor: usize = 0;
     for &rc in per_way_rcs {
@@ -747,31 +744,33 @@ pub(super) fn encode_blob_payload_from_record(
     blob_idx: usize,
     inject_prepass: bool,
     output: &mut Vec<u8>,
-) -> std::result::Result<(), String> {
+) -> crate::Result<()> {
     let mut cursor = protohoggr::Cursor::new(record);
     let num_ways = cursor
         .read_varint()
-        .map_err(|e| format!("per-way sidecar blob {blob_idx} num_ways: {e}"))?;
+        .map_err(|e| Error::from(e).context(format!("per-way sidecar blob {blob_idx} num_ways")))?;
     #[allow(clippy::cast_possible_truncation)]
     let num_ways_usize = num_ways as usize;
 
     let mut coord_cursor: usize = 0;
     for way_idx in 0..num_ways_usize {
-        let rc = cursor
-            .read_varint()
-            .map_err(|e| format!("per-way sidecar blob {blob_idx} way {way_idx}: {e}"))?;
+        let rc = cursor.read_varint().map_err(|e| {
+            Error::from(e).context(format!("per-way sidecar blob {blob_idx} way {way_idx}"))
+        })?;
         #[allow(clippy::cast_possible_truncation)]
         let rc_usize = rc as usize;
-        let way_bytes = rc_usize
-            .checked_mul(COORD_SLOT_SIZE)
-            .ok_or_else(|| format!("blob {blob_idx} way {way_idx}: refcount byte size overflow"))?;
+        let way_bytes = rc_usize.checked_mul(COORD_SLOT_SIZE).ok_or_else(|| {
+            Error::internal(format!(
+                "blob {blob_idx} way {way_idx}: refcount byte size overflow"
+            ))
+        })?;
         if coord_cursor + way_bytes > coord_bytes.len() {
-            return Err(format!(
+            return Err(Error::internal(format!(
                 "coord_bytes length mismatch for blob {blob_idx}: got {} bytes, \
                  need at least {} bytes by way {way_idx}",
                 coord_bytes.len(),
                 coord_cursor + way_bytes,
-            ));
+            )));
         }
 
         let mut last_lat: i32 = 0;
@@ -827,17 +826,17 @@ pub(super) fn encode_blob_payload_from_record(
         }
     }
     if cursor.remaining() != 0 {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "per-way sidecar blob {blob_idx} has {} trailing bytes",
             cursor.remaining()
-        ));
+        )));
     }
     if coord_cursor != coord_bytes.len() {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "coord_bytes length mismatch for blob {blob_idx}: got {} bytes, expected {}",
             coord_bytes.len(),
             coord_cursor,
-        ));
+        )));
     }
     Ok(())
 }
@@ -1091,7 +1090,7 @@ mod tests {
                                 .expect("right half");
                         }
                         2 => router.mark_producer_done(),
-                        _ => router.abort("test failure".to_string()),
+                        _ => router.abort(Error::internal("test failure")),
                     }
                     sent.send(()).expect("publication completed");
                 });

@@ -115,9 +115,9 @@ impl OutputFile {
     /// Returns an error if `final_path` has no file name.
     pub fn new(final_path: &Path) -> crate::error::Result<Self> {
         let name = final_path.file_name().ok_or_else(|| {
-            crate::error::Error::from(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("output path has no file name: {}", final_path.display()),
+            crate::error::Error::invalid_argument(format!(
+                "output path has no file name: {}",
+                final_path.display()
             ))
         })?;
         // Counter as well as pid: one process can write several outputs

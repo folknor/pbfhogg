@@ -60,6 +60,9 @@ pub(super) struct BlobDescriptor {
     /// Monotonic sequence number assigned by the scanner in file order.
     /// The drain's reorder buffer keys on this.
     pub seq: u64,
+    /// The blob's file-wide ordinal as counted by the header walker (the
+    /// OsmHeader blob is blob 0, so this is not `seq`). Error provenance.
+    pub blob_index: u64,
     /// Byte offset of the 4-byte length prefix at the start of the frame.
     pub frame_start: u64,
     /// Total framed bytes: `4 + header_len + data_size`.

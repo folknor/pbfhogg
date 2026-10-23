@@ -27,14 +27,15 @@ use std::path::Path;
 
 use crate::blob::BlobKind;
 use crate::block_builder::{BlockBuilder, HeaderBuilder, Metadata, OwnedBlock};
+use crate::error::Error;
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::write::OutputBackend;
 use crate::writer::{Compression, PbfWriter};
 
-// Alias for crate::BoxResult kept for short `super::Result` imports inside command
-// implementations. The canonical definition (with rationale) is at the crate root.
-pub(crate) type Result<T> = crate::BoxResult<T>;
+// Alias for crate::Result kept for short `super::Result` imports inside command
+// implementations.
+pub(crate) type Result<T> = crate::Result<T>;
 
 // ---------------------------------------------------------------------------
 // Shared output helpers
@@ -117,14 +118,14 @@ pub(crate) fn ensure_relation_capacity(
 /// Blocks are written sequentially in batch order. The `merge` closure
 /// accumulates stats from each result into the caller's aggregator.
 pub(crate) fn drain_batch_results<S>(
-    results: Vec<std::result::Result<(Vec<OwnedBlock>, S), String>>,
+    results: Vec<Result<(Vec<OwnedBlock>, S)>>,
     writer: &mut PbfWriter<FileWriter>,
     mut merge: impl FnMut(S),
     host: &crate::host::Host,
 ) -> Result<()> {
     let _ = host;
     for result in results {
-        let (blocks, stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let (blocks, stats) = result?;
         merge(stats);
         for OwnedBlock {
             bytes: block_bytes,
@@ -148,11 +149,8 @@ pub(crate) fn drain_batch_results<S>(
 ///
 /// Like `flush_block` but writes to a `Vec<OwnedBlock>` instead of a
 /// `PbfWriter`, so it can be called from rayon worker threads.
-pub(crate) fn flush_local(
-    bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
-) -> std::result::Result<(), String> {
-    if let Some(owned) = bb.take_owned().map_err(|e| e.to_string())? {
+pub(crate) fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<OwnedBlock>) -> Result<()> {
+    if let Some(owned) = bb.take_owned()? {
         output.push(owned);
     }
     Ok(())
@@ -163,7 +161,7 @@ pub(crate) fn flush_local(
 pub(crate) fn ensure_node_capacity_local(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> std::result::Result<(), String> {
+) -> Result<()> {
     if !bb.can_add_node() {
         flush_local(bb, output)?;
     }
@@ -175,7 +173,7 @@ pub(crate) fn ensure_node_capacity_local(
 pub(crate) fn ensure_way_capacity_local(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> std::result::Result<(), String> {
+) -> Result<()> {
     if !bb.can_add_way() {
         flush_local(bb, output)?;
     }
@@ -187,7 +185,7 @@ pub(crate) fn ensure_way_capacity_local(
 pub(crate) fn ensure_relation_capacity_local(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> std::result::Result<(), String> {
+) -> Result<()> {
     if !bb.can_add_relation() {
         flush_local(bb, output)?;
     }
@@ -305,24 +303,23 @@ impl HeaderOverrides {
         };
         for entry in output_headers {
             let (key, value) = entry.split_once('=').ok_or_else(|| {
-                format!("invalid --output-header format: '{entry}' (expected key=value)")
+                Error::invalid_argument(format!(
+                    "invalid --output-header format: '{entry}' (expected key=value)"
+                ))
             })?;
-            let key = HeaderOverrideKey::parse(key)
-                .ok_or_else(|| format!("unknown --output-header key: '{key}'"))?;
+            let key = HeaderOverrideKey::parse(key).ok_or_else(|| {
+                Error::invalid_argument(format!("unknown --output-header key: '{key}'"))
+            })?;
             match key.kind {
                 HeaderOverrideKind::Timestamp => {
-                    ov.replication_timestamp = Some(
-                        value
-                            .parse::<i64>()
-                            .map_err(|_| format!("invalid {}: '{value}'", key.name))?,
-                    );
+                    ov.replication_timestamp = Some(value.parse::<i64>().map_err(|_| {
+                        Error::invalid_argument(format!("invalid {}: '{value}'", key.name))
+                    })?);
                 }
                 HeaderOverrideKind::SequenceNumber => {
-                    ov.replication_sequence_number = Some(
-                        value
-                            .parse::<i64>()
-                            .map_err(|_| format!("invalid {}: '{value}'", key.name))?,
-                    );
+                    ov.replication_sequence_number = Some(value.parse::<i64>().map_err(|_| {
+                        Error::invalid_argument(format!("invalid {}: '{value}'", key.name))
+                    })?);
                 }
                 HeaderOverrideKind::BaseUrl => {
                     ov.replication_base_url = Some(value.to_string());
@@ -388,7 +385,7 @@ pub(crate) fn build_output_header(
         hb = hb.sorted();
     }
     hb = overrides.apply(hb);
-    Ok(hb.build()?)
+    hb.build()
 }
 
 /// Open a pipelined writer from an input header.
@@ -439,7 +436,9 @@ pub(crate) fn writer_from_header_bytes(
             }
             #[cfg(not(feature = "linux-io-uring"))]
             {
-                Err("--io-uring requires the linux-io-uring feature".into())
+                Err(Error::invalid_argument(
+                    "--io-uring requires the linux-io-uring feature",
+                ))
             }
         }
         OutputBackend::Direct => {
@@ -455,7 +454,9 @@ pub(crate) fn writer_from_header_bytes(
             }
             #[cfg(not(feature = "linux-direct-io"))]
             {
-                Err("--direct-io requires the linux-direct-io feature".into())
+                Err(Error::invalid_argument(
+                    "--direct-io requires the linux-direct-io feature",
+                ))
             }
         }
         OutputBackend::Parallel => Ok(PbfWriter::to_path_parallel_in(
@@ -524,13 +525,12 @@ pub(crate) fn require_indexdata(
 ) -> Result<bool> {
     let present = has_indexdata(path, direct_io, &host.diagnostics)?;
     if !force && !present {
-        return Err(format!(
+        return Err(Error::invalid_data(format!(
             "{reason}\n\n\
              Generate an indexed PBF first:\n\n\
              \x20 pbfhogg cat input.osm.pbf -o indexed.osm.pbf\n\n\
              Or pass --force to proceed anyway."
-        )
-        .into());
+        )));
     }
     Ok(present)
 }
@@ -546,7 +546,7 @@ pub(crate) fn require_sorted(
     reason: &str,
 ) -> Result<()> {
     if !is_sorted {
-        return Err(format!(
+        return Err(Error::invalid_data(format!(
             "{context} is not sorted (missing Sort.Type_then_ID optional feature).\n\
              File: {}\n\n\
              Sort the input file first:\n\n\
@@ -554,8 +554,7 @@ pub(crate) fn require_sorted(
              {reason}",
             path.display(),
             path.display(),
-        )
-        .into());
+        )));
     }
     Ok(())
 }
@@ -673,6 +672,20 @@ pub(crate) fn format_epoch_secs(secs: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
 }
 
+/// Why a timestamp could not be parsed by [`parse_rfc3339_utc`]. A neutral
+/// leaf: the caller decides whether the bad timestamp is an invalid argument
+/// (the CLI cutoff) or invalid data (an OSC attribute).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TimestampError(&'static str);
+
+impl std::fmt::Display for TimestampError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for TimestampError {}
+
 /// Parse an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`, the OSM XML
 /// timestamp format) into Unix epoch seconds.
 ///
@@ -680,10 +693,10 @@ pub(crate) fn format_epoch_secs(secs: i64) -> String {
 /// no fractional seconds or offsets (OSM planet/OSC files never carry
 /// either). Used by the OSC parser for element `timestamp` attributes and
 /// by the CLI for `time-filter`'s cutoff argument.
-pub fn parse_rfc3339_utc(input: &str) -> std::result::Result<i64, String> {
-    const FORMAT_ERR: &str = "timestamp must be YYYY-MM-DDTHH:MM:SSZ";
+pub fn parse_rfc3339_utc(input: &str) -> std::result::Result<i64, TimestampError> {
+    const FORMAT_ERR: TimestampError = TimestampError("timestamp must be YYYY-MM-DDTHH:MM:SSZ");
     if input.len() != 20 {
-        return Err(FORMAT_ERR.to_owned());
+        return Err(FORMAT_ERR);
     }
 
     let bytes = input.as_bytes();
@@ -694,13 +707,13 @@ pub fn parse_rfc3339_utc(input: &str) -> std::result::Result<i64, String> {
         || bytes[16] != b':'
         || bytes[19] != b'Z'
     {
-        return Err(FORMAT_ERR.to_owned());
+        return Err(FORMAT_ERR);
     }
 
-    let field = |start: usize, end: usize| -> std::result::Result<i64, String> {
+    let field = |start: usize, end: usize| -> std::result::Result<i64, TimestampError> {
         input[start..end]
             .parse::<i64>()
-            .map_err(|_| "invalid numeric timestamp component".to_owned())
+            .map_err(|_| TimestampError("invalid numeric timestamp component"))
     };
 
     let year = field(0, 4)?;
@@ -711,10 +724,10 @@ pub fn parse_rfc3339_utc(input: &str) -> std::result::Result<i64, String> {
     let second = field(17, 19)?;
 
     if !(1..=12).contains(&month) {
-        return Err("invalid month in timestamp".to_owned());
+        return Err(TimestampError("invalid month in timestamp"));
     }
     if hour > 23 || minute > 59 || second > 59 {
-        return Err("invalid time in timestamp".to_owned());
+        return Err(TimestampError("invalid time in timestamp"));
     }
     let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
     let max_day = match month {
@@ -725,7 +738,7 @@ pub fn parse_rfc3339_utc(input: &str) -> std::result::Result<i64, String> {
         _ => 0,
     };
     if day == 0 || day > max_day {
-        return Err("invalid day in timestamp".to_owned());
+        return Err(TimestampError("invalid day in timestamp"));
     }
 
     // Howard Hinnant's civil-date algorithm (inverse of format_epoch_secs).
@@ -747,7 +760,7 @@ mod tests {
     /// `parse_rfc3339_utc` is the exact inverse of `format_epoch_secs` and
     /// rejects malformed input.
     #[test]
-    fn rfc3339_parse_inverts_format() -> std::result::Result<(), String> {
+    fn rfc3339_parse_inverts_format() -> std::result::Result<(), TimestampError> {
         // Known anchor values.
         assert_eq!(parse_rfc3339_utc("1970-01-01T00:00:00Z")?, 0);
         assert_eq!(parse_rfc3339_utc("1970-01-02T00:00:00Z")?, 86_400);

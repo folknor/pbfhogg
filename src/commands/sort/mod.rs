@@ -19,8 +19,10 @@ use crate::blob::{
 };
 use crate::blob_meta::{BlobIndex, scan_block_ids_checked};
 use crate::block_builder::BlockBuilder;
+use crate::error::Error;
 use crate::file_writer::FileWriter;
 use crate::read::header_walker::HeaderWalker;
+use crate::read::raw_frame::frame_location;
 use crate::write::WriteOptions;
 use crate::writer::{PbfWriter, reframe_raw_with_index};
 
@@ -296,15 +298,15 @@ pub fn sort(
         Vec::new()
     } else {
         crate::debug::emit_marker("SORT_OVERLAP_PARALLEL_START");
-        let results: std::result::Result<Vec<_>, String> = host.executor.install(|| {
+        let results: crate::Result<Vec<_>> = host.executor.install(|| {
             overlap_runs
                 .par_iter()
                 .map(|(start, end, kind)| {
-                    compute_overlap_run_local(&entries[*start..*end], *kind, input, host)
+                    compute_overlap_run_local(&entries[*start..*end], *kind, input)
                 })
                 .collect()
         });
-        let out = results.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let out = results?;
         crate::debug::emit_marker("SORT_OVERLAP_PARALLEL_END");
         out
     };
@@ -334,7 +336,7 @@ pub fn sort(
             }
             let (blocks, counts) = overlap_iter
                 .next()
-                .ok_or_else(|| io::Error::other("overlap output iterator drained"))?;
+                .ok_or_else(|| Error::internal("overlap output iterator drained"))?;
             for OwnedBlock {
                 bytes: block_bytes,
                 index,
@@ -459,8 +461,13 @@ fn build_blob_index(
     while let Some(meta) = walker.next_header()? {
         match meta.blob_type {
             BlobKind::OsmHeader if header.is_none() => {
-                walker.pread_data(meta.data_offset, meta.data_size, &mut data_buf)?;
-                header = Some(decode_blob_to_headerblock(&data_buf)?);
+                walker
+                    .pread_data(meta.data_offset, meta.data_size, &mut data_buf)
+                    .map_err(|e| walker.locate_meta(&meta, e))?;
+                header = Some(
+                    decode_blob_to_headerblock(&data_buf)
+                        .map_err(|e| walker.locate_meta(&meta, e))?,
+                );
             }
             BlobKind::OsmData => {
                 let has_indexdata = meta.index.is_some();
@@ -498,7 +505,8 @@ fn build_blob_index(
                                  intra-blob order (pass 1 decodes every blob payload)"
                             );
                         }
-                        scan_payload_checked(&walker, &meta, &mut data_buf, &mut decompress_buf)?
+                        scan_payload_checked(&walker, &meta, &mut data_buf, &mut decompress_buf)
+                            .map_err(|e| walker.locate_meta(&meta, e))?
                     }
                 };
                 entries.push(BlobEntry {
@@ -518,8 +526,7 @@ fn build_blob_index(
         }
     }
 
-    let header = header
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no OSMHeader blob found"))?;
+    let header = header.ok_or_else(|| Error::invalid_data("no OSMHeader blob found"))?;
 
     Ok((header, entries))
 }
@@ -545,7 +552,7 @@ fn scan_payload_checked(
     walker.pread_data(meta.data_offset, meta.data_size, data_buf)?;
     decompress_blob_data_into(data_buf, decompress_buf)?;
     let (index, sorted) = scan_block_ids_checked(decompress_buf)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "failed to scan block IDs"))?;
+        .ok_or_else(|| Error::invalid_data("failed to scan block IDs"))?;
     Ok((index, !sorted))
 }
 
@@ -763,13 +770,13 @@ fn read_frame_into(file: &mut File, entry: &BlobEntry, buf: &mut Vec<u8>) -> io:
 /// Frame layout: `[4-byte header_len][BlobHeader][Blob]`.
 fn extract_blob_bytes(frame: &[u8]) -> Result<&[u8]> {
     if frame.len() < 4 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too short").into());
+        return Err(Error::invalid_data("frame too short"));
     }
     #[allow(clippy::cast_possible_truncation)]
     let header_len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
     let blob_start = 4 + header_len;
     if blob_start > frame.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid header length").into());
+        return Err(Error::invalid_data("invalid header length"));
     }
     Ok(&frame[blob_start..])
 }
@@ -840,9 +847,9 @@ fn compute_overlap_run_local(
     entries: &[BlobEntry],
     kind: ElementKind,
     input_path: &Path,
-    host: &crate::host::Host,
-) -> std::result::Result<(Vec<OwnedBlock>, OverlapCounts), String> {
-    let mut input_file = File::open(input_path).map_err(|e| e.to_string())?;
+) -> crate::Result<(Vec<OwnedBlock>, OverlapCounts)> {
+    let mut input_file =
+        File::open(input_path).map_err(|e| crate::file_reader::open_error(input_path, e))?;
     let mut bb = BlockBuilder::new();
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut counts = OverlapCounts::default();
@@ -859,7 +866,7 @@ fn compute_overlap_run_local(
                     _ => {}
                 },
                 write_single_node_local,
-                host,
+                input_path,
             )?;
         }
         ElementKind::Way => {
@@ -874,7 +881,7 @@ fn compute_overlap_run_local(
                     }
                 },
                 write_single_way_local,
-                host,
+                input_path,
             )?;
         }
         ElementKind::Relation => {
@@ -889,7 +896,7 @@ fn compute_overlap_run_local(
                     }
                 },
                 write_single_relation_local,
-                host,
+                input_path,
             )?;
         }
     };
@@ -906,14 +913,9 @@ fn sweep_merge_local<T: Ord + HasId>(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
     mut extract: impl FnMut(&Element<'_>, &mut BinaryHeap<Reverse<T>>),
-    mut write_elem: impl FnMut(
-        &T,
-        &mut BlockBuilder,
-        &mut Vec<OwnedBlock>,
-    ) -> std::result::Result<(), String>,
-    host: &crate::host::Host,
-) -> std::result::Result<u64, String> {
-    let _ = host;
+    mut write_elem: impl FnMut(&T, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> crate::Result<()>,
+    input_path: &Path,
+) -> crate::Result<u64> {
     let mut heap: BinaryHeap<Reverse<T>> = BinaryHeap::new();
     let mut frame_buf: Vec<u8> = Vec::new();
     let mut count: u64 = 0;
@@ -929,9 +931,13 @@ fn sweep_merge_local<T: Ord + HasId>(
             },
         )?;
 
-        read_frame_into(input_file, entry, &mut frame_buf).map_err(|e| e.to_string())?;
-        let blob_bytes = extract_blob_bytes(&frame_buf).map_err(|e| e.to_string())?;
-        let block = decode_blob_to_primitiveblock(blob_bytes).map_err(|e| e.to_string())?;
+        // The run's blobs are addressed by frame offset in `input_path`; a
+        // failure on one is located there (the worker's input is captured
+        // once, in `input_path`).
+        let locate = |e: Error| e.locate(frame_location(input_path, entry.file_offset));
+        read_frame_into(input_file, entry, &mut frame_buf).map_err(|e| locate(e.into()))?;
+        let blob_bytes = extract_blob_bytes(&frame_buf).map_err(locate)?;
+        let block = decode_blob_to_primitiveblock(blob_bytes).map_err(locate)?;
         for element in block.elements() {
             extract(&element, &mut heap);
         }
@@ -948,8 +954,8 @@ fn sweep_merge_local<T: Ord + HasId>(
 fn flush_heap_below_local<T: Ord + HasId>(
     heap: &mut BinaryHeap<Reverse<T>>,
     below: i64,
-    mut emit: impl FnMut(T) -> std::result::Result<(), String>,
-) -> std::result::Result<(), String> {
+    mut emit: impl FnMut(T) -> crate::Result<()>,
+) -> crate::Result<()> {
     while heap
         .peek()
         .is_some_and(|Reverse(e)| crate::osm_id::osm_id_cmp(e.id(), below).is_lt())

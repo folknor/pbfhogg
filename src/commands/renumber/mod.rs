@@ -51,6 +51,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
 use super::{HeaderOverrides, Result, require_sorted, writer_from_header};
+use crate::error::Error;
 use crate::write::WriteOptions;
 use crate::writer::Compression;
 
@@ -212,17 +213,18 @@ impl BlobBuffers {
         file: &std::fs::File,
         task: &BlobTask,
         counters: &StageCounters,
-    ) -> std::result::Result<(), String> {
+    ) -> crate::Result<()> {
         use std::os::unix::fs::FileExt as _;
         let t = Instant::now();
         self.raw.resize(task.data_size, 0);
         file.read_exact_at(&mut self.raw, task.data_offset)
-            .map_err(|e| format!("pread failed at offset {}: {e}", task.data_offset))?;
+            .map_err(|e| {
+                Error::from(e).context(format!("pread failed at offset {}", task.data_offset))
+            })?;
         add_ns(&counters.pread_ns, t);
 
         let t = Instant::now();
-        crate::blob::decompress_blob_raw(&self.raw, &mut self.decompressed)
-            .map_err(|e| e.to_string())?;
+        crate::blob::decompress_blob_raw(&self.raw, &mut self.decompressed)?;
         add_ns(&counters.decompress_ns, t);
         Ok(())
     }
@@ -248,11 +250,10 @@ fn positional_bases(start: i64, schedule: &[BlobTask], kind: &str) -> Result<Vec
                 .and_then(|end| end.checked_sub(1))
                 .and_then(|last| i64::try_from(last).ok());
             if last.is_none() {
-                return Err(format!(
+                return Err(Error::invalid_data(format!(
                     "renumber: {kind} start id {start} plus the input's {kind} count \
                      runs past the largest 64-bit id"
-                )
-                .into());
+                )));
             }
         }
         bases.push(i64::try_from(cursor).unwrap_or(i64::MAX));
@@ -267,12 +268,16 @@ fn blob_index(
     base: i64,
     count: u64,
     bbox: Option<crate::blob_meta::BlobBbox>,
-) -> std::result::Result<crate::blob_meta::BlobIndex, String> {
+) -> crate::Result<crate::blob_meta::BlobIndex> {
     let max_id = count
         .checked_sub(1)
         .and_then(|span| i64::try_from(span).ok())
         .and_then(|span| base.checked_add(span))
-        .ok_or_else(|| format!("renumber: blob of {count} elements from id {base} overflows"))?;
+        .ok_or_else(|| {
+            Error::invalid_data(format!(
+                "renumber: blob of {count} elements from id {base} overflows"
+            ))
+        })?;
     Ok(crate::blob_meta::BlobIndex {
         kind,
         min_id: base,
@@ -294,9 +299,9 @@ fn validate_start_ids(opts: &RenumberOptions) -> Result<()> {
         ("relation", opts.start_relation_id),
     ] {
         if start < 1 {
-            return Err(
-                format!("renumber: the {kind} start id must be at least 1, got {start}").into(),
-            );
+            return Err(Error::invalid_argument(format!(
+                "renumber: the {kind} start id must be at least 1, got {start}"
+            )));
         }
     }
     Ok(())
@@ -344,7 +349,7 @@ pub fn renumber_external(
         let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
         let header_blob = header_reader
             .next()
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+            .ok_or_else(crate::error::new_missing_header)??;
         header_blob.to_headerblock()?
     };
     require_sorted(
@@ -387,10 +392,12 @@ pub fn renumber_external(
 
     // Single shared input fd for all phases - pread is concurrent-safe.
     let shared_file = std::fs::File::open(input)
-        .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
+        .map_err(|e| Error::from(e).context(format!("failed to open {}", input.display())))?;
+    // The path every worker locates its errors against, captured once.
+    let source: std::sync::Arc<Path> = std::sync::Arc::from(input);
     let file_len = shared_file
         .metadata()
-        .map_err(|e| format!("failed to stat {}: {e}", input.display()))?
+        .map_err(|e| Error::from(e).context(format!("failed to stat {}", input.display())))?
         .len();
 
     crate::debug::emit_marker("RENUMBER_EXT_START");
@@ -426,16 +433,16 @@ pub fn renumber_external(
         &pass1_schedule,
         opts.start_node_id,
         &shared_file,
+        &source,
         &node_id_set,
         &mut writer,
     )?;
     if pass1.nodes_written != pass1_total_nodes {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "pass1 node count mismatch: schedule reported {pass1_total_nodes}, \
              workers wrote {}",
             pass1.nodes_written,
-        )
-        .into());
+        )));
     }
     // IDs the pre-allocation did not cover, inserted now that no worker
     // holds the set. Already checked non-negative and strictly increasing.
@@ -467,6 +474,7 @@ pub fn renumber_external(
         .collect();
     let stage2d = stage2d_parallel_way_assembly(
         &shared_file,
+        &source,
         &mut writer,
         &mut way_id_sets,
         &way_schedule,
@@ -488,7 +496,12 @@ pub fn renumber_external(
     set_matches_written("way", way_id_set.total_count(), stage2d.ways_written)?;
 
     let mut relation_id_set = crate::idset::IdSet::new();
-    relation_r1_collect_ids(&shared_file, &relation_schedule, &mut relation_id_set)?;
+    relation_r1_collect_ids(
+        &shared_file,
+        &source,
+        &relation_schedule,
+        &mut relation_id_set,
+    )?;
     let t_rel_rank = Instant::now();
     let relation_id_set = relation_id_set.into_ranked();
     emit_elapsed_ms("renumber_ext_rel_rank_ms", t_rel_rank);
@@ -504,6 +517,7 @@ pub fn renumber_external(
     crate::debug::emit_marker("RENUMBER_EXT_R2D_START");
     let r2d = relation_r2d_assembly(
         &shared_file,
+        &source,
         &relation_schedule,
         &mut writer,
         &wire_rewrite::RelationIdSpaces {
@@ -540,11 +554,10 @@ fn positional_last_fits(start: i64, count: u64, kind: &str) -> Result<()> {
     if fits {
         Ok(())
     } else {
-        Err(format!(
+        Err(Error::invalid_data(format!(
             "renumber: {kind} start id {start} plus the input's {count} {kind}s \
              runs past the largest 64-bit id"
-        )
-        .into())
+        )))
     }
 }
 
@@ -558,10 +571,9 @@ fn set_matches_written(kind: &str, in_set: u64, written: u64) -> Result<()> {
     if in_set == written {
         Ok(())
     } else {
-        Err(
-            format!("renumber: collected {in_set} distinct {kind} ids but wrote {written} {kind}s")
-                .into(),
-        )
+        Err(Error::internal(format!(
+            "renumber: collected {in_set} distinct {kind} ids but wrote {written} {kind}s"
+        )))
     }
 }
 
@@ -582,6 +594,8 @@ mod tests {
 
     fn task(count: u64) -> BlobTask {
         BlobTask {
+            blob_index: 0,
+            frame_offset: 0,
             data_offset: 0,
             data_size: 0,
             element_count: count,

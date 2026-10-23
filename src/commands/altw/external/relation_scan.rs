@@ -28,8 +28,11 @@ pub(super) fn collect_relation_member_ids_indexed(
     want_ways: bool,
 ) -> Result<RelationScanOutput> {
     let file = Arc::new(
-        std::fs::File::open(input).map_err(|e| format!("open pbf for relation scan: {e}"))?,
+        std::fs::File::open(input)
+            .map_err(|e| crate::Error::from(e).context("open pbf for relation scan"))?,
     );
+    // Errors are located against the input once, not per blob.
+    let source: Arc<Path> = Arc::from(input);
 
     let mut node_ids = want_nodes.then(IdSet::new);
     let mut way_ids = want_ways.then(IdSet::new);
@@ -43,15 +46,23 @@ pub(super) fn collect_relation_member_ids_indexed(
         .filter(|m| matches!(m.kind, ElementKind::Relation))
     {
         read_buf.resize(meta.data_size, 0);
+        let locate = |e: crate::Error| {
+            e.locate(crate::error::Location::new(
+                Some(&source),
+                None,
+                Some(crate::ByteOffset(meta.frame_offset)),
+            ))
+        };
         file.read_exact_at(&mut read_buf, meta.data_offset)
-            .map_err(|e| format!("relation scan pread: {e}"))?;
+            .map_err(|e| locate(crate::Error::from(e).context("relation scan pread")))?;
         crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
-            .map_err(|e| format!("relation scan decompress: {e}"))?;
+            .map_err(|e| locate(e.context("relation scan decompress")))?;
         let block = PrimitiveBlock::from_vec_with_scratch(
             std::mem::take(&mut decompress_buf),
             &mut st_scratch,
             &mut gr_scratch,
-        )?;
+        )
+        .map_err(locate)?;
         super::super::relation_member_ids(&block, want_nodes, want_ways, |way, id| {
             if way {
                 way_ids.as_mut().expect("requested").set(id);

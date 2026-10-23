@@ -175,7 +175,7 @@ fn time_filter_history(
         let (kind, id, timestamp) = match element_identity_and_timestamp(&element) {
             Ok(v) => v,
             Err(e) => {
-                flush_error = Err(e.into());
+                flush_error = Err(e);
                 return;
             }
         };
@@ -303,11 +303,11 @@ fn time_filter_snapshot(
         return Ok(stats);
     }
 
-    type PhaseResult = std::result::Result<(Vec<Vec<u8>>, TimeFilterStats), String>;
+    type PhaseResult = crate::Result<(Vec<Vec<u8>>, TimeFilterStats)>;
     let mut reorder: ReorderBuffer<PhaseResult> =
         ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY_WIDE);
-    let mut write_error: Option<Box<dyn std::error::Error>> = None;
-    let mut classify_error: Option<String> = None;
+    let mut write_error: Option<crate::Error> = None;
+    let mut classify_error: Option<crate::Error> = None;
 
     // BlockBuilder contains `Rc<str>` (string interning) which is not
     // Send, so it can't ride the `S: Send` worker-state slot. Per-blob
@@ -340,8 +340,7 @@ fn time_filter_snapshot(
                     Some(indexdata.as_slice()),
                     tagdata.as_deref(),
                     way_members.as_deref(),
-                )
-                .map_err(|e| e.to_string())?;
+                )?;
                 framed.push(blob.into_vec());
             }
             Ok((framed, block_stats))
@@ -371,7 +370,7 @@ fn time_filter_snapshot(
                             block_stats.dropped_no_snapshot_version;
                         for blob in framed {
                             if let Err(e) = writer.write_raw_owned(blob) {
-                                write_error = Some(e.into());
+                                write_error = Some(e);
                                 break;
                             }
                         }
@@ -391,7 +390,7 @@ fn time_filter_snapshot(
         return Err(e);
     }
     if let Some(e) = classify_error {
-        return Err(e.into());
+        return Err(e);
     }
 
     // Brokkr stores named counters generically and reports changes in sidecar
@@ -410,7 +409,7 @@ fn snapshot_gate(
     visible: bool,
     cutoff_timestamp: i64,
     stats: &mut TimeFilterStats,
-) -> std::result::Result<Option<()>, String> {
+) -> crate::Result<Option<()>> {
     // An element with no timestamp is not an element from before the
     // cutoff. See the timestamp section at the bottom of this file.
     let ts = require_timestamp(ts, ident.0, ident.1)?;
@@ -433,7 +432,7 @@ fn filter_block_snapshot(
     cutoff_timestamp: i64,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> std::result::Result<TimeFilterStats, String> {
+) -> crate::Result<TimeFilterStats> {
     let mut stats = TimeFilterStats {
         versions_seen: 0,
         versions_before_cutoff: 0,
@@ -680,9 +679,7 @@ fn write_owned_element(
     Ok(())
 }
 
-fn element_identity_and_timestamp(
-    element: &Element<'_>,
-) -> std::result::Result<(ElementKind, i64, i64), String> {
+fn element_identity_and_timestamp(element: &Element<'_>) -> crate::Result<(ElementKind, i64, i64)> {
     let (kind, id, ts) = match element {
         Element::DenseNode(dn) => (ElementKind::Node, dn.id(), dense_timestamp(dn)),
         Element::Node(n) => (ElementKind::Node, n.id(), node_timestamp(n)),
@@ -729,16 +726,16 @@ fn relation_timestamp(r: &Relation<'_>) -> Option<i64> {
 }
 
 /// Turn an absent timestamp into the error that names it.
-fn require_timestamp(ts: Option<i64>, kind: &str, id: i64) -> std::result::Result<i64, String> {
+fn require_timestamp(ts: Option<i64>, kind: &str, id: i64) -> crate::Result<i64> {
     ts.ok_or_else(|| {
-        format!(
+        crate::Error::invalid_data(format!(
             "time-filter: {kind} {id} carries no timestamp. Filtering by time needs one, and \
              treating an absent timestamp as the Unix epoch would place every such element at \
              or below any cutoff - so the command would keep the entire input, write it out \
              unchanged, and report success having filtered nothing. The input has had its \
              metadata stripped (osmium --drop-metadata and several pbfhogg write paths do \
              this); re-run time-filter against an input that still carries element metadata."
-        )
+        ))
     })
 }
 

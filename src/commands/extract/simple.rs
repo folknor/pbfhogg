@@ -190,7 +190,7 @@ fn extract_simple_two_pass(
         blob_reader.set_parse_indexdata(true);
         blob_reader
             .next()
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+            .ok_or_else(crate::error::new_missing_header)??;
 
         for blob_result in &mut blob_reader {
             let blob = blob_result?;
@@ -224,7 +224,7 @@ fn extract_simple_two_pass(
     blob_reader.set_parse_indexdata(true);
     let header_blob = blob_reader
         .next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        .ok_or_else(crate::error::new_missing_header)??;
     let header = header_blob.to_headerblock()?;
     let bbox = region.bbox();
     let mut writer = writer_from_header(
@@ -376,7 +376,7 @@ fn extract_simple_single_pass(
     let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     let header_blob = header_reader
         .next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        .ok_or_else(crate::error::new_missing_header)??;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
     super::super::warn_locations_on_ways_loss(&header, host);
@@ -416,9 +416,11 @@ fn extract_simple_single_pass(
         // node_schedule already filtered to node blobs.
 
         let classify_file = std::sync::Arc::new(
-            std::fs::File::open(input)
-                .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+            std::fs::File::open(input).map_err(|e| crate::file_reader::open_error(input, e))?,
         );
+        // The input's identity, captured once; each worker borrows it.
+        let source: std::sync::Arc<Path> = std::sync::Arc::from(input);
+        let source = &source;
 
         let decode_threads = crate::host::sized_workers(
             &*host.resources,
@@ -430,7 +432,7 @@ fn extract_simple_single_pass(
         // Per blob: the matching node ids, plus - for a passthrough candidate
         // - the observed node count if the blob verified (see `Passthrough`).
         type ClassifyResult = (usize, crate::error::Result<(Vec<i64>, Option<u64>)>);
-        let (cls_tx, cls_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize, bool)>(
+        let (cls_tx, cls_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize, bool, u64)>(
             crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
         );
         let cls_rx = std::sync::Arc::new(std::sync::Mutex::new(cls_rx));
@@ -440,12 +442,12 @@ fn extract_simple_single_pass(
 
         std::thread::scope(|scope| -> Result<()> {
             // Dispatcher: send node blob descriptors.
-            let descs: Vec<(usize, u64, usize, bool)> = node_schedule
+            let descs: Vec<(usize, u64, usize, bool, u64)> = node_schedule
                 .iter()
                 .enumerate()
                 .map(|(i, d)| {
                     let candidate = d.passthrough == Passthrough::Candidate;
-                    (i, d.offset, d.size, candidate)
+                    (i, d.offset, d.size, candidate, d.frame_offset)
                 })
                 .collect();
             scope.spawn(move || {
@@ -470,7 +472,7 @@ fn extract_simple_single_pass(
                     let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
                     loop {
-                        let (seq, data_offset, data_size, candidate) = {
+                        let (seq, data_offset, data_size, candidate, frame_offset) = {
                             let guard =
                                 rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             match guard.recv() {
@@ -479,42 +481,42 @@ fn extract_simple_single_pass(
                             }
                         };
 
-                        let r: crate::error::Result<(Vec<i64>, Option<u64>)> = (|| {
-                            read_buf.resize(data_size, 0);
-                            file.read_exact_at(&mut read_buf, data_offset)
-                                .map_err(|e| {
-                                    crate::error::new_error(crate::error::ErrorKind::Io(e))
-                                })?;
-                            crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
-                            tuples.clear();
-                            crate::scan::node::extract_node_tuples(
-                                &decompress_buf,
-                                &mut tuples,
-                                &mut group_starts,
-                            )
+                        let r: crate::error::Result<(Vec<i64>, Option<u64>)> =
+                            (|| -> crate::error::Result<(Vec<i64>, Option<u64>)> {
+                                read_buf.resize(data_size, 0);
+                                file.read_exact_at(&mut read_buf, data_offset)?;
+                                crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
+                                tuples.clear();
+                                crate::scan::node::extract_node_tuples(
+                                    &decompress_buf,
+                                    &mut tuples,
+                                    &mut group_starts,
+                                )?;
+                                // Classification is the same for every blob,
+                                // candidate or not, so verification can never
+                                // change which nodes are selected.
+                                let matching: Vec<i64> = tuples
+                                    .iter()
+                                    .filter(|t| {
+                                        region_ref.contains_decimicro(bbox_int_ref, t.lat, t.lon)
+                                    })
+                                    .map(|t| t.id)
+                                    .collect();
+                                let verified = if candidate {
+                                    verify_candidate(&decompress_buf, tuples.len(), matching.len())?
+                                } else {
+                                    None
+                                };
+                                Ok((matching, verified))
+                            })()
+                            // Cold: only a failure builds the location.
                             .map_err(|e| {
-                                crate::error::new_error(crate::error::ErrorKind::Io(
-                                    std::io::Error::other(e.to_string()),
+                                e.locate(crate::error::Location::new(
+                                    Some(source),
+                                    None,
+                                    Some(crate::ByteOffset(frame_offset)),
                                 ))
-                            })?;
-                            // Classification is the same for every blob,
-                            // candidate or not, so verification can never
-                            // change which nodes are selected.
-                            let matching: Vec<i64> = tuples
-                                .iter()
-                                .filter(|t| {
-                                    region_ref.contains_decimicro(bbox_int_ref, t.lat, t.lon)
-                                })
-                                .map(|t| t.id)
-                                .collect();
-                            let verified = if candidate {
-                                verify_candidate(&decompress_buf, tuples.len(), matching.len())?
-                            } else {
-                                None
-                            };
-                            Ok((matching, verified))
-                        })(
-                        );
+                            });
                         if tx.send((seq, r)).is_err() {
                             break;
                         }
@@ -575,9 +577,11 @@ fn extract_simple_single_pass(
         use std::os::unix::fs::FileExt as _;
 
         let classify_file = std::sync::Arc::new(
-            std::fs::File::open(input)
-                .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+            std::fs::File::open(input).map_err(|e| crate::file_reader::open_error(input, e))?,
         );
+        // The input's identity, captured once; each worker borrows it.
+        let source: std::sync::Arc<Path> = std::sync::Arc::from(input);
+        let source = &source;
         let decode_threads = crate::host::sized_workers(
             &*host.resources,
             crate::tunables::DECODE_WORKERS_RESERVED,
@@ -586,7 +590,7 @@ fn extract_simple_single_pass(
         );
 
         type WayClassifyResult = (usize, crate::error::Result<Vec<i64>>);
-        let (cls_tx, cls_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(
+        let (cls_tx, cls_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize, u64)>(
             crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
         );
         let cls_rx = std::sync::Arc::new(std::sync::Mutex::new(cls_rx));
@@ -595,10 +599,10 @@ fn extract_simple_single_pass(
         );
 
         std::thread::scope(|scope| -> Result<()> {
-            let descs: Vec<(usize, u64, usize)> = way_schedule
+            let descs: Vec<(usize, u64, usize, u64)> = way_schedule
                 .iter()
                 .enumerate()
-                .map(|(i, d)| (i, d.offset, d.size))
+                .map(|(i, d)| (i, d.offset, d.size, d.frame_offset))
                 .collect();
             scope.spawn(move || {
                 for item in descs {
@@ -621,7 +625,7 @@ fn extract_simple_single_pass(
                     let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
                     loop {
-                        let (seq, data_offset, data_size) = {
+                        let (seq, data_offset, data_size, frame_offset) = {
                             let guard =
                                 rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             match guard.recv() {
@@ -630,31 +634,32 @@ fn extract_simple_single_pass(
                             }
                         };
 
-                        let r: crate::error::Result<Vec<i64>> = (|| {
-                            read_buf.resize(data_size, 0);
-                            file.read_exact_at(&mut read_buf, data_offset)
-                                .map_err(|e| {
-                                    crate::error::new_error(crate::error::ErrorKind::Io(e))
-                                })?;
-                            crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
-                            let mut matching: Vec<i64> = Vec::new();
-                            crate::scan::way::scan_way_refs(
-                                &decompress_buf,
-                                &mut refs_buf,
-                                &mut group_starts,
-                                |way_id, refs| {
-                                    if refs.iter().any(|&r| bbox_ids_ref.get(r)) {
-                                        matching.push(way_id);
-                                    }
-                                },
-                            )
+                        let r: crate::error::Result<Vec<i64>> =
+                            (|| -> crate::error::Result<Vec<i64>> {
+                                read_buf.resize(data_size, 0);
+                                file.read_exact_at(&mut read_buf, data_offset)?;
+                                crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
+                                let mut matching: Vec<i64> = Vec::new();
+                                crate::scan::way::scan_way_refs(
+                                    &decompress_buf,
+                                    &mut refs_buf,
+                                    &mut group_starts,
+                                    |way_id, refs| {
+                                        if refs.iter().any(|&r| bbox_ids_ref.get(r)) {
+                                            matching.push(way_id);
+                                        }
+                                    },
+                                )?;
+                                Ok(matching)
+                            })()
+                            // Cold: only a failure builds the location.
                             .map_err(|e| {
-                                crate::error::new_error(crate::error::ErrorKind::Io(
-                                    std::io::Error::other(e.to_string()),
+                                e.locate(crate::error::Location::new(
+                                    Some(source),
+                                    None,
+                                    Some(crate::ByteOffset(frame_offset)),
                                 ))
-                            })?;
-                            Ok(matching)
-                        })();
+                            });
                         if tx.send((seq, r)).is_err() {
                             break;
                         }
@@ -844,7 +849,7 @@ fn process_extract_pass2_batch(
     stats: &mut ExtractStats,
     host: &crate::host::Host,
 ) -> Result<()> {
-    type BatchResult = std::result::Result<(Vec<OwnedBlock>, ExtractStats), String>;
+    type BatchResult = crate::Result<(Vec<OwnedBlock>, ExtractStats)>;
     let results: Vec<BatchResult> = host.executor.install(|| {
         batch
             .par_iter()

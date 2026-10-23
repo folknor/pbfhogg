@@ -18,7 +18,8 @@ use crate::writer::{Compression, PbfWriter, reframe_raw_with_index};
 use crate::{BlobFilter, Element, PrimitiveBlock};
 
 use super::{Result, flush_local};
-use crate::read::raw_frame::read_raw_frame;
+use crate::error::Error;
+use crate::read::raw_frame::{frame_location, read_raw_frame};
 use crate::writer::frame_blob_pipelined;
 
 /// Which metadata attributes to strip via `--clean`.
@@ -78,7 +79,7 @@ pub fn cat(
 ) -> Result<CatStats> {
     let (direct_io, force) = (write.direct_reads, write.force);
     if files.is_empty() {
-        return Err("no input files specified".into());
+        return Err(Error::invalid_argument("no input files specified"));
     }
 
     // The indexdata requirement belongs to `cat_filtered`, not to `--type`.
@@ -145,10 +146,11 @@ fn read_header(
     while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, file)?
     {
         if frame.blob_type == BlobKind::OsmHeader {
-            return Ok(decode_blob_to_headerblock(frame.blob_bytes())?);
+            return decode_blob_to_headerblock(frame.blob_bytes())
+                .map_err(|e| e.locate(frame_location(file, frame.file_offset)));
         }
     }
-    Err("no OSMHeader blob found in input file".into())
+    Err(Error::invalid_data("no OSMHeader blob found in input file"))
 }
 
 /// Build the output header bytes for a plain `cat` run over `files` (every
@@ -204,7 +206,7 @@ fn output_header_bytes(
     if sorted {
         hb = hb.sorted();
     }
-    Ok(overrides.apply(hb).build()?)
+    overrides.apply(hb).build()
 }
 
 /// Reconcile the headers of every input into one output header builder.
@@ -239,7 +241,9 @@ fn reconciled_header(
     if headers.is_empty() {
         // `agreed` indexes [0] and the bbox `all()` below is vacuously true on
         // an empty slice; refuse here, where that precondition is relied on.
-        return Err("no input headers to reconcile (no input files specified)".into());
+        return Err(Error::invalid_argument(
+            "no input headers to reconcile (no input files specified)",
+        ));
     }
 
     let mut hb = crate::block_builder::HeaderBuilder::new();
@@ -348,18 +352,15 @@ fn cat_passthrough(
                     } else {
                         // No indexdata - decompress to scan IDs/tags, reframe with index.
                         let blob_bytes = frame.blob_bytes();
-                        decompress_blob_data_into(blob_bytes, &mut decompress_buf)?;
-                        // Name the input and the blob's frame offset through the
-                        // crate error's own location fields, which print as
-                        // "(in PATH, at byte offset N)". `From<io::Error>`
-                        // unwraps the scanner's own error from the io carrier,
-                        // so its kind survives rather than a stringified copy.
+                        // Name the input and the blob's frame offset through
+                        // the crate error's own location, which prints as
+                        // "(in PATH, at byte offset N)". The walk owns the
+                        // provenance; the frame carries its true offset.
+                        let locate = |e: Error| e.locate(frame_location(file, frame.file_offset));
+                        decompress_blob_data_into(blob_bytes, &mut decompress_buf)
+                            .map_err(locate)?;
                         let (index, tagdata) =
-                            scan_block_ids_and_tags(&decompress_buf).map_err(|source| {
-                                crate::error::Error::from(source)
-                                    .at(crate::ByteOffset(frame.file_offset))
-                                    .in_input(Some(&std::sync::Arc::<Path>::from(*file)), None)
-                            })?;
+                            scan_block_ids_and_tags(&decompress_buf).map_err(locate)?;
                         let index = match index {
                             Some(idx) => idx,
                             None => {
@@ -458,7 +459,9 @@ fn cat_type_passthrough(
                     } else {
                         let blob_bytes = frame.blob_bytes();
                         decompress_buf.clear();
-                        decompress_blob_data_into(blob_bytes, &mut decompress_buf)?;
+                        let locate = |e: Error| e.locate(frame_location(file, frame.file_offset));
+                        decompress_blob_data_into(blob_bytes, &mut decompress_buf)
+                            .map_err(locate)?;
                         // Take the decompressed Vec straight into the block: no
                         // Bytes round-trip, no second whole-buffer copy (the
                         // dropped `new_with_scratch(Bytes)` route paid a `to_vec`).
@@ -467,7 +470,8 @@ fn cat_type_passthrough(
                             std::mem::take(&mut decompress_buf),
                             &mut st_scratch,
                             &mut gr_scratch,
-                        )?;
+                        )
+                        .map_err(locate)?;
                         output_blocks.clear();
                         let count = process_block(
                             &block,
@@ -477,8 +481,7 @@ fn cat_type_passthrough(
                             &clean,
                             &mut refs_buf,
                         )?;
-                        flush_local(&mut bb, &mut output_blocks)
-                            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                        flush_local(&mut bb, &mut output_blocks)?;
                         for OwnedBlock {
                             bytes: block_bytes,
                             index,
@@ -526,7 +529,7 @@ fn process_block(
     tf: &TypeFilter,
     clean: &CleanAttrs,
     refs_buf: &mut Vec<i64>,
-) -> std::result::Result<u64, String> {
+) -> crate::Result<u64> {
     let (filter_node, filter_way, filter_relation) = (tf.nodes, tf.ways, tf.relations);
     let mut count: u64 = 0;
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
@@ -735,13 +738,13 @@ fn run_kind_phase(
         relations: kind == ElementKind::Relation,
     };
 
-    type PhaseResult = std::result::Result<(Vec<Vec<u8>>, u64), String>;
+    type PhaseResult = crate::Result<(Vec<Vec<u8>>, u64)>;
     let mut reorder: ReorderBuffer<PhaseResult> =
         ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY_WIDE);
     let mut total_blobs: u64 = 0;
     let mut total_elements: u64 = 0;
-    let mut write_error: Option<Box<dyn std::error::Error>> = None;
-    let mut classify_error: Option<String> = None;
+    let mut write_error: Option<Error> = None;
+    let mut classify_error: Option<Error> = None;
 
     // BlockBuilder contains `Rc<str>` (string interning) which is not Send,
     // so it can't ride the `S: Send` worker-state slot. Per-blob alloc inside
@@ -781,8 +784,7 @@ fn run_kind_phase(
                     Some(indexdata.as_slice()),
                     tagdata.as_deref(),
                     way_members.as_deref(),
-                )
-                .map_err(|e| e.to_string())?;
+                )?;
                 framed.push(blob.into_vec());
             }
             Ok((framed, count))
@@ -805,7 +807,7 @@ fn run_kind_phase(
                         }
                         for blob in framed {
                             if let Err(e) = writer.write_raw_owned(blob) {
-                                write_error = Some(e.into());
+                                write_error = Some(e);
                                 break;
                             }
                             total_blobs += 1;
@@ -827,7 +829,7 @@ fn run_kind_phase(
         return Err(e);
     }
     if let Some(e) = classify_error {
-        return Err(e.into());
+        return Err(e);
     }
 
     Ok((total_blobs, total_elements))

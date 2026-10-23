@@ -38,6 +38,7 @@ use super::compact::{
     member_type_to_byte,
 };
 use super::parse::CompactDiffOverlay;
+use crate::error::Error;
 
 // ---------------------------------------------------------------------------
 // Shared vocabulary
@@ -85,27 +86,52 @@ pub(crate) trait OscSink {
 // Attribute parsing helpers (shared by every sink)
 // ---------------------------------------------------------------------------
 
+/// Classify an XML-level failure (a malformed attribute, an unreadable or
+/// ill-formed document) as invalid OSC input, keeping the XML error as the
+/// cause.
+fn xml_err(source: impl std::error::Error + Send + Sync + 'static) -> Error {
+    Error::invalid_data_with("malformed OSC XML", source)
+}
+
+/// Classify a failure of the XML reader itself. A failed read of the
+/// underlying stream (EIO, a corrupt gzip member) is an I/O failure and keeps
+/// its `io::ErrorKind`; only syntax and encoding errors are invalid input.
+fn xml_read_err(source: quick_xml::Error) -> Error {
+    match source {
+        quick_xml::Error::Io(io_err) => Error::from(io::Error::new(io_err.kind(), io_err)),
+        other => xml_err(other),
+    }
+}
+
+fn missing_attr(name: &str) -> Error {
+    Error::invalid_data(format!("missing attribute '{name}'"))
+}
+
 pub(crate) fn parse_i64_attr(
     e: &quick_xml::events::BytesStart<'_>,
     name: &str,
 ) -> ParseResult<i64> {
     for attr_result in e.attributes() {
-        let attr = attr_result?;
+        let attr = attr_result.map_err(xml_err)?;
         if attr.key.as_ref() == name {
-            return Ok(attr.value.parse::<i64>()?);
+            return attr.value.parse::<i64>().map_err(|err| {
+                Error::invalid_data_with(format!("attribute '{name}' is not a valid integer"), err)
+            });
         }
     }
-    Err(format!("missing attribute '{name}'").into())
+    Err(missing_attr(name))
 }
 
 fn parse_f64_attr(e: &quick_xml::events::BytesStart<'_>, name: &str) -> ParseResult<f64> {
     for attr_result in e.attributes() {
-        let attr = attr_result?;
+        let attr = attr_result.map_err(xml_err)?;
         if attr.key.as_ref() == name {
-            return Ok(attr.value.parse::<f64>()?);
+            return attr.value.parse::<f64>().map_err(|err| {
+                Error::invalid_data_with(format!("attribute '{name}' is not a valid number"), err)
+            });
         }
     }
-    Err(format!("missing attribute '{name}'").into())
+    Err(missing_attr(name))
 }
 
 pub(crate) fn parse_str_attr(
@@ -113,13 +139,15 @@ pub(crate) fn parse_str_attr(
     name: &str,
 ) -> ParseResult<String> {
     for attr_result in e.attributes() {
-        let attr = attr_result?;
+        let attr = attr_result.map_err(xml_err)?;
         if attr.key.as_ref() == name {
-            let val = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)?;
+            let val = attr
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .map_err(xml_err)?;
             return Ok(val.into_owned());
         }
     }
-    Err(format!("missing attribute '{name}'").into())
+    Err(missing_attr(name))
 }
 
 // Deliberately treat malformed optional roles as absent. Refusing them would
@@ -145,7 +173,9 @@ pub(crate) fn parse_member_type(s: &str) -> ParseResult<MemberType> {
         Some(ElementKind::Node) => Ok(MemberType::Node),
         Some(ElementKind::Way) => Ok(MemberType::Way),
         Some(ElementKind::Relation) => Ok(MemberType::Relation),
-        None => Err(format!("unknown relation member type: '{s}'").into()),
+        None => Err(Error::invalid_data(format!(
+            "unknown relation member type: '{s}'"
+        ))),
     }
 }
 
@@ -209,7 +239,7 @@ where
 {
     let mut any = false;
     for attr_result in e.attributes() {
-        let attr = attr_result?;
+        let attr = attr_result.map_err(xml_err)?;
         let field = match attr.key.as_ref() {
             "version" => MetaField::Version,
             "timestamp" => MetaField::Timestamp,
@@ -233,19 +263,20 @@ pub(crate) fn meta_int<T: std::str::FromStr>(
     attr: &Attribute<'_>,
 ) -> ParseResult<T>
 where
-    T::Err: std::fmt::Display,
+    T::Err: std::error::Error + Send + Sync + 'static,
 {
     let text = attr.value.as_ref();
-    text.parse::<T>()
-        .map_err(|err| -> Box<dyn std::error::Error> {
+    text.parse::<T>().map_err(|err| {
+        Error::invalid_data_with(
             format!(
-                "OSC element metadata attribute '{}' has unparsable value '{text}' ({err}); \
-             refusing to record it as 0, because an absent or broken value is not the \
-             value zero and the version-regression gate compares these numbers",
+                "OSC element metadata attribute '{}' has unparsable value '{text}'; \
+                 refusing to record it as 0, because an absent or broken value is not the \
+                 value zero and the version-regression gate compares these numbers",
                 field.name()
-            )
-            .into()
-        })
+            ),
+            err,
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -390,14 +421,13 @@ fn handle_open<S: OscSink>(
         // dropped non-self-closing ones. All three answers were
         // different, and only refusing is defensible - we cannot know
         // whether the producer meant to create, modify or delete it.
-        let action = state.section.ok_or_else(|| -> Box<dyn std::error::Error> {
-            format!(
+        let action = state.section.ok_or_else(|| {
+            Error::invalid_data(format!(
                 "OSC {} {} appears outside any <create>, <modify> or <delete> section; \
                  refusing to guess which change it was meant to be",
                 kind.as_str(),
                 parse_i64_attr(e, "id").map_or_else(|_| "(no id)".to_string(), |id| id.to_string())
-            )
-            .into()
+            ))
         })?;
         sink.begin_element(action, kind, e)?;
         if is_empty {
@@ -441,7 +471,7 @@ pub(crate) fn drive_osc<R: io::BufRead, S: OscSink>(
             }
             Ok(Event::Eof) => break,
             Ok(_) => {}
-            Err(e) => return Err(Box::new(e)),
+            Err(e) => return Err(xml_read_err(e)),
         }
         buf.clear();
     }
@@ -452,13 +482,12 @@ pub(crate) fn drive_osc<R: io::BufRead, S: OscSink>(
     // wrote a partially-applied PBF and reported success. Only the
     // closing tag proves the document is whole.
     if !state.saw_root_end {
-        return Err(
+        return Err(Error::invalid_data(
             "OSC input ended without a closing </osmChange> tag: the file is \
-                    truncated (a .osc.gz cut at a gzip member boundary decompresses \
-                    cleanly, so this is the only way to notice). Applying it would \
-                    produce a partially-applied result reported as success."
-                .into(),
-        );
+             truncated (a .osc.gz cut at a gzip member boundary decompresses \
+             cleanly, so this is the only way to notice). Applying it would \
+             produce a partially-applied result reported as success.",
+        ));
     }
 
     Ok(())
@@ -498,13 +527,12 @@ pub(crate) fn coord_to_decimicro(
     name: &str,
     id: i64,
 ) -> ParseResult<i32> {
-    let degrees = parse_f64_attr(e, name).map_err(|err| -> Box<dyn std::error::Error> {
-        format!(
-            "OSC node {id}: {name} attribute is missing or unparsable ({err}). A created or \
+    let degrees = parse_f64_attr(e, name).map_err(|err| {
+        err.context(format!(
+            "OSC node {id}: {name} attribute is missing or unparsable (a created or \
              modified node must carry usable coordinates; storing it at 0/0 would silently \
-             move it to the Gulf of Guinea."
-        )
-        .into()
+             move it to the Gulf of Guinea)"
+        ))
     })?;
     // Two independent checks. The geographic one comes first because it is
     // the one a caller can reason about: lat="100" is not a place, and an
@@ -519,14 +547,13 @@ pub(crate) fn coord_to_decimicro(
         validate_lon
     };
     validate(name, degrees)
-        .map_err(|err| -> Box<dyn std::error::Error> { format!("OSC node {id}: {err}").into() })?;
+        .map_err(|err| Error::invalid_data_from(err).context(format!("OSC node {id}")))?;
     let scaled = deg_to_e7(degrees);
     if !scaled.is_finite() || scaled < f64::from(i32::MIN) || scaled > f64::from(i32::MAX) {
-        return Err(format!(
+        return Err(Error::invalid_data(format!(
             "OSC node {id}: {name} value {degrees} is outside the range representable in \
              decimicrodegrees"
-        )
-        .into());
+        )));
     }
     // The bounds check above rules out every value `as i32` would saturate
     // or map to 0, so the cast is exact.
@@ -577,7 +604,8 @@ pub(crate) fn parse_owned_metadata(
             return Ok(());
         }
         let text = attr
-            .normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .map_err(xml_err)?
             .into_owned();
         match field {
             MetaField::Timestamp => meta.timestamp = text,
@@ -609,21 +637,22 @@ fn arena_meta(
             }
             MetaField::Timestamp => {
                 let text = attr.value.as_ref();
-                meta.timestamp = crate::commands::parse_rfc3339_utc(text).map_err(
-                    |err| -> Box<dyn std::error::Error> {
+                meta.timestamp = crate::commands::parse_rfc3339_utc(text).map_err(|err| {
+                    Error::invalid_data_with(
                         format!(
                             "OSC element metadata attribute 'timestamp' has unparsable \
-                             value '{text}' ({err}); refusing to record it as the epoch"
-                        )
-                        .into()
-                    },
-                )?;
+                             value '{text}'; refusing to record it as the epoch"
+                        ),
+                        err,
+                    )
+                })?;
             }
             MetaField::Changeset => meta.changeset = meta_int::<i64>(field, attr)?,
             MetaField::Uid => meta.uid = meta_int::<i32>(field, attr)?,
             MetaField::User => {
                 user = Some(
-                    attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)?
+                    attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                        .map_err(xml_err)?
                         .into_owned(),
                 );
             }
@@ -793,7 +822,7 @@ impl OscSink for CompactSink<'_> {
 mod tests {
     use super::*;
     #[test]
-    fn owned_sinks_pass_metadata_without_native_validation() -> crate::BoxResult<()> {
+    fn owned_sinks_pass_metadata_without_native_validation() -> crate::Result<()> {
         for attributes in [
             "timestamp=\"yesterday\"",
             "changeset=\"no\"",
@@ -811,7 +840,8 @@ mod tests {
             "node uid=\"&#48;\" visible=\"False\" timestamp=\"a\tb\"",
             4,
         );
-        let owned = parse_owned_metadata(&element)?.ok_or("metadata missing")?;
+        let owned =
+            parse_owned_metadata(&element)?.ok_or_else(|| Error::internal("metadata missing"))?;
         assert_eq!(owned.uid, "0");
         assert_eq!(owned.timestamp, "a b");
         let visible = quick_xml::events::BytesStart::from_content("node visible=\"False\"", 4);
@@ -839,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_recreation_keeps_delete_and_success_clears_it() -> crate::BoxResult<()> {
+    fn failed_recreation_keeps_delete_and_success_clears_it() -> crate::Result<()> {
         let mut overlay = CompactDiffOverlay::new();
         let deletion =
             quick_xml::events::BytesStart::from_content("node id=\"7\" version=\"5\"", 4);

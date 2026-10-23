@@ -86,13 +86,14 @@ use crate::blob::BlobKind;
 /// Compatibility alias for [`crate::block_builder::DEFAULT_ELEMENT_CAP`].
 pub use crate::block_builder::DEFAULT_ELEMENT_CAP as DEFAULT_BLOCK_CAP;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::error::Error;
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::owned::{
     OwnedElement, OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata,
     read_dense_node, read_node, read_relation, read_way,
 };
-use crate::read::raw_frame::read_raw_frame;
+use crate::read::raw_frame::{frame_location, read_raw_frame};
 use crate::write::WriteOptions;
 use crate::writer::{
     Compression, PbfWriter, frame_blob_pipelined, strip_blob_header_fields,
@@ -129,18 +130,25 @@ pub struct DropSpec {
 impl DropSpec {
     /// Parse the required absolute-count and seed pair.
     pub fn parse(s: &str) -> Result<Self> {
-        let (n_str, seed_str) = s
-            .split_once(':')
-            .ok_or("--drop-ids expects N:SEED (e.g. 5000:42); the ':' separator is required")?;
-        let n = n_str
-            .trim()
-            .parse()
-            .map_err(|_| format!("--drop-ids: N must be a non-negative integer, got {n_str:?}"))?;
+        let (n_str, seed_str) = s.split_once(':').ok_or_else(|| {
+            Error::invalid_argument(
+                "--drop-ids expects N:SEED (e.g. 5000:42); the ':' separator is required",
+            )
+        })?;
+        let n = n_str.trim().parse().map_err(|_| {
+            Error::invalid_argument(format!(
+                "--drop-ids: N must be a non-negative integer, got {n_str:?}"
+            ))
+        })?;
         let seed = seed_str.trim().parse().map_err(|_| {
-            format!("--drop-ids: SEED must be a non-negative integer, got {seed_str:?}")
+            Error::invalid_argument(format!(
+                "--drop-ids: SEED must be a non-negative integer, got {seed_str:?}"
+            ))
         })?;
         if n == 0 {
-            return Err("--drop-ids: N must be >= 1 (dropping zero elements is a no-op)".into());
+            return Err(Error::invalid_argument(
+                "--drop-ids: N must be >= 1 (dropping zero elements is a no-op)",
+            ));
         }
         Ok(Self { n, seed })
     }
@@ -402,9 +410,9 @@ pub fn degrade(
 ) -> Result<DegradeStats> {
     if !flags.any() {
         let flag_names = flags.flag_names().join(", ");
-        return Err(
-            format!("degrade requires at least one transformation flag ({flag_names})").into(),
-        );
+        return Err(Error::invalid_argument(format!(
+            "degrade requires at least one transformation flag ({flag_names})"
+        )));
     }
     // The decode path rebuilds each blob's hints from the elements it just
     // re-encoded, so a corrupt hint written there would be overwritten by a
@@ -412,41 +420,37 @@ pub fn degrade(
     if (flags.corrupt_tagdata || flags.corrupt_indexdata || flags.corrupt_indexdata_kind)
         && flags.needs_decode()
     {
-        return Err(
+        return Err(Error::invalid_argument(
             "--corrupt-tagdata, --corrupt-indexdata and --corrupt-indexdata-kind are \
-                    header-only rewrites and cannot be combined with a transformation \
-                    that re-encodes blobs \
-                    (--unsort, --unsort-intra, --strip-locations, --drop-ids), which \
-                    would rebuild the hint correctly"
-                .into(),
-        );
+             header-only rewrites and cannot be combined with a transformation \
+             that re-encodes blobs \
+             (--unsort, --unsort-intra, --strip-locations, --drop-ids), which \
+             would rebuild the hint correctly",
+        ));
     }
     if flags.strip_tagdata && flags.corrupt_tagdata {
-        return Err(
+        return Err(Error::invalid_argument(
             "--strip-tagdata and --corrupt-tagdata are mutually exclusive: \
-                    both rewrite BlobHeader field 4, one to nothing and one to a \
-                    deliberately wrong index"
-                .into(),
-        );
+             both rewrite BlobHeader field 4, one to nothing and one to a \
+             deliberately wrong index",
+        ));
     }
     if flags.strip_indexdata && (flags.corrupt_indexdata || flags.corrupt_indexdata_kind) {
-        return Err(
+        return Err(Error::invalid_argument(
             "--strip-indexdata is mutually exclusive with --corrupt-indexdata and \
-                    --corrupt-indexdata-kind: all three rewrite BlobHeader field 2, \
-                    one to nothing and the others to a deliberately wrong index"
-                .into(),
-        );
+             --corrupt-indexdata-kind: all three rewrite BlobHeader field 2, \
+             one to nothing and the others to a deliberately wrong index",
+        ));
     }
     if flags.unsort && flags.unsort_intra {
-        return Err(
+        return Err(Error::invalid_argument(
             "--unsort and --unsort-intra are mutually exclusive: --unsort \
-                    produces cross-blob ID-range overlap, --unsort-intra produces \
-                    an intra-blob inversion"
-                .into(),
-        );
+             produces cross-blob ID-range overlap, --unsort-intra produces \
+             an intra-blob inversion",
+        ));
     }
     if block_cap == 0 {
-        return Err("--block-cap must be > 0".into());
+        return Err(Error::invalid_argument("--block-cap must be > 0"));
     }
     // An intra-blob inversion needs two same-kind elements sitting inside
     // one output block. A cap of 1 puts every element in its own block, so
@@ -456,10 +460,11 @@ pub fn degrade(
     // adjacent single-element blobs with a descending step overlap, so it
     // stays supported.
     if flags.unsort_intra && block_cap < 2 {
-        return Err("--unsort-intra needs --block-cap >= 2: an intra-blob \
-                    inversion requires at least two same-kind elements inside \
-                    one output block, which a cap of 1 cannot hold"
-            .into());
+        return Err(Error::invalid_argument(
+            "--unsort-intra needs --block-cap >= 2: an intra-blob \
+             inversion requires at least two same-kind elements inside \
+             one output block, which a cap of 1 cannot hold",
+        ));
     }
 
     #[allow(clippy::cast_possible_wrap)]
@@ -561,15 +566,20 @@ fn passthrough_header_bytes(
         let mut reader = FileReader::open(input, direct_io)?;
         let mut file_offset: u64 = 0;
         let frame = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, input)?
-            .ok_or("input PBF is empty: no OSMHeader blob")?;
+            .ok_or_else(|| Error::invalid_data("input PBF is empty: no OSMHeader blob"))?;
+        let locate = |e: Error| e.locate(frame_location(input, frame.file_offset));
         if !matches!(frame.blob_type, BlobKind::OsmHeader) {
-            return Err("input PBF does not start with an OSMHeader blob".into());
+            return Err(locate(Error::invalid_data(
+                "input PBF does not start with an OSMHeader blob",
+            )));
         }
         let mut header_block = Vec::new();
-        crate::read::decompress::decompress_blob_data_into(frame.blob_bytes(), &mut header_block)?;
+        crate::read::decompress::decompress_blob_data_into(frame.blob_bytes(), &mut header_block)
+            .map_err(locate)?;
         if flags.strip_bbox {
             let mut stripped = Vec::with_capacity(header_block.len());
-            strip_header_block_fields(&header_block, &[HeaderBlockField::Bbox], &mut stripped)?;
+            strip_header_block_fields(&header_block, &[HeaderBlockField::Bbox], &mut stripped)
+                .map_err(locate)?;
             Ok(stripped)
         } else {
             Ok(header_block)
@@ -636,7 +646,8 @@ fn degrade_passthrough(
                     flags.strip_tagdata || flags.corrupt_tagdata,
                     flags.corrupt_tagdata,
                     corrupt_index,
-                )?;
+                )
+                .map_err(|e| e.locate(frame_location(input, frame.file_offset)))?;
                 writer.write_raw_owned(reframed)?;
                 blobs_written += 1;
             }
@@ -711,7 +722,7 @@ fn reframe_raw(
     strip_tagdata: bool,
     corrupt_tagdata: bool,
     corrupt_index: Option<crate::blob_meta::BlobIndex>,
-) -> std::io::Result<Vec<u8>> {
+) -> Result<Vec<u8>> {
     let mut strip_fields: Vec<BlobHeaderField> = Vec::with_capacity(2);
     if strip_indexdata {
         strip_fields.push(BlobHeaderField::Indexdata);
@@ -730,12 +741,11 @@ fn reframe_raw(
         // Field 4 was just removed above; re-emit it carrying an index that
         // parses cleanly and describes a blob other than this one.
         let bogus = crate::blob_meta::encode_tag_index(std::iter::once(CORRUPT_TAGDATA_KEY))
-            .ok_or_else(|| std::io::Error::other("could not encode the corrupt tag index"))?;
+            .ok_or_else(|| Error::internal("could not encode the corrupt tag index"))?;
         protohoggr::encode_bytes_field(&mut header_buf, 4, &bogus);
     }
-    let header_len = u32::try_from(header_buf.len()).map_err(|_| {
-        std::io::Error::other(format!("header too large: {} bytes", header_buf.len()))
-    })?;
+    let header_len = u32::try_from(header_buf.len())
+        .map_err(|_| Error::internal(format!("header too large: {} bytes", header_buf.len())))?;
     let total_len = 4 + header_buf.len() + blob_bytes.len();
     let mut out = Vec::with_capacity(total_len);
     out.extend_from_slice(&header_len.to_be_bytes());
@@ -1012,11 +1022,10 @@ fn select_drop_sets(
         )?;
     }
     if spec.n > total {
-        return Err(format!(
+        return Err(Error::invalid_argument(format!(
             "--drop-ids: cannot drop {} elements, input has only {}",
             spec.n, total,
-        )
-        .into());
+        )));
     }
     let mut sets = DropSets::default();
     for key in heap {
@@ -1100,7 +1109,7 @@ fn run_kind_phase(
         });
     }
 
-    type PhaseResult = std::result::Result<WorkerOutput, String>;
+    type PhaseResult = crate::Result<WorkerOutput>;
     let mut reorder: ReorderBuffer<PhaseResult> =
         ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY);
 
@@ -1111,8 +1120,8 @@ fn run_kind_phase(
 
     let mut blobs: u64 = 0;
     let mut elements: u64 = 0;
-    let mut write_error: Option<Box<dyn std::error::Error>> = None;
-    let mut classify_error: Option<String> = None;
+    let mut write_error: Option<Error> = None;
+    let mut classify_error: Option<Error> = None;
 
     crate::scan::classify::parallel_classify_phase(
         shared_file,
@@ -1183,7 +1192,7 @@ fn run_kind_phase(
 
                 for framed in full_framed {
                     if let Err(e) = writer.write_raw_owned(framed) {
-                        write_error = Some(e.into());
+                        write_error = Some(e);
                         break;
                     }
                     blobs += 1;
@@ -1192,7 +1201,7 @@ fn run_kind_phase(
                     continue;
                 }
 
-                let consume_res: std::result::Result<(), String> = if flags.unsort_any() {
+                let consume_res: crate::Result<()> = if flags.unsort_any() {
                     feed_tail_unsort(tail, &mut unsort, &mut bb, &mut output)
                 } else {
                     feed_tail_plain(tail, &mut bb, &mut output)
@@ -1231,18 +1240,17 @@ fn run_kind_phase(
         return Err(e);
     }
     if let Some(e) = classify_error {
-        return Err(e.into());
+        return Err(e);
     }
 
     // End-of-phase: re-inject any held element (partial swap fire), then
     // flush the central builder one last time.
     if let Some(elem) = unsort.held.take() {
-        write_owned_to_central(&elem, &mut bb, &mut output)
-            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        write_owned_to_central(&elem, &mut bb, &mut output)?;
         // This element was already counted in its input tail.
     }
 
-    flush_local(&mut bb, &mut output).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    flush_local(&mut bb, &mut output)?;
     pending.append(&mut output);
     if !pending.is_empty() {
         let final_batch = std::mem::take(&mut pending);
@@ -1277,7 +1285,7 @@ fn worker_decode_kind(
     flags: DegradeFlags,
     compression: &Compression,
     drop: Option<&FxHashSet<i64>>,
-) -> std::result::Result<WorkerOutput, String> {
+) -> crate::Result<WorkerOutput> {
     // `element_matches_kind` already discriminates by `kind`, so the count is
     // identical for every kind - no per-kind match needed.
     let total = block
@@ -1417,7 +1425,7 @@ fn feed_tail_unsort(
     unsort: &mut UnsortKindState,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> std::result::Result<(), String> {
+) -> crate::Result<()> {
     match tail {
         KindPayload::Nodes(v) => {
             for n in v {
@@ -1479,7 +1487,7 @@ fn feed_tail_plain(
     tail: KindPayload,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> std::result::Result<(), String> {
+) -> crate::Result<()> {
     match tail {
         KindPayload::Nodes(v) => {
             for n in &v {
@@ -1504,7 +1512,7 @@ fn write_owned_to_central(
     element: &OwnedElement,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> std::result::Result<(), String> {
+) -> crate::Result<()> {
     match element {
         OwnedElement::Node(n) => crate::owned::write_single_node_local(n, bb, output),
         OwnedElement::Way(w) => crate::owned::write_single_way_local(w, bb, output),
@@ -1517,7 +1525,7 @@ fn frame_owned(
     compression: &Compression,
     strip_indexdata: bool,
     strip_tagdata: bool,
-) -> std::result::Result<Vec<u8>, String> {
+) -> crate::Result<Vec<u8>> {
     let OwnedBlock {
         bytes: block_bytes,
         index,
@@ -1541,8 +1549,7 @@ fn frame_owned(
         indexdata,
         tagdata,
         way_members.as_deref(),
-    )
-    .map_err(|e| e.to_string())?;
+    )?;
     Ok(blob.into_vec())
 }
 
@@ -1554,10 +1561,10 @@ fn frame_and_write_batch(
     strip_indexdata: bool,
     strip_tagdata: bool,
     executor: &crate::host::Executor,
-) -> std::result::Result<u64, Box<dyn std::error::Error>> {
+) -> Result<u64> {
     use rayon::prelude::*;
 
-    let framed: Vec<std::io::Result<Vec<u8>>> = executor.install(|| {
+    let framed: Vec<Result<Vec<u8>>> = executor.install(|| {
         batch
             .into_par_iter()
             .map(
@@ -1567,7 +1574,7 @@ fn frame_and_write_batch(
                      tagdata,
                      way_members,
                  }|
-                 -> std::io::Result<Vec<u8>> {
+                 -> Result<Vec<u8>> {
                     let indexdata_buf = index.serialize();
                     let indexdata = if strip_indexdata {
                         None

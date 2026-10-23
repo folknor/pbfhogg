@@ -67,7 +67,8 @@ pub(super) fn try_extract_multi_single_pass(
                     host.diagnostics,
                     Note,
                     "extract.multi.probe_read_error",
-                    "Multi-extract single-pass probe could not read the first blob: {e}"
+                    "Multi-extract single-pass probe could not read the first blob: {}",
+                    e.report()
                 );
                 crate::debug::emit_counter("multi_extract_probe_read_error", 1);
                 return Ok(None);
@@ -141,9 +142,13 @@ pub(super) fn try_extract_multi_single_pass(
             hb.sorted()
         })?;
         let mut w = PbfWriter::to_path_sync(&slot.output, compression)
-            .map_err(|e| format!("failed to create {}: {e}", display_path.display()))?;
-        w.write_header(&header_bytes)
-            .map_err(|e| format!("failed to write header to {}: {e}", display_path.display()))?;
+            .map_err(|e| e.context(format!("failed to create {}", display_path.display())))?;
+        w.write_header(&header_bytes).map_err(|e| {
+            e.context(format!(
+                "failed to write header to {}",
+                display_path.display()
+            ))
+        })?;
         writers.push(w);
     }
 
@@ -186,7 +191,7 @@ pub(super) fn try_extract_multi_single_pass(
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
     let _ = walker
         .next_header()?
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
+        .ok_or_else(crate::error::new_missing_header)?;
 
     let mut node_schedule: Vec<(usize, u64, usize)> = Vec::new();
     let mut way_schedule: Vec<(usize, u64, usize)> = Vec::new();
@@ -702,7 +707,7 @@ pub(super) fn try_extract_multi_single_pass(
         let display_path = display_paths.map_or(&slot.output, |paths| &paths[i]);
         writers[i]
             .flush()
-            .map_err(|e| format!("failed to flush {}: {e}", display_path.display()))?;
+            .map_err(|e| e.context(format!("failed to flush {}", display_path.display())))?;
     }
 
     // Counters: schedule sizes + cross-region totals. Parallels the single-region
@@ -777,7 +782,7 @@ where
             &mut Vec<BlockBuilder>,
             &mut Vec<Vec<OwnedBlock>>,
             &mut Vec<i64>,
-        ) -> std::result::Result<Vec<u64>, String>
+        ) -> crate::Result<Vec<u64>>
         + Send
         + Sync,
 {
@@ -818,9 +823,7 @@ where
         let mut frame_buf: Vec<u8> = Vec::new();
         for &(_, frame_offset, frame_size, count) in &passthrough_items {
             frame_buf.resize(frame_size, 0);
-            shared_file
-                .read_exact_at(&mut frame_buf, frame_offset)
-                .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+            shared_file.read_exact_at(&mut frame_buf, frame_offset)?;
             for i in 0..n {
                 writers[i].write_raw(&frame_buf)?;
                 stats[i].nodes_in_bbox += count;
@@ -880,8 +883,7 @@ where
 
                     let r: WorkerResult = (|| {
                         read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)
-                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        file.read_exact_at(&mut read_buf, data_offset)?;
                         let mut buf = crate::blob::pool_get(
                             Some(&worker_pool),
                             data_size * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
@@ -896,18 +898,9 @@ where
                         for v in &mut output {
                             v.clear();
                         }
-                        let counts = block_fn_ref(&block, &mut bbs, &mut output, &mut i64_scratch)
-                            .map_err(|e| {
-                                crate::error::new_error(crate::error::ErrorKind::Io(
-                                    std::io::Error::other(e),
-                                ))
-                            })?;
+                        let counts = block_fn_ref(&block, &mut bbs, &mut output, &mut i64_scratch)?;
                         for i in 0..n {
-                            flush_local(&mut bbs[i], &mut output[i]).map_err(|e| {
-                                crate::error::new_error(crate::error::ErrorKind::Io(
-                                    std::io::Error::other(e),
-                                ))
-                            })?;
+                            flush_local(&mut bbs[i], &mut output[i])?;
                         }
                         let taken: Vec<Vec<OwnedBlock>> =
                             output.iter_mut().map(std::mem::take).collect();
@@ -983,9 +976,7 @@ fn write_consumer_item(
         }
         MultiNodeCI::Passthrough(frame_offset, frame_size, count) => {
             frame_buf.resize(frame_size, 0);
-            shared_file
-                .read_exact_at(frame_buf, frame_offset)
-                .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+            shared_file.read_exact_at(frame_buf, frame_offset)?;
             for i in 0..n {
                 writers[i].write_raw(frame_buf)?;
                 stats[i].nodes_in_bbox += count;
@@ -1025,7 +1016,7 @@ where
             &mut Vec<BlockBuilder>,
             &mut Vec<Vec<OwnedBlock>>,
             &mut Vec<i64>,
-        ) -> std::result::Result<Vec<u64>, String>
+        ) -> crate::Result<Vec<u64>>
         + Send
         + Sync,
 {
@@ -1089,8 +1080,7 @@ where
 
                     let r: WorkerResult = (|| {
                         read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)
-                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        file.read_exact_at(&mut read_buf, data_offset)?;
                         let mut buf = crate::blob::pool_get(
                             Some(&worker_pool),
                             data_size * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
@@ -1105,19 +1095,10 @@ where
                         for v in &mut output {
                             v.clear();
                         }
-                        let counts = block_fn_ref(&block, &mut bbs, &mut output, &mut i64_scratch)
-                            .map_err(|e| {
-                                crate::error::new_error(crate::error::ErrorKind::Io(
-                                    std::io::Error::other(e),
-                                ))
-                            })?;
+                        let counts = block_fn_ref(&block, &mut bbs, &mut output, &mut i64_scratch)?;
                         // Flush remaining elements in each BlockBuilder.
                         for i in 0..n {
-                            flush_local(&mut bbs[i], &mut output[i]).map_err(|e| {
-                                crate::error::new_error(crate::error::ErrorKind::Io(
-                                    std::io::Error::other(e),
-                                ))
-                            })?;
+                            flush_local(&mut bbs[i], &mut output[i])?;
                         }
                         let taken: Vec<Vec<OwnedBlock>> =
                             output.iter_mut().map(std::mem::take).collect();

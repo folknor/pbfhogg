@@ -47,7 +47,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::ElementKind;
 use crate::blob::decompress_blob_raw;
 use crate::block_builder::{BlockBuilder, OwnedBlock};
-use crate::error::{Error, ErrorKind, Result, new_error};
+use crate::error::{Error, Result};
 use crate::writer::{Compression, frame_blob_pipelined};
 
 use super::classify::block_overlaps_diff;
@@ -253,9 +253,9 @@ pub(super) fn run_workers(
     if locations_on_ways {
         let slots_len = coord_slots.as_ref().map_or(0, Vec::len);
         if slots_len != worker_count {
-            failure.publish(new_error(ErrorKind::Io(std::io::Error::other(format!(
+            failure.publish(Error::internal(format!(
                 "streaming: locations_on_ways requires coord_slots.len()={worker_count}, got {slots_len}",
-            )))));
+            )));
             return;
         }
     }
@@ -265,10 +265,9 @@ pub(super) fn run_workers(
     let shared_file = match std::fs::File::open(&*base_pbf) {
         Ok(file) => file,
         Err(e) => {
-            failure.publish(new_error(ErrorKind::Io(std::io::Error::other(format!(
-                "streaming: failed to open {}: {e}",
-                base_pbf.display(),
-            )))));
+            failure.publish(
+                Error::from(e).context(format!("streaming: failed to open {}", base_pbf.display())),
+            );
             return;
         }
     };
@@ -278,6 +277,9 @@ pub(super) fn run_workers(
     // `recv()` (microseconds); workers spend their time in pread +
     // decompress + parse, not queued on the receiver lock.
     let candidate_rx = Mutex::new(candidate_rx);
+    // Worker errors are located against the base PBF; captured once, not per
+    // blob.
+    let source: Arc<Path> = Arc::from(&*base_pbf);
 
     std::thread::scope(|scope| {
         for worker_id in 0..worker_count {
@@ -286,6 +288,7 @@ pub(super) fn run_workers(
             let loc_map_handle = loc_map_handle.as_ref().map(Arc::clone);
             let needed_set = needed_set.as_ref().map(Arc::clone);
             let file = &shared_file;
+            let source = &source;
             let candidate_rx = &candidate_rx;
             let failure = &*failure;
             let ranges = &*ranges;
@@ -296,6 +299,7 @@ pub(super) fn run_workers(
                     worker_loop(
                         worker_id,
                         file,
+                        source,
                         candidate_rx,
                         &drain_tx,
                         counters,
@@ -337,6 +341,7 @@ pub(super) fn run_workers(
 fn worker_loop(
     _worker_id: usize,
     file: &std::fs::File,
+    source: &Arc<Path>,
     candidate_rx: &Mutex<mpsc::Receiver<ScannedBlob>>,
     drain_tx: &mpsc::SyncSender<DrainItem>,
     counters: &WorkerCounters,
@@ -410,7 +415,7 @@ fn worker_loop(
                     compression,
                     route,
                 )
-                .map_err(|e| blob_err(&desc, &e))?;
+                .map_err(|e| blob_err(&desc, source, e))?;
             }
             ScannedBlob::Passthrough(desc) => {
                 // Only seen here under --direct-io output (scanner routes
@@ -429,7 +434,7 @@ fn worker_loop(
                     count,
                     None,
                 )
-                .map_err(|e| blob_err(&desc, &e))?;
+                .map_err(|e| blob_err(&desc, source, e))?;
             }
         }
     }
@@ -479,10 +484,10 @@ fn handle_candidate(
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
 
     let body_offset = desc.frame_start + desc.blob_offset as u64;
-    pread_into(file, read_buf, body_offset, desc.data_size).map_err(io_err)?;
+    pread_into(file, read_buf, body_offset, desc.data_size)?;
 
     let t_decompress = std::time::Instant::now();
-    decompress_blob_raw(read_buf, decompress_buf).map_err(io_err)?;
+    decompress_blob_raw(read_buf, decompress_buf)?;
     counters
         .decompress_ns
         .fetch_add(elapsed_ns(t_decompress), Ordering::Relaxed);
@@ -515,8 +520,7 @@ fn handle_candidate(
 
     let t_parse = std::time::Instant::now();
     let raw = std::mem::take(decompress_buf);
-    let block = crate::PrimitiveBlock::from_vec_with_scratch(raw, st_scratch, gr_scratch)
-        .map_err(io_err)?;
+    let block = crate::PrimitiveBlock::from_vec_with_scratch(raw, st_scratch, gr_scratch)?;
     counters
         .parse_ns
         .fetch_add(elapsed_ns(t_parse), Ordering::Relaxed);
@@ -621,8 +625,7 @@ fn handle_candidate(
     let loc = LocMode::new(locations_on_ways, loc_arc.as_deref());
 
     let t_rewrite = std::time::Instant::now();
-    let output = rewrite_block_parallel(&block, diff, bb, inline_upserts, effective_kind, loc)
-        .map_err(|e| new_error(ErrorKind::Io(std::io::Error::other(e.to_string()))))?;
+    let output = rewrite_block_parallel(&block, diff, bb, inline_upserts, effective_kind, loc)?;
     counters
         .rewrite_ns
         .fetch_add(elapsed_ns(t_rewrite), Ordering::Relaxed);
@@ -647,8 +650,7 @@ fn handle_candidate(
             Some(&indexdata),
             tagdata.as_deref(),
             way_members.as_deref(),
-        )
-        .map_err(io_err)?;
+        )?;
         framed_chunks.push(parts.into_vec());
     }
     counters
@@ -768,7 +770,7 @@ fn handle_owned_passthrough(
         .blobs_owned_passthrough
         .fetch_add(1, Ordering::Relaxed);
 
-    pread_into(file, read_buf, desc.frame_start, desc.frame_len).map_err(io_err)?;
+    pread_into(file, read_buf, desc.frame_start, desc.frame_len)?;
 
     // Move the bytes into the DrainItem; reset read_buf for the next
     // pread without keeping the per-blob allocation alive.
@@ -789,14 +791,9 @@ fn handle_owned_passthrough(
 }
 
 /// Resize `buf` to `len` and pread `len` bytes at `offset`.
-fn pread_into(
-    file: &std::fs::File,
-    buf: &mut Vec<u8>,
-    offset: u64,
-    len: usize,
-) -> std::io::Result<()> {
+fn pread_into(file: &std::fs::File, buf: &mut Vec<u8>, offset: u64, len: usize) -> Result<()> {
     buf.resize(len, 0);
-    file.read_exact_at(buf, offset)
+    Ok(file.read_exact_at(buf, offset)?)
 }
 
 /// Compute the inline-upsert slice for one blob: upserts whose OSM ID
@@ -833,25 +830,21 @@ fn flush_local_coords(
 /// Send to the drain. Returns `Err` only if the drain has already exited
 /// (channel closed) - treat as graceful shutdown.
 fn send_drain(drain_tx: &mpsc::SyncSender<DrainItem>, item: DrainItem) -> Result<()> {
-    drain_tx.send(item).map_err(|_| {
-        new_error(ErrorKind::Io(std::io::Error::other(
-            "streaming: drain closed worker→drain channel",
-        )))
-    })
+    drain_tx
+        .send(item)
+        .map_err(|_| Error::internal("streaming: drain closed worker-to-drain channel"))
 }
 
-/// Prefix a per-blob error with the blob's seq and frame offset so the
-/// caller can find the blob that failed.
-fn blob_err(desc: &BlobDescriptor, e: &Error) -> Error {
-    new_error(ErrorKind::Io(std::io::Error::other(format!(
-        "apply-changes: base blob seq {} at byte offset {}: {e}",
-        desc.seq, desc.frame_start,
-    ))))
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn io_err<E: std::fmt::Display>(e: E) -> Error {
-    new_error(ErrorKind::Io(std::io::Error::other(e.to_string())))
+/// Locate a per-blob error at the base blob that failed: the file, the
+/// walker's blob ordinal and the frame offset. `source` is captured once per
+/// pool, so there is no per-blob reference counting.
+fn blob_err(desc: &BlobDescriptor, source: &Arc<Path>, e: Error) -> Error {
+    e.context("apply-changes: base blob")
+        .locate(crate::error::Location::new(
+            Some(source),
+            Some(desc.blob_index),
+            Some(crate::ByteOffset(desc.frame_start)),
+        ))
 }
 
 fn elapsed_ns(t: std::time::Instant) -> u64 {

@@ -10,6 +10,7 @@ use s2::cellid::CellID;
 use super::BuildConfig;
 use super::Result;
 use super::pass1::RawAdminRelation;
+use crate::error::Error;
 use crate::geo::RingSearchBudgetExceeded;
 use crate::tunables::{
     ADMIN_VERTEX_MULTIPLIER_DEFAULT, ADMIN_VERTEX_MULTIPLIER_LEVEL_3,
@@ -305,26 +306,21 @@ pub(super) fn write_admin_data(dir: &Path, polygons: &[AssembledPolygon]) -> Res
         for v in &p.vertices {
             vert_out.write_all(&v.to_bytes())?;
         }
-        let step_bytes = p.vertices.len().checked_mul(NODE_COORD_SIZE).ok_or_else(
-            || -> Box<dyn std::error::Error> {
-                format!(
-                    "write_admin_data: polygon vertex bytes overflow usize ({} * {NODE_COORD_SIZE}).",
-                    p.vertices.len(),
-                )
-                .into()
-            },
-        )?;
-        let step_u64 = u64::try_from(step_bytes)
-            .map_err(|_| "write_admin_data: polygon vertex bytes exceed u64")?;
-        offset = offset
-            .checked_add(step_u64)
-            .ok_or_else(|| -> Box<dyn std::error::Error> {
-                format!(
-                    "write_admin_data: cumulative admin-vertex byte offset overflows u64 \
-                     (current {offset}, step {step_u64})"
-                )
-                .into()
-            })?;
+        let step_bytes = p.vertices.len().checked_mul(NODE_COORD_SIZE).ok_or_else(|| {
+            Error::invalid_data(format!(
+                "write_admin_data: polygon vertex bytes overflow usize ({} * {NODE_COORD_SIZE}).",
+                p.vertices.len(),
+            ))
+        })?;
+        let step_u64 = u64::try_from(step_bytes).map_err(|_| {
+            Error::invalid_data("write_admin_data: polygon vertex bytes exceed u64")
+        })?;
+        offset = offset.checked_add(step_u64).ok_or_else(|| {
+            Error::invalid_data(format!(
+                "write_admin_data: cumulative admin-vertex byte offset overflows u64 \
+                 (current {offset}, step {step_u64})"
+            ))
+        })?;
     }
     poly_out.flush()?;
     vert_out.flush()?;
@@ -370,17 +366,17 @@ pub(super) fn write_admin_index(
         // increment `FORMAT_VERSION`.
         let group_len = i - start;
         let count = u16::try_from(group_len).map_err(|_| {
-            format!(
+            Error::invalid_data(format!(
                 "write_admin_index: admin cell {cell_token} ({cid}) has {group_len} entries, exceeds u16::MAX. \
              Bump on-disk count to u32 and increment FORMAT_VERSION."
-            )
+            ))
         })?;
         entries_out.write_all(&count.to_le_bytes())?;
         byte_off = byte_off.checked_add(2).ok_or_else(|| {
-            format!(
+            Error::invalid_data(format!(
                 "write_admin_index: admin-entries byte offset overflows u64 at cell {cell_token} ({cid}) \
              (current {byte_off})"
-            )
+            ))
         })?;
         for e in &entries[start..i] {
             // INTERIOR_FLAG (= 0x8000_0000) ORs into the high bit of
@@ -389,13 +385,12 @@ pub(super) fn write_admin_index(
             // and the decoded poly_index would be wrong. Guard here
             // rather than at the upstream counter.
             if e.poly_index & INTERIOR_FLAG != 0 {
-                return Err(format!(
+                return Err(Error::invalid_data(format!(
                     "write_admin_index: poly_index {} in cell {cell_token} ({cid}) has the INTERIOR_FLAG bit set; \
                      admin polygon count has exceeded 2^31 - 1. Split INTERIOR_FLAG into a \
                      separate byte or grow AdminEntry to u64 and increment FORMAT_VERSION.",
                     e.poly_index
-                )
-                .into());
+                )));
             }
             let val = if e.is_interior {
                 e.poly_index | INTERIOR_FLAG
@@ -404,10 +399,10 @@ pub(super) fn write_admin_index(
             };
             entries_out.write_all(&val.to_le_bytes())?;
             byte_off = byte_off.checked_add(4).ok_or_else(|| {
-                format!(
+                Error::invalid_data(format!(
                     "write_admin_index: admin-entries byte offset overflows u64 at cell {cell_token} ({cid}) \
                  (current {byte_off})"
-                )
+                ))
             })?;
         }
     }

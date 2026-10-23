@@ -63,9 +63,7 @@ pub(crate) fn estimate_blob_count(
     let mut walker = HeaderWalker::open(path, diagnostics)?;
     let file_size = walker.file_size();
     if file_size == 0 {
-        return Err(crate::error::new_error(
-            crate::error::ErrorKind::MissingHeader,
-        ));
+        return Err(crate::error::new_missing_header());
     }
     let mut frames = 0_usize;
     let mut osmdata_blobs = 0_u64;
@@ -81,9 +79,7 @@ pub(crate) fn estimate_blob_count(
         };
         frames += 1;
         if frames == 1 && meta.blob_type != BlobKind::OsmHeader {
-            return Err(crate::error::new_error(
-                crate::error::ErrorKind::MissingHeader,
-            ));
+            return Err(crate::error::new_missing_header());
         }
         if meta.blob_type == BlobKind::OsmData {
             osmdata_blobs += 1;
@@ -133,6 +129,11 @@ pub(crate) struct BlobHeaderMeta {
     /// length prefix). Callers that want to `pread` the full frame for
     /// raw passthrough use `(frame_start, frame_size)`.
     pub frame_start: u64,
+    /// 0-based index of this blob in the file. The walker owns provenance:
+    /// work items built from this meta carry `(blob_index, frame_start)` so
+    /// a worker that decodes the blob away from the walker can locate its
+    /// errors truthfully.
+    pub blob_index: u64,
     /// Byte offset in the file where the blob's Blob protobuf starts
     /// (i.e. the data payload after the 4-byte length prefix + header).
     pub data_offset: u64,
@@ -181,15 +182,9 @@ impl HeaderWalker {
     /// `shared_file()`, rather than flowing `--direct-io` through
     /// this helper.
     pub(crate) fn open(path: &Path, diagnostics: &crate::host::Diagnostics) -> Result<Self> {
-        let file = std::fs::File::open(path).map_err(|e| {
-            crate::error::new_error(crate::error::ErrorKind::Io(super::file_reader::open_error(
-                path, &e,
-            )))
-        })?;
-        let file_size = file
-            .metadata()
-            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?
-            .len();
+        let file =
+            std::fs::File::open(path).map_err(|e| super::file_reader::open_error(path, e))?;
+        let file_size = file.metadata()?.len();
         // POSIX_FADV_RANDOM: suppresses readahead. Our pread pattern is
         // header-at-a-time (tiny reads) with big gaps, plus occasional
         // full-blob body preads that are also not in a sequential stream
@@ -217,12 +212,18 @@ impl HeaderWalker {
         })
     }
 
-    /// Attach this walker's input identity to an error. Every error path
+    /// Attach this walker's input identity, the blob it was reading and that
+    /// blob's frame start to an error, as one location. Every error path
     /// out of `next_header` goes through here; one that does not makes
     /// `Error::source_path` lie by omission on that path only, which is
-    /// worse than never having had it.
-    fn stamp(&self, err: crate::error::Error) -> crate::error::Error {
-        err.in_input(Some(&self.path), Some(self.blob_index))
+    /// worse than never having had it. `self.offset` is the frame start
+    /// here: it only advances once a frame has been fully validated.
+    fn locate(&self, err: crate::error::Error) -> crate::error::Error {
+        err.locate(crate::error::Location::new(
+            Some(&self.path),
+            Some(self.blob_index),
+            Some(crate::ByteOffset(self.offset)),
+        ))
     }
 
     /// Report a filtered schedule retaining an unindexed data blob. Call only
@@ -241,6 +242,28 @@ impl HeaderWalker {
             "Input contains blobs without indexdata; blob type and spatial filters cannot skip those blobs"
         );
         crate::debug::emit_counter("schedule_filter_without_indexdata", 1);
+    }
+
+    /// The path this walker was opened from. Workers that decode blobs the
+    /// walker scheduled capture this once and locate their errors with it.
+    pub(crate) fn path(&self) -> &Arc<Path> {
+        &self.path
+    }
+
+    /// Attach the provenance this walker handed out in `meta` (the input,
+    /// the blob's true index and its frame start) to an error raised while
+    /// working on that blob. Applied only when the error has no location yet.
+    #[cold]
+    pub(crate) fn locate_meta(
+        &self,
+        meta: &BlobHeaderMeta,
+        err: crate::error::Error,
+    ) -> crate::error::Error {
+        err.locate(crate::error::Location::new(
+            Some(&self.path),
+            Some(meta.blob_index),
+            Some(crate::ByteOffset(meta.frame_start)),
+        ))
     }
 
     /// Shared `Arc<File>` for worker threads to `pread` data bodies.
@@ -278,7 +301,7 @@ impl HeaderWalker {
                 Ok(Some(meta))
             }
             Ok(None) => Ok(None),
-            Err(err) => Err(self.stamp(err)),
+            Err(err) => Err(self.locate(err)),
         }
     }
 
@@ -306,9 +329,7 @@ impl HeaderWalker {
         // `file_size`) is shape 2 or 3 - hard error, not silent EOF.
         // The clean-EOF case is handled above at the `probe_len < 4`
         // guard.
-        self.file
-            .read_exact_at(&mut self.header_buf, self.offset)
-            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+        self.file.read_exact_at(&mut self.header_buf, self.offset)?;
 
         let header_len = u32::from_be_bytes([
             self.header_buf[0],
@@ -328,8 +349,7 @@ impl HeaderWalker {
             self.header_buf.resize(header_end, 0);
             let tail_offset = self.offset + probe_len as u64;
             self.file
-                .read_exact_at(&mut self.header_buf[probe_len..header_end], tail_offset)
-                .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                .read_exact_at(&mut self.header_buf[probe_len..header_end], tail_offset)?;
         }
 
         // parse_blob_header_with_index rejects an oversized declared datasize
@@ -354,25 +374,20 @@ impl HeaderWalker {
         // truncated tail blob would silently terminate the walk on the
         // next call (offset >= file_size returns Ok(None)).
         let payload_end = data_offset.checked_add(data_size as u64).ok_or_else(|| {
-            crate::error::new_error(crate::error::ErrorKind::Io(::std::io::Error::new(
-                ::std::io::ErrorKind::InvalidData,
-                format!(
-                    "blob at offset {} declares overflowing payload size {data_size}",
-                    self.offset
-                ),
-            )))
+            crate::error::Error::invalid_data(format!(
+                "blob at offset {} declares overflowing payload size {data_size}",
+                self.offset
+            ))
         })?;
         if payload_end > self.file_size {
-            return Err(crate::error::new_error(crate::error::ErrorKind::Io(
-                ::std::io::Error::new(
-                    ::std::io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "blob payload truncated: declared {data_size} bytes \
-                         from offset {data_offset}, file_size {}",
-                        self.file_size
-                    ),
+            return Err(crate::error::Error::io_kind(
+                ::std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "blob payload truncated: declared {data_size} bytes \
+                     from offset {data_offset}, file_size {}",
+                    self.file_size
                 ),
-            )));
+            ));
         }
         self.offset = payload_end;
         let frame_size = 4 + header_len + data_size;
@@ -380,6 +395,7 @@ impl HeaderWalker {
         Ok(Some(BlobHeaderMeta {
             blob_type,
             frame_start,
+            blob_index: self.blob_index,
             data_offset,
             data_size,
             index,
@@ -392,9 +408,7 @@ impl HeaderWalker {
     pub(crate) fn pread_data(&self, offset: u64, size: usize, buf: &mut Vec<u8>) -> Result<()> {
         use std::os::unix::fs::FileExt as _;
         buf.resize(size, 0);
-        self.file
-            .read_exact_at(buf, offset)
-            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))
+        Ok(self.file.read_exact_at(buf, offset)?)
     }
 }
 

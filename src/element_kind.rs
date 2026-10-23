@@ -80,17 +80,20 @@ impl std::fmt::Display for ElementKind {
 }
 
 impl FromStr for ElementKind {
-    type Err = String;
+    type Err = crate::Error;
 
     /// Accepts the full names `node`, `way`, `relation` and the one-letter
-    /// forms `n`, `w`, `r`. Nothing else, no case folding.
+    /// forms `n`, `w`, `r`. Nothing else, no case folding. Anything else is
+    /// an `InvalidArgument` error.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "n" => Ok(Self::Node),
             "w" => Ok(Self::Way),
             "r" => Ok(Self::Relation),
             other => Self::from_name(other).ok_or_else(|| {
-                format!("invalid element kind '{other}': expected node, way or relation")
+                crate::Error::invalid_argument(format!(
+                    "invalid element kind '{other}': expected node, way or relation"
+                ))
             }),
         }
     }
@@ -118,8 +121,11 @@ mod tests {
         assert_eq!(ElementKind::Way.type_char(), 'w');
         assert_eq!(ElementKind::Relation.type_char(), 'r');
         for kind in all {
-            assert_eq!(kind.as_str().parse(), Ok(kind));
-            assert_eq!(kind.type_char().to_string().parse(), Ok(kind));
+            assert_eq!(kind.as_str().parse::<ElementKind>().ok(), Some(kind));
+            assert_eq!(
+                kind.type_char().to_string().parse::<ElementKind>().ok(),
+                Some(kind)
+            );
         }
         assert!("Node".parse::<ElementKind>().is_err());
         assert!("".parse::<ElementKind>().is_err());

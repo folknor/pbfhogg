@@ -227,7 +227,7 @@ fn writer_on_a_one_thread_pool_flushes() {
     let dir = tempfile::tempdir().expect("directory");
     let path = dir.path().join("pool.pbf");
     let pool = one_thread_pool();
-    pool.install(|| -> std::io::Result<()> {
+    pool.install(|| -> pbfhogg::Result<()> {
         let mut writer = pbfhogg::writer::PbfWriter::to_path(
             &path,
             Default::default(),
@@ -252,7 +252,7 @@ fn writer_on_a_one_thread_pool_drops_unflushed() {
     // drop on a non-panicking path is the error-bail-out shape, which the
     // library allows (its unit-test-only flush assertion does not apply to
     // integration tests).
-    pool.install(|| -> std::io::Result<()> {
+    pool.install(|| -> pbfhogg::Result<()> {
         let mut writer = pbfhogg::writer::PbfWriter::to_path(
             &path,
             Default::default(),
@@ -273,7 +273,7 @@ fn ambient_writer_inside_a_foreign_pool_flushes() {
     let dir = tempfile::tempdir().expect("directory");
     let path = dir.path().join("ambient.pbf");
     one_thread_pool()
-        .install(|| -> std::io::Result<()> {
+        .install(|| -> pbfhogg::Result<()> {
             let mut writer = pbfhogg::writer::PbfWriter::to_path(
                 &path,
                 Default::default(),
@@ -612,10 +612,10 @@ mod platform {
         let error =
             match pbfhogg::has_indexdata(&path, true, &pbfhogg::host::Diagnostics::discard()) {
                 Ok(_) => panic!("truncated header blob must fail while skipping"),
-                Err(error) if common::is_einval(&*error) => return,
+                Err(error) if common::is_einval(&error) => return,
                 Err(error) => error,
             };
-        assert_unexpected_eof(&*error);
+        assert_unexpected_eof(&error);
     }
 
     /// The skip error reaches the caller as a bare `io::Error` or wrapped in
@@ -654,9 +654,9 @@ mod platform {
         let error =
             match pbfhogg::has_indexdata(&path, true, &pbfhogg::host::Diagnostics::discard()) {
                 Ok(_) => panic!("aligned skip beyond EOF must fail"),
-                Err(error) if common::is_einval(&*error) => return,
+                Err(error) if common::is_einval(&error) => return,
                 Err(error) => error,
             };
-        assert_unexpected_eof(&*error);
+        assert_unexpected_eof(&error);
     }
 }

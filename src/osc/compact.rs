@@ -49,13 +49,12 @@ pub(super) fn member_type_to_byte(mt: MemberType) -> ParseResult<u8> {
         MemberType::Node => Ok(0),
         MemberType::Way => Ok(1),
         MemberType::Relation => Ok(2),
-        MemberType::Unknown(v) => Err(format!(
+        MemberType::Unknown(v) => Err(crate::Error::invalid_data(format!(
             "relation member has unknown type value {v} (expected node, way or relation); \
              refusing to store it, because the compact OSC overlay has no faithful \
              encoding for it and any substitute would silently change what the member \
              points at"
-        )
-        .into()),
+        ))),
     }
 }
 
@@ -206,8 +205,8 @@ pub(super) fn arena_append_node(
 /// record shape; a silent `as u32` here would make the reader walk the
 /// wrong number of items and read a neighbouring record's bytes.
 fn count_u32(len: usize, what: &str, kind: ElementKind, id: i64) -> ParseResult<u32> {
-    u32::try_from(len).map_err(|_| -> Box<dyn std::error::Error> {
-        format!("OSC {kind} {id} has {len} {what}, which exceeds the {} the compact overlay can address", u32::MAX).into()
+    u32::try_from(len).map_err(|_| {
+        crate::Error::invalid_data(format!("OSC {kind} {id} has {len} {what}, which exceeds the {} the compact overlay can address", u32::MAX))
     })
 }
 

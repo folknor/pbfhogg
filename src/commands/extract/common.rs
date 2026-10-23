@@ -203,7 +203,7 @@ pub(super) fn build_blob_schedule_with_passthrough(
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
     let _ = walker
         .next_header()?
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
+        .ok_or_else(crate::error::new_missing_header)?;
 
     let mut schedule = Vec::new();
     let mut passthrough_candidates: u64 = 0;
@@ -279,11 +279,7 @@ pub(super) fn pread_execute<F>(
     host: &crate::host::Host,
 ) -> Result<()>
 where
-    F: Fn(
-            &PrimitiveBlock,
-            &mut BlockBuilder,
-            &mut Vec<OwnedBlock>,
-        ) -> std::result::Result<ExtractStats, String>
+    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> crate::Result<ExtractStats>
         + Send
         + Sync,
 {
@@ -303,9 +299,12 @@ where
     // seconds of pread+decode work. Hoisting to the caller is possible but
     // buys nothing measurable; the local-scope Arc keeps the API simple.
     let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+        std::fs::File::open(input).map_err(|e| crate::file_reader::open_error(input, e))?,
     );
+    // The input's identity, captured once; each worker borrows it to locate a
+    // failure with the frame offset the schedule handed it.
+    let source: std::sync::Arc<Path> = std::sync::Arc::from(input);
+    let source = &source;
 
     let decode_threads = crate::host::sized_workers(
         &*host.resources,
@@ -318,7 +317,8 @@ where
 
     // Split schedule: decode blobs go to workers, passthrough blobs handled by consumer.
     // Both are re-sequenced for the reorder buffer.
-    let mut decode_items: Vec<(usize, u64, usize)> = Vec::new(); // (global_seq, data_offset, data_size)
+    // (global_seq, data_offset, data_size, frame_offset)
+    let mut decode_items: Vec<(usize, u64, usize, u64)> = Vec::new();
     // (global_seq, frame_offset, frame_size, observed node count)
     let mut passthrough_items: Vec<(usize, u64, usize, u64)> = Vec::new();
     for (i, d) in schedule.iter().enumerate() {
@@ -328,11 +328,11 @@ where
         if let Passthrough::Verified { nodes } = d.passthrough {
             passthrough_items.push((i, d.frame_offset, d.frame_size, nodes));
         } else {
-            decode_items.push((i, d.offset, d.size));
+            decode_items.push((i, d.offset, d.size, d.frame_offset));
         }
     }
 
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize, u64)>(
         crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
     );
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
@@ -365,7 +365,7 @@ where
                 let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
                 loop {
-                    let (s, data_offset, data_size) = {
+                    let (s, data_offset, data_size, frame_offset) = {
                         let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         match guard.recv() {
                             Ok(d) => d,
@@ -373,38 +373,36 @@ where
                         }
                     };
 
-                    let r: crate::error::Result<(Vec<OwnedBlock>, ExtractStats)> = (|| {
-                        read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)
-                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                    let r: crate::error::Result<(Vec<OwnedBlock>, ExtractStats)> =
+                        (|| -> crate::error::Result<(Vec<OwnedBlock>, ExtractStats)> {
+                            read_buf.resize(data_size, 0);
+                            file.read_exact_at(&mut read_buf, data_offset)?;
 
-                        // Decode path: full PrimitiveBlock → extract → OwnedBlocks.
-                        let mut buf = crate::blob::pool_get(
-                            Some(&worker_pool),
-                            data_size * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
-                        );
-                        crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
-                        let block = PrimitiveBlock::from_vec_pooled_with_scratch(
-                            buf,
-                            &worker_pool,
-                            &mut st_scratch,
-                            &mut gr_scratch,
-                        )?;
-                        output_blocks.clear();
-                        let block_stats = block_fn_ref(&block, &mut bb, &mut output_blocks)
-                            .map_err(|e| {
-                                crate::error::new_error(crate::error::ErrorKind::Io(
-                                    std::io::Error::other(e),
-                                ))
-                            })?;
-                        flush_local(&mut bb, &mut output_blocks).map_err(|e| {
-                            crate::error::new_error(crate::error::ErrorKind::Io(
-                                std::io::Error::other(e),
+                            // Decode path: full PrimitiveBlock, extract, OwnedBlocks.
+                            let mut buf = crate::blob::pool_get(
+                                Some(&worker_pool),
+                                data_size * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
+                            );
+                            crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
+                            let block = PrimitiveBlock::from_vec_pooled_with_scratch(
+                                buf,
+                                &worker_pool,
+                                &mut st_scratch,
+                                &mut gr_scratch,
+                            )?;
+                            output_blocks.clear();
+                            let block_stats = block_fn_ref(&block, &mut bb, &mut output_blocks)?;
+                            flush_local(&mut bb, &mut output_blocks)?;
+                            Ok((std::mem::take(&mut output_blocks), block_stats))
+                        })()
+                        // Cold: only a failure builds the location.
+                        .map_err(|e| {
+                            e.locate(crate::error::Location::new(
+                                Some(source),
+                                None,
+                                Some(crate::ByteOffset(frame_offset)),
                             ))
-                        })?;
-                        Ok((std::mem::take(&mut output_blocks), block_stats))
-                    })(
-                    );
+                        });
                     if tx.send((s, r)).is_err() {
                         break;
                     }
@@ -466,9 +464,7 @@ where
                     ConsumerItem::Passthrough(frame_offset, frame_size, count) => {
                         // Read raw frame directly and write without decode/re-encode.
                         frame_read_buf.resize(frame_size, 0);
-                        shared_file
-                            .read_exact_at(&mut frame_read_buf, frame_offset)
-                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        shared_file.read_exact_at(&mut frame_read_buf, frame_offset)?;
                         writer.write_raw_owned(std::mem::take(&mut frame_read_buf))?;
                         stats.nodes_in_bbox += count;
                     }
@@ -499,9 +495,7 @@ where
                 }
                 ConsumerItem::Passthrough(frame_offset, frame_size, count) => {
                     frame_read_buf.resize(frame_size, 0);
-                    shared_file
-                        .read_exact_at(&mut frame_read_buf, frame_offset)
-                        .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                    shared_file.read_exact_at(&mut frame_read_buf, frame_offset)?;
                     writer.write_raw_owned(std::mem::take(&mut frame_read_buf))?;
                     stats.nodes_in_bbox += count;
                 }
@@ -525,11 +519,7 @@ pub(super) fn pread_write_pass<F>(
     host: &crate::host::Host,
 ) -> Result<()>
 where
-    F: Fn(
-            &PrimitiveBlock,
-            &mut BlockBuilder,
-            &mut Vec<OwnedBlock>,
-        ) -> std::result::Result<ExtractStats, String>
+    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> crate::Result<ExtractStats>
         + Send
         + Sync,
 {
@@ -560,11 +550,7 @@ pub(super) fn pread_write_pass_with_schedule<F>(
     host: &crate::host::Host,
 ) -> Result<()>
 where
-    F: Fn(
-            &PrimitiveBlock,
-            &mut BlockBuilder,
-            &mut Vec<OwnedBlock>,
-        ) -> std::result::Result<ExtractStats, String>
+    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> crate::Result<ExtractStats>
         + Send
         + Sync,
 {
@@ -614,7 +600,7 @@ pub(super) fn extract_block_pass2(
     phase_kind: Option<crate::ElementKind>,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> std::result::Result<ExtractStats, String> {
+) -> crate::Result<ExtractStats> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,

@@ -316,56 +316,20 @@ exempt. The alternative is to accept CLI-first wording and say so in
 
 Reported by: CLI and plumbing, write path, re-encoding.
 
-## HYG-021 - Error kinds are stringified away at thread boundaries and reported as I/O
-
-Anger: 9 - error kinds and texts: API and output.
-
-- `streaming::io_err`, `drain::io_err` ("Mirrors the io_err helper in
-  streaming.rs") and about eight inline
-  `new_error(ErrorKind::Io(std::io::Error::other(e.to_string())))` in the
-  apply-changes drain: decompress failures, protobuf parse failures, the
-  overlay's typed errors, protocol bugs ("barrier ran twice?", "coord_slots is
-  None", "scanner: fast-path descriptor missing indexdata") and the
-  unsorted-output refusal all reach the caller as `Io`.
-- Merge-changes maps every error to `String` across the rayon boundary
-  (`do_work`, `build_simplify_stream`, per-chunk closures) because
-  `BoxResult` is not `Send`.
-- Altw: stage 4 wraps router aborts, reframe and assembly failures as
-  `Io(Other)`; sparse `SharedSparseWriter::insert` does the same for an
-  out-of-domain coordinate (input data, not I/O); `.map_err(|e| e.to_string())`
-  appears more than ten times, with `external_join` explaining the `Send`
-  problem.
-- Renumber worker results are `Result<_, String>`.
-- `extract::pread_execute`'s `block_fn` and `getparents`' `ClassifyResult` are
-  `Result<_, String>`, re-wrapped as `Io(Other)`; `ExportOptions::new` wraps
-  tag expression and bbox parse errors as `io::Error(InvalidInput)`, so user
-  input errors are classed as I/O for exit-code mapping.
-- Read path: "decode task panicked", "failed to build decode pool", the fused
-  transform's `String` error, "pipeline consumer dropped", "pipeline thread
-  terminated without completing", "IndexedReader requires a seekable
-  BlobReader" are internal faults reported as `Io(Other)`. Each site spells the
-  full `new_error(ErrorKind::Io(std::io::Error::other(...)))` with its own
-  wording and `io::ErrorKind` (`pipeline.rs` x5, `reader.rs` x3, `indexed.rs`,
-  `header_walker.rs` x5); that is how the walker once lost the open error's
-`io::ErrorKind`.
-- The geocode builder and reader use `Result<T, Box<dyn Error>>` from
-  `format!(...).into()` throughout and never use `error.rs`; pass 1.5 and 2b
-  stringify worker errors.
-
-A caller matching on `ErrorKind::Io` to decide "retry or bad disk" misfires,
-and the `source()` chain is gone. Fix: make the crate error `Send + Sync`, so
-thread closures return `crate::Result` and the `String` round trips go; add
-`ErrorKind::Internal` and a `PipelineError { seq, frame_start, stage, source }`;
-a small set of constructors in `error.rs`. Enforce by deleting both `io_err`
-helpers and a `disallowed-methods` / text rule on `std::io::Error::other`
-outside `error.rs`.
-
-Reported by: change application, altw and scanning, re-encoding, filtering and
-spatial, read path, geocode index.
-
 ## HYG-022 - Errors that reach the operator name no file, offset or subject
 
 Anger: 7 - message content.
+
+Partly addressed by the typed-error rework: `main` prints `Error: {report}`
+with the whole chain, walker-owned pools (sort, cat, dedupe, altw passthrough,
+renumber, apply-changes, diff shards, the read pipeline's decode tasks) locate
+errors with the true file, blob and offset through `Error::locate`, and the
+read-path decode panic is located. Re-verify each bullet below against the
+code before acting. New gap: the pread-schedule pools carry no blob ordinal,
+so their errors can name at most a frame offset: `scan/classify.rs`
+`parallel_classify_*`, tags-filter pass 2, `extract/multi.rs`, geocode passes
+1.5 and 2, and most of `check/`. Their schedules are `(seq, offset, size)`
+tuples used in about 67 places across 13 files.
 
 - No write-path error names the output file: `check_stream_complete` names a
   backend but not the path; ENOSPC reaches the operator as "No space left on
@@ -923,6 +887,17 @@ literal to carry a `#[cfg(feature = "test-hooks")]` line and a hand-written
 workers as an `Arc`, behind a single `pbfhogg::test_hooks` facade; until then, a
 `HookGuard` returned by arming that resets on `Drop`. Enforce with a text rule
 banning `static` inside `mod test_hooks`.
+
+A concrete untested contract waiting on such a seam: altw external's stage 4
+builds the output writer on a worker thread, and a `--direct-io` /
+`--io-uring` setup refusal there must reach the caller as the typed
+`PlatformUnsupported` (exit 3, not 2). Nothing can force that refusal today
+without a host assumption: the CLI's `--direct-io` also makes reads direct, so
+an input-side refusal fires first on the main thread, and
+`external_backend_output_refusal_stays_typed_across_stage_join` in
+`tests/cli_add_locations_to_ways.rs` passes without exercising the join on any
+host whose filesystem accepts O_DIRECT output. An injection point that makes
+stage 4's writer construction fail would make it deterministic.
 
 Reported by: test harness, read path, write path, altw and scanning, geocode
 index, change application, CLI and plumbing.

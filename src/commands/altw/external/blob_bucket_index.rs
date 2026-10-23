@@ -34,7 +34,7 @@ pub(super) fn classify_blobs_in_bucket(
     bucket_end_slot: u64,
     way_slot_starts: &[u64],
     total_slots: u64,
-) -> std::result::Result<Vec<BlobBucketIntersection>, String> {
+) -> crate::Result<Vec<BlobBucketIntersection>> {
     let bucket_size = bucket_end_slot - bucket_start_slot;
     let n = way_slot_starts.len();
 
@@ -62,11 +62,11 @@ pub(super) fn classify_blobs_in_bucket(
 
         let blob_size = blob_end - blob_start;
         if blob_size > bucket_size {
-            return Err(format!(
+            return Err(crate::Error::internal(format!(
                 "blob {i} slot range [{blob_start}, {blob_end}) is wider ({blob_size}) than \
                  bucket [{bucket_start_slot}, {bucket_end_slot}) ({bucket_size}); \
                  structural assumption violated"
-            ));
+            )));
         }
 
         if blob_end <= bucket_start_slot {

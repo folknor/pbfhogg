@@ -37,7 +37,7 @@ pub(super) fn scan_blob_metadata(
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
     let _ = walker
         .next_header()?
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
+        .ok_or_else(crate::error::new_missing_header)?;
 
     let mut metas = Vec::new();
     let mut node_blobs: u64 = 0;
@@ -47,10 +47,14 @@ pub(super) fn scan_blob_metadata(
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
         }
-        let idx = meta
-            .index
-            .as_ref()
-            .ok_or("external join metadata scan: OsmData blob missing indexdata")?;
+        let idx = meta.index.as_ref().ok_or_else(|| {
+            walker.locate_meta(
+                &meta,
+                crate::Error::invalid_data(
+                    "external join metadata scan: OsmData blob missing indexdata",
+                ),
+            )
+        })?;
         let tag_index = if parse_tagdata {
             meta.tagdata
                 .as_deref()

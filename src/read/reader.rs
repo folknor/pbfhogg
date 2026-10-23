@@ -6,7 +6,7 @@ use super::elements::Element;
 use super::file_reader::FileReader;
 use super::pipeline::PipelineConfig;
 use crate::blob_meta::BlobFilter;
-use crate::error::{ErrorKind, Result, new_error};
+use crate::error::{Error, Result, new_missing_header};
 use crate::tunables::{
     BLOCK_QUEUE, PAR_BATCH_MAX_BLOBS, PAR_BATCH_MAX_BYTES, PAR_INFLIGHT_BUDGET,
     PAR_READER_WORKERS_FALLBACK, PAR_READER_WORKERS_MIN, PAR_READER_WORKERS_RESERVED,
@@ -200,6 +200,7 @@ impl<R: Read + Send> ElementReader<R> {
         let mut buf: Vec<u8> = Vec::new();
         let mut st_scratch: Vec<(u32, u32)> = Vec::new();
         let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+        let source = blob_iter.source().cloned();
 
         for blob in blob_iter {
             let blob = blob?;
@@ -210,12 +211,14 @@ impl<R: Read + Send> ElementReader<R> {
             if blob.get_type() != BlobType::OsmData {
                 continue;
             }
-            blob.decompress_into(&mut buf)?;
+            blob.decompress_into(&mut buf)
+                .map_err(|e| blob.locate_error(source.as_ref(), e))?;
             let block = PrimitiveBlock::from_vec_with_scratch(
                 std::mem::take(&mut buf),
                 &mut st_scratch,
                 &mut gr_scratch,
-            )?;
+            )
+            .map_err(|e| blob.locate_error(source.as_ref(), e))?;
             block.for_each_element(|element| {
                 if !matches!(order, NodeSortOrder::Unchecked)
                     && let Some(id) = node_id(&element)
@@ -293,7 +296,7 @@ impl<R: Read + Send> ElementReader<R> {
     pub(crate) fn for_each_fused_block<T, X, F>(self, transform: X, consume: F) -> Result<()>
     where
         T: Send,
-        X: Fn(PrimitiveBlock) -> std::result::Result<T, String> + Sync,
+        X: Fn(PrimitiveBlock) -> Result<T> + Sync,
         F: FnMut(T) -> Result<()>,
     {
         super::pipeline::run_pipeline_fused(
@@ -344,11 +347,8 @@ impl<R: Read + Send> ElementReader<R> {
 
         let handle = std::thread::spawn(move || {
             let deliver = |block: PrimitiveBlock| {
-                tx.send(Ok(block)).map_err(|_| {
-                    new_error(ErrorKind::Io(std::io::Error::other(
-                        "pipeline consumer dropped",
-                    )))
-                })
+                tx.send(Ok(block))
+                    .map_err(|_| Error::internal("pipeline consumer dropped"))
             };
             let result = super::pipeline::run_pipeline(
                 blob_iter,
@@ -512,6 +512,9 @@ where
     let queue = Arc::new(BatchQueue::new());
     let budget = Arc::new(ByteBudget::new(budget_cap));
     let pool = DecompressPool::new();
+    // Captured once; every worker borrows it to locate decode failures.
+    let source = blob_iter.source().cloned();
+    let source = source.as_ref();
 
     // Borrow the caller closures by shared reference so every worker shares
     // one instance. Their `Sync + Send` bounds make the shared references
@@ -536,7 +539,7 @@ where
             let budget = Arc::clone(&budget);
             let pool = Arc::clone(&pool);
             handles.push(scope.spawn(move || -> Result<T> {
-                run_par_worker(&queue, &budget, &pool, map_op, identity, reduce_op)
+                run_par_worker(&queue, &budget, &pool, source, map_op, identity, reduce_op)
             }));
         }
 
@@ -741,6 +744,7 @@ fn run_par_worker<MP, RD, ID, T>(
     queue: &BatchQueue,
     budget: &ByteBudget,
     pool: &Arc<DecompressPool>,
+    source: Option<&Arc<std::path::Path>>,
     map_op: &MP,
     identity: &ID,
     reduce_op: &RD,
@@ -774,7 +778,7 @@ where
                     }
                 }
                 Err(e) => {
-                    decode_err = Some(e);
+                    decode_err = Some(blob.locate_error(source, e));
                     break;
                 }
             }
@@ -1076,12 +1080,15 @@ impl ElementReader<FileReader> {
 /// or the first blob is not an `OsmHeader`.
 fn read_header_blob<R: Read + Send>(blob_iter: &mut BlobReader<R>) -> Result<HeaderBlock> {
     match blob_iter.next() {
-        Some(Ok(blob)) => match blob.decode()? {
+        Some(Ok(blob)) => match blob
+            .decode()
+            .map_err(|e| blob.locate_error(blob_iter.source(), e))?
+        {
             BlobDecode::OsmHeader(header) => Ok(*header),
-            _ => Err(new_error(ErrorKind::MissingHeader)),
+            _ => Err(new_missing_header()),
         },
         Some(Err(e)) => Err(e),
-        None => Err(new_error(ErrorKind::MissingHeader)),
+        None => Err(new_missing_header()),
     }
 }
 
@@ -1170,9 +1177,7 @@ impl Iterator for PipelinedBlocks {
                         ),
                         _ => "pipeline thread terminated without completing".to_owned(),
                     };
-                    Some(Err(new_error(ErrorKind::Io(std::io::Error::other(
-                        message,
-                    )))))
+                    Some(Err(Error::internal(message)))
                 }
             }
         }

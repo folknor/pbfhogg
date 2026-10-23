@@ -96,9 +96,9 @@ impl StringPool {
 
     pub(super) fn validate(&self) -> super::Result<()> {
         if self.overflowed {
-            return Err(
-                "string pool exceeds u32 offsets; widen offsets and bump FORMAT_VERSION".into(),
-            );
+            return Err(crate::error::Error::invalid_data(
+                "string pool exceeds u32 offsets; widen offsets and bump FORMAT_VERSION",
+            ));
         }
         Ok(())
     }

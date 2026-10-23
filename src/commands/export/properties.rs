@@ -38,8 +38,8 @@ impl<'a> MetaView<'a> {
 }
 
 fn push_json_string(buf: &mut String, value: &str) -> crate::Result<()> {
-    let encoded =
-        serde_json::to_string(value).map_err(|error| std::io::Error::other(error.to_string()))?;
+    let encoded = serde_json::to_string(value)
+        .map_err(|error| crate::Error::internal_with("failed to encode a JSON string", error))?;
     buf.push_str(&encoded);
     Ok(())
 }
@@ -105,11 +105,7 @@ where
             }
             if let Some(user) = &meta.user {
                 push_name(buf, &mut first, "@user")?;
-                push_json_string(
-                    buf,
-                    user.as_ref()
-                        .map_err(|error| std::io::Error::other(error.to_string()))?,
-                )?;
+                push_json_string(buf, user.as_ref().map_err(crate::Error::clone)?)?;
             }
             if let Some(value) = meta.visible {
                 push_name(buf, &mut first, "@visible")?;

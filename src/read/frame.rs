@@ -89,7 +89,7 @@ pub(crate) fn read_frame_prefix<R: Read>(reader: &mut R) -> Result<Option<usize>
     match reader.read_exact(&mut len_buf) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(crate::error::new_error(crate::error::ErrorKind::Io(e))),
+        Err(e) => return Err(e.into()),
     }
     check_header_len(u32::from_be_bytes(len_buf)).map(Some)
 }
@@ -142,9 +142,7 @@ pub(crate) fn read_frame_header<R: Read>(
     };
     header_buf.clear();
     header_buf.resize(header_len, 0);
-    reader
-        .read_exact(header_buf)
-        .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+    reader.read_exact(header_buf)?;
 
     // `parse_blob_header_with_index` rejects an oversized declared datasize
     // (>= MAX_BLOB_DATASIZE) before returning, so `data_size` is bounded here
@@ -159,10 +157,9 @@ pub(crate) fn read_frame_header<R: Read>(
                 offset: Some(frame_start),
             },
         )?;
-    // Stamp the frame start: the raw-frame callers otherwise report this
-    // refusal with no position, and on a multi-input command no input either.
-    check_header_position(&blob_type, frame_start == 0)
-        .map_err(|err| err.at(crate::ByteOffset(frame_start)))?;
+    // No location here: the caller walks the input and owns provenance, so
+    // it locates this refusal with the file, blob and frame start it knows.
+    check_header_position(&blob_type, frame_start == 0)?;
     Ok(Some(FrameHeader {
         header_len,
         blob_type,
@@ -198,7 +195,7 @@ mod tests {
     #[test]
     fn header_len_guards_bound_the_prefix() {
         assert!(matches!(
-            check_header_len(0).unwrap_err().into_kind(),
+            check_header_len(0).unwrap_err().kind(),
             ErrorKind::Blob(BlobError::InvalidHeaderSize)
         ));
         assert_eq!(check_header_len(1).unwrap(), 1);
@@ -206,18 +203,18 @@ mod tests {
         #[allow(clippy::cast_possible_truncation)]
         let cap = crate::blob::MAX_BLOB_HEADER_SIZE as u32;
         assert_eq!(check_header_len(cap - 1).unwrap(), cap as usize - 1);
-        match check_header_len(cap).unwrap_err().into_kind() {
+        match check_header_len(cap).unwrap_err().kind() {
             ErrorKind::Blob(BlobError::HeaderTooBig { size }) => {
-                assert_eq!(size, u64::from(cap));
+                assert_eq!(*size, u64::from(cap));
             }
             other => panic!("expected HeaderTooBig, got {other:?}"),
         }
         // The worst case the guard exists for: four 0xFF bytes ask for a 4 GiB
         // allocation. It must be refused by the size guard, not by the
         // allocator.
-        match check_header_len(u32::MAX).unwrap_err().into_kind() {
+        match check_header_len(u32::MAX).unwrap_err().kind() {
             ErrorKind::Blob(BlobError::HeaderTooBig { size }) => {
-                assert_eq!(size, u64::from(u32::MAX));
+                assert_eq!(*size, u64::from(u32::MAX));
             }
             other => panic!("expected HeaderTooBig, got {other:?}"),
         }
@@ -272,7 +269,7 @@ mod tests {
             None,
         ) {
             Err(err) => assert!(
-                matches!(err.into_kind(), ErrorKind::Io(_)),
+                matches!(err.kind(), ErrorKind::Io(_)),
                 "a truncated BlobHeader must surface as an I/O error"
             ),
             Ok(_) => panic!("a truncated BlobHeader must not read as EOF or success"),

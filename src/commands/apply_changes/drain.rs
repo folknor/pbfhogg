@@ -49,7 +49,7 @@ use rustc_hash::FxHashMap;
 use crate::ElementKind;
 use crate::block_builder::BlockBuilder;
 use crate::commands::{flush_block, flush_passthrough_buf};
-use crate::error::{Error, ErrorKind, Result, new_error};
+use crate::error::{Error, Result};
 use crate::file_writer::FileWriter;
 use crate::osc::CompactDiffOverlay;
 use crate::writer::PbfWriter;
@@ -383,9 +383,7 @@ pub(super) fn run_drain(
     // `failure.rs`), so checking here, after the disconnect, cannot miss one.
     if cfg.failure.has_failed() {
         return Err(cfg.failure.take().unwrap_or_else(|| {
-            new_error(ErrorKind::Io(std::io::Error::other(
-                "drain: a producer failed and its error was already reported",
-            )))
+            Error::internal("drain: a producer failed and its error was already reported")
         }));
     }
 
@@ -395,19 +393,18 @@ pub(super) fn run_drain(
     // genuine producer bug, which is what the message points at.
     if !state.buffer.is_empty() {
         let first_remaining = state.buffer.keys().next().copied().unwrap_or(0);
-        return Err(new_error(ErrorKind::Io(std::io::Error::other(format!(
+        return Err(Error::internal(format!(
             "drain: channel closed with {} items still in reorder buffer; expected next seq {}, \
              smallest remaining seq {}. Producer dropped a seq.",
             state.buffer.len(),
             state.next_seq,
             first_remaining,
-        )))));
+        )));
     }
 
     // Final flush of any in-flight coalescers.
     flush_copy_range(&mut state, &cfg, writer, counters)?;
-    flush_passthrough_buf(&mut state.passthrough_chunks, writer)
-        .map_err(|e| new_error(ErrorKind::Io(std::io::Error::other(e.to_string()))))?;
+    flush_passthrough_buf(&mut state.passthrough_chunks, writer)?;
 
     // Trailing creates: port `types_to_flush` match verbatim from
     // `rewrite.rs` so the cursor walk after end-of-stream emits creates
@@ -440,16 +437,14 @@ pub(super) fn run_drain(
             // run of trailing creates never trips the guard on its own; a
             // create ordered before base output already emitted does.
             check_output_order(&mut state, kind, id, id)?;
-            emit_create_for_output(id, kind, cfg.diff, &mut state.bb, writer, &mut stats, loc)
-                .map_err(|e| new_error(ErrorKind::Io(std::io::Error::other(e.to_string()))))?;
+            emit_create_for_output(id, kind, cfg.diff, &mut state.bb, writer, &mut stats, loc)?;
             let (cursor, _) = state.cursors.get_mut(kind, cfg.ranges);
             *cursor += 1;
             counters
                 .trailing_creates_emitted
                 .fetch_add(1, Ordering::Relaxed);
         }
-        flush_block(&mut state.bb, writer)
-            .map_err(|e| new_error(ErrorKind::Io(std::io::Error::other(e.to_string()))))?;
+        flush_block(&mut state.bb, writer)?;
     }
     crate::debug::emit_marker("MERGE_TRAILING_CREATES_END");
 
@@ -547,14 +542,14 @@ fn check_output_order(
             .order_watermark
             .observe(kind.ordinal(), min_id, max_id)
     {
-        return Err(new_error(ErrorKind::Io(std::io::Error::other(format!(
+        return Err(Error::invalid_data(format!(
             "apply-changes: refusing to write an unsorted PBF under a Sort.Type_then_ID \
              header - a {} blob starting at id {} follows {} output \
              already reaching id {previous_id}; re-sort the base with `pbfhogg sort`.",
             kind.as_str(),
             crate::osm_id::blob_osm_first_id(min_id, max_id),
             ElementKind::from_ordinal(previous_kind).map_or("unknown", ElementKind::as_str),
-        )))));
+        )));
     }
     Ok(())
 }
@@ -574,7 +569,7 @@ fn handle_type_transition(
 ) -> Result<()> {
     flush_copy_range(state, cfg, writer, counters)?;
     let had_chunks = !state.passthrough_chunks.is_empty();
-    flush_passthrough_buf(&mut state.passthrough_chunks, writer).map_err(io_err)?;
+    flush_passthrough_buf(&mut state.passthrough_chunks, writer)?;
     if had_chunks {
         counters
             .passthrough_chunks_flushed
@@ -601,7 +596,6 @@ fn handle_type_transition(
         stats,
         loc,
     )
-    .map_err(io_err)
 }
 
 /// Emit gap creates for the current blob's kind: upserts whose ID
@@ -619,7 +613,7 @@ fn handle_gap_creates(
         return Ok(());
     }
     flush_copy_range(state, cfg, writer, counters)?;
-    flush_passthrough_buf(&mut state.passthrough_chunks, writer).map_err(io_err)?;
+    flush_passthrough_buf(&mut state.passthrough_chunks, writer)?;
     let loc = LocMode::new(cfg.locations_on_ways, state.loc_map.as_deref());
     emit_gap_creates(
         item_kind,
@@ -631,9 +625,8 @@ fn handle_gap_creates(
         writer,
         stats,
         loc,
-    )
-    .map_err(io_err)?;
-    flush_block(&mut state.bb, writer).map_err(io_err)?;
+    )?;
+    flush_block(&mut state.bb, writer)?;
     counters.gap_creates_emitted.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
@@ -704,11 +697,11 @@ fn dispatch_variant(
             tagdata: _,
         } => {
             if !cfg.route.is_splice() {
-                return Err(new_error(ErrorKind::Io(std::io::Error::other(
+                return Err(Error::internal(
                     "drain: received CopyRange item on the owned route",
-                ))));
+                ));
             }
-            flush_passthrough_buf(&mut state.passthrough_chunks, writer).map_err(io_err)?;
+            flush_passthrough_buf(&mut state.passthrough_chunks, writer)?;
 
             let new_end = frame_start + frame_len as u64;
             match state.copy_range_run {
@@ -778,7 +771,7 @@ fn dispatch_variant(
             stats: per_blob_stats,
         } => {
             flush_copy_range(state, cfg, writer, counters)?;
-            flush_passthrough_buf(&mut state.passthrough_chunks, writer).map_err(io_err)?;
+            flush_passthrough_buf(&mut state.passthrough_chunks, writer)?;
             let mut rewrite_bytes: u64 = 0;
             // P1.5: workers already framed each chunk. Drain ships
             // them through `write_raw_owned` so the writer's
@@ -786,7 +779,7 @@ fn dispatch_variant(
             // `pipeline_send_wait_ns` blowup) is bypassed entirely.
             for chunk in framed_chunks {
                 rewrite_bytes += chunk.len() as u64;
-                writer.write_raw_owned(chunk).map_err(io_err)?;
+                writer.write_raw_owned(chunk)?;
                 counters
                     .rewrite_blocks_written
                     .fetch_add(1, Ordering::Relaxed);
@@ -830,14 +823,12 @@ fn flush_copy_range(
         return Ok(());
     };
     let Route::Splice(input_file) = &cfg.route else {
-        return Err(new_error(ErrorKind::Io(std::io::Error::other(
+        return Err(Error::internal(
             "drain: copy range run pending on the owned route",
-        ))));
+        ));
     };
     let len = end - start;
-    writer
-        .write_raw_copy(input_file, start, len)
-        .map_err(io_err)?;
+    writer.write_raw_copy(input_file, start, len)?;
     counters.copy_range_calls.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
@@ -855,9 +846,9 @@ fn flush_copy_range(
     _counters: &DrainCounters,
 ) -> Result<()> {
     if state.copy_range_run.take().is_some() {
-        return Err(new_error(ErrorKind::Io(std::io::Error::other(
+        return Err(Error::internal(
             "drain: copy_file_range path requires linux-direct-io feature",
-        ))));
+        ));
     }
     Ok(())
 }
@@ -872,16 +863,14 @@ fn barrier_publish_loc_map(
 ) -> Result<()> {
     crate::debug::emit_marker("MERGE_DRAIN_BARRIER_START");
 
-    let slots = cfg.coord_slots.as_ref().ok_or_else(|| {
-        new_error(ErrorKind::Io(std::io::Error::other(
-            "drain: locations_on_ways true but coord_slots is None",
-        )))
-    })?;
-    let loc_map_out = cfg.loc_map_out.as_ref().ok_or_else(|| {
-        new_error(ErrorKind::Io(std::io::Error::other(
-            "drain: locations_on_ways true but loc_map_out is None",
-        )))
-    })?;
+    let slots = cfg
+        .coord_slots
+        .as_ref()
+        .ok_or_else(|| Error::internal("drain: locations_on_ways true but coord_slots is None"))?;
+    let loc_map_out = cfg
+        .loc_map_out
+        .as_ref()
+        .ok_or_else(|| Error::internal("drain: locations_on_ways true but loc_map_out is None"))?;
 
     // Seed with OSC pre-seeded coords (from
     // `NodeLocationIndex::build_from_diff`'s `locations`) before
@@ -917,9 +906,9 @@ fn barrier_publish_loc_map(
     // the drain calls this exactly once, so a set failure is a bug,
     // not a steady-state condition.
     if loc_map_out.set(Arc::clone(&arc)).is_err() {
-        return Err(new_error(ErrorKind::Io(std::io::Error::other(
+        return Err(Error::internal(
             "drain: loc_map_out already published - barrier ran twice?",
-        ))));
+        ));
     }
     state.loc_map = Some(arc);
     state.barrier_done = true;
@@ -937,11 +926,4 @@ fn barrier_publish_loc_map(
 
     crate::debug::emit_marker("MERGE_DRAIN_BARRIER_END");
     Ok(())
-}
-
-/// Map any error displayable as a string into `crate::error::Error::Io`.
-/// Mirrors the io_err helper in `streaming.rs`.
-#[allow(clippy::needless_pass_by_value)]
-fn io_err<E: std::fmt::Display>(e: E) -> Error {
-    new_error(ErrorKind::Io(std::io::Error::other(e.to_string())))
 }

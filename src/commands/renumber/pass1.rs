@@ -36,6 +36,7 @@ pub(super) fn pass1_parallel_scan(
     schedule: &[BlobTask],
     start_node_id: i64,
     shared_file: &std::fs::File,
+    source: &std::sync::Arc<std::path::Path>,
     node_id_set: &IdSet,
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
 ) -> Result<Pass1Result> {
@@ -53,6 +54,7 @@ pub(super) fn pass1_parallel_scan(
     let totals = run_rewrite_stage(
         "node",
         "pass1",
+        source,
         schedule.len(),
         &mut workers,
         &counters,
@@ -60,42 +62,48 @@ pub(super) fn pass1_parallel_scan(
         |w: &mut Pass1Worker, idx| {
             let task = &schedule[idx];
             let base = bases[idx];
-            // Deliberately load only payload bytes and emit no tagdata. Carrying
-            // header key lists would change output and add per-blob rewrite work.
-            w.buffers.load(shared_file, task, &counters)?;
+            (|| {
+                // Deliberately load only payload bytes and emit no tagdata. Carrying
+                // header key lists would change output and add per-blob rewrite work.
+                w.buffers.load(shared_file, task, &counters)?;
 
-            let t = std::time::Instant::now();
-            let outcome = reframe_dense_with_new_ids(
-                &w.buffers.decompressed,
-                base,
-                node_id_set,
-                &mut w.overflow,
-                &mut w.reframe_buf,
-                &mut w.scratch,
-            )?;
-            add_ns(&counters.reframe_ns, t);
+                let t = std::time::Instant::now();
+                let outcome = reframe_dense_with_new_ids(
+                    &w.buffers.decompressed,
+                    base,
+                    node_id_set,
+                    &mut w.overflow,
+                    &mut w.reframe_buf,
+                    &mut w.scratch,
+                )?;
+                add_ns(&counters.reframe_ns, t);
 
-            if outcome.count != task.element_count {
-                return Err(format!(
-                    "pass1 blob {idx} decoded {} nodes, indexdata said {}",
-                    outcome.count, task.element_count
-                ));
-            }
-            counters.bump_blobs();
-            let block = if outcome.count == 0 {
-                None
-            } else {
-                let bytes = std::mem::take(&mut w.reframe_buf);
-                w.reframe_buf.reserve(bytes.len());
-                let index = blob_index(crate::ElementKind::Node, base, outcome.count, task.bbox)?;
-                Some((bytes, index))
-            };
-            Ok(Rewritten {
-                block,
-                span: outcome.span,
-                count: outcome.count,
-                orphans: 0,
-            })
+                if outcome.count != task.element_count {
+                    return Err(crate::Error::invalid_data(format!(
+                        "pass1 decoded {} nodes, indexdata said {}",
+                        outcome.count, task.element_count
+                    )));
+                }
+                counters.bump_blobs();
+                let block = if outcome.count == 0 {
+                    None
+                } else {
+                    let bytes = std::mem::take(&mut w.reframe_buf);
+                    w.reframe_buf.reserve(bytes.len());
+                    let index =
+                        blob_index(crate::ElementKind::Node, base, outcome.count, task.bbox)?;
+                    Some((bytes, index))
+                };
+                Ok(Rewritten {
+                    blob_index: task.blob_index,
+                    frame_offset: task.frame_offset,
+                    block,
+                    span: outcome.span,
+                    count: outcome.count,
+                    orphans: 0,
+                })
+            })()
+            .map_err(|e| task.locate(source, e))
         },
     )?;
 

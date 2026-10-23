@@ -150,9 +150,9 @@ impl Header {
         let fine_search_radius_m = f32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
         let coarse_search_radius_m = f32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]);
         validate_radius("search radius", fine_search_radius_m)
-            .map_err(FormatError::InvalidMetadata)?;
+            .map_err(|e| FormatError::InvalidMetadata(e.to_string()))?;
         validate_radius("coarse search radius", coarse_search_radius_m)
-            .map_err(FormatError::InvalidMetadata)?;
+            .map_err(|e| FormatError::InvalidMetadata(e.to_string()))?;
         Ok(Self {
             format_version: version,
             street_cell_level: street,
@@ -578,12 +578,13 @@ pub const FILE_STRINGS: &str = "strings.bin";
 
 /// Map a read-only file, including valid empty record files.
 #[cfg(feature = "geocode-reader")]
-pub(crate) fn mmap_or_empty(path: &std::path::Path) -> crate::BoxResult<memmap2::Mmap> {
-    let file =
-        std::fs::File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+pub(crate) fn mmap_or_empty(path: &std::path::Path) -> crate::Result<memmap2::Mmap> {
+    use crate::error::Error;
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::from(e).context(format!("failed to open {}", path.display())))?;
     let len = file
         .metadata()
-        .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
+        .map_err(|e| Error::from(e).context(format!("failed to stat {}", path.display())))?
         .len();
     let mapped = if len == 0 {
         // memmap2 refuses zero-length files; every consumer bounds-checks
@@ -591,12 +592,17 @@ pub(crate) fn mmap_or_empty(path: &std::path::Path) -> crate::BoxResult<memmap2:
         memmap2::MmapOptions::new()
             .map_anon()
             .and_then(memmap2::MmapMut::make_read_only)
-            .map_err(|e| format!("failed to create empty mmap for {}: {e}", path.display()))?
+            .map_err(|e| {
+                Error::from(e).context(format!(
+                    "failed to create empty mmap for {}",
+                    path.display()
+                ))
+            })?
     } else {
         // SAFETY: index files must remain unchanged while mapped, in both
         // the builder's post-flush phase and the Reader's lifetime.
         unsafe { memmap2::Mmap::map(&file) }
-            .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?
+            .map_err(|e| Error::from(e).context(format!("failed to mmap {}", path.display())))?
     };
     Ok(mapped)
 }
@@ -616,14 +622,36 @@ pub enum FormatError {
 /// Shared by the builder's config validation and the reader's header parse,
 /// so both sides accept exactly the same radii. The caller supplies the error
 /// framing: a bad build config is not bad index metadata.
-pub(crate) fn validate_radius(name: &str, radius: f32) -> Result<(), String> {
+pub(crate) fn validate_radius(name: &str, radius: f32) -> Result<(), RadiusError> {
     if !radius.is_finite() || radius < 0.0 {
-        return Err(format!(
-            "{name} must be a finite non-negative number, got {radius}"
-        ));
+        return Err(RadiusError {
+            name: name.to_owned(),
+            radius,
+        });
     }
     Ok(())
 }
+
+/// A search radius that is not a finite non-negative number. A neutral leaf:
+/// the builder config check classifies it as an invalid argument, the header
+/// parse as invalid index metadata.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RadiusError {
+    name: String,
+    radius: f32,
+}
+
+impl std::fmt::Display for RadiusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} must be a finite non-negative number, got {}",
+            self.name, self.radius
+        )
+    }
+}
+
+impl std::error::Error for RadiusError {}
 
 impl std::fmt::Display for FormatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

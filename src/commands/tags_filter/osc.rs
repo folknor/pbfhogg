@@ -8,7 +8,7 @@ use flate2::write::GzEncoder;
 use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 
-use crate::BoxResult as Result;
+use crate::error::Result;
 use crate::osc::write::{
     OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay, write_delete_xml,
     write_node_xml, write_relation_xml, write_way_xml,
@@ -282,7 +282,9 @@ impl OscSink for FilterSink<'_> {
             crate::MemberType::Way => MemberId::Way(id),
             crate::MemberType::Relation => MemberId::Relation(id),
             crate::MemberType::Unknown(v) => {
-                return Err(format!("unknown relation member type value '{v}'").into());
+                return Err(crate::Error::invalid_data(format!(
+                    "unknown relation member type value '{v}'"
+                )));
             }
         };
         if let Some(cur) = self.current.as_mut() {

@@ -10,7 +10,7 @@ use bytes::Bytes;
 use flate2::Decompress;
 use std::cell::RefCell;
 
-use crate::error::{BlobError, ErrorKind, Result, new_blob_error, new_error};
+use crate::error::{BlobError, Error, Result, new_blob_error};
 use crate::tunables::{
     DECOMPRESS_EXPANSION_GUESS, DECOMPRESS_POOL_MAX_BUFFERS, DECOMPRESS_POOL_MAX_RETAINED_CAPACITY,
 };
@@ -259,11 +259,7 @@ fn zlib_inflate_bounded(compressed: &[u8], buf: &mut Vec<u8>, budget: usize) -> 
             let before_out = buf.len();
             let status = decompress
                 .decompress_vec(input, buf, flate2::FlushDecompress::None)
-                .map_err(|e| {
-                    new_error(ErrorKind::Io(std::io::Error::other(format!(
-                        "zlib decompress error: {e}"
-                    ))))
-                })?;
+                .map_err(|e| Error::invalid_data_with("zlib decompress error", e))?;
             let consumed = (decompress.total_in() - before_in) as usize;
             input = &input[consumed..];
             if matches!(status, flate2::Status::StreamEnd) {
@@ -272,7 +268,7 @@ fn zlib_inflate_bounded(compressed: &[u8], buf: &mut Vec<u8>, budget: usize) -> 
             if consumed == 0 && buf.len() == before_out {
                 // No input consumed, no output produced, no stream end: the
                 // deflate stream cannot be completed from the bytes we have.
-                return Err(new_error(ErrorKind::Io(std::io::Error::new(
+                return Err(Error::io_kind(
                     std::io::ErrorKind::UnexpectedEof,
                     format!(
                         "zlib stream ended before the final deflate block: \
@@ -280,7 +276,7 @@ fn zlib_inflate_bounded(compressed: &[u8], buf: &mut Vec<u8>, budget: usize) -> 
                         decompress.total_in(),
                         buf.len() - start
                     ),
-                ))));
+                ));
             }
         }
         let size = (buf.len() - start) as u64;
@@ -575,11 +571,15 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "call sites pass fresh results; the error is only inspected"
+    )]
     fn assert_too_big(result: crate::error::Result<()>, expected_size: u64) {
-        match result.map_err(crate::error::Error::into_kind) {
+        match result.as_ref().map_err(crate::error::Error::kind) {
             Err(ErrorKind::Blob(BlobError::MessageTooBig { size })) => {
                 assert_eq!(
-                    size, expected_size,
+                    *size, expected_size,
                     "surfaced size must be the payload size"
                 );
             }
@@ -684,7 +684,7 @@ mod tests {
         let err = super::decompress_blob_raw(&blob, &mut out)
             .expect_err("decompress_blob_raw must reject a two-payload blob");
         assert!(
-            matches!(err.into_kind(), ErrorKind::WireFormat { .. }),
+            matches!(err.kind(), ErrorKind::WireFormat { .. }),
             "a multi-payload Blob must be a wire-format error"
         );
         assert!(
@@ -802,7 +802,8 @@ mod tests {
                 assert!(
                     matches!(
                         decompress_wire_blob_into(&blob, &mut out)
-                            .map_err(crate::error::Error::into_kind),
+                            .as_ref()
+                            .map_err(crate::error::Error::kind),
                         Err(ErrorKind::WireFormat { .. })
                     ),
                     "{kind:?}: raw_size {lie} against {honest} bytes must be rejected"
@@ -966,7 +967,7 @@ mod tests {
         let err = decompress_wire_blob_into(&blob, &mut out)
             .expect_err("a raw_size of i32::MAX over a 4-byte payload is a lie");
         assert!(
-            matches!(err.into_kind(), ErrorKind::WireFormat { .. }),
+            matches!(err.kind(), ErrorKind::WireFormat { .. }),
             "a raw_size mismatch must be a wire-format error"
         );
         assert_eq!(out, b"tiny");

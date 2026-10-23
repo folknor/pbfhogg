@@ -20,6 +20,7 @@ use super::super::Result;
 use super::blob_meta::BlobMeta;
 use super::radix::ScratchDir;
 use super::{BucketLayout, ID_RECORD_SIZE, IdRecord, NodeBlobInfo};
+use crate::error::Error;
 use crate::tunables::{
     BUCKET_BUF_SIZE, DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN, DECODE_WORKERS_RESERVED,
     NUM_BUCKETS, PER_WAY_REFCOUNT_SIDECAR_BUF_BYTES, POOL_REORDER_CAPACITY_WIDE,
@@ -129,7 +130,7 @@ pub(super) fn stage1_pass_a(
 
     let shared_file = std::sync::Arc::new(
         std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+            .map_err(|e| Error::from(e).context(format!("failed to open {}", input.display())))?,
     );
 
     crate::debug::emit_marker("EXTJOIN_S1_PASS_A_START");
@@ -155,7 +156,7 @@ pub(super) fn stage1_pass_a(
     let s1a_id_shard_bytes_written = std::sync::atomic::AtomicU64::new(0);
     let s1a_id_shard_write_ns = std::sync::atomic::AtomicU64::new(0);
     let s1a_id_shard_write_calls = std::sync::atomic::AtomicU64::new(0);
-    let s1a_id_shard_flush_err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let s1a_id_shard_flush_err: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
     // Per-(id-bucket) record counts. Each worker tallies into a local
     // `Vec<u64>` (no atomic in the hot loop - the per-record cost
     // would dominate; europe sees ~4.7B records and a contended
@@ -167,7 +168,7 @@ pub(super) fn stage1_pass_a(
     let s1a_id_bucket_counts_workers: std::sync::Mutex<Vec<Vec<u64>>> =
         std::sync::Mutex::new(Vec::new());
     {
-        type PassAItem = (u32, std::result::Result<(u64, Vec<u32>), String>);
+        type PassAItem = (u32, crate::Result<(u64, Vec<u32>)>);
         let (tx, rx) = std::sync::mpsc::sync_channel::<PassAItem>(POOL_RESULT_CHANNEL_DEPTH);
         let schedule_ref = schedule;
         let next_ref = &next_idx;
@@ -213,11 +214,11 @@ pub(super) fn stage1_pass_a(
                         }
                         let task = &schedule_ref[idx];
 
-                        let result: std::result::Result<(u64, Vec<u32>), String> = (|| {
+                        let result: crate::Result<(u64, Vec<u32>)> = (|| {
                             let t0 = std::time::Instant::now();
                             read_buf.resize(task.data_size, 0);
                             file.read_exact_at(&mut read_buf, task.data_offset)
-                                .map_err(|e| format!("pass A pread: {e}"))?;
+                                .map_err(|e| Error::from(e).context("pass A pread"))?;
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
                             s1a_bytes_ref.fetch_add(task.data_size as u64, Relaxed);
@@ -225,7 +226,7 @@ pub(super) fn stage1_pass_a(
 
                             let t1 = std::time::Instant::now();
                             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
-                                .map_err(|e| format!("pass A decompress: {e}"))?;
+                                .map_err(|e| e.context("pass A decompress"))?;
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
 
@@ -255,8 +256,7 @@ pub(super) fn stage1_pass_a(
                                     #[allow(clippy::cast_possible_truncation)]
                                     per_way_rcs.push(refs.len() as u32);
                                 },
-                            )
-                            .map_err(|e| e.to_string())?;
+                            )?;
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_scan_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
 
@@ -273,7 +273,8 @@ pub(super) fn stage1_pass_a(
                                         .path
                                         .join(format!("id-W{worker_id}-{bucket_idx:03}"));
                                     let f = std::fs::File::create(&path).map_err(|e| {
-                                        format!("create id shard {}: {e}", path.display(),)
+                                        Error::from(e)
+                                            .context(format!("create id shard {}", path.display()))
                                     })?;
                                     id_shard_writers.push(Some(BufWriter::with_capacity(
                                         BUCKET_BUF_SIZE,
@@ -290,7 +291,9 @@ pub(super) fn stage1_pass_a(
                             let mut blob_bytes: u64 = 0;
                             for (i, &node_id) in blob_node_ids.iter().enumerate() {
                                 let blob_local_slot = u32::try_from(i).map_err(|_| {
-                                    format!("blob {} has > u32::MAX refs (i={i})", task.seq,)
+                                    Error::invalid_data(format!(
+                                        "way blob has > u32::MAX refs (i={i})"
+                                    ))
                                 })?;
                                 let location = if node_id < 0 {
                                     None
@@ -313,9 +316,10 @@ pub(super) fn stage1_pass_a(
                                     let writer = id_shard_writers[bucket_idx]
                                         .as_mut()
                                         .expect("shard writer initialised");
-                                    writer
-                                        .write_all(&id_rec_buf)
-                                        .map_err(|e| format!("write id shard W{worker_id}: {e}"))?;
+                                    writer.write_all(&id_rec_buf).map_err(|e| {
+                                        Error::from(e)
+                                            .context(format!("write id shard W{worker_id}"))
+                                    })?;
                                     id_bucket_local_counts[bucket_idx] += 1;
                                     blob_emitted += 1;
                                     blob_bytes += ID_RECORD_SIZE as u64;
@@ -330,8 +334,7 @@ pub(super) fn stage1_pass_a(
                             s1a_id_bytes_ref.fetch_add(blob_bytes, Relaxed);
 
                             Ok((blob_node_ids.len() as u64, per_way_rcs))
-                        })(
-                        );
+                        })();
 
                         if tx.send((task.seq, result)).is_err() {
                             break;
@@ -349,7 +352,9 @@ pub(super) fn stage1_pass_a(
                                 .lock()
                                 .expect("id shard flush error mutex");
                             if slot.is_none() {
-                                *slot = Some(format!("flush id shard W{worker_id}: {e}",));
+                                *slot = Some(
+                                    Error::from(e).context(format!("flush id shard W{worker_id}")),
+                                );
                             }
                             break;
                         }
@@ -368,23 +373,21 @@ pub(super) fn stage1_pass_a(
             let mut sidecar_writer = BufWriter::with_capacity(
                 REF_COUNT_SIDECAR_BUF_BYTES,
                 std::fs::File::create(ref_count_sidecar)
-                    .map_err(|e| format!("create sidecar: {e}"))?,
+                    .map_err(|e| Error::from(e).context("create sidecar"))?,
             );
             let mut per_way_writer = BufWriter::with_capacity(
                 PER_WAY_REFCOUNT_SIDECAR_BUF_BYTES,
                 std::fs::File::create(per_way_refcount_sidecar)
-                    .map_err(|e| format!("create per-way sidecar: {e}"))?,
+                    .map_err(|e| Error::from(e).context("create per-way sidecar"))?,
             );
             let mut varint_buf: Vec<u8> = Vec::with_capacity(STAGE1_VARINT_BUF_CAPACITY);
-            let mut reorder: crate::reorder_buffer::ReorderBuffer<
-                std::result::Result<(u64, Vec<u32>), String>,
-            > = crate::reorder_buffer::ReorderBuffer::with_capacity(POOL_REORDER_CAPACITY_WIDE);
+            let mut reorder: crate::reorder_buffer::ReorderBuffer<crate::Result<(u64, Vec<u32>)>> =
+                crate::reorder_buffer::ReorderBuffer::with_capacity(POOL_REORDER_CAPACITY_WIDE);
 
             for (seq_num, item) in rx {
                 reorder.push(seq_num as usize, item);
                 while let Some(result) = reorder.pop_ready() {
-                    let (ref_count, per_way_rcs) =
-                        result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                    let (ref_count, per_way_rcs) = result?;
                     sidecar_writer.write_all(&ref_count.to_le_bytes())?;
                     total_refs += ref_count;
 
@@ -410,9 +413,9 @@ pub(super) fn stage1_pass_a(
     // Surface any worker-side flush errors from the id-shard writers.
     let mut id_flush_slot = s1a_id_shard_flush_err
         .lock()
-        .map_err(|e| format!("id shard flush mutex poisoned: {e}"))?;
+        .map_err(|_| Error::internal("id shard flush mutex poisoned"))?;
     if let Some(err) = id_flush_slot.take() {
-        return Err(err.into());
+        return Err(err);
     }
     drop(id_flush_slot);
 
@@ -506,12 +509,11 @@ pub(super) fn build_node_blob_mapping(blob_meta: &[BlobMeta]) -> Result<Vec<Node
         // and stage 2's id-range partition would otherwise consume
         // some other blob's records as if they belonged here.
         if meta.max_id < meta.min_id {
-            return Err(format!(
+            return Err(Error::invalid_data(format!(
                 "altw stage 1: blob at data_offset={} has reversed \
                  indexdata range [min_id={}, max_id={}]",
                 meta.data_offset, meta.min_id, meta.max_id,
-            )
-            .into());
+            )));
         }
         mapping.push(NodeBlobInfo {
             data_offset: meta.data_offset,
@@ -586,7 +588,9 @@ pub(super) fn stage1_way_pass(
     let buckets_per_worker = NUM_BUCKETS as u64;
     let min_needed = STAGE1_HEADROOM_FDS + buckets_per_worker;
     if available < min_needed {
-        return Err(fd_allowance_too_low(&fd_budget, min_needed).into());
+        return Err(Error::invalid_argument(fd_allowance_too_low(
+            &fd_budget, min_needed,
+        )));
     }
     #[allow(clippy::cast_possible_truncation)]
     let fd_cap = ((available - STAGE1_HEADROOM_FDS) / buckets_per_worker) as usize;

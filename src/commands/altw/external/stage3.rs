@@ -4,6 +4,7 @@
 use super::super::Result;
 #[cfg(feature = "linux-direct-io")]
 use super::radix::advise_dontneed_file;
+use crate::error::Error;
 
 // Fault-injection hooks for tests. Gated behind the `static-test-hooks`
 // Cargo feature and `not(test)`: product builds and the library's own
@@ -59,13 +60,13 @@ fn scatter_bucket_entries(
     data_buf: &[u8],
     bucket_idx: usize,
     scatter_buf: &mut [u8],
-) -> std::result::Result<u64, String> {
+) -> crate::Result<u64> {
     if !data_buf.len().is_multiple_of(RESOLVED_ENTRY_SIZE) {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "slot bucket {bucket_idx} has {} trailing bytes (entry size {})",
             data_buf.len() % RESOLVED_ENTRY_SIZE,
             RESOLVED_ENTRY_SIZE,
-        ));
+        )));
     }
 
     let bucket_slots = scatter_buf.len() / COORD_SLOT_SIZE;
@@ -74,9 +75,9 @@ fn scatter_bucket_entries(
     for chunk in chunks {
         let local_slot_pos = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as usize;
         if local_slot_pos >= bucket_slots {
-            return Err(format!(
+            return Err(Error::internal(format!(
                 "slot bucket {bucket_idx} local_pos {local_slot_pos} outside bucket slot span {bucket_slots}"
-            ));
+            )));
         }
         let offset = local_slot_pos * COORD_SLOT_SIZE;
         // Preserve the private ResolvedEntry latitude/pin encoding verbatim.
@@ -123,7 +124,7 @@ pub(super) fn stage3_slot_reorder(
     let s3_max_worker_buf_bytes = std::sync::atomic::AtomicU64::new(0);
     let s3_fadvise_calls = std::sync::atomic::AtomicU64::new(0);
     let s3_fadvise_bytes = std::sync::atomic::AtomicU64::new(0);
-    let s3_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let s3_error: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
 
     // Integrated path counters.
     let s3_integ_encode_ms = std::sync::atomic::AtomicU64::new(0);
@@ -160,7 +161,7 @@ pub(super) fn stage3_slot_reorder(
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(num_workers);
         for worker_id in 0..num_workers {
-            let handle = scope.spawn(move || -> std::result::Result<(), String> {
+            let handle = scope.spawn(move || -> crate::Result<()> {
                 use std::sync::atomic::Ordering::Relaxed;
 
                 // Panic-safety: if this closure unwinds before `disarm`,
@@ -216,11 +217,11 @@ pub(super) fn stage3_slot_reorder(
                         // bytes so the FullyContained and straddler paths stay
                         // consistent with what the per-blob coord slice looked
                         // like under the pre-integration coord_slots reader.
-                        let result: std::result::Result<(), String> = (|| {
+                        let result: crate::Result<()> = (|| {
                             let intersections = classify_blobs_in_bucket(
                                 bucket_start, bucket_end,
                                 ctx.way_slot_starts, total_slots,
-                            ).map_err(|e| format!("classify bucket {bucket_idx}: {e}"))?;
+                            ).map_err(|e| e.context(format!("classify bucket {bucket_idx}")))?;
                             let bucket_bytes = bucket_slots as usize * COORD_SLOT_SIZE;
                             scatter_buf.clear();
                             scatter_buf.resize(bucket_bytes, 0);
@@ -238,14 +239,14 @@ pub(super) fn stage3_slot_reorder(
                         })();
                         if let Err(e) = result {
                             *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.clone());
-                            router.abort(format!("stage 3 worker {worker_id} error: {e}"));
+                            router.abort(e.clone().context(format!("stage 3 worker {worker_id} error")));
                             abort_guard.disarm();
                             return Err(e);
                         }
                         continue;
                     }
 
-                    let result: std::result::Result<(), String> = (|| {
+                    let result: crate::Result<()> = (|| {
                         let bucket_bytes = bucket_slots as usize * COORD_SLOT_SIZE;
                         scatter_buf.clear();
                         scatter_buf.resize(bucket_bytes, 0);
@@ -253,13 +254,13 @@ pub(super) fn stage3_slot_reorder(
                         let t_open = std::time::Instant::now();
                         data_buf.clear();
                         let bucket_file = std::fs::File::open(&paths[bucket_idx])
-                            .map_err(|e| format!("open slot bucket: {e}"))?;
+                            .map_err(|e| Error::from(e).context("open slot bucket"))?;
                         #[allow(clippy::cast_possible_truncation)]
                         s3_open_ref.fetch_add(t_open.elapsed().as_millis() as u64, Relaxed);
 
                         let t_read = std::time::Instant::now();
                         std::io::Read::read_to_end(&mut &bucket_file, &mut data_buf)
-                            .map_err(|e| format!("read slot bucket: {e}"))?;
+                            .map_err(|e| Error::from(e).context("read slot bucket"))?;
                         #[cfg(feature = "linux-direct-io")]
                         {
                             s3_fadvise_calls_ref.fetch_add(1, Relaxed);
@@ -303,7 +304,7 @@ pub(super) fn stage3_slot_reorder(
                         let intersections = classify_blobs_in_bucket(
                             bucket_start, bucket_end,
                             ctx.way_slot_starts, total_slots,
-                        ).map_err(|e| format!("classify bucket {bucket_idx}: {e}"))?;
+                        ).map_err(|e| e.context(format!("classify bucket {bucket_idx}")))?;
                         emit_integrated_intersections(
                             &intersections, &scatter_buf, bucket_start,
                             total_slots, ctx, &mut encode_scratch,
@@ -321,7 +322,7 @@ pub(super) fn stage3_slot_reorder(
                     if let Err(e) = result {
                         *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                             Some(e.clone());
-                        router.abort(format!("stage 3 worker {worker_id} error: {e}"));
+                        router.abort(e.clone().context(format!("stage 3 worker {worker_id} error")));
                         abort_guard.disarm();
                         return Err(e);
                     }
@@ -335,7 +336,7 @@ pub(super) fn stage3_slot_reorder(
 
         // Propagate first worker error or panic. No manifests to collect -
         // each worker published directly to the router.
-        let mut first_err: Option<String> = None;
+        let mut first_err: Option<Error> = None;
         for handle in handles {
             match handle.join() {
                 Ok(Ok(())) => {}
@@ -345,10 +346,9 @@ pub(super) fn stage3_slot_reorder(
                     }
                 }
                 Err(payload) => {
-                    let msg =
-                        crate::error::panic_error("worker thread", payload.as_ref()).to_string();
                     if first_err.is_none() {
-                        first_err = Some(msg);
+                        first_err =
+                            Some(crate::error::panic_error("worker thread", payload.as_ref()));
                     }
                 }
             }
@@ -361,7 +361,7 @@ pub(super) fn stage3_slot_reorder(
     });
 
     if let Some(e) = s3_error.into_inner().unwrap_or(None) {
-        return Err(e.into());
+        return Err(e);
     }
 
     #[allow(clippy::cast_possible_wrap)]
@@ -423,7 +423,7 @@ fn emit_integrated_intersections(
     s3_integ_worker_tmp_bytes_ref: &std::sync::atomic::AtomicU64,
     s3_tmp_pwrite_ns_ref: &std::sync::atomic::AtomicU64,
     s3_tmp_pwrite_calls_ref: &std::sync::atomic::AtomicU64,
-) -> std::result::Result<(), String> {
+) -> crate::Result<()> {
     use std::os::unix::fs::FileExt as _;
     use std::sync::atomic::Ordering::Relaxed;
 
@@ -455,7 +455,7 @@ fn emit_integrated_intersections(
                     ctx.inject_prepass,
                     encode_scratch,
                 )
-                .map_err(|e| format!("encode blob {blob_idx}: {e}"))?;
+                .map_err(|e| e.context(format!("encode blob {blob_idx}")))?;
                 #[allow(clippy::cast_possible_truncation)]
                 s3_integ_encode_ref.fetch_add(t_enc.elapsed().as_millis() as u64, Relaxed);
 
@@ -464,7 +464,9 @@ fn emit_integrated_intersections(
                 let t_pw = std::time::Instant::now();
                 tmp_file
                     .write_all_at(encode_scratch, byte_offset)
-                    .map_err(|e| format!("write worker tmp blob {blob_idx}: {e}"))?;
+                    .map_err(|e| {
+                        Error::from(e).context(format!("write worker tmp blob {blob_idx}"))
+                    })?;
                 #[allow(clippy::cast_possible_truncation)]
                 s3_tmp_pwrite_ns_ref.fetch_add(t_pw.elapsed().as_nanos() as u64, Relaxed);
                 s3_tmp_pwrite_calls_ref.fetch_add(1, Relaxed);
@@ -476,7 +478,7 @@ fn emit_integrated_intersections(
                 // will see them.
                 router
                     .publish_worker(blob_idx, worker_id, byte_offset, byte_length)
-                    .map_err(|e| format!("publish blob {blob_idx}: {e}"))?;
+                    .map_err(|e| e.context(format!("publish blob {blob_idx}")))?;
             }
             BlobBucketIntersection::LeftHalf { blob_idx } => {
                 let blob_idx = *blob_idx;
@@ -498,7 +500,7 @@ fn emit_integrated_intersections(
                         ctx.inject_prepass,
                         encode_scratch,
                     )
-                    .map_err(|e| format!("straddler left blob {blob_idx}: {e}"))?;
+                    .map_err(|e| e.context(format!("straddler left blob {blob_idx}")))?;
             }
             BlobBucketIntersection::RightHalf { blob_idx } => {
                 let blob_idx = *blob_idx;
@@ -524,7 +526,7 @@ fn emit_integrated_intersections(
                         ctx.inject_prepass,
                         encode_scratch,
                     )
-                    .map_err(|e| format!("straddler right blob {blob_idx}: {e}"))?;
+                    .map_err(|e| e.context(format!("straddler right blob {blob_idx}")))?;
             }
         }
     }

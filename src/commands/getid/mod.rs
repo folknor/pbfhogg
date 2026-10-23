@@ -9,6 +9,7 @@ use super::{
     ensure_way_capacity_local, flush_local, require_indexdata, writer_from_header,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::error::Error;
 use crate::file_writer::FileWriter;
 use crate::owned::{dense_node_metadata, element_metadata};
 use crate::read::header_walker::ScanArm;
@@ -89,7 +90,7 @@ pub struct ElementRef {
 }
 
 impl std::str::FromStr for ElementRef {
-    type Err = String;
+    type Err = crate::Error;
 
     fn from_str(spec: &str) -> std::result::Result<Self, Self::Err> {
         let (kind, id_str) = if let Some(id) = spec.strip_prefix("node/") {
@@ -105,33 +106,34 @@ impl std::str::FromStr for ElementRef {
         } else if let Some(id) = spec.strip_prefix('r') {
             (ElementKind::Relation, id)
         } else {
-            return Err(format!(
+            return Err(Error::invalid_argument(format!(
                 "invalid element spec '{spec}': expected n<id>, w<id>, r<id>, \
                  node/<id>, way/<id>, or relation/<id>"
-            ));
+            )));
         };
 
-        let id = id_str
-            .parse()
-            .map_err(|_| format!("invalid ID in '{spec}': '{id_str}' is not an integer"))?;
+        let id = id_str.parse().map_err(|_| {
+            Error::invalid_argument(format!(
+                "invalid ID in '{spec}': '{id_str}' is not an integer"
+            ))
+        })?;
         Ok(Self { kind, id })
     }
 }
 
 /// Parse an ID spec like "n123", "w456", "r789".
-// String errors are intentional - shows the bad input value, which is more helpful
-// for CLI users than the underlying ParseIntError.
+// The messages show the bad input value, which is more helpful for CLI users
+// than the underlying ParseIntError.
 fn parse_id_spec(spec: &str, default_type: Option<ElementKind>) -> Result<(ElementKind, i64)> {
     let (kind, id) = parse_id_spec_inner(spec, default_type)?;
     if id < 0 {
         let kind = kind.as_str();
-        return Err(format!(
+        return Err(Error::invalid_argument(format!(
             "getid requires non-negative input ids. \
              Input contains {kind} id {id}. \
              Negative ids are JOSM editor-local staging identifiers \
              that should be resolved before processing."
-        )
-        .into());
+        )));
     }
     Ok((kind, id))
 }
@@ -144,27 +146,31 @@ fn parse_id_spec_inner(
     // default, pbfhogg requires an explicit --default-type for bare numbers.
     if spec.len() < 2 {
         if let Some(default) = default_type {
-            let id: i64 = spec
-                .parse()
-                .map_err(|_| format!("invalid ID spec: {spec:?} (bad number)"))?;
+            let id: i64 = spec.parse().map_err(|_| {
+                Error::invalid_argument(format!("invalid ID spec: {spec:?} (bad number)"))
+            })?;
             return Ok((default, id));
         }
-        return Err(format!("invalid ID spec: {spec:?} (expected n/w/r prefix + number)").into());
+        return Err(Error::invalid_argument(format!(
+            "invalid ID spec: {spec:?} (expected n/w/r prefix + number)"
+        )));
     }
     let prefix = spec.as_bytes()[0];
     if matches!(prefix, b'n' | b'w' | b'r') {
         let element_ref: ElementRef = spec
             .parse()
-            .map_err(|error| format!("invalid ID spec: {spec:?} ({error})"))?;
+            .map_err(|error: Error| error.context(format!("invalid ID spec: {spec:?}")))?;
         return Ok((element_ref.kind, element_ref.id));
     }
     if let Some(default) = default_type {
-        let id: i64 = spec
-            .parse()
-            .map_err(|_| format!("invalid ID spec: {spec:?} (bad number)"))?;
+        let id: i64 = spec.parse().map_err(|_| {
+            Error::invalid_argument(format!("invalid ID spec: {spec:?} (bad number)"))
+        })?;
         return Ok((default, id));
     }
-    Err(format!("invalid ID spec: {spec:?} (expected prefix 'n', 'w', or 'r')").into())
+    Err(Error::invalid_argument(format!(
+        "invalid ID spec: {spec:?} (expected prefix 'n', 'w', or 'r')"
+    )))
 }
 
 /// Parse ID specs from command-line arguments.
@@ -221,7 +227,11 @@ pub fn parse_ids_from_file_with_default_type(
         .filter_map(id_file_token)
         .map(ToString::to_string)
         .collect();
-    parse_ids_with_default_type(&specs, default_type)
+    // A bad id in a file is malformed input content, not a bad request: the
+    // spec parser's `InvalidArgument` is reclassified here, kept as the cause.
+    parse_ids_with_default_type(&specs, default_type).map_err(|error| {
+        Error::invalid_data_with(format!("invalid id file {}", path.display()), error)
+    })
 }
 
 /// The id token on one raw line of an id file, or `None` to skip the line.
@@ -586,10 +596,15 @@ fn filter_by_id_walker(
     let mut writer: Option<PbfWriter<FileWriter>> = None;
 
     while let Some(meta) = walker.next_header()? {
+        // The walker owns provenance: failures on this blob are located with
+        // the blob index and frame start it handed out.
+        let locate = |e: Error| walker.locate_meta(&meta, e);
         match meta.blob_type {
             BlobKind::OsmHeader => {
-                walker.pread_data(meta.data_offset, meta.data_size, &mut data_buf)?;
-                let header = decode_blob_to_headerblock(&data_buf)?;
+                walker
+                    .pread_data(meta.data_offset, meta.data_size, &mut data_buf)
+                    .map_err(locate)?;
+                let header = decode_blob_to_headerblock(&data_buf).map_err(locate)?;
                 super::warn_locations_on_ways_loss(&header, host);
                 let header_bytes = super::build_output_header(&header, true, overrides, |hb| hb)?;
                 writer = Some(super::writer_from_header_bytes(
@@ -602,9 +617,11 @@ fn filter_by_id_walker(
             }
             BlobKind::OsmData => {
                 osmdata_blobs += 1;
-                let w = writer
-                    .as_mut()
-                    .ok_or("no OSMHeader blob found before OsmData")?;
+                let w = writer.as_mut().ok_or_else(|| {
+                    locate(Error::invalid_data(
+                        "no OSMHeader blob found before OsmData",
+                    ))
+                })?;
 
                 if let Some(ref idx) = meta.index {
                     let has_match = match idx.kind {
@@ -625,7 +642,9 @@ fn filter_by_id_walker(
                         // Invert mode, no ID match: raw passthrough. We
                         // need the full frame bytes (length prefix +
                         // header + data) to write verbatim.
-                        walker.pread_data(meta.frame_start, meta.frame_size, &mut frame_buf)?;
+                        walker
+                            .pread_data(meta.frame_start, meta.frame_size, &mut frame_buf)
+                            .map_err(locate)?;
                         // The blob is copied verbatim and never decoded, so
                         // `idx.count` is what the file says about itself, not
                         // something this command observed. It goes in its own
@@ -639,9 +658,12 @@ fn filter_by_id_walker(
                 // Blob might contain matching IDs, or the blob carries no
                 // indexdata and we must decode to check. Pread the data
                 // and run the per-element filter.
-                walker.pread_data(meta.data_offset, meta.data_size, &mut data_buf)?;
+                walker
+                    .pread_data(meta.data_offset, meta.data_size, &mut data_buf)
+                    .map_err(locate)?;
                 decompress_buf.clear();
-                crate::blob::decompress_blob_data_into(&data_buf, &mut decompress_buf)?;
+                crate::blob::decompress_blob_data_into(&data_buf, &mut decompress_buf)
+                    .map_err(locate)?;
                 // Move the decompressed Vec into the block: no Bytes round-trip,
                 // no second whole-buffer copy (the `new_with_scratch(Bytes)` route
                 // paid a `to_vec`). `decompress_buf` is reallocated next blob.
@@ -649,7 +671,8 @@ fn filter_by_id_walker(
                     std::mem::take(&mut decompress_buf),
                     &mut st_scratch,
                     &mut gr_scratch,
-                )?;
+                )
+                .map_err(locate)?;
                 output_blocks.clear();
                 let outcome = process_block(
                     &block,
@@ -661,9 +684,8 @@ fn filter_by_id_walker(
                     false,
                     report_found,
                 )
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                flush_local(&mut bb, &mut output_blocks)
-                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                .map_err(locate)?;
+                flush_local(&mut bb, &mut output_blocks)?;
                 for OwnedBlock {
                     bytes: block_bytes,
                     index,
@@ -691,7 +713,7 @@ fn filter_by_id_walker(
         }
     }
 
-    let mut writer = writer.ok_or("no OSMHeader blob found")?;
+    let mut writer = writer.ok_or_else(|| Error::invalid_data("no OSMHeader blob found"))?;
     crate::debug::emit_counter(
         "walk_actual_osmdata_blobs",
         i64::try_from(osmdata_blobs).unwrap_or(i64::MAX),
@@ -740,7 +762,7 @@ fn filter_by_id_streaming(
 ) -> Result<GetidStats> {
     use crate::blob::{BlobKind, decode_blob_to_headerblock};
     use crate::file_reader::FileReader;
-    use crate::read::raw_frame::read_raw_frame;
+    use crate::read::raw_frame::{frame_location, read_raw_frame};
 
     crate::debug::emit_marker("GETID_SCAN_START");
 
@@ -770,9 +792,11 @@ fn filter_by_id_streaming(
 
     while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, input)?
     {
+        // The frame loop owns the provenance of failures on this frame.
+        let locate = |e: Error| e.locate(frame_location(input, frame.file_offset));
         match frame.blob_type {
             BlobKind::OsmHeader if writer.is_none() => {
-                let header = decode_blob_to_headerblock(frame.blob_bytes())?;
+                let header = decode_blob_to_headerblock(frame.blob_bytes()).map_err(locate)?;
                 super::warn_locations_on_ways_loss(&header, host);
                 let header_bytes = super::build_output_header(&header, true, overrides, |hb| hb)?;
                 writer = Some(super::writer_from_header_bytes(
@@ -785,9 +809,11 @@ fn filter_by_id_streaming(
             }
             BlobKind::OsmData => {
                 osmdata_blobs += 1;
-                let w = writer
-                    .as_mut()
-                    .ok_or("no OSMHeader blob found before OsmData")?;
+                let w = writer.as_mut().ok_or_else(|| {
+                    locate(Error::invalid_data(
+                        "no OSMHeader blob found before OsmData",
+                    ))
+                })?;
                 if let Some(ref idx) = frame.index {
                     let has_match = match idx.kind {
                         crate::ElementKind::Node => {
@@ -806,7 +832,8 @@ fn filter_by_id_streaming(
                 // Blob might contain matching IDs, or carries no indexdata
                 // and must be decoded to check.
                 decompress_buf.clear();
-                crate::blob::decompress_blob_data_into(frame.blob_bytes(), &mut decompress_buf)?;
+                crate::blob::decompress_blob_data_into(frame.blob_bytes(), &mut decompress_buf)
+                    .map_err(locate)?;
                 // Move the decompressed Vec into the block: no Bytes round-trip,
                 // no second whole-buffer copy (the `new_with_scratch(Bytes)` route
                 // paid a `to_vec`). `decompress_buf` is reallocated next blob.
@@ -814,7 +841,8 @@ fn filter_by_id_streaming(
                     std::mem::take(&mut decompress_buf),
                     &mut st_scratch,
                     &mut gr_scratch,
-                )?;
+                )
+                .map_err(locate)?;
                 output_blocks.clear();
                 let outcome = process_block(
                     &block,
@@ -826,9 +854,8 @@ fn filter_by_id_streaming(
                     false,
                     report_found,
                 )
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                flush_local(&mut bb, &mut output_blocks)
-                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                .map_err(locate)?;
+                flush_local(&mut bb, &mut output_blocks)?;
                 for OwnedBlock {
                     bytes: block_bytes,
                     index,
@@ -856,7 +883,7 @@ fn filter_by_id_streaming(
         }
     }
 
-    let mut writer = writer.ok_or("no OSMHeader blob found")?;
+    let mut writer = writer.ok_or_else(|| Error::invalid_data("no OSMHeader blob found"))?;
     crate::debug::emit_counter(
         "walk_actual_osmdata_blobs",
         i64::try_from(osmdata_blobs).unwrap_or(i64::MAX),
@@ -1087,7 +1114,7 @@ fn process_block(
     dep_node_ids: Option<&crate::idset::IdSet>,
     strip_tags: bool,
     report_found: bool,
-) -> std::result::Result<BlockOutcome, String> {
+) -> crate::Result<BlockOutcome> {
     let mut nodes: u64 = 0;
     let mut ways: u64 = 0;
     let mut relations: u64 = 0;

@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::Result;
+use crate::error::Error;
 
 use crate::tunables::{NODE_PREALLOC_IDS_PER_BYTE, OVERFLOW_COMPACT_MIN};
 
@@ -96,14 +97,14 @@ fn record_way_refs(
 }
 
 /// Whether any worker has already reported an error.
-fn has_first_err(slot: &Mutex<Option<String>>) -> bool {
+fn has_first_err(slot: &Mutex<Option<Error>>) -> bool {
     slot.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .is_some()
 }
 
 /// Keep the first error any worker reports.
-fn store_first_err(slot: &Mutex<Option<String>>, e: String) {
+fn store_first_err(slot: &Mutex<Option<Error>>, e: Error) {
     let mut slot = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -204,7 +205,7 @@ pub(super) fn run_pass1_5(
         let next_ref = &next_idx;
         // First error observed across all workers. Workers drain until
         // the schedule is empty or the shared slot is populated.
-        let first_err: Mutex<Option<String>> = Mutex::new(None);
+        let first_err: Mutex<Option<Error>> = Mutex::new(None);
         let first_err_ref = &first_err;
         let overflow_lists: Mutex<Vec<Vec<i64>>> = Mutex::new(Vec::new());
         let overflow_lists_ref = &overflow_lists;
@@ -245,13 +246,13 @@ pub(super) fn run_pass1_5(
                         }
                         let (_seq, offset, size) = way_schedule[idx];
 
-                        let result = (|| -> std::result::Result<(), String> {
+                        let result = (|| -> Result<()> {
                             read_buf.resize(size, 0);
-                            file.read_exact_at(&mut read_buf, offset)
-                                .map_err(|e| format!("pread at {offset}: {e}"))?;
+                            file.read_exact_at(&mut read_buf, offset).map_err(|e| {
+                                Error::from(e).context(format!("pread at {offset}"))
+                            })?;
                             decompress_buf.clear();
-                            crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
-                                .map_err(|e| e.to_string())?;
+                            crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
                             crate::scan::way::scan_way_geocode_tagged_refs(
                                 &decompress_buf,
                                 literals_ref,
@@ -275,8 +276,7 @@ pub(super) fn run_pass1_5(
                                             ));
                                     }
                                 },
-                            )
-                            .map_err(|e| e.to_string())?;
+                            )?;
                             compact_overflow_nodes(
                                 &mut overflow_nodes,
                                 &mut overflow_compacted_len,
@@ -305,7 +305,7 @@ pub(super) fn run_pass1_5(
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
         {
-            return Err(e.into());
+            return Err(e);
         }
 
         report_negative_node_refs(&negative_node_ref_count, negative_node_ids, host);
@@ -357,7 +357,7 @@ pub(super) fn build_pass2_schedules(
     let mut walker = crate::read::header_walker::HeaderWalker::open(input_path, &host.diagnostics)?;
     let _ = walker
         .next_header()?
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
+        .ok_or_else(crate::error::new_missing_header)?;
 
     // Entries are `(seq, offset, size)`; `seq` is assigned once both
     // schedules are complete (see `renumber` below).
@@ -433,7 +433,9 @@ pub(super) fn build_pass2_schedules(
         )?;
         for (&(seq, offset, size), kinds) in unindexed.iter().zip(found) {
             let kinds = kinds.ok_or_else(|| {
-                format!("internal error: unindexed blob {seq} at offset {offset} was never decoded")
+                Error::internal(format!(
+                    "unindexed blob {seq} at offset {offset} was never decoded"
+                ))
             })?;
             if kinds.has_nodes {
                 max_node_id = max_node_id.max(kinds.max_node_id);

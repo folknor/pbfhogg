@@ -560,9 +560,9 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )
         .unwrap_err();
-        match err.into_kind() {
+        match err.kind() {
             ErrorKind::Blob(BlobError::DataSizeTooBig { size }) => {
-                assert_eq!(size, MAX_BLOB_DATASIZE);
+                assert_eq!(*size, MAX_BLOB_DATASIZE);
             }
             other => panic!("expected DataSizeTooBig, got {other:?}"),
         }
@@ -575,9 +575,9 @@ mod tests {
             &crate::host::Diagnostics::discard(),
         )
         .unwrap_err();
-        match err.into_kind() {
+        match err.kind() {
             ErrorKind::Blob(BlobError::DataSizeTooBig { size }) => {
-                assert_eq!(size, over);
+                assert_eq!(*size, over);
             }
             other => panic!("expected DataSizeTooBig, got {other:?}"),
         }
@@ -612,8 +612,8 @@ mod tests {
             let err = parse_blob_header_with_index(&bytes, &crate::host::Diagnostics::discard())
                 .unwrap_err();
             assert!(matches!(
-                err.into_kind(),
-                ErrorKind::Blob(BlobError::InvalidDataSize { size }) if size == expected
+                err.kind(),
+                ErrorKind::Blob(BlobError::InvalidDataSize { size }) if *size == expected
             ));
         }
     }
@@ -653,7 +653,7 @@ mod tests {
         let err = parse_blob_header_with_index(&no_type, &crate::host::Diagnostics::discard())
             .unwrap_err();
         assert!(
-            matches!(err.into_kind(), ErrorKind::WireFormat { .. }),
+            matches!(err.kind(), ErrorKind::WireFormat { .. }),
             "a typeless BlobHeader must be a wire-format error"
         );
 

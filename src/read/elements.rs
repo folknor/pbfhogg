@@ -544,10 +544,8 @@ impl<'a> RelMember<'a> {
     #[allow(clippy::cast_sign_loss)]
     pub fn role(&self) -> Result<&'a str> {
         if self.role_sid < 0 {
-            return Err(crate::error::new_error(
-                crate::error::ErrorKind::WireFormat {
-                    msg: "relation member has negative role string index",
-                },
+            return Err(crate::error::new_wire_error(
+                "relation member has negative role string index",
             ));
         }
         str_from_stringtable(self.block, self.role_sid as usize)
@@ -671,10 +669,8 @@ impl<'a> Iterator for CheckedTagIter<'a> {
             // Block construction rejects mismatched keys/vals arrays, so this
             // is unreachable on a constructed block; report it rather than
             // trusting that.
-            _ => Err(crate::error::new_error(
-                crate::error::ErrorKind::WireFormat {
-                    msg: "element has mismatched keys/vals tag array lengths",
-                },
+            _ => Err(crate::error::new_wire_error(
+                "element has mismatched keys/vals tag array lengths",
             )),
         };
         self.failed = item.is_err();
@@ -757,9 +753,7 @@ impl<'a> Info<'a> {
     pub fn user(&self) -> Option<Result<&'a str>> {
         self.info.user_sid.map(|sid| {
             if sid < 0 {
-                return Err(crate::error::new_error(
-                    crate::error::ErrorKind::StringtableIndexOutOfBounds { index: 0 },
-                ));
+                return Err(crate::error::new_stringtable_index_out_of_bounds(0));
             }
             str_from_stringtable(self.block, sid as usize)
         })

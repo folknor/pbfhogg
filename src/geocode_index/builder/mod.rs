@@ -33,7 +33,9 @@ pub mod pass3_test_hooks {
 
 use strings::StringPool;
 
-pub(super) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub(super) type Result<T> = crate::Result<T>;
+
+use crate::error::Error;
 
 use crate::tunables::DIAGNOSTIC_ID_SAMPLE_LIMIT;
 
@@ -110,11 +112,10 @@ impl BuildConfig {
         let max_level = crate::tunables::MAX_BUILD_S2_LEVEL;
         for (name, level) in [("street", self.street_level), ("coarse", self.coarse_level)] {
             if level > max_level {
-                return Err(format!(
+                return Err(Error::invalid_argument(format!(
                     "{name} S2 level must be in 0..={max_level}, got {level}. Levels above \
                      {max_level} exceed the builder's per-segment cell-covering budget."
-                )
-                .into());
+                )));
             }
             debug_assert!(
                 !pass3::level_exceeds_sampling_budget(level),
@@ -123,23 +124,23 @@ impl BuildConfig {
         }
         if pass3::admin_level_exceeds_cell_budget(self.admin_level) {
             let max_level = pass3::MAX_ADMIN_S2_LEVEL;
-            return Err(format!(
+            return Err(Error::invalid_argument(format!(
                 "admin S2 level must be in 0..={max_level}, got {}. Higher levels exceed the \
                  per-polygon flood-fill cell budget.",
                 self.admin_level
-            )
-            .into());
+            )));
         }
         debug_assert!(self.admin_level <= pass3::MAX_ADMIN_S2_LEVEL);
         if self.coarse_level >= self.street_level {
-            return Err(format!(
+            return Err(Error::invalid_argument(format!(
                 "coarse S2 level ({}) must be less than street S2 level ({})",
                 self.coarse_level, self.street_level
-            )
-            .into());
+            )));
         }
-        validate_radius("search radius", self.fine_search_radius_m)?;
-        validate_radius("coarse search radius", self.coarse_search_radius_m)?;
+        validate_radius("search radius", self.fine_search_radius_m)
+            .map_err(Error::invalid_argument_from)?;
+        validate_radius("coarse search radius", self.coarse_search_radius_m)
+            .map_err(Error::invalid_argument_from)?;
         Ok(())
     }
 }
@@ -207,12 +208,11 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
     // cannot be (and `.` would hold its own staging directory). Refuse here,
     // not after a full build has been spent on an unpublishable generation.
     if destination.file_name().is_none() {
-        return Err(format!(
+        return Err(Error::invalid_argument(format!(
             "output directory {} must name a directory, not '.', '..' or a root, \
              because publication renames it",
             destination.display()
-        )
-        .into());
+        )));
     }
 
     let destination_metadata = match std::fs::symlink_metadata(destination) {
@@ -224,35 +224,32 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
         .as_ref()
         .is_some_and(|metadata| metadata.file_type().is_symlink())
     {
-        return Err(format!(
+        return Err(Error::invalid_argument(format!(
             "output path {} is a symlink; staged publication replaces the path itself. \
              Choose a real directory.",
             destination.display()
-        )
-        .into());
+        )));
     }
     if destination_metadata
         .as_ref()
         .is_some_and(std::fs::Metadata::is_dir)
         && is_mount_point(destination)?
     {
-        return Err(format!(
+        return Err(Error::invalid_argument(format!(
             "output directory {} is a mount point; staged publication renames the \
              directory itself. Choose a regular directory.",
             destination.display()
-        )
-        .into());
+        )));
     }
 
     let has_index = destination.join(FILE_HEADER).exists();
     let overwrite = config.force || config.overwrite;
     if has_index && !overwrite {
-        return Err(format!(
+        return Err(Error::invalid_argument(format!(
             "output directory {} already contains a geocode index. \
              Use --overwrite (or --force) to replace it.",
             destination.display()
-        )
-        .into());
+        )));
     }
     // Publication replaces the whole directory, so anything that is not an
     // index (or empty) would be deleted with it. `--overwrite` and its legacy
@@ -264,12 +261,11 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
             .is_some_and(std::fs::Metadata::is_dir)
             && std::fs::read_dir(destination)?.next().is_none();
         if !replaceable {
-            return Err(format!(
+            return Err(Error::invalid_argument(format!(
                 "output path {} exists and is not a geocode index directory; \
                  publication would replace it wholesale. Choose a new or empty directory.",
                 destination.display()
-            )
-            .into());
+            )));
         }
     }
     // Build on separate inodes. Renaming a completed generation never truncates
@@ -289,12 +285,10 @@ pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Re
 // answers false and the final rename remains authoritative.
 fn is_mount_point(path: &std::path::Path) -> Result<bool> {
     crate::process::is_mount_point(path).map_err(|error| {
-        format!(
-            "cannot check whether output directory {} is a mount point before \
-             publication: {error}",
+        error.context(format!(
+            "cannot check whether output directory {} is a mount point before publication",
             path.display()
-        )
-        .into()
+        ))
     })
 }
 
@@ -346,11 +340,13 @@ impl StagedIndex {
         if let Err(e) = std::fs::rename(self.path.join("new"), destination) {
             if had_old && let Err(restore) = std::fs::rename(&backup, destination) {
                 // Preserve the only old generation if rollback itself fails.
-                return Err(format!(
-                    "publish failed: {e}; restore failed: {restore}; old index retained at {}",
+                // Two failures, one chain: the restore failure is the typed
+                // cause (it decides what state the old index is in); the
+                // publish failure that led here is named in the context.
+                return Err(Error::from(restore).context(format!(
+                    "publish failed: {e}; restore failed (old index retained at {})",
                     backup.display()
-                )
-                .into());
+                )));
             }
             return Err(e.into());
         }
@@ -406,9 +402,11 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
             .osmosis_replication_sequence_number()
             .unwrap_or(0),
     )
-    .map_err(
-        |_| "replication sequence exceeds the geocode header u32 range; bump FORMAT_VERSION",
-    )?;
+    .map_err(|_| {
+        Error::invalid_data(
+            "replication sequence exceeds the geocode header u32 range; bump FORMAT_VERSION",
+        )
+    })?;
     #[allow(clippy::cast_sign_loss)]
     let repl_ts = pbf_header.osmosis_replication_timestamp().unwrap_or(0) as u64;
     drop(reader);
@@ -602,7 +600,9 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
         && interp_ways.is_empty()
         && admin_polygons.is_empty()
     {
-        return Err("geocode build found zero address points, streets, interpolation ways, and admin polygons; refusing to publish an empty index".into());
+        return Err(Error::invalid_data(
+            "geocode build found zero address points, streets, interpolation ways, and admin polygons; refusing to publish an empty index",
+        ));
     }
 
     #[cfg(feature = "hotpath")]
@@ -675,10 +675,9 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
     // Write admin + strings data files
     let polygon_count = checked_count(admin_polygons.len(), "admin polygons")?;
     if polygon_count > INTERIOR_FLAG {
-        return Err(
-            "admin polygon count exceeds the format interior-flag limit; bump FORMAT_VERSION"
-                .into(),
-        );
+        return Err(Error::invalid_data(
+            "admin polygon count exceeds the format interior-flag limit; bump FORMAT_VERSION",
+        ));
     }
     admin::write_admin_data(&config.output_dir, &admin_polygons)?;
     std::fs::write(config.output_dir.join(FILE_STRINGS), &strings.data)?;
@@ -780,17 +779,13 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
     // unchecked by the reader path.
     let first_addr_point = if addr_point_count > 0 {
         let bytes = addr_points_mmap.get(..ADDR_POINT_SIZE).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
+            Error::internal(
                 "address point count is nonzero but addr_points.bin has no first record",
             )
         })?;
-        let record: &[u8; ADDR_POINT_SIZE] = bytes.try_into().map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "addr_points.bin first record has an invalid length",
-            )
-        })?;
+        let record: &[u8; ADDR_POINT_SIZE] = bytes
+            .try_into()
+            .map_err(|_| Error::internal("addr_points.bin first record has an invalid length"))?;
         Some(AddrPoint::from_bytes(record))
     } else {
         None
@@ -804,10 +799,12 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
         );
         let test_reader = super::reader::Reader::open(&config.output_dir)?;
         if let Some(first_addr_point) = first_addr_point {
-            let result = test_reader.query(
-                e7_to_deg(f64::from(first_addr_point.lat_e7)),
-                e7_to_deg(f64::from(first_addr_point.lon_e7)),
-            )?;
+            let result = test_reader
+                .query(
+                    e7_to_deg(f64::from(first_addr_point.lat_e7)),
+                    e7_to_deg(f64::from(first_addr_point.lon_e7)),
+                )
+                .map_err(|e| Error::internal_with("geocode smoke test query failed", e))?;
             if result.address.is_none() && result.street.is_none() {
                 crate::host::diag!(
                     host.diagnostics,
@@ -943,8 +940,9 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
 
 fn checked_count(count: usize, kind: &str) -> Result<u32> {
     u32::try_from(count).map_err(|_| {
-        format!("{kind} count exceeds u32::MAX; widen the on-disk count and bump FORMAT_VERSION")
-            .into()
+        Error::invalid_data(format!(
+            "{kind} count exceeds u32::MAX; widen the on-disk count and bump FORMAT_VERSION"
+        ))
     })
 }
 

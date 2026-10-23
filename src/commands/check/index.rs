@@ -79,9 +79,9 @@
 
 use std::path::Path;
 
-use crate::BoxResult as Result;
 use crate::blob::BlobKind;
 use crate::blob_meta::{BlobBbox, BlobIndex, scan_block_tags};
+use crate::error::Result;
 use crate::file_reader::FileReader;
 use crate::read::decompress::decompress_blob_data_into;
 use crate::read::raw_frame::read_raw_frame;
@@ -479,15 +479,21 @@ pub fn check_index(
 
         // Unconditional decode: the stored metadata is under test, so it must
         // not be allowed to decide which blobs get looked at.
-        decompress_blob_data_into(frame.blob_bytes(), &mut block)?;
+        decompress_blob_data_into(frame.blob_bytes(), &mut block).map_err(|e| {
+            e.locate(crate::read::raw_frame::frame_location(
+                path,
+                frame.file_offset,
+            ))
+        })?;
         // A malformed payload is an error even when no metadata was stored.
         // Valid unsupported shapes remain unindexable rather than malformed.
         let observed = crate::blob_meta::try_scan_block_ids_checked(&block)
             .map_err(|e| {
-                format!(
-                    "blob {ordinal} (offset {}): malformed payload: {e}",
-                    frame.file_offset
-                )
+                e.context(format!("OsmData blob {ordinal}: malformed payload"))
+                    .locate(crate::read::raw_frame::frame_location(
+                        path,
+                        frame.file_offset,
+                    ))
             })?
             .map(|(index, _sorted)| index);
         if observed.is_none() {

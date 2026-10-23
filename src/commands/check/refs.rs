@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use crate::{Element, MemberId};
 
-use crate::BoxResult as Result;
+use crate::error::Result;
 use crate::idset::IdSet;
 use crate::scan::classify::{build_classify_schedules_split, parallel_classify_phase};
 use crate::tunables::{NODE_ID_FLOOR, RELATION_ID_FLOOR, WAY_ID_FLOOR};

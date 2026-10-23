@@ -11,13 +11,13 @@
 //! back into sequence order. Raw passthrough blobs bypass compression entirely.
 
 use crate::blob_meta;
-use crate::error::panic_error;
+use crate::error::{Error, Result, panic_error};
 #[cfg(feature = "linux-direct-io")]
 use crate::write::copy_range::copy_range;
 use crate::write::file_writer::FileWriter;
 use crate::write::metrics::WRITER_METRICS;
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::sync_channel;
@@ -54,38 +54,39 @@ const WRITER_CONSUMED: &str = "PbfWriter: the pipelined writer owns the output f
 /// dropped, which means the writer thread has already exited - so the join
 /// returns immediately and carries the real cause: ENOSPC, EIO, a short uring
 /// write, a reorder gap. Every one of these call sites used to substitute
-/// `io::Error::other("writer thread terminated")`, the caller `?`-bailed on
+/// a generic "writer thread terminated" error, the caller `?`-bailed on
 /// that, `Drop` discarded the join result, and the only description of what
 /// actually went wrong was gone. Wrapping the innermost real cause is fine;
 /// replacing it is not.
 ///
 /// Takes the join handle, so a later `flush()` will not try to join twice; the
 /// error it recovered has already been returned to the caller by then.
-fn pipeline_send_error(pipeline: &mut WritePipeline) -> io::Error {
+fn pipeline_send_error(pipeline: &mut WritePipeline) -> Error {
     match pipeline.join_handle.take() {
         Some(handle) => match handle.join() {
             Ok(Err(e)) => e,
-            Ok(Ok(())) => io::Error::other(
+            Ok(Ok(())) => Error::internal(
                 "writer thread finished before all blobs were sent; output is incomplete",
             ),
             Err(payload) => panic_error("writer thread", payload.as_ref()),
         },
         // Already joined - flush() or an earlier send failure took the handle
         // and surfaced whatever it found.
-        None => io::Error::other("writer thread terminated"),
+        None => Error::internal("writer thread terminated"),
     }
 }
 
-fn flush_wrapped_writer<W: Write>(writer: &mut W) -> io::Result<()> {
-    writer.flush()
+fn flush_wrapped_writer<W: Write>(writer: &mut W) -> Result<()> {
+    Ok(writer.flush()?)
 }
 
-fn sync_buffered_file(writer: &mut BufWriter<File>) -> io::Result<()> {
+fn sync_buffered_file(writer: &mut BufWriter<File>) -> Result<()> {
     writer.flush()?;
     let t_sync = std::time::Instant::now();
+    // `sync_file` decides on the original errno before anything converts it.
     let result = crate::write::file_writer::sync_file(writer.get_ref());
     WRITER_METRICS.record_sync_all(t_sync);
-    result
+    Ok(result?)
 }
 
 /// Take one dispatch permit, blocking until one is free, and return the guard
@@ -97,17 +98,17 @@ fn sync_buffered_file(writer: &mut BufWriter<File>) -> io::Result<()> {
 ///
 /// Every send path participates in the dispatch bound, including raw writes;
 /// see [`WRITE_AHEAD`] for how channel backpressure differs from that bound.
-fn acquire_permit(pipeline: &WritePipeline) -> io::Result<PermitGuard> {
+fn acquire_permit(pipeline: &WritePipeline) -> Result<PermitGuard> {
     take_permit(pipeline)?;
     Ok(PermitGuard::new(pipeline.permit_tx.clone()))
 }
 
 /// Take one dispatch permit through [`recv_permit`], timing the wait into
 /// `writer_permit_wait_ns`. The caller owns giving it back.
-fn take_permit(pipeline: &WritePipeline) -> io::Result<()> {
+fn take_permit(pipeline: &WritePipeline) -> Result<()> {
     let t_permit = std::time::Instant::now();
     recv_permit(&pipeline.permit_rx, &pipeline.executor)
-        .map_err(|_| io::Error::other("pipelined writer permit pool disconnected"))?;
+        .map_err(|_| Error::internal("pipelined writer permit pool disconnected"))?;
     WRITER_METRICS
         .permit_wait_ns
         .fetch_add(elapsed_ns_u64(t_permit), Relaxed);
@@ -148,7 +149,7 @@ pub struct PbfWriter<W: Write> {
     pipeline: Option<WritePipeline>,
     /// Final operation for the owned synchronous writer. Generic writers only
     /// flush; the path-owned sync constructor also synchronizes the file.
-    finalize_writer: fn(&mut W) -> io::Result<()>,
+    finalize_writer: fn(&mut W) -> Result<()>,
     #[cfg(test)]
     /// Whether all successfully accepted writes have been explicitly flushed.
     finished: bool,
@@ -175,7 +176,7 @@ impl PbfWriter<FileWriter> {
         compression: Compression,
         header_block_bytes: &[u8],
         executor: Executor,
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         Self::to_path_in(
             path,
             compression,
@@ -191,7 +192,7 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
         diagnostics: Diagnostics,
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         // The buffered backend's writer thread reports nothing.
         drop(diagnostics);
         let writer = FileWriter::buffered(path)?;
@@ -209,7 +210,7 @@ impl PbfWriter<FileWriter> {
         compression: Compression,
         header_block_bytes: &[u8],
         executor: Executor,
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         Self::to_path_direct_in(
             path,
             compression,
@@ -226,7 +227,7 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
         diagnostics: Diagnostics,
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         // The O_DIRECT backend's writer thread reports nothing.
         drop(diagnostics);
         let writer = FileWriter::direct(path)?;
@@ -258,7 +259,7 @@ impl PbfWriter<FileWriter> {
         compression: Compression,
         header_block_bytes: &[u8],
         executor: Executor,
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         Self::to_path_uring_in(
             path,
             compression,
@@ -275,7 +276,7 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
         diagnostics: Diagnostics,
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         use crate::write::uring_writer;
 
         // The writer thread reports nothing; its error is its return value.
@@ -313,7 +314,7 @@ impl PbfWriter<FileWriter> {
                 // Thread panicked or exited before sending init result.
                 drop(tx);
                 return Err(match handle.join() {
-                    Ok(Ok(())) => io::Error::other("writer thread exited without init signal"),
+                    Ok(Ok(())) => Error::internal("writer thread exited without init signal"),
                     Ok(Err(e)) => e,
                     Err(payload) => panic_error("writer thread (during init)", payload.as_ref()),
                 });
@@ -346,7 +347,7 @@ impl PbfWriter<FileWriter> {
         compression: Compression,
         header_block_bytes: &[u8],
         executor: Executor,
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         Self::to_path_parallel_in(
             path,
             compression,
@@ -362,7 +363,7 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
         diagnostics: Diagnostics,
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         use crate::write::parallel_writer;
 
         // The writer thread reports nothing; its error is its return value.
@@ -396,7 +397,7 @@ impl PbfWriter<FileWriter> {
                 drop(tx);
                 return Err(match handle.join() {
                     Ok(Ok(())) => {
-                        io::Error::other("parallel writer thread exited without init signal")
+                        Error::internal("parallel writer thread exited without init signal")
                     }
                     Ok(Err(e)) => e,
                     Err(payload) => {
@@ -423,7 +424,7 @@ impl PbfWriter<FileWriter> {
         compression: Compression,
         header_block_bytes: &[u8],
         executor: Executor,
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         // Write header synchronously before starting the pipeline.
         let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
         writer.write_all(&framed_header)?;
@@ -514,7 +515,7 @@ impl<W: Write> PbfWriter<W> {
     ///
     /// `header_block_bytes` is a serialized `HeaderBlock` protobuf message,
     /// typically produced by [`HeaderBuilder::build`](crate::block_builder::HeaderBuilder::build).
-    pub fn write_header(&mut self, header_block_bytes: &[u8]) -> io::Result<()> {
+    pub fn write_header(&mut self, header_block_bytes: &[u8]) -> Result<()> {
         let result = self.write_blob("OSMHeader", header_block_bytes);
         if result.is_ok() {
             self.mark_pending();
@@ -530,7 +531,7 @@ impl<W: Write> PbfWriter<W> {
     ///
     /// `block_bytes` is produced by [`BlockBuilder::take`](crate::block_builder::BlockBuilder::take).
     #[hotpath::measure]
-    pub fn write_primitive_block(&mut self, block_bytes: &[u8]) -> io::Result<()> {
+    pub fn write_primitive_block(&mut self, block_bytes: &[u8]) -> Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
             // Acquire a dispatch permit before enqueuing new work on rayon.
             // This blocks the caller when `PIPELINE_DISPATCH_PERMITS` blocks
@@ -637,7 +638,7 @@ impl<W: Write> PbfWriter<W> {
     // Keep this public: emitting standard PBF without private indexes is a
     // supported writer operation, including for downstream fixture producers.
     #[hotpath::measure]
-    pub fn write_primitive_block_no_indexdata(&mut self, block_bytes: &[u8]) -> io::Result<()> {
+    pub fn write_primitive_block_no_indexdata(&mut self, block_bytes: &[u8]) -> Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
             // A framing closure already found the writer thread gone. Join
             // it now and return its real cause, rather than framing the rest
@@ -722,7 +723,7 @@ impl<W: Write> PbfWriter<W> {
         index: blob_meta::BlobIndex,
         tagdata: Option<&[u8]>,
         way_members: Option<&[u8]>,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         let indexdata = index.serialize();
         if let Some(ref mut pipeline) = self.pipeline {
             // Bound in-flight rayon dispatches - see the sibling
@@ -808,7 +809,7 @@ impl<W: Write> PbfWriter<W> {
     ///
     /// In pipelined mode, the data is sent directly to the writer thread
     /// (no rayon task needed since there is no compression work).
-    pub fn write_raw(&mut self, raw_framed_bytes: &[u8]) -> io::Result<()> {
+    pub fn write_raw(&mut self, raw_framed_bytes: &[u8]) -> Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
             // Hold a dispatch permit across the send so raw writes share the
             // dispatch bound with framing tasks. The send can still block;
@@ -836,7 +837,7 @@ impl<W: Write> PbfWriter<W> {
             if result.is_ok() {
                 self.mark_pending();
             }
-            result
+            Ok(result?)
         }
     }
 
@@ -846,7 +847,7 @@ impl<W: Write> PbfWriter<W> {
     /// pipeline channel instead of copying. Use when the caller already
     /// owns the bytes and won't need them afterwards (e.g. merge passthrough
     /// with `std::mem::take`).
-    pub fn write_raw_owned(&mut self, raw_framed_bytes: Vec<u8>) -> io::Result<()> {
+    pub fn write_raw_owned(&mut self, raw_framed_bytes: Vec<u8>) -> Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
             // Hold a dispatch permit across the send so raw writes share the
             // dispatch bound with framing tasks. The send can still block;
@@ -874,7 +875,7 @@ impl<W: Write> PbfWriter<W> {
             if result.is_ok() {
                 self.mark_pending();
             }
-            result
+            Ok(result?)
         }
     }
 
@@ -883,7 +884,7 @@ impl<W: Write> PbfWriter<W> {
     /// Like [`write_raw_owned`](Self::write_raw_owned) but accepts a list of
     /// owned chunks. The writer thread writes each chunk sequentially.
     /// Used by passthrough coalescers to avoid `extend_from_slice` memcpy.
-    pub fn write_raw_chunks(&mut self, chunks: Vec<Vec<u8>>) -> io::Result<()> {
+    pub fn write_raw_chunks(&mut self, chunks: Vec<Vec<u8>>) -> Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
             // Hold a dispatch permit across the send so raw writes share the
             // dispatch bound with framing tasks. The send can still block;
@@ -938,7 +939,7 @@ impl<W: Write> PbfWriter<W> {
     /// not guarantee durability. Dropping without flushing performs cleanup
     /// but cannot report errors or a missing tail.
     #[hotpath::measure]
-    pub fn flush(&mut self) -> io::Result<()> {
+    pub fn flush(&mut self) -> Result<()> {
         self.mark_finished();
         let t_flush = std::time::Instant::now();
         if let Some(mut pipeline) = self.pipeline.take() {
@@ -1000,16 +1001,16 @@ impl<W: Write> PbfWriter<W> {
     /// finished pipelined writer - which used to panic out of a public `&mut
     /// self` method. It is a caller error, but a caller error on a public API
     /// is an error to return, not a panic.
-    fn writer_mut(&mut self) -> io::Result<&mut W> {
+    fn writer_mut(&mut self) -> Result<&mut W> {
         self.writer
             .as_mut()
-            .ok_or_else(|| io::Error::other(WRITER_CONSUMED))
+            .ok_or_else(|| Error::invalid_argument(WRITER_CONSUMED))
     }
 
     // wontfix(type-no-stringly): blob_type is &str matching protobuf wire format;
     // only 2 constants ("OSMHeader"/"OSMData"), no real typo risk.
     #[hotpath::measure]
-    fn write_blob(&mut self, blob_type: &str, uncompressed: &[u8]) -> io::Result<()> {
+    fn write_blob(&mut self, blob_type: &str, uncompressed: &[u8]) -> Result<()> {
         self.write_framed_blob(blob_type, uncompressed, None, None, None)
     }
 
@@ -1024,7 +1025,7 @@ impl<W: Write> PbfWriter<W> {
         indexdata: Option<&[u8]>,
         tagdata: Option<&[u8]>,
         way_members: Option<&[u8]>,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         self.scratch.trim_oversize_retained_buffers();
         let result =
             self.write_framed_blob_inner(blob_type, uncompressed, indexdata, tagdata, way_members);
@@ -1039,7 +1040,7 @@ impl<W: Write> PbfWriter<W> {
         indexdata: Option<&[u8]>,
         tagdata: Option<&[u8]>,
         way_members: Option<&[u8]>,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         let t_compress = std::time::Instant::now();
         encode_blob_body(uncompressed, &self.compression, &mut self.scratch)?;
         WRITER_METRICS
@@ -1051,7 +1052,7 @@ impl<W: Write> PbfWriter<W> {
         // path must refuse here too or a `PbfWriter::new` writer emits a file
         // that only fails when somebody tries to read it.
         if self.scratch.blob_buf.len() as u64 >= crate::read::blob_wire::MAX_BLOB_DATASIZE {
-            return Err(io::Error::other(format!(
+            return Err(Error::invalid_argument(format!(
                 "blob body for {blob_type} is {} bytes, must be smaller than \
                  {} (lower --elements-per-blob)",
                 self.scratch.blob_buf.len(),
@@ -1059,7 +1060,7 @@ impl<W: Write> PbfWriter<W> {
             )));
         }
         let datasize = i32::try_from(self.scratch.blob_buf.len()).map_err(|_| {
-            io::Error::other(format!(
+            Error::internal(format!(
                 "blob datasize overflow: {} bytes",
                 self.scratch.blob_buf.len()
             ))
@@ -1073,7 +1074,7 @@ impl<W: Write> PbfWriter<W> {
             &mut self.scratch.header_buf,
         )?;
         let header_len = u32::try_from(self.scratch.header_buf.len()).map_err(|_| {
-            io::Error::other(format!(
+            Error::internal(format!(
                 "header too large: {} bytes",
                 self.scratch.header_buf.len()
             ))
@@ -1089,7 +1090,7 @@ impl<W: Write> PbfWriter<W> {
         let writer = self
             .writer
             .as_mut()
-            .ok_or_else(|| io::Error::other(WRITER_CONSUMED))?;
+            .ok_or_else(|| Error::invalid_argument(WRITER_CONSUMED))?;
         let t_write = std::time::Instant::now();
         writer.write_all(&header_len.to_be_bytes())?;
         writer.write_all(&self.scratch.header_buf)?;
@@ -1113,7 +1114,7 @@ impl PbfWriter<BufWriter<File>> {
     /// synchronizes the file. Use [`PbfWriter::new`] when the caller owns an
     /// arbitrary `Write` value and only needs its ordinary `Write::flush`
     /// behavior.
-    pub fn to_path_sync(path: &Path, compression: Compression) -> io::Result<Self> {
+    pub fn to_path_sync(path: &Path, compression: Compression) -> Result<Self> {
         let file = File::create(path)?;
         let buffered = BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file);
         let mut writer = Self::new(buffered, compression);
@@ -1188,7 +1189,7 @@ impl PbfWriter<FileWriter> {
         in_file: &std::sync::Arc<std::fs::File>,
         offset: u64,
         len: u64,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         use std::os::unix::io::AsRawFd;
         if let Some(ref mut pipeline) = self.pipeline {
             // Hold a dispatch permit across the send so raw writes share the
@@ -1224,19 +1225,18 @@ impl PbfWriter<FileWriter> {
             let out_fd = self
                 .writer
                 .as_mut()
-                .ok_or_else(|| io::Error::other(WRITER_CONSUMED))?
+                .ok_or_else(|| Error::invalid_argument(WRITER_CONSUMED))?
                 .flush_and_raw_fd()?
                 .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "copy_file_range incompatible with O_DIRECT output",
-                    )
+                    Error::invalid_argument("copy_file_range incompatible with O_DIRECT output")
                 })?;
+            // `copy_range` decides on the original errno (EXDEV) before
+            // anything converts it.
             let result = copy_range(in_file.as_raw_fd(), out_fd, offset, len);
             if result.is_ok() {
                 self.mark_pending();
             }
-            result
+            Ok(result?)
         }
     }
 }
@@ -1245,16 +1245,26 @@ impl PbfWriter<FileWriter> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{Compression, Executor, PbfWriter, WritePipeline};
+    use crate::error::{Error, ErrorKind, Result};
     use crate::write::framing::FrameScratch;
     use crate::write::pipeline::{PipelineItem, SeqTotal};
     use std::io;
     use std::sync::mpsc::sync_channel;
 
+    /// A disk-full failure as the writer thread would report it.
+    fn storage_full(msg: &'static str) -> Error {
+        Error::from(io::Error::new(io::ErrorKind::StorageFull, msg))
+    }
+
+    fn is_storage_full(err: &Error) -> bool {
+        matches!(err.kind(), ErrorKind::Io(e) if e.kind() == io::ErrorKind::StorageFull)
+    }
+
     #[test]
     fn malformed_primitive_block_is_not_written_without_an_index() {
         let mut writer = PbfWriter::new(Vec::new(), Compression::None);
         let err = writer.write_primitive_block(&[0x80]).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(err.kind(), ErrorKind::WireFormat { .. }));
         // An empty block is unsupported by the index, but is not malformed.
         writer.write_primitive_block(&[]).unwrap();
         writer.flush().unwrap();
@@ -1271,7 +1281,10 @@ mod tests {
         let queued = writer.write_primitive_block(&[0x80]);
         let flushed = writer.flush();
         let result = queued.and(flushed);
-        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(
+            result.unwrap_err().kind(),
+            ErrorKind::WireFormat { .. }
+        ));
     }
 
     /// A `PbfWriter` whose writer thread has already exited with `outcome`.
@@ -1279,7 +1292,7 @@ mod tests {
     /// The receiver is dropped before the writer is handed back, so the very
     /// next send fails - which is exactly the shape of a writer thread that
     /// died on ENOSPC halfway through a planet write.
-    fn writer_with_dead_thread(outcome: io::Result<()>) -> PbfWriter<Vec<u8>> {
+    fn writer_with_dead_thread(outcome: Result<()>) -> PbfWriter<Vec<u8>> {
         let (tx, rx) = sync_channel::<PipelineItem>(1);
         // Drop the receiver before the thread even starts, so every send is
         // guaranteed to fail without a race to synchronise against.
@@ -1303,22 +1316,18 @@ mod tests {
 
     /// The writer thread's real error must survive, not be replaced.
     ///
-    /// Every send-failure path returned `io::Error::other("writer thread
-    /// terminated")`. The caller `?`-bailed, `Drop` discarded the join
+    /// Every send-failure path returned a generic "writer thread
+    /// terminated" error. The caller `?`-bailed, `Drop` discarded the join
     /// result, and the only description of the actual failure - a full disk,
     /// a permission problem - was thrown away. The assertions here are on the
     /// kind and message the *thread* produced, which no synthetic substitute
     /// can supply.
     #[test]
     fn a_dead_writer_thread_surfaces_its_own_error_not_a_generic_one() {
-        let mut w = writer_with_dead_thread(Err(io::Error::new(
-            io::ErrorKind::StorageFull,
-            "no space left on device",
-        )));
+        let mut w = writer_with_dead_thread(Err(storage_full("no space left on device")));
         let err = w.write_raw(b"blob").expect_err("the send must fail");
-        assert_eq!(
-            err.kind(),
-            io::ErrorKind::StorageFull,
+        assert!(
+            is_storage_full(&err),
             "the ENOSPC kind must reach the caller"
         );
         assert!(
@@ -1376,10 +1385,7 @@ mod tests {
     /// error long before the cap.
     #[test]
     fn write_primitive_block_stops_once_the_writer_thread_is_dead() {
-        let mut w = writer_with_dead_thread(Err(io::Error::new(
-            io::ErrorKind::StorageFull,
-            "no space left on device",
-        )));
+        let mut w = writer_with_dead_thread(Err(storage_full("no space left on device")));
         // A minimal but real PrimitiveBlock: an empty PrimitiveGroup (field 2).
         let block = [0x12u8, 0x00];
         let mut err = None;
@@ -1394,9 +1400,8 @@ mod tests {
             "the producer must notice the dead writer thread; \
              it ran 2,000 blocks without a single report",
         );
-        assert_eq!(
-            err.kind(),
-            io::ErrorKind::StorageFull,
+        assert!(
+            is_storage_full(&err),
             "the ENOSPC kind must reach the caller, not a generic substitute"
         );
         assert!(
@@ -1535,10 +1540,8 @@ mod tests {
             bbox: None,
         };
 
-        let mut w = writer_with_dead_thread(Err(io::Error::new(
-            io::ErrorKind::StorageFull,
-            "owned variant: no space left on device",
-        )));
+        let mut w =
+            writer_with_dead_thread(Err(storage_full("owned variant: no space left on device")));
         let mut err = None;
         for _ in 0..2_000 {
             if let Err(e) = w.write_primitive_block_owned(block.to_vec(), index, None, None) {
@@ -1553,8 +1556,7 @@ mod tests {
         );
         w.flush().unwrap();
 
-        let mut w = writer_with_dead_thread(Err(io::Error::new(
-            io::ErrorKind::StorageFull,
+        let mut w = writer_with_dead_thread(Err(storage_full(
             "no-indexdata variant: no space left on device",
         )));
         let mut err = None;

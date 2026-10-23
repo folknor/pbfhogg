@@ -46,6 +46,7 @@ use super::{
 };
 use crate::ElementKind;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::error::Error;
 use crate::owned::{
     OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata, read_dense_node,
     read_node, read_relation, read_way, read_way_with_locations, write_single_node_local,
@@ -141,7 +142,7 @@ pub fn repack(
         force,
     } = *write;
     if elements_per_blob == 0 {
-        return Err("--elements-per-blob must be > 0".into());
+        return Err(Error::invalid_argument("--elements-per-blob must be > 0"));
     }
 
     require_indexdata(
@@ -396,7 +397,7 @@ fn run_kind_phase(
         });
     }
 
-    type PhaseResult = std::result::Result<WorkerOutput, String>;
+    type PhaseResult = crate::Result<WorkerOutput>;
     // Reorder buffer depth: enough to absorb decode-thread variance
     // without holding too many decoded payloads in flight.
     let mut reorder: ReorderBuffer<PhaseResult> =
@@ -415,8 +416,8 @@ fn run_kind_phase(
     let mut coalesces: u64 = 0;
     let mut worker_full_blobs: u64 = 0;
     let mut central_blobs: u64 = 0;
-    let mut write_error: Option<Box<dyn std::error::Error>> = None;
-    let mut classify_error: Option<String> = None;
+    let mut write_error: Option<Error> = None;
+    let mut classify_error: Option<Error> = None;
 
     crate::scan::classify::parallel_classify_phase(
         shared_file,
@@ -491,7 +492,7 @@ fn run_kind_phase(
                         // Write the worker's already-framed full blocks directly.
                         for framed in full_framed {
                             if let Err(e) = writer.write_raw_owned(framed) {
-                                write_error = Some(e.into());
+                                write_error = Some(e);
                                 break;
                             }
                             blobs += 1;
@@ -508,7 +509,7 @@ fn run_kind_phase(
                             coalesces += 1;
                         }
 
-                        let consume_res: std::result::Result<(), String> = (|| {
+                        let consume_res: crate::Result<()> = (|| {
                             match tail {
                                 KindPayload::Nodes(nodes) => {
                                     for node in &nodes {
@@ -527,8 +528,7 @@ fn run_kind_phase(
                                 }
                             }
                             Ok(())
-                        })(
-                        );
+                        })();
                         if let Err(e) = consume_res {
                             classify_error.get_or_insert(e);
                             continue;
@@ -564,13 +564,13 @@ fn run_kind_phase(
         return Err(e);
     }
     if let Some(e) = classify_error {
-        return Err(e.into());
+        return Err(e);
     }
 
     // Final flush: emit the residual block (if any) for this kind. Any
     // blocks `output` holds at this point are residuals, not mid-stream
     // flushes, so they don't count toward `central_blobs`.
-    flush_local(&mut bb, &mut output).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    flush_local(&mut bb, &mut output)?;
     let residual = output.len() as u64;
     pending.append(&mut output);
     if !pending.is_empty() {
@@ -642,7 +642,7 @@ fn worker_split_blob(
     cap: usize,
     preserve_locations: bool,
     compression: &Compression,
-) -> std::result::Result<WorkerOutput, String> {
+) -> crate::Result<WorkerOutput> {
     let total = match kind {
         ElementKind::Node => block
             .elements()
@@ -770,10 +770,7 @@ fn worker_split_blob(
 /// Frame a single `OwnedBlock` to wire bytes. Worker-side helper; uses
 /// the thread-local `PIPELINE_SCRATCH` so it's safe to call from any
 /// rayon / `parallel_classify_phase` worker.
-fn frame_owned(
-    owned: OwnedBlock,
-    compression: &Compression,
-) -> std::result::Result<Vec<u8>, String> {
+fn frame_owned(owned: OwnedBlock, compression: &Compression) -> crate::Result<Vec<u8>> {
     let OwnedBlock {
         bytes: block_bytes,
         index,
@@ -787,8 +784,7 @@ fn frame_owned(
         Some(indexdata.as_slice()),
         tagdata.as_deref(),
         way_members.as_deref(),
-    )
-    .map_err(|e| e.to_string())?;
+    )?;
     Ok(blob.into_vec())
 }
 
@@ -801,10 +797,10 @@ fn frame_and_write_batch(
     compression: Compression,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     executor: &crate::host::Executor,
-) -> std::result::Result<u64, Box<dyn std::error::Error>> {
+) -> Result<u64> {
     use rayon::prelude::*;
 
-    let framed: Vec<std::io::Result<Vec<u8>>> = executor.install(|| {
+    let framed: Vec<Result<Vec<u8>>> = executor.install(|| {
         batch
             .into_par_iter()
             .map(
@@ -814,7 +810,7 @@ fn frame_and_write_batch(
                      tagdata,
                      way_members,
                  }|
-                 -> std::io::Result<Vec<u8>> {
+                 -> Result<Vec<u8>> {
                     let indexdata = index.serialize();
                     let blob = frame_blob_pipelined(
                         &block_bytes,

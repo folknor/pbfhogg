@@ -64,7 +64,7 @@ pub(super) fn reframe_way_blob_with_locations(
     shared_node_ids: Option<&crate::idset::IdSet>,
     member_way_ids: Option<&crate::idset::IdSet>,
     inject_prepass: bool,
-) -> std::result::Result<WayReframeStats, String> {
+) -> crate::Result<WayReframeStats> {
     if inject_prepass {
         scratch.pin_tally = super::inject_metrics::PinTally::default();
     }
@@ -113,7 +113,7 @@ pub(super) fn reframe_way_blob_with_locations(
 fn parse_block_top(
     decompressed: &[u8],
     scratch: &mut WayReframeScratch,
-) -> std::result::Result<(usize, usize), String> {
+) -> crate::Result<(usize, usize)> {
     scratch.group_ranges.clear();
     scratch.scalar_fields.clear();
     let mut stringtable_range: Option<(usize, usize)> = None;
@@ -121,38 +121,39 @@ fn parse_block_top(
     let mut cursor = Cursor::new(decompressed);
     while let Some((field, wire_type)) = cursor
         .read_tag()
-        .map_err(|e| format!("reframe block tag: {e}"))?
+        .map_err(|e| crate::Error::from(e).context("reframe block tag"))?
     {
         match (field, wire_type) {
             (1, WIRE_LEN) => {
                 let data = cursor
                     .read_len_delimited()
-                    .map_err(|e| format!("reframe st: {e}"))?;
+                    .map_err(|e| crate::Error::from(e).context("reframe st"))?;
                 let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
                 stringtable_range = Some((offset, data.len()));
             }
             (2, WIRE_LEN) => {
                 let data = cursor
                     .read_len_delimited()
-                    .map_err(|e| format!("reframe group: {e}"))?;
+                    .map_err(|e| crate::Error::from(e).context("reframe group"))?;
                 let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
                 scratch.group_ranges.push((offset, data.len()));
             }
             (17..=20, WIRE_VARINT) => {
                 let raw = cursor
                     .read_raw_field(wire_type)
-                    .map_err(|e| format!("reframe scalar: {e}"))?;
+                    .map_err(|e| crate::Error::from(e).context("reframe scalar"))?;
                 check_default_coord_framing(field, raw)?;
                 encode_tag(&mut scratch.scalar_fields, field, wire_type);
                 scratch.scalar_fields.extend_from_slice(raw);
             }
             _ => cursor
                 .skip_field(wire_type)
-                .map_err(|e| format!("reframe skip: {e}"))?,
+                .map_err(|e| crate::Error::from(e).context("reframe skip"))?,
         }
     }
 
-    stringtable_range.ok_or_else(|| "reframe: no StringTable in PrimitiveBlock".to_string())
+    stringtable_range
+        .ok_or_else(|| crate::Error::invalid_data("reframe: no StringTable in PrimitiveBlock"))
 }
 
 /// Refuse a way blob whose coordinate framing is not the PBF default.
@@ -176,7 +177,7 @@ fn parse_block_top(
 pub(in crate::commands::altw) fn check_default_coord_framing(
     field: u32,
     raw: &[u8],
-) -> std::result::Result<(), String> {
+) -> crate::Result<()> {
     let (name, default) = match field {
         17 => ("granularity", 100_u64),
         19 => ("lat_offset", 0),
@@ -194,13 +195,13 @@ pub(in crate::commands::altw) fn check_default_coord_framing(
     if value == default {
         return Ok(());
     }
-    Err(format!(
+    Err(crate::Error::invalid_data(format!(
         "reframe: PrimitiveBlock.{name} is {value}, not the default {default}. \
          add-locations-to-ways writes way coordinates in decimicrodegrees and \
          cannot honour a non-default coordinate framing on this path; the \
          output would be silently wrong. Re-encode the input first, e.g. \
          `pbfhogg cat --clean`."
-    ))
+    )))
 }
 
 /// Walk one `PrimitiveGroup`. Way submessages get reframed (locations
@@ -217,18 +218,18 @@ fn process_group(
     shared_node_ids: Option<&crate::idset::IdSet>,
     member_way_ids: Option<&crate::idset::IdSet>,
     inject_prepass: bool,
-) -> std::result::Result<(), String> {
+) -> crate::Result<()> {
     scratch.group_out.clear();
 
     let mut gr_cursor = Cursor::new(group_bytes);
     while let Some((field, wire_type)) = gr_cursor
         .read_tag()
-        .map_err(|e| format!("reframe gtag: {e}"))?
+        .map_err(|e| crate::Error::from(e).context("reframe gtag"))?
     {
         if field == 3 && wire_type == WIRE_LEN {
             let way_bytes = gr_cursor
                 .read_len_delimited()
-                .map_err(|e| format!("reframe way: {e}"))?;
+                .map_err(|e| crate::Error::from(e).context("reframe way"))?;
             splice_way_locations(
                 way_bytes,
                 node_index,
@@ -242,7 +243,7 @@ fn process_group(
         } else {
             let raw = gr_cursor
                 .read_raw_field(wire_type)
-                .map_err(|e| format!("reframe gskip: {e}"))?;
+                .map_err(|e| crate::Error::from(e).context("reframe gskip"))?;
             encode_tag(&mut scratch.group_out, field, wire_type);
             scratch.group_out.extend_from_slice(raw);
         }
@@ -266,7 +267,7 @@ fn splice_way_locations(
     shared_node_ids: Option<&crate::idset::IdSet>,
     member_way_ids: Option<&crate::idset::IdSet>,
     inject_prepass: bool,
-) -> std::result::Result<(), String> {
+) -> crate::Result<()> {
     scratch.reframed_way.clear();
     scratch.refs.clear();
     scratch.packed_lats.clear();
@@ -280,13 +281,13 @@ fn splice_way_locations(
     let mut way_cursor = Cursor::new(way_bytes);
     while let Some((wf, wt)) = way_cursor
         .read_tag()
-        .map_err(|e| format!("reframe wtag: {e}"))?
+        .map_err(|e| crate::Error::from(e).context("reframe wtag"))?
     {
         match (wf, wt) {
             (1, WIRE_VARINT) => {
                 way_id = way_cursor
                     .read_varint_i64()
-                    .map_err(|e| format!("reframe wid: {e}"))?;
+                    .map_err(|e| crate::Error::from(e).context("reframe wid"))?;
                 have_id = true;
                 encode_int64_field(&mut scratch.reframed_way, 1, way_id);
             }
@@ -302,11 +303,11 @@ fn splice_way_locations(
                 let refs_data = if wt == WIRE_LEN {
                     way_cursor
                         .read_len_delimited()
-                        .map_err(|e| format!("reframe wrefs: {e}"))?
+                        .map_err(|e| crate::Error::from(e).context("reframe wrefs"))?
                 } else {
                     way_cursor
                         .read_raw_field(WIRE_VARINT)
-                        .map_err(|e| format!("reframe wrefs: {e}"))?
+                        .map_err(|e| crate::Error::from(e).context("reframe wrefs"))?
                 };
                 if !refs_data.is_empty() {
                     if have_refs {
@@ -319,12 +320,11 @@ fn splice_way_locations(
                         // occurrence - which is why unpacked support here is
                         // exact for a one-element array and an error beyond
                         // it, matching `src/read/wire.rs::take_packed`.
-                        return Err(
+                        return Err(crate::Error::invalid_data(
                             "reframe: Way.refs appears twice with data - a packed field \
                              split across segments, or more than one unpacked value. Re-encode \
-                             the input first, e.g. `pbfhogg cat --clean`."
-                                .to_string(),
-                        );
+                             the input first, e.g. `pbfhogg cat --clean`.",
+                        ));
                     }
                     have_refs = true;
                     let mut cum: i64 = 0;
@@ -353,12 +353,12 @@ fn splice_way_locations(
             (9 | 10 | 20, WIRE_LEN | WIRE_VARINT) => {
                 let _ = way_cursor
                     .read_raw_field(wt)
-                    .map_err(|e| format!("reframe wstrip: {e}"))?;
+                    .map_err(|e| crate::Error::from(e).context("reframe wstrip"))?;
             }
             _ => {
                 let raw = way_cursor
                     .read_raw_field(wt)
-                    .map_err(|e| format!("reframe wskip: {e}"))?;
+                    .map_err(|e| crate::Error::from(e).context("reframe wskip"))?;
                 encode_tag(&mut scratch.reframed_way, wf, wt);
                 scratch.reframed_way.extend_from_slice(raw);
             }
@@ -366,7 +366,9 @@ fn splice_way_locations(
     }
 
     if !have_id {
-        return Err("reframe: way without field 1 (id)".to_string());
+        return Err(crate::Error::invalid_data(
+            "reframe: way without field 1 (id)",
+        ));
     }
 
     if way_id < stats.min_way_id {
@@ -501,7 +503,7 @@ mod tests {
         block
     }
 
-    fn try_run(block: &[u8]) -> std::result::Result<(Vec<u8>, u64, u64), String> {
+    fn try_run(block: &[u8]) -> crate::Result<(Vec<u8>, u64, u64)> {
         let index = NodeIndex::InMemory([(7_i64, (100_i32, 200_i32))].into_iter().collect());
         let mut out = Vec::new();
         let mut scratch = WayReframeScratch::default();
@@ -604,7 +606,7 @@ mod tests {
         let err = try_run(&way_block(42, &[7, 9], false))
             .expect_err("two unpacked refs values must be refused");
         assert!(
-            err.contains("Way.refs appears twice with data"),
+            err.to_string().contains("Way.refs appears twice with data"),
             "expected the repeated-occurrence guard specifically. Got: {err}"
         );
     }
@@ -638,7 +640,7 @@ mod tests {
             let block = with_scalar(way_block(42, &[7], true), field, value);
             let err = try_run(&block).expect_err("non-default framing must be refused");
             assert!(
-                err.contains(name) && err.contains("not the default"),
+                err.to_string().contains(name) && err.to_string().contains("not the default"),
                 "expected the coordinate-framing guard naming {name}. Got: {err}"
             );
         }

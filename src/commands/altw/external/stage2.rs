@@ -34,6 +34,7 @@ use super::{
     BucketLayout, CLOSURE_FLAG, ID_RECORD_SIZE, IdRecord, LOCAL_ID_MASK, NodeBlobInfo,
     RESOLVED_ENTRY_SIZE, ResolvedEntry, slot_bucket_bounds,
 };
+use crate::error::Error;
 use crate::scan::node::{NodeTuple, extract_node_tuples};
 use crate::tunables::{
     ALTW_STAGE2_WORKERS_CAP, BUCKET_BUF_SIZE, DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN,
@@ -78,7 +79,7 @@ fn prepare_bucket(
     scratch: &ScratchDir,
     num_shard_workers: usize,
     loader: &mut LoaderScratch,
-) -> std::result::Result<PreparedBucket, String> {
+) -> crate::Result<PreparedBucket> {
     loader.data_buf.clear();
     loader.records.clear();
     let mut open_calls: u64 = 0;
@@ -99,12 +100,12 @@ fn prepare_bucket(
                 f
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("open id shard: {e}")),
+            Err(e) => return Err(Error::from(e).context("open id shard")),
         };
         stat_calls += 1;
         let len = file
             .metadata()
-            .map_err(|e| format!("stat id shard: {e}"))?
+            .map_err(|e| Error::from(e).context("stat id shard"))?
             .len() as usize;
         if len == 0 {
             continue;
@@ -112,7 +113,7 @@ fn prepare_bucket(
         let start = loader.data_buf.len();
         loader.data_buf.resize(start + len, 0);
         std::io::Read::read_exact(&mut &file, &mut loader.data_buf[start..])
-            .map_err(|e| format!("read id shard: {e}"))?;
+            .map_err(|e| Error::from(e).context("read id shard"))?;
         #[cfg(feature = "linux-direct-io")]
         {
             fadvise_calls += 1;
@@ -127,11 +128,11 @@ fn prepare_bucket(
     // worker write that didn't flush). chunks_exact would silently
     // drop the partial tail; error explicitly instead.
     if !loader.data_buf.len().is_multiple_of(ID_RECORD_SIZE) {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "stage2 bucket {bucket_idx}: id shard total length {} is not \
              a multiple of {ID_RECORD_SIZE}",
             loader.data_buf.len(),
-        ));
+        )));
     }
 
     // Parse 12-byte chunks into IdRecords.
@@ -171,17 +172,15 @@ pub(super) struct SharedSlotBuckets {
 }
 
 impl SharedSlotBuckets {
-    pub(super) fn create(
-        scratch: &ScratchDir,
-        slot_bucket_count: usize,
-    ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+    pub(super) fn create(scratch: &ScratchDir, slot_bucket_count: usize) -> Result<Self> {
         let mut writers = Vec::with_capacity(slot_bucket_count);
         let mut entry_counts = Vec::with_capacity(slot_bucket_count);
 
         for i in 0..slot_bucket_count {
             let path = scratch.bucket_path("slot", i);
-            let file = std::fs::File::create(&path)
-                .map_err(|e| format!("failed to create slot bucket {}: {e}", path.display()))?;
+            let file = std::fs::File::create(&path).map_err(|e| {
+                Error::from(e).context(format!("failed to create slot bucket {}", path.display()))
+            })?;
             writers.push(std::sync::Mutex::new(std::io::BufWriter::with_capacity(
                 BUCKET_BUF_SIZE,
                 file,
@@ -195,7 +194,7 @@ impl SharedSlotBuckets {
         })
     }
 
-    pub(super) fn finish(&self) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    pub(super) fn finish(&self) -> Result<()> {
         for writer_mutex in &self.writers {
             let mut w = writer_mutex
                 .lock()
@@ -286,7 +285,7 @@ pub(super) fn stage2_node_join(
     let s2_stat_calls = std::sync::atomic::AtomicU64::new(0);
     let s2_fadvise_calls = std::sync::atomic::AtomicU64::new(0);
     let s2_fadvise_bytes = std::sync::atomic::AtomicU64::new(0);
-    let s2_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let s2_error: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
 
     let next_ref = &next_idx;
     let resolved_ref = &resolved_total;
@@ -353,7 +352,7 @@ pub(super) fn stage2_node_join(
                     if bucket_idx >= NUM_BUCKETS { break; }
                     if id_bucket_counts[bucket_idx] == 0 { continue; }
 
-                    let result: std::result::Result<(), String> = (|| {
+                    let result: crate::Result<()> = (|| {
                         // Load + sort id-bucket records.
                         let t_load = std::time::Instant::now();
                         let bkt = prepare_bucket(
@@ -420,7 +419,7 @@ pub(super) fn stage2_node_join(
                             let t_pr = std::time::Instant::now();
                             node_read_buf.resize(blob.data_size, 0);
                             pbf_file.read_exact_at(&mut node_read_buf, blob.data_offset)
-                                .map_err(|e| format!("stage2 node pread: {e}"))?;
+                                .map_err(|e| Error::from(e).context("stage2 node pread"))?;
                             #[allow(clippy::cast_possible_truncation)]
                             node_pread_ref.fetch_add(
                                 t_pr.elapsed().as_millis() as u64, Relaxed,
@@ -434,7 +433,7 @@ pub(super) fn stage2_node_join(
                             let t_dc = std::time::Instant::now();
                             crate::blob::decompress_blob_raw(
                                 &node_read_buf, &mut node_decompress_buf,
-                            ).map_err(|e| format!("stage2 node decompress: {e}"))?;
+                            ).map_err(|e| e.context("stage2 node decompress"))?;
                             #[allow(clippy::cast_possible_truncation)]
                             node_decompress_ref.fetch_add(
                                 t_dc.elapsed().as_millis() as u64, Relaxed,
@@ -448,7 +447,7 @@ pub(super) fn stage2_node_join(
                             node_tuples.clear();
                             extract_node_tuples(
                                 &node_decompress_buf, &mut node_tuples, &mut node_group_starts,
-                            ).map_err(|e| format!("stage2 node extract: {e}"))?;
+                            ).map_err(|e| e.context("stage2 node extract"))?;
                             #[allow(clippy::cast_possible_truncation)]
                             node_extract_ref.fetch_add(
                                 t_ex.elapsed().as_millis() as u64, Relaxed,
@@ -546,12 +545,12 @@ pub(super) fn stage2_node_join(
                                         .get(record.blob_idx as usize)
                                         .copied()
                                         .ok_or_else(|| {
-                                            format!(
+                                            Error::internal(format!(
                                                 "stage2: record blob_idx {} out of range \
                                                  (way_slot_starts.len()={})",
                                                 record.blob_idx,
                                                 slot_starts_ref.len(),
-                                            )
+                                            ))
                                         })?;
                                     let linear_slot_pos =
                                         blob_start + u64::from(record.blob_local_slot);
@@ -623,7 +622,7 @@ pub(super) fn stage2_node_join(
                                         let t_wr = std::time::Instant::now();
                                         let flush_bytes = slot_bufs[bucket].len() as u64;
                                         w.write_all(&slot_bufs[bucket])
-                                            .map_err(|e| format!("write slot bucket: {e}"))?;
+                                            .map_err(|e| Error::from(e).context("write slot bucket"))?;
                                         drop(w);
                                         #[allow(clippy::cast_possible_truncation)]
                                         flush_write_ref.fetch_add(
@@ -713,7 +712,7 @@ pub(super) fn stage2_node_join(
                             let t_wr = std::time::Instant::now();
                             let flush_bytes = slot_bufs[sb].len() as u64;
                             w.write_all(&slot_bufs[sb])
-                                .map_err(|e| format!("write slot bucket: {e}"))?;
+                                .map_err(|e| Error::from(e).context("write slot bucket"))?;
                             drop(w);
                             #[allow(clippy::cast_possible_truncation)]
                             flush_write_ref.fetch_add(
@@ -747,7 +746,7 @@ pub(super) fn stage2_node_join(
     });
 
     if let Some(e) = s2_error.into_inner().unwrap_or(None) {
-        return Err(e.into());
+        return Err(e);
     }
 
     #[allow(clippy::cast_possible_wrap)]

@@ -14,6 +14,7 @@ use super::IO_BUF_BYTES;
 
 use std::collections::VecDeque;
 
+use crate::error::{Error, Result};
 use crate::reorder_buffer::ReorderBuffer;
 use crate::tunables::{NUM_BUFS, WRITE_AHEAD};
 use crate::write::pipeline::{OutputChunk, PipelineItem, SeqTotal, check_stream_complete};
@@ -108,7 +109,7 @@ unsafe impl Send for AlignedBufferPool {}
 
 impl AlignedBufferPool {
     /// Allocate `count` page-aligned buffers of `buf_size` bytes each.
-    fn new(count: u16, buf_size: usize) -> io::Result<Self> {
+    fn new(count: u16, buf_size: usize) -> Result<Self> {
         let total = buf_size * count as usize;
         let (base, layout) = alloc_page_aligned(total)?;
         let mut free = VecDeque::with_capacity(count as usize);
@@ -191,7 +192,7 @@ impl UringState {
     /// Accumulates into the current registered buffer. When the buffer fills,
     /// submits a `WriteFixed` SQE. Handles any data size by splitting across
     /// multiple buffer fills.
-    fn write(&mut self, data: &[u8]) -> io::Result<()> {
+    fn write(&mut self, data: &[u8]) -> Result<()> {
         let mut offset = 0;
         while offset < data.len() {
             // Ensure we have a current buffer.
@@ -203,7 +204,7 @@ impl UringState {
             // Safety: current_buf is Some - we just ensured it above.
             let buf_idx = match self.current_buf {
                 Some(idx) => idx,
-                None => return Err(io::Error::other("no current buffer")),
+                None => return Err(Error::internal("no current buffer")),
             };
 
             let remaining = self.pool.buf_size - self.current_len;
@@ -236,7 +237,7 @@ impl UringState {
     }
 
     /// Submit the current accumulation buffer as a `WriteFixed` SQE.
-    fn submit_current(&mut self) -> io::Result<()> {
+    fn submit_current(&mut self) -> Result<()> {
         let buf_idx = match self.current_buf.take() {
             Some(idx) => idx,
             None => return Ok(()),
@@ -253,7 +254,7 @@ impl UringState {
     /// Does **not** update `logical_size`: `accept_buffered` already counted
     /// payload bytes, and alignment padding must never contribute.
     #[allow(clippy::cast_possible_truncation)] // aligned_len as u32/u64, buf_idx as u64: bounded by IO_BUF_BYTES/NUM_BUFS
-    fn submit_buffer(&mut self, buf_idx: u16, data_len: usize) -> io::Result<()> {
+    fn submit_buffer(&mut self, buf_idx: u16, data_len: usize) -> Result<()> {
         if data_len == 0 {
             self.pool.release(buf_idx);
             return Ok(());
@@ -287,7 +288,7 @@ impl UringState {
         self.ring
             .submitter()
             .submit()
-            .map_err(|e| io::Error::new(e.kind(), format!("io_uring submit failed: {e}")))?;
+            .map_err(|e| Error::from(e).context("io_uring submit failed"))?;
         WRITER_METRICS.uring_submit_calls.fetch_add(1, Relaxed);
         WRITER_METRICS
             .uring_submit_ns
@@ -300,7 +301,7 @@ impl UringState {
     }
 
     /// Acquire a free buffer, reaping CQEs if necessary.
-    fn acquire_buffer(&mut self) -> io::Result<u16> {
+    fn acquire_buffer(&mut self) -> Result<u16> {
         // Fast path: free buffer available.
         if let Some(idx) = self.pool.acquire() {
             return Ok(idx);
@@ -308,7 +309,7 @@ impl UringState {
         // Slow path: all buffers in-flight, wait until a buffer is freed.
         loop {
             if self.in_flight == 0 {
-                return Err(io::Error::other("no free buffers and nothing in-flight"));
+                return Err(Error::internal("no free buffers and nothing in-flight"));
             }
             self.reap_cqes(true)?;
             if let Some(idx) = self.pool.acquire() {
@@ -318,7 +319,7 @@ impl UringState {
     }
 
     /// Push a single SQE to the submission queue, waiting for SQ space if full.
-    fn push_sqe(&mut self, sqe: &io_uring::squeue::Entry) -> io::Result<()> {
+    fn push_sqe(&mut self, sqe: &io_uring::squeue::Entry) -> Result<()> {
         // Safety: SQE references registered buffers/fds, validated by callers.
         unsafe {
             if self.ring.submission().push(sqe).is_ok() {
@@ -329,12 +330,12 @@ impl UringState {
         self.ring
             .submitter()
             .squeue_wait()
-            .map_err(|e| io::Error::new(e.kind(), format!("squeue_wait failed: {e}")))?;
+            .map_err(|e| Error::from(e).context("squeue_wait failed"))?;
         unsafe {
             self.ring
                 .submission()
                 .push(sqe)
-                .map_err(|_| io::Error::other("io_uring SQ still full after squeue_wait"))?;
+                .map_err(|_| Error::internal("io_uring SQ still full after squeue_wait"))?;
         }
         Ok(())
     }
@@ -343,15 +344,16 @@ impl UringState {
     ///
     /// If `wait` is true, blocks until at least one CQE is available.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // ud as u16, result as u32: io_uring CQE fields
-    fn reap_cqes(&mut self, wait: bool) -> io::Result<()> {
+    fn reap_cqes(&mut self, wait: bool) -> Result<()> {
         if self.in_flight == 0 {
             return Ok(());
         }
         if wait {
             let t_wait = std::time::Instant::now();
-            self.ring.submitter().submit_and_wait(1).map_err(|e| {
-                io::Error::new(e.kind(), format!("io_uring submit_and_wait failed: {e}"))
-            })?;
+            self.ring
+                .submitter()
+                .submit_and_wait(1)
+                .map_err(|e| Error::from(e).context("io_uring submit_and_wait failed"))?;
             let elapsed = elapsed_ns_u64(t_wait);
             WRITER_METRICS
                 .uring_submit_and_wait_calls
@@ -377,19 +379,20 @@ impl UringState {
             self.pool.release(buf_idx);
 
             if result < 0 {
-                return Err(io::Error::from_raw_os_error(-result));
+                return Err(io::Error::from_raw_os_error(-result).into());
             }
             if result.cast_unsigned() != expected_len {
-                return Err(io::Error::other(format!(
-                    "io_uring short write: expected {expected_len} bytes, got {result}"
-                )));
+                return Err(Error::io_kind(
+                    io::ErrorKind::WriteZero,
+                    format!("io_uring short write: expected {expected_len} bytes, got {result}"),
+                ));
             }
         }
         Ok(())
     }
 
     /// Drain all in-flight SQEs.
-    fn drain(&mut self) -> io::Result<()> {
+    fn drain(&mut self) -> Result<()> {
         while self.in_flight > 0 {
             self.reap_cqes(true)?;
         }
@@ -429,7 +432,7 @@ impl UringState {
 
     /// Flush the current partial buffer, drain all in-flight writes,
     /// truncate to logical size, and sync to disk.
-    fn flush_final(&mut self, file: &File) -> io::Result<()> {
+    fn flush_final(&mut self, file: &File) -> Result<()> {
         self.submit_current()?;
         self.drain()?;
         file.set_len(self.logical_size)?;
@@ -510,7 +513,7 @@ fn handle_copy_range_uring(
     in_fd: std::os::unix::io::RawFd,
     mut src_offset: u64,
     mut remaining: u64,
-) -> io::Result<()> {
+) -> Result<()> {
     while remaining > 0 {
         if state.current_buf.is_none() {
             let idx = state.acquire_buffer()?;
@@ -519,7 +522,7 @@ fn handle_copy_range_uring(
         }
         let buf_idx = match state.current_buf {
             Some(idx) => idx,
-            None => return Err(io::Error::other("no current buffer")),
+            None => return Err(Error::internal("no current buffer")),
         };
 
         let space = state.pool.buf_size - state.current_len;
@@ -534,12 +537,13 @@ fn handle_copy_range_uring(
         // readable file descriptor passed in from the caller.
         let n = unsafe { libc::pread(in_fd, dst.cast::<libc::c_void>(), chunk, src_offset as i64) };
         if n < 0 {
-            return Err(io::Error::last_os_error());
+            return Err(io::Error::last_os_error().into());
         }
         if n.cast_unsigned() != chunk {
-            return Err(io::Error::other(format!(
-                "io_uring CopyRange pread short: expected {chunk}, got {n}"
-            )));
+            return Err(Error::io_kind(
+                io::ErrorKind::UnexpectedEof,
+                format!("io_uring CopyRange pread short: expected {chunk}, got {n}"),
+            ));
         }
 
         state.accept_buffered(chunk);
@@ -568,9 +572,9 @@ pub(crate) fn uring_writer_thread(
     rx: Receiver<PipelineItem>,
     path: PathBuf,
     framed_header: Vec<u8>,
-    init_tx: SyncSender<io::Result<()>>,
+    init_tx: SyncSender<Result<()>>,
     expected: &SeqTotal,
-) -> io::Result<()> {
+) -> Result<()> {
     // A failure is not logged here: it is the thread's return value, which the
     // writer's `flush` (or the failed send that noticed the thread was gone)
     // hands to the caller, so the operator sees it exactly once.
@@ -579,11 +583,11 @@ pub(crate) fn uring_writer_thread(
 
 /// Refuse, as a typed platform refusal, a ring whose kernel cannot run
 /// `WriteFixed` or whose opcode probe fails for a reason other than age.
-fn require_write_fixed(ring: &IoUring) -> io::Result<()> {
+fn require_write_fixed(ring: &IoUring) -> Result<()> {
     let mut probe = io_uring::Probe::new();
     match ring.submitter().register_probe(&mut probe) {
         Ok(()) if probe.is_supported(opcode::WriteFixed::CODE) => Ok(()),
-        Ok(()) => Err(crate::error::platform_unsupported(
+        Ok(()) => Err(Error::platform_unsupported(
             "io-uring",
             io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -595,11 +599,19 @@ fn require_write_fixed(ring: &IoUring) -> io::Result<()> {
         // EINVAL here is a 5.1-5.5 kernel that supports WriteFixed and cannot
         // say so; refusing it would reject a working host.
         Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(()),
-        Err(e) => Err(crate::error::platform_unsupported(
+        Err(e) => Err(Error::platform_unsupported(
             "io-uring",
-            io::Error::new(e.kind(), format!("io_uring opcode probe failed: {e}")),
+            setup_step(e, "io_uring opcode probe failed"),
         )),
     }
+}
+
+/// A setup failure `source` with the failing step named, as the `io::Error`
+/// a platform refusal holds. The original error stays the cause inside the
+/// carried chain; `report()` prints `step: cause` after the refusal's own
+/// text.
+fn setup_step(source: io::Error, step: &'static str) -> io::Error {
+    io::Error::from(Error::from(source).context(step))
 }
 
 /// Initialize the io_uring ring and run the writer loop.
@@ -611,9 +623,9 @@ fn uring_init_and_run(
     rx: &Receiver<PipelineItem>,
     path: &std::path::Path,
     framed_header: &[u8],
-    init_tx: &SyncSender<io::Result<()>>,
+    init_tx: &SyncSender<Result<()>>,
     expected: &SeqTotal,
-) -> io::Result<()> {
+) -> Result<()> {
     // Step 1: Allocate buffer pool.
     let pool = AlignedBufferPool::new(NUM_BUFS, IO_BUF_BYTES)?;
     let iovecs = pool.iovecs();
@@ -637,11 +649,10 @@ fn uring_init_and_run(
             e.raw_os_error(),
             Some(libc::ENOSYS | libc::EPERM | libc::EACCES | libc::EOPNOTSUPP)
         );
-        let e = io::Error::new(e.kind(), format!("io_uring creation failed: {e}"));
         if refused {
-            crate::error::platform_unsupported("io-uring", e)
+            Error::platform_unsupported("io-uring", setup_step(e, "io_uring creation failed"))
         } else {
-            e
+            Error::from(e).context("io_uring creation failed")
         }
     })?;
 
@@ -660,7 +671,7 @@ fn uring_init_and_run(
     // Step 4: Register the output fd so `WriteFixed` can reference it by slot.
     ring.submitter()
         .register_files(&[file.as_raw_fd()])
-        .map_err(|e| io::Error::new(e.kind(), format!("register_files failed: {e}")))?;
+        .map_err(|e| Error::from(e).context("register_files failed"))?;
 
     // Step 5: Register buffers (this is where RLIMIT_MEMLOCK bites).
     // Safety: iovecs point into the AlignedBufferPool allocation which
@@ -679,26 +690,23 @@ fn uring_init_and_run(
         let limited = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } == 0
             && limit.rlim_cur < (u64::from(NUM_BUFS) * IO_BUF_BYTES as u64);
         if limited && matches!(e.raw_os_error(), Some(libc::ENOMEM | libc::EPERM)) {
-            crate::error::platform_unsupported(
+            Error::platform_unsupported(
                 "io-uring",
-                io::Error::new(
-                    e.kind(),
-                    format!(
-                        "register_buffers failed: RLIMIT_MEMLOCK too low \
-                         (need {} MB, try `ulimit -l unlimited`): {e}",
-                        (NUM_BUFS as usize * IO_BUF_BYTES) / (1024 * 1024)
-                    ),
-                ),
+                io::Error::from(Error::from(e).context(format!(
+                    "register_buffers failed: RLIMIT_MEMLOCK too low \
+                     (need {} MB, try `ulimit -l unlimited`)",
+                    (NUM_BUFS as usize * IO_BUF_BYTES) / (1024 * 1024)
+                ))),
             )
         } else {
-            io::Error::new(e.kind(), format!("register_buffers failed: {e}"))
+            Error::from(e).context("register_buffers failed")
         }
     })?;
 
     // Step 6: Signal successful init.
     init_tx
         .send(Ok(()))
-        .map_err(|_| io::Error::other("constructor dropped before init completed"))?;
+        .map_err(|_| Error::internal("constructor dropped before init completed"))?;
 
     let mut state = UringState {
         ring,
@@ -728,9 +736,8 @@ fn uring_main_loop(
     rx: &Receiver<PipelineItem>,
     state: &mut UringState,
     expected: &SeqTotal,
-) -> io::Result<()> {
-    let mut pending: ReorderBuffer<io::Result<OutputChunk>> =
-        ReorderBuffer::with_capacity(WRITE_AHEAD);
+) -> Result<()> {
+    let mut pending: ReorderBuffer<Result<OutputChunk>> = ReorderBuffer::with_capacity(WRITE_AHEAD);
 
     loop {
         let t_recv = std::time::Instant::now();

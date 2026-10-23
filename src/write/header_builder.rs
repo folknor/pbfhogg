@@ -3,7 +3,7 @@
 use crate::read::block::Feature;
 use crate::read::wire_schema::{header_bbox, header_block};
 
-use std::io;
+use crate::error::{Error, Result};
 
 use protohoggr::{encode_bytes_field, encode_int64_field_always, encode_sint64_field_always};
 
@@ -100,7 +100,7 @@ impl<'a> HeaderBuilder<'a> {
 
     /// Set the bounding box (left/bottom/right/top in degrees).
     ///
-    /// [`build`](Self::build) returns `InvalidInput` if a coordinate is
+    /// [`build`](Self::build) returns `InvalidArgument` if a coordinate is
     /// non-finite, outside the usual longitude/latitude bounds, or if either
     /// minimum is greater than its maximum. A box copied by
     /// [`from_header`](Self::from_header) is re-serialized as read instead;
@@ -215,12 +215,12 @@ impl<'a> HeaderBuilder<'a> {
     /// osmosis_replication_sequence_number (int64, field 33),
     /// osmosis_replication_base_url (string, field 34).
     ///
-    /// Returns `InvalidInput` when the bounding box has a non-finite
+    /// Returns `ErrorKind::InvalidArgument` when the bounding box has a non-finite
     /// coordinate, or when a box set through [`bbox`](Self::bbox) is out of
     /// range or inverted. A box copied from an input header is not range-
     /// or order-checked; see [`bbox`](Self::bbox).
     #[allow(clippy::cast_possible_truncation)]
-    pub fn build(self) -> io::Result<Vec<u8>> {
+    pub fn build(self) -> Result<Vec<u8>> {
         // Validate and quantize before writing any bytes. A non-finite
         // value would silently quantize to 0 or saturate, so it is refused
         // whatever its origin (an input header decodes from sint64 and is
@@ -228,27 +228,23 @@ impl<'a> HeaderBuilder<'a> {
         // boxes: input boxes round-trip as read.
         let bbox = if let Some((left, bottom, right, top)) = self.bbox {
             if !left.is_finite() || !bottom.is_finite() || !right.is_finite() || !top.is_finite() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
+                return Err(Error::invalid_argument(
                     "bounding box coordinates must be finite",
                 ));
             }
             if !self.bbox_from_input {
                 if !(-180.0..=180.0).contains(&left) || !(-180.0..=180.0).contains(&right) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
+                    return Err(Error::invalid_argument(
                         "bounding box longitude must be within [-180, 180] degrees",
                     ));
                 }
                 if !(-90.0..=90.0).contains(&bottom) || !(-90.0..=90.0).contains(&top) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
+                    return Err(Error::invalid_argument(
                         "bounding box latitude must be within [-90, 90] degrees",
                     ));
                 }
                 if left > right || bottom > top {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
+                    return Err(Error::invalid_argument(
                         "bounding box minima must not exceed maxima",
                     ));
                 }
@@ -513,7 +509,10 @@ mod tests {
                 .bbox(left, bottom, right, top)
                 .build()
                 .expect_err("invalid bounds must not be serialized");
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(matches!(
+                err.kind(),
+                crate::ErrorKind::InvalidArgument { .. }
+            ));
         }
     }
 
@@ -557,6 +556,9 @@ mod tests {
             .bbox(0.0, 0.0, 1.0, 91.0)
             .build()
             .expect_err("a caller-set out-of-range bbox must be refused");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(matches!(
+            err.kind(),
+            crate::ErrorKind::InvalidArgument { .. }
+        ));
     }
 }

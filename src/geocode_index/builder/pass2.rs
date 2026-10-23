@@ -38,6 +38,7 @@ use crate::Element;
 use super::BuildConfig;
 use super::Result;
 use super::strings::StringPool;
+use crate::error::Error;
 
 use super::super::format::*;
 
@@ -79,7 +80,7 @@ pub(super) struct SlimInterpWay {
 #[derive(Default)]
 struct NodeBlobOut {
     addr_points: Vec<PendingAddrPoint>,
-    error: Option<String>,
+    error: Option<Error>,
 }
 
 /// Pending address point - used by both Phase 2a (addr-tagged nodes) and
@@ -114,20 +115,25 @@ struct PendingAddrPoint {
 fn coord_slots(mmap: &mut memmap2::MmapMut, slot_count: usize) -> Result<&[AtomicU64]> {
     let needed = slot_count
         .checked_mul(std::mem::size_of::<AtomicU64>())
-        .ok_or_else(|| format!("coordinate store of {slot_count} slots overflows usize"))?;
+        .ok_or_else(|| {
+            Error::internal(format!(
+                "coordinate store of {slot_count} slots overflows usize"
+            ))
+        })?;
     if needed > mmap.len() {
-        return Err(format!(
+        return Err(Error::internal(format!(
             "coordinate store mapping is {} bytes, {needed} needed for {slot_count} slots",
             mmap.len()
-        )
-        .into());
+        )));
     }
     if slot_count == 0 {
         return Ok(&[]);
     }
     let base = mmap.as_mut_ptr();
     if base.align_offset(std::mem::align_of::<AtomicU64>()) != 0 {
-        return Err("coordinate store mapping is not aligned for AtomicU64".into());
+        return Err(Error::internal(
+            "coordinate store mapping is not aligned for AtomicU64",
+        ));
     }
     // SAFETY: `base` is valid for reads and writes of `needed` bytes (checked
     // above against the mapping's length) and aligned for `AtomicU64`
@@ -187,7 +193,7 @@ struct WayBlobOut {
     admin_geoms: Vec<(i64, Vec<(i32, i32)>)>,
     missing_node_ref_count: u64,
     missing_ref_way_ids: Vec<i64>,
-    error: Option<String>,
+    error: Option<Error>,
 }
 
 struct PendingStreet {
@@ -295,11 +301,11 @@ fn classify_way_into(
         })
         .collect();
     if let Some(rank) = rank_outside_store {
-        state.error = Some(format!(
+        state.error = Some(Error::internal(format!(
             "internal error: way {way_id} resolves to coordinate rank {rank}, outside the \
              {}-slot store built from the same referenced-node set",
             coord_slots.len()
-        ));
+        )));
         return;
     }
     if missing_node_ref_count > 0 {
@@ -332,12 +338,12 @@ fn classify_way_into(
                 _ => InterpolationType::All as u8,
             };
             if u16::try_from(coords.len()).is_err() {
-                state.error = Some(format!(
+                state.error = Some(Error::invalid_data(format!(
                     "interp way: {} coords exceeds u16::MAX. OSM ways are capped at \
                      2000 refs by convention; if this limit ever changes, bump \
                      `InterpWay.node_count` to u32 and increment FORMAT_VERSION.",
                     coords.len()
-                ));
+                )));
                 return;
             }
             state.interps.push(PendingInterp {
@@ -380,12 +386,12 @@ fn classify_way_into(
     // Streets - defer file writes to merge. Same u16 invariant as interp.
     if is_street && coords.len() >= 2 {
         if u16::try_from(coords.len()).is_err() {
-            state.error = Some(format!(
+            state.error = Some(Error::invalid_data(format!(
                 "street way: {} coords exceeds u16::MAX. OSM ways are capped at \
                  2000 refs by convention; if this limit ever changes, bump \
                  `StreetWay.node_count` to u32 and increment FORMAT_VERSION.",
                 coords.len()
-            ));
+            )));
             return;
         }
         state.streets.push(PendingStreet {
@@ -447,11 +453,16 @@ pub(super) fn run_pass2(
         referenced_count * 8 / 1_000_000
     );
     // One packed 8-byte coordinate slot per referenced node.
-    let slot_count = usize::try_from(referenced_count)
-        .map_err(|_| format!("{referenced_count} referenced nodes exceed usize"))?;
+    let slot_count = usize::try_from(referenced_count).map_err(|_| {
+        Error::invalid_data(format!("{referenced_count} referenced nodes exceed usize"))
+    })?;
     let coord_array_len = slot_count
         .checked_mul(std::mem::size_of::<AtomicU64>())
-        .ok_or_else(|| format!("coordinate store for {referenced_count} nodes overflows usize"))?;
+        .ok_or_else(|| {
+            Error::invalid_data(format!(
+                "coordinate store for {referenced_count} nodes overflows usize"
+            ))
+        })?;
     // `map_anon` rejects a zero length; the view below still exposes zero
     // slots when there are no referenced nodes.
     let mut coord_mmap = memmap2::MmapMut::map_anon(coord_array_len.max(1))?;
@@ -485,8 +496,8 @@ pub(super) fn run_pass2(
     crate::debug::emit_marker("GEOCODE_PASS2A_START");
     {
         let referenced_ref = &referenced_nodes;
-        let mut merge_err: Option<std::io::Error> = None;
-        let mut semantic_err: Option<String> = None;
+        let mut merge_err: Option<Error> = None;
+        let mut semantic_err: Option<Error> = None;
         crate::scan::classify::parallel_classify_phase_ordered(
             shared_file,
             node_schedule,
@@ -505,13 +516,13 @@ pub(super) fn run_pass2(
                             // every decoded node - before any other test can
                             // skip it - rather than trust the claim.
                             if node_id > max_node_id {
-                                state.error = Some(format!(
+                                state.error = Some(Error::invalid_data(format!(
                                     "node {node_id} exceeds the node-ID bound {max_node_id} derived \
                                      from the blob metadata (the largest indexdata max_id over node \
                                      blobs, widened by any blob without indexdata). Some blob's \
                                      indexdata understates its ID range; regenerate it with \
                                      `pbfhogg cat`."
-                                ));
+                                )));
                                 continue;
                             }
                             let lat_e7 = node.decimicro_lat();
@@ -522,25 +533,25 @@ pub(super) fn run_pass2(
                                 // edge. Silently skipping it could publish
                                 // plausible but incomplete geometry, so this
                                 // build remains fatal for that condition.
-                                state.error = Some(format!(
+                                state.error = Some(Error::invalid_data(format!(
                                     "node {node_id} has coordinates outside the geographic domain (lat {lat_e7}, lon {lon_e7} in decimicrodegrees)"
-                                ));
+                                )));
                                 continue;
                             };
                             if let Some(rank) = referenced_ref.rank_if_set(node_id) {
                                 let Some(slot) = coord_slot(coord_store, rank) else {
-                                    state.error = Some(format!(
+                                    state.error = Some(Error::internal(format!(
                                         "internal error: node {node_id} has coordinate rank {rank}, \
                                          outside the {}-slot store built from the same \
                                          referenced-node set",
                                         coord_store.len()
-                                    ));
+                                    )));
                                     continue;
                                 };
                                 if !install_coord(slot, packed) {
-                                    state.error = Some(format!(
+                                    state.error = Some(Error::invalid_data(format!(
                                         "node {node_id} has conflicting coordinates across occurrences"
-                                    ));
+                                    )));
                                     continue;
                                 }
                             }
@@ -594,13 +605,13 @@ pub(super) fn run_pass2(
                         postcode_offset: pc_off,
                     };
                     if let Err(e) = addr_points_out.write_all(&ap.to_bytes()) {
-                        merge_err = Some(e);
+                        merge_err = Some(Error::from(e));
                         return;
                     }
                     let Some(next_count) = addr_point_count.checked_add(1) else {
-                        semantic_err = Some(
-                            "address point count exceeds u32::MAX; bump FORMAT_VERSION".into(),
-                        );
+                        semantic_err = Some(Error::invalid_data(
+                            "address point count exceeds u32::MAX; bump FORMAT_VERSION",
+                        ));
                         return;
                     };
                     addr_point_count = next_count;
@@ -609,10 +620,10 @@ pub(super) fn run_pass2(
             &*host.resources,
         )?;
         if let Some(e) = merge_err {
-            return Err(e.into());
+            return Err(e);
         }
         if let Some(e) = semantic_err {
-            return Err(e.into());
+            return Err(e);
         }
     }
     crate::debug::emit_marker("GEOCODE_PASS2A_END");
@@ -635,7 +646,7 @@ pub(super) fn run_pass2(
     {
         let referenced_ref = &referenced_nodes;
         let needed_admin_ways_ref = &needed_admin_ways;
-        let mut merge_err: Option<String> = None;
+        let mut merge_err: Option<Error> = None;
 
         crate::scan::classify::parallel_classify_phase_ordered(
             shared_file,
@@ -681,10 +692,10 @@ pub(super) fn run_pass2(
                     let nc = match u16::try_from(pi.coords.len()) {
                         Ok(n) => n,
                         Err(_) => {
-                            merge_err = Some(format!(
+                            merge_err = Some(Error::internal(format!(
                                 "interp way coord count {} overflows u16 at merge (classify should have caught)",
                                 pi.coords.len(),
-                            ));
+                            )));
                             return;
                         }
                     };
@@ -707,7 +718,7 @@ pub(super) fn run_pass2(
                             }
                             .to_bytes(),
                         ) {
-                            merge_err = Some(e.to_string());
+                            merge_err = Some(Error::from(e));
                             return;
                         }
                     }
@@ -727,13 +738,13 @@ pub(super) fn run_pass2(
                         postcode_offset: pc_off,
                     };
                     if let Err(e) = addr_points_out.write_all(&ap.to_bytes()) {
-                        merge_err = Some(e.to_string());
+                        merge_err = Some(Error::from(e));
                         return;
                     }
                     let Some(next_count) = addr_point_count.checked_add(1) else {
-                        merge_err = Some(
-                            "address point count exceeds u32::MAX; bump FORMAT_VERSION".into(),
-                        );
+                        merge_err = Some(Error::invalid_data(
+                            "address point count exceeds u32::MAX; bump FORMAT_VERSION",
+                        ));
                         return;
                     };
                     addr_point_count = next_count;
@@ -744,10 +755,10 @@ pub(super) fn run_pass2(
                     let nc = match u16::try_from(ps.coords.len()) {
                         Ok(n) => n,
                         Err(_) => {
-                            merge_err = Some(format!(
+                            merge_err = Some(Error::internal(format!(
                                 "street way coord count {} overflows u16 at merge (classify should have caught)",
                                 ps.coords.len(),
-                            ));
+                            )));
                             return;
                         }
                     };
@@ -758,7 +769,7 @@ pub(super) fn run_pass2(
                         node_count: nc,
                     };
                     if let Err(e) = street_ways_out.write_all(&sw.to_bytes()) {
-                        merge_err = Some(e.to_string());
+                        merge_err = Some(Error::from(e));
                         return;
                     }
                     for &(lat, lon) in &ps.coords {
@@ -769,14 +780,15 @@ pub(super) fn run_pass2(
                             }
                             .to_bytes(),
                         ) {
-                            merge_err = Some(e.to_string());
+                            merge_err = Some(Error::from(e));
                             return;
                         }
                     }
                     street_node_offset += (ps.coords.len() * NODE_COORD_SIZE) as u64;
                     let Some(next_count) = street_way_count.checked_add(1) else {
-                        merge_err =
-                            Some("street way count exceeds u32::MAX; bump FORMAT_VERSION".into());
+                        merge_err = Some(Error::invalid_data(
+                            "street way count exceeds u32::MAX; bump FORMAT_VERSION",
+                        ));
                         return;
                     };
                     street_way_count = next_count;
@@ -785,7 +797,7 @@ pub(super) fn run_pass2(
             &*host.resources,
         )?;
         if let Some(e) = merge_err {
-            return Err(e.into());
+            return Err(e);
         }
     }
     crate::debug::emit_marker("GEOCODE_PASS2B_END");

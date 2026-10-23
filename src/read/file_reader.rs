@@ -10,6 +10,8 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::Path;
 
+use crate::error::{Error, Result};
+
 #[cfg(feature = "linux-direct-io")]
 use super::direct_reader::DirectReader;
 
@@ -23,17 +25,16 @@ pub enum FileReader {
     Direct(DirectReader),
 }
 
-/// Name the file an open failed on, preserving the original
-/// [`io::ErrorKind`] so callers matching on `NotFound` still match.
+/// Name the file an open failed on, keeping the original error (and so its
+/// [`io::ErrorKind`] and OS error) as the cause, so callers matching on
+/// `NotFound` still match.
 ///
 /// A bare `No such file or directory (os error 2)` is what a user saw for
 /// a mistyped input path: true, and useless on a command with several
 /// inputs. The path is known here and nowhere below here.
-pub(crate) fn open_error(path: &Path, err: &io::Error) -> io::Error {
-    io::Error::new(
-        err.kind(),
-        format!("failed to open {}: {err}", path.display()),
-    )
+pub(crate) fn open_error(path: &Path, err: impl Into<Error>) -> Error {
+    err.into()
+        .context(format!("failed to open {}", path.display()))
 }
 
 impl FileReader {
@@ -65,8 +66,8 @@ impl FileReader {
     ///
     /// On Linux, advises the kernel for sequential readahead via
     /// `posix_fadvise(POSIX_FADV_SEQUENTIAL)`.
-    pub fn buffered(path: &Path) -> io::Result<Self> {
-        let f = File::open(path).map_err(|e| open_error(path, &e))?;
+    pub fn buffered(path: &Path) -> Result<Self> {
+        let f = File::open(path).map_err(|e| open_error(path, e))?;
         #[cfg(all(
             target_os = "linux",
             any(feature = "linux-direct-io", feature = "linux-io-uring")
@@ -85,11 +86,15 @@ impl FileReader {
 
     /// Open a file for O_DIRECT reading with page-aligned buffers.
     #[cfg(feature = "linux-direct-io")]
-    pub fn direct(path: &Path) -> io::Result<Self> {
-        // `open_error` rebuilds the error from its message, so name the path
-        // on the carried source and keep a platform refusal typed.
+    pub fn direct(path: &Path) -> Result<Self> {
+        // A platform refusal already names the path inside its source, so
+        // it stays the outermost text; any other failure gets the context.
         Ok(Self::Direct(DirectReader::open(path).map_err(|e| {
-            crate::error::map_io_preserving_platform(e, |e| open_error(path, &e))
+            if matches!(e.kind(), crate::ErrorKind::PlatformUnsupported { .. }) {
+                e
+            } else {
+                open_error(path, e)
+            }
         })?))
     }
 
@@ -97,7 +102,7 @@ impl FileReader {
     ///
     /// Returns an error if `direct` is true but the `linux-direct-io` feature
     /// is not enabled.
-    pub fn open(path: &Path, direct: bool) -> io::Result<Self> {
+    pub fn open(path: &Path, direct: bool) -> Result<Self> {
         if direct {
             #[cfg(feature = "linux-direct-io")]
             {
@@ -105,8 +110,7 @@ impl FileReader {
             }
             #[cfg(not(feature = "linux-direct-io"))]
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
+                return Err(Error::invalid_argument(
                     "--direct-io requires the linux-direct-io feature",
                 ));
             }

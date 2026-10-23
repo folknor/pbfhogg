@@ -31,7 +31,7 @@ pub enum FileWriter {
 
 impl FileWriter {
     /// Create a buffered file writer (default path).
-    pub fn buffered(path: &Path) -> io::Result<Self> {
+    pub fn buffered(path: &Path) -> crate::Result<Self> {
         let file = File::create(path)?;
         Ok(FileWriter::Buffered(BufWriter::with_capacity(
             crate::write::IO_BUF_BYTES,
@@ -41,7 +41,7 @@ impl FileWriter {
 
     /// Create an `O_DIRECT` file writer.
     #[cfg(feature = "linux-direct-io")]
-    pub fn direct(path: &Path) -> io::Result<Self> {
+    pub fn direct(path: &Path) -> crate::Result<Self> {
         Ok(FileWriter::Direct(DirectWriter::create(path)?))
     }
 
@@ -64,7 +64,7 @@ impl FileWriter {
     /// returned. That is reported as success, not as a failed write. Regular
     /// files and block devices propagate every
     /// `fsync` error, `EINVAL` included.
-    pub fn sync(&mut self) -> io::Result<()> {
+    pub fn sync(&mut self) -> crate::Result<()> {
         self.flush()?;
         let t_sync = std::time::Instant::now();
         let result = match self {
@@ -73,7 +73,7 @@ impl FileWriter {
             FileWriter::Direct(w) => w.sync_all(),
         };
         WRITER_METRICS.record_sync_all(t_sync);
-        result
+        Ok(result?)
     }
 }
 

@@ -30,7 +30,7 @@
 //! its stop check raced the publication. What the owner guarantees is that
 //! no thread it started outlives the call, not that work halts instantly.
 
-use crate::error::panic_error;
+use crate::error::{Error, panic_error};
 
 use std::any::Any;
 use std::io;
@@ -41,7 +41,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 /// the participants poll. See the module doc for the ordering contract.
 pub(crate) struct FirstFailure {
     stop: AtomicBool,
-    first: Mutex<Option<io::Error>>,
+    first: Mutex<Option<Error>>,
 }
 
 impl FirstFailure {
@@ -55,17 +55,18 @@ impl FirstFailure {
     /// Nothing panics while this lock is held, so poisoning cannot happen
     /// through this type; recovering the guard keeps that true even if a
     /// future edit introduces a panic.
-    fn slot(&self) -> MutexGuard<'_, Option<io::Error>> {
+    fn slot(&self) -> MutexGuard<'_, Option<Error>> {
         self.first.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Record `e` unless a failure is already recorded, and publish `stop`.
     /// A later failure is dropped: it is either a consequence of the first
-    /// or an independent fault that does not outrank it.
-    pub(crate) fn record(&self, e: io::Error) {
+    /// or an independent fault that does not outrank it. An `io::Error`
+    /// carrying a `pbfhogg::Error` is recorded as that error.
+    pub(crate) fn record(&self, e: impl Into<Error>) {
         let mut slot = self.slot();
         if slot.is_none() {
-            *slot = Some(e);
+            *slot = Some(e.into());
         }
         // Published under the lock, so `stopped()` implies a filled slot.
         self.stop.store(true, Ordering::Release);
@@ -87,18 +88,17 @@ impl FirstFailure {
     /// The recorded failure, removed. Call only after every participant has
     /// been joined.
     pub(crate) fn take(&self) -> Option<io::Error> {
-        self.slot().take()
+        self.slot().take().map(Error::into_io)
     }
 
-    /// A faithful copy of the recorded failure (same `ErrorKind`, same
-    /// message), leaving the original in place for [`take`](Self::take).
-    /// For the places that must answer *now* while the owner still has to
-    /// surface the original later: flush-barrier acks, a producer whose
-    /// send failed. `io::Error` is not `Clone`.
+    /// A clone of the recorded failure, leaving the original in place for
+    /// [`take`](Self::take). For the places that must answer *now* while the
+    /// owner still has to surface the original later: flush-barrier acks, a
+    /// producer whose send failed. Both views carry the same error (it
+    /// shares one kind), inside an `io::Error` whose kind follows the
+    /// `From<Error> for io::Error` table.
     pub(crate) fn restate(&self) -> Option<io::Error> {
-        self.slot()
-            .as_ref()
-            .map(|e| io::Error::new(e.kind(), e.to_string()))
+        self.slot().clone().map(io::Error::from)
     }
 }
 
@@ -112,7 +112,7 @@ mod tests {
         assert!(!f.stopped());
         f.record(io::Error::new(io::ErrorKind::StorageFull, "cause"));
         assert!(f.stopped());
-        f.record(io::Error::other("consequence"));
+        f.record(io::Error::new(io::ErrorKind::BrokenPipe, "consequence"));
         let restated = f.restate().expect("restate after record");
         assert_eq!(restated.kind(), io::ErrorKind::StorageFull);
         assert_eq!(restated.to_string(), "cause");

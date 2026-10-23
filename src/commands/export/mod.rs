@@ -9,7 +9,6 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::commands::extract::Bbox;
-use crate::error::{ErrorKind, new_error};
 use crate::owned::TypeFilter;
 use crate::tag_expr::{Expression, parse_expressions, tag_matches};
 use crate::{Element, ElementReader};
@@ -51,19 +50,8 @@ impl ExportOptions {
         bbox: Option<&str>,
         metadata: bool,
     ) -> crate::Result<Self> {
-        let expressions = parse_expressions(expressions).map_err(|error| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
-        })?;
-        let bbox = bbox
-            .map(|value| {
-                crate::commands::extract::parse_bbox(value).map_err(|error| {
-                    crate::Error::from(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        error.to_string(),
-                    ))
-                })
-            })
-            .transpose()?;
+        let expressions = parse_expressions(expressions)?;
+        let bbox = bbox.map(crate::commands::extract::parse_bbox).transpose()?;
         Ok(Self {
             format,
             types,
@@ -166,9 +154,9 @@ pub fn export<W: Write>(
 ) -> crate::Result<ExportStats> {
     let reader = ElementReader::open_in(input, false, host)?;
     if admits_ways(opts.types) && !reader.header().has_locations_on_ways() {
-        return Err(new_error(ErrorKind::MissingFeature(
+        return Err(crate::error::new_missing_feature(
             crate::HeaderBlock::LOCATIONS_ON_WAYS,
-        )));
+        ));
     }
 
     let mut writer = FeatureWriter::new(out, opts.format)?;

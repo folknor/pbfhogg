@@ -43,6 +43,7 @@
 //! so at its own definition, with a reason.
 
 use std::fs::File;
+#[cfg(feature = "linux-direct-io")]
 use std::io;
 use std::os::unix::fs::FileExt;
 #[cfg(feature = "linux-direct-io")]
@@ -53,6 +54,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{Scope, ScopedJoinHandle};
 
+use crate::error::{Error, Result};
 use crate::reorder_buffer::ReorderBuffer;
 use crate::tunables::{PER_WORKER_CAPACITY, POOL_SIZE, WRITE_AHEAD};
 use crate::write::metrics::WRITER_METRICS;
@@ -238,9 +240,9 @@ pub(crate) fn parallel_writer_thread(
     rx: Receiver<PipelineItem>,
     path: PathBuf,
     framed_header: Vec<u8>,
-    init_tx: SyncSender<io::Result<()>>,
+    init_tx: SyncSender<Result<()>>,
     expected: &SeqTotal,
-) -> io::Result<()> {
+) -> Result<()> {
     // A failure is not logged here: it is the thread's return value, which the
     // writer's `flush` (or the failed send that noticed the thread was gone)
     // hands to the caller, so the operator sees it exactly once.
@@ -252,25 +254,26 @@ fn parallel_writer_thread_inner(
     rx: Receiver<PipelineItem>,
     path: PathBuf,
     framed_header: Vec<u8>,
-    init_tx: SyncSender<io::Result<()>>,
+    init_tx: SyncSender<Result<()>>,
     expected: &SeqTotal,
-) -> io::Result<()> {
+) -> Result<()> {
     let file = match File::create(&path) {
         Ok(f) => f,
         Err(e) => {
-            let sent = io::Error::new(e.kind(), format!("create {}: {e}", path.display()));
-            init_tx.send(Err(sent)).ok();
-            return Err(e);
+            // The same typed error goes to the constructor waiting on init
+            // and out as the thread's result.
+            let error = Error::from(e).context(format!("create {}", path.display()));
+            init_tx.send(Err(error.clone())).ok();
+            return Err(error);
         }
     };
 
     // Write the header at offset 0. Everything after grows from
     // `framed_header.len()`.
     if let Err(e) = file.write_all_at(&framed_header, 0) {
-        init_tx
-            .send(Err(io::Error::new(e.kind(), format!("header write: {e}"))))
-            .ok();
-        return Err(e);
+        let error = Error::from(e).context("header write");
+        init_tx.send(Err(error.clone())).ok();
+        return Err(error);
     }
 
     // Signal init success so the constructor can return.
@@ -282,7 +285,7 @@ fn parallel_writer_thread_inner(
 
     // Every pool thread has been joined; the record is final.
     if let Some(e) = failure.take() {
-        return Err(e);
+        return Err(e.into());
     }
 
     let t_sync = std::time::Instant::now();
@@ -316,10 +319,9 @@ fn run_pool<'scope, 'env>(
                 worker_handles.push(handle);
             }
             Err(e) => {
-                failure.record(io::Error::new(
-                    e.kind(),
-                    format!("spawn parallel writer pool worker {index}: {e}"),
-                ));
+                failure.record(
+                    Error::from(e).context(format!("spawn parallel writer pool worker {index}")),
+                );
                 break;
             }
         }
@@ -371,9 +373,8 @@ fn dispatch_loop(
     failure: &FirstFailure,
     header_len: u64,
     expected: &SeqTotal,
-) -> io::Result<()> {
-    let mut pending: ReorderBuffer<io::Result<OutputChunk>> =
-        ReorderBuffer::with_capacity(WRITE_AHEAD);
+) -> Result<()> {
+    let mut pending: ReorderBuffer<Result<OutputChunk>> = ReorderBuffer::with_capacity(WRITE_AHEAD);
     let mut current_offset: u64 = header_len;
     let mut next_worker: usize = 0;
 
@@ -382,7 +383,7 @@ fn dispatch_loop(
         // only seen when the next send to that worker fails, up to a full
         // round-robin pass later.
         if failure.stopped() {
-            return Err(io::Error::other(
+            return Err(Error::internal(
                 "parallel writer stopped after a pool failure",
             ));
         }
@@ -425,7 +426,7 @@ fn dispatch_chunk(
     worker_txs: &[SyncSender<WriteOp>],
     current_offset: &mut u64,
     next_worker: &mut usize,
-) -> io::Result<()> {
+) -> Result<()> {
     match chunk {
         OutputChunk::Framed(parts) => {
             let bytes = parts.into_vec();
@@ -517,9 +518,9 @@ fn send_to_worker(
     worker_txs: &[SyncSender<WriteOp>],
     next_worker: &mut usize,
     op: WriteOp,
-) -> io::Result<()> {
+) -> Result<()> {
     if worker_txs[*next_worker].send(op).is_err() {
-        return Err(io::Error::other("parallel writer worker channel closed"));
+        return Err(Error::internal("parallel writer worker channel closed"));
     }
     *next_worker = (*next_worker + 1) % worker_txs.len();
     Ok(())
@@ -562,7 +563,9 @@ fn worker_loop(index: usize, rx: &Receiver<WriteOp>, file: &File, failure: &Firs
 
         let t = std::time::Instant::now();
         let result = match op {
-            WriteOp::Write { offset, bytes } => file.write_all_at(&bytes, offset),
+            WriteOp::Write { offset, bytes } => {
+                file.write_all_at(&bytes, offset).map_err(Error::from)
+            }
             #[cfg(feature = "linux-direct-io")]
             WriteOp::CopyRange {
                 out_offset,
@@ -603,7 +606,7 @@ fn copy_range_to_fd(
     mut src_offset: u64,
     mut out_offset: u64,
     mut remaining: u64,
-) -> io::Result<()> {
+) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     let out_fd = out.as_raw_fd();
     while remaining > 0 {
@@ -621,6 +624,7 @@ fn copy_range_to_fd(
             )
         };
         if ret < 0 {
+            // Decide on the original syscall error, before any conversion.
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EXDEV) {
                 // Cross-device copy: kernel-side splice isn't available
@@ -630,16 +634,16 @@ fn copy_range_to_fd(
                 // don't race on the output fd's position.
                 return copy_range_fallback_pwrite(out, in_fd, src_offset, out_offset, remaining);
             }
-            return Err(err);
+            return Err(err.into());
         }
         if ret == 0 {
-            return Err(io::Error::new(
+            return Err(Error::io_kind(
                 io::ErrorKind::UnexpectedEof,
                 "copy_file_range returned 0 before completing",
             ));
         }
         let advanced = u64::try_from(ret)
-            .map_err(|_| io::Error::other("copy_file_range returned negative advance"))?;
+            .map_err(|_| Error::internal("copy_file_range returned negative advance"))?;
         src_offset += advanced;
         out_offset += advanced;
         remaining -= advanced;
@@ -662,7 +666,7 @@ fn copy_range_fallback_pwrite(
     mut src_offset: u64,
     mut out_offset: u64,
     mut remaining: u64,
-) -> io::Result<()> {
+) -> Result<()> {
     let mut buf = vec![0u8; crate::write::IO_BUF_BYTES];
     while remaining > 0 {
         let chunk = buf.len().min(remaining as usize);
@@ -674,17 +678,17 @@ fn copy_range_fallback_pwrite(
                 if err.raw_os_error() == Some(libc::EINTR) {
                     continue;
                 }
-                return Err(err);
+                return Err(err.into());
             }
             break ret;
         };
         if n == 0 {
-            return Err(io::Error::new(
+            return Err(Error::io_kind(
                 io::ErrorKind::UnexpectedEof,
                 "pread returned 0 during cross-device copy",
             ));
         }
-        let n_u = usize::try_from(n).map_err(|_| io::Error::other("pread returned negative"))?;
+        let n_u = usize::try_from(n).map_err(|_| Error::internal("pread returned negative"))?;
         out.write_all_at(&buf[..n_u], out_offset)?;
         src_offset += n_u as u64;
         out_offset += n_u as u64;
@@ -702,12 +706,12 @@ mod tests {
     use std::io::Read;
 
     #[test]
-    fn parallel_writer_basic() -> io::Result<()> {
+    fn parallel_writer_basic() -> Result<()> {
         let dir = crate::path_guard::tests::scratch();
         let out = dir.path().join("out.bin");
 
         let (tx, rx) = sync_channel::<PipelineItem>(WRITE_AHEAD);
-        let (init_tx, init_rx) = sync_channel::<io::Result<()>>(1);
+        let (init_tx, init_rx) = sync_channel::<Result<()>>(1);
         let header = b"HDR".to_vec();
 
         let path = out.clone();
@@ -720,7 +724,7 @@ mod tests {
         // Wait for init.
         init_rx
             .recv()
-            .map_err(|_| io::Error::other("init channel closed"))??;
+            .map_err(|_| Error::internal("init channel closed"))??;
 
         // Send 16 items in seq order, each with a unique payload.
         for i in 0..16u32 {
@@ -729,14 +733,14 @@ mod tests {
                 seq: i as usize,
                 data: Ok(OutputChunk::Raw(payload)),
             })
-            .map_err(|_| io::Error::other("send"))?;
+            .map_err(|_| Error::internal("send"))?;
         }
         seq_total.announce(16);
         drop(tx);
 
         handle
             .join()
-            .map_err(|_| io::Error::other("writer thread panicked"))??;
+            .map_err(|_| Error::internal("writer thread panicked"))??;
 
         let mut actual = Vec::new();
         std::fs::File::open(&out)?.read_to_end(&mut actual)?;

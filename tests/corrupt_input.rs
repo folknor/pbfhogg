@@ -92,10 +92,7 @@ fn zero_length_blob_header_is_rejected() {
         .expect("a complete 4-byte length prefix is a committed frame, not EOF")
         .unwrap_err();
     assert!(
-        matches!(
-            err.into_kind(),
-            ErrorKind::Blob(BlobError::InvalidHeaderSize)
-        ),
+        matches!(err.kind(), ErrorKind::Blob(BlobError::InvalidHeaderSize)),
         "a zero-length BlobHeader must be InvalidHeaderSize"
     );
 }
@@ -137,9 +134,9 @@ fn header_too_big() {
     let data = 65536u32.to_be_bytes().to_vec();
     let mut reader = BlobReader::new(Cursor::new(data));
     let err = reader.next().unwrap().unwrap_err();
-    match err.into_kind() {
+    match err.kind() {
         ErrorKind::Blob(BlobError::HeaderTooBig { size }) => {
-            assert_eq!(size, 65536);
+            assert_eq!(*size, 65536);
         }
         other => panic!("expected HeaderTooBig, got {other:?}"),
     }
@@ -238,8 +235,8 @@ fn truncated_header_data() {
     data.extend_from_slice(&[0x0A; 5]); // only 5 bytes follow
     let mut reader = BlobReader::new(Cursor::new(data));
     let err = reader.next().unwrap().unwrap_err();
-    match err.into_kind() {
-        ErrorKind::Io(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+    match err.kind() {
+        ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
         other => panic!("expected Io(UnexpectedEof) for truncated header, got {other:?}"),
     }
 }
@@ -307,7 +304,7 @@ fn garbage_header() {
     data.extend_from_slice(&[0xFF; 10]); // 10 bytes of garbage
     let mut reader = BlobReader::new(Cursor::new(data));
     let err = reader.next().unwrap().unwrap_err();
-    match err.into_kind() {
+    match err.kind() {
         ErrorKind::WireFormat { .. } => {}
         other => panic!("expected WireFormat error for garbage header, got {other:?}"),
     }
@@ -516,20 +513,16 @@ fn inspect_rejects_oversized_header_length_via_walker() {
 // path hard-errors before the allocation.
 //
 // Command entry points (`cat`, `inspect`, `has_indexdata`) return
-// `Box<dyn Error>`; the concrete error boxed at the `?` boundary is
-// `pbfhogg::Error`, so these downcast to the typed
+// `pbfhogg::Error`, so these check the typed
 // `ErrorKind::Blob(BlobError::DataSizeTooBig)` rather than matching display text.
 // ---------------------------------------------------------------------------
 
-/// Downcast a boxed command error to the crate's typed `DataSizeTooBig` and
-/// assert it carries the expected declared size.
-fn assert_datasize_too_big(err: Box<dyn std::error::Error>, expected: u64) {
-    let typed = err
-        .downcast::<pbfhogg::Error>()
-        .unwrap_or_else(|e| panic!("expected a pbfhogg::Error, got: {e}"));
-    match typed.into_kind() {
+/// Assert a command error is the crate's typed `DataSizeTooBig` carrying the
+/// expected declared size.
+fn assert_datasize_too_big(err: &pbfhogg::Error, expected: u64) {
+    match err.kind() {
         ErrorKind::Blob(BlobError::DataSizeTooBig { size }) => {
-            assert_eq!(size, expected);
+            assert_eq!(*size, expected);
         }
         other => panic!("expected DataSizeTooBig, got {other:?}"),
     }
@@ -576,9 +569,9 @@ fn blob_reader_rejects_oversized_datasize() {
     assert_eq!(first.get_type(), BlobType::OsmHeader);
     // Second (adversarial) blob is rejected before payload allocation.
     let err = reader.next().unwrap().unwrap_err();
-    match err.into_kind() {
+    match err.kind() {
         ErrorKind::Blob(BlobError::DataSizeTooBig { size }) => {
-            assert_eq!(size, MAX_BLOB_DATASIZE);
+            assert_eq!(*size, MAX_BLOB_DATASIZE);
         }
         other => panic!("expected DataSizeTooBig, got {other:?}"),
     }
@@ -608,7 +601,7 @@ fn cat_rejects_oversized_datasize() {
         Ok(_) => panic!("expected cat() to error on adversarial datasize"),
         Err(e) => e,
     };
-    assert_datasize_too_big(err, MAX_BLOB_DATASIZE);
+    assert_datasize_too_big(&err, MAX_BLOB_DATASIZE);
 }
 
 /// `read_blob_header_only` (via `has_indexdata`) rejects an oversized declared
@@ -628,7 +621,7 @@ fn has_indexdata_rejects_oversized_datasize() {
 
     let err =
         pbfhogg::has_indexdata(&path, false, &pbfhogg::host::Diagnostics::discard()).unwrap_err();
-    assert_datasize_too_big(err, MAX_BLOB_DATASIZE);
+    assert_datasize_too_big(&err, MAX_BLOB_DATASIZE);
 }
 
 /// `HeaderWalker::next_header` (via `inspect`'s index-only fast path) rejects an
@@ -658,7 +651,7 @@ fn inspect_rejects_oversized_datasize_via_walker() {
         Ok(_) => panic!("expected inspect() to error on adversarial datasize"),
         Err(e) => e,
     };
-    assert_datasize_too_big(err, MAX_BLOB_DATASIZE);
+    assert_datasize_too_big(&err, MAX_BLOB_DATASIZE);
 }
 
 /// After an error, BlobReader stops iteration (returns None on

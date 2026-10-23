@@ -215,7 +215,12 @@ pub struct Reader {
     strings: Mmap,
 }
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+type Result<T> = crate::Result<T>;
+
+/// A malformed index file: the index content is bad, not the request.
+fn corrupt(msg: impl Into<std::borrow::Cow<'static, str>>) -> crate::Error {
+    crate::Error::invalid_data(msg)
+}
 
 impl Reader {
     /// Open an index directory. Memory-maps all files.
@@ -238,13 +243,14 @@ impl Reader {
     pub fn open(dir: &Path) -> Result<Self> {
         let header_bytes = std::fs::read(dir.join(format::FILE_HEADER))?;
         if header_bytes.len() < HEADER_SIZE {
-            return Err("geocode header too short".into());
+            return Err(corrupt("geocode header too short"));
         }
         let header = Header::from_bytes(
             header_bytes[..HEADER_SIZE]
                 .try_into()
-                .map_err(|_| "header size mismatch")?,
-        )?;
+                .map_err(|_| corrupt("header size mismatch"))?,
+        )
+        .map_err(crate::Error::invalid_data_from)?;
 
         let mmap = |name: &str| format::mmap_or_empty(&dir.join(name));
 
@@ -299,12 +305,13 @@ impl Reader {
             let expected = usize::try_from(count)
                 .ok()
                 .and_then(|n| n.checked_mul(size))
-                .ok_or_else(|| format!("{name} size from header overflows this platform"))?;
+                .ok_or_else(|| {
+                    corrupt(format!("{name} size from header overflows this platform"))
+                })?;
             if actual != expected {
-                return Err(format!(
+                return Err(corrupt(format!(
                     "invalid geocode index: {name} is {actual} bytes, expected {expected}"
-                )
-                .into());
+                )));
             }
             Ok(())
         }
@@ -378,7 +385,7 @@ impl Reader {
     fn validate_admin_tree(&self) -> Result<()> {
         for index in 0..self.admin_cells.len() / ADMIN_CELL_SIZE {
             let rec = read_record::<ADMIN_CELL_SIZE>(&self.admin_cells, index * ADMIN_CELL_SIZE)
-                .ok_or("invalid admin cell record")?;
+                .ok_or_else(|| corrupt("invalid admin cell record"))?;
             let cell = AdminCell::from_bytes(rec);
             validate_list(cell.entries_offset, &self.admin_entries, 4, "admin entry")?;
         }
@@ -407,7 +414,7 @@ impl Reader {
     fn validate_way_geometry(&self) -> Result<()> {
         for index in 0..self.street_ways.len() / STREET_WAY_SIZE {
             let rec = read_record::<STREET_WAY_SIZE>(&self.street_ways, index * STREET_WAY_SIZE)
-                .ok_or("invalid street way record")?;
+                .ok_or_else(|| corrupt("invalid street way record"))?;
             let way = StreetWay::from_bytes(rec);
             validate_span(
                 way.node_offset,
@@ -420,9 +427,10 @@ impl Reader {
         }
         for index in 0..self.interp_ways.len() / INTERP_WAY_SIZE {
             let rec = read_record::<INTERP_WAY_SIZE>(&self.interp_ways, index * INTERP_WAY_SIZE)
-                .ok_or("invalid interpolation way record")?;
+                .ok_or_else(|| corrupt("invalid interpolation way record"))?;
             let way = InterpWay::from_bytes(rec);
-            InterpolationType::try_from(way.interpolation_type)?;
+            InterpolationType::try_from(way.interpolation_type)
+                .map_err(crate::Error::invalid_data_from)?;
             validate_span(
                 way.node_offset,
                 u64::from(way.node_count),
@@ -435,7 +443,7 @@ impl Reader {
         for index in 0..self.admin_polygons.len() / ADMIN_POLYGON_SIZE {
             let rec =
                 read_record::<ADMIN_POLYGON_SIZE>(&self.admin_polygons, index * ADMIN_POLYGON_SIZE)
-                    .ok_or("invalid admin polygon record")?;
+                    .ok_or_else(|| corrupt("invalid admin polygon record"))?;
             let poly = AdminPolygon::from_bytes(rec);
             // Producer rings repeat their first vertex: assemble_rings keeps
             // only closed rings and simplify_ring preserves both endpoints.
@@ -457,7 +465,7 @@ impl Reader {
         }
         for index in 0..self.addr_points.len() / ADDR_POINT_SIZE {
             let rec = read_record::<ADDR_POINT_SIZE>(&self.addr_points, index * ADDR_POINT_SIZE)
-                .ok_or("invalid address point record")?;
+                .ok_or_else(|| corrupt("invalid address point record"))?;
             let pt = AddrPoint::from_bytes(rec);
             validate_string_offset(pt.housenumber_offset, &self.strings, "address housenumber")?;
             validate_string_offset(pt.street_offset, &self.strings, "address street")?;
@@ -477,7 +485,7 @@ impl Reader {
     ) -> Result<()> {
         for index in 0..cells.len() / GEO_CELL_SIZE {
             let rec = read_record::<GEO_CELL_SIZE>(cells, index * GEO_CELL_SIZE)
-                .ok_or("invalid geo cell record")?;
+                .ok_or_else(|| corrupt("invalid geo cell record"))?;
             let cell = GeoCell::from_bytes(rec);
             validate_list(cell.addr_offset, addrs, 4, "address entry")?;
             validate_list(
@@ -1639,24 +1647,27 @@ fn validate_list(offset: u64, data: &[u8], item_size: usize, kind: &str) -> Resu
         return Ok(());
     }
     let off = usize::try_from(offset).map_err(|_| {
-        format!("invalid geocode index: {kind} offset {offset} does not fit this platform")
+        corrupt(format!(
+            "invalid geocode index: {kind} offset {offset} does not fit this platform"
+        ))
     })?;
     let count_end = off
         .checked_add(2)
-        .ok_or_else(|| format!("invalid geocode index: {kind} offset overflows"))?;
-    let count_bytes = data
-        .get(off..count_end)
-        .ok_or_else(|| format!("invalid geocode index: {kind} offset {offset} is out of bounds"))?;
+        .ok_or_else(|| corrupt(format!("invalid geocode index: {kind} offset overflows")))?;
+    let count_bytes = data.get(off..count_end).ok_or_else(|| {
+        corrupt(format!(
+            "invalid geocode index: {kind} offset {offset} is out of bounds"
+        ))
+    })?;
     let count = usize::from(u16::from_le_bytes([count_bytes[0], count_bytes[1]]));
     let end = count
         .checked_mul(item_size)
         .and_then(|bytes| count_end.checked_add(bytes))
-        .ok_or_else(|| format!("invalid geocode index: {kind} list size overflows"))?;
+        .ok_or_else(|| corrupt(format!("invalid geocode index: {kind} list size overflows")))?;
     if end > data.len() {
-        return Err(format!(
+        return Err(corrupt(format!(
             "invalid geocode index: {kind} list at {offset} extends past end of file"
-        )
-        .into());
+        )));
     }
     Ok(())
 }
@@ -1669,20 +1680,25 @@ fn validate_span(offset: u64, count: u64, item_size: usize, data: &[u8], kind: &
         return Ok(());
     }
     let off = usize::try_from(offset).map_err(|_| {
-        format!("invalid geocode index: {kind} offset {offset} does not fit this platform")
+        corrupt(format!(
+            "invalid geocode index: {kind} offset {offset} does not fit this platform"
+        ))
     })?;
     let end = usize::try_from(count)
         .ok()
         .and_then(|n| n.checked_mul(item_size))
         .and_then(|bytes| off.checked_add(bytes))
-        .ok_or_else(|| format!("invalid geocode index: {kind} span at {offset} overflows"))?;
+        .ok_or_else(|| {
+            corrupt(format!(
+                "invalid geocode index: {kind} span at {offset} overflows"
+            ))
+        })?;
     if end > data.len() {
-        return Err(format!(
+        return Err(corrupt(format!(
             "invalid geocode index: {kind} span at {offset} covering {count} records extends \
              past end of file ({} bytes)",
             data.len()
-        )
-        .into());
+        )));
     }
     Ok(())
 }
@@ -1693,11 +1709,10 @@ fn validate_string_offset(offset: u32, strings: &[u8], kind: &str) -> Result<()>
     format::read_nul_string(strings, offset)
         .map(|_| ())
         .ok_or_else(|| {
-            format!(
+            corrupt(format!(
                 "invalid geocode index: {kind} string at offset {offset} is out of bounds, \
              unterminated, or invalid UTF-8"
-            )
-            .into()
+            ))
         })
 }
 

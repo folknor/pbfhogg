@@ -28,6 +28,7 @@ use super::{
 use crate::idset::IdSet;
 
 use super::Result;
+use crate::error::Error;
 
 use self::passthrough::write_output_passthrough;
 use self::sparse::{SparseArrayIndex, build_node_index_sparse};
@@ -42,16 +43,16 @@ fn filesystem_available_bytes(dir: &Path, purpose: &str) -> Result<u64> {
     use std::os::unix::ffi::OsStrExt as _;
 
     let path = CString::new(dir.as_os_str().as_bytes())
-        .map_err(|_| "scratch directory path contains a NUL byte")?;
+        .map_err(|_| Error::invalid_argument("scratch directory path contains a NUL byte"))?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // Safety: `path` is NUL-terminated and `stats` points to writable storage.
     if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return Err(format!(
-            "failed to query free space for {purpose} in {}: {}",
-            dir.display(),
-            std::io::Error::last_os_error()
-        )
-        .into());
+        return Err(
+            Error::from(std::io::Error::last_os_error()).context(format!(
+                "failed to query free space for {purpose} in {}",
+                dir.display()
+            )),
+        );
     }
     // Safety: statvfs initialized `stats` on success.
     let stats = unsafe { stats.assume_init() };
@@ -59,13 +60,13 @@ fn filesystem_available_bytes(dir: &Path, purpose: &str) -> Result<u64> {
 }
 
 /// Shared refusal text for a referenced node rejected by the coordinate owner.
-fn node_coordinate_domain_error(node_id: i64, lat: i32, lon: i32) -> String {
-    format!(
+fn node_coordinate_domain_error(node_id: i64, lat: i32, lon: i32) -> Error {
+    Error::invalid_data(format!(
         "node {node_id} has coordinates outside the geographic domain \
          (lat {lat}, lon {lon} in decimicrodegrees; latitude must be \
          within +/-90 degrees and longitude within +/-180). Refusing \
          to build a node index from it."
-    )
+    ))
 }
 
 /// Apply the output features owned by ALTW, including the injected payloads.
@@ -584,7 +585,7 @@ fn enforce_missing_locations_policy(stats: &Stats, ignore_missing_nodes: bool) -
     if stats.missing_locations == 0 || ignore_missing_nodes {
         return Ok(());
     }
-    Err(format!(
+    Err(Error::invalid_data(format!(
         "{} way node references could not be resolved to a node location. \
          Those vertices can only be written as (0, 0), which is a real \
          coordinate off the coast of Ghana and cannot be told apart from \
@@ -592,8 +593,7 @@ fn enforce_missing_locations_policy(stats: &Stats, ignore_missing_nodes: bool) -
          complete input, or pass --ignore-missing-nodes to accept the \
          placeholder coordinates.",
         stats.missing_locations,
-    )
-    .into())
+    )))
 }
 
 // Auto-select: sparse unless the input qualifies for external (sorted +
@@ -1094,7 +1094,9 @@ fn write_output_checked(
     host: &crate::host::Host,
 ) -> Result<Stats> {
     if inject_prepass && !indexdata_present {
-        return Err("--inject-prepass requires blob-level indexdata; --force cannot enable the decode-all fallback because it cannot attach per-blob WayMembers metadata".into());
+        return Err(Error::invalid_argument(
+            "--inject-prepass requires blob-level indexdata; --force cannot enable the decode-all fallback because it cannot attach per-blob WayMembers metadata",
+        ));
     }
     if indexdata_present {
         write_output_passthrough(
@@ -1239,7 +1241,7 @@ fn process_block(
     relation_member_node_ids: Option<&IdSet>,
     refs_buf: &mut Vec<i64>,
     locations_buf: &mut Vec<(i32, i32)>,
-) -> std::result::Result<Stats, String> {
+) -> crate::Result<Stats> {
     let mut stats = Stats::default();
 
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();

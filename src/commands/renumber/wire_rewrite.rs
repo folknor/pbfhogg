@@ -29,6 +29,7 @@
 
 use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
 
+use crate::error::Error;
 use crate::idset::{IdSet, RankedIdSet};
 
 /// Error text for a packed field this rewriter cannot splice.
@@ -53,13 +54,13 @@ use crate::idset::{IdSet, RankedIdSet};
 /// as `None`, so the relation was treated as memberless, the id was patched,
 /// and the unpacked member IDs were copied through **un-renumbered** into
 /// output that claims to be renumbered.
-fn unpacked_field_error(message: &str, field: &str) -> String {
-    format!(
+fn unpacked_field_error(message: &str, field: &str) -> Error {
+    Error::invalid_data(format!(
         "renumber: {message}.{field} is written in the unpacked wire form \
          (individually tagged varints). That encoding is spec-legal but the \
          renumber wire-splice rewriter can only patch the length-delimited \
          packed form. Re-encode the input first, e.g. `pbfhogg cat --clean`."
-    )
+    ))
 }
 
 /// Error text for a packed field that occurs more than once carrying data.
@@ -81,14 +82,14 @@ fn unpacked_field_error(message: &str, field: &str) -> String {
 /// Empty occurrences are ignored in either position, matching `take_packed`:
 /// a zero-length segment carries no elements and cannot participate in a
 /// concatenation.
-fn repeated_field_error(message: &str, field: &str) -> String {
-    format!(
+fn repeated_field_error(message: &str, field: &str) -> Error {
+    Error::invalid_data(format!(
         "renumber: {message}.{field} appears twice with data; packed field split \
          across segments. Protobuf concatenates such segments, which a byte-level \
          splice cannot express as one contiguous range - the earlier segment would \
          be copied through unrenumbered. Re-encode the input first, e.g. \
          `pbfhogg cat --clean`."
-    )
+    ))
 }
 
 /// Error text for a message that repeats a field the rewriter must read as
@@ -96,46 +97,46 @@ fn repeated_field_error(message: &str, field: &str) -> String {
 /// beside the patched one (protobuf takes the last, so which ID the output
 /// "has" depends on the reader), and a second `DenseNodes` or `StringTable`
 /// would be merged by protobuf but read here as just one of the two.
-fn repeated_message_field_error(message: &str, field: &str) -> String {
-    format!(
+fn repeated_message_field_error(message: &str, field: &str) -> Error {
+    Error::invalid_data(format!(
         "renumber: {message} carries {field} more than once. Protobuf merges or \
          overrides repeated occurrences, which the wire-splice rewriter does not \
          reproduce. Re-encode the input first, e.g. `pbfhogg cat --clean`."
-    )
+    ))
 }
 
 /// Error text for a PrimitiveGroup that holds an element kind other than
 /// the one its blob is being rewritten as. A group holds one kind; the
 /// rewriters used to drop the stranger (node and relation rewriters) or copy
 /// it through un-renumbered (way rewriter), both silently.
-fn foreign_kind_error(rewriting: &str, field: u32) -> String {
+fn foreign_kind_error(rewriting: &str, field: u32) -> Error {
     let found = match field {
         1 => "plain Node",
         2 => "DenseNodes",
         3 => "Way",
         _ => "Relation",
     };
-    format!(
+    Error::invalid_data(format!(
         "renumber: a {rewriting} blob's PrimitiveGroup also carries {found} \
          elements. A group must hold one element kind; renumber cannot rewrite \
          a mixed group without dropping or mis-numbering part of it."
-    )
+    ))
 }
 
 /// Error text for input IDs that are not strictly increasing.
-pub(super) fn order_error(kind: &str, prev: i64, id: i64) -> String {
+pub(super) fn order_error(kind: &str, prev: i64, id: i64) -> Error {
     let what = if id == prev {
         "appears twice"
     } else {
         "comes after a larger id"
     };
-    format!(
+    Error::invalid_data(format!(
         "renumber requires {kind} ids to strictly increase in file order, but \
          {kind} {id} {what} ({kind} {prev} precedes it). New ids are assigned by \
          position and references resolved by rank, which agree only on sorted, \
          duplicate-free input; a Sort.Type_then_ID header claim is not checked. \
          Sort the input (pbfhogg sort) and remove duplicate ids before renumbering."
-    )
+    ))
 }
 
 // The decoder reconstructs deltas modulo 2^64 (the writer encodes them that
@@ -145,37 +146,41 @@ pub(super) fn order_error(kind: &str, prev: i64, id: i64) -> String {
 // sum that overflows on addition wraps to a negative id the modular form
 // would refuse anyway. Checked addition only gives that refusal a clearer
 // message.
-fn delta_overflow_error(field: &str) -> String {
-    format!(
+fn delta_overflow_error(field: &str) -> Error {
+    Error::invalid_data(format!(
         "renumber: {field} delta sum overflows a 64-bit id; the input's delta \
          encoding is corrupt."
-    )
+    ))
 }
 
-fn negative_id_error(kind: &str, id: i64) -> String {
-    format!(
+fn negative_id_error(kind: &str, id: i64) -> Error {
+    Error::invalid_data(format!(
         "renumber requires non-negative input ids. \
          Input contains {kind} id {id}. \
          Negative ids are JOSM editor-local staging identifiers \
          that should be resolved before processing."
-    )
+    ))
 }
 
-fn wire_err(e: impl std::fmt::Display) -> String {
-    e.to_string()
+fn wire_err(e: protohoggr::WireError) -> Error {
+    Error::from(e)
 }
 
 /// `start + rank` as an output ID.
-fn offset_id(start: i64, rank: u64) -> Result<i64, String> {
+fn offset_id(start: i64, rank: u64) -> crate::Result<i64> {
     i64::try_from(rank)
         .ok()
         .and_then(|r| start.checked_add(r))
-        .ok_or_else(|| format!("renumber: new id {start} + {rank} overflows a 64-bit id"))
+        .ok_or_else(|| {
+            Error::invalid_data(format!(
+                "renumber: new id {start} + {rank} overflows a 64-bit id"
+            ))
+        })
 }
 
-fn inc(n: u64) -> Result<u64, String> {
+fn inc(n: u64) -> crate::Result<u64> {
     n.checked_add(1)
-        .ok_or_else(|| "renumber: element count overflow".to_string())
+        .ok_or_else(|| Error::invalid_data("renumber: element count overflow"))
 }
 
 /// One element kind's old-to-new ID mapping, for resolving references.
@@ -215,7 +220,7 @@ impl<'a> IdSpace<'a> {
     /// The new ID of an element that must be in the set (a relation's own
     /// ID in R2d). `None` when it is not.
     #[inline]
-    fn live(&self, old_id: i64) -> Result<Option<i64>, String> {
+    fn live(&self, old_id: i64) -> crate::Result<Option<i64>> {
         self.set
             .rank_if_set(old_id)
             .map(|r| offset_id(self.start, r))
@@ -224,19 +229,19 @@ impl<'a> IdSpace<'a> {
 
     /// `(new_id, is_orphan)` for a reference, with a single chunk lookup.
     #[inline]
-    fn resolve(&self, old_id: i64) -> Result<(i64, bool), String> {
+    fn resolve(&self, old_id: i64) -> crate::Result<(i64, bool)> {
         if let Some(new_id) = self.live(old_id)? {
             return Ok((new_id, false));
         }
         let shifted = self.orphan_base.saturating_add(i128::from(old_id));
         i64::try_from(shifted).map(|id| (id, true)).map_err(|_| {
-            format!(
+            Error::invalid_data(format!(
                 "renumber: orphan {kind} ref {old_id} (the {kind} is not in the input) \
                  would become {shifted}, the first id past the renumbered {kind}s \
                  ({base}) plus its old id, which overflows a 64-bit id",
                 kind = self.kind,
                 base = self.orphan_base,
-            )
+            ))
         })
     }
 }
@@ -246,14 +251,14 @@ impl<'a> IdSpace<'a> {
 /// faster but silently accepts truncation (no terminator means the last
 /// byte is missed; extra `0x80` bytes after the last terminator are
 /// silently ignored). A full walk catches both classes at the boundary.
-fn count_varints_strict(data: &[u8]) -> Result<usize, String> {
+fn count_varints_strict(data: &[u8]) -> crate::Result<usize> {
     let mut cursor = Cursor::new(data);
     let mut count = 0_usize;
     while cursor.remaining() > 0 {
         cursor.read_varint().map_err(wire_err)?;
         count = count
             .checked_add(1)
-            .ok_or_else(|| "renumber: varint count overflow".to_string())?;
+            .ok_or_else(|| Error::invalid_data("renumber: varint count overflow"))?;
     }
     Ok(count)
 }
@@ -267,7 +272,7 @@ struct Span {
 }
 
 impl Span {
-    fn push(&mut self, kind: &str, id: i64) -> Result<(), String> {
+    fn push(&mut self, kind: &str, id: i64) -> crate::Result<()> {
         if let Some(prev) = self.last
             && id <= prev
         {
@@ -322,7 +327,7 @@ fn split_block<'a>(
     keep_all: bool,
     scalars: &mut Vec<u8>,
     who: &str,
-) -> Result<&'a [u8], String> {
+) -> crate::Result<&'a [u8]> {
     scalars.clear();
     let mut stringtable: Option<&[u8]> = None;
     let mut cursor = Cursor::new(block);
@@ -343,7 +348,8 @@ fn split_block<'a>(
             _ => cursor.skip_field(wire_type).map_err(wire_err)?,
         }
     }
-    stringtable.ok_or_else(|| format!("{who}: no StringTable in PrimitiveBlock"))
+    stringtable
+        .ok_or_else(|| Error::invalid_data(format!("{who}: no StringTable in PrimitiveBlock")))
 }
 
 fn copy_field(
@@ -351,7 +357,7 @@ fn copy_field(
     field: u32,
     wire_type: u32,
     out: &mut Vec<u8>,
-) -> Result<(), String> {
+) -> crate::Result<()> {
     let raw = cursor.read_raw_field(wire_type).map_err(wire_err)?;
     protohoggr::encode_tag(out, field, wire_type);
     out.extend_from_slice(raw);
@@ -361,8 +367,8 @@ fn copy_field(
 /// Call `f` on every PrimitiveGroup of `block`, in order. Returns how many.
 fn for_each_group<'a>(
     block: &'a [u8],
-    mut f: impl FnMut(&'a [u8]) -> Result<(), String>,
-) -> Result<u64, String> {
+    mut f: impl FnMut(&'a [u8]) -> crate::Result<()>,
+) -> crate::Result<u64> {
     let mut groups: u64 = 0;
     let mut cursor = Cursor::new(block);
     while let Some((field, wire_type)) = cursor.read_tag().map_err(wire_err)? {
@@ -383,7 +389,7 @@ fn for_each_group<'a>(
 /// The one DenseNodes message of a node group. Refuses a second one (protobuf
 /// would merge the two, concatenating their packed arrays, where taking
 /// either alone silently drops nodes) and any other element kind.
-fn single_dense(group: &[u8]) -> Result<&[u8], String> {
+fn single_dense(group: &[u8]) -> crate::Result<&[u8]> {
     let mut dense: Option<&[u8]> = None;
     let mut cursor = Cursor::new(group);
     while let Some((field, wire_type)) = cursor.read_tag().map_err(wire_err)? {
@@ -398,7 +404,7 @@ fn single_dense(group: &[u8]) -> Result<&[u8], String> {
             _ => cursor.skip_field(wire_type).map_err(wire_err)?,
         }
     }
-    dense.ok_or_else(|| "reframe: no DenseNodes in PrimitiveGroup".to_string())
+    dense.ok_or_else(|| Error::invalid_data("reframe: no DenseNodes in PrimitiveGroup"))
 }
 
 /// Reframe a decompressed PrimitiveBlock by replacing only the DenseNodes
@@ -416,7 +422,7 @@ pub(super) fn reframe_dense_with_new_ids(
     overflow: &mut Vec<i64>,
     output: &mut Vec<u8>,
     s: &mut Scratch,
-) -> Result<Outcome, String> {
+) -> crate::Result<Outcome> {
     let stringtable = split_block(decompressed, false, &mut s.scalars, "reframe")?;
     output.clear();
     protohoggr::encode_bytes_field_always(output, 1, stringtable);
@@ -452,7 +458,9 @@ pub(super) fn reframe_dense_with_new_ids(
             }
         }
         if !saw_id_field {
-            return Err("reframe: no packed ID field in DenseNodes".into());
+            return Err(Error::invalid_data(
+                "reframe: no packed ID field in DenseNodes",
+            ));
         }
 
         let mut old_id: i64 = 0;
@@ -483,13 +491,14 @@ pub(super) fn reframe_dense_with_new_ids(
         if group_count > 0 {
             let first_new = offset_id(base_new_id, assigned)?;
             protohoggr::encode_varint(&mut s.packed, protohoggr::zigzag_encode_64(first_new));
-            let n = usize::try_from(group_count).map_err(|_| "group node count > usize")?;
+            let n = usize::try_from(group_count)
+                .map_err(|_| Error::invalid_data("group node count > usize"))?;
             s.packed
                 .extend(std::iter::repeat_n(0x02u8, n.saturating_sub(1)));
         }
         assigned = assigned
             .checked_add(group_count)
-            .ok_or_else(|| "renumber: node count overflow".to_string())?;
+            .ok_or_else(|| Error::invalid_data("renumber: node count overflow"))?;
 
         s.element.clear();
         // Always written, even empty: a DenseNodes with no `id` field is
@@ -503,7 +512,9 @@ pub(super) fn reframe_dense_with_new_ids(
         Ok(())
     })?;
     if groups == 0 {
-        return Err("reframe: no PrimitiveGroup in PrimitiveBlock".into());
+        return Err(Error::invalid_data(
+            "reframe: no PrimitiveGroup in PrimitiveBlock",
+        ));
     }
     output.extend_from_slice(&s.scalars);
 
@@ -532,7 +543,7 @@ pub(super) fn reframe_ways_with_new_ids(
     way_id_set: &mut IdSet,
     output: &mut Vec<u8>,
     s: &mut Scratch,
-) -> Result<Outcome, String> {
+) -> crate::Result<Outcome> {
     let stringtable = split_block(decompressed, true, &mut s.scalars, "reframe_ways")?;
     output.clear();
     protohoggr::encode_bytes_field_always(output, 1, stringtable);
@@ -559,11 +570,13 @@ pub(super) fn reframe_ways_with_new_ids(
                     )?;
                     orphans = orphans
                         .checked_add(way_orphans)
-                        .ok_or_else(|| "renumber: orphan count overflow".to_string())?;
+                        .ok_or_else(|| Error::invalid_data("renumber: orphan count overflow"))?;
                     protohoggr::encode_bytes_field(&mut s.group, 3, &s.element);
                     total = inc(total)?;
                 }
-                (1 | 2 | 4, _) => return Err(foreign_kind_error("way", field)),
+                (1 | 2 | 4, _) => {
+                    return Err(foreign_kind_error("way", field));
+                }
                 // Any other group field is copied verbatim.
                 _ => copy_field(&mut gr_cursor, field, wire_type, &mut s.group)?,
             }
@@ -592,7 +605,7 @@ fn reframe_way(
     span: &mut Span,
     refs_out: &mut Vec<u8>,
     out: &mut Vec<u8>,
-) -> Result<u64, String> {
+) -> crate::Result<u64> {
     // (tag_start, value_end) of the fields being replaced. The tag start is
     // the cursor position before the tag is read, so a multi-byte tag is
     // spliced correctly too.
@@ -613,7 +626,9 @@ fn reframe_way(
                     return Err(repeated_message_field_error("Way", "id"));
                 }
             }
-            (8, WIRE_VARINT) => return Err(unpacked_field_error("Way", "refs")),
+            (8, WIRE_VARINT) => {
+                return Err(unpacked_field_error("Way", "refs"));
+            }
             (8, WIRE_LEN) => {
                 let seg = cursor.read_len_delimited().map_err(wire_err)?;
                 if !seg.is_empty() && !old_refs_data.is_empty() {
@@ -632,7 +647,7 @@ fn reframe_way(
         }
     }
 
-    let (old_way_id, id_r) = id.ok_or("reframe_ways: no id field")?;
+    let (old_way_id, id_r) = id.ok_or_else(|| Error::invalid_data("reframe_ways: no id field"))?;
     // Unconditional: a negative way id slipping past stale indexdata would
     // be silently dropped by `way_id_set.set` (which ignores `id < 0`),
     // producing phantom orphan refs in relations.
@@ -655,17 +670,17 @@ fn reframe_way(
             .ok_or_else(|| delta_overflow_error("Way.refs"))?;
         let old_node_id = prev_old_ref;
         if old_node_id < 0 {
-            return Err(format!(
+            return Err(Error::invalid_data(format!(
                 "renumber requires non-negative input ids. \
                  Way references negative node id {old_node_id}. \
                  Negative ids are JOSM editor-local staging \
                  identifiers that should be resolved before \
                  processing."
-            ));
+            )));
         }
         let (new_ref, is_orphan) = nodes
             .resolve(old_node_id)
-            .map_err(|e| format!("{e} (in way {old_way_id})"))?;
+            .map_err(|e| e.context(format!("in way {old_way_id}")))?;
         if is_orphan {
             orphans = inc(orphans)?;
         }
@@ -676,7 +691,7 @@ fn reframe_way(
         prev_new_ref = new_ref;
     }
 
-    let refs_r = refs_range.ok_or("reframe_ways: no refs field")?;
+    let refs_r = refs_range.ok_or_else(|| Error::invalid_data("reframe_ways: no refs field"))?;
     splice_two(
         way_bytes,
         id_r,
@@ -723,7 +738,7 @@ fn splice_two(
 /// applies: exactly one varint field 1. R1 collects the relation ID set
 /// through this, so the ID it records is always the one R2d later looks up
 /// (R1 used to stop at the first id field while R2d kept the last).
-pub(super) fn relation_id(rel_bytes: &[u8]) -> Result<i64, String> {
+pub(super) fn relation_id(rel_bytes: &[u8]) -> crate::Result<i64> {
     let mut id: Option<i64> = None;
     let mut cursor = Cursor::new(rel_bytes);
     while let Some((field, wire_type)) = cursor.read_tag().map_err(wire_err)? {
@@ -736,7 +751,7 @@ pub(super) fn relation_id(rel_bytes: &[u8]) -> Result<i64, String> {
             cursor.skip_field(wire_type).map_err(wire_err)?;
         }
     }
-    id.ok_or_else(|| "reframe_relations: relation without an id field".to_string())
+    id.ok_or_else(|| Error::invalid_data("reframe_relations: relation without an id field"))
 }
 
 /// The three ID spaces a relation's members resolve against.
@@ -762,7 +777,7 @@ pub(super) fn reframe_relations_with_new_ids(
     ids: &RelationIdSpaces<'_>,
     output: &mut Vec<u8>,
     s: &mut Scratch,
-) -> Result<Outcome, String> {
+) -> crate::Result<Outcome> {
     let stringtable = split_block(decompressed, true, &mut s.scalars, "reframe_relations")?;
     output.clear();
     protohoggr::encode_bytes_field_always(output, 1, stringtable);
@@ -782,7 +797,7 @@ pub(super) fn reframe_relations_with_new_ids(
                         reframe_relation(rel_bytes, ids, &mut span, &mut s.packed, &mut s.element)?;
                     orphans = orphans
                         .checked_add(rel_orphans)
-                        .ok_or_else(|| "renumber: orphan count overflow".to_string())?;
+                        .ok_or_else(|| Error::invalid_data("renumber: orphan count overflow"))?;
                     new_range = Some(match new_range {
                         None => (new_id, new_id),
                         Some((lo, hi)) => (lo.min(new_id), hi.max(new_id)),
@@ -790,7 +805,9 @@ pub(super) fn reframe_relations_with_new_ids(
                     protohoggr::encode_bytes_field(&mut s.group, 4, &s.element);
                     total = inc(total)?;
                 }
-                (1..=3, _) => return Err(foreign_kind_error("relation", field)),
+                (1..=3, _) => {
+                    return Err(foreign_kind_error("relation", field));
+                }
                 // Other group fields are dropped (only relations are emitted).
                 _ => gr_cursor.skip_field(wire_type).map_err(wire_err)?,
             }
@@ -816,7 +833,7 @@ fn reframe_relation(
     span: &mut Span,
     memids_out: &mut Vec<u8>,
     out: &mut Vec<u8>,
-) -> Result<(i64, u64), String> {
+) -> crate::Result<(i64, u64)> {
     let mut id: Option<(i64, (usize, usize))> = None;
     let mut memids_range: Option<(usize, usize)> = None;
     let mut old_memids_data: &[u8] = &[];
@@ -861,8 +878,12 @@ fn reframe_relation(
             // relation" branch and copied the member IDs through
             // un-renumbered. An unpacked `types` would leave the dispatch
             // blind instead.
-            (9, WIRE_VARINT) => return Err(unpacked_field_error("Relation", "memids")),
-            (10, WIRE_VARINT) => return Err(unpacked_field_error("Relation", "types")),
+            (9, WIRE_VARINT) => {
+                return Err(unpacked_field_error("Relation", "memids"));
+            }
+            (10, WIRE_VARINT) => {
+                return Err(unpacked_field_error("Relation", "types"));
+            }
             _ => {
                 cursor.read_raw_field(rt).map_err(wire_err)?;
             }
@@ -870,7 +891,7 @@ fn reframe_relation(
     }
 
     let (old_rel_id, id_r) =
-        id.ok_or_else(|| "reframe_relations: relation without an id field".to_string())?;
+        id.ok_or_else(|| Error::invalid_data("reframe_relations: relation without an id field"))?;
     if old_rel_id < 0 {
         return Err(negative_id_error("relation", old_rel_id));
     }
@@ -878,7 +899,9 @@ fn reframe_relation(
     // R1 recorded every relation id through `relation_id`, which reads the
     // same field this loop does, so a miss is a bug rather than input.
     let new_rel_id = ids.relations.live(old_rel_id)?.ok_or_else(|| {
-        format!("renumber: relation {old_rel_id} was not collected by the R1 pass")
+        Error::internal(format!(
+            "renumber: relation {old_rel_id} was not collected by the R1 pass"
+        ))
     })?;
 
     // ---- Patch memids: decode old deltas + types, look up new ids ----
@@ -888,14 +911,14 @@ fn reframe_relation(
         // Both must hold the same number of varints. A full walk rather than
         // a terminator-byte count, which silently miscounts truncated input.
         let memids_count = count_varints_strict(old_memids_data)
-            .map_err(|e| format!("reframe_relations: relation {old_rel_id} memids: {e}"))?;
+            .map_err(|e| e.context(format!("reframe_relations: relation {old_rel_id} memids")))?;
         let types_count = count_varints_strict(types_data)
-            .map_err(|e| format!("reframe_relations: relation {old_rel_id} types: {e}"))?;
+            .map_err(|e| e.context(format!("reframe_relations: relation {old_rel_id} types")))?;
         if memids_count != types_count {
-            return Err(format!(
+            return Err(Error::invalid_data(format!(
                 "reframe_relations: relation {old_rel_id} has {memids_count} memids \
                  but {types_count} types"
-            ));
+            )));
         }
 
         let mut memids_cursor = Cursor::new(old_memids_data);
@@ -905,10 +928,10 @@ fn reframe_relation(
         for _ in 0..memids_count {
             let member_type = types_cursor
                 .read_varint()
-                .map_err(|e| format!("types varint: {e}"))?;
+                .map_err(|e| Error::from(e).context("types varint"))?;
             let delta = memids_cursor
                 .read_sint64()
-                .map_err(|e| format!("memids varint: {e}"))?;
+                .map_err(|e| Error::from(e).context("memids varint"))?;
             prev_old_id = prev_old_id
                 .checked_add(delta)
                 .ok_or_else(|| delta_overflow_error("Relation.memids"))?;
@@ -917,12 +940,12 @@ fn reframe_relation(
             // Unconditional reject, same policy as the node and way paths: a
             // negative member ref would otherwise flow through as an orphan.
             if old_abs_id < 0 {
-                return Err(format!(
+                return Err(Error::invalid_data(format!(
                     "renumber requires non-negative input ids. \
                      Input contains relation {old_rel_id} with \
                      member ref {old_abs_id}. Resolve JOSM-style \
                      negative staging IDs before renumbering.",
-                ));
+                )));
             }
 
             // `types` is `repeated int32`: dispatch on the varint truncated
@@ -944,7 +967,7 @@ fn reframe_relation(
             let (new_abs_id, is_orphan) = match space {
                 Some(space) => space
                     .resolve(old_abs_id)
-                    .map_err(|e| format!("{e} (in relation {old_rel_id})"))?,
+                    .map_err(|e| e.context(format!("in relation {old_rel_id}")))?,
                 None => (old_abs_id, false),
             };
             if is_orphan {
@@ -1046,7 +1069,7 @@ mod tests {
         block_of(&[group])
     }
 
-    fn run(block: &[u8]) -> Result<Outcome, String> {
+    fn run(block: &[u8]) -> crate::Result<Outcome> {
         let mut node_ids = IdSet::new();
         node_ids.set(7);
         let node_ids = node_ids.into_ranked();
@@ -1133,7 +1156,7 @@ mod tests {
         block_of(&[group])
     }
 
-    fn run_ways(block: &[u8]) -> Result<Outcome, String> {
+    fn run_ways(block: &[u8]) -> crate::Result<Outcome> {
         let mut node_ids = IdSet::new();
         node_ids.set(7);
         let node_ids = node_ids.into_ranked();
@@ -1160,7 +1183,7 @@ mod tests {
             .err()
             .expect("two data-bearing refs segments must be refused");
         assert!(
-            err.contains("Way.refs appears twice with data"),
+            err.to_string().contains("Way.refs appears twice with data"),
             "expected the Way.refs repeated-occurrence guard specifically - no \
              other guard in this rewriter names Way.refs and a repeated \
              occurrence together, and without it the rewrite SUCCEEDS with \
@@ -1226,7 +1249,7 @@ mod tests {
         block_of(&[group])
     }
 
-    fn run_dense_into(block: &[u8], out: &mut Vec<u8>) -> Result<(Outcome, Vec<i64>), String> {
+    fn run_dense_into(block: &[u8], out: &mut Vec<u8>) -> crate::Result<(Outcome, Vec<i64>)> {
         let mut ids = IdSet::new();
         ids.pre_allocate(1_000);
         let mut overflow = Vec::new();
@@ -1241,7 +1264,7 @@ mod tests {
         Ok((outcome, overflow))
     }
 
-    fn run_dense(block: &[u8]) -> Result<Outcome, String> {
+    fn run_dense(block: &[u8]) -> crate::Result<Outcome> {
         run_dense_into(block, &mut Vec::new()).map(|(o, _)| o)
     }
 
@@ -1255,7 +1278,8 @@ mod tests {
             .err()
             .expect("two data-bearing DenseNodes.id segments must be refused");
         assert!(
-            err.contains("DenseNodes.id appears twice with data"),
+            err.to_string()
+                .contains("DenseNodes.id appears twice with data"),
             "expected the DenseNodes.id repeated-occurrence guard specifically; \
              without it the call SUCCEEDS and simply reports one node instead \
              of two. Got: {err}"
@@ -1291,12 +1315,12 @@ mod tests {
         let err = run_dense(&block_of(&[group]))
             .err()
             .expect("overflow must be refused");
-        assert!(err.contains("overflows"), "got: {err}");
+        assert!(err.to_string().contains("overflows"), "got: {err}");
         // And the zero delta in `block` is a duplicate, refused on order.
         let err = run_dense(&block)
             .err()
             .expect("a duplicate must be refused");
-        assert!(err.contains("appears twice"), "got: {err}");
+        assert!(err.to_string().contains("appears twice"), "got: {err}");
     }
 
     #[test]
@@ -1316,7 +1340,10 @@ mod tests {
         let err = run_ways(&block_of(&[group]))
             .err()
             .expect("overflow must be refused");
-        assert!(err.contains("Way.refs delta sum overflows"), "got: {err}");
+        assert!(
+            err.to_string().contains("Way.refs delta sum overflows"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1336,7 +1363,8 @@ mod tests {
             .err()
             .expect("overflow must be refused");
         assert!(
-            err.contains("Relation.memids delta sum overflows"),
+            err.to_string()
+                .contains("Relation.memids delta sum overflows"),
             "got: {err}"
         );
     }
@@ -1348,7 +1376,7 @@ mod tests {
         let err = run_dense(&dense_groups(&[&[10, 20], &[15]]))
             .err()
             .expect("a step back across groups must be refused");
-        assert!(err.contains("strictly increase"), "got: {err}");
+        assert!(err.to_string().contains("strictly increase"), "got: {err}");
         let ok = run_dense(&dense_groups(&[&[10, 20], &[25]])).expect("increasing is fine");
         assert_eq!(ok.count, 3);
         assert_eq!(ok.span, Some((10, 25)));
@@ -1362,7 +1390,10 @@ mod tests {
         let err = run_ways(&block_of(&[group]))
             .err()
             .expect("a duplicate way must be refused");
-        assert!(err.contains("way 9 appears twice"), "got: {err}");
+        assert!(
+            err.to_string().contains("way 9 appears twice"),
+            "got: {err}"
+        );
     }
 
     /// An empty DenseNodes group used to emit its base id anyway: a
@@ -1415,7 +1446,10 @@ mod tests {
         let err = run_dense(&block_of(&[group]))
             .err()
             .expect("must be refused");
-        assert!(err.contains("DenseNodes more than once"), "got: {err}");
+        assert!(
+            err.to_string().contains("DenseNodes more than once"),
+            "got: {err}"
+        );
         assert!(run_dense(&block).is_ok());
     }
 
@@ -1430,18 +1464,24 @@ mod tests {
         let err = run_dense(&block_of(&[group.clone()]))
             .err()
             .expect("node rewriter");
-        assert!(err.contains("also carries Way"), "got: {err}");
+        assert!(err.to_string().contains("also carries Way"), "got: {err}");
         // The same group through the way rewriter: dense nodes used to be
         // copied through un-renumbered.
         let err = run_ways(&block_of(&[group])).err().expect("way rewriter");
-        assert!(err.contains("also carries DenseNodes"), "got: {err}");
+        assert!(
+            err.to_string().contains("also carries DenseNodes"),
+            "got: {err}"
+        );
         // A dense group inside a relation blob: dropped before.
         let mut rel_group = Vec::new();
         len_delimited(2, &dense, &mut rel_group);
         let err = run(&block_of(&[rel_group]))
             .err()
             .expect("relation rewriter");
-        assert!(err.contains("also carries DenseNodes"), "got: {err}");
+        assert!(
+            err.to_string().contains("also carries DenseNodes"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1452,7 +1492,10 @@ mod tests {
         let mut group = Vec::new();
         len_delimited(3, &way, &mut group);
         let err = run_ways(&block_of(&[group])).err().expect("way");
-        assert!(err.contains("Way carries id more than once"), "got: {err}");
+        assert!(
+            err.to_string().contains("Way carries id more than once"),
+            "got: {err}"
+        );
 
         let mut rel = vec![0x08];
         varint(5, &mut rel);
@@ -1463,7 +1506,8 @@ mod tests {
         len_delimited(4, &rel, &mut group);
         let err = run(&block_of(&[group])).err().expect("relation");
         assert!(
-            err.contains("Relation carries id more than once"),
+            err.to_string()
+                .contains("Relation carries id more than once"),
             "got: {err}"
         );
     }
@@ -1485,7 +1529,8 @@ mod tests {
             .err()
             .expect("two data-bearing memids segments must be refused");
         assert!(
-            err.contains("Relation.memids appears twice with data"),
+            err.to_string()
+                .contains("Relation.memids appears twice with data"),
             "expected the memids repeated-occurrence guard specifically. Only \
              that guard names Relation.memids together with a repeated \
              occurrence; without it the sibling memids/types count cross-check \
@@ -1503,7 +1548,8 @@ mod tests {
             .err()
             .expect("two data-bearing types segments must be refused");
         assert!(
-            err.contains("Relation.types appears twice with data"),
+            err.to_string()
+                .contains("Relation.types appears twice with data"),
             "expected the types repeated-occurrence guard specifically; the \
              count cross-check would otherwise claim a memids/types length \
              mismatch. Got: {err}"
@@ -1561,8 +1607,11 @@ mod tests {
         let nodes = IdSpace::new("node", &set, i64::MAX);
         assert_eq!(nodes.resolve(7).unwrap(), (i64::MAX, false));
         let err = nodes.resolve(0).expect_err("orphan 0 needs i64::MAX + 1");
-        assert!(err.contains("overflows a 64-bit id"), "got: {err}");
-        assert!(err.contains("orphan node ref 0"), "got: {err}");
+        assert!(
+            err.to_string().contains("overflows a 64-bit id"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("orphan node ref 0"), "got: {err}");
 
         let set = ranked(&[7]);
         let ways = IdSpace::new("way", &set, i64::MAX - 10);
@@ -1625,7 +1674,8 @@ mod tests {
             .err()
             .expect("an unpacked memids field must be refused, not mis-spliced");
         assert!(
-            err.contains("Relation.memids is written in the unpacked wire form"),
+            err.to_string()
+                .contains("Relation.memids is written in the unpacked wire form"),
             "expected the memids unpacked-form guard specifically; only that \
              guard names Relation.memids and the unpacked form together. Got: {err}"
         );

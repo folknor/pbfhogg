@@ -9,7 +9,7 @@ use crate::ElementKind;
 use crate::{BlockType, Element, PrimitiveBlock};
 
 use super::write::{OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay};
-use crate::BoxResult;
+use crate::error::{Error, Result};
 
 // ---------------------------------------------------------------------------
 // StreamingBlocks - block-level cursor with stashing
@@ -37,10 +37,13 @@ impl StreamingBlocks {
         blob_reader.set_parse_indexdata(true);
         blob_reader
             .next()
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+            .ok_or_else(crate::error::new_missing_header)??;
         let mut decompress_buf: Vec<u8> = Vec::new();
         let mut st_scratch: Vec<(u32, u32)> = Vec::new();
         let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+        // Captured once; a decode failure is located with the blob's true
+        // index and offset.
+        let source = blob_reader.source().cloned();
         let iter = std::iter::from_fn(move || {
             loop {
                 let blob = match blob_reader.next()? {
@@ -51,13 +54,16 @@ impl StreamingBlocks {
                     continue;
                 }
                 if let Err(e) = blob.decompress_into(&mut decompress_buf) {
-                    return Some(Err(e));
+                    return Some(Err(blob.locate_error(source.as_ref(), e)));
                 }
-                return Some(crate::block::PrimitiveBlock::from_vec_with_scratch(
-                    std::mem::take(&mut decompress_buf),
-                    &mut st_scratch,
-                    &mut gr_scratch,
-                ));
+                return Some(
+                    crate::block::PrimitiveBlock::from_vec_with_scratch(
+                        std::mem::take(&mut decompress_buf),
+                        &mut st_scratch,
+                        &mut gr_scratch,
+                    )
+                    .map_err(|e| blob.locate_error(source.as_ref(), e)),
+                );
             }
         });
         Ok(Self {
@@ -66,13 +72,13 @@ impl StreamingBlocks {
         })
     }
 
-    fn next_block(&mut self) -> BoxResult<Option<PrimitiveBlock>> {
+    fn next_block(&mut self) -> Result<Option<PrimitiveBlock>> {
         if let Some(b) = self.stashed.take() {
             return Ok(Some(b));
         }
         match self.blocks.next() {
             Some(Ok(b)) => Ok(Some(b)),
-            Some(Err(e)) => Err(e.into()),
+            Some(Err(e)) => Err(e),
             None => Ok(None),
         }
     }
@@ -105,7 +111,7 @@ fn fill_buffer<T>(
     buffer: &mut Vec<T>,
     is_phase_type: fn(BlockType) -> bool,
     convert: fn(&Element<'_>) -> ConvertResult<T>,
-) -> BoxResult<bool> {
+) -> Result<bool> {
     loop {
         let block = match source.next_block()? {
             Some(b) => b,
@@ -146,13 +152,12 @@ fn fill_buffer<T>(
         // precondition of this merge, so a mixed block means the input does
         // not meet it - say so rather than quietly dropping elements.
         if wrong_type_seen {
-            return Err(
+            return Err(Error::invalid_data(
                 "streaming merge-join: input contains a mixed-type block, so elements \
-                        of a later type would be consumed and discarded by an earlier phase. \
-                        This merge requires Sort.Type_then_ID input with one element type per \
-                        block; re-sort the file first with `pbfhogg sort`."
-                    .into(),
-            );
+                 of a later type would be consumed and discarded by an earlier phase. \
+                 This merge requires Sort.Type_then_ID input with one element type per \
+                 block; re-sort the file first with `pbfhogg sort`.",
+            ));
         }
 
         if buffer.is_empty() {
@@ -174,7 +179,7 @@ pub(crate) fn next_element<T>(
     buffer: &mut Vec<T>,
     is_phase_type: fn(BlockType) -> bool,
     convert: fn(&Element<'_>) -> ConvertResult<T>,
-) -> BoxResult<Option<T>> {
+) -> Result<Option<T>> {
     loop {
         if let Some(elem) = buffer.pop() {
             return Ok(Some(elem));
@@ -349,8 +354,8 @@ pub(crate) fn merge_join_phase<T: MergeJoinElement>(
     old_buf: &mut Vec<T>,
     new_src: &mut StreamingBlocks,
     new_buf: &mut Vec<T>,
-    mut on_action: impl FnMut(MergeJoinAction<'_, T>) -> BoxResult<()>,
-) -> BoxResult<()> {
+    mut on_action: impl FnMut(MergeJoinAction<'_, T>) -> Result<()>,
+) -> Result<()> {
     let mut old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
     let mut new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
 
@@ -489,7 +494,7 @@ fn next_blob_for_kind(
     reader: &mut crate::blob::BlobReader<crate::file_reader::FileReader>,
     kind: ElementKind,
     stash: &mut Option<crate::blob::Blob>,
-) -> BoxResult<Option<PendingBlob>> {
+) -> Result<Option<PendingBlob>> {
     loop {
         let blob = if let Some(stashed) = stash.take() {
             stashed
@@ -506,7 +511,9 @@ fn next_blob_for_kind(
         let index = match blob.index() {
             Some(idx) => idx,
             None => {
-                return Err("block-pair merge requires indexdata but blob has none".into());
+                return Err(Error::invalid_data(
+                    "block-pair merge requires indexdata but blob has none",
+                ));
             }
         };
         if index.kind != kind {
@@ -522,14 +529,13 @@ fn next_blob_for_kind(
             // exactly what `degrade --unsort` produces. This used to
             // `continue`, which discarded the blob and every element in it
             // for the rest of the run, with no error and no count anomaly.
-            return Err(format!(
+            return Err(Error::invalid_data(format!(
                 "block-pair merge: found a {} blob during the {} phase. The input's header \
                  claims Sort.Type_then_ID but its blobs are not in canonical order \
                  (nodes, then ways, then relations); re-sort it first with `pbfhogg sort`.",
                 index.kind.as_str(),
                 kind.as_str(),
-            )
-            .into());
+            )));
         }
         return Ok(Some(PendingBlob { blob, index }));
     }
@@ -585,12 +591,12 @@ impl BlobOrderGuard {
 
     /// Observe the next blob in file order. Returns the error message a
     /// caller should surface, or `Ok(())`.
-    pub(crate) fn observe(&mut self, index: &crate::blob_meta::BlobIndex) -> Result<(), String> {
+    pub(crate) fn observe(&mut self, index: &crate::blob_meta::BlobIndex) -> crate::Result<()> {
         if let Err((previous_kind, previous_id)) =
             self.watermark
                 .observe(index.kind.ordinal(), index.min_id, index.max_id)
         {
-            return Err(format!(
+            return Err(Error::invalid_data(format!(
                 "block-pair merge: a {} blob starting at id {} follows {} \
                  output already reaching id {previous_id}. The input's header claims \
                  Sort.Type_then_ID but its blobs are not in canonical order; re-sort it \
@@ -598,7 +604,7 @@ impl BlobOrderGuard {
                 index.kind.as_str(),
                 crate::osm_id::blob_osm_first_id(index.min_id, index.max_id),
                 ElementKind::from_ordinal(previous_kind).map_or("unknown", ElementKind::as_str),
-            ));
+            )));
         }
         Ok(())
     }
@@ -677,7 +683,7 @@ fn next_decoded_block(
     gr: &mut Vec<(u32, u32)>,
     kind: ElementKind,
     stash: &mut Option<crate::blob::Blob>,
-) -> BoxResult<Option<BlockState>> {
+) -> Result<Option<BlockState>> {
     match next_blob_for_kind(reader, kind, stash)? {
         Some(p) => Ok(Some(decode_pending(p, buf, st, gr)?)),
         None => Ok(None),
@@ -690,8 +696,8 @@ fn drain_remaining(
     state: &mut BlockPairMergeState,
     kind: ElementKind,
     is_old: bool,
-    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> BoxResult<()>,
-) -> BoxResult<()> {
+    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
+) -> Result<()> {
     let stats = &mut state.stats;
     let (reader, buf, st, gr, stash) = if is_old {
         (
@@ -722,9 +728,9 @@ fn drain_remaining(
 fn emit_block(
     bs: &BlockState,
     is_old: bool,
-    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> BoxResult<()>,
+    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
     stats: &mut BlockPairMergeStats,
-) -> BoxResult<()> {
+) -> Result<()> {
     let remaining = bs.index.count.saturating_sub(bs.skip_count as u64);
     if is_old {
         stats.blobs_old_only += 1;
@@ -751,8 +757,8 @@ fn merge_decoded_pair(
     old_decoded: &mut Option<BlockState>,
     new_decoded: &mut Option<BlockState>,
     type_char: char,
-    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> BoxResult<()>,
-) -> BoxResult<()> {
+    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
+) -> Result<()> {
     let mut os = old_decoded.take().expect("checked Some");
     let mut ns = new_decoded.take().expect("checked Some");
 
@@ -832,19 +838,18 @@ fn check_claimed_max(
     has_more: bool,
     merge_up_to: i64,
     side: &str,
-) -> BoxResult<()> {
+) -> Result<()> {
     if !has_more {
         return Ok(());
     }
     let claimed_last = blob_last(index);
     if crate::osm_id::osm_id_cmp(claimed_last, merge_up_to).is_le() {
-        return Err(format!(
+        return Err(Error::invalid_data(format!(
             "block-pair merge: the {side} blob's indexdata claims its last ID is \
              {claimed_last}, but the block still holds elements past the merge boundary \
              {merge_up_to}. The stored blob metadata does not match the blob's contents; \
              re-generate the file's indexdata (for example with `pbfhogg cat`)."
-        )
-        .into());
+        )));
     }
     Ok(())
 }
@@ -865,8 +870,8 @@ pub(crate) fn block_pair_merge_phase(
     state: &mut BlockPairMergeState,
     kind: ElementKind,
     skip_equal_blobs: bool,
-    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> BoxResult<()>,
-) -> BoxResult<()> {
+    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
+) -> Result<()> {
     let type_char = kind.type_char();
     let mut old_decoded: Option<BlockState> = None;
     let mut new_decoded: Option<BlockState> = None;
@@ -1031,8 +1036,8 @@ fn element_merge_pair(
     new_skip: usize,
     merge_up_to: i64,
     type_char: char,
-    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> BoxResult<()>,
-) -> BoxResult<MergePairOutcome> {
+    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
+) -> Result<MergePairOutcome> {
     let mut old_iter = old_block.elements().skip(old_skip).peekable();
     let mut new_iter = new_block.elements().skip(new_skip).peekable();
     let mut old_consumed: usize = 0;

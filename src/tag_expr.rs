@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use crate::BoxResult;
+use crate::error::{Error, Result};
 use crate::owned::TypeFilter;
 
 // ---------------------------------------------------------------------------
@@ -104,7 +104,7 @@ fn is_type_prefix(prefix: &str) -> bool {
 /// instead, the rule for any other unrecognised prefix, would turn an
 /// indented line in an `--expressions` file into the literal key
 /// `w/highway`: a filter that silently matches nothing.
-fn parse_type_prefix(input: &str) -> BoxResult<(TypeFilter, &str)> {
+fn parse_type_prefix(input: &str) -> Result<(TypeFilter, &str)> {
     if let Some(slash_pos) = input.find('/') {
         let prefix = &input[..slash_pos];
         let rest = &input[slash_pos + 1..];
@@ -117,12 +117,11 @@ fn parse_type_prefix(input: &str) -> BoxResult<(TypeFilter, &str)> {
             return Ok((tf, rest));
         }
         if prefix.contains(' ') && is_type_prefix(strip_spaces(prefix)) {
-            return Err(format!(
+            return Err(Error::invalid_argument(format!(
                 "type prefix {prefix:?} in expression {input:?} contains spaces; \
                  write it without them, e.g. \"{}/...\"",
                 strip_spaces(prefix)
-            )
-            .into());
+            )));
         }
     }
     Ok((TypeFilter::all(), input))
@@ -195,7 +194,7 @@ fn parse_string_matcher(input: &str) -> StringMatcher {
 /// different set of elements than osmium does for the same expression, which
 /// is worse than an error: the equivalence is advertised and there is nothing
 /// in the output to notice.
-fn parse_tag_matcher(input: &str) -> BoxResult<TagMatcher> {
+fn parse_tag_matcher(input: &str) -> Result<TagMatcher> {
     let (key_part, value_part) = match input.find('=') {
         Some(pos) => (&input[..pos], Some(&input[pos + 1..])),
         None => (input, None),
@@ -212,11 +211,11 @@ fn parse_tag_matcher(input: &str) -> BoxResult<TagMatcher> {
     let key_str = strip_spaces(raw_key);
 
     if key_str.is_empty() {
-        return Err(if value_part.is_some() {
-            "empty key in expression".into()
+        return Err(Error::invalid_argument(if value_part.is_some() {
+            "empty key in expression"
         } else {
-            "empty expression".into()
-        });
+            "empty expression"
+        }));
     }
 
     Ok(TagMatcher {
@@ -226,7 +225,7 @@ fn parse_tag_matcher(input: &str) -> BoxResult<TagMatcher> {
     })
 }
 
-pub(crate) fn parse_expression(input: &str) -> BoxResult<Expression> {
+pub(crate) fn parse_expression(input: &str) -> Result<Expression> {
     let (type_filter, tag_part) = parse_type_prefix(input)?;
     let matcher = parse_tag_matcher(tag_part)?;
     Ok(Expression {
@@ -235,7 +234,7 @@ pub(crate) fn parse_expression(input: &str) -> BoxResult<Expression> {
     })
 }
 
-pub(crate) fn parse_expressions(inputs: &[String]) -> BoxResult<Vec<Expression>> {
+pub(crate) fn parse_expressions(inputs: &[String]) -> Result<Vec<Expression>> {
     inputs.iter().map(|s| parse_expression(s)).collect()
 }
 
@@ -260,9 +259,16 @@ pub(crate) fn parse_expressions(inputs: &[String]) -> BoxResult<Vec<Expression>>
 /// steps 2 and 3 is skipped. osmium hands it to `get_tag_matcher` too, which
 /// builds a matcher for the empty key; pbfhogg rejects an empty key outright
 /// (see [`parse_expression`]), and erroring on a blank line would be hostile.
-pub fn read_expressions_file(path: &Path) -> BoxResult<Vec<String>> {
-    let contents = std::fs::read_to_string(path)
-        .map_err(|e| format!("could not read expressions file '{}': {e}", path.display()))?;
+pub fn read_expressions_file(path: &Path) -> Result<Vec<String>> {
+    let contents = std::fs::read_to_string(path).map_err(|e| {
+        let msg = format!("could not read expressions file '{}'", path.display());
+        // Content that is not UTF-8 is malformed input, not an I/O failure.
+        if e.kind() == std::io::ErrorKind::InvalidData {
+            Error::invalid_data_with(msg, e)
+        } else {
+            Error::from(e).context(msg)
+        }
+    })?;
     Ok(contents
         .split('\n')
         .filter_map(expression_line)

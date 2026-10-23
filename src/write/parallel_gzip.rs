@@ -40,6 +40,7 @@ use std::thread::JoinHandle;
 
 use flate2::write::GzEncoder;
 
+use crate::error::Error;
 pub use crate::tunables::DEFAULT_CHUNK_SIZE;
 use crate::tunables::{GZIP_REORDER_PERMIT_POLL, QUEUE_SLOTS_PER_WORKER};
 use crate::write::metrics::WRITER_METRICS;
@@ -245,10 +246,9 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
             match spawned {
                 Ok(handle) => worker_handles.push(handle),
                 Err(e) => {
-                    failure.record(io::Error::new(
-                        e.kind(),
-                        format!("spawn parallel gzip worker {index}: {e}"),
-                    ));
+                    failure.record(
+                        Error::from(e).context(format!("spawn parallel gzip worker {index}")),
+                    );
                     break;
                 }
             }
@@ -281,10 +281,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
         let writer_handle = match spawned {
             Ok(handle) => Some(handle),
             Err(e) => {
-                failure.record(io::Error::new(
-                    e.kind(),
-                    format!("spawn parallel gzip writer thread: {e}"),
-                ));
+                failure.record(Error::from(e).context("spawn parallel gzip writer thread"));
                 None
             }
         };
@@ -309,7 +306,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
     fn pool_error(&self, fallback: &str) -> io::Error {
         self.failure
             .restate()
-            .unwrap_or_else(|| io::Error::other(format!("ParallelGzipWriter: {fallback}")))
+            .unwrap_or_else(|| Error::internal(format!("ParallelGzipWriter: {fallback}")).into())
     }
 
     /// Wait for room in the sequence window. A timeout only polls the shared
@@ -359,10 +356,11 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
         if self.failure.stopped() {
             return Err(self.pool_error("pool stopped"));
         }
-        let tx = self
-            .raw_tx
-            .as_ref()
-            .ok_or_else(|| io::Error::other("ParallelGzipWriter: already finished"))?;
+        let tx = self.raw_tx.as_ref().ok_or_else(|| {
+            io::Error::from(Error::invalid_argument(
+                "ParallelGzipWriter: already finished",
+            ))
+        })?;
         self.wait_for_reorder_permit()?;
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -424,8 +422,9 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
             return Err(e);
         }
         shipped?;
-        inner
-            .ok_or_else(|| io::Error::other("ParallelGzipWriter: writer thread returned no writer"))
+        inner.ok_or_else(|| {
+            Error::internal("ParallelGzipWriter: writer thread returned no writer").into()
+        })
     }
 }
 
@@ -558,7 +557,7 @@ fn worker_loop(
         let item = {
             // Hold the lock only for the recv call.
             let Ok(guard) = raw_rx.lock() else {
-                failure.record(io::Error::other(
+                failure.record(Error::internal(
                     "parallel gzip: the raw chunk queue lock was poisoned",
                 ));
                 return;
@@ -697,9 +696,8 @@ fn writer_loop<W: Write>(
                     if !failure.stopped() {
                         guarded(failure, WHO, || inner.flush());
                     }
-                    // `io::Error` is not `Clone`; the ack carries a faithful
-                    // restatement (same `ErrorKind`, same message) while the
-                    // original goes on to `finish()`.
+                    // The ack carries a clone of the recorded error (they share
+                    // one kind) while the original goes on to `finish()`.
                     let reply = match failure.restate() {
                         Some(e) => Err(e),
                         None => Ok(()),
@@ -720,7 +718,7 @@ fn writer_loop<W: Write>(
     // a gap means a worker exited between dequeue and send, which
     // `worker_loop` is structured never to do.
     if !pending.is_empty() {
-        failure.record(io::Error::other(format!(
+        failure.record(Error::internal(format!(
             "parallel gzip writer: {} chunks missing at seq {expected}",
             pending.len()
         )));

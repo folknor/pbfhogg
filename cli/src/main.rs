@@ -1,5 +1,8 @@
+mod exit_code;
 mod host;
 mod output;
+
+use exit_code::{Hinted, error_report, is_platform_unsupported};
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -92,28 +95,6 @@ fn accept_outcome(
         *overall = Outcome::Negative;
     }
     Ok(())
-}
-
-/// Whether `err` is, or wraps, a platform setup refusal. Walks
-/// `source()` chains and looks inside `io::Error` carriers, whose
-/// `source()` skips the wrapped error itself - the writers carry the typed
-/// refusal inside an `io::Error` to keep their `io::Result` signatures.
-fn is_platform_unsupported(err: &(dyn std::error::Error + 'static)) -> bool {
-    let mut current = Some(err);
-    while let Some(error) = current {
-        if let Some(error) = error.downcast_ref::<pbfhogg::Error>()
-            && matches!(error.kind(), pbfhogg::ErrorKind::PlatformUnsupported { .. })
-        {
-            return true;
-        }
-        current = match error.downcast_ref::<std::io::Error>() {
-            Some(io) => io
-                .get_ref()
-                .map(|inner| inner as &(dyn std::error::Error + 'static)),
-            None => error.source(),
-        };
-    }
-    false
 }
 
 #[derive(Parser)]
@@ -2134,7 +2115,7 @@ fn main() -> process::ExitCode {
                 // rather than on the shape of `e`.
                 process::ExitCode::SUCCESS
             } else {
-                output::cli_eprintln!("Error: {e}");
+                output::cli_eprintln!("Error: {}", error_report(e.as_ref()));
                 let status = if is_platform_unsupported(e.as_ref()) {
                     ExitStatus::PlatformUnsupported
                 } else {
@@ -2829,7 +2810,7 @@ fn export_error(err: pbfhogg::Error) -> Box<dyn std::error::Error> {
         err.kind(),
         pbfhogg::ErrorKind::MissingFeature(f) if *f == pbfhogg::HeaderBlock::LOCATIONS_ON_WAYS
     ) {
-        return format!("{err}; use --type node to export nodes only").into();
+        return Box::new(Hinted::new(err, "; use --type node to export nodes only"));
     }
     Box::new(err)
 }
@@ -3402,7 +3383,8 @@ fn parse_timestamp(input: &str) -> Result<i64, Box<dyn std::error::Error>> {
     if let Ok(value) = input.parse::<i64>() {
         return Ok(value);
     }
-    pbfhogg::commands::parse_rfc3339_utc(input).map_err(|e| format!("{e} (or UNIX seconds)").into())
+    pbfhogg::commands::parse_rfc3339_utc(input)
+        .map_err(|e| Box::new(Hinted::new(e, " (or UNIX seconds)")).into())
 }
 
 fn run_show_element(

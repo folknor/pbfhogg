@@ -25,8 +25,8 @@ use crate::ElementReader;
 use crate::write::WriteOptions;
 
 use super::Stats;
-use crate::BoxResult as Result;
 use crate::commands::{HeaderOverrides, require_indexdata};
+use crate::error::Result;
 
 mod blob_bucket_index;
 mod blob_meta;
@@ -127,7 +127,7 @@ impl BucketLayout {
         let last_lo = (num_buckets as u64 - 1).saturating_mul(bw);
         let max_local = (bw - 1).max(max_node_id.saturating_sub(last_lo));
         if bw > MAX_BUCKET_WIDTH || max_local > u64::from(LOCAL_ID_MASK) {
-            return Err(format!(
+            return Err(crate::Error::invalid_data(format!(
                 "add-locations-to-ways --index-type external: the input's node \
                  indexdata advertises max_id {max_node_id}, above the {} this \
                  backend can encode ({num_buckets} buckets of at most {} ids). \
@@ -137,8 +137,7 @@ impl BucketLayout {
                  which blobs disagree with their contents.",
                 (num_buckets as u64).saturating_mul(MAX_BUCKET_WIDTH),
                 MAX_BUCKET_WIDTH,
-            )
-            .into());
+            )));
         }
         Ok(Self {
             max_node_id,
@@ -188,20 +187,18 @@ fn max_node_id_from_blob_meta(blob_meta: &[blob_meta::BlobMeta]) -> Result<u64> 
             continue;
         }
         if meta.max_id < meta.min_id {
-            return Err(format!(
+            return Err(crate::Error::invalid_data(format!(
                 "altw external: node blob at data_offset={} has reversed \
                  indexdata range [min_id={}, max_id={}]",
                 meta.data_offset, meta.min_id, meta.max_id,
-            )
-            .into());
+            )));
         }
         if meta.max_id < 0 {
-            return Err(format!(
+            return Err(crate::Error::invalid_data(format!(
                 "altw external: node blob at data_offset={} has negative \
                  max_id={}; pbfhogg rejects negative element ids",
                 meta.data_offset, meta.max_id,
-            )
-            .into());
+            )));
         }
         if meta.max_id > max_id {
             max_id = meta.max_id;
@@ -689,20 +686,26 @@ pub fn external_join(
 /// buckets. Empty blobs publish no straddler half, including at total_slots.
 fn validate_slot_layout(starts: &[u64], total: u64, buckets: usize) -> Result<()> {
     if buckets == 0 || starts.first().is_some_and(|&start| start != 0) {
-        return Err("external join: invalid slot bucket layout".into());
+        return Err(crate::Error::internal(
+            "external join: invalid slot bucket layout",
+        ));
     }
     let width = total / buckets as u64;
     for (i, &start) in starts.iter().enumerate() {
         let end = starts.get(i + 1).copied().unwrap_or(total);
-        let length = end
-            .checked_sub(start)
-            .ok_or("external join: way slot starts are not monotonic")?;
+        let length = end.checked_sub(start).ok_or_else(|| {
+            crate::Error::internal("external join: way slot starts are not monotonic")
+        })?;
         if end > total || length > width {
-            return Err(format!("external join: way blob {i} spans {length} slots, exceeding slot bucket width {width}; two-piece straddler bound would be violated").into());
+            return Err(crate::Error::internal(format!(
+                "external join: way blob {i} spans {length} slots, exceeding slot bucket width {width}; two-piece straddler bound would be violated"
+            )));
         }
     }
     if starts.is_empty() && total != 0 {
-        return Err("external join: nonzero slots without way blobs".into());
+        return Err(crate::Error::internal(
+            "external join: nonzero slots without way blobs",
+        ));
     }
     Ok(())
 }
@@ -756,7 +759,7 @@ pub(crate) fn external_join_in(
     // indexdata" message. Reject the combination up front with a
     // clear migration hint.
     if !has_indexdata {
-        return Err(
+        return Err(crate::Error::invalid_argument(
             "add-locations-to-ways --index-type external requires indexed input; \
              --force is not supported on this path because the ID bucket \
              ranges depend on per-blob indexdata.\n\n\
@@ -764,17 +767,17 @@ pub(crate) fn external_join_in(
              \x20 pbfhogg cat <input.osm.pbf> -o indexed.osm.pbf\n\n\
              Then run add-locations-to-ways against the indexed output, or use \
              --index-type sparse (which decodes every blob anyway and \
-             therefore tolerates --force)."
-                .into(),
-        );
+             therefore tolerates --force).",
+        ));
     }
 
     {
         let reader = ElementReader::open_in(input, direct_io, host)?;
         if !reader.header().is_sorted() {
-            return Err("external join requires a sorted PBF (Sort.Type_then_ID). \
-                        The single-pass node merge depends on ascending node ID order."
-                .into());
+            return Err(crate::Error::invalid_data(
+                "external join requires a sorted PBF (Sort.Type_then_ID). \
+                 The single-pass node merge depends on ascending node ID order.",
+            ));
         }
     }
 
@@ -828,13 +831,10 @@ pub(crate) fn external_join_in(
     let blob_meta_ref_parallel = &blob_meta;
     let bucket_layout_ref = &bucket_layout;
     let (stage1_out, relation_member_node_ids) = std::thread::scope(
-        |scope| -> std::result::Result<
-            (
-                super::external::stage1::Stage1Output,
-                Option<relation_scan::RelationScanOutput>,
-            ),
-            String,
-        > {
+        |scope| -> Result<(
+            super::external::stage1::Stage1Output,
+            Option<relation_scan::RelationScanOutput>,
+        )> {
             let s1_handle = scope.spawn(|| {
                 stage1_way_pass(
                     blob_meta_ref_parallel,
@@ -847,7 +847,6 @@ pub(crate) fn external_join_in(
                     inject_prepass,
                     host,
                 )
-                .map_err(|e| e.to_string())
             });
             let rel_handle = if keep_untagged_nodes && !inject_prepass {
                 None
@@ -860,15 +859,14 @@ pub(crate) fn external_join_in(
                         blob_meta_ref_parallel,
                         !keep_untagged_nodes,
                         inject_prepass,
-                    )
-                    .map_err(|e| e.to_string())?;
+                    )?;
                     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
                     crate::debug::emit_counter(
                         "extjoin_relation_member_collect_ms",
                         t_relscan.elapsed().as_millis() as i64,
                     );
                     crate::debug::emit_marker("EXTJOIN_RELATION_SCAN_END");
-                    Ok::<_, String>(ids)
+                    Ok::<_, crate::Error>(ids)
                 }))
             };
 
@@ -883,18 +881,17 @@ pub(crate) fn external_join_in(
             // ADR-0004), and cancelling the relation scan would require
             // plumbing a shutdown signal we don't otherwise need.
             let s1_res = s1_handle.join().map_err(|payload| {
-                crate::error::panic_error("stage 1 thread", payload.as_ref()).to_string()
+                crate::error::panic_error("stage 1 thread", payload.as_ref())
             })??;
             let rel_res = match rel_handle {
                 Some(handle) => Some(handle.join().map_err(|payload| {
-                    crate::error::panic_error("relation scan thread", payload.as_ref()).to_string()
+                    crate::error::panic_error("relation scan thread", payload.as_ref())
                 })??),
                 None => None,
             };
             Ok((s1_res, rel_res))
         },
-    )
-    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    )?;
 
     let s1_faults_after = crate::debug::read_page_faults();
     let total_id_records: u64 = stage1_out.id_bucket_counts.iter().sum();
@@ -1006,7 +1003,8 @@ pub(crate) fn external_join_in(
     let s2_faults_before = crate::debug::read_page_faults();
     let slot_buckets = SlotBuckets::create(&scratch_dir, slot_bucket_count)?;
     let input_pbf = std::sync::Arc::new(
-        std::fs::File::open(input).map_err(|e| format!("open input pbf for stage 2: {e}"))?,
+        std::fs::File::open(input)
+            .map_err(|e| crate::Error::from(e).context("open input pbf for stage 2"))?,
     );
     let resolved_count = stage2_node_join(
         &scratch_dir,
@@ -1073,9 +1071,9 @@ pub(crate) fn external_join_in(
                 .truncate(true)
                 .open(p)
                 .map(std::sync::Arc::new)
-                .map_err(|e| format!("open worker tmp {p:?}: {e}"))
+                .map_err(|e| crate::Error::from(e).context(format!("open worker tmp {p:?}")))
         })
-        .collect::<std::result::Result<_, String>>()?;
+        .collect::<crate::Result<_>>()?;
 
     let slot_entry_counts: Vec<u64> = (0..slot_bucket_count)
         .map(|i| {
@@ -1145,12 +1143,11 @@ pub(crate) fn external_join_in(
     let inject_metrics = super::inject_metrics::InjectMetrics::default();
     let inject_metrics_ref = &inject_metrics;
 
-    // Closures return Result<_, String> because BoxResult's error type
-    // (Box<dyn Error>) is not Send and thread::scope requires Send
-    // return values. Errors are stringified at the scope boundary and
-    // converted back to BoxResult outside.
-    let mut stats = std::thread::scope(|scope| -> std::result::Result<Stats, String> {
-        let s3_handle = scope.spawn(move || -> std::result::Result<(), String> {
+    // Both stage threads return the typed crate::Error unchanged, so a
+    // PlatformUnsupported raised by the output writer in stage 4 keeps its
+    // kind (and exit code) across the join.
+    let mut stats = std::thread::scope(|scope| -> crate::Result<Stats> {
+        let s3_handle = scope.spawn(move || -> crate::Result<()> {
             let integrated = IntegratedInputs {
                 way_slot_starts: way_slot_starts_ref,
                 per_way_rcs: per_way_rcs_ref,
@@ -1163,8 +1160,7 @@ pub(crate) fn external_join_in(
                 total_slots,
                 &integrated,
                 num_workers,
-            )
-            .map_err(|e| e.to_string());
+            );
             // Signal the router that no more publishes are coming. Must
             // run whether stage 3 succeeded or errored - otherwise stage
             // 4 waiters on unpublished slots would hang. On error the
@@ -1173,7 +1169,7 @@ pub(crate) fn external_join_in(
             router_ref.mark_producer_done();
             result
         });
-        let s4_handle = scope.spawn(move || -> std::result::Result<Stats, String> {
+        let s4_handle = scope.spawn(move || -> crate::Result<Stats> {
             stage4_assembly(
                 input,
                 output,
@@ -1190,23 +1186,21 @@ pub(crate) fn external_join_in(
                 overrides,
                 host,
             )
-            .map_err(|e| e.to_string())
         });
 
-        let s3_res = s3_handle.join().map_err(|payload| {
-            crate::error::panic_error("stage 3 thread", payload.as_ref()).to_string()
-        })?;
-        let s4_res = s4_handle.join().map_err(|payload| {
-            crate::error::panic_error("stage 4 thread", payload.as_ref()).to_string()
-        })?;
+        let s3_res = s3_handle
+            .join()
+            .map_err(|payload| crate::error::panic_error("stage 3 thread", payload.as_ref()))?;
+        let s4_res = s4_handle
+            .join()
+            .map_err(|payload| crate::error::panic_error("stage 4 thread", payload.as_ref()))?;
 
         // Prefer the stage 3 error if both failed (it's usually the root
         // cause - stage 4 typically errors only because of an abort that
         // stage 3 or the writer raised).
         s3_res?;
         s4_res
-    })
-    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    })?;
 
     let s3_faults_after = crate::debug::read_page_faults();
     for i in 0..slot_bucket_count {

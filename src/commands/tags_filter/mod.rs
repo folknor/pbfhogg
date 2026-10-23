@@ -326,7 +326,7 @@ fn filter_block_parallel(
     invert: bool,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> std::result::Result<TagsFilterStats, String> {
+) -> crate::Result<TagsFilterStats> {
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
         nodes_from_ways: 0,
@@ -516,7 +516,7 @@ fn filter_block_pass2(
     remove_tags: bool,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> std::result::Result<TagsFilterStats, String> {
+) -> crate::Result<TagsFilterStats> {
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
         nodes_from_ways: 0,
@@ -697,7 +697,7 @@ fn tags_filter_two_pass(
         header_reader.set_parse_indexdata(true);
         let header_blob = header_reader
             .next()
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+            .ok_or_else(crate::error::new_missing_header)??;
         super::warn_locations_on_ways_loss(&header_blob.to_headerblock()?, host);
         drop(header_reader);
 
@@ -708,7 +708,7 @@ fn tags_filter_two_pass(
         let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
         let _ = walker
             .next_header()?
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
+            .ok_or_else(crate::error::new_missing_header)?;
 
         let expr_filter = trusted_blob_filter(expressions, invert, distrust_metadata);
 
@@ -894,7 +894,7 @@ fn tags_filter_two_pass(
     let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     let header_blob = header_reader
         .next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        .ok_or_else(crate::error::new_missing_header)??;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
     let mut writer = writer_from_header(
@@ -928,7 +928,7 @@ fn tags_filter_two_pass(
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
     let _ = walker
         .next_header()?
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
+        .ok_or_else(crate::error::new_missing_header)?;
 
     let mut schedule: Vec<(u64, usize)> = Vec::new(); // (data_offset, data_size)
     let mut blobs_skipped: u64 = 0;
@@ -1025,8 +1025,7 @@ fn tags_filter_two_pass(
         use std::os::unix::fs::FileExt as _;
 
         let shared_file = std::sync::Arc::new(
-            std::fs::File::open(input)
-                .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+            std::fs::File::open(input).map_err(|e| crate::file_reader::open_error(input, e))?,
         );
 
         let decode_threads = crate::host::sized_workers(
@@ -1091,10 +1090,7 @@ fn tags_filter_two_pass(
 
                         let r: crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats)> = (|| {
                             read_buf.resize(data_size, 0);
-                            file.read_exact_at(&mut read_buf, data_offset)
-                                .map_err(|e| {
-                                    crate::error::new_error(crate::error::ErrorKind::Io(e))
-                                })?;
+                            file.read_exact_at(&mut read_buf, data_offset)?;
                             let mut buf = crate::blob::pool_get(
                                 Some(&worker_pool),
                                 data_size * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
@@ -1113,17 +1109,8 @@ fn tags_filter_two_pass(
                                 remove_tags,
                                 &mut bb,
                                 &mut output_blocks,
-                            )
-                            .map_err(|e| {
-                                crate::error::new_error(crate::error::ErrorKind::Io(
-                                    std::io::Error::other(e),
-                                ))
-                            })?;
-                            flush_local(&mut bb, &mut output_blocks).map_err(|e| {
-                                crate::error::new_error(crate::error::ErrorKind::Io(
-                                    std::io::Error::other(e),
-                                ))
-                            })?;
+                            )?;
+                            flush_local(&mut bb, &mut output_blocks)?;
                             Ok((std::mem::take(&mut output_blocks), block_stats))
                         })(
                         );

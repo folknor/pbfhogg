@@ -106,13 +106,12 @@ fn parse_peak_rss_kb(status: &str) -> Option<u64> {
 /// rename) remains the authority.
 #[cfg(target_os = "linux")]
 #[cfg_attr(not(feature = "commands"), allow(dead_code))]
-pub(crate) fn is_mount_point(path: &std::path::Path) -> std::io::Result<bool> {
+pub(crate) fn is_mount_point(path: &std::path::Path) -> crate::Result<bool> {
     use std::os::unix::ffi::OsStrExt;
 
     let canonical = std::fs::canonicalize(path)?;
-    let mountinfo = std::fs::read("/proc/self/mountinfo").map_err(|e| {
-        std::io::Error::new(e.kind(), format!("cannot read /proc/self/mountinfo: {e}"))
-    })?;
+    let mountinfo = std::fs::read("/proc/self/mountinfo")
+        .map_err(|e| crate::Error::from(e).context("cannot read /proc/self/mountinfo"))?;
     for line in mountinfo.split(|byte| *byte == b'\n') {
         // Fields: mount ID, parent ID, major:minor, root, mount point, ...
         // The kernel octal-escapes whitespace inside a path, so splitting
@@ -133,7 +132,7 @@ pub(crate) fn is_mount_point(path: &std::path::Path) -> std::io::Result<bool> {
 
 #[cfg(not(target_os = "linux"))]
 #[cfg_attr(not(feature = "commands"), allow(dead_code))]
-pub(crate) fn is_mount_point(_path: &std::path::Path) -> std::io::Result<bool> {
+pub(crate) fn is_mount_point(_path: &std::path::Path) -> crate::Result<bool> {
     Ok(false)
 }
 

@@ -12,8 +12,8 @@
 use crate::ElementKind;
 use crate::PrimitiveBlock;
 use crate::blob_meta::BlobIndex;
+use crate::error::Result;
 use rustc_hash::FxHashSet;
-use std::io;
 
 /// Encoded block bytes plus the metadata needed to frame them into a blob.
 ///
@@ -933,9 +933,9 @@ impl BlockBuilder {
     /// After this returns `Some(index)`, `encode_buf` contains the serialized
     /// `PrimitiveBlock` bytes and the returned `BlobIndex` describes the block
     /// contents (element type, ID range, count).
-    fn encode_block(&mut self) -> io::Result<Option<BlobIndex>> {
+    fn encode_block(&mut self) -> Result<Option<BlobIndex>> {
         if let Some(reason) = self.poison.as_deref() {
-            return Err(io::Error::other(format!(
+            return Err(crate::error::Error::invalid_data(format!(
                 "BlockBuilder refused to encode a block: {reason}"
             )));
         }
@@ -1043,7 +1043,7 @@ impl BlockBuilder {
     /// an internal encode buffer that is reused across calls, eliminating
     /// per-block allocation after the first `take()`.
     #[hotpath::measure]
-    pub fn take(&mut self) -> io::Result<Option<&[u8]>> {
+    pub fn take(&mut self) -> Result<Option<&[u8]>> {
         if self.encode_block()?.is_some() {
             Ok(Some(&self.encode_buf))
         } else {
@@ -1065,7 +1065,7 @@ impl BlockBuilder {
     /// The total allocation is the same as `take()` + `to_vec()` but the
     /// `memcpy` is eliminated.
     #[hotpath::measure]
-    pub(crate) fn take_owned(&mut self) -> io::Result<Option<OwnedBlock>> {
+    pub(crate) fn take_owned(&mut self) -> Result<Option<OwnedBlock>> {
         if let Some(index) = self.encode_block()? {
             let tagdata = self.last_tagdata.take();
             Ok(Some(OwnedBlock {

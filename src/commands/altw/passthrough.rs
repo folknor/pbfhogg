@@ -56,6 +56,9 @@ use super::{NodeIndex, Stats, process_block};
 #[derive(Clone, Copy)]
 struct BlobDescriptor {
     seq: usize,
+    /// True 0-based blob index in the input, handed out by the header walk.
+    /// Provenance for locating a failure; `seq` is only an ordering key.
+    blob_index: u64,
     /// Start of the on-disk 4-byte length prefix. Used by the
     /// consumer-side passthrough path to pread the entire framed blob
     /// (header + data) and hand it verbatim to
@@ -131,8 +134,9 @@ fn build_schedule(
                 walker
                     .shared_file()
                     .read_exact_at(&mut data_buf, meta.data_offset)
-                    .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-                let header = crate::blob::decode_blob_to_headerblock(&data_buf)?;
+                    .map_err(|e| walker.locate_meta(&meta, e.into()))?;
+                let header = crate::blob::decode_blob_to_headerblock(&data_buf)
+                    .map_err(|e| walker.locate_meta(&meta, e))?;
                 let bytes = build_output_header(&header, true, overrides, |hb| {
                     super::altw_header_features(hb, inject_prepass)
                 })?;
@@ -148,6 +152,7 @@ fn build_schedule(
 
                 schedule.push(BlobDescriptor {
                     seq,
+                    blob_index: meta.blob_index,
                     frame_offset: meta.frame_start,
                     frame_size: meta.frame_size,
                     data_offset: meta.data_offset,
@@ -162,8 +167,8 @@ fn build_schedule(
         }
     }
 
-    let header_bytes = header_bytes
-        .ok_or_else(|| -> Box<dyn std::error::Error> { "no OSMHeader blob found".into() })?;
+    let header_bytes =
+        header_bytes.ok_or_else(|| crate::error::Error::invalid_data("no OSMHeader blob found"))?;
     let shared_file = std::sync::Arc::clone(walker.shared_file());
     crate::debug::emit_marker("ALTW_PASS2_SCHEDULE_WALK_END");
     Ok((schedule, header_bytes, shared_file))
@@ -222,11 +227,11 @@ fn decode_one(
     inject_metrics: &InjectMetrics,
     scratch: &mut WorkerScratch,
     counters: &Pass2Counters,
-) -> std::result::Result<(Vec<OwnedBlock>, Stats), String> {
+) -> crate::Result<(Vec<OwnedBlock>, Stats)> {
     let t_pread = std::time::Instant::now();
     scratch.read_buf.resize(desc.data_size, 0);
     file.read_exact_at(&mut scratch.read_buf, desc.data_offset)
-        .map_err(|e| format!("pass 2 pread: {e}"))?;
+        .map_err(|e| crate::error::Error::from(e).context("pass 2 pread"))?;
     #[allow(clippy::cast_possible_truncation)]
     counters
         .pread_ns
@@ -238,8 +243,7 @@ fn decode_one(
 
     if desc.is_way_blob {
         let t_dc = std::time::Instant::now();
-        decompress_blob_raw(&scratch.read_buf, &mut scratch.decompress_buf)
-            .map_err(|e| e.to_string())?;
+        decompress_blob_raw(&scratch.read_buf, &mut scratch.decompress_buf)?;
         #[allow(clippy::cast_possible_truncation)]
         counters
             .decompress_ns
@@ -299,7 +303,7 @@ fn decode_one(
     // `decompress_blob_raw` - the same wire-level path the way branch above uses.
     let t_dc = std::time::Instant::now();
     let mut decompressed = crate::blob::pool_get(Some(&scratch.pool), 0);
-    decompress_blob_raw(&scratch.read_buf, &mut decompressed).map_err(|e| e.to_string())?;
+    decompress_blob_raw(&scratch.read_buf, &mut decompressed)?;
     #[allow(clippy::cast_possible_truncation)]
     counters
         .decompress_ns
@@ -310,8 +314,7 @@ fn decode_one(
         &scratch.pool,
         &mut scratch.st_scratch,
         &mut scratch.gr_scratch,
-    )
-    .map_err(|e| e.to_string())?;
+    )?;
     // A Way in a blob the index classified as non-way would be emitted without
     // field 9/10/20 and would be absent from every field-5 payload, silently
     // breaking the WayMembers superset. Reject it, mirroring the external
@@ -321,11 +324,11 @@ fn decode_one(
             .elements_skip_metadata()
             .any(|e| matches!(e, crate::Element::Way(_)))
     {
-        return Err(format!(
+        return Err(crate::error::Error::invalid_data(format!(
             "--inject-prepass: blob {} classified as non-way contains a Way element; \
              refusing to emit unenriched ways",
-            desc.seq,
-        ));
+            desc.blob_index,
+        )));
     }
     let block_stats = process_block(
         &block,
@@ -423,6 +426,9 @@ pub(super) fn write_output_passthrough(
     let p2_send_stall = super::external::StallGauge::new("WAIT_P2_SEND_START", "WAIT_P2_SEND_END");
     let p2_counters_ref = &p2_counters;
     let p2_send_stall_ref = &p2_send_stall;
+    // The input's identity, captured once; each worker borrows it.
+    let source: std::sync::Arc<Path> = std::sync::Arc::from(input);
+    let source = &source;
 
     // Consumer-side counters (single thread; plain locals).
     let mut p2_recv_ns: u64 = 0;
@@ -431,7 +437,7 @@ pub(super) fn write_output_passthrough(
     let mut p2_pt_bytes: u64 = 0;
     let mut p2_pt_blobs: u64 = 0;
 
-    type DecodedItem = (usize, std::result::Result<(Vec<OwnedBlock>, Stats), String>);
+    type DecodedItem = (usize, crate::Result<(Vec<OwnedBlock>, Stats)>);
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(
         crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
     );
@@ -481,7 +487,16 @@ pub(super) fn write_output_passthrough(
                         inject_metrics,
                         &mut scratch,
                         p2_counters_ref,
-                    );
+                    )
+                    // Cold: only a failure builds the location, from the true
+                    // blob index and frame start the walker handed out.
+                    .map_err(|e| {
+                        e.locate(crate::error::Location::new(
+                            Some(source),
+                            Some(desc.blob_index),
+                            Some(crate::ByteOffset(desc.frame_offset)),
+                        ))
+                    });
                     let t_send = std::time::Instant::now();
                     match tx.try_send((desc.seq, result)) {
                         Ok(()) => {}
@@ -509,7 +524,7 @@ pub(super) fn write_output_passthrough(
         // contiguous ready items so input element ordering (nodes ->
         // ways -> relations) is preserved.
         enum ConsumerItem {
-            Decoded(std::result::Result<(Vec<OwnedBlock>, Stats), String>),
+            Decoded(crate::Result<(Vec<OwnedBlock>, Stats)>),
             Passthrough {
                 frame_offset: u64,
                 frame_size: usize,
@@ -543,8 +558,7 @@ pub(super) fn write_output_passthrough(
             while let Some(item) = reorder.pop_ready() {
                 match item {
                     ConsumerItem::Decoded(result) => {
-                        let (blocks, block_stats) =
-                            result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                        let (blocks, block_stats) = result?;
                         total_stats.merge(&block_stats);
                         let t_write = std::time::Instant::now();
                         for OwnedBlock {
@@ -583,9 +597,7 @@ pub(super) fn write_output_passthrough(
                     } => {
                         let t_pt = std::time::Instant::now();
                         frame_read_buf.resize(frame_size, 0);
-                        shared_file
-                            .read_exact_at(frame_read_buf, frame_offset)
-                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        shared_file.read_exact_at(frame_read_buf, frame_offset)?;
                         #[allow(clippy::cast_possible_truncation)]
                         {
                             p2_pt_pread_ns += t_pt.elapsed().as_nanos() as u64;

@@ -115,20 +115,18 @@ fn build_header_bytes(
     // general path silently dropped creates on malformed unsorted
     // input.
     if !header.is_sorted() {
-        return Err(
+        return Err(crate::Error::invalid_data(
             "apply-changes requires a sorted base PBF (Sort.Type_then_ID). \
              All nodes must precede all ways, and elements within a kind \
-             must be ordered by ID."
-                .into(),
-        );
+             must be ordered by ID.",
+        ));
     }
     if locations_on_ways {
         if !header.has_locations_on_ways() {
-            return Err(
+            return Err(crate::Error::invalid_data(
                 "merge --locations-on-ways requires the base PBF to have LocationsOnWays. \
-                 Run add-locations-to-ways first to bootstrap coordinates."
-                    .into(),
-            );
+                 Run add-locations-to-ways first to bootstrap coordinates.",
+            ));
         }
         build_output_header(header, false, overrides, |hb| {
             hb.sorted()
@@ -156,7 +154,7 @@ fn read_header(
                 return build_header_bytes(&header, locations_on_ways, overrides, host);
             }
             Some(_) => {}
-            None => return Err("base PBF has no OSMHeader blob".into()),
+            None => return Err(crate::Error::invalid_data("base PBF has no OSMHeader blob")),
         }
     }
 }
@@ -202,12 +200,11 @@ pub fn merge(
     // not-yet-created output cannot be the base, so the CLI's extra
     // planned-path check is not needed here.
     if crate::path_guard::same_file(base_pbf, output_pbf)? {
-        return Err(format!(
+        return Err(crate::Error::invalid_argument(format!(
             "apply-changes output '{}' aliases base input '{}'",
             output_pbf.display(),
             base_pbf.display()
-        )
-        .into());
+        )));
     }
 
     let MergeOptions {
@@ -244,14 +241,13 @@ pub fn merge(
     // now turns it into a mid-run error, and this check rejects the
     // combination up front with a clear migration path instead.
     if force && locations_on_ways && !has_base_indexdata {
-        return Err(
+        return Err(crate::Error::invalid_argument(
             "apply-changes --force --locations-on-ways on a non-indexed PBF would \
              silently strip LocationsOnWays data from base ways. Generate an indexed \
              PBF first:\n\n\
              \x20 pbfhogg cat <input.osm.pbf> -o indexed.osm.pbf\n\n\
-             Then run apply-changes against the indexed output."
-                .into(),
-        );
+             Then run apply-changes against the indexed output.",
+        ));
     }
 
     let osc_start = std::time::Instant::now();
@@ -388,11 +384,10 @@ pub fn merge(
     // keep the explicit refusal rather than silently substituting workers.
     let worker_count = match jobs {
         Some(1) => {
-            return Err(
+            return Err(crate::Error::invalid_argument(
                 "apply-changes needs at least 2 workers (--jobs 2 or more, or omit \
-                 --jobs): a single worker has not been validated"
-                    .into(),
-            );
+                 --jobs): a single worker has not been validated",
+            ));
         }
         Some(n) if n > 1 => n,
         _ => crate::host::sized_workers(
@@ -549,9 +544,9 @@ pub fn merge(
         // The drain checks producer failures before reporting a seq gap.
         // Keep its error: a later scanner send failure can be a consequence
         // of the drain dropping its receiver after an output write failed.
-        let stats = drain_stats.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let stats = drain_stats?;
         if let Some(e) = failure.take() {
-            return Err(e.into());
+            return Err(e);
         }
         Ok(stats)
     })?;
@@ -586,11 +581,10 @@ pub fn merge(
     }
 
     if locations_on_ways && final_stats.loc_missing != 0 && !ignore_missing_nodes {
-        return Err(format!(
+        return Err(crate::Error::invalid_data(format!(
             "cannot write LocationsOnWays: {} referenced node(s) could not be resolved; use --ignore-missing-nodes to retain the legacy (0,0) fallback",
             final_stats.loc_missing
-        )
-        .into());
+        )));
     }
 
     // No summary here: the caller renders the returned stats, as for every

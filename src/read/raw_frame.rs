@@ -11,11 +11,26 @@
 
 use std::io::Read;
 
-use crate::BoxResult as Result;
-use crate::blob::BlobKind;
+use crate::blob::{BlobKind, ByteOffset};
 use crate::blob_meta::BlobIndex;
+use crate::error::{Location, Result};
 use crate::file_reader::FileReader;
 use crate::frame::read_frame_header;
+
+/// The location of the raw frame starting at `frame_start` in `source`.
+///
+/// The raw-frame walks do not count blobs, so the location names the input
+/// and the frame's byte offset only. The walker owns this provenance: it is
+/// applied by [`read_raw_frame`] and [`read_blob_header_only`] to their own
+/// failures, and by callers that decode the frame afterwards.
+#[cold]
+pub(crate) fn frame_location(source: &std::path::Path, frame_start: u64) -> Location {
+    Location::new(
+        Some(&std::sync::Arc::from(source)),
+        None,
+        Some(ByteOffset(frame_start)),
+    )
+}
 
 /// A raw blob frame for passthrough or selective decode.
 ///
@@ -70,6 +85,18 @@ impl RawBlobFrame {
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) fn read_raw_frame<R: Read>(
+    reader: &mut R,
+    file_offset: &mut u64,
+    diagnostics: &crate::host::Diagnostics,
+    source: &std::path::Path,
+) -> Result<Option<RawBlobFrame>> {
+    let frame_start = *file_offset;
+    read_raw_frame_inner(reader, file_offset, diagnostics, source)
+        .map_err(|e| e.locate(frame_location(source, frame_start)))
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn read_raw_frame_inner<R: Read>(
     reader: &mut R,
     file_offset: &mut u64,
     diagnostics: &crate::host::Diagnostics,
@@ -139,6 +166,18 @@ pub(crate) struct BlobHeaderInfo {
 /// and then advance `*file_offset += data_size as u64`.
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) fn read_blob_header_only(
+    reader: &mut FileReader,
+    file_offset: &mut u64,
+    diagnostics: &crate::host::Diagnostics,
+    source: &std::path::Path,
+) -> Result<Option<BlobHeaderInfo>> {
+    let frame_start = *file_offset;
+    read_blob_header_only_inner(reader, file_offset, diagnostics, source)
+        .map_err(|e| e.locate(frame_location(source, frame_start)))
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn read_blob_header_only_inner(
     reader: &mut FileReader,
     file_offset: &mut u64,
     diagnostics: &crate::host::Diagnostics,

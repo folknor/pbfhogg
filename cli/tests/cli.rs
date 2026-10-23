@@ -12,6 +12,83 @@ fn pbfhogg_bin() -> &'static str {
     env!("CARGO_BIN_EXE_pbfhogg")
 }
 
+/// The binary's own error walk and report, compiled directly so it can be
+/// tested without a unit-test harness in `src/`.
+#[path = "../src/exit_code.rs"]
+mod exit_code;
+
+mod exit_code_walker {
+    use super::exit_code::{Hinted, error_report, is_platform_unsupported};
+    use std::io;
+
+    fn platform() -> pbfhogg::Error {
+        pbfhogg::Error::platform_unsupported("io-uring", io::Error::other("refused"))
+    }
+
+    #[test]
+    fn bare_and_context_wrapped_refusals_exit_3() {
+        assert!(is_platform_unsupported(&platform()));
+        assert!(is_platform_unsupported(&platform().context("opening")));
+    }
+
+    #[test]
+    fn io_carrier_and_double_wrapping_exit_3() {
+        let carried = io::Error::from(platform());
+        assert!(is_platform_unsupported(&carried));
+        let once = pbfhogg::Error::from(carried);
+        assert!(is_platform_unsupported(&once));
+        // An Io error holding an io::Error that holds the refusal, which a
+        // plain source() walk skips.
+        let twice = pbfhogg::Error::from(io::Error::other(io::Error::from(platform())));
+        assert!(is_platform_unsupported(&twice));
+    }
+
+    #[test]
+    fn refusal_under_external_exits_3() {
+        let external = pbfhogg::Error::external(platform());
+        assert!(is_platform_unsupported(&external));
+        let boxed: Box<dyn std::error::Error> = Box::new(external);
+        assert!(is_platform_unsupported(boxed.as_ref()));
+    }
+
+    #[test]
+    fn ordinary_errors_do_not() {
+        assert!(!is_platform_unsupported(&pbfhogg::Error::from(
+            io::Error::other("x")
+        )));
+        assert!(!is_platform_unsupported(&pbfhogg::Error::external(
+            io::Error::other("x")
+        )));
+        assert!(!is_platform_unsupported(&io::Error::other("x")));
+    }
+
+    #[test]
+    fn report_covers_bare_carried_and_foreign_errors() {
+        assert_eq!(
+            error_report(&platform()),
+            "platform feature io-uring unavailable: refused"
+        );
+        let carried = io::Error::from(platform().context("opening"));
+        assert_eq!(
+            error_report(&carried),
+            "opening: platform feature io-uring unavailable: refused"
+        );
+        assert_eq!(error_report(&io::Error::other("plain")), "plain");
+    }
+
+    #[test]
+    fn hinted_error_keeps_the_typed_cause_reachable_and_prints_cause_then_advice() {
+        let hinted = Hinted::new(platform().context("opening"), "; try again");
+        // The advice never hides the refusal from the exit-code walk.
+        assert!(is_platform_unsupported(&hinted));
+        assert_eq!(
+            error_report(&hinted),
+            "opening: platform feature io-uring unavailable: refused; try again"
+        );
+        assert_eq!(hinted.to_string(), "try again");
+    }
+}
+
 /// Write a minimal valid PBF file using the library API.
 fn write_minimal_pbf(path: &Path) {
     write_minimal_pbf_impl(path, false);

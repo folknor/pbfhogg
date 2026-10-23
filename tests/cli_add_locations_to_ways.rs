@@ -1055,6 +1055,64 @@ mod platform {
             )],
         );
     }
+
+    /// Stage 4 of the external backend owns the output writer, and runs on
+    /// its own thread. A platform setup refusal raised there must cross the
+    /// stage's thread join as the typed refusal, not flattened into a generic
+    /// failure.
+    ///
+    /// This drives the library with a direct output and buffered reads
+    /// (`direct_reads: false`), a combination the CLI cannot express (its
+    /// `--direct-io` sets both, so an input-side refusal would fire first on
+    /// the main thread and never reach stage 4). With reads buffered, the only
+    /// way the run can fail with a refusal is stage 4's output open. A host
+    /// whose filesystem accepts O_DIRECT output completes the run instead, so
+    /// the test cannot force the refusal; it then passes without exercising
+    /// the join, and only a failure is held to the contract.
+    #[test]
+    fn external_backend_output_refusal_stays_typed_across_stage_join() {
+        let dir = TempDir::new().expect("tempdir");
+        let input = dir.path().join("input.osm.pbf");
+        let output = dir.path().join("output.osm.pbf");
+
+        let nodes = generate_nodes(6, 1);
+        let mut ways = generate_ways(1, 1_000, 3, 1);
+        ways[0].refs = vec![1, 2, 3];
+        write_multi_block_test_pbf(&input, &nodes, &ways, &[], 3);
+
+        let result = pbfhogg::altw::add_locations_to_ways(
+            &input,
+            &output,
+            &pbfhogg::altw::AltwOptions {
+                keep_untagged_nodes: true,
+                write: pbfhogg::write::WriteOptions {
+                    backend: pbfhogg::write::OutputBackend::Direct,
+                    direct_reads: false,
+                    force: true,
+                    ..pbfhogg::write::WriteOptions::default()
+                },
+                index_type: pbfhogg::altw::IndexType::External,
+                inject_prepass: false,
+                ignore_missing_nodes: false,
+            },
+            &pbfhogg::HeaderOverrides::default(),
+            &crate::common::test_host(),
+        );
+        match result {
+            Ok(_) => crate::common::skip("O_DIRECT output accepted on this filesystem"),
+            Err(error) => assert!(
+                matches!(
+                    error.kind(),
+                    pbfhogg::ErrorKind::PlatformUnsupported {
+                        feature: "direct-io",
+                        ..
+                    }
+                ),
+                "an output-side O_DIRECT refusal must stay typed; got: {}",
+                error.report(),
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -20,13 +20,12 @@ pub(super) struct StringInterner {
     lookup: FxHashMap<String, u32>,
 }
 
-fn interner_overflow(what: &str) -> Box<dyn std::error::Error> {
-    format!(
+fn interner_overflow(what: &str) -> crate::Error {
+    crate::Error::invalid_data(format!(
         "OSC string interner overflowed: more than {} {what}. The overlay cannot address \
          them without silently aliasing one string onto another",
         u32::MAX
-    )
-    .into()
+    ))
 }
 
 impl StringInterner {

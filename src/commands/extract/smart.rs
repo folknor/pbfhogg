@@ -148,7 +148,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     blob_reader.set_parse_indexdata(true);
     let header_blob = blob_reader
         .next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        .ok_or_else(crate::error::new_missing_header)??;
     let is_sorted = header_blob.to_headerblock()?.is_sorted();
     let filter = spatial_blob_filter(bbox_int);
     let mut decompress_buf: Vec<u8> = Vec::new();
@@ -172,7 +172,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             blob_reader.set_parse_indexdata(true);
             blob_reader
                 .next()
-                .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+                .ok_or_else(crate::error::new_missing_header)??;
             for blob_result in &mut blob_reader {
                 let blob = blob_result?;
                 if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
@@ -246,7 +246,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
     let _ = walker
         .next_header()?
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
+        .ok_or_else(crate::error::new_missing_header)?;
 
     let mut node_schedule: Vec<(usize, u64, usize)> = Vec::new();
     let mut way_schedule: Vec<(usize, u64, usize)> = Vec::new();
@@ -540,8 +540,7 @@ pub(super) fn extract_smart(
             )?
         } else {
             let shared_file = std::sync::Arc::new(
-                std::fs::File::open(input)
-                    .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+                std::fs::File::open(input).map_err(|e| crate::file_reader::open_error(input, e))?,
             );
             (pass1_way_schedule, shared_file)
         };
@@ -596,7 +595,7 @@ pub(super) fn extract_smart(
     let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     let header_blob = header_reader
         .next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        .ok_or_else(crate::error::new_missing_header)??;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
     super::super::warn_locations_on_ways_loss(&header, host);
@@ -688,7 +687,7 @@ fn extract_block_pass3(
     clean: &CleanAttrs,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> std::result::Result<ExtractStats, String> {
+) -> crate::Result<ExtractStats> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,

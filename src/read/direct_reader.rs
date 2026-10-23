@@ -12,6 +12,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::NonNull;
 
+use crate::error::{Error, Result};
 use crate::write::{IO_BUF_BYTES, PAGE_SIZE};
 
 // ---------------------------------------------------------------------------
@@ -34,13 +35,13 @@ unsafe impl Send for AlignedReadBuffer {}
 
 impl AlignedReadBuffer {
     /// Allocate a new buffer of `capacity` bytes aligned to `PAGE_SIZE`.
-    fn new(capacity: usize) -> io::Result<Self> {
+    fn new(capacity: usize) -> Result<Self> {
         let layout = Layout::from_size_align(capacity, PAGE_SIZE)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            .map_err(|e| Error::internal_with("invalid aligned read buffer layout", e))?;
         // Safety: layout has non-zero size (IO_BUF_BYTES > 0).
         let ptr = unsafe { alloc::alloc(layout) };
         let ptr = NonNull::new(ptr)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "aligned alloc failed"))?;
+            .ok_or_else(|| Error::io_kind(io::ErrorKind::OutOfMemory, "aligned alloc failed"))?;
         Ok(Self {
             ptr,
             layout,
@@ -184,15 +185,14 @@ impl DirectReader {
 
     /// Open a file for reading with `O_DIRECT`.
     ///
-    /// A filesystem that refuses `O_DIRECT` at open fails with an error
-    /// carrying `ErrorKind::PlatformUnsupported` (feature `direct-io`);
-    /// converting it to [`crate::Error`] restores the typed variant.
-    pub fn open(path: &Path) -> io::Result<Self> {
+    /// A filesystem that refuses `O_DIRECT` at open fails with
+    /// `ErrorKind::PlatformUnsupported` (feature `direct-io`).
+    pub fn open(path: &Path) -> Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT)
             .open(path)
-            .map_err(crate::error::direct_io_open_error)?;
+            .map_err(|e| crate::error::direct_io_open_error_at(path, e))?;
         let file_len = file.metadata()?.len();
         let buf = AlignedReadBuffer::new(IO_BUF_BYTES)?;
         Ok(Self {

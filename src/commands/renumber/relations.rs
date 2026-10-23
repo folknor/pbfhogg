@@ -24,13 +24,12 @@ use crate::idset::IdSet;
 /// Renumber rejects them with a clear error.
 fn reject_negative_id(id: i64, kind: &str) -> Result<()> {
     if id < 0 {
-        return Err(format!(
+        return Err(crate::Error::invalid_data(format!(
             "renumber requires non-negative input ids. \
              Input contains {kind} id {id}. \
              Negative ids are JOSM editor-local staging identifiers \
              that should be resolved before processing."
-        )
-        .into());
+        )));
     }
     Ok(())
 }
@@ -48,6 +47,7 @@ fn reject_negative_id(id: i64, kind: &str) -> Result<()> {
 #[hotpath::measure]
 pub(super) fn relation_r1_collect_ids(
     shared_file: &std::fs::File,
+    source: &std::sync::Arc<std::path::Path>,
     relation_schedule: &[BlobTask],
     relation_id_set: &mut IdSet,
 ) -> Result<()> {
@@ -57,50 +57,56 @@ pub(super) fn relation_r1_collect_ids(
     let mut prev: Option<i64> = None;
 
     for task in relation_schedule {
-        buffers
-            .load(shared_file, task, &counters)
-            .map_err(|e| format!("R1: {e}"))?;
+        (|| -> Result<()> {
+            buffers
+                .load(shared_file, task, &counters)
+                .map_err(|e| e.context("R1"))?;
 
-        let t = std::time::Instant::now();
-        let mut cursor = Cursor::new(&buffers.decompressed);
-        while let Some((field, wire_type)) =
-            cursor.read_tag().map_err(|e| format!("R1 block: {e}"))?
-        {
-            if field != 2 || wire_type != WIRE_LEN {
-                cursor
-                    .skip_field(wire_type)
-                    .map_err(|e| format!("R1 skip: {e}"))?;
-                continue;
-            }
-            let group = cursor
-                .read_len_delimited()
-                .map_err(|e| format!("R1 group: {e}"))?;
-            let mut gcursor = Cursor::new(group);
-            while let Some((gfield, gwire)) =
-                gcursor.read_tag().map_err(|e| format!("R1 gfield: {e}"))?
+            let t = std::time::Instant::now();
+            let mut cursor = Cursor::new(&buffers.decompressed);
+            while let Some((field, wire_type)) = cursor
+                .read_tag()
+                .map_err(|e| crate::Error::from(e).context("R1 block"))?
             {
-                if gfield != 4 || gwire != WIRE_LEN {
-                    gcursor
-                        .skip_field(gwire)
-                        .map_err(|e| format!("R1 gskip: {e}"))?;
+                if field != 2 || wire_type != WIRE_LEN {
+                    cursor
+                        .skip_field(wire_type)
+                        .map_err(|e| crate::Error::from(e).context("R1 skip"))?;
                     continue;
                 }
-                let rel_bytes = gcursor
+                let group = cursor
                     .read_len_delimited()
-                    .map_err(|e| format!("R1 rel: {e}"))?;
-                let rel_id = relation_id(rel_bytes)?;
-                reject_negative_id(rel_id, "relation")?;
-                if let Some(p) = prev
-                    && rel_id <= p
+                    .map_err(|e| crate::Error::from(e).context("R1 group"))?;
+                let mut gcursor = Cursor::new(group);
+                while let Some((gfield, gwire)) = gcursor
+                    .read_tag()
+                    .map_err(|e| crate::Error::from(e).context("R1 gfield"))?
                 {
-                    return Err(order_error("relation", p, rel_id).into());
+                    if gfield != 4 || gwire != WIRE_LEN {
+                        gcursor
+                            .skip_field(gwire)
+                            .map_err(|e| crate::Error::from(e).context("R1 gskip"))?;
+                        continue;
+                    }
+                    let rel_bytes = gcursor
+                        .read_len_delimited()
+                        .map_err(|e| crate::Error::from(e).context("R1 rel"))?;
+                    let rel_id = relation_id(rel_bytes)?;
+                    reject_negative_id(rel_id, "relation")?;
+                    if let Some(p) = prev
+                        && rel_id <= p
+                    {
+                        return Err(order_error("relation", p, rel_id));
+                    }
+                    prev = Some(rel_id);
+                    relation_id_set.set(rel_id);
                 }
-                prev = Some(rel_id);
-                relation_id_set.set(rel_id);
             }
-        }
-        add_ns(&counters.reframe_ns, t);
-        counters.bump_blobs();
+            add_ns(&counters.reframe_ns, t);
+            counters.bump_blobs();
+            Ok(())
+        })()
+        .map_err(|e| task.locate(source, e))?;
     }
 
     counters.emit("r1");
@@ -127,6 +133,7 @@ pub(super) struct R2dResult {
 #[hotpath::measure]
 pub(super) fn relation_r2d_assembly(
     shared_file: &std::fs::File,
+    source: &std::sync::Arc<std::path::Path>,
     relation_schedule: &[BlobTask],
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
     ids: &RelationIdSpaces<'_>,
@@ -151,47 +158,53 @@ pub(super) fn relation_r2d_assembly(
     let totals = run_rewrite_stage(
         "relation",
         "r2d",
+        source,
         relation_schedule.len(),
         &mut workers,
         &counters,
         writer,
         |w: &mut R2dWorker, idx| {
             let task = &relation_schedule[idx];
-            // Deliberately load only payload bytes and emit no tagdata. Carrying
-            // header key lists would change output and add per-blob rewrite work.
-            w.buffers.load(shared_file, task, &counters)?;
+            (|| {
+                // Deliberately load only payload bytes and emit no tagdata. Carrying
+                // header key lists would change output and add per-blob rewrite work.
+                w.buffers.load(shared_file, task, &counters)?;
 
-            let t = std::time::Instant::now();
-            let outcome = reframe_relations_with_new_ids(
-                &w.buffers.decompressed,
-                ids,
-                &mut w.reframe_buf,
-                &mut w.scratch,
-            )?;
-            add_ns(&counters.reframe_ns, t);
-            counters.bump_blobs();
+                let t = std::time::Instant::now();
+                let outcome = reframe_relations_with_new_ids(
+                    &w.buffers.decompressed,
+                    ids,
+                    &mut w.reframe_buf,
+                    &mut w.scratch,
+                )?;
+                add_ns(&counters.reframe_ns, t);
+                counters.bump_blobs();
 
-            let block = match outcome.new_range {
-                Some((min_id, max_id)) if outcome.count > 0 => {
-                    let bytes = std::mem::take(&mut w.reframe_buf);
-                    w.reframe_buf.reserve(bytes.len());
-                    let index = crate::blob_meta::BlobIndex {
-                        kind: crate::ElementKind::Relation,
-                        min_id,
-                        max_id,
-                        count: outcome.count,
-                        bbox: None,
-                    };
-                    Some((bytes, index))
-                }
-                _ => None,
-            };
-            Ok(Rewritten {
-                block,
-                span: outcome.span,
-                count: outcome.count,
-                orphans: outcome.orphans,
-            })
+                let block = match outcome.new_range {
+                    Some((min_id, max_id)) if outcome.count > 0 => {
+                        let bytes = std::mem::take(&mut w.reframe_buf);
+                        w.reframe_buf.reserve(bytes.len());
+                        let index = crate::blob_meta::BlobIndex {
+                            kind: crate::ElementKind::Relation,
+                            min_id,
+                            max_id,
+                            count: outcome.count,
+                            bbox: None,
+                        };
+                        Some((bytes, index))
+                    }
+                    _ => None,
+                };
+                Ok(Rewritten {
+                    blob_index: task.blob_index,
+                    frame_offset: task.frame_offset,
+                    block,
+                    span: outcome.span,
+                    count: outcome.count,
+                    orphans: outcome.orphans,
+                })
+            })()
+            .map_err(|e| task.locate(source, e))
         },
     )?;
 

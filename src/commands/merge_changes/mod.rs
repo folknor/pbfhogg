@@ -151,7 +151,9 @@ pub fn merge_changes(
     host: &crate::host::Host,
 ) -> Result<MergeChangesStats> {
     if inputs.is_empty() {
-        return Err("at least one input OSC file is required".into());
+        return Err(crate::Error::invalid_argument(
+            "at least one input OSC file is required",
+        ));
     }
 
     let worker_count = match jobs {
@@ -188,26 +190,22 @@ pub fn merge_changes(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(worker_count)
                 .build()
-                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?,
+                .map_err(|e| crate::Error::pool_build("merge-changes worker pool", e))?,
         ))
     } else {
         host.executor.clone()
     };
 
-    // The closure converts errors to String so it is Send across the
-    // pool.install boundary; the project's `BoxResult` wraps a non-Send
-    // `Box<dyn Error>` which `rayon::ThreadPool::install` cannot bridge.
-    let do_work = |write_path: &Path| -> std::result::Result<(u64, u64), String> {
+    let do_work = |write_path: &Path| -> crate::Result<(u64, u64)> {
         if simplify {
             let stream = build_simplify_stream(inputs)?;
             let changes_in = stream.changes.len() as u64;
             let changes_out =
-                write_simplified(write_path, stream, worker_count, allow_version_regression)
-                    .map_err(|e| e.to_string())? as u64;
+                write_simplified(write_path, stream, worker_count, allow_version_regression)?
+                    as u64;
             Ok((changes_in, changes_out))
         } else {
-            let changes_out =
-                write_streaming(inputs, write_path, &executor).map_err(|e| e.to_string())?;
+            let changes_out = write_streaming(inputs, write_path, &executor)?;
             Ok((changes_out, changes_out))
         }
     };
@@ -252,9 +250,7 @@ pub fn merge_changes(
         // OSC XML and drives no `PbfWriter`, so wrapping all of it puts no
         // producer on a worker. Under `Executor::Ambient` (the CLI) this is a
         // direct call, exactly as before.
-        let result = executor
-            .install(|| do_work(write_path))
-            .map_err(|s| -> Box<dyn std::error::Error> { s.into() })?;
+        let result = executor.install(|| do_work(write_path))?;
 
         if let Some(scratch) = scratch {
             scratch.commit()?;
@@ -286,14 +282,12 @@ pub fn merge_changes(
 /// N <= 1: serial, same as the pre-parallel shape. N > 1: rayon
 /// `par_iter` fan-out into per-input streams, concatenated in input order
 /// so `write_simplified`'s "later inputs win" `BTreeMap` dedupe still
-/// observes inputs in sequence order. Errors are returned as `String`
-/// so the closure can be `Send` across the `rayon::ThreadPool::install`
-/// boundary in `merge_changes`.
-fn build_simplify_stream(inputs: &[&Path]) -> std::result::Result<ChangeStream, String> {
+/// observes inputs in sequence order.
+fn build_simplify_stream(inputs: &[&Path]) -> crate::Result<ChangeStream> {
     if inputs.len() <= 1 {
         let mut stream = ChangeStream::default();
         for path in inputs {
-            parse_one_into_stream(path, &mut stream).map_err(|e| e.to_string())?;
+            parse_one_into_stream(path, &mut stream)?;
         }
         return Ok(stream);
     }
@@ -306,11 +300,11 @@ fn build_simplify_stream(inputs: &[&Path]) -> std::result::Result<ChangeStream, 
     }
 
     crate::debug::emit_marker("MERGECHANGES_PARALLEL_PARSE_START");
-    let streams: std::result::Result<Vec<ChangeStream>, String> = inputs
+    let streams: crate::Result<Vec<ChangeStream>> = inputs
         .par_iter()
-        .map(|path| -> std::result::Result<ChangeStream, String> {
+        .map(|path| -> crate::Result<ChangeStream> {
             let mut s = ChangeStream::default();
-            parse_osc_into(path, &mut s).map_err(|e| e.to_string())?;
+            parse_osc_into(path, &mut s)?;
             Ok(s)
         })
         .collect();
@@ -417,7 +411,7 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
         action: Action,
         kind: ElementKind,
         e: &BytesStart<'_>,
-    ) -> crate::BoxResult<()> {
+    ) -> crate::Result<()> {
         let id = parse_i64_attr(e, "id")?;
         let metadata = parse_owned_metadata(e)?;
         let mut elem = CurrentElem::new(kind, id, metadata);
@@ -439,7 +433,7 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
         Ok(())
     }
 
-    fn tag(&mut self, e: &BytesStart<'_>) -> crate::BoxResult<()> {
+    fn tag(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
         if let Some(cur) = self.current.as_mut() {
             let k = parse_str_attr(e, "k")?;
             let v = parse_str_attr(e, "v")?;
@@ -448,7 +442,7 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
         Ok(())
     }
 
-    fn nd(&mut self, e: &BytesStart<'_>) -> crate::BoxResult<()> {
+    fn nd(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
         let rf = parse_i64_attr(e, "ref")?;
         if let Some(cur) = self.current.as_mut() {
             cur.refs.push(rf);
@@ -456,7 +450,7 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
         Ok(())
     }
 
-    fn member(&mut self, e: &BytesStart<'_>) -> crate::BoxResult<()> {
+    fn member(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
         let ref_id = parse_i64_attr(e, "ref")?;
         // Deliberately normalize readable roles and replace malformed roles with
         // empty text. Rejecting them would break the accepted OSC input contract.
@@ -466,7 +460,9 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
             crate::MemberType::Way => MemberId::Way(ref_id),
             crate::MemberType::Relation => MemberId::Relation(ref_id),
             crate::MemberType::Unknown(v) => {
-                return Err(format!("unknown relation member type value '{v}'").into());
+                return Err(crate::Error::invalid_data(format!(
+                    "unknown relation member type value '{v}'"
+                )));
             }
         };
         if let Some(cur) = self.current.as_mut() {
@@ -478,7 +474,7 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
         Ok(())
     }
 
-    fn end_element(&mut self) -> crate::BoxResult<()> {
+    fn end_element(&mut self) -> crate::Result<()> {
         let Some(elem) = self.current.take() else {
             return Ok(());
         };
@@ -674,13 +670,12 @@ fn write_streaming(
     // The per-member drain overlaps this span; DRAIN below is the postlude.
     crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_START");
     emit_members_ordered(executor, inputs, is_gz, window, |bytes, n| {
-        out.write_all(&bytes).map_err(|e| e.to_string())?;
+        out.write_all(&bytes)?;
         count += n;
         #[allow(clippy::cast_possible_wrap)]
         crate::debug::emit_counter("merge_changes_changes_per_osc", n as i64);
         Ok(())
-    })
-    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    })?;
     crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_END");
     crate::debug::emit_marker("MERGECHANGES_DRAIN_START");
     out.write_all(&postlude)?;
@@ -694,22 +689,19 @@ fn write_streaming(
 
 /// One input's self-contained output member: parse, XML re-emit and (under
 /// gzip) compression into an in-memory buffer, closing any open action.
-fn emit_member(path: &Path, is_gz: bool) -> std::result::Result<(Vec<u8>, u64), String> {
+fn emit_member(path: &Path, is_gz: bool) -> crate::Result<(Vec<u8>, u64)> {
     let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
     let mut open_action: Option<Action> = None;
     let mut count = 0u64;
-    parse_osc_streaming(path, &mut writer, &mut open_action, &mut count)
-        .map_err(|e| e.to_string())?;
+    parse_osc_streaming(path, &mut writer, &mut open_action, &mut count)?;
     if let Some(prev) = open_action {
-        writer
-            .write_event(Event::End(BytesEnd::new(action_tag(prev))))
-            .map_err(|e| e.to_string())?;
+        writer.write_event(Event::End(BytesEnd::new(action_tag(prev))))?;
     }
-    let bytes = writer.into_inner().map_err(|e| e.to_string())?;
+    let bytes = writer.into_inner()?;
     Ok((bytes, count))
 }
 
-type MemberResult = (usize, std::result::Result<(Vec<u8>, u64), String>);
+type MemberResult = (usize, crate::Result<(Vec<u8>, u64)>);
 
 /// Emit every input's member on `executor`'s pool and hand them to `drain`
 /// in input order, with at most `window` members alive at once.
@@ -726,8 +718,8 @@ fn emit_members_ordered(
     inputs: &[&Path],
     is_gz: bool,
     window: usize,
-    mut drain: impl FnMut(Vec<u8>, u64) -> std::result::Result<(), String> + Send,
-) -> std::result::Result<(), String> {
+    mut drain: impl FnMut(Vec<u8>, u64) -> crate::Result<()> + Send,
+) -> crate::Result<()> {
     if inputs.is_empty() {
         return Ok(());
     }
@@ -745,11 +737,11 @@ fn emit_members_ordered(
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     emit_member(path, is_gz)
                 }))
-                .unwrap_or_else(|_| {
-                    Err(format!(
-                        "merge-changes worker panicked on {}",
-                        path.display()
-                    ))
+                .unwrap_or_else(|payload| {
+                    Err(
+                        crate::error::panic_error("merge-changes worker", payload.as_ref())
+                            .context(format!("while merging {}", path.display())),
+                    )
                 });
                 drop(tx.send((position, result)));
             });
@@ -782,23 +774,23 @@ fn emit_members_ordered(
 fn recv_member(
     rx: &std::sync::mpsc::Receiver<MemberResult>,
     executor: &crate::host::Executor,
-) -> std::result::Result<MemberResult, String> {
+) -> crate::Result<MemberResult> {
     use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
-    const LOST: &str = "merge-changes workers exited without a result";
+    let lost = || crate::Error::internal("merge-changes workers exited without a result");
     loop {
         match rx.try_recv() {
             Ok(item) => return Ok(item),
-            Err(TryRecvError::Disconnected) => return Err(LOST.into()),
+            Err(TryRecvError::Disconnected) => return Err(lost()),
             Err(TryRecvError::Empty) => match executor.yield_now() {
                 Some(rayon::Yield::Executed) => {}
                 Some(rayon::Yield::Idle) => {
                     match rx.recv_timeout(crate::tunables::EXECUTOR_IDLE_RECV_TIMEOUT) {
                         Ok(item) => return Ok(item),
                         Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => return Err(LOST.into()),
+                        Err(RecvTimeoutError::Disconnected) => return Err(lost()),
                     }
                 }
-                None => return rx.recv().map_err(|_| LOST.to_string()),
+                None => return rx.recv().map_err(|_| lost()),
             },
         }
     }
@@ -894,15 +886,14 @@ fn check_version_advance(floor: &mut VersionFloor, incoming: &Change) -> Result<
             ChangeElement::Way(w) => (ElementKind::Way, w.id),
             ChangeElement::Relation(r) => (ElementKind::Relation, r.id),
         };
-        return Err(regression_message(
+        return Err(crate::Error::invalid_data(regression_message(
             "merge-changes --simplify",
             kind.as_str(),
             id,
             version,
             held,
             "pass --allow-version-regression",
-        )
-        .into());
+        )));
     }
     floor.raise(claim);
     Ok(())
@@ -995,24 +986,19 @@ fn write_simplified(
         // output bytes depend on the worker count (and through `-j 0` on
         // the host's core count) while the changes and their order do not.
         let chunk_len = group.len().div_ceil(worker_count).max(1);
-        let chunks: std::result::Result<Vec<Vec<u8>>, String> = group
+        let chunks: crate::Result<Vec<Vec<u8>>> = group
             .par_chunks(chunk_len)
-            .map(|chunk| -> std::result::Result<Vec<u8>, String> {
+            .map(|chunk| -> crate::Result<Vec<u8>> {
                 let mut writer = OscWriter::<Vec<u8>>::new_buf(is_gz);
-                writer
-                    .write_event(Event::Start(BytesStart::new(action_tag(action))))
-                    .map_err(|e| e.to_string())?;
+                writer.write_event(Event::Start(BytesStart::new(action_tag(action))))?;
                 for change in chunk {
-                    write_change_to(&mut writer, change).map_err(|e| e.to_string())?;
+                    write_change_to(&mut writer, change)?;
                 }
-                writer
-                    .write_event(Event::End(BytesEnd::new(action_tag(action))))
-                    .map_err(|e| e.to_string())?;
-                writer.into_inner().map_err(|e| e.to_string())
+                writer.write_event(Event::End(BytesEnd::new(action_tag(action))))?;
+                writer.into_inner()
             })
             .collect();
-        let chunks = chunks.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        all_chunks.extend(chunks);
+        all_chunks.extend(chunks?);
     }
     crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_END");
 
@@ -1074,7 +1060,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gzip_members_preserve_document_framing() -> crate::BoxResult<()> {
+    fn gzip_members_preserve_document_framing() -> crate::Result<()> {
         use std::io::Read;
         let mut bytes = build_prelude_bytes(true)?;
         let mut body = OscWriter::new_buf(true);
@@ -1096,7 +1082,7 @@ mod tests {
     // of admission order, including empty inputs and action transitions. The
     // one-thread pool exercises the drain's cooperative wait (window 1).
     #[test]
-    fn ordered_window_preserves_buffered_member_bytes() -> crate::BoxResult<()> {
+    fn ordered_window_preserves_buffered_member_bytes() -> crate::Result<()> {
         let scratch = crate::path_guard::tests::scratch();
         let mut paths = Vec::new();
         for i in 0..5 {

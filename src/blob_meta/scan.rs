@@ -54,7 +54,7 @@
 use protohoggr::Cursor;
 
 use super::{BlobBbox, BlobIndex, ElementKind, TagIndex};
-use crate::error::{ErrorKind, Result, new_error, new_wire_error};
+use crate::error::{Result, new_stringtable_index_out_of_bounds, new_wire_error};
 use crate::read::wire::{
     WIRE_LEN, WIRE_VARINT, WireDenseNodes, WireNode, WireRelation, WireWay, read_int32,
 };
@@ -187,7 +187,7 @@ impl<'a> Walk<'a> {
         if let Some(sid) = walk.max_key_sid {
             let index = usize::try_from(sid).unwrap_or(usize::MAX);
             if index >= walk.strings.len() {
-                return Err(new_error(ErrorKind::StringtableIndexOutOfBounds { index }));
+                return Err(new_stringtable_index_out_of_bounds(index));
             }
         }
         Ok(walk)

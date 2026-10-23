@@ -4,6 +4,42 @@
 
 ### Breaking
 
+- **Errors keep their kind and their cause end to end; `BoxResult` is gone.**
+  The functions that returned `BoxResult` (the command entry points,
+  `osc::parse_osc_file`, `osc::load_all_diffs`, `geocode_index::Reader::open`,
+  `build_geocode_index`, `geo::Bbox::try_new`, `tag_expr::read_expressions_file`
+  and the rest) and every `PbfWriter` method (previously `io::Result`) now
+  return `pbfhogg::Result`; `?` into an `io::Error` or a `Box<dyn Error>` still
+  works. Functions with a small error type of their own that was not `BoxResult`
+  keep it: the `FromStr` impls of `TypeFilter`, `Compression` and `IndexType`
+  still return their own parse errors. Also changed: `FromStr for ElementKind`
+  and for `getid::ElementRef` now have `Err = pbfhogg::Error` (was `String`);
+  `commands::parse_rfc3339_utc` returns the new public `TimestampError` (was
+  `String`); `HeaderBuilder::build`, `BlockBuilder::take`,
+  `DirectWriter::create`, `FileWriter::buffered`, `FileWriter::direct`,
+  `FileWriter::sync`, `FileReader::buffered` and `FileReader::open` moved from
+  `io::Result` to `pbfhogg::Result`. `HeaderBuilder::build` now reports an
+  invalid bounding box as `ErrorKind::InvalidArgument`, so code matching
+  `io::ErrorKind::InvalidInput` on it must match the new kind. `ErrorKind` gains
+  `InvalidArgument`, `InvalidData`, `Internal` and `External`, each with a
+  message and an optional typed cause, and what used to surface as a string or
+  as `Io` wrapping `ErrorKind::Other` is now classified: `Io` means a real I/O
+  failure, a malformed input is `InvalidData`, a bad request is
+  `InvalidArgument`, a broken invariant or caught panic is `Internal`. Matches
+  on `ErrorKind` need the new arms. `Error` is now `Clone`, gains
+  `Error::context`, `Error::external` and `Error::report`, and loses
+  `into_kind`. `Display` shows only the error's own context, message and
+  location (no longer its source's text, which used to print twice); `report()`
+  renders the whole chain with locations at the end, and the CLI prints it.
+  `DirectReader::open` and `FileReader::direct` return the typed
+  `PlatformUnsupported` directly rather than inside an `io::Error`. Errors now
+  name the true blob ordinal (the header blob is blob 0) and byte offset in
+  more places; for example an `apply-changes` failure in a base blob now ends
+  `(in base.osm.pbf, blob 1, at byte offset 123)` where it used to read
+  `base blob seq 0 at byte offset 123`. Fixes the external
+  `add-locations-to-ways` backend flattening an output-side `--direct-io` or
+  `--io-uring` refusal in stage 4: it now exits 3 like the other commands, not 2.
+
 - **Library write entry points take `WriteOptions`, and the output backend is
   an `OutputBackend`.** The positional `compression, direct_io, io_uring,
   force` tail is replaced by one `&pbfhogg::write::WriteOptions { compression,

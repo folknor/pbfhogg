@@ -201,7 +201,7 @@ impl CompactDiffOverlay {
         else {
             return Ok(());
         };
-        Err(regression_message(
+        Err(crate::Error::invalid_data(regression_message(
             "OSC change overlay",
             kind.as_str(),
             id,
@@ -209,8 +209,7 @@ impl CompactDiffOverlay {
             stored,
             "pass apply-changes --allow-version-regression \
              (`CompactDiffOverlay::allow_version_regression(true)` from the library)",
-        )
-        .into())
+        )))
     }
 
     /// Returns true if the overlay contains no data at all.
@@ -616,15 +615,14 @@ pub fn load_all_diffs(
         if skipped.len() > shown.len() {
             shown.push("...");
         }
-        return Err(format!(
+        return Err(crate::Error::invalid_argument(format!(
             "no OSC diffs matched in {}: {} file(s) are present but none is named \
              `<sequence>.osc` or `<sequence>.osc.gz`, which are the only names this loader recognises (saw: {}). \
              Loading them as zero diffs would apply no changes and report success.",
             diffs_dir.display(),
             skipped.len(),
             shown.join(", ")
-        )
-        .into());
+        )));
     }
 
     entries.sort_by_key(|(seq, _)| *seq);
@@ -721,7 +719,7 @@ mod tests {
         // Modified node should overwrite created node
         let node = overlay
             .get_node(100)
-            .ok_or("node 100 should exist in overlay")?;
+            .ok_or_else(|| crate::Error::internal("node 100 should exist in overlay"))?;
         // lat=55.68 -> decimicro = 556800000, but f64 rounding may be +-1
         assert!((node.decimicro_lat() - 556_800_000).abs() <= 1);
         assert!((node.decimicro_lon() - 125_700_000).abs() <= 1);
@@ -761,8 +759,12 @@ mod tests {
         write_osc_gz(&dir, "meta.osc.gz", xml);
         let overlay = parse_osc_file(&dir.join("meta.osc.gz"))?;
 
-        let node = overlay.get_node(100).ok_or("node 100 missing")?;
-        let meta = node.metadata().ok_or("node 100 metadata missing")?;
+        let node = overlay
+            .get_node(100)
+            .ok_or_else(|| crate::Error::internal("node 100 missing"))?;
+        let meta = node
+            .metadata()
+            .ok_or_else(|| crate::Error::internal("node 100 metadata missing"))?;
         assert_eq!(meta.version, 7);
         assert_eq!(meta.timestamp, 86_400);
         assert_eq!(meta.changeset, 123_456);
@@ -771,19 +773,25 @@ mod tests {
         assert!(meta.visible);
 
         // No metadata attributes at all -> None.
-        let way = overlay.get_way(200).ok_or("way 200 missing")?;
+        let way = overlay
+            .get_way(200)
+            .ok_or_else(|| crate::Error::internal("way 200 missing"))?;
         assert!(way.metadata().is_none());
         // Metadata does not disturb the variable-length sections.
         assert_eq!(way.refs().collect::<Vec<_>>(), vec![100]);
 
         // Partial metadata: version + timestamp only; user absent -> "".
-        let rel = overlay.get_relation(300).ok_or("relation 300 missing")?;
-        let rmeta = rel.metadata().ok_or("relation 300 metadata missing")?;
+        let rel = overlay
+            .get_relation(300)
+            .ok_or_else(|| crate::Error::internal("relation 300 missing"))?;
+        let rmeta = rel
+            .metadata()
+            .ok_or_else(|| crate::Error::internal("relation 300 metadata missing"))?;
         assert_eq!(rmeta.version, 2);
         assert_eq!(
             rmeta.timestamp,
             crate::commands::parse_rfc3339_utc("2026-02-20T21:39:49Z")
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
+                .map_err(crate::Error::invalid_data_from)?
         );
         assert_eq!(rmeta.changeset, 0);
         assert_eq!(rmeta.user, "");
@@ -823,7 +831,7 @@ mod tests {
 
         let node = overlay
             .get_node(100)
-            .ok_or("node 100 should exist after merge")?;
+            .ok_or_else(|| crate::Error::internal("node 100 should exist after merge"))?;
         // lat=3.0 -> decimicro = 30000000
         assert_eq!(node.decimicro_lat(), 30_000_000);
         assert_eq!(node.decimicro_lon(), 40_000_000);
@@ -925,7 +933,7 @@ mod tests {
         // Node 1 should have been created by 999, then modified by 10000
         let node1 = overlay
             .get_node(1)
-            .ok_or("node 1 should exist after loading diffs")?;
+            .ok_or_else(|| crate::Error::internal("node 1 should exist after loading diffs"))?;
         assert_eq!(node1.decimicro_lat(), 100_000_000);
         assert_eq!(node1.decimicro_lon(), 100_000_000);
 
@@ -1020,11 +1028,15 @@ mod tests {
     #[test]
     fn test_genuine_null_island_node_still_parses() -> ParseResult<()> {
         let overlay = parse_single_node("create", r#"id="1" lat="0.0" lon="0.0" version="1""#)?;
-        let node = overlay.get_node(1).ok_or("node 1 missing")?;
+        let node = overlay
+            .get_node(1)
+            .ok_or_else(|| crate::Error::internal("node 1 missing"))?;
         assert_eq!((node.decimicro_lat(), node.decimicro_lon()), (0, 0));
 
         let overlay = parse_single_node("create", r#"id="1" lat="-90.0" lon="180.0" version="1""#)?;
-        let node = overlay.get_node(1).ok_or("node 1 missing")?;
+        let node = overlay
+            .get_node(1)
+            .ok_or_else(|| crate::Error::internal("node 1 missing"))?;
         assert_eq!(
             (node.decimicro_lat(), node.decimicro_lon()),
             (-900_000_000, 1_800_000_000)
@@ -1165,10 +1177,12 @@ mod tests {
             "create",
             r#"id="1" lat="1.0" lon="2.0" timestamp="1970-01-02T00:00:00Z" user="m""#,
         )?;
-        let node = overlay.get_node(1).ok_or("node 1 missing")?;
+        let node = overlay
+            .get_node(1)
+            .ok_or_else(|| crate::Error::internal("node 1 missing"))?;
         let meta = node
             .metadata()
-            .ok_or("metadata must survive an absent version")?;
+            .ok_or_else(|| crate::Error::internal("metadata must survive an absent version"))?;
         assert_eq!(meta.timestamp, 86_400);
         assert_eq!(meta.user, "m");
         Ok(())
@@ -1272,7 +1286,10 @@ mod tests {
             ("modify", r#"id="1" lat="1.0" lon="2.0" version="7""#),
         ])?;
         assert_eq!(
-            overlay.get_node(1).ok_or("node 1 missing")?.decimicro_lat(),
+            overlay
+                .get_node(1)
+                .ok_or_else(|| crate::Error::internal("node 1 missing"))?
+                .decimicro_lat(),
             10_000_000
         );
 
@@ -1282,7 +1299,10 @@ mod tests {
             ("modify", r#"id="1" lat="3.0" lon="4.0" version="7""#),
         ])?;
         assert_eq!(
-            overlay.get_node(1).ok_or("node 1 missing")?.decimicro_lat(),
+            overlay
+                .get_node(1)
+                .ok_or_else(|| crate::Error::internal("node 1 missing"))?
+                .decimicro_lat(),
             30_000_000
         );
 
@@ -1312,7 +1332,7 @@ mod tests {
             ("modify", r#"id="1" lat="1.0" lon="2.0" version="11""#),
         ])
         .err()
-        .ok_or("a lower claim after equal ones must be refused")?;
+        .ok_or_else(|| crate::Error::internal("a lower claim after equal ones must be refused"))?;
         assert!(
             err.to_string().contains("is lower than version 12"),
             "got: {err}"
@@ -1330,7 +1350,9 @@ mod tests {
             ("create", r#"id="1" lat="1.0" lon="2.0" version="1""#),
             ("modify", r#"id="1" lat="3.0" lon="4.0" version="2""#),
         ])?;
-        let node = overlay.get_node(1).ok_or("node 1 missing")?;
+        let node = overlay
+            .get_node(1)
+            .ok_or_else(|| crate::Error::internal("node 1 missing"))?;
         assert_eq!(node.decimicro_lat(), 30_000_000);
 
         // Neither element claims a version, so there is nothing to
@@ -1339,7 +1361,9 @@ mod tests {
             ("create", r#"id="1" lat="1.0" lon="2.0""#),
             ("modify", r#"id="1" lat="3.0" lon="4.0""#),
         ])?;
-        let node = overlay.get_node(1).ok_or("node 1 missing")?;
+        let node = overlay
+            .get_node(1)
+            .ok_or_else(|| crate::Error::internal("node 1 missing"))?;
         assert_eq!(node.decimicro_lat(), 30_000_000);
 
         // And the escape hatch really is an escape hatch.
@@ -1772,7 +1796,9 @@ mod tests {
         let overlay = parse_osc_file(&dir.join("children.osc.gz"))?;
 
         // Way 100: 3 refs, 2 tags
-        let way100 = overlay.get_way(100).ok_or("way 100 should exist")?;
+        let way100 = overlay
+            .get_way(100)
+            .ok_or_else(|| crate::Error::internal("way 100 should exist"))?;
         let refs: Vec<i64> = way100.refs().collect();
         assert_eq!(refs, vec![1, 2, 3]);
         let tags: Vec<(&str, &str)> = way100.tags().collect();
@@ -1782,7 +1808,9 @@ mod tests {
         );
 
         // Way 300: 2 refs, 1 tag (modify)
-        let way300 = overlay.get_way(300).ok_or("way 300 should exist")?;
+        let way300 = overlay
+            .get_way(300)
+            .ok_or_else(|| crate::Error::internal("way 300 should exist"))?;
         let refs: Vec<i64> = way300.refs().collect();
         assert_eq!(refs, vec![10, 11]);
         let tags: Vec<(&str, &str)> = way300.tags().collect();
@@ -1791,7 +1819,7 @@ mod tests {
         // Relation 200: 3 members, 1 tag
         let rel = overlay
             .get_relation(200)
-            .ok_or("relation 200 should exist")?;
+            .ok_or_else(|| crate::Error::internal("relation 200 should exist"))?;
         let members: Vec<(MemberType, i64, &str)> = rel.members().collect();
         assert_eq!(members.len(), 3);
         assert_eq!(members[0], (MemberType::Way, 100, "outer"));

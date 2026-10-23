@@ -112,7 +112,10 @@ pub struct DirectWriter {
 
 impl DirectWriter {
     /// Open a file for writing with `O_DIRECT`.
-    pub fn create(path: &Path) -> io::Result<Self> {
+    ///
+    /// A filesystem that refuses `O_DIRECT` at open fails with
+    /// `ErrorKind::PlatformUnsupported` (feature `direct-io`).
+    pub fn create(path: &Path) -> crate::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -196,10 +199,12 @@ impl Write for DirectWriter {
         // `flush_final` early-returns on the latch and `Drop` calls the same
         // latched function. Refuse instead of producing that file.
         if self.flushed {
-            return Err(io::Error::other(
+            // A call-order error, carried through the `Write` signature whole.
+            return Err(crate::Error::invalid_argument(
                 "DirectWriter: write after flush; the file has already been \
                  padded and truncated to its final size",
-            ));
+            )
+            .into());
         }
         self.logical_size += data.len() as u64;
         let mut offset = 0;

@@ -47,7 +47,7 @@ fn run_check_refs(
     check_relations: bool,
     show_ids: bool,
     max_errors: usize,
-) -> Result<pbfhogg::check::refs::RefCheckResult, Box<dyn std::error::Error>> {
+) -> pbfhogg::Result<pbfhogg::check::refs::RefCheckResult> {
     let opts = pbfhogg::check::refs::CheckRefsOptions {
         check: pbfhogg::check::CheckOptions {
             max_errors,

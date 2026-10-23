@@ -173,8 +173,13 @@ fn getparents_walker(
     while let Some(meta) = walker.next_header()? {
         match meta.blob_type {
             BlobKind::OsmHeader if header_block.is_none() => {
-                walker.pread_data(meta.data_offset, meta.data_size, &mut header_buf)?;
-                header_block = Some(decode_blob_to_headerblock(&header_buf)?);
+                walker
+                    .pread_data(meta.data_offset, meta.data_size, &mut header_buf)
+                    .map_err(|e| walker.locate_meta(&meta, e))?;
+                header_block = Some(
+                    decode_blob_to_headerblock(&header_buf)
+                        .map_err(|e| walker.locate_meta(&meta, e))?,
+                );
             }
             BlobKind::OsmData => {
                 // A kind filter only prunes when some kind is unwanted.
@@ -191,11 +196,13 @@ fn getparents_walker(
                 };
                 if keep {
                     if meta.data_offset + meta.data_size as u64 > file_size {
-                        return Err(format!(
-                            "blob at offset {} claims data_size {} but file is only {} bytes",
-                            meta.data_offset, meta.data_size, file_size,
-                        )
-                        .into());
+                        return Err(walker.locate_meta(
+                            &meta,
+                            crate::error::Error::invalid_data(format!(
+                                "blob at offset {} claims data_size {} but file is only {} bytes",
+                                meta.data_offset, meta.data_size, file_size,
+                            )),
+                        ));
                     }
                     schedule.push((schedule.len(), meta.data_offset, meta.data_size));
                 } else {
@@ -216,8 +223,7 @@ fn getparents_walker(
     let shared_file = Arc::clone(walker.shared_file());
     drop(walker);
 
-    let header = header_block
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
+    let header = header_block.ok_or_else(crate::error::new_missing_header)?;
 
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -243,13 +249,13 @@ fn getparents_walker(
     };
 
     crate::debug::emit_marker("GETPARENTS_DECODE_START");
-    type ClassifyResult = std::result::Result<(Vec<OwnedBlock>, (u64, u64, u64)), String>;
+    type ClassifyResult = crate::Result<(Vec<OwnedBlock>, (u64, u64, u64))>;
     let mut reorder: ReorderBuffer<ClassifyResult> =
         ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY);
     // Captured write error: `parallel_classify_phase`'s `merge` is `FnMut(usize, R)`
     // and cannot return a Result. Capture the first error here and bail out
     // at the end of the phase.
-    let mut write_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+    let mut write_err: Option<crate::Error> = None;
 
     crate::scan::classify::parallel_classify_phase_abortable(
         &shared_file,
@@ -295,7 +301,7 @@ fn getparents_walker(
                                 tagdata.as_deref(),
                                 way_members.as_deref(),
                             ) {
-                                write_err = Some(Box::new(e));
+                                write_err = Some(e);
                                 return ControlFlow::Break(());
                             }
                         }
@@ -304,7 +310,7 @@ fn getparents_walker(
                         stats.relations_written += r;
                     }
                     Err(e) => {
-                        write_err = Some(e.into());
+                        write_err = Some(e);
                         return ControlFlow::Break(());
                     }
                 }
@@ -392,7 +398,7 @@ fn process_block(
     output: &mut Vec<OwnedBlock>,
     ids: &ElementIds,
     add_self: bool,
-) -> std::result::Result<(u64, u64, u64), String> {
+) -> crate::Result<(u64, u64, u64)> {
     let mut nodes: u64 = 0;
     let mut ways: u64 = 0;
     let mut relations: u64 = 0;

@@ -8,8 +8,8 @@
 //! `PbfWriter` holds its own for the sync path.
 
 use std::cell::RefCell;
-use std::io;
 
+use crate::error::{Error, Result};
 use flate2::Compress;
 use flate2::Compression as FlateCompression;
 use flate2::FlushCompress;
@@ -135,7 +135,7 @@ pub(crate) fn frame_blob(
     uncompressed: &[u8],
     compression: &Compression,
     indexdata: Option<&[u8]>,
-) -> io::Result<Vec<u8>> {
+) -> Result<Vec<u8>> {
     let mut scratch = FrameScratch::new();
     Ok(frame_blob_into(
         blob_type,
@@ -160,7 +160,7 @@ pub(crate) fn frame_blob_pipelined(
     indexdata: Option<&[u8]>,
     tagdata: Option<&[u8]>,
     way_members: Option<&[u8]>,
-) -> io::Result<FramedBlobParts> {
+) -> Result<FramedBlobParts> {
     PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
         frame_blob_into(
             "OSMData",
@@ -219,7 +219,7 @@ pub(super) fn frame_blob_into(
     tagdata: Option<&[u8]>,
     way_members: Option<&[u8]>,
     scratch: &mut FrameScratch,
-) -> io::Result<FramedBlobParts> {
+) -> Result<FramedBlobParts> {
     let t_compress = std::time::Instant::now();
     scratch.trim_oversize_retained_buffers();
     if let Err(error) = encode_blob_body(uncompressed, compression, scratch) {
@@ -240,7 +240,7 @@ pub(super) fn frame_blob_into(
     // the point where the knob that caused it can still be named.
     if scratch.blob_buf.len() as u64 >= MAX_BLOB_DATASIZE {
         let body_len = scratch.blob_buf.len();
-        let error = io::Error::other(format!(
+        let error = Error::invalid_argument(format!(
             "blob body for {blob_type} is {body_len} bytes, must be smaller than \
              {MAX_BLOB_DATASIZE} (lower --elements-per-blob)"
         ));
@@ -248,7 +248,7 @@ pub(super) fn frame_blob_into(
         return Err(error);
     }
     let datasize = i32::try_from(scratch.blob_buf.len()).map_err(|_| {
-        io::Error::other(format!(
+        Error::internal(format!(
             "blob datasize overflow: {} bytes",
             scratch.blob_buf.len()
         ))
@@ -270,7 +270,7 @@ pub(super) fn frame_blob_into(
     scratch.trim_oversize_compress_buffer();
 
     let header_len = u32::try_from(scratch.header_buf.len()).map_err(|_| {
-        io::Error::other(format!(
+        Error::internal(format!(
             "header too large: {} bytes",
             scratch.header_buf.len()
         ))
@@ -322,7 +322,7 @@ pub(super) fn encode_blob_body(
     uncompressed: &[u8],
     compression: &Compression,
     scratch: &mut FrameScratch,
-) -> io::Result<()> {
+) -> Result<()> {
     scratch.blob_buf.clear();
     // Check once per blob, before compression or copying. The encoded-body
     // guard cannot catch a highly compressible oversized block. Element caps
@@ -330,7 +330,7 @@ pub(super) fn encode_blob_body(
     // Both sync and pipelined framing use this encoder. Exactly the raw limit
     // is legal; the separate encoded-body limit can still reject its framing.
     if uncompressed.len() as u64 > MAX_BLOB_MESSAGE_SIZE {
-        return Err(io::Error::other(format!(
+        return Err(Error::invalid_argument(format!(
             "uncompressed blob payload is {} bytes, must be at most \
              {MAX_BLOB_MESSAGE_SIZE} (lower --elements-per-blob or reduce element size)",
             uncompressed.len()
@@ -349,21 +349,16 @@ pub(super) fn encode_blob_body(
             match &scratch.zstd_compressor {
                 Some((cached_level, _)) if *cached_level == *level => {}
                 _ => {
-                    scratch.zstd_compressor = Some((
-                        *level,
-                        zstd::bulk::Compressor::new(*level).map_err(io::Error::other)?,
-                    ));
+                    scratch.zstd_compressor = Some((*level, zstd::bulk::Compressor::new(*level)?));
                 }
             }
             let (_, compressor) = scratch.zstd_compressor.as_mut().expect("just initialized");
             let bound = zstd::zstd_safe::compress_bound(uncompressed.len());
             scratch.compress_buf.clear();
             scratch.compress_buf.reserve(bound);
-            compressor
-                .compress_to_buffer(uncompressed, &mut scratch.compress_buf)
-                .map_err(io::Error::other)?;
+            compressor.compress_to_buffer(uncompressed, &mut scratch.compress_buf)?;
             let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
-                io::Error::other(format!(
+                Error::internal(format!(
                     "blob raw_size overflow: {} bytes",
                     uncompressed.len()
                 ))
@@ -382,7 +377,7 @@ pub(super) fn encode_blob_body(
 }
 
 /// Zlib compression via reusable `flate2::Compress` with `reset()`.
-fn compress_zlib(uncompressed: &[u8], level: u32, scratch: &mut FrameScratch) -> io::Result<()> {
+fn compress_zlib(uncompressed: &[u8], level: u32, scratch: &mut FrameScratch) -> Result<()> {
     let needs_new = match &scratch.zlib_compressor {
         Some((cached_level, _)) => *cached_level != level,
         None => true,
@@ -402,15 +397,15 @@ fn compress_zlib(uncompressed: &[u8], level: u32, scratch: &mut FrameScratch) ->
             &mut scratch.compress_buf,
             FlushCompress::Finish,
         )
-        .map_err(|e| io::Error::other(format!("zlib compress error: {e}")))?;
+        .map_err(|e| Error::internal_with("zlib compress error", e))?;
     if !matches!(status, Status::StreamEnd) {
-        return Err(io::Error::other(
+        return Err(Error::internal(
             "zlib compress did not complete in one call",
         ));
     }
     compressor.reset();
     let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
-        io::Error::other(format!(
+        Error::internal(format!(
             "blob raw_size overflow: {} bytes",
             uncompressed.len()
         ))
@@ -470,7 +465,7 @@ pub(crate) fn encode_blob_header_into(
     tagdata: Option<&[u8]>,
     way_members: Option<&[u8]>,
     buf: &mut Vec<u8>,
-) -> io::Result<()> {
+) -> Result<()> {
     encode_blob_header_fields(blob_type, datasize, indexdata, tagdata, way_members, buf);
     if (buf.len() as u64) < MAX_BLOB_HEADER_SIZE {
         return Ok(());
@@ -491,7 +486,7 @@ pub(crate) fn encode_blob_header_into(
     } else {
         " (lower --elements-per-blob)"
     };
-    Err(io::Error::other(format!(
+    Err(Error::invalid_argument(format!(
         "BlobHeader for {blob_type} is {} bytes, must be smaller than \
          {MAX_BLOB_HEADER_SIZE}{culprit}",
         buf.len()
@@ -558,7 +553,7 @@ pub(crate) fn strip_blob_header_fields(
     header_bytes: &[u8],
     strip_fields: &[BlobHeaderField],
     out: &mut Vec<u8>,
-) -> io::Result<()> {
+) -> Result<()> {
     strip_message_fields(
         header_bytes,
         |field| strip_fields.iter().any(|f| *f as u32 == field),
@@ -588,7 +583,7 @@ pub(crate) fn strip_header_block_fields(
     header_block_bytes: &[u8],
     strip_fields: &[HeaderBlockField],
     out: &mut Vec<u8>,
-) -> io::Result<()> {
+) -> Result<()> {
     strip_message_fields(
         header_block_bytes,
         |field| strip_fields.iter().any(|f| *f as u32 == field),
@@ -605,7 +600,7 @@ fn strip_message_fields(
     strip_field: impl Fn(u32) -> bool,
     out: &mut Vec<u8>,
     ctx: &str,
-) -> io::Result<()> {
+) -> Result<()> {
     use protohoggr::Cursor;
     out.clear();
     let mut cursor = Cursor::new(msg_bytes);
@@ -613,13 +608,13 @@ fn strip_message_fields(
         let field_start = cursor.position();
         let Some((field, wire_type)) = cursor
             .read_tag()
-            .map_err(|e| io::Error::other(format!("{ctx} parse: {e}")))?
+            .map_err(|e| Error::from(e).context(format!("{ctx} parse")))?
         else {
             break;
         };
         cursor
             .skip_field(wire_type)
-            .map_err(|e| io::Error::other(format!("{ctx} parse: {e}")))?;
+            .map_err(|e| Error::from(e).context(format!("{ctx} parse")))?;
         let field_end = cursor.position();
         if !strip_field(field) {
             out.extend_from_slice(&msg_bytes[field_start..field_end]);
@@ -640,7 +635,7 @@ pub(crate) fn reframe_raw_with_index(
     blob_bytes: &[u8],
     indexdata: &[u8],
     tagdata: Option<&[u8]>,
-) -> io::Result<Vec<u8>> {
+) -> Result<Vec<u8>> {
     let mut header_buf = Vec::new();
     reframe_raw_with_index_scratch(blob_bytes, indexdata, tagdata, &mut header_buf)
 }
@@ -650,9 +645,9 @@ pub(crate) fn reframe_raw_with_index_scratch(
     indexdata: &[u8],
     tagdata: Option<&[u8]>,
     header_buf: &mut Vec<u8>,
-) -> io::Result<Vec<u8>> {
+) -> Result<Vec<u8>> {
     let datasize = i32::try_from(blob_bytes.len()).map_err(|_| {
-        io::Error::other(format!(
+        Error::internal(format!(
             "blob datasize overflow: {} bytes",
             blob_bytes.len()
         ))
@@ -668,7 +663,7 @@ pub(crate) fn reframe_raw_with_index_scratch(
     )?;
 
     let header_len = u32::try_from(header_buf.len())
-        .map_err(|_| io::Error::other(format!("header too large: {} bytes", header_buf.len())))?;
+        .map_err(|_| Error::internal(format!("header too large: {} bytes", header_buf.len())))?;
     let total_len = 4 + header_buf.len() + blob_bytes.len();
 
     let mut out = Vec::with_capacity(total_len);

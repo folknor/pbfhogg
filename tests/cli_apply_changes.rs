@@ -1770,7 +1770,10 @@ fn merge_locations_on_ways_fails_loudly_on_undecodable_node_coordinates() {
 
     let out = run_apply_changes(&base, &osc, &output, low_opts());
     assert!(!out.status.success(), "stderr:\n{}", out.stderr_str());
-    out.assert_stderr_contains("base blob seq 0");
+    out.assert_stderr_contains("apply-changes: base blob");
+    // The location is the walker's true blob ordinal (the header is blob 0),
+    // not the pipeline's data-blob sequence number.
+    out.assert_stderr_contains("base.osm.pbf, blob 1, at byte offset");
     out.assert_stderr_contains("does not fit in an i32");
     assert!(!output.exists(), "failed merge must leave no output");
 }

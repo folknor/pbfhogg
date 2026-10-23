@@ -66,6 +66,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 use crate::blob_meta::BlobIndex;
 use crate::content::write_record;
+use crate::error::Error;
 use crate::read::header_walker::HeaderWalker;
 use crate::{BlockType, Element, ElementKind, ElementReader, PrimitiveBlock};
 
@@ -122,21 +123,16 @@ pub fn digest(path: &Path, direct_io: bool, host: &crate::host::Host) -> Result<
 
     let reader = ElementReader::open_in(path, direct_io, host)?;
     if !reader.header().is_sorted() {
-        return Err(format!(
+        return Err(Error::invalid_data(format!(
             "{}: the header does not claim Sort.Type_then_ID; digest covers sorted input only, \
              as diff does. Sort it first with `pbfhogg sort`.",
             path.display()
-        )
-        .into());
+        )));
     }
 
     crate::debug::emit_marker("DIGEST_SCAN_START");
     let mut state = DigestState::new(indexes);
-    reader.for_each_fused_block(summarize_block, |summary| {
-        state.absorb(summary).map_err(|msg| {
-            crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(msg)))
-        })
-    })?;
+    reader.for_each_fused_block(summarize_block, |summary| state.absorb(summary))?;
     let digest = state.finish()?;
     crate::debug::emit_marker("DIGEST_SCAN_END");
     Ok(digest)
@@ -157,15 +153,19 @@ fn walk_envelope(path: &Path, host: &crate::host::Host) -> Result<Vec<Option<Blo
             BlobKind::OsmHeader => seen_header = true,
             BlobKind::OsmData if seen_header => indexes.push(meta.index),
             BlobKind::OsmData => {
-                return Err("the first blob is not an OsmHeader".into());
+                return Err(Error::invalid_data("the first blob is not an OsmHeader"));
             }
             BlobKind::Unknown(name) => {
-                return Err(format!("blob of unknown type {name:?}; digest refuses it").into());
+                return Err(Error::invalid_data(format!(
+                    "blob of unknown type {name:?}; digest refuses it"
+                )));
             }
         }
     }
     if !seen_header {
-        return Err("no OsmHeader blob: the file is empty or not a PBF".into());
+        return Err(Error::invalid_data(
+            "no OsmHeader blob: the file is empty or not a PBF",
+        ));
     }
     Ok(indexes)
 }
@@ -197,15 +197,16 @@ fn element_kind(element: &Element<'_>) -> ElementKind {
     }
 }
 
-fn block_kind(block_type: BlockType) -> std::result::Result<Option<ElementKind>, String> {
+fn block_kind(block_type: BlockType) -> crate::Result<Option<ElementKind>> {
     match block_type {
         BlockType::DenseNodes | BlockType::Nodes => Ok(Some(ElementKind::Node)),
         BlockType::Ways => Ok(Some(ElementKind::Way)),
         BlockType::Relations => Ok(Some(ElementKind::Relation)),
         BlockType::Empty => Ok(None),
-        BlockType::Mixed => Err("a data block mixes element kinds (or carries an unknown \
-                                 group field); diff's streaming merge rejects such blocks"
-            .to_owned()),
+        BlockType::Mixed => Err(Error::invalid_data(
+            "a data block mixes element kinds (or carries an unknown \
+             group field); diff's streaming merge rejects such blocks",
+        )),
     }
 }
 
@@ -213,21 +214,21 @@ fn block_kind(block_type: BlockType) -> std::result::Result<Option<ElementKind>,
 /// Runs on the decode workers. Takes the block by value because the fused
 /// pipeline hands ownership to its transform.
 #[allow(clippy::needless_pass_by_value)]
-fn summarize_block(block: PrimitiveBlock) -> std::result::Result<BlockSummary, String> {
+fn summarize_block(block: PrimitiveBlock) -> crate::Result<BlockSummary> {
     let classified = block_kind(block.block_type())?;
     let mut content: Option<BlockContent> = None;
     for element in block.elements() {
         let kind = element_kind(&element);
         if classified != Some(kind) {
-            return Err(format!(
+            return Err(Error::invalid_data(format!(
                 "a data block classified as {} holds a {} element; diff's streaming merge \
                  would misroute it",
                 classified.map_or("empty", ElementKind::as_str),
                 kind.as_str(),
-            ));
+            )));
         }
         let id = crate::osc::merge_join::element_id(&element);
-        check_user(&element).map_err(|e| format!("{} {id}: {e}", kind.as_str()))?;
+        check_user(&element).map_err(|e| e.context(format!("{} {id}", kind.as_str())))?;
         let c = content.get_or_insert_with(|| BlockContent {
             kind,
             first_id: id,
@@ -238,15 +239,15 @@ fn summarize_block(block: PrimitiveBlock) -> std::result::Result<BlockSummary, S
             records: Vec::new(),
         });
         if c.count > 0 && crate::osm_id::osm_id_cmp(c.last_id, id).is_ge() {
-            return Err(format!(
+            return Err(Error::invalid_data(format!(
                 "{} {id} follows {} {} in the same block; IDs must strictly ascend",
                 kind.as_str(),
                 kind.as_str(),
                 c.last_id,
-            ));
+            )));
         }
         write_record(&element, id, &mut c.records)
-            .map_err(|e| format!("{} {id}: {e}", kind.as_str()))?;
+            .map_err(|e| e.context(format!("{} {id}", kind.as_str())))?;
         c.last_id = id;
         c.min_id = c.min_id.min(id);
         c.max_id = c.max_id.max(id);
@@ -300,13 +301,12 @@ impl DigestState {
         }
     }
 
-    fn absorb(&mut self, summary: BlockSummary) -> std::result::Result<(), String> {
+    fn absorb(&mut self, summary: BlockSummary) -> crate::Result<()> {
         // The pipeline and the envelope walk both visit data blobs in file
         // order, so the n-th summary belongs to the n-th walked blob.
-        let index = self
-            .indexes
-            .next()
-            .ok_or("the file has more data blobs than its envelope walk found")?;
+        let index = self.indexes.next().ok_or_else(|| {
+            Error::internal("the file has more data blobs than its envelope walk found")
+        })?;
         self.check_index(index, summary.content.as_ref())?;
         let Some(content) = summary.content else {
             return Ok(());
@@ -314,20 +314,20 @@ impl DigestState {
         if let Some((last_kind, last_id)) = self.last {
             let (this, prev) = (content.kind, last_kind);
             if this < prev {
-                return Err(format!(
+                return Err(Error::invalid_data(format!(
                     "a {} block follows {} elements; kinds must appear nodes, ways, relations",
                     content.kind.as_str(),
                     last_kind.as_str(),
-                ));
+                )));
             }
             if this == prev && crate::osm_id::osm_id_cmp(last_id, content.first_id).is_ge() {
-                return Err(format!(
+                return Err(Error::invalid_data(format!(
                     "{} {} follows {} {} in an earlier block; IDs must strictly ascend",
                     content.kind.as_str(),
                     content.first_id,
                     last_kind.as_str(),
                     last_id,
-                ));
+                )));
             }
         }
         self.last = Some((content.kind, content.last_id));
@@ -342,14 +342,15 @@ impl DigestState {
         &mut self,
         index: Option<BlobIndex>,
         content: Option<&BlockContent>,
-    ) -> std::result::Result<(), String> {
+    ) -> crate::Result<()> {
         let present = index.is_some();
         match self.indexed {
             None => self.indexed = Some(present),
             Some(expected) if expected != present => {
-                return Err("indexdata is present on some data blobs and absent (or \
-                            unreadable) on others; diff refuses a partially indexed file"
-                    .into());
+                return Err(Error::invalid_data(
+                    "indexdata is present on some data blobs and absent (or \
+                     unreadable) on others; diff refuses a partially indexed file",
+                ));
             }
             Some(_) => {}
         }
@@ -357,14 +358,14 @@ impl DigestState {
             return Ok(());
         };
         let Some(c) = content else {
-            return Err("an empty data block carries indexdata".into());
+            return Err(Error::invalid_data("an empty data block carries indexdata"));
         };
         if index.kind != c.kind
             || index.min_id != c.min_id
             || index.max_id != c.max_id
             || index.count != c.count
         {
-            return Err(format!(
+            return Err(Error::invalid_data(format!(
                 "a {} blob's indexdata claims kind {}, ids {}..={}, count {}, but the block \
                  holds ids {}..={}, count {}; diff trusts these claims",
                 c.kind.as_str(),
@@ -375,14 +376,16 @@ impl DigestState {
                 c.min_id,
                 c.max_id,
                 c.count,
-            ));
+            )));
         }
         Ok(())
     }
 
     fn finish(mut self) -> Result<ContentDigest> {
         if self.indexes.next().is_some() {
-            return Err("the envelope walk found more data blobs than were decoded".into());
+            return Err(Error::internal(
+                "the envelope walk found more data blobs than were decoded",
+            ));
         }
         let [nodes, ways, relations] = self.kinds;
         let kind = |(count, hasher): (u64, Xxh3)| KindDigest {

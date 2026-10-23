@@ -34,20 +34,46 @@ pub(crate) fn in_domain(lat: i32, lon: i32) -> bool {
         && (-LON_LIMIT..=LON_LIMIT).contains(&i64::from(lon))
 }
 
+/// A coordinate outside the geographic range. A neutral leaf: the caller
+/// classifies it, because the same bad number is an invalid argument for a
+/// bounding box and invalid data in an OSC file or a GeoJSON polygon.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CoordRangeError {
+    name: String,
+    value: f64,
+    limit: f64,
+}
+
+impl std::fmt::Display for CoordRangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({}) must be within -{} and {} degrees",
+            self.name, self.value, self.limit, self.limit
+        )
+    }
+}
+
+impl std::error::Error for CoordRangeError {}
+
 /// Validate a named latitude in degrees, retaining the caller's field name.
-pub(crate) fn validate_lat(name: &str, value: f64) -> crate::BoxResult<()> {
+pub(crate) fn validate_lat(name: &str, value: f64) -> Result<(), CoordRangeError> {
     validate_degrees(name, value, LAT_BIAS)
 }
 
 /// Validate a named longitude in degrees, retaining the caller's field name.
-pub(crate) fn validate_lon(name: &str, value: f64) -> crate::BoxResult<()> {
+pub(crate) fn validate_lon(name: &str, value: f64) -> Result<(), CoordRangeError> {
     validate_degrees(name, value, LON_LIMIT)
 }
 
-fn validate_degrees(name: &str, value: f64, limit_e7: i64) -> crate::BoxResult<()> {
+fn validate_degrees(name: &str, value: f64, limit_e7: i64) -> Result<(), CoordRangeError> {
     let limit = crate::coord_fmt::e7_to_deg(limit_e7 as f64);
     if !value.is_finite() || !(-limit..=limit).contains(&value) {
-        return Err(format!("{name} ({value}) must be within -{limit} and {limit} degrees").into());
+        return Err(CoordRangeError {
+            name: name.to_owned(),
+            value,
+            limit,
+        });
     }
     Ok(())
 }

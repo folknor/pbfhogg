@@ -297,11 +297,8 @@ pub(crate) fn write_record(element: &Element<'_>, id: i64, out: &mut Vec<u8>) ->
 fn write_str(out: &mut Vec<u8>, s: &str) -> Result<()> {
     // A string-table entry lives inside a block capped at 32 MiB, so this
     // cannot fail on anything the reader constructed.
-    let len = u32::try_from(s.len()).map_err(|_| {
-        crate::error::new_error(crate::error::ErrorKind::WireFormat {
-            msg: "string longer than u32::MAX bytes",
-        })
-    })?;
+    let len = u32::try_from(s.len())
+        .map_err(|_| crate::error::new_wire_error("string longer than u32::MAX bytes"))?;
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(s.as_bytes());
     Ok(())

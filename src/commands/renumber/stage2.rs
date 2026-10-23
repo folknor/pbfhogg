@@ -28,6 +28,7 @@ pub(super) struct Stage2dResult {
 #[hotpath::measure]
 pub(super) fn stage2d_parallel_way_assembly(
     shared_file: &std::fs::File,
+    source: &std::sync::Arc<std::path::Path>,
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
     way_id_sets: &mut [IdSet],
     way_schedule: &[BlobTask],
@@ -49,6 +50,7 @@ pub(super) fn stage2d_parallel_way_assembly(
     let totals = run_rewrite_stage(
         "way",
         "stage2d",
+        source,
         way_schedule.len(),
         &mut workers,
         &counters,
@@ -56,42 +58,47 @@ pub(super) fn stage2d_parallel_way_assembly(
         |w: &mut Stage2dWorker<'_>, idx| {
             let task = &way_schedule[idx];
             let base = bases[idx];
-            // Deliberately load only payload bytes and emit no tagdata. Carrying
-            // header key lists would change output and add per-blob rewrite work.
-            w.buffers.load(shared_file, task, &counters)?;
+            (|| {
+                // Deliberately load only payload bytes and emit no tagdata. Carrying
+                // header key lists would change output and add per-blob rewrite work.
+                w.buffers.load(shared_file, task, &counters)?;
 
-            let t = std::time::Instant::now();
-            let outcome = reframe_ways_with_new_ids(
-                &w.buffers.decompressed,
-                base,
-                nodes,
-                &mut *w.way_ids,
-                &mut w.reframe_buf,
-                &mut w.scratch,
-            )?;
-            add_ns(&counters.reframe_ns, t);
+                let t = std::time::Instant::now();
+                let outcome = reframe_ways_with_new_ids(
+                    &w.buffers.decompressed,
+                    base,
+                    nodes,
+                    &mut *w.way_ids,
+                    &mut w.reframe_buf,
+                    &mut w.scratch,
+                )?;
+                add_ns(&counters.reframe_ns, t);
 
-            if outcome.count != task.element_count {
-                return Err(format!(
-                    "stage 2d blob {idx} decoded {} ways, indexdata said {}",
-                    outcome.count, task.element_count
-                ));
-            }
-            counters.bump_blobs();
-            let block = if outcome.count == 0 {
-                None
-            } else {
-                let bytes = std::mem::take(&mut w.reframe_buf);
-                w.reframe_buf.reserve(bytes.len());
-                let index = blob_index(crate::ElementKind::Way, base, outcome.count, None)?;
-                Some((bytes, index))
-            };
-            Ok(Rewritten {
-                block,
-                span: outcome.span,
-                count: outcome.count,
-                orphans: outcome.orphans,
-            })
+                if outcome.count != task.element_count {
+                    return Err(crate::Error::invalid_data(format!(
+                        "stage 2d decoded {} ways, indexdata said {}",
+                        outcome.count, task.element_count
+                    )));
+                }
+                counters.bump_blobs();
+                let block = if outcome.count == 0 {
+                    None
+                } else {
+                    let bytes = std::mem::take(&mut w.reframe_buf);
+                    w.reframe_buf.reserve(bytes.len());
+                    let index = blob_index(crate::ElementKind::Way, base, outcome.count, None)?;
+                    Some((bytes, index))
+                };
+                Ok(Rewritten {
+                    blob_index: task.blob_index,
+                    frame_offset: task.frame_offset,
+                    block,
+                    span: outcome.span,
+                    count: outcome.count,
+                    orphans: outcome.orphans,
+                })
+            })()
+            .map_err(|e| task.locate(source, e))
         },
     )?;
 

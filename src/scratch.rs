@@ -10,12 +10,9 @@
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 /// Create a scratch fragment, retaining its path in any creation error.
-pub(crate) fn create_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn create_file(path: &std::path::Path) -> crate::Result<std::fs::File> {
     std::fs::File::create(path).map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!("failed to create scratch file {}: {e}", path.display()),
-        )
+        crate::Error::from(e).context(format!("failed to create scratch file {}", path.display()))
     })
 }
 
@@ -29,16 +26,16 @@ impl RunToken {
     /// Take the next token. Tokens are never reused within a process; the
     /// space running out is an error rather than a wrap back to a token an
     /// earlier run may still hold.
-    pub(crate) fn next() -> crate::BoxResult<Self> {
+    pub(crate) fn next() -> crate::Result<Self> {
         Self::next_from(&NEXT)
     }
 
-    fn next_from(counter: &AtomicU64) -> crate::BoxResult<Self> {
+    fn next_from(counter: &AtomicU64) -> crate::Result<Self> {
         let mut n = counter.load(Relaxed);
         loop {
             let next = n
                 .checked_add(1)
-                .ok_or("scratch run token space exhausted")?;
+                .ok_or_else(|| crate::Error::internal("scratch run token space exhausted"))?;
             match counter.compare_exchange_weak(n, next, Relaxed, Relaxed) {
                 Ok(_) => return Ok(Self(n)),
                 Err(actual) => n = actual,

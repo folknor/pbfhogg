@@ -309,8 +309,11 @@ use `NoProcessActions`; the CLI applies its arena cap in a child. The
 `process_nofile` target owns its process because it needs an unraised limit.
 
 Platform setup refusals use `ErrorKind::PlatformUnsupported { feature, source }`.
-Writers carry that error inside `io::Error` to preserve their `io::Result` API;
-conversion to the library error restores the typed variant. Every `O_DIRECT`
+`PbfWriter` and the file reader and writer constructors return
+`pbfhogg::Result`, so the refusal reaches the caller typed. Only the standard
+`Write`/`Read`/`Seek` impls keep their `io::Result` signatures and carry the
+error inside `io::Error`; conversion to the library error restores the typed
+variant. Every `O_DIRECT`
 open (reader, direct writer, io_uring writer) classifies its refusal through
 one helper, and path context added above it must keep the carrier typed. The
 CLI exits 3 for this variant (see the exit-code table in

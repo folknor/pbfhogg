@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cat::CleanAttrs;
 use crate::coord_fmt::e7_to_deg;
+use crate::error::Error;
 use crate::write::WriteOptions;
 
 use super::{HeaderOverrides, Result, require_indexdata};
@@ -21,33 +22,32 @@ mod smart;
 pub use crate::geo::Bbox;
 
 /// Parse a bbox string in osmium convention: `minlon,minlat,maxlon,maxlat`.
-// String errors are intentional for CLI arg parsing - the bad input value is more
-// useful to users than the underlying ParseFloatError ("invalid float literal").
+// The messages show the bad input value, which is more useful to users than the
+// underlying ParseFloatError ("invalid float literal").
 pub fn parse_bbox(s: &str) -> Result<Bbox> {
     let parts: Vec<&str> = s.split(',').collect();
     if parts.len() != 4 {
-        return Err(format!(
+        return Err(Error::invalid_argument(format!(
             "bbox must have 4 comma-separated values, got {}",
             parts.len()
-        )
-        .into());
+        )));
     }
     let min_lon: f64 = parts[0]
         .trim()
         .parse()
-        .map_err(|_| format!("invalid min_lon: {}", parts[0]))?;
+        .map_err(|_| Error::invalid_argument(format!("invalid min_lon: {}", parts[0])))?;
     let min_lat: f64 = parts[1]
         .trim()
         .parse()
-        .map_err(|_| format!("invalid min_lat: {}", parts[1]))?;
+        .map_err(|_| Error::invalid_argument(format!("invalid min_lat: {}", parts[1])))?;
     let max_lon: f64 = parts[2]
         .trim()
         .parse()
-        .map_err(|_| format!("invalid max_lon: {}", parts[2]))?;
+        .map_err(|_| Error::invalid_argument(format!("invalid max_lon: {}", parts[2])))?;
     let max_lat: f64 = parts[3]
         .trim()
         .parse()
-        .map_err(|_| format!("invalid max_lat: {}", parts[3]))?;
+        .map_err(|_| Error::invalid_argument(format!("invalid max_lat: {}", parts[3])))?;
 
     Bbox::try_new(min_lon, min_lat, max_lon, max_lat)
 }
@@ -155,17 +155,18 @@ use crate::geo::ring_crosses_antimeridian;
 /// - A FeatureCollection whose Polygon/MultiPolygon features are all included
 pub fn parse_geojson(path: &Path) -> Result<Region> {
     let data = std::fs::read_to_string(path)?;
-    let value: serde_json::Value = serde_json::from_str(&data)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&data).map_err(|e| Error::invalid_data_with("invalid GeoJSON", e))?;
     let geometries = extract_geometries(&value)?;
     let mut polygons = Vec::new();
     for geometry in geometries {
         let geo_type = geometry
             .get("type")
             .and_then(serde_json::Value::as_str)
-            .ok_or("geometry missing 'type' field")?;
+            .ok_or_else(|| Error::invalid_data("geometry missing 'type' field"))?;
         let coords = geometry
             .get("coordinates")
-            .ok_or("geometry missing 'coordinates' field")?;
+            .ok_or_else(|| Error::invalid_data("geometry missing 'coordinates' field"))?;
         polygons.extend(parse_geometry_by_type(geo_type, coords)?);
     }
     let bbox = bbox_from_polygons(&polygons)?;
@@ -177,34 +178,38 @@ fn extract_geometries(value: &serde_json::Value) -> Result<Vec<&serde_json::Valu
     let obj_type = value
         .get("type")
         .and_then(serde_json::Value::as_str)
-        .ok_or("GeoJSON missing 'type' field")?;
+        .ok_or_else(|| Error::invalid_data("GeoJSON missing 'type' field"))?;
     match obj_type {
         "Polygon" | "MultiPolygon" => Ok(vec![value]),
         "Feature" => {
             let geom = value
                 .get("geometry")
-                .ok_or("Feature missing 'geometry' field")?;
+                .ok_or_else(|| Error::invalid_data("Feature missing 'geometry' field"))?;
             Ok(vec![geom])
         }
         "FeatureCollection" => {
             let features = value
                 .get("features")
                 .and_then(serde_json::Value::as_array)
-                .ok_or("FeatureCollection missing 'features' array")?;
+                .ok_or_else(|| Error::invalid_data("FeatureCollection missing 'features' array"))?;
             if features.is_empty() {
-                return Err("FeatureCollection has no features".into());
+                return Err(Error::invalid_data("FeatureCollection has no features"));
             }
             features
                 .iter()
                 .enumerate()
                 .map(|(i, feature)| {
                     feature.get("geometry").ok_or_else(|| {
-                        format!("FeatureCollection feature {i} missing 'geometry' field").into()
+                        Error::invalid_data(format!(
+                            "FeatureCollection feature {i} missing 'geometry' field"
+                        ))
                     })
                 })
                 .collect()
         }
-        other => Err(format!("unsupported GeoJSON type: {other}").into()),
+        other => Err(Error::invalid_data(format!(
+            "unsupported GeoJSON type: {other}"
+        ))),
     }
 }
 
@@ -218,14 +223,16 @@ fn parse_geometry_by_type(geo_type: &str, coords: &serde_json::Value) -> Result<
         "MultiPolygon" => {
             let arr = coords
                 .as_array()
-                .ok_or("MultiPolygon coordinates must be an array")?;
+                .ok_or_else(|| Error::invalid_data("MultiPolygon coordinates must be an array"))?;
             let mut polygons = Vec::with_capacity(arr.len());
             for polygon_coords in arr {
                 polygons.push(parse_polygon_coordinates(polygon_coords)?);
             }
             Ok(polygons)
         }
-        other => Err(format!("unsupported geometry type: {other}").into()),
+        other => Err(Error::invalid_data(format!(
+            "unsupported geometry type: {other}"
+        ))),
     }
 }
 
@@ -233,8 +240,10 @@ fn parse_geometry_by_type(geo_type: &str, coords: &serde_json::Value) -> Result<
 fn parse_polygon_coordinates(coords: &serde_json::Value) -> Result<PolygonRings> {
     let rings = coords
         .as_array()
-        .ok_or("polygon coordinates must be an array of rings")?;
-    let exterior_val = rings.first().ok_or("polygon must have at least one ring")?;
+        .ok_or_else(|| Error::invalid_data("polygon coordinates must be an array of rings"))?;
+    let exterior_val = rings
+        .first()
+        .ok_or_else(|| Error::invalid_data("polygon must have at least one ring"))?;
     let exterior = parse_ring(exterior_val)?;
     let mut holes = Vec::new();
     for hole_val in rings.iter().skip(1) {
@@ -247,7 +256,7 @@ fn parse_polygon_coordinates(coords: &serde_json::Value) -> Result<PolygonRings>
 fn parse_ring(ring: &serde_json::Value) -> Result<Vec<(f64, f64)>> {
     let points = ring
         .as_array()
-        .ok_or("ring must be an array of coordinate pairs")?;
+        .ok_or_else(|| Error::invalid_data("ring must be an array of coordinate pairs"))?;
     // A one- or two-point ring has a bounding box but no interior, so
     // accepting it turns a malformed polygon into a successful empty
     // extract. Open rings are accepted on purpose: RFC 7946 asks for a
@@ -256,20 +265,30 @@ fn parse_ring(ring: &serde_json::Value) -> Result<Vec<(f64, f64)>> {
     // (its .poly parser closes them). Refusing them would break region
     // files that have always worked.
     if points.len() < 3 {
-        return Err("polygon ring must contain at least 3 coordinate positions".into());
+        return Err(Error::invalid_data(
+            "polygon ring must contain at least 3 coordinate positions",
+        ));
     }
     let mut result = Vec::with_capacity(points.len());
     for point in points {
         let pair = point
             .as_array()
-            .ok_or("coordinate must be a [lon, lat] array")?;
+            .ok_or_else(|| Error::invalid_data("coordinate must be a [lon, lat] array"))?;
         if pair.len() < 2 {
-            return Err("coordinate array must have at least 2 elements".into());
+            return Err(Error::invalid_data(
+                "coordinate array must have at least 2 elements",
+            ));
         }
-        let lon = pair[0].as_f64().ok_or("coordinate lon must be a number")?;
-        let lat = pair[1].as_f64().ok_or("coordinate lat must be a number")?;
-        crate::coord_pack::validate_lon("polygon longitude", lon)?;
-        crate::coord_pack::validate_lat("polygon latitude", lat)?;
+        let lon = pair[0]
+            .as_f64()
+            .ok_or_else(|| Error::invalid_data("coordinate lon must be a number"))?;
+        let lat = pair[1]
+            .as_f64()
+            .ok_or_else(|| Error::invalid_data("coordinate lat must be a number"))?;
+        crate::coord_pack::validate_lon("polygon longitude", lon)
+            .map_err(Error::invalid_data_from)?;
+        crate::coord_pack::validate_lat("polygon latitude", lat)
+            .map_err(Error::invalid_data_from)?;
         result.push((lon, lat));
     }
     // Self-intersections are deliberately not rejected here. osmium extract
@@ -292,7 +311,9 @@ fn parse_ring(ring: &serde_json::Value) -> Result<Vec<(f64, f64)>> {
         })
         .sum::<f64>();
     if twice_area == 0.0 {
-        return Err("polygon ring must enclose a non-zero area".into());
+        return Err(Error::invalid_data(
+            "polygon ring must enclose a non-zero area",
+        ));
     }
     Ok(result)
 }
@@ -328,7 +349,9 @@ fn bbox_from_polygons(polygons: &[PolygonRings]) -> Result<Bbox> {
     }
 
     if !found_any {
-        return Err("no exterior ring vertices found for bounding box".into());
+        return Err(Error::invalid_data(
+            "no exterior ring vertices found for bounding box",
+        ));
     }
 
     // Region::bbox and blob scheduling accept one ordinary interval. A crossing
@@ -387,7 +410,8 @@ pub fn parse_extract_config_with_output_directory(
     directory_override: Option<&Path>,
 ) -> Result<(Option<PathBuf>, Vec<ExtractSlot>)> {
     let data = std::fs::read_to_string(config_path)?;
-    let value: serde_json::Value = serde_json::from_str(&data)?;
+    let value: serde_json::Value = serde_json::from_str(&data)
+        .map_err(|e| Error::invalid_data_with("invalid extract config JSON", e))?;
 
     let directory = value
         .get("directory")
@@ -397,18 +421,17 @@ pub fn parse_extract_config_with_output_directory(
     let extracts_arr = value
         .get("extracts")
         .and_then(serde_json::Value::as_array)
-        .ok_or("config must have an 'extracts' array")?;
+        .ok_or_else(|| Error::invalid_data("config must have an 'extracts' array"))?;
 
     if extracts_arr.is_empty() {
-        return Err("'extracts' array must not be empty".into());
+        return Err(Error::invalid_data("'extracts' array must not be empty"));
     }
     if extracts_arr.len() > crate::tunables::MAX_EXTRACTS {
-        return Err(format!(
+        return Err(Error::invalid_data(format!(
             "too many extracts: {} (max {})",
             extracts_arr.len(),
             crate::tunables::MAX_EXTRACTS
-        )
-        .into());
+        )));
     }
 
     let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
@@ -433,7 +456,7 @@ pub fn parse_extract_config_with_output_directory(
         let output_name = entry
             .get("output")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| format!("extract[{i}] missing 'output' field"))?;
+            .ok_or_else(|| Error::invalid_data(format!("extract[{i}] missing 'output' field")))?;
 
         let output_name_path = Path::new(output_name);
         let output_path = if directory_override.is_some() {
@@ -442,7 +465,10 @@ pub fn parse_extract_config_with_output_directory(
             resolve_dir.join(output_name_path)
         };
         if output_paths.contains(&output_path) {
-            return Err(format!("duplicate output path: {}", output_path.display()).into());
+            return Err(Error::invalid_data(format!(
+                "duplicate output path: {}",
+                output_path.display()
+            )));
         }
         output_paths.push(output_path.clone());
 
@@ -491,60 +517,63 @@ fn parse_extract_geometry(
     let geo_count =
         usize::from(has_bbox) + usize::from(has_polygon) + usize::from(has_polygon_file);
     if geo_count == 0 {
-        return Err(format!(
+        return Err(Error::invalid_data(format!(
             "extract[{index}] must have exactly one of 'bbox', 'polygon', or 'polygon_file'"
-        )
-        .into());
+        )));
     }
     if geo_count > 1 {
-        return Err(format!(
+        return Err(Error::invalid_data(format!(
             "extract[{index}] has multiple geometry fields; use exactly one of 'bbox', 'polygon', or 'polygon_file'"
-        )
-        .into());
+        )));
     }
 
     if has_bbox {
         let arr = entry
             .get("bbox")
             .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| format!("extract[{index}] 'bbox' must be an array"))?;
+            .ok_or_else(|| {
+                Error::invalid_data(format!("extract[{index}] 'bbox' must be an array"))
+            })?;
         if arr.len() != 4 {
-            return Err(format!(
+            return Err(Error::invalid_data(format!(
                 "extract[{index}] 'bbox' must have 4 elements, got {}",
                 arr.len()
-            )
-            .into());
+            )));
         }
-        let min_lon = arr[0]
-            .as_f64()
-            .ok_or_else(|| format!("extract[{index}] bbox[0] must be a number"))?;
-        let min_lat = arr[1]
-            .as_f64()
-            .ok_or_else(|| format!("extract[{index}] bbox[1] must be a number"))?;
-        let max_lon = arr[2]
-            .as_f64()
-            .ok_or_else(|| format!("extract[{index}] bbox[2] must be a number"))?;
-        let max_lat = arr[3]
-            .as_f64()
-            .ok_or_else(|| format!("extract[{index}] bbox[3] must be a number"))?;
+        let number = |slot: usize| {
+            arr[slot].as_f64().ok_or_else(|| {
+                Error::invalid_data(format!("extract[{index}] bbox[{slot}] must be a number"))
+            })
+        };
+        let min_lon = number(0)?;
+        let min_lat = number(1)?;
+        let max_lon = number(2)?;
+        let max_lat = number(3)?;
+        // The config is the input here, so a bad box is invalid data, not an
+        // invalid argument: a deliberate reclassification that keeps the
+        // `Bbox` refusal as the cause.
         return Bbox::try_new(min_lon, min_lat, max_lon, max_lat)
             .map(Region::Bbox)
-            .map_err(|e| format!("extract[{index}] bbox: {e}").into());
+            .map_err(|e| Error::invalid_data_with(format!("extract[{index}] bbox"), e));
     }
 
     if has_polygon {
         let geom = entry
             .get("polygon")
-            .ok_or_else(|| format!("extract[{index}] missing 'polygon'"))?;
+            .ok_or_else(|| Error::invalid_data(format!("extract[{index}] missing 'polygon'")))?;
         let mut polygons = Vec::new();
         for geometry in extract_geometries(geom)? {
             let geo_type = geometry
                 .get("type")
                 .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| format!("extract[{index}] polygon missing 'type' field"))?;
-            let coords = geometry
-                .get("coordinates")
-                .ok_or_else(|| format!("extract[{index}] polygon missing 'coordinates' field"))?;
+                .ok_or_else(|| {
+                    Error::invalid_data(format!("extract[{index}] polygon missing 'type' field"))
+                })?;
+            let coords = geometry.get("coordinates").ok_or_else(|| {
+                Error::invalid_data(format!(
+                    "extract[{index}] polygon missing 'coordinates' field"
+                ))
+            })?;
             polygons.extend(parse_geometry_by_type(geo_type, coords)?);
         }
         let bbox = bbox_from_polygons(&polygons)?;
@@ -555,7 +584,9 @@ fn parse_extract_geometry(
     let file_str = entry
         .get("polygon_file")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| format!("extract[{index}] 'polygon_file' must be a string"))?;
+        .ok_or_else(|| {
+            Error::invalid_data(format!("extract[{index}] 'polygon_file' must be a string"))
+        })?;
     let polygon_path = config_dir.join(file_str);
     parse_geojson(&polygon_path)
 }
@@ -592,12 +623,11 @@ pub fn extract_multi_with_display_paths(
     host: &crate::host::Host,
 ) -> Result<Vec<ExtractStats>> {
     if display_paths.len() != slots.len() {
-        return Err(format!(
+        return Err(Error::invalid_argument(format!(
             "got {} display paths for {} extract slots",
             display_paths.len(),
             slots.len()
-        )
-        .into());
+        )));
     }
 
     extract_multi_inner(

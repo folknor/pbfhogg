@@ -25,6 +25,7 @@ use super::Result;
 use super::admin::AssembledPolygon;
 use super::interp::{read_addr_point_mmap, read_node_at};
 use super::pass2::SlimInterpWay;
+use crate::error::Error;
 
 use super::super::format::*;
 
@@ -312,13 +313,13 @@ fn write_bucket_record(
     etype: u8,
     index: u32,
     segment: u16,
-) -> std::io::Result<()> {
+) -> Result<()> {
     let mut buf = [0u8; BUCKET_RECORD_SIZE];
     buf[0..8].copy_from_slice(&cell_id.to_le_bytes());
     buf[8] = etype;
     buf[9..13].copy_from_slice(&index.to_le_bytes());
     buf[13..15].copy_from_slice(&segment.to_le_bytes());
-    w.write_all(&buf)
+    Ok(w.write_all(&buf)?)
 }
 
 struct ParsedBucketEntry {
@@ -328,20 +329,17 @@ struct ParsedBucketEntry {
     segment: u16,
 }
 
-fn parse_bucket_file(data: &[u8]) -> std::io::Result<Vec<ParsedBucketEntry>> {
+fn parse_bucket_file(data: &[u8]) -> Result<Vec<ParsedBucketEntry>> {
     // A partial trailing record means Stage A was interrupted mid-flush
     // (ENOSPC, SIGKILL during write). Silently truncating would drop
     // real assignments with no diagnostic; error loudly instead.
     if !data.len().is_multiple_of(BUCKET_RECORD_SIZE) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "geocode bucket file has partial trailing record ({} bytes, \
-                 not a multiple of {BUCKET_RECORD_SIZE}); Stage A write was \
-                 likely interrupted (ENOSPC or crash)",
-                data.len(),
-            ),
-        ));
+        return Err(Error::internal(format!(
+            "geocode bucket file has partial trailing record ({} bytes, \
+             not a multiple of {BUCKET_RECORD_SIZE}); Stage A write was \
+             likely interrupted (ENOSPC or crash)",
+            data.len(),
+        )));
     }
     let count = data.len() / BUCKET_RECORD_SIZE;
     let mut entries = Vec::with_capacity(count);
@@ -569,10 +567,9 @@ pub(super) fn bucketed_cell_assignment_fused(
         });
         let missing = first_missing_street.load(AtomicOrdering::Relaxed);
         if missing != u32::MAX {
-            return Err(format!(
+            return Err(Error::internal(format!(
                 "geocode Stage A: street way {missing} has a record or node outside the files Pass 2 wrote"
-            )
-            .into());
+            )));
         }
 
         for &(fine_cid, coarse_opt, wi, si) in &entries {
@@ -636,10 +633,9 @@ pub(super) fn bucketed_cell_assignment_fused(
         });
         let missing = first_missing_addr.load(AtomicOrdering::Relaxed);
         if missing != usize::MAX {
-            return Err(format!(
+            return Err(Error::internal(format!(
                 "geocode Stage A: address point {missing} is outside the file Pass 2 wrote"
-            )
-            .into());
+            )));
         }
         for &(fine_cid, coarse_cid, idx) in &addr_entries {
             let b = bucket_for_cell(fine_cid);
@@ -722,10 +718,9 @@ pub(super) fn bucketed_cell_assignment_fused(
         });
         let missing = first_missing_interp.load(AtomicOrdering::Relaxed);
         if missing != usize::MAX {
-            return Err(format!(
+            return Err(Error::internal(format!(
                 "geocode Stage A: interpolation way {missing} has a node outside the file Pass 2 wrote"
-            )
-            .into());
+            )));
         }
         for &(fine_cid, coarse_opt, wi, si) in &interp_entries {
             let b = bucket_for_cell(fine_cid);
@@ -839,7 +834,7 @@ fn run_stage_b(
         let sorted_buckets: Vec<Vec<ParsedBucketEntry>> = executor.install(|| {
             (window_start..window_end)
                 .into_par_iter()
-                .map(|bucket_idx| -> std::io::Result<Vec<ParsedBucketEntry>> {
+                .map(|bucket_idx| -> Result<Vec<ParsedBucketEntry>> {
                     let bucket_path = bucket_dir.join(format!("{bucket_idx:03}"));
                     if !bucket_path.exists() {
                         return Ok(Vec::new());
@@ -854,7 +849,7 @@ fn run_stage_b(
                     entries.sort_unstable_by_key(|e| e.cell_id);
                     Ok(entries)
                 })
-                .collect::<std::io::Result<_>>()
+                .collect::<Result<_>>()
         })?;
 
         for entries in &sorted_buckets {
@@ -884,9 +879,9 @@ fn run_stage_b(
                         ENTRY_TYPE_ADDR => addrs.push(e),
                         ENTRY_TYPE_INTERP => interps.push(e),
                         other => {
-                            return Err(format!(
+                            return Err(Error::internal(format!(
                                 "geocode Stage B: unknown bucket entry type {other} in cell {cell_id}"
-                            ).into());
+                            )));
                         }
                     }
                 }
@@ -901,11 +896,11 @@ fn run_stage_b(
                 let has_streets = !streets.is_empty();
                 if has_streets {
                     let count = u16::try_from(streets.len()).map_err(|_| {
-                    format!(
+                    Error::invalid_data(format!(
                         "geocode Stage B: cell {cell_token} ({cell_id}) has {} street entries, exceeds u16::MAX. \
                      Bump on-disk count to u32 and increment FORMAT_VERSION.",
                         streets.len()
-                    )
+                    ))
                 })?;
                     street_out.write_all(&count.to_le_bytes())?;
                     for e in &streets {
@@ -922,11 +917,11 @@ fn run_stage_b(
                 let has_addrs = !addrs.is_empty();
                 if has_addrs {
                     let count = u16::try_from(addrs.len()).map_err(|_| {
-                    format!(
+                    Error::invalid_data(format!(
                         "geocode Stage B: cell {cell_token} ({cell_id}) has {} addr entries, exceeds u16::MAX. \
                      Bump on-disk count to u32 and increment FORMAT_VERSION.",
                         addrs.len()
-                    )
+                    ))
                 })?;
                     addr_out.write_all(&count.to_le_bytes())?;
                     for e in &addrs {
@@ -937,11 +932,11 @@ fn run_stage_b(
                 let has_interps = !interps.is_empty();
                 if has_interps {
                     let count = u16::try_from(interps.len()).map_err(|_| {
-                    format!(
+                    Error::invalid_data(format!(
                         "geocode Stage B: cell {cell_token} ({cell_id}) has {} interp entries, exceeds u16::MAX. \
                      Bump on-disk count to u32 and increment FORMAT_VERSION.",
                         interps.len()
-                    )
+                    ))
                 })?;
                     interp_out.write_all(&count.to_le_bytes())?;
                     for e in &interps {
@@ -981,9 +976,9 @@ fn run_stage_b(
                     CellID(prev_cell_id),
                 );
                 prev_cell_id = cell_id;
-                total_cells = total_cells
-                    .checked_add(1)
-                    .ok_or("geocode cell count exceeds u32::MAX; bump FORMAT_VERSION")?;
+                total_cells = total_cells.checked_add(1).ok_or_else(|| {
+                    Error::invalid_data("geocode cell count exceeds u32::MAX; bump FORMAT_VERSION")
+                })?;
 
                 // The per-type `u16::try_from` above guarantees `X.len() <= u16::MAX`
                 // so these `* SIZE as u64` casts won't overflow.

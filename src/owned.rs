@@ -6,7 +6,7 @@ use crate::block_builder::{BlockBuilder, MemberData, Metadata, OwnedBlock, RawMe
 use crate::file_writer::FileWriter;
 use crate::writer::PbfWriter;
 
-use crate::BoxResult;
+use crate::error::Result;
 pub(crate) use crate::osc::write::OwnedMember;
 
 // ---------------------------------------------------------------------------
@@ -515,7 +515,7 @@ pub(crate) fn write_single_node(
     node: &OwnedNode,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-) -> BoxResult<()> {
+) -> Result<()> {
     crate::commands::ensure_node_capacity(bb, writer)?;
     let meta = owned_to_metadata(node.metadata.as_ref());
     bb.add_node(
@@ -532,7 +532,7 @@ pub(crate) fn write_single_way(
     way: &OwnedWay,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-) -> BoxResult<()> {
+) -> Result<()> {
     crate::commands::ensure_way_capacity(bb, writer)?;
     let meta = owned_to_metadata(way.metadata.as_ref());
     if way.locations.len() == way.refs.len() && !way.locations.is_empty() {
@@ -558,7 +558,7 @@ pub(crate) fn write_single_relation(
     rel: &OwnedRelation,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-) -> BoxResult<()> {
+) -> Result<()> {
     crate::commands::ensure_relation_capacity(bb, writer)?;
     let members: Vec<MemberData<'_>> = rel
         .members
@@ -587,7 +587,7 @@ pub(crate) fn write_single_node_local(
     node: &OwnedNode,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> std::result::Result<(), String> {
+) -> crate::Result<()> {
     crate::commands::ensure_node_capacity_local(bb, output)?;
     let meta = owned_to_metadata(node.metadata.as_ref());
     bb.add_node(
@@ -604,7 +604,7 @@ pub(crate) fn write_single_way_local(
     way: &OwnedWay,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> std::result::Result<(), String> {
+) -> crate::Result<()> {
     crate::commands::ensure_way_capacity_local(bb, output)?;
     let meta = owned_to_metadata(way.metadata.as_ref());
     if way.locations.len() == way.refs.len() && !way.locations.is_empty() {
@@ -630,7 +630,7 @@ pub(crate) fn write_single_relation_local(
     rel: &OwnedRelation,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> std::result::Result<(), String> {
+) -> crate::Result<()> {
     crate::commands::ensure_relation_capacity_local(bb, output)?;
     let members: Vec<MemberData<'_>> = rel
         .members

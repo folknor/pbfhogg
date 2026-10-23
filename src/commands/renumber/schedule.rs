@@ -13,6 +13,11 @@ use super::super::Result;
 // Deliberately schedule payloads without tagdata header lengths or key lists.
 // Renumber is terminal; carrying those adds per-blob work and changes output.
 pub(super) struct BlobTask {
+    /// File-wide ordinal of the blob, counted by the header walker (not the
+    /// position in this per-kind schedule). Provenance for error locations.
+    pub(super) blob_index: u64,
+    /// Start of the blob's on-disk frame (its 4-byte length prefix).
+    pub(super) frame_offset: u64,
     pub(super) data_offset: u64,
     pub(super) data_size: usize,
     pub(super) element_count: u64,
@@ -21,6 +26,22 @@ pub(super) struct BlobTask {
     pub(super) max_id: i64,
     /// Source blob's spatial bbox (node blobs only).
     pub(super) bbox: Option<crate::blob_meta::BlobBbox>,
+}
+
+impl BlobTask {
+    /// Stamp `error` with this blob's true position in `source`. Workers
+    /// capture `source` once, so no per-blob reference counting is needed.
+    pub(super) fn locate(
+        &self,
+        source: &std::sync::Arc<Path>,
+        error: crate::Error,
+    ) -> crate::Error {
+        error.locate(crate::error::Location::new(
+            Some(source),
+            Some(self.blob_index),
+            Some(crate::ByteOffset(self.frame_offset)),
+        ))
+    }
 }
 
 /// Header-only scan building a per-kind schedule with element counts.
@@ -45,7 +66,7 @@ pub(super) fn build_all_blob_schedules(
     drop(
         walker
             .next_header()?
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?,
+            .ok_or_else(crate::error::new_missing_header)?,
     );
     let mut nodes: Vec<BlobTask> = Vec::new();
     let mut ways: Vec<BlobTask> = Vec::new();
@@ -54,12 +75,14 @@ pub(super) fn build_all_blob_schedules(
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
         }
-        let Some(idx) = meta.index else {
-            return Err(
-                "renumber requires an indexed PBF - run `pbfhogg cat` to add \
-                 indexdata or use the indexed variant"
-                    .into(),
-            );
+        let Some(idx) = &meta.index else {
+            return Err(walker.locate_meta(
+                &meta,
+                crate::Error::invalid_data(
+                    "renumber requires an indexed PBF - run `pbfhogg cat` to add \
+                     indexdata or use the indexed variant",
+                ),
+            ));
         };
         let sched = match idx.kind {
             crate::ElementKind::Node => &mut nodes,
@@ -67,6 +90,8 @@ pub(super) fn build_all_blob_schedules(
             crate::ElementKind::Relation => &mut relations,
         };
         sched.push(BlobTask {
+            blob_index: meta.blob_index,
+            frame_offset: meta.frame_start,
             data_offset: meta.data_offset,
             data_size: meta.data_size,
             element_count: idx.count,

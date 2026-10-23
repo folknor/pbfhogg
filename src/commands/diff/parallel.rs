@@ -50,10 +50,6 @@ pub mod test_hooks {
     }
 }
 
-fn io_err(e: io::Error) -> crate::error::Error {
-    crate::error::new_error(crate::error::ErrorKind::Io(e))
-}
-
 // ---------------------------------------------------------------------------
 // Per-shard worker: in-memory block-pair merge
 // ---------------------------------------------------------------------------
@@ -71,17 +67,25 @@ struct ShardOutput {
 /// Pread a blob's compressed data and decompress + parse into a `PrimitiveBlock`.
 fn pread_decode(
     file: &std::fs::File,
+    source: &Arc<Path>,
     desc: BlobDesc,
     read_buf: &mut Vec<u8>,
     st_scratch: &mut Vec<(u32, u32)>,
     gr_scratch: &mut Vec<(u32, u32)>,
 ) -> Result<PrimitiveBlock> {
+    let locate = |e: crate::error::Error| {
+        e.locate(crate::error::Location::new(
+            Some(source),
+            Some(desc.blob_index),
+            Some(crate::ByteOffset(desc.frame_offset)),
+        ))
+    };
     read_buf.resize(desc.data_size, 0);
     file.read_exact_at(read_buf, desc.data_offset)
-        .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+        .map_err(|e| locate(e.into()))?;
     let mut decompressed: Vec<u8> = Vec::new();
-    crate::blob::decompress_blob_raw(read_buf, &mut decompressed)?;
-    PrimitiveBlock::from_vec_with_scratch(decompressed, st_scratch, gr_scratch)
+    crate::blob::decompress_blob_raw(read_buf, &mut decompressed).map_err(locate)?;
+    PrimitiveBlock::from_vec_with_scratch(decompressed, st_scratch, gr_scratch).map_err(locate)
 }
 
 /// Decoded-side state carried between iterations within a shard.
@@ -106,6 +110,8 @@ fn run_shard(
     new_descs: &[BlobDesc],
     old_file: &std::fs::File,
     new_file: &std::fs::File,
+    old_source: &Arc<Path>,
+    new_source: &Arc<Path>,
     kind: ElementKind,
     options: &DiffOptions,
     scratch_dir: &Path,
@@ -126,7 +132,7 @@ fn run_shard(
 
     let type_char = kind.type_char();
     let text_path = shard_text_path(scratch_dir, scratch_suffix, kind, shard_idx);
-    let file = crate::scratch::create_file(&text_path).map_err(io_err)?;
+    let file = crate::scratch::create_file(&text_path)?;
     let mut out = BufWriter::new(file);
 
     let mut stats = DiffStats::default();
@@ -154,7 +160,14 @@ fn run_shard(
         if old_decoded.is_none() && old_idx < old_slice.len() {
             let desc = old_slice[old_idx];
             old_idx += 1;
-            let block = pread_decode(old_file, desc, &mut old_read, &mut old_st, &mut old_gr)?;
+            let block = pread_decode(
+                old_file,
+                old_source,
+                desc,
+                &mut old_read,
+                &mut old_st,
+                &mut old_gr,
+            )?;
             old_decoded = Some(Side {
                 block,
                 skip_count: 0,
@@ -164,7 +177,14 @@ fn run_shard(
         if new_decoded.is_none() && new_idx < new_slice.len() {
             let desc = new_slice[new_idx];
             new_idx += 1;
-            let block = pread_decode(new_file, desc, &mut new_read, &mut new_st, &mut new_gr)?;
+            let block = pread_decode(
+                new_file,
+                new_source,
+                desc,
+                &mut new_read,
+                &mut new_st,
+                &mut new_gr,
+            )?;
             new_decoded = Some(Side {
                 block,
                 skip_count: 0,
@@ -210,7 +230,9 @@ fn run_shard(
 
     // BufWriter::into_inner propagates any deferred flush error; dropping
     // the unwrapped File closes it and the main thread reopens the path.
-    let _ = out.into_inner().map_err(|e| io_err(e.into_error()))?;
+    let _ = out
+        .into_inner()
+        .map_err(|e| crate::error::Error::from(e.into_error()))?;
     Ok(ShardOutput { text_path, stats })
 }
 
@@ -416,7 +438,7 @@ fn emit_element(
         Some(v) => writeln!(out, "{prefix}{type_char}{id} v{v}"),
         None => writeln!(out, "{prefix}{type_char}{id}"),
     }
-    .map_err(io_err)
+    .map_err(crate::error::Error::from)
 }
 
 fn emit_modified(
@@ -434,7 +456,7 @@ fn emit_modified(
         (Some(v), None) => writeln!(out, "*{type_char}{id} v{v}"),
         (None, None) => writeln!(out, "*{type_char}{id}"),
     }
-    .map_err(io_err)
+    .map_err(crate::error::Error::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -552,6 +574,8 @@ pub(crate) fn diff_block_pair_parallel(
             for (shard_idx, shard) in shards.iter().copied().enumerate() {
                 let old_file = Arc::clone(&old.file);
                 let new_file = Arc::clone(&new.file);
+                let old_source = &old.path;
+                let new_source = &new.path;
                 let h = s.spawn(move || {
                     run_shard(
                         shard,
@@ -560,6 +584,8 @@ pub(crate) fn diff_block_pair_parallel(
                         new_descs,
                         &old_file,
                         &new_file,
+                        old_source,
+                        new_source,
                         kind,
                         options,
                         scratch_dir,
@@ -570,9 +596,7 @@ pub(crate) fn diff_block_pair_parallel(
             }
             for (idx, h) in handles.into_iter().enumerate() {
                 shard_outputs[idx] = Some(h.join().unwrap_or_else(|payload| {
-                    Err(crate::error::new_error(crate::error::ErrorKind::Io(
-                        crate::error::panic_error("shard worker", payload.as_ref()),
-                    )))
+                    Err(crate::error::panic_error("shard worker", payload.as_ref()))
                 }));
             }
         });
@@ -666,6 +690,6 @@ fn append_and_cleanup(out: &mut impl Write, src: &Path) -> Result<()> {
     drop(std::fs::remove_file(src));
     match copied {
         Ok(_) => Ok(()),
-        Err(e) => Err(io_err(e)),
+        Err(e) => Err(e.into()),
     }
 }

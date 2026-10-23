@@ -12,8 +12,8 @@ use std::path::Path;
 use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 
-use crate::BoxResult as Result;
 use crate::ElementKind;
+use crate::error::Result;
 use crate::osc::merge_join::{
     BlockMergeAction, BlockPairMergeState, MergeJoinAction, StreamingBlocks,
     block_pair_merge_phase, merge_join_phase,
@@ -130,8 +130,7 @@ pub fn derive_changes(
             timestamp,
             host,
             &token,
-        )
-        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?
+        )?
     } else {
         None
     };
@@ -206,7 +205,7 @@ impl ChangeSink {
         token: &crate::scratch::RunToken,
         increment_version: bool,
         timestamp: Option<u64>,
-    ) -> io::Result<Self> {
+    ) -> Result<Self> {
         let pid = std::process::id();
         let suffix = token.suffix();
         let cp = scratch_dir.join(format!("derive-creates-{pid}{suffix}.xml.tmp"));

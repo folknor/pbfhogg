@@ -34,7 +34,7 @@ fn remaining_scratch_bytes(refs: u64, slot_buckets: usize, payload_files: usize)
             let files = (slot_buckets as u64).checked_add(payload_files as u64)?;
             n.checked_add(files.checked_mul(65536)?)
         })
-        .ok_or_else(|| "external join scratch-space estimate overflow".into())
+        .ok_or_else(|| crate::Error::internal("external join scratch-space estimate overflow"))
 }
 
 /// Refuse before stage 2 when the scratch filesystem cannot hold what stages
@@ -71,7 +71,13 @@ fn check_free_space(_scratch: &Path, _bytes: u64) -> Result<()> {
 
 fn require_space(scratch: &Path, needed: u64, available: u64) -> Result<()> {
     if available < needed {
-        return Err(format!("insufficient free space for external join scratch: stages 2-4 need {needed} more bytes, have {available} bytes in {} (final output space is additional)", scratch.display()).into());
+        return Err(crate::Error::io_kind(
+            std::io::ErrorKind::StorageFull,
+            format!(
+                "insufficient free space for external join scratch: stages 2-4 need {needed} more bytes, have {available} bytes in {} (final output space is additional)",
+                scratch.display()
+            ),
+        ));
     }
     // This is a precheck, not a reservation against concurrent writers.
     Ok(())

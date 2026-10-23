@@ -42,6 +42,10 @@ use crate::read::header_walker::HeaderWalker;
 /// classify without decompression.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BlobDesc {
+    /// File-wide ordinal and frame start from the header walker; provenance
+    /// for errors, never used for scheduling.
+    pub(super) blob_index: u64,
+    pub(super) frame_offset: u64,
     pub(super) data_offset: u64,
     pub(super) data_size: usize,
     pub(super) index: BlobIndex,
@@ -49,6 +53,9 @@ pub(super) struct BlobDesc {
 
 /// Three per-kind blob lists plus a shared `File` handle for pread.
 pub(super) struct WalkedFile {
+    /// The path the walker was opened from; workers locate their errors
+    /// against it.
+    pub(super) path: Arc<Path>,
     pub(super) nodes: Vec<BlobDesc>,
     pub(super) ways: Vec<BlobDesc>,
     pub(super) relations: Vec<BlobDesc>,
@@ -79,6 +86,7 @@ pub(super) fn walk_pair(
 
 /// One file's data blobs in file order, before the order check.
 struct RawWalk {
+    path: Arc<Path>,
     in_file_order: Vec<BlobDesc>,
     has_negative: bool,
     file: Arc<std::fs::File>,
@@ -100,11 +108,16 @@ fn walk_file(path: &Path, host: &crate::host::Host) -> Result<RawWalk> {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
         }
-        let index = meta.index.ok_or_else(|| {
-            io_error("block-pair merge requires indexdata but blob has none".to_owned())
-        })?;
+        let Some(index) = meta.index else {
+            return Err(walker.locate_meta(
+                &meta,
+                crate::Error::invalid_data("block-pair merge requires indexdata but blob has none"),
+            ));
+        };
         has_negative |= index.min_id < 0;
         in_file_order.push(BlobDesc {
+            blob_index: meta.blob_index,
+            frame_offset: meta.frame_start,
             data_offset: meta.data_offset,
             data_size: meta.data_size,
             index,
@@ -112,6 +125,7 @@ fn walk_file(path: &Path, host: &crate::host::Host) -> Result<RawWalk> {
     }
 
     Ok(RawWalk {
+        path: Arc::clone(walker.path()),
         in_file_order,
         has_negative,
         file: Arc::clone(walker.shared_file()),
@@ -129,7 +143,13 @@ impl RawWalk {
         let mut ways: Vec<BlobDesc> = Vec::new();
         let mut relations: Vec<BlobDesc> = Vec::new();
         for desc in self.in_file_order {
-            order.observe(&desc.index).map_err(io_error)?;
+            order.observe(&desc.index).map_err(|e| {
+                e.locate(crate::error::Location::new(
+                    Some(&self.path),
+                    Some(desc.blob_index),
+                    Some(crate::ByteOffset(desc.frame_offset)),
+                ))
+            })?;
             match desc.index.kind {
                 ElementKind::Node => nodes.push(desc),
                 ElementKind::Way => ways.push(desc),
@@ -137,16 +157,13 @@ impl RawWalk {
             }
         }
         Ok(WalkedFile {
+            path: self.path,
             nodes,
             ways,
             relations,
             file: self.file,
         })
     }
-}
-
-fn io_error(msg: String) -> crate::error::Error {
-    crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(msg)))
 }
 
 /// One shard: an ID range `(t_low, t_high]` plus the index ranges of old and

@@ -480,6 +480,65 @@ full file per step: passthrough saves little there.
   lets a rayon framer block in `send` while holding the earlier-seq task the
   writer thread is waiting for. A compile-time assertion pins the relation.
 
+## Error propagation and provenance
+
+Every fallible library function returns `pbfhogg::Result`. An error is an
+`ErrorKind` (`Io`, `PlatformUnsupported`, `InvalidArgument`, `InvalidData`,
+`Internal`, `External`, plus the PBF-structure kinds), optional context text,
+an optional `Location` (file, blob ordinal, byte offset) and, where the cause
+has a type of its own, that cause as `source()`. `Error` is `Clone`, so a
+first-failure slot or a cross-thread channel carries the error itself.
+
+**Rule: a typed error keeps its kind and its cause for as long as it travels.**
+
+- Propagate with `?`. Add words with `Error::context`, which never changes the
+  kind. Reclassify only at a deliberate boundary (a config bbox that fails a
+  range check becomes `InvalidData` for that config, with the leaf error as the
+  cause), never as a side effect of passing an error along.
+- Text is produced in two places only: the final rendering (`Error::report`,
+  and the CLI's print of it) and the message of a caught panic
+  (`panic_error`). Nothing in between turns an error into a `String`, an
+  `io::Error::other`, a `Box<dyn Error>` or an `Error` built from
+  `format!("... {e}")`. What enforces this is chiefly the type system:
+  `Error` has no `From<String>` or `From<&str>`, so a string cannot become an
+  error by `?` or `.into()`, and every constructor that takes text says which
+  kind it is. The `brokkr.toml` textlint rules `no-io-error-other`,
+  `no-io-error-new-other`, `no-io-error-restringing`, `no-map-err-to-string`,
+  `no-string-error-result`, `no-box-dyn-error`, `no-error-kind-construction`
+  and `no-error-interpolated-into-message` are guardrails over `src/` against
+  the common flattening shapes (the interpolation rule sees single-line
+  constructors only); they cannot catch every flattening. `src/error.rs` is the
+  one file exempt, because it owns the constructors and the `io::Error`
+  carrier.
+- Decisions that depend on an OS error (`copy_range` falling back to `pwrite`,
+  the parallel writer's `EXDEV` copy-range fallback and `EINTR` retry,
+  `sync_file` tolerating an
+  unsupported fsync, classifying a failed `O_DIRECT` open) look at the original
+  `io::Error` before it is converted. Once it is a `pbfhogg::Error`, the kind
+  is the answer.
+- An error returned through a standard `Write`/`Read`/`Seek` implementation is
+  an `io::Error`; a `pbfhogg::Error` crossing that boundary rides inside it as
+  a carrier, and `Error::from(io::Error)` and `report()` see through the carrier
+  to the original.
+
+**Provenance.** The code that walks the file owns it. `HeaderWalker` hands out
+the blob's true ordinal and frame start (`BlobHeaderMeta`); a pool that decodes
+what the walker scheduled keeps those two numbers in its work item, captures
+the input path once per worker, and stamps a failure with
+`Error::locate(Location::new(Some(path), Some(blob_index), Some(frame_start)))`.
+`locate` applies only when the error has no location yet and applies as a unit,
+so the innermost, most precise site wins. A pipeline sequence number is never a
+location: it counts a filtered subset, not the file. Errors that came out of a
+caller-supplied callback are never located by the library. Pools whose work
+items are `(seq, offset, size)` schedules (the pread classify pools) carry only
+the frame offset or nothing; they do not invent a blob ordinal.
+
+**Exit codes.** The CLI picks exit `3` by walking the error chain for
+`ErrorKind::PlatformUnsupported`, through context, `io::Error` carriers and
+`External` wrappers, not by matching text. A command that runs several stages
+on several threads must therefore hand the typed error across the join, not a
+string.
+
 ## Compression Summary
 
 | Path | Decompress | Compress | Backend |

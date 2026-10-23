@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
-use crate::BoxResult as Result;
 use crate::ElementReader;
+use crate::error::Result;
 use crate::idset::IdSet;
 use crate::osm_id::osm_id_cmp;
 use crate::owned::TypeFilter;
@@ -133,9 +133,8 @@ impl VerifyIdsReport {
 
     /// Serialize the report as a JSON string.
     pub fn to_json(&self, file_name: &str) -> Result<String> {
-        Ok(serde_json::to_string_pretty(
-            &self.to_json_value(file_name),
-        )?)
+        serde_json::to_string_pretty(&self.to_json_value(file_name))
+            .map_err(|e| crate::Error::internal_with("failed to serialize the report as JSON", e))
     }
 
     /// Write the human-readable summary to `out`.

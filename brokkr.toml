@@ -1162,6 +1162,84 @@ paths = ["src/**/*.rs"]
 region = "code"
 message = "Unit-test scratch must come from path_guard::tests::scratch(), never the system temp dir or a fixed name"
 
+# Error propagation (reference/pipeline.md, "Error propagation and
+# provenance"). A typed error keeps its kind and
+# its cause as it travels; text is only ever produced for the final rendering
+# (`Error::report`) and for a caught panic's payload. Every rule below keeps
+# `src/error.rs`, which owns the constructors and the io carrier, out of scope.
+# The library crate only: the CLI's `Box<dyn Error>` is its program boundary.
+[[textlint]]
+name = "no-io-error-other"
+pattern = '\bio::Error::other\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/error.rs"]
+region = "code"
+message = "io::Error::other flattens a typed error into an opaque Other; use a pbfhogg::Error constructor (Error::internal and friends) or keep the original io::Error"
+
+[[textlint]]
+name = "no-io-error-new-other"
+pattern = '\bErrorKind::Other\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/error.rs"]
+region = "code"
+message = "io::ErrorKind::Other discards what failed; pick the real io kind, or a pbfhogg::Error constructor"
+
+[[textlint]]
+name = "no-io-error-restringing"
+pattern = '\bio::Error::new\(\s*\w+\.kind\(\)\s*,\s*(?:\w+\.to_string\(\)|format!)'
+paths = ["src/**/*.rs"]
+exclude = ["src/error.rs"]
+region = "code"
+message = "Rebuilding an io::Error from its own kind and text loses its OS error and its source; add context with Error::context instead"
+
+[[textlint]]
+name = "no-map-err-to-string"
+pattern = '\.map_err\(\|\w+\|\s*\w+\.to_string\(\)\)'
+paths = ["src/**/*.rs"]
+exclude = ["src/error.rs"]
+region = "code"
+message = "map_err to a String flattens the error's kind and cause; propagate the typed error and add context with Error::context"
+
+[[textlint]]
+name = "no-string-error-result"
+pattern = '\bResult<(?:[^;{<>,]|<(?:[^<>]|<[^<>]*>)*>)*,\s*String>'
+paths = ["src/**/*.rs"]
+exclude = ["src/error.rs"]
+region = "code"
+message = "A String error carries no kind and no cause; return pbfhogg::Result"
+
+[[textlint]]
+name = "no-box-dyn-error"
+pattern = 'Box<dyn (?:std::error::)?Error'
+paths = ["src/**/*.rs"]
+exclude = ["src/error.rs"]
+region = "code"
+message = "Box<dyn Error> erases the error's kind; return pbfhogg::Result"
+
+# Only error.rs builds an ErrorKind; everything else uses the constructors
+# (`Error::invalid_data`, `Error::internal`, `new_blob_error`, ...), so a new
+# classification is one reviewed place.
+[[textlint]]
+name = "no-error-kind-construction"
+pattern = '\bnew_error\(\s*(?:crate::error::)?ErrorKind::'
+paths = ["src/**/*.rs"]
+exclude = ["src/error.rs"]
+region = "code"
+message = "Build errors with the constructors in error.rs, not new_error(ErrorKind::..)"
+
+# A rough check: an error constructor whose text interpolates another error
+# flattens the cause into the message. Pass the cause as the typed source
+# (`invalid_data_with`, `internal_with`) or add context to the typed error.
+# Catches the single-line shape only. The interpolation sits inside a string
+# literal, which `region = "code"` blanks out, so this rule scans the whole
+# file (no region).
+[[textlint]]
+name = "no-error-interpolated-into-message"
+pattern = '\b(?:invalid_argument|invalid_data|internal)\(\s*format!\(.*\{(?:e|err|error|source)(?::[^}]*)?\}'
+paths = ["src/**/*.rs"]
+exclude = ["src/error.rs"]
+message = "Do not interpolate an error into a new error's message; keep it as the typed source or add context to it"
+
 # Source-only guard: no build or test-harness startup.
 [[script_check]]
 name = "static-hook-test-isolation"

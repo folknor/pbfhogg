@@ -321,11 +321,25 @@ fn validate_start_ids(opts: &RenumberOptions) -> Result<()> {
 ///
 /// Refuses input whose node, way or relation IDs do not strictly increase
 /// in file order (see the module docs), and start IDs below 1.
-#[allow(clippy::too_many_lines)]
-#[hotpath::measure]
 pub fn renumber_external(
     input: &Path,
-    output: &Path,
+    output: crate::output::Output,
+    opts: &RenumberOptions,
+    write: &WriteOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<RenumberStats> {
+    let result = renumber_external_to(input, &output, opts, write, overrides, host)?;
+    output.publish()?;
+    Ok(result)
+}
+
+/// [`renumber_external`] writing to a borrowed output it does not publish.
+#[allow(clippy::too_many_lines)]
+#[hotpath::measure]
+pub(crate) fn renumber_external_to(
+    input: &Path,
+    output: &crate::output::Output,
     opts: &RenumberOptions,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -372,12 +386,8 @@ pub fn renumber_external(
     } else {
         compression
     };
-    // `output` is written in place. Protecting a *user-named* destination
-    // from a mid-run failure is the front end's job, not this function's:
-    // only the caller knows whether the path it passed is a name a user
-    // chose or a scratch file the run created. `pbfhogg-cli` routes every
-    // `--output` through `path_guard::OutputFile` for exactly that reason,
-    // so this entry point is already handed a scratch sibling.
+    // The writer fills the output's staging file; `renumber_external`
+    // publishes it only after this function has succeeded.
     let mut writer = writer_from_header(
         output,
         effective_compression,

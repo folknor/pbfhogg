@@ -67,10 +67,25 @@ impl CatStats {
 /// If `type_filter` is set, only elements of matching types are included
 /// (requires full decode). Without a filter, blobs are passed through as
 /// raw bytes (zero decode).
-#[hotpath::measure]
 pub fn cat(
     files: &[&Path],
-    output: &Path,
+    output: crate::output::Output,
+    type_filter: Option<TypeFilter>,
+    clean: &CleanAttrs,
+    write: &WriteOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<CatStats> {
+    let result = cat_to(files, &output, type_filter, clean, write, overrides, host)?;
+    output.publish()?;
+    Ok(result)
+}
+
+/// [`cat`] writing to a borrowed output it does not publish.
+#[hotpath::measure]
+pub(crate) fn cat_to(
+    files: &[&Path],
+    output: &crate::output::Output,
     type_filter: Option<TypeFilter>,
     clean: &CleanAttrs,
     write: &WriteOptions,
@@ -318,7 +333,7 @@ fn agreed<'a, T: PartialEq + Copy>(
 
 fn cat_passthrough(
     files: &[&Path],
-    output: &Path,
+    output: &crate::output::Output,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
@@ -408,7 +423,7 @@ fn cat_passthrough(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn cat_type_passthrough(
     files: &[&Path],
-    output: &Path,
+    output: &crate::output::Output,
     tf: TypeFilter,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -619,7 +634,7 @@ use super::clean_metadata;
 #[allow(clippy::too_many_lines)]
 fn cat_filtered(
     files: &[&Path],
-    output: &Path,
+    output: &crate::output::Output,
     tf: TypeFilter,
     clean: &CleanAttrs,
     write: &WriteOptions,

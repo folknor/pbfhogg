@@ -24,8 +24,8 @@ mod altw_external_stage3 {
 
     /// A stage-3 worker panic during altw external join must surface
     /// as an `Err`, wake stage-4 waiters via the `AbortOnDrop` guard
-    /// (no indefinite hang), and leave no `external-join-*` scratch
-    /// tree behind after `ScratchDir::drop` fires.
+    /// (no indefinite hang), and leave no run scratch
+    /// directory behind after the guard drops.
     #[test]
     fn fault_injection_altw_stage3_bucket_panic_surfaces_and_cleans_scratch() {
         altw_hooks::stage3::reset();
@@ -51,7 +51,7 @@ mod altw_external_stage3 {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             add_locations_to_ways(
                 &input,
-                &output,
+                crate::common::out(&output),
                 &AltwOptions {
                     keep_untagged_nodes: false,
                     write: WriteOptions {
@@ -64,6 +64,7 @@ mod altw_external_stage3 {
                 },
                 &pbfhogg::HeaderOverrides::default(),
                 &crate::common::test_host(),
+                crate::common::scratch_in(dir.path()),
             )
         }));
 
@@ -75,15 +76,15 @@ mod altw_external_stage3 {
             "altw external with an armed stage-3 panic must not return Ok"
         );
 
-        // ScratchDir::drop sweeps its entire tree. Assert no
-        // `external-join-*` directory remains as a leftover.
+        // The run scratch directory is swept whole. Assert no `.pbfhogg-run-*`
+        // directory remains as a leftover.
         let mut after = snapshot_dir(dir.path());
         // Output file may or may not exist depending on how far the
         // pipeline got; exclude it from the scratch-leak check.
         after.remove(std::path::Path::new("out.osm.pbf"));
         let scratch_leaks: Vec<_> = after
             .difference(&before)
-            .filter(|p| p.to_string_lossy().contains("external-join"))
+            .filter(|p| p.to_string_lossy().contains(".pbfhogg-run-"))
             .collect();
         assert!(
             scratch_leaks.is_empty(),

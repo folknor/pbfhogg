@@ -13,7 +13,7 @@
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use quick_xml::Writer;
@@ -57,61 +57,40 @@ use super::shard::{BlobDesc, Shard, plan_shards, walk_pair};
 /// Per-shard output: paths to this shard's three scratch files (creates,
 /// modifies, deletes) plus element counts.
 struct ShardOutput {
-    creates_path: PathBuf,
-    modifies_path: PathBuf,
-    deletes_path: PathBuf,
+    creates_path: crate::scratch::ScratchPath,
+    modifies_path: crate::scratch::ScratchPath,
+    deletes_path: crate::scratch::ScratchPath,
     create_count: u64,
     modify_count: u64,
     delete_count: u64,
 }
 
-/// Process-lifetime random tag for scratch filenames. PID alone collides
-/// when two `pbfhogg` processes share a PID in the same scratch dir
-/// (container restart recycling PID); adding this tag dodges that.
-fn process_scratch_tag() -> &'static str {
-    static TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    TAG.get_or_init(|| {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        #[allow(clippy::cast_possible_truncation)]
-        let lo = nanos as u32;
-        format!("{lo:08x}")
-    })
-}
-
-/// Compute the three per-shard scratch paths that `run_shard` would
-/// create. Exposed so the caller can clean up leftover files from
-/// panicked / errored shards whose `ShardOutput` is unavailable.
-///
-/// `suffix` is the run token's ([`crate::scratch::RunToken::suffix`]), so two
-/// runs in one process - which share the pid and the process tag - name and
-/// clean up disjoint files.
+/// The three per-shard scratch paths `run_shard` writes.
 fn shard_xml_paths(
-    scratch_dir: &Path,
-    suffix: &str,
+    scratch: &crate::scratch::RunScratch,
     kind: ElementKind,
     shard_idx: usize,
-) -> (PathBuf, PathBuf, PathBuf) {
-    let pid = std::process::id();
-    let tag = process_scratch_tag();
+) -> Result<(
+    crate::scratch::ScratchPath,
+    crate::scratch::ScratchPath,
+    crate::scratch::ScratchPath,
+)> {
     let kind_tag = match kind {
         ElementKind::Node => "n",
         ElementKind::Way => "w",
         ElementKind::Relation => "r",
     };
-    (
-        scratch_dir.join(format!(
-            "derive-par-creates-{pid}{suffix}-{tag}-{kind_tag}-{shard_idx}.xml.tmp"
-        )),
-        scratch_dir.join(format!(
-            "derive-par-modifies-{pid}{suffix}-{tag}-{kind_tag}-{shard_idx}.xml.tmp"
-        )),
-        scratch_dir.join(format!(
-            "derive-par-deletes-{pid}{suffix}-{tag}-{kind_tag}-{shard_idx}.xml.tmp"
-        )),
-    )
+    Ok((
+        scratch.file(&format!(
+            "derive-par-creates-{kind_tag}-{shard_idx}.xml.tmp"
+        ))?,
+        scratch.file(&format!(
+            "derive-par-modifies-{kind_tag}-{shard_idx}.xml.tmp"
+        ))?,
+        scratch.file(&format!(
+            "derive-par-deletes-{kind_tag}-{shard_idx}.xml.tmp"
+        ))?,
+    ))
 }
 
 fn pread_decode(
@@ -155,8 +134,7 @@ fn run_shard(
     old_source: &Arc<Path>,
     new_source: &Arc<Path>,
     kind: ElementKind,
-    scratch_dir: &Path,
-    scratch_suffix: &str,
+    scratch: &crate::scratch::RunScratch,
     increment_version: bool,
     timestamp: Option<u64>,
 ) -> Result<ShardOutput> {
@@ -174,11 +152,11 @@ fn run_shard(
         }
     }
 
-    let (cp, mp, dp) = shard_xml_paths(scratch_dir, scratch_suffix, kind, shard_idx);
+    let (cp, mp, dp) = shard_xml_paths(scratch, kind, shard_idx)?;
 
-    let mut creates_w = Writer::new(BufWriter::new(File::create(&cp)?));
-    let mut modifies_w = Writer::new(BufWriter::new(File::create(&mp)?));
-    let mut deletes_w = Writer::new(BufWriter::new(File::create(&dp)?));
+    let mut creates_w = Writer::new(BufWriter::new(crate::scratch::create(&cp)?));
+    let mut modifies_w = Writer::new(BufWriter::new(crate::scratch::create(&mp)?));
+    let mut deletes_w = Writer::new(BufWriter::new(crate::scratch::create(&dp)?));
     let mut coord_buf = String::new();
 
     let old_slice = &old_descs[shard.old_start..shard.old_end];
@@ -584,13 +562,12 @@ fn write_delete_element<W: Write>(
 pub(crate) fn derive_changes_parallel(
     old_path: &Path,
     new_path: &Path,
-    output: &Path,
-    scratch_dir: &Path,
+    output: &crate::output::Output,
+    scratch: &crate::scratch::RunScratch,
     shard_count: usize,
     increment_version: bool,
     timestamp: Option<u64>,
     host: &crate::host::Host,
-    token: &crate::scratch::RunToken,
 ) -> Result<Option<DeriveChangesStats>> {
     let Some((old, new)) = walk_pair(old_path, new_path, host)? else {
         crate::host::diag!(
@@ -602,8 +579,6 @@ pub(crate) fn derive_changes_parallel(
         crate::debug::emit_counter("derive_changes_negative_id_fallback", 1);
         return Ok(None);
     };
-    let suffix = token.suffix();
-    let suffix = suffix.as_str();
 
     // Scratch peaks include completed outer action files plus the current
     // kind's shard fragments. Appending temporarily duplicates the source
@@ -612,16 +587,11 @@ pub(crate) fn derive_changes_parallel(
     // free-space refusal here would be a guess, not a lifetime-aware budget.
     // An exact estimate requires repeating the measured serialization pass;
     // retain bounded-memory streaming and propagate actual write failures.
-    // Outer temp files that `assemble_osc_from_paths` consumes. Wrap each in
-    // a `PathGuard` (see `decisions/0003-*`) so any early return
-    // (shard panic, sweep error, flush failure) removes them instead
-    // of leaking into scratch. Guards are `commit()`ed after the
-    // assemble step reads them, just before they'd be removed
-    // manually anyway.
-    let pid = std::process::id();
-    let outer_creates = scratch_dir.join(format!("derive-par-creates-{pid}{suffix}.xml.tmp"));
-    let outer_modifies = scratch_dir.join(format!("derive-par-modifies-{pid}{suffix}.xml.tmp"));
-    let outer_deletes = scratch_dir.join(format!("derive-par-deletes-{pid}{suffix}.xml.tmp"));
+    // Outer temp files that `assemble_osc_from_paths` consumes. A failure
+    // anywhere leaves them to the run directory's guard.
+    let outer_creates = scratch.file("derive-par-creates.xml.tmp")?;
+    let outer_modifies = scratch.file("derive-par-modifies.xml.tmp")?;
+    let outer_deletes = scratch.file("derive-par-deletes.xml.tmp")?;
 
     let mut totals = DeriveChangesStats {
         creates: 0,
@@ -632,11 +602,8 @@ pub(crate) fn derive_changes_parallel(
     // Open outer temp files up front; each phase appends its shard outputs
     // in order.
     let mut outer_creates_w = BufWriter::new(crate::scratch::create_file(&outer_creates)?);
-    let outer_creates_guard = crate::path_guard::PathGuard::file(outer_creates.clone());
     let mut outer_modifies_w = BufWriter::new(crate::scratch::create_file(&outer_modifies)?);
-    let outer_modifies_guard = crate::path_guard::PathGuard::file(outer_modifies.clone());
     let mut outer_deletes_w = BufWriter::new(crate::scratch::create_file(&outer_deletes)?);
-    let outer_deletes_guard = crate::path_guard::PathGuard::file(outer_deletes.clone());
 
     struct PhaseSlot<'a> {
         kind: ElementKind,
@@ -724,8 +691,7 @@ pub(crate) fn derive_changes_parallel(
                         old_source,
                         new_source,
                         kind,
-                        scratch_dir,
-                        suffix,
+                        scratch,
                         increment_version,
                         timestamp,
                     )
@@ -742,14 +708,8 @@ pub(crate) fn derive_changes_parallel(
             }
         });
 
-        // Partition shard outputs into (successful, first error). If any
-        // shard errored or panicked, clean up every possible per-shard
-        // temp file - including ones that completed successfully as well
-        // as any that a panicked worker left behind - before returning.
-        // Without this pass, `scratch_dir` accumulates
-        // `derive-par-{creates,modifies,deletes}-{pid}{suffix}-*` on every
-        // failed run. The names are recomputed from the same token, so a
-        // concurrent run in this process keeps its own files.
+        // Partition shard outputs into (successful, first error). On an error
+        // every shard file is left for the run directory's guard.
         let mut outputs: Vec<ShardOutput> = Vec::with_capacity(shard_outputs.len());
         let mut first_err: Option<crate::error::Error> = None;
         for slot in shard_outputs {
@@ -763,17 +723,6 @@ pub(crate) fn derive_changes_parallel(
             }
         }
         if let Some(e) = first_err {
-            for out in &outputs {
-                drop(std::fs::remove_file(&out.creates_path));
-                drop(std::fs::remove_file(&out.modifies_path));
-                drop(std::fs::remove_file(&out.deletes_path));
-            }
-            for shard_idx in 0..shards.len() {
-                let (cp, mp, dp) = shard_xml_paths(scratch_dir, suffix, kind, shard_idx);
-                drop(std::fs::remove_file(cp));
-                drop(std::fs::remove_file(mp));
-                drop(std::fs::remove_file(dp));
-            }
             return Err(e);
         }
 
@@ -786,6 +735,7 @@ pub(crate) fn derive_changes_parallel(
             &mut outer_deletes_w,
             outputs,
             &mut totals,
+            scratch,
         )?;
 
         crate::debug::emit_marker(&end_marker);
@@ -811,16 +761,11 @@ pub(crate) fn derive_changes_parallel(
     )?;
     crate::debug::emit_marker("DERIVECHANGES_WRITE_END");
 
-    // Clean up outer temp files. Explicit `commit()` first so the
-    // guards know the happy path handled the cleanup; their Drop
-    // would otherwise try to remove-already-removed files (harmless
-    // but this is cleaner and silences the unused-variable warning).
-    drop(outer_creates_guard.commit());
-    drop(outer_modifies_guard.commit());
-    drop(outer_deletes_guard.commit());
-    drop(std::fs::remove_file(&outer_creates));
-    drop(std::fs::remove_file(&outer_modifies));
-    drop(std::fs::remove_file(&outer_deletes));
+    // The outer files are the largest scratch of the run; give the space back
+    // before the caller does anything else.
+    scratch.remove(&outer_creates);
+    scratch.remove(&outer_modifies);
+    scratch.remove(&outer_deletes);
 
     Ok(Some(totals))
 }
@@ -837,21 +782,30 @@ fn append_shard_outputs(
     deletes_w: &mut BufWriter<File>,
     outputs: Vec<ShardOutput>,
     totals: &mut DeriveChangesStats,
+    scratch: &crate::scratch::RunScratch,
 ) -> Result<()> {
     let mut first_err = None;
     for shard_out in outputs {
         if first_err.is_some() {
-            drop(std::fs::remove_file(&shard_out.creates_path));
-            drop(std::fs::remove_file(&shard_out.modifies_path));
-            drop(std::fs::remove_file(&shard_out.deletes_path));
+            scratch.remove(&shard_out.creates_path);
+            scratch.remove(&shard_out.modifies_path);
+            scratch.remove(&shard_out.deletes_path);
             continue;
         }
         // `and` takes its argument eagerly, so all three calls run and each
         // removes its own source file even when an earlier copy failed; the
         // first error is the one kept.
-        let appended = append_and_cleanup(creates_w, &shard_out.creates_path)
-            .and(append_and_cleanup(modifies_w, &shard_out.modifies_path))
-            .and(append_and_cleanup(deletes_w, &shard_out.deletes_path));
+        let appended = append_and_cleanup(creates_w, &shard_out.creates_path, scratch)
+            .and(append_and_cleanup(
+                modifies_w,
+                &shard_out.modifies_path,
+                scratch,
+            ))
+            .and(append_and_cleanup(
+                deletes_w,
+                &shard_out.deletes_path,
+                scratch,
+            ));
         if let Err(e) = appended {
             first_err = Some(e);
             continue;
@@ -865,8 +819,12 @@ fn append_shard_outputs(
 
 /// Copy a shard's scratch file onto `out` and then remove it - also when the
 /// copy fails, so a failed write does not leave the temp file behind.
-fn append_and_cleanup(out: &mut BufWriter<File>, src: &Path) -> Result<()> {
+fn append_and_cleanup(
+    out: &mut BufWriter<File>,
+    src: &crate::scratch::ScratchPath,
+    scratch: &crate::scratch::RunScratch,
+) -> Result<()> {
     let copied = File::open(src).and_then(|mut f| io::copy(&mut f, out));
-    drop(std::fs::remove_file(src));
+    scratch.remove(src);
     Ok(copied.map(drop)?)
 }

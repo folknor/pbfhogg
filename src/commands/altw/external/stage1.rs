@@ -18,9 +18,9 @@ use std::path::Path;
 
 use super::super::Result;
 use super::blob_meta::BlobMeta;
-use super::radix::ScratchDir;
 use super::{BucketLayout, ID_RECORD_SIZE, IdRecord, NodeBlobInfo};
 use crate::error::Error;
+use crate::scratch::{RunScratch, ScratchPath};
 use crate::tunables::{
     BUCKET_BUF_SIZE, DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN, DECODE_WORKERS_RESERVED,
     NUM_BUCKETS, PER_WAY_REFCOUNT_SIDECAR_BUF_BYTES, POOL_REORDER_CAPACITY_WIDE,
@@ -120,10 +120,10 @@ pub(super) fn stage1_pass_a(
     input: &Path,
     schedule: &[WayBlobTask],
     num_workers: usize,
-    scratch: &ScratchDir,
+    scratch: &RunScratch,
     layout: &BucketLayout,
-    ref_count_sidecar: &Path,
-    per_way_refcount_sidecar: &Path,
+    ref_count_sidecar: &ScratchPath,
+    per_way_refcount_sidecar: &ScratchPath,
     inject_prepass: bool,
 ) -> Result<(u64, Vec<u64>)> {
     use std::os::unix::fs::FileExt as _;
@@ -269,10 +269,12 @@ pub(super) fn stage1_pass_a(
                             if id_shard_writers.is_empty() {
                                 id_shard_writers.reserve(NUM_BUCKETS);
                                 for bucket_idx in 0..NUM_BUCKETS {
-                                    let path = scratch_ref
-                                        .path
-                                        .join(format!("id-W{worker_id}-{bucket_idx:03}"));
-                                    let f = std::fs::File::create(&path).map_err(|e| {
+                                    let path = super::radix::id_shard_path(
+                                        scratch_ref,
+                                        worker_id,
+                                        bucket_idx,
+                                    )?;
+                                    let f = crate::scratch::create(&path).map_err(|e| {
                                         Error::from(e)
                                             .context(format!("create id shard {}", path.display()))
                                     })?;
@@ -372,12 +374,12 @@ pub(super) fn stage1_pass_a(
 
             let mut sidecar_writer = BufWriter::with_capacity(
                 REF_COUNT_SIDECAR_BUF_BYTES,
-                std::fs::File::create(ref_count_sidecar)
+                crate::scratch::create(ref_count_sidecar)
                     .map_err(|e| Error::from(e).context("create sidecar"))?,
             );
             let mut per_way_writer = BufWriter::with_capacity(
                 PER_WAY_REFCOUNT_SIDECAR_BUF_BYTES,
-                std::fs::File::create(per_way_refcount_sidecar)
+                crate::scratch::create(per_way_refcount_sidecar)
                     .map_err(|e| Error::from(e).context("create per-way sidecar"))?,
             );
             let mut varint_buf: Vec<u8> = Vec::with_capacity(STAGE1_VARINT_BUF_CAPACITY);
@@ -546,10 +548,10 @@ pub(super) fn stage1_way_pass(
     blob_meta: &[BlobMeta],
     input: &Path,
     _direct_io: bool,
-    scratch: &ScratchDir,
+    scratch: &RunScratch,
     layout: &BucketLayout,
-    ref_count_sidecar: &Path,
-    per_way_refcount_sidecar: &Path,
+    ref_count_sidecar: &ScratchPath,
+    per_way_refcount_sidecar: &ScratchPath,
     inject_prepass: bool,
     host: &crate::host::Host,
 ) -> Result<Stage1Output> {

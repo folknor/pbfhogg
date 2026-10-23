@@ -136,7 +136,10 @@ fn run_apply_changes(base: &Path, osc: &Path, output: &Path, opts: ApplyOpts) ->
         .arg(base)
         .arg(osc)
         .arg("-o")
-        .arg(output);
+        .arg(output)
+        // Several tests run more than one apply against one output path;
+        // the replacement itself is not what they test.
+        .arg("--overwrite");
     if opts.locations_on_ways {
         cli = cli.arg("--locations-on-ways");
     }
@@ -2097,6 +2100,7 @@ fn merge_refuses_a_version_regression_and_honours_the_escape_hatch() {
         .arg(&osc)
         .arg("-o")
         .arg(&output)
+        .arg("--overwrite")
         .arg("--allow-version-regression")
         .arg("--force")
         .run();
@@ -2242,6 +2246,7 @@ fn merge_admits_equal_versions_from_overlapping_diffs() {
         .arg(&combined_stale)
         .arg("-o")
         .arg(&output)
+        .arg("--overwrite")
         .arg("--allow-version-regression")
         .arg("--force")
         .run();

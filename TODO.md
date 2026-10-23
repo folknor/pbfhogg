@@ -596,27 +596,6 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   `Arc<Path>`, matching the two readers that now carry one, through the
   raw-frame helpers and their callers.
 
-- [ ] **"A failed run leaves the destination byte-identical" is untested for
-  single-input commands.** The multi-input case is covered end to end:
-  `cat good.pbf corrupt.pbf -c version -o dest` fails after its writer is open,
-  and `cat_failure_leaves_preexisting_destination_intact` in
-  `tests/cli_output_guard.rs` is confirmed to fail when `guarded_output` is
-  pointed at the destination. What is uncovered is `sort`, `tags-filter`,
-  `getid`, `getparents`, `time-filter`, `repack`, `degrade`, `renumber` and
-  `add-locations-to-ways`: every corrupt-input fixture available makes them fail
-  *before* the writer opens (a truncated PBF dies in the header-walk preflight,
-  a corrupted payload dies in pass 1), so they are covered for wiring only.
-  Closing it wants a `test-hooks`-gated fault-injection flag on the CLI, shaped
-  like `apply_changes`'s existing `panic_at_blob_seq`.
-
-- [ ] **`bench-merge --output` is the one output-producing command outside
-  `guarded_output`.** Deliberate: it is a synthetic write benchmark and the
-  guard would put a `rename` inside the measured region. Consequence:
-  `pbfhogg bench-merge -o existing.pbf` still truncates up front and leaves a
-  partial file if the run dies - pre-guard behaviour, on a command no one points
-  at real data. If the guard is ever wanted there, commit *outside* the timed
-  region rather than wrapping the whole run. Low urgency.
-
 - [ ] **`ReorderBuffer::with_capacity(N)` is a tuning guess at ~20 sites.** The
   `N` passed is rarely the caller's true permit window - `time_filter` asks for
   64 with no matching semaphore anywhere in the file. Round 4 added a

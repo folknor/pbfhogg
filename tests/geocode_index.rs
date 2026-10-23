@@ -9,6 +9,27 @@ use std::path::Path;
 use crate::common::{TestMember, TestNode, TestRelation, TestWay, write_test_pbf_sorted};
 use pbfhogg::MemberId;
 
+/// Build an index into `output_dir`, replacing an existing one when
+/// `overwrite` is set: the output is checked and staged first, exactly as
+/// the CLI does, then handed to the builder, which publishes it.
+pub(crate) fn build_index(
+    config: &pbfhogg::geocode_index::builder::BuildConfig,
+    output_dir: &Path,
+    overwrite: bool,
+    host: &pbfhogg::host::Host,
+) -> pbfhogg::Result<pbfhogg::geocode_index::builder::BuildStats> {
+    let output = pbfhogg::geocode_index::builder::index_output(
+        output_dir,
+        pbfhogg::Overwrite::from_flag(overwrite),
+    )?;
+    pbfhogg::geocode_index::builder::build_geocode_index(
+        config,
+        output,
+        host,
+        crate::common::scratch_in(output_dir.parent().unwrap_or(Path::new("."))),
+    )
+}
+
 pub(crate) fn write_synthetic_indexed_input(path: &Path) {
     write_test_pbf_sorted(
         path,
@@ -856,13 +877,13 @@ fn synthetic_build_query_matches_low_level_api() {
 
     write_synthetic_indexed_input(&input);
 
-    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+    let stats = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.clone(),
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("build should succeed");
@@ -984,13 +1005,13 @@ fn null_island_street_vertex_is_not_treated_as_absent() {
         }],
         &[],
     );
-    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+    let stats = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.clone(),
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("Null Island is a real coordinate");
@@ -1044,13 +1065,14 @@ fn build_into(
     index_dir: &Path,
     force: bool,
 ) -> pbfhogg::geocode_index::builder::BuildStats {
-    pbfhogg::geocode_index::builder::build_geocode_index(
+    build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.to_path_buf(),
-            force,
+            allow_unindexed: force,
             ..Default::default()
         },
+        index_dir,
+        force,
         &crate::common::test_host(),
     )
     .expect("build must succeed")
@@ -1089,13 +1111,13 @@ fn understated_node_max_id_is_an_error_not_a_panic() {
     });
     std::fs::write(&lying, forged).expect("write forged");
 
-    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+    let err = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: lying,
-            output_dir: dir.path().join("lying-index"),
-            force: false,
             ..Default::default()
         },
+        &dir.path().join("lying-index"),
+        false,
         &crate::common::test_host(),
     )
     .expect_err("an understated node max_id must fail the build");
@@ -1179,13 +1201,14 @@ fn legal_non_dense_nodes_build_a_queryable_index() {
         Err(error) => panic!("run osmium to produce a legal non-dense fixture: {error}"),
     };
     assert!(status.success(), "osmium fixture conversion failed");
-    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+    let stats = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.clone(),
-            force: true,
+            allow_unindexed: true,
             ..Default::default()
         },
+        &index_dir,
+        true,
         &crate::common::test_host(),
     )
     .expect("legal non-dense Node messages must be indexed");
@@ -1220,13 +1243,13 @@ fn builder_refuses_a_truly_empty_index() {
         &[],
         &[],
     );
-    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+    let err = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir,
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect_err("a build with no queryable records must fail");
@@ -1243,13 +1266,13 @@ fn reader_rejects_hostile_entry_offset_instead_of_panicking() {
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     write_synthetic_indexed_input(&input);
-    pbfhogg::geocode_index::builder::build_geocode_index(
+    build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.clone(),
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("build index");
@@ -1278,13 +1301,13 @@ fn reader_rejects_every_out_of_bounds_offset_kind() {
     let input = dir.path().join("input.osm.pbf");
     let good = dir.path().join("good");
     write_all_record_kinds_input(&input);
-    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+    let stats = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: good.clone(),
-            force: false,
             ..Default::default()
         },
+        &good,
+        false,
         &crate::common::test_host(),
     )
     .expect("build index");
@@ -1465,25 +1488,26 @@ fn force_with_bad_input_leaves_the_existing_index_intact() {
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     write_synthetic_indexed_input(&input);
-    pbfhogg::geocode_index::builder::build_geocode_index(
+    build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.clone(),
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("initial build");
     let before = std::fs::read(index_dir.join("geocode_header.bin")).expect("header exists");
 
-    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+    let err = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: dir.path().join("missing.pbf"),
-            output_dir: index_dir.clone(),
-            force: true,
+            allow_unindexed: true,
             ..Default::default()
         },
+        &index_dir,
+        true,
         &crate::common::test_host(),
     )
     .expect_err("a forced rebuild from a nonexistent input must fail");
@@ -1516,13 +1540,13 @@ fn force_preserves_the_index_when_pass_two_fails() {
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     write_synthetic_indexed_input(&input);
-    pbfhogg::geocode_index::builder::build_geocode_index(
+    build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input.clone(),
-            output_dir: index_dir.clone(),
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("initial build");
@@ -1542,13 +1566,14 @@ fn force_preserves_the_index_when_pass_two_fails() {
         &[],
         &[],
     );
-    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+    let err = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: empty,
-            output_dir: index_dir.clone(),
-            force: true,
+            allow_unindexed: true,
             ..Default::default()
         },
+        &index_dir,
+        true,
         &crate::common::test_host(),
     )
     .expect_err("a build with no queryable records must fail");
@@ -1567,9 +1592,9 @@ fn force_preserves_the_index_when_pass_two_fails() {
     );
 }
 
-/// `overwrite` and `allow_unindexed` grant one permission each; only the
-/// legacy `force` (or both fields) grants both. Each refusal must leave the
-/// existing index byte-identical.
+/// Overwrite permission (on the output) and `allow_unindexed` (on the
+/// config) grant one permission each; the CLI's legacy `--force` grants
+/// both. Each refusal must leave the existing index byte-identical.
 #[test]
 fn overwrite_and_allow_unindexed_are_independent_permissions() {
     let dir = crate::common::test_scratch();
@@ -1585,23 +1610,24 @@ fn overwrite_and_allow_unindexed_are_independent_permissions() {
     );
     crate::common::assert_non_indexed(&unindexed);
     let build = |overwrite: bool, allow_unindexed: bool| {
-        pbfhogg::geocode_index::builder::build_geocode_index(
+        build_index(
             &pbfhogg::geocode_index::builder::BuildConfig {
                 input_path: unindexed.clone(),
-                output_dir: index_dir.clone(),
-                overwrite,
                 allow_unindexed,
                 ..Default::default()
             },
+            &index_dir,
+            overwrite,
             &crate::common::test_host(),
         )
     };
-    pbfhogg::geocode_index::builder::build_geocode_index(
+    build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: indexed,
-            output_dir: index_dir.clone(),
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("initial build");
@@ -1614,7 +1640,10 @@ fn overwrite_and_allow_unindexed_are_independent_permissions() {
     );
     let err = build(false, true).expect_err("allow_unindexed alone must not overwrite");
     assert!(
-        err.to_string().contains("already contains a geocode index"),
+        matches!(
+            err.kind(),
+            pbfhogg::ErrorKind::Output(pbfhogg::OutputError::Exists { .. })
+        ),
         "unexpected error: {err}"
     );
     assert_eq!(
@@ -1640,13 +1669,14 @@ fn symlinked_output_dir_is_refused_before_the_build() {
     write_synthetic_indexed_input(&input);
     std::fs::create_dir(&target).expect("create link target");
     std::os::unix::fs::symlink(&target, &link).expect("create symlink");
-    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+    let err = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: link.clone(),
-            force: true,
+            allow_unindexed: true,
             ..Default::default()
         },
+        &link,
+        true,
         &crate::common::test_host(),
     )
     .expect_err("a symlinked output directory must be refused");
@@ -1682,15 +1712,16 @@ fn levels_past_the_sampling_budget_are_refused_before_reading_input() {
     write_synthetic_indexed_input(&input);
     let cases: [(&str, u8, u8); 2] = [("street", 20, 14), ("coarse", 21, 20)];
     for (name, street, coarse) in cases {
-        let err = pbfhogg::geocode_index::builder::build_geocode_index(
+        let err = build_index(
             &pbfhogg::geocode_index::builder::BuildConfig {
                 input_path: input.clone(),
-                output_dir: index_dir.clone(),
-                force: true,
+                allow_unindexed: true,
                 street_level: street,
                 coarse_level: coarse,
                 ..Default::default()
             },
+            &index_dir,
+            true,
             &crate::common::test_host(),
         )
         .expect_err("a level past the sampling budget must be refused");
@@ -1704,14 +1735,15 @@ fn levels_past_the_sampling_budget_are_refused_before_reading_input() {
         );
     }
 
-    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+    let err = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input.clone(),
-            output_dir: index_dir.clone(),
-            force: true,
+            allow_unindexed: true,
             admin_level: 11,
             ..Default::default()
         },
+        &index_dir,
+        true,
         &crate::common::test_host(),
     )
     .expect_err("an admin level over the flood-fill budget must be refused");
@@ -1726,16 +1758,17 @@ fn levels_past_the_sampling_budget_are_refused_before_reading_input() {
 
     // Level 19 remains accepted for the segment-sampled street index while
     // admin indexing uses its separate, lower flood-fill budget.
-    pbfhogg::geocode_index::builder::build_geocode_index(
+    build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir,
-            force: true,
+            allow_unindexed: true,
             street_level: 19,
             coarse_level: 14,
             admin_level: 10,
             ..Default::default()
         },
+        &index_dir,
+        true,
         &crate::common::test_host(),
     )
     .expect("the highest accepted level must build");
@@ -1754,15 +1787,15 @@ fn fallback_recovers_hits_outside_fine_radius() {
         (&no_fallback_dir, 1.0_f32),
         (&coarse_fallback_dir, 100.0_f32),
     ] {
-        pbfhogg::geocode_index::builder::build_geocode_index(
+        build_index(
             &pbfhogg::geocode_index::builder::BuildConfig {
                 input_path: input.clone(),
-                output_dir: output_dir.clone(),
-                force: false,
                 fine_search_radius_m: 1.0,
                 coarse_search_radius_m,
                 ..Default::default()
             },
+            output_dir,
+            false,
             &crate::common::test_host(),
         )
         .expect("build should succeed");
@@ -1813,14 +1846,15 @@ fn fallback_fills_address_when_fine_street_exists() {
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     write_synthetic_indexed_input(&input);
-    pbfhogg::geocode_index::builder::build_geocode_index(
+    build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.clone(),
             fine_search_radius_m: 2.0,
             coarse_search_radius_m: 100.0,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("build should succeed");
@@ -1859,13 +1893,13 @@ fn synthetic_admin_polygon_query_returns_country_match() {
 
     write_synthetic_admin_input(&input);
 
-    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+    let stats = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.clone(),
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("build should succeed");
@@ -1920,13 +1954,13 @@ fn nested_same_level_admin_prefers_smallest_polygon() {
 
     write_synthetic_nested_admin_same_level_input(&input);
 
-    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+    let stats = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.clone(),
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("build should succeed");
@@ -1997,13 +2031,13 @@ fn admin_polygon_hole_excludes_queries_inside_the_hole() {
 
     write_synthetic_admin_with_hole_input(&input);
 
-    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+    let stats = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.clone(),
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("build should succeed");
@@ -2122,13 +2156,13 @@ fn admin_interior_hint_does_not_bypass_point_in_polygon() {
 
     write_synthetic_large_admin_input(&input);
 
-    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+    let stats = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.clone(),
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("build should succeed");
@@ -2228,14 +2262,14 @@ fn synthetic_interpolation_query_resolves_even_house_number() {
 
     write_synthetic_interpolation_input(&input);
 
-    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+    let stats = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.clone(),
-            force: false,
             coarse_search_radius_m: 1.0,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("build should succeed");
@@ -2296,14 +2330,14 @@ fn unresolved_interpolation_stays_hidden_behind_zero_sentinel() {
 
     write_synthetic_unresolved_interpolation_input(&input);
 
-    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+    let stats = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.clone(),
-            force: false,
             coarse_search_radius_m: 1.0,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("build should succeed");
@@ -2367,15 +2401,15 @@ fn fallback_recovers_interpolation_outside_fine_radius() {
         (&no_fallback_dir, 1.0_f32),
         (&coarse_fallback_dir, 100.0_f32),
     ] {
-        pbfhogg::geocode_index::builder::build_geocode_index(
+        build_index(
             &pbfhogg::geocode_index::builder::BuildConfig {
                 input_path: input.clone(),
-                output_dir: output_dir.clone(),
-                force: false,
                 fine_search_radius_m: 1.0,
                 coarse_search_radius_m,
                 ..Default::default()
             },
+            output_dir,
+            false,
             &crate::common::test_host(),
         )
         .expect("build should succeed");
@@ -2448,13 +2482,13 @@ fn antimeridian_interpolation_snaps_on_the_short_arc() {
 
     write_synthetic_antimeridian_interpolation_input(&input);
 
-    pbfhogg::geocode_index::builder::build_geocode_index(
+    build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.clone(),
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("build should succeed");
@@ -2504,15 +2538,15 @@ fn unresolvable_fine_interpolation_does_not_shadow_the_fallback() {
 
     write_synthetic_shadowed_interpolation_input(&input);
 
-    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+    let stats = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.clone(),
-            force: false,
             fine_search_radius_m: 30.0,
             coarse_search_radius_m: 300.0,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("build should succeed");
@@ -2571,13 +2605,13 @@ fn synthetic_postal_boundary_query_returns_level_11_match() {
 
     write_synthetic_postal_boundary_input(&input);
 
-    let stats = pbfhogg::geocode_index::builder::build_geocode_index(
+    let stats = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.clone(),
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("build should succeed");
@@ -2617,13 +2651,13 @@ fn build_rejects_street_way_coord_count_over_u16_max() {
 
     write_oversized_street_input(&input);
 
-    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+    let err = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir,
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect_err("builder should hard-error on street node_count overflow");
@@ -2643,13 +2677,13 @@ fn build_rejects_interpolation_way_coord_count_over_u16_max() {
 
     write_oversized_interpolation_input(&input);
 
-    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+    let err = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir,
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect_err("builder should hard-error on interpolation node_count overflow");
@@ -2669,13 +2703,13 @@ fn build_rejects_addr_entry_count_over_u16_max_for_one_cell() {
 
     write_addr_cell_overflow_input(&input);
 
-    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+    let err = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir,
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect_err("builder should hard-error on per-cell addr entry overflow");
@@ -2706,13 +2740,13 @@ fn build_rejects_street_entry_count_over_u16_max_for_one_cell() {
 
     write_street_cell_overflow_input(&input);
 
-    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+    let err = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir,
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect_err("builder should hard-error on per-cell street entry overflow");
@@ -2740,13 +2774,13 @@ fn build_rejects_interp_entry_count_over_u16_max_for_one_cell() {
 
     write_interp_cell_overflow_input(&input);
 
-    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+    let err = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir,
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect_err("builder should hard-error on per-cell interp entry overflow");
@@ -2775,13 +2809,13 @@ fn build_rejects_admin_entry_count_over_u16_max_for_one_cell() {
 
     write_admin_cell_overflow_input(&input);
 
-    let err = pbfhogg::geocode_index::builder::build_geocode_index(
+    let err = build_index(
         &pbfhogg::geocode_index::builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir,
-            force: false,
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect_err("builder should hard-error on per-cell admin entry overflow");
@@ -2812,12 +2846,13 @@ fn segment_distance_respects_the_owning_way_node_count() {
         } else {
             write_synthetic_indexed_input(&input);
         }
-        builder::build_geocode_index(
+        build_index(
             &builder::BuildConfig {
                 input_path: input,
-                output_dir: index_dir.clone(),
                 ..Default::default()
             },
+            &index_dir,
+            false,
             &crate::common::test_host(),
         )
         .expect("build fixture");
@@ -2893,13 +2928,11 @@ fn force_rebuild_preserves_open_reader_mappings() {
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     write_synthetic_indexed_input(&input);
-    let mut config = pbfhogg::geocode_index::builder::BuildConfig {
+    let config = pbfhogg::geocode_index::builder::BuildConfig {
         input_path: input,
-        output_dir: index_dir.clone(),
         ..Default::default()
     };
-    pbfhogg::geocode_index::builder::build_geocode_index(&config, &crate::common::test_host())
-        .expect("initial build");
+    build_index(&config, &index_dir, false, &crate::common::test_host()).expect("initial build");
     let old = pbfhogg::geocode_index::reader::Reader::open(&index_dir).expect("old reader");
     let before = old.query(55.70005, 12.5005).expect("before");
     assert!(before.address.is_some());
@@ -2910,9 +2943,7 @@ fn force_rebuild_preserves_open_reader_mappings() {
             .expect("old strings")
             .ino()
     };
-    config.force = true;
-    pbfhogg::geocode_index::builder::build_geocode_index(&config, &crate::common::test_host())
-        .expect("refresh");
+    build_index(&config, &index_dir, true, &crate::common::test_host()).expect("refresh");
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -2939,12 +2970,13 @@ fn caller_built_interpolation_candidate_cannot_escape_its_way() {
     let input = dir.path().join("input.osm.pbf");
     let index_dir = dir.path().join("index");
     write_synthetic_interpolation_input(&input);
-    builder::build_geocode_index(
+    build_index(
         &builder::BuildConfig {
             input_path: input,
-            output_dir: index_dir.clone(),
             ..Default::default()
         },
+        &index_dir,
+        false,
         &crate::common::test_host(),
     )
     .expect("build interpolation fixture");
@@ -3014,12 +3046,13 @@ fn repeated_multiblob_geocode_builds_have_identical_files() {
     let a = dir.path().join("a");
     let b = dir.path().join("b");
     for output_dir in [&a, &b] {
-        builder::build_geocode_index(
+        build_index(
             &builder::BuildConfig {
                 input_path: input.clone(),
-                output_dir: output_dir.clone(),
                 ..Default::default()
             },
+            output_dir,
+            false,
             &crate::common::test_host(),
         )
         .expect("build fixture");

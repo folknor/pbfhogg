@@ -80,7 +80,7 @@ fn empty_pbf_survives_sort() {
     };
     pbfhogg::commands::sort::sort(
         &input,
-        &output,
+        crate::common::out(&output),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -398,12 +398,11 @@ fn altw_options() -> pbfhogg::altw::AltwOptions {
 ///
 /// The missing-locations gate can only run after a complete output exists -
 /// the external backend does not know its resolved count until its last
-/// stage - so the write happens before the refusal. Under the CLI that is
-/// already covered: `guarded_output` hands the command a scratch sibling and
-/// never renames it into place on a failing exit. A library caller has no
-/// such front end, and used to be handed an error together with a
-/// well-formed PBF at the path it named, full of fabricated `(0, 0)`
-/// vertices that no reader can tell from genuine data.
+/// stage - so the write happens before the refusal. A library caller used
+/// to be handed an error together with a well-formed PBF at the path it
+/// named, full of fabricated `(0, 0)` vertices that no reader can tell from
+/// genuine data. The output's staging file is what keeps it out now: the
+/// entry point publishes only after the gate passes.
 #[test]
 fn altw_refusal_writes_no_output_for_a_library_caller() {
     let dir = TempDir::new().expect("tempdir");
@@ -414,10 +413,11 @@ fn altw_refusal_writes_no_output_for_a_library_caller() {
     // `Stats` is not `Debug`, so no `expect_err` here.
     let Err(err) = pbfhogg::altw::add_locations_to_ways(
         &input,
-        &output,
+        crate::common::out(&output),
         &altw_options(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
+        crate::common::scratch_in(dir.path()),
     ) else {
         panic!("an unresolvable way ref must fail the default policy");
     };
@@ -437,10 +437,11 @@ fn altw_refusal_writes_no_output_for_a_library_caller() {
     opts.ignore_missing_nodes = true;
     pbfhogg::altw::add_locations_to_ways(
         &input,
-        &output,
+        crate::common::out(&output),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
+        crate::common::scratch_in(dir.path()),
     )
     .expect("--ignore-missing-nodes must accept the input");
     assert!(output.exists(), "an accepted run must publish its output");
@@ -461,10 +462,11 @@ fn altw_refusal_leaves_a_preexisting_destination_intact() {
     assert!(
         pbfhogg::altw::add_locations_to_ways(
             &input,
-            &output,
+            crate::common::out_replace(&output),
             &altw_options(),
             &pbfhogg::HeaderOverrides::default(),
-            &crate::common::test_host()
+            &crate::common::test_host(),
+            crate::common::scratch_in(dir.path())
         )
         .is_err(),
         "an unresolvable way ref must fail the default policy"

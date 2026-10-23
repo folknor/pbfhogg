@@ -2208,6 +2208,7 @@ fn degrade_bounds_preallocation_by_input_size() {
             .arg(&input)
             .arg("-o")
             .arg(&output)
+            .arg("--overwrite")
             .arg(flag)
             .arg("--block-cap")
             .arg(usize::MAX.to_string())

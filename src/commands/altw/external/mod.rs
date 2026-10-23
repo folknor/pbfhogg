@@ -51,7 +51,6 @@ use crate::tunables::{
     ALTW_STAGE3_WORKERS_CAP, DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN, DECODE_WORKERS_RESERVED,
     MAX_BUCKET_WIDTH, NUM_BUCKETS,
 };
-use radix::ScratchDir;
 
 use stage1::stage1_way_pass;
 use stage2::{SlotBuckets, stage2_node_join};
@@ -659,26 +658,30 @@ pub(super) fn slot_bucket_bounds(
 /// Bounded working memory and sequential I/O. Temporary-disk demand depends
 /// on the input; see `reference/performance.md` for measured resource use and
 /// the module docs for the algorithm.
+#[allow(clippy::too_many_arguments)]
 pub fn external_join(
     input: &Path,
-    output: &Path,
+    output: crate::output::Output,
     keep_untagged_nodes: bool,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     inject_prepass: bool,
     host: &crate::host::Host,
+    scratch: crate::scratch::RunScratch,
 ) -> Result<Stats> {
-    let token = crate::scratch::RunToken::next()?;
-    external_join_in(
+    let result = external_join_in(
         input,
-        output,
+        &output,
         keep_untagged_nodes,
         write,
         overrides,
         inject_prepass,
         host,
-        &token,
-    )
+        &scratch,
+    )?;
+    drop(scratch);
+    output.publish()?;
+    Ok(result)
 }
 
 /// Validate before stage 2 writes slot buckets. Each nonempty blob is no
@@ -725,20 +728,19 @@ mod slot_layout_tests {
     }
 }
 
-/// [`external_join`] under a scratch token the caller already took, so
-/// `add_locations_to_ways` names its scratch with the one token it allocated
-/// at its own entry.
+/// [`external_join`] writing to a borrowed output it does not publish, in
+/// scratch the caller owns.
 #[hotpath::measure]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) fn external_join_in(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     keep_untagged_nodes: bool,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     inject_prepass: bool,
     host: &crate::host::Host,
-    token: &crate::scratch::RunToken,
+    scratch: &crate::scratch::RunScratch,
 ) -> Result<Stats> {
     let (direct_io, force) = (write.direct_reads, write.force);
     let has_indexdata = require_indexdata(
@@ -781,14 +783,8 @@ pub(crate) fn external_join_in(
         }
     }
 
-    let scratch_dir = ScratchDir::new(
-        host.scratch_parent_or(output.parent().unwrap_or(Path::new("."))),
-        "external-join",
-        token,
-    )?;
-
-    let ref_count_sidecar = scratch_dir.file_path("way-ref-counts");
-    let per_way_refcount_sidecar = scratch_dir.file_path("per-way-refcounts");
+    let ref_count_sidecar = scratch.file("way-ref-counts")?;
+    let per_way_refcount_sidecar = scratch.file("per-way-refcounts")?;
 
     crate::debug::emit_marker("EXTJOIN_META_SCAN_START");
     let t_meta = std::time::Instant::now();
@@ -840,7 +836,7 @@ pub(crate) fn external_join_in(
                     blob_meta_ref_parallel,
                     input_ref_parallel,
                     direct_io,
-                    &scratch_dir,
+                    scratch,
                     bucket_layout_ref,
                     &ref_count_sidecar,
                     &per_way_refcount_sidecar,
@@ -983,12 +979,7 @@ pub(crate) fn external_join_in(
     .min(ALTW_STAGE3_WORKERS_CAP);
     // Stage 1's exact ref count is the first point at which stage 2-4
     // scratch can be sized without an extra input pass; see `space`.
-    space::precheck(
-        &scratch_dir.path,
-        total_slots,
-        slot_bucket_count,
-        num_workers,
-    )?;
+    space::precheck(scratch.path(), total_slots, slot_bucket_count, num_workers)?;
     let total_id_shard_files = num_shard_workers * NUM_BUCKETS;
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -1001,13 +992,13 @@ pub(crate) fn external_join_in(
 
     crate::debug::emit_marker("EXTJOIN_STAGE2_START");
     let s2_faults_before = crate::debug::read_page_faults();
-    let slot_buckets = SlotBuckets::create(&scratch_dir, slot_bucket_count)?;
+    let slot_buckets = SlotBuckets::create(scratch, slot_bucket_count)?;
     let input_pbf = std::sync::Arc::new(
         std::fs::File::open(input)
             .map_err(|e| crate::Error::from(e).context("open input pbf for stage 2"))?,
     );
     let resolved_count = stage2_node_join(
-        &scratch_dir,
+        scratch,
         &id_bucket_counts,
         num_shard_workers,
         bucket_layout_ref,
@@ -1026,10 +1017,7 @@ pub(crate) fn external_join_in(
     // handoff allocates its own temporary space.
     for worker_id in 0..num_shard_workers {
         for bucket_idx in 0..NUM_BUCKETS {
-            let path = scratch_dir
-                .path
-                .join(format!("id-W{worker_id}-{bucket_idx:03}"));
-            drop(std::fs::remove_file(&path));
+            scratch.remove(&radix::id_shard_path(scratch, worker_id, bucket_idx)?);
         }
     }
     #[allow(clippy::cast_possible_wrap)]
@@ -1058,18 +1046,13 @@ pub(crate) fn external_join_in(
     // Arc<File> so stage 3 can `write_all_at` and stage 4 can
     // `read_exact_at` on the same `&File`. `File` is `Sync` on Unix for
     // pread/pwrite so no extra locking is needed.
-    let worker_tmp_paths: Vec<std::path::PathBuf> = (0..num_workers)
-        .map(|i| scratch_dir.file_path(&format!("payloads-W{i}")))
-        .collect();
+    let worker_tmp_paths: Vec<crate::scratch::ScratchPath> = (0..num_workers)
+        .map(|i| radix::payload_path(scratch, i))
+        .collect::<crate::Result<_>>()?;
     let worker_files: Vec<std::sync::Arc<std::fs::File>> = worker_tmp_paths
         .iter()
         .map(|p| {
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(p)
+            crate::scratch::create_read_write(p, false)
                 .map(std::sync::Arc::new)
                 .map_err(|e| crate::Error::from(e).context(format!("open worker tmp {p:?}")))
         })
@@ -1077,12 +1060,12 @@ pub(crate) fn external_join_in(
 
     let slot_entry_counts: Vec<u64> = (0..slot_bucket_count)
         .map(|i| {
-            let path = scratch_dir.bucket_path("slot", i);
-            std::fs::metadata(&path)
+            let path = radix::slot_bucket_path(scratch, i)?;
+            Ok(std::fs::metadata(&path)
                 .map(|m| m.len() / RESOLVED_ENTRY_SIZE as u64)
-                .unwrap_or(0)
+                .unwrap_or(0))
         })
-        .collect();
+        .collect::<crate::Result<_>>()?;
     // Slot-bucket balance twin of the id-bucket counters above; min is
     // over nonempty buckets.
     {
@@ -1102,8 +1085,8 @@ pub(crate) fn external_join_in(
         }
     }
     let slot_paths: Vec<std::path::PathBuf> = (0..slot_bucket_count)
-        .map(|i| scratch_dir.bucket_path("slot", i))
-        .collect();
+        .map(|i| radix::slot_bucket_path(scratch, i).map(|p| p.to_path_buf()))
+        .collect::<crate::Result<_>>()?;
     let slot_bucket_ref = SlotBucketRef {
         paths: slot_paths,
         entry_counts: slot_entry_counts,
@@ -1204,7 +1187,7 @@ pub(crate) fn external_join_in(
 
     let s3_faults_after = crate::debug::read_page_faults();
     for i in 0..slot_bucket_count {
-        drop(std::fs::remove_file(scratch_dir.bucket_path("slot", i)));
+        scratch.remove(&radix::slot_bucket_path(scratch, i)?);
     }
     crate::debug::emit_page_fault_deltas(
         ("s3_minflt_delta", "s3_majflt_delta"),
@@ -1260,8 +1243,6 @@ pub(crate) fn external_join_in(
         let member_ways = member_way_ids_ref.map_or(0, |set| set.iter().count() as u64);
         inject_metrics.emit(member_ways);
     }
-
-    drop(scratch_dir);
 
     Ok(stats)
 }

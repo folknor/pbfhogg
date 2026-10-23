@@ -56,10 +56,25 @@ impl GetparentsStats {
 }
 
 /// Find parent ways/relations referencing the given IDs.
-#[hotpath::measure]
 pub fn getparents(
     input: &Path,
-    output: &Path,
+    output: crate::output::Output,
+    ids: &ElementIds,
+    opts: &GetparentsOptions,
+    write: &WriteOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<GetparentsStats> {
+    let result = getparents_to(input, &output, ids, opts, write, overrides, host)?;
+    output.publish()?;
+    Ok(result)
+}
+
+/// [`getparents`] writing to a borrowed output it does not publish.
+#[hotpath::measure]
+pub(crate) fn getparents_to(
+    input: &Path,
+    output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetparentsOptions,
     write: &WriteOptions,
@@ -80,11 +95,29 @@ pub fn getparents(
 }
 
 /// Test instrument for exercising the FullScan arm on small fixtures.
-#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn getparents_with_min_blobs(
     input: &Path,
-    output: &Path,
+    output: crate::output::Output,
+    ids: &ElementIds,
+    opts: &GetparentsOptions,
+    write: &WriteOptions,
+    overrides: &HeaderOverrides,
+    min_blobs: u64,
+    host: &crate::host::Host,
+) -> Result<GetparentsStats> {
+    let result =
+        getparents_with_min_blobs_to(input, &output, ids, opts, write, overrides, min_blobs, host)?;
+    output.publish()?;
+    Ok(result)
+}
+
+/// [`getparents_with_min_blobs`] writing to a borrowed output it does not publish.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn getparents_with_min_blobs_to(
+    input: &Path,
+    output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetparentsOptions,
     write: &WriteOptions,
@@ -102,7 +135,7 @@ pub fn getparents_with_min_blobs(
 #[allow(clippy::too_many_arguments)]
 fn getparents_dispatched(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetparentsOptions,
     write: &WriteOptions,
@@ -123,7 +156,7 @@ fn getparents_dispatched(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn getparents_with_arm(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetparentsOptions,
     write: &WriteOptions,
@@ -153,7 +186,7 @@ fn needed_blob_kinds(ids: &ElementIds, opts: &GetparentsOptions) -> (bool, bool,
 #[allow(clippy::too_many_lines)]
 fn getparents_walker(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetparentsOptions,
     write: &WriteOptions,
@@ -331,7 +364,7 @@ fn getparents_walker(
 
 fn getparents_pipelined(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetparentsOptions,
     write: &WriteOptions,
@@ -553,9 +586,11 @@ mod tests {
         let query = parse_ids(&["n1".to_owned()]).expect("ids");
         let opts = GetparentsOptions { add_self: true };
         let output = dir.path().join("output.pbf");
+        let staged = crate::output::Output::new(&output, crate::output::Overwrite::Refuse)
+            .expect("stage output");
         getparents_with_arm(
             &input,
-            &output,
+            &staged,
             &query,
             &opts,
             &WriteOptions::default(),
@@ -564,6 +599,7 @@ mod tests {
             &crate::host::Host::for_tests(),
         )
         .expect("getparents");
+        staged.publish().expect("publish");
         assert_eq!(ids(&output), vec![1, 10]);
     }
 
@@ -577,9 +613,11 @@ mod tests {
         let walker = dir.path().join("walker.pbf");
         let pipelined = dir.path().join("pipelined.pbf");
         for (output, arm) in [(&walker, ScanArm::Walker), (&pipelined, ScanArm::FullScan)] {
+            let staged = crate::output::Output::new(output, crate::output::Overwrite::Refuse)
+                .expect("stage output");
             getparents_with_arm(
                 input,
-                output,
+                &staged,
                 &query,
                 &opts,
                 &WriteOptions::default(),
@@ -588,6 +626,7 @@ mod tests {
                 &crate::host::Host::for_tests(),
             )
             .expect("getparents");
+            staged.publish().expect("publish");
         }
         let walker_ids = ids(&walker);
         assert_eq!(walker_ids, ids(&pipelined));
@@ -737,9 +776,11 @@ mod tests {
             (FULL_SCAN_ARM_MIN_BLOBS, ScanArm::Walker),
         ] {
             let output = dir.path().join(format!("out-{min_blobs}.pbf"));
+            let staged = crate::output::Output::new(&output, crate::output::Overwrite::Refuse)
+                .expect("stage output");
             let (arm, _) = getparents_dispatched(
                 &input,
-                &output,
+                &staged,
                 &query,
                 &opts,
                 &WriteOptions::default(),
@@ -748,6 +789,7 @@ mod tests {
                 &crate::host::Host::for_tests(),
             )
             .expect("getparents");
+            staged.publish().expect("publish");
             assert_eq!(arm, expected_arm);
             assert_eq!(ids(&output), vec![1, 10]);
         }

@@ -355,7 +355,7 @@ fn decode_one(
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn write_output_passthrough(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     node_index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,

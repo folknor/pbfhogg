@@ -121,11 +121,24 @@ struct BlobEntry {
 /// Uses blob-level permutation sort: O(num_blobs) memory. Non-overlapping
 /// blobs are passed through as raw bytes; overlapping blobs are decoded,
 /// sorted, and re-encoded.
-#[allow(clippy::too_many_lines)]
-#[hotpath::measure]
 pub fn sort(
     input: &Path,
-    output: &Path,
+    output: crate::output::Output,
+    opts: &WriteOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<SortStats> {
+    let result = sort_to(input, &output, opts, overrides, host)?;
+    output.publish()?;
+    Ok(result)
+}
+
+/// [`sort`] writing to a borrowed output it does not publish.
+#[allow(clippy::too_many_lines)]
+#[hotpath::measure]
+pub(crate) fn sort_to(
+    input: &Path,
+    output: &crate::output::Output,
     opts: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
@@ -414,7 +427,7 @@ pub fn sort(
     crate::debug::emit_marker("WAIT_WRITER_END");
     crate::debug::emit_marker("SORT_FLUSH_END");
     #[allow(clippy::cast_possible_wrap)]
-    if let Ok(meta) = std::fs::metadata(output) {
+    if let Ok(meta) = std::fs::metadata(output.path()) {
         crate::debug::emit_counter("sort_total_bytes_out", meta.len() as i64);
     }
     crate::debug::emit_marker("SORT_PASS2_END");

@@ -87,6 +87,30 @@ mod exit_code_walker {
         );
         assert_eq!(hinted.to_string(), "try again");
     }
+
+    /// An existing output earns the advice naming the flag that grants the
+    /// replacement, however deep in the chain the refusal sits; nothing
+    /// else does.
+    #[test]
+    fn output_refusal_earns_the_overwrite_advice() {
+        use super::exit_code::output_hint;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let existing = dir.path().join("out.osm.pbf");
+        std::fs::write(&existing, b"user data").expect("write existing output");
+        let refused = pbfhogg::Output::new(&existing, pbfhogg::Overwrite::Refuse)
+            .expect_err("an existing output is refused");
+        assert!(matches!(
+            refused.kind(),
+            pbfhogg::ErrorKind::Output(pbfhogg::OutputError::Exists { .. })
+        ));
+        assert_eq!(
+            output_hint(&refused),
+            Some("; pass --overwrite (-O) to replace it")
+        );
+        let carried = io::Error::from(refused.context("publishing"));
+        assert!(output_hint(&carried).is_some());
+        assert_eq!(output_hint(&platform()), None);
+    }
 }
 
 /// Write a minimal valid PBF file using the library API.
@@ -562,7 +586,12 @@ fn cli_merge_changes_non_utf8_gz_path_stays_plain() {
             .path()
             .join(std::ffi::OsStr::from_bytes(b"invalid-\xff.osc.gz"));
         let mut cli = Command::new(pbfhogg_bin());
-        cli.arg("merge-changes").arg(&input).arg("-o").arg(&output);
+        // Both passes write the same name; the second replaces the first.
+        cli.arg("merge-changes")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .arg("--overwrite");
         if simplify {
             cli.arg("--simplify");
         }

@@ -65,10 +65,24 @@ struct PendingGroup {
 ///
 /// Requires sorted input (`Sort.Type_then_ID`) so each object's versions are
 /// contiguous and the snapshot can be computed in one streaming pass.
-#[hotpath::measure]
 pub fn time_filter(
     input: &Path,
-    output: &Path,
+    output: crate::output::Output,
+    cutoff_timestamp: i64,
+    write: &WriteOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<TimeFilterStats> {
+    let result = time_filter_to(input, &output, cutoff_timestamp, write, overrides, host)?;
+    output.publish()?;
+    Ok(result)
+}
+
+/// [`time_filter`] writing to a borrowed output it does not publish.
+#[hotpath::measure]
+pub(crate) fn time_filter_to(
+    input: &Path,
+    output: &crate::output::Output,
     cutoff_timestamp: i64,
     write: &WriteOptions,
     overrides: &HeaderOverrides,

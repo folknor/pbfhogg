@@ -940,6 +940,7 @@ fn clean_on_an_unindexed_input_refuses_without_force() {
         .arg(&indexed)
         .arg("-o")
         .arg(&output)
+        .arg("--overwrite")
         .arg("-c")
         .arg("version")
         .assert_success();

@@ -1082,7 +1082,7 @@ mod platform {
 
         let result = pbfhogg::altw::add_locations_to_ways(
             &input,
-            &output,
+            crate::common::out(&output),
             &pbfhogg::altw::AltwOptions {
                 keep_untagged_nodes: true,
                 write: pbfhogg::write::WriteOptions {
@@ -1097,6 +1097,7 @@ mod platform {
             },
             &pbfhogg::HeaderOverrides::default(),
             &crate::common::test_host(),
+            crate::common::scratch_in(dir.path()),
         );
         match result {
             Ok(_) => crate::common::skip("O_DIRECT output accepted on this filesystem"),

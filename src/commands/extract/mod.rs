@@ -591,11 +591,17 @@ fn parse_extract_geometry(
     parse_geojson(&polygon_path)
 }
 
-/// Run multiple extracts from a parsed config, calling [`extract`] for each slot.
+/// Run one extract per region, writing region `i` to member `i` of
+/// `outputs`, and publish the whole set once every extract has succeeded.
+///
+/// `outputs` is checked in full when it is built, so a refusal for any
+/// region costs no extraction work, and a failure in any region publishes
+/// nothing.
 #[allow(clippy::too_many_arguments)]
 pub fn extract_multi(
     input: &Path,
-    slots: &[ExtractSlot],
+    regions: &[Region],
+    outputs: crate::output::OutputSet,
     strategy: ExtractStrategy,
     set_bounds: bool,
     clean: &CleanAttrs,
@@ -603,51 +609,25 @@ pub fn extract_multi(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<Vec<ExtractStats>> {
-    extract_multi_inner(
-        input, slots, None, strategy, set_bounds, clean, write, overrides, host,
-    )
-}
-
-/// Run multiple extracts while reporting the final output paths separately
-/// from the paths used to write intermediate output files.
-#[allow(clippy::too_many_arguments)]
-pub fn extract_multi_with_display_paths(
-    input: &Path,
-    slots: &[ExtractSlot],
-    display_paths: &[PathBuf],
-    strategy: ExtractStrategy,
-    set_bounds: bool,
-    clean: &CleanAttrs,
-    write: &WriteOptions,
-    overrides: &HeaderOverrides,
-    host: &crate::host::Host,
-) -> Result<Vec<ExtractStats>> {
-    if display_paths.len() != slots.len() {
+    if regions.len() != outputs.len() {
         return Err(Error::invalid_argument(format!(
-            "got {} display paths for {} extract slots",
-            display_paths.len(),
-            slots.len()
+            "got {} outputs for {} extract regions",
+            outputs.len(),
+            regions.len()
         )));
     }
-
-    extract_multi_inner(
-        input,
-        slots,
-        Some(display_paths),
-        strategy,
-        set_bounds,
-        clean,
-        write,
-        overrides,
-        host,
-    )
+    let stats = extract_multi_to(
+        input, regions, &outputs, strategy, set_bounds, clean, write, overrides, host,
+    )?;
+    outputs.publish()?;
+    Ok(stats)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn extract_multi_inner(
+fn extract_multi_to(
     input: &Path,
-    slots: &[ExtractSlot],
-    display_paths: Option<&[PathBuf]>,
+    regions: &[Region],
+    outputs: &crate::output::OutputSet,
     strategy: ExtractStrategy,
     set_bounds: bool,
     clean: &CleanAttrs,
@@ -662,8 +642,8 @@ fn extract_multi_inner(
         && !clean.any()
         && let Some(stats) = multi::try_extract_multi_single_pass(
             input,
-            slots,
-            display_paths,
+            regions,
+            outputs,
             set_bounds,
             write.compression,
             write.direct_reads,
@@ -687,29 +667,21 @@ fn extract_multi_inner(
         crate::debug::emit_counter("multi_extract_sequential_fallback", 1);
     }
 
-    // Sequential fallback: one extract at a time.
-    let mut all_stats = Vec::with_capacity(slots.len());
-    for (i, slot) in slots.iter().enumerate() {
-        let display_path = display_paths.map_or(&slot.output, |paths| &paths[i]);
+    // Sequential fallback: one extract at a time, each into its borrowed
+    // member. Nothing is published until every region has succeeded.
+    let mut all_stats = Vec::with_capacity(regions.len());
+    for (i, (region, output)) in regions.iter().zip(outputs.iter()).enumerate() {
         crate::host::diag!(
             host.diagnostics,
             Progress,
             "extract.multi.slot",
             "[{}/{}] Extracting to {}",
             i + 1,
-            slots.len(),
-            display_path.display()
+            regions.len(),
+            output.destination().display()
         );
-        let stats = extract(
-            input,
-            &slot.output,
-            &slot.region,
-            strategy,
-            set_bounds,
-            clean,
-            write,
-            overrides,
-            host,
+        let stats = extract_to(
+            input, output, region, strategy, set_bounds, clean, write, overrides, host,
         )?;
         all_stats.push(stats);
     }
@@ -789,10 +761,30 @@ impl ExtractStats {
 
 /// Extract elements within `region` from `input` and write to `output`.
 #[allow(clippy::too_many_arguments)]
-#[hotpath::measure]
 pub fn extract(
     input: &Path,
-    output: &Path,
+    output: crate::output::Output,
+    region: &Region,
+    strategy: ExtractStrategy,
+    set_bounds: bool,
+    clean: &CleanAttrs,
+    write: &WriteOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<ExtractStats> {
+    let result = extract_to(
+        input, &output, region, strategy, set_bounds, clean, write, overrides, host,
+    )?;
+    output.publish()?;
+    Ok(result)
+}
+
+/// [`extract`] writing to a borrowed output it does not publish.
+#[allow(clippy::too_many_arguments)]
+#[hotpath::measure]
+pub(crate) fn extract_to(
+    input: &Path,
+    output: &crate::output::Output,
     region: &Region,
     strategy: ExtractStrategy,
     set_bounds: bool,

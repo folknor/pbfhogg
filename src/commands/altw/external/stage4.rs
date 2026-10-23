@@ -110,7 +110,7 @@ pub(super) fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Ve
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn stage4_assembly(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     blob_meta: &[BlobMeta],
     coord_payloads_reader: &super::coord_payloads::ConcurrentBlobLocationRouter,
     per_way_rcs: &super::coord_payloads::PerWayRcs,
@@ -819,8 +819,10 @@ pub(super) fn stage4_assembly(
     writer.flush()?;
     #[allow(clippy::cast_possible_truncation)]
     let s4_flush_ms: u64 = t_flush.elapsed().as_millis() as u64;
-    let s4_output_bytes = std::fs::metadata(output)
-        .map_err(|e| Error::from(e).context(format!("stat output {}", output.display())))?
+    let s4_output_bytes = std::fs::metadata(output.path())
+        .map_err(|e| {
+            Error::from(e).context(format!("stat output {}", output.destination().display()))
+        })?
         .len();
 
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]

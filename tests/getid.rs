@@ -174,7 +174,7 @@ fn getid_reports_found_ids_without_rereading_output() {
     let id_set = parse_ids(&ids(&["n1"])).expect("parse ids");
     let stats = getid(
         &input,
-        &output,
+        crate::common::out_replace(&output),
         &id_set,
         &default_opts(),
         &forced_write_options(),
@@ -196,7 +196,7 @@ fn getid_reports_found_ids_without_rereading_output() {
     };
     let stats = getid(
         &input,
-        &output,
+        crate::common::out_replace(&output),
         &id_set,
         &opts,
         &forced_write_options(),
@@ -258,7 +258,7 @@ fn getid_found_ids_exclude_referenced_pull_ins() {
     };
     let stats = getid(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &opts,
         &forced_write_options(),
@@ -319,7 +319,7 @@ fn getid_nodes() {
     let id_set = parse_ids(&ids(&["n1", "n3"])).expect("parse ids");
     let stats = getid(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &default_opts(),
         &forced_write_options(),
@@ -382,7 +382,7 @@ fn getid_mixed_types() {
     let id_set = parse_ids(&ids(&["n2", "w10", "r100"])).expect("parse ids");
     let stats = getid(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &default_opts(),
         &forced_write_options(),
@@ -451,7 +451,7 @@ fn getid_add_referenced() {
     let id_set = parse_ids(&ids(&["w10"])).expect("parse ids");
     let stats = getid(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &default_opts(),
         &forced_write_options(),
@@ -469,7 +469,7 @@ fn getid_add_referenced() {
     let output2 = dir.path().join("output2.osm.pbf");
     let stats = getid(
         &input,
-        &output2,
+        crate::common::out(&output2),
         &id_set,
         &add_ref_opts(),
         &forced_write_options(),
@@ -522,7 +522,7 @@ fn removeid_nodes() {
     let id_set = parse_ids(&ids(&["n2"])).expect("parse ids");
     let stats = removeid(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
@@ -592,7 +592,7 @@ fn removeid_mixed_types() {
     let id_set = parse_ids(&ids(&["n1", "w11", "r100"])).expect("parse ids");
     let stats = removeid(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),
@@ -631,7 +631,7 @@ fn getid_empty_result() {
     let id_set = parse_ids(&ids(&["n999"])).expect("parse ids");
     let stats = getid(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &default_opts(),
         &forced_write_options(),
@@ -676,7 +676,7 @@ fn getid_preserves_tags() {
     let id_set = parse_ids(&ids(&["n1"])).expect("parse ids");
     getid(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &default_opts(),
         &forced_write_options(),
@@ -727,7 +727,7 @@ fn getid_normalizes_dense_node_version_minus_one_to_absent_metadata() {
     let id_set = parse_ids(&ids(&["n1"])).expect("parse ids");
     getid(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &default_opts(),
         &forced_write_options(),
@@ -780,7 +780,7 @@ fn getid_normalizes_dense_node_changeset_minus_one_to_zero() {
     let id_set = parse_ids(&ids(&["n1"])).expect("parse ids");
     getid(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &default_opts(),
         &forced_write_options(),
@@ -847,7 +847,7 @@ fn getid_normalizes_way_version_minus_one_to_absent_metadata() {
     let id_set = parse_ids(&ids(&["w10"])).expect("parse ids");
     getid(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &default_opts(),
         &forced_write_options(),
@@ -914,7 +914,7 @@ fn getid_normalizes_way_changeset_minus_one_to_zero() {
     let id_set = parse_ids(&ids(&["w10"])).expect("parse ids");
     getid(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &default_opts(),
         &forced_write_options(),
@@ -984,7 +984,7 @@ fn getid_from_id_file() {
     let id_set = pbfhogg::getid::parse_ids_from_file(&id_file).expect("parse file");
     let stats = getid(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &default_opts(),
         &forced_write_options(),
@@ -1051,7 +1051,7 @@ fn getid_add_referenced_plus_direct_node() {
     let id_set = parse_ids(&ids(&["n1", "w10"])).expect("parse ids");
     let stats = getid(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &add_ref_opts(),
         &forced_write_options(),
@@ -1118,7 +1118,7 @@ fn getid_remove_tags_strips_referenced_nodes() {
     };
     let stats = getid(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &opts,
         &forced_write_options(),
@@ -1196,7 +1196,7 @@ fn removeid_multi_blob_passthrough() {
     .expect("parse ids");
     let stats = removeid(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &forced_write_options(),
         &pbfhogg::HeaderOverrides::default(),

@@ -191,6 +191,25 @@ bb.add_node(1, 556_761_000, 125_683_000, [("name", "Copenhagen")], Some(&meta));
 
 `PbfWriter` handles blob framing, compression, and file output. It has pipelined constructors (`to_path`, `to_path_direct`, `to_path_uring`) and synchronous ones (`to_path_sync`, `new`).
 
+The `to_path*` constructors write the path they are given, in place. To get the guarantees the commands give their outputs - an existing file refused unless replacing it was asked for, a symlink refused, nothing under the final name until the write has succeeded - write through a `pbfhogg::Output`:
+
+```rust
+use pbfhogg::{Output, Overwrite};
+
+let output = Output::new("output.osm.pbf", Overwrite::Refuse)?; // checks, stages
+let mut writer = PbfWriter::to_path(
+    output.path(),            // the staging file beside output.osm.pbf
+    Compression::default(),
+    &header_bytes,
+    Executor::Ambient,
+)?;
+// ... write blocks ...
+writer.flush()?;
+output.publish()?;            // renamed into place only now
+```
+
+Dropping the `Output` without publishing removes the staging file. The command entry points (`sort::sort`, `cat::cat`, ...) take an `Output` by value and publish it themselves.
+
 ### to_path - pipelined parallel compression
 
 The production write path. Compresses blobs in parallel using rayon, with a dedicated writer thread that reorders results back into sequence order.

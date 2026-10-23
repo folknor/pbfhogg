@@ -37,6 +37,22 @@ mod scratch;
 #[allow(unused_imports)]
 pub use scratch::test_scratch;
 
+/// A fresh output at `path` for a library command: refused if anything is
+/// already there, so a test that writes one path twice says so with
+/// [`out_replace`].
+#[track_caller]
+pub fn out(path: impl AsRef<Path>) -> pbfhogg::Output {
+    pbfhogg::Output::new(path.as_ref(), pbfhogg::Overwrite::Refuse)
+        .unwrap_or_else(|e| panic!("stage output {}: {}", path.as_ref().display(), e.report()))
+}
+
+/// An output at `path` that replaces whatever file is already there.
+#[track_caller]
+pub fn out_replace(path: impl AsRef<Path>) -> pbfhogg::Output {
+    pbfhogg::Output::new(path.as_ref(), pbfhogg::Overwrite::Replace)
+        .unwrap_or_else(|e| panic!("stage output {}: {}", path.as_ref().display(), e.report()))
+}
+
 /// Report a test that cannot run on this host and returns early.
 pub fn skip(reason: impl std::fmt::Display) {
     eprintln!("Skipping: {reason}");
@@ -1573,6 +1589,14 @@ pub(crate) fn fixed_resources() -> pbfhogg::host::Fixed {
     }
 }
 
+/// A run scratch directory inside `dir`, for the library entry points that
+/// take one by value.
+#[track_caller]
+pub(crate) fn scratch_in(dir: impl AsRef<Path>) -> pbfhogg::scratch::RunScratch {
+    pbfhogg::scratch::RunScratch::create(dir.as_ref(), &test_host())
+        .unwrap_or_else(|e| panic!("scratch in {}: {e}", dir.as_ref().display()))
+}
+
 pub(crate) fn test_host() -> pbfhogg::host::Host {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
@@ -1584,6 +1608,5 @@ pub(crate) fn test_host() -> pbfhogg::host::Host {
         resources: std::sync::Arc::new(fixed_resources()),
         page_cache: pbfhogg::host::PageCachePolicy::Keep,
         executor: pbfhogg::host::Executor::Ambient,
-        scratch_parent: None,
     }
 }

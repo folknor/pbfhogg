@@ -74,7 +74,7 @@ fn merge_disjoint_node_files() {
     let inputs: Vec<&std::path::Path> = vec![a.as_path(), b.as_path()];
     let stats = merge_pbf(
         &inputs,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -158,7 +158,7 @@ fn merge_overlapping_nodes_dedup() {
     let inputs: Vec<&std::path::Path> = vec![a.as_path(), b.as_path()];
     let stats = merge_pbf(
         &inputs,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -239,7 +239,7 @@ fn merge_with_ways_and_relations() {
     let inputs: Vec<&std::path::Path> = vec![a.as_path(), b.as_path()];
     let stats = merge_pbf(
         &inputs,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -287,7 +287,7 @@ fn merge_single_file() {
     let inputs: Vec<&std::path::Path> = vec![a.as_path()];
     let stats = merge_pbf(
         &inputs,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -349,7 +349,7 @@ fn merge_three_files() {
     let inputs: Vec<&std::path::Path> = vec![a.as_path(), b.as_path(), c_file.as_path()];
     let stats = merge_pbf(
         &inputs,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -376,7 +376,7 @@ fn merge_empty_files() {
     let inputs: Vec<&std::path::Path> = vec![a.as_path(), b.as_path()];
     let stats = merge_pbf(
         &inputs,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -533,7 +533,7 @@ fn merge_same_input_preserves_ways_and_relations() {
     let inputs: Vec<&std::path::Path> = vec![a.as_path(), a.as_path()];
     let stats = merge_pbf(
         &inputs,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -650,7 +650,7 @@ fn merge_three_files_overlapping_ids() {
     let inputs: Vec<&std::path::Path> = vec![a.as_path(), b.as_path(), c_file.as_path()];
     let stats = merge_pbf(
         &inputs,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -734,7 +734,7 @@ fn merge_rejects_a_corrupt_frame_prefix_without_allocating() {
         let inputs: Vec<&std::path::Path> = vec![a.as_path()];
         let err = merge_pbf(
             &inputs,
-            &output,
+            crate::common::out(&output),
             &default_opts(),
             &pbfhogg::HeaderOverrides::default(),
             &crate::common::test_host(),

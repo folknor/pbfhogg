@@ -397,11 +397,26 @@ impl DegradeStats {
 ///
 /// `force` skips the indexdata precondition required by the decode path's
 /// per-kind classify pipeline. Has no effect on the passthrough path.
-#[allow(clippy::too_many_lines)]
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn degrade(
     input: &Path,
-    output: &Path,
+    output: crate::output::Output,
+    flags: DegradeFlags,
+    block_cap: usize,
+    write: &WriteOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<DegradeStats> {
+    let result = degrade_to(input, &output, flags, block_cap, write, overrides, host)?;
+    output.publish()?;
+    Ok(result)
+}
+
+/// [`degrade`] writing to a borrowed output it does not publish.
+#[allow(clippy::too_many_lines)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn degrade_to(
+    input: &Path,
+    output: &crate::output::Output,
     flags: DegradeFlags,
     block_cap: usize,
     write: &WriteOptions,
@@ -605,7 +620,7 @@ fn passthrough_header_bytes(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn degrade_passthrough(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     flags: DegradeFlags,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -836,7 +851,7 @@ impl UnsortKindState {
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn degrade_decode_path(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     flags: DegradeFlags,
     block_cap: usize,
     write: &WriteOptions,

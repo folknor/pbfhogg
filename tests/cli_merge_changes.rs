@@ -59,7 +59,9 @@ fn run_merge_changes(inputs: &[&Path], output: &Path, simplify: bool) -> String 
     for input in inputs {
         cli = cli.arg(*input);
     }
-    cli = cli.arg("-o").arg(output);
+    // Tests here run several merges into one output path; the replacement
+    // is not what they test.
+    cli = cli.arg("-o").arg(output).arg("--overwrite");
     if simplify {
         cli = cli.arg("--simplify");
     }
@@ -390,7 +392,7 @@ fn merge_changes_failure(inputs: &[&Path], output: &Path, extra: &[&str]) -> Str
     for input in inputs {
         cli = cli.arg(*input);
     }
-    cli = cli.arg("-o").arg(output);
+    cli = cli.arg("-o").arg(output).arg("--overwrite");
     for a in extra {
         cli = cli.arg(*a);
     }
@@ -685,6 +687,7 @@ fn simplify_admits_equal_versions_from_overlapping_diffs() {
         .arg(&stale)
         .arg("-o")
         .arg(&out)
+        .arg("--overwrite")
         .arg("--simplify")
         .arg("--allow-version-regression")
         .assert_success();

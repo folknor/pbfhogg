@@ -151,11 +151,24 @@ impl HasId for OwnedRelation {
 /// non-overlapping blobs; overlapping blobs are decoded, merged, and deduped
 /// via a streaming sweep. A blob that overlaps no other is never decoded, so
 /// duplicates inside it survive.
-#[allow(clippy::too_many_lines)]
-#[hotpath::measure]
 pub fn merge_pbf(
     inputs: &[&Path],
-    output: &Path,
+    output: crate::output::Output,
+    opts: &WriteOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<MergePbfStats> {
+    let result = merge_pbf_to(inputs, &output, opts, overrides, host)?;
+    output.publish()?;
+    Ok(result)
+}
+
+/// [`merge_pbf`] writing to a borrowed output it does not publish.
+#[allow(clippy::too_many_lines)]
+#[hotpath::measure]
+pub(crate) fn merge_pbf_to(
+    inputs: &[&Path],
+    output: &crate::output::Output,
     opts: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,

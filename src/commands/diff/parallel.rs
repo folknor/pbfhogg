@@ -15,7 +15,7 @@
 
 use std::io::{self, BufWriter, Write};
 use std::os::unix::fs::FileExt as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::ElementKind;
@@ -59,7 +59,7 @@ struct ShardOutput {
     /// Path to the per-shard scratch temp file holding this shard's
     /// formatted diff text. The driver streams it in shard order to the
     /// caller's output and then removes it.
-    text_path: PathBuf,
+    text_path: crate::scratch::ScratchPath,
     /// Per-shard stats, aggregated into the caller's `DiffStats`.
     stats: DiffStats,
 }
@@ -114,8 +114,7 @@ fn run_shard(
     new_source: &Arc<Path>,
     kind: ElementKind,
     options: &DiffOptions,
-    scratch_dir: &Path,
-    scratch_suffix: &str,
+    scratch: &crate::scratch::RunScratch,
 ) -> Result<ShardOutput> {
     // Test-only: arm via `test_hooks::PANIC_AT_SHARD_IDX`. Simulates a
     // mid-phase shard crash. The caller's `scope.spawn(...).join()`
@@ -131,7 +130,7 @@ fn run_shard(
     }
 
     let type_char = kind.type_char();
-    let text_path = shard_text_path(scratch_dir, scratch_suffix, kind, shard_idx);
+    let text_path = shard_text_path(scratch, kind, shard_idx)?;
     let file = crate::scratch::create_file(&text_path)?;
     let mut out = BufWriter::new(file);
 
@@ -411,20 +410,14 @@ fn element_merge(
     Ok((old_consumed, new_consumed))
 }
 
-/// A shard's scratch text file. `suffix` is the run token's
-/// ([`crate::scratch::RunToken::suffix`]), so two runs in one process name and
-/// clean up disjoint files.
+/// A shard's scratch text file.
 fn shard_text_path(
-    scratch_dir: &Path,
-    suffix: &str,
+    scratch: &crate::scratch::RunScratch,
     kind: ElementKind,
     shard_idx: usize,
-) -> PathBuf {
+) -> Result<crate::scratch::ScratchPath> {
     let kind_tag = kind.type_char();
-    let pid = std::process::id();
-    scratch_dir.join(format!(
-        "diff-par-{pid}{suffix}-{kind_tag}-{shard_idx}.txt.tmp"
-    ))
+    scratch.file(&format!("diff-par-{kind_tag}-{shard_idx}.txt.tmp"))
 }
 
 fn emit_element(
@@ -484,7 +477,7 @@ pub(crate) fn diff_block_pair_parallel(
     filter: &TypeFilter,
     shard_count: usize,
     host: &crate::host::Host,
-    token: &crate::scratch::RunToken,
+    scratch: &crate::scratch::RunScratch,
 ) -> Result<Option<DiffStats>> {
     // DIFF_SCAN_START/END and diff_common/created/modified/deleted counters
     // are emitted by the calling `diff()` function in `mod.rs`; do not
@@ -500,10 +493,8 @@ pub(crate) fn diff_block_pair_parallel(
         return Ok(None);
     };
 
-    // Scratch temp files live alongside the old input unless the host names
-    // a scratch parent (the old input's parent is assumed to be on a
-    // writable, fast filesystem; this is the same assumption the `--format
-    // osc` sibling driver makes for its shard fragments).
+    // Scratch temp files live in the run's scratch directory, which the caller
+    // placed (the CLI's --tmp-dir, else beside the output).
     // No input-size-based free-space refusal: compressed PBF sizes and index
     // counts do not bound changed text bytes (identical inputs emit none).
     // Exact sizing would repeat the measured comparison/serialization pass.
@@ -511,10 +502,6 @@ pub(crate) fn diff_block_pair_parallel(
     // the caller's arbitrary Write destination may share this filesystem or
     // consume no disk at all, so twice the input size is not a space budget.
     // Keep write errors authoritative rather than rejecting on that guess.
-    let scratch_dir = host.scratch_parent_or(old_path.parent().unwrap_or(Path::new(".")));
-    let suffix = token.suffix();
-    let suffix = suffix.as_str();
-
     let mut total = DiffStats::default();
 
     struct PhaseSlot<'a> {
@@ -578,18 +565,8 @@ pub(crate) fn diff_block_pair_parallel(
                 let new_source = &new.path;
                 let h = s.spawn(move || {
                     run_shard(
-                        shard,
-                        shard_idx,
-                        old_descs,
-                        new_descs,
-                        &old_file,
-                        &new_file,
-                        old_source,
-                        new_source,
-                        kind,
-                        options,
-                        scratch_dir,
-                        suffix,
+                        shard, shard_idx, old_descs, new_descs, &old_file, &new_file, old_source,
+                        new_source, kind, options, scratch,
                     )
                 });
                 handles.push(h);
@@ -601,14 +578,8 @@ pub(crate) fn diff_block_pair_parallel(
             }
         });
 
-        // Partition shard outputs into (successful, first error). If any
-        // shard errored or panicked, clean up every possible per-shard
-        // temp file - including ones that completed successfully as well
-        // as any that a panicked worker left behind - before returning.
-        // Without this pass, `scratch_dir` accumulates
-        // `diff-par-{pid}{suffix}-*` files on every failed run. The names
-        // are recomputed from the same token, so a concurrent run in this
-        // process keeps its own files.
+        // Partition shard outputs into (successful, first error). On an
+        // error every shard file is left for the run directory's guard.
         let mut outputs: Vec<ShardOutput> = Vec::with_capacity(shard_outputs.len());
         let mut first_err: Option<crate::error::Error> = None;
         for slot in shard_outputs {
@@ -622,25 +593,12 @@ pub(crate) fn diff_block_pair_parallel(
             }
         }
         if let Some(e) = first_err {
-            for out in &outputs {
-                drop(std::fs::remove_file(&out.text_path));
-            }
-            // Also sweep any files a panicked shard created before crashing;
-            // the `ShardOutput` for such shards is absent from `outputs`.
-            for shard_idx in 0..shards.len() {
-                drop(std::fs::remove_file(shard_text_path(
-                    scratch_dir,
-                    suffix,
-                    kind,
-                    shard_idx,
-                )));
-            }
             return Err(e);
         }
 
         // All successful: emit shard outputs in shard order, streaming each
         // per-shard temp file to the caller's output and removing it.
-        emit_shard_outputs(output, outputs, &mut total)?;
+        emit_shard_outputs(output, outputs, &mut total, scratch)?;
 
         crate::debug::emit_marker(&end_marker);
     }
@@ -660,14 +618,15 @@ fn emit_shard_outputs(
     output: &mut impl Write,
     outputs: Vec<ShardOutput>,
     total: &mut DiffStats,
+    scratch: &crate::scratch::RunScratch,
 ) -> Result<()> {
     let mut first_err = None;
     for shard_out in outputs {
         if first_err.is_some() {
-            drop(std::fs::remove_file(&shard_out.text_path));
+            scratch.remove(&shard_out.text_path);
             continue;
         }
-        if let Err(e) = append_and_cleanup(output, &shard_out.text_path) {
+        if let Err(e) = append_and_cleanup(output, &shard_out.text_path, scratch) {
             first_err = Some(e);
             continue;
         }
@@ -685,9 +644,13 @@ fn emit_shard_outputs(
 /// Copy a shard's scratch temp file to the caller's output writer and then
 /// remove it - also when the copy fails, so a failed write does not leave
 /// the temp file behind. Mirrors `derive_parallel::append_and_cleanup`.
-fn append_and_cleanup(out: &mut impl Write, src: &Path) -> Result<()> {
+fn append_and_cleanup(
+    out: &mut impl Write,
+    src: &crate::scratch::ScratchPath,
+    scratch: &crate::scratch::RunScratch,
+) -> Result<()> {
     let copied = std::fs::File::open(src).and_then(|mut f| io::copy(&mut f, out));
-    drop(std::fs::remove_file(src));
+    scratch.remove(src);
     match copied {
         Ok(_) => Ok(()),
         Err(e) => Err(e.into()),

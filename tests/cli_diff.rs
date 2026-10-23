@@ -77,7 +77,10 @@ fn run_diff(old: &Path, new: &Path, opts: DiffOpts) -> (String, DiffStats) {
         .arg(old)
         .arg(new)
         .arg("-o")
-        .arg(&out_path);
+        .arg(&out_path)
+        // Paired runs (indexed and fallback) share this name and read the
+        // output straight back, so the second replaces the first.
+        .arg("--overwrite");
     if opts.suppress_common {
         cli = cli.arg("-c");
     }

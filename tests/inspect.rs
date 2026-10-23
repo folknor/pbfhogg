@@ -127,7 +127,7 @@ fn inspect_distrust_metadata_measures_instead_of_quoting_the_index() {
 
     pbfhogg::degrade::degrade(
         &honest,
-        &lying,
+        crate::common::out(&lying),
         pbfhogg::degrade::DegradeFlags {
             corrupt_indexdata: true,
             ..Default::default()

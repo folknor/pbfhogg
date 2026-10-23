@@ -131,7 +131,7 @@ mod apply_changes {
             merge(
                 &base,
                 &osc,
-                &output,
+                common::out(&output),
                 &opts,
                 &pbfhogg::HeaderOverrides::default(),
                 &crate::common::test_host(),
@@ -148,25 +148,14 @@ mod apply_changes {
             "merge must preserve the worker panic payload, got: {err}"
         );
 
-        // Scratch tracking: the only new path relative to `before` is the
-        // output file (possibly created). Remove it from the after-set
-        // before comparing.
-        let mut after = common::snapshot_dir(dir.path());
-        after.remove(std::path::Path::new("output.osm.pbf"));
+        // A forced mid-run failure leaves nothing behind: no output file
+        // under the name the caller chose, no staging file beside it, no
+        // scratch.
+        let after = common::snapshot_dir(dir.path());
         common::assert_scratch_unchanged(&before, &after);
-
-        // Output file: if it exists at all, must be short enough to be
-        // unmistakably incomplete. A full output would be at least the
-        // size of the input base; an abandoned stream is either absent
-        // or smaller.
-        if output.exists() {
-            let out_len = std::fs::metadata(&output).expect("stat output").len();
-            let base_len = std::fs::metadata(&base).expect("stat base").len();
-            assert!(
-                out_len < base_len,
-                "output ({out_len} bytes) must be truncated relative to base ({base_len} bytes) \
-                 when a worker panics mid-stream"
-            );
-        }
+        assert!(
+            !output.exists(),
+            "a worker panic mid-stream must leave no output file at the destination"
+        );
     }
 }

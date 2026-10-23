@@ -332,18 +332,31 @@ impl Stats {
 ///
 /// If `keep_untagged_nodes` is false, nodes with zero tags are omitted from
 /// the output (their coordinates are still used for ways).
-#[hotpath::measure]
-#[allow(clippy::too_many_lines)]
 pub fn add_locations_to_ways(
     input: &Path,
-    output: &Path,
+    output: crate::output::Output,
     options: &AltwOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
+    scratch: crate::scratch::RunScratch,
 ) -> Result<Stats> {
-    // One scratch token per run, whichever backend ends up placing scratch.
-    let token = crate::scratch::RunToken::next()?;
+    let result = add_locations_to_ways_to(input, &output, options, overrides, host, &scratch)?;
+    drop(scratch);
+    output.publish()?;
+    Ok(result)
+}
 
+/// [`add_locations_to_ways`] writing to a borrowed output it does not publish.
+#[hotpath::measure]
+#[allow(clippy::too_many_lines)]
+pub(crate) fn add_locations_to_ways_to(
+    input: &Path,
+    output: &crate::output::Output,
+    options: &AltwOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+    scratch: &crate::scratch::RunScratch,
+) -> Result<Stats> {
     // Auto-select: sparse unless the input qualifies for external AND the
     // estimated store exceeds the page-cache budget (see IndexType::Auto).
     let backend = match options.index_type {
@@ -354,19 +367,17 @@ pub fn add_locations_to_ways(
 
     // External join has its own pipeline - dispatch early.
     if backend == ResolvedBackend::External {
-        let dest = DestinationGuard::new(output)?;
         let stats = external::external_join_in(
             input,
-            dest.path(),
+            output,
             options.keep_untagged_nodes,
             &options.write,
             overrides,
             options.inject_prepass,
             host,
-            &token,
+            scratch,
         )?;
         enforce_missing_locations_policy(&stats, options.ignore_missing_nodes)?;
-        dest.commit()?;
         return Ok(stats);
     }
 
@@ -399,9 +410,6 @@ pub fn add_locations_to_ways(
         }
     }
 
-    let dest = DestinationGuard::new(output)?;
-    let scratch_dir = host.scratch_parent_or(output.parent().unwrap_or(Path::new(".")));
-
     // Pass 0: collect the set of node IDs referenced by ways. Only these
     // nodes need coordinate lookups, so only these get indexed. The store
     // therefore follows the referenced-node working set rather than every
@@ -426,14 +434,8 @@ pub fn add_locations_to_ways(
     }
 
     crate::debug::emit_marker("ALTW_PASS1_START");
-    let index = build_node_index_sparse(
-        input,
-        options.write.direct_reads,
-        scratch_dir,
-        referenced,
-        host,
-        &token,
-    )?;
+    let index =
+        build_node_index_sparse(input, options.write.direct_reads, scratch, referenced, host)?;
     #[cfg(test)]
     let index = NodeIndex::Sparse(index);
     crate::debug::emit_marker("ALTW_PASS1_END");
@@ -464,7 +466,7 @@ pub fn add_locations_to_ways(
     let inject_metrics = inject_metrics::InjectMetrics::default();
     let stats = write_output_checked(
         input,
-        dest.path(),
+        output,
         &index,
         options.keep_untagged_nodes,
         relation_scan.0.as_ref(),
@@ -487,75 +489,7 @@ pub fn add_locations_to_ways(
         inject_metrics.emit(member_ways);
     }
     enforce_missing_locations_policy(&stats, options.ignore_missing_nodes)?;
-    dest.commit()?;
     Ok(stats)
-}
-
-/// Failure hygiene for the library entry point, on the merge-changes
-/// precedent.
-///
-/// The write and the missing-locations gate are necessarily separate steps:
-/// the external backend only learns its resolved count when its final stage
-/// completes, so the gate has to run after a complete output exists. That
-/// leaves a window in which a run that is about to fail has already written
-/// a well-formed PBF full of fabricated `(0, 0)` vertices. Under the CLI
-/// this is already harmless - `guarded_output` hands this function a fresh
-/// scratch sibling and never renames it into place on a failing exit - but a
-/// library caller has no such front end, and would be left holding a
-/// plausible-looking file at the path it named.
-///
-/// So the guard is chosen from what is at the destination, which also keeps
-/// it from duplicating the CLI's work rather than double-guarding:
-///
-///   - destination absent (every CLI call, since the scratch path is fresh):
-///     a plain `PathGuard` deletes the file this call created if the call
-///     fails. No second scratch, no second rename.
-///   - destination present (a library caller overwriting a real file): route
-///     the writes through an `OutputFile` scratch sibling, so the existing
-///     file is untouched until success.
-struct DestinationGuard {
-    scratch: Option<crate::path_guard::OutputFile>,
-    created: Option<crate::path_guard::PathGuard>,
-    final_path: std::path::PathBuf,
-}
-
-impl DestinationGuard {
-    fn new(output: &Path) -> Result<Self> {
-        let existing = output.exists();
-        Ok(Self {
-            scratch: if existing {
-                Some(crate::path_guard::OutputFile::new(output)?)
-            } else {
-                None
-            },
-            created: if existing {
-                None
-            } else {
-                Some(crate::path_guard::PathGuard::file(output.to_path_buf()))
-            },
-            final_path: output.to_path_buf(),
-        })
-    }
-
-    /// The path the backends must write to. Not necessarily the destination
-    /// the caller named.
-    fn path(&self) -> &Path {
-        self.scratch
-            .as_ref()
-            .map_or(self.final_path.as_path(), |s| s.path())
-    }
-
-    /// Publish the output. Until this call the destination either does not
-    /// exist or still holds its previous contents.
-    fn commit(self) -> Result<()> {
-        if let Some(scratch) = self.scratch {
-            scratch.commit()?;
-        }
-        if let Some(created) = self.created {
-            drop(created.commit());
-        }
-        Ok(())
-    }
 }
 
 /// Refuse an output that carries placeholder vertices, unless the caller
@@ -572,15 +506,12 @@ impl DestinationGuard {
 /// external backend only learns its resolved count when its final stage
 /// completes; a single post-pass gate is the one place that provably covers
 /// all three backends. The output written in the meantime is never published:
-/// [`DestinationGuard`] holds it at a scratch path and drops it when this
-/// gate refuses, so no caller is left holding a file of fabricated
-/// coordinates.
+/// it sits at the [`Output`](crate::output::Output)'s staging path, and
+/// [`add_locations_to_ways`] publishes only after this gate passes, so no
+/// caller is left holding a file of fabricated coordinates.
 ///
-/// The message deliberately does not name the output path. Under the CLI the
-/// path this function knows is `guarded_output`'s scratch sibling, not the
-/// `-o` the user typed, so quoting it would have shown the operator a
-/// dot-prefixed temp name they never chose - and there is no output to point
-/// at in any case, since nothing is published.
+/// The message deliberately does not name the output path: nothing is
+/// published, so there is no output to point at.
 fn enforce_missing_locations_policy(stats: &Stats, ignore_missing_nodes: bool) -> Result<()> {
     if stats.missing_locations == 0 || ignore_missing_nodes {
         return Ok(());
@@ -1080,7 +1011,7 @@ pub(crate) fn collect_relation_member_ids(
 #[allow(clippy::too_many_arguments)]
 fn write_output_checked(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,
@@ -1135,7 +1066,7 @@ fn write_output_checked(
 #[allow(clippy::too_many_arguments)]
 fn write_output_decode_all(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSet>,

@@ -1088,8 +1088,11 @@ fn multi_extract_refuses_when_a_destination_cannot_be_published() {
         .arg("--simple")
         .arg("--set-bounds")
         .arg("--force")
+        .arg("--overwrite")
         .assert_failure();
-    result.assert_stderr_contains("existing directory");
+    // Refused before any extraction, even with overwrite permission: a
+    // directory is never replaced by a file output.
+    result.assert_stderr_contains("is not a regular file");
     assert_eq!(
         std::fs::read(&out_a).expect("read first destination"),
         b"placeholder",

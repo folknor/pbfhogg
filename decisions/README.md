@@ -13,7 +13,7 @@ context in which the decision was made.
 Add one when any of the following holds:
 
 - The decision establishes a project-wide convention (e.g. "all commands
-  with file output must route the output path through `path_guard`").
+  with file output must route the output through `pbfhogg::output`").
 - The decision is a policy call with multiple defensible alternatives and
   the rationale is non-obvious from the code.
 - The decision changes or cements how pbfhogg diverges from a reference
@@ -114,9 +114,9 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
   getid, `debug_assert` in diff / derive shard planners, silent
   inheritance through `IdSet` for tags-filter / altw-external.
 - [ADR-0003](0003-error-path-hygiene-via-pathguard.md) - Error path
-  hygiene via shared RAII primitives - `PathGuard` for run-owned paths,
-  `OutputFile` for user-named outputs, guarded at the CLI front end rather
-  than in the library - plus a counters-after-write rule.
+  hygiene: `PathGuard` for run-owned paths, plus a counters-after-write
+  rule. Its caller-named-output rules are superseded by ADR-0017 and its
+  scratch-directory and sweep rules by ADR-0018.
 - [ADR-0004](0004-defensive-input-errors-and-fixtures.md) -
   Defensive handling of adversarial or malformed input: promote
   indexdata/varint/sortedness-trust sites to hard errors at
@@ -167,3 +167,13 @@ transient process note retired at the 0.3.0 release (commit `30ca861`);
 0008 was never assigned to a landed decision.
 
 - [0016: The library does not own the process](0016-the-library-does-not-own-the-process.md)
+- [ADR-0017](0017-outputs-are-published-by-the-library.md) - Every output
+  is a `pbfhogg::output` value: refused before any work if it exists
+  without overwrite permission or is a symlink, written to a staging
+  sibling, and published (exclusively under `Refuse`, with group rollback)
+  by the library entry point that owns it.
+- [ADR-0018](0018-scratch-is-one-run-directory-and-leftovers-are-reported.md) -
+  Scratch is one exclusively created, flock-guarded per-run directory owned
+  by the entry point; `--tmp-dir` chooses where; leftovers of crashed runs
+  are returned as typed values and reported, never reaped, and backups are
+  never touched.

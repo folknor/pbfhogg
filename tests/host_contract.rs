@@ -40,7 +40,7 @@ fn process_actions_fire_once_at_each_hook_site() {
     };
     pbfhogg::cat::cat(
         &[&base],
-        &dir.path().join("clean.pbf"),
+        crate::common::out(dir.path().join("clean.pbf")),
         None,
         &clean,
         &Default::default(),
@@ -55,12 +55,13 @@ fn process_actions_fire_once_at_each_hook_site() {
     actions.alloc.store(0, Relaxed);
     pbfhogg::altw::external::external_join(
         &base,
-        &dir.path().join("external.pbf"),
+        crate::common::out(dir.path().join("external.pbf")),
         true,
         &Default::default(),
         &overrides,
         false,
         &host,
+        crate::common::scratch_in(dir.path()),
     )
     .expect("external");
     assert_eq!(
@@ -70,7 +71,7 @@ fn process_actions_fire_once_at_each_hook_site() {
     actions.fd.store(0, Relaxed);
     pbfhogg::cat::cat(
         &[&base],
-        &dir.path().join("cat.pbf"),
+        crate::common::out(dir.path().join("cat.pbf")),
         None,
         &Default::default(),
         &Default::default(),
@@ -102,7 +103,7 @@ fn resources_provider_is_consulted() {
     host.resources = Arc::clone(&resources) as Arc<dyn Resources>;
     pbfhogg::repack::repack(
         &base,
-        &dir.path().join("repack.pbf"),
+        crate::common::out(dir.path().join("repack.pbf")),
         8000,
         &Default::default(),
         &Default::default(),
@@ -143,7 +144,7 @@ fn diagnostics_are_per_run() {
                 let mut host = crate::common::test_host();
                 pbfhogg::cat::cat(
                     &[&raw],
-                    &indexed,
+                    crate::common::out(&indexed),
                     None,
                     &Default::default(),
                     &Default::default(),
@@ -157,7 +158,7 @@ fn diagnostics_are_per_run() {
                 );
                 pbfhogg::sort::sort(
                     &indexed,
-                    &dir.path().join("sorted.pbf"),
+                    crate::common::out(dir.path().join("sorted.pbf")),
                     &Default::default(),
                     &Default::default(),
                     &host,
@@ -368,15 +369,17 @@ fn run_external_join(
     input: &std::path::Path,
     output: &std::path::Path,
     host: &pbfhogg::host::Host,
+    scratch: pbfhogg::scratch::RunScratch,
 ) -> Result<(), String> {
     pbfhogg::altw::external::external_join(
         input,
-        output,
+        crate::common::out(output),
         true,
         &Default::default(),
         &Default::default(),
         false,
         host,
+        scratch,
     )
     .map(drop)
     .map_err(|e| e.to_string())
@@ -387,7 +390,13 @@ fn concurrent_external_joins_use_distinct_scratch() {
     let base = input(dir.path());
     let host = crate::common::test_host();
     let reference = dir.path().join("reference.pbf");
-    run_external_join(&base, &reference, &host).expect("sequential external join");
+    run_external_join(
+        &base,
+        &reference,
+        &host,
+        crate::common::scratch_in(dir.path()),
+    )
+    .expect("sequential external join");
     // Both outputs share one parent, so both runs place their scratch
     // directory beside each other under the same pid.
     let outputs = [dir.path().join("a.pbf"), dir.path().join("b.pbf")];
@@ -404,7 +413,11 @@ fn concurrent_external_joins_use_distinct_scratch() {
     std::thread::scope(|scope| {
         let handles: Vec<_> = outputs
             .iter()
-            .map(|output| scope.spawn(|| run_external_join(&base, output, &host)))
+            .map(|output| {
+                scope.spawn(|| {
+                    run_external_join(&base, output, &host, crate::common::scratch_in(dir.path()))
+                })
+            })
             .collect();
         for handle in handles {
             handle
@@ -422,16 +435,14 @@ fn concurrent_external_joins_use_distinct_scratch() {
     }
 }
 #[test]
-fn scratch_parent_override_is_honoured() {
+fn a_missing_scratch_parent_is_refused_before_anything_is_created() {
     let dir = tempfile::tempdir().expect("directory");
-    let base = input(dir.path());
     let missing = dir.path().join("missing");
-    let mut host = crate::common::test_host();
-    host.scratch_parent = Some(missing.clone());
-    let err = run_external_join(&base, &dir.path().join("out.pbf"), &host)
-        .expect_err("a missing scratch parent must fail the run");
+    let host = crate::common::test_host();
+    let err = pbfhogg::scratch::RunScratch::create(&missing, &host)
+        .expect_err("a missing scratch parent must fail");
     assert!(
-        err.contains(&missing.display().to_string()),
+        err.to_string().contains(&missing.display().to_string()),
         "the error must name the scratch parent, got: {err}"
     );
     assert!(!missing.exists(), "the scratch parent must not be created");
@@ -462,10 +473,11 @@ fn fixed_memory_routes_auto() {
         };
         pbfhogg::altw::add_locations_to_ways(
             &base,
-            &dir.path().join(format!("auto-{backend}.pbf")),
+            crate::common::out(dir.path().join(format!("auto-{backend}.pbf"))),
             &opts,
             &Default::default(),
             &host,
+            crate::common::scratch_in(dir.path()),
         )
         .expect("auto");
         let prefix = format!("auto-selected --index-type {backend} (store estimate");
@@ -480,39 +492,74 @@ fn fixed_memory_routes_auto() {
     }
 }
 
-/// The override must reach every scratch-producing backend, including both
-/// derive paths and text diff's shards, rather than only external altw.
+/// Every scratch-producing backend works in the run directory it is handed
+/// and leaves its parent exactly as it found it.
 #[test]
-fn scratch_parent_override_reaches_sparse_diff_and_derive() {
+fn scratch_backends_use_the_given_directory_and_leave_nothing() {
     let dir = tempfile::tempdir().expect("directory");
     let scratch = dir.path().join("scratch");
-    let missing = dir.path().join("missing");
     std::fs::create_dir(&scratch).expect("scratch directory");
     let base = input(dir.path());
     let changed = dir.path().join("changed.osm.pbf");
     crate::common::write_changed_pbf(&changed);
     for (command, jobs) in [("sparse", 1), ("text", 2), ("osc", 1), ("osc", 2)] {
         let output = dir.path().join(format!("{command}-{jobs}.out"));
-        let mut host = crate::common::test_host();
-        for parent in [&missing, &scratch] {
-            host.scratch_parent = Some(parent.clone());
-            let result = run_scratch_backend(command, jobs, &base, &changed, &output, &host);
-            if parent == &missing {
-                let err = result.expect_err("the scratch parent must exist");
-                assert!(
-                    err.contains(&missing.display().to_string()),
-                    "{command}: {err}"
-                );
-                assert!(!missing.exists());
-            } else {
-                result.expect("valid scratch override");
-                assert_eq!(
-                    std::fs::read_dir(&scratch).expect("scratch").count(),
-                    0,
-                    "{command} must remove its scratch fragments"
-                );
-            }
-        }
+        let host = crate::common::test_host();
+        run_scratch_backend(
+            command,
+            jobs,
+            &base,
+            &changed,
+            &output,
+            &host,
+            crate::common::scratch_in(&scratch),
+        )
+        .expect("valid scratch");
+        assert_eq!(
+            std::fs::read_dir(&scratch).expect("scratch").count(),
+            0,
+            "{command} must remove its scratch directory"
+        );
+    }
+}
+
+/// The backends write their scratch into the run directory they are given
+/// and nowhere else. A run directory that cannot be written to makes each
+/// fail naming a path inside it, which a backend creating its files beside
+/// the input or output (as before) would not.
+#[test]
+fn scratch_backends_write_inside_the_run_directory() {
+    // Root ignores directory permissions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("directory");
+    let base = input(dir.path());
+    let changed = dir.path().join("changed.osm.pbf");
+    crate::common::write_changed_pbf(&changed);
+    for (command, jobs) in [("sparse", 1), ("text", 2), ("osc", 1), ("osc", 2)] {
+        let parent = dir.path().join(format!("parent-{command}-{jobs}"));
+        std::fs::create_dir(&parent).expect("parent");
+        let scratch = crate::common::scratch_in(&parent);
+        let run_dir = scratch.path().to_path_buf();
+        std::fs::set_permissions(
+            &run_dir,
+            std::os::unix::fs::PermissionsExt::from_mode(0o500),
+        )
+        .expect("lock the run directory");
+        let output = dir.path().join(format!("locked-{command}-{jobs}.out"));
+        let host = crate::common::test_host();
+        let result = run_scratch_backend(command, jobs, &base, &changed, &output, &host, scratch);
+        std::fs::set_permissions(
+            &run_dir,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("unlock");
+        let err = result.expect_err("a run directory that cannot be written must fail the run");
+        assert!(
+            err.contains(&run_dir.display().to_string()),
+            "{command} jobs {jobs}: {err}"
+        );
     }
 }
 
@@ -523,6 +570,7 @@ fn run_scratch_backend(
     changed: &std::path::Path,
     output: &std::path::Path,
     host: &pbfhogg::host::Host,
+    scratch: pbfhogg::scratch::RunScratch,
 ) -> Result<(), String> {
     match command {
         "text" => {
@@ -533,12 +581,28 @@ fn run_scratch_backend(
                 type_filter: None,
                 jobs,
             };
-            pbfhogg::diff::diff(base, changed, &mut Vec::new(), &options, false, host)
-                .map(drop)
-                .map_err(|e| e.to_string())
+            pbfhogg::diff::diff(
+                base,
+                changed,
+                &mut Vec::new(),
+                &options,
+                false,
+                host,
+                scratch,
+            )
+            .map(drop)
+            .map_err(|e| e.to_string())
         }
         "osc" => pbfhogg::diff::derive::derive_changes(
-            base, changed, output, false, false, None, jobs, host,
+            base,
+            changed,
+            crate::common::out(output),
+            false,
+            false,
+            None,
+            jobs,
+            host,
+            scratch,
         )
         .map(drop)
         .map_err(|e| e.to_string()),
@@ -550,9 +614,16 @@ fn run_scratch_backend(
                 inject_prepass: false,
                 ignore_missing_nodes: false,
             };
-            pbfhogg::altw::add_locations_to_ways(base, output, &options, &Default::default(), host)
-                .map(drop)
-                .map_err(|e| e.to_string())
+            pbfhogg::altw::add_locations_to_ways(
+                base,
+                crate::common::out(output),
+                &options,
+                &Default::default(),
+                host,
+                scratch,
+            )
+            .map(drop)
+            .map_err(|e| e.to_string())
         }
         _ => unreachable!("test backend"),
     }

@@ -27,7 +27,6 @@ use std::io::Write as _;
 use std::sync::Arc;
 
 use super::super::Result;
-use super::radix::ScratchDir;
 #[cfg(feature = "linux-direct-io")]
 use super::radix::advise_dontneed_file;
 use super::{
@@ -36,6 +35,7 @@ use super::{
 };
 use crate::error::Error;
 use crate::scan::node::{NodeTuple, extract_node_tuples};
+use crate::scratch::RunScratch;
 use crate::tunables::{
     ALTW_STAGE2_WORKERS_CAP, BUCKET_BUF_SIZE, DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN,
     DECODE_WORKERS_RESERVED, NUM_BUCKETS, STAGE2_FLUSH_THRESHOLD,
@@ -76,7 +76,7 @@ struct PreparedBucket {
 #[allow(clippy::cast_possible_truncation)]
 fn prepare_bucket(
     bucket_idx: usize,
-    scratch: &ScratchDir,
+    scratch: &RunScratch,
     num_shard_workers: usize,
     loader: &mut LoaderScratch,
 ) -> crate::Result<PreparedBucket> {
@@ -91,9 +91,7 @@ fn prepare_bucket(
     let mut fadvise_bytes: u64 = 0;
 
     for worker_id in 0..num_shard_workers {
-        let path = scratch
-            .path
-            .join(format!("id-W{worker_id}-{bucket_idx:03}"));
+        let path = super::radix::id_shard_path(scratch, worker_id, bucket_idx)?;
         let file = match std::fs::File::open(&path) {
             Ok(f) => {
                 open_calls += 1;
@@ -172,13 +170,13 @@ pub(super) struct SharedSlotBuckets {
 }
 
 impl SharedSlotBuckets {
-    pub(super) fn create(scratch: &ScratchDir, slot_bucket_count: usize) -> Result<Self> {
+    pub(super) fn create(scratch: &RunScratch, slot_bucket_count: usize) -> Result<Self> {
         let mut writers = Vec::with_capacity(slot_bucket_count);
         let mut entry_counts = Vec::with_capacity(slot_bucket_count);
 
         for i in 0..slot_bucket_count {
-            let path = scratch.bucket_path("slot", i);
-            let file = std::fs::File::create(&path).map_err(|e| {
+            let path = super::radix::slot_bucket_path(scratch, i)?;
+            let file = crate::scratch::create(&path).map_err(|e| {
                 Error::from(e).context(format!("failed to create slot bucket {}", path.display()))
             })?;
             writers.push(std::sync::Mutex::new(std::io::BufWriter::with_capacity(
@@ -224,7 +222,7 @@ impl SharedSlotBuckets {
 #[hotpath::measure]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn stage2_node_join(
-    scratch: &ScratchDir,
+    scratch: &RunScratch,
     id_bucket_counts: &[u64],
     num_shard_workers: usize,
     bucket_layout: &BucketLayout,

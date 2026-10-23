@@ -215,6 +215,9 @@ impl DiffMeta for OwnedRelation {
 /// Streams through both files in constant memory (~3 MB overhead per cursor)
 /// using pipelined block iterators. Requires both inputs to declare
 /// `Sort.Type_then_ID` - returns an actionable error if either is unsorted.
+///
+/// `scratch` is the run's scratch directory, used by the parallel path for
+/// its shard files and removed when the call returns.
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub fn diff(
@@ -224,8 +227,8 @@ pub fn diff(
     options: &DiffOptions,
     direct_io: bool,
     host: &crate::host::Host,
+    scratch: crate::scratch::RunScratch,
 ) -> Result<DiffStats> {
-    let token = crate::scratch::RunToken::next()?;
     let filter = TypeFilter::or_all(options.type_filter);
 
     // Single-pass: check sorted headers + indexdata from one file open each.
@@ -277,7 +280,7 @@ pub fn diff(
             &filter,
             options.jobs,
             host,
-            &token,
+            &scratch,
         )?
     } else {
         None
@@ -303,6 +306,7 @@ pub fn diff(
         crate::debug::emit_counter("diff_deleted", stats.deleted as i64);
     }
 
+    drop(scratch);
     Ok(stats)
 }
 

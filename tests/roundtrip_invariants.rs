@@ -76,7 +76,7 @@ fn sort_idempotence() {
     let opts = forced(Compression::default());
     pbfhogg::commands::sort::sort(
         &input,
-        &once,
+        crate::common::out(&once),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -84,7 +84,7 @@ fn sort_idempotence() {
     .expect("sort once");
     pbfhogg::commands::sort::sort(
         &once,
-        &twice,
+        crate::common::out(&twice),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -117,7 +117,7 @@ fn extract_simple_idempotence() {
     let extract = |input: &Path, output: &Path| {
         pbfhogg::commands::extract::extract(
             input,
-            output,
+            crate::common::out(output),
             &region,
             pbfhogg::commands::extract::ExtractStrategy::Simple,
             true,
@@ -197,13 +197,14 @@ fn derive_then_apply_roundtrip() {
     let stats = pbfhogg::diff::derive::derive_changes(
         &base,
         &modified,
-        &osc,
+        crate::common::out(&osc),
         false,
         true, // increment_version
         // Delete timestamp: any fixed instant stands in for "now" here.
         Some(1_700_000_000),
         1,
         &crate::common::test_host(),
+        crate::common::scratch_in(dir.path()),
     )
     .expect("derive_changes");
     assert!(
@@ -224,7 +225,7 @@ fn derive_then_apply_roundtrip() {
     pbfhogg::apply_changes::merge(
         &base,
         &osc,
-        &reconstructed,
+        crate::common::out(&reconstructed),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -327,12 +328,13 @@ fn derive_then_apply_preserves_metadata() {
     let stats = pbfhogg::diff::derive::derive_changes(
         &base,
         &modified,
-        &osc,
+        crate::common::out(&osc),
         false,
         false, // increment_version: keep raw metadata
         None,  // delete timestamp: keep raw metadata
         1,
         &crate::common::test_host(),
+        crate::common::scratch_in(dir.path()),
     )
     .expect("derive_changes");
     assert!(
@@ -352,7 +354,7 @@ fn derive_then_apply_preserves_metadata() {
     pbfhogg::apply_changes::merge(
         &base,
         &osc,
-        &reconstructed,
+        crate::common::out(&reconstructed),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -408,7 +410,7 @@ fn tags_filter_idempotence() {
 
     pbfhogg::tags_filter::tags_filter(
         &input,
-        &once,
+        crate::common::out(&once),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -416,7 +418,7 @@ fn tags_filter_idempotence() {
     .expect("tags_filter once");
     pbfhogg::tags_filter::tags_filter(
         &once,
-        &twice,
+        crate::common::out(&twice),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -501,7 +503,7 @@ fn tags_filter_blob_layout_independence() {
     };
     pbfhogg::tags_filter::tags_filter(
         &b1,
-        &out_1,
+        crate::common::out(&out_1),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -509,7 +511,7 @@ fn tags_filter_blob_layout_independence() {
     .expect("tags_filter bs=1");
     pbfhogg::tags_filter::tags_filter(
         &b5,
-        &out_5,
+        crate::common::out(&out_5),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -517,7 +519,7 @@ fn tags_filter_blob_layout_independence() {
     .expect("tags_filter bs=5");
     pbfhogg::tags_filter::tags_filter(
         &b100,
-        &out_100,
+        crate::common::out(&out_100),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -561,6 +563,7 @@ fn diff_blob_layout_independence() {
             &opts,
             false,
             &crate::common::test_host(),
+            crate::common::scratch_in(dir.path()),
         )
         .expect("diff")
     };
@@ -634,7 +637,7 @@ fn sort_compression_level_parity() {
         let opts = forced(*compression);
         pbfhogg::commands::sort::sort(
             &input,
-            path,
+            crate::common::out(path),
             &opts,
             &pbfhogg::HeaderOverrides::default(),
             &crate::common::test_host(),
@@ -680,7 +683,7 @@ fn tags_filter_compression_level_parity() {
         };
         pbfhogg::tags_filter::tags_filter(
             &input,
-            path,
+            crate::common::out(path),
             &opts,
             &pbfhogg::HeaderOverrides::default(),
             &crate::common::test_host(),
@@ -711,7 +714,7 @@ fn none_compression_reads_back_identical() {
         let opts = forced(compression);
         pbfhogg::commands::sort::sort(
             &input,
-            output,
+            crate::common::out(output),
             &opts,
             &pbfhogg::HeaderOverrides::default(),
             &crate::common::test_host(),

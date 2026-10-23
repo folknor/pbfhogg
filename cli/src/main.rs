@@ -1,8 +1,13 @@
+// Every file the CLI writes is a `pbfhogg::Output`: checked, staged and
+// published by the library. clippy.toml lists the path-writing methods this
+// refuses.
+#![deny(clippy::disallowed_methods)]
+
 mod exit_code;
 mod host;
 mod output;
 
-use exit_code::{Hinted, error_report, is_platform_unsupported};
+use exit_code::{Hinted, error_report, is_platform_unsupported, output_hint};
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -109,6 +114,43 @@ struct OutputArg {
     /// Output file
     #[arg(short, long)]
     output: PathBuf,
+    #[command(flatten)]
+    overwrite: OverwriteArg,
+}
+
+impl OutputArg {
+    /// The output, checked against the output rules and staged, before any
+    /// work is done.
+    fn open(&self) -> Result<pbfhogg::Output, Box<dyn std::error::Error>> {
+        Ok(pbfhogg::Output::new(&self.output, self.overwrite.intent())?)
+    }
+}
+
+/// Where a command that needs scratch space puts it.
+#[derive(Args)]
+struct TmpDirArg {
+    /// Directory for this run's scratch files, which can be large (add-locations-to-ways
+    /// needs up to hundreds of GB with `--index-type external`; parallel diff writes a copy of
+    /// the changed text). The directory must exist and be writable; it is checked before any
+    /// work starts. Each run makes one hidden `.pbfhogg-run-*` directory in it and removes it
+    /// at the end. Default: the output's directory, or the current directory when there is
+    /// no output file. Output staging files stay beside the output regardless.
+    #[arg(long = "tmp-dir", value_name = "DIR")]
+    tmp_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct OverwriteArg {
+    /// Replace an output that already exists. Without it an existing output
+    /// is refused before any work is done. A symlink is refused either way.
+    #[arg(short = 'O', long)]
+    overwrite: bool,
+}
+
+impl OverwriteArg {
+    const fn intent(&self) -> pbfhogg::Overwrite {
+        pbfhogg::Overwrite::from_flag(self.overwrite)
+    }
 }
 
 /// Every free-form flag is parsed exactly once, here at the argument
@@ -579,6 +621,8 @@ enum Command {
         /// Output file. Omit to write to stdout.
         #[arg(short, long)]
         output: Option<PathBuf>,
+        #[command(flatten)]
+        overwrite: OverwriteArg,
         /// Output format: geojsonseq or geojson.
         #[arg(long = "format", default_value = "geojsonseq")]
         format: ExportFormatArg,
@@ -629,6 +673,8 @@ enum Command {
         /// Write diff output to file instead of stdout
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
+        #[command(flatten)]
+        overwrite: OverwriteArg,
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type", value_parser = parse_type_filter)]
         type_filter: Option<TypeFilter>,
@@ -662,6 +708,8 @@ enum Command {
         /// Set delete timestamp to current time (--format osc only)
         #[arg(long)]
         update_timestamp: bool,
+        #[command(flatten)]
+        tmp: TmpDirArg,
         #[command(flatten)]
         io: DirectIoArg,
     },
@@ -767,6 +815,11 @@ enum Command {
         /// Output file (required for single extract, omit with --config)
         #[arg(short, long, required_unless_present = "config")]
         output: Option<PathBuf>,
+        /// Replace outputs that already exist, including every output a
+        /// --config names. Without it any existing output is refused before
+        /// any work is done. A symlink is refused either way.
+        #[arg(short = 'O', long)]
+        overwrite: bool,
         /// Bounding box: minlon,minlat,maxlon,maxlat
         #[arg(
             short = 'b',
@@ -848,6 +901,8 @@ enum Command {
         force: ForceArg,
         #[command(flatten)]
         header: HeaderOverrideArg,
+        #[command(flatten)]
+        tmp: TmpDirArg,
     },
     /// Filter history PBF to a snapshot at a timestamp
     TimeFilter {
@@ -1129,8 +1184,10 @@ enum Command {
         coarse_search_radius: f32,
         #[command(flatten)]
         io: DirectIoArg,
-        /// Replace an existing index in --output-dir after the new build succeeds.
-        #[arg(long)]
+        /// Replace an existing index (or empty directory) at --output-dir
+        /// after the new build succeeds. Without it an existing --output-dir
+        /// is refused before any work is done.
+        #[arg(short = 'O', long)]
         overwrite: bool,
         /// Accept input without blob-level indexdata (slower fallback path).
         #[arg(long)]
@@ -1138,6 +1195,8 @@ enum Command {
         /// Legacy shorthand for both --overwrite and --allow-unindexed.
         #[arg(long)]
         force: bool,
+        #[command(flatten)]
+        tmp: TmpDirArg,
     },
 }
 
@@ -1334,6 +1393,7 @@ fn main() -> process::ExitCode {
     let mut outcome = Outcome::Positive;
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         validate_input_output_aliases(&cli.command)?;
+        report_leftovers(&cli.command, &host);
         match cli.command {
             Command::Cat {
                 files,
@@ -1361,24 +1421,20 @@ fn main() -> process::ExitCode {
                     if !clean.is_empty() {
                         return Err("--clean is not valid with --dedupe".into());
                     }
-                    guarded_output(&output.output, |out| {
-                        run_merge_pbf(&files, out, &write, &overrides, &host)
-                    })
+                    run_merge_pbf(&files, output.open()?, &write, &overrides, &host)
                 } else {
                     if uring.io_uring {
                         return Err("--io-uring is only valid with --dedupe".into());
                     }
-                    guarded_output(&output.output, |out| {
-                        run_cat(
-                            &files,
-                            out,
-                            type_filter,
-                            &clean_attrs(&clean),
-                            &write,
-                            &overrides,
-                            &host,
-                        )
-                    })
+                    run_cat(
+                        &files,
+                        output.open()?,
+                        type_filter,
+                        &clean_attrs(&clean),
+                        &write,
+                        &overrides,
+                        &host,
+                    )
                 }
             }
             Command::Sort {
@@ -1397,9 +1453,7 @@ fn main() -> process::ExitCode {
                     direct_reads: io.direct_io,
                     force: force.force,
                 };
-                guarded_output(&output.output, |out| {
-                    run_sort(&file, out, &write, &overrides, &host)
-                })
+                run_sort(&file, output.open()?, &write, &overrides, &host)
             }
             Command::Repack {
                 file,
@@ -1418,9 +1472,14 @@ fn main() -> process::ExitCode {
                     direct_reads: io.direct_io,
                     force: force.force,
                 };
-                guarded_output(&output.output, |out| {
-                    run_repack(&file, out, elements_per_blob, &write, &overrides, &host)
-                })
+                run_repack(
+                    &file,
+                    output.open()?,
+                    elements_per_blob,
+                    &write,
+                    &overrides,
+                    &host,
+                )
             }
             Command::Degrade {
                 file,
@@ -1467,9 +1526,15 @@ fn main() -> process::ExitCode {
                         .map(pbfhogg::degrade::DropSpec::parse)
                         .transpose()?,
                 };
-                guarded_output(&output.output, |out| {
-                    run_degrade(&file, out, flags, block_cap, &write, &overrides, &host)
-                })
+                run_degrade(
+                    &file,
+                    output.open()?,
+                    flags,
+                    block_cap,
+                    &write,
+                    &overrides,
+                    &host,
+                )
             }
             Command::Renumber {
                 file,
@@ -1486,9 +1551,7 @@ fn main() -> process::ExitCode {
                     direct_reads: io.direct_io,
                     force: false,
                 };
-                guarded_output(&output.output, |out| {
-                    run_renumber(&file, out, &start_id, &write, &overrides, &host)
-                })
+                run_renumber(&file, output.open()?, &start_id, &write, &overrides, &host)
             }
             Command::TagsFilter {
                 file,
@@ -1530,9 +1593,7 @@ fn main() -> process::ExitCode {
                     if jobs != 0 {
                         return Err("-j/--jobs is not valid in OSC mode (OSC parse is single-threaded)".into());
                     }
-                    guarded_output(&output.output, |out| {
-                        run_tags_filter_osc(&file, out, expressions_file.as_deref(), &expressions, &host)
-                    })
+                    run_tags_filter_osc(&file, output.open()?, expressions_file.as_deref(), &expressions, &host)
                 }
                 InputKind::Pbf if omit_referenced && jobs != 0 => {
                     Err("-j/--jobs has no effect with -R/--omit-referenced (single-pass mode uses the pipelined reader, not the parallel classify path). Drop -R or drop -j.".into())
@@ -1552,24 +1613,23 @@ fn main() -> process::ExitCode {
                         remove_tags,
                         distrust_metadata: distrust.distrust_metadata,
                     };
-                    guarded_output(&output.output, |out| {
-                        run_tags_filter(
-                            &file,
-                            out,
-                            expressions_file.as_deref(),
-                            &expressions,
-                            flags,
-                            &write,
-                            jobs,
-                            &overrides,
-                         &host)
-                    })
+                    run_tags_filter(
+                        &file,
+                        output.open()?,
+                        expressions_file.as_deref(),
+                        &expressions,
+                        flags,
+                        &write,
+                        jobs,
+                        &overrides,
+                     &host)
                 }
             }
             }
             Command::Export {
                 file,
                 output,
+                overwrite,
                 format,
                 type_filter,
                 expressions_file,
@@ -1579,7 +1639,10 @@ fn main() -> process::ExitCode {
                 metadata,
             } => run_export(
                 &file,
-                output.as_deref(),
+                output
+                    .as_deref()
+                    .map(|path| pbfhogg::Output::new(path, overwrite.intent()))
+                    .transpose()?,
                 format,
                 type_filter,
                 expressions_file.as_deref(),
@@ -1597,11 +1660,13 @@ fn main() -> process::ExitCode {
                 osmium_summary,
                 quiet,
                 output,
+                overwrite,
                 type_filter,
                 jobs,
                 format,
                 increment_version,
                 update_timestamp,
+                tmp,
                 io,
             } => match format {
                 DiffFormat::Osc => {
@@ -1626,18 +1691,18 @@ fn main() -> process::ExitCode {
                     if type_filter.is_some() {
                         return Err("--type is not valid with --format osc".into());
                     }
-                    guarded_output(&output, |out| {
-                        run_derive_changes(
-                            &old,
-                            &new,
-                            out,
-                            io.direct_io,
-                            increment_version,
-                            update_timestamp,
-                            jobs,
-                            &host,
-                        )
-                    })
+                    let scratch = run_scratch(&tmp, Some(&output), &host)?;
+                    run_derive_changes(
+                        &old,
+                        &new,
+                        pbfhogg::Output::new(&output, overwrite.intent())?,
+                        io.direct_io,
+                        increment_version,
+                        update_timestamp,
+                        jobs,
+                        &host,
+                        scratch,
+                    )
                 }
                 DiffFormat::Text => {
                     if increment_version {
@@ -1646,38 +1711,31 @@ fn main() -> process::ExitCode {
                     if update_timestamp {
                         return Err("--update-timestamp is only valid with --format osc".into());
                     }
+                    // A quiet diff writes no output file, whatever -o says.
+                    let scratch = run_scratch(&tmp, output.as_deref().filter(|_| !quiet), &host)?;
                     let flags = DiffFlags {
                         suppress_common,
                         verbose,
                         osmium_summary,
                         quiet,
                     };
+                    let output = output
+                        .as_deref()
+                        .map(|path| pbfhogg::Output::new(path, overwrite.intent()))
+                        .transpose()?;
                     accept_outcome(
                         &mut outcome,
-                        match output.as_deref() {
-                            Some(path) => guarded_output(path, |out| {
-                                run_diff(
-                                    &old,
-                                    &new,
-                                    flags,
-                                    Some(out),
-                                    type_filter,
-                                    jobs,
-                                    io.direct_io,
-                                    &host,
-                                )
-                            }),
-                            None => run_diff(
-                                &old,
-                                &new,
-                                flags,
-                                None,
-                                type_filter,
-                                jobs,
-                                io.direct_io,
-                                &host,
-                            ),
-                        },
+                        run_diff(
+                            &old,
+                            &new,
+                            flags,
+                            output,
+                            type_filter,
+                            jobs,
+                            io.direct_io,
+                            &host,
+                            scratch,
+                        ),
                     )
                 }
             },
@@ -1712,39 +1770,35 @@ fn main() -> process::ExitCode {
                     force: force.force,
                 };
                 if invert {
-                    guarded_output(&output.output, |out| {
-                        run_removeid(
-                            &file,
-                            out,
-                            id_file.as_deref(),
-                            id_osm_file.as_deref(),
-                            default_type,
-                            &ids,
-                            &write,
-                            &overrides,
-                            &host,
-                        )
-                    })
+                    run_removeid(
+                        &file,
+                        output.open()?,
+                        id_file.as_deref(),
+                        id_osm_file.as_deref(),
+                        default_type,
+                        &ids,
+                        &write,
+                        &overrides,
+                        &host,
+                    )
                 } else {
                     let flags = GetidFlags {
                         add_referenced,
                         remove_tags,
                         verbose_ids,
                     };
-                    guarded_output(&output.output, |out| {
-                        run_getid(
-                            &file,
-                            out,
-                            flags,
-                            id_file.as_deref(),
-                            id_osm_file.as_deref(),
-                            default_type,
-                            &ids,
-                            &write,
-                            &overrides,
-                            &host,
-                        )
-                    })
+                    run_getid(
+                        &file,
+                        output.open()?,
+                        flags,
+                        id_file.as_deref(),
+                        id_osm_file.as_deref(),
+                        default_type,
+                        &ids,
+                        &write,
+                        &overrides,
+                        &host,
+                    )
                 }
             }
             Command::Getparents {
@@ -1767,25 +1821,24 @@ fn main() -> process::ExitCode {
                     direct_reads: io.direct_io,
                     force: false,
                 };
-                guarded_output(&output.output, |out| {
-                    run_getparents(
-                        &file,
-                        out,
-                        add_self,
-                        id_file.as_deref(),
-                        id_osm_file.as_deref(),
-                        default_type,
-                        &ids,
-                        &write,
-                        &overrides,
-                        full_scan_min_blobs,
-                        &host,
-                    )
-                })
+                run_getparents(
+                    &file,
+                    output.open()?,
+                    add_self,
+                    id_file.as_deref(),
+                    id_osm_file.as_deref(),
+                    default_type,
+                    &ids,
+                    &write,
+                    &overrides,
+                    full_scan_min_blobs,
+                    &host,
+                )
             }
             Command::Extract {
                 file,
                 output,
+                overwrite,
                 bbox,
                 polygon,
                 config,
@@ -1806,11 +1859,13 @@ fn main() -> process::ExitCode {
                     direct_reads: io.direct_io,
                     force: force.force,
                 };
+                let overwrite = pbfhogg::Overwrite::from_flag(overwrite);
                 if let Some(config_path) = config.as_deref() {
                     run_extract_config(
                         &file,
                         config_path,
                         directory.as_deref(),
+                        overwrite,
                         extract_strategy(simple, smart),
                         set_bounds,
                         &clean_attrs(&clean),
@@ -1819,20 +1874,18 @@ fn main() -> process::ExitCode {
                         &host,
                     )
                 } else if let Some(output) = output.as_ref() {
-                    guarded_output(output, |out| {
-                        run_extract(
-                            &file,
-                            out,
-                            bbox.as_deref(),
-                            polygon.as_deref(),
-                            extract_strategy(simple, smart),
-                            set_bounds,
-                            &clean_attrs(&clean),
-                            &write,
-                            &overrides,
-                            &host,
-                        )
-                    })
+                    run_extract(
+                        &file,
+                        pbfhogg::Output::new(output, overwrite)?,
+                        bbox.as_deref(),
+                        polygon.as_deref(),
+                        extract_strategy(simple, smart),
+                        set_bounds,
+                        &clean_attrs(&clean),
+                        &write,
+                        &overrides,
+                        &host,
+                    )
                 } else {
                     Err("--output is required without --config".into())
                 }
@@ -1848,7 +1901,9 @@ fn main() -> process::ExitCode {
                 force,
                 io,
                 header,
+                tmp,
             } => {
+                let scratch = run_scratch(&tmp, Some(&output.output), &host)?;
                 let index_type = index_type.resolve()?;
                 let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
                 let write = WriteOptions {
@@ -1864,9 +1919,14 @@ fn main() -> process::ExitCode {
                     inject_prepass,
                     ignore_missing_nodes,
                 };
-                guarded_output(&output.output, |out| {
-                    run_add_locations_to_ways(&file, out, &options, &overrides, &host)
-                })
+                run_add_locations_to_ways(
+                    &file,
+                    output.open()?,
+                    &options,
+                    &overrides,
+                    &host,
+                    scratch,
+                )
             }
             Command::TimeFilter {
                 file,
@@ -1883,9 +1943,7 @@ fn main() -> process::ExitCode {
                     direct_reads: io.direct_io,
                     force: false,
                 };
-                guarded_output(&output.output, |out| {
-                    run_time_filter(&file, out, &timestamp, &write, &overrides, &host)
-                })
+                run_time_filter(&file, output.open()?, &timestamp, &write, &overrides, &host)
             }
             Command::Inspect {
                 subcommand,
@@ -1993,9 +2051,7 @@ fn main() -> process::ExitCode {
                     #[cfg(feature = "test-hooks")]
                     panic_at_blob_seq: None,
                 };
-                guarded_output(&output.output, |out| {
-                    run_apply_changes(&base, &changes, out, &opts, &overrides, &host)
-                })
+                run_apply_changes(&base, &changes, output.open()?, &opts, &overrides, &host)
             }
             Command::MergeChanges {
                 changes,
@@ -2003,16 +2059,14 @@ fn main() -> process::ExitCode {
                 simplify,
                 allow_version_regression,
                 jobs,
-            } => guarded_output(&output.output, |out| {
-                run_merge_changes(
-                    &changes,
-                    out,
-                    simplify,
-                    jobs,
-                    allow_version_regression,
-                    &host,
-                )
-            }),
+            } => run_merge_changes(
+                &changes,
+                output.open()?,
+                simplify,
+                jobs,
+                allow_version_regression,
+                &host,
+            ),
             Command::Check {
                 file,
                 ids,
@@ -2059,6 +2113,7 @@ fn main() -> process::ExitCode {
                 overwrite,
                 allow_unindexed,
                 force,
+                tmp,
             } => run_build_geocode_index(
                 &file,
                 &output_dir,
@@ -2073,6 +2128,7 @@ fn main() -> process::ExitCode {
                 io.direct_io,
                 overwrite || force,
                 allow_unindexed || force,
+                &tmp,
                 &host,
             ),
             Command::BenchRead { file, mode } => run_bench_read(&file, mode, &host),
@@ -2087,9 +2143,7 @@ fn main() -> process::ExitCode {
                 output,
                 compression,
                 io_mode,
-            } => guarded_output(&output.output, |path| {
-                run_bench_merge(&base, &changes, path, compression, io_mode, &host)
-            }),
+            } => run_bench_merge(&base, &changes, output.open()?, compression, io_mode, &host),
         }
     })();
 
@@ -2115,7 +2169,11 @@ fn main() -> process::ExitCode {
                 // rather than on the shape of `e`.
                 process::ExitCode::SUCCESS
             } else {
-                output::cli_eprintln!("Error: {}", error_report(e.as_ref()));
+                output::cli_eprintln!(
+                    "Error: {}{}",
+                    error_report(e.as_ref()),
+                    output_hint(e.as_ref()).unwrap_or_default()
+                );
                 let status = if is_platform_unsupported(e.as_ref()) {
                     ExitStatus::PlatformUnsupported
                 } else {
@@ -2129,6 +2187,7 @@ fn main() -> process::ExitCode {
     // returned `ExitCode` is converted to the process exit status.
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_build_geocode_index(
     file: &std::path::Path,
     output_dir: &std::path::Path,
@@ -2136,18 +2195,23 @@ fn run_build_geocode_index(
     direct_io: bool,
     overwrite: bool,
     allow_unindexed: bool,
+    tmp: &TmpDirArg,
     host: &pbfhogg::host::Host,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // The caller has already expanded the legacy `--force` into both
+    // permissions. Refusals happen here, before any work.
+    let output = pbfhogg::geocode_index::builder::index_output(
+        output_dir,
+        pbfhogg::Overwrite::from_flag(overwrite),
+    )?;
+    // After the output, so an existing index directory is judged before the
+    // run's scratch directory could be made inside it.
+    let scratch = run_scratch(tmp, Some(output_dir), host)?;
     // Exhaustive on purpose: a new `BuildConfig` field must be wired here
     // rather than silently taking its default. The clap defaults already
     // come from `BuildConfig::default()`.
     let config = GeocodeBuildConfig {
         input_path: file.to_path_buf(),
-        output_dir: output_dir.to_path_buf(),
-        // The caller has already expanded the legacy `--force` into both
-        // permissions below.
-        force: false,
-        overwrite,
         allow_unindexed,
         direct_io,
         street_level: levels.street_level,
@@ -2158,7 +2222,7 @@ fn run_build_geocode_index(
         coarse_search_radius_m: levels.coarse_search_radius,
     };
     // The library reports the counts itself, ahead of its closing "Done" line.
-    pbfhogg::geocode_index::builder::build_geocode_index(&config, host)?;
+    pbfhogg::geocode_index::builder::build_geocode_index(&config, output, host, scratch)?;
     Ok(())
 }
 
@@ -2461,7 +2525,7 @@ fn run_tags_count(
 
 fn run_cat(
     files: &[PathBuf],
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     type_filter: Option<TypeFilter>,
     clean: &CleanAttrs,
     write: &WriteOptions,
@@ -2476,7 +2540,7 @@ fn run_cat(
 
 fn run_sort(
     file: &std::path::Path,
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
@@ -2488,7 +2552,7 @@ fn run_sort(
 
 fn run_repack(
     file: &std::path::Path,
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     elements_per_blob: usize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -2501,7 +2565,7 @@ fn run_repack(
 
 fn run_degrade(
     file: &std::path::Path,
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     flags: pbfhogg::degrade::DegradeFlags,
     block_cap: usize,
     write: &WriteOptions,
@@ -2515,7 +2579,7 @@ fn run_degrade(
 
 fn run_renumber(
     file: &std::path::Path,
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     start_id: &str,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -2568,7 +2632,7 @@ fn run_renumber(
 #[allow(clippy::too_many_arguments)]
 fn run_tags_filter(
     file: &std::path::Path,
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     expressions_file: Option<&std::path::Path>,
     expressions: &[String],
     flags: TagsFilterFlags,
@@ -2609,7 +2673,7 @@ fn run_tags_filter(
 
 fn run_tags_filter_osc(
     changes: &std::path::Path,
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     expressions_file: Option<&std::path::Path>,
     expressions: &[String],
     host: &pbfhogg::host::Host,
@@ -2666,24 +2730,6 @@ fn planned_path(path: &std::path::Path) -> std::io::Result<Option<PathBuf>> {
     Ok(path.file_name().map(|name| parent.join(name)))
 }
 
-/// Alias check between two *outputs*, where neither side is required to exist
-/// yet. Whenever at least one side is already present on disk this delegates to
-/// `paths_alias`, so symlink and hardlink identity is decided in exactly one
-/// place; only when both are still absent does it fall back to comparing the
-/// planned destinations.
-fn outputs_alias(a: &std::path::Path, b: &std::path::Path) -> std::io::Result<bool> {
-    if a.exists() {
-        return paths_alias(a, b);
-    }
-    if b.exists() {
-        return paths_alias(b, a);
-    }
-    match (planned_path(a)?, planned_path(b)?) {
-        (Some(a), Some(b)) => Ok(a == b),
-        _ => Ok(false),
-    }
-}
-
 fn reject_aliases(
     inputs: &[&std::path::Path],
     output: &std::path::Path,
@@ -2699,6 +2745,97 @@ fn reject_aliases(
         }
     }
     Ok(())
+}
+
+/// The run's scratch directory, made before any input is opened so that a
+/// missing or unwritable `--tmp-dir` fails first. `output` is the file the
+/// command writes, when it writes one: the default scratch location is its
+/// directory.
+fn run_scratch(
+    tmp: &TmpDirArg,
+    output: Option<&std::path::Path>,
+    host: &pbfhogg::host::Host,
+) -> Result<pbfhogg::scratch::RunScratch, Box<dyn std::error::Error>> {
+    if let Some(dir) = &tmp.tmp_dir {
+        return pbfhogg::scratch::RunScratch::create(dir, host)
+            .map_err(|e| format!("--tmp-dir {}: {}", dir.display(), error_report(&e)).into());
+    }
+    let parent = output
+        .and_then(std::path::Path::parent)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    Ok(pbfhogg::scratch::RunScratch::create(parent, host)?)
+}
+
+/// The directories a command's leftovers would be in: the directory of each
+/// output it writes (staging and backups sit beside it) and the scratch
+/// location.
+fn leftover_dirs(command: &Command) -> Vec<PathBuf> {
+    fn parent_of(path: &std::path::Path) -> PathBuf {
+        match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        }
+    }
+    let mut dirs = Vec::new();
+    match command {
+        Command::Cat { output, .. }
+        | Command::Sort { output, .. }
+        | Command::Repack { output, .. }
+        | Command::Degrade { output, .. }
+        | Command::Renumber { output, .. }
+        | Command::TagsFilter { output, .. }
+        | Command::Getid { output, .. }
+        | Command::Getparents { output, .. }
+        | Command::TimeFilter { output, .. }
+        | Command::ApplyChanges { output, .. }
+        | Command::MergeChanges { output, .. }
+        | Command::BenchMerge { output, .. } => dirs.push(parent_of(&output.output)),
+        Command::AddLocationsToWays { output, tmp, .. } => {
+            dirs.push(parent_of(&output.output));
+            dirs.extend(tmp.tmp_dir.clone());
+        }
+        Command::Export {
+            output: Some(output),
+            ..
+        }
+        | Command::Extract {
+            output: Some(output),
+            ..
+        } => dirs.push(parent_of(output)),
+        Command::Diff { output, tmp, .. } => {
+            dirs.extend(output.as_deref().map(parent_of));
+            dirs.extend(tmp.tmp_dir.clone());
+        }
+        Command::BuildGeocodeIndex {
+            output_dir, tmp, ..
+        } => {
+            dirs.push(parent_of(output_dir));
+            dirs.extend(tmp.tmp_dir.clone());
+        }
+        _ => {}
+    }
+    dirs
+}
+
+/// Report what earlier runs that never finished left behind, before this
+/// run reserves any output of its own. Nothing is removed.
+fn report_leftovers(command: &Command, host: &pbfhogg::host::Host) {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut seen = std::collections::HashSet::new();
+    for dir in leftover_dirs(command) {
+        // The same directory reached by two spellings is scanned once.
+        // A directory that does not exist has no leftovers; the command's own
+        // checks say what is wrong with it.
+        let Ok(meta) = std::fs::metadata(&dir) else {
+            continue;
+        };
+        if !seen.insert((meta.dev(), meta.ino())) {
+            continue;
+        }
+        let scan = pbfhogg::scratch::find_stale(&dir);
+        pbfhogg::scratch::report_stale(&host.diagnostics, &scan);
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2763,33 +2900,6 @@ fn validate_input_output_aliases(command: &Command) -> Result<(), Box<dyn std::e
     }
 }
 
-/// Run a command that writes one final output file through a scratch sibling,
-/// renamed into place after the command completes without an error. A
-/// negative semantic outcome is still a completed result, so its file commits.
-///
-/// Every user-named `--output` goes through here. Without it a mid-run
-/// failure leaves a truncated partial file under the name the user chose -
-/// and, worse, `File::create` truncates a pre-existing file of that name
-/// before the first byte of new output exists. The closure receives the
-/// scratch path, so the command never learns the destination at all.
-///
-/// The scratch file is a dot-prefixed sibling in the destination directory
-/// (so `commit`'s rename never crosses a filesystem), and keeps the
-/// destination's suffix so extension-sniffing writers behave identically.
-fn guarded_output<F, T>(output: &std::path::Path, run: F) -> Result<T, Box<dyn std::error::Error>>
-where
-    F: FnOnce(&std::path::Path) -> Result<T, Box<dyn std::error::Error>>,
-{
-    let out = pbfhogg::path_guard::OutputFile::new(output)?;
-    match run(out.path()) {
-        Ok(value) => {
-            out.commit()?;
-            Ok(value)
-        }
-        Err(e) => Err(e),
-    }
-}
-
 fn run_export_to<W: std::io::Write>(
     file: &std::path::Path,
     writer: W,
@@ -2818,7 +2928,7 @@ fn export_error(err: pbfhogg::Error) -> Box<dyn std::error::Error> {
 #[allow(clippy::too_many_arguments)]
 fn run_export(
     file: &std::path::Path,
-    output: Option<&std::path::Path>,
+    output: Option<pbfhogg::Output>,
     format: ExportFormatArg,
     type_filter: Option<ExportTypeArg>,
     expressions_file: Option<&std::path::Path>,
@@ -2847,20 +2957,16 @@ fn run_export(
     )?;
 
     if let Some(output) = output {
-        if paths_alias(file, output)? {
-            return Err(format!(
-                "export output '{}' aliases input '{}'",
-                output.display(),
-                file.display()
-            )
-            .into());
-        }
-        // Write through a scratch sibling: a mid-run failure must not
-        // truncate or delete a pre-existing file the user named as output.
-        let out = pbfhogg::path_guard::OutputFile::new(output)?;
-        let file_out = std::fs::File::create(out.path())?;
-        run_export_to(file, std::io::BufWriter::new(file_out), &options, host)?;
-        out.commit()?;
+        // The input/output alias refusal already ran in
+        // `validate_input_output_aliases`, against the destination.
+        let mut buf = std::io::BufWriter::new(output.create()?);
+        run_export_to(file, &mut buf, &options, host)?;
+        // Checked: dropping a `BufWriter` swallows its final write error,
+        // and the file must be complete and durable before it is published.
+        buf.into_inner()
+            .map_err(std::io::IntoInnerError::into_error)?
+            .sync_all()?;
+        output.publish()?;
     } else {
         // `export` flushes its writer when it finishes, so a failed final
         // flush surfaces as an error rather than vanishing in a drop.
@@ -2970,11 +3076,12 @@ fn run_diff(
     old: &std::path::Path,
     new: &std::path::Path,
     flags: DiffFlags,
-    output_path: Option<&std::path::Path>,
+    output: Option<pbfhogg::Output>,
     type_filter: Option<TypeFilter>,
     jobs: usize,
     direct_io: bool,
     host: &pbfhogg::host::Host,
+    scratch: pbfhogg::scratch::RunScratch,
 ) -> Result<Outcome, Box<dyn std::error::Error>> {
     let DiffFlags {
         suppress_common,
@@ -3000,19 +3107,23 @@ fn run_diff(
     };
     let stats = if quiet {
         let mut sink = std::io::sink();
-        pbfhogg::diff::diff(old, new, &mut sink, &options, direct_io, host)?
-    } else if let Some(path) = output_path {
-        let file = std::fs::File::create(path)?;
-        let mut out = std::io::BufWriter::new(file);
-        let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io, host)?;
-        out.flush()?;
+        pbfhogg::diff::diff(old, new, &mut sink, &options, direct_io, host, scratch)?
+    } else if let Some(output) = output {
+        let mut out = std::io::BufWriter::new(output.create()?);
+        let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io, host, scratch)?;
+        out.into_inner()
+            .map_err(std::io::IntoInnerError::into_error)?
+            .sync_all()?;
+        // A diff that found differences is a completed answer, not a
+        // failure: its output is published like any other.
+        output.publish()?;
         stats
     } else {
         // A reader that leaves early stops the diff here, before its verdict
         // exists, so the run ends with success rather than with the
         // differences status `main` cannot know.
         let mut out = output::buffered();
-        let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io, host)?;
+        let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io, host, scratch)?;
         out.flush()?;
         stats
     };
@@ -3036,12 +3147,13 @@ fn run_diff(
 fn run_derive_changes(
     old: &std::path::Path,
     new: &std::path::Path,
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     direct_io: bool,
     increment_version: bool,
     update_timestamp: bool,
     jobs: usize,
     host: &pbfhogg::host::Host,
+    scratch: pbfhogg::scratch::RunScratch,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let jobs_resolved = if jobs == 0 {
         host.resources
@@ -3068,6 +3180,7 @@ fn run_derive_changes(
         timestamp,
         jobs_resolved,
         host,
+        scratch,
     )?;
     stats.write_summary(&mut host.diagnostics.summary_writer("derive.summary"))?;
     Ok(())
@@ -3076,7 +3189,7 @@ fn run_derive_changes(
 #[allow(clippy::too_many_arguments)]
 fn run_getid(
     file: &std::path::Path,
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     flags: GetidFlags,
     id_file: Option<&std::path::Path>,
     id_osm_file: Option<&std::path::Path>,
@@ -3131,7 +3244,7 @@ fn run_getid(
 #[allow(clippy::too_many_arguments)]
 fn run_getparents(
     file: &std::path::Path,
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     add_self: bool,
     id_file: Option<&std::path::Path>,
     id_osm_file: Option<&std::path::Path>,
@@ -3165,7 +3278,7 @@ fn run_getparents(
 #[allow(clippy::too_many_arguments)]
 fn run_removeid(
     file: &std::path::Path,
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     id_file: Option<&std::path::Path>,
     id_osm_file: Option<&std::path::Path>,
     default_type: Option<DefaultTypeArg>,
@@ -3200,7 +3313,7 @@ fn extract_strategy(simple: bool, smart: bool) -> pbfhogg::extract::ExtractStrat
 #[allow(clippy::too_many_arguments)]
 fn run_extract(
     file: &std::path::Path,
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     bbox_str: Option<&str>,
     polygon_path: Option<&std::path::Path>,
     strategy: pbfhogg::extract::ExtractStrategy,
@@ -3226,51 +3339,12 @@ fn run_extract(
     Ok(())
 }
 
-/// Check every destination a multi-output command is about to publish
-/// *before* the first of them is published.
-///
-/// `OutputFile::commit` renames a scratch sibling over the destination.
-/// Renaming over a directory fails, as does renaming into a directory that
-/// no longer exists - and once one rename has succeeded, a later failure
-/// leaves the output set half replaced. Running these checks over the whole
-/// set first turns the common causes into a clean refusal that publishes
-/// nothing. It is a narrowing, not a guarantee: see the call site.
-///
-/// Write access to the parent is not probed here; it is already proven by
-/// the scratch file the run wrote into that same directory.
-fn preflight_publishable(paths: &[PathBuf]) -> Result<(), Box<dyn std::error::Error>> {
-    for path in paths {
-        // A bare relative filename has an empty parent, which means the current directory.
-        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-        let parent = if parent.as_os_str().is_empty() {
-            std::path::Path::new(".")
-        } else {
-            parent
-        };
-        if !parent.is_dir() {
-            return Err(format!(
-                "cannot publish '{}': directory '{}' does not exist",
-                path.display(),
-                parent.display()
-            )
-            .into());
-        }
-        if path.is_dir() {
-            return Err(format!(
-                "cannot publish '{}': it is an existing directory",
-                path.display()
-            )
-            .into());
-        }
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_extract_config(
     file: &std::path::Path,
     config_path: &std::path::Path,
     directory_override: Option<&std::path::Path>,
+    overwrite: pbfhogg::Overwrite,
     strategy: pbfhogg::extract::ExtractStrategy,
     set_bounds: bool,
     clean: &CleanAttrs,
@@ -3278,7 +3352,7 @@ fn run_extract_config(
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_, mut slots) = pbfhogg::extract::parse_extract_config_with_output_directory(
+    let (_, slots) = pbfhogg::extract::parse_extract_config_with_output_directory(
         config_path,
         directory_override,
     )?;
@@ -3286,68 +3360,27 @@ fn run_extract_config(
     for slot in &slots {
         reject_aliases(&[file], &slot.output)?;
     }
-    // Two config slots resolving to the same file (identical path, a symlink,
-    // or a hardlink) would open two independent writers on it: the second
-    // File::create truncates what the first is producing and the two streams
-    // interleave. Reject the collision before any writer is opened.
-    for (i, slot) in slots.iter().enumerate() {
-        for other in &slots[i + 1..] {
-            if outputs_alias(&slot.output, &other.output)? {
-                return Err(format!(
-                    "extract outputs '{}' and '{}' resolve to the same file",
-                    slot.output.display(),
-                    other.output.display()
-                )
-                .into());
-            }
-        }
-    }
-
-    // Guard each destination and redirect the slot at its scratch sibling.
-    // Order matters: both alias checks above ran on the *final* paths, which
-    // is the only place the user's collision can be seen - two scratch names
-    // never collide, so checking them would silently pass a config that
-    // writes two extracts to one file.
-    let final_paths: Vec<PathBuf> = slots.iter().map(|slot| slot.output.clone()).collect();
-    preflight_publishable(&final_paths)?;
-    let guards: Vec<pbfhogg::path_guard::OutputFile> = final_paths
+    // Every output the config names is checked here, before any extraction:
+    // an existing one (without --overwrite), a symlink, two slots resolving
+    // to one file. A config with many regions never fails on a late one
+    // after the early ones were extracted.
+    let outputs = pbfhogg::OutputSet::files(slots.iter().map(|slot| &slot.output), overwrite)?;
+    let destinations: Vec<PathBuf> = outputs
         .iter()
-        .map(|path| pbfhogg::path_guard::OutputFile::new(path))
-        .collect::<Result<_, _>>()?;
-    for (slot, guard) in slots.iter_mut().zip(&guards) {
-        slot.output = guard.path().to_path_buf();
-    }
+        .map(|output| output.destination().to_path_buf())
+        .collect();
+    let regions: Vec<pbfhogg::extract::Region> =
+        slots.into_iter().map(|slot| slot.region).collect();
 
-    output::cli_eprintln!("Multi-extract: {} extracts from config", slots.len());
-    let all_stats = pbfhogg::extract::extract_multi_with_display_paths(
-        file,
-        &slots,
-        &final_paths,
-        strategy,
-        set_bounds,
-        clean,
-        write,
-        overrides,
-        host,
+    output::cli_eprintln!("Multi-extract: {} extracts from config", regions.len());
+    // Extraction is all-or-nothing, and so, as far as failures allow, is
+    // publication: the set is published as a group, rolling back members
+    // already installed if a later one fails.
+    let all_stats = pbfhogg::extract::extract_multi(
+        file, &regions, outputs, strategy, set_bounds, clean, write, overrides, host,
     )?;
-    // Extraction is all-or-nothing: a failure above drops every guard and no
-    // destination was ever opened, so nothing is published at all. What
-    // follows is *not* a transaction. Publication is a preflighted sequence
-    // of renames: the preflight is repeated here, immediately before the
-    // first rename, so the ordinary reasons a rename fails - a destination
-    // that is a directory, a parent directory that vanished - become a
-    // refusal with nothing published rather than a partial set. It cannot be
-    // made airtight: another process may still change a destination between
-    // this check and the rename that reaches it, and if a rename fails after
-    // an earlier one succeeded the output set is partial. POSIX offers no
-    // N-way atomic rename, and the rollback log that would close the gap is
-    // out of proportion to this command.
-    preflight_publishable(&final_paths)?;
-    for guard in guards {
-        guard.commit()?;
-    }
     for (i, stats) in all_stats.iter().enumerate() {
-        output::cli_eprint!("  [{}] {} - ", i + 1, final_paths[i].display());
+        output::cli_eprint!("  [{}] {} - ", i + 1, destinations[i].display());
         stats.write_summary(&mut host.diagnostics.summary_writer("extract.summary"))?;
     }
     Ok(())
@@ -3355,19 +3388,21 @@ fn run_extract_config(
 
 fn run_add_locations_to_ways(
     file: &std::path::Path,
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     options: &pbfhogg::altw::AltwOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
+    scratch: pbfhogg::scratch::RunScratch,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::altw::add_locations_to_ways(file, output, options, overrides, host)?;
+    let stats =
+        pbfhogg::altw::add_locations_to_ways(file, output, options, overrides, host, scratch)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("altw.summary"))?;
     Ok(())
 }
 
 fn run_time_filter(
     file: &std::path::Path,
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     timestamp: &str,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -3677,7 +3712,7 @@ fn run_inspect(
 fn run_apply_changes(
     base: &std::path::Path,
     changes: &std::path::Path,
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     opts: &pbfhogg::apply_changes::MergeOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
@@ -3689,7 +3724,7 @@ fn run_apply_changes(
 
 fn run_merge_pbf(
     inputs: &[PathBuf],
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &pbfhogg::host::Host,
@@ -3702,7 +3737,7 @@ fn run_merge_pbf(
 
 fn run_merge_changes(
     changes: &[PathBuf],
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     simplify: bool,
     jobs: usize,
     allow_version_regression: bool,
@@ -3911,6 +3946,12 @@ fn run_bench_write(
 
     let (elapsed_ms, nodes, ways, rels) = match writer_mode {
         BenchWriterMode::Sync => {
+            // A sink, not an output: the benchmark measures encoding and
+            // discards the bytes.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "/dev/null is a byte sink, not a published output"
+            )]
             let file = std::fs::File::create("/dev/null")?;
             let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
             let mut writer = pbfhogg::writer::PbfWriter::new(buf, compression);
@@ -3955,7 +3996,7 @@ fn run_bench_write(
 fn run_bench_merge(
     base: &std::path::Path,
     changes: &std::path::Path,
-    output: &std::path::Path,
+    output: pbfhogg::Output,
     compression: Compression,
     io_mode: BenchIoMode,
     host: &pbfhogg::host::Host,
@@ -3963,6 +4004,7 @@ fn run_bench_merge(
     use std::time::Instant;
 
     let backend = OutputBackend::from_flags(false, matches!(io_mode, BenchIoMode::Uring));
+    let destination = output.destination().to_path_buf();
 
     let start = Instant::now();
     let opts = pbfhogg::apply_changes::MergeOptions {
@@ -3989,7 +4031,7 @@ fn run_bench_merge(
     )?;
     let elapsed_ms = start.elapsed().as_millis();
 
-    let output_mb = std::fs::metadata(output)
+    let output_mb = std::fs::metadata(&destination)
         .map(|m| m.len() as f64 / 1_000_000.0)
         .unwrap_or(0.0);
 
@@ -4012,4 +4054,49 @@ fn run_bench_merge(
         output::cli_eprintln!("peak_rss_kb={peak_kb}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::disallowed_methods)]
+mod scratch_location_tests {
+    use super::{TmpDirArg, host, run_scratch};
+
+    #[test]
+    fn scratch_goes_to_tmp_dir_else_the_output_directory_else_dot() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join("tmp");
+        let out_dir = dir.path().join("out");
+        std::fs::create_dir(&tmp).unwrap();
+        std::fs::create_dir(&out_dir).unwrap();
+        let output = out_dir.join("result.pbf");
+        let host = host::cli_host();
+
+        let explicit = TmpDirArg {
+            tmp_dir: Some(tmp.clone()),
+        };
+        let scratch = run_scratch(&explicit, Some(&output), &host).unwrap();
+        assert_eq!(scratch.path().parent(), Some(tmp.as_path()));
+        drop(scratch);
+
+        let default = TmpDirArg { tmp_dir: None };
+        let scratch = run_scratch(&default, Some(&output), &host).unwrap();
+        assert_eq!(scratch.path().parent(), Some(out_dir.as_path()));
+        drop(scratch);
+
+        assert!(std::fs::read_dir(&tmp).unwrap().next().is_none());
+        assert!(std::fs::read_dir(&out_dir).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn an_explicit_tmp_dir_error_names_the_flag_and_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let host = host::cli_host();
+        let tmp = TmpDirArg {
+            tmp_dir: Some(missing.clone()),
+        };
+        let err = run_scratch(&tmp, None, &host).err().unwrap().to_string();
+        assert!(err.contains("--tmp-dir"), "{err}");
+        assert!(err.contains(&missing.display().to_string()), "{err}");
+    }
 }

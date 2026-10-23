@@ -388,7 +388,7 @@ fn cat_rejects_oversized_header_length() {
 
     let result = pbfhogg::cat::cat(
         &[input.as_path()],
-        &output,
+        crate::common::out(&output),
         None,
         &pbfhogg::cat::CleanAttrs::default(),
         &pbfhogg::write::WriteOptions::default(),
@@ -590,7 +590,7 @@ fn cat_rejects_oversized_datasize() {
 
     let result = pbfhogg::cat::cat(
         &[input.as_path()],
-        &output,
+        crate::common::out(&output),
         None,
         &pbfhogg::cat::CleanAttrs::default(),
         &pbfhogg::write::WriteOptions::default(),

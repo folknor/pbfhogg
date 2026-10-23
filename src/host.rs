@@ -13,25 +13,6 @@ pub struct Host {
     pub page_cache: PageCachePolicy,
     /// Where the library's own data-parallel work and writer framing run.
     pub executor: Executor,
-    /// Directory for scratch files the library would otherwise place beside
-    /// an input or output (add-locations-to-ways, diff, derive-changes).
-    /// `None` keeps that default. The directory must exist.
-    pub scratch_parent: Option<std::path::PathBuf>,
-}
-impl Host {
-    /// The scratch parent for a run whose default is `default`.
-    pub(crate) fn scratch_parent_or<'a>(
-        &'a self,
-        default: &'a std::path::Path,
-    ) -> &'a std::path::Path {
-        if let Some(parent) = self.scratch_parent.as_deref() {
-            parent
-        } else if default.as_os_str().is_empty() {
-            std::path::Path::new(".")
-        } else {
-            default
-        }
-    }
 }
 /// Page-cache policy for the input files a command reads.
 ///
@@ -300,7 +281,6 @@ impl Host {
             }),
             page_cache: PageCachePolicy::Keep,
             executor: Executor::Ambient,
-            scratch_parent: None,
         }
     }
 }
@@ -308,15 +288,6 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn scratch_parent_uses_current_directory_for_empty_output_parent() {
-        let host = Host::for_tests();
-        let output = std::path::Path::new("out.osm.pbf");
-        let parent = output.parent().expect("bare filename has a parent");
-        assert!(parent.as_os_str().is_empty());
-        assert_eq!(host.scratch_parent_or(parent), std::path::Path::new("."));
-    }
 
     #[cfg(target_os = "linux")]
     #[test]

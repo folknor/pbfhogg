@@ -1,3 +1,10 @@
+// The command layer writes outputs only through `crate::output` (the writer
+// factory below takes an `Output`) and scratch only through
+// `crate::scratch`; clippy.toml lists the path-writing methods this refuses.
+// Unit-test fixtures build their inputs directly, so the rule holds for the
+// shipped code, which `--all-targets` lints without `cfg(test)`.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+
 pub mod altw;
 pub mod apply_changes;
 pub mod cat;
@@ -394,7 +401,7 @@ pub(crate) fn build_output_header(
 /// in and `backend` asks for them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn writer_from_header(
-    output: &Path,
+    output: &crate::output::Output,
     compression: Compression,
     header: &crate::HeaderBlock,
     preserve_sorted: bool,
@@ -415,13 +422,18 @@ pub(crate) fn writer_from_header(
 /// ALTW pass 2) passes `backend.parallel_by_default()` to get
 /// `PbfWriter::to_path_parallel`, which lifts the ~1.5 GB/s NVMe single-thread
 /// write ceiling.
+///
+/// Takes the run's [`Output`](crate::output::Output) rather than a path: every
+/// backend writes the staging file, and only the command's single publication
+/// owner renames it into place.
 pub(crate) fn writer_from_header_bytes(
-    output: &Path,
+    output: &crate::output::Output,
     compression: Compression,
     header_bytes: &[u8],
     backend: OutputBackend,
     host: &crate::host::Host,
 ) -> Result<PbfWriter<FileWriter>> {
+    let output = output.path();
     match backend {
         OutputBackend::Uring => {
             #[cfg(feature = "linux-io-uring")]

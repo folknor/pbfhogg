@@ -33,7 +33,7 @@ use super::super::format::*;
 // Cargo feature and `not(test)`: product builds and the library's own
 // unit-test harness never compile this module.
 // Static atomic fired inside the rayon streets par_iter closure on
-// a matching way_idx. Verifies that the `PathGuard::dir()` bucket
+// a matching way_idx. Verifies that the run scratch directory's
 // cleanup (see ADR-0003) fires correctly when a rayon worker
 // panics during Pass 3 Stage A.
 #[cfg(all(feature = "static-test-hooks", not(test)))]
@@ -383,6 +383,8 @@ fn parse_bucket_file(data: &[u8]) -> Result<Vec<ParsedBucketEntry>> {
 // bucket directories or the reader's mmap roles, so retain these bindings.
 pub(super) struct FusedCellAssignmentParams<'a> {
     pub(super) output_dir: &'a Path,
+    /// The run's scratch directory, which holds the bucket trees.
+    pub(super) scratch: &'a crate::scratch::RunScratch,
     pub(super) street_ways_mmap: &'a [u8],
     pub(super) street_nodes_mmap: &'a [u8],
     pub(super) street_way_count: u32,
@@ -427,6 +429,7 @@ pub(super) fn bucketed_cell_assignment_fused(
 
     let FusedCellAssignmentParams {
         output_dir,
+        scratch,
         street_ways_mmap,
         street_nodes_mmap,
         street_way_count,
@@ -451,21 +454,12 @@ pub(super) fn bucketed_cell_assignment_fused(
     let fine_level = *fine_level;
     let coarse_level = *coarse_level;
 
-    // Create two bucket directories (one per level). The stale-dir sweep
-    // handles the case of a prior build that was SIGKILLed before any
-    // Drop could run; the PathGuards below handle every in-run error
-    // path (mid-Stage-A panic, Stage B error, etc.) so ~256 temp files
-    // per bucket dir don't leak to the next invocation.
-    let fine_bucket_dir = output_dir.join(format!(".buckets-level{fine_level}"));
-    let coarse_bucket_dir = output_dir.join(format!(".buckets-level{coarse_level}"));
-    for dir in [&fine_bucket_dir, &coarse_bucket_dir] {
-        if dir.exists() {
-            std::fs::remove_dir_all(dir)?;
-        }
-        std::fs::create_dir_all(dir)?;
-    }
-    let fine_guard = crate::path_guard::PathGuard::dir(fine_bucket_dir.clone());
-    let coarse_guard = crate::path_guard::PathGuard::dir(coarse_bucket_dir.clone());
+    // Create two bucket directories (one per level) in the run's scratch
+    // directory, whose guard removes them on every exit path (mid-Stage-A
+    // panic, Stage B error, etc.), so ~256 temp files per bucket dir don't
+    // leak. They are not part of the index being built.
+    let fine_bucket_dir = scratch.create_subdir(&format!("buckets-level{fine_level}"))?;
+    let coarse_bucket_dir = scratch.create_subdir(&format!("buckets-level{coarse_level}"))?;
 
     // Two sets of bucket writers (lazy).
     let mut fine_writers: Vec<Option<BufWriter<std::fs::File>>> =
@@ -503,9 +497,9 @@ pub(super) fn bucketed_cell_assignment_fused(
                     // `test_hooks::PANIC_AT_STREETS_WAY_IDX`. Simulates a
                     // mid-Stage-A crash inside a rayon worker. Rayon
                     // propagates the panic to the `.collect()` call site
-                    // on the main thread; the `PathGuard::dir()` wrappers
-                    // around `fine_bucket_dir` / `coarse_bucket_dir`
-                    // (ADR-0003) sweep the scratch trees on the unwind.
+                    // on the main thread; the run scratch directory
+                    // holding `fine_bucket_dir` / `coarse_bucket_dir`
+                    // (ADR-0003) is swept on the unwind.
                     // Release builds compile this out entirely.
                     #[cfg(all(feature = "static-test-hooks", not(test)))]
                     if test_hooks::PANIC_AT_STREETS_WAY_IDX
@@ -772,7 +766,7 @@ pub(super) fn bucketed_cell_assignment_fused(
         fine_interp_entries_file,
         executor,
     )?;
-    drop(fine_guard);
+    scratch.remove_tree(&fine_bucket_dir);
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_FINE_END");
 
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_COARSE_START");
@@ -785,7 +779,7 @@ pub(super) fn bucketed_cell_assignment_fused(
         coarse_interp_entries_file,
         executor,
     )?;
-    drop(coarse_guard);
+    scratch.remove_tree(&coarse_bucket_dir);
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_COARSE_END");
 
     Ok((fine_count, coarse_count))
@@ -1001,10 +995,9 @@ fn run_stage_b(
     addr_out.flush()?;
     interp_out.flush()?;
 
-    // Bucket-dir cleanup is handled by the PathGuard at the
-    // bucketed_cell_assignment_fused caller: on success the caller
-    // `drop`s the guard right after this function returns; on error
-    // the guard's Drop runs via ? propagation.
+    // Bucket-dir cleanup is handled by the run scratch directory: on
+    // success the caller removes the tree right after this function
+    // returns; on error the run directory's guard sweeps it.
 
     Ok(total_cells)
 }

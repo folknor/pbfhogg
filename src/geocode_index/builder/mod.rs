@@ -65,13 +65,11 @@ pub(super) fn counter_value(value: u64) -> i64 {
 
 /// Configuration for the geocode index builder.
 #[derive(Clone)]
+///
+/// Where the index goes, and whether an existing one may be replaced, is the
+/// [`OutputDir`](crate::output::OutputDir) passed beside it.
 pub struct BuildConfig {
     pub input_path: PathBuf,
-    pub output_dir: PathBuf,
-    /// Compatibility alias for `overwrite` and `allow_unindexed` together.
-    pub force: bool,
-    /// Replace an existing geocode index after a successful build.
-    pub overwrite: bool,
     /// Permit input PBFs that do not have blob-level indexdata.
     pub allow_unindexed: bool,
     pub direct_io: bool,
@@ -87,9 +85,6 @@ impl Default for BuildConfig {
     fn default() -> Self {
         Self {
             input_path: PathBuf::new(),
-            output_dir: PathBuf::new(),
-            force: false,
-            overwrite: false,
             allow_unindexed: false,
             street_level: crate::tunables::GEOCODE_DEFAULT_STREET_LEVEL,
             coarse_level: crate::tunables::GEOCODE_DEFAULT_COARSE_LEVEL,
@@ -199,177 +194,102 @@ pub struct BuildStats {
 ///   measured peak memory and host are recorded in `reference/performance.md`
 ///   ("build-geocode-index"). A host with less memory than that record shows
 ///   needs those intermediates moved to temp files.
-#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
-pub fn build_geocode_index(config: &BuildConfig, host: &crate::host::Host) -> Result<BuildStats> {
+pub fn build_geocode_index(
+    config: &BuildConfig,
+    output: IndexOutput,
+    host: &crate::host::Host,
+    scratch: crate::scratch::RunScratch,
+) -> Result<BuildStats> {
     config.validate()?;
-    let destination = &config.output_dir;
-    // Publication renames the directory itself, which `.`, `..` or a root
-    // cannot be (and `.` would hold its own staging directory). Refuse here,
-    // not after a full build has been spent on an unpublishable generation.
-    if destination.file_name().is_none() {
-        return Err(Error::invalid_argument(format!(
-            "output directory {} must name a directory, not '.', '..' or a root, \
-             because publication renames it",
-            destination.display()
-        )));
-    }
-
-    let destination_metadata = match std::fs::symlink_metadata(destination) {
-        Ok(metadata) => Some(metadata),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    if destination_metadata
-        .as_ref()
-        .is_some_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(Error::invalid_argument(format!(
-            "output path {} is a symlink; staged publication replaces the path itself. \
-             Choose a real directory.",
-            destination.display()
-        )));
-    }
-    if destination_metadata
-        .as_ref()
-        .is_some_and(std::fs::Metadata::is_dir)
-        && is_mount_point(destination)?
-    {
-        return Err(Error::invalid_argument(format!(
-            "output directory {} is a mount point; staged publication renames the \
-             directory itself. Choose a regular directory.",
-            destination.display()
-        )));
-    }
-
-    let has_index = destination.join(FILE_HEADER).exists();
-    let overwrite = config.force || config.overwrite;
-    if has_index && !overwrite {
-        return Err(Error::invalid_argument(format!(
-            "output directory {} already contains a geocode index. \
-             Use --overwrite (or --force) to replace it.",
-            destination.display()
-        )));
-    }
-    // Publication replaces the whole directory, so anything that is not an
-    // index (or empty) would be deleted with it. `--overwrite` and its legacy
-    // `--force` alias replace an index, never an arbitrary directory, so this
-    // refusal holds under either flag.
-    if !has_index && destination_metadata.is_some() {
-        let replaceable = destination_metadata
-            .as_ref()
-            .is_some_and(std::fs::Metadata::is_dir)
-            && std::fs::read_dir(destination)?.next().is_none();
-        if !replaceable {
-            return Err(Error::invalid_argument(format!(
-                "output path {} exists and is not a geocode index directory; \
-                 publication would replace it wholesale. Choose a new or empty directory.",
-                destination.display()
-            )));
-        }
-    }
-    // Build on separate inodes. Renaming a completed generation never truncates
-    // the files mapped by an already-open Reader, including on failed builds.
-    let staging = StagedIndex::new(destination)?;
-    let mut staged_config = config.clone();
-    staged_config.output_dir = staging.path.join("new");
-    let stats = build_generation(&staged_config, host)?;
-    staging.publish(destination)?;
+    refuse_scratch_inside_index(scratch.path(), output.destination())?;
+    // The generation is built inside the output's staging directory, on
+    // inodes of its own: publication swaps the whole directory, so a failed
+    // build never truncates the files an already-open Reader has mapped,
+    // and the previous index survives every failure.
+    let stats = build_generation(config, output.0.path(), host, &scratch)?;
+    drop(scratch);
+    output.0.publish()?;
     Ok(stats)
 }
 
-// Check before spending a full build: rename of a mounted directory fails
-// with EBUSY or EXDEV only when publication is attempted. The symlink check
-// above is separate because the mount probe canonicalizes, which would hide
-// the fact that publication replaces the link itself. Off Linux the probe
-// answers false and the final rename remains authoritative.
-fn is_mount_point(path: &std::path::Path) -> Result<bool> {
-    crate::process::is_mount_point(path).map_err(|error| {
-        error.context(format!(
-            "cannot check whether output directory {} is a mount point before publication",
-            path.display()
-        ))
-    })
-}
+/// The output directory of a geocode index: an
+/// [`OutputDir`](crate::output::OutputDir) sure to carry
+/// [`replaceable_index_dir`], so overwrite permission can replace an index
+/// but never an arbitrary directory. Built only by [`index_output`].
+#[derive(Debug)]
+pub struct IndexOutput(crate::output::OutputDir);
 
-struct StagedIndex {
-    path: PathBuf,
-}
-
-impl StagedIndex {
-    fn new(destination: &std::path::Path) -> Result<Self> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let parent = destination
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        std::fs::create_dir_all(parent)?;
-        // Do not sweep old `.geocode-build-*` siblings here. Drop removes a
-        // stage after ordinary success or failure, but SIGKILL and power loss
-        // bypass Drop. A directory without a lock cannot be distinguished
-        // safely from a concurrent builder's live staging area, and it may
-        // contain the only recoverable old index after an interrupted publish.
-        loop {
-            let path = parent.join(format!(
-                ".geocode-build-{}",
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            match std::fs::create_dir(&path) {
-                Ok(()) => return Ok(Self { path }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-    }
-
-    fn publish(&self, destination: &std::path::Path) -> Result<()> {
-        let backup = self.path.join("old");
-        let had_old = match std::fs::rename(destination, &backup) {
-            Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(e.into()),
-        };
-        // There is a short pathname gap between these two renames. Callers
-        // must serialize publication with Reader::open and other builders;
-        // queries on already-open readers need no such coordination. The
-        // earlier mount-point check can also race a mount-table change; a
-        // trial rename before the build would create another pathname gap and
-        // race those same readers/builders, so these final renames remain the
-        // authority if the filesystem topology changes during the build.
-        if let Err(e) = std::fs::rename(self.path.join("new"), destination) {
-            if had_old && let Err(restore) = std::fs::rename(&backup, destination) {
-                // Preserve the only old generation if rollback itself fails.
-                // Two failures, one chain: the restore failure is the typed
-                // cause (it decides what state the old index is in); the
-                // publish failure that led here is named in the context.
-                return Err(Error::from(restore).context(format!(
-                    "publish failed: {e}; restore failed (old index retained at {})",
-                    backup.display()
-                )));
-            }
-            return Err(e.into());
-        }
-        Ok(())
+impl IndexOutput {
+    /// The directory the caller named.
+    #[must_use]
+    pub fn destination(&self) -> &std::path::Path {
+        self.0.destination()
     }
 }
 
-impl Drop for StagedIndex {
-    fn drop(&mut self) {
-        // A failed rollback leaves the backup here for manual recovery. This
-        // cleanup only runs on ordinary Rust unwinding; SIGKILL and power loss
-        // can leave a sibling staging directory. Startup does not sweep those
-        // directories because another process may still be building there or
-        // an `old` subdirectory may be the only recoverable previous index.
-        if !self.path.join("old").exists() || !self.path.join("new").exists() {
-            drop(std::fs::remove_dir_all(&self.path));
-        }
+/// Scratch must not live inside the directory the index is published over:
+/// publication moves a replaced directory aside and deletes it, scratch and
+/// all. The scratch directory is already created when this runs, so an
+/// existing destination that contains it is refused.
+fn refuse_scratch_inside_index(
+    scratch: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<()> {
+    if crate::scratch::is_within(scratch, destination)? {
+        return Err(Error::invalid_argument(format!(
+            "the scratch directory {} is inside the index output {}, which publication replaces; \
+             choose a scratch directory outside it",
+            scratch.display(),
+            destination.display()
+        )));
     }
+    Ok(())
+}
+
+/// The geocode index's rule for replacing an existing output directory:
+/// only an index, or an empty directory, may be replaced. Publication swaps
+/// the whole directory, so anything else in it would be deleted with it;
+/// overwrite permission replaces an index, never an arbitrary directory.
+/// Run when the output is built and again immediately before publication.
+///
+/// # Errors
+/// An invalid-argument error naming the directory when it holds anything
+/// but an index.
+pub fn replaceable_index_dir(destination: &std::path::Path) -> Result<()> {
+    if !destination.is_dir() || destination.join(FILE_HEADER).exists() {
+        return Ok(());
+    }
+    if std::fs::read_dir(destination)?.next().is_none() {
+        return Ok(());
+    }
+    Err(Error::invalid_argument(format!(
+        "output path {} exists and is not a geocode index directory; publication would \
+         replace it wholesale. Choose a new or empty directory.",
+        destination.display()
+    )))
+}
+
+/// Check and stage the output for an index at `destination`.
+///
+/// # Errors
+/// As [`OutputDir::new`](crate::output::OutputDir::new), plus
+/// [`replaceable_index_dir`]'s refusal.
+pub fn index_output(
+    destination: impl AsRef<std::path::Path>,
+    overwrite: crate::output::Overwrite,
+) -> Result<IndexOutput> {
+    crate::output::OutputDir::new(destination, overwrite, Some(replaceable_index_dir))
+        .map(IndexOutput)
 }
 
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
-fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<BuildStats> {
-    config.validate()?;
+fn build_generation(
+    config: &BuildConfig,
+    output_dir: &std::path::Path,
+    host: &crate::host::Host,
+    scratch: &crate::scratch::RunScratch,
+) -> Result<BuildStats> {
     // Pass 2a pread worker pool: PrimitiveBlock Vec<u8>s allocated on
     // decode workers and freed on the main-thread merge path. Uncapped,
     // arenas grow to 25+ GB anon RSS at planet scale (documented
@@ -378,13 +298,13 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
 
     let start_time = std::time::Instant::now();
 
-    std::fs::create_dir_all(&config.output_dir)?;
+    std::fs::create_dir_all(output_dir)?;
 
     // Validate input
     crate::commands::require_indexdata(
         &config.input_path,
         config.direct_io,
-        config.force || config.allow_unindexed,
+        config.allow_unindexed,
         "input PBF has no blob-level indexdata. Without indexdata, \
          every blob must be decompressed (significantly slower). \
          --allow-unindexed accepts it without also granting --overwrite.",
@@ -516,7 +436,7 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
         addr_points_mmap,
         interp_nodes_mmap,
     } = pass2::run_pass2(
-        config,
+        output_dir,
         &node_schedule,
         &way_schedule,
         &shared_file,
@@ -655,9 +575,7 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
     // Write interp_ways.bin now (after resolution has set start/end numbers)
     crate::debug::emit_marker("GEOCODE_PASS2_WRITE_START");
     {
-        let mut iw_out = BufWriter::new(std::fs::File::create(
-            config.output_dir.join(FILE_INTERP_WAYS),
-        )?);
+        let mut iw_out = BufWriter::new(std::fs::File::create(output_dir.join(FILE_INTERP_WAYS))?);
         for iw in &interp_ways {
             let rec = InterpWay {
                 node_offset: iw.node_file_offset,
@@ -679,8 +597,8 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
             "admin polygon count exceeds the format interior-flag limit; bump FORMAT_VERSION",
         ));
     }
-    admin::write_admin_data(&config.output_dir, &admin_polygons)?;
-    std::fs::write(config.output_dir.join(FILE_STRINGS), &strings.data)?;
+    admin::write_admin_data(output_dir, &admin_polygons)?;
+    std::fs::write(output_dir.join(FILE_STRINGS), &strings.data)?;
     crate::debug::emit_marker("GEOCODE_PASS2_WRITE_END");
 
     // -----------------------------------------------------------------------
@@ -719,7 +637,8 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
     crate::debug::emit_marker("GEOCODE_PASS3_CELLS_START");
     let (fine_count, coarse_count) =
         pass3::bucketed_cell_assignment_fused(&pass3::FusedCellAssignmentParams {
-            output_dir: &config.output_dir,
+            output_dir,
+            scratch,
             street_ways_mmap: &street_ways_mmap,
             street_nodes_mmap: &street_nodes_mmap,
             street_way_count,
@@ -741,7 +660,7 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
         })?;
     crate::debug::emit_marker("GEOCODE_PASS3_CELLS_END");
     crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_INDEX_START");
-    let admin_count = admin::write_admin_index(&config.output_dir, &mut { admin_cell_entries })?;
+    let admin_count = admin::write_admin_index(output_dir, &mut { admin_cell_entries })?;
     crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_INDEX_END");
 
     crate::host::diag!(
@@ -770,7 +689,7 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
         coarse_cell_count: coarse_count,
         admin_cell_count: admin_count,
     };
-    std::fs::write(config.output_dir.join(FILE_HEADER), header.to_bytes())?;
+    std::fs::write(output_dir.join(FILE_HEADER), header.to_bytes())?;
 
     // `Reader::open` runs the same record and string validation described on
     // its public API, so this smoke test intentionally repeats that structural
@@ -797,7 +716,7 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
             "geocode.smoke_test",
             "  Running smoke test..."
         );
-        let test_reader = super::reader::Reader::open(&config.output_dir)?;
+        let test_reader = super::reader::Reader::open(output_dir)?;
         if let Some(first_addr_point) = first_addr_point {
             let result = test_reader
                 .query(
@@ -814,7 +733,7 @@ fn build_generation(config: &BuildConfig, host: &crate::host::Host) -> Result<Bu
                      or street match",
                     e7_to_deg(f64::from(first_addr_point.lat_e7)),
                     e7_to_deg(f64::from(first_addr_point.lon_e7)),
-                    config.output_dir.display()
+                    output_dir.display()
                 );
                 SmokeOutcome::NoMatch {
                     latitude_e7: first_addr_point.lat_e7,

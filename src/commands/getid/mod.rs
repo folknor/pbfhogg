@@ -383,10 +383,25 @@ impl GetidStats {
 ///
 /// If `opts.add_referenced` is true, referenced nodes of matching ways are also
 /// included (two-pass). Otherwise, only exact ID matches are output.
-#[hotpath::measure]
 pub fn getid(
     input: &Path,
-    output: &Path,
+    output: crate::output::Output,
+    ids: &ElementIds,
+    opts: &GetidOptions,
+    write: &WriteOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<GetidStats> {
+    let result = getid_to(input, &output, ids, opts, write, overrides, host)?;
+    output.publish()?;
+    Ok(result)
+}
+
+/// [`getid`] writing to a borrowed output it does not publish.
+#[hotpath::measure]
+pub(crate) fn getid_to(
+    input: &Path,
+    output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetidOptions,
     write: &WriteOptions,
@@ -413,7 +428,7 @@ pub fn getid(
 #[allow(clippy::too_many_arguments)]
 fn getid_dispatched(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetidOptions,
     write: &WriteOptions,
@@ -467,10 +482,24 @@ fn getid_dispatched(
 /// path at `filter_by_id` can skip re-encoding non-matching blobs. On a
 /// non-indexed PBF the fast path is unreachable and every blob would
 /// decode-and-re-encode silently; `--force` overrides.
-#[hotpath::measure]
 pub fn removeid(
     input: &Path,
-    output: &Path,
+    output: crate::output::Output,
+    ids: &ElementIds,
+    write: &WriteOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<GetidStats> {
+    let result = removeid_to(input, &output, ids, write, overrides, host)?;
+    output.publish()?;
+    Ok(result)
+}
+
+/// [`removeid`] writing to a borrowed output it does not publish.
+#[hotpath::measure]
+pub(crate) fn removeid_to(
+    input: &Path,
+    output: &crate::output::Output,
     ids: &ElementIds,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -513,7 +542,7 @@ pub fn removeid(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn filter_by_id(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     ids: &ElementIds,
     include: bool,
     write: &WriteOptions,
@@ -548,7 +577,7 @@ fn filter_by_id(
 #[allow(clippy::too_many_lines)]
 fn filter_by_id_walker(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     ids: &ElementIds,
     include: bool,
     write: &WriteOptions,
@@ -753,7 +782,7 @@ fn filter_by_id_walker(
 #[allow(clippy::too_many_lines)]
 fn filter_by_id_streaming(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     ids: &ElementIds,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -908,7 +937,7 @@ fn filter_by_id_streaming(
 #[allow(clippy::too_many_lines)]
 fn getid_with_refs(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetidOptions,
     write: &WriteOptions,
@@ -1484,9 +1513,10 @@ mod tests {
             report_found: false,
         };
         let output = dir.path().join("output.pbf");
+        let staged = crate::output::Output::new(&output, crate::output::Overwrite::Refuse).unwrap();
         getid_with_refs(
             &input,
-            &output,
+            &staged,
             &ids,
             &opts,
             &WriteOptions::default(),
@@ -1494,6 +1524,7 @@ mod tests {
             &crate::host::Host::for_tests(),
         )
         .unwrap();
+        staged.publish().unwrap();
         assert_eq!(
             read_ids(&output, &crate::host::Host::for_tests()),
             vec![1, 2, 10]
@@ -1509,9 +1540,11 @@ mod tests {
         let walker = dir.path().join("walker.pbf");
         let full_scan = dir.path().join("full-scan.pbf");
         for (output, arm) in [(&walker, ScanArm::Walker), (&full_scan, ScanArm::FullScan)] {
+            let staged =
+                crate::output::Output::new(output, crate::output::Overwrite::Refuse).unwrap();
             filter_by_id(
                 input,
-                output,
+                &staged,
                 &query,
                 true,
                 &WriteOptions::default(),
@@ -1521,6 +1554,7 @@ mod tests {
                 host,
             )
             .unwrap();
+            staged.publish().unwrap();
         }
         let walker_ids = read_ids(&walker, host);
         assert_eq!(walker_ids, read_ids(&full_scan, host));
@@ -1584,9 +1618,11 @@ mod tests {
             (FULL_SCAN_ARM_MIN_BLOBS, ScanArm::Walker),
         ] {
             let output = dir.path().join(format!("out-{min_blobs}.pbf"));
+            let staged =
+                crate::output::Output::new(&output, crate::output::Overwrite::Refuse).unwrap();
             let (arm, _) = getid_dispatched(
                 &input,
-                &output,
+                &staged,
                 &query,
                 &opts,
                 &WriteOptions::default(),
@@ -1595,6 +1631,7 @@ mod tests {
                 &crate::host::Host::for_tests(),
             )
             .unwrap();
+            staged.publish().unwrap();
             assert_eq!(arm, Some(expected_arm));
             assert_eq!(
                 read_ids(&output, &crate::host::Host::for_tests()),

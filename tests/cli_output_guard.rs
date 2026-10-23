@@ -1,51 +1,28 @@
-//! Every user-named `--output` is written through a scratch sibling and
-//! renamed into place only on success.
+//! The output contract, end to end through the binary: every output is
+//! written to a staging sibling and published only on success; an existing
+//! output is refused before any work unless `--overwrite` (`-O`) is given;
+//! a symlink is refused always.
 //!
-//! The regression this guards: a command opened the destination with
+//! The regression the staging guards: a command opened the destination with
 //! `File::create` before it had produced a single byte, so pointing `-o` at
 //! an existing file destroyed that file the moment the run began, and any
 //! mid-run failure left a truncated stub under the name the user chose.
 //!
-//! ## What is testable from here, and what is not
+//! ## Where each property is proven
 //!
-//! The survival property itself - "a run that dies after the writer opened
-//! leaves the destination byte-identical" - is covered where it can be
-//! covered honestly: `src/path_guard.rs` proves it on the primitive, and
-//! `tests/cli_export.rs` proves it end-to-end on `export`, whose decode
-//! failure genuinely lands after its writer is open.
+//! The publication mechanism - staging, refusal, exclusive publication,
+//! group rollback, every injected fault - is proven on the library type in
+//! `src/output.rs`. Forced mid-run failures of real commands are in the
+//! fault tests (`fault_apply_changes`, `fault_parallel_writer`,
+//! `fault_geocode_pass3`) and `renumber_external`, each asserting that no
+//! file appears at the destination.
 //!
-//! It is covered here for `cat`, the one CLI-reachable case where a failure
-//! genuinely lands after the writer opened: re-encoding several inputs
-//! writes the first one out before it ever reads the second, so a corrupt
-//! second input fails mid-stream with the destination already open under
-//! the old shape. `cat_failure_leaves_preexisting_destination_intact` is
-//! confirmed to fail when `guarded_output` is made to run against the
-//! destination path.
-//!
-//! It is also covered for one single-input command:
-//! `add-locations-to-ways`. Its missing-locations policy can only be
-//! evaluated once a complete output exists - the external backend does not
-//! learn its resolved count until its last stage - so a way referencing an
-//! absent node is a CLI-reachable failure that lands *after* the writer has
-//! finished, which is exactly the shape this file could not previously
-//! reach. `altw_missing_nodes_leave_preexisting_destination_intact` covers
-//! it, and needs no fault injection: a two-node fixture with a dangling ref
-//! is enough.
-//!
-//! It remains uncovered for the *other* single-input commands, deliberately.
-//! Every corrupt-input fixture reachable from the CLI makes those fail
-//! before their writer opens: a truncated file dies in the header-walk
-//! preflight, and a corrupted blob payload dies in `sort`'s pass 1. A
-//! survival test built on either passes with the guard removed - it proves
-//! nothing, and a test that still passes when the production change is
-//! reverted is worse than no test. Closing that remaining gap needs a
-//! `test-hooks`-gated fault-injection flag on the CLI, of the same shape as
-//! `apply_changes`'s existing `panic_at_blob_seq`.
-//!
-//! What is tested here is the wiring, against the failure modes the wiring
-//! actually has: a guard that never commits (output missing), a guard whose
-//! scratch name changes what the writer produces (the `.gz` case), and a
-//! guard that leaks its scratch file.
+//! Here, through the CLI: `cat` with a corrupt second input fails after its
+//! writer opened, and `add-locations-to-ways` refuses a complete output
+//! after its writer finished; both must leave a pre-existing destination
+//! byte-identical. The refusal tests prove "before any work" by pointing the
+//! command at an input that does not exist: the output refusal must be the
+//! error reported, not the missing input.
 
 #![allow(clippy::unwrap_used)]
 
@@ -317,8 +294,9 @@ fn framing_error_names_the_input_file() {
 /// second, so a corrupt second input fails mid-stream with the destination
 /// already opened under the old shape.
 ///
-/// This bites on the production change itself: run the closure against the
-/// destination instead of the scratch sibling and the seeded file is gone.
+/// `--overwrite` is given, so the run gets past the refusal and genuinely
+/// fails mid-stream: writing to the destination instead of the staging file
+/// would leave the seeded file gone.
 #[test]
 fn cat_failure_leaves_preexisting_destination_intact() {
     let dir = TempDir::new().unwrap();
@@ -338,6 +316,7 @@ fn cat_failure_leaves_preexisting_destination_intact() {
             "--force",
             "-o",
             dest.to_str().unwrap(),
+            "--overwrite",
         ])
         .run();
     assert!(!out.status.success(), "corrupt input should fail the run");
@@ -381,6 +360,7 @@ fn bench_merge_failure_leaves_preexisting_destination_intact() {
             changes.to_str().unwrap(),
             "-o",
             dest.to_str().unwrap(),
+            "--overwrite",
         ])
         .run();
     assert!(!out.status.success(), "malformed OSC should fail the merge");
@@ -439,6 +419,7 @@ fn altw_missing_nodes_leave_preexisting_destination_intact() {
             "--force",
             "-o",
             dest.to_str().unwrap(),
+            "--overwrite",
         ])
         .run();
     assert!(
@@ -509,4 +490,263 @@ fn help_exits_zero_on_stdout() {
         String::from_utf8_lossy(&out.stdout).contains("OpenStreetMap PBF toolkit"),
         "--help text did not reach stdout"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Existing outputs and symlinks
+// ---------------------------------------------------------------------------
+
+/// An existing output is refused, and refused before any work: the input
+/// here does not exist, so a command that did any work first would report
+/// the missing input instead. The advice names the flag; the file survives.
+#[test]
+fn an_existing_output_is_refused_before_any_work() {
+    let dir = TempDir::new().unwrap();
+    let missing = dir.path().join("no-such-input.osm.pbf");
+    let dest = dir.path().join("out.osm.pbf");
+    std::fs::write(&dest, b"user data").unwrap();
+    let out = CliInvoker::new()
+        .args([
+            "sort",
+            missing.to_str().unwrap(),
+            "-o",
+            dest.to_str().unwrap(),
+        ])
+        .run();
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{}", out.stderr_str());
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("already exists") && stderr.contains("--overwrite (-O)"),
+        "the refusal must name the output and the flag; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("no-such-input"),
+        "the refusal must come before the input is read; stderr:\n{stderr}"
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), b"user data");
+    assert!(scratch_leftovers(dir.path()).is_empty());
+}
+
+/// `--overwrite` and its short form `-O` replace an existing output.
+#[test]
+fn overwrite_replaces_an_existing_output() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("in.osm.pbf");
+    write_fixture(&input);
+    for flag in ["--overwrite", "-O"] {
+        let dest = dir.path().join(format!("out{flag}.osm.pbf"));
+        std::fs::write(&dest, b"stale").unwrap();
+        CliInvoker::new()
+            .args([
+                "sort",
+                input.to_str().unwrap(),
+                "--force",
+                "-o",
+                dest.to_str().unwrap(),
+                flag,
+            ])
+            .assert_success();
+        let bytes = std::fs::read(&dest).unwrap();
+        assert_ne!(bytes, b"stale", "{flag} did not replace the output");
+        assert!(
+            pbfhogg::ElementReader::from_path(&dest).is_ok(),
+            "{flag}: the replaced output is not a PBF"
+        );
+    }
+    assert!(scratch_leftovers(dir.path()).is_empty());
+}
+
+/// A symlink is never an output, not even with `--overwrite`: renaming over
+/// it would turn the link into a regular file. The error names the link and
+/// its target, and both are left alone.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_output_is_refused_even_with_overwrite() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("in.osm.pbf");
+    write_fixture(&input);
+    let target = dir.path().join("target.osm.pbf");
+    std::fs::write(&target, b"user data").unwrap();
+    let link = dir.path().join("link.osm.pbf");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let out = CliInvoker::new()
+        .args([
+            "sort",
+            input.to_str().unwrap(),
+            "--force",
+            "-o",
+            link.to_str().unwrap(),
+            "--overwrite",
+        ])
+        .run();
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{}", out.stderr_str());
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("link.osm.pbf is a symlink to") && stderr.contains("target.osm.pbf"),
+        "the error must name the link and its target; stderr:\n{stderr}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"user data");
+}
+
+/// Every output a config names is checked before any extraction: one
+/// existing output among several refuses the whole run and creates none of
+/// the others. `--overwrite` on the command line covers them all.
+#[test]
+fn extract_config_checks_every_output_up_front() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("in.osm.pbf");
+    write_fixture(&input);
+    let config = dir.path().join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{
+                "directory": "{}",
+                "extracts": [
+                    {{ "output": "a.osm.pbf", "bbox": [9.0, 9.0, 11.0, 11.0] }},
+                    {{ "output": "b.osm.pbf", "bbox": [9.0, 9.0, 11.0, 11.0] }},
+                    {{ "output": "c.osm.pbf", "bbox": [9.0, 9.0, 11.0, 11.0] }}
+                ]
+            }}"#,
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+    let existing = dir.path().join("c.osm.pbf");
+    std::fs::write(&existing, b"user data").unwrap();
+    let args = [
+        "extract",
+        input.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+        "--simple",
+        "--force",
+    ];
+    let out = CliInvoker::new().args(args).run();
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{}", out.stderr_str());
+    out.assert_stderr_contains("c.osm.pbf already exists");
+    assert!(!dir.path().join("a.osm.pbf").exists());
+    assert!(!dir.path().join("b.osm.pbf").exists());
+    assert_eq!(std::fs::read(&existing).unwrap(), b"user data");
+    assert!(scratch_leftovers(dir.path()).is_empty());
+
+    CliInvoker::new()
+        .args(args)
+        .arg("--overwrite")
+        .assert_success();
+    for name in ["a.osm.pbf", "b.osm.pbf", "c.osm.pbf"] {
+        assert!(
+            pbfhogg::ElementReader::from_path(dir.path().join(name)).is_ok(),
+            "{name} was not published"
+        );
+    }
+    assert!(scratch_leftovers(dir.path()).is_empty());
+}
+
+/// A directory output follows the same rule: an existing index directory is
+/// refused before any work without `--overwrite`.
+#[test]
+fn an_existing_index_directory_is_refused_before_any_work() {
+    let dir = TempDir::new().unwrap();
+    let index = dir.path().join("index");
+    std::fs::create_dir(&index).unwrap();
+    let out = CliInvoker::new()
+        .args([
+            "build-geocode-index",
+            dir.path().join("no-such-input.osm.pbf").to_str().unwrap(),
+            "--output-dir",
+            index.to_str().unwrap(),
+        ])
+        .run();
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{}", out.stderr_str());
+    let stderr = out.stderr_str();
+    assert!(
+        stderr.contains("already exists") && stderr.contains("--overwrite (-O)"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!stderr.contains("no-such-input"), "stderr:\n{stderr}");
+    assert!(index.is_dir());
+}
+
+/// Non-PBF outputs go through the same rules: `diff -o`, `export -o` and
+/// `merge-changes -o` refuse an existing output and replace it under `-O`.
+#[test]
+fn text_and_osc_outputs_follow_the_same_rules() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("in.osm.pbf");
+    // Sorted, because diff requires it.
+    crate::common::write_test_pbf_sorted(
+        &input,
+        &[crate::common::TestNode {
+            id: 1,
+            lat: 100_000_000,
+            lon: 100_000_000,
+            tags: vec![("amenity", "cafe")],
+            meta: None,
+        }],
+        &[],
+        &[],
+    );
+    let osc = dir.path().join("a.osc");
+    std::fs::write(
+        &osc,
+        b"<osmChange version=\"0.6\"><create><node id=\"1\" version=\"1\" lat=\"1.0\" lon=\"2.0\"/></create></osmChange>",
+    )
+    .unwrap();
+    let cases: [(&str, Vec<String>); 3] = [
+        (
+            "diff.txt",
+            vec![
+                "diff".into(),
+                input.display().to_string(),
+                input.display().to_string(),
+            ],
+        ),
+        (
+            "export.geojsonseq",
+            vec![
+                "export".into(),
+                input.display().to_string(),
+                "--type".into(),
+                "node".into(),
+            ],
+        ),
+        (
+            "merged.osc",
+            vec!["merge-changes".into(), osc.display().to_string()],
+        ),
+    ];
+    for (name, args) in cases {
+        let dest = dir.path().join(name);
+        std::fs::write(&dest, b"user data").unwrap();
+        let out = CliInvoker::new().args(&args).arg("-o").arg(&dest).run();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{name}: stderr:\n{}",
+            out.stderr_str()
+        );
+        out.assert_stderr_contains("already exists");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"user data", "{name}");
+
+        let out = CliInvoker::new()
+            .args(&args)
+            .arg("-o")
+            .arg(&dest)
+            .arg("-O")
+            .run();
+        assert!(
+            out.status.code() == Some(0) || out.status.code() == Some(1),
+            "{name}: stderr:\n{}",
+            out.stderr_str()
+        );
+        assert_ne!(std::fs::read(&dest).unwrap(), b"user data", "{name}");
+    }
+    assert!(scratch_leftovers(dir.path()).is_empty());
 }

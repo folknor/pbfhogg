@@ -4,6 +4,64 @@
 
 ### Breaking
 
+- **Scratch is one hidden directory per run, and the library takes it as an
+  argument.** `altw::add_locations_to_ways`, `altw::external::external_join`,
+  `diff::diff`, `diff::derive::derive_changes` and
+  `geocode_index::builder::build_geocode_index` take a
+  `pbfhogg::scratch::RunScratch` by value, made with
+  `RunScratch::create(parent, &host)` (the parent must exist and be writable;
+  create it before opening any input). Everything the run writes as scratch
+  goes in `parent/.pbfhogg-run-<pid>-<random>`, which is removed when the
+  run ends; a removal that fails is reported through the host's diagnostics
+  with the leftover's path. `Host::scratch_parent` is gone, and so are the
+  `diff-par-*`, `derive-*`, `.pbfhogg-external-join-*` and
+  `.pbfhogg-sparse-index-*` names. Scratch no longer lands beside the input
+  (parallel `diff` used to write next to the old PBF) or inside the geocode
+  index directory's staging copy.
+
+- **Existing outputs are refused unless `--overwrite` (`-O`) is given.**
+  Every command that writes a file or directory - PBF output, `merge-changes`
+  and `diff --format osc` OSC, `diff -o`, `export -o`, every output of
+  `extract --config` (all checked up front, so a late region never fails
+  after early ones were extracted), and `build-geocode-index --output-dir` -
+  now stops before doing any work when the output path already exists, with
+  `Error: output <path> already exists and replacing it was not requested;
+  pass --overwrite (-O) to replace it` and exit 2. `--overwrite` restores the
+  old replace-in-place behaviour, matching osmium's `-O`. Scripts and
+  benchmarks that rerun into the same path must add it. For
+  `build-geocode-index` an existing empty directory is now refused too
+  without `--overwrite`; its legacy `--force` still grants both overwrite and
+  unindexed input.
+
+- **A symlink is never accepted as an output**, even with `--overwrite`: it
+  used to be silently replaced by a regular file. The error names the link
+  and its target. An existing directory or special file (`-o /dev/null`) is
+  likewise refused for a file output.
+
+- **Library command entry points take a `pbfhogg::Output` instead of an
+  output `&Path`, and publish it themselves.** `Output::new(path,
+  Overwrite::Refuse | Overwrite::Replace)` applies the rules above (refusals
+  are the typed `ErrorKind::Output(OutputError::Exists | Symlink | NotAFile
+  | ...)`, whose text names no CLI flag) and stages the file; the entry point
+  writes the staging file and renames it into place only when it succeeds,
+  so a failed library call no longer truncates or leaves a partial file at
+  the path it was given. Changed: `sort::sort`, `cat::cat`,
+  `cat::dedupe::merge_pbf`, `repack::repack`, `degrade::degrade`,
+  `time_filter::time_filter`, `renumber::renumber_external`, `getid::getid`
+  and `removeid`, `getparents::getparents` and
+  `getparents_with_min_blobs`, `extract::extract`,
+  `tags_filter::tags_filter`, `tags_filter::osc::tags_filter_osc`,
+  `apply_changes::merge`, `altw::add_locations_to_ways`,
+  `altw::external::external_join`, `merge_changes::merge_changes` and
+  `diff::derive::derive_changes`. `extract::extract_multi` now takes the
+  regions and a `pbfhogg::OutputSet` (`extract_multi_with_display_paths` is
+  gone). `geocode_index::builder::build_geocode_index` takes a
+  `builder::IndexOutput`, an `OutputDir` that only `builder::index_output`
+  builds, so an existing non-index directory can never be replaced; and
+  `BuildConfig` loses `output_dir`, `overwrite` and `force` (overwrite
+  permission is the `OutputDir`'s; unindexed input is `allow_unindexed`).
+  `path_guard::OutputFile` is gone.
+
 - **Errors keep their kind and their cause end to end; `BoxResult` is gone.**
   The functions that returned `BoxResult` (the command entry points,
   `osc::parse_osc_file`, `osc::load_all_diffs`, `geocode_index::Reader::open`,
@@ -86,13 +144,13 @@
   refusal), and converting to `pbfhogg::Error` restores the typed variant.
 
 - **`build-geocode-index` publishes a complete index or nothing.** Every
-  build is written to a `.geocode-build-*` staging directory beside
+  build is written to a `.pbfhogg-tmp-*` staging directory beside
   `--output-dir` and swapped into place only after it and its smoke test
   succeed, so a failed `--overwrite` rebuild leaves the old index intact and
   readers already open keep working. The output directory is replaced as a
-  whole: it must be new, empty, or an existing index (with `--overwrite`); a
-  directory holding anything else is refused rather than deleted. Allow
-  disk space for two generations during a rebuild.
+  whole: it must be new, or (with `--overwrite`) an existing index or empty
+  directory; a directory holding anything else is refused rather than
+  deleted. Allow disk space for two generations during a rebuild.
 
 - **`build-geocode-index --force` is split into `--overwrite` and
   `--allow-unindexed`.** Replacing an existing index no longer also waives
@@ -580,6 +638,24 @@
 
 ### Added
 
+- **`--tmp-dir <DIR>` on `add-locations-to-ways`, `diff` and
+  `build-geocode-index`** chooses where the run's scratch goes, for when the
+  output's volume is small or slow (`--index-type external` needs hundreds of
+  GB at planet scale). The directory must exist and be writable and is checked
+  before any input is opened, so a bad value fails at once. The default is the
+  output's directory, as before; a `diff` with no output file uses the current
+  directory (it used to use the old input's directory). Output staging files
+  stay beside the output regardless.
+
+- **Leftovers of runs that never finished are reported.** A command that
+  writes an output now prints a `Warning:` for each unfinished run directory,
+  old-style scratch file or directory, hidden `.pbfhogg-tmp-*` staging file
+  and `.pbfhogg-backup-*` backup it finds in the output's directory (and in
+  `--tmp-dir`), with its size and why it is believed stale, and never removes
+  any of them. A backup is worded separately: it can be the only copy of a
+  previous output. The scan is also available to library callers as
+  `scratch::find_stale`, which returns typed values.
+
 - **`PbfWriter::to_path_sync`: synchronous file output that syncs on
   `flush()`.** It creates the file, owns a 256 KiB buffer and compresses on
   the calling thread, and `flush()` syncs the file like every pipelined
@@ -722,6 +798,21 @@
   makes the decision before the header is read.
 
 ### Fixed
+
+- **No output path ever holds a partial or abandoned file.** Every output,
+  through the CLI and through the library alike, is written to a hidden
+  `.pbfhogg-tmp-*` staging file beside it and renamed into place only after
+  its final flush and every check on it succeed; a failed or dropped run
+  removes the staging file and leaves an existing output untouched. Without
+  `--overwrite` the final rename is exclusive, so an output that appears
+  while a long run is in flight is not clobbered either. `extract --config`
+  publishes its outputs as a group and rolls back the ones already in place
+  if a later one cannot be published, instead of leaving a half-replaced
+  set. `merge-changes`, `tags-filter` on OSC input and `export -o` now check
+  their final buffered write and sync the file before publishing; the gzip
+  OSC writers could previously report success after a failed last write.
+  `build-geocode-index` syncs the new index's files before it replaces the
+  old index.
 
 - **Overlapping and regional diffs merge and apply instead of failing the
   version gate.** `apply-changes` and `merge-changes --simplify` refused any
@@ -1088,11 +1179,10 @@
 - **Concurrent library runs no longer share or delete each other's scratch.**
   Two `add-locations-to-ways`, `diff` or `diff --format osc` runs in one
   process named their scratch files by process id alone, so they wrote into
-  and cleaned up the same files. Each run now takes its own token; the first
-  run in a process keeps the old names. A `Host::scratch_parent` override
-  places that scratch in the named directory, which must exist. Scratch
-  creation errors name the path; sequential derive also removes fragments
-  after partial initialization or a panic.
+  and cleaned up the same files. Each run now owns its own scratch directory
+  (see the scratch entries above). Scratch creation errors name the path;
+  sequential derive also removes fragments after partial initialization or a
+  panic.
 
 - **Piping CLI output into a reader that exits early no longer panics.**
   `pbfhogg inspect x.pbf | head`, and the same with `check`, `diff`,

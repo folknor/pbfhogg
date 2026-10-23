@@ -66,7 +66,7 @@ fn renumber_nodes_sequentially() {
 
     let stats = renumber_external(
         &input,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -127,7 +127,7 @@ fn renumber_custom_start_node_id() {
 
     let stats = renumber_external(
         &input,
-        &output,
+        crate::common::out(&output),
         &opts,
         &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -210,7 +210,7 @@ fn renumber_preserves_sorted_header_and_type_order() {
 
     renumber_external(
         &input,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -292,7 +292,7 @@ fn renumber_relations_end_to_end() {
 
     let stats = renumber_external(
         &input,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -375,7 +375,7 @@ fn renumber_relation_forward_ref() {
 
     renumber_external(
         &input,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -415,7 +415,7 @@ fn renumber_relation_self_reference() {
 
     renumber_external(
         &input,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -530,7 +530,7 @@ fn renumber_relation_mixed_member_types_interleaved() {
 
     renumber_external(
         &input,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -621,7 +621,7 @@ fn renumber_nodes_and_ways_end_to_end() {
 
     let stats = renumber_external(
         &input,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -700,7 +700,7 @@ fn renumber_custom_start_ids() {
 
     renumber_external(
         &input,
-        &output,
+        crate::common::out(&output),
         &opts,
         &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -743,7 +743,7 @@ fn renumber_rejects_negative_node_id() {
 
     let err = renumber_external(
         &input,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -797,7 +797,7 @@ fn renumber_rejects_negative_way_ref() {
 
     let err = renumber_external(
         &input,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -857,7 +857,7 @@ fn renumber_orphan_way_ref_is_shifted_past_the_new_range() {
 
     let stats = renumber_external(
         &input,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -943,7 +943,7 @@ fn renumber_orphan_relation_members_are_shifted_past_the_new_range() {
 
     let stats = renumber_external(
         &input,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -1169,7 +1169,7 @@ fn renumber_rejects_negative_relation_member_ref() {
 
     let err = renumber_external(
         &input,
-        &output,
+        crate::common::out(&output),
         &default_opts(),
         &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -1199,7 +1199,7 @@ fn run_renumber(
 ) -> Result<RenumberStats, String> {
     renumber_external(
         input,
-        output,
+        crate::common::out(output),
         opts,
         &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -1297,12 +1297,18 @@ fn assert_fails_promptly(mutate: impl FnOnce(&[u8]) -> Vec<u8>, expect: &str) {
 
     let pbf = std::fs::read(&input).expect("read fixture");
     std::fs::write(&input, mutate(&pbf)).expect("rewrite fixture");
-    let err = renumber_within_deadline(input, output)
+    let failed_output = dir.path().join("failed.osm.pbf");
+    let err = renumber_within_deadline(input, failed_output.clone())
         .expect(HUNG)
         .expect_err("a corrupt blob mid-stream must fail the run");
     assert!(
         err.contains(expect),
         "expected an error naming {expect:?}; got: {err}"
+    );
+    // A failure mid-stream publishes nothing.
+    assert!(
+        !failed_output.exists(),
+        "a failed renumber left a file at its output path"
     );
 }
 

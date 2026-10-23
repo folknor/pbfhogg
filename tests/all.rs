@@ -44,6 +44,8 @@ mod cli_extract;
 #[cfg(feature = "commands")]
 mod cli_output_guard;
 #[cfg(feature = "commands")]
+mod cli_scratch;
+#[cfg(feature = "commands")]
 mod geocode_index;
 #[cfg(feature = "commands")]
 mod inspect;

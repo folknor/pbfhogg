@@ -141,10 +141,31 @@ impl CurrentElem {
     }
 }
 
-#[hotpath::measure]
 pub fn merge_changes(
     inputs: &[&Path],
-    output: &Path,
+    output: crate::output::Output,
+    simplify: bool,
+    jobs: Option<usize>,
+    allow_version_regression: bool,
+    host: &crate::host::Host,
+) -> Result<MergeChangesStats> {
+    let result = merge_changes_to(
+        inputs,
+        &output,
+        simplify,
+        jobs,
+        allow_version_regression,
+        host,
+    )?;
+    output.publish()?;
+    Ok(result)
+}
+
+/// [`merge_changes`] writing to a borrowed output it does not publish.
+#[hotpath::measure]
+pub(crate) fn merge_changes_to(
+    inputs: &[&Path],
+    output: &crate::output::Output,
     simplify: bool,
     jobs: Option<usize>,
     allow_version_regression: bool,
@@ -196,74 +217,35 @@ pub fn merge_changes(
         host.executor.clone()
     };
 
-    let do_work = |write_path: &Path| -> crate::Result<(u64, u64)> {
+    // Gzip or plain XML is decided by the name the caller chose, never by
+    // the staging name.
+    let is_gz = gz_requested(output.destination());
+    // The one whole-body executor install in the library. Everywhere else
+    // `install` wraps only a parallel computation, so that no `PbfWriter`
+    // producer ends up on a pool worker; this body writes OSC XML and drives
+    // no `PbfWriter`, so wrapping all of it puts no producer on a worker.
+    // Under `Executor::Ambient` (the CLI) this is a direct call.
+    let (changes_in, changes_out) = executor.install(|| -> crate::Result<(u64, u64)> {
         if simplify {
             let stream = build_simplify_stream(inputs)?;
             let changes_in = stream.changes.len() as u64;
-            let changes_out =
-                write_simplified(write_path, stream, worker_count, allow_version_regression)?
-                    as u64;
+            let changes_out = write_simplified(
+                output,
+                is_gz,
+                stream,
+                worker_count,
+                allow_version_regression,
+            )? as u64;
             Ok((changes_in, changes_out))
         } else {
-            let changes_out = write_streaming(inputs, write_path, &executor)?;
+            let changes_out = write_streaming(inputs, output, is_gz, &executor)?;
             Ok((changes_out, changes_out))
         }
-    };
-
-    let (changes_in, changes_out) = {
-        // Failure hygiene for the library entry point.
-        //
-        // `write_streaming`'s single-input path creates the destination and
-        // streams XML into it while parsing, so a truncated input - a
-        // missing closing `osmChange`, an I/O error halfway - used to leave
-        // the destination holding a partial document. Under the CLI that is
-        // already harmless: `guarded_output` hands this function a scratch
-        // sibling that does not exist yet and removes it on failure. A
-        // library caller has no such front end.
-        //
-        // So the guard chosen here depends on what is at the destination,
-        // which also keeps it from duplicating the CLI's work:
-        //
-        //   - destination absent (every CLI call, since the scratch path is
-        //     fresh): a plain `PathGuard` deletes the file this call
-        //     created if the call fails. No second scratch, no second
-        //     rename.
-        //   - destination present (a library caller overwriting a real
-        //     file): route the writes through an `OutputFile` scratch
-        //     sibling so the existing file is untouched until success.
-        let existing = output.exists();
-        let scratch = if existing {
-            Some(crate::path_guard::OutputFile::new(output)?)
-        } else {
-            None
-        };
-        let write_path: &Path = scratch.as_ref().map_or(output, |s| s.path());
-        let created = if existing {
-            None
-        } else {
-            Some(crate::path_guard::PathGuard::file(output.to_path_buf()))
-        };
-
-        // The one whole-body executor install in the library. Everywhere
-        // else `install` wraps only a parallel computation, so that no
-        // `PbfWriter` producer ends up on a pool worker; `do_work` writes
-        // OSC XML and drives no `PbfWriter`, so wrapping all of it puts no
-        // producer on a worker. Under `Executor::Ambient` (the CLI) this is a
-        // direct call, exactly as before.
-        let result = executor.install(|| do_work(write_path))?;
-
-        if let Some(scratch) = scratch {
-            scratch.commit()?;
-        }
-        if let Some(created) = created {
-            drop(created.commit());
-        }
-        result
-    };
+    })?;
 
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("merge_changes_changes_out", changes_out as i64);
-    if let Ok(meta) = std::fs::metadata(output) {
+    if let Ok(meta) = std::fs::metadata(output.path()) {
         #[allow(clippy::cast_possible_wrap)]
         crate::debug::emit_counter("merge_changes_total_bytes_out", meta.len() as i64);
     }
@@ -522,13 +504,27 @@ impl<W: io::Write> OscWriter<W> {
     }
 }
 
+/// Whether a merged OSC goes out gzipped: a UTF-8 destination name ending in
+/// `.gz`. Decided from the destination the caller named, never from the
+/// staging file the bytes are written to.
+fn gz_requested(destination: &Path) -> bool {
+    // Deliberately require a UTF-8 name ending in .gz. Extension-only
+    // detection changes the historical output contract.
+    destination.to_str().is_some_and(|s| s.ends_with(".gz"))
+}
+
+/// Finish an output file: flush the buffer checked (dropping a `BufWriter`
+/// swallows its last write error) and sync, so the file is complete before
+/// it is published.
+fn finish_file(buf: io::BufWriter<File>) -> Result<()> {
+    let file = buf.into_inner().map_err(io::IntoInnerError::into_error)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 impl OscWriter<io::BufWriter<File>> {
-    fn from_file(output: &Path) -> Result<Self> {
-        let file = File::create(output)?;
-        let buf = io::BufWriter::new(file);
-        // Deliberately require a UTF-8 name ending in .gz, including for worker
-        // chunks. Extension-only detection changes the historical output contract.
-        let is_gz = output.to_str().is_some_and(|s| s.ends_with(".gz"));
+    fn from_output(output: &crate::output::Output, is_gz: bool) -> Result<Self> {
+        let buf = io::BufWriter::new(output.create()?);
         if is_gz {
             Ok(Self::Gz(Box::new(Writer::new_with_indent(
                 GzEncoder::new(buf, flate2::Compression::fast()),
@@ -541,17 +537,11 @@ impl OscWriter<io::BufWriter<File>> {
     }
 
     fn finish(self) -> Result<()> {
-        match self {
-            Self::Gz(w) => {
-                let gz = w.into_inner();
-                gz.finish()?;
-            }
-            Self::Plain(w) => {
-                let mut buf = w.into_inner();
-                io::Write::flush(&mut buf)?;
-            }
-        }
-        Ok(())
+        let buf = match self {
+            Self::Gz(w) => w.into_inner().finish()?,
+            Self::Plain(w) => w.into_inner(),
+        };
+        finish_file(buf)
     }
 }
 
@@ -578,13 +568,10 @@ impl OscWriter<Vec<u8>> {
 #[hotpath::measure]
 fn write_streaming(
     inputs: &[&Path],
-    output: &Path,
+    output: &crate::output::Output,
+    is_gz: bool,
     executor: &crate::host::Executor,
 ) -> Result<u64> {
-    // Deliberately require a UTF-8 name ending in .gz, including for worker
-    // chunks. Extension-only detection changes the historical output contract.
-    let is_gz = output.to_str().is_some_and(|s| s.ends_with(".gz"));
-
     crate::debug::emit_counter(
         "merge_changes_buffered_strategy",
         i64::from(inputs.len() > 1),
@@ -596,7 +583,7 @@ fn write_streaming(
         // buffer-and-drain would inflict at single-OSC scale (drain pass
         // is pure overhead when there is no parse to overlap with).
         crate::debug::emit_marker("MERGECHANGES_WRITE_OPEN_START");
-        let mut writer = OscWriter::from_file(output)?;
+        let mut writer = OscWriter::from_output(output, is_gz)?;
 
         writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
         let mut root = BytesStart::new("osmChange");
@@ -663,8 +650,7 @@ fn write_streaming(
     let window = rayon::current_num_threads().max(1);
     let prelude = build_prelude_bytes(is_gz)?;
     let postlude = build_postlude_bytes(is_gz)?;
-    let file = File::create(output)?;
-    let mut out = io::BufWriter::new(file);
+    let mut out = io::BufWriter::new(output.create()?);
     out.write_all(&prelude)?;
     let mut count = 0u64;
     // The per-member drain overlaps this span; DRAIN below is the postlude.
@@ -679,7 +665,7 @@ fn write_streaming(
     crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_END");
     crate::debug::emit_marker("MERGECHANGES_DRAIN_START");
     out.write_all(&postlude)?;
-    out.flush()?;
+    finish_file(out)?;
     crate::debug::emit_marker("MERGECHANGES_DRAIN_END");
     crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_START");
     crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_END");
@@ -901,7 +887,8 @@ fn check_version_advance(floor: &mut VersionFloor, incoming: &Change) -> Result<
 
 #[hotpath::measure]
 fn write_simplified(
-    output: &Path,
+    output: &crate::output::Output,
+    is_gz: bool,
     stream: ChangeStream,
     worker_count: usize,
     allow_version_regression: bool,
@@ -954,10 +941,6 @@ fn write_simplified(
     crate::debug::emit_marker("MERGECHANGES_SIMPLIFY_END");
 
     let total_out = creates.len() + modifies.len() + deletes.len();
-    // Deliberately require a UTF-8 name ending in .gz, including for worker
-    // chunks. Extension-only detection changes the historical output contract.
-    let is_gz = output.to_str().is_some_and(|s| s.ends_with(".gz"));
-
     // Mirror the streaming-path parallel-drain shape: split each
     // non-empty action group into chunks, parallel-emit each chunk as a
     // self-contained `<action>...</action>` gzip member, main thread
@@ -1005,14 +988,13 @@ fn write_simplified(
     crate::debug::emit_marker("MERGECHANGES_DRAIN_START");
     let prelude = build_prelude_bytes(is_gz)?;
     let postlude = build_postlude_bytes(is_gz)?;
-    let file = File::create(output)?;
-    let mut out = io::BufWriter::new(file);
+    let mut out = io::BufWriter::new(output.create()?);
     out.write_all(&prelude)?;
     for bytes in &all_chunks {
         out.write_all(bytes)?;
     }
     out.write_all(&postlude)?;
-    out.flush()?;
+    finish_file(out)?;
     crate::debug::emit_marker("MERGECHANGES_DRAIN_END");
     crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_START");
     crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_END");
@@ -1122,7 +1104,7 @@ mod tests {
                 let output = scratch.path().join(name);
                 merge_changes(
                     &inputs,
-                    &output,
+                    crate::output::Output::new(&output, crate::output::Overwrite::Replace)?,
                     false,
                     Some(jobs),
                     false,
@@ -1149,14 +1131,10 @@ mod tests {
     /// `</osmChange>` - is refused, and the destination the caller named
     /// must be untouched by the attempt.
     ///
-    /// The CLI has been safe here since `guarded_output` started handing
-    /// every user-named output a scratch sibling, so this is not
-    /// reachable through the binary. A library caller has no such front
-    /// end: the single-input path creates the destination and streams
-    /// XML into it during the parse, so before this guard a failed merge
-    /// replaced a pre-existing file with a partial document. Tested at
-    /// the library layer because that is the only layer it was ever
-    /// broken at.
+    /// The single-input path streams XML into its output during the parse,
+    /// so before publication moved into the library a failed merge called
+    /// through the library replaced a pre-existing file with a partial
+    /// document. The `Output` staging file is what keeps it out now.
     #[test]
     fn a_failed_merge_leaves_a_pre_existing_destination_intact() {
         let scratch = crate::path_guard::tests::scratch();
@@ -1172,7 +1150,7 @@ mod tests {
 
         let err = merge_changes(
             &[&input],
-            &dest,
+            crate::output::Output::new(&dest, crate::output::Overwrite::Replace).unwrap(),
             false,
             Some(1),
             false,
@@ -1207,7 +1185,7 @@ mod tests {
 
         merge_changes(
             &[&input],
-            &dest,
+            crate::output::Output::new(&dest, crate::output::Overwrite::Refuse).unwrap(),
             false,
             Some(1),
             false,
@@ -1244,7 +1222,7 @@ mod tests {
         std::fs::write(&dest, b"stale").unwrap();
         let stats = merge_changes(
             &[&input],
-            &dest,
+            crate::output::Output::new(&dest, crate::output::Overwrite::Replace).unwrap(),
             false,
             Some(1),
             false,

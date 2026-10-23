@@ -64,7 +64,7 @@ fn overlay_verdict(input: &Path) -> Verdict {
 fn merge_verdict(input: &Path, out: &Path) -> Verdict {
     pbfhogg::commands::merge_changes::merge_changes(
         &[input],
-        out,
+        crate::common::out_replace(out),
         false,
         Some(1),
         false,
@@ -77,7 +77,7 @@ fn merge_verdict(input: &Path, out: &Path) -> Verdict {
 fn simplify_verdict(input: &Path, out: &Path) -> Verdict {
     pbfhogg::commands::merge_changes::merge_changes(
         &[input],
-        out,
+        crate::common::out_replace(out),
         true,
         Some(1),
         false,
@@ -90,7 +90,7 @@ fn simplify_verdict(input: &Path, out: &Path) -> Verdict {
 fn tags_filter_verdict(input: &Path, out: &Path) -> Verdict {
     tags_filter_osc(
         input,
-        out,
+        crate::common::out_replace(out),
         &["highway=primary".to_string()],
         &crate::common::test_host(),
     )
@@ -297,7 +297,7 @@ fn every_consumer_agrees_on_metadata_leniency() {
     let merge_out = dir.path().join("meta-out.osc");
     pbfhogg::commands::merge_changes::merge_changes(
         &[&input],
-        &merge_out,
+        crate::common::out_replace(&merge_out),
         false,
         Some(1),
         false,
@@ -307,7 +307,7 @@ fn every_consumer_agrees_on_metadata_leniency() {
     let filter_out = dir.path().join("meta-out-filter.osc.gz");
     tags_filter_osc(
         &input,
-        &filter_out,
+        crate::common::out_replace(&filter_out),
         &["highway=primary".to_string()],
         &crate::common::test_host(),
     )
@@ -394,7 +394,7 @@ fn only_the_overlay_interprets_changeset_uid_and_timestamp() {
         let merge_out = dir.path().join("verbatim-out.osc");
         pbfhogg::commands::merge_changes::merge_changes(
             &[&input],
-            &merge_out,
+            crate::common::out_replace(&merge_out),
             false,
             Some(1),
             false,
@@ -404,7 +404,7 @@ fn only_the_overlay_interprets_changeset_uid_and_timestamp() {
         let filter_out = dir.path().join("verbatim-out-filter.osc.gz");
         tags_filter_osc(
             &input,
-            &filter_out,
+            crate::common::out_replace(&filter_out),
             &["highway=primary".to_string()],
             &crate::common::test_host(),
         )
@@ -452,7 +452,7 @@ fn re_emit_sinks_escape_user_data_identically() {
     let merge_out = dir.path().join("escape-out.osc");
     pbfhogg::commands::merge_changes::merge_changes(
         &[&input],
-        &merge_out,
+        crate::common::out_replace(&merge_out),
         false,
         Some(1),
         false,
@@ -462,7 +462,7 @@ fn re_emit_sinks_escape_user_data_identically() {
     let filter_out = dir.path().join("escape-out-filter.osc.gz");
     tags_filter_osc(
         &input,
-        &filter_out,
+        crate::common::out_replace(&filter_out),
         &["highway=primary".to_string()],
         &crate::common::test_host(),
     )
@@ -527,7 +527,7 @@ fn simplify_sequence_verdict(inputs: &[PathBuf], out: &Path) -> Verdict {
     let refs: Vec<&Path> = inputs.iter().map(PathBuf::as_path).collect();
     pbfhogg::commands::merge_changes::merge_changes(
         &refs,
-        out,
+        crate::common::out_replace(out),
         true,
         Some(1),
         false,

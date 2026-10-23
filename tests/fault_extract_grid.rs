@@ -24,7 +24,7 @@ mod grid_parity {
     use pbfhogg::MemberId;
     use pbfhogg::cat::CleanAttrs;
     use pbfhogg::commands::extract::{
-        Bbox, ExtractSlot, ExtractStrategy, PolygonRings, Region, extract_multi, parse_bbox,
+        Bbox, ExtractStrategy, PolygonRings, Region, extract_multi, parse_bbox,
     };
     use pbfhogg::read::region_grid_test_hooks as grid_hooks;
     use pbfhogg::write::WriteOptions;
@@ -125,15 +125,14 @@ mod grid_parity {
     where
         F: Fn(usize) -> Region,
     {
-        let slots: Vec<ExtractSlot> = (0..20)
-            .map(|i| ExtractSlot {
-                region: region(i),
-                output: dir.join(format!("out-{i}.osm.pbf")),
-            })
+        let regions: Vec<Region> = (0..20).map(&region).collect();
+        let outputs: Vec<std::path::PathBuf> = (0..20)
+            .map(|i| dir.join(format!("out-{i}.osm.pbf")))
             .collect();
         extract_multi(
             input,
-            &slots,
+            &regions,
+            pbfhogg::OutputSet::files(&outputs, pbfhogg::Overwrite::Refuse).expect("stage outputs"),
             ExtractStrategy::Simple,
             true,
             &CleanAttrs::default(),
@@ -145,7 +144,7 @@ mod grid_parity {
             &crate::common::test_host(),
         )
         .expect("extract_multi");
-        slots.into_iter().map(|s| s.output).collect()
+        outputs
     }
 
     fn assert_byte_identical(

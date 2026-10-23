@@ -82,64 +82,28 @@ fn preallocate_sparse_file(file: &std::fs::File, _scratch_dir: &Path, bytes: u64
 }
 
 /// Create, preallocate and immediately unlink the sparse node store, handing
-/// back the still-open descriptor.
-///
-/// The file is named by PID and run token (so two runs in one process cannot
-/// remove each other's file) and is therefore reachable by name for the window
-/// between `create_new` and the unlink. Preallocation can fail inside that
-/// window *after* `posix_fallocate` has reserved blocks, so the window is
-/// covered by a `PathGuard`: without it a failed run leaves a partially
-/// allocated, potentially multi-gigabyte file in scratch until some later
-/// run happens to be assigned the same PID and clears it. The guard is
-/// committed only once the unlink has succeeded, at which point the path is
-/// already gone.
+/// back the still-open descriptor: the store is anonymous, so a run killed
+/// outright gives its space back with the process. The file lives in the
+/// run's scratch directory, so a failure between creation and unlink leaves
+/// nothing outside it for the directory's guard to miss.
 fn open_anonymous_sparse_file(
-    scratch_dir: &Path,
+    scratch: &crate::scratch::RunScratch,
     total_bytes: u64,
-    host: &crate::host::Host,
-    token: &crate::scratch::RunToken,
 ) -> Result<std::fs::File> {
-    let temp_path = scratch_dir.join(format!(
-        ".pbfhogg-sparse-index-{}{}",
-        std::process::id(),
-        token.suffix()
-    ));
-    match std::fs::remove_file(&temp_path) {
-        Ok(()) => crate::host::diag!(
-            host.diagnostics,
-            Note,
-            "altw.sparse.stale_temp_removed",
-            "removed stale sparse index temp file {}",
+    let temp_path = scratch.file("sparse-index")?;
+    let file = crate::scratch::create_read_write(&temp_path, true).map_err(|e| {
+        Error::from(e).context(format!(
+            "failed to create sparse index temp file {}",
             temp_path.display()
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(Error::from(e).context(format!(
-                "failed to remove stale sparse index temp file {}",
-                temp_path.display()
-            )));
-        }
-    }
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-        .map_err(|e| {
-            Error::from(e).context(format!(
-                "failed to create sparse index temp file {}",
-                temp_path.display()
-            ))
-        })?;
-    let guard = crate::path_guard::PathGuard::file(temp_path.clone());
-    preallocate_sparse_file(&file, scratch_dir, total_bytes)?;
-    std::fs::remove_file(&temp_path).map_err(|e| {
+        ))
+    })?;
+    preallocate_sparse_file(&file, scratch.path(), total_bytes)?;
+    scratch.unlink(&temp_path).map_err(|e| {
         Error::from(e).context(format!(
             "failed to unlink sparse index temp file {} after allocation",
             temp_path.display()
         ))
     })?;
-    drop(guard.commit());
     Ok(file)
 }
 
@@ -263,10 +227,9 @@ impl<'a> SharedSparseWriter<'a> {
 pub(super) fn build_node_index_sparse(
     input: &Path,
     _direct_io: bool,
-    scratch_dir: &Path,
+    scratch: &crate::scratch::RunScratch,
     referenced: IdSet,
     host: &crate::host::Host,
-    token: &crate::scratch::RunToken,
 ) -> Result<SparseArrayIndex> {
     let t_rank = std::time::Instant::now();
     let referenced = referenced.into_ranked();
@@ -282,7 +245,7 @@ pub(super) fn build_node_index_sparse(
     // No referenced nodes (e.g. every way has zero refs): posix_fallocate and
     // mmap both reject a zero length, so back the store with one unused slot.
     // The borrowed slot slice stays at `total_bytes`, so no rank can address it.
-    let file = open_anonymous_sparse_file(scratch_dir, total_bytes.max(8), host, token)?;
+    let file = open_anonymous_sparse_file(scratch, total_bytes.max(8))?;
 
     // SAFETY: file is exclusively owned, opened read+write, sized to total_bytes.
     let mut mmap = unsafe {
@@ -452,22 +415,18 @@ mod tests {
         assert_eq!(file.metadata().unwrap().len(), 0);
     }
 
-    /// The preallocation failure path used to `?` out between `create_new`
-    /// and the unlink, leaving the PID-named store behind - after
-    /// `posix_fallocate` may already have reserved its blocks. The guard has
-    /// to hold from creation all the way through a successful unlink, so the
-    /// assertion is on the scratch directory being empty, not on the error.
+    /// A failed preallocation leaves its file to the run directory, and the
+    /// run directory's drop removes it: nothing is left in the parent.
     #[cfg(target_os = "linux")]
     #[test]
     fn failed_preallocation_leaves_no_file_in_scratch() {
         let dir = crate::path_guard::tests::scratch();
-        super::open_anonymous_sparse_file(
-            dir.path(),
-            u64::MAX,
-            &crate::host::Host::for_tests(),
-            &crate::scratch::RunToken::next().unwrap(),
-        )
-        .expect_err("impossible allocation must be rejected");
+        let scratch =
+            crate::scratch::RunScratch::create(dir.path(), &crate::host::Host::for_tests())
+                .unwrap();
+        super::open_anonymous_sparse_file(&scratch, u64::MAX)
+            .expect_err("impossible allocation must be rejected");
+        drop(scratch);
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -483,14 +442,15 @@ mod tests {
     #[test]
     fn successful_allocation_unlinks_the_store() {
         let dir = crate::path_guard::tests::scratch();
-        let file = super::open_anonymous_sparse_file(
-            dir.path(),
-            4096,
-            &crate::host::Host::for_tests(),
-            &crate::scratch::RunToken::next().unwrap(),
-        )
-        .unwrap();
+        let scratch =
+            crate::scratch::RunScratch::create(dir.path(), &crate::host::Host::for_tests())
+                .unwrap();
+        let file = super::open_anonymous_sparse_file(&scratch, 4096).unwrap();
         assert_eq!(file.metadata().unwrap().len(), 4096);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let names: Vec<_> = std::fs::read_dir(scratch.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(!names.iter().any(|n| n == "sparse-index"), "{names:?}");
     }
 }

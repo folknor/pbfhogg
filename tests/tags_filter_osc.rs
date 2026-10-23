@@ -66,7 +66,7 @@ fn create_and_modify_are_filtered_but_deletes_are_preserved() {
 
     let stats = tags_filter_osc(
         &input,
-        &output,
+        crate::common::out(&output),
         &exprs(&["highway=primary"]),
         &crate::common::test_host(),
     )
@@ -127,7 +127,7 @@ fn type_prefix_applies_to_create_modify_only() {
 
     let stats = tags_filter_osc(
         &input,
-        &output,
+        crate::common::out(&output),
         &exprs(&["w/amenity=bench"]),
         &crate::common::test_host(),
     )
@@ -170,7 +170,7 @@ fn multiple_expressions_use_or_semantics() {
 
     let stats = tags_filter_osc(
         &input,
-        &output,
+        crate::common::out(&output),
         &exprs(&["amenity", "shop"]),
         &crate::common::test_host(),
     )
@@ -214,7 +214,7 @@ fn plain_osc_input_is_accepted() {
 
     let stats = tags_filter_osc(
         &input,
-        &output,
+        crate::common::out(&output),
         &exprs(&["amenity"]),
         &crate::common::test_host(),
     )
@@ -238,7 +238,7 @@ fn truncated_osc_is_refused() {
     );
     let err = tags_filter_osc(
         &input,
-        &output,
+        crate::common::out(&output),
         &exprs(&["amenity"]),
         &crate::common::test_host(),
     )
@@ -268,7 +268,7 @@ fn node_without_usable_coords_is_refused() {
     );
     let err = tags_filter_osc(
         &input,
-        &output,
+        crate::common::out(&output),
         &exprs(&["amenity"]),
         &crate::common::test_host(),
     )
@@ -288,7 +288,7 @@ fn legacy_output_is_gzip_without_suffix_and_metadata_is_normalized() {
     std::fs::write(&input, b"<osmChange version=\"0.6\"><create><node id=\"7\" lat=\"1\" lon=\"2\" timestamp=\"yesterday\" changeset=\"no\" uid=\"&#48;\" visible=\"False\"><tag k=\"name\" v=\"test\"/></node></create></osmChange>").expect("XML");
     tags_filter_osc(
         &input,
-        &output,
+        crate::common::out(&output),
         &exprs(&["name"]),
         &crate::common::test_host(),
     )

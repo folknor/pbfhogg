@@ -10,12 +10,19 @@ fn external_join(
 ) -> Result<(), String> {
     pbfhogg::altw::external::external_join(
         input,
-        output,
+        crate::common::out(output),
         true,
         &Default::default(),
         &Default::default(),
         false,
         host,
+        // Made from the test's own host: `common::test_host` raises the soft
+        // limit this test is measuring.
+        pbfhogg::scratch::RunScratch::create(
+            output.parent().unwrap_or(std::path::Path::new(".")),
+            host,
+        )
+        .map_err(|e| e.to_string())?,
     )
     .map(drop)
     .map_err(|e| e.to_string())
@@ -36,7 +43,6 @@ fn no_process_actions_leave_rlimit_nofile_unchanged() {
         resources: Arc::new(common::fixed_resources()),
         page_cache: pbfhogg::host::PageCachePolicy::Keep,
         executor: pbfhogg::host::Executor::Ambient,
-        scratch_parent: None,
     };
     let set_soft = |soft: u64| {
         // SAFETY: this standalone test owns its process and initializes the output.

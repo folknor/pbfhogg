@@ -35,7 +35,6 @@ use rustc_hash::FxHashMap;
 
 use crate::Element;
 
-use super::BuildConfig;
 use super::Result;
 use super::strings::StringPool;
 use crate::error::Error;
@@ -425,7 +424,7 @@ pub(super) struct Pass2Output {
 )]
 #[hotpath::measure]
 pub(super) fn run_pass2(
-    config: &BuildConfig,
+    output_dir: &std::path::Path,
     node_schedule: &[(usize, u64, usize)],
     way_schedule: &[(usize, u64, usize)],
     shared_file: &std::sync::Arc<std::fs::File>,
@@ -472,18 +471,14 @@ pub(super) fn run_pass2(
 
     // Streaming output: write data files directly during the merge instead
     // of accumulating Vecs. Running counters track offsets and record counts.
-    let mut street_ways_out = BufWriter::new(std::fs::File::create(
-        config.output_dir.join(FILE_STREET_WAYS),
-    )?);
-    let mut street_nodes_out = BufWriter::new(std::fs::File::create(
-        config.output_dir.join(FILE_STREET_NODES),
-    )?);
-    let mut addr_points_out = BufWriter::new(std::fs::File::create(
-        config.output_dir.join(FILE_ADDR_POINTS),
-    )?);
-    let mut interp_nodes_out = BufWriter::new(std::fs::File::create(
-        config.output_dir.join(FILE_INTERP_NODES),
-    )?);
+    let mut street_ways_out =
+        BufWriter::new(std::fs::File::create(output_dir.join(FILE_STREET_WAYS))?);
+    let mut street_nodes_out =
+        BufWriter::new(std::fs::File::create(output_dir.join(FILE_STREET_NODES))?);
+    let mut addr_points_out =
+        BufWriter::new(std::fs::File::create(output_dir.join(FILE_ADDR_POINTS))?);
+    let mut interp_nodes_out =
+        BufWriter::new(std::fs::File::create(output_dir.join(FILE_INTERP_NODES))?);
 
     // State that Phase 2a populates and Phase 2b carries forward.
     let mut addr_point_count: u32 = 0;
@@ -842,7 +837,7 @@ pub(super) fn run_pass2(
     drop(coord_mmap);
 
     // Mmap output files for coordinate access in cell assignment + interpolation
-    let mmap_file = |name: &str| mmap_or_empty(&config.output_dir.join(name));
+    let mmap_file = |name: &str| mmap_or_empty(&output_dir.join(name));
     let street_ways_mmap = mmap_file(FILE_STREET_WAYS)?;
     let street_nodes_mmap = mmap_file(FILE_STREET_NODES)?;
     let addr_points_mmap = mmap_file(FILE_ADDR_POINTS)?;

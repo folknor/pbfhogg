@@ -8,64 +8,35 @@
 //! ownership shapes (per-worker shards in stage 1, shared per-bucket
 //! mutexes in stage 2).
 //!
-use std::path::{Path, PathBuf};
+use crate::scratch::{RunScratch, ScratchPath};
 
 use super::Result;
 
 // ---------------------------------------------------------------------------
-// Scratch directory management
+// Scratch file names
 // ---------------------------------------------------------------------------
+//
+// The external join's scratch lives in the run's `RunScratch` directory. These
+// are the only places its file names are spelled, so stage 1 (create), stage 2
+// (open) and the reclaiming code cannot drift apart.
 
-/// Managed scratch directory for bucket files. Cleaned up on drop.
-///
-/// The directory name is `<parent>/.pbfhogg-<name>-<pid><suffix>`, the suffix
-/// coming from the run's [`RunToken`](crate::scratch::RunToken). `name`
-/// identifies the command that owns the scratch dir so concurrent runs of
-/// different commands don't collide, and so stale directories left behind by
-/// a crash are attributable; the pid and token separate concurrent runs of the
-/// same command across and within processes.
-///
-/// `parent` must exist: scratch goes into a directory, it does not create one.
-/// A directory already at the path (a crashed run whose pid was reused) is
-/// reused, as before.
-pub(crate) struct ScratchDir {
-    pub(crate) path: PathBuf,
+/// Worker `worker_id`'s id-shard file for id bucket `bucket_idx`.
+pub(crate) fn id_shard_path(
+    scratch: &RunScratch,
+    worker_id: usize,
+    bucket_idx: usize,
+) -> Result<ScratchPath> {
+    scratch.file(&format!("id-W{worker_id}-{bucket_idx:03}"))
 }
 
-impl ScratchDir {
-    pub(crate) fn new(parent: &Path, name: &str, token: &crate::scratch::RunToken) -> Result<Self> {
-        let path = parent.join(format!(
-            ".pbfhogg-{name}-{}{}",
-            std::process::id(),
-            token.suffix()
-        ));
-        match std::fs::create_dir(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
-            Err(e) => {
-                return Err(crate::Error::from(e).context(format!(
-                    "failed to create scratch directory {}",
-                    path.display()
-                )));
-            }
-        }
-        Ok(Self { path })
-    }
-
-    pub(crate) fn bucket_path(&self, prefix: &str, index: usize) -> PathBuf {
-        self.path.join(format!("{prefix}-{index:03}"))
-    }
-
-    pub(crate) fn file_path(&self, name: &str) -> PathBuf {
-        self.path.join(name)
-    }
+/// Slot bucket `index`.
+pub(crate) fn slot_bucket_path(scratch: &RunScratch, index: usize) -> Result<ScratchPath> {
+    scratch.file(&format!("slot-{index:03}"))
 }
 
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        // Best-effort cleanup. Ignore errors (crash leaves stale dir, user can clean).
-        drop(std::fs::remove_dir_all(&self.path));
-    }
+/// Stage 3 worker `index`'s payload file.
+pub(crate) fn payload_path(scratch: &RunScratch, index: usize) -> Result<ScratchPath> {
+    scratch.file(&format!("payloads-W{index}"))
 }
 
 // ---------------------------------------------------------------------------

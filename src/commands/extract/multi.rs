@@ -1,6 +1,6 @@
 //! Multi-extract: single-pass multi-region extraction for sorted inputs (simple strategy).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
@@ -17,7 +17,7 @@ use super::common::{
     BboxInt, Passthrough, dense_only_payload, relation_has_matched_member, spatial_blob_filter,
     warn_passthrough_demotions,
 };
-use super::{ExtractSlot, ExtractStats, Region};
+use super::{ExtractStats, Region};
 
 use crate::owned::{dense_node_metadata, element_metadata};
 
@@ -35,8 +35,8 @@ use crate::owned::{dense_node_metadata, element_metadata};
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn try_extract_multi_single_pass(
     input: &Path,
-    slots: &[ExtractSlot],
-    display_paths: Option<&[PathBuf]>,
+    regions: &[Region],
+    outputs: &crate::output::OutputSet,
     set_bounds: bool,
     compression: Compression,
     direct_io: bool,
@@ -77,7 +77,7 @@ pub(super) fn try_extract_multi_single_pass(
         }
     };
 
-    let n = slots.len();
+    let n = regions.len();
     crate::debug::emit_marker("MULTI_EXTRACT_START");
     crate::host::diag!(
         host.diagnostics,
@@ -87,13 +87,13 @@ pub(super) fn try_extract_multi_single_pass(
     );
 
     // Precompute per-region integer bboxes.
-    let bbox_ints: Vec<BboxInt> = slots
+    let bbox_ints: Vec<BboxInt> = regions
         .iter()
-        .map(|s| BboxInt::from_bbox(s.region.bbox()))
+        .map(|region| BboxInt::from_bbox(region.bbox()))
         .collect();
-    let inside_bbox_ints: Vec<BboxInt> = slots
+    let inside_bbox_ints: Vec<BboxInt> = regions
         .iter()
-        .map(|s| BboxInt::inside_bbox(s.region.bbox()))
+        .map(|region| BboxInt::inside_bbox(region.bbox()))
         .collect();
 
     // Union bbox for blob-level spatial skip.
@@ -130,9 +130,9 @@ pub(super) fn try_extract_multi_single_pass(
     // stable matched measurement at a larger scale - the single-region writer's
     // shape is not known to transfer to N concurrent outputs.
     let mut writers: Vec<PbfWriter<BufWriter<std::fs::File>>> = Vec::with_capacity(n);
-    for (i, slot) in slots.iter().enumerate() {
-        let display_path = display_paths.map_or(&slot.output, |paths| &paths[i]);
-        let bbox = slot.region.bbox();
+    for (region, output) in regions.iter().zip(outputs.iter()) {
+        let display_path = output.destination();
+        let bbox = region.bbox();
         let header_bytes = super::super::build_output_header(&header, true, overrides, |hb| {
             let hb = if set_bounds {
                 hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
@@ -141,7 +141,7 @@ pub(super) fn try_extract_multi_single_pass(
             };
             hb.sorted()
         })?;
-        let mut w = PbfWriter::to_path_sync(&slot.output, compression)
+        let mut w = PbfWriter::to_path_sync(output.path(), compression)
             .map_err(|e| e.context(format!("failed to create {}", display_path.display())))?;
         w.write_header(&header_bytes).map_err(|e| {
             e.context(format!(
@@ -216,13 +216,16 @@ pub(super) fn try_extract_multi_single_pass(
                     // blob goes to every region. This nominates on the
                     // indexdata bbox claim; the node classify phase verifies.
                     let candidate = idx.bbox.as_ref().is_some_and(|blob_bbox| {
-                        inside_bbox_ints.iter().zip(slots.iter()).all(|(bi, slot)| {
-                            matches!(slot.region, Region::Bbox(_))
-                                && crate::BlobBbox::new(
-                                    bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon,
-                                )
-                                .contains(blob_bbox)
-                        })
+                        inside_bbox_ints
+                            .iter()
+                            .zip(regions.iter())
+                            .all(|(bi, region)| {
+                                matches!(region, Region::Bbox(_))
+                                    && crate::BlobBbox::new(
+                                        bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon,
+                                    )
+                                    .contains(blob_bbox)
+                            })
                     });
                     node_blob_info.push(NodeBlobInfo {
                         passthrough: if candidate {
@@ -303,7 +306,9 @@ pub(super) fn try_extract_multi_single_pass(
     // For all-bbox regions, use columnar decode (batch IDs/lats/lons into
     // contiguous arrays) with single-pass multi-region classification.
     // Polygon regions fall back to element-by-element iteration.
-    let all_bbox = slots.iter().all(|s| matches!(s.region, Region::Bbox(_)));
+    let all_bbox = regions
+        .iter()
+        .all(|region| matches!(region, Region::Bbox(_)));
     use crate::tunables::GRID_REGION_THRESHOLD;
     let region_bboxes: Vec<(i32, i32, i32, i32)> = inside_bbox_ints
         .iter()
@@ -438,22 +443,16 @@ pub(super) fn try_extract_multi_single_pass(
                         Some(grid) => {
                             for &region in grid.candidates(lat, lon) {
                                 let region = region as usize;
-                                if slots[region].region.contains_decimicro(
-                                    &bbox_ints[region],
-                                    lat,
-                                    lon,
-                                ) {
+                                if regions[region].contains_decimicro(&bbox_ints[region], lat, lon)
+                                {
                                     scratch[region].push(id);
                                 }
                             }
                         }
                         None => {
                             for region in 0..n {
-                                if slots[region].region.contains_decimicro(
-                                    &bbox_ints[region],
-                                    lat,
-                                    lon,
-                                ) {
+                                if regions[region].contains_decimicro(&bbox_ints[region], lat, lon)
+                                {
                                     scratch[region].push(id);
                                 }
                             }
@@ -703,9 +702,9 @@ pub(super) fn try_extract_multi_single_pass(
     crate::debug::emit_marker("MULTI_REL_WRITE_END");
 
     // Flush all writers (workers already flushed their BlockBuilders per blob).
-    for (i, slot) in slots.iter().enumerate() {
-        let display_path = display_paths.map_or(&slot.output, |paths| &paths[i]);
-        writers[i]
+    for (writer, output) in writers.iter_mut().zip(outputs.iter()) {
+        let display_path = output.destination();
+        writer
             .flush()
             .map_err(|e| e.context(format!("failed to flush {}", display_path.display())))?;
     }

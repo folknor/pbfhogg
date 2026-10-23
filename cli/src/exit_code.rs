@@ -85,3 +85,35 @@ pub fn error_report(err: &(dyn std::error::Error + 'static)) -> String {
     }
     err.to_string()
 }
+
+/// Advice for an output refusal, naming the flag that grants what was
+/// refused. The library error names no flag; this front end does. Walks the
+/// chain the way [`is_platform_unsupported`] does, so a refusal raised at
+/// publication inside a command is found too.
+pub fn output_hint(err: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
+    let mut current = Some(err);
+    while let Some(error) = current {
+        current = if let Some(error) = error.downcast_ref::<pbfhogg::Error>() {
+            match error.kind() {
+                pbfhogg::ErrorKind::Output(pbfhogg::OutputError::Exists { .. }) => {
+                    return Some("; pass --overwrite (-O) to replace it");
+                }
+                pbfhogg::ErrorKind::Output(pbfhogg::OutputError::ExclusivePublishUnsupported {
+                    ..
+                }) => {
+                    return Some("; pass --overwrite (-O) to publish without the exclusive check");
+                }
+                pbfhogg::ErrorKind::Io(io) => io
+                    .get_ref()
+                    .map(|inner| inner as &(dyn std::error::Error + 'static)),
+                _ => std::error::Error::source(error),
+            }
+        } else if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            io.get_ref()
+                .map(|inner| inner as &(dyn std::error::Error + 'static))
+        } else {
+            error.source()
+        };
+    }
+    None
+}

@@ -336,8 +336,7 @@ tuples used in about 67 places across 13 files.
   device"; `parallel_writer` attaches `create {path}` to the copy on `init_tx`
   but returns the bare `e` from the thread, so init and join results disagree.
   `multi-extract` is the one caller that wraps with the path, by hand.
-- Open and create failures: `FileReader::open`, `File::create(out.path())` in
-  `run_export`, `canonicalize` in the alias check (which also aborts on a
+- Open and create failures: `FileReader::open`, `canonicalize` in the alias check (which also aborts on a
   permission error that has nothing to do with aliasing), `parse_ids_from_file`,
   `parse_geojson` and `parse_extract_config` (a config with 30 polygon files
   says "expected value at line 1 column 1"; `read_expressions_file` does name
@@ -395,127 +394,30 @@ that fails when a `.rs` file under `src/write/` is missing from the funnel's
 
 Reported by: altw and scanning, write path.
 
-## HYG-028 - Where scratch goes is decided per command, with no override
+## HYG-029 - The leftover scan has coverage gaps
 
-Anger: 9 - scratch location, a new --tmp-dir, reaping old scratch.
+Anger: 3 - report-only code.
 
-- Altw sparse (`referenced * 8`, 29 GB at europe) and external (hundreds of GB
-  at planet) put scratch in `output.parent()`, with no `--tmp-dir`, `TMPDIR`
-  or library option; a small or slow output volume leaves the user no choice.
-- `diff -j` puts shard files next to the old input
-  (`old_path.parent().unwrap_or(".")`), claiming "the same assumption the
-  `--format osc` sibling driver makes", which it is not. Inputs often live in
-  a read-only or shared dataset directory (brokkr's data dir, a mirror), so
-  this fails with an unattributed error or drops multi-GB `.txt.tmp` files into
-  another tool's directory that `brokkr clean` does not know about.
-- `derive-changes` puts temp files next to the output ("same as brokkr
-  scratch").
-- The geocode builder creates `.buckets-level{N}` inside `output_dir`, the
-  user's index directory (possibly live, BUG-048), and `remove_dir_all`s any
-  pre-existing directory of that name without checking it is its own.
+Scratch is one per-run directory and leftovers are reported, never reaped
+(`decisions/0018`). What the scan does not reach, because it lists one
+directory per command (each output's directory and `--tmp-dir`):
 
-Fix: one `scratch_dir` resolved once by the CLI (explicit `--tmp-dir`, else the
-output's directory with `""` mapped to `.`), validated up front, passed into
-the library as a required `&ScratchDir` whose only constructor is in the CLI;
-`BuildConfig.scratch_dir` for geocode. If the index file set were enumerated
-(it is not; `format.rs` records why), geocode `validate_structure` could
-reject unexpected entries in the index dir.
+- `extract --config` outputs: the CLI scans only the top-level `-o` parent, so
+  leftovers beside config-named destinations in other directories are not
+  reported before the run.
+- Scratch that older versions left beside a `diff` input (`diff-par-*`) or
+  inside an old geocode index directory (`.buckets-level*`, under a
+  `.pbfhogg-tmp-*` staging directory or in a published index): the first sits
+  in a directory no current command looks at, the second inside an entry.
+- A `.pbfhogg-run-*` directory on a filesystem where `flock` is local-only
+  (some NFS mounts) is judged by the lock alone and may be reported while a
+  live run on another host holds it.
 
-Reported by: altw and scanning, re-encoding, geocode index.
-
-## HYG-029 - Scratch naming and cleanup use a different mechanism at every site, and nothing reaps crashed runs
-
-Anger: 9 - scratch location, a new --tmp-dir, reaping old scratch.
-
-Naming: `diff-par-{pid}{run}-{kind}-{shard}.txt.tmp`;
-`derive-{creates,modifies,deletes}-{pid}{run}.xml.tmp`, where `{run}` is the
-per-run token suffix (`scratch::RunToken`, empty for a process's first run), so
-runs inside one process no longer collide and what remains here is the
-cross-process side; derive-parallel shards add
-a process-lifetime nanosecond tag "because PID alone collides across
-containers", while derive-parallel's outer files in the same function omit it;
-`process_scratch_tag` derives the tag from the low 32 bits of `SystemTime`
-nanoseconds, so two processes in one tick or on a coarse clock collide; altw's
-`format!("id-W{worker_id}-{bucket_idx:03}")` is spelled in `stage1.rs`
-(create), `stage2.rs` (open) and `external/mod.rs` (cleanup) while
-`ScratchDir::bucket_path` exists for `slot-NNN`, and if one copy changes stage 2
-skips missing shards (`NotFound => continue`), surfacing as missing locations.
-`std::process::id()` plus the run token is the identity in `ScratchDir` and the
-sparse store, and the pid plus a counter in `OutputFile`; none of them guards
-against a pid reused by a later process.
-
-Cleanup: sequential derive fragments now use `PathGuard`, including partial
-sink construction and unwinding. Derive-parallel outer files use `PathGuard` (citing
-`decisions/0003`), then `commit()` and `remove_file` anyway; shard files are
-deleted by a sweep that recomputes every possible path on error and by
-`append_and_cleanup`, which since the output-write-failure fix (parallel diff
-and `diff --format osc`) removes its temp file and every remaining shard's even
-when the write to the output fails, but still has no guard over a panic
-mid-append; altw deletes id shards and slot buckets mid-run with
-`drop(std::fs::remove_file(...))`, so a failed cleanup leaves 80+ GB while
-stages 3 and 4 allocate more, unlogged; `ScratchDir::drop` ignores
-`remove_dir_all` failure ("user can clean") without saying where; altw has a
-`DestinationGuard` as a third output-guard idea beside `OutputFile` and
-`PathGuard`.
-
-Stale scratch: a crashed external run leaves `.pbfhogg-external-join-<pid>/`
-(hundreds of GB) in the output directory forever; sparse's "removed stale
-sparse index temp file" check looks only for its own pid's name, so it almost
-never finds anything; a SIGKILLed geocode build at levels 18/15 followed by one
-at 17/14 leaves `.buckets-level18` and `.buckets-level15` (tens of GB) because
-the sweep only removes the current levels; `OutputFile`'s
-`.pbfhogg-tmp-<pid>-<n>.<name>` survives a SIGKILL or OOM kill as a hidden
-multi-GB file.
-
-Fix: one per-run scratch directory created with `O_EXCL` / a random name,
-everything inside it, one `remove_dir_all` guard on `Drop`; this removes the
-need for tags. At startup, report (one hunter says report, another says reap)
-`.pbfhogg-*` entries whose pid is dead. Enforce with `disallowed-methods` on
-`std::fs::File::create` inside `src/commands/diff/` pointing at the helper, and
-a `ScratchDir::id_shard_path` that owns the format.
+Fix, if it matters: have `extract --config` collect its destination
+directories before reserving outputs and scan each; a `pbfhogg inspect
+--leftovers <dir>` style explicit scan for the rest.
 
 Reported by: re-encoding, altw and scanning, geocode index, CLI and plumbing.
-
-## HYG-030 - Output publication policy is implemented four ways
-
-Anger: 9 - output .partial and rename for every command.
-
-- Every write backend creates the final path up front (`File::create` /
-  `O_TRUNC`) and none removes, renames into place or marks it on failure.
-  `pipeline::writer_thread`'s own comment says a short file "ends on a blob
-  boundary and reads as a valid shorter PBF"; `DirectWriter::Drop` pads and
-  `set_len`s it into shape; uring deliberately does not `set_len`; parallel
-  leaves holes up to the highest written offset. A caller that ignores exit
-  status, or a killed run, leaves a plausible truncated planet.
-- `cli/src/main.rs::guarded_output` claims "Every user-named `--output` goes
-  through here". `run_export` hand-rolls the `OutputFile` dance and repeats
-  the alias check with a different message; `run_extract_config` builds a guard
-  vector with preflight; `run_diff` calls `File::create(path)` directly;
-  `build-geocode-index` writes
-  the index directory in place, so a failed build leaves a partial index under
-  the user's name, though `PathGuard::dir` exists.
-- Merge-changes builds its own `OutputFile`-or-`PathGuard` choice from
-  `output.exists()` (a TOCTOU with no consequence today); apply-changes'
-  library entry refuses an output that is the base file, through
-  `path_guard::same_file`, the one owner of file identity, but has no
-  publication guard; `tags_filter/osc.rs::write_filtered_osc`
-  and `multi.rs` `File::create` whatever they are given, so library callers get
-  truncate-then-fail.
-- Altw's `DestinationGuard` cites the merge-changes precedent.
-- `OutputFile::commit` replacing an existing file is silent, and because it
-  renames over the destination, a user `--output` that is a symlink has the
-  link replaced by a regular file (the geocode builder now refuses a
-  symlinked output directory up front; no `OutputFile` user does).
-
-Fix: one policy in `PbfWriter` (write `<path>.partial` in the same directory,
-rename after `flush` succeeds, unlink on `Drop`) and an `Outputs` type owning
-file, multi-file and directory publication that every `run_*` and library
-entry takes instead of a `&Path`. Enforce with `disallowed-methods` on
-`std::fs::File::create` under `src/commands/` (writer layer exempt) and a
-forced-error test asserting the destination does not exist.
-
-Reported by: write path, change application, filtering and spatial, CLI and
-plumbing, altw and scanning.
 
 ## HYG-032 - Record layouts are serialised by hand at both ends
 
@@ -930,8 +832,10 @@ Reported by: test harness, CLI and plumbing.
 
 Anger: 8 - clippy.toml with expect_used denied means hundreds of edits.
 
-There is no `clippy.toml`, so `disallowed-methods`, `disallowed-types` and
-`disallowed-macros` are unused; `expect_used`, `print_stderr`, `print_stdout`,
+`clippy.toml` exists but carries only the output choke point
+(`disallowed-methods` on the path-writing `std::fs` methods, allowed
+workspace-wide and denied in `src/commands/` and the CLI);
+`disallowed-types` and `disallowed-macros` are unused; `expect_used`, `print_stderr`, `print_stdout`,
 `arithmetic_side_effects`, `panic`, `unreachable` and `exit` are not enabled;
 `allow_attributes_without_reason` is not enabled, so `#[allow(dead_code)]` and
 the many `too_many_*` exemptions (HYG-036) need no justification; the existing

@@ -180,29 +180,44 @@ fn read_header(
 /// Returns an error if the base PBF or OSC file cannot be read, the
 /// output path aliases the base PBF, the output file cannot be written, or
 /// any PBF parsing/encoding fails.
+pub fn merge(
+    base_pbf: &Path,
+    osc_file: &Path,
+    output_pbf: crate::output::Output,
+    opts: &MergeOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<MergeStats> {
+    let result = merge_to(base_pbf, osc_file, &output_pbf, opts, overrides, host)?;
+    output_pbf.publish()?;
+    Ok(result)
+}
+
+/// [`merge`] writing to a borrowed output it does not publish.
 #[allow(
     clippy::too_many_lines,
     clippy::cognitive_complexity,
     clippy::cast_precision_loss
 )]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub fn merge(
+pub(crate) fn merge_to(
     base_pbf: &Path,
     osc_file: &Path,
-    output_pbf: &Path,
+    output_pbf: &crate::output::Output,
     opts: &MergeOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<MergeStats> {
-    // `merge` is public library API, so direct callers need the same guard as
-    // CLI callers before writer setup truncates its destination. The later
-    // passthrough path reads from the base file after that setup. A
+    // `merge` is public library API, so direct callers need the same refusal
+    // as CLI callers. Writing goes to a staging file, so the base is never
+    // truncated, but publication would replace the base the run read from.
+    // Identity is the destination's, never the staging file's. A
     // not-yet-created output cannot be the base, so the CLI's extra
     // planned-path check is not needed here.
-    if crate::path_guard::same_file(base_pbf, output_pbf)? {
+    if crate::path_guard::same_file(base_pbf, output_pbf.destination())? {
         return Err(crate::Error::invalid_argument(format!(
             "apply-changes output '{}' aliases base input '{}'",
-            output_pbf.display(),
+            output_pbf.destination().display(),
             base_pbf.display()
         )));
     }
@@ -650,10 +665,13 @@ mod tests {
         let original: &[u8] = b"base file must survive";
         std::fs::write(&base, original).expect("write base sentinel");
 
+        // Overwrite permission granted, so the alias refusal itself is
+        // what stops the run (without it the existing base is refused as an
+        // existing output first).
         let error = merge(
             &base,
             &osc,
-            &base,
+            crate::output::Output::new(&base, crate::output::Overwrite::Replace).unwrap(),
             &MergeOptions::default(),
             &HeaderOverrides::default(),
             &crate::host::Host::for_tests(),

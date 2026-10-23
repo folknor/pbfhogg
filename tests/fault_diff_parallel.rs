@@ -47,13 +47,11 @@ mod diff_parallel {
         write_multi_block_test_pbf(&old, &old_nodes, &[], &[], 5);
         write_multi_block_test_pbf(&new, &new_nodes, &[], &[], 5);
 
-        // Use an explicit scratch parent and consume token 0 with a clean
-        // run first. The fault then exercises suffix-aware cleanup, rather
-        // than only the legacy names used by a process's first invocation.
+        // An explicit scratch parent, checked empty after a clean run first so
+        // that the faulted run's leftovers cannot be a previous run's.
         let scratch = dir.path().join("scratch");
         std::fs::create_dir(&scratch).unwrap();
-        let mut host = crate::common::test_host();
-        host.scratch_parent = Some(scratch.clone());
+        let host = crate::common::test_host();
         let options = DiffOptions {
             suppress_common: false,
             verbose: false,
@@ -61,7 +59,16 @@ mod diff_parallel {
             type_filter: None,
             jobs: 3,
         };
-        diff(&old, &new, &mut Vec::new(), &options, false, &host).unwrap();
+        diff(
+            &old,
+            &new,
+            &mut Vec::new(),
+            &options,
+            false,
+            &host,
+            crate::common::scratch_in(&scratch),
+        )
+        .unwrap();
         assert!(snapshot_dir(&scratch).is_empty());
         let before = snapshot_dir(dir.path());
 
@@ -77,7 +84,15 @@ mod diff_parallel {
                 type_filter: None,
                 jobs: 3,
             };
-            diff(&old, &new, &mut out, &opts, false, &host)
+            diff(
+                &old,
+                &new,
+                &mut out,
+                &opts,
+                false,
+                &host,
+                crate::common::scratch_in(&scratch),
+            )
         }));
 
         diff_hooks::reset();

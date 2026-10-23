@@ -81,7 +81,7 @@ fn ways_referencing_node() {
     let id_set = parse_ids(&ids(&["n2"])).expect("parse ids");
     let stats = getparents(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &default_opts(),
         &WriteOptions::default(),
@@ -147,7 +147,7 @@ fn relations_referencing_way() {
     let id_set = parse_ids(&ids(&["w10"])).expect("parse ids");
     let stats = getparents(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &default_opts(),
         &WriteOptions::default(),
@@ -200,7 +200,7 @@ fn add_self_includes_queried_objects() {
     let opts = GetparentsOptions { add_self: true };
     let stats = getparents(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &opts,
         &WriteOptions::default(),
@@ -254,7 +254,7 @@ fn no_transitive_relations() {
     let id_set = parse_ids(&ids(&["n1"])).expect("parse ids");
     let stats = getparents(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &default_opts(),
         &WriteOptions::default(),
@@ -298,7 +298,7 @@ fn empty_result() {
     let id_set = parse_ids(&ids(&["n999"])).expect("parse ids");
     let stats = getparents(
         &input,
-        &output,
+        crate::common::out(&output),
         &id_set,
         &default_opts(),
         &WriteOptions::default(),

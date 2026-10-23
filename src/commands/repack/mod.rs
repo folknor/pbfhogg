@@ -125,11 +125,25 @@ fn warn_way_metadata_loss(header: &crate::HeaderBlock, host: &crate::host::Host)
 /// round-trips with its tags, refs, members, metadata, and DenseNodes
 /// encoding. Output is type-sorted (nodes, then ways, then relations);
 /// the `Sort.Type_then_ID` flag is propagated when the input has it.
-#[allow(clippy::too_many_lines)]
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn repack(
     input: &Path,
-    output: &Path,
+    output: crate::output::Output,
+    elements_per_blob: usize,
+    write: &WriteOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<RepackStats> {
+    let result = repack_to(input, &output, elements_per_blob, write, overrides, host)?;
+    output.publish()?;
+    Ok(result)
+}
+
+/// [`repack`] writing to a borrowed output it does not publish.
+#[allow(clippy::too_many_lines)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn repack_to(
+    input: &Path,
+    output: &crate::output::Output,
     elements_per_blob: usize,
     write: &WriteOptions,
     overrides: &HeaderOverrides,

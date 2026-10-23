@@ -18,11 +18,78 @@ These flags appear on most commands that produce PBF output:
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file path |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--compression <COMPRESSION>` | Blob compression: `none`, `zlib` (default), `zstd`, or with level (`zlib:9`, `zstd:19`) |
 | `--direct-io` | Use O_DIRECT to bypass page cache (requires `linux-direct-io` feature) |
 | `--force` | Proceed even if input lacks indexdata (slower fallback path) |
 | `--generator <GENERATOR>` | Override the writing program name in the output header |
 | `--output-header <KEY=VALUE>` | Set output header fields (repeatable). Keys: `osmosis_replication_timestamp`, `osmosis_replication_sequence_number`, `osmosis_replication_base_url` |
+
+## Output files
+
+Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
+`extract --config`, the `build-geocode-index` directory - follows one contract:
+
+- **An existing output is refused before any work is done**, unless
+  `-O, --overwrite` is given. `Error: output <path> already exists and
+  replacing it was not requested; pass --overwrite (-O) to replace it`, exit
+  `2`. For `extract --config` every output the config names is checked up
+  front, and `--overwrite` on the command line covers all of them.
+- **A symlink is never an output**, even with `--overwrite`: replacing it
+  would turn the link into a regular file. The error names the link and its
+  target. An existing directory (or device, FIFO) where a file output is
+  named, or a non-directory where a directory output is named, is refused
+  the same way.
+- **Nothing appears under the output name until the run has succeeded.**
+  The command writes a hidden staging file beside the output
+  (`.pbfhogg-tmp-<pid>-<n>.<name>`) and renames it into place after its
+  final flush; a failed run removes it, so a failed run leaves no file at
+  the output path and leaves an existing output untouched. A run killed
+  outright (SIGKILL, power loss) can leave the hidden staging file behind,
+  never a file under the output name. The output's directory must exist and
+  be writable.
+- Without `--overwrite` publication is exclusive: an output that appears
+  while the command runs is not replaced either. On a filesystem with
+  neither an exclusive rename nor hard links, such a run fails at the end
+  and says so; `--overwrite` publishes there.
+- Several outputs (`extract --config`) are published together: if one cannot
+  be put in place, the ones already published are rolled back. If a rollback
+  step itself fails, the previous output is kept in a `.pbfhogg-backup-*`
+  directory beside it and the error names it.
+
+`-o /dev/null` is not an output: it is refused as not a regular file.
+
+## Scratch files
+
+`add-locations-to-ways`, `diff` (parallel `-j`, and `--format osc`) and `build-geocode-index` write
+scratch: disposable files that can be very large (hundreds of GB for `add-locations-to-ways
+--index-type external` at planet scale). Each run makes **one** hidden directory,
+`.pbfhogg-run-<pid>-<random>`, holds everything it writes in there and removes it when it ends,
+whether it succeeded or failed. If the directory cannot be removed the run says where the
+leftover is.
+
+- `--tmp-dir <DIR>` chooses the directory the run directory is made in. It must exist and be
+  writable, and it is checked before any input is opened, so a bad value fails at once. Without
+  it the scratch goes in the output's directory (`diff` text to stdout, or with `--quiet`:
+  the current directory). `build-geocode-index` refuses a `--tmp-dir` inside the index
+  directory it replaces.
+- An output's own staging file (`.pbfhogg-tmp-*`) and a replaced output's backup
+  (`.pbfhogg-backup-*`) stay beside the output whatever `--tmp-dir` says: publication is a
+  rename, which needs the same filesystem.
+
+**Leftovers of runs that never finished** (SIGKILL, power loss, the OOM killer) are reported,
+never removed. Before it starts, a command that writes an output scans the output's directory
+(and `--tmp-dir`, when given) and prints one `Warning:` per entry it finds: an unfinished run
+directory, scratch left by older pbfhogg versions (`.pbfhogg-external-join-*`,
+`.pbfhogg-sparse-index-*`, `diff-par-*`, `derive-*` files), and an output's hidden staging
+file. Each line gives the size and why the entry is believed stale. That is a belief, not a
+proof: a run directory is judged by whether its `flock` is still held, other entries by whether the
+pid in the name exists, and a pid can be reused or belong to another container sharing the
+volume. Check before you delete.
+
+A `.pbfhogg-backup-*` entry is reported with its own wording. It can be the only copy of a
+previous output, so pbfhogg never deletes one and you should look at it before removing it.
+Library callers get the same scan as typed values from `pbfhogg::scratch::find_stale`.
 
 ---
 
@@ -188,6 +255,7 @@ pbfhogg cat [OPTIONS] --output <OUTPUT> <FILES>...
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation) |
 | `-c, --clean <ATTR>` | Strip metadata attribute (repeatable: version, timestamp, changeset, uid, user) |
 | `--dedupe` | K-way sorted merge with dedup (all inputs must be sorted). Rejects `--type` and `--clean`: the dedupe path is blob-level passthrough and implements neither |
@@ -215,6 +283,7 @@ pbfhogg sort [OPTIONS] --output <OUTPUT> <FILE>
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O |
@@ -237,6 +306,7 @@ pbfhogg repack [OPTIONS] --output <OUTPUT> <FILE>
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--elements-per-blob <N>` | Per-blob element cap [default: 8000]. `8000` matches the osmium / Geofabrik convention; pass a larger value to approximate `planet.openstreetmap.org`-style packing. Must be > 0. |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
@@ -260,6 +330,7 @@ pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--unsort` | Clear `Sort.Type_then_ID`; perturb the element stream so at least one adjacent same-kind blob pair has overlapping IDs. Triggers `sort`'s overlap-rewrite path. |
 | `--unsort-intra` | Clear `Sort.Type_then_ID`; leave one same-kind blob per kind with an internal ID-order inversion but non-overlapping blob ranges, the intra-blob shape `sort`'s overlap detector cannot see. Mutually exclusive with `--unsort`. |
 | `--strip-locations` | Drop the `LocationsOnWays` header feature. Inline way-node coordinates are not preserved. |
@@ -292,6 +363,7 @@ pbfhogg renumber [OPTIONS] --output <OUTPUT> <FILE>
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `-s, --start-id <ID>` | Starting ID(s): single value or comma-separated node,way,relation [default: 1] |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
@@ -321,6 +393,7 @@ pbfhogg extract [OPTIONS] <FILE>
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file (required for single extract, omit with --config) |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `-b, --bbox <BBOX>` | Bounding box: minlon,minlat,maxlon,maxlat |
 | `-p, --polygon <FILE>` | Polygon GeoJSON file |
 | `-c, --config <FILE>` | Multi-extract JSON config file |
@@ -370,6 +443,7 @@ pbfhogg tags-filter [OPTIONS] --output <OUTPUT> <FILE> [EXPRESSIONS]...
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--input-kind <KIND>` | Input kind override: `pbf` or `osc` (autodetect from extension by default) |
 | `--distrust-metadata` | Do not skip blobs on their indexdata or tag index; decode every blob (PBF only). Nothing validates a blob's tag index against its payload, so a file whose index omits a key its elements carry silently loses those elements. Trades the skip speedup for an answer that depends only on element data, and waives the indexdata precondition |
 | `-R, --omit-referenced` | Omit referenced objects (faster, single pass, direct matches only; PBF only) |
@@ -402,7 +476,8 @@ pbfhogg export [OPTIONS] <FILE> [EXPRESSIONS]...
 
 | Flag | Description |
 |------|-------------|
-| `-o, --output <FILE>` | Write to a guarded file instead of stdout |
+| `-o, --output <FILE>` | Write to a file instead of stdout |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--format <FORMAT>` | `geojsonseq` (default) or `geojson` |
 | `--type <TYPE>` | Export only `node` or `way` |
 | `-e, --expressions <FILE>` | Read tag expressions from a file, one per line |
@@ -433,10 +508,12 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `-s, --osmium-summary` | Print osmium-style summary (left/right/same/different counts) to stderr instead of the default pbfhogg-format summary (text only). The pbfhogg-format summary always fires on stderr unless `--quiet` - this flag only swaps the format |
 | `-q, --quiet` | Exit-code only, suppress output (text only) |
 | `-o, --output <FILE>` | Write output to file (required for `--format osc`) |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `-t, --type <TYPE>` | Filter by element type (text only) |
 | `-j, --jobs <N>` | Parallel shard count for the block-pair merge. `0` (default) auto-picks from available cores; `1` restores the sequential, scratch-free path; higher values partition the ID space across that many worker threads. Applies to both `--format text` and `osc`; requires both inputs indexed. **Rejected with `-v/--verbose`**, which is sequential-only - an explicit `-j` there used to be accepted and discarded. The parallel path writes shard temp files, removed on completion; scratch demand varies by input. See `reference/performance.md` for measurements |
 | `--increment-version` | Bump version of deleted elements by 1 (osc only) |
 | `--update-timestamp` | Set delete timestamp to current time (osc only) |
+| `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read. Default: the output's directory, or the current directory without `-o` |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 
 With `--format osc`, produces a lossless roundtrip - applying the derived OSC to the old PBF reproduces the new PBF exactly (see [DEVIATIONS](/cli/deviations#derive-changes-lossless-delete-roundtrip)).
@@ -492,6 +569,7 @@ pbfhogg getid [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--invert` | Invert selection: remove listed IDs instead of keeping them |
 | `-r, --add-referenced` | Include referenced nodes of matching ways (two-pass; not with `--invert`) |
 | `-t, --remove-tags` | Remove tags from referenced objects (use with -r; not with `--invert`) |
@@ -527,6 +605,7 @@ pbfhogg getparents [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `-s, --add-self` | Also include the queried objects themselves in the output |
 | `-i, --id-file <FILE>` | Read IDs from text file (one per line) |
 | `-I, --id-osm-file <FILE>` | Read IDs from an OSM/PBF file (all element IDs are collected) |
@@ -554,6 +633,7 @@ pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--index-type <TYPE>` | Node index type: `sparse` (default), `external`, or `auto` (runtime routing; see `reference/pipeline.md`) |
 | `--keep-untagged-nodes` | Keep all untagged nodes in output |
 | `--inject-prepass` | Emit the opt-in `pbfhogg.WayMembers-v1` and `pbfhogg.SharedNodePins-v1` metadata for downstream reuse |
@@ -561,6 +641,7 @@ pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed even if input lacks indexdata |
+| `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read. Default: the output's directory |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
@@ -577,6 +658,7 @@ The timestamp can be UNIX seconds or RFC3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--generator` | Override writing program name |
@@ -595,6 +677,7 @@ pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--locations-on-ways` | Preserve way-node locations through the merge (requires base PBF with LocationsOnWays). Ways the OSC creates or modifies get locations from the merged nodes; base ways the OSC does not touch keep their existing locations, even when the OSC moves or deletes a node they reference. Rerun `add-locations-to-ways` on the output for a full refresh |
 | `--ignore-missing-nodes` | With `--locations-on-ways`, permit unresolved references to retain the legacy `(0,0)` fallback instead of failing |
 | `-j, --jobs <N>` | Worker-pool size for the descriptor-first pipeline. `0` (default) uses the `nproc - 2` heuristic (leaves two cores for the scanner + drain threads, minimum 2). An explicit `-j 1` is refused |
@@ -617,6 +700,7 @@ pbfhogg merge-changes [OPTIONS] --output <OUTPUT> <CHANGES>...
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
+| `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--simplify` | Keep only the last change per object (type + id) |
 | `--allow-version-regression` | Requires `--simplify`, the mode that resolves conflicts; passing it alone is a usage error. Accepts a later change whose `version` is lower than one seen earlier in input order. Off by default, so listing the input files out of sequence order is an error rather than a silent downgrade. An equal version is always accepted and the later change wins |
 | `-j, --jobs <N>` | Parallel worker threads. `1` forces sequential, `0` (default) auto-picks from `available_parallelism()`, higher values cap the worker pool. Affects both the per-input parse fan-out and the simplify path's chunk fan-out |
@@ -625,7 +709,7 @@ pbfhogg merge-changes [OPTIONS] --output <OUTPUT> <CHANGES>...
 
 Build a reverse geocoding index from a PBF file. Produces a set of binary files (S2 cell index, address points, street segments, admin boundaries, string pool) that can be memory-mapped for sub-millisecond reverse geocoding queries.
 
-Requires an indexed PBF (generated by `pbfhogg cat`) unless `--allow-unindexed` is set. The output directory must be new or empty, or hold an existing geocode index and `--overwrite` must be set; any other existing path is refused because publication replaces the whole directory. The output path itself cannot be a symlink. On Linux, an existing mount-point output directory is refused before the build.
+Requires an indexed PBF (generated by `pbfhogg cat`) unless `--allow-unindexed` is set. An existing output directory is refused before any work unless `--overwrite` is set, and even then it must hold a geocode index or be empty; any other existing path is refused because publication replaces the whole directory. The output path itself cannot be a symlink. On Linux, an existing mount-point output directory is refused before the build.
 
 ```
 pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
@@ -641,9 +725,10 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | `--search-radius <M>` | Fine-level max search distance in meters. Default comes from the builder configuration |
 | `--coarse-search-radius <M>` | Coarse-level max search distance in meters. Default comes from the builder configuration |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
-| `--overwrite` | Replace an existing index in `--output-dir` after the new build succeeds. Does not bypass the indexdata requirement |
+| `-O, --overwrite` | Replace an existing index (or empty directory) at `--output-dir` after the new build succeeds. Without it an existing `--output-dir` is refused before any work. Does not bypass the indexdata requirement |
 | `--allow-unindexed` | Accept input without blob-level indexdata (slower fallback path). Does not replace an existing index |
 | `--force` | Legacy shorthand equivalent to `--overwrite --allow-unindexed` |
+| `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read. Default: the directory containing `--output-dir` |
 
 A node whose coordinates fall outside the geographic domain fails the whole
 build. Incomplete extracts remain usable: missing way nodes and missing admin
@@ -674,13 +759,15 @@ use a dedicated directory for the index. Allow disk space for both generations.
 Publication uses two renames, so it is not crash-atomic and there is a short
 pathname gap. Serialize publication with new reader opens and other builds;
 queries on readers already open need no coordination. An interrupted publication
-may leave the old index in `.geocode-build-*/old` beside the output directory.
-SIGKILL or power loss during a build can also leave an incomplete
-`.geocode-build-*` sibling because process cleanup does not run. There is no
-automatic sweep: a directory may belong to a concurrent build, and `old` may
-hold the only recoverable prior index. After confirming no builder is active,
-inspect abandoned staging directories and preserve or restore any `old` index
-before removing scratch. A mount table change after the Linux preflight can
+may leave the old index in a `.pbfhogg-backup-*` directory beside the output
+directory; a publication that fails and cannot put the old index back says so
+and names that directory. SIGKILL or power loss during a build can also leave an
+incomplete `.pbfhogg-tmp-*` staging directory beside it because process cleanup
+does not run. The next command that writes in that directory reports both
+(see Scratch files) but never removes them: a directory may belong to a
+concurrent build, and a backup may hold the only recoverable prior index. After
+confirming no builder is active, inspect abandoned staging directories and
+preserve or restore any backed-up index before removing scratch. A mount table change after the Linux preflight can
 still make the final rename fail; on other platforms mount points are not
 preflighted and the final rename may fail after the build.
 External writers must also replace files rather than modify mapped inodes:

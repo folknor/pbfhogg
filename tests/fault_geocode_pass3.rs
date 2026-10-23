@@ -15,7 +15,7 @@ mod geocode_pass3 {
 
     use pbfhogg::block_builder::{self, BlockBuilder};
     use pbfhogg::geocode_index::builder::{
-        BuildConfig, build_geocode_index, pass3_test_hooks as pass3_hooks,
+        BuildConfig, build_geocode_index, index_output, pass3_test_hooks as pass3_hooks,
     };
     use pbfhogg::writer::{Compression, PbfWriter};
 
@@ -47,33 +47,44 @@ mod geocode_pass3 {
             build_geocode_index(
                 &BuildConfig {
                     input_path: input.clone(),
-                    output_dir: index_dir.clone(),
-                    force: false,
                     ..Default::default()
                 },
+                index_output(&index_dir, pbfhogg::Overwrite::Refuse).expect("stage output"),
                 &crate::common::test_host(),
+                crate::common::scratch_in(dir.path()),
             )
         }));
 
         pass3_hooks::reset();
 
-        let silently_succeeded = matches!(result, Ok(Ok(_)));
+        // The failure must be the armed hook, not something earlier.
+        let message = match &result {
+            Ok(Ok(_)) => {
+                panic!("geocode build with an armed Pass 3 streets panic must not return Ok")
+            }
+            Ok(Err(e)) => e.report(),
+            Err(payload) => payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                .unwrap_or_default(),
+        };
         assert!(
-            !silently_succeeded,
-            "geocode build with an armed Pass 3 streets panic must not return Ok"
+            message.contains("geocode pass3 stage A streets way 2 panicking"),
+            "the build failed, but not at the armed hook: {message}"
         );
-
-        // The `.buckets-levelN` directories are wrapped in
-        // `PathGuard::dir()`; any unwind sweeps them. Assert none
-        // remain in the index dir.
-        let after = snapshot_dir(dir.path());
-        let bucket_leaks: Vec<_> = after
-            .difference(&before)
-            .filter(|p| p.to_string_lossy().contains(".buckets-level"))
-            .collect();
+        // A forced mid-build failure publishes nothing: no index directory
+        // under the name the caller chose, and nothing new beside it - no
+        // staging directory and no `.buckets-levelN` scratch.
         assert!(
-            bucket_leaks.is_empty(),
-            "geocode builder leaked .buckets-level* scratch dirs after panic: {bucket_leaks:?}"
+            !index_dir.exists(),
+            "a failed build left a directory at the output path"
+        );
+        let after = snapshot_dir(dir.path());
+        let leaks: Vec<_> = after.difference(&before).collect();
+        assert!(
+            leaks.is_empty(),
+            "geocode builder left entries behind after the panic: {leaks:?}"
         );
     }
 

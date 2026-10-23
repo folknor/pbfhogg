@@ -22,7 +22,6 @@ pub(crate) fn cli_host() -> Host {
         resources: Arc::new(MachineProbe),
         page_cache: PageCachePolicy::Evict,
         executor: Executor::Ambient,
-        scratch_parent: None,
     }
 }
 

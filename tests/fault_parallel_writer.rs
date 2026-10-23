@@ -100,7 +100,7 @@ mod parallel_writer {
             merge(
                 &base,
                 &osc,
-                &output,
+                common::out(&output),
                 &MergeOptions {
                     write: WriteOptions {
                         force: true,
@@ -167,8 +167,13 @@ mod parallel_writer {
              running - the writer detached its pool"
         );
 
-        let mut after = common::snapshot_dir(dir.path());
-        after.remove(std::path::Path::new("output.osm.pbf"));
+        // A writer that failed mid-stream publishes nothing: no output under
+        // the destination name, no staging file, no scratch.
+        let after = common::snapshot_dir(dir.path());
         common::assert_scratch_unchanged(&before, &after);
+        assert!(
+            !output.exists(),
+            "a failed parallel write left an output file"
+        );
     }
 }

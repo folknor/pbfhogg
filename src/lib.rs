@@ -169,13 +169,14 @@ pub mod geocode_index; // format is always available; reader requires geocode-re
 pub(crate) mod idset;
 pub mod osc;
 pub(crate) mod osm_id;
+pub mod output;
 pub(crate) mod owned;
 #[doc(hidden)]
 pub mod path_guard;
 pub mod read;
 pub(crate) mod reorder_buffer;
 pub(crate) mod scan;
-pub(crate) mod scratch;
+pub mod scratch;
 #[doc(hidden)]
 pub mod tag_expr;
 // Every performance and behaviour tunable lives here; public ones are
@@ -197,7 +198,8 @@ pub mod write;
 // Explicit re-exports: flat public API (`pbfhogg::Element`, `pbfhogg::BlobReader`, etc.)
 pub use blob_meta::{BlobBbox, BlobFilter};
 pub use element_kind::ElementKind;
-pub use error::{BlobError, Error, ErrorKind, Result};
+pub use error::{BlobError, Error, ErrorKind, OutputError, Result};
+pub use output::{Output, OutputDir, OutputSet, Overwrite};
 pub use owned::{ParseTypeFilterError, TypeFilter};
 pub use read::blob::{
     Blob, BlobDecode, BlobHeader, BlobReader, BlobReaderSource, BlobType, ByteOffset,

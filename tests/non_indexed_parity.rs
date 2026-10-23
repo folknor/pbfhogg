@@ -195,7 +195,7 @@ fn sort_non_indexed_parity() {
     let opts = forced();
     pbfhogg::commands::sort::sort(
         &in_idx,
-        &out_idx,
+        crate::common::out(&out_idx),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -203,7 +203,7 @@ fn sort_non_indexed_parity() {
     .expect("sort indexed");
     pbfhogg::commands::sort::sort(
         &in_non,
-        &out_non,
+        crate::common::out(&out_non),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -238,7 +238,7 @@ fn tags_filter_non_indexed_parity() {
     };
     pbfhogg::tags_filter::tags_filter(
         &in_idx,
-        &out_idx,
+        crate::common::out(&out_idx),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -246,7 +246,7 @@ fn tags_filter_non_indexed_parity() {
     .expect("tags_filter indexed");
     pbfhogg::tags_filter::tags_filter(
         &in_non,
-        &out_non,
+        crate::common::out(&out_non),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -287,7 +287,7 @@ fn extract_simple_non_indexed_parity() {
     let extract = |input: &Path, output: &Path| {
         pbfhogg::commands::extract::extract(
             input,
-            output,
+            crate::common::out(output),
             &region,
             pbfhogg::commands::extract::ExtractStrategy::Simple,
             true,
@@ -332,7 +332,7 @@ fn getid_include_non_indexed_parity() {
 
     pbfhogg::getid::getid(
         &in_idx,
-        &out_idx,
+        crate::common::out(&out_idx),
         &id_set,
         &opts,
         &write,
@@ -342,7 +342,7 @@ fn getid_include_non_indexed_parity() {
     .expect("getid indexed");
     pbfhogg::getid::getid(
         &in_non,
-        &out_non,
+        crate::common::out(&out_non),
         &id_set,
         &opts,
         &write,
@@ -415,7 +415,7 @@ fn apply_changes_non_indexed_parity() {
     pbfhogg::apply_changes::merge(
         &in_idx,
         &osc,
-        &out_idx,
+        crate::common::out(&out_idx),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -424,7 +424,7 @@ fn apply_changes_non_indexed_parity() {
     pbfhogg::apply_changes::merge(
         &in_non,
         &osc,
-        &out_non,
+        crate::common::out(&out_non),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -659,23 +659,25 @@ fn derive_changes_non_indexed_parity() {
     let stats_ii = pbfhogg::diff::derive::derive_changes(
         &old_idx,
         &new_idx,
-        &osc_ii,
+        crate::common::out(&osc_ii),
         false,
         false,
         None,
         1,
         &crate::common::test_host(),
+        crate::common::scratch_in(dir.path()),
     )
     .expect("derive_changes indexed");
     let stats_nn = pbfhogg::diff::derive::derive_changes(
         &old_non,
         &new_non,
-        &osc_nn,
+        crate::common::out(&osc_nn),
         false,
         false,
         None,
         1,
         &crate::common::test_host(),
+        crate::common::scratch_in(dir.path()),
     )
     .expect("derive_changes non-indexed");
 
@@ -718,7 +720,7 @@ fn renumber_external_rejects_non_indexed() {
     // Indexed input proceeds normally.
     let stats_idx = pbfhogg::commands::renumber::renumber_external(
         &in_idx,
-        &out_idx,
+        crate::common::out(&out_idx),
         &opts,
         &pbfhogg::write::WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -733,7 +735,7 @@ fn renumber_external_rejects_non_indexed() {
     // Non-indexed input is rejected with an actionable error message.
     let err = pbfhogg::commands::renumber::renumber_external(
         &in_non,
-        &out_non,
+        crate::common::out(&out_non),
         &opts,
         &pbfhogg::write::WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
@@ -770,50 +772,42 @@ fn extract_multi_complete_ways_non_indexed_parity() {
     let in_non = dir.path().join("in_non.osm.pbf");
     write_both(&in_idx, &in_non);
 
-    let make_slots = |suffix: &str| -> Vec<pbfhogg::commands::extract::ExtractSlot> {
+    let regions = || {
         let bbox_a =
             pbfhogg::commands::extract::parse_bbox("0.0,0.0,0.0006,0.0006").expect("parse bbox a");
         let bbox_b =
             pbfhogg::commands::extract::parse_bbox("0.0,0.0,0.002,0.002").expect("parse bbox b");
         vec![
-            pbfhogg::commands::extract::ExtractSlot {
-                region: pbfhogg::commands::extract::Region::Bbox(bbox_a),
-                output: dir.path().join(format!("a_{suffix}.osm.pbf")),
-            },
-            pbfhogg::commands::extract::ExtractSlot {
-                region: pbfhogg::commands::extract::Region::Bbox(bbox_b),
-                output: dir.path().join(format!("b_{suffix}.osm.pbf")),
-            },
+            pbfhogg::commands::extract::Region::Bbox(bbox_a),
+            pbfhogg::commands::extract::Region::Bbox(bbox_b),
         ]
     };
-    let slots_idx = make_slots("idx");
-    let slots_non = make_slots("non");
+    let outputs = |suffix: &str| {
+        [
+            dir.path().join(format!("a_{suffix}.osm.pbf")),
+            dir.path().join(format!("b_{suffix}.osm.pbf")),
+        ]
+    };
+    let outputs_idx = outputs("idx");
+    let outputs_non = outputs("non");
 
-    pbfhogg::commands::extract::extract_multi(
-        &in_idx,
-        &slots_idx,
-        pbfhogg::commands::extract::ExtractStrategy::CompleteWays,
-        true,
-        &pbfhogg::cat::CleanAttrs::default(),
-        &forced(),
-        &pbfhogg::HeaderOverrides::default(),
-        &crate::common::test_host(),
-    )
-    .expect("extract_multi indexed");
-    pbfhogg::commands::extract::extract_multi(
-        &in_non,
-        &slots_non,
-        pbfhogg::commands::extract::ExtractStrategy::CompleteWays,
-        true,
-        &pbfhogg::cat::CleanAttrs::default(),
-        &forced(),
-        &pbfhogg::HeaderOverrides::default(),
-        &crate::common::test_host(),
-    )
-    .expect("extract_multi non-indexed");
+    for (input, paths) in [(&in_idx, &outputs_idx), (&in_non, &outputs_non)] {
+        pbfhogg::commands::extract::extract_multi(
+            input,
+            &regions(),
+            pbfhogg::OutputSet::files(paths, pbfhogg::Overwrite::Refuse).expect("stage outputs"),
+            pbfhogg::commands::extract::ExtractStrategy::CompleteWays,
+            true,
+            &pbfhogg::cat::CleanAttrs::default(),
+            &forced(),
+            &pbfhogg::HeaderOverrides::default(),
+            &crate::common::test_host(),
+        )
+        .expect("extract_multi");
+    }
 
-    assert_elements_equivalent(&slots_idx[0].output, &slots_non[0].output);
-    assert_elements_equivalent(&slots_idx[1].output, &slots_non[1].output);
+    assert_elements_equivalent(&outputs_idx[0], &outputs_non[0]);
+    assert_elements_equivalent(&outputs_idx[1], &outputs_non[1]);
 }
 
 // Pins the non-indexed parity contract for `extract --strategy smart`
@@ -836,7 +830,7 @@ fn extract_smart_non_indexed_parity() {
 
     pbfhogg::commands::extract::extract(
         &in_idx,
-        &out_idx,
+        crate::common::out(&out_idx),
         &region,
         pbfhogg::commands::extract::ExtractStrategy::Smart,
         true,
@@ -848,7 +842,7 @@ fn extract_smart_non_indexed_parity() {
     .expect("extract indexed");
     pbfhogg::commands::extract::extract(
         &in_non,
-        &out_non,
+        crate::common::out(&out_non),
         &region,
         pbfhogg::commands::extract::ExtractStrategy::Smart,
         true,
@@ -992,7 +986,7 @@ fn merge_pbf_non_indexed_parity() {
     };
     let stats_idx = pbfhogg::cat::dedupe::merge_pbf(
         &[&a_idx, &b_idx],
-        &out_idx,
+        crate::common::out(&out_idx),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
@@ -1000,7 +994,7 @@ fn merge_pbf_non_indexed_parity() {
     .expect("merge_pbf indexed");
     let stats_non = pbfhogg::cat::dedupe::merge_pbf(
         &[&a_non, &b_non],
-        &out_non,
+        crate::common::out(&out_non),
         &opts,
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),

@@ -64,18 +64,47 @@ impl DeriveChangesStats {
 /// Requires both inputs to declare `Sort.Type_then_ID` - returns an
 /// actionable error if either is unsorted.
 #[allow(clippy::too_many_arguments)]
-#[hotpath::measure]
 pub fn derive_changes(
     old_path: &Path,
     new_path: &Path,
-    output: &Path,
+    output: crate::output::Output,
     direct_io: bool,
     increment_version: bool,
     timestamp: Option<u64>,
     jobs: usize,
     host: &crate::host::Host,
+    scratch: crate::scratch::RunScratch,
 ) -> Result<DeriveChangesStats> {
-    let token = crate::scratch::RunToken::next()?;
+    let result = derive_changes_to(
+        old_path,
+        new_path,
+        &output,
+        direct_io,
+        increment_version,
+        timestamp,
+        jobs,
+        host,
+        &scratch,
+    )?;
+    drop(scratch);
+    output.publish()?;
+    Ok(result)
+}
+
+/// [`derive_changes`] writing to a borrowed output it does not publish.
+#[allow(clippy::too_many_arguments)]
+#[hotpath::measure]
+pub(crate) fn derive_changes_to(
+    old_path: &Path,
+    new_path: &Path,
+    output: &crate::output::Output,
+    direct_io: bool,
+    increment_version: bool,
+    timestamp: Option<u64>,
+    jobs: usize,
+    host: &crate::host::Host,
+    scratch: &crate::scratch::RunScratch,
+) -> Result<DeriveChangesStats> {
     // Single-pass: check sorted headers + indexdata from one file open each.
     let (old_sorted, old_indexed) = super::check_sorted_and_indexed(old_path, direct_io, host)?;
     let (new_sorted, new_indexed) = super::check_sorted_and_indexed(new_path, direct_io, host)?;
@@ -108,8 +137,6 @@ pub fn derive_changes(
     // An exact preflight would repeat comparison and XML serialization on this
     // measured path. Keep write errors authoritative instead of refusing a
     // potentially empty diff against an invented scratch-space requirement.
-    // Scratch directory for temp files (same as brokkr scratch).
-    let scratch_dir = host.scratch_parent_or(output.parent().unwrap_or(Path::new(".")));
 
     crate::debug::emit_marker("DERIVECHANGES_SCAN_START");
 
@@ -124,12 +151,11 @@ pub fn derive_changes(
             old_path,
             new_path,
             output,
-            scratch_dir,
+            scratch,
             jobs,
             increment_version,
             timestamp,
             host,
-            &token,
         )?
     } else {
         None
@@ -145,7 +171,7 @@ pub fn derive_changes(
         return Ok(stats);
     }
 
-    let mut sink = ChangeSink::new(scratch_dir, &token, increment_version, timestamp)?;
+    let mut sink = ChangeSink::new(scratch, increment_version, timestamp)?;
 
     let result = (|| -> Result<DeriveChangesStats> {
         if both_indexed {
@@ -186,39 +212,29 @@ struct ChangeSink {
     creates: Writer<io::BufWriter<File>>,
     modifies: Writer<io::BufWriter<File>>,
     deletes: Writer<io::BufWriter<File>>,
-    creates_path: std::path::PathBuf,
-    modifies_path: std::path::PathBuf,
-    deletes_path: std::path::PathBuf,
+    creates_path: crate::scratch::ScratchPath,
+    modifies_path: crate::scratch::ScratchPath,
+    deletes_path: crate::scratch::ScratchPath,
     create_count: u64,
     modify_count: u64,
     delete_count: u64,
     increment_version: bool,
     timestamp: Option<u64>,
     coord_buf: String,
-    // Declared after the writers so files close before their paths are removed.
-    _scratch_guards: [crate::path_guard::PathGuard; 3],
 }
 
 impl ChangeSink {
     fn new(
-        scratch_dir: &Path,
-        token: &crate::scratch::RunToken,
+        scratch: &crate::scratch::RunScratch,
         increment_version: bool,
         timestamp: Option<u64>,
     ) -> Result<Self> {
-        let pid = std::process::id();
-        let suffix = token.suffix();
-        let cp = scratch_dir.join(format!("derive-creates-{pid}{suffix}.xml.tmp"));
-        let mp = scratch_dir.join(format!("derive-modifies-{pid}{suffix}.xml.tmp"));
-        let dp = scratch_dir.join(format!("derive-deletes-{pid}{suffix}.xml.tmp"));
-        // Arm each guard as soon as its file exists. Constructing a later
-        // fragment can fail before there is a ChangeSink to drop.
+        let cp = scratch.file("derive-creates.xml.tmp")?;
+        let mp = scratch.file("derive-modifies.xml.tmp")?;
+        let dp = scratch.file("derive-deletes.xml.tmp")?;
         let creates = Writer::new(io::BufWriter::new(crate::scratch::create_file(&cp)?));
-        let creates_guard = crate::path_guard::PathGuard::file(cp.clone());
         let modifies = Writer::new(io::BufWriter::new(crate::scratch::create_file(&mp)?));
-        let modifies_guard = crate::path_guard::PathGuard::file(mp.clone());
         let deletes = Writer::new(io::BufWriter::new(crate::scratch::create_file(&dp)?));
-        let deletes_guard = crate::path_guard::PathGuard::file(dp.clone());
         Ok(Self {
             creates,
             modifies,
@@ -232,7 +248,6 @@ impl ChangeSink {
             increment_version,
             timestamp,
             coord_buf: String::new(),
-            _scratch_guards: [creates_guard, modifies_guard, deletes_guard],
         })
     }
 
@@ -545,7 +560,11 @@ fn derive_changes_element_stream(
 /// Writes XML structure via quick_xml Writer, copies raw fragment bytes
 /// directly to the underlying parallel gzip writer (not through the XML
 /// writer).
-fn assemble_osc(output: &Path, sink: &ChangeSink, host: &crate::host::Host) -> Result<()> {
+fn assemble_osc(
+    output: &crate::output::Output,
+    sink: &ChangeSink,
+    host: &crate::host::Host,
+) -> Result<()> {
     assemble_osc_from_paths(
         output,
         &sink.creates_path,
@@ -564,7 +583,7 @@ fn assemble_osc(output: &Path, sink: &ChangeSink, host: &crate::host::Host) -> R
 /// produce fragments however they like and feed them in.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_osc_from_paths(
-    output: &Path,
+    output: &crate::output::Output,
     creates_path: &Path,
     modifies_path: &Path,
     deletes_path: &Path,
@@ -588,8 +607,7 @@ pub(crate) fn assemble_osc_from_paths(
     // Output can also be on a different filesystem from host-selected scratch.
     // A statvfs snapshot would not reserve capacity against concurrent writers;
     // propagate actual output write failures rather than promise a preflight.
-    let file = File::create(output)?;
-    let buf = io::BufWriter::new(file);
+    let buf = io::BufWriter::new(output.create()?);
 
     // Gzip member count = ceil(total_uncompressed_bytes / chunk_size).
     // At planet scale (~45 GB of XML across the three temp files) that's
@@ -685,7 +703,7 @@ fn write_delete_element<W: Write>(
 #[cfg(test)]
 mod scratch_tests {
     use super::ChangeSink;
-    use crate::scratch::RunToken;
+    use crate::scratch::RunScratch;
 
     #[test]
     fn delete_elements_use_the_supplied_timestamp() {
@@ -699,35 +717,16 @@ mod scratch_tests {
     }
 
     #[test]
-    fn partial_sink_construction_removes_created_fragments() {
+    fn dropping_the_run_scratch_removes_all_sink_fragments() {
         let dir = crate::path_guard::tests::scratch();
-        let token = RunToken::next().expect("token");
-        let blocked = dir.path().join(format!(
-            "derive-modifies-{}{}.xml.tmp",
-            std::process::id(),
-            token.suffix()
-        ));
-        std::fs::create_dir(&blocked).expect("block second fragment");
-        let err = ChangeSink::new(dir.path(), &token, false, None)
-            .err()
-            .expect("second fragment must fail");
-        assert!(err.to_string().contains(&blocked.display().to_string()));
-        let remaining: Vec<_> = std::fs::read_dir(dir.path())
-            .expect("scratch directory")
-            .map(|entry| entry.expect("entry").path())
-            .collect();
-        assert_eq!(remaining, [blocked], "the first fragment must be removed");
-    }
-
-    #[test]
-    fn unwinding_removes_all_sink_fragments() {
-        let dir = crate::path_guard::tests::scratch();
-        let token = RunToken::next().expect("token");
-        let result = std::panic::catch_unwind(|| {
-            let _sink = ChangeSink::new(dir.path(), &token, false, None).expect("sink");
+        let scratch =
+            RunScratch::create(dir.path(), &crate::host::Host::for_tests()).expect("scratch");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _sink = ChangeSink::new(&scratch, false, None).expect("sink");
             panic!("simulate a failed derive run");
-        });
+        }));
         assert!(result.is_err());
+        drop(scratch);
         assert_eq!(std::fs::read_dir(dir.path()).expect("directory").count(), 0);
     }
 }

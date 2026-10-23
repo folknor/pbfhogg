@@ -205,6 +205,7 @@ worth knowing about.
 |--------|---------|----------|
 | `-t, --object-type` | `-t, --type` | cat, diff, inspect tags, check |
 | `--strategy simple\|complete_ways\|smart` | `--simple` / `--smart` (default: complete) | extract |
+| `-O, --overwrite` | `-O, --overwrite`, as in osmium: an existing output is refused without it. Unlike osmium a symlink is refused even with it | every command with an output |
 | `-p, --polygon` (accepts `.poly`, GeoJSON, or OSM file) | `-p, --polygon` (GeoJSON only: bare Polygon/MultiPolygon geometry, Feature, or FeatureCollection - first feature only; Osmosis `.poly` files are not accepted) | extract |
 
 ### Flags pbfhogg doesn't have
@@ -217,7 +218,6 @@ These osmium flags have no pbfhogg equivalent:
 | `-f, --output-format` | PBF output only (except `diff --format osc` and `merge-changes`) |
 | `-v, --verbose` | No per-command verbosity control |
 | `--progress` / `--no-progress` | No progress bars |
-| `-O, --overwrite` | pbfhogg always overwrites |
 | `--fsync` | Always enabled (no flag needed) |
 | `-H, --with-history` | Current-snapshot tool, no history file support |
 | `--buffer-data` | Pipelined writer handles buffering internally |

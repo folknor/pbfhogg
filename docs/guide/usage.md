@@ -129,9 +129,17 @@ Most write commands accept these flags:
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file path |
+| `-O, --overwrite` | Replace the output if it already exists |
 | `--compression <SPEC>` | Compression: `none`, `zlib` (default), `zstd`, or with level (`zlib:9`, `zstd:19`) |
 | `--direct-io` | Bypass page cache via O_DIRECT (Linux, requires `linux-direct-io` feature) |
 | `--io-uring` | Use io_uring for output writes (Linux, requires `linux-io-uring` feature) |
 | `--force` | Proceed without indexdata (slower fallback path) |
 | `--generator <NAME>` | Override the writing program name in the output header |
 | `--output-header <K=V>` | Set replication metadata fields in the output header |
+
+An existing output is refused before any work is done unless `-O,
+--overwrite` is given, and a symlink is never accepted as an output. Every
+output is written to a hidden staging file beside it and renamed into place
+only when the command succeeds, so a failed run never leaves a partial file
+under the output name. The [CLI reference](../cli/commands#output-files) has
+the details.

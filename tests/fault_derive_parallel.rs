@@ -42,14 +42,23 @@ mod derive_parallel {
         write_multi_block_test_pbf(&old, &old_nodes, &[], &[], 5);
         write_multi_block_test_pbf(&new, &new_nodes, &[], &[], 5);
 
-        // Use an explicit scratch parent and consume token 0 with a clean
-        // run first. The fault then exercises suffix-aware cleanup, rather
-        // than only the legacy names used by a process's first invocation.
+        // An explicit scratch parent, checked empty after a clean run first so
+        // that the faulted run's leftovers cannot be a previous run's.
         let scratch = dir.path().join("scratch");
         std::fs::create_dir(&scratch).unwrap();
-        let mut host = crate::common::test_host();
-        host.scratch_parent = Some(scratch.clone());
-        derive_changes(&old, &new, &osc, false, false, None, 3, &host).unwrap();
+        let host = crate::common::test_host();
+        derive_changes(
+            &old,
+            &new,
+            crate::common::out(&osc),
+            false,
+            false,
+            None,
+            3,
+            &host,
+            crate::common::scratch_in(&scratch),
+        )
+        .unwrap();
         assert!(snapshot_dir(&scratch).is_empty());
         let before = snapshot_dir(dir.path());
 
@@ -58,8 +67,15 @@ mod derive_parallel {
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             derive_changes(
-                &old, &new, &osc, /* direct_io */ false, /* increment_version */ false,
-                /* delete timestamp */ None, /* jobs */ 3, &host,
+                &old,
+                &new,
+                crate::common::out(&osc),
+                /* direct_io */ false,
+                /* increment_version */ false,
+                /* delete timestamp */ None,
+                /* jobs */ 3,
+                &host,
+                crate::common::scratch_in(&scratch),
             )
         }));
 

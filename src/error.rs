@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::result;
 use std::str;
 use std::str::Utf8Error;
@@ -58,6 +58,11 @@ pub(crate) fn new_wire_error(msg: &'static str) -> Error {
 #[cold]
 pub(crate) fn new_missing_header() -> Error {
     new_error(ErrorKind::MissingHeader)
+}
+
+#[cold]
+pub(crate) fn new_output_error(kind: OutputError) -> Error {
+    new_error(ErrorKind::Output(kind))
 }
 
 #[cold]
@@ -344,7 +349,13 @@ impl Error {
             | ErrorKind::External { source, .. } => {
                 source.as_deref().map(|s| s as &(dyn StdError + 'static))
             }
-            ErrorKind::StringtableIndexOutOfBounds { .. }
+            ErrorKind::Output(
+                OutputError::ExclusivePublishUnsupported { source, .. }
+                | OutputError::Unsynced { source, .. },
+            ) => Some(source),
+            ErrorKind::Output(OutputError::RollbackIncomplete { source, .. }) => Some(source),
+            ErrorKind::Output(_)
+            | ErrorKind::StringtableIndexOutOfBounds { .. }
             | ErrorKind::Blob(_)
             | ErrorKind::WireFormat { .. }
             | ErrorKind::MissingHeader
@@ -462,6 +473,105 @@ pub enum ErrorKind {
         msg: Cow<'static, str>,
         source: Option<Arc<dyn StdError + Send + Sync>>,
     },
+    /// An output could not be prepared or published; see
+    /// [`crate::output`].
+    Output(OutputError),
+}
+
+/// Why an output was refused or could not be published.
+///
+/// The texts name no front-end flag: how a caller grants overwrite
+/// permission is the caller's business.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum OutputError {
+    /// The destination exists and replacing it was not requested.
+    Exists { path: PathBuf },
+    /// The destination is a symlink. Refused whatever the overwrite intent.
+    Symlink { path: PathBuf, target: PathBuf },
+    /// A file output's destination exists and is not a regular file.
+    NotAFile { path: PathBuf },
+    /// A directory output's destination exists and is not a directory.
+    NotADirectory { path: PathBuf },
+    /// A directory output's destination is a mount point.
+    MountPoint { path: PathBuf },
+    /// The path names no file or directory (empty, a root, or ending in
+    /// `..`).
+    InvalidPath { path: PathBuf },
+    /// Two outputs of one run resolve to the same file.
+    Collision { first: PathBuf, second: PathBuf },
+    /// Publication without replacement needs an exclusive rename (or, for a
+    /// file, a hard link), and this filesystem offers neither.
+    ExclusivePublishUnsupported { path: PathBuf, source: io::Error },
+    /// The output *was* published; syncing its directory failed, so its
+    /// survival across a crash is unconfirmed.
+    Unsynced { path: PathBuf, source: io::Error },
+    /// Publishing failed and undoing it failed too. Each entry says what was
+    /// left where; nothing it names was deleted.
+    RollbackIncomplete {
+        unresolved: Vec<String>,
+        source: Error,
+    },
+}
+
+impl fmt::Display for OutputError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Exists { path } => write!(
+                f,
+                "output {} already exists and replacing it was not requested",
+                path.display()
+            ),
+            Self::Symlink { path, target } => write!(
+                f,
+                "output {} is a symlink to {}; an output is never written over a symlink",
+                path.display(),
+                target.display()
+            ),
+            Self::NotAFile { path } => write!(
+                f,
+                "output {} exists and is not a regular file",
+                path.display()
+            ),
+            Self::NotADirectory { path } => {
+                write!(f, "output {} exists and is not a directory", path.display())
+            }
+            Self::MountPoint { path } => write!(
+                f,
+                "output directory {} is a mount point; publication renames the directory \
+                 itself, which a mount point cannot be",
+                path.display()
+            ),
+            Self::InvalidPath { path } => write!(
+                f,
+                "output path '{}' does not name a file or directory",
+                path.display()
+            ),
+            Self::Collision { first, second } => write!(
+                f,
+                "outputs {} and {} resolve to the same file",
+                first.display(),
+                second.display()
+            ),
+            Self::ExclusivePublishUnsupported { path, .. } => write!(
+                f,
+                "cannot publish {} without risking replacing an entry that appeared meanwhile: \
+                 the filesystem supports neither an exclusive rename nor, for a file, a hard link",
+                path.display()
+            ),
+            Self::Unsynced { path, .. } => write!(
+                f,
+                "output {} was published, but syncing its directory failed, so it may not \
+                 survive a crash",
+                path.display()
+            ),
+            Self::RollbackIncomplete { unresolved, .. } => write!(
+                f,
+                "publishing the output failed and could not be fully undone: {}",
+                unresolved.join("; ")
+            ),
+        }
+    }
 }
 
 /// An error that occurs when decoding a blob.
@@ -536,6 +646,16 @@ impl From<Error> for io::Error {
             ErrorKind::PlatformUnsupported { .. } => io::ErrorKind::Unsupported,
             ErrorKind::InvalidData { .. } => io::ErrorKind::InvalidData,
             ErrorKind::InvalidArgument { .. } => io::ErrorKind::InvalidInput,
+            ErrorKind::Output(OutputError::Exists { .. } | OutputError::Collision { .. }) => {
+                io::ErrorKind::AlreadyExists
+            }
+            ErrorKind::Output(
+                OutputError::Symlink { .. }
+                | OutputError::NotAFile { .. }
+                | OutputError::NotADirectory { .. }
+                | OutputError::MountPoint { .. }
+                | OutputError::InvalidPath { .. },
+            ) => io::ErrorKind::InvalidInput,
             _ => io::ErrorKind::Other,
         };
         io::Error::new(kind, err)
@@ -600,6 +720,7 @@ impl fmt::Display for Message<'_> {
             | ErrorKind::InvalidData { ref msg, .. }
             | ErrorKind::Internal { ref msg, .. }
             | ErrorKind::External { ref msg, .. } => f.write_str(msg),
+            ErrorKind::Output(ref output) => fmt::Display::fmt(output, f),
             ErrorKind::StringtableUtf8 { index, .. } => {
                 write!(f, "invalid UTF-8 at string table index {index}")
             }

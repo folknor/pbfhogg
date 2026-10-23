@@ -226,10 +226,23 @@ pub struct TagsFilterOptions<'a> {
 /// If `omit_referenced` is true (`-R` flag), only directly matching elements
 /// are output (single pass, faster). Otherwise, referenced nodes of matching
 /// ways are also included (two-pass).
-#[hotpath::measure]
 pub fn tags_filter(
     input: &Path,
-    output: &Path,
+    output: crate::output::Output,
+    opts: &TagsFilterOptions<'_>,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<TagsFilterStats> {
+    let result = tags_filter_to(input, &output, opts, overrides, host)?;
+    output.publish()?;
+    Ok(result)
+}
+
+/// [`tags_filter`] writing to a borrowed output it does not publish.
+#[hotpath::measure]
+pub(crate) fn tags_filter_to(
+    input: &Path,
+    output: &crate::output::Output,
     opts: &TagsFilterOptions<'_>,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
@@ -415,7 +428,7 @@ fn filter_block_parallel(
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn tags_filter_single_pass(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     expressions: &[Expression],
     invert: bool,
     distrust_metadata: bool,
@@ -646,7 +659,7 @@ fn filter_block_pass2(
 #[allow(clippy::too_many_lines)]
 fn tags_filter_two_pass(
     input: &Path,
-    output: &Path,
+    output: &crate::output::Output,
     expressions: &[Expression],
     invert: bool,
     distrust_metadata: bool,
@@ -1487,9 +1500,10 @@ mod tests {
 
         let expressions = parse_expressions(&["amenity".to_owned()]).unwrap();
         let output = dir.path().join("output.pbf");
+        let staged = crate::output::Output::new(&output, crate::output::Overwrite::Refuse).unwrap();
         tags_filter_single_pass(
             &input,
-            &output,
+            &staged,
             &expressions,
             false,
             false,
@@ -1498,6 +1512,7 @@ mod tests {
             &crate::host::Host::for_tests(),
         )
         .unwrap();
+        staged.publish().unwrap();
         let mut ids = Vec::new();
         ElementReader::open_in(&output, false, &crate::host::Host::for_tests())
             .unwrap()

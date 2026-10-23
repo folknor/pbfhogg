@@ -760,9 +760,8 @@ regresses under it. With jemalloc/mimalloc as the global allocator it silently
 does nothing and the documented RSS difference reappears. `brokkr.toml`
 captures `MALLOC*` env vars, suggesting `MALLOC_ARENA_MAX` was once the knob.
 Fix: allocator tuning belongs to `cli/src/main.rs`, per subcommand if needed,
-rather than a hook at command level. A `--target x86_64-unknown-linux-musl`
-build in a sweep would pin the musl half, which is currently held only by the
-textlint rule.
+rather than a hook at command level. The `musl` check sweep builds and runs
+the suite for `x86_64-unknown-linux-musl`, so the musl half is enforced.
 
 Reported by: re-encoding, geocode index, CLI and plumbing.
 
@@ -1304,19 +1303,6 @@ leads stay). What remains:
 
 Reported by: all nine scopes (split out of the library stderr item when the
 library stopped writing stderr).
-
-## HYG-068 - Nothing verifies the workspace MSRV
-
-Anger: 5 - toolchain install.
-
-`rust-version` is inherited from `[workspace.package]` (the Cargo.toml
-comment now says metadata alone verifies nothing), but no sweep checks the
-workspace builds on it. Only a nightly toolchain is installed. brokkr's
-per-sweep environment field can already set `RUSTUP_TOOLCHAIN`, so once the
-pinned toolchain is installed, a `[[check]]` sweep with that variable closes
-this.
-
-Reported by: CLI and plumbing.
 
 ## HYG-069 - Code comments and help text still hard-code drifting figures
 

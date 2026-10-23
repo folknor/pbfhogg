@@ -120,6 +120,16 @@ name = "cli"
 packages = ["pbfhogg-cli"]
 parallel = {}
 
+# The glibc-only allocator calls (mallopt, mallinfo2, malloc_trim) are gated
+# on target_env = "gnu"; this sweep builds, lints and runs the suite against
+# musl so an ungated call fails here rather than in a downstream musl build.
+# x86_64 musl binaries run natively on the glibc host.
+[[check]]
+name = "musl"
+target = "x86_64-unknown-linux-musl"
+build_packages = ["pbfhogg-cli"]
+parallel = {}
+
 # Doctests live in cargo's `--doc` pseudo-target, which a `parallel` sweep
 # cannot carry, and `[test] doctests` is off by default - so until this entry
 # existed no doctest in the library ever ran, and a broken example in a doc
@@ -225,7 +235,7 @@ gate_profile = "gate"
 # themselves out there.
 [test.profiles.tier1]
 description = "Fast edit loop used by brokkr check (tier 1)"
-sweeps = ["all", "faults", "consumer", "minimal", "geocode-reader", "cli"]
+sweeps = ["all", "faults", "consumer", "minimal", "geocode-reader", "cli", "musl"]
 skip = ["tier2::", "tier3::", "platform::", "serial::"]
 include_ignored = false
 
@@ -295,7 +305,7 @@ skip = ["platform::", "serial::"]
 # a test that stops running cannot go unnoticed here.
 [test.profiles.gate-tests]
 description = "Every sweep, unfiltered"
-sweeps = ["all", "faults", "consumer", "minimal", "geocode-reader", "cli"]
+sweeps = ["all", "faults", "consumer", "minimal", "geocode-reader", "cli", "musl"]
 
 [test.profiles.doc-twin]
 description = "The doc-only carrier"

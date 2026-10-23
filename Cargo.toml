@@ -10,8 +10,8 @@ serde_json = { version = "1.0.150", features = ["float_roundtrip"] }
 [workspace.package]
 version = "0.5.0"
 edition = "2024"
-# This declaration is not itself an MSRV check. The workspace check sweeps do
-# not yet verify this minimum with a pinned toolchain.
+# This declaration is not itself an MSRV check, and none is planned: only a
+# nightly toolchain is installed, and no sweep builds on this pinned version.
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 authors = ["folknor <folk@folk.wtf>"]

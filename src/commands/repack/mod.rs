@@ -103,23 +103,6 @@ struct WorkerOutput {
     tail: KindPayload,
 }
 
-/// Warn if the input header declares way-level metadata that repack does not
-/// preserve. Narrower than [`super::warn_locations_on_ways_loss`]: repack
-/// preserves `LocationsOnWays` (see the coordinate-threading comment in
-/// [`repack`]) so it must not warn about that feature, but it still drops
-/// `pbfhogg.WayMembers-v1` and `pbfhogg.SharedNodePins-v1`.
-fn warn_way_metadata_loss(header: &crate::HeaderBlock, host: &crate::host::Host) {
-    if header.has_way_members_v1() || header.has_shared_node_pins_v1() {
-        crate::host::diag!(
-            host.diagnostics,
-            Warning,
-            "repack.way_metadata_loss",
-            "input PBF has way-level enrichment metadata. \
-             Injected prepass metadata (WayMembers/SharedNodePins) is not preserved in the output."
-        );
-    }
-}
-
 /// Re-encode `input` to `output` with a per-blob element cap of
 /// `elements_per_blob`. Element semantics are preserved: every element
 /// round-trips with its tags, refs, members, metadata, and DenseNodes
@@ -172,40 +155,26 @@ pub(crate) fn repack_to(
     // Per-blob worker pool; same precedent as `cat --clean`.
     host.process.cross_thread_alloc_pool();
 
-    // Detect LocationsOnWays on the input header once, up front. Unlike
-    // tags-filter / extract, repack round-trips way payloads verbatim, so it
-    // CAN preserve inline way-ref coordinates - hence no
-    // `warn_locations_on_ways_loss` call here (that helper also warns about
-    // LocationsOnWays, which would misfire on the case repack now handles).
-    // When the input declares LOW, the output header re-advertises the
-    // feature (below) and the way phase threads the inline coordinates
-    // through both the worker full-block path and the trailing Owned* merge
-    // path. When the input lacks LOW, none of that fires and the output is
-    // byte-for-byte the pre-v2.2 shape (no LOW feature, no way coordinates) -
-    // the no-implicit-conversion constraint.
-    //
-    // repack still drops the other two optional way-metadata features
-    // (`pbfhogg.WayMembers-v1`, `pbfhogg.SharedNodePins-v1`), so those still
-    // need a loss warning; see `warn_way_metadata_loss` below.
+    // Unlike tags-filter / extract, repack round-trips way payloads with
+    // their inline coordinates, so an input declaring LocationsOnWays keeps
+    // it: the way phase threads the coordinates through both the worker
+    // full-block path and the trailing Owned* merge path. An input without
+    // LocationsOnWays carries no coordinates and the output is the plain
+    // shape (no implicit conversion). The prepass fields are not rewritten,
+    // so their declarations go, with the shared warning.
     let (header, preserve_locations) = {
         let reader = ElementReader::open_in(input, direct_io, host)?;
         let preserve = reader.header().has_locations_on_ways();
-        warn_way_metadata_loss(reader.header(), host);
         (reader.header().clone(), preserve)
     };
     let mut writer = writer_from_header(
         output,
         compression,
         &header,
-        true,
+        &super::output_header::OutputFacts::carry(
+            super::output_header::Ways::ReencodedWithLocations,
+        ),
         overrides,
-        |hb| {
-            if preserve_locations {
-                hb.optional_feature(crate::read::block::Feature::LOCATIONS_ON_WAYS)
-            } else {
-                hb
-            }
-        },
         backend,
         host,
     )?;

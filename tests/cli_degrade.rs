@@ -53,12 +53,11 @@ fn write_degrade_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestR
 /// `n * 1e-4` degrees, so `1..60` land in `[1e-4, 6e-3]`).
 const FIXTURE_BBOX: (f64, f64, f64, f64) = (0.0, 0.0, 0.01, 0.01);
 
-// Rich HeaderBlock metadata the bbox fixture carries beyond the bbox. Every
-// one of these is a field that a `HeaderBuilder::from_header` rebuild would
-// silently drop or replace (source and custom optional features have no
-// `HeaderBuilder` encoder; the writingprogram would be reset to "pbfhogg"),
-// so asserting they SURVIVE `--strip-bbox` pins that the passthrough path
-// preserves the input HeaderBlock payload verbatim instead of rebuilding it.
+// Rich HeaderBlock metadata the bbox fixture carries beyond the bbox. A
+// header rebuilt by the output-header policy would drop or replace several of
+// these (custom optional features are never carried; the writingprogram is
+// reset to "pbfhogg"), so asserting they SURVIVE `--strip-bbox` pins that the
+// passthrough path forwards the input HeaderBlock payload verbatim.
 const FIXTURE_WRITING_PROGRAM: &str = "degrade-test-writer/3.1";
 const FIXTURE_SOURCE: &str = "survey-import-2019";
 const FIXTURE_CUSTOM_FEATURE: &str = "Custom.Extension-v9";
@@ -1339,19 +1338,13 @@ fn degrade_strip_bbox_extract_bbox_matches_original() {
 }
 
 /// `--strip-bbox --generator <name>` on a passthrough-eligible bbox-bearing
-/// input takes the *rebuild* branch of `passthrough_header_bytes`, not the
-/// verbatim-forward branch: `--generator` is a `HeaderOverrides` override, so
-/// `passthrough_header_bytes` rebuilds the header via `HeaderBuilder` (bbox
-/// omitted under `--strip-bbox`) instead of forwarding the decompressed
-/// `HeaderBlock` protobuf field-for-field. Two independent signals pin this:
-/// the bbox is gone (proving the strip still applied) AND `writingprogram`
-/// equals the override rather than the fixture's original value (proving the
-/// override actually took effect, which only happens on the rebuild path -
-/// the verbatim path has no override plumbing at all). Without this test the
-/// rebuild branch in `passthrough_header_bytes` had no direct coverage; every
-/// other `--strip-bbox` test above exercises only the verbatim branch.
+/// input: the header is still forwarded field for field, with the bbox
+/// removed and only `writingprogram` replaced by the override. Two signals
+/// pin both edits: the bbox is gone AND `writingprogram` equals the override
+/// rather than the fixture's original value. That every other field
+/// survives an override is pinned by `tests/cli_output_header.rs`.
 #[test]
-fn degrade_strip_bbox_with_generator_override_rebuilds_header() {
+fn degrade_strip_bbox_with_generator_override_replaces_only_its_field() {
     let dir = tempfile::tempdir().expect("tempdir");
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -1382,13 +1375,12 @@ fn degrade_strip_bbox_with_generator_override_rebuilds_header() {
     let out_header = read_header(&output);
     assert!(
         out_header.bbox().is_none(),
-        "--strip-bbox must still clear HeaderBlock.bbox on the override-rebuild path"
+        "--strip-bbox must still clear HeaderBlock.bbox alongside an override"
     );
     assert_eq!(
         out_header.writing_program(),
         Some(OVERRIDE_GENERATOR),
-        "--generator must win on the rebuild path, proving passthrough_header_bytes \
-         took the HeaderBuilder rebuild branch rather than the verbatim-forward branch"
+        "--generator must replace the forwarded writingprogram"
     );
 
     // Element semantics preserved: only the header changed.

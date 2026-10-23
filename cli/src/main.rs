@@ -1609,6 +1609,12 @@ fn main() -> process::ExitCode {
                     if jobs != 0 {
                         return Err("-j/--jobs is not valid in OSC mode (OSC parse is single-threaded)".into());
                     }
+                    // OSC output has no PBF header for these to land in.
+                    if header.generator.is_some() || !header.output_headers.is_empty() {
+                        return Err(
+                            "--generator and --output-header are not valid in OSC mode (OSC output has no PBF header)".into(),
+                        );
+                    }
                     run_tags_filter_osc(&file, output.open(&host)?, expressions_file.as_deref(), &expressions, &host)
                 }
                 InputKind::Pbf if omit_referenced && jobs != 0 => {
@@ -2937,16 +2943,47 @@ fn validate_input_output_aliases(command: &Command) -> Result<(), Box<dyn std::e
         | Command::Repack { file, output, .. }
         | Command::Degrade { file, output, .. }
         | Command::Renumber { file, output, .. }
-        | Command::TagsFilter { file, output, .. }
-        | Command::Getid { file, output, .. }
-        | Command::Getparents { file, output, .. }
         | Command::AddLocationsToWays { file, output, .. }
         | Command::TimeFilter { file, output, .. } => reject_aliases(&[file], &output.output),
+        Command::TagsFilter {
+            file,
+            output,
+            expressions_file,
+            ..
+        } => {
+            let mut inputs: Vec<&std::path::Path> = vec![file];
+            inputs.extend(expressions_file.as_deref());
+            reject_aliases(&inputs, &output.output)
+        }
+        Command::Getid {
+            file,
+            output,
+            id_file,
+            id_osm_file,
+            ..
+        }
+        | Command::Getparents {
+            file,
+            output,
+            id_file,
+            id_osm_file,
+            ..
+        } => {
+            let mut inputs: Vec<&std::path::Path> = vec![file];
+            inputs.extend(id_file.as_deref());
+            inputs.extend(id_osm_file.as_deref());
+            reject_aliases(&inputs, &output.output)
+        }
         Command::Export {
             file,
             output: Some(output),
+            expressions_file,
             ..
-        } => reject_aliases(&[file], output),
+        } => {
+            let mut inputs: Vec<&std::path::Path> = vec![file];
+            inputs.extend(expressions_file.as_deref());
+            reject_aliases(&inputs, output)
+        }
         Command::Diff {
             old,
             new,
@@ -2956,8 +2993,13 @@ fn validate_input_output_aliases(command: &Command) -> Result<(), Box<dyn std::e
         Command::Extract {
             file,
             output: Some(output),
+            polygon,
             ..
-        } => reject_aliases(&[file], output),
+        } => {
+            let mut inputs: Vec<&std::path::Path> = vec![file];
+            inputs.extend(polygon.as_deref());
+            reject_aliases(&inputs, output)
+        }
         Command::ApplyChanges {
             base,
             changes,
@@ -3441,8 +3483,12 @@ fn run_extract_config(
         directory_override,
     )?;
 
+    // Every input the run reads: the PBF, the config itself, and each
+    // `polygon_file` the config names.
     for slot in &slots {
-        reject_aliases(&[file], &slot.output)?;
+        let mut inputs: Vec<&std::path::Path> = vec![file, config_path];
+        inputs.extend(slots.iter().filter_map(|s| s.polygon_file.as_deref()));
+        reject_aliases(&inputs, &slot.output)?;
     }
     // The config names the outputs, so only now are their directories known.
     // Scanned before any output is reserved, each directory once.
@@ -3672,17 +3718,10 @@ fn run_inspect(
             return Ok(Outcome::Positive);
         }
         InspectMode::HeaderGet { key, known } => {
-            let mut reader = pbfhogg::BlobReader::open(path, direct_io)?
-                .evict_page_cache(true)
-                .diagnostics(host.diagnostics.clone());
-            let header = match reader.next() {
-                Some(Ok(blob)) => match blob.decode()? {
-                    pbfhogg::blob::BlobDecode::OsmHeader(h) => *h,
-                    _ => return Err("first blob is not an OsmHeader".into()),
-                },
-                Some(Err(e)) => return Err(e.into()),
-                None => return Err("empty PBF file".into()),
-            };
+            // The reader parses the header eagerly, and reports a file
+            // without one through the library's single missing-header error.
+            let reader = pbfhogg::ElementReader::open(path, direct_io)?;
+            let header = reader.header();
             let val = match known {
                 Some(pbfhogg::inspect::InspectGetKeyKind::FileName) => Some(
                     path.file_name()
@@ -3951,6 +3990,9 @@ fn bench_write_loop<W: std::io::Write>(
     use pbfhogg::block_builder::{BlockBuilder, MemberData};
     use std::io::BufReader;
 
+    // The leading OsmHeader is required like everywhere else: a zero-byte or
+    // header-less file is the one missing-header error, not an empty run.
+    drop(pbfhogg::ElementReader::open(path, false)?);
     let reader = pbfhogg::BlobReader::new(BufReader::new(std::fs::File::open(path)?))
         .diagnostics(host.diagnostics.clone());
     let mut bb = BlockBuilder::new();

@@ -16,8 +16,7 @@ use std::path::Path;
 
 use super::{
     HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
-    ensure_way_capacity_local, flush_local, require_sorted, warn_locations_on_ways_loss,
-    writer_from_header,
+    ensure_way_capacity_local, flush_local, require_sorted, writer_from_header,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::owned::{
@@ -104,16 +103,17 @@ pub(crate) fn time_filter_to(
         "Input history PBF",
         "Time filtering requires sorted input to preserve type-then-ID ordering while selecting the snapshot.",
     )?;
-    warn_locations_on_ways_loss(reader.header(), host);
 
     let is_history = reader.header().has_historical_information();
     let mut writer = writer_from_header(
         output,
         compression,
         reader.header(),
-        true,
+        &super::output_header::OutputFacts {
+            replication: super::output_header::Replication::AsOf(cutoff_timestamp),
+            ..super::output_header::OutputFacts::carry(super::output_header::Ways::Reencoded)
+        },
         overrides,
-        |hb| hb.replication_timestamp(cutoff_timestamp),
         backend,
         host,
     )?;

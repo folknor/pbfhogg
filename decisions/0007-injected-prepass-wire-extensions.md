@@ -22,9 +22,14 @@ non-closure positions and resolved to an actual location. Missing references
 remain unpinned, preserving the existing zero-coordinate sentinel behavior.
 
 The extension is opt-in. Normal ALTW output remains compatible with existing
-flows. Commands that rewrite way payloads do not preserve these extensions;
-`HeaderBuilder::from_header` intentionally does not copy optional features,
-and the command layer warns before dropping enrichment metadata.
+flows. Commands that rewrite way payloads do not preserve these extensions.
+The output-header policy (`reference/cli-reference.md` "Output header")
+declares them on a command's output only where every way blob is copied whole
+from a single input with nothing added, and warns when it stops declaring
+them. The fields are authoritative only in a file whose header declares them:
+a splice path (apply-changes) can leave stale field-5 or field-20 bytes in a
+file that no longer declares the feature, and a reader that forces their
+parsing there reads bytes nobody vouches for.
 
 ## Consequences
 

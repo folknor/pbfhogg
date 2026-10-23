@@ -11,7 +11,7 @@
 //! blob that overlaps nothing pass through untouched.
 //!
 //! The output header is reconciled across every input's header by the same
-//! constructor the other cat paths use (`super::output_header_bytes`).
+//! owner every command uses (`commands::output_header::build`).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -235,11 +235,28 @@ pub(crate) fn merge_pbf_to(
         "Pass 2: writing merged output..."
     );
     // Reconciled across every input, not taken from the first: the merge's
-    // header has to describe the merge. Always stamped sorted - every input
-    // passed `require_sorted` and the sweep emits in type-then-ID order.
-    let header_bytes = super::output_header_bytes(inputs, &headers, true, overrides, host)?;
+    // header has to describe the merge. Always sorted - every input passed
+    // `require_sorted` and the sweep emits in type-then-ID order. The way
+    // enrichments follow from the index just built: a way blob in an overlap
+    // run is re-encoded, an unindexed passthrough way blob is reframed.
+    let ways = crate::commands::output_header::Ways::from_copy(
+        entries
+            .iter()
+            .zip(&overlaps)
+            .any(|(e, &o)| o && e.index.kind == ElementKind::Way),
+        entries
+            .iter()
+            .zip(&overlaps)
+            .any(|(e, &o)| !o && !e.has_indexdata && e.index.kind == ElementKind::Way),
+    );
+    let header = crate::commands::output_header::build(
+        &headers,
+        &crate::commands::output_header::OutputFacts::sorted(ways),
+        overrides,
+        host,
+    )?;
     let mut writer =
-        writer_from_header_bytes(output, opts.compression, &header_bytes, opts.backend, host)?;
+        writer_from_header_bytes(output, opts.compression, &header.bytes, opts.backend, host)?;
 
     // Open all input files for random access
     let mut files: Vec<File> = inputs.iter().map(File::open).collect::<io::Result<_>>()?;
@@ -352,15 +369,6 @@ struct IndexScratch {
     blob_buf: Vec<u8>,
 }
 
-/// An input whose blob sequence is not "one OSMHeader, then data".
-fn frame_order_error(input: &Path, what: &str) -> Error {
-    Error::invalid_data(format!(
-        "input file {}: {what}; a PBF file carries exactly one OSMHeader blob, \
-         as its first blob",
-        input.display()
-    ))
-}
-
 /// Pass 1 over one input: append its OSMData blobs to `entries` and return
 /// its header. See [`build_blob_index`] for the header rules.
 fn index_input(
@@ -428,10 +436,7 @@ fn index_input(
                 header = Some(hdr);
             }
             (_, false) => {
-                return Err(locate(frame_order_error(
-                    input,
-                    "the first blob is not an OSMHeader",
-                )));
+                return Err(crate::error::new_missing_header(input));
             }
             (BlobKind::OsmData, true) => {
                 let has_indexdata = raw_index.is_some();
@@ -464,7 +469,7 @@ fn index_input(
         }
     }
 
-    header.ok_or_else(|| frame_order_error(input, "no OSMHeader blob found"))
+    header.ok_or_else(|| crate::error::new_missing_header(input))
 }
 
 // ---------------------------------------------------------------------------

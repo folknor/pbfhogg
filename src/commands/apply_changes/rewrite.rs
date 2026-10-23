@@ -10,9 +10,8 @@ use crate::blob::{BlobKind, decode_blob_to_headerblock};
 use crate::file_reader::FileReader;
 use crate::write::WriteOptions;
 
-use crate::commands::{
-    HeaderOverrides, build_output_header, require_indexdata, writer_from_header_bytes,
-};
+use crate::commands::output_header::{Bbox, OutputFacts, Ways};
+use crate::commands::{HeaderOverrides, require_indexdata, writer_from_header_bytes};
 use crate::read::raw_frame::read_raw_frame;
 
 use super::descriptor::{DrainItem, Route};
@@ -97,7 +96,6 @@ impl MergeOptions {
     }
 }
 
-#[allow(clippy::redundant_closure_for_method_calls)]
 fn build_header_bytes(
     header: &crate::HeaderBlock,
     locations_on_ways: bool,
@@ -121,21 +119,26 @@ fn build_header_bytes(
              must be ordered by ID.",
         ));
     }
-    if locations_on_ways {
-        if !header.has_locations_on_ways() {
-            return Err(crate::Error::invalid_data(
-                "merge --locations-on-ways requires the base PBF to have LocationsOnWays. \
-                 Run add-locations-to-ways first to bootstrap coordinates.",
-            ));
-        }
-        build_output_header(header, false, overrides, |hb| {
-            hb.sorted()
-                .optional_feature(crate::read::block::Feature::LOCATIONS_ON_WAYS)
-        })
-    } else {
-        crate::commands::warn_locations_on_ways_loss(header, host);
-        build_output_header(header, false, overrides, |hb| hb.sorted())
+    if locations_on_ways && !header.has_locations_on_ways() {
+        return Err(crate::Error::invalid_data(
+            "merge --locations-on-ways requires the base PBF to have LocationsOnWays. \
+             Run add-locations-to-ways first to bootstrap coordinates.",
+        ));
     }
+    // Sorted by construction. Under -l every way keeps or gets inline
+    // coordinates; the prepass fields of spliced blobs are stale against the
+    // changed relations and ways, so they are not declared. Without -l a
+    // rewritten way blob loses its coordinates. An OSC can create or move a
+    // node outside the base's bbox, so no bbox is declared.
+    let facts = OutputFacts {
+        bbox: Bbox::Drop,
+        ..OutputFacts::sorted(if locations_on_ways {
+            Ways::ReencodedWithLocations
+        } else {
+            Ways::Reencoded
+        })
+    };
+    Ok(crate::commands::output_header::build_one(header, &facts, overrides, host)?.bytes)
 }
 
 fn read_header(
@@ -154,7 +157,7 @@ fn read_header(
                 return build_header_bytes(&header, locations_on_ways, overrides, host);
             }
             Some(_) => {}
-            None => return Err(crate::Error::invalid_data("base PBF has no OSMHeader blob")),
+            None => return Err(crate::error::new_missing_header(base_pbf)),
         }
     }
 }

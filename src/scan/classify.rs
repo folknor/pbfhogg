@@ -284,7 +284,7 @@ pub(crate) fn build_classify_schedule_blob_filtered(
     drop(
         walker
             .next_header()?
-            .ok_or_else(crate::error::new_missing_header)?,
+            .ok_or_else(|| crate::error::new_missing_header(input))?,
     );
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
@@ -386,7 +386,7 @@ pub(crate) fn build_classify_schedules_split(
     drop(
         walker
             .next_header()?
-            .ok_or_else(crate::error::new_missing_header)?,
+            .ok_or_else(|| crate::error::new_missing_header(input))?,
     );
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 

@@ -146,9 +146,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     // Sequential reader to avoid PrimitiveBlock cross-thread retention OOM.
     let mut blob_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     blob_reader.set_parse_indexdata(true);
-    let header_blob = blob_reader
-        .next()
-        .ok_or_else(crate::error::new_missing_header)??;
+    let header_blob = blob_reader.leading_header()?;
     let is_sorted = header_blob.to_headerblock()?.is_sorted();
     let filter = spatial_blob_filter(bbox_int);
     let mut decompress_buf: Vec<u8> = Vec::new();
@@ -170,9 +168,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         ] {
             let mut blob_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
             blob_reader.set_parse_indexdata(true);
-            blob_reader
-                .next()
-                .ok_or_else(crate::error::new_missing_header)??;
+            blob_reader.leading_header()?;
             for blob_result in &mut blob_reader {
                 let blob = blob_result?;
                 if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
@@ -246,7 +242,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
     let _ = walker
         .next_header()?
-        .ok_or_else(crate::error::new_missing_header)?;
+        .ok_or_else(|| crate::error::new_missing_header(input))?;
 
     let mut node_schedule: Vec<(usize, u64, usize)> = Vec::new();
     let mut way_schedule: Vec<(usize, u64, usize)> = Vec::new();
@@ -593,27 +589,16 @@ pub(super) fn extract_smart(
     crate::debug::emit_marker("SMART_PASS3_SETUP_START");
 
     let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
-    let header_blob = header_reader
-        .next()
-        .ok_or_else(crate::error::new_missing_header)??;
+    let header_blob = header_reader.leading_header()?;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
-    super::super::warn_locations_on_ways_loss(&header, host);
     let bbox = region.bbox();
     let mut writer = writer_from_header(
         output,
         compression,
         &header,
-        false,
+        &super::output_facts(set_bounds, bbox),
         overrides,
-        |hb| {
-            let hb = if set_bounds {
-                hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-            } else {
-                hb
-            };
-            hb.sorted()
-        },
         backend,
         host,
     )?;

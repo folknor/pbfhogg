@@ -377,7 +377,8 @@ fn merge_empty_files() {
     let stats = merge_pbf(
         &inputs,
         crate::common::out(&output),
-        &default_opts(),
+        // No `force`: a header-only file has no blob lacking indexdata.
+        &WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )

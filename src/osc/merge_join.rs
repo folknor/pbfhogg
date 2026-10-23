@@ -35,9 +35,7 @@ impl StreamingBlocks {
     ) -> crate::error::Result<Self> {
         let mut blob_reader = crate::blob::BlobReader::open_in(path, direct_io, host)?;
         blob_reader.set_parse_indexdata(true);
-        blob_reader
-            .next()
-            .ok_or_else(crate::error::new_missing_header)??;
+        blob_reader.leading_header()?;
         let mut decompress_buf: Vec<u8> = Vec::new();
         let mut st_scratch: Vec<(u32, u32)> = Vec::new();
         let mut gr_scratch: Vec<(u32, u32)> = Vec::new();

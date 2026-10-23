@@ -459,8 +459,17 @@ what the inputs collectively support:
 - **bbox**: the union, and only when *every* input declares one. An input
   without a declared box has unknown extent, so the union is unknown and the
   field is omitted.
-- **replication timestamp / sequence number / base URL, and `source`**: kept
-  per field, and only when every input agrees on that field's value.
+- **replication base URL, and `source`**: kept when every input agrees on the
+  value.
+- **replication timestamp and sequence number**: kept only when every input
+  carries the same timestamp, sequence number *and* base URL. They name a
+  position in one feed; the same sequence number in two feeds is not one
+  state.
+- **optional features**: not sorted (a concatenation of several inputs is
+  not in type-then-ID order, however each input is ordered);
+  `LocationsOnWays` when every input declares it, since every way blob is
+  copied with its coordinates; never the two `pbfhogg.*` prepass features,
+  which a second input can falsify.
 - **`HistoricalInformation`**: the logical OR, since it declares that history
   metadata *may* be present.
 
@@ -477,6 +486,20 @@ This is a deviation from *osmium*, not from pbfhogg's own prior behaviour,
 which was worse than either: the cat paths built the output header from the
 first input alone, so the output advertised one input's bounding box over
 data drawn from all of them.
+
+## time-filter: the sequence number does not outlive the replication state
+
+`osmium time-filter` (`command_time_filter.cpp`) lowers the output's
+`osmosis_replication_timestamp` to the cutoff when the input's is later, and
+keeps the rest of the input header, sequence number included. That sequence
+number names the input's replication state, which the snapshot is no longer
+at: an updater resuming from it would skip every diff between the cutoff and
+the input's state.
+
+`pbfhogg time-filter` lowers the timestamp the same way and drops the
+sequence number whenever it cannot show the output is still at the input's
+state: when it lowered the timestamp, and when the input has no timestamp to
+compare against. A cutoff at or after the input's timestamp keeps both.
 
 ## tags-filter and inspect tags: expression-syntax edge cases
 

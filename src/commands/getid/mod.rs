@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::idset::IdSet;
 
+use super::output_header::{Declared, OutputFacts, Ways};
 use super::{
     HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
     ensure_way_capacity_local, flush_local, require_indexdata, writer_from_header,
@@ -459,6 +460,7 @@ fn getid_dispatched(
             output,
             ids,
             true,
+            Ways::Reencoded,
             write,
             overrides,
             arm,
@@ -505,8 +507,7 @@ pub(crate) fn removeid_to(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetidStats> {
-    let _ = host;
-    require_indexdata(
+    let indexed = require_indexdata(
         input,
         write.direct_reads,
         write.force,
@@ -515,6 +516,16 @@ pub(crate) fn removeid_to(
          blob is decompressed and re-encoded (significantly slower).",
         host,
     )?;
+    // Every way blob is copied whole when no way ID is removed and the blobs
+    // carry indexdata (a blob without it is decoded to find its IDs, and the
+    // walker refuses an unindexed way blob behind an indexed first blob when
+    // the header has declared a way enrichment). The output is a subset of
+    // the input with nothing changed, so the copied declarations still hold.
+    let ways = if indexed && !ids.way_ids.has_any() {
+        Ways::BlobsCopied
+    } else {
+        Ways::Reencoded
+    };
     // Invert mode is pinned to the walker arm. The streaming full-scan
     // arm implements include mode only; fusing invert's raw passthrough
     // into a sequential stream is possible but unmeasured (ADR-0006).
@@ -523,6 +534,7 @@ pub(crate) fn removeid_to(
         output,
         ids,
         false,
+        ways,
         write,
         overrides,
         ScanArm::Walker,
@@ -545,6 +557,7 @@ fn filter_by_id(
     output: &crate::output::Output,
     ids: &ElementIds,
     include: bool,
+    ways: Ways,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     arm: ScanArm,
@@ -557,6 +570,7 @@ fn filter_by_id(
             output,
             ids,
             include,
+            ways,
             write,
             overrides,
             report_found,
@@ -580,6 +594,7 @@ fn filter_by_id_walker(
     output: &crate::output::Output,
     ids: &ElementIds,
     include: bool,
+    ways: Ways,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     report_found: bool,
@@ -623,6 +638,8 @@ fn filter_by_id_walker(
 
     // Find and decode the leading OsmHeader blob to build the output header.
     let mut writer: Option<PbfWriter<FileWriter>> = None;
+    let facts = OutputFacts::carry(ways);
+    let mut declared = Declared::default();
 
     while let Some(meta) = walker.next_header()? {
         // The walker owns provenance: failures on this blob are located with
@@ -636,8 +653,9 @@ fn filter_by_id_walker(
                     .pread_data(meta.data_offset, meta.data_size, &mut data_buf)
                     .map_err(locate)?;
                 let header = decode_blob_to_headerblock(&data_buf).map_err(locate)?;
-                super::warn_locations_on_ways_loss(&header, host);
-                let header_bytes = super::build_output_header(&header, true, overrides, |hb| hb)?;
+                let built = super::output_header::build_one(&header, &facts, overrides, host)?;
+                declared = built.declared;
+                let header_bytes = built.bytes;
                 writer = Some(super::writer_from_header_bytes(
                     output,
                     write.compression,
@@ -648,11 +666,9 @@ fn filter_by_id_walker(
             }
             BlobKind::OsmData => {
                 osmdata_blobs += 1;
-                let w = writer.as_mut().ok_or_else(|| {
-                    locate(Error::invalid_data(
-                        "no OSMHeader blob found before OsmData",
-                    ))
-                })?;
+                let w = writer
+                    .as_mut()
+                    .ok_or_else(|| crate::error::new_missing_header(input))?;
 
                 if let Some(ref idx) = meta.index {
                     let has_match = match idx.kind {
@@ -717,6 +733,19 @@ fn filter_by_id_walker(
                 )
                 .map_err(locate)?;
                 flush_local(&mut bb, &mut output_blocks)?;
+                // Only an unindexed blob can be a way blob decoded under a
+                // header that declared way enrichment (with one, no way ID is
+                // removed, so an indexed way blob never matches).
+                if meta.index.is_none()
+                    && declared.way_enrichment()
+                    && output_blocks
+                        .iter()
+                        .any(|b| b.index.kind == crate::ElementKind::Way)
+                {
+                    return Err(locate(
+                        declared.broken_by_unindexed_way_blob("re-encoding it"),
+                    ));
+                }
                 for OwnedBlock {
                     bytes: block_bytes,
                     index,
@@ -744,7 +773,7 @@ fn filter_by_id_walker(
         }
     }
 
-    let mut writer = writer.ok_or_else(|| Error::invalid_data("no OSMHeader blob found"))?;
+    let mut writer = writer.ok_or_else(|| crate::error::new_missing_header(input))?;
     crate::debug::emit_counter(
         "walk_actual_osmdata_blobs",
         i64::try_from(osmdata_blobs).unwrap_or(i64::MAX),
@@ -828,8 +857,15 @@ fn filter_by_id_streaming(
         match frame.blob_type {
             BlobKind::OsmHeader if writer.is_none() => {
                 let header = decode_blob_to_headerblock(frame.blob_bytes()).map_err(locate)?;
-                super::warn_locations_on_ways_loss(&header, host);
-                let header_bytes = super::build_output_header(&header, true, overrides, |hb| hb)?;
+                let header_bytes = super::output_header::build_one(
+                    &header,
+                    &super::output_header::OutputFacts::carry(
+                        super::output_header::Ways::Reencoded,
+                    ),
+                    overrides,
+                    host,
+                )?
+                .bytes;
                 writer = Some(super::writer_from_header_bytes(
                     output,
                     write.compression,
@@ -840,11 +876,9 @@ fn filter_by_id_streaming(
             }
             BlobKind::OsmData => {
                 osmdata_blobs += 1;
-                let w = writer.as_mut().ok_or_else(|| {
-                    locate(Error::invalid_data(
-                        "no OSMHeader blob found before OsmData",
-                    ))
-                })?;
+                let w = writer
+                    .as_mut()
+                    .ok_or_else(|| crate::error::new_missing_header(input))?;
                 if let Some(ref idx) = frame.index {
                     let has_match = match idx.kind {
                         crate::ElementKind::Node => {
@@ -914,7 +948,7 @@ fn filter_by_id_streaming(
         }
     }
 
-    let mut writer = writer.ok_or_else(|| Error::invalid_data("no OSMHeader blob found"))?;
+    let mut writer = writer.ok_or_else(|| crate::error::new_missing_header(input))?;
     crate::debug::emit_counter(
         "walk_actual_osmdata_blobs",
         i64::try_from(osmdata_blobs).unwrap_or(i64::MAX),
@@ -1012,7 +1046,6 @@ fn getid_with_refs(
     // the decode workers).
     crate::debug::emit_marker("GETID_PASS2_START");
     let reader = ElementReader::open_in(input, write.direct_reads, host)?;
-    super::warn_locations_on_ways_loss(reader.header(), host);
     // Skip blob types not needed: nodes if no node IDs and no dependent nodes,
     // ways always needed (add-referenced mode), relations if no relation IDs.
     let reader = reader.with_blob_filter(BlobFilter::new(
@@ -1024,9 +1057,8 @@ fn getid_with_refs(
         output,
         write.compression,
         reader.header(),
-        true,
+        &super::output_header::OutputFacts::carry(super::output_header::Ways::Reencoded),
         overrides,
-        |hb| hb,
         write.backend,
         host,
     )?;
@@ -1558,6 +1590,7 @@ mod tests {
                 &staged,
                 &query,
                 true,
+                super::Ways::Reencoded,
                 &WriteOptions::default(),
                 &HeaderOverrides::default(),
                 arm,

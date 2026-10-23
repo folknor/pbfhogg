@@ -17,6 +17,7 @@ use crate::write::WriteOptions;
 use crate::writer::{Compression, PbfWriter, reframe_raw_with_index};
 use crate::{BlobFilter, Element, PrimitiveBlock};
 
+use super::output_header::{OutputFacts, OutputHeader, Ways};
 use super::{Result, flush_local};
 use crate::error::Error;
 use crate::read::raw_frame::{frame_location, read_raw_frame};
@@ -165,166 +166,63 @@ fn read_header(
                 .map_err(|e| e.locate(frame_location(file, frame.file_offset)));
         }
     }
-    Err(Error::invalid_data("no OSMHeader blob found in input file"))
+    Err(crate::error::new_missing_header(file))
 }
 
-/// Build the output header bytes for a plain `cat` run over `files` (every
-/// path except `--dedupe`, which collects its headers during its own index
-/// pass and calls [`output_header_bytes`] directly).
-///
-/// A concatenation of one sorted input is still sorted; a concatenation of
-/// several is not, however each of them is ordered, so the sort stamp
-/// survives only the single-input case.
-fn cat_output_header_bytes(
+/// Read every input's `OSMHeader`, one per input, in input order.
+pub(super) fn read_headers(
     files: &[&Path],
     direct_io: bool,
-    overrides: &HeaderOverrides,
     host: &crate::host::Host,
-) -> Result<Vec<u8>> {
-    let headers: Vec<crate::HeaderBlock> = files
+) -> Result<Vec<crate::HeaderBlock>> {
+    files
         .iter()
         .map(|f| read_header(f, direct_io, host))
-        .collect::<Result<Vec<_>>>()?;
-    let sorted = matches!(headers.as_slice(), [only] if only.is_sorted());
-    output_header_bytes(files, &headers, sorted, overrides, host)
+        .collect()
 }
 
-/// Build the output header bytes for any `cat` path from the headers of
-/// *every* input, one per input.
+/// What a raw-copying cat path does to ways, decided before the header is
+/// written: every way blob is copied whole when every input's first data blob
+/// carries indexdata, otherwise `unindexed` (the path's treatment of a blob
+/// without indexdata). The probe reads the first data blob only; the paths
+/// refuse a later unindexed way blob that would break what the header then
+/// declared (see [`Declared::broken_by_unindexed_way_blob`]).
 ///
-/// This takes the whole slice rather than one header on purpose. Every cat
-/// path used to build its output header from the first input alone - the
-/// three plain paths from `files[0]`, and `--dedupe` from whichever input its
-/// index pass met first - so a multi-input output advertised one input's
-/// bounding box over data drawn from all of them (a declared extent that does
-/// not cover the file's own contents, which is worse than declaring none) and
-/// carried replication fields from whichever file happened to be listed
-/// first. The fix was once applied per call site and missed one; a single
-/// constructor fed every input's header is what keeps the paths from
-/// drifting apart again.
-///
-/// `sorted` is the caller's decision, because only the caller knows whether
-/// its output order is established: plain `cat` keeps the stamp for a single
-/// sorted input, `--dedupe` always sets it (every input was required to be
-/// sorted and the merge emits in type-then-ID order).
-fn output_header_bytes(
-    inputs: &[&Path],
+/// [`Declared::broken_by_unindexed_way_blob`]: super::output_header::Declared::broken_by_unindexed_way_blob
+fn raw_copy_ways(
+    files: &[&Path],
     headers: &[crate::HeaderBlock],
-    sorted: bool,
+    direct_io: bool,
+    unindexed: Ways,
+    host: &crate::host::Host,
+) -> Result<Ways> {
+    let enriched = headers.iter().any(|h| {
+        h.has_locations_on_ways() || h.has_way_members_v1() || h.has_shared_node_pins_v1()
+    });
+    // Without a declared enrichment the variants all declare the same thing,
+    // so the probe is skipped.
+    if !enriched {
+        return Ok(Ways::BlobsCopied);
+    }
+    for file in files {
+        if !super::has_indexdata(file, direct_io, &host.diagnostics)? {
+            return Ok(unindexed);
+        }
+    }
+    Ok(Ways::BlobsCopied)
+}
+
+/// The output header of a non-dedupe cat run. Order is the inputs': one sorted
+/// input stays sorted, a concatenation of several does not, however each is
+/// ordered. Header fields are reconciled across every input by
+/// [`output_header::build`](super::output_header::build).
+fn cat_output_header(
+    headers: &[crate::HeaderBlock],
+    ways: Ways,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
-) -> Result<Vec<u8>> {
-    for (input, header) in inputs.iter().zip(headers) {
-        super::warn_locations_on_ways_loss_in(header, input, host);
-    }
-    let mut hb = reconciled_header(headers)?;
-    if sorted {
-        hb = hb.sorted();
-    }
-    overrides.apply(hb).build()
-}
-
-/// Reconcile the headers of every input into one output header builder.
-///
-/// The rules are chosen so the header can only ever understate:
-///
-/// - **bbox**: the union, and only when *every* input declares one. An input
-///   without a bbox has unknown extent, so the union is unknown too and the
-///   field is omitted rather than guessed.
-/// - **replication timestamp / sequence / base URL, and `source`**: kept per
-///   field, only when every input agrees on that field's value (absent and
-///   present-but-empty are different values). Two inputs from different
-///   replication states have no single correct answer, and dropping the field
-///   is more honest than picking one.
-/// - **`HistoricalInformation`**: the OR. It is a required feature declaring
-///   that history metadata *may* be present, so one input carrying history
-///   makes it true of the output.
-///
-/// Optional features (`Sort.Type_then_ID`, `LocationsOnWays`, ...) and the
-/// writing program are never carried, exactly as
-/// [`HeaderBuilder::from_header`](crate::block_builder::HeaderBuilder::from_header)
-/// does not carry them. For a single header the result is therefore the same
-/// builder `from_header` produces, so one input and many go through one rule.
-///
-/// osmium's `cat` writes a completely blank header for multiple inputs
-/// (`command_cat.cpp`), which is the same honesty rule applied bluntly. This
-/// keeps whatever the inputs actually agree on, and is documented as a
-/// deliberate deviation.
-fn reconciled_header(
-    headers: &[crate::HeaderBlock],
-) -> Result<crate::block_builder::HeaderBuilder<'_>> {
-    if headers.is_empty() {
-        // `agreed` indexes [0] and the bbox `all()` below is vacuously true on
-        // an empty slice; refuse here, where that precondition is relied on.
-        return Err(Error::invalid_argument(
-            "no input headers to reconcile (no input files specified)",
-        ));
-    }
-
-    let mut hb = crate::block_builder::HeaderBuilder::new();
-
-    if headers.iter().all(|h| h.bbox().is_some()) {
-        let boxes: Vec<_> = headers
-            .iter()
-            .filter_map(crate::HeaderBlock::bbox)
-            .collect();
-        let fold = |pick: fn(f64, f64) -> f64, get: fn(&crate::HeaderBBox) -> f64| {
-            boxes.iter().map(get).fold(
-                f64::NAN,
-                |acc, v| {
-                    if acc.is_nan() { v } else { pick(acc, v) }
-                },
-            )
-        };
-        // The union of input header boxes is still the inputs' claim, so it
-        // round-trips unchecked like a single copied header box.
-        hb = hb.input_bbox(
-            fold(f64::min, |b| b.left),
-            fold(f64::min, |b| b.bottom),
-            fold(f64::max, |b| b.right),
-            fold(f64::max, |b| b.top),
-        );
-    }
-
-    if let Some(ts) = agreed(headers, crate::HeaderBlock::osmosis_replication_timestamp) {
-        hb = hb.replication_timestamp(ts);
-    }
-    if let Some(seq) = agreed(
-        headers,
-        crate::HeaderBlock::osmosis_replication_sequence_number,
-    ) {
-        hb = hb.replication_sequence_number(seq);
-    }
-    if let Some(url) = agreed(headers, crate::HeaderBlock::osmosis_replication_base_url) {
-        hb = hb.replication_base_url(url);
-    }
-    if let Some(source) = agreed(headers, crate::HeaderBlock::source) {
-        hb = hb.source(source);
-    }
-
-    if headers
-        .iter()
-        .any(crate::HeaderBlock::has_historical_information)
-    {
-        hb = hb.historical();
-    }
-
-    Ok(hb)
-}
-
-/// The value every header agrees on for one optional field, or `None` when
-/// any header lacks it or they disagree. Values are compared and returned
-/// as-is, so `Some(0)` and `Some("")` are real agreed values, distinct from
-/// absence. Callers guarantee `headers` is non-empty.
-fn agreed<'a, T: PartialEq + Copy>(
-    headers: &'a [crate::HeaderBlock],
-    get: impl Fn(&'a crate::HeaderBlock) -> Option<T>,
-) -> Option<T> {
-    let first = get(&headers[0])?;
-    headers
-        .iter()
-        .all(|h| get(h) == Some(first))
-        .then_some(first)
+) -> Result<OutputHeader> {
+    super::output_header::build(headers, &OutputFacts::carry(ways), overrides, host)
 }
 
 // ---------------------------------------------------------------------------
@@ -339,12 +237,17 @@ fn cat_passthrough(
     host: &crate::host::Host,
 ) -> Result<CatStats> {
     let direct_io = write.direct_reads;
-    let header_bytes = cat_output_header_bytes(files, direct_io, overrides, host)?;
+    // Every payload is copied byte for byte; an unindexed blob's header is
+    // rebuilt to add indexdata, which drops its field 5.
+    let headers = read_headers(files, direct_io, host)?;
+    let ways = raw_copy_ways(files, &headers, direct_io, Ways::PayloadsCopied, host)?;
+    let header = cat_output_header(&headers, ways, overrides, host)?;
+    let declared = header.declared;
 
     let mut writer = super::writer_from_header_bytes(
         output,
         write.compression,
-        &header_bytes,
+        &header.bytes,
         write.backend,
         host,
     )?;
@@ -386,6 +289,11 @@ fn cat_passthrough(
                                 continue;
                             }
                         };
+                        if declared.way_members && index.kind == crate::ElementKind::Way {
+                            return Err(locate(
+                                declared.broken_by_unindexed_way_blob("adding its indexdata"),
+                            ));
+                        }
                         let tagdata_bytes = tagdata
                             .as_ref()
                             .and_then(crate::blob_meta::TagIndex::serialize);
@@ -432,12 +340,17 @@ fn cat_type_passthrough(
     let blob_filter = BlobFilter::new(tf.nodes, tf.ways, tf.relations);
     let direct_io = write.direct_reads;
 
-    let header_bytes = cat_output_header_bytes(files, direct_io, overrides, host)?;
+    // Matching indexed blobs are copied whole; an unindexed blob is decoded
+    // and re-encoded without way enrichment.
+    let headers = read_headers(files, direct_io, host)?;
+    let ways = raw_copy_ways(files, &headers, direct_io, Ways::Reencoded, host)?;
+    let header = cat_output_header(&headers, ways, overrides, host)?;
+    let declared = header.declared;
 
     let mut writer = super::writer_from_header_bytes(
         output,
         write.compression,
-        &header_bytes,
+        &header.bytes,
         write.backend,
         host,
     )?;
@@ -497,6 +410,15 @@ fn cat_type_passthrough(
                             &mut refs_buf,
                         )?;
                         flush_local(&mut bb, &mut output_blocks)?;
+                        if declared.way_enrichment()
+                            && output_blocks
+                                .iter()
+                                .any(|b| b.index.kind == crate::ElementKind::Way)
+                        {
+                            return Err(locate(
+                                declared.broken_by_unindexed_way_blob("re-encoding it"),
+                            ));
+                        }
                         for OwnedBlock {
                             bytes: block_bytes,
                             index,
@@ -650,11 +572,12 @@ fn cat_filtered(
     host.process.cross_thread_alloc_pool();
 
     // -----------------------------------------------------------------------
-    // Output header: reconciled across every input (see `cat_output_header_bytes`)
+    // Output header: reconciled across every input; every way re-encoded.
     // -----------------------------------------------------------------------
-    let header_bytes = cat_output_header_bytes(files, direct_io, overrides, host)?;
+    let headers = read_headers(files, direct_io, host)?;
+    let header = cat_output_header(&headers, Ways::Reencoded, overrides, host)?;
     let mut writer =
-        super::writer_from_header_bytes(output, compression, &header_bytes, write.backend, host)?;
+        super::writer_from_header_bytes(output, compression, &header.bytes, write.backend, host)?;
 
     let mut blobs_decoded: u64 = 0;
     let mut elements: u64 = 0;
@@ -848,96 +771,4 @@ fn run_kind_phase(
     }
 
     Ok((total_blobs, total_elements))
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::{HeaderOverrides, reconciled_header};
-    use crate::block_builder::HeaderBuilder;
-
-    fn parse(bytes: &[u8]) -> crate::HeaderBlock {
-        crate::HeaderBlock::parse_from_bytes(bytes).unwrap()
-    }
-
-    /// A header exercising every field `HeaderBuilder::build` emits, with the
-    /// values most likely to be normalized away by accident: replication
-    /// timestamp and sequence number 0, and an empty base URL.
-    fn full_header() -> crate::HeaderBlock {
-        parse(
-            &HeaderBuilder::new()
-                .bbox(1.0, 10.0, 2.0, 20.0)
-                .replication_timestamp(0)
-                .replication_sequence_number(0)
-                .replication_base_url("")
-                .source("geofabrik.de")
-                .historical()
-                .sorted()
-                .optional_feature(crate::read::block::Feature::LOCATIONS_ON_WAYS)
-                .writing_program("other-tool")
-                .build()
-                .unwrap(),
-        )
-    }
-
-    /// One input and many go through the same reconciler, so for a single
-    /// header it must produce exactly the bytes the single-input path used to
-    /// produce via `build_output_header(.., preserve_sorted = true, ..)`. A
-    /// byte comparison, not a field-by-field one, so a field the reconciler
-    /// forgets to carry cannot pass.
-    #[test]
-    fn a_single_header_reconciles_to_the_old_single_input_bytes() {
-        let header = full_header();
-        for overrides in [
-            HeaderOverrides::default(),
-            HeaderOverrides {
-                generator: Some("gen".to_string()),
-                replication_timestamp: Some(5),
-                replication_sequence_number: None,
-                replication_base_url: Some("https://override.invalid/".to_string()),
-            },
-        ] {
-            let old =
-                crate::commands::build_output_header(&header, true, &overrides, |hb| hb).unwrap();
-            let new = overrides
-                .apply(
-                    reconciled_header(std::slice::from_ref(&header))
-                        .unwrap()
-                        .sorted(),
-                )
-                .build()
-                .unwrap();
-            assert_eq!(new, old);
-        }
-    }
-
-    #[test]
-    fn source_survives_only_when_every_input_agrees() {
-        let with = |s: Option<&str>| {
-            let mut hb = HeaderBuilder::new();
-            if let Some(s) = s {
-                hb = hb.source(s);
-            }
-            parse(&hb.build().unwrap())
-        };
-        let agree = [with(Some("a")), with(Some("a"))];
-        let reconciled = parse(&reconciled_header(&agree).unwrap().build().unwrap());
-        assert_eq!(reconciled.source(), Some("a"));
-
-        for disagree in [
-            [with(Some("a")), with(Some("b"))],
-            [with(Some("a")), with(None)],
-        ] {
-            let reconciled = parse(&reconciled_header(&disagree).unwrap().build().unwrap());
-            assert_eq!(reconciled.source(), None, "a disagreed source is dropped");
-        }
-    }
-
-    /// The reconciler indexes the first header and folds `all()` over the
-    /// slice, which is vacuously true when empty. An empty slice must be an
-    /// error, not a panic and not a header claiming a bbox of NaNs.
-    #[test]
-    fn an_empty_header_slice_is_refused() {
-        assert!(reconciled_header(&[]).is_err());
-    }
 }

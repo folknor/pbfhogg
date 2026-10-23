@@ -21,6 +21,7 @@ pub mod getid;
 pub mod getparents;
 pub mod inspect;
 pub mod merge_changes;
+pub(crate) mod output_header;
 pub mod renumber;
 pub mod repack;
 pub mod sort;
@@ -199,51 +200,6 @@ pub(crate) fn ensure_relation_capacity_local(
     Ok(())
 }
 
-/// Warn if the input header declares way-level metadata that re-encoding does
-/// not propagate.
-pub(crate) fn warn_locations_on_ways_loss(header: &crate::HeaderBlock, host: &crate::host::Host) {
-    warn_way_metadata_loss_of(header, None, host);
-}
-
-/// [`warn_locations_on_ways_loss`] for a command with several inputs: the
-/// warning names the input the header came from.
-pub(crate) fn warn_locations_on_ways_loss_in(
-    header: &crate::HeaderBlock,
-    input: &std::path::Path,
-    host: &crate::host::Host,
-) {
-    warn_way_metadata_loss_of(header, Some(input), host);
-}
-
-fn warn_way_metadata_loss_of(
-    header: &crate::HeaderBlock,
-    input: Option<&std::path::Path>,
-    host: &crate::host::Host,
-) {
-    if header.has_locations_on_ways()
-        || header.has_way_members_v1()
-        || header.has_shared_node_pins_v1()
-    {
-        match input {
-            Some(input) => crate::host::diag!(
-                host.diagnostics,
-                Warning,
-                "header.way_metadata_loss",
-                "input PBF {} has way-level enrichment metadata. \
-                 LocationsOnWays and injected prepass metadata are not preserved in the output.",
-                input.display()
-            ),
-            None => crate::host::diag!(
-                host.diagnostics,
-                Warning,
-                "header.way_metadata_loss",
-                "input PBF has way-level enrichment metadata. \
-                 LocationsOnWays and injected prepass metadata are not preserved in the output."
-            ),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Header overrides (--generator, --output-header)
 // ---------------------------------------------------------------------------
@@ -318,10 +274,19 @@ impl HeaderOverrides {
                 Error::invalid_argument(format!("unknown --output-header key: '{key}'"))
             })?;
             match key.kind {
+                // Integer seconds or RFC 3339, the same two spellings
+                // time-filter's cutoff takes.
                 HeaderOverrideKind::Timestamp => {
-                    ov.replication_timestamp = Some(value.parse::<i64>().map_err(|_| {
-                        Error::invalid_argument(format!("invalid {}: '{value}'", key.name))
-                    })?);
+                    ov.replication_timestamp = Some(match value.parse::<i64>() {
+                        Ok(seconds) => seconds,
+                        Err(_) => parse_rfc3339_utc(value).map_err(|_| {
+                            Error::invalid_argument(format!(
+                                "invalid {}: '{value}' (expected UNIX seconds or \
+                                 YYYY-MM-DDTHH:MM:SSZ)",
+                                key.name
+                            ))
+                        })?,
+                    });
                 }
                 HeaderOverrideKind::SequenceNumber => {
                     ov.replication_sequence_number = Some(value.parse::<i64>().map_err(|_| {
@@ -341,25 +306,15 @@ impl HeaderOverrides {
     #[must_use]
     pub fn output_header_help() -> String {
         format!(
-            "Set output header fields (repeatable, format: key=value). Supported keys: {}.",
+            "Set output header fields (repeatable, format: key=value). Supported keys: {}. \
+             The timestamp takes UNIX seconds or YYYY-MM-DDTHH:MM:SSZ. Each key replaces \
+             only its own field.",
             HeaderOverrideKey::help_list()
         )
     }
 
-    /// Returns `true` when no header override was supplied, i.e. the user
-    /// passed neither `--generator` nor any `--output-header` key. In that
-    /// case a passthrough command is free to preserve the input header's
-    /// fields verbatim; when an override *is* present the header must be
-    /// rebuilt so the override can take effect.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.generator.is_none()
-            && self.replication_timestamp.is_none()
-            && self.replication_sequence_number.is_none()
-            && self.replication_base_url.is_none()
-    }
-
-    /// Apply overrides to a header builder. Called after the command-specific
-    /// configure closure so CLI flags always win.
+    /// Apply overrides to a header builder. Called last by
+    /// [`output_header::build`] so CLI flags always win.
     pub(crate) fn apply<'a>(&'a self, mut hb: HeaderBuilder<'a>) -> HeaderBuilder<'a> {
         if let Some(program) = &self.generator {
             hb = hb.writing_program(program);
@@ -377,25 +332,8 @@ impl HeaderOverrides {
     }
 }
 
-/// Build output header bytes from an input header.
-///
-/// Applies `configure` to the header builder, then preserves sortedness if
-/// requested and if the input header is sorted, then applies CLI overrides.
-pub(crate) fn build_output_header(
-    header: &crate::HeaderBlock,
-    preserve_sorted: bool,
-    overrides: &HeaderOverrides,
-    configure: impl FnOnce(HeaderBuilder) -> HeaderBuilder,
-) -> Result<Vec<u8>> {
-    let mut hb = configure(HeaderBuilder::from_header(header));
-    if preserve_sorted && header.is_sorted() {
-        hb = hb.sorted();
-    }
-    hb = overrides.apply(hb);
-    hb.build()
-}
-
-/// Open a pipelined writer from an input header.
+/// Open a pipelined writer whose header [`output_header::build_one`] derives
+/// from one input header and the facts the command states about its output.
 ///
 /// Supports O_DIRECT and io_uring when the corresponding features are compiled
 /// in and `backend` asks for them.
@@ -404,14 +342,13 @@ pub(crate) fn writer_from_header(
     output: &crate::output::Output,
     compression: Compression,
     header: &crate::HeaderBlock,
-    preserve_sorted: bool,
+    facts: &output_header::OutputFacts,
     overrides: &HeaderOverrides,
-    configure: impl FnOnce(HeaderBuilder) -> HeaderBuilder,
     backend: OutputBackend,
     host: &crate::host::Host,
 ) -> Result<PbfWriter<FileWriter>> {
-    let header_bytes = build_output_header(header, preserve_sorted, overrides, configure)?;
-    writer_from_header_bytes(output, compression, &header_bytes, backend, host)
+    let built = output_header::build_one(header, facts, overrides, host)?;
+    writer_from_header_bytes(output, compression, &built.bytes, backend, host)
 }
 
 /// Open an output writer from prebuilt header bytes on the given backend.
@@ -552,8 +489,11 @@ pub(crate) fn dispatch_scan_arm(
 /// Check if the first OsmData blob in a PBF has indexdata.
 ///
 /// O(1) header-only probe: reads blob headers until the first OsmData
-/// blob and returns whether it carries indexdata. Returns false if the
-/// file has no data blobs. Trusts the first blob to be representative; a
+/// blob and returns whether it carries indexdata. A file with a header and
+/// no data blobs is vacuously indexed (no blob lacks indexdata), so it
+/// returns true. A file with no leading OsmHeader blob, a zero-byte file
+/// included, is the missing-header error naming it. Trusts the first blob
+/// to be representative; a
 /// partially-indexed PBF is not detected up front, and each consuming site
 /// decides what a later unindexed blob means (some decode it on a fallback
 /// path, some stop with an error mid-run).
@@ -570,8 +510,9 @@ pub fn has_indexdata(
 ///
 /// O(1) header-only probe, the tagdata sibling of [`has_indexdata`]: reads
 /// blob headers until the first OsmData blob and returns whether it carries
-/// tagdata. Returns false if the file has no data blobs. Trusts the first
-/// blob to be representative.
+/// tagdata. Returns false if the file has no data blobs, and the
+/// missing-header error for a file without a leading OsmHeader blob. Trusts
+/// the first blob to be representative.
 pub fn has_tagdata(
     path: &Path,
     direct_io: bool,
@@ -592,16 +533,30 @@ fn probe_first_data_blob(
 ) -> Result<(bool, bool)> {
     let mut reader = FileReader::open(path, direct_io)?;
     let mut offset = 0u64;
+    let mut first = true;
     while let Some(info) =
         crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset, diagnostics, path)?
     {
+        // The header comes first or the file is not a PBF: a zero-byte or
+        // header-less file gets the one missing-header error here, ahead of
+        // any question about indexdata.
+        if first && !matches!(info.blob_type, BlobKind::OsmHeader) {
+            return Err(crate::error::new_missing_header(path));
+        }
+        first = false;
         if matches!(info.blob_type, BlobKind::OsmData) {
             return Ok((info.index.is_some(), info.has_tagdata));
         }
         reader.skip(info.data_size as u64)?;
         offset += info.data_size as u64;
     }
-    Ok((false, false))
+    if first {
+        return Err(crate::error::new_missing_header(path));
+    }
+    // No data blob: nothing lacks indexdata, so the file counts as indexed.
+    // It carries no tagdata, which is a statement about presence, not a
+    // gate.
+    Ok((true, false))
 }
 
 /// Format a Unix epoch timestamp (seconds) as ISO 8601 UTC string.

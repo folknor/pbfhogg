@@ -465,6 +465,18 @@ impl<R: Read + Send> BlobReader<R> {
         self.source.as_ref()
     }
 
+    /// The first blob, which must be the OsmHeader. An empty input, or one
+    /// that opens with anything else, is the one missing-header error naming
+    /// this reader's input; a data blob is never silently consumed in the
+    /// header's place.
+    pub(crate) fn leading_header(&mut self) -> Result<Blob> {
+        match self.next() {
+            Some(Ok(blob)) if matches!(blob.get_type(), BlobType::OsmHeader) => Ok(blob),
+            Some(Ok(_)) | None => Err(crate::error::new_missing_header_in(self.source())),
+            Some(Err(e)) => Err(e),
+        }
+    }
+
     /// Attach this reader's input identity, its current blob index and
     /// `offset` to an error, as one location. Applied only when the error
     /// has none yet, so a caller that built a more exact location (the

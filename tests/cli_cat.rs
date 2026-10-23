@@ -1106,7 +1106,7 @@ fn cat_dedupe_refuses_an_input_without_exactly_one_leading_header() {
         (
             "headerless",
             &headerless,
-            "the first blob is not an OSMHeader",
+            "does not start with an OsmHeader blob",
         ),
         ("two headers", &twice, "a second OSMHeader blob"),
     ] {

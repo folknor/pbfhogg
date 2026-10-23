@@ -56,8 +56,15 @@ pub(crate) fn new_wire_error(msg: &'static str) -> Error {
 }
 
 #[cold]
-pub(crate) fn new_missing_header() -> Error {
-    new_error(ErrorKind::MissingHeader)
+pub(crate) fn new_missing_header(path: &Path) -> Error {
+    new_missing_header_in(Some(&Arc::from(path)))
+}
+
+/// The one missing-header error, for a reader that may not know its input's
+/// path (a `BlobReader` over an arbitrary `Read` has none).
+#[cold]
+pub(crate) fn new_missing_header_in(source: Option<&Arc<Path>>) -> Error {
+    new_error(ErrorKind::MissingHeader).locate(Location::new(source, None, None))
 }
 
 #[cold]

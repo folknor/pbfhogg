@@ -94,3 +94,20 @@ during decode.
 
 Reported by: the extract passthrough fix.
 
+## BUG-085 - `HeaderBuilder` drops an empty-string base URL or `source`
+
+Anger: 4 - header bytes, contained.
+
+Reported, not run. `HeaderBuilder::build` in `src/write/header_builder.rs`
+writes `source` and `osmosis_replication_base_url` through protohoggr's
+`encode_bytes_field`, which skips an empty value. So a header that carries an
+empty string comes out with the field absent, while comments in the header
+code treat empty and absent as distinct. Whether any input in the wild
+carries an empty value is unknown; the effect is that a passthrough or
+rebuilt header loses the distinction silently. Fix: encode the presence
+decision from the `Option`, as fields 32 and 33 already do with
+`encode_int64_field_always`, and pin it with a round-trip test of an empty
+`source` and base URL.
+
+Reported by: the output-header policy work.
+

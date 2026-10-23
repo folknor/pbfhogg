@@ -26,9 +26,7 @@ use crate::read::raw_frame::frame_location;
 use crate::write::WriteOptions;
 use crate::writer::{PbfWriter, reframe_raw_with_index};
 
-use super::{
-    HeaderOverrides, Result, build_output_header, require_indexdata, writer_from_header_bytes,
-};
+use super::{HeaderOverrides, Result, require_indexdata, writer_from_header_bytes};
 use crate::block_builder::OwnedBlock;
 use crate::owned::{
     OwnedNode, OwnedRelation, OwnedWay, read_dense_node, read_node, read_relation, read_way,
@@ -183,7 +181,6 @@ pub(crate) fn sort_to(
     crate::debug::emit_marker("SORT_INDEX_BUILD_START");
     let (header, mut entries) = build_blob_index(input, direct_io, host)?;
     crate::debug::emit_marker("SORT_INDEX_BUILD_END");
-    super::warn_locations_on_ways_loss(&header, host);
     crate::host::diag!(
         host.diagnostics,
         Progress,
@@ -255,8 +252,27 @@ pub(crate) fn sort_to(
         "Pass 2: writing sorted output..."
     );
     crate::debug::emit_marker("SORT_WRITER_SETUP_START");
-    #[allow(clippy::redundant_closure_for_method_calls)]
-    let header_bytes = build_output_header(&header, false, overrides, |hb| hb.sorted())?;
+    // Sorted by construction. The way enrichments follow from the index pass
+    // 1 built: a way blob in a rewrite run is decoded and re-encoded without
+    // them, an unindexed passthrough way blob is reframed (field 5 dropped),
+    // every other way blob is copied whole.
+    let ways = super::output_header::Ways::from_copy(
+        entries
+            .iter()
+            .zip(&overlaps)
+            .any(|(e, &o)| o && e.index.kind == ElementKind::Way),
+        entries
+            .iter()
+            .zip(&overlaps)
+            .any(|(e, &o)| !o && !e.has_indexdata && e.index.kind == ElementKind::Way),
+    );
+    let header_bytes = super::output_header::build_one(
+        &header,
+        &super::output_header::OutputFacts::sorted(ways),
+        overrides,
+        host,
+    )?
+    .bytes;
     let mut writer = writer_from_header_bytes(output, compression, &header_bytes, backend, host)?;
     crate::debug::emit_marker("SORT_WRITER_SETUP_END");
 
@@ -539,7 +555,7 @@ fn build_blob_index(
         }
     }
 
-    let header = header.ok_or_else(|| Error::invalid_data("no OSMHeader blob found"))?;
+    let header = header.ok_or_else(|| crate::error::new_missing_header(input))?;
 
     Ok((header, entries))
 }

@@ -55,27 +55,16 @@ pub(super) fn extract_complete_ways(
     crate::debug::emit_marker("COMPLETE_PASS2_SETUP_START");
 
     let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
-    let header_blob = header_reader
-        .next()
-        .ok_or_else(crate::error::new_missing_header)??;
+    let header_blob = header_reader.leading_header()?;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
-    super::super::warn_locations_on_ways_loss(&header, host);
     let bbox = region.bbox();
     let mut writer = writer_from_header(
         output,
         compression,
         &header,
-        false,
+        &super::output_facts(set_bounds, bbox),
         overrides,
-        |hb| {
-            let hb = if set_bounds {
-                hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-            } else {
-                hb
-            };
-            hb.sorted()
-        },
         backend,
         host,
     )?;

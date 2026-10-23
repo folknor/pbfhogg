@@ -63,7 +63,7 @@ pub(crate) fn estimate_blob_count(
     let mut walker = HeaderWalker::open(path, diagnostics)?;
     let file_size = walker.file_size();
     if file_size == 0 {
-        return Err(crate::error::new_missing_header());
+        return Err(crate::error::new_missing_header(path));
     }
     let mut frames = 0_usize;
     let mut osmdata_blobs = 0_u64;
@@ -79,7 +79,7 @@ pub(crate) fn estimate_blob_count(
         };
         frames += 1;
         if frames == 1 && meta.blob_type != BlobKind::OsmHeader {
-            return Err(crate::error::new_missing_header());
+            return Err(crate::error::new_missing_header(path));
         }
         if meta.blob_type == BlobKind::OsmData {
             osmdata_blobs += 1;

@@ -36,6 +36,9 @@ Do not use your Memory functionality. Durable context belongs in CLAUDE.md or th
   avoiding braces, brackets, parens, angle brackets and the hash sign.
 - Has `Cargo.lock` changed? Commit it.
 - Never `git push` unless the user explicitly asks. Stop after the commit.
+- Standing instruction: when a large slice of agent work has landed and been
+  verified, commit it before launching the next agent, so each slice gets its
+  own commit instead of mixing into the next agent's edits.
 - Remember to update CHANGELOG.md for relevant commits (but not general small performance improvements.)
 - Never offer to commit or tell the user "per your rules I've left things uncommitted". Don't mention git commits, ever. The user will instruct you when to commit.
 

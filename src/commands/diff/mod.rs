@@ -59,43 +59,16 @@ pub(crate) fn check_sorted_and_indexed(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<(bool, bool)> {
-    use crate::blob::BlobKind;
+    // Pass 1: read the sorted flag from the OsmHeader (reads ~1 blob). A
+    // file without a leading header is the missing-header error here, ahead
+    // of any question about sortedness.
+    let sorted = crate::ElementReader::open_in(path, direct_io, host)?
+        .header()
+        .is_sorted();
 
-    // Pass 1: read sorted flag from OsmHeader via BlobReader (reads ~1 blob).
-    let sorted = {
-        let mut blob_reader = crate::blob::BlobReader::open_in(path, direct_io, host)?;
-        let mut s = false;
-        for blob_result in &mut blob_reader {
-            let blob = blob_result?;
-            match blob.get_type() {
-                crate::blob::BlobType::OsmHeader => {
-                    let header = blob.to_headerblock()?;
-                    s = header.is_sorted();
-                }
-                _ => break,
-            }
-        }
-        s
-    };
-
-    // Pass 2: O(1) header-only probe of the first OsmData blob.
-    let mut reader = crate::file_reader::FileReader::open(path, direct_io)?;
-    let mut offset = 0u64;
-    let mut indexed = false;
-
-    while let Some(info) = crate::read::raw_frame::read_blob_header_only(
-        &mut reader,
-        &mut offset,
-        &host.diagnostics,
-        path,
-    )? {
-        if matches!(info.blob_type, BlobKind::OsmData) {
-            indexed = info.index.is_some();
-            break;
-        }
-        reader.skip(info.data_size as u64)?;
-        offset += info.data_size as u64;
-    }
+    // Pass 2: O(1) header-only probe of the first OsmData blob. A file with
+    // no data blob counts as indexed.
+    let indexed = super::has_indexdata(path, direct_io, &host.diagnostics)?;
 
     Ok((sorted, indexed))
 }

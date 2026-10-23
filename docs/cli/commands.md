@@ -23,7 +23,33 @@ These flags appear on most commands that produce PBF output:
 | `--direct-io` | Use O_DIRECT to bypass page cache (requires `linux-direct-io` feature) |
 | `--force` | Proceed even if input lacks indexdata (slower fallback path) |
 | `--generator <GENERATOR>` | Override the writing program name in the output header |
-| `--output-header <KEY=VALUE>` | Set output header fields (repeatable). Keys: `osmosis_replication_timestamp`, `osmosis_replication_sequence_number`, `osmosis_replication_base_url` |
+| `--output-header <KEY=VALUE>` | Set output header fields (repeatable). Keys: `osmosis_replication_timestamp` (UNIX seconds or `YYYY-MM-DDTHH:MM:SSZ`), `osmosis_replication_sequence_number`, `osmosis_replication_base_url`. Each key replaces only its own field |
+
+## Output header
+
+A command's output header never claims more than its output contains:
+
+- `Sort.Type_then_ID` only when the output is in that order: by construction
+  (`sort`, `renumber`, `apply-changes`, `cat --dedupe`), or because the
+  command keeps the order of its one sorted input. An extract of an unsorted
+  file is not declared sorted.
+- `LocationsOnWays`, `pbfhogg.WayMembers-v1` and `pbfhogg.SharedNodePins-v1`
+  only when every way blob written carries them. Commands that copy way blobs
+  whole (`cat`, `cat --type`, `sort` of sorted input, `getid --invert` of
+  node or relation IDs, degrade's header-only flags) keep what the input
+  declares; `repack` and `apply-changes --locations-on-ways` keep
+  `LocationsOnWays`; `add-locations-to-ways` adds it; everything that
+  re-encodes ways drops them, with a warning. The prepass features survive
+  only from a single input.
+- The input's bbox (the union when every input declares one), except
+  `apply-changes`, which declares none, and `extract --set-bounds`, which
+  declares the region.
+- The input's replication state; `time-filter` lowers the timestamp to its
+  cutoff when the cutoff is earlier, and then drops the sequence number.
+- Writing program `pbfhogg`, unless `--generator` says otherwise.
+
+`degrade`'s header-only flags forward the input header field for field
+instead. The full rule is in `reference/cli-reference.md` "Output header".
 
 ## Output files
 
@@ -35,6 +61,12 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   replacing it was not requested; pass --overwrite (-O) to replace it`, exit
   `2`. For `extract --config` every output the config names is checked up
   front, and `--overwrite` on the command line covers all of them.
+- **An output may not be any file the command reads**, refused before any
+  work with `output <path> aliases input <path>`, exit `2`, even with
+  `--overwrite`. That covers every input, not only the positional ones:
+  `getid` and `getparents` `-i` and `-I`, the `-e` expressions file of
+  `tags-filter` and `export`, `extract --polygon`, the `extract --config`
+  file and the `polygon_file` entries it names.
 - **A symlink is never an output**, even with `--overwrite`: replacing it
   would turn the link into a regular file. The error names the link and its
   target. An existing directory (or device, FIFO) where a file output is
@@ -134,7 +166,7 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 
 | Flag | Description |
 |------|-------------|
-| `--indexed` | Check if PBF has blob-level indexdata (exit code 0 = yes, 1 = no). Reads the first data blob only; later blobs are not checked |
+| `--indexed` | Check if PBF has blob-level indexdata (exit code 0 = yes, 1 = no). Reads the first data blob only; later blobs are not checked. A header-only file (no data blobs) is indexed; a file without a leading OSMHeader is an error (exit 2), not a "no" |
 | `--nodes` | Analyze node coordinate statistics for FOR compression sizing |
 | `-j, --jobs <N>` | Parallel worker threads for `--nodes`. `0` (default) auto-picks from `available_parallelism()`, `1` forces sequential, higher values cap the pool. **Requires `--nodes`**: no other inspect mode reads it, so passing it elsewhere is an error rather than a no-op |
 | `--blocks [N]` | Show per-block distribution stats and optional block listing (N limits to first/last N blocks) |
@@ -292,11 +324,16 @@ pbfhogg cat [OPTIONS] --output <OUTPUT> <FILES>...
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
-With several inputs the output header is reconciled across all of them rather
-than copied from the first: the bbox is the union, and is omitted unless every
-input declares one; each replication field is kept only when every input agrees
-on it; `HistoricalInformation` is the OR. osmium writes a blank header for
-multiple inputs, so keeping the agreed fields is a deliberate deviation.
+Plain `cat` and `--type` copy way blobs whole, so they keep the
+`LocationsOnWays` and prepass declarations the input carries; `--clean`
+re-encodes and drops them. With several inputs the output header is reconciled
+across all of them rather than copied from the first: the bbox is the union,
+and is omitted unless every input declares one; the base URL is kept when every
+input names the same feed, the timestamp and sequence number only when every
+input agrees on all three; `HistoricalInformation` is the OR; the output is
+not declared sorted and the prepass features are dropped. osmium writes a
+blank header for multiple inputs, so keeping the agreed fields is a deliberate
+deviation. See [Output header](#output-header).
 
 ### sort
 
@@ -374,7 +411,7 @@ pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
-`--strip-indexdata`, `--strip-tagdata`, and/or `--strip-bbox` (with no `--unsort`/`--strip-locations`/`--drop-ids`) run as a header-and-blob-level passthrough: only the targeted field is cleared and every other header and blob-header field survives byte-for-byte, including `source`, custom optional features, replication metadata, and unknown/extension fields. Any combination involving `--unsort`, `--strip-locations`, or `--drop-ids` decodes elements and re-encodes via `BlockBuilder`. `--drop-ids` requires `N:SEED`, rejects zero N, and is reproducible for a given input and seed.
+`--strip-indexdata`, `--strip-tagdata`, and/or `--strip-bbox` (with no `--unsort`/`--strip-locations`/`--drop-ids`) run as a header-and-blob-level passthrough: only the targeted field is cleared and every other header and blob-header field survives byte-for-byte, including `source`, custom optional features, replication metadata, and unknown/extension fields; `--generator` and `--output-header` replace only the field they name. Any combination involving `--unsort`, `--strip-locations`, or `--drop-ids` decodes elements and re-encodes via `BlockBuilder`. `--drop-ids` requires `N:SEED`, rejects zero N, and is reproducible for a given input and seed.
 
 `--recompress` from the design doc remains deferred; so do configurable `--unsort` chaos modes (rotate / shuffle / reverse).
 
@@ -426,7 +463,7 @@ pbfhogg extract [OPTIONS] <FILE>
 | `-d, --directory <DIR>` | Rebase config outputs under this directory (only with --config) |
 | `-s, --simple` | Simple strategy (single pass) |
 | `--smart` | Smart strategy (three passes, complete relations) |
-| `--set-bounds` | Write the extract region bounding box to the output header |
+| `--set-bounds` | Write the extract region bounding box to the output header instead of the input's. complete_ways and smart exceed it by design with the out-of-region nodes of selected ways |
 | `--clean <ATTR>` | Strip metadata attribute (repeatable: version, timestamp, changeset, uid, user) |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
@@ -681,6 +718,10 @@ pbfhogg time-filter [OPTIONS] --output <OUTPUT> <FILE> <TIMESTAMP>
 
 The timestamp can be UNIX seconds or RFC3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
 
+The output's replication timestamp is the earlier of the input's and the
+cutoff; the input's sequence number is kept only when the input's timestamp is
+known and not after the cutoff.
+
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
@@ -695,6 +736,10 @@ The timestamp can be UNIX seconds or RFC3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`).
 ### apply-changes
 
 Apply an OSC diff to a sorted PBF file. Uses blob passthrough -- unmodified blobs are copied as raw bytes without decompression.
+
+The output header declares no bbox (the OSC can place a node outside the
+base's) and carries the base's replication state unchanged; set the new state
+with `--output-header`.
 
 ```
 pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>

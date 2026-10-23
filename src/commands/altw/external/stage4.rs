@@ -139,9 +139,7 @@ pub(super) fn stage4_assembly(
 
     // Also read the header for the writer (need a regular BlobReader for this).
     let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
-    let header_blob = header_reader
-        .next()
-        .ok_or_else(crate::error::new_missing_header)??;
+    let header_blob = header_reader.leading_header()?;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
 
@@ -245,9 +243,8 @@ pub(super) fn stage4_assembly(
         output,
         compression,
         &header,
-        true,
+        &super::super::altw_output_facts(inject_prepass),
         overrides,
-        |hb| super::super::altw_header_features(hb, inject_prepass),
         backend,
         host,
     )?;

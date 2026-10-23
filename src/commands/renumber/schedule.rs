@@ -66,7 +66,7 @@ pub(super) fn build_all_blob_schedules(
     drop(
         walker
             .next_header()?
-            .ok_or_else(crate::error::new_missing_header)?,
+            .ok_or_else(|| crate::error::new_missing_header(input))?,
     );
     let mut nodes: Vec<BlobTask> = Vec::new();
     let mut ways: Vec<BlobTask> = Vec::new();

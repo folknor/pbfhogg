@@ -203,7 +203,7 @@ pub(super) fn build_blob_schedule_with_passthrough(
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
     let _ = walker
         .next_header()?
-        .ok_or_else(crate::error::new_missing_header)?;
+        .ok_or_else(|| crate::error::new_missing_header(input))?;
 
     let mut schedule = Vec::new();
     let mut passthrough_candidates: u64 = 0;

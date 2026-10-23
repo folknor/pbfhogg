@@ -69,19 +69,13 @@ fn node_coordinate_domain_error(node_id: i64, lat: i32, lon: i32) -> Error {
     ))
 }
 
-/// Apply the output features owned by ALTW, including the injected payloads.
-fn altw_header_features<'a>(
-    hb: crate::block_builder::HeaderBuilder<'a>,
-    inject_prepass: bool,
-) -> crate::block_builder::HeaderBuilder<'a> {
-    use crate::read::block::Feature;
-    let hb = hb.optional_feature(Feature::LOCATIONS_ON_WAYS);
-    if inject_prepass {
-        hb.optional_feature(Feature::WAY_MEMBERS_V1)
-            .optional_feature(Feature::SHARED_NODE_PINS_V1)
-    } else {
-        hb
-    }
+/// What ALTW states about its output: input order, and every way written with
+/// inline coordinates (plus the injected prepass fields when asked).
+fn altw_output_facts(inject_prepass: bool) -> crate::commands::output_header::OutputFacts {
+    use crate::commands::output_header::{OutputFacts, Ways};
+    OutputFacts::carry(Ways::Located {
+        prepass: inject_prepass,
+    })
 }
 
 /// Relations need no edits; nodes can bypass filtering only when all are kept.
@@ -1081,9 +1075,8 @@ fn write_output_decode_all(
         output,
         write.compression,
         reader.header(),
-        true,
+        &altw_output_facts(false),
         overrides,
-        |hb| altw_header_features(hb, false),
         write.backend.parallel_by_default(),
         host,
     )?;

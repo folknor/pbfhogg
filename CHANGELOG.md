@@ -857,6 +857,72 @@
 
 ### Fixed
 
+- **A header-only PBF counts as indexed.** A valid file with a header and no
+  data blobs has no blob lacking indexdata, so every command that wants
+  indexdata (`sort`, `repack`, `getid`, `tags-filter`, `apply-changes`,
+  `add-locations-to-ways`, `extract`, `cat --type`, `inspect --nodes`, ...)
+  now accepts it without `--force`, and `inspect --indexed` prints
+  `Indexed: yes` and exits 0. They used to refuse it with advice to generate
+  an indexed PBF.
+
+- **A missing first header is one error that names the file.** A zero-byte
+  file, or one whose first blob is not the OSMHeader, now stops every command
+  with `PBF file does not start with an OsmHeader blob` and the file's path,
+  exit 2, before any question about indexdata. Seven different spellings,
+  most naming no file, are gone. `inspect --indexed` exits 2 for such a file
+  instead of answering `Indexed: no` with exit 1. `inspect`, `extract
+  --simple`, `renumber`, `diff` and `bench-write` used to read a header-less
+  file as empty or as unsorted instead of refusing it. Library: the error is
+  `ErrorKind::MissingHeader` with the file in its location.
+
+- **Every input file an output could clobber is checked, not only the
+  positional ones.** `getid` and `getparents` `-i` and `-I`, the `-e`
+  expressions file of `tags-filter` and `export`, `extract --polygon`, the
+  `extract --config` file and the `polygon_file` entries it names are all
+  refused as an output (`output ... aliases input ...`, exit 2) before any
+  work. `getid -I ids.osm.pbf -o ids.osm.pbf -O` used to replace the ID file.
+  Library: `extract::ExtractSlot` gains a `polygon_file` field.
+
+- **Output headers describe the output.** Every PBF-writing command now
+  derives its header from one rule (`reference/cli-reference.md` "Output
+  header"); what changed:
+  - `extract` no longer declares `Sort.Type_then_ID` on the extract of an
+    unsorted file (every strategy, and `--config`). Downstream commands that
+    trust the flag (`apply-changes`, `diff`, `renumber`, `digest`,
+    `cat --dedupe`) were reading an unsorted file as sorted.
+  - `cat`, `cat --type`, `sort` of sorted input and `getid --invert` of node
+    or relation IDs copy way blobs whole, and now keep the
+    `LocationsOnWays`, `pbfhogg.WayMembers-v1` and
+    `pbfhogg.SharedNodePins-v1` declarations of the input; they used to drop
+    them while copying the blobs that carry them, so `export` refused a
+    `cat` of an enriched file. A `cat` of several inputs keeps
+    `LocationsOnWays` when every input declares it, and never the prepass
+    features.
+  - `degrade`'s header-only flags with `--generator` or `--output-header`
+    no longer rebuild the header: each override replaces only its own field,
+    so the prepass declarations, custom features, writing program and
+    unknown fields survive as they do without an override.
+  - `apply-changes` declares no bbox: its OSC can place nodes outside the
+    base's box. (Its replication fields are still the base's; set them with
+    `--output-header`.)
+  - `time-filter` writes the earlier of the input's replication timestamp
+    and the cutoff (it used to write the cutoff even when later than the
+    data), and drops the sequence number when the output is no longer at the
+    input's replication state.
+  - With several `cat` inputs, the replication timestamp and sequence number
+    are kept only when the inputs agree on the timestamp, sequence number and
+    base URL together.
+  - A carried bbox is widened onto the decimicrodegree grid when off it, so a
+    re-encoded node on its edge stays inside.
+  - A raw-copying command whose first data blob carries indexdata but a later
+    way blob does not now fails instead of writing that blob without the
+    enrichment its header already declared.
+  - `tags-filter --input-kind osc` refuses `--generator` and
+    `--output-header`, which have no PBF header to land in, instead of
+    ignoring them.
+  - `--output-header osmosis_replication_timestamp` accepts
+    `YYYY-MM-DDTHH:MM:SSZ` as well as UNIX seconds, like `time-filter`.
+
 - **No output path ever holds a partial or abandoned file.** Every output,
   through the CLI and through the library alike, is written to a hidden
   `.pbfhogg-tmp-*` staging file beside it and renamed into place only after

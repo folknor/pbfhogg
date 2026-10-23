@@ -42,7 +42,13 @@ mod cli_export;
 #[cfg(feature = "commands")]
 mod cli_extract;
 #[cfg(feature = "commands")]
+mod cli_input_contract;
+#[cfg(feature = "commands")]
+mod cli_output_contract;
+#[cfg(feature = "commands")]
 mod cli_output_guard;
+#[cfg(feature = "commands")]
+mod cli_output_header;
 #[cfg(feature = "commands")]
 mod cli_scratch;
 #[cfg(feature = "commands")]

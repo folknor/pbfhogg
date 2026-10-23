@@ -37,9 +37,7 @@ use crate::reorder_buffer::ReorderBuffer;
 use crate::write::WriteOptions;
 use crate::writer::PbfWriter;
 
-use crate::commands::{
-    HeaderOverrides, build_output_header, flush_local, writer_from_header_bytes,
-};
+use crate::commands::{HeaderOverrides, flush_local, writer_from_header_bytes};
 
 use super::Result;
 use super::inject_metrics::InjectMetrics;
@@ -137,9 +135,13 @@ fn build_schedule(
                     .map_err(|e| walker.locate_meta(&meta, e.into()))?;
                 let header = crate::blob::decode_blob_to_headerblock(&data_buf)
                     .map_err(|e| walker.locate_meta(&meta, e))?;
-                let bytes = build_output_header(&header, true, overrides, |hb| {
-                    super::altw_header_features(hb, inject_prepass)
-                })?;
+                let bytes = crate::commands::output_header::build_one(
+                    &header,
+                    &super::altw_output_facts(inject_prepass),
+                    overrides,
+                    host,
+                )?
+                .bytes;
                 header_bytes = Some(bytes);
             }
             BlobKind::Unknown(_) => continue,
@@ -167,8 +169,7 @@ fn build_schedule(
         }
     }
 
-    let header_bytes =
-        header_bytes.ok_or_else(|| crate::error::Error::invalid_data("no OSMHeader blob found"))?;
+    let header_bytes = header_bytes.ok_or_else(|| crate::error::new_missing_header(input))?;
     let shared_file = std::sync::Arc::clone(walker.shared_file());
     crate::debug::emit_marker("ALTW_PASS2_SCHEDULE_WALK_END");
     Ok((schedule, header_bytes, shared_file))

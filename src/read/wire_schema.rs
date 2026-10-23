@@ -49,9 +49,15 @@ pub(crate) enum BlobHeaderField {
     Tagdata = blob_header::TAGDATA,
 }
 
-/// HeaderBlock fields that the metadata-only degrade path can remove.
+/// HeaderBlock fields that degrade's verbatim header passthrough can remove
+/// (the bbox under `--strip-bbox`) or replace (the ones `--generator` and
+/// `--output-header` override).
 #[derive(Clone, Copy)]
 #[repr(u32)]
 pub(crate) enum HeaderBlockField {
     Bbox = header_block::BBOX,
+    WritingProgram = header_block::WRITING_PROGRAM,
+    ReplicationTimestamp = header_block::REPLICATION_TIMESTAMP,
+    ReplicationSequenceNumber = header_block::REPLICATION_SEQUENCE_NUMBER,
+    ReplicationBaseUrl = header_block::REPLICATION_BASE_URL,
 }

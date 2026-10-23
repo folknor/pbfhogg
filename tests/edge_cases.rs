@@ -74,14 +74,11 @@ fn empty_pbf_survives_sort() {
     let output = dir.path().join("sorted.osm.pbf");
     write_empty_pbf(&input);
 
-    let opts = pbfhogg::write::WriteOptions {
-        force: true,
-        ..Default::default()
-    };
+    // No `force`: a header-only file has no blob lacking indexdata.
     pbfhogg::commands::sort::sort(
         &input,
         crate::common::out(&output),
-        &opts,
+        &pbfhogg::write::WriteOptions::default(),
         &pbfhogg::HeaderOverrides::default(),
         &crate::common::test_host(),
     )

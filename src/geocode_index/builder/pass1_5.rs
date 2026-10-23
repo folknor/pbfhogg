@@ -357,7 +357,7 @@ pub(super) fn build_pass2_schedules(
     let mut walker = crate::read::header_walker::HeaderWalker::open(input_path, &host.diagnostics)?;
     let _ = walker
         .next_header()?
-        .ok_or_else(crate::error::new_missing_header)?;
+        .ok_or_else(|| crate::error::new_missing_header(input_path))?;
 
     // Entries are `(seq, offset, size)`; `seq` is assigned once both
     // schedules are complete (see `renumber` below).

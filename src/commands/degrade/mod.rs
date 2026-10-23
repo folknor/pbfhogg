@@ -10,18 +10,16 @@
 //! Implementation paths:
 //!
 //! - Pure passthrough (`--strip-indexdata`, `--strip-tagdata`, and/or
-//!   `--strip-bbox` with no unsort/strip-locations/drop-ids): with no
-//!   `--generator`/`--output-header` override the input `HeaderBlock`
-//!   payload is preserved verbatim (the outer Blob envelope is
+//!   `--strip-bbox` with no unsort/strip-locations/drop-ids): the input
+//!   `HeaderBlock` payload is preserved verbatim (the outer Blob envelope is
 //!   re-compressed, so the decompressed `HeaderBlock` protobuf is
 //!   field-identical, not blob-byte-identical) - it is forwarded
-//!   field-for-field and only the bbox (field 1) is surgically removed under
-//!   `--strip-bbox`, so `source`, custom optional features
+//!   field-for-field, only the bbox (field 1) is surgically removed under
+//!   `--strip-bbox`, and a `--generator` / `--output-header` override
+//!   replaces only the field it names. `source`, custom optional features
 //!   (`pbfhogg.WayMembers-v1`, `SharedNodePins-v1`), a non-default
 //!   `writingprogram`, replication metadata, and unknown fields all survive
-//!   byte-for-byte. (When a header override is set the header is rebuilt via
-//!   `HeaderBuilder` so the override wins, dropping the bbox under
-//!   `--strip-bbox`.) Raw OsmData blob frames are then reframed by copying
+//!   byte-for-byte. Raw OsmData blob frames are then reframed by copying
 //!   the original `BlobHeader` through byte-for-byte and clearing only the
 //!   targeted field(s) - `indexdata` (field 2) and/or `tagdata` (field 4).
 //!   `--strip-bbox` is entirely an OSMHeader change; it never touches an
@@ -70,16 +68,16 @@
 //!   claims sortedness). Requires `block_cap >= 2`; a cap of 1 cannot
 //!   hold two same-kind elements in one block and is rejected up front.
 
-use crate::read::wire_schema::{BlobHeaderField, HeaderBlockField};
+use super::output_header::{Bbox, Order, OutputFacts, Ways};
+use crate::read::wire_schema::BlobHeaderField;
 use std::collections::BinaryHeap;
 use std::path::Path;
 
 use rustc_hash::FxHashSet;
 
 use super::{
-    HeaderOverrides, Result, build_output_header, ensure_node_capacity_local,
-    ensure_relation_capacity_local, ensure_way_capacity_local, flush_local, require_indexdata,
-    writer_from_header_bytes,
+    HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
+    ensure_way_capacity_local, flush_local, require_indexdata, writer_from_header_bytes,
 };
 use crate::ElementKind;
 use crate::blob::BlobKind;
@@ -95,10 +93,7 @@ use crate::owned::{
 };
 use crate::read::raw_frame::{frame_location, read_raw_frame};
 use crate::write::WriteOptions;
-use crate::writer::{
-    Compression, PbfWriter, frame_blob_pipelined, strip_blob_header_fields,
-    strip_header_block_fields,
-};
+use crate::writer::{Compression, PbfWriter, frame_blob_pipelined, strip_blob_header_fields};
 use crate::{Element, ElementReader};
 
 use crate::tunables::{CORRUPT_INDEXDATA_INFLATION, FRAME_BATCH};
@@ -546,27 +541,16 @@ pub(crate) fn degrade_to(
 /// Build the OSMHeader payload (raw `HeaderBlock` protobuf bytes) for the
 /// passthrough path.
 ///
-/// With no `--generator` / `--output-header` override the input `HeaderBlock`
-/// payload is preserved verbatim (the outer Blob envelope is re-compressed,
-/// so this is field-identical, not blob-byte-identical): the decompressed
-/// `HeaderBlock` protobuf is forwarded field-for-field, and only the bbox
-/// (field 1) is surgically removed under
-/// `--strip-bbox`. So `source` (field 17), custom/optional features
-/// (`pbfhogg.WayMembers-v1`, `SharedNodePins-v1`, `LocationsOnWays`,
-/// `Sort.Type_then_ID`), a non-default `writingprogram`, the osmosis
-/// replication metadata, and any unknown/extension fields all survive
-/// byte-for-byte. This matters because rebuilding through
-/// [`HeaderBuilder::from_header`](crate::block_builder::HeaderBuilder::from_header)
-/// deliberately drops `source`, custom optional features, and unknown fields
-/// and replaces a non-default `writingprogram` - so a plain `--strip-bbox`
-/// (or `--strip-indexdata` / `--strip-tagdata`) would otherwise silently
-/// mutate far more than its target field.
-///
-/// When an override *is* present the user is explicitly rewriting header
-/// fields, so the header is rebuilt through `HeaderBuilder` (with the bbox
-/// omitted under `--strip-bbox`) and the overrides applied. `LocationsOnWays`
-/// is re-declared on this rebuild path when the input carried it, since the
-/// blob payloads still encode inline way coordinates.
+/// The passthrough copies every blob payload and every `BlobHeader` field but
+/// the targeted hint, so the input header still describes the output: it is
+/// forwarded field for field by
+/// [`output_header::verbatim`](super::output_header::verbatim). `source`,
+/// every optional feature (`Sort.Type_then_ID`, `LocationsOnWays`,
+/// `pbfhogg.WayMembers-v1`, `pbfhogg.SharedNodePins-v1`, custom extension
+/// features), the writing program, the replication metadata and unknown
+/// fields survive byte for byte. `--strip-bbox` removes the bbox, and each
+/// `--generator` / `--output-header` override replaces only the field it
+/// names, so adding `--generator` no longer changes the declared features.
 fn passthrough_header_bytes(
     input: &Path,
     flags: DegradeFlags,
@@ -574,47 +558,19 @@ fn passthrough_header_bytes(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<Vec<u8>> {
-    if overrides.is_empty() {
-        // Verbatim path: forward the original HeaderBlock protobuf, removing
-        // only the bbox field when requested. The OSMHeader is always the
-        // first blob in a well-formed PBF.
-        let mut reader = FileReader::open(input, direct_io)?;
-        let mut file_offset: u64 = 0;
-        let frame = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, input)?
-            .ok_or_else(|| Error::invalid_data("input PBF is empty: no OSMHeader blob"))?;
-        let locate = |e: Error| e.locate(frame_location(input, frame.file_offset));
-        if !matches!(frame.blob_type, BlobKind::OsmHeader) {
-            return Err(locate(Error::invalid_data(
-                "input PBF does not start with an OSMHeader blob",
-            )));
-        }
-        let mut header_block = Vec::new();
-        crate::read::decompress::decompress_blob_data_into(frame.blob_bytes(), &mut header_block)
-            .map_err(locate)?;
-        if flags.strip_bbox {
-            let mut stripped = Vec::with_capacity(header_block.len());
-            strip_header_block_fields(&header_block, &[HeaderBlockField::Bbox], &mut stripped)
-                .map_err(locate)?;
-            Ok(stripped)
-        } else {
-            Ok(header_block)
-        }
-    } else {
-        // Override present: rebuild so --generator / --output-header take
-        // effect. This is the lossy-but-intentional path.
-        let reader = ElementReader::open_in(input, direct_io, host)?;
-        let header = reader.header().clone();
-        build_output_header(&header, header.is_sorted(), overrides, |hb| {
-            let mut hb = hb;
-            if header.has_locations_on_ways() {
-                hb = hb.optional_feature(crate::read::block::Feature::LOCATIONS_ON_WAYS);
-            }
-            if flags.strip_bbox {
-                hb = hb.without_bbox();
-            }
-            hb
-        })
+    // The OSMHeader is always the first blob in a well-formed PBF.
+    let mut reader = FileReader::open(input, direct_io)?;
+    let mut file_offset: u64 = 0;
+    let frame = read_raw_frame(&mut reader, &mut file_offset, &host.diagnostics, input)?
+        .ok_or_else(|| crate::error::new_missing_header(input))?;
+    let locate = |e: Error| e.locate(frame_location(input, frame.file_offset));
+    if !matches!(frame.blob_type, BlobKind::OsmHeader) {
+        return Err(crate::error::new_missing_header(input));
     }
+    let mut header_block = Vec::new();
+    crate::read::decompress::decompress_blob_data_into(frame.blob_bytes(), &mut header_block)
+        .map_err(locate)?;
+    super::output_header::verbatim(&header_block, flags.strip_bbox, overrides).map_err(locate)
 }
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
@@ -877,16 +833,9 @@ fn degrade_decode_path(
     // Per-blob worker pool; same precedent as `cat --clean` and `repack`.
     host.process.cross_thread_alloc_pool();
 
-    let header = {
-        let reader = ElementReader::open_in(input, direct_io, host)?;
-        // Warn about LocationsOnWays loss on the decode path - BlockBuilder
-        // does not preserve inline way-node coordinates. `--strip-locations`
-        // makes the loss explicit, so suppress the warning in that case.
-        if !flags.strip_locations {
-            super::warn_locations_on_ways_loss(reader.header(), host);
-        }
-        reader.header().clone()
-    };
+    let header = ElementReader::open_in(input, direct_io, host)?
+        .header()
+        .clone();
 
     let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
         crate::scan::classify::build_classify_schedules_split(input, &host.diagnostics)?;
@@ -913,14 +862,26 @@ fn degrade_decode_path(
         None
     };
 
-    let preserve_sorted = !flags.unsort_any() && header.is_sorted();
-    let header_bytes = build_output_header(&header, preserve_sorted, overrides, |hb| {
-        if flags.strip_bbox {
-            hb.without_bbox()
+    // Every way is re-encoded without inline coordinates or prepass fields;
+    // under --strip-locations that is the request, not a loss to warn about.
+    let facts = OutputFacts {
+        order: if flags.unsort_any() {
+            Order::Unsorted
         } else {
-            hb
-        }
-    })?;
+            Order::AsInput
+        },
+        bbox: if flags.strip_bbox {
+            Bbox::Drop
+        } else {
+            Bbox::Carry
+        },
+        ..OutputFacts::carry(if flags.strip_locations {
+            Ways::Stripped
+        } else {
+            Ways::Reencoded
+        })
+    };
+    let header_bytes = super::output_header::build_one(&header, &facts, overrides, host)?.bytes;
     let mut writer = writer_from_header_bytes(output, compression, &header_bytes, backend, host)?;
 
     let mut blobs_written: u64 = 0;

@@ -110,19 +110,10 @@ pub(super) fn extract_simple(
     // Check if input is sorted - if so, classify + write in a single file pass.
     // We need a quick header check without keeping the reader open. Use BlobReader
     // to read just the first blob (header).
-    let is_sorted = {
-        let mut br = crate::BlobReader::open_in(input, write.direct_reads, host)?;
-        match br.next() {
-            Some(Ok(blob)) => match blob.decode()? {
-                crate::blob::BlobDecode::OsmHeader(h) => {
-                    super::super::warn_locations_on_ways_loss(&h, host);
-                    h.is_sorted()
-                }
-                _ => false,
-            },
-            _ => false,
-        }
-    };
+    let is_sorted = crate::BlobReader::open_in(input, write.direct_reads, host)?
+        .leading_header()?
+        .to_headerblock()?
+        .is_sorted();
 
     if is_sorted {
         return extract_simple_single_pass(
@@ -188,9 +179,7 @@ fn extract_simple_two_pass(
     ] {
         let mut blob_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
         blob_reader.set_parse_indexdata(true);
-        blob_reader
-            .next()
-            .ok_or_else(crate::error::new_missing_header)??;
+        blob_reader.leading_header()?;
 
         for blob_result in &mut blob_reader {
             let blob = blob_result?;
@@ -222,25 +211,15 @@ fn extract_simple_two_pass(
 
     let mut blob_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
     blob_reader.set_parse_indexdata(true);
-    let header_blob = blob_reader
-        .next()
-        .ok_or_else(crate::error::new_missing_header)??;
+    let header_blob = blob_reader.leading_header()?;
     let header = header_blob.to_headerblock()?;
     let bbox = region.bbox();
     let mut writer = writer_from_header(
         output,
         compression,
         &header,
-        false,
+        &super::output_facts(set_bounds, bbox),
         overrides,
-        |hb| {
-            let hb = if set_bounds {
-                hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-            } else {
-                hb
-            };
-            hb.sorted()
-        },
         backend,
         host,
     )?;
@@ -374,27 +353,16 @@ fn extract_simple_single_pass(
 
     // Open writer.
     let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
-    let header_blob = header_reader
-        .next()
-        .ok_or_else(crate::error::new_missing_header)??;
+    let header_blob = header_reader.leading_header()?;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
-    super::super::warn_locations_on_ways_loss(&header, host);
     let bbox = region.bbox();
     let mut writer = writer_from_header(
         output,
         compression,
         &header,
-        false,
+        &super::output_facts(set_bounds, bbox),
         overrides,
-        |hb| {
-            let hb = if set_bounds {
-                hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-            } else {
-                hb
-            };
-            hb.sorted()
-        },
         backend,
         host,
     )?;

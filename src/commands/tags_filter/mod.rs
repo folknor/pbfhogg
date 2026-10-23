@@ -444,7 +444,6 @@ fn tags_filter_single_pass(
     } = *write;
     crate::debug::emit_marker("TAGSFILTER_SCAN_START");
     let reader = ElementReader::open_in(input, direct_io, host)?;
-    super::warn_locations_on_ways_loss(reader.header(), host);
     // Blob-level filtering can't help in invert mode - we want non-matching blobs.
     let reader = match trusted_blob_filter(expressions, invert, distrust_metadata) {
         Some(filter) => reader.with_blob_filter(filter),
@@ -454,9 +453,8 @@ fn tags_filter_single_pass(
         output,
         compression,
         reader.header(),
-        true,
+        &super::output_header::OutputFacts::carry(super::output_header::Ways::Reencoded),
         overrides,
-        |hb| hb,
         backend,
         host,
     )?;
@@ -705,13 +703,13 @@ fn tags_filter_two_pass(
     // PrimitiveBlock → tag match → send compact results). Consumer merges
     // matching IDs into the IdSet collections.
     {
-        // Read header for locations-on-ways warning.
+        // Refuse a file without a readable header before pass 1. (The output
+        // header, and its warning about undeclared enrichment, is built
+        // before pass 2.)
         let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
         header_reader.set_parse_indexdata(true);
-        let header_blob = header_reader
-            .next()
-            .ok_or_else(crate::error::new_missing_header)??;
-        super::warn_locations_on_ways_loss(&header_blob.to_headerblock()?, host);
+        let header_blob = header_reader.leading_header()?;
+        header_blob.to_headerblock()?;
         drop(header_reader);
 
         // Build schedule from header-only scan via the pread-only HeaderWalker.
@@ -721,7 +719,7 @@ fn tags_filter_two_pass(
         let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
         let _ = walker
             .next_header()?
-            .ok_or_else(crate::error::new_missing_header)?;
+            .ok_or_else(|| crate::error::new_missing_header(input))?;
 
         let expr_filter = trusted_blob_filter(expressions, invert, distrust_metadata);
 
@@ -905,18 +903,15 @@ fn tags_filter_two_pass(
     crate::debug::emit_marker("TAGSFILTER_PASS2_START");
 
     let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
-    let header_blob = header_reader
-        .next()
-        .ok_or_else(crate::error::new_missing_header)??;
+    let header_blob = header_reader.leading_header()?;
     let header = header_blob.to_headerblock()?;
     drop(header_reader);
     let mut writer = writer_from_header(
         output,
         compression,
         &header,
-        true,
+        &super::output_header::OutputFacts::carry(super::output_header::Ways::Reencoded),
         overrides,
-        |hb| hb,
         backend,
         host,
     )?;
@@ -941,7 +936,7 @@ fn tags_filter_two_pass(
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
     let _ = walker
         .next_header()?
-        .ok_or_else(crate::error::new_missing_header)?;
+        .ok_or_else(|| crate::error::new_missing_header(input))?;
 
     let mut schedule: Vec<(u64, usize)> = Vec::new(); // (data_offset, data_size)
     let mut blobs_skipped: u64 = 0;

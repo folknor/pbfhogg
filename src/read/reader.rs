@@ -6,7 +6,7 @@ use super::elements::Element;
 use super::file_reader::FileReader;
 use super::pipeline::PipelineConfig;
 use crate::blob_meta::BlobFilter;
-use crate::error::{Error, Result, new_missing_header};
+use crate::error::{Error, Result, new_missing_header_in};
 use crate::tunables::{
     BLOCK_QUEUE, PAR_BATCH_MAX_BLOBS, PAR_BATCH_MAX_BYTES, PAR_INFLIGHT_BUDGET,
     PAR_READER_WORKERS_FALLBACK, PAR_READER_WORKERS_MIN, PAR_READER_WORKERS_RESERVED,
@@ -1085,10 +1085,10 @@ fn read_header_blob<R: Read + Send>(blob_iter: &mut BlobReader<R>) -> Result<Hea
             .map_err(|e| blob.locate_error(blob_iter.source(), e))?
         {
             BlobDecode::OsmHeader(header) => Ok(*header),
-            _ => Err(new_missing_header()),
+            _ => Err(new_missing_header_in(blob_iter.source())),
         },
         Some(Err(e)) => Err(e),
-        None => Err(new_missing_header()),
+        None => Err(new_missing_header_in(blob_iter.source())),
     }
 }
 

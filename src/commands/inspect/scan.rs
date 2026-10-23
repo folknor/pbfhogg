@@ -49,7 +49,9 @@ pub fn inspect(
     opts: &InspectOptions,
     host: &crate::host::Host,
 ) -> Result<InspectReport> {
-    let _ = host;
+    // A zero-byte or header-less file is the one missing-header error, not an
+    // empty report; neither scan below insists on a leading header itself.
+    drop(crate::ElementReader::open_in(path, opts.direct_io, host)?);
     // Index-only fast path: skip decompression when all blobs have indexdata.
     // --locations and --extended require per-element data, so they need full decode.
     if !opts.show_locations

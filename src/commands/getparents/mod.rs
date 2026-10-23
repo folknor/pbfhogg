@@ -256,7 +256,7 @@ fn getparents_walker(
     let shared_file = Arc::clone(walker.shared_file());
     drop(walker);
 
-    let header = header_block.ok_or_else(crate::error::new_missing_header)?;
+    let header = header_block.ok_or_else(|| crate::error::new_missing_header(input))?;
 
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -265,8 +265,13 @@ fn getparents_walker(
     }
     crate::debug::emit_marker("GETPARENTS_SCHEDULE_END");
 
-    super::warn_locations_on_ways_loss(&header, host);
-    let header_bytes = super::build_output_header(&header, true, overrides, |hb| hb)?;
+    let header_bytes = super::output_header::build_one(
+        &header,
+        &super::output_header::OutputFacts::carry(super::output_header::Ways::Reencoded),
+        overrides,
+        host,
+    )?
+    .bytes;
     let mut writer = writer_from_header_bytes(
         output,
         write.compression,
@@ -375,8 +380,13 @@ fn getparents_pipelined(
     let reader = ElementReader::open_in(input, write.direct_reads, host)?.with_blob_filter(
         BlobFilter::new(need_node_blobs, need_way_blobs, need_relation_blobs),
     );
-    super::warn_locations_on_ways_loss(reader.header(), host);
-    let header_bytes = super::build_output_header(reader.header(), true, overrides, |hb| hb)?;
+    let header_bytes = super::output_header::build_one(
+        reader.header(),
+        &super::output_header::OutputFacts::carry(super::output_header::Ways::Reencoded),
+        overrides,
+        host,
+    )?
+    .bytes;
     let mut writer = writer_from_header_bytes(
         output,
         write.compression,

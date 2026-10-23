@@ -303,7 +303,9 @@ constructors say `--io-uring requires ...`; `inspect`'s scan says
 `BlockBuilder::with_element_cap_prealloc` asserts the same thing with the same
 flag name; framing errors and the WayMembers message name
 `--elements-per-blob`, which altw, apply-changes and extract never had;
-degrade names `--block-cap` and `--unsort`. `error.rs` explicitly refuses to
+degrade names `--block-cap` and `--unsort`; `HeaderOverrides::parse` names
+`--output-header`; `Output::pbf_writer` and `FileReader::open` say
+`--io-uring` and `--direct-io requires the ... feature`. `error.rs` explicitly refuses to
 name CLI flags ("made the library a dependency of the CLI's argument surface")
 and `export_error` moved one hint to the CLI; the rule is applied in one place
 and broken in about ten. Fix: typed errors (`MissingIndexdata { path }`,
@@ -466,13 +468,26 @@ Reported by: read path, CLI and plumbing, change application.
 Anger: 9 - validate flags earlier, refuse no-op flags.
 
 - `--io-uring` / `--direct-io` without the feature are refused in
-  `writer_from_header_bytes*`, after the input is opened, headers read and
-  sometimes a full first pass done; on altw or apply-changes the refusal can
-  come minutes in.
+  `Output::pbf_writer` (writer backends) and `FileReader::open` (direct
+  reads), after the input is opened, headers read and sometimes a full first
+  pass done; on altw or apply-changes the refusal can come minutes in.
 - Apply-changes refuses `-j 1` after parsing the whole OSC, building
-  `DiffRanges` and creating the output writer; the `--force
-  --locations-on-ways` refusal is up front, as it should be. `MergeOptions`
-  wants a `validate()` called first.
+  `DiffRanges` and creating the output writer; the sortedness refusal and the
+  `--locations-on-ways` without LocationsOnWays refusal (both in
+  `build_header_bytes`) also come after the OSC is parsed and the ranges are
+  built, while the `--force --locations-on-ways` refusal is up front, as it
+  should be. `MergeOptions` wants a `validate()` called first.
+- Refusals that depend on parsing are ordered differently per command:
+  `tags_filter_to` runs `require_indexdata` (a file probe) before
+  `parse_expressions`, so a syntax error in an expression surfaces after the
+  probe; extract parses `--bbox` and the polygon after its output is
+  reserved; getid resolves its IDs (a full pass over the `-I` PBF) after the
+  output is reserved, and refuses an empty ID set only then. When two
+  problems exist at once, which error the operator sees depends on the arm:
+  altw and diff make their scratch directory before the output is checked
+  (a missing output directory reads "scratch directory X is unusable"),
+  build-geocode-index checks the output first, every other command reports
+  the output's own error.
 - Altw refuses `inject_prepass && !indexdata_present` inside
   `write_output_checked`, after pass 0 and pass 1 have built the whole sparse
   store.
@@ -480,15 +495,12 @@ Anger: 9 - validate flags earlier, refuse no-op flags.
   closure, after the header is written and the output created, surfacing via
   `WriterGone` lag; `copy_file_range` incompatibility with `--direct-io` is
   discovered when the first `CopyRange` chunk reaches the sink.
-- `diff -j` scratch writability is discovered after both header walks;
-  derive-parallel creates its outer files after `walk_file` on both inputs.
 - `--output-header` and `--generator` are parsed per dispatch arm
-  (`HeaderOverrides::parse` in fourteen arms); `--drop-ids`, `--start-id`,
-  time-filter's timestamp, `--bbox` and `--show` are parsed in `run_*` or the
-  library. The `main.rs` comment "Every free-form flag is parsed exactly once,
-  here at the argument boundary" is not true for these. `tags-filter` with no
-  expressions and `getid` with no IDs are refused after the fact.
-- The external altw free-space need is never checked (HYG-057).
+  (`HeaderOverrides::parse` in every arm that writes a PBF); `--drop-ids`,
+  `--start-id`, time-filter's timestamp and `--bbox` are parsed in `run_*` or
+  the library. The `main.rs` comment "Every free-form flag is parsed exactly
+  once, here at the argument boundary" is not true for these. `tags-filter`
+  with no expressions and `getid` with no IDs are refused after the fact.
 
 Fix: `value_parser`s for every free-form flag; feature-availability checks at
 argument time; a `validate()` per options struct; an altw `AltwPlan::resolve`
@@ -507,11 +519,17 @@ Refused: `-j` with `-R`, `--distrust-metadata` outside the scanning report,
 `-v` with `-j` on diff, `inspect -j` / `--force` outside `--nodes`. Warned
 (a `Warning:` line from `run_*`): `tags-filter -R -t`, `getid -t` without `-r`, and
 `--remove-tags` without `--add-referenced` (which the library accepts
-silently). Ignored: `--direct-io` on `check`, `getid -I` and many pipeline
-passes (HYG-037), `--jobs` with `-R` in the tags-filter library. Validation is
-split between clap attributes and about sixteen hand-written
-`if x { return Err(...) }` lines in `main`, which exit 2 with a different
-message format from clap's. The library now takes one `WriteOptions`
+silently). Ignored: `--direct-io` on `check --refs`, `getid -I` and many
+pipeline passes (HYG-037), `--jobs` with `-R` in the tags-filter library;
+`tags-filter --input-kind osc`, which refuses `-R`, `-i`, `-t`,
+`--distrust-metadata`, `-j`, `--generator` and `--output-header` but accepts
+and discards `--compression`, `--direct-io` and `--force` (its output is OSC,
+so none can apply); `-O` when `export` or `diff` write to stdout and no
+output exists to replace; plain `cat --force`, which is consulted only with
+`--type`, `--clean` or `--dedupe`; a `diff --tmp-dir` on a run that takes the
+scratch-free `-j 1` path. Validation is split between clap attributes and
+many hand-written `if x { return Err(...) }` lines in `main`, which exit 2
+with a different message format from clap's. The library now takes one `WriteOptions`
 (compression, `OutputBackend`, direct reads, force) instead of the positional
 bools, but `too_many_arguments` is still `#[allow]`ed on the extract entry
 points, `writer_from_header`, `getid_dispatched`, `filter_by_id`, the
@@ -541,9 +559,34 @@ into it), and `check_refs` (`let _ = direct_io;`). Extract's pread passes open
 buffered regardless (a comment explains alignment), `multi.rs` writes through
 `PbfWriter::new(BufWriter)` regardless, `export` has no I/O flag. `inspect`
 prints that it ignored the flag. An operator who chose O_DIRECT to protect the
-page cache still fills it, with nothing logged. Fix: remove the parameters, and
-have the CLI refuse or say so where a command honours the flag on some passes
-only, so `--direct-io` help can say what it affects.
+page cache still fills it, with nothing logged.
+
+Where the flag is honoured it is often only for the header read and the
+first-blob indexdata probe: renumber (header only), repack and degrade's decode
+path (probe and header, the classify pools pread through a buffered shared
+fd), time-filter's snapshot path, tags-filter's two-pass scans, and
+getparents' dispatch probe all read their bulk data buffered. The `sort`
+reads and `check --refs` (`let _ = direct_io`, with a comment that it is
+"accepted silently for now") discard it. The writes are honoured by every
+PBF writer that goes through `Output::pbf_writer`, except multi-extract's
+single-pass path (a synchronous `BufWriter`).
+
+Two consequences are visible to a user. The "I/O capability matrix" in
+`reference/cli-reference.md` marks sort, renumber, repack, degrade, extract,
+tags-filter, getid, getparents, time-filter, add-locations-to-ways, apply-changes
+and `check --refs` as "Yes (R+W)" or "Yes", and has no row for `digest`: it
+describes the flag's presence, not its reach. And in a build without the
+`linux-direct-io` feature, whether `--direct-io` is refused ("requires the
+linux-direct-io feature", exit 2) depends on whether the command happens to
+open a reader with the flag set: `check --ids --direct-io` is refused,
+`check --refs --direct-io` runs and ignores it.
+
+Fix: remove the parameters, and have the CLI refuse or say so where a command
+honours the flag on some passes only, so `--direct-io` help can say what it
+affects; regenerate the matrix from a per-command table in code (read passes
+honoured, write honoured) rather than by hand. Enforce with one contract test
+per command that a no-feature build refuses `--direct-io` before opening any
+input, and a unit test of the table against the capability matrix.
 
 Reported by: altw and scanning, re-encoding, filtering and spatial, CLI and
 plumbing.
@@ -727,9 +770,37 @@ misleading "missing locations" error instead of "input not sorted" (stage 1
 could check `prev.max_id < next.min_id` in `build_node_blob_mapping` for free);
 the geocode builder trusts indexdata kind to schedule node blobs, so a node
 in a blob labelled way or relation is never seen by Pass 2a. `CORRECTNESS.md`
-partly states this for sort. Fix: state the trust model once in `reference/`
-(indexdata is a hint; these properties are verified, these are believed, and
-this is the consequence) and have each command cite it.
+partly states this for sort. `has_indexdata` decides whether a whole file is
+indexed from its first data blob alone, so a file with indexdata on the first
+blob and not on a later one passes every gate; the output-header policy had to
+add its own check for that case on the raw-copy paths.
+
+The second half of the model is what a command does when indexdata is absent,
+and that is decided per command too. Refuse unless `--force`: sort, repack,
+tags-filter (not with `-i` or `--distrust-metadata`), getid and `getid
+--invert`, apply-changes, altw, extract complete and smart (not simple), cat
+with `--type`, `--clean` or `--dedupe`, degrade's decode path (not its
+passthrough path), `inspect --nodes`, `inspect tags`. Refuse with no escape:
+renumber (its schedule scan hard-errors on an unindexed blob), altw
+`--index-type external` (accepts `--force`, then refuses it). Refuse unless
+`--allow-unindexed` (whose legacy `--force` also grants overwrite):
+build-geocode-index. Fall back silently or with a `Note`: diff and `diff
+--format osc` (sequential element stream, `diff.sequential_fallback`),
+getparents (the probe only picks the scan arm), time-filter, plain cat (which
+adds indexdata), check (`verify_ids` warns instead of refusing). Verify rather
+than trust: digest (refuses partial or inaccurate indexdata), `check --index`.
+Only tags-filter and inspect have a `--distrust-metadata` switch; getid, cat
+`--type`, apply-changes and altw trust the metadata with no way to turn that
+off. The sortedness the same commands require is read from the header flag
+alone (renumber and digest additionally check order while reading), and a
+header-only input counts as indexed (no blob lacks indexdata). No sentence
+anywhere says which of refuse, fall back or verify a command is meant to be.
+
+Fix: state the trust model once in `reference/` (indexdata is a hint; these
+properties are verified, these are believed, this is the consequence, and this
+is what a missing index does: refuse with `--force`, or fall back with a
+`Note`) and have each command cite it. Enforce with a contract test table,
+unindexed input times command, expecting refuse, fall back or ok.
 
 Reported by: change application, re-encoding, altw and scanning, geocode index.
 
@@ -834,7 +905,10 @@ base PBF five times by path (`require_indexdata`, `read_header`, `File::open`
 for copy, `HeaderWalker::open`, `run_workers`), so a file replaced mid-run gives
 mixed reads. Renumber opens and parses the header twice in a row. `multi.rs`
 reads the header via `BlobReader` and again via `HeaderWalker`, and the first
-decides sortedness. Fix: open once and hand the `File` and parsed header down
+decides sortedness. `inspect`, `bench-write`, `renumber` and `diff` also open
+a reader (or run a probe) whose only job is to make a header-less file fail
+with the missing-header error before the scan proper, which would otherwise
+read it as empty. Fix: open once and hand the `File` and parsed header down
 (the altw `AltwPlan` of HYG-035).
 
 Reported by: altw and scanning, change application, re-encoding, filtering and
@@ -886,20 +960,359 @@ blocks may be parsed by brokkr. Which kinds `--quiet` drops (Note and
 Progress, presumably; never Warning) and how it interacts with the two
 existing flags is the maintainer's call.
 
+More facts a quiet or JSON mode has to cope with. The `bench-read`,
+`bench-write` and `bench-merge` key=value blocks are raw `cli_eprintln!` lines
+too, and `inspect tags` ends with a raw `N distinct tag values` while every
+other command's closing line goes through `summary_writer`. `Progress` events
+exist only in sort, extract (single and multi), build-geocode-index,
+`cat --dedupe` and apply-changes, so a `--quiet` that drops Progress
+silences those five and no other command. Summary lines have no common
+shape: some lead with the command name (`time-filter:`,
+`add-locations-to-ways:`), some with a verb (`Wrote`, `Sorted`, `Renumbered`,
+`Merged`), apply-changes prints a multi-line block, `export` keys itself
+`export_to.summary`, and getid and `getid --invert` share the key
+`getid.summary` while `cat --dedupe` has its own. A `--json` sink would
+inherit all of it.
+
 Reported by: split out of the diagnostic-wording item.
 
-## HYG-110 - Which OSMHeader wins in a multi-header input is decided per command
+## HYG-110 - The one-header policy is owned by the frame decoder, but callers still carry dead per-command policies
 
-Anger: 5 - malformed-input policy, no hot-path cost.
+Anger: 3 - comments and dead branches, no behaviour change.
 
-A PBF with more than one OSMHeader blob is malformed, and commands disagree
-on what to do with it. `getid`'s header walk and streaming path keep the
-first and ignore the rest. Altw's `passthrough::build_schedule` documents
-"the first OsmHeader blob is consumed" but overwrites `header_bytes` on every
-header, so it keeps the last. Other commands were not surveyed. Fix: one
-policy, first wins or refuse with a located error naming the second header,
-owned by the header walker rather than each caller, and a test feeding a
-two-header input through every command that builds an output header.
+A PBF with more than one OSMHeader blob is malformed. The policy is now
+`read/frame.rs::check_header_position`, applied once per frame by
+`BlobReader`, `read_raw_frame`, `read_blob_header_only`, `HeaderWalker` and the
+`cat --dedupe` frame loop: an OSMHeader anywhere but the first frame is
+refused ("a second OSMHeader blob follows the first frame"). Tests pin it for
+the readers, cat, sort and digest. What is left is the callers that still
+describe or implement a policy the decoder makes unreachable: getid's two
+header walks (`BlobKind::OsmHeader if writer.is_none()`, whose comment says
+"a later one is ignored, as on the streaming arm"), altw's
+`passthrough::build_schedule` (documents that the first header is consumed,
+overwrites `header_bytes` on every header), and the loops in cat's
+`read_header` and apply-changes' `read_header` that skip any non-header frame
+looking for one. Fix: delete the branches and comments, or make the first
+header a typed result of the walker (`Header` then `Data` items) so a caller
+cannot ask for a second one; keep a two-header test through each command that
+builds an output header (cat, sort and digest have one; the others go through
+the same decoder but have no test of their own, which the contract test table
+covers).
 
-Reported by: the output-publication review fixes.
+Reported by: the output-publication review fixes; the command-matrix audit
+found the decoder now owns the policy.
+
+## HYG-111 - `-j/--jobs` is on a minority of commands and means something different on each
+
+Anger: 7 - CLI behaviour.
+
+Flag by flag, with `0` and `1` as the values that differ:
+
+- tags-filter: `0` is auto, N caps the parallel classify workers; only the
+  two-pass mode reads it. The CLI refuses a non-zero value with `-R` and in
+  OSC mode; the library accepts and ignores it with `-R`.
+- `inspect --nodes` (clap `requires = "nodes"`) and `inspect tags`: `0` auto,
+  `1` sequential, N caps the pool.
+- diff and `diff --format osc`: the CLI resolves `0` to the host's
+  parallelism, `1` selects the sequential path that the docs call scratch-free,
+  and N is a shard count for the ID space, not only a thread cap. Refused with
+  `-v`. The library `jobs: usize` has no auto: `0` behaves as sequential
+  (`options.jobs > 1` gates the parallel path), and a comment says the caller
+  resolves it.
+- apply-changes: `0` is a `nproc - 2` heuristic with a minimum of 2, `1` is
+  refused (after the OSC is parsed, HYG-035), N >= 2 is the worker count.
+- merge-changes: `0` auto through `sized_workers` with the merge-changes
+  reserve, minimum and fallback constants, `1` builds a one-thread pool and
+  runs, N builds a pool of N.
+
+"Auto" is not one thing either: every core (tags-filter, diff), cores minus a
+reserve (apply-changes, merge-changes, each with its own constants). The
+library has three shapes for the same knob: `usize` with `0` as auto
+(`tags_count`, `node_stats`), `usize` the caller must have resolved (`diff`,
+`derive_changes`), `Option<usize>` (`tags_filter`, `apply_changes`,
+`merge_changes`, where `Some(0)` also means auto). Sort, cat, repack,
+degrade, renumber, extract, altw, getid, getparents, time-filter, check and
+build-geocode-index all run worker pools and have no flag; their size comes
+from host probes and constants. `docs/cli/commands.md` and
+`reference/cli-reference.md` describe each flag where it appears and state no
+cross-command rule.
+
+Fix: one `JobsArg` in the CLI (`0` auto, N a cap on worker threads, one help
+text) and one library `Parallelism` (`Auto | Fixed(NonZeroUsize)`) replacing
+the three shapes, diff's shard count derived from it; either give the pooled
+commands the flag or say once in the references that they have none. Apply-
+changes' `-j 1` refusal stays as a documented exception until its barrier is
+reworked (HYG-081). Enforce with a text rule rejecting a `jobs: usize` field
+in `src/`, and a contract test table of command times `-j 0|1|2` expecting
+accept or refuse.
+
+Reported by: the command-matrix audit.
+
+## HYG-112 - `--force` means a different thing on each command that has it
+
+Anger: 7 - CLI behaviour.
+
+The common-flags table says "Proceed even if input lacks indexdata (slower
+fallback path)". What the flag does:
+
+- cat: consulted only with `--type`, `--clean` or `--dedupe`; on plain `cat`
+  it is accepted and does nothing (plain cat adds the indexdata).
+- sort, repack, tags-filter (not with `-i` or `--distrust-metadata`), getid
+  and `getid --invert`, apply-changes, add-locations-to-ways with sparse,
+  extract complete and smart (not `--simple`), `inspect --nodes`, `inspect
+  tags`: refuse without it, fall back to decoding with it.
+- altw `--index-type external`: accepted, then refused ("--force is not
+  supported on this path"). apply-changes `--force --locations-on-ways` on an
+  unindexed base: refused.
+- degrade: its own plain `bool` field with its own help text, consulted only
+  on the decode path; the header-and-blob passthrough path never reads it.
+- build-geocode-index: the indexdata switch is `--allow-unindexed`, and
+  `--force` is "legacy shorthand for both `--overwrite` and
+  `--allow-unindexed`", the only `--force` that also bypasses output
+  protection and the only place where force and overwrite are linked.
+- renumber, getparents, time-filter, diff, digest, check, export: no flag.
+  Renumber's schedule scan hard-errors on an unindexed blob with no escape;
+  getparents, time-filter and diff fall back silently (diff with a `Note`).
+- bench-merge hard-codes `force: true`.
+
+The unwritten rule seems to be "refuse where the unindexed fallback changes the
+cost class (three decodes per blob, a full element stream), fall back where it
+does not", and it is applied by hand per command (HYG-061 lists the
+indexdata-absent outcomes).
+
+Fix: write the rule once in `reference/cli-reference.md`; give the flag to
+every command that refuses and to none that does not; keep geocode's `--force`
+working but warn that it grants overwrite and point at `--overwrite` and
+`--allow-unindexed`. Enforce with the contract table of HYG-061 (unindexed
+input times command) plus a clap-tree test that every command with a
+`--force` also calls the shared gate.
+
+Reported by: the command-matrix audit.
+
+## HYG-114 - OSC output is gzipped by three different rules, and no user document says which
+
+Anger: 6 - CLI behaviour; likely ends as documentation.
+
+`merge-changes` gzips when the destination name ends `.gz` (a UTF-8 name
+test on the destination, never the staging name); `tags-filter --input-kind
+osc` always gzips, whatever the name, with the fast level; `diff --format osc`
+always gzips through the parallel gzip writer. Each site carries a
+"Deliberately ..." comment saying the contract is historical and framing has
+no shared owner (`osc/write.rs`, `tags_filter/osc.rs`, `diff/derive.rs`,
+`merge_changes`). The readers sniff gzip magic, so either is read back. But
+`docs/cli/commands.md` and `reference/cli-reference.md` call every one of these
+"Output file", so `tags-filter -o changes.osc` writes gzip bytes into a file
+named `.osc`, and `merge-changes -o merged.osc.xml.gz` is gzip while
+`merge-changes -o merged.osc.gzip` is not.
+
+Fix: per rule 3 the comments exist and the `Output files` section of both
+references owes the three rules (or one new rule: gzip unless the name ends
+`.osc`, which would change two outputs). Enforce with a contract test writing
+each OSC producer to `x.osc` and `x.osc.gz` and asserting the magic bytes
+against one table.
+
+Reported by: the command-matrix audit.
+
+## HYG-115 - `renumber` quietly writes zlib:1; every other PBF writer defaults to zlib:6
+
+Anger: 9 - the measured write path and a documented default.
+
+`--compression` is documented as `[default: zlib]` on every PBF writer, and
+`Compression::default()` is `Zlib(6)` with a comment saying every CLI
+default is spelled "zlib" so that the write benchmark measures the level the
+commands write. `renumber_external_to` maps `compression ==
+Compression::default()` to `Zlib(1)`, and says why (the external-renumber
+default in `reference/performance.md`, a measured path). Consequences: an
+explicit `--compression zlib` or `zlib:6` on renumber also yields level 1,
+because the value-based API cannot tell omission from an explicit default;
+the renumber section of both CLI references states the generic default and
+does not mention level 1; and renumber's blobs are compressed at a different
+level than the same data written by any other command. The code comment
+documents the choice; the user documents do not.
+
+Fix: per rules 3 and 6 this should end as documentation: the renumber
+section says "default zlib:1" and why, and the `[default]` column in the flag
+table is per command. The code change (an `Option<Compression>` carried from
+clap through `WriteOptions`, so an explicit level 6 is honoured) is the
+migration the comment already describes; do it only with the measured default
+kept. Enforce with a test that `renumber --compression zlib:6` and no flag
+produce different blob compression, once the Option exists.
+
+Reported by: the command-matrix audit.
+
+## HYG-116 - Run scratch is made eagerly, at a different point per command, and sized by hand
+
+Anger: 6 - CLI behaviour, small.
+
+- `run_scratch` creates the run directory unconditionally for `diff` (text
+  and osc), also on the paths that never write scratch: `diff -j 1`, which
+  the docs call the "scratch-free" path, and the sequential fallback for
+  unindexed input. So `diff -j 1 old new` to stdout, or with `-q`, fails in a
+  read-only current directory and creates and removes a `.pbfhogg-run-*`
+  there.
+- Where the directory goes: the output's directory (altw, geocode, `diff -o`),
+  the current directory (`diff` to stdout or `-q`), or `--tmp-dir`, which
+  exists on exactly those three commands.
+- When it is made relative to the output check differs (HYG-035).
+- Free-space preflight: altw sparse (`insufficient free space for sparse
+  node index`) and altw external (`space::precheck`) have one; diff and derive
+  deliberately have none (a comment in `derive.rs` explains); the geocode
+  builder has none, though its `.buckets-level*` trees are hundreds of GB at
+  planet scale.
+- `leftover_dirs` in `main.rs` is a hand-kept per-command list of where
+  leftovers may be, ending in `_ => {}`, beside `validate_input_output_aliases`
+  (which is exhaustive) and the clap structs; a command that gains scratch
+  compiles without being scanned.
+
+Fix: make `RunScratch` lazy (the directory appears at the first
+`file()` or `create_subdir()`), give `Command` accessors for its outputs,
+inputs and scratch parent used by the alias check, the leftover scan and
+`run_scratch` alike, and make `leftover_dirs` exhaustive. Enforce with
+`clippy::wildcard_enum_match_arm` on that function and a test that `diff -j 1`
+runs in a read-only directory.
+
+Reported by: the command-matrix audit.
+
+## HYG-117 - Nothing handles SIGINT or SIGTERM, so every cleanup guard is skipped by Ctrl-C
+
+Anger: 7 - process policy and CLI behaviour.
+
+No handler exists in `src/`, `cli/` or the dependencies. Output staging
+removal (`Output` drop), the run scratch directory (`RunScratch` drop) and the
+group rollback of `extract --config` all run on return or unwind. Ctrl-C,
+`timeout`, a service manager's stop and a plain `kill` end the process
+without running a destructor, leaving `.pbfhogg-tmp-*` beside the output and,
+for altw, diff and build-geocode-index, the whole run directory, which the
+docs size at hundreds of GB. The docs name SIGKILL, power loss and the OOM
+killer as the causes of leftovers; the commonest, an operator's own
+interrupt, is not among them. The next run reports the leftovers
+(`find_stale`) but never removes them.
+
+Fix: first, say so in the "Scratch files" and "Output files" sections (cheap,
+and consistent with rule 6). The real fix is CLI-owned (ADR-0016 keeps the
+library free of process state): a handler through `signal-hook` that sets a
+cancellation flag, a cancellation token on the pool engine that HYG-011 wants
+anyway, an `Interrupted` error that unwinds normally so the guards run, and
+exit status 130 or 143. Enforce with a test that starts a long command,
+sends SIGINT and SIGTERM, and asserts no `.pbfhogg-*` entry remains and the
+exit status.
+
+Reported by: the command-matrix audit.
+
+## HYG-118 - The cross-thread allocator cap is requested by some block-producing commands and not others
+
+Anger: 9 - measured memory behaviour on the planet path.
+
+`ProcessActions::cross_thread_alloc_pool` (glibc arena cap; `renumber`'s
+comment attributes about 26 GB of anonymous RSS on planet to blocks allocated on
+worker threads and freed on compression threads) is called by repack, degrade's
+decode path, cat's decode path, renumber, time-filter's snapshot path, `check
+--ids` and `check --refs`, and the geocode builder. It is not called by sort,
+tags-filter, extract, getid, getparents, add-locations-to-ways, apply-changes,
+diff, tags-count or `inspect --nodes`, which also run worker pools. Whether each
+of those allocates on one thread and frees on another, and whether it needs the
+cap, was not checked here. Each call site is a per-command decision that the
+CLI's `ProcessActions` could make once.
+
+Fix: measure the omitted commands (rule 8: not until the documents are drained),
+and if the cap is harmless, call it once from `main` as CLI process policy and delete
+the per-command calls; if it is harmful on some, keep the calls and write down which
+and why next to `ProcessActions`. Enforce with a text rule that the hook is
+called from one place.
+
+Reported by: the command-matrix audit.
+
+## HYG-119 - The flag vocabulary reuses short flags for unrelated options
+
+Anger: 7 - CLI behaviour; any rename breaks scripts.
+
+- `-t`: `--type` on cat, diff, check and `inspect tags`; `--remove-tags` on
+  tags-filter and getid.
+- `-i`: `--id-file` on getid and getparents; `--invert-match` on tags-filter
+  (getid's own inversion is long-only `--invert`).
+- `-c`: `--clean` on cat, `--suppress-common` on diff, `--config` on extract;
+  extract's `--clean` has no short while cat's has.
+- `-s`: `--simple` on extract, `--add-self` on getparents, `--osmium-summary`
+  on diff, `--sort` on `inspect tags`.
+- `-e`: `--expressions` on tags-filter, export and `inspect tags`;
+  `--extended` on inspect.
+- `--type` grammar: a comma list on cat, diff and check, exactly one on
+  `inspect tags`, a `node|way` enum with no short on export (and export cannot
+  name a relation).
+- Quiet and verbose: `diff -q`, `check --quiet` (long only), nothing elsewhere;
+  `diff -v`, `getid --verbose-ids`.
+- Output location: `--output-dir` on build-geocode-index, `-o/--output` on
+  every other writer.
+
+Fix: an owner ruling on one vocabulary table in `reference/cli-reference.md`;
+add aliases rather than rename. Enforce with a test that walks the clap
+`Command` tree and asserts each short flag has one meaning across subcommands
+or sits in an allow-list with a reason.
+
+Reported by: the command-matrix audit.
+
+## HYG-121 - apply-changes carries the base's replication state onto a newer output
+
+Anger: 8 - apply-changes output contract; nidhogg reads replication state
+from PBF headers.
+
+Output headers now come from one policy (`src/commands/output_header.rs`,
+`reference/cli-reference.md` "Output header"). What remains: apply-changes
+states `Replication::Carry`, so its output declares the base's
+`osmosis_replication_timestamp` and sequence number although it holds the base
+plus the OSC, a later state. osmium apply-changes writes a fresh header with
+no replication fields. Claiming the older state is the safe direction for an
+updater (it re-applies a diff, which is idempotent at equal versions), but it
+is not what the output contains. The OSC carries no sequence number, so the
+honest options are to drop the timestamp and sequence number (osmium) or keep
+them and document them as the base's; which one depends on how nidhogg's
+`update.rs` reads them, which the maintainer has to check. bench-merge shares
+the path.
+
+Reported by: the output-header policy work.
+
+## HYG-122 - The writing program carries no version
+
+Anger: 7 - output header contents.
+
+Every output header says `writingprogram = "pbfhogg"` (the `HeaderBuilder`
+default, which the output-header policy always applies). osmium writes
+`osmium/<version>`, so a file in the wild can be traced to the release that
+made it; a pbfhogg file cannot, which matters when a header-policy or encoding
+bug is found later and the question is which files are affected. Fix: the CLI
+supplies `pbfhogg/<version>` from its own package version; library callers
+keep choosing their own. Tests that assert the exact string need updating.
+
+Reported by: the output-header policy work.
+
+## HYG-123 - `HeaderBuilder::from_header` survives only as public API
+
+Anger: 3 - unused public surface.
+
+No command calls `HeaderBuilder::from_header` any more; output headers come
+from `src/commands/output_header.rs`. Its doc still explains which features it
+deliberately does not copy and why, which is now the policy module's job, so
+the two statements can drift. Decide whether it stays public library API, in
+which case its doc should defer to the policy and a test should keep it
+working, or goes, since the crate is pre-1.0.
+
+Reported by: the output-header policy work.
+
+## HYG-124 - The input-contract table drives one mode per command
+
+Anger: 2 - test coverage.
+
+`tests/cli_input_contract.rs` feeds header-only, zero-byte and header-less
+files to one or a few invocations per command, and an output aliasing each
+secondary input flag. Modes that read the input through a different path are
+not in it: `inspect --show` and `--blocks`/`--extended`/`--locations`/
+`--id-ranges`/`--anomalies`, `check` with `--ids`, `--refs` or `--index`,
+`getid --add-referenced` and `--invert`, `getparents --add-self`, `cat --type
+way|relation`, `diff --format osc`, `time-filter` on an input with metadata,
+and `merge-changes`, whose OSC inputs have no alias case of their own (it sits
+in the table's no-PBF list). Each could still spell the missing-header error
+its own way or hold an empty file against indexdata. Fix: add rows for the
+modes above, and a merge-changes alias case per input.
+
+Reported by: the input-gate work.
 

@@ -359,20 +359,17 @@ pub(crate) fn renumber_external_to(
     host.process.cross_thread_alloc_pool();
 
     // ---- Header validation + output writer setup ----
-    let header = {
-        let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
-        let header_blob = header_reader
-            .next()
-            .ok_or_else(crate::error::new_missing_header)??;
-        header_blob.to_headerblock()?
-    };
+    // The reader reports a file without a leading OsmHeader through the one
+    // missing-header error, ahead of the sortedness check.
+    let header = crate::ElementReader::open_in(input, direct_io, host)?
+        .header()
+        .clone();
     require_sorted(
         header.is_sorted(),
         input,
         "Input PBF",
         "Renumber assigns IDs by file position and resolves references by rank.",
     )?;
-    super::warn_locations_on_ways_loss(&header, host);
     // Preserve the external-renumber zlib:1 default documented in
     // reference/performance.md. This legacy value-based API cannot distinguish
     // omitted compression from an explicit Zlib(6): both arrive as the same
@@ -392,10 +389,8 @@ pub(crate) fn renumber_external_to(
         output,
         effective_compression,
         &header,
-        true,
+        &super::output_header::OutputFacts::sorted(super::output_header::Ways::Reencoded),
         overrides,
-        #[allow(clippy::redundant_closure_for_method_calls)]
-        |hb| hb.sorted(),
         backend,
         host,
     )?;

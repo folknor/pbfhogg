@@ -153,7 +153,7 @@ fn walk_envelope(path: &Path, host: &crate::host::Host) -> Result<Vec<Option<Blo
             BlobKind::OsmHeader => seen_header = true,
             BlobKind::OsmData if seen_header => indexes.push(meta.index),
             BlobKind::OsmData => {
-                return Err(Error::invalid_data("the first blob is not an OsmHeader"));
+                return Err(crate::error::new_missing_header(path));
             }
             BlobKind::Unknown(name) => {
                 return Err(Error::invalid_data(format!(
@@ -163,9 +163,7 @@ fn walk_envelope(path: &Path, host: &crate::host::Host) -> Result<Vec<Option<Blo
         }
     }
     if !seen_header {
-        return Err(Error::invalid_data(
-            "no OsmHeader blob: the file is empty or not a PBF",
-        ));
+        return Err(crate::error::new_missing_header(path));
     }
     Ok(indexes)
 }

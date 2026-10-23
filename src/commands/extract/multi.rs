@@ -51,7 +51,6 @@ pub(super) fn try_extract_multi_single_pass(
         match br.next() {
             Some(Ok(blob)) => match blob.decode()? {
                 crate::blob::BlobDecode::OsmHeader(h) => {
-                    super::super::warn_locations_on_ways_loss(&h, host);
                     if !h.is_sorted() {
                         return Ok(None); // fall back to sequential
                     }
@@ -133,14 +132,13 @@ pub(super) fn try_extract_multi_single_pass(
     for (region, output) in regions.iter().zip(outputs.iter()) {
         let display_path = output.destination();
         let bbox = region.bbox();
-        let header_bytes = super::super::build_output_header(&header, true, overrides, |hb| {
-            let hb = if set_bounds {
-                hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-            } else {
-                hb
-            };
-            hb.sorted()
-        })?;
+        let header_bytes = super::super::output_header::build_one(
+            &header,
+            &super::output_facts(set_bounds, bbox),
+            overrides,
+            host,
+        )?
+        .bytes;
         let completion = output.begin_write()?;
         let mut w = PbfWriter::to_staged_file(output.path(), compression)
             .map_err(|e| e.context(format!("failed to create {}", display_path.display())))?
@@ -193,7 +191,7 @@ pub(super) fn try_extract_multi_single_pass(
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, &host.diagnostics)?;
     let _ = walker
         .next_header()?
-        .ok_or_else(crate::error::new_missing_header)?;
+        .ok_or_else(|| crate::error::new_missing_header(input))?;
 
     let mut node_schedule: Vec<(usize, u64, usize)> = Vec::new();
     let mut way_schedule: Vec<(usize, u64, usize)> = Vec::new();

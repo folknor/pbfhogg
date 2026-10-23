@@ -1,6 +1,5 @@
 //! Filter OSC files by tag expressions while preserving all delete actions.
 
-use std::io;
 use std::path::Path;
 
 use flate2::write::GzEncoder;
@@ -399,8 +398,7 @@ fn finalize_current(
 fn write_filtered_osc(output: &crate::output::Output, filtered: &FilteredOsc) -> Result<()> {
     // Deliberately gzip every OSC output regardless of its name. Inferring the
     // transport from an extension would change this command's output contract.
-    let file = output.create()?;
-    let gz = GzEncoder::new(io::BufWriter::new(file), flate2::Compression::fast());
+    let gz = GzEncoder::new(output.writer()?, flate2::Compression::fast());
     let mut writer = Writer::new_with_indent(gz, b' ', 2);
 
     writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
@@ -460,14 +458,10 @@ fn write_filtered_osc(output: &crate::output::Output, filtered: &FilteredOsc) ->
     }
 
     writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
-    // Finish the gzip stream, then take the buffer apart checked: dropping a
-    // `BufWriter` swallows its final flush error, and a publication after an
-    // unreported short write would put a truncated file in place.
+    // Finish the gzip stream, then the output's writer, whose checked flush
+    // is what lets the output be published.
     let gz = writer.into_inner();
-    let buf = gz.finish()?;
-    let file = buf.into_inner().map_err(io::IntoInnerError::into_error)?;
-    file.sync_all()?;
-    Ok(())
+    gz.finish()?.finish()
 }
 
 // The local `write_node` / `write_way` / `write_relation` /

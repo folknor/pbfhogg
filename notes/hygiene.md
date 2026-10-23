@@ -355,7 +355,6 @@ tuples used in about 67 places across 13 files.
   dedupe's "failed to scan block IDs"; the read-path decode-panic error, which
   holds `blob.offset()` and the path and names neither, on a 2.5 M-blob
   planet; geocode reader validation errors (no record index or directory).
-- `main` prints `Error: {e}` without the `source()` chain.
 
 Fix: the writer owns its `PathBuf` and wraps every escaping error once
 (`WriteError { path, backend, source }`); `open_input(path)` /
@@ -393,31 +392,6 @@ that fails when a `.rs` file under `src/write/` is missing from the funnel's
 `SOURCES`.
 
 Reported by: altw and scanning, write path.
-
-## HYG-029 - The leftover scan has coverage gaps
-
-Anger: 3 - report-only code.
-
-Scratch is one per-run directory and leftovers are reported, never reaped
-(`decisions/0018`). What the scan does not reach, because it lists one
-directory per command (each output's directory and `--tmp-dir`):
-
-- `extract --config` outputs: the CLI scans only the top-level `-o` parent, so
-  leftovers beside config-named destinations in other directories are not
-  reported before the run.
-- Scratch that older versions left beside a `diff` input (`diff-par-*`) or
-  inside an old geocode index directory (`.buckets-level*`, under a
-  `.pbfhogg-tmp-*` staging directory or in a published index): the first sits
-  in a directory no current command looks at, the second inside an entry.
-- A `.pbfhogg-run-*` directory on a filesystem where `flock` is local-only
-  (some NFS mounts) is judged by the lock alone and may be reported while a
-  live run on another host holds it.
-
-Fix, if it matters: have `extract --config` collect its destination
-directories before reserving outputs and scan each; a `pbfhogg inspect
---leftovers <dir>` style explicit scan for the rest.
-
-Reported by: re-encoding, altw and scanning, geocode index, CLI and plumbing.
 
 ## HYG-032 - Record layouts are serialised by hand at both ends
 
@@ -832,8 +806,8 @@ Reported by: test harness, CLI and plumbing.
 
 Anger: 8 - clippy.toml with expect_used denied means hundreds of edits.
 
-`clippy.toml` exists but carries only the output choke point
-(`disallowed-methods` on the path-writing `std::fs` methods, allowed
+`clippy.toml` exists but carries only the filesystem choke points for
+output publication and run scratch (`disallowed-methods`, allowed
 workspace-wide and denied in `src/commands/` and the CLI);
 `disallowed-types` and `disallowed-macros` are unused; `expect_used`, `print_stderr`, `print_stdout`,
 `arithmetic_side_effects`, `panic`, `unreachable` and `exit` are not enabled;
@@ -913,4 +887,19 @@ Progress, presumably; never Warning) and how it interacts with the two
 existing flags is the maintainer's call.
 
 Reported by: split out of the diagnostic-wording item.
+
+## HYG-110 - Which OSMHeader wins in a multi-header input is decided per command
+
+Anger: 5 - malformed-input policy, no hot-path cost.
+
+A PBF with more than one OSMHeader blob is malformed, and commands disagree
+on what to do with it. `getid`'s header walk and streaming path keep the
+first and ignore the rest. Altw's `passthrough::build_schedule` documents
+"the first OsmHeader blob is consumed" but overwrites `header_bytes` on every
+header, so it keeps the last. Other commands were not surveyed. Fix: one
+policy, first wins or refuse with a located error naming the second header,
+owned by the header walker rather than each caller, and a test feeding a
+two-header input through every command that builds an output header.
+
+Reported by: the output-publication review fixes.
 

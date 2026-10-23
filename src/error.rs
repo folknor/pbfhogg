@@ -504,14 +504,41 @@ pub enum OutputError {
     /// file, a hard link), and this filesystem offers neither.
     ExclusivePublishUnsupported { path: PathBuf, source: io::Error },
     /// The output *was* published; syncing its directory failed, so its
-    /// survival across a crash is unconfirmed.
-    Unsynced { path: PathBuf, source: io::Error },
+    /// survival across a crash is unconfirmed. Every previous output the
+    /// publication moved aside is kept, never removed, at the paths in
+    /// `kept`; `kept_synced` is false when syncing one of those backups
+    /// failed as well, so their own durability is unconfirmed too.
+    Unsynced {
+        path: PathBuf,
+        source: io::Error,
+        kept: Vec<PathBuf>,
+        kept_synced: bool,
+    },
+    /// The destination's name, or a directory on the way to it, is one of
+    /// the names pbfhogg leaves behind (`component`): an output is never
+    /// written as, or inside, a staging entry, a backup or a run directory.
+    ReservedName { path: PathBuf, component: PathBuf },
+    /// A directory output to be replaced holds entries pbfhogg never deletes
+    /// (a backup, a staging entry, a run directory, possibly live, or an
+    /// older version's scratch), which replacing the directory would delete
+    /// with it. Nothing was installed.
+    HoldsLeftovers {
+        path: PathBuf,
+        entries: Vec<PathBuf>,
+    },
     /// Publishing failed and undoing it failed too. Each entry says what was
     /// left where; nothing it names was deleted.
     RollbackIncomplete {
         unresolved: Vec<String>,
         source: Error,
     },
+    /// Publication was reached without a finished writing session: no writer
+    /// was ever opened on the output, or its writer was never finished, was
+    /// dropped, or reported an error. Nothing was installed.
+    Unfinished { path: PathBuf },
+    /// The staging entry is no longer the file reserved for this output, so
+    /// what was synced is not what would be installed. Nothing was installed.
+    StagingReplaced { path: PathBuf },
 }
 
 impl fmt::Display for OutputError {
@@ -559,19 +586,79 @@ impl fmt::Display for OutputError {
                  the filesystem supports neither an exclusive rename nor, for a file, a hard link",
                 path.display()
             ),
-            Self::Unsynced { path, .. } => write!(
+            Self::Unsynced {
+                path,
+                kept,
+                kept_synced,
+                ..
+            } => write_unsynced(f, path, kept, *kept_synced),
+            Self::ReservedName { path, component } => write!(
                 f,
-                "output {} was published, but syncing its directory failed, so it may not \
-                 survive a crash",
-                path.display()
+                "output {} is refused: {} is a name pbfhogg uses for its own staging, backups \
+                 or scratch, and an output is never written as or inside one",
+                path.display(),
+                component.display()
+            ),
+            Self::HoldsLeftovers { path, entries } => write!(
+                f,
+                "output directory {} cannot be replaced: it holds {}, which replacing it would \
+                 delete. pbfhogg never deletes these (a backup can be the only copy of a \
+                 previous output, a run directory can be in use); move or remove them yourself \
+                 first",
+                path.display(),
+                join_paths(entries)
             ),
             Self::RollbackIncomplete { unresolved, .. } => write!(
                 f,
                 "publishing the output failed and could not be fully undone: {}",
                 unresolved.join("; ")
             ),
+            Self::Unfinished { path } => write!(
+                f,
+                "output {} was not published: no writer finished it (none was opened, it was \
+                 not finished, or it reported an error)",
+                path.display()
+            ),
+            Self::StagingReplaced { path } => write!(
+                f,
+                "output {} was not published: its staging file was replaced while the run wrote it",
+                path.display()
+            ),
         }
     }
+}
+
+fn join_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn write_unsynced(
+    f: &mut fmt::Formatter,
+    path: &std::path::Path,
+    kept: &[PathBuf],
+    kept_synced: bool,
+) -> fmt::Result {
+    write!(
+        f,
+        "output {} was published, but syncing its directory failed, so it may not survive a \
+         crash",
+        path.display()
+    )?;
+    if !kept.is_empty() {
+        write!(
+            f,
+            "; the previous output it replaced is kept at {} and pbfhogg will not remove it",
+            join_paths(kept)
+        )?;
+        if !kept_synced {
+            f.write_str(", though syncing that copy failed too")?;
+        }
+    }
+    Ok(())
 }
 
 /// An error that occurs when decoding a blob.
@@ -654,7 +741,8 @@ impl From<Error> for io::Error {
                 | OutputError::NotAFile { .. }
                 | OutputError::NotADirectory { .. }
                 | OutputError::MountPoint { .. }
-                | OutputError::InvalidPath { .. },
+                | OutputError::InvalidPath { .. }
+                | OutputError::ReservedName { .. },
             ) => io::ErrorKind::InvalidInput,
             _ => io::ErrorKind::Other,
         };

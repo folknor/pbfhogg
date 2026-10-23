@@ -49,7 +49,12 @@ mod geocode_pass3 {
                     input_path: input.clone(),
                     ..Default::default()
                 },
-                index_output(&index_dir, pbfhogg::Overwrite::Refuse).expect("stage output"),
+                index_output(
+                    &index_dir,
+                    pbfhogg::Overwrite::Refuse,
+                    &pbfhogg::host::Diagnostics::discard(),
+                )
+                .expect("stage output"),
                 &crate::common::test_host(),
                 crate::common::scratch_in(dir.path()),
             )

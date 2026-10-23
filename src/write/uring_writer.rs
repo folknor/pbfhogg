@@ -431,14 +431,17 @@ impl UringState {
     }
 
     /// Flush the current partial buffer, drain all in-flight writes,
-    /// truncate to logical size, and sync to disk.
-    fn flush_final(&mut self, file: &File) -> Result<()> {
+    /// truncate to logical size, and (when `finish` is durable) sync to disk.
+    /// A deferred finish leaves the sync to the output's owner.
+    fn flush_final(&mut self, file: &File, finish: super::Finish) -> Result<()> {
         self.submit_current()?;
         self.drain()?;
         file.set_len(self.logical_size)?;
-        let t_sync = std::time::Instant::now();
-        file.sync_all()?;
-        WRITER_METRICS.record_sync_all(t_sync);
+        if finish == super::Finish::Durable {
+            let t_sync = std::time::Instant::now();
+            file.sync_all()?;
+            WRITER_METRICS.record_sync_all(t_sync);
+        }
         Ok(())
     }
 }
@@ -574,11 +577,12 @@ pub(crate) fn uring_writer_thread(
     framed_header: Vec<u8>,
     init_tx: SyncSender<Result<()>>,
     expected: &SeqTotal,
+    finish: super::Finish,
 ) -> Result<()> {
     // A failure is not logged here: it is the thread's return value, which the
     // writer's `flush` (or the failed send that noticed the thread was gone)
     // hands to the caller, so the operator sees it exactly once.
-    uring_init_and_run(&rx, &path, &framed_header, &init_tx, expected)
+    uring_init_and_run(&rx, &path, &framed_header, &init_tx, expected, finish)
 }
 
 /// Refuse, as a typed platform refusal, a ring whose kernel cannot run
@@ -625,6 +629,7 @@ fn uring_init_and_run(
     framed_header: &[u8],
     init_tx: &SyncSender<Result<()>>,
     expected: &SeqTotal,
+    finish: super::Finish,
 ) -> Result<()> {
     // Step 1: Allocate buffer pool.
     let pool = AlignedBufferPool::new(NUM_BUFS, IO_BUF_BYTES)?;
@@ -725,7 +730,7 @@ fn uring_init_and_run(
     uring_main_loop(rx, &mut state, expected)?;
 
     // Step 9: Flush and finalize.
-    state.flush_final(&file)?;
+    state.flush_final(&file, finish)?;
 
     Ok(())
 }

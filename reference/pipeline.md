@@ -76,8 +76,15 @@ Output modes:
 Each syncs its output when `flush()` completes. `PbfWriter::to_path_sync()`
 is the synchronous counterpart: no pipeline and no executor, compression on
 the calling thread into a 256 KiB buffer it owns, and the same sync on
-`flush()`. Multi-extract uses it for every region output. `PbfWriter::new()`
-wraps a caller-owned `Write` and only calls its `flush`.
+`flush()`. `PbfWriter::new()` wraps a caller-owned `Write` and only calls its
+`flush`.
+
+Command-layer writers are different: they write an `Output`'s staging file
+(`Output::pbf_writer` on any of the backends above, and multi-extract's
+synchronous per-region writers over their staged files), finish the file at
+`flush()` without syncing it, and leave the `fsync` to the output's
+publication, which runs after the command's phase markers have ended
+(ADR-0017).
 
 Special: raw passthrough for unmodified blobs via `write_raw()` / `write_raw_chunks()` - zero decompression/recompression, uses `copy_file_range` on Linux.
 

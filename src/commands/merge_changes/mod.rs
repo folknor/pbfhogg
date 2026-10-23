@@ -5,7 +5,6 @@
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -513,18 +512,9 @@ fn gz_requested(destination: &Path) -> bool {
     destination.to_str().is_some_and(|s| s.ends_with(".gz"))
 }
 
-/// Finish an output file: flush the buffer checked (dropping a `BufWriter`
-/// swallows its last write error) and sync, so the file is complete before
-/// it is published.
-fn finish_file(buf: io::BufWriter<File>) -> Result<()> {
-    let file = buf.into_inner().map_err(io::IntoInnerError::into_error)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-impl OscWriter<io::BufWriter<File>> {
+impl OscWriter<crate::output::OutputWriter> {
     fn from_output(output: &crate::output::Output, is_gz: bool) -> Result<Self> {
-        let buf = io::BufWriter::new(output.create()?);
+        let buf = output.writer()?;
         if is_gz {
             Ok(Self::Gz(Box::new(Writer::new_with_indent(
                 GzEncoder::new(buf, flate2::Compression::fast()),
@@ -541,7 +531,7 @@ impl OscWriter<io::BufWriter<File>> {
             Self::Gz(w) => w.into_inner().finish()?,
             Self::Plain(w) => w.into_inner(),
         };
-        finish_file(buf)
+        buf.finish()
     }
 }
 
@@ -650,7 +640,7 @@ fn write_streaming(
     let window = rayon::current_num_threads().max(1);
     let prelude = build_prelude_bytes(is_gz)?;
     let postlude = build_postlude_bytes(is_gz)?;
-    let mut out = io::BufWriter::new(output.create()?);
+    let mut out = output.writer()?;
     out.write_all(&prelude)?;
     let mut count = 0u64;
     // The per-member drain overlaps this span; DRAIN below is the postlude.
@@ -665,7 +655,7 @@ fn write_streaming(
     crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_END");
     crate::debug::emit_marker("MERGECHANGES_DRAIN_START");
     out.write_all(&postlude)?;
-    finish_file(out)?;
+    out.finish()?;
     crate::debug::emit_marker("MERGECHANGES_DRAIN_END");
     crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_START");
     crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_END");
@@ -988,13 +978,13 @@ fn write_simplified(
     crate::debug::emit_marker("MERGECHANGES_DRAIN_START");
     let prelude = build_prelude_bytes(is_gz)?;
     let postlude = build_postlude_bytes(is_gz)?;
-    let mut out = io::BufWriter::new(output.create()?);
+    let mut out = output.writer()?;
     out.write_all(&prelude)?;
     for bytes in &all_chunks {
         out.write_all(bytes)?;
     }
     out.write_all(&postlude)?;
-    finish_file(out)?;
+    out.finish()?;
     crate::debug::emit_marker("MERGECHANGES_DRAIN_END");
     crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_START");
     crate::debug::emit_marker("MERGECHANGES_WRITE_FINISH_END");
@@ -1104,7 +1094,11 @@ mod tests {
                 let output = scratch.path().join(name);
                 merge_changes(
                     &inputs,
-                    crate::output::Output::new(&output, crate::output::Overwrite::Replace)?,
+                    crate::output::Output::new(
+                        &output,
+                        crate::output::Overwrite::Replace,
+                        &crate::host::Diagnostics::discard(),
+                    )?,
                     false,
                     Some(jobs),
                     false,
@@ -1121,7 +1115,7 @@ mod tests {
     }
 
     fn write_gz(path: &Path, xml: &str) {
-        let file = File::create(path).unwrap();
+        let file = std::fs::File::create(path).unwrap();
         let mut enc = GzEncoder::new(file, flate2::Compression::fast());
         enc.write_all(xml.as_bytes()).unwrap();
         enc.finish().unwrap();
@@ -1150,7 +1144,12 @@ mod tests {
 
         let err = merge_changes(
             &[&input],
-            crate::output::Output::new(&dest, crate::output::Overwrite::Replace).unwrap(),
+            crate::output::Output::new(
+                &dest,
+                crate::output::Overwrite::Replace,
+                &crate::host::Diagnostics::discard(),
+            )
+            .unwrap(),
             false,
             Some(1),
             false,
@@ -1185,7 +1184,12 @@ mod tests {
 
         merge_changes(
             &[&input],
-            crate::output::Output::new(&dest, crate::output::Overwrite::Refuse).unwrap(),
+            crate::output::Output::new(
+                &dest,
+                crate::output::Overwrite::Refuse,
+                &crate::host::Diagnostics::discard(),
+            )
+            .unwrap(),
             false,
             Some(1),
             false,
@@ -1222,7 +1226,12 @@ mod tests {
         std::fs::write(&dest, b"stale").unwrap();
         let stats = merge_changes(
             &[&input],
-            crate::output::Output::new(&dest, crate::output::Overwrite::Replace).unwrap(),
+            crate::output::Output::new(
+                &dest,
+                crate::output::Overwrite::Replace,
+                &crate::host::Diagnostics::discard(),
+            )
+            .unwrap(),
             false,
             Some(1),
             false,

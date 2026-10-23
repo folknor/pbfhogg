@@ -795,7 +795,12 @@ fn extract_multi_complete_ways_non_indexed_parity() {
         pbfhogg::commands::extract::extract_multi(
             input,
             &regions(),
-            pbfhogg::OutputSet::files(paths, pbfhogg::Overwrite::Refuse).expect("stage outputs"),
+            pbfhogg::OutputSet::files(
+                paths,
+                pbfhogg::Overwrite::Refuse,
+                &pbfhogg::host::Diagnostics::discard(),
+            )
+            .expect("stage outputs"),
             pbfhogg::commands::extract::ExtractStrategy::CompleteWays,
             true,
             &pbfhogg::cat::CleanAttrs::default(),

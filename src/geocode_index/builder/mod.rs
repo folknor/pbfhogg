@@ -194,10 +194,24 @@ pub struct BuildStats {
 ///   measured peak memory and host are recorded in `reference/performance.md`
 ///   ("build-geocode-index"). A host with less memory than that record shows
 ///   needs those intermediates moved to temp files.
-#[hotpath::measure]
 pub fn build_geocode_index(
     config: &BuildConfig,
     output: IndexOutput,
+    host: &crate::host::Host,
+    scratch: crate::scratch::RunScratch,
+) -> Result<BuildStats> {
+    let stats = build_geocode_index_to(config, &output, host, scratch)?;
+    output.0.publish()?;
+    Ok(stats)
+}
+
+/// [`build_geocode_index`] up to, and not including, publication. The
+/// profiler span sits here so it ends where the work ends: the fsync and the
+/// directory swap that follow are the output's, not the build's.
+#[hotpath::measure]
+fn build_geocode_index_to(
+    config: &BuildConfig,
+    output: &IndexOutput,
     host: &crate::host::Host,
     scratch: crate::scratch::RunScratch,
 ) -> Result<BuildStats> {
@@ -206,10 +220,14 @@ pub fn build_geocode_index(
     // The generation is built inside the output's staging directory, on
     // inodes of its own: publication swaps the whole directory, so a failed
     // build never truncates the files an already-open Reader has mapped,
-    // and the previous index survives every failure.
-    let stats = build_generation(config, output.0.path(), host, &scratch)?;
+    // and the previous index survives every failure. The writer is finished
+    // only once the build returned with every file it wrote closed.
+    let writer = output.0.writer()?;
+    let stats = build_generation(config, writer.path(), host, &scratch)?;
+    writer.finish();
+    // The run scratch goes before publication: its removal is the run's
+    // cleanup, and publication only syncs and renames the index.
     drop(scratch);
-    output.0.publish()?;
     Ok(stats)
 }
 
@@ -251,7 +269,11 @@ fn refuse_scratch_inside_index(
 /// only an index, or an empty directory, may be replaced. Publication swaps
 /// the whole directory, so anything else in it would be deleted with it;
 /// overwrite permission replaces an index, never an arbitrary directory.
-/// Run when the output is built and again immediately before publication.
+/// Run when the output is built and again immediately before publication,
+/// after the output layer's own rule for every directory it replaces: one
+/// that holds anything pbfhogg never deletes (a backup, staging, a run
+/// directory, an older version's scratch) is refused whatever this says, and
+/// only an index's `.buckets-level*` trees go with it.
 ///
 /// # Errors
 /// An invalid-argument error naming the directory when it holds anything
@@ -270,7 +292,8 @@ pub fn replaceable_index_dir(destination: &std::path::Path) -> Result<()> {
     )))
 }
 
-/// Check and stage the output for an index at `destination`.
+/// Check and stage the output for an index at `destination`;
+/// `diagnostics` receives its cleanup warnings.
 ///
 /// # Errors
 /// As [`OutputDir::new`](crate::output::OutputDir::new), plus
@@ -278,9 +301,15 @@ pub fn replaceable_index_dir(destination: &std::path::Path) -> Result<()> {
 pub fn index_output(
     destination: impl AsRef<std::path::Path>,
     overwrite: crate::output::Overwrite,
+    diagnostics: &crate::host::Diagnostics,
 ) -> Result<IndexOutput> {
-    crate::output::OutputDir::new(destination, overwrite, Some(replaceable_index_dir))
-        .map(IndexOutput)
+    crate::output::OutputDir::new(
+        destination,
+        overwrite,
+        Some(replaceable_index_dir),
+        diagnostics,
+    )
+    .map(IndexOutput)
 }
 
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]

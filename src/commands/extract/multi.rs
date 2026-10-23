@@ -121,8 +121,8 @@ pub(super) fn try_extract_multi_single_pass(
     };
     let spatial_filter = spatial_blob_filter(&union_bbox);
 
-    // Open N sync-mode writers. Each owns a 256 KiB buffer and synchronizes
-    // its output at the final flush. All N outputs are compressed serially on
+    // Open N sync-mode writers. Each owns a 256 KiB buffer; publication
+    // syncs each staged output after the final flush. All N outputs are compressed serially on
     // the consumer thread. Switching to the parallel writer was tried and
     // reverted on 2026-08-20: two interleaved Denmark 5-region pairs came out
     // with opposite signs (parallel/sync 1200/1100 ms, then 501/1101 ms), which
@@ -141,8 +141,10 @@ pub(super) fn try_extract_multi_single_pass(
             };
             hb.sorted()
         })?;
-        let mut w = PbfWriter::to_path_sync(output.path(), compression)
-            .map_err(|e| e.context(format!("failed to create {}", display_path.display())))?;
+        let completion = output.begin_write()?;
+        let mut w = PbfWriter::to_staged_file(output.path(), compression)
+            .map_err(|e| e.context(format!("failed to create {}", display_path.display())))?
+            .with_completion(completion);
         w.write_header(&header_bytes).map_err(|e| {
             e.context(format!(
                 "failed to write header to {}",

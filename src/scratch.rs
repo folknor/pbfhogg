@@ -26,10 +26,30 @@
 //! `flock(2)` for its whole life, and a `READY` marker created once that lock
 //! is held. The kernel drops the lock when the process dies, so a lock that
 //! can be taken is evidence the owner is gone that does not depend on pid
-//! reuse. It is still only evidence: network filesystems may lock locally, and
-//! a forked child can keep the lock alive. A scanner takes the lock only when
-//! `READY` exists, never creates `LOCK`, and releases it before measuring, so
-//! scanning can never stall or fail a run that is starting.
+//! reuse. It is still only evidence: a forked child can keep the lock alive,
+//! and network filesystems behave differently (below). A scanner takes the
+//! lock only when `READY` exists, never creates `LOCK`, opens it read-write
+//! (an exclusive lock needs a descriptor open for writing on NFS, where
+//! `flock` is carried out as a whole-file POSIX lock), and releases it before
+//! measuring, so scanning can never stall or fail a run that is starting.
+//! Only "the lock was taken" counts as evidence the owner is gone; any probe
+//! failure other than "held" (permissions, an unexpected file type, a lock
+//! the filesystem refuses) leaves liveness unknown, and such a directory is
+//! recorded as an issue, never as stale.
+//!
+//! Known limits on network filesystems, accepted:
+//! - An NFS mount with `local_lock=flock` or `local_lock=all` (or an NFSv3
+//!   mount with `nolock`) keeps `flock` local to each client. A live run on
+//!   another host is then invisible: this host takes the lock, and the
+//!   directory is reported as probably stale while it is in use.
+//! - A client that loses its lock (an NFSv4 lease that expired while the
+//!   client was cut off from the server) no longer protects its run
+//!   directory, with the same result.
+//!
+//! The report only ever says "probably" and nothing is deleted. No probe can
+//! establish liveness across hosts, so the scan does not try: the answer is
+//! to point `--tmp-dir` at a local filesystem or to check a reported
+//! directory before deleting it.
 //!
 //! # Finding leftovers
 //!
@@ -37,12 +57,16 @@
 //! [`report_stale`] renders it as diagnostics. Nothing here ever deletes a
 //! leftover. A `.pbfhogg-backup-*` entry can hold the only copy of a user's
 //! previous output and is reported as its own kind.
+//!
+//! The exact names, and which of them an external tool may delete, are
+//! defined in `reference/cli-reference.md`, "Names pbfhogg leaves behind".
 
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
 use std::io;
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
@@ -411,6 +435,11 @@ pub enum StaleKind {
     /// A kept copy of a previous output (`.pbfhogg-backup-*`). This can be
     /// the only copy there is. It is reported and never deleted.
     OutputBackup,
+    /// Scratch an older geocode builder left inside an index directory
+    /// (`.buckets-level*`). Found by [`find_stale_in_index`]. Replacing the
+    /// index deletes it along with the old index, which is why it is its own
+    /// kind: the other kinds are never deleted by anything.
+    IndexScratch,
 }
 
 /// What was observed that makes a leftover probably stale. Each is an
@@ -420,11 +449,9 @@ pub enum StaleKind {
 pub enum Observation {
     /// The directory's lock could be taken: no live owner holds it.
     LockAvailable,
-    /// The directory has no usable lock yet or any more: a run still starting
-    /// or finishing, or one that died there.
+    /// The ownership handshake is incomplete: `READY` or `LOCK` is absent.
+    /// A run still starting or finishing, or one that died there.
     LockMissing,
-    /// Probing the lock failed with this OS error number.
-    LockProbeFailed(i32),
     /// The pid in the name does not exist in this process namespace. A run in
     /// another container or namespace sharing the volume would look the same.
     PidAbsent(u32),
@@ -468,13 +495,9 @@ impl fmt::Display for Observation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LockAvailable => f.write_str("its lock is not held"),
-            Self::LockMissing => {
-                f.write_str("it has no lock file, so it is unfinished or abandoned")
-            }
-            Self::LockProbeFailed(errno) => write!(
-                f,
-                "its lock could not be probed ({})",
-                io::Error::from_raw_os_error(*errno)
+            Self::LockMissing => f.write_str(
+                "its READY or LOCK file is missing, so its owner never completed or already \
+                 undid the lock handshake: a run starting or finishing, or one that died there",
             ),
             Self::PidAbsent(pid) => write!(f, "no process {pid} exists here"),
             Self::PidPresent(pid) => write!(
@@ -531,6 +554,13 @@ impl fmt::Display for StaleScratch {
                  run is using it",
                 self.observation
             ),
+            StaleKind::IndexScratch => write!(
+                f,
+                "{path} is probably scratch left inside a geocode index by an older pbfhogg run \
+                 that did not finish ({size}; {}). pbfhogg does not remove it, but publishing a \
+                 replacement index deletes the old index directory, and this with it",
+                self.observation
+            ),
             StaleKind::OutputStaging => write!(
                 f,
                 "{path} is probably the hidden staging copy of an output a pbfhogg run did not \
@@ -548,6 +578,18 @@ impl fmt::Display for StaleScratch {
 #[must_use]
 pub fn find_stale(dir: &Path) -> StaleScan {
     let mut scan = StaleScan::default();
+    scan_dir(dir, false, &mut scan);
+    scan.stale.sort_by(|a, b| a.path.cmp(&b.path));
+    scan
+}
+
+/// Classify the entries directly inside `dir` into `scan`, and return the
+/// unclassified subdirectories (never followed through a symlink) for a
+/// caller that walks a tree. Classified entries are reported whole and never
+/// descended into. With `inside_index`, `.buckets-level*` trees are reported
+/// as [`StaleKind::IndexScratch`].
+fn scan_dir(dir: &Path, inside_index: bool, scan: &mut StaleScan) -> Vec<PathBuf> {
+    let mut subdirs = Vec::new();
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -555,7 +597,7 @@ pub fn find_stale(dir: &Path) -> StaleScan {
                 path: dir.to_path_buf(),
                 error: e.to_string(),
             });
-            return scan;
+            return subdirs;
         }
     };
     for entry in entries {
@@ -570,20 +612,47 @@ pub fn find_stale(dir: &Path) -> StaleScan {
             }
         };
         let name = entry.file_name();
-        let Some((kind, pid)) = classify(&name) else {
-            continue;
-        };
         let path = entry.path();
-        let observation = match kind {
-            StaleKind::RunDirectory => match probe_lock(&path) {
-                Probe::Live => continue,
-                Probe::Observed(o) => o,
-                Probe::Unexpected(error) => {
-                    scan.issues.push(ScanIssue { path, error });
-                    continue;
-                }
-            },
-            _ => pid_observation(pid),
+        let (kind, observation) = if is_geocode_staging(&name) {
+            let kind = classify_geocode_staging(&path, &mut scan.issues);
+            // The digits in the name are a sequence counter, not a pid.
+            (kind, Observation::NoOwnerRecorded)
+        } else if let Some((kind, pid)) = classify(&name) {
+            let observation = match kind {
+                StaleKind::RunDirectory => match probe_lock(&path) {
+                    Probe::Live => continue,
+                    Probe::Observed(o) => o,
+                    Probe::Unknown(detail) => {
+                        scan.issues.push(ScanIssue {
+                            path,
+                            error: format!(
+                                "whether a run is using this run directory is unknown \
+                                 ({detail}); pbfhogg does not remove it, and it must not be \
+                                 deleted while any run could be using it"
+                            ),
+                        });
+                        continue;
+                    }
+                },
+                _ => pid_observation(pid),
+            };
+            (kind, observation)
+        } else if inside_index
+            && name
+                .as_bytes()
+                .starts_with(LEGACY_BUCKETS_PREFIX.as_bytes())
+        {
+            (StaleKind::IndexScratch, Observation::NoOwnerRecorded)
+        } else {
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => subdirs.push(path),
+                Ok(_) => {}
+                Err(e) => scan.issues.push(ScanIssue {
+                    path,
+                    error: e.to_string(),
+                }),
+            }
+            continue;
         };
         let (observed_bytes, walk_complete) = walk_size(&path);
         scan.stale.push(StaleScratch {
@@ -593,6 +662,121 @@ pub fn find_stale(dir: &Path) -> StaleScan {
             walk_complete,
             observation,
         });
+    }
+    subdirs
+}
+
+/// The geocode builder before the output module staged a rebuild in
+/// `<parent>/.geocode-build-<n>` (`new/` the generation being built, `old/`
+/// the previous index while it was swapped), where `<n>` is a counter.
+const LEGACY_GEOCODE_STAGING_PREFIX: &str = ".geocode-build-";
+
+/// The `.buckets-level<N>` directories the geocode builder once made inside
+/// the directory it was building.
+const LEGACY_BUCKETS_PREFIX: &str = ".buckets-level";
+
+fn is_geocode_staging(name: &OsStr) -> bool {
+    name.as_bytes()
+        .strip_prefix(LEGACY_GEOCODE_STAGING_PREFIX.as_bytes())
+        .is_some_and(|rest| !rest.is_empty() && rest.iter().all(u8::is_ascii_digit))
+}
+
+/// Whether `name` is one of the names pbfhogg leaves behind (a run
+/// directory, an output's staging or backup, an older version's scratch or
+/// geocode staging). Matched on bytes: a staging or backup name keeps the
+/// destination's tail, which need not be UTF-8. `.buckets-level*` is not
+/// among them; it only means something inside an index.
+pub(crate) fn is_leftover_name(name: &OsStr) -> bool {
+    is_geocode_staging(name) || classify(name).is_some()
+}
+
+/// Every entry under `dir` (not `dir` itself) that no pbfhogg code path may
+/// delete: anything [`is_leftover_name`] recognises, whatever its liveness.
+/// Classified entries are listed whole and not descended into, nor are
+/// `.buckets-level*` trees (index scratch, which replacing an index may
+/// discard). Symlinks are never followed.
+///
+/// Used before anything is removed recursively: replacing a directory
+/// output, removing a replaced output's backup, and dropping a directory
+/// output's staging. A walk that cannot be completed is an error, because
+/// what it did not see cannot be shown to be deletable.
+pub(crate) fn protected_entries(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in fs::read_dir(&next)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if is_leftover_name(&name) {
+                found.push(entry.path());
+            } else if !name
+                .as_bytes()
+                .starts_with(LEGACY_BUCKETS_PREFIX.as_bytes())
+                && entry.file_type()?.is_dir()
+            {
+                pending.push(entry.path());
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// What an old geocode staging directory is. It can hold `old/`, which after
+/// an interrupted swap was the only copy of the previous index, so anything
+/// that cannot be shown to be plain scratch is classed as a backup. The
+/// candidate itself is inspected first and never traversed when it is not a
+/// real directory, so classification and measurement look at one object.
+fn classify_geocode_staging(path: &Path, issues: &mut Vec<ScanIssue>) -> StaleKind {
+    let mut uncertain = |error: String| {
+        issues.push(ScanIssue {
+            path: path.to_path_buf(),
+            error,
+        });
+        StaleKind::OutputBackup
+    };
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return StaleKind::OutputBackup,
+        Err(e) => return uncertain(e.to_string()),
+    }
+    match fs::symlink_metadata(path.join("old")) {
+        Ok(_) => StaleKind::OutputBackup,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => StaleKind::LegacyScratch,
+        Err(e) => uncertain(e.to_string()),
+    }
+}
+
+/// List what crashed runs left anywhere inside an index directory that is
+/// about to be replaced: everything [`find_stale`] recognises, at any depth,
+/// plus the `.buckets-level*` trees older geocode builders left there
+/// ([`StaleKind::IndexScratch`]). Classified entries are reported whole and
+/// not descended into.
+///
+/// Replacing an index refuses while any entry other than a `.buckets-level*`
+/// tree is in it (`OutputError::HoldsLeftovers`, live run directories
+/// included); the buckets are deleted with the old index, and the
+/// [`StaleKind::IndexScratch`] wording says so. Nothing is deleted here.
+/// `dir` is not followed if it is a symlink, and neither are its entries.
+#[must_use]
+pub fn find_stale_in_index(dir: &Path) -> StaleScan {
+    let mut scan = StaleScan::default();
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => {}
+        // Not a directory: nothing is inside it.
+        Ok(_) => return scan,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return scan,
+        Err(e) => {
+            scan.issues.push(ScanIssue {
+                path: dir.to_path_buf(),
+                error: e.to_string(),
+            });
+            return scan;
+        }
+    }
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        pending.extend(scan_dir(&next, true, &mut scan));
     }
     scan.stale.sort_by(|a, b| a.path.cmp(&b.path));
     scan
@@ -624,20 +808,18 @@ pub fn report_stale(diagnostics: &Diagnostics, scan: &StaleScan) {
 }
 
 /// The kind of leftover a directory entry name denotes, and the pid in it.
+/// Matched on bytes, so a name whose tail is not UTF-8 is still recognised.
 fn classify(name: &OsStr) -> Option<(StaleKind, Option<u32>)> {
-    let name = name.to_str()?;
-    if let Some(rest) = name.strip_prefix(RUN_PREFIX) {
-        return Some((StaleKind::RunDirectory, leading_pid(rest)));
-    }
-    if let Some(rest) = name.strip_prefix(STAGING_PREFIX) {
-        return Some((StaleKind::OutputStaging, leading_pid(rest)));
-    }
-    if let Some(rest) = name.strip_prefix(BACKUP_PREFIX) {
-        return Some((StaleKind::OutputBackup, leading_pid(rest)));
-    }
-    for prefix in [".pbfhogg-external-join-", ".pbfhogg-sparse-index-"] {
-        if let Some(rest) = name.strip_prefix(prefix) {
-            return Some((StaleKind::LegacyScratch, leading_pid(rest)));
+    let name = name.as_bytes();
+    for (prefix, kind) in [
+        (RUN_PREFIX, StaleKind::RunDirectory),
+        (STAGING_PREFIX, StaleKind::OutputStaging),
+        (BACKUP_PREFIX, StaleKind::OutputBackup),
+        (".pbfhogg-external-join-", StaleKind::LegacyScratch),
+        (".pbfhogg-sparse-index-", StaleKind::LegacyScratch),
+    ] {
+        if let Some(rest) = name.strip_prefix(prefix.as_bytes()) {
+            return Some((kind, leading_pid(rest)));
         }
     }
     for prefix in [
@@ -649,8 +831,8 @@ fn classify(name: &OsStr) -> Option<(StaleKind, Option<u32>)> {
         "derive-par-modifies-",
         "derive-par-deletes-",
     ] {
-        if let Some(rest) = name.strip_prefix(prefix)
-            && name.ends_with(".tmp")
+        if let Some(rest) = name.strip_prefix(prefix.as_bytes())
+            && name.ends_with(b".tmp")
         {
             return Some((StaleKind::LegacyScratch, leading_pid(rest)));
         }
@@ -658,9 +840,10 @@ fn classify(name: &OsStr) -> Option<(StaleKind, Option<u32>)> {
     None
 }
 
-fn leading_pid(rest: &str) -> Option<u32> {
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits
+fn leading_pid(rest: &[u8]) -> Option<u32> {
+    let len = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+    std::str::from_utf8(&rest[..len])
+        .ok()?
         .parse()
         .ok()
         .filter(|&pid| pid != 0 && i32::try_from(pid).is_ok())
@@ -687,25 +870,35 @@ fn pid_observation(pid: Option<u32>) -> Observation {
 enum Probe {
     /// The lock is held: a live run. Not reported.
     Live,
+    /// Something was observed that makes the directory probably stale.
     Observed(Observation),
-    Unexpected(String),
+    /// The probe could not tell; the text says why. Never reported as stale.
+    Unknown(String),
 }
 
+/// Probe a run directory's lock. Only a lock that could be taken
+/// (`LockAvailable`) or a missing handshake file (`LockMissing`) counts as an
+/// observation; every other outcome is `Unknown`, because a probe that
+/// failed says nothing about the owner. See the module docs, "Liveness", for
+/// what a successful probe cannot see on network filesystems.
 fn probe_lock(dir: &Path) -> Probe {
-    let ready = dir.join(READY_NAME);
-    match fs::symlink_metadata(&ready) {
-        Ok(meta) if meta.is_file() => {}
-        Ok(_) => return Probe::Unexpected(format!("{} is not a regular file", ready.display())),
-        Err(_) => return Probe::Observed(Observation::LockMissing),
+    for name in [READY_NAME, LOCK_NAME] {
+        let path = dir.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Probe::Unknown(format!("{} is not a regular file", path.display())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Probe::Observed(Observation::LockMissing);
+            }
+            Err(e) => return Probe::Unknown(format!("cannot inspect {}: {e}", path.display())),
+        }
     }
     let lock = dir.join(LOCK_NAME);
-    match fs::symlink_metadata(&lock) {
-        Ok(meta) if meta.is_file() => {}
-        Ok(_) => return Probe::Unexpected(format!("{} is not a regular file", lock.display())),
-        Err(_) => return Probe::Observed(Observation::LockMissing),
-    }
+    // Read-write, never create: on NFS `flock` is carried out as a POSIX
+    // lock, and an exclusive one needs a descriptor open for writing.
     let file = match fs::OpenOptions::new()
         .read(true)
+        .write(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&lock)
     {
@@ -714,14 +907,27 @@ fn probe_lock(dir: &Path) -> Probe {
             return Probe::Observed(Observation::LockMissing);
         }
         Err(e) => {
-            return Probe::Observed(Observation::LockProbeFailed(e.raw_os_error().unwrap_or(0)));
+            return Probe::Unknown(format!(
+                "cannot open {} for writing to probe its lock: {e}",
+                lock.display()
+            ));
         }
     };
+    // What was opened is what is judged: the check above can race with a
+    // replacement of the file.
+    match file.metadata() {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Probe::Unknown(format!("{} is not a regular file", lock.display())),
+        Err(e) => return Probe::Unknown(format!("cannot inspect {}: {e}", lock.display())),
+    }
     match flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
         // The lock is released as `file` drops, before anything is measured.
         Ok(()) => Probe::Observed(Observation::LockAvailable),
         Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => Probe::Live,
-        Err(e) => Probe::Observed(Observation::LockProbeFailed(e.raw_os_error().unwrap_or(0))),
+        Err(e) => Probe::Unknown(format!(
+            "probing the lock on {} failed: {e}",
+            lock.display()
+        )),
     }
 }
 
@@ -941,6 +1147,206 @@ mod tests {
         assert_eq!(
             fs::read(dir.join(format!("{BACKUP_PREFIX}999999-0.out.pbf"))).expect("backup"),
             b"previous"
+        );
+    }
+
+    #[test]
+    fn old_geocode_staging_is_told_apart_by_whether_it_holds_the_old_index() {
+        let parent = crate::path_guard::tests::scratch();
+        let dir = parent.path();
+        // A build that died: scratch only.
+        let plain = dir.join(".geocode-build-3");
+        fs::create_dir_all(plain.join("new").join(".buckets-level17")).expect("dirs");
+        fs::write(plain.join("new").join(".buckets-level17").join("b"), b"x").expect("bucket");
+        // A swap that died: the previous index may be the only copy.
+        let swap = dir.join(".geocode-build-4");
+        fs::create_dir_all(swap.join("old")).expect("dirs");
+        fs::write(swap.join("old").join("header"), b"index").expect("old index");
+        // A link is judged without being followed.
+        let target = dir.join("elsewhere");
+        fs::create_dir_all(target.join("old")).expect("dirs");
+        std::os::unix::fs::symlink(&target, dir.join(".geocode-build-5")).expect("link");
+        // Not a staging name.
+        fs::create_dir(dir.join(".geocode-build-notes")).expect("dir");
+        fs::create_dir(dir.join(".geocode-build-")).expect("dir");
+
+        let scan = find_stale(dir);
+        assert!(scan.issues.is_empty(), "{scan:?}");
+        let kinds: Vec<_> = scan
+            .stale
+            .iter()
+            .map(|s| (s.path.clone(), s.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                (plain.clone(), StaleKind::LegacyScratch),
+                (swap.clone(), StaleKind::OutputBackup),
+                (dir.join(".geocode-build-5"), StaleKind::OutputBackup),
+            ]
+        );
+        // The digits are a counter: no pid is read out of them.
+        assert!(
+            scan.stale
+                .iter()
+                .all(|s| s.observation == Observation::NoOwnerRecorded)
+        );
+        let swap_text = scan.stale[1].to_string();
+        assert!(swap_text.contains("only copy"), "{swap_text}");
+        assert!(
+            plain
+                .join("new")
+                .join(".buckets-level17")
+                .join("b")
+                .exists()
+        );
+        assert!(swap.join("old").join("header").exists());
+    }
+
+    #[test]
+    fn scratch_inside_an_index_directory_is_found_and_left_alone() {
+        let parent = crate::path_guard::tests::scratch();
+        let index = parent.path().join("index");
+        fs::create_dir_all(index.join(".buckets-level17")).expect("dirs");
+        fs::write(index.join(".buckets-level17").join("b"), vec![0_u8; 300]).expect("bucket");
+        fs::create_dir(index.join(".buckets-level21")).expect("dir");
+        fs::write(index.join("header"), b"index").expect("index file");
+        fs::write(index.join("buckets-level-notes"), b"mine").expect("unrelated");
+
+        let scan = find_stale_in_index(&index);
+        assert!(scan.issues.is_empty(), "{scan:?}");
+        assert_eq!(scan.stale.len(), 2, "{scan:?}");
+        assert!(scan.stale.iter().all(|s| s.kind == StaleKind::IndexScratch));
+        assert_eq!(scan.stale[0].path, index.join(".buckets-level17"));
+        assert!(scan.stale[0].observed_bytes >= 300);
+        let text = scan.stale[0].to_string();
+        assert!(text.contains("deletes the old index"), "{text}");
+        assert!(index.join(".buckets-level17").join("b").exists());
+        assert!(index.join("buckets-level-notes").exists());
+
+        // The plain scan of the same directory does not know these names.
+        assert!(find_stale(&index).stale.is_empty());
+        // Missing, plain-file and symlinked indexes hold nothing to report.
+        assert!(
+            find_stale_in_index(&parent.path().join("missing"))
+                .stale
+                .is_empty()
+        );
+        assert!(find_stale_in_index(&index.join("header")).stale.is_empty());
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&index, &link).expect("link");
+        assert!(find_stale_in_index(&link).stale.is_empty());
+    }
+
+    /// Inside an index the scan goes to any depth and recognises every kind,
+    /// not only the buckets; what it classifies it does not descend into.
+    #[test]
+    fn the_index_scan_classifies_everything_at_any_depth() {
+        let parent = crate::path_guard::tests::scratch();
+        let index = parent.path().join("index");
+        let deep = index.join("a").join("b");
+        fs::create_dir_all(&deep).expect("dirs");
+        let backup = deep.join(".pbfhogg-backup-999999-0.x");
+        fs::create_dir_all(backup.join(".pbfhogg-tmp-999999-1.y")).expect("backup");
+        let staging = index.join(".pbfhogg-tmp-999999-2.z");
+        fs::write(&staging, b"x").expect("staging");
+        let buckets = index.join("a").join(".buckets-level9");
+        fs::create_dir_all(&buckets).expect("buckets");
+        let scan = find_stale_in_index(&index);
+        assert!(scan.issues.is_empty(), "{scan:?}");
+        let found: Vec<_> = scan
+            .stale
+            .iter()
+            .map(|s| (s.path.clone(), s.kind))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (staging.clone(), StaleKind::OutputStaging),
+                (buckets.clone(), StaleKind::IndexScratch),
+                (backup.clone(), StaleKind::OutputBackup),
+            ]
+        );
+        // The protected walk sees the same entries but the buckets.
+        assert_eq!(
+            protected_entries(&index).expect("walk"),
+            [staging, backup.clone()]
+        );
+        assert!(backup.exists());
+    }
+
+    /// Names are matched on bytes: a staging or backup name keeps the
+    /// destination's tail, which need not be UTF-8.
+    #[test]
+    fn a_name_that_is_not_utf8_is_still_classified() {
+        let mut name = b".pbfhogg-backup-999999-0.".to_vec();
+        name.push(0xff);
+        let name = OsStr::from_bytes(&name);
+        assert_eq!(
+            classify(name),
+            Some((StaleKind::OutputBackup, Some(999_999)))
+        );
+        assert!(is_leftover_name(name));
+        let mut legacy = b"diff-par-12-\xfe".to_vec();
+        legacy.extend_from_slice(b".tmp");
+        assert_eq!(
+            classify(OsStr::from_bytes(&legacy)),
+            Some((StaleKind::LegacyScratch, Some(12)))
+        );
+        assert!(!is_leftover_name(OsStr::new(".buckets-level17")));
+    }
+
+    /// A lock that cannot be probed says nothing about the owner: the
+    /// directory is an issue that says so, never a stale entry.
+    #[test]
+    fn a_lock_that_cannot_be_probed_leaves_liveness_unknown() {
+        // Root opens anything, so the probe cannot fail there.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let parent = crate::path_guard::tests::scratch();
+        let run = parent.path().join(".pbfhogg-run-999999-00");
+        fs::create_dir(&run).expect("dir");
+        fs::write(run.join(LOCK_NAME), b"").expect("lock");
+        fs::write(run.join(READY_NAME), b"").expect("ready");
+        // Not writable: the read-write probe cannot open it.
+        fs::set_permissions(
+            run.join(LOCK_NAME),
+            std::os::unix::fs::PermissionsExt::from_mode(0o400),
+        )
+        .expect("chmod");
+        let scan = find_stale(parent.path());
+        assert!(scan.stale.is_empty(), "{scan:?}");
+        assert_eq!(scan.issues.len(), 1, "{scan:?}");
+        assert_eq!(scan.issues[0].path, run);
+        assert!(scan.issues[0].error.contains("unknown"), "{scan:?}");
+        assert!(
+            scan.issues[0].error.contains("must not be deleted"),
+            "{scan:?}"
+        );
+    }
+
+    /// The lock a live run holds is seen through a read-write probe. (On a
+    /// local filesystem a read-only one would see it too; on NFS it would
+    /// fail with EBADF, which is why the probe opens for writing.)
+    #[test]
+    fn the_probe_opens_the_lock_for_writing() {
+        let parent = crate::path_guard::tests::scratch();
+        let live = RunScratch::create(parent.path(), &host()).expect("live");
+        assert!(matches!(probe_lock(live.path()), Probe::Live));
+        let src = include_str!("scratch.rs");
+        let probe = src
+            .split("fn probe_lock(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("probe_lock source");
+        assert!(
+            probe.contains(".write(true)"),
+            "the probe must open read-write"
+        );
+        assert!(
+            !probe.contains(".create("),
+            "the probe must never create LOCK"
         );
     }
 

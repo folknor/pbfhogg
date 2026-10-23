@@ -1500,7 +1500,12 @@ mod tests {
 
         let expressions = parse_expressions(&["amenity".to_owned()]).unwrap();
         let output = dir.path().join("output.pbf");
-        let staged = crate::output::Output::new(&output, crate::output::Overwrite::Refuse).unwrap();
+        let staged = crate::output::Output::new(
+            &output,
+            crate::output::Overwrite::Refuse,
+            &crate::host::Diagnostics::discard(),
+        )
+        .unwrap();
         tags_filter_single_pass(
             &input,
             &staged,

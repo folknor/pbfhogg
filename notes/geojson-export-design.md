@@ -26,7 +26,8 @@ folded into "Deferred / future work" below.
   (vertex-overlap), `--metadata`. Every feature carries `@id` and `@type`.
 - Hard-errors when ways are requested from input lacking `LocationsOnWays`
   (`--type node` works without it).
-- Sequential streaming, O(1) memory, PathGuard-protected `--output` file,
+- Sequential streaming, O(1) memory, `--output` published through the
+  library's staged output (`src/output.rs`),
   stats to stderr so stdout stays pipeable.
 
 ## Deferred / future work
@@ -62,8 +63,8 @@ enriched-input requirement) was resolved in ADR-0010 and the shipped code.
   `()`-returning closure cannot stop the decode, so v1 captures the first
   write/serialize error and surfaces it only after decoding to EOF (a
   consumer like `head` exiting does not abort the run early). A fallible
-  reader callback is the named follow-up; the file path is
-  PathGuard-protected so no partial file survives regardless.
+  reader callback is the named follow-up; the output is staged and only
+  published on success, so no partial file survives regardless.
 - **True bbox overlap for ways.** v1's way bbox filter is vertex-only and
   lossy: a way whose edge crosses the box with no vertex inside, or a
   polygon that encloses the whole box, is dropped. Real overlap / clipping

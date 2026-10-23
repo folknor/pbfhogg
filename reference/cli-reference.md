@@ -65,12 +65,17 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   the same way.
 - **Nothing appears under the output name until the run has succeeded.**
   The command writes a hidden staging file beside the output
-  (`.pbfhogg-tmp-<pid>-<n>.<name>`) and renames it into place after its
-  final flush; a failed run removes it, so a failed run leaves no file at
-  the output path and leaves an existing output untouched. A run killed
-  outright (SIGKILL, power loss) can leave the hidden staging file behind,
-  never a file under the output name. The output's directory must exist and
-  be writable.
+  (`.pbfhogg-tmp-<pid>-<n>.<name>`), syncs it and renames it into place after
+  its final flush; a run that fails before that removes it, so it leaves no
+  file at the output path and leaves an existing output untouched. A run
+  killed outright (SIGKILL, power loss) before publication can leave the
+  hidden staging file behind, never a file under the output name. The
+  rename itself is the last step, and the few failures possible after it are
+  reported as such: a directory sync that fails after the output was put in
+  place is an error that says the output *was* published (naming any backup
+  of a replaced output, which is then kept), and a group whose rollback
+  cannot complete names what is left where. The output's directory must
+  exist and be writable.
 - Without `--overwrite` publication is exclusive: an output that appears
   while the command runs is not replaced either. On a filesystem with
   neither an exclusive rename nor hard links, such a run fails at the end
@@ -108,11 +113,70 @@ directory, scratch left by older pbfhogg versions (`.pbfhogg-external-join-*`,
 file. Each line gives the size and why the entry is believed stale. That is a belief, not a
 proof: a run directory is judged by whether its `flock` is still held, other entries by whether the
 pid in the name exists, and a pid can be reused or belong to another container sharing the
-volume. Check before you delete.
+volume. Check before you delete. A run directory whose lock cannot be probed at all (another
+user's, an unexpected file type, a lock the filesystem refuses) is not reported as stale but as
+a `Note:` saying whether it is in use is unknown: do not delete it. On an NFS mount that keeps
+`flock` local to each client (`local_lock=flock` or `local_lock=all`, or NFSv3 with `nolock`)
+the lock cannot see a live run on another host, so such a run's directory may be reported while
+it is in use, as it may after a client lost its lock to an expired NFSv4 lease; keep `--tmp-dir`
+on a local filesystem when hosts share a directory.
+
+Each command also looks where older versions of the same command left their scratch:
+`extract --config` scans the directory of every output the config names (each directory
+once), `diff` also scans the old input's directory (`diff-par-*`; `--format osc` fragments of
+older versions sat beside the output, which is scanned anyway), and `build-geocode-index` also
+scans everything inside the existing index directory it is about to replace, at any depth,
+including `.buckets-level*` trees (and the parent for `.geocode-build-*` staging of earlier
+versions). A `.buckets-level*` tree inside an index is deleted along with the old index when
+`--overwrite` replaces it; the report says so. That is the only reported entry that
+publication removes: an index that holds anything else pbfhogg leaves behind (a backup, a
+staging entry, a run directory, live or not, an older version's scratch) is not replaced at
+all. `--overwrite` then fails before any work, naming the entries; move or remove them first.
+An output named like one of these names, or inside one, is refused the same way.
 
 A `.pbfhogg-backup-*` entry is reported with its own wording. It can be the only copy of a
 previous output, so pbfhogg never deletes one and you should look at it before removing it.
-Library callers get the same scan as typed values from `pbfhogg::scratch::find_stale`.
+If a backup cannot be removed after a successful replacement, the run still succeeds and
+prints a `Warning:` naming it. If the replacement's directory cannot be synced, the backup is
+kept rather than removed, and the error names it. Library callers get the same scan as typed values from
+`pbfhogg::scratch::find_stale` and `pbfhogg::scratch::find_stale_in_index`.
+
+### Names pbfhogg leaves behind
+
+The spellings below are the contract for an external tool (a benchmark harness that kills
+pbfhogg children, a cleanup job). `<pid>` is the pid of the pbfhogg process, `<seq>` a counter
+within it, `<dest name>` the last component of the output path (the last 200 bytes of it, when
+longer).
+
+| Name | What it is | An external tool may delete it |
+|------|-----------|--------------------------------|
+| `.pbfhogg-tmp-<pid>-<seq>.<dest name>` | Staging for an output, beside the destination: a file for file outputs, a directory (holding `new/`) for the geocode index. Never a file under the output name. | When no pbfhogg process is live that could own it (check `<pid>`; it is a hint only) |
+| `.pbfhogg-backup-<pid>-<seq>.<dest name>` | A directory holding the previous output, kept while a replacement is published, and kept for good when a rollback could not restore it, when syncing the replacement's directory failed (the error names it), when removing it after a successful replacement failed, or when something pbfhogg never deletes turned up inside it (a warning names it in the last two cases). | **Never without a human.** It can hold the only copy of the previous output |
+| `.pbfhogg-run-<pid>-<random>` | One run's scratch directory, in the output's directory or `--tmp-dir`. | When its lock is not held (below), and nothing is using it |
+
+A run directory holds a `LOCK` file, on which the owning process keeps an exclusive `flock(2)`
+for its whole life, and a `READY` file created after the lock was taken. The kernel drops the
+lock when the process dies. To test liveness, open `LOCK` read-write without creating it
+(`O_RDWR`, no `O_CREAT`; on NFS an exclusive `flock` is a POSIX write lock and fails with
+`EBADF` on a read-only descriptor) and try `flock(LOCK_EX | LOCK_NB)`: failure with
+`EWOULDBLOCK` means a live run; success means the owner is gone (release the lock at once).
+**Any other error**, from the open or the lock, means liveness is unknown: do not delete. A
+directory without `READY`, or without `LOCK`, is a run that is starting or one that died while
+starting or finishing; there is no lock to take, so treat it as live while any pbfhogg process
+could still be using that location. Never create `LOCK`. The lock is advisory: on an NFS mount
+that keeps `flock` local to each client (`local_lock=flock` or `local_lock=all`, NFSv3
+`nolock`) it says nothing about a run on another host, and a client whose NFSv4 lease expired
+has lost it.
+
+Names older versions used, which the scan still recognises and which are disposable once no
+pbfhogg process runs there: `.pbfhogg-external-join-<pid>*`, `.pbfhogg-sparse-index-<pid>*`
+(directories and files), `diff-par-<pid>*.tmp`, `derive-creates-<pid>*.tmp`,
+`derive-modifies-<pid>*.tmp`, `derive-deletes-<pid>*.tmp`, `derive-par-creates-<pid>*.tmp`,
+`derive-par-modifies-<pid>*.tmp`, `derive-par-deletes-<pid>*.tmp`, and, inside an index
+directory, `.buckets-level<N>`. The geocode staging of the previous version,
+`.geocode-build-<n>` (`<n>` a counter, not a pid), is disposable only when it has no `old/`
+inside: `old/` was the previous index during a swap and may be the only copy, so the scan
+reports it as a backup.
 
 ---
 

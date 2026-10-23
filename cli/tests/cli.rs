@@ -97,8 +97,12 @@ mod exit_code_walker {
         let dir = tempfile::tempdir().expect("tempdir");
         let existing = dir.path().join("out.osm.pbf");
         std::fs::write(&existing, b"user data").expect("write existing output");
-        let refused = pbfhogg::Output::new(&existing, pbfhogg::Overwrite::Refuse)
-            .expect_err("an existing output is refused");
+        let refused = pbfhogg::Output::new(
+            &existing,
+            pbfhogg::Overwrite::Refuse,
+            &pbfhogg::host::Diagnostics::discard(),
+        )
+        .expect_err("an existing output is refused");
         assert!(matches!(
             refused.kind(),
             pbfhogg::ErrorKind::Output(pbfhogg::OutputError::Exists { .. })

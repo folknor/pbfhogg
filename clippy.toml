@@ -23,6 +23,12 @@ disallowed-methods = [
     { path = "std::fs::remove_dir_all", reason = "scratch is removed with RunScratch::remove_tree or by its guard; outputs by crate::output" },
     { path = "std::fs::rename", reason = "outputs are published by crate::output" },
     { path = "std::fs::hard_link", reason = "outputs are published by crate::output" },
+    # An output file is finished by its writer (`OutputWriter::finish`, or the
+    # PBF writer's flush) and synced by `crate::output` at publication,
+    # through the writer-metrics funnel. A hand-rolled sync is a second owner
+    # of durability that the sidecar cannot see.
+    { path = "std::fs::File::sync_all", reason = "outputs are synced by crate::output at publication, through the writer-metrics funnel" },
+    { path = "std::fs::File::sync_data", reason = "outputs are synced by crate::output at publication, through the writer-metrics funnel" },
     { path = "std::process::id", reason = "scratch is named by its run directory, not by pid" },
     { path = "std::env::temp_dir", reason = "scratch goes where the caller put the run directory" },
 ]

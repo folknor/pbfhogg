@@ -586,8 +586,12 @@ mod tests {
         let query = parse_ids(&["n1".to_owned()]).expect("ids");
         let opts = GetparentsOptions { add_self: true };
         let output = dir.path().join("output.pbf");
-        let staged = crate::output::Output::new(&output, crate::output::Overwrite::Refuse)
-            .expect("stage output");
+        let staged = crate::output::Output::new(
+            &output,
+            crate::output::Overwrite::Refuse,
+            &crate::host::Diagnostics::discard(),
+        )
+        .expect("stage output");
         getparents_with_arm(
             &input,
             &staged,
@@ -613,8 +617,12 @@ mod tests {
         let walker = dir.path().join("walker.pbf");
         let pipelined = dir.path().join("pipelined.pbf");
         for (output, arm) in [(&walker, ScanArm::Walker), (&pipelined, ScanArm::FullScan)] {
-            let staged = crate::output::Output::new(output, crate::output::Overwrite::Refuse)
-                .expect("stage output");
+            let staged = crate::output::Output::new(
+                output,
+                crate::output::Overwrite::Refuse,
+                &crate::host::Diagnostics::discard(),
+            )
+            .expect("stage output");
             getparents_with_arm(
                 input,
                 &staged,
@@ -776,8 +784,12 @@ mod tests {
             (FULL_SCAN_ARM_MIN_BLOBS, ScanArm::Walker),
         ] {
             let output = dir.path().join(format!("out-{min_blobs}.pbf"));
-            let staged = crate::output::Output::new(&output, crate::output::Overwrite::Refuse)
-                .expect("stage output");
+            let staged = crate::output::Output::new(
+                &output,
+                crate::output::Overwrite::Refuse,
+                &crate::host::Diagnostics::discard(),
+            )
+            .expect("stage output");
             let (arm, _) = getparents_dispatched(
                 &input,
                 &staged,

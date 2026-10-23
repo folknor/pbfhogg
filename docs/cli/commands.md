@@ -42,11 +42,16 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   the same way.
 - **Nothing appears under the output name until the run has succeeded.**
   The command writes a hidden staging file beside the output
-  (`.pbfhogg-tmp-<pid>-<n>.<name>`) and renames it into place after its
-  final flush; a failed run removes it, so a failed run leaves no file at
-  the output path and leaves an existing output untouched. A run killed
-  outright (SIGKILL, power loss) can leave the hidden staging file behind,
-  never a file under the output name. The output's directory must exist and
+  (`.pbfhogg-tmp-<pid>-<n>.<name>`), syncs it and renames it into place after its
+  final flush; a run that fails before that removes it, so it leaves no file
+  at the output path and leaves an existing output untouched. A run killed
+  outright (SIGKILL, power loss) before publication can leave the hidden
+  staging file behind, never a file under the output name. The rename itself
+  is the last step, and the few failures possible after it are reported as
+  such: a directory sync that fails after the output was put in place is an
+  error that says the output *was* published (naming any backup of a
+  replaced output, which is then kept), and a group whose rollback cannot
+  complete names what is left where. The output's directory must exist and
   be writable.
 - Without `--overwrite` publication is exclusive: an output that appears
   while the command runs is not replaced either. On a filesystem with
@@ -85,11 +90,32 @@ directory, scratch left by older pbfhogg versions (`.pbfhogg-external-join-*`,
 file. Each line gives the size and why the entry is believed stale. That is a belief, not a
 proof: a run directory is judged by whether its `flock` is still held, other entries by whether the
 pid in the name exists, and a pid can be reused or belong to another container sharing the
-volume. Check before you delete.
+volume. Check before you delete. A run directory whose lock cannot be probed at all (another
+user's, an unexpected file type, a lock the filesystem refuses) is not reported as stale but as
+a `Note:` saying whether it is in use is unknown: do not delete it. On an NFS mount that keeps
+`flock` local to each client (`local_lock=flock` or `local_lock=all`, or NFSv3 with `nolock`)
+the lock cannot see a live run on another host, so such a run's directory may be reported while
+it is in use, as it may after a client lost its lock to an expired NFSv4 lease; keep `--tmp-dir`
+on a local filesystem when hosts share a directory.
+
+Each command also looks where older versions of the same command left their scratch:
+`extract --config` scans the directory of every output the config names (each directory
+once), `diff` also scans the old input's directory (`diff-par-*`; `--format osc` fragments of
+older versions sat beside the output, which is scanned anyway), and `build-geocode-index` also
+scans everything inside the existing index directory it is about to replace, at any depth,
+including `.buckets-level*` trees (and the parent for `.geocode-build-*` staging of earlier
+versions). A `.buckets-level*` tree inside an index is deleted along with the old index when
+`--overwrite` replaces it; the report says so. An index that holds anything else pbfhogg leaves
+behind (a backup, a staging entry, a run directory, live or not, an older version's scratch) is
+not replaced at all: `--overwrite` fails before any work, naming the entries. An output named
+like one of these names, or inside one, is refused the same way.
 
 A `.pbfhogg-backup-*` entry is reported with its own wording. It can be the only copy of a
 previous output, so pbfhogg never deletes one and you should look at it before removing it.
-Library callers get the same scan as typed values from `pbfhogg::scratch::find_stale`.
+If a backup cannot be removed after a successful replacement, the run still succeeds and
+prints a `Warning:` naming it. If the replacement's directory cannot be synced, the backup is
+kept rather than removed, and the error names it. Library callers get the same scan as typed values from
+`pbfhogg::scratch::find_stale` and `pbfhogg::scratch::find_stale_in_index`.
 
 ---
 

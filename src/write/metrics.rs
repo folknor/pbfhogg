@@ -130,6 +130,17 @@ impl WriterMetrics {
         self.sync_all_calls.fetch_add(1, Relaxed);
     }
 
+    /// `fsync` `file` and record it through [`record_sync_all`]
+    /// (Self::record_sync_all), success or failure. The one way publication
+    /// (`crate::output`) syncs a staged file or a directory, so those syncs
+    /// show up in the sidecar like the writers' own.
+    pub(crate) fn sync_recorded(&self, file: &std::fs::File) -> std::io::Result<()> {
+        let start = std::time::Instant::now();
+        let result = file.sync_all();
+        self.record_sync_all(start);
+        result
+    }
+
     /// Record time spent blocked in a writer-thread `recv`.
     ///
     /// Feeds `brokkr sidecar --stalls` via the `writer_recv_wait_ns`

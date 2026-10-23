@@ -671,7 +671,12 @@ mod tests {
         let error = merge(
             &base,
             &osc,
-            crate::output::Output::new(&base, crate::output::Overwrite::Replace).unwrap(),
+            crate::output::Output::new(
+                &base,
+                crate::output::Overwrite::Replace,
+                &crate::host::Diagnostics::discard(),
+            )
+            .unwrap(),
             &MergeOptions::default(),
             &HeaderOverrides::default(),
             &crate::host::Host::for_tests(),

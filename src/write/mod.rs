@@ -104,6 +104,24 @@ pub mod writer;
 
 pub use options::{OutputBackend, WriteOptions};
 
+/// What a pipelined writer does at end of stream beyond finishing the file
+/// (draining, tail padding, truncation to the logical size).
+///
+/// Only the `fsync` differs. A writer driven by an [`Output`](crate::Output)
+/// is `Deferred`: the output's publication syncs the staged file, after every
+/// in-process timer has stopped, through the same
+/// [`WriterMetrics::record_sync_all`](metrics::WriterMetrics::record_sync_all)
+/// funnel. The public path constructors (`PbfWriter::to_path` and friends)
+/// stay `Durable`, because a library caller that owns the path has no
+/// publication to do it for them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Finish {
+    /// `fsync` as the last step of end of stream.
+    Durable,
+    /// Leave the `fsync` to the owner of the file.
+    Deferred,
+}
+
 /// Page size for alignment. 4096 is universally safe across Linux filesystems.
 pub(crate) const PAGE_SIZE: usize = 4096;
 

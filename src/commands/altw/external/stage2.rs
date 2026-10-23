@@ -201,6 +201,11 @@ impl SharedSlotBuckets {
             #[cfg(feature = "linux-direct-io")]
             {
                 use std::os::unix::io::AsRawFd;
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "scratch pages are written back so the fadvise below can drop them; \
+                              this is not an output sync"
+                )]
                 drop(w.get_ref().sync_data());
                 unsafe {
                     libc::posix_fadvise(w.get_ref().as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED)

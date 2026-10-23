@@ -242,11 +242,12 @@ pub(crate) fn parallel_writer_thread(
     framed_header: Vec<u8>,
     init_tx: SyncSender<Result<()>>,
     expected: &SeqTotal,
+    finish: super::Finish,
 ) -> Result<()> {
     // A failure is not logged here: it is the thread's return value, which the
     // writer's `flush` (or the failed send that noticed the thread was gone)
     // hands to the caller, so the operator sees it exactly once.
-    parallel_writer_thread_inner(rx, path, framed_header, init_tx, expected)
+    parallel_writer_thread_inner(rx, path, framed_header, init_tx, expected, finish)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -256,6 +257,7 @@ fn parallel_writer_thread_inner(
     framed_header: Vec<u8>,
     init_tx: SyncSender<Result<()>>,
     expected: &SeqTotal,
+    finish: super::Finish,
 ) -> Result<()> {
     let file = match File::create(&path) {
         Ok(f) => f,
@@ -288,9 +290,11 @@ fn parallel_writer_thread_inner(
         return Err(e.into());
     }
 
-    let t_sync = std::time::Instant::now();
-    file.sync_all()?;
-    WRITER_METRICS.record_sync_all(t_sync);
+    if finish == super::Finish::Durable {
+        let t_sync = std::time::Instant::now();
+        file.sync_all()?;
+        WRITER_METRICS.record_sync_all(t_sync);
+    }
 
     Ok(())
 }
@@ -718,7 +722,14 @@ mod tests {
         let seq_total = SeqTotal::new();
         let thread_total = seq_total.clone();
         let handle = std::thread::spawn(move || {
-            parallel_writer_thread(rx, path, header, init_tx, &thread_total)
+            parallel_writer_thread(
+                rx,
+                path,
+                header,
+                init_tx,
+                &thread_total,
+                crate::write::Finish::Durable,
+            )
         });
 
         // Wait for init.

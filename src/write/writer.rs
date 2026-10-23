@@ -12,6 +12,8 @@
 
 use crate::blob_meta;
 use crate::error::{Error, Result, panic_error};
+use crate::output::Completion;
+use crate::write::Finish;
 #[cfg(feature = "linux-direct-io")]
 use crate::write::copy_range::copy_range;
 use crate::write::file_writer::FileWriter;
@@ -62,6 +64,10 @@ const WRITER_CONSUMED: &str = "PbfWriter: the pipelined writer owns the output f
 /// Takes the join handle, so a later `flush()` will not try to join twice; the
 /// error it recovered has already been returned to the caller by then.
 fn pipeline_send_error(pipeline: &mut WritePipeline) -> Error {
+    // The failure is consumed here, so a later `flush` can no longer see it.
+    if let Some(completion) = &pipeline.completion {
+        completion.fail();
+    }
     match pipeline.join_handle.take() {
         Some(handle) => match handle.join() {
             Ok(Err(e)) => e,
@@ -155,6 +161,9 @@ pub struct PbfWriter<W: Write> {
     finished: bool,
     /// Scratch buffers for sync-mode blob framing (unused in pipelined mode).
     scratch: FrameScratch,
+    /// The writing session of the [`Output`](crate::Output) this writer
+    /// fills, if any; see [`PbfWriter::with_completion`].
+    completion: Option<Completion>,
 }
 
 impl PbfWriter<FileWriter> {
@@ -183,6 +192,7 @@ impl PbfWriter<FileWriter> {
             header_block_bytes,
             executor,
             Diagnostics::discard(),
+            Finish::Durable,
         )
     }
 
@@ -192,11 +202,12 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
         diagnostics: Diagnostics,
+        finish: Finish,
     ) -> Result<Self> {
         // The buffered backend's writer thread reports nothing.
         drop(diagnostics);
         let writer = FileWriter::buffered(path)?;
-        Self::start_pipeline(writer, compression, header_block_bytes, executor)
+        Self::start_pipeline(writer, compression, header_block_bytes, executor, finish)
     }
 
     /// Create a pipelined `PbfWriter` with `O_DIRECT` for page-cache-free writes.
@@ -217,6 +228,7 @@ impl PbfWriter<FileWriter> {
             header_block_bytes,
             executor,
             Diagnostics::discard(),
+            Finish::Durable,
         )
     }
 
@@ -227,11 +239,12 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
         diagnostics: Diagnostics,
+        finish: Finish,
     ) -> Result<Self> {
         // The O_DIRECT backend's writer thread reports nothing.
         drop(diagnostics);
         let writer = FileWriter::direct(path)?;
-        Self::start_pipeline(writer, compression, header_block_bytes, executor)
+        Self::start_pipeline(writer, compression, header_block_bytes, executor, finish)
     }
 
     /// Create a pipelined `PbfWriter` that uses io_uring for output I/O.
@@ -266,6 +279,7 @@ impl PbfWriter<FileWriter> {
             header_block_bytes,
             executor,
             Diagnostics::discard(),
+            Finish::Durable,
         )
     }
 
@@ -276,6 +290,7 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
         diagnostics: Diagnostics,
+        finish: Finish,
     ) -> Result<Self> {
         use crate::write::uring_writer;
 
@@ -297,6 +312,7 @@ impl PbfWriter<FileWriter> {
                 framed_header,
                 init_tx,
                 &thread_expected,
+                finish,
             )
         });
 
@@ -329,6 +345,7 @@ impl PbfWriter<FileWriter> {
             #[cfg(test)]
             finished: false,
             scratch: FrameScratch::new(),
+            completion: None,
         })
     }
 
@@ -354,6 +371,7 @@ impl PbfWriter<FileWriter> {
             header_block_bytes,
             executor,
             Diagnostics::discard(),
+            Finish::Durable,
         )
     }
 
@@ -363,6 +381,7 @@ impl PbfWriter<FileWriter> {
         header_block_bytes: &[u8],
         executor: Executor,
         diagnostics: Diagnostics,
+        finish: Finish,
     ) -> Result<Self> {
         use crate::write::parallel_writer;
 
@@ -382,6 +401,7 @@ impl PbfWriter<FileWriter> {
                 framed_header,
                 init_tx,
                 &thread_expected,
+                finish,
             )
         });
 
@@ -415,6 +435,7 @@ impl PbfWriter<FileWriter> {
             #[cfg(test)]
             finished: false,
             scratch: FrameScratch::new(),
+            completion: None,
         })
     }
 
@@ -424,6 +445,7 @@ impl PbfWriter<FileWriter> {
         compression: Compression,
         header_block_bytes: &[u8],
         executor: Executor,
+        finish: Finish,
     ) -> Result<Self> {
         // Write header synchronously before starting the pipeline.
         let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
@@ -434,7 +456,7 @@ impl PbfWriter<FileWriter> {
         let expected = SeqTotal::new();
         let thread_expected = expected.clone();
         let handle = std::thread::spawn(move || {
-            writer_thread(rx, FileOutputSink::new(writer), &thread_expected)
+            writer_thread(rx, FileOutputSink::new(writer, finish), &thread_expected)
         });
 
         Ok(PbfWriter {
@@ -445,6 +467,7 @@ impl PbfWriter<FileWriter> {
             #[cfg(test)]
             finished: false,
             scratch: FrameScratch::new(),
+            completion: None,
         })
     }
 }
@@ -473,6 +496,7 @@ impl<W: Write> PbfWriter<W> {
             #[cfg(test)]
             finished: true,
             scratch: FrameScratch::new(),
+            completion: None,
         }
     }
 
@@ -508,6 +532,33 @@ impl<W: Write> PbfWriter<W> {
         }
     }
 
+    /// Tie this writer to the writing session of the [`Output`](crate::Output)
+    /// it fills. The session finishes only when [`flush`](Self::flush)
+    /// succeeds; any failure the writer observes, or taking the inner writer
+    /// out, fails it for good, and publication then refuses the output.
+    #[must_use]
+    pub(crate) fn with_completion(mut self, completion: Completion) -> Self {
+        if let Some(pipeline) = self.pipeline.as_mut() {
+            pipeline.completion = Some(completion.clone());
+        }
+        self.completion = Some(completion);
+        self
+    }
+
+    /// Fail the output's session on any error a write reports, from wherever
+    /// in the method it came (a scan, a permit, framing, the write itself):
+    /// a caller that carries on past a lost blob must not be able to certify
+    /// the output with a later successful `flush`. A write after a successful
+    /// `flush` fails too, and fails the session with it.
+    fn poison_on_error<T>(&self, result: Result<T>) -> Result<T> {
+        if result.is_err()
+            && let Some(completion) = &self.completion
+        {
+            completion.fail();
+        }
+        result
+    }
+
     /// Write the `OSMHeader` blob. Must be the first blob in the file.
     ///
     /// Not needed when using [`to_path`](Self::to_path), which writes the
@@ -517,6 +568,7 @@ impl<W: Write> PbfWriter<W> {
     /// typically produced by [`HeaderBuilder::build`](crate::block_builder::HeaderBuilder::build).
     pub fn write_header(&mut self, header_block_bytes: &[u8]) -> Result<()> {
         let result = self.write_blob("OSMHeader", header_block_bytes);
+        let result = self.poison_on_error(result);
         if result.is_ok() {
             self.mark_pending();
         }
@@ -532,6 +584,11 @@ impl<W: Write> PbfWriter<W> {
     /// `block_bytes` is produced by [`BlockBuilder::take`](crate::block_builder::BlockBuilder::take).
     #[hotpath::measure]
     pub fn write_primitive_block(&mut self, block_bytes: &[u8]) -> Result<()> {
+        let result = self.write_primitive_block_unchecked(block_bytes);
+        self.poison_on_error(result)
+    }
+
+    fn write_primitive_block_unchecked(&mut self, block_bytes: &[u8]) -> Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
             // Acquire a dispatch permit before enqueuing new work on rayon.
             // This blocks the caller when `PIPELINE_DISPATCH_PERMITS` blocks
@@ -639,6 +696,11 @@ impl<W: Write> PbfWriter<W> {
     // supported writer operation, including for downstream fixture producers.
     #[hotpath::measure]
     pub fn write_primitive_block_no_indexdata(&mut self, block_bytes: &[u8]) -> Result<()> {
+        let result = self.write_primitive_block_no_indexdata_unchecked(block_bytes);
+        self.poison_on_error(result)
+    }
+
+    fn write_primitive_block_no_indexdata_unchecked(&mut self, block_bytes: &[u8]) -> Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
             // A framing closure already found the writer thread gone. Join
             // it now and return its real cause, rather than framing the rest
@@ -718,6 +780,18 @@ impl<W: Write> PbfWriter<W> {
     /// (`pbfhogg.WayMembers-v1`); all non-enrichment callers pass `None`.
     #[hotpath::measure]
     pub(crate) fn write_primitive_block_owned(
+        &mut self,
+        block_bytes: Vec<u8>,
+        index: blob_meta::BlobIndex,
+        tagdata: Option<&[u8]>,
+        way_members: Option<&[u8]>,
+    ) -> Result<()> {
+        let result =
+            self.write_primitive_block_owned_unchecked(block_bytes, index, tagdata, way_members);
+        self.poison_on_error(result)
+    }
+
+    fn write_primitive_block_owned_unchecked(
         &mut self,
         block_bytes: Vec<u8>,
         index: blob_meta::BlobIndex,
@@ -810,6 +884,11 @@ impl<W: Write> PbfWriter<W> {
     /// In pipelined mode, the data is sent directly to the writer thread
     /// (no rayon task needed since there is no compression work).
     pub fn write_raw(&mut self, raw_framed_bytes: &[u8]) -> Result<()> {
+        let result = self.write_raw_unchecked(raw_framed_bytes);
+        self.poison_on_error(result)
+    }
+
+    fn write_raw_unchecked(&mut self, raw_framed_bytes: &[u8]) -> Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
             // Hold a dispatch permit across the send so raw writes share the
             // dispatch bound with framing tasks. The send can still block;
@@ -848,6 +927,11 @@ impl<W: Write> PbfWriter<W> {
     /// owns the bytes and won't need them afterwards (e.g. merge passthrough
     /// with `std::mem::take`).
     pub fn write_raw_owned(&mut self, raw_framed_bytes: Vec<u8>) -> Result<()> {
+        let result = self.write_raw_owned_unchecked(raw_framed_bytes);
+        self.poison_on_error(result)
+    }
+
+    fn write_raw_owned_unchecked(&mut self, raw_framed_bytes: Vec<u8>) -> Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
             // Hold a dispatch permit across the send so raw writes share the
             // dispatch bound with framing tasks. The send can still block;
@@ -885,6 +969,11 @@ impl<W: Write> PbfWriter<W> {
     /// owned chunks. The writer thread writes each chunk sequentially.
     /// Used by passthrough coalescers to avoid `extend_from_slice` memcpy.
     pub fn write_raw_chunks(&mut self, chunks: Vec<Vec<u8>>) -> Result<()> {
+        let result = self.write_raw_chunks_unchecked(chunks);
+        self.poison_on_error(result)
+    }
+
+    fn write_raw_chunks_unchecked(&mut self, chunks: Vec<Vec<u8>>) -> Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
             // Hold a dispatch permit across the send so raw writes share the
             // dispatch bound with framing tasks. The send can still block;
@@ -931,8 +1020,10 @@ impl<W: Write> PbfWriter<W> {
     /// the output file". Calling `flush` twice is harmless.
     ///
     /// After successful writes, `flush` checks completion and reports deferred
-    /// errors. File-backed pipelines and [`to_path_sync`](PbfWriter::to_path_sync)
-    /// also sync the file (on Linux, a buffered
+    /// errors. The public file-backed constructors (`to_path*`,
+    /// [`to_path_sync`](PbfWriter::to_path_sync)) also sync the file; a writer
+    /// from [`Output::pbf_writer`](crate::Output::pbf_writer) does not, because
+    /// the output's publication syncs it (on Linux, a buffered
     /// target that does not support `fsync` - a FIFO, socket or character
     /// device such as `/dev/null` - is not an error); a synchronous writer
     /// created with `new` only calls its underlying `Write::flush`, which does
@@ -940,6 +1031,23 @@ impl<W: Write> PbfWriter<W> {
     /// but cannot report errors or a missing tail.
     #[hotpath::measure]
     pub fn flush(&mut self) -> Result<()> {
+        let result = self.flush_inner();
+        if let Some(completion) = &self.completion {
+            if result.is_ok() {
+                completion.finish();
+                // Finishing is terminal for a writer filling an output: a
+                // synchronous writer drops its inner writer (already flushed)
+                // so a later write fails instead of buffering bytes that the
+                // published file would not contain.
+                self.writer = None;
+            } else {
+                completion.fail();
+            }
+        }
+        result
+    }
+
+    fn flush_inner(&mut self) -> Result<()> {
         self.mark_finished();
         let t_flush = std::time::Instant::now();
         if let Some(mut pipeline) = self.pipeline.take() {
@@ -989,6 +1097,11 @@ impl<W: Write> PbfWriter<W> {
     /// Panics if the writer was consumed by a pipeline. This is a programming
     /// error (misuse of the API), not a runtime condition.
     pub fn into_inner(mut self) -> W {
+        // The inner writer leaves without end-of-stream finalization, so a
+        // writer filling an output can no longer certify it.
+        if let Some(completion) = &self.completion {
+            completion.fail();
+        }
         self.mark_finished();
         self.writer.take().expect("writer consumed by pipeline")
     }
@@ -1106,6 +1219,15 @@ impl<W: Write> PbfWriter<W> {
 }
 
 impl PbfWriter<BufWriter<File>> {
+    /// A synchronous writer over the staged file of an
+    /// [`Output`](crate::Output): like [`to_path_sync`](Self::to_path_sync),
+    /// but `flush` only flushes, because publication syncs the file.
+    pub(crate) fn to_staged_file(path: &Path, compression: Compression) -> Result<Self> {
+        let file = File::create(path)?;
+        let buffered = BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file);
+        Ok(Self::new(buffered, compression))
+    }
+
     /// Create a synchronous writer that owns a 256 KiB buffered output file.
     ///
     /// The returned writer has no header yet. Call
@@ -1185,6 +1307,16 @@ impl PbfWriter<FileWriter> {
     /// Callers must not use this when the output writer is O_DIRECT - use
     /// [`write_raw`](Self::write_raw) instead.
     pub fn write_raw_copy(
+        &mut self,
+        in_file: &std::sync::Arc<std::fs::File>,
+        offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        let result = self.write_raw_copy_unchecked(in_file, offset, len);
+        self.poison_on_error(result)
+    }
+
+    fn write_raw_copy_unchecked(
         &mut self,
         in_file: &std::sync::Arc<std::fs::File>,
         offset: u64,
@@ -1311,6 +1443,7 @@ mod tests {
             #[cfg(test)]
             finished: false,
             scratch: FrameScratch::new(),
+            completion: None,
         }
     }
 

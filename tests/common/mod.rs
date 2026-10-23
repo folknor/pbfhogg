@@ -42,15 +42,27 @@ pub use scratch::test_scratch;
 /// [`out_replace`].
 #[track_caller]
 pub fn out(path: impl AsRef<Path>) -> pbfhogg::Output {
-    pbfhogg::Output::new(path.as_ref(), pbfhogg::Overwrite::Refuse)
-        .unwrap_or_else(|e| panic!("stage output {}: {}", path.as_ref().display(), e.report()))
+    pbfhogg::Output::new(
+        path.as_ref(),
+        pbfhogg::Overwrite::Refuse,
+        // Not `test_host()`: that raises the process's descriptor limit,
+        // which the rlimit tests must observe unchanged.
+        &pbfhogg::host::Diagnostics::discard(),
+    )
+    .unwrap_or_else(|e| panic!("stage output {}: {}", path.as_ref().display(), e.report()))
 }
 
 /// An output at `path` that replaces whatever file is already there.
 #[track_caller]
 pub fn out_replace(path: impl AsRef<Path>) -> pbfhogg::Output {
-    pbfhogg::Output::new(path.as_ref(), pbfhogg::Overwrite::Replace)
-        .unwrap_or_else(|e| panic!("stage output {}: {}", path.as_ref().display(), e.report()))
+    pbfhogg::Output::new(
+        path.as_ref(),
+        pbfhogg::Overwrite::Replace,
+        // Not `test_host()`: that raises the process's descriptor limit,
+        // which the rlimit tests must observe unchanged.
+        &pbfhogg::host::Diagnostics::discard(),
+    )
+    .unwrap_or_else(|e| panic!("stage output {}: {}", path.as_ref().display(), e.report()))
 }
 
 /// Report a test that cannot run on this host and returns early.

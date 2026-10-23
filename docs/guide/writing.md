@@ -194,21 +194,25 @@ bb.add_node(1, 556_761_000, 125_683_000, [("name", "Copenhagen")], Some(&meta));
 The `to_path*` constructors write the path they are given, in place. To get the guarantees the commands give their outputs - an existing file refused unless replacing it was asked for, a symlink refused, nothing under the final name until the write has succeeded - write through a `pbfhogg::Output`:
 
 ```rust
+use pbfhogg::host::Diagnostics;
+use pbfhogg::write::OutputBackend;
 use pbfhogg::{Output, Overwrite};
 
-let output = Output::new("output.osm.pbf", Overwrite::Refuse)?; // checks, stages
-let mut writer = PbfWriter::to_path(
-    output.path(),            // the staging file beside output.osm.pbf
+// Checks the destination and stages it; cleanup trouble goes to the
+// diagnostics given here (`Diagnostics::discard()` to opt out).
+let output = Output::new("output.osm.pbf", Overwrite::Refuse, &host.diagnostics)?;
+let mut writer = output.pbf_writer(
     Compression::default(),
     &header_bytes,
-    Executor::Ambient,
+    OutputBackend::Buffered,  // or Parallel, Direct, Uring
+    &host,
 )?;
 // ... write blocks ...
-writer.flush()?;
-output.publish()?;            // renamed into place only now
+writer.flush()?;              // finishes the file; does not fsync
+output.publish()?;            // fsyncs, then renames into place
 ```
 
-Dropping the `Output` without publishing removes the staging file. The command entry points (`sort::sort`, `cat::cat`, ...) take an `Output` by value and publish it themselves.
+`Output::pbf_writer` opens the output's one writing session: the output is published only if that writer's `flush` succeeded and none of its writes failed. Writing to `Output::path` with a writer of your own is not published at all; for a format that is not PBF use `Output::writer`, an `std::io::Write` ended by `OutputWriter::finish`. Dropping the `Output` without publishing removes the staging file. The command entry points (`sort::sort`, `cat::cat`, ...) take an `Output` by value and publish it themselves.
 
 ### to_path - pipelined parallel compression
 

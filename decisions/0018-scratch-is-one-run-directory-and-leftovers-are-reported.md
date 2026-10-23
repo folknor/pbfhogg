@@ -40,16 +40,25 @@ staged beside their destination because publication is a rename.
   are gone.
 - **Liveness.** The guard holds an exclusive `flock` on `LOCK` for its whole
   life and creates `READY` after taking it. A scanner locks only when `READY`
-  exists, never creates anything, and releases the lock before measuring, so
-  scanning can neither fail nor stall a starting run. A held lock means live
-  and the entry is not reported. The pid in a name is a hint only.
+  exists, never creates anything, opens `LOCK` read-write (on NFS `flock` is
+  carried out as a whole-file POSIX lock, and an exclusive one on a
+  read-only descriptor fails with `EBADF`, which would make every live run
+  look stale), checks that what it opened is a regular file, and releases
+  the lock before measuring, so scanning can neither fail nor stall a
+  starting run. A held lock (`EWOULDBLOCK`) means live and the entry is not
+  reported. Only a lock that could be taken, or a missing `READY` or `LOCK`
+  (a handshake not completed or already undone), is an observation; every
+  other probe outcome (no permission to open the lock, an unexpected file
+  type, a lock the filesystem refuses) leaves liveness unknown, and the
+  directory is recorded as a scan issue that says not to delete it, never as
+  stale. The pid in a name is a hint only.
 - **Leftovers are reported, never reaped.** `scratch::find_stale(dir)` lists,
   directly inside one directory, run directories, the scratch names of older
   versions, output staging entries and output backups, as typed values (kind,
   observed bytes, whether the walk was complete, and an `Observation` such as
   `LockAvailable`, `LockMissing`, `PidAbsent(pid)`, `PidPresent(pid)`), with
   per-entry inspection failures kept apart from the findings. The observations
-  are what was seen, not proofs: network filesystems may lock locally, a forked
+  are what was seen, not proofs: network filesystems may lock locally (below), a forked
   child can keep a lock alive, and a pid can be reused or belong to another
   container sharing the volume; the rendered text says "probably". The CLI
   scans each output directory and `--tmp-dir` once, before it reserves any
@@ -57,6 +66,37 @@ staged beside their destination because publication is a rename.
   diagnostics sink (`scratch.stale`, and `scratch.backup` for backups).
   A `.pbfhogg-backup-*` entry can hold the only copy of a user's previous
   output: it is its own kind with its own wording, and no code path removes it.
+  Coverage follows where each command's older versions put their scratch:
+  `extract --config` scans the directory of every output the config names
+  (known only after parsing it, so before the outputs are reserved, each
+  directory once); `diff` also scans the old input's directory (`diff-par-*`
+  shards) and, with no output file, the current directory its own run
+  directory goes in (older versions of `diff --format osc` put their
+  `derive-*` fragments beside the output, which the output-directory scan
+  covers); `build-geocode-index` also scans, by `scratch::find_stale_in_index`,
+  everything inside the existing index directory at any depth - every kind
+  `find_stale` knows, plus `.buckets-level*` (kind `IndexScratch`) - and
+  recognises the previous version's `.geocode-build-<n>` staging siblings (a
+  backup when it holds `old/`, which may be the only copy of the previous
+  index, else legacy scratch). Names are matched on bytes, since a staging or
+  backup name keeps a destination tail that need not be UTF-8. A classified
+  entry is one entry whatever is inside it. The exact spellings are defined
+  in prose in `reference/cli-reference.md`, "Names pbfhogg leaves behind".
+  Replacing an index with `--overwrite` deletes the old index directory,
+  `.buckets-level*` trees in it included. That is accepted: replacing an
+  index wholesale is what was asked for, only an index or an empty directory
+  can be replaced, scratch is by definition not index content, and the
+  `IndexScratch` report says publication will delete it. It is the one reported
+  kind that anything removes. Every other kind inside a directory output
+  blocks its replacement outright (`OutputError::HoldsLeftovers`, ADR-0017),
+  live or not: the scan reports, the output layer refuses.
+  Network filesystems limit what the lock can say, accepted because the
+  report is worded as a belief and nothing is deleted: an NFS mount with
+  `local_lock=flock` or `local_lock=all` (or an NFSv3 mount with `nolock`)
+  keeps `flock` local to each client, so a live run on another host is
+  invisible and its directory is reported as probably stale; a client that
+  lost its lock (an NFSv4 lease that expired while it was cut off from the
+  server) no longer protects its directory either.
 - **Trust.** The scratch parent and the path to it are trusted and must stay
   stable for the run, as an output's parent is; operations are path based.
   A scratch location inside a directory that publication replaces is refused

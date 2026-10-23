@@ -425,7 +425,9 @@ pub(crate) fn writer_from_header(
 ///
 /// Takes the run's [`Output`](crate::output::Output) rather than a path: every
 /// backend writes the staging file, and only the command's single publication
-/// owner renames it into place.
+/// owner renames it into place. The writer is
+/// [`Output::pbf_writer`](crate::output::Output::pbf_writer): it holds the
+/// output's writing session and leaves the `fsync` to publication.
 pub(crate) fn writer_from_header_bytes(
     output: &crate::output::Output,
     compression: Compression,
@@ -433,59 +435,7 @@ pub(crate) fn writer_from_header_bytes(
     backend: OutputBackend,
     host: &crate::host::Host,
 ) -> Result<PbfWriter<FileWriter>> {
-    let output = output.path();
-    match backend {
-        OutputBackend::Uring => {
-            #[cfg(feature = "linux-io-uring")]
-            {
-                Ok(PbfWriter::to_path_uring_in(
-                    output,
-                    compression,
-                    header_bytes,
-                    host.executor.clone(),
-                    host.diagnostics.clone(),
-                )?)
-            }
-            #[cfg(not(feature = "linux-io-uring"))]
-            {
-                Err(Error::invalid_argument(
-                    "--io-uring requires the linux-io-uring feature",
-                ))
-            }
-        }
-        OutputBackend::Direct => {
-            #[cfg(feature = "linux-direct-io")]
-            {
-                Ok(PbfWriter::to_path_direct_in(
-                    output,
-                    compression,
-                    header_bytes,
-                    host.executor.clone(),
-                    host.diagnostics.clone(),
-                )?)
-            }
-            #[cfg(not(feature = "linux-direct-io"))]
-            {
-                Err(Error::invalid_argument(
-                    "--direct-io requires the linux-direct-io feature",
-                ))
-            }
-        }
-        OutputBackend::Parallel => Ok(PbfWriter::to_path_parallel_in(
-            output,
-            compression,
-            header_bytes,
-            host.executor.clone(),
-            host.diagnostics.clone(),
-        )?),
-        OutputBackend::Buffered => Ok(PbfWriter::to_path_in(
-            output,
-            compression,
-            header_bytes,
-            host.executor.clone(),
-            host.diagnostics.clone(),
-        )?),
-    }
+    output.pbf_writer(compression, header_bytes, backend, host)
 }
 
 /// Apply per-attribute cleaning to metadata. Returns `None` if all attributes

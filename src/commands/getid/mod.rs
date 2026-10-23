@@ -629,7 +629,9 @@ fn filter_by_id_walker(
         // the blob index and frame start it handed out.
         let locate = |e: Error| walker.locate_meta(&meta, e);
         match meta.blob_type {
-            BlobKind::OsmHeader => {
+            // The first header sets the output's; a later one is ignored,
+            // as on the streaming arm.
+            BlobKind::OsmHeader if writer.is_none() => {
                 walker
                     .pread_data(meta.data_offset, meta.data_size, &mut data_buf)
                     .map_err(locate)?;
@@ -1513,7 +1515,12 @@ mod tests {
             report_found: false,
         };
         let output = dir.path().join("output.pbf");
-        let staged = crate::output::Output::new(&output, crate::output::Overwrite::Refuse).unwrap();
+        let staged = crate::output::Output::new(
+            &output,
+            crate::output::Overwrite::Refuse,
+            &crate::host::Diagnostics::discard(),
+        )
+        .unwrap();
         getid_with_refs(
             &input,
             &staged,
@@ -1540,8 +1547,12 @@ mod tests {
         let walker = dir.path().join("walker.pbf");
         let full_scan = dir.path().join("full-scan.pbf");
         for (output, arm) in [(&walker, ScanArm::Walker), (&full_scan, ScanArm::FullScan)] {
-            let staged =
-                crate::output::Output::new(output, crate::output::Overwrite::Refuse).unwrap();
+            let staged = crate::output::Output::new(
+                output,
+                crate::output::Overwrite::Refuse,
+                &crate::host::Diagnostics::discard(),
+            )
+            .unwrap();
             filter_by_id(
                 input,
                 &staged,
@@ -1618,8 +1629,12 @@ mod tests {
             (FULL_SCAN_ARM_MIN_BLOBS, ScanArm::Walker),
         ] {
             let output = dir.path().join(format!("out-{min_blobs}.pbf"));
-            let staged =
-                crate::output::Output::new(&output, crate::output::Overwrite::Refuse).unwrap();
+            let staged = crate::output::Output::new(
+                &output,
+                crate::output::Overwrite::Refuse,
+                &crate::host::Diagnostics::discard(),
+            )
+            .unwrap();
             let (arm, _) = getid_dispatched(
                 &input,
                 &staged,

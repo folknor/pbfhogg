@@ -21,6 +21,7 @@ pub(crate) fn build_index(
     let output = pbfhogg::geocode_index::builder::index_output(
         output_dir,
         pbfhogg::Overwrite::from_flag(overwrite),
+        &host.diagnostics,
     )?;
     pbfhogg::geocode_index::builder::build_geocode_index(
         config,

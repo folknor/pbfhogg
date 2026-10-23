@@ -103,11 +103,12 @@ pub(crate) trait OutputSink {
 /// them to the underlying writer.
 pub(crate) struct FileOutputSink {
     writer: FileWriter,
+    finish: super::Finish,
 }
 
 impl FileOutputSink {
-    pub(crate) fn new(writer: FileWriter) -> Self {
-        Self { writer }
+    pub(crate) fn new(writer: FileWriter, finish: super::Finish) -> Self {
+        Self { writer, finish }
     }
 }
 
@@ -178,8 +179,14 @@ impl OutputSink for FileOutputSink {
     /// to be the same method on [`FileWriter`], which meant every incidental
     /// `flush()` anywhere bought an `fsync`; the sibling uring and parallel
     /// backends already `sync_all` by name at this point.
+    ///
+    /// A `Deferred` sink only finishes the file (for `O_DIRECT`, the tail
+    /// padding and truncation); its owner syncs it.
     fn flush(&mut self) -> Result<()> {
-        self.writer.sync()
+        match self.finish {
+            super::Finish::Durable => self.writer.sync(),
+            super::Finish::Deferred => Ok(self.writer.flush()?),
+        }
     }
 }
 
@@ -203,6 +210,11 @@ pub(super) struct WritePipeline {
     /// Where the framing closures run, and whether the producer is on one of
     /// its workers (see [`recv_permit`]).
     pub(super) executor: crate::host::Executor,
+    /// The output's writing session, when this writer is driven by an
+    /// [`Output`](crate::Output). A failure recovered from the writer thread
+    /// poisons it, so the later `flush` (which finds no thread left to join
+    /// and would otherwise succeed) cannot certify the output.
+    pub(super) completion: Option<crate::output::Completion>,
     /// Test hook: the framing closure for this seq panics before framing.
     #[cfg(feature = "test-hooks")]
     pub(super) framing_panic_at: Option<usize>,
@@ -227,6 +239,7 @@ impl WritePipeline {
             expected,
             writer_gone: WriterGone::new(),
             executor,
+            completion: None,
             #[cfg(feature = "test-hooks")]
             framing_panic_at: None,
         }

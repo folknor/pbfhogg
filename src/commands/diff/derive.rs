@@ -607,7 +607,7 @@ pub(crate) fn assemble_osc_from_paths(
     // Output can also be on a different filesystem from host-selected scratch.
     // A statvfs snapshot would not reserve capacity against concurrent writers;
     // propagate actual output write failures rather than promise a preflight.
-    let buf = io::BufWriter::new(output.create()?);
+    let buf = output.writer()?;
 
     // Gzip member count = ceil(total_uncompressed_bytes / chunk_size).
     // At planet scale (~45 GB of XML across the three temp files) that's
@@ -641,10 +641,7 @@ pub(crate) fn assemble_osc_from_paths(
     writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
 
     let gz = writer.into_inner();
-    let buf = gz.finish()?;
-    let file = buf.into_inner().map_err(io::IntoInnerError::into_error)?;
-    file.sync_all()?;
-    Ok(())
+    gz.finish()?.finish()
 }
 
 /// Copy a temp file's raw XML bytes into an action section.

@@ -132,7 +132,12 @@ mod grid_parity {
         extract_multi(
             input,
             &regions,
-            pbfhogg::OutputSet::files(&outputs, pbfhogg::Overwrite::Refuse).expect("stage outputs"),
+            pbfhogg::OutputSet::files(
+                &outputs,
+                pbfhogg::Overwrite::Refuse,
+                &pbfhogg::host::Diagnostics::discard(),
+            )
+            .expect("stage outputs"),
             ExtractStrategy::Simple,
             true,
             &CleanAttrs::default(),

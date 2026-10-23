@@ -440,7 +440,8 @@ leave them unless a specific counter implicates them.
 Unblocked in principle by the second-drive plan; still gated on the
 drive actually matching 990-PRO class (the 2026-04-22 probe regressed
 +30 % on the slower 970 EVO Plus - verify raw throughput before
-benching). Not pure config: `ScratchDir` is single-rooted, so this needs
+benching). Not pure config: the run scratch directory (`RunScratch`) is
+single-rooted, so this needs
 a small categorized-scratch change (id shards / slot buckets / payload
 tmps routed independently).
 
@@ -753,7 +754,7 @@ Load-bearing patterns; apply to any lead above.
 - **ReorderBuffer for parallel producer -> serialized consumer.** Used by
   stage 1 pass A receiver and the stage-4 consumer. Reuse, do not
   reinvent - including for N1(b)'s watermark and N3's ordered queue.
-- **ScratchDir for all temp files**; lifetime-tied cleanup. N5 will
+- **`RunScratch` for all temp files**; lifetime-tied cleanup. N5 will
   extend it with categorized roots - keep the drop-cleanup semantics per
   root.
 - **`#[hotpath::measure]` on functions > 1 ms wall**, annotate inner

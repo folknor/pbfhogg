@@ -40,7 +40,8 @@
 
 - **Library command entry points take a `pbfhogg::Output` instead of an
   output `&Path`, and publish it themselves.** `Output::new(path,
-  Overwrite::Refuse | Overwrite::Replace)` applies the rules above (refusals
+  Overwrite::Refuse | Overwrite::Replace, &diagnostics)` applies the rules
+  above (refusals
   are the typed `ErrorKind::Output(OutputError::Exists | Symlink | NotAFile
   | ...)`, whose text names no CLI flag) and stages the file; the entry point
   writes the staging file and renames it into place only when it succeeds,
@@ -61,6 +62,50 @@
   `BuildConfig` loses `output_dir`, `overwrite` and `force` (overwrite
   permission is the `OutputDir`'s; unindexed input is `allow_unindexed`).
   `path_guard::OutputFile` is gone.
+
+- **Publication syncs the output, and an output must be written through
+  one finished writing session to be published.** `Output::publish` (and the
+  `OutputDir` and `OutputSet` ones) now `fsync`s the staged file before
+  renaming it into place, so a writeback error stops the publication instead
+  of surfacing after the previous output is gone; the PBF writers the
+  commands use no longer sync at their own end of stream. An output is
+  written through `Output::pbf_writer` (a `PbfWriter` on the chosen
+  `OutputBackend`, finished by a successful `flush`), `Output::writer` (an
+  `OutputWriter` for anything else, replacing `Output::create`, which handed
+  out a bare `File`; finished by `OutputWriter::finish`) or
+  `OutputDir::writer` (a `DirWriter` whose `finish` declares the directory
+  complete). `publish` refuses, with `OutputError::Unfinished`, an output no
+  writer was opened on (writing to `Output::path` behind the session's back
+  is no longer published), one whose writer was not finished, and one whose
+  writer reported any error, even if the caller carried on. The public
+  `PbfWriter::to_path*` constructors still sync at `flush`.
+  `Output::before_publish` runs a callback when publication starts.
+  `Output::new`, `OutputDir::new`, `OutputSet::files` and
+  `builder::index_output` take the `Diagnostics` that cleanup trouble is
+  reported to (`output.cleanup` warnings), so it cannot be dropped by
+  omission; pass `Diagnostics::discard()` to opt out.
+
+- **Publication never deletes what pbfhogg never deletes.** An output named
+  like, or inside, a `.pbfhogg-tmp-*`, `.pbfhogg-backup-*` or
+  `.pbfhogg-run-*` entry (or an older version's scratch name) is refused
+  (`OutputError::ReservedName`). Replacing a directory output (the geocode
+  index) is refused before any work, and again before the swap, while
+  anything of that kind is anywhere inside it, live run directories
+  included (`OutputError::HoldsLeftovers`, naming the entries); before this,
+  `build-geocode-index --overwrite` deleted them with the old index. Only an
+  index's `.buckets-level*` scratch trees still go with it. A replaced
+  output's backup is made durable before the new output is put in place, and
+  removed only once the replacement's directory sync succeeded: when that
+  sync fails, `OutputError::Unsynced` now names the kept backups instead of
+  having already deleted them.
+
+- **`bench-merge`'s `elapsed_ms` stops before publication.** It measures the
+  merge, its write and its flush; the fsync, the rename and the directory sync
+  are outside it. Sidecar phase markers end before them too, and the new
+  `PUBLISH_START` / `PUBLISH_END` pair brackets them, so they show up in
+  `--durations` instead of inside the last phase. Wall-clock around the whole
+  process includes them, as it always did. Numbers recorded before this change
+  include the publication and are not comparable.
 
 - **Errors keep their kind and their cause end to end; `BoxResult` is gone.**
   The functions that returned `BoxResult` (the command entry points,
@@ -654,15 +699,28 @@
   `--tmp-dir`), with its size and why it is believed stale, and never removes
   any of them. A backup is worded separately: it can be the only copy of a
   previous output. The scan is also available to library callers as
-  `scratch::find_stale`, which returns typed values.
+  `scratch::find_stale`, which returns typed values. It also looks where older
+  versions of each command left scratch: every directory an
+  `extract --config` output goes in, the old input's directory for `diff`,
+  and for `build-geocode-index` everything inside the index directory it is
+  about to replace, at any depth (via `scratch::find_stale_in_index`, which
+  also reports older builders' `.buckets-level*` trees; `--overwrite` deletes
+  those with the old index, and the report says so), and the earlier
+  `.geocode-build-*` staging siblings. A backup that cannot be removed after
+  a successful replacement is reported as a warning instead of staying
+  silently. A run directory whose lock cannot be probed (another user's, an
+  unexpected file type, a lock the filesystem refuses) is reported as "in
+  use or not, unknown; do not delete", never as stale; the probe opens the
+  lock read-write, which NFS needs for an exclusive lock.
 
 - **`PbfWriter::to_path_sync`: synchronous file output that syncs on
   `flush()`.** It creates the file, owns a 256 KiB buffer and compresses on
   the calling thread, and `flush()` syncs the file like every pipelined
-  path constructor. `multi-extract` now writes each region through it, so
-  its outputs are synced when the command finishes (they were not before)
-  and each output gets a 256 KiB buffer instead of 8 KiB; allow for that
-  buffer per region when extracting hundreds of regions at once.
+  path constructor. `multi-extract` writes each region through the same
+  synchronous writer over its staged output, so its outputs are synced (at
+  publication) when the command finishes (they were not before) and each
+  output gets a 256 KiB buffer instead of 8 KiB; allow for that buffer per
+  region when extracting hundreds of regions at once.
   `PbfWriter::new` is unchanged: it only calls the wrapped writer's `flush`.
 
 - **`build-geocode-index` reports the data it drops.** Way node references

@@ -750,3 +750,186 @@ fn text_and_osc_outputs_follow_the_same_rules() {
     }
     assert!(scratch_leftovers(dir.path()).is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Who syncs: publication, never the writer
+// ---------------------------------------------------------------------------
+//
+// Command-layer PBF writers finish their files and leave the `fsync` to
+// publication (ADR-0017). Each run below arms the sidecar marker stream at a
+// regular file and reads two counters back: `writer_sync_all_calls`, every
+// fsync the process recorded, and `publish_sync_calls`, the share recorded
+// inside the publication span. Equal and at the expected count means the
+// writer synced nothing and publication synced every staged file plus each
+// parent once. A writer that went back to syncing at its own end of stream
+// makes the total exceed the publication share; a publication that stopped
+// syncing the file makes both fall short.
+
+/// The value of the last `@name=` counter in a marker stream.
+fn counter(events: &str, name: &str) -> Option<i64> {
+    let needle = format!(" @{name}=");
+    events
+        .lines()
+        .filter_map(|line| line.split_once(&needle).map(|(_, value)| value))
+        .next_back()
+        .map(|value| value.parse().unwrap())
+}
+
+/// Run the CLI with the marker stream armed; `None` when the run reports
+/// that the host lacks what `args` asked for (O_DIRECT, io_uring).
+fn run_with_markers(dir: &Path, label: &str, args: &[&str]) -> Option<String> {
+    let markers = dir.join(format!("{label}.markers"));
+    std::fs::write(&markers, []).unwrap();
+    let out = CliInvoker::new()
+        .env("BROKKR_MARKER_FIFO", &markers)
+        .args(args)
+        .run();
+    if out.is_o_direct_unsupported() || out.is_uring_unsupported() {
+        crate::common::skip(format!("{label}: the host lacks the requested I/O backend"));
+        return None;
+    }
+    assert!(out.status.success(), "{label}: {}", out.stderr_str());
+    Some(std::fs::read_to_string(&markers).unwrap())
+}
+
+#[track_caller]
+fn assert_publication_did_every_sync(events: &str, label: &str, expected: i64) {
+    let total = counter(events, "writer_sync_all_calls");
+    let published = counter(events, "publish_sync_calls");
+    assert_eq!(
+        published,
+        Some(expected),
+        "{label}: syncs inside the publication span\n{events}"
+    );
+    assert_eq!(
+        total,
+        Some(expected),
+        "{label}: every sync of the run, writer included\n{events}"
+    );
+    assert!(
+        counter(events, "publish_sync_ns").is_some_and(|ns| ns >= 0),
+        "{label}: publication's sync time\n{events}"
+    );
+    let start = events.find(" PUBLISH_START").expect("PUBLISH_START");
+    let end = events.find(" PUBLISH_END").expect("PUBLISH_END");
+    assert!(start < end, "{label}\n{events}");
+}
+
+fn empty_osc(dir: &Path) -> std::path::PathBuf {
+    let osc = dir.join("empty.osc");
+    std::fs::write(&osc, b"<osmChange version=\"0.6\"></osmChange>").unwrap();
+    osc
+}
+
+#[test]
+fn pbf_writers_leave_every_sync_to_publication() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("in.osm.pbf");
+    crate::common::write_base_pbf(&input);
+    let osc = empty_osc(dir.path());
+    let (input, osc) = (input.to_str().unwrap(), osc.to_str().unwrap());
+    let cat_out = dir.path().join("cat.osm.pbf");
+    let apply_out = dir.path().join("apply.osm.pbf");
+    // The buffered backend (`cat`) and the parallel one (apply-changes'
+    // default): one staged file and its parent each.
+    for (label, args) in [
+        ("cat", vec!["cat", input, "-o", cat_out.to_str().unwrap()]),
+        (
+            "apply-changes",
+            vec![
+                "apply-changes",
+                input,
+                osc,
+                "-o",
+                apply_out.to_str().unwrap(),
+            ],
+        ),
+    ] {
+        let events = run_with_markers(dir.path(), label, &args).unwrap();
+        assert_publication_did_every_sync(&events, label, 2);
+    }
+}
+
+/// `extract --config` writes every region through a synchronous writer and
+/// publishes them as one group: N staged files and their shared parent. A
+/// replaced member also makes its backup durable before the swap (its
+/// container and the parent), two more each.
+#[test]
+fn a_group_publication_does_every_sync_once() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("in.osm.pbf");
+    crate::common::write_base_pbf(&input);
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+    let config = dir.path().join("config.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[
+                {{"output":"a.osm.pbf","bbox":[0.0,0.0,1.0,1.0]}},
+                {{"output":"b.osm.pbf","bbox":[0.0,0.0,1.0,1.0]}},
+                {{"output":"c.osm.pbf","bbox":[0.0,0.0,1.0,1.0]}}]}}"#,
+            out_dir.display()
+        ),
+    )
+    .unwrap();
+    let args = [
+        "extract",
+        input.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+        "--simple",
+    ];
+    let events = run_with_markers(dir.path(), "fresh", &args).unwrap();
+    assert_publication_did_every_sync(&events, "fresh", 3 + 1);
+
+    // Replace all three: each backup adds its container and the parent.
+    let mut replace = args.to_vec();
+    replace.push("--overwrite");
+    let events = run_with_markers(dir.path(), "replace", &replace).unwrap();
+    assert_publication_did_every_sync(&events, "replace", 3 + 1 + 2 * 3);
+    // Staging and the three backups are all gone once the parent synced.
+    let left: Vec<_> = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".pbfhogg-"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+mod platform {
+    use super::*;
+
+    /// The O_DIRECT and io_uring backends leave the sync to publication
+    /// too: bypassing the page cache is not stable storage, and publication
+    /// syncs their files like any other.
+    #[test]
+    fn direct_and_uring_writers_leave_every_sync_to_publication() {
+        let dir = TempDir::new().unwrap();
+        let input = dir.path().join("in.osm.pbf");
+        crate::common::write_base_pbf(&input);
+        let osc = empty_osc(dir.path());
+        let (input, osc) = (input.to_str().unwrap(), osc.to_str().unwrap());
+        let mut flags: Vec<&str> = Vec::new();
+        #[cfg(feature = "linux-direct-io")]
+        flags.push("--direct-io");
+        #[cfg(feature = "linux-io-uring")]
+        flags.push("--io-uring");
+        for flag in flags {
+            let out = dir.path().join(format!("apply{flag}.osm.pbf"));
+            let args = [
+                "apply-changes",
+                input,
+                osc,
+                "-o",
+                out.to_str().unwrap(),
+                flag,
+            ];
+            let Some(events) = run_with_markers(dir.path(), flag, &args) else {
+                continue;
+            };
+            assert_publication_did_every_sync(&events, flag, 2);
+        }
+    }
+}

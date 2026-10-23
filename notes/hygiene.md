@@ -1615,24 +1615,6 @@ planet builds on record in `reference/performance.md`.
 
 Reported by: altw and scanning, geocode index, CLI and plumbing, test harness.
 
-## HYG-071 - Unit tests under `src/` still pick their own scratch
-
-Anger: 3 - unit-test scratch and test timeouts.
-
-Integration tests now share `common::test_scratch()` under the gitignored
-`data/test-scratch/`, and `path_guard.rs` / `tag_expr.rs` unit tests share
-`path_guard::tests::scratch()` on the same root. Unit-test scratch sites still
-choosing their own location: `diff/derive.rs`, `altw/sparse.rs`,
-`altw/external/stage3.rs`, `getparents`, `getid`, `merge_changes`,
-`extract/mod.rs`, `tags_filter/mod.rs`, `debug.rs`,
-`write/{file_writer,writer,direct_writer,parallel_writer}.rs`,
-`osc/{parse,write}.rs`, `read/{blob,header_walker}.rs`, `scan/classify.rs`.
-One implementation for both harnesses needs a shared file such as
-`tests/common/scratch.rs` included by both. Enforce with
-`disallowed-methods = ["std::env::temp_dir"]`.
-
-Reported by: test harness, change application, CLI and plumbing, read path.
-
 ## HYG-073 - Test skips outside the converted files still pass silently
 
 Anger: 6 - needs brokkr changes.

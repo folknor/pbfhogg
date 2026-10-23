@@ -574,7 +574,7 @@ mod tests {
 
     #[test]
     fn full_scan_writes_parents() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         fixture(&input);
         let query = parse_ids(&["n1".to_owned()]).expect("ids");
@@ -598,7 +598,7 @@ mod tests {
     /// Run the same query under both arms, assert they emit identical element
     /// sets, and return that common (sorted) ID list.
     fn ids_from_both_arms(input: &std::path::Path, query: &[&str], add_self: bool) -> Vec<i64> {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::path_guard::tests::scratch();
         let query: Vec<String> = query.iter().map(|s| (*s).to_owned()).collect();
         let query = parse_ids(&query).expect("ids");
         let opts = GetparentsOptions { add_self };
@@ -625,7 +625,7 @@ mod tests {
 
     #[test]
     fn walker_and_pipelined_arms_emit_the_same_elements() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         fixture(&input);
         // Plain parent query: the referencing way, not the queried node.
@@ -636,7 +636,7 @@ mod tests {
 
     #[test]
     fn arms_agree_on_empty_query_result() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         fixture(&input);
         assert!(ids_from_both_arms(&input, &["n999"], true).is_empty());
@@ -644,7 +644,7 @@ mod tests {
 
     #[test]
     fn arms_agree_on_single_data_blob_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], None, true);
         assert_eq!(ids_from_both_arms(&input, &["n1"], true), vec![1]);
@@ -652,7 +652,7 @@ mod tests {
 
     #[test]
     fn arms_agree_when_a_blob_lacks_indexdata() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], Some((10, &[1, 2])), false);
         assert_eq!(ids_from_both_arms(&input, &["n1"], false), vec![10]);
@@ -717,7 +717,7 @@ mod tests {
     /// references rel 100, not the queried node).
     #[test]
     fn node_query_scans_relation_blobs_for_relation_parents() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         write_rich_fixture(&input);
         assert_eq!(ids_from_both_arms(&input, &["n1"], false), vec![10, 100]);
@@ -728,7 +728,7 @@ mod tests {
     /// member. Without --add-self the queried way itself is not emitted.
     #[test]
     fn way_query_skips_way_blobs_but_finds_relation_parents() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         write_rich_fixture(&input);
         assert_eq!(ids_from_both_arms(&input, &["w10"], false), vec![100]);
@@ -738,7 +738,7 @@ mod tests {
     /// relation) and finds only the relation-of-relation parent.
     #[test]
     fn relation_query_scans_relation_blobs_only() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         write_rich_fixture(&input);
         assert_eq!(ids_from_both_arms(&input, &["r100"], false), vec![101]);
@@ -748,7 +748,7 @@ mod tests {
     /// appears alongside its way and relation parents from the other blobs.
     #[test]
     fn add_self_node_query_emits_node_and_all_parent_kinds() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         write_rich_fixture(&input);
         assert_eq!(ids_from_both_arms(&input, &["n1"], true), vec![1, 10, 100]);
@@ -756,7 +756,7 @@ mod tests {
 
     #[test]
     fn auto_dispatch_crosses_arms_at_the_injected_threshold() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         fixture(&input);
         let query = parse_ids(&["n1".to_owned()]).expect("ids");

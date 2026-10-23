@@ -1328,7 +1328,7 @@ mod tests {
     /// recovery path hit `.expect("writer consumed by pipeline")`.
     #[test]
     fn writing_after_flush_on_a_pipelined_writer_errors_instead_of_panicking() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("post-flush.osm.pbf");
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
         let mut w =
@@ -1430,7 +1430,7 @@ mod tests {
     fn a_queued_copy_range_outlives_the_callers_handle() {
         use std::sync::Arc;
 
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let input_path = dir.path().join("input.bin");
         let decoy_path = dir.path().join("decoy.bin");
         let out_path = dir.path().join("out.osm.pbf");
@@ -1481,7 +1481,7 @@ mod tests {
         use crate::write::metrics::WRITER_METRICS;
         use std::sync::atomic::Ordering::Relaxed;
 
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("durable.osm.pbf");
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
 
@@ -1561,7 +1561,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
         let block = [0x12u8, 0x00];
         let index = crate::blob_meta::BlobIndex {

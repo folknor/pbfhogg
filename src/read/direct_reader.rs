@@ -258,10 +258,8 @@ mod tests {
     #[test]
     fn direct_reader_reads_file() {
         // Write a test file with known content.
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("data")
-            .join("bench-tmp");
-        drop(std::fs::create_dir_all(&dir));
+        let scratch = crate::path_guard::tests::scratch();
+        let dir = scratch.path();
         let path = dir.join("direct_reader_test.bin");
 
         let data: Vec<u8> = (0..10000u32).flat_map(u32::to_le_bytes).collect();
@@ -273,7 +271,6 @@ mod tests {
         // Read back via DirectReader.
         let result = DirectReader::open(&path);
         drop(std::fs::remove_file(&path));
-        drop(std::fs::remove_dir(&dir));
 
         match result {
             Ok(mut reader) => {
@@ -291,10 +288,8 @@ mod tests {
 
         #[test]
         fn aligned_skip_rejects_a_target_past_eof() {
-            let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("data")
-                .join("bench-tmp");
-            std::fs::create_dir_all(&dir).expect("create fixture directory");
+            let scratch = crate::path_guard::tests::scratch();
+            let dir = scratch.path();
             let path = dir.join(format!(
                 "direct-reader-aligned-skip-{}.bin",
                 std::process::id()

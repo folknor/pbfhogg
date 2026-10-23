@@ -1320,7 +1320,7 @@ mod tests {
         let cut = last_payload_start + 3;
         assert!(cut < last_payload_end, "cut must land inside the payload");
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("shape4.osm.pbf");
         std::fs::write(&path, &full[..cut as usize]).unwrap();
         (dir, path)

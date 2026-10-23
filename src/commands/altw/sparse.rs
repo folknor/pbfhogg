@@ -434,7 +434,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sparse_store_precheck_reports_insufficient_space_before_mapping() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let file = std::fs::File::create(dir.path().join("store")).unwrap();
         let err = super::preallocate_sparse_file(&file, dir.path(), u64::MAX)
             .expect_err("impossible allocation must be rejected");
@@ -454,7 +454,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn failed_preallocation_leaves_no_file_in_scratch() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         super::open_anonymous_sparse_file(
             dir.path(),
             u64::MAX,
@@ -476,7 +476,7 @@ mod tests {
     /// design, held open only through the returned descriptor.
     #[test]
     fn successful_allocation_unlinks_the_store() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let file = super::open_anonymous_sparse_file(
             dir.path(),
             4096,

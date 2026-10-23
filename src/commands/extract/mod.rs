@@ -1332,7 +1332,7 @@ mod tests {
 
     #[test]
     fn parse_geojson_bare_polygon() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let json = r#"{
             "type": "Polygon",
             "coordinates": [
@@ -1387,7 +1387,7 @@ mod tests {
 
     #[test]
     fn parse_geojson_feature() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let json = r#"{
             "type": "Feature",
             "properties": {},
@@ -1406,7 +1406,7 @@ mod tests {
 
     #[test]
     fn parse_geojson_feature_collection() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let json = r#"{
             "type": "FeatureCollection",
             "features": [{
@@ -1438,7 +1438,7 @@ mod tests {
 
     #[test]
     fn parse_geojson_rejects_out_of_domain_ring_coordinate() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let path = write_temp_geojson(
             &dir,
             "bad-domain.geojson",
@@ -1456,7 +1456,7 @@ mod tests {
 
     #[test]
     fn parse_geojson_multipolygon() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let json = r#"{
             "type": "MultiPolygon",
             "coordinates": [
@@ -1482,7 +1482,7 @@ mod tests {
 
     #[test]
     fn parse_geojson_antimeridian_polygon() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let json = r#"{
             "type": "Polygon",
             "coordinates": [
@@ -1501,7 +1501,7 @@ mod tests {
 
     #[test]
     fn parse_geojson_invalid_type() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let json = r#"{
             "type": "Point",
             "coordinates": [10.0, 50.0]
@@ -1523,7 +1523,7 @@ mod tests {
 
     #[test]
     fn config_bbox_extracts() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let json = r#"{
             "extracts": [
                 { "output": "a.osm.pbf", "bbox": [8.0, 54.0, 13.0, 58.0] },
@@ -1546,7 +1546,7 @@ mod tests {
 
     #[test]
     fn config_with_directory() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let outdir = dir.path().join("out");
         std::fs::create_dir(&outdir).unwrap();
         let json = format!(
@@ -1566,7 +1566,7 @@ mod tests {
 
     #[test]
     fn config_inline_polygon() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let json = r#"{
             "extracts": [{
                 "output": "poly.osm.pbf",
@@ -1587,7 +1587,7 @@ mod tests {
 
     #[test]
     fn config_polygon_file() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let geojson = r#"{
             "type": "Polygon",
             "coordinates": [
@@ -1609,7 +1609,7 @@ mod tests {
 
     #[test]
     fn config_no_geometry_fails() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let json = r#"{
             "extracts": [{ "output": "bad.osm.pbf" }]
         }"#;
@@ -1619,7 +1619,7 @@ mod tests {
 
     #[test]
     fn config_duplicate_output_fails() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let json = r#"{
             "extracts": [
                 { "output": "same.osm.pbf", "bbox": [0.0, 0.0, 1.0, 1.0] },
@@ -1632,7 +1632,7 @@ mod tests {
 
     #[test]
     fn config_empty_extracts_fails() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let json = r#"{ "extracts": [] }"#;
         let path = write_temp_json(&dir, "config.json", json);
         assert!(parse_extract_config(&path).is_err());
@@ -1640,7 +1640,7 @@ mod tests {
 
     #[test]
     fn config_missing_output_fails() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let json = r#"{
             "extracts": [{ "bbox": [0.0, 0.0, 1.0, 1.0] }]
         }"#;
@@ -1650,7 +1650,7 @@ mod tests {
 
     #[test]
     fn config_multiple_geometry_fails() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let json = r#"{
             "extracts": [{
                 "output": "bad.osm.pbf",

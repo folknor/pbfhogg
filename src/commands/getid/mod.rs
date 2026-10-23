@@ -1378,7 +1378,7 @@ mod tests {
 
     #[test]
     fn id_file_inline_comments_and_crlf() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("ids.txt");
         std::fs::write(
             &path,
@@ -1527,7 +1527,7 @@ mod tests {
 
     #[test]
     fn with_refs_writes_referenced_elements() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2, 3], Some((10, &[1, 2])), true);
         let ids = parse_ids(&["w10".to_owned()]).unwrap();
@@ -1557,7 +1557,7 @@ mod tests {
     /// Run the same include-mode query under both arms, assert they emit
     /// identical element sets, and return that common (sorted) ID list.
     fn ids_from_both_arms(input: &Path, query: &[&str], host: &crate::host::Host) -> Vec<i64> {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let query: Vec<String> = query.iter().map(|s| (*s).to_owned()).collect();
         let query = parse_ids(&query).unwrap();
         let walker = dir.path().join("walker.pbf");
@@ -1584,7 +1584,7 @@ mod tests {
 
     #[test]
     fn walker_and_full_scan_include_arms_emit_the_same_elements() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
         assert_eq!(
@@ -1595,7 +1595,7 @@ mod tests {
 
     #[test]
     fn include_arms_agree_on_empty_query_result() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
         assert!(ids_from_both_arms(&input, &["n999"], &crate::host::Host::for_tests()).is_empty());
@@ -1603,7 +1603,7 @@ mod tests {
 
     #[test]
     fn include_arms_agree_on_single_data_blob_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], None, true);
         assert_eq!(
@@ -1614,7 +1614,7 @@ mod tests {
 
     #[test]
     fn include_arms_agree_when_a_blob_lacks_indexdata() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], Some((10, &[1, 2])), false);
         assert_eq!(
@@ -1625,7 +1625,7 @@ mod tests {
 
     #[test]
     fn auto_dispatch_crosses_arms_at_the_injected_threshold() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
         let query = parse_ids(&["n1".to_owned(), "w10".to_owned()]).unwrap();

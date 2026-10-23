@@ -393,10 +393,8 @@ mod tests {
 
     #[test]
     fn open_preserves_not_found_error_kind() {
-        let missing = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("data")
-            .join("bench-tmp")
-            .join(format!("missing-header-walker-{}.pbf", std::process::id()));
+        let scratch = crate::path_guard::tests::scratch();
+        let missing = scratch.path().join("missing.pbf");
         let result = super::HeaderWalker::open(&missing, &crate::host::Diagnostics::discard());
 
         match result {
@@ -441,7 +439,7 @@ mod tests {
     /// swallowing a committed frame as EOF, with both gates green.
     #[test]
     fn the_walk_tolerates_a_short_tail_but_not_a_complete_prefix() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::path_guard::tests::scratch();
         let base = dir.path().join("base.pbf");
         write_fixture(&base, true);
         let good = std::fs::read(&base).expect("read fixture");
@@ -514,7 +512,7 @@ mod tests {
 
     #[test]
     fn estimator_is_exact_for_small_and_header_only_files() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::path_guard::tests::scratch();
         let header_only = dir.path().join("header-only.pbf");
         write_fixture(&header_only, false);
         assert_eq!(
@@ -540,7 +538,7 @@ mod tests {
 
     #[test]
     fn estimator_rejects_empty_input() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::path_guard::tests::scratch();
         let empty = dir.path().join("empty.pbf");
         std::fs::File::create(&empty).expect("create empty file");
         assert!(estimate_blob_count(&empty, &crate::host::Diagnostics::discard()).is_err());
@@ -548,7 +546,7 @@ mod tests {
 
     #[test]
     fn estimator_projects_within_tolerance_on_mixed_frame_sizes() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::path_guard::tests::scratch();
         let mixed = dir.path().join("mixed.pbf");
         let file = std::fs::File::create(&mixed).expect("create fixture");
         let mut writer = PbfWriter::new(

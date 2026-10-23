@@ -210,23 +210,16 @@ pub fn same_file(a: &Path, b: &Path) -> std::io::Result<bool> {
 }
 
 #[cfg(test)]
+#[path = "../tests/common/scratch.rs"]
+mod shared_scratch;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
-    // Unit tests cannot import the integration harness in tests/common.
-    // Keep the same project-owned root here without linking that harness
-    // (and its public-library imports) back into the library under test.
-    pub(crate) fn scratch() -> tempfile::TempDir {
-        // Never `std::env::temp_dir()`: process-id-only names collide
-        // across the concurrent check sweeps, and the project keeps its
-        // scratch inside the repo tree.
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/test-scratch");
-        fs::create_dir_all(&root).expect("create test scratch root");
-        tempfile::Builder::new()
-            .prefix("pbfhogg-path-guard-")
-            .tempdir_in(root)
-            .expect("create scratch dir")
-    }
+    // Include only the shared allocator, keeping the integration harness
+    // and its public-library imports out of the library under test.
+    pub(crate) use super::shared_scratch::test_scratch as scratch;
 
     #[test]
     fn file_drop_removes() {

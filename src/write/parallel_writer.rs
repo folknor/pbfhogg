@@ -726,11 +726,10 @@ fn copy_range_fallback_pwrite(
 mod tests {
     use super::*;
     use std::io::Read;
-    use tempfile::TempDir;
 
     #[test]
     fn parallel_writer_basic() -> io::Result<()> {
-        let dir = TempDir::new().map_err(io::Error::other)?;
+        let dir = crate::path_guard::tests::scratch();
         let out = dir.path().join("out.bin");
 
         let (tx, rx) = sync_channel::<PipelineItem>(WRITE_AHEAD);

@@ -940,8 +940,6 @@ fn write_change_element<W: Write>(
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use std::path::PathBuf;
-
     use super::*;
 
     #[test]
@@ -961,17 +959,6 @@ mod tests {
         assert!(xml.contains("<create>"));
         assert!(xml.ends_with("</osmChange>"));
         Ok(())
-    }
-
-    fn scratch(name: &str) -> PathBuf {
-        // Inside the repo tree, never the system temp dir: the project
-        // keeps its scratch where the concurrent check sweeps cannot
-        // collide on a pid-only name.
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join(format!("merge-changes-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
     }
 
     fn write_gz(path: &Path, xml: &str) {
@@ -995,7 +982,8 @@ mod tests {
     /// broken at.
     #[test]
     fn a_failed_merge_leaves_a_pre_existing_destination_intact() {
-        let dir = scratch("failed-merge");
+        let scratch = crate::path_guard::tests::scratch();
+        let dir = scratch.path().to_path_buf();
         let input = dir.join("cut.osc.gz");
         let dest = dir.join("out.osc.gz");
         write_gz(
@@ -1023,7 +1011,6 @@ mod tests {
             b"precious user data",
             "the destination must be byte-identical after a failed merge"
         );
-        drop(std::fs::remove_dir_all(&dir));
     }
 
     /// The same failure against a destination that did not exist must
@@ -1031,7 +1018,8 @@ mod tests {
     /// scratch sibling lying around.
     #[test]
     fn a_failed_merge_creates_no_partial_destination() {
-        let dir = scratch("partial-merge");
+        let scratch = crate::path_guard::tests::scratch();
+        let dir = scratch.path().to_path_buf();
         let input = dir.join("cut.osc.gz");
         let dest = dir.join("out.osc.gz");
         write_gz(
@@ -1059,7 +1047,6 @@ mod tests {
             .filter(|n| n != "cut.osc.gz")
             .collect();
         assert!(leftovers.is_empty(), "scratch leaked: {leftovers:?}");
-        drop(std::fs::remove_dir_all(&dir));
     }
 
     /// A successful merge still lands at the path the caller named, with
@@ -1067,7 +1054,8 @@ mod tests {
     /// two tests above from being satisfied by never writing anything.
     #[test]
     fn a_successful_merge_lands_at_the_named_path() {
-        let dir = scratch("ok-merge");
+        let scratch = crate::path_guard::tests::scratch();
+        let dir = scratch.path().to_path_buf();
         let input = dir.join("in.osc.gz");
         let dest = dir.join("out.osc.gz");
         write_gz(
@@ -1093,6 +1081,5 @@ mod tests {
             b"\x1f\x8b",
             "a .gz destination must still be gzip, so the scratch sibling kept the suffix"
         );
-        drop(std::fs::remove_dir_all(&dir));
     }
 }

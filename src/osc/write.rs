@@ -525,13 +525,6 @@ mod tests {
     use std::io::Write as IoWrite;
     use std::path::{Path, PathBuf};
 
-    fn make_test_dir(suffix: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("pbfhogg_osc_write_test_{suffix}"));
-        drop(std::fs::remove_dir_all(&dir));
-        std::fs::create_dir_all(&dir).expect("create test dir");
-        dir
-    }
-
     fn write_osc_gz(dir: &Path, filename: &str, xml: &[u8]) -> crate::BoxResult<PathBuf> {
         let path = dir.join(filename);
         let file = File::create(&path)?;
@@ -578,14 +571,12 @@ mod tests {
         assert!(!xml_str.contains('\r'), "raw CR in output: {xml_str}");
 
         // Parse-side roundtrip: the value comes back byte-identical.
-        let dir = make_test_dir("tag_values");
-        let path = write_osc_gz(&dir, "roundtrip.osc.gz", &xml)?;
+        let scratch = crate::path_guard::tests::scratch();
+        let path = write_osc_gz(scratch.path(), "roundtrip.osc.gz", &xml)?;
         let overlay = parse_osc_file(&path)?;
         let parsed = overlay.get_node(100).ok_or("node 100 missing")?;
         let tags: Vec<(&str, &str)> = parsed.tags().collect();
         assert_eq!(tags, vec![("inscription", value)]);
-
-        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 
@@ -616,15 +607,13 @@ mod tests {
         assert!(xml_str.contains("&#10;"), "newline not escaped: {xml_str}");
         assert!(!xml_str.contains('\n'), "raw newline in output: {xml_str}");
 
-        let dir = make_test_dir("member_roles");
-        let path = write_osc_gz(&dir, "roundtrip.osc.gz", &xml)?;
+        let scratch = crate::path_guard::tests::scratch();
+        let path = write_osc_gz(scratch.path(), "roundtrip.osc.gz", &xml)?;
         let overlay = parse_osc_file(&path)?;
         let parsed = overlay.get_relation(200).ok_or("relation 200 missing")?;
         let members: Vec<_> = parsed.members().collect();
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].2, role);
-
-        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 

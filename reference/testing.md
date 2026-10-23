@@ -254,6 +254,19 @@ exception, not a tier - should not survive across many PRs.
   `generate_nodes_with_negatives`, `generate_ways_with_negatives`,
   `generate_relations_with_negatives` for mixed-sign fixtures (per
   `decisions/0002-negative-ids-rejected-project-wide.md`).
+- **Test scratch.** `tests/common/scratch.rs` owns random, RAII-cleaned
+  directories under `data/test-scratch/`. It is the one implementation
+  for both harnesses: integration tests reach it as
+  `common::test_scratch()`, and unit tests under `src/` as
+  `path_guard::tests::scratch()`, which mounts the same file by `#[path]`
+  so the library's unit tests never link the integration harness. Every
+  unit-test scratch site under `src/` goes through it (enforced by the
+  `unit-test-scratch-via-path-guard` textlint in `brokkr.toml`); many integration
+  tests still take `tempfile::TempDir::new()` in the system temp dir,
+  which is collision-free but outside the project tree. Keep the guard
+  alive for the fixture lifetime (the `TempDir` drop is the cleanup, so no
+  manual `remove_dir_all` is needed). Never use benchmark scratch or
+  fixed shared names.
 - **Scratch tracking.** `tests/common/mod.rs` exports `snapshot_dir`
   and `assert_scratch_unchanged` for before/after comparisons
   around error paths, plus `with_tracked_scratch_dir(scratch_root,

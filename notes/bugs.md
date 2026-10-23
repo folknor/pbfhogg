@@ -176,22 +176,6 @@ under `BROKKR_TEST_PLATFORM`. Left:
 
 Reported by: test harness, write path, CLI and plumbing.
 
-## BUG-064 - Unit tests use fixed scratch names and collide across parallel sweeps
-
-Anger: 3 - unit-test scratch and test timeouts.
-
-The integration-test sites are fixed (unique dirs under
-`common::test_scratch()`). Still fixed-name in unit tests:
-`src/osc/parse.rs::make_test_dir` and `src/osc/write.rs`
-(`temp_dir().join("pbfhogg_osc_test_{suffix}")`, `remove_dir_all` first, so
-two sweeps delete each other's directory), and
-`src/read/direct_reader.rs::direct_reader_reads_file` (a fixed file under
-`data/bench-tmp`, then `remove_dir` of brokkr's scratch dir when empty). The
-fix is HYG-071's shared scratch.
-
-Reported by: change application, filtering and spatial, read path, test
-harness.
-
 ## BUG-108 - Raw string-table indices are unchecked in release, and the interner trusts FxHash on input strings
 
 Anger: 9 - string-table remap in the rewrite hot path.

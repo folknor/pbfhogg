@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn marker_open_failure_is_returned_to_caller() {
-        let dir = tempfile::tempdir().expect("scratch directory");
+        let dir = crate::path_guard::tests::scratch();
         let error = super::open_marker_fifo(&dir.path().join("missing"))
             .expect_err("missing FIFO must be diagnosed by caller");
         #[cfg(unix)]
@@ -269,7 +269,8 @@ mod tests {
         let mut line = Line::new();
         line.push(format_args!("{} {name}\n", 42_u128));
 
-        let sink = tempfile::tempfile().expect("scratch file");
+        let scratch = crate::path_guard::tests::scratch();
+        let sink = tempfile::tempfile_in(scratch.path()).expect("scratch file");
         line.emit(&sink);
         assert_eq!(
             sink.metadata().expect("stat sink").len(),
@@ -285,7 +286,8 @@ mod tests {
     fn line_within_pipe_buf_emits_in_full() {
         let mut line = Line::new();
         line.push(format_args!("{} PASS1_END\n", 42_u128));
-        let sink = tempfile::tempfile().expect("scratch file");
+        let scratch = crate::path_guard::tests::scratch();
+        let sink = tempfile::tempfile_in(scratch.path()).expect("scratch file");
         line.emit(&sink);
         assert_eq!(
             sink.metadata().expect("stat sink").len(),

@@ -1059,7 +1059,7 @@ mod tests {
     /// `Break` actually unwinds the dispatcher and the workers.
     #[test]
     fn a_breaking_merge_stops_the_scan_rather_than_draining_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         const BLOBS: usize = 400;
         let path = write_many_blob_pbf(dir.path(), BLOBS);
 
@@ -1130,7 +1130,7 @@ mod tests {
     fn ordered_phase_merges_in_schedule_order_within_its_window() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         const BLOBS: usize = 40;
         const WINDOW: usize = 4;
         let path = write_many_blob_pbf(dir.path(), BLOBS);

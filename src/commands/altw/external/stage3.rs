@@ -538,7 +538,7 @@ mod tests {
     #[test]
     fn empty_bucket_error_aborts_router_with_the_actual_error() {
         let per_way_rcs = parse_per_way_refcount_sidecar_bytes(&[1, 1], 1).expect("sidecar");
-        let temp = tempfile::tempdir().expect("scratch directory");
+        let temp = crate::path_guard::tests::scratch();
         let worker_file = std::fs::File::create(temp.path().join("worker")).expect("worker file");
         let router = ConcurrentBlobLocationRouter::new(&per_way_rcs, vec![Arc::new(worker_file)])
             .expect("router");

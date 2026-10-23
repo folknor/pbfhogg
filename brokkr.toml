@@ -1137,6 +1137,19 @@ exclude = ["cli/src/output.rs"]
 region = "code"
 message = "Library diagnostics must use the caller's Diagnostics handle; the CLI writes stderr through output::cli_eprintln! and cli_eprint!, which survive a closed stderr"
 
+# Unit-test scratch under src/ comes from `path_guard::tests::scratch()`,
+# which mounts tests/common/scratch.rs: random directories under the
+# gitignored data/test-scratch/, removed when the guard drops. Fixed names in
+# the system temp dir let concurrent check sweeps delete each other's
+# fixtures. The `_in` forms (`tempfile_in`, `tempdir_in`, `TempDir::new_in`)
+# stay legal so a test can place a file inside its guard's directory.
+[[textlint]]
+name = "unit-test-scratch-via-path-guard"
+pattern = '\benv::temp_dir\b|\btempfile::(?:tempdir|tempfile|NamedTempFile|Builder)\b|\bTempDir::new\b'
+paths = ["src/**/*.rs"]
+region = "code"
+message = "Unit-test scratch must come from path_guard::tests::scratch(), never the system temp dir or a fixed name"
+
 # Source-only guard: no build or test-harness startup.
 [[script_check]]
 name = "static-hook-test-isolation"

@@ -1453,7 +1453,7 @@ mod tests {
 
     #[test]
     fn single_pass_filters_matching_elements() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("input.pbf");
         let file = std::fs::File::create(&input).unwrap();
         let mut writer = PbfWriter::new(

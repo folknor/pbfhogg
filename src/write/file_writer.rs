@@ -207,7 +207,7 @@ mod tests {
     /// if `flush` synced, the delta would be at least one per iteration.
     #[test]
     fn flush_pushes_bytes_onward_without_fsyncing() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("flush-is-not-fsync.bin");
         let mut w = FileWriter::buffered(&path).unwrap();
 

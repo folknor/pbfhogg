@@ -33,13 +33,9 @@ use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, ElementReader, MemberId};
 
-/// Project-owned scratch, separate from Cargo output and benchmark scratch.
-/// TempDir's random names isolate concurrent tests and feature sweeps.
-pub fn test_scratch() -> tempfile::TempDir {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/test-scratch");
-    std::fs::create_dir_all(&root).expect("create test scratch root");
-    tempfile::TempDir::new_in(root).expect("create test scratch directory")
-}
+mod scratch;
+#[allow(unused_imports)]
+pub use scratch::test_scratch;
 
 /// Emit one machine-countable skip marker; required runs fail on a skip.
 pub fn skip(reason: impl std::fmt::Display) {

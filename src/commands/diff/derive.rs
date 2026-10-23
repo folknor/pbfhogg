@@ -669,7 +669,7 @@ mod scratch_tests {
 
     #[test]
     fn partial_sink_construction_removes_created_fragments() {
-        let dir = tempfile::tempdir().expect("directory");
+        let dir = crate::path_guard::tests::scratch();
         let token = RunToken::next().expect("token");
         let blocked = dir.path().join(format!(
             "derive-modifies-{}{}.xml.tmp",
@@ -690,7 +690,7 @@ mod scratch_tests {
 
     #[test]
     fn unwinding_removes_all_sink_fragments() {
-        let dir = tempfile::tempdir().expect("directory");
+        let dir = crate::path_guard::tests::scratch();
         let token = RunToken::next().expect("token");
         let result = std::panic::catch_unwind(|| {
             let _sink = ChangeSink::new(dir.path(), &token, false, None).expect("sink");

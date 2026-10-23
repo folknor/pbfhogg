@@ -275,7 +275,7 @@ mod tests {
     /// itself; only the refusal is under test, so this runs anywhere.
     #[test]
     fn write_after_flush_is_refused() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("direct.bin");
         let mut w = DirectWriter {
             file: File::create(&path).unwrap(),

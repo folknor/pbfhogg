@@ -1065,20 +1065,6 @@ which checks every path owes.
 
 Reported by: the BUG-138 fix.
 
-## HYG-147 - Test metadata helpers still read dense absence as `!= -1`
-
-Anger: 2 - test helpers only.
-
-Product printers now treat a dense version below 1 as no version claim, and a
-version-0 slot's other fields as present only when they hold a value padding
-never has (`DenseNodeInfo::claims`). `tests/common/mod.rs::meta_from_dense_node`
-and `cli/tests/cli_cat.rs` still test only `!= -1`, so a metadata comparison
-there can see a padding slot (all zeros) and a node with no metadata block as
-different. Fix: build the helpers on `claimed_version` / the same presence
-rule.
-
-Reported by: the BUG-133 fix.
-
 ## HYG-145 - The unindexed diff decodes kinds the filter excludes
 
 Anger: 9 - measured path; skipping also stops refusals of corrupt data in
@@ -1091,20 +1077,3 @@ excluded blobs undecoded) removes the work, but those kinds' corrupt data
 would no longer be refused, which ties into HYG-144.
 
 Reported by: the BUG-138 fix.
-
-## HYG-148 - Geocode pass 3 bucket write failures do not name the file
-
-Anger: 7 - geocode builder, Stage A hot loop.
-
-`create_data_file` names the path when a bucket file cannot be created, but
-`write_bucket_record` in `src/geocode_index/builder/pass3.rs` returns a bare
-`write_all` error, and so do the bucket writers' final flushes. An ENOSPC in
-Stage A therefore reports only "building geocode index <dir>" and the OS
-error, not which scratch file or filesystem filled. The builder deliberately
-has no free-space preflight (the comment at the bucket-tree creation says
-why), so this error is the whole report. Fix: attach the bucket path on the
-error path only (the bucket index and tree are known at each call site), so
-the per-record success path is unchanged.
-
-Reported by: the scratch-placement consolidation.
-

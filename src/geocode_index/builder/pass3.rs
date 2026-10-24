@@ -301,14 +301,29 @@ fn ensure_bucket_writer(
     bucket_dir: &Path,
 ) -> Result<()> {
     if writers[bucket].is_none() {
-        let path = bucket_dir.join(format!("{bucket:03}"));
-        writers[bucket] = Some(super::create_data_file(&path)?);
+        writers[bucket] = Some(super::create_data_file(&bucket_path(bucket_dir, bucket))?);
     }
     Ok(())
 }
 
+fn bucket_path(bucket_dir: &Path, bucket: usize) -> std::path::PathBuf {
+    bucket_dir.join(format!("{bucket:03}"))
+}
+
+/// Name the bucket file in a write or flush failure. Called only on the
+/// error path, so the per-record success path is unchanged.
+#[cold]
+fn bucket_write_error(e: std::io::Error, bucket_dir: &Path, bucket: usize) -> crate::error::Error {
+    Error::from(e).context(format!(
+        "failed to write {}",
+        bucket_path(bucket_dir, bucket).display()
+    ))
+}
+
 fn write_bucket_record(
     w: &mut BufWriter<std::fs::File>,
+    bucket_dir: &Path,
+    bucket: usize,
     cell_id: u64,
     etype: u8,
     index: u32,
@@ -319,7 +334,8 @@ fn write_bucket_record(
     buf[8] = etype;
     buf[9..13].copy_from_slice(&index.to_le_bytes());
     buf[13..15].copy_from_slice(&segment.to_le_bytes());
-    Ok(w.write_all(&buf)?)
+    w.write_all(&buf)
+        .map_err(|e| bucket_write_error(e, bucket_dir, bucket))
 }
 
 struct ParsedBucketEntry {
@@ -588,6 +604,8 @@ pub(super) fn bucketed_cell_assignment_fused(
             ensure_bucket_writer(&mut fine_writers, b, &fine_bucket_dir)?;
             write_bucket_record(
                 fine_writers[b].as_mut().expect("ensured"),
+                &fine_bucket_dir,
+                b,
                 fine_cid,
                 ENTRY_TYPE_STREET,
                 wi,
@@ -598,6 +616,8 @@ pub(super) fn bucketed_cell_assignment_fused(
                 ensure_bucket_writer(&mut coarse_writers, b, &coarse_bucket_dir)?;
                 write_bucket_record(
                     coarse_writers[b].as_mut().expect("ensured"),
+                    &coarse_bucket_dir,
+                    b,
                     coarse_cid,
                     ENTRY_TYPE_STREET,
                     wi,
@@ -654,6 +674,8 @@ pub(super) fn bucketed_cell_assignment_fused(
             ensure_bucket_writer(&mut fine_writers, b, &fine_bucket_dir)?;
             write_bucket_record(
                 fine_writers[b].as_mut().expect("ensured"),
+                &fine_bucket_dir,
+                b,
                 fine_cid,
                 ENTRY_TYPE_ADDR,
                 idx,
@@ -663,6 +685,8 @@ pub(super) fn bucketed_cell_assignment_fused(
             ensure_bucket_writer(&mut coarse_writers, b, &coarse_bucket_dir)?;
             write_bucket_record(
                 coarse_writers[b].as_mut().expect("ensured"),
+                &coarse_bucket_dir,
+                b,
                 coarse_cid,
                 ENTRY_TYPE_ADDR,
                 idx,
@@ -740,6 +764,8 @@ pub(super) fn bucketed_cell_assignment_fused(
             ensure_bucket_writer(&mut fine_writers, b, &fine_bucket_dir)?;
             write_bucket_record(
                 fine_writers[b].as_mut().expect("ensured"),
+                &fine_bucket_dir,
+                b,
                 fine_cid,
                 ENTRY_TYPE_INTERP,
                 wi,
@@ -750,6 +776,8 @@ pub(super) fn bucketed_cell_assignment_fused(
                 ensure_bucket_writer(&mut coarse_writers, b, &coarse_bucket_dir)?;
                 write_bucket_record(
                     coarse_writers[b].as_mut().expect("ensured"),
+                    &coarse_bucket_dir,
+                    b,
                     coarse_cid,
                     ENTRY_TYPE_INTERP,
                     wi,
@@ -762,11 +790,19 @@ pub(super) fn bucketed_cell_assignment_fused(
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_INTERP_END");
 
     // Flush and drop both sets of bucket writers
-    for writer in fine_writers.iter_mut().flatten() {
-        writer.flush()?;
+    for (b, writer) in fine_writers.iter_mut().enumerate() {
+        if let Some(writer) = writer {
+            writer
+                .flush()
+                .map_err(|e| bucket_write_error(e, &fine_bucket_dir, b))?;
+        }
     }
-    for writer in coarse_writers.iter_mut().flatten() {
-        writer.flush()?;
+    for (b, writer) in coarse_writers.iter_mut().enumerate() {
+        if let Some(writer) = writer {
+            writer
+                .flush()
+                .map_err(|e| bucket_write_error(e, &coarse_bucket_dir, b))?;
+        }
     }
     drop(fine_writers);
     drop(coarse_writers);

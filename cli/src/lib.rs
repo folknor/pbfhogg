@@ -20,6 +20,7 @@ const _: () = assert!(
     "pbfhogg-cli's test harnesses must not link a pbfhogg built with static-test-hooks"
 );
 
+mod command_paths;
 mod exit_code;
 mod host;
 #[cfg(test)]
@@ -27,6 +28,7 @@ mod library_text_rule;
 mod output;
 mod signals;
 
+use command_paths::{CommandPaths, LeftoverScanner, parent_of, reject_aliases};
 use exit_code::{Hinted, error_report, is_cancelled, is_platform_unsupported, output_hint};
 
 use std::io::Write;
@@ -2409,9 +2411,12 @@ pub fn run() -> process::ExitCode {
         // read (the four-byte sniff it always did), so its OSC-mode refusals
         // ride that read.
         let tags_filter_kind = validate_command(&cli.command, &matches, quiet)?;
-        validate_input_output_aliases(&cli.command)?;
+        // The command line's inputs, outputs and scratch location, stated
+        // once; the dispatch below moves the command's fields.
+        let paths = CommandPaths::of(&cli.command, quiet);
+        paths.refuse_aliases()?;
         let mut leftovers = LeftoverScanner::default();
-        leftovers.command(&cli.command, &host);
+        paths.scan_leftovers(&mut leftovers, &host);
         match cli.command {
             Command::Cat {
                 files,
@@ -2666,7 +2671,8 @@ pub fn run() -> process::ExitCode {
                 format,
                 increment_version,
                 update_timestamp,
-                tmp,
+                // Placed by `paths`.
+                tmp: _,
                 io,
             } => match format {
                 DiffFormat::Osc => {
@@ -2676,7 +2682,7 @@ pub fn run() -> process::ExitCode {
                     // made, so a missing output directory reports the output.
                     let output_handle =
                         pbfhogg::Output::new(&output, overwrite.intent(), &host.diagnostics)?;
-                    let scratch = run_scratch(&tmp, Some(&output), &host)?;
+                    let scratch = paths.create_scratch(&host)?;
                     accept_outcome(
                         &mut outcome,
                         run_derive_changes(
@@ -2705,16 +2711,10 @@ pub fn run() -> process::ExitCode {
                             pbfhogg::Output::new(path, overwrite.intent(), &host.diagnostics)
                         })
                         .transpose()?;
-                    // The sequential path writes no scratch: `-j 1`, and
-                    // `--verbose`, which is sequential-only. A quiet diff
-                    // only counts (`diff_stats`), which shards without
-                    // scratch. Any other text diff may shard, so it gets its
-                    // directory now, before any input is opened.
-                    let scratch = if quiet || verbose || jobs.fixed() == Some(1) {
-                        None
-                    } else {
-                        Some(run_scratch(&tmp, output.as_deref(), &host)?)
-                    };
+                    // Only a text diff that may shard writes scratch
+                    // (`diff_writes_scratch`); it gets its directory now,
+                    // before any input is opened.
+                    let scratch = paths.create_scratch_if_any(&host)?;
                     let output = output_handle;
                     accept_outcome(
                         &mut outcome,
@@ -2894,7 +2894,8 @@ pub fn run() -> process::ExitCode {
                 force,
                 io,
                 header,
-                tmp,
+                // Placed by `paths`.
+                tmp: _,
             } => {
                 // `validate_command` refused the hidden `dense` value.
                 let index_type = index_type.resolve()?;
@@ -2915,7 +2916,7 @@ pub fn run() -> process::ExitCode {
                 // The output is checked before the scratch directory is made,
                 // so a missing output directory reports the output.
                 let output = output.open(&host)?;
-                let scratch = run_scratch(&tmp, Some(output.destination()), &host)?;
+                let scratch = paths.create_scratch(&host)?;
                 run_add_locations_to_ways(&file, output, &options, &overrides, &host, scratch)
             }
             Command::TimeFilter {
@@ -3118,7 +3119,8 @@ pub fn run() -> process::ExitCode {
                 overwrite,
                 allow_unindexed,
                 force,
-                tmp,
+                // Placed by `paths`.
+                tmp: _,
             } => {
                 // The one --force that is not the indexdata rule: it predates
                 // --overwrite and --allow-unindexed and still grants both, so
@@ -3148,7 +3150,7 @@ pub fn run() -> process::ExitCode {
                     io.direct_io,
                     overwrite || force,
                     allow_unindexed || force,
-                    &tmp,
+                    &paths,
                     &host,
                 )
             }
@@ -3259,7 +3261,7 @@ fn run_build_geocode_index(
     direct_io: bool,
     overwrite: bool,
     allow_unindexed: bool,
-    tmp: &TmpDirArg,
+    paths: &CommandPaths,
     host: &pbfhogg::host::Host,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // The caller has already expanded the legacy `--force` into both
@@ -3271,7 +3273,7 @@ fn run_build_geocode_index(
     )?;
     // After the output, so an existing index directory is judged before the
     // run's scratch directory could be made inside it.
-    let scratch = run_scratch(tmp, Some(output_dir), host)?;
+    let scratch = paths.create_scratch(host)?;
     // Exhaustive on purpose: a new `BuildConfig` field must be wired here
     // rather than silently taking its default. The clap defaults already
     // come from `BuildConfig::default()`.
@@ -3696,310 +3698,6 @@ fn run_tags_filter_osc(
     let stats = pbfhogg::tags_filter::osc::tags_filter_osc(changes, output, expressions, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("tags_filter.osc.summary"))?;
     Ok(())
-}
-
-fn paths_alias(input: &std::path::Path, output: &std::path::Path) -> std::io::Result<bool> {
-    // An input that does not exist cannot alias anything, and reporting it
-    // from here would replace the command's own "failed to open <path>"
-    // with a bare aliasing-check IO error that never names the file. The
-    // check runs before every command, so it must stay silent about
-    // problems that are not aliasing and let the command speak first.
-    // `same_file` answers false for a missing path on either side.
-    //
-    // File identity (symlinks, hard links) is the library's test, shared
-    // with the library entry points that refuse an aliased output; only the
-    // not-yet-created planned-path case below is CLI-specific.
-    if pbfhogg::path_guard::same_file(input, output)? {
-        return Ok(true);
-    }
-    if output.exists() {
-        return Ok(false);
-    }
-    let input_canonical = match std::fs::canonicalize(input) {
-        Ok(path) => path,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
-    };
-
-    let Some(planned) = planned_path(output)? else {
-        return Ok(false);
-    };
-    Ok(input_canonical == planned)
-}
-
-/// Resolve the location a not-yet-created file will occupy: the canonical
-/// parent directory joined with the final component. Returns `None` when the
-/// path has no file name (e.g. a bare `..`), which can never be a valid output.
-fn planned_path(path: &std::path::Path) -> std::io::Result<Option<PathBuf>> {
-    // A bare relative filename has an empty parent, which means the current directory.
-    let parent = path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let parent = std::fs::canonicalize(parent)?;
-    Ok(path.file_name().map(|name| parent.join(name)))
-}
-
-fn reject_aliases(
-    inputs: &[&std::path::Path],
-    output: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for input in inputs {
-        if paths_alias(input, output)? {
-            return Err(format!(
-                "output '{}' aliases input '{}'",
-                output.display(),
-                input.display()
-            )
-            .into());
-        }
-    }
-    Ok(())
-}
-
-/// The run's scratch directory, made before any input is opened so that a
-/// missing or unwritable `--tmp-dir` fails first (ADR-0018). A run whose
-/// command line guarantees it needs no scratch must not call this at all.
-/// `output` is the file the command writes, when it writes one: the default
-/// scratch location is its directory, and the current directory when the
-/// output name has no directory part or there is no output.
-fn run_scratch(
-    tmp: &TmpDirArg,
-    output: Option<&std::path::Path>,
-    host: &pbfhogg::host::Host,
-) -> Result<pbfhogg::scratch::RunScratch, Box<dyn std::error::Error>> {
-    if let Some(dir) = &tmp.tmp_dir {
-        return pbfhogg::scratch::RunScratch::create(dir, host)
-            .map_err(|e| format!("--tmp-dir {}: {}", dir.display(), error_report(&e)).into());
-    }
-    let parent = output
-        .and_then(std::path::Path::parent)
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."));
-    Ok(pbfhogg::scratch::RunScratch::create(parent, host)?)
-}
-
-fn parent_of(path: &std::path::Path) -> PathBuf {
-    match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    }
-}
-
-/// The directories a command's leftovers would be in: the directory of each
-/// output it writes (staging and backups sit beside it), the scratch
-/// location, and where older versions of the same command put their scratch
-/// (`diff` shards beside the old input).
-// A new `Command` variant must be considered here, not swallowed by `_`.
-#[deny(clippy::wildcard_enum_match_arm)]
-fn leftover_dirs(command: &Command) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    match command {
-        Command::Cat { output, .. }
-        | Command::Sort { output, .. }
-        | Command::Repack { output, .. }
-        | Command::Degrade { output, .. }
-        | Command::Renumber { output, .. }
-        | Command::TagsFilter { output, .. }
-        | Command::Getid { output, .. }
-        | Command::Getparents { output, .. }
-        | Command::TimeFilter { output, .. }
-        | Command::ApplyChanges { output, .. }
-        | Command::MergeChanges { output, .. }
-        | Command::BenchMerge { output, .. } => dirs.push(parent_of(&output.output)),
-        Command::AddLocationsToWays { output, tmp, .. } => {
-            dirs.push(parent_of(&output.output));
-            dirs.extend(tmp.tmp_dir.clone());
-        }
-        Command::Export {
-            output: Some(output),
-            ..
-        }
-        | Command::Extract {
-            output: Some(output),
-            ..
-        } => dirs.push(parent_of(output)),
-        Command::Diff {
-            old, output, tmp, ..
-        } => {
-            // Older versions wrote `diff-par-*` shards beside the old input.
-            dirs.push(parent_of(old));
-            dirs.extend(output.as_deref().map(parent_of));
-            // Where `run_scratch` puts a diff's run directory: `--tmp-dir`,
-            // else the output's directory, else (text to stdout) the current
-            // directory. A run that makes none (`-j 1`, `-v`, a quiet text
-            // diff, which takes no -o) still scans the current directory,
-            // where an earlier stdout diff's leftover would be.
-            match &tmp.tmp_dir {
-                Some(dir) => dirs.push(dir.clone()),
-                None if output.is_none() => dirs.push(PathBuf::from(".")),
-                None => {}
-            }
-        }
-        Command::BuildGeocodeIndex {
-            output_dir, tmp, ..
-        } => {
-            dirs.push(parent_of(output_dir));
-            dirs.extend(tmp.tmp_dir.clone());
-        }
-        // These leave no run scratch to scan for.
-        Command::Export { output: None, .. }
-        | Command::Extract { output: None, .. }
-        | Command::Inspect { .. }
-        | Command::Digest { .. }
-        | Command::Check { .. }
-        | Command::BenchRead { .. }
-        | Command::BenchWrite { .. } => {}
-    }
-    dirs
-}
-
-/// Reports what earlier runs that never finished left behind, before the run
-/// reserves any output of its own. Nothing is removed. Each directory is
-/// scanned at most once per kind of scan, however many ways a command reaches
-/// it (two spellings, a `--tmp-dir` that is the output's directory, several
-/// `extract --config` outputs in one directory).
-#[derive(Default)]
-struct LeftoverScanner {
-    /// Directories already scanned beside outputs and for scratch.
-    beside: std::collections::HashSet<(u64, u64)>,
-    /// Directories already scanned from the inside, as an index to replace.
-    inside_index: std::collections::HashSet<(u64, u64)>,
-}
-
-impl LeftoverScanner {
-    /// `true` the first time `dir` is seen in `seen`. A directory that does
-    /// not exist has no leftovers; the command's own checks say what is wrong
-    /// with it.
-    fn first_visit(
-        seen: &mut std::collections::HashSet<(u64, u64)>,
-        dir: &std::path::Path,
-    ) -> bool {
-        use std::os::unix::fs::MetadataExt as _;
-        std::fs::metadata(dir).is_ok_and(|meta| seen.insert((meta.dev(), meta.ino())))
-    }
-
-    fn dir(&mut self, dir: &std::path::Path, host: &pbfhogg::host::Host) {
-        if Self::first_visit(&mut self.beside, dir) {
-            let scan = pbfhogg::scratch::find_stale(dir);
-            pbfhogg::scratch::report_stale(&host.diagnostics, &scan);
-        }
-    }
-
-    /// An existing index directory about to be replaced.
-    fn index(&mut self, dir: &std::path::Path, host: &pbfhogg::host::Host) {
-        if Self::first_visit(&mut self.inside_index, dir) {
-            let scan = pbfhogg::scratch::find_stale_in_index(dir);
-            pbfhogg::scratch::report_stale(&host.diagnostics, &scan);
-        }
-    }
-
-    fn command(&mut self, command: &Command, host: &pbfhogg::host::Host) {
-        for dir in leftover_dirs(command) {
-            self.dir(&dir, host);
-        }
-        if let Command::BuildGeocodeIndex { output_dir, .. } = command {
-            self.index(output_dir, host);
-        }
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-fn validate_input_output_aliases(command: &Command) -> Result<(), Box<dyn std::error::Error>> {
-    match command {
-        Command::Cat { files, output, .. } => {
-            let inputs: Vec<&std::path::Path> = files.iter().map(PathBuf::as_path).collect();
-            reject_aliases(&inputs, &output.output)
-        }
-        Command::Sort { file, output, .. }
-        | Command::Repack { file, output, .. }
-        | Command::Degrade { file, output, .. }
-        | Command::Renumber { file, output, .. }
-        | Command::AddLocationsToWays { file, output, .. }
-        | Command::TimeFilter { file, output, .. } => reject_aliases(&[file], &output.output),
-        Command::TagsFilter {
-            file,
-            output,
-            expressions_file,
-            ..
-        } => {
-            let mut inputs: Vec<&std::path::Path> = vec![file];
-            inputs.extend(expressions_file.as_deref());
-            reject_aliases(&inputs, &output.output)
-        }
-        Command::Getid {
-            file,
-            output,
-            id_file,
-            id_osm_file,
-            ..
-        }
-        | Command::Getparents {
-            file,
-            output,
-            id_file,
-            id_osm_file,
-            ..
-        } => {
-            let mut inputs: Vec<&std::path::Path> = vec![file];
-            inputs.extend(id_file.as_deref());
-            inputs.extend(id_osm_file.as_deref());
-            reject_aliases(&inputs, &output.output)
-        }
-        Command::Export {
-            file,
-            output: Some(output),
-            expressions_file,
-            ..
-        } => {
-            let mut inputs: Vec<&std::path::Path> = vec![file];
-            inputs.extend(expressions_file.as_deref());
-            reject_aliases(&inputs, output)
-        }
-        Command::Diff {
-            old,
-            new,
-            output: Some(output),
-            ..
-        } => reject_aliases(&[old, new], output),
-        Command::Extract {
-            file,
-            output: Some(output),
-            polygon,
-            ..
-        } => {
-            let mut inputs: Vec<&std::path::Path> = vec![file];
-            inputs.extend(polygon.as_deref());
-            reject_aliases(&inputs, output)
-        }
-        Command::ApplyChanges {
-            base,
-            changes,
-            output,
-            ..
-        } => reject_aliases(&[base, changes], &output.output),
-        Command::MergeChanges {
-            changes, output, ..
-        } => {
-            let inputs: Vec<&std::path::Path> = changes.iter().map(PathBuf::as_path).collect();
-            reject_aliases(&inputs, &output.output)
-        }
-        Command::BenchMerge {
-            base,
-            changes,
-            output,
-            ..
-        } => reject_aliases(&[base, changes], &output.output),
-        Command::Export { output: None, .. }
-        | Command::Diff { output: None, .. }
-        | Command::Extract { output: None, .. }
-        | Command::Inspect { .. }
-        | Command::Digest { .. }
-        | Command::Check { .. }
-        | Command::BenchRead { .. }
-        | Command::BenchWrite { .. }
-        | Command::BuildGeocodeIndex { .. } => Ok(()),
-    }
 }
 
 fn run_export_to<W: std::io::Write>(
@@ -5406,67 +5104,5 @@ mod short_flag_tests {
         let mut expected = expected;
         expected.sort();
         assert_eq!(documented, expected);
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::disallowed_methods)]
-mod scratch_location_tests {
-    use super::{TmpDirArg, host, run_scratch};
-
-    #[test]
-    fn scratch_goes_to_tmp_dir_else_the_output_directory_else_dot() {
-        let dir = tempfile::tempdir().unwrap();
-        let tmp = dir.path().join("tmp");
-        let out_dir = dir.path().join("out");
-        std::fs::create_dir(&tmp).unwrap();
-        std::fs::create_dir(&out_dir).unwrap();
-        let output = out_dir.join("result.pbf");
-        let host = host::cli_host(pbfhogg::host::Cancel::new());
-
-        let explicit = TmpDirArg {
-            tmp_dir: Some(tmp.clone()),
-        };
-        let scratch = run_scratch(&explicit, Some(&output), &host).unwrap();
-        assert_eq!(scratch.path().parent(), Some(tmp.as_path()));
-        // Made at startup, not at first use, and the only entry there.
-        assert!(scratch.path().is_dir());
-        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 1);
-        drop(scratch);
-        assert!(std::fs::read_dir(&tmp).unwrap().next().is_none());
-
-        let default = TmpDirArg { tmp_dir: None };
-        let scratch = run_scratch(&default, Some(&output), &host).unwrap();
-        assert_eq!(scratch.path().parent(), Some(out_dir.as_path()));
-        assert!(scratch.path().is_dir());
-        assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 1);
-        drop(scratch);
-        assert!(std::fs::read_dir(&out_dir).unwrap().next().is_none());
-    }
-
-    /// An output name with no directory part, and no output at all, both
-    /// place scratch in the current directory.
-    #[test]
-    fn a_bare_output_name_or_none_places_scratch_in_the_current_directory() {
-        let host = host::cli_host(pbfhogg::host::Cancel::new());
-        let default = TmpDirArg { tmp_dir: None };
-        for output in [Some(std::path::Path::new("out.pbf")), None] {
-            let scratch = run_scratch(&default, output, &host).unwrap();
-            assert_eq!(scratch.path().parent(), Some(std::path::Path::new(".")));
-            assert!(scratch.path().is_dir());
-        }
-    }
-
-    #[test]
-    fn an_explicit_tmp_dir_error_names_the_flag_and_the_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing");
-        let host = host::cli_host(pbfhogg::host::Cancel::new());
-        let tmp = TmpDirArg {
-            tmp_dir: Some(missing.clone()),
-        };
-        let err = run_scratch(&tmp, None, &host).err().unwrap().to_string();
-        assert!(err.contains("--tmp-dir"), "{err}");
-        assert!(err.contains(&missing.display().to_string()), "{err}");
     }
 }

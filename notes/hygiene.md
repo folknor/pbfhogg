@@ -111,6 +111,13 @@ The judgement calls already known, to be checked first:
   count mode deliberately keeps the byte-equal fast path off (it follows
   `suppress_common`, which `diff_stats` holds false) so its counts and
   refusals equal an unsuppressed text diff's.
+- The CLI's inputs, outputs and scratch site now come from one
+  `CommandPaths` (`cli/src/command_paths.rs`), which also made
+  `build-geocode-index` refuse an `--output-dir` holding its input (or the
+  entry naming it). That refusal is new and runs before the existing-output
+  refusal, as the alias check does for every other command; the directory
+  rule deliberately allows a path that only passes through a symlinked
+  directory inside the output.
 
 ---
 
@@ -942,32 +949,6 @@ library changes. Facts it has to cope with:
 
 Reported by: split out of the diagnostic-wording item.
 
-## HYG-116 - Run scratch is placed and sized by hand, per command
-
-Anger: 6 - CLI behaviour, small.
-
-- Per-command placement: where the directory goes is decided at each
-  `run_scratch` call site (the output's directory for altw, geocode and
-  `diff -o`; the current directory for `diff` to stdout or `-q`; `--tmp-dir`,
-  which exists on exactly those three commands), and whether a diff run needs
-  scratch at all is a separate hand-written condition at the diff call site.
-  Neither is derived from one place.
-- Geocode free-space preflight: altw sparse and altw external have one;
-  diff and derive deliberately have none (a comment in `derive.rs` explains);
-  the geocode builder has none, though its `.buckets-level*` trees are
-  hundreds of GB at planet scale.
-- `leftover_dirs` in `cli/src/lib.rs` is a hand-kept per-command list of where
-  leftovers may be, beside `validate_input_output_aliases` and the clap
-  structs. It is now exhaustive (`clippy::wildcard_enum_match_arm` denied on
-  the function), so a new command cannot compile unconsidered, but the three
-  remain three hand-kept views of the same per-command facts.
-
-Fix: give `Command` accessors for its outputs, inputs and scratch parent
-used by the alias check, the leftover scan and `run_scratch` alike. The run
-directory stays eager (ADR-0018).
-
-Reported by: the command-matrix audit.
-
 ## HYG-121 - apply-changes carries the base's replication state onto a newer output
 
 Anger: 8 - apply-changes output contract; nidhogg reads replication state
@@ -1122,8 +1103,27 @@ only. Some forty files under `tests/` and `cli/tests/` still call
 `tempfile::TempDir::new()`, which lands in `/tmp`, against the project's
 "all data lives in the project" rule; `reference/testing.md` ("Scratch")
 records the gap without a plan. New tests already use
-`common::test_scratch()`. Fix: convert the remaining sites and widen the
-textlint's `paths` to `tests/**/*.rs` and `cli/tests/**/*.rs`.
+`common::test_scratch()`. The CLI crate's own unit tests
+(`cli/src/command_paths.rs`) also use `tempfile::tempdir()`: `cli/src` has
+no scratch helper of its own. Fix: convert the remaining sites and widen the
+textlint's `paths` to `tests/**/*.rs`, `cli/tests/**/*.rs` and
+`cli/src/**/*.rs`.
 
 Reported by: the `cat --dedupe` pass-2 error tests.
+
+## HYG-148 - Geocode pass 3 bucket write failures do not name the file
+
+Anger: 7 - geocode builder, Stage A hot loop.
+
+`create_data_file` names the path when a bucket file cannot be created, but
+`write_bucket_record` in `src/geocode_index/builder/pass3.rs` returns a bare
+`write_all` error, and so do the bucket writers' final flushes. An ENOSPC in
+Stage A therefore reports only "building geocode index <dir>" and the OS
+error, not which scratch file or filesystem filled. The builder deliberately
+has no free-space preflight (the comment at the bucket-tree creation says
+why), so this error is the whole report. Fix: attach the bucket path on the
+error path only (the bucket index and tree are known at each call site), so
+the per-record success path is unchanged.
+
+Reported by: the scratch-placement consolidation.
 

@@ -1081,6 +1081,14 @@
 
 ### Fixed
 
+- **`build-geocode-index --overwrite` no longer deletes an input kept
+  inside the index directory.** Replacing an index swaps the whole
+  directory and deletes the old one, and the alias check never ran for
+  this command, so `build-geocode-index idx/in.osm.pbf -o idx --overwrite`
+  published the index and deleted `in.osm.pbf` (a symlink there was
+  deleted the same way). An `--output-dir` that contains the input, or the
+  entry naming it, is now refused before any work with `output <dir>
+  contains input <path>`, exit 2.
 - **A version below 1 is no longer printed as a version.** A node written
   without metadata into a dense block whose other nodes carry it is stored
   as version 0 with zeroed fields (as libosmium also writes it), and

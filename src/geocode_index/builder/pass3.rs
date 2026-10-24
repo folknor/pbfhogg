@@ -462,6 +462,18 @@ pub(super) fn bucketed_cell_assignment_fused(
     // directory, whose guard removes them on every exit path (mid-Stage-A
     // panic, Stage B error, etc.), so ~256 temp files per bucket dir don't
     // leak. They are not part of the index being built.
+    //
+    // No free-space check precedes them, unlike add-locations-to-ways'
+    // sparse index and external join. The trees hold one record per covered
+    // cell, and how many cells a street segment or interpolation way covers
+    // is known only by covering it, which is Stage A itself. Before Stage A
+    // the only figure is a lower bound from the counts pass 2 produced. A check against it would refuse only runs
+    // that are certain to fail, and could save at most Stage A's work up to
+    // the ENOSPC (nearly all of it, when the bound is dominated by records
+    // written late), never passes 1 and 2, which have run by now; it could
+    // never say the run fits. That is not worth a second sizing policy that
+    // must track the bucket record format, so an ENOSPC surfaces as the
+    // write error, failing the build before anything is published.
     let fine_bucket_dir = scratch.create_subdir(&format!("buckets-level{fine_level}"))?;
     let coarse_bucket_dir = scratch.create_subdir(&format!("buckets-level{coarse_level}"))?;
 

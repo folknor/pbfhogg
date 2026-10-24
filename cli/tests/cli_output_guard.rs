@@ -136,6 +136,55 @@ fn input_output_alias_is_still_rejected() {
     );
 }
 
+/// Publication swaps a geocode index directory whole and deletes the one it
+/// replaced, so an input inside it - or a symlink inside it naming an input
+/// elsewhere - would be deleted by a successful `--overwrite` run. Both are
+/// refused before any work, even though the directory is a replaceable index.
+#[test]
+fn a_geocode_index_directory_holding_an_input_is_refused() {
+    let dir = crate::common::test_scratch();
+    let idx = dir.path().join("idx");
+    std::fs::create_dir(&idx).unwrap();
+    // An index, as far as replacement is concerned.
+    std::fs::write(idx.join("geocode_header.bin"), b"").unwrap();
+    let inside = idx.join("in.osm.pbf");
+    write_fixture(&inside);
+    let outside = dir.path().join("source.osm.pbf");
+    write_fixture(&outside);
+    let link = idx.join("link.osm.pbf");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    for input in [&inside, &link] {
+        let out = CliInvoker::new()
+            .arg("build-geocode-index")
+            .arg(input)
+            .arg("--allow-unindexed")
+            .arg("--overwrite")
+            .arg("--output-dir")
+            .arg(&idx)
+            .run();
+        let stderr = out.stderr_str();
+        assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+        assert!(
+            stderr.contains("contains input"),
+            "containment check did not fire; stderr:\n{stderr}"
+        );
+        // Nothing was deleted, staged or made as scratch, here or inside.
+        let names = |d: &Path| {
+            let mut names: Vec<String> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(dir.path()), ["idx", "source.osm.pbf"]);
+        assert_eq!(
+            names(&idx),
+            ["geocode_header.bin", "in.osm.pbf", "link.osm.pbf"]
+        );
+    }
+}
+
 /// A framing error names the input it came from and the blob it sits in.
 /// On a multi-input command a byte offset alone cannot say which stream it
 /// indexes.

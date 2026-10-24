@@ -127,7 +127,13 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   `--overwrite`. That covers every input, not only the positional ones:
   `getid` and `getparents` `-i` and `-I`, the `-e` expressions file of
   `tags-filter` and `export`, `extract --polygon`, the `extract --config`
-  file and the `polygon_file` entries it names.
+  file and the `polygon_file` entries it names. A directory output may not
+  hold one either: `build-geocode-index` refuses an `--output-dir` that
+  contains its input, or the entry naming it (a symlink or hard link
+  inside), with `output <dir> contains input <path>`, because replacing
+  the index directory deletes everything in it. A path that merely passes
+  through the directory (a symlinked directory inside it) is not refused;
+  only that link would be lost.
 - **A symlink is never an output**, even with `--overwrite`: replacing it
   would turn the link into a regular file. The error names the link and its
   target. An existing directory (or device, FIFO) where a file output is

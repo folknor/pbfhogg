@@ -1,141 +1,102 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
-pub(crate) struct WriterMetrics {
-    pub permit_wait_ns: AtomicU64,
-    pub frame_ns: AtomicU64,
-    pub compress_ns: AtomicU64,
-    pub pipeline_send_wait_ns: AtomicU64,
-    pub recv_wait_ns: AtomicU64,
-    pub reorder_high_water: AtomicU64,
-    /// Time blocked waiting for a sequence permit in `ParallelGzipWriter`.
-    pub parallel_gzip_reorder_wait_ns: AtomicU64,
-    /// Number of `ParallelGzipWriter` dispatches that waited for a sequence permit.
-    pub parallel_gzip_reorder_blocked: AtomicU64,
-    /// Peak `ParallelGzipWriter` reorder-map length, in gzip chunks. Kept
-    /// apart from `reorder_high_water`, which counts PBF blobs in the
-    /// writer backends' reorder buffers.
-    pub parallel_gzip_reorder_high_water: AtomicU64,
-    pub write_ns: AtomicU64,
-    pub flush_ns: AtomicU64,
-    pub bytes_framed: AtomicU64,
-    pub bytes_written: AtomicU64,
+use crate::counters::Stopwatch;
 
-    pub payload_framed_items: AtomicU64,
-    pub payload_framed_bytes: AtomicU64,
-    pub payload_raw_items: AtomicU64,
-    pub payload_raw_bytes: AtomicU64,
-    pub payload_raw_chunk_items: AtomicU64,
-    pub payload_raw_chunk_bytes: AtomicU64,
-    pub payload_copy_range_items: AtomicU64,
-    pub payload_copy_range_bytes: AtomicU64,
-    /// Passthrough ranges the kernel refused to `copy_file_range` (cross
-    /// filesystem, unsupported filesystem or kernel, seccomp, non-regular
-    /// output; see `copy_range::kernel_copy_refused`) and that were copied
-    /// through userspace instead. Non-zero on a planet run is a performance
-    /// cliff worth knowing about, not a failure.
-    pub copy_range_fallback_ranges: AtomicU64,
-    /// Bytes those ranges routed to the userspace fallback, counted when the
-    /// range is routed (a fallback that then fails is still counted).
-    pub copy_range_fallback_bytes: AtomicU64,
+crate::counters::counter_set! {
+    pub(crate) struct WriterMetrics {
+        pub permit_wait_ns => "writer_permit_wait_ns",
+        pub frame_ns => "writer_frame_ns",
+        pub compress_ns => "writer_compress_ns",
+        pub pipeline_send_wait_ns => "writer_pipeline_send_wait_ns",
+        pub recv_wait_ns => "writer_recv_wait_ns",
+        pub reorder_high_water => "writer_reorder_high_water",
+        /// Time blocked waiting for a sequence permit in `ParallelGzipWriter`.
+        pub parallel_gzip_reorder_wait_ns => "writer_parallel_gzip_reorder_wait_ns",
+        /// Number of `ParallelGzipWriter` dispatches that waited for a sequence permit.
+        pub parallel_gzip_reorder_blocked => "writer_parallel_gzip_reorder_blocked",
+        /// Peak `ParallelGzipWriter` reorder-map length, in gzip chunks. Kept
+        /// apart from `reorder_high_water`, which counts PBF blobs in the
+        /// writer backends' reorder buffers.
+        pub parallel_gzip_reorder_high_water => "writer_parallel_gzip_reorder_high_water",
+        pub write_ns => "writer_write_ns",
+        pub flush_ns => "writer_flush_ns",
+        pub bytes_framed => "writer_bytes_framed",
+        pub bytes_written => "writer_bytes_written",
 
-    pub buffered_write_calls: AtomicU64,
-    pub buffered_write_bytes: AtomicU64,
-    pub direct_write_calls: AtomicU64,
-    pub direct_write_bytes: AtomicU64,
-    pub sync_all_ns: AtomicU64,
-    /// Number of `fsync` calls issued. Separate from `sync_all_ns` because
-    /// "did anything fsync at all" is a correctness question - `Write::flush`
-    /// must not - while the nanosecond total is a performance one.
-    ///
-    /// Every backend that fsyncs must record it through
-    /// [`WriterMetrics::record_sync_all`]; there is no correct way to bump
-    /// `sync_all_ns` alone. The pair used to be maintained by hand at each
-    /// site and the parallel and io_uring backends bumped only the
-    /// nanoseconds, so `writer_sync_all_calls` reported zero fsyncs for two
-    /// of the three backends - a benchmark counter that silently disagreed
-    /// with its own documentation.
-    pub sync_all_calls: AtomicU64,
+        pub payload_framed_items => "writer_payload_framed_items",
+        pub payload_framed_bytes => "writer_payload_framed_bytes",
+        pub payload_raw_items => "writer_payload_raw_items",
+        pub payload_raw_bytes => "writer_payload_raw_bytes",
+        pub payload_raw_chunk_items => "writer_payload_raw_chunk_items",
+        pub payload_raw_chunk_bytes => "writer_payload_raw_chunk_bytes",
+        pub payload_copy_range_items => "writer_payload_copy_range_items",
+        pub payload_copy_range_bytes => "writer_payload_copy_range_bytes",
+        /// Passthrough ranges the kernel refused to `copy_file_range` (cross
+        /// filesystem, unsupported filesystem or kernel, seccomp, non-regular
+        /// output; see `copy_range::kernel_copy_refused`) and that were copied
+        /// through userspace instead. Non-zero on a planet run is a performance
+        /// cliff worth knowing about, not a failure.
+        pub copy_range_fallback_ranges => "writer_copy_range_fallback_ranges",
+        /// Bytes those ranges routed to the userspace fallback, counted when the
+        /// range is routed (a fallback that then fails is still counted).
+        pub copy_range_fallback_bytes => "writer_copy_range_fallback_bytes",
 
-    pub uring_submit_calls: AtomicU64,
-    pub uring_submit_ns: AtomicU64,
-    pub uring_submit_and_wait_calls: AtomicU64,
-    pub uring_submit_and_wait_ns: AtomicU64,
+        pub buffered_write_calls => "writer_buffered_write_calls",
+        pub buffered_write_bytes => "writer_buffered_write_bytes",
+        pub direct_write_calls => "writer_direct_write_calls",
+        pub direct_write_bytes => "writer_direct_write_bytes",
+        pub sync_all_ns => "writer_sync_all_ns",
+        /// Number of `fsync` calls issued. Separate from `sync_all_ns` because
+        /// "did anything fsync at all" is a correctness question - `Write::flush`
+        /// must not - while the nanosecond total is a performance one.
+        ///
+        /// Every backend that fsyncs must record it through
+        /// [`WriterMetrics::record_sync_all`]; there is no correct way to bump
+        /// `sync_all_ns` alone. The pair used to be maintained by hand at each
+        /// site and the parallel and io_uring backends bumped only the
+        /// nanoseconds, so `writer_sync_all_calls` reported zero fsyncs for two
+        /// of the three backends - a benchmark counter that silently disagreed
+        /// with its own documentation.
+        pub sync_all_calls => "writer_sync_all_calls",
 
-    /// Blobs whose `tagdata` was dropped because the encoded `BlobHeader`
-    /// would otherwise have hit the 64 KiB format cap. Non-zero means the
-    /// output is correct but some blobs lost their tag skip-index; see
-    /// `encode_blob_header_into`.
-    pub tagdata_dropped_oversize: AtomicU64,
+        pub uring_submit_calls => "writer_uring_submit_calls",
+        pub uring_submit_ns => "writer_uring_submit_ns",
+        pub uring_submit_and_wait_calls => "writer_uring_submit_and_wait_calls",
+        pub uring_submit_and_wait_ns => "writer_uring_submit_and_wait_ns",
 
-    /// Scratch buffers whose capacity exceeded the 4 MiB retention limit and
-    /// were handed off or dropped instead of retained by a worker thread.
-    pub frame_scratch_capped_buffers: AtomicU64,
-    /// Sum of the full capacities of buffers capped from thread-local scratch.
-    pub frame_scratch_capped_capacity_bytes: AtomicU64,
+        /// Blobs whose `tagdata` was dropped because the encoded `BlobHeader`
+        /// would otherwise have hit the 64 KiB format cap. Non-zero means the
+        /// output is correct but some blobs lost their tag skip-index; see
+        /// `encode_blob_header_into`.
+        pub tagdata_dropped_oversize => "writer_tagdata_dropped_oversize",
 
-    /// Time a producer on a worker of the writer's executor pool spent in the
-    /// cooperative permit wait (`pipeline::recv_permit`). Zero on every CLI
-    /// path, which drives its writers off-worker; non-zero means a
-    /// `PbfWriter` is being driven from a rayon worker.
-    pub coop_wait_ns: AtomicU64,
+        /// Scratch buffers whose capacity exceeded the 4 MiB retention limit and
+        /// were handed off or dropped instead of retained by a worker thread.
+        pub frame_scratch_capped_buffers => "writer_frame_scratch_capped_buffers",
+        /// Sum of the full capacities of buffers capped from thread-local scratch.
+        pub frame_scratch_capped_capacity_bytes => "writer_frame_scratch_capped_capacity_bytes",
 
-    /// Latch for [`WriterMetrics::emit_once`], so a process emits the
-    /// counter set exactly once no matter how many writers it flushes.
-    emitted: AtomicBool,
+        /// Time a producer on a worker of the writer's executor pool spent in the
+        /// cooperative permit wait (`pipeline::recv_permit`). Zero on every CLI
+        /// path, which drives its writers off-worker; non-zero means a
+        /// `PbfWriter` is being driven from a rayon worker.
+        pub coop_wait_ns => "writer_coop_wait_ns",
+    }
+    extra {
+        /// Latch for [`WriterMetrics::emit_once`], so a process emits the
+        /// counter set exactly once no matter how many writers it flushes.
+        emitted: AtomicBool = AtomicBool::new(false),
+    }
 }
 
 impl WriterMetrics {
-    const fn new() -> Self {
-        Self {
-            permit_wait_ns: AtomicU64::new(0),
-            frame_ns: AtomicU64::new(0),
-            compress_ns: AtomicU64::new(0),
-            pipeline_send_wait_ns: AtomicU64::new(0),
-            recv_wait_ns: AtomicU64::new(0),
-            reorder_high_water: AtomicU64::new(0),
-            parallel_gzip_reorder_wait_ns: AtomicU64::new(0),
-            parallel_gzip_reorder_blocked: AtomicU64::new(0),
-            parallel_gzip_reorder_high_water: AtomicU64::new(0),
-            write_ns: AtomicU64::new(0),
-            flush_ns: AtomicU64::new(0),
-            bytes_framed: AtomicU64::new(0),
-            bytes_written: AtomicU64::new(0),
-            payload_framed_items: AtomicU64::new(0),
-            payload_framed_bytes: AtomicU64::new(0),
-            payload_raw_items: AtomicU64::new(0),
-            payload_raw_bytes: AtomicU64::new(0),
-            payload_raw_chunk_items: AtomicU64::new(0),
-            payload_raw_chunk_bytes: AtomicU64::new(0),
-            payload_copy_range_items: AtomicU64::new(0),
-            payload_copy_range_bytes: AtomicU64::new(0),
-            copy_range_fallback_ranges: AtomicU64::new(0),
-            copy_range_fallback_bytes: AtomicU64::new(0),
-            buffered_write_calls: AtomicU64::new(0),
-            buffered_write_bytes: AtomicU64::new(0),
-            direct_write_calls: AtomicU64::new(0),
-            direct_write_bytes: AtomicU64::new(0),
-            sync_all_ns: AtomicU64::new(0),
-            sync_all_calls: AtomicU64::new(0),
-            uring_submit_calls: AtomicU64::new(0),
-            uring_submit_ns: AtomicU64::new(0),
-            uring_submit_and_wait_calls: AtomicU64::new(0),
-            uring_submit_and_wait_ns: AtomicU64::new(0),
-            tagdata_dropped_oversize: AtomicU64::new(0),
-            frame_scratch_capped_buffers: AtomicU64::new(0),
-            frame_scratch_capped_capacity_bytes: AtomicU64::new(0),
-            coop_wait_ns: AtomicU64::new(0),
-            emitted: AtomicBool::new(false),
-        }
-    }
-
     /// Record one completed `fsync` and how long it took.
     ///
     /// The single funnel for the `sync_all_ns` / `sync_all_calls` pair. Call
     /// this from every backend that syncs, rather than touching either field
     /// directly, so the two cannot drift apart again.
-    pub fn record_sync_all(&self, start: std::time::Instant) {
-        self.sync_all_ns
-            .fetch_add(crate::elapsed::elapsed_ns_u64(start), Relaxed);
+    pub fn record_sync_all(&self, start: Stopwatch) {
+        start.record_ns(&self.sync_all_ns);
         self.sync_all_calls.fetch_add(1, Relaxed);
     }
 
@@ -144,7 +105,7 @@ impl WriterMetrics {
     /// (`crate::output`) syncs a staged file or a directory, so those syncs
     /// show up in the sidecar like the writers' own.
     pub(crate) fn sync_recorded(&self, file: &std::fs::File) -> std::io::Result<()> {
-        let start = std::time::Instant::now();
+        let start = Stopwatch::start();
         // The funnel itself.
         #[allow(clippy::disallowed_methods)]
         let result = file.sync_all();
@@ -157,23 +118,12 @@ impl WriterMetrics {
     /// Feeds `brokkr sidecar --stalls` via the `writer_recv_wait_ns`
     /// convention. Every backend's writer loop must call it, or that backend
     /// reports as never having stalled on its input.
-    pub fn record_recv_wait(&self, start: std::time::Instant) {
-        self.recv_wait_ns
-            .fetch_add(crate::elapsed::elapsed_ns_u64(start), Relaxed);
+    pub fn record_recv_wait(&self, start: Stopwatch) {
+        start.record_ns(&self.recv_wait_ns);
     }
 
     pub fn record_reorder_high_water(&self, len: usize) {
-        let len = len as u64;
-        let mut current = self.reorder_high_water.load(Relaxed);
-        while len > current {
-            match self
-                .reorder_high_water
-                .compare_exchange_weak(current, len, Relaxed, Relaxed)
-            {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
+        crate::counters::record_max(&self.reorder_high_water, len as u64);
     }
 
     /// Emit the counters, at most once per process.
@@ -206,82 +156,11 @@ impl WriterMetrics {
         self.emit()
     }
 
-    /// Returns `true` if anything was emitted.
+    /// Returns `true` if anything was emitted. Emits one captured snapshot:
+    /// the values the all-zero gate checks are the values published.
     fn emit(&self) -> bool {
-        let mut counters: Vec<(&'static str, i64)> = Vec::new();
-        macro_rules! emit {
-            ($name:literal, $field:ident) => {
-                counters.push((
-                    $name,
-                    i64::try_from(self.$field.load(Relaxed)).unwrap_or(i64::MAX),
-                ));
-            };
-        }
-
-        emit!("writer_permit_wait_ns", permit_wait_ns);
-        emit!("writer_frame_ns", frame_ns);
-        emit!("writer_compress_ns", compress_ns);
-        emit!("writer_pipeline_send_wait_ns", pipeline_send_wait_ns);
-        emit!("writer_recv_wait_ns", recv_wait_ns);
-        emit!("writer_reorder_high_water", reorder_high_water);
-        emit!(
-            "writer_parallel_gzip_reorder_wait_ns",
-            parallel_gzip_reorder_wait_ns
-        );
-        emit!(
-            "writer_parallel_gzip_reorder_blocked",
-            parallel_gzip_reorder_blocked
-        );
-        emit!(
-            "writer_parallel_gzip_reorder_high_water",
-            parallel_gzip_reorder_high_water
-        );
-        emit!("writer_write_ns", write_ns);
-        emit!("writer_flush_ns", flush_ns);
-        emit!("writer_bytes_framed", bytes_framed);
-        emit!("writer_bytes_written", bytes_written);
-
-        emit!("writer_payload_framed_items", payload_framed_items);
-        emit!("writer_payload_framed_bytes", payload_framed_bytes);
-        emit!("writer_payload_raw_items", payload_raw_items);
-        emit!("writer_payload_raw_bytes", payload_raw_bytes);
-        emit!("writer_payload_raw_chunk_items", payload_raw_chunk_items);
-        emit!("writer_payload_raw_chunk_bytes", payload_raw_chunk_bytes);
-        emit!("writer_payload_copy_range_items", payload_copy_range_items);
-        emit!("writer_payload_copy_range_bytes", payload_copy_range_bytes);
-        emit!(
-            "writer_copy_range_fallback_ranges",
-            copy_range_fallback_ranges
-        );
-        emit!(
-            "writer_copy_range_fallback_bytes",
-            copy_range_fallback_bytes
-        );
-
-        emit!("writer_buffered_write_calls", buffered_write_calls);
-        emit!("writer_buffered_write_bytes", buffered_write_bytes);
-        emit!("writer_direct_write_calls", direct_write_calls);
-        emit!("writer_direct_write_bytes", direct_write_bytes);
-        emit!("writer_sync_all_ns", sync_all_ns);
-        emit!("writer_sync_all_calls", sync_all_calls);
-
-        emit!("writer_uring_submit_calls", uring_submit_calls);
-        emit!("writer_uring_submit_ns", uring_submit_ns);
-        emit!(
-            "writer_uring_submit_and_wait_calls",
-            uring_submit_and_wait_calls
-        );
-        emit!("writer_uring_submit_and_wait_ns", uring_submit_and_wait_ns);
-        emit!("writer_tagdata_dropped_oversize", tagdata_dropped_oversize);
-        emit!(
-            "writer_frame_scratch_capped_buffers",
-            frame_scratch_capped_buffers
-        );
-        emit!(
-            "writer_frame_scratch_capped_capacity_bytes",
-            frame_scratch_capped_capacity_bytes
-        );
-        emit!("writer_coop_wait_ns", coop_wait_ns);
+        let mut counters: Vec<(&'static str, u64)> = Vec::new();
+        self.for_each(|name, value| counters.push((name, value)));
 
         // An all-zero set means no writer ever ran in this process. Say
         // nothing rather than publishing thirty zeroes for every `inspect`.
@@ -335,7 +214,7 @@ mod tests {
     fn record_sync_all_bumps_calls_and_nanos_together() {
         let calls_before = WRITER_METRICS.sync_all_calls.load(Relaxed);
         let ns_before = WRITER_METRICS.sync_all_ns.load(Relaxed);
-        let start = std::time::Instant::now();
+        let start = crate::counters::Stopwatch::start();
         std::thread::sleep(std::time::Duration::from_millis(2));
         WRITER_METRICS.record_sync_all(start);
         assert!(

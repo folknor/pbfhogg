@@ -448,14 +448,8 @@ pub(crate) fn add_locations_to_ways_to(
     crate::debug::emit_marker("ALTW_PASS0_END");
     // Cheap one-shot iter().count(); surfaces the way-ref IdSet size before
     // the index build so the counter survives SIGKILL during pass 1.
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter(
-            "altw_referenced_node_ids",
-            i64::try_from(referenced.iter().count()).unwrap_or(i64::MAX),
-        );
-        crate::debug::emit_counter("altw_index_kind", 1);
-    }
+    crate::debug::emit_counter("altw_referenced_node_ids", referenced.iter().count());
+    crate::debug::emit_counter("altw_index_kind", 1);
 
     crate::debug::emit_marker("ALTW_PASS1_START");
     let index =
@@ -476,14 +470,10 @@ pub(crate) fn add_locations_to_ways_to(
             host,
         )?;
         crate::debug::emit_marker("ALTW_REL_MEMBER_SCAN_END");
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            crate::debug::emit_counter(
-                "altw_relation_member_node_ids",
-                i64::try_from(ids.0.as_ref().map_or(0, |set| set.iter().count()))
-                    .unwrap_or(i64::MAX),
-            );
-        }
+        crate::debug::emit_counter(
+            "altw_relation_member_node_ids",
+            ids.0.as_ref().map_or(0, |set| set.iter().count()),
+        );
         ids
     };
     crate::debug::emit_marker("ALTW_PASS2_START");
@@ -706,7 +696,7 @@ fn page_cache_budget_bytes(host: &crate::host::Host) -> Option<u64> {
 /// its `WayReframeCounters`; the previous process-global statics took two
 /// contended atomic adds per pinned way.
 pub(super) mod inject_metrics {
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::sync::atomic::Ordering::Relaxed;
 
     /// One blob's field-20 tally, accumulated by a single worker without
     /// atomics. Reset at the start of every way-blob reframe, so a blob
@@ -731,13 +721,15 @@ pub(super) mod inject_metrics {
         }
     }
 
-    /// One run's injected-prepass totals, shared by reference across that
-    /// run's reframe workers.
-    #[derive(Default, Debug)]
-    pub(super) struct InjectMetrics {
-        pinned_refs: AtomicU64,
-        field20_ways: AtomicU64,
-        field5_bytes: AtomicU64,
+    crate::counters::counter_set! {
+        /// One run's injected-prepass totals, shared by reference across that
+        /// run's reframe workers.
+        #[derive(Debug)]
+        pub(super) struct InjectMetrics {
+            pinned_refs => "altw_pinned_refs",
+            field20_ways => "altw_field20_ways_emitted",
+            field5_bytes => "altw_field5_bytes",
+        }
     }
 
     impl InjectMetrics {
@@ -754,15 +746,9 @@ pub(super) mod inject_metrics {
 
         /// Emit the four injected-prepass counters. `member_ways` is the
         /// size of the relation member-way IdSet, computed by the caller.
-        #[allow(clippy::cast_possible_wrap)]
         pub(super) fn emit(&self, member_ways: u64) {
-            crate::debug::emit_counter("altw_member_ways", member_ways as i64);
-            crate::debug::emit_counter("altw_pinned_refs", self.pinned_refs.load(Relaxed) as i64);
-            crate::debug::emit_counter(
-                "altw_field20_ways_emitted",
-                self.field20_ways.load(Relaxed) as i64,
-            );
-            crate::debug::emit_counter("altw_field5_bytes", self.field5_bytes.load(Relaxed) as i64);
+            crate::debug::emit_counter("altw_member_ways", member_ways);
+            self.emit_all();
         }
 
         #[cfg(test)]
@@ -833,16 +819,15 @@ pub(super) mod inject_metrics {
     }
 }
 
-#[allow(clippy::cast_possible_wrap)]
 fn emit_stats_counters(stats: &Stats) {
-    crate::debug::emit_counter("altw_nodes_read", stats.nodes_read as i64);
-    crate::debug::emit_counter("altw_nodes_written", stats.nodes_written as i64);
-    crate::debug::emit_counter("altw_nodes_dropped", stats.nodes_dropped as i64);
-    crate::debug::emit_counter("altw_ways_written", stats.ways_written as i64);
-    crate::debug::emit_counter("altw_relations_written", stats.relations_written as i64);
-    crate::debug::emit_counter("altw_missing_locations", stats.missing_locations as i64);
-    crate::debug::emit_counter("altw_blobs_passthrough", stats.blobs_passthrough as i64);
-    crate::debug::emit_counter("altw_blobs_decoded", stats.blobs_decoded as i64);
+    crate::debug::emit_counter("altw_nodes_read", stats.nodes_read);
+    crate::debug::emit_counter("altw_nodes_written", stats.nodes_written);
+    crate::debug::emit_counter("altw_nodes_dropped", stats.nodes_dropped);
+    crate::debug::emit_counter("altw_ways_written", stats.ways_written);
+    crate::debug::emit_counter("altw_relations_written", stats.relations_written);
+    crate::debug::emit_counter("altw_missing_locations", stats.missing_locations);
+    crate::debug::emit_counter("altw_blobs_passthrough", stats.blobs_passthrough);
+    crate::debug::emit_counter("altw_blobs_decoded", stats.blobs_decoded);
 }
 
 // ---------------------------------------------------------------------------
@@ -922,7 +907,7 @@ fn collect_way_referenced_node_ids(
             Ok(refs_vec)
         },
         |_seq, refs_vec| {
-            let t_union = std::time::Instant::now();
+            let t_union = crate::counters::Stopwatch::start();
             union_refs_total += refs_vec.len() as u64;
             // Split on `shared` rather than branching per ref: the plain
             // path must not pay the shared-detection `get`, which only
@@ -946,23 +931,14 @@ fn collect_way_referenced_node_ids(
                     }
                 }
             }
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                union_ns += t_union.elapsed().as_nanos() as u64;
-            }
+            union_ns += t_union.elapsed_ns();
         },
         host,
     )?;
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("altw_pass0_union_ms", (union_ns / 1_000_000) as i64);
-        crate::debug::emit_counter("altw_pass0_refs_total", union_refs_total as i64);
-    }
+    crate::debug::emit_counter("altw_pass0_union_ms", union_ns / 1_000_000);
+    crate::debug::emit_counter("altw_pass0_refs_total", union_refs_total);
     if let Some(shared_set) = &shared {
-        crate::debug::emit_counter(
-            "altw_pass0_shared_node_ids",
-            i64::try_from(shared_set.iter().count()).unwrap_or(i64::MAX),
-        );
+        crate::debug::emit_counter("altw_pass0_shared_node_ids", shared_set.iter().count());
     }
     Ok((referenced, shared))
 }
@@ -1150,18 +1126,12 @@ fn write_output_decode_all(
             stats.merge(&block_stats);
             decoded_blocks += 1;
             if decoded_blocks.is_multiple_of(64) {
-                crate::debug::emit_counter(
-                    "altw_pass2_blocks",
-                    i64::try_from(decoded_blocks).unwrap_or(i64::MAX),
-                );
+                crate::debug::emit_counter("altw_pass2_blocks", decoded_blocks);
             }
             Ok(())
         },
     )?;
-    crate::debug::emit_counter(
-        "altw_pass2_blocks",
-        i64::try_from(decoded_blocks).unwrap_or(i64::MAX),
-    );
+    crate::debug::emit_counter("altw_pass2_blocks", decoded_blocks);
 
     writer.flush()?;
     Ok(stats)

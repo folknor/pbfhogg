@@ -10,7 +10,7 @@ use super::super::Result;
 use super::pool::{Rewritten, run_rewrite_stage};
 use super::schedule::BlobTask;
 use super::wire_rewrite::{Scratch, reframe_dense_with_new_ids};
-use super::{BlobBuffers, StageCounters, add_ns, blob_index, positional_bases};
+use super::{BlobBuffers, StageCounters, blob_index, positional_bases};
 use crate::idset::IdSet;
 use crate::tunables::RENUMBER_PASS1_WORKERS;
 
@@ -67,7 +67,7 @@ pub(super) fn pass1_parallel_scan(
                 // header key lists would change output and add per-blob rewrite work.
                 w.buffers.load(shared_file, task, &counters)?;
 
-                let t = std::time::Instant::now();
+                let t = crate::counters::Stopwatch::start();
                 let outcome = reframe_dense_with_new_ids(
                     &w.buffers.decompressed,
                     base,
@@ -76,7 +76,7 @@ pub(super) fn pass1_parallel_scan(
                     &mut w.reframe_buf,
                     &mut w.scratch,
                 )?;
-                add_ns(&counters.reframe_ns, t);
+                t.record_ns(&counters.reframe_ns);
 
                 if outcome.count != task.element_count {
                     return Err(crate::Error::invalid_data(format!(

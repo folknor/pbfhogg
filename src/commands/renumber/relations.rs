@@ -14,7 +14,7 @@ use super::schedule::BlobTask;
 use super::wire_rewrite::{
     RelationIdSpaces, Scratch, order_error, reframe_relations_with_new_ids, relation_id,
 };
-use super::{BlobBuffers, StageCounters, add_ns};
+use super::{BlobBuffers, StageCounters};
 use crate::idset::IdSet;
 
 /// Reject negative ids at the entry of the external path.
@@ -65,7 +65,7 @@ pub(super) fn relation_r1_collect_ids(
                 .load(shared_file, task, &counters)
                 .map_err(|e| e.context("R1"))?;
 
-            let t = std::time::Instant::now();
+            let t = crate::counters::Stopwatch::start();
             let mut cursor = Cursor::new(&buffers.decompressed);
             while let Some((field, wire_type)) = cursor
                 .read_tag()
@@ -105,7 +105,7 @@ pub(super) fn relation_r1_collect_ids(
                     relation_id_set.set(rel_id);
                 }
             }
-            add_ns(&counters.reframe_ns, t);
+            t.record_ns(&counters.reframe_ns);
             counters.bump_blobs();
             Ok(())
         })()
@@ -173,14 +173,14 @@ pub(super) fn relation_r2d_assembly(
                 // header key lists would change output and add per-blob rewrite work.
                 w.buffers.load(shared_file, task, &counters)?;
 
-                let t = std::time::Instant::now();
+                let t = crate::counters::Stopwatch::start();
                 let outcome = reframe_relations_with_new_ids(
                     &w.buffers.decompressed,
                     ids,
                     &mut w.reframe_buf,
                     &mut w.scratch,
                 )?;
-                add_ns(&counters.reframe_ns, t);
+                t.record_ns(&counters.reframe_ns);
                 counters.bump_blobs();
 
                 let block = match outcome.new_range {

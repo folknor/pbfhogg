@@ -16,7 +16,7 @@ use crate::tunables::{
 };
 
 use super::blob_wire::{BlobData, MAX_BLOB_MESSAGE_SIZE, WireBlob};
-use super::pipeline_metrics::PIPELINE_METRICS;
+use super::pipeline_metrics::DECOMPRESS_POOL_METRICS;
 
 thread_local! {
     /// Per-thread reusable zlib decompressor state (~32 KB inflate tables).
@@ -69,14 +69,14 @@ impl DecompressPool {
     fn put(&self, mut buf: Vec<u8>) {
         let capacity = buf.capacity();
         if capacity > DECOMPRESS_POOL_MAX_RETAINED_CAPACITY {
-            PIPELINE_METRICS.record_decompress_pool_oversize_drop(capacity);
+            DECOMPRESS_POOL_METRICS.record_oversize_drop(capacity);
             return;
         }
         buf.clear();
         match self.buffers.lock() {
             Ok(mut buffers) if buffers.len() < DECOMPRESS_POOL_MAX_BUFFERS => buffers.push(buf),
-            Ok(_) => PIPELINE_METRICS.record_decompress_pool_full_drop(capacity),
-            Err(_) => PIPELINE_METRICS.record_decompress_pool_poisoned_drop(capacity),
+            Ok(_) => DECOMPRESS_POOL_METRICS.record_full_drop(capacity),
+            Err(_) => DECOMPRESS_POOL_METRICS.record_poisoned_drop(capacity),
         }
     }
 }

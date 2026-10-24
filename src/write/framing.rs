@@ -24,7 +24,6 @@ use crate::read::wire_schema::{BlobHeaderField, HeaderBlockField, blob, blob_hea
 
 use super::compression::Compression;
 use super::pipeline::FramedBlobParts;
-use crate::elapsed::elapsed_ns_u64;
 
 use crate::tunables::{MAX_RETAINED_SCRATCH_CAPACITY, ZLIB_RESERVE_SHIFT, ZLIB_RESERVE_SLACK};
 
@@ -283,16 +282,14 @@ pub(super) fn frame_in_scratch<'a>(
     way_members: Option<&[u8]>,
     scratch: &'a mut FrameScratch,
 ) -> Result<ScratchFrame<'a>> {
-    let t_compress = std::time::Instant::now();
+    let t_compress = crate::counters::Stopwatch::start();
     scratch.trim_oversize_retained_buffers();
     if let Err(error) = encode_blob_body(uncompressed, compression, scratch) {
         scratch.trim_oversize_retained_buffers();
         return Err(error);
     }
-    WRITER_METRICS
-        .compress_ns
-        .fetch_add(elapsed_ns_u64(t_compress), Relaxed);
-    let t_frame = std::time::Instant::now();
+    t_compress.record_ns(&WRITER_METRICS.compress_ns);
+    let t_frame = crate::counters::Stopwatch::start();
 
     // The format caps a Blob body at `MAX_BLOB_DATASIZE`, and our own reader
     // enforces it on the way back in ("blob header declares datasize too
@@ -338,9 +335,7 @@ pub(super) fn frame_in_scratch<'a>(
         ))
     })?;
     let total_len = 4 + scratch.header_buf.len() + scratch.blob_buf.len();
-    WRITER_METRICS
-        .frame_ns
-        .fetch_add(elapsed_ns_u64(t_frame), Relaxed);
+    t_frame.record_ns(&WRITER_METRICS.frame_ns);
     WRITER_METRICS
         .bytes_framed
         .fetch_add(total_len as u64, Relaxed);

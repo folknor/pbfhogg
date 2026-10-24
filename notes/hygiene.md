@@ -204,6 +204,37 @@ The judgement calls already known, to be checked first:
   stage 3 test set `force`, which the external index refuses before
   stage 3, and the derive test re-staged the output its clean run had
   just published, which is refused before any shard runs.
+- Sidecar counters moved onto `src/counters.rs`: `counter_set!` generates
+  each counter struct, `new`, `Default` and a private visitor and emitter
+  from one list of `field => "emitted_name"` (optional `/ 1_000_000` for
+  nanosecond accumulators emitted as milliseconds); `record_max` is the one
+  max loop; `Stopwatch` replaced `crate::elapsed::elapsed_ns_u64` (deleted)
+  and the altw `as_millis() as u64` / `as_nanos() as u64` truncations;
+  `debug::emit_counter` takes `impl CounterValue` (signed exact, unsigned
+  saturating, conversion inside the armed-FIFO closure). Every emitted
+  name was checked to appear the same number of times per file before and
+  after. Judgement calls on measured paths, none measured:
+  - Altw stages 1 to 4, passthrough and sparse pass 1 hold their counters
+    in one struct per stage instead of separate stack-local atomics (the
+    `_ref` bindings are gone). Same atomic operations, but which counters
+    share a cache line changed; argued below noise at per-blob, per-bucket
+    and per-flush frequency. No counter in these stages is bumped per way
+    or per ref; the finest-grained are stage 4's per-group and
+    per-non-way-field reframe timers, which already shared one struct and
+    keep their field order.
+  - The two production `fetch_max` sites (altw stage 4 readiness-wait max,
+    the parallel gzip reorder high-water) now use `record_max`: fewer
+    locked operations when the maximum does not move, the same otherwise.
+  - Truncating and saturating conversions were treated as value-identical
+    (they differ only past about 584 years of nanoseconds, or past
+    `i64::MAX` at emission). Per-sample millisecond truncation was kept,
+    and the stage 2 `_ms` / `_ns` twins still read the clock twice, in the
+    old order.
+  - Emission order changed only in altw stage 4 (the worker set first, then
+    the consumer-side locals). `PIPELINE_METRICS` stays one process-global
+    static; its six pool-drop fields moved to a second static,
+    `DECOMPRESS_POOL_METRICS`, still emitted only through
+    `emit_decompress_pool_counters` from the exit hook.
 
 ---
 
@@ -476,43 +507,6 @@ range and byte counts (the errno would need one more cold-path counter). Fix: on
 elsewhere.
 
 Reported by: write path.
-
-## HYG-024 - Counter declaration and emission is hand-written boilerplate
-
-Anger: 8 - counter machinery and semantics.
-
-Altw stages each declare 10 to 35 `AtomicU64` locals, a `_ref` binding for
-each, and an emit block repeating `emit_counter("x", x.load(Relaxed) as i64)`
-under `#[allow(clippy::cast_possible_wrap)]`, about 300 lines;
-`passthrough.rs` has a `Pass2Counters` struct and stages 1 to 4 do not. The
-compare-exchange "track the max" loops (altw stages 2 to 4, `cas_max` in
-`read/pipeline_metrics.rs`, `write/metrics.rs`) were proposed for
-`fetch_max` (already used in renumber's pool, altw stage 4's readiness wait
-and `parallel_gzip`), but they are probably not a candidate: they load and
-store only when the candidate is larger, so in steady state a call is a
-plain read and the cache line stays shared across workers, while
-`fetch_max` on x86-64 compiles to a locked read-modify-write on every call,
-which on these per-blob paths would take the line exclusively once per blob
-per worker. Unmeasured (rule 8). Comments at the loops recording why they
-are hand-written were proposed and deferred, not declined; whoever picks
-this up should settle both the comment and whether the existing `fetch_max`
-sites are hot enough to matter.
-`write/metrics.rs` spells its field list three times (struct, `new`, `emit`)
-with hand-kept name strings; its `include_str!` funnel tests scan six files but
-not `framing.rs` (which writes `compress_ns`, `frame_ns`, `bytes_framed`,
-`tagdata_dropped_oversize`) or `parallel_gzip.rs`, and cover only the
-`sync_all` pair and `recv_wait_ns`, while `write_ns` and `bytes_written` are
-hand-rolled at about ten sites. Elapsed nanoseconds have one owner,
-`crate::elapsed::elapsed_ns_u64`, except the altw sites that truncate with
-`as u64` (stages 1 to 4, `passthrough.rs`, `coord_payloads`), which were left
-because truncating and saturating differ. Fix: a derive or
-macro generating struct, `new` and `emit` from one list (see above on the
-max loops); a `Stopwatch` whose only exit is
-`record_into(&AtomicU64)`; the funnel's source scans moved to brokkr.toml
-textlint rules selected by glob, so no file escapes a hand-kept `SOURCES`
-list.
-
-Reported by: altw and scanning, write path.
 
 ## HYG-032 - Record layouts are serialised by hand at both ends
 
@@ -1097,3 +1091,30 @@ anything measurable at planet scale is unknown (rule 8); a fix would return
 the buffer when the block drops, or decode into a pooled buffer.
 
 Reported by: the BUG-146 fix.
+
+## HYG-150 - Counter sets outside altw and the read and write metrics are still hand-rolled
+
+Anger: 6 - sidecar counter plumbing on per-blob command paths.
+
+`crate::counters` now owns counter declaration (`counter_set!`, one list
+pairing each field with its emitted name), the max update (`record_max`)
+and elapsed-time conversion (`Stopwatch`), and `debug::emit_counter` takes
+unsigned values directly. Altw, the writer metrics and the read pipeline
+metrics use them; about twenty other modules do not. Two kinds of leftover:
+shared atomic counter sets declared by hand (apply-changes `rewrite.rs` and
+`streaming.rs`, and others to be sorted out per module), which belong on
+`counter_set!`; and plain values (stats fields, schedule lengths, local
+tallies) emitted with `x as i64` under cast allows (check refs, degrade,
+repack, merge-changes, tags-filter, sort, cat, diff and derive, extract
+common, smart and multi, getid, getparents, time-filter, geocode pass 1.5,
+`scan/classify.rs`), which need only the cast dropped - never a new atomic.
+Raw `elapsed().as_millis()` / `as_nanos()` conversions remain in the
+geocode builder, check refs and renumber's `emit_elapsed_ms`.
+Renumber's `StageCounters` builds its names with `format!` from a prefix,
+so its sidecar names are not greppable verbatim. Every one sits on a
+measured path, so each move owes the same care the altw move did: no
+emitted name or value may change, single-sample reuse where one elapsed
+value feeds two counters, and no new atomic on a single-threaded consumer.
+A source scan could then forbid `as i64` inside `emit_counter(` calls.
+
+Reported by: the HYG-024 implementation.

@@ -35,5 +35,5 @@ pub fn emit_read_counters() {
     if EMITTED.swap(true, Relaxed) {
         return;
     }
-    pipeline_metrics::PIPELINE_METRICS.emit_decompress_pool_counters();
+    pipeline_metrics::emit_decompress_pool_counters();
 }

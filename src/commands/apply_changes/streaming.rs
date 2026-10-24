@@ -487,14 +487,12 @@ fn handle_candidate(
     let body_offset = desc.frame_start + desc.blob_offset as u64;
     pread_into(file, read_buf, body_offset, desc.data_size)?;
 
-    let t_decompress = std::time::Instant::now();
+    let t_decompress = crate::counters::Stopwatch::start();
     decompress_blob_raw(read_buf, decompress_buf)?;
-    counters
-        .decompress_ns
-        .fetch_add(elapsed_ns(t_decompress), Ordering::Relaxed);
+    t_decompress.record_ns(&counters.decompress_ns);
 
     if locations_on_ways && desc.kind == ElementKind::Node {
-        let t_extract = std::time::Instant::now();
+        let t_extract = crate::counters::Stopwatch::start();
         let mut hits = 0u64;
         // Every node is decoded and validated; only the ones an OSC way
         // references are kept, so the per-worker map doesn't grow with
@@ -514,23 +512,17 @@ fn handle_candidate(
         counters
             .coord_pairs_extracted
             .fetch_add(hits, Ordering::Relaxed);
-        counters
-            .coord_extract_ns
-            .fetch_add(elapsed_ns(t_extract), Ordering::Relaxed);
+        t_extract.record_ns(&counters.coord_extract_ns);
     }
 
-    let t_parse = std::time::Instant::now();
+    let t_parse = crate::counters::Stopwatch::start();
     let raw = std::mem::take(decompress_buf);
     let block = crate::PrimitiveBlock::from_vec_with_scratch(raw, st_scratch, gr_scratch)?;
-    counters
-        .parse_ns
-        .fetch_add(elapsed_ns(t_parse), Ordering::Relaxed);
+    t_parse.record_ns(&counters.parse_ns);
 
-    let t_precise = std::time::Instant::now();
+    let t_precise = crate::counters::Stopwatch::start();
     let overlaps = block_overlaps_diff(&block, ranges);
-    counters
-        .precise_ns
-        .fetch_add(elapsed_ns(t_precise), Ordering::Relaxed);
+    t_precise.record_ns(&counters.precise_ns);
 
     // Sync per-worker coords into the shared slot before emitting the
     // DrainItem. This guarantees the drain's barrier merge (which fires
@@ -625,17 +617,15 @@ fn handle_candidate(
     };
     let loc = LocMode::new(locations_on_ways, loc_arc.as_deref());
 
-    let t_rewrite = std::time::Instant::now();
+    let t_rewrite = crate::counters::Stopwatch::start();
     let output = rewrite_block_parallel(&block, diff, bb, inline_upserts, effective_kind, loc)?;
-    counters
-        .rewrite_ns
-        .fetch_add(elapsed_ns(t_rewrite), Ordering::Relaxed);
+    t_rewrite.record_ns(&counters.rewrite_ns);
 
     // P1.5: frame each output block in-line via per-thread scratch so the
     // drain side can `write_raw_owned` without the writer's
     // `rayon::spawn`-per-block dispatch (which was the dominant
     // contributor to `writer_pipeline_send_wait_ns` at planet).
-    let t_frame = std::time::Instant::now();
+    let t_frame = crate::counters::Stopwatch::start();
     let mut framed_chunks: Vec<Vec<u8>> = Vec::with_capacity(output.blocks.len());
     for OwnedBlock {
         bytes: block_bytes,
@@ -654,9 +644,7 @@ fn handle_candidate(
         )?;
         framed_chunks.push(parts.into_vec());
     }
-    counters
-        .frame_ns
-        .fetch_add(elapsed_ns(t_frame), Ordering::Relaxed);
+    t_frame.record_ns(&counters.frame_ns);
 
     counters.blobs_rewritten.fetch_add(1, Ordering::Relaxed);
     send_drain(
@@ -847,5 +835,3 @@ fn blob_err(desc: &BlobDescriptor, source: &Arc<Path>, e: Error) -> Error {
             Some(crate::ByteOffset(desc.frame_start)),
         ))
 }
-
-use crate::elapsed::elapsed_ns_u64 as elapsed_ns;

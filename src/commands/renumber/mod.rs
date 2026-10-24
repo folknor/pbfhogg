@@ -132,17 +132,11 @@ use crate::tunables::{RENUMBER_PREALLOC_IDS_PER_BYTE, RENUMBER_STAGE2D_WORKERS};
 // Shared instrumentation counters
 // ---------------------------------------------------------------------------
 
-/// Add the nanoseconds since `since` to `counter`.
-///
-/// Nanoseconds, not milliseconds: these counters sum one span per blob, and
-/// a planet node blob's pread is well under a millisecond, so per-blob
-/// `as_millis()` summed truncated zeros.
-fn add_ns(counter: &AtomicU64, since: Instant) {
-    counter.fetch_add(crate::elapsed::elapsed_ns_u64(since), Relaxed);
-}
-
 /// Per-stage timing counters, summed across workers and emitted once the
-/// stage ends. The two `*_wait_ns` fields follow brokkr's stall convention
+/// stage ends. Timed in nanoseconds (`Stopwatch::record_ns`), not
+/// milliseconds: these counters sum one span per blob, and a planet node
+/// blob's pread is well under a millisecond, so per-blob `as_millis()` summed
+/// truncated zeros. The two `*_wait_ns` fields follow brokkr's stall convention
 /// (`brokkr sidecar <uuid> --stalls`): `window_wait` is workers parked
 /// because the writer side is a full window behind, `consumer_recv_wait` is
 /// the writer side idle for want of a finished blob.
@@ -214,17 +208,17 @@ impl BlobBuffers {
         counters: &StageCounters,
     ) -> crate::Result<()> {
         use std::os::unix::fs::FileExt as _;
-        let t = Instant::now();
+        let t = crate::counters::Stopwatch::start();
         self.raw.resize(task.data_size, 0);
         file.read_exact_at(&mut self.raw, task.data_offset)
             .map_err(|e| {
                 Error::from(e).context(format!("pread failed at offset {}", task.data_offset))
             })?;
-        add_ns(&counters.pread_ns, t);
+        t.record_ns(&counters.pread_ns);
 
-        let t = Instant::now();
+        let t = crate::counters::Stopwatch::start();
         crate::blob::decompress_blob_raw(&self.raw, &mut self.decompressed)?;
-        add_ns(&counters.decompress_ns, t);
+        t.record_ns(&counters.decompress_ns);
         Ok(())
     }
 }

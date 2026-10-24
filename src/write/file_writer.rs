@@ -66,7 +66,7 @@ impl FileWriter {
     /// `fsync` error, `EINVAL` included.
     pub fn sync(&mut self) -> crate::Result<()> {
         self.flush()?;
-        let t_sync = std::time::Instant::now();
+        let t_sync = crate::counters::Stopwatch::start();
         let result = match self {
             FileWriter::Buffered(w) => sync_file(w.get_ref()),
             #[cfg(feature = "linux-direct-io")]

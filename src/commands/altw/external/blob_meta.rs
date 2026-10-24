@@ -113,12 +113,9 @@ pub(super) fn scan_blob_metadata(
     }
     crate::debug::emit_marker("ALTW_BLOB_META_SCAN_END");
 
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("altw_meta_node_blobs", node_blobs as i64);
-        crate::debug::emit_counter("altw_meta_way_blobs", way_blobs as i64);
-        crate::debug::emit_counter("altw_meta_relation_blobs", relation_blobs as i64);
-    }
+    crate::debug::emit_counter("altw_meta_node_blobs", node_blobs);
+    crate::debug::emit_counter("altw_meta_way_blobs", way_blobs);
+    crate::debug::emit_counter("altw_meta_relation_blobs", relation_blobs);
     Ok(metas)
 }
 

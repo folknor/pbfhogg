@@ -17,6 +17,7 @@ use super::super::{
     HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
     flush_local, writer_from_header,
 };
+use crate::counters::record_max;
 use crate::error::Error;
 use crate::idset::IdSet;
 use crate::owned::{dense_node_metadata, element_metadata};
@@ -53,6 +54,41 @@ struct BlobDescriptor {
     /// Index of this way blob within `way_slot_starts` (0 for non-way blobs;
     /// only meaningful when `is_way_blob`).
     way_blob_idx: usize,
+}
+
+crate::counters::counter_set! {
+    /// Stage 4 decode-worker counters, shared by every worker; bumped once
+    /// per scheduled blob. Consumer-side counters stay plain locals on the
+    /// single consumer thread.
+    struct Stage4WorkerCounters {
+        pread_ms => "s4_pread_ms",
+        decompress_ms => "s4_decompress_ms",
+        assemble_ms => "s4_assemble_ms",
+        way_reframe_ms => "s4_way_reframe_ms",
+        nonway_assemble_ms => "s4_nonway_assemble_ms",
+        way_blobs_processed => "s4_way_blobs_processed",
+        nonway_blobs_processed => "s4_nonway_blobs_processed",
+        send_ms => "s4_send_ms",
+        blobs => "s4_blobs",
+        bytes_read => "s4_bytes_read",
+        pread_calls => "s4_pread_calls",
+        max_worker_buf_bytes => "s4_max_worker_buf_bytes",
+        coord_payload_pread_ms => "s4_coord_payload_pread_ms",
+        coord_payload_bytes => "s4_coord_payload_bytes",
+        /// Streaming-router readiness wait. `wait_ready` is called at the
+        /// top of the way-blob branch, ahead of the input pread, so a decode
+        /// worker never holds a decompressed block + StringTable resident
+        /// while blocked. Counted only for a positive measured wait.
+        readiness_wait_ns => "s4_readiness_wait_ms" / 1_000_000,
+        readiness_wait_blobs => "s4_readiness_wait_blobs",
+        readiness_wait_max_ns => "s4_readiness_wait_max_ms" / 1_000_000,
+        /// Result-channel depth high-water (workers ++ before send, consumer
+        /// -- after recv). Reaching `decoded_tx` capacity means the channel
+        /// was the binding queue at some point; staying well below capacity
+        /// says workers were never able to fill it (so consumer/writer is
+        /// the limiter, not the channel).
+        channel_high_water => "s4_channel_high_water",
+    }
 }
 
 /// Load the ref-count sidecar and compute prefix sums for slot_start values.
@@ -139,7 +175,7 @@ pub(super) fn stage4_assembly(
     } = *write;
     // Build the blob schedule from the shared metadata scan.
     crate::debug::emit_marker("EXTJOIN_S4_SCHEDULE_START");
-    let t_schedule = std::time::Instant::now();
+    let t_schedule = crate::counters::Stopwatch::start();
 
     // Also read the header for the writer (need a regular BlobReader for this).
     let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
@@ -262,8 +298,7 @@ pub(super) fn stage4_assembly(
     // off a cliff. The streaming overlap's readiness wait is
     // effectively zero-cost (s4_readiness_wait_max_ms=0 on Europe), so
     // stage 4 is still CPU/writer-bound. Keep uncapped.
-    #[allow(clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("s4_decode_thread_count", decode_threads as i64);
+    crate::debug::emit_counter("s4_decode_thread_count", decode_threads);
 
     // Split schedule: passthrough-eligible blobs (relations always; node
     // blobs when keep_untagged_nodes=true) are handled by the consumer
@@ -287,57 +322,16 @@ pub(super) fn stage4_assembly(
     let mut total_stats = Stats::default();
 
     // Worker-side cumulative counters.
-    let s4_pread_ms = std::sync::atomic::AtomicU64::new(0);
-    let s4_decompress_ms = std::sync::atomic::AtomicU64::new(0);
-    let s4_assemble_ms = std::sync::atomic::AtomicU64::new(0);
-    let s4_way_reframe_ms = std::sync::atomic::AtomicU64::new(0);
-    let s4_nonway_assemble_ms = std::sync::atomic::AtomicU64::new(0);
-    let s4_way_blobs_processed = std::sync::atomic::AtomicU64::new(0);
-    let s4_nonway_blobs_processed = std::sync::atomic::AtomicU64::new(0);
-    let s4_send_ms = std::sync::atomic::AtomicU64::new(0);
-    let s4_blobs = std::sync::atomic::AtomicU64::new(0);
-    let s4_bytes_read = std::sync::atomic::AtomicU64::new(0);
-    let s4_pread_calls = std::sync::atomic::AtomicU64::new(0);
-    let s4_max_worker_buf_bytes = std::sync::atomic::AtomicU64::new(0);
-    let s4_coord_payload_pread_ms = std::sync::atomic::AtomicU64::new(0);
-    let s4_coord_payload_bytes = std::sync::atomic::AtomicU64::new(0);
-    // Streaming-router readiness-wait counters (item #2).
-    // `wait_ready` is called at the top of the way-blob branch, ahead of
-    // the input pread, so a decode worker never holds a decompressed
-    // block + StringTable resident while blocked.
-    let s4_readiness_wait_ns = std::sync::atomic::AtomicU64::new(0);
-    let s4_readiness_wait_blobs = std::sync::atomic::AtomicU64::new(0);
-    let s4_readiness_wait_max_ns = std::sync::atomic::AtomicU64::new(0);
-    // Channel depth high-water (workers ++ before send, consumer --
-    // after recv). Reaching `decoded_tx` capacity means the channel
-    // was the binding queue at some point; staying well below capacity
-    // says workers were never able to fill it (so consumer/writer is
-    // the limiter, not the channel).
+    let worker_counters = Stage4WorkerCounters::new();
+    let c = &worker_counters;
+    // Channel depth gauge (workers ++ before send, consumer -- after
+    // recv); its high-water is `Stage4WorkerCounters::channel_high_water`.
     let s4_channel_depth = std::sync::atomic::AtomicUsize::new(0);
-    let s4_channel_high_water = std::sync::atomic::AtomicUsize::new(0);
     // Consumer-side passthrough telemetry.
     let mut s4_passthrough_blobs: u64 = 0;
     let mut s4_passthrough_pread_ms: u64 = 0;
     let mut s4_passthrough_bytes: u64 = 0;
-    let s4_pread_ref = &s4_pread_ms;
-    let s4_decompress_ref = &s4_decompress_ms;
-    let s4_assemble_ref = &s4_assemble_ms;
-    let s4_way_reframe_ref = &s4_way_reframe_ms;
-    let s4_nonway_assemble_ref = &s4_nonway_assemble_ms;
-    let s4_way_blobs_ref = &s4_way_blobs_processed;
-    let s4_nonway_blobs_ref = &s4_nonway_blobs_processed;
-    let s4_send_ref = &s4_send_ms;
-    let s4_blobs_ref = &s4_blobs;
-    let s4_bytes_read_ref = &s4_bytes_read;
-    let s4_pread_calls_ref = &s4_pread_calls;
-    let s4_max_worker_buf_ref = &s4_max_worker_buf_bytes;
-    let s4_coord_payload_pread_ref = &s4_coord_payload_pread_ms;
-    let s4_coord_payload_bytes_ref = &s4_coord_payload_bytes;
-    let s4_readiness_wait_ns_ref = &s4_readiness_wait_ns;
-    let s4_readiness_wait_blobs_ref = &s4_readiness_wait_blobs;
-    let s4_readiness_wait_max_ns_ref = &s4_readiness_wait_max_ns;
     let s4_channel_depth_ref = &s4_channel_depth;
-    let s4_channel_high_water_ref = &s4_channel_high_water;
     let way_reframe_counters = WayReframeCounters::new();
     let way_reframe_cref = &way_reframe_counters;
 
@@ -417,47 +411,44 @@ pub(super) fn stage4_assembly(
                             // block + StringTable resident. Non-way blobs skip
                             // this entirely - they never consume a coord payload.
                             if desc.is_way_blob {
-                                let t_wait = std::time::Instant::now();
+                                let t_wait = crate::counters::Stopwatch::start();
                                 coord_payloads_reader.wait_ready(desc.way_blob_idx)?;
-                                #[allow(clippy::cast_possible_truncation)]
-                                let wait_ns = t_wait.elapsed().as_nanos() as u64;
+                                // One sample feeds the total, the count and
+                                // the maximum.
+                                let wait_ns = t_wait.elapsed_ns();
                                 if wait_ns > 0 {
-                                    s4_readiness_wait_ns_ref.fetch_add(wait_ns, Relaxed);
-                                    s4_readiness_wait_blobs_ref.fetch_add(1, Relaxed);
-                                    s4_readiness_wait_max_ns_ref.fetch_max(wait_ns, Relaxed);
+                                    c.readiness_wait_ns.fetch_add(wait_ns, Relaxed);
+                                    c.readiness_wait_blobs.fetch_add(1, Relaxed);
+                                    record_max(&c.readiness_wait_max_ns, wait_ns);
                                 }
                             }
 
-                            let t0 = std::time::Instant::now();
+                            let t0 = crate::counters::Stopwatch::start();
                             read_buf.resize(desc.data_size, 0);
                             file.read_exact_at(&mut read_buf, desc.data_offset)
                                 .map_err(|e| at_frame(Error::from(e)))?;
-                            #[allow(clippy::cast_possible_truncation)]
-                            s4_pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
-                            s4_bytes_read_ref.fetch_add(desc.data_size as u64, Relaxed);
-                            s4_pread_calls_ref.fetch_add(1, Relaxed);
+                            t0.record_ms(&c.pread_ms);
+                            c.bytes_read.fetch_add(desc.data_size as u64, Relaxed);
+                            c.pread_calls.fetch_add(1, Relaxed);
 
-                            let t1 = std::time::Instant::now();
+                            let t1 = crate::counters::Stopwatch::start();
                             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
                                 .map_err(at_frame)?;
-                            #[allow(clippy::cast_possible_truncation)]
-                            s4_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
+                            t1.record_ms(&c.decompress_ms);
 
-                            let t2 = std::time::Instant::now();
+                            let t2 = crate::counters::Stopwatch::start();
                             output_blocks.clear();
 
                             if desc.is_way_blob {
                                 // Read this blob's coord_payloads payload into a
                                 // worker-local buffer before reframe.
-                                let t_cpread = std::time::Instant::now();
+                                let t_cpread = crate::counters::Stopwatch::start();
                                 coord_payloads_reader.pread_blob_payload(
                                     desc.way_blob_idx,
                                     &mut coord_payload_buf,
                                 )?;
-                                #[allow(clippy::cast_possible_truncation)]
-                                s4_coord_payload_pread_ref
-                                    .fetch_add(t_cpread.elapsed().as_millis() as u64, Relaxed);
-                                s4_coord_payload_bytes_ref
+                                t_cpread.record_ms(&c.coord_payload_pread_ms);
+                                c.coord_payload_bytes
                                     .fetch_add(coord_payload_buf.len() as u64, Relaxed);
 
                                 // Wire-format reframe: splice locations without
@@ -507,14 +498,12 @@ pub(super) fn stage4_assembly(
                                     blobs_decoded: 1,
                                     ..Stats::default()
                                 };
-                                #[allow(clippy::cast_possible_truncation)]
-                                {
-                                    let elapsed = t2.elapsed().as_millis() as u64;
-                                    s4_assemble_ref.fetch_add(elapsed, Relaxed);
-                                    s4_way_reframe_ref.fetch_add(elapsed, Relaxed);
-                                }
-                                s4_blobs_ref.fetch_add(1, Relaxed);
-                                s4_way_blobs_ref.fetch_add(1, Relaxed);
+                                // One sample, so the pair agrees exactly.
+                                let elapsed = t2.elapsed_ms();
+                                c.assemble_ms.fetch_add(elapsed, Relaxed);
+                                c.way_reframe_ms.fetch_add(elapsed, Relaxed);
+                                c.blobs.fetch_add(1, Relaxed);
+                                c.way_blobs_processed.fetch_add(1, Relaxed);
                                 return Ok((std::mem::take(&mut output_blocks), block_stats));
                             }
 
@@ -536,19 +525,16 @@ pub(super) fn stage4_assembly(
                             .map_err(at_frame)?;
                             block_stats.blobs_decoded = 1;
                             flush_local(&mut bb, &mut output_blocks).map_err(at_frame)?;
-                            #[allow(clippy::cast_possible_truncation)]
-                            {
-                                let elapsed = t2.elapsed().as_millis() as u64;
-                                s4_assemble_ref.fetch_add(elapsed, Relaxed);
-                                s4_nonway_assemble_ref.fetch_add(elapsed, Relaxed);
-                            }
-                            s4_nonway_blobs_ref.fetch_add(1, Relaxed);
+                            let elapsed = t2.elapsed_ms();
+                            c.assemble_ms.fetch_add(elapsed, Relaxed);
+                            c.nonway_assemble_ms.fetch_add(elapsed, Relaxed);
+                            c.nonway_blobs_processed.fetch_add(1, Relaxed);
 
                             if decompress_buf.capacity() == 0 {
                                 decompress_buf = Vec::new();
                             }
 
-                            s4_blobs_ref.fetch_add(1, Relaxed);
+                            c.blobs.fetch_add(1, Relaxed);
 
                             Ok((std::mem::take(&mut output_blocks), block_stats))
                         })();
@@ -558,22 +544,10 @@ pub(super) fn stage4_assembly(
                         let worker_bytes = read_buf.capacity() as u64
                             + decompress_buf.capacity() as u64
                             + reframe_output.capacity() as u64;
-                        let mut current =
-                            s4_max_worker_buf_ref.load(std::sync::atomic::Ordering::Relaxed);
-                        while worker_bytes > current {
-                            match s4_max_worker_buf_ref.compare_exchange_weak(
-                                current,
-                                worker_bytes,
-                                std::sync::atomic::Ordering::Relaxed,
-                                std::sync::atomic::Ordering::Relaxed,
-                            ) {
-                                Ok(_) => break,
-                                Err(actual) => current = actual,
-                            }
-                        }
+                        record_max(&c.max_worker_buf_bytes, worker_bytes);
                     }
 
-                    let t3 = std::time::Instant::now();
+                    let t3 = crate::counters::Stopwatch::start();
                     // Bump channel depth before send and update the
                     // high-water mark with the post-bump value (i.e.
                     // the depth the channel will hold once this send
@@ -582,21 +556,7 @@ pub(super) fn stage4_assembly(
                     // a real moment of saturation.
                     let depth_after =
                         s4_channel_depth_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    {
-                        let mut hw =
-                            s4_channel_high_water_ref.load(std::sync::atomic::Ordering::Relaxed);
-                        while depth_after > hw {
-                            match s4_channel_high_water_ref.compare_exchange_weak(
-                                hw,
-                                depth_after,
-                                std::sync::atomic::Ordering::Relaxed,
-                                std::sync::atomic::Ordering::Relaxed,
-                            ) {
-                                Ok(_) => break,
-                                Err(actual) => hw = actual,
-                            }
-                        }
-                    }
+                    record_max(&c.channel_high_water, depth_after as u64);
                     match tx.try_send((desc.seq, result)) {
                         Ok(()) => {}
                         Err(std::sync::mpsc::TrySendError::Full(item)) => {
@@ -607,11 +567,7 @@ pub(super) fn stage4_assembly(
                         }
                         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
                     }
-                    #[allow(clippy::cast_possible_truncation)]
-                    s4_send_ref.fetch_add(
-                        t3.elapsed().as_millis() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    t3.record_ms(&c.send_ms);
                 }
             });
         }
@@ -689,17 +645,14 @@ pub(super) fn stage4_assembly(
                         {
                             *s4_bytes_written += block_bytes.len() as u64;
                             *s4_write_calls += 1;
-                            let t_w = std::time::Instant::now();
+                            let t_w = crate::counters::Stopwatch::start();
                             writer.write_primitive_block_owned(
                                 block_bytes,
                                 index,
                                 tagdata.as_deref(),
                                 way_members.as_deref(),
                             )?;
-                            #[allow(clippy::cast_possible_truncation)]
-                            {
-                                *s4_write_ms += t_w.elapsed().as_millis() as u64;
-                            }
+                            *s4_write_ms += t_w.elapsed_ms();
                         }
                     }
                     ConsumerItem::Passthrough {
@@ -708,7 +661,7 @@ pub(super) fn stage4_assembly(
                         count,
                         kind,
                     } => {
-                        let t_pread = std::time::Instant::now();
+                        let t_pread = crate::counters::Stopwatch::start();
                         frame_read_buf.resize(frame_size, 0);
                         shared_file
                             .read_exact_at(&mut frame_read_buf, frame_offset)
@@ -716,23 +669,17 @@ pub(super) fn stage4_assembly(
                                 Error::from(e)
                                     .locate(crate::error::Location::at_offset(input, frame_offset))
                             })?;
-                        #[allow(clippy::cast_possible_truncation)]
-                        {
-                            *s4_passthrough_pread_ms += t_pread.elapsed().as_millis() as u64;
-                        }
+                        *s4_passthrough_pread_ms += t_pread.elapsed_ms();
                         *s4_passthrough_bytes += frame_size as u64;
 
-                        let t_w = std::time::Instant::now();
+                        let t_w = crate::counters::Stopwatch::start();
                         *s4_bytes_written += frame_size as u64;
                         *s4_write_calls += 1;
                         writer.write_raw_owned(std::mem::replace(
                             &mut frame_read_buf,
                             Vec::with_capacity(frame_size),
                         ))?;
-                        #[allow(clippy::cast_possible_truncation)]
-                        {
-                            *s4_write_ms += t_w.elapsed().as_millis() as u64;
-                        }
+                        *s4_write_ms += t_w.elapsed_ms();
 
                         *s4_passthrough_blobs += 1;
                         total_stats.blobs_passthrough += 1;
@@ -776,12 +723,9 @@ pub(super) fn stage4_assembly(
             // Workers parked in `wait_ready` are woken by stage 3, which
             // observes the same token per bucket and aborts the router.
             host.cancel.check()?;
-            let t_recv = std::time::Instant::now();
+            let t_recv = crate::counters::Stopwatch::start();
             let msg = decoded_rx.recv();
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                s4_recv_ms += t_recv.elapsed().as_millis() as u64;
-            }
+            s4_recv_ms += t_recv.elapsed_ms();
             let (seq_num, item) = match msg {
                 Ok(v) => {
                     // Decrement channel depth on successful recv.
@@ -829,123 +773,38 @@ pub(super) fn stage4_assembly(
     // backpressure that used to surface as `s4_send_ms` shifts into
     // the writer pipeline and only materialises here. Isolating
     // flush makes the channel-vs-writer attribution legible.
-    let t_flush = std::time::Instant::now();
+    let t_flush = crate::counters::Stopwatch::start();
     writer.flush()?;
-    #[allow(clippy::cast_possible_truncation)]
-    let s4_flush_ms: u64 = t_flush.elapsed().as_millis() as u64;
+    let s4_flush_ms: u64 = t_flush.elapsed_ms();
     let s4_output_bytes = std::fs::metadata(output.path())
         .map_err(|e| {
             Error::from(e).context(format!("stat output {}", output.destination().display()))
         })?
         .len();
 
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    {
-        crate::debug::emit_counter(
-            "s4_pread_ms",
-            s4_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s4_decompress_ms",
-            s4_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s4_assemble_ms",
-            s4_assemble_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s4_way_reframe_ms",
-            s4_way_reframe_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s4_nonway_assemble_ms",
-            s4_nonway_assemble_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s4_way_blobs_processed",
-            s4_way_blobs_processed.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s4_nonway_blobs_processed",
-            s4_nonway_blobs_processed.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s4_send_ms",
-            s4_send_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s4_blobs",
-            s4_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s4_bytes_read",
-            s4_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter("s4_bytes_written", s4_bytes_written as i64);
-        crate::debug::emit_counter(
-            "s4_pread_calls",
-            s4_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter("s4_write_calls", s4_write_calls as i64);
-        crate::debug::emit_counter(
-            "s4_max_worker_buf_bytes",
-            s4_max_worker_buf_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s4_coord_payload_pread_ms",
-            s4_coord_payload_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s4_coord_payload_bytes",
-            s4_coord_payload_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s4_readiness_wait_ms",
-            (s4_readiness_wait_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000) as i64,
-        );
-        crate::debug::emit_counter(
-            "s4_readiness_wait_blobs",
-            s4_readiness_wait_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s4_readiness_wait_max_ms",
-            (s4_readiness_wait_max_ns.load(std::sync::atomic::Ordering::Relaxed) / 1_000_000)
-                as i64,
-        );
-        crate::debug::emit_counter("s4_passthrough_blobs", s4_passthrough_blobs as i64);
-        crate::debug::emit_counter("s4_passthrough_pread_ms", s4_passthrough_pread_ms as i64);
-        crate::debug::emit_counter("s4_passthrough_bytes", s4_passthrough_bytes as i64);
-        crate::debug::emit_counter("s4_consumer_recv_ms", s4_recv_ms as i64);
-        crate::debug::emit_counter("s4_consumer_write_ms", s4_write_ms as i64);
-        crate::debug::emit_counter("s4_flush_ms", s4_flush_ms as i64);
-        crate::debug::emit_counter("s4_decode_threads", decode_threads as i64);
-        crate::debug::emit_counter("s4_output_bytes", s4_output_bytes as i64);
-        crate::debug::emit_counter(
-            "s4_channel_high_water",
-            s4_channel_high_water.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter("extjoin_skipped_node_blobs", skipped_node_blobs as i64);
-        crate::debug::emit_counter("s4_node_blobs_total", s4_node_blobs_total as i64);
-        crate::debug::emit_counter(
-            "s4_node_blobs_no_tagindex",
-            s4_node_blobs_no_tagindex as i64,
-        );
-        crate::debug::emit_counter("s4_node_blobs_empty_tags", s4_node_blobs_empty_tags as i64);
-        crate::debug::emit_counter(
-            "s4_node_blobs_kept_by_tags",
-            s4_node_blobs_kept_by_tags as i64,
-        );
-        crate::debug::emit_counter(
-            "s4_node_blobs_kept_by_members",
-            s4_node_blobs_kept_by_members as i64,
-        );
-        crate::debug::emit_counter("s4_way_blobs", s4_way_blobs as i64);
-        crate::debug::emit_counter("s4_relation_blobs", s4_relation_blobs as i64);
-        crate::debug::emit_counter(
-            "s4_schedule_scan_ms",
-            t_schedule.elapsed().as_millis() as i64,
-        );
-    }
+    worker_counters.emit_all();
+    crate::debug::emit_counter("s4_bytes_written", s4_bytes_written);
+    crate::debug::emit_counter("s4_write_calls", s4_write_calls);
+    crate::debug::emit_counter("s4_passthrough_blobs", s4_passthrough_blobs);
+    crate::debug::emit_counter("s4_passthrough_pread_ms", s4_passthrough_pread_ms);
+    crate::debug::emit_counter("s4_passthrough_bytes", s4_passthrough_bytes);
+    crate::debug::emit_counter("s4_consumer_recv_ms", s4_recv_ms);
+    crate::debug::emit_counter("s4_consumer_write_ms", s4_write_ms);
+    crate::debug::emit_counter("s4_flush_ms", s4_flush_ms);
+    crate::debug::emit_counter("s4_decode_threads", decode_threads);
+    crate::debug::emit_counter("s4_output_bytes", s4_output_bytes);
+    crate::debug::emit_counter("extjoin_skipped_node_blobs", skipped_node_blobs);
+    crate::debug::emit_counter("s4_node_blobs_total", s4_node_blobs_total);
+    crate::debug::emit_counter("s4_node_blobs_no_tagindex", s4_node_blobs_no_tagindex);
+    crate::debug::emit_counter("s4_node_blobs_empty_tags", s4_node_blobs_empty_tags);
+    crate::debug::emit_counter("s4_node_blobs_kept_by_tags", s4_node_blobs_kept_by_tags);
+    crate::debug::emit_counter(
+        "s4_node_blobs_kept_by_members",
+        s4_node_blobs_kept_by_members,
+    );
+    crate::debug::emit_counter("s4_way_blobs", s4_way_blobs);
+    crate::debug::emit_counter("s4_relation_blobs", s4_relation_blobs);
+    crate::debug::emit_counter("s4_schedule_scan_ms", t_schedule.elapsed_ms());
     way_reframe_counters.emit();
 
     Ok(total_stats)
@@ -1046,77 +905,40 @@ fn assemble_block(
 // Wire-format way reframe for stage 4
 // ---------------------------------------------------------------------------
 
-/// Sub-phase counters for the way reframe hot path.
-///
-/// Timing is captured **per-blob** only (parse_block, group_reframe,
-/// unknown_field_copy). The earlier per-way timers were stripped after
-/// they confirmed the way path is not the wall-critical segment; per-way
-/// `Instant::now()` samples were a measurable cost at 1.16B ways/planet
-/// and provided no actionable signal beyond the blob-level attribution.
-struct WayReframeCounters {
-    parse_block_ns: std::sync::atomic::AtomicU64,
-    unknown_field_copy_ns: std::sync::atomic::AtomicU64,
-    group_reframe_ns: std::sync::atomic::AtomicU64,
-    refs_total: std::sync::atomic::AtomicU64,
-    refs_present: std::sync::atomic::AtomicU64,
-    max_refs_per_way: std::sync::atomic::AtomicU64,
-    lat_bytes: std::sync::atomic::AtomicU64,
-    lon_bytes: std::sync::atomic::AtomicU64,
-    ways_total: std::sync::atomic::AtomicU64,
+crate::counters::counter_set! {
+    /// Sub-phase counters for the way reframe hot path.
+    ///
+    /// Timing is captured per blob (parse_block), per PrimitiveGroup
+    /// (group_reframe) and per non-way field inside a group
+    /// (unknown_field_copy), never per
+    /// way. The earlier per-way timers were stripped after they confirmed
+    /// the way path is not the wall-critical segment; per-way
+    /// `Instant::now()` samples were a measurable cost at 1.16B ways/planet
+    /// and provided no actionable signal beyond the blob-level attribution.
+    /// Nanosecond accumulators, emitted in milliseconds.
+    struct WayReframeCounters {
+        parse_block_ns => "s4_way_parse_block_ms" / 1_000_000,
+        unknown_field_copy_ns => "s4_way_unknown_field_copy_ms" / 1_000_000,
+        group_reframe_ns => "s4_way_group_reframe_ms" / 1_000_000,
+        refs_total => "s4_way_refs_total",
+        refs_present => "s4_way_refs_present",
+        max_refs_per_way => "s4_way_max_refs_per_way",
+        lat_bytes => "s4_way_lat_bytes",
+        lon_bytes => "s4_way_lon_bytes",
+        ways_total => "s4_way_messages_total",
+    }
 }
 
 impl WayReframeCounters {
-    fn new() -> Self {
-        Self {
-            parse_block_ns: std::sync::atomic::AtomicU64::new(0),
-            unknown_field_copy_ns: std::sync::atomic::AtomicU64::new(0),
-            group_reframe_ns: std::sync::atomic::AtomicU64::new(0),
-            refs_total: std::sync::atomic::AtomicU64::new(0),
-            refs_present: std::sync::atomic::AtomicU64::new(0),
-            max_refs_per_way: std::sync::atomic::AtomicU64::new(0),
-            lat_bytes: std::sync::atomic::AtomicU64::new(0),
-            lon_bytes: std::sync::atomic::AtomicU64::new(0),
-            ways_total: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    #[allow(clippy::cast_possible_wrap)]
+    /// Emit the set, then the derived average, which is present only when
+    /// at least one way was reframed.
     fn emit(&self) {
         use std::sync::atomic::Ordering::Relaxed;
-        // Convert nanosecond accumulators to milliseconds at emit time so
-        // counter names and downstream comparisons stay on the same unit.
-        let ns_to_ms = |ns: u64| (ns / 1_000_000) as i64;
-        crate::debug::emit_counter(
-            "s4_way_parse_block_ms",
-            ns_to_ms(self.parse_block_ns.load(Relaxed)),
-        );
-        crate::debug::emit_counter(
-            "s4_way_unknown_field_copy_ms",
-            ns_to_ms(self.unknown_field_copy_ns.load(Relaxed)),
-        );
-        crate::debug::emit_counter(
-            "s4_way_group_reframe_ms",
-            ns_to_ms(self.group_reframe_ns.load(Relaxed)),
-        );
-        crate::debug::emit_counter("s4_way_refs_total", self.refs_total.load(Relaxed) as i64);
-        crate::debug::emit_counter(
-            "s4_way_refs_present",
-            self.refs_present.load(Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s4_way_max_refs_per_way",
-            self.max_refs_per_way.load(Relaxed) as i64,
-        );
-        crate::debug::emit_counter("s4_way_lat_bytes", self.lat_bytes.load(Relaxed) as i64);
-        crate::debug::emit_counter("s4_way_lon_bytes", self.lon_bytes.load(Relaxed) as i64);
-        crate::debug::emit_counter(
-            "s4_way_messages_total",
-            self.ways_total.load(Relaxed) as i64,
-        );
+        self.emit_all();
         let total_refs = self.refs_total.load(Relaxed);
         let total_ways = self.ways_total.load(Relaxed);
         if let Some(avg) = total_refs.checked_div(total_ways) {
-            crate::debug::emit_counter("s4_way_avg_refs_per_way", avg as i64);
+            crate::debug::emit_counter("s4_way_avg_refs_per_way", avg);
         }
     }
 }
@@ -1198,7 +1020,7 @@ fn reframe_way_blob_with_locations(
     let mut stringtable_range: Option<(usize, usize)> = None;
 
     // Level 1: PrimitiveBlock - find string table + groups.
-    let t_block = std::time::Instant::now();
+    let t_block = crate::counters::Stopwatch::start();
     let mut cursor = Cursor::new(decompressed);
     while let Some((field, wire_type)) = cursor
         .read_tag()
@@ -1241,10 +1063,7 @@ fn reframe_way_blob_with_locations(
         .ok_or_else(|| Error::invalid_data("reframe: no StringTable in PrimitiveBlock"))?;
     let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
 
-    #[allow(clippy::cast_possible_truncation)]
-    counters
-        .parse_block_ns
-        .fetch_add(t_block.elapsed().as_nanos() as u64, Relaxed);
+    t_block.record_ns(&counters.parse_block_ns);
 
     let mut refcount_cursor = Cursor::new(per_way_refcount_record);
     let expected_ways = refcount_cursor.read_varint().map_err(|e| {
@@ -1442,25 +1261,19 @@ fn reframe_way_blob_with_locations(
                 total_ways += 1;
             } else {
                 // Non-way field in the group - copy verbatim.
-                let t_copy = std::time::Instant::now();
+                let t_copy = crate::counters::Stopwatch::start();
                 let raw = gr_cursor
                     .read_raw_field(wire_type)
                     .map_err(|e| Error::from(e).context("reframe gskip"))?;
                 protohoggr::encode_tag(&mut scratch.group_out, field, wire_type);
                 scratch.group_out.extend_from_slice(raw);
-                #[allow(clippy::cast_possible_truncation)]
-                counters
-                    .unknown_field_copy_ns
-                    .fetch_add(t_copy.elapsed().as_nanos() as u64, Relaxed);
+                t_copy.record_ns(&counters.unknown_field_copy_ns);
             }
         }
 
-        let t_group = std::time::Instant::now();
+        let t_group = crate::counters::Stopwatch::start();
         protohoggr::encode_bytes_field(output, 2, &scratch.group_out);
-        #[allow(clippy::cast_possible_truncation)]
-        counters
-            .group_reframe_ns
-            .fetch_add(t_group.elapsed().as_nanos() as u64, Relaxed);
+        t_group.record_ns(&counters.group_reframe_ns);
     }
 
     // Append scalar fields (granularity, etc.).
@@ -1488,18 +1301,7 @@ fn reframe_way_blob_with_locations(
     counters.lon_bytes.fetch_add(blob_lon_bytes, Relaxed);
     counters.ways_total.fetch_add(total_ways, Relaxed);
     if blob_max_refs_per_way > 0 {
-        let mut current = counters.max_refs_per_way.load(Relaxed);
-        while blob_max_refs_per_way > current {
-            match counters.max_refs_per_way.compare_exchange_weak(
-                current,
-                blob_max_refs_per_way,
-                Relaxed,
-                Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
+        record_max(&counters.max_refs_per_way, blob_max_refs_per_way);
     }
 
     if payload_pos != coord_payload.len() {

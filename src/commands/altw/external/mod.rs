@@ -747,17 +747,11 @@ pub(crate) fn external_join_in(
     let per_way_refcount_sidecar = scratch.file("per-way-refcounts")?;
 
     crate::debug::emit_marker("EXTJOIN_META_SCAN_START");
-    let t_meta = std::time::Instant::now();
+    let t_meta = crate::counters::Stopwatch::start();
     let blob_meta = blob_meta::scan_blob_metadata(input, !keep_untagged_nodes, host)?;
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    {
-        crate::debug::emit_counter("extjoin_meta_scan_ms", t_meta.elapsed().as_millis() as i64);
-        crate::debug::emit_counter("extjoin_meta_blobs", blob_meta.len() as i64);
-        crate::debug::emit_counter(
-            "extjoin_meta_tag_scan_enabled",
-            if keep_untagged_nodes { 0 } else { 1 },
-        );
-    }
+    crate::debug::emit_counter("extjoin_meta_scan_ms", t_meta.elapsed_ms());
+    crate::debug::emit_counter("extjoin_meta_blobs", blob_meta.len());
+    crate::debug::emit_counter("extjoin_meta_tag_scan_enabled", !keep_untagged_nodes);
     crate::debug::emit_marker("EXTJOIN_META_SCAN_END");
 
     // Build the BucketLayout for IdRecord emission. Width is derived
@@ -766,11 +760,8 @@ pub(crate) fn external_join_in(
     // and exact for any real input.
     let max_node_id = max_node_id_from_blob_meta(&blob_meta);
     let bucket_layout = BucketLayout::new(max_node_id, NUM_BUCKETS)?;
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("extjoin_bucket_max_node_id", max_node_id as i64);
-        crate::debug::emit_counter("extjoin_bucket_width", bucket_layout.bucket_width as i64);
-    }
+    crate::debug::emit_counter("extjoin_bucket_max_node_id", max_node_id);
+    crate::debug::emit_counter("extjoin_bucket_width", bucket_layout.bucket_width);
 
     // Stage 1: produces total_slots, id_bucket_counts, num_shard_workers
     // and the per-node-blob mapping (see `Stage1Output`).
@@ -809,7 +800,7 @@ pub(crate) fn external_join_in(
             } else {
                 crate::debug::emit_marker("EXTJOIN_RELATION_SCAN_START");
                 Some(scope.spawn(move || {
-                    let t_relscan = std::time::Instant::now();
+                    let t_relscan = crate::counters::Stopwatch::start();
                     let ids = relation_scan::collect_relation_member_ids_indexed(
                         input_ref_parallel,
                         blob_meta_ref_parallel,
@@ -817,10 +808,9 @@ pub(crate) fn external_join_in(
                         inject_prepass,
                         &host.cancel,
                     )?;
-                    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
                     crate::debug::emit_counter(
                         "extjoin_relation_member_collect_ms",
-                        t_relscan.elapsed().as_millis() as i64,
+                        t_relscan.elapsed_ms(),
                     );
                     crate::debug::emit_marker("EXTJOIN_RELATION_SCAN_END");
                     Ok::<_, crate::Error>(ids)
@@ -874,20 +864,11 @@ pub(crate) fn external_join_in(
         .iter()
         .filter(|&&c| c > 0)
         .count();
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("extjoin_total_slots", stage1_out.total_slots as i64);
-        crate::debug::emit_counter("extjoin_total_id_records", total_id_records as i64);
-        crate::debug::emit_counter(
-            "extjoin_id_bucket_max_records",
-            id_bucket_max_records as i64,
-        );
-        crate::debug::emit_counter(
-            "extjoin_id_bucket_min_records",
-            id_bucket_min_records as i64,
-        );
-        crate::debug::emit_counter("extjoin_id_buckets_nonempty", id_buckets_nonempty as i64);
-    }
+    crate::debug::emit_counter("extjoin_total_slots", stage1_out.total_slots);
+    crate::debug::emit_counter("extjoin_total_id_records", total_id_records);
+    crate::debug::emit_counter("extjoin_id_bucket_max_records", id_bucket_max_records);
+    crate::debug::emit_counter("extjoin_id_bucket_min_records", id_bucket_min_records);
+    crate::debug::emit_counter("extjoin_id_buckets_nonempty", id_buckets_nonempty);
     crate::debug::emit_page_fault_deltas(
         ("s1_minflt_delta", "s1_majflt_delta"),
         s1_faults_before,
@@ -942,14 +923,11 @@ pub(crate) fn external_join_in(
     // scratch can be sized without an extra input pass; see `space`.
     space::precheck(scratch.path(), total_slots, slot_bucket_count, num_workers)?;
     let total_id_shard_files = num_shard_workers * NUM_BUCKETS;
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("extjoin_id_bucket_count", NUM_BUCKETS as i64);
-        crate::debug::emit_counter("extjoin_slot_bucket_count", slot_bucket_count as i64);
-        crate::debug::emit_counter("extjoin_max_blob_slots", max_blob_slots as i64);
-        crate::debug::emit_counter("extjoin_num_shard_workers", num_shard_workers as i64);
-        crate::debug::emit_counter("extjoin_total_id_shard_files", total_id_shard_files as i64);
-    }
+    crate::debug::emit_counter("extjoin_id_bucket_count", NUM_BUCKETS);
+    crate::debug::emit_counter("extjoin_slot_bucket_count", slot_bucket_count);
+    crate::debug::emit_counter("extjoin_max_blob_slots", max_blob_slots);
+    crate::debug::emit_counter("extjoin_num_shard_workers", num_shard_workers);
+    crate::debug::emit_counter("extjoin_total_id_shard_files", total_id_shard_files);
 
     // Stage boundary: the sidecar loads and the scratch precheck above have
     // no checkpoint of their own.
@@ -981,10 +959,7 @@ pub(crate) fn external_join_in(
             scratch.remove(&radix::id_shard_path(scratch, worker_id, bucket_idx)?);
         }
     }
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("extjoin_resolved_count", resolved_count as i64);
-    }
+    crate::debug::emit_counter("extjoin_resolved_count", resolved_count);
     crate::debug::emit_page_fault_deltas(
         ("s2_minflt_delta", "s2_majflt_delta"),
         s2_faults_before,
@@ -1000,8 +975,7 @@ pub(crate) fn external_join_in(
         &per_way_refcount_sidecar,
         way_slot_starts.len(),
     )?;
-    #[allow(clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("s3_worker_count", num_workers as i64);
+    crate::debug::emit_counter("s3_worker_count", num_workers);
 
     // Worker tmp files opened once here with read + write, wrapped in
     // Arc<File> so stage 3 can `write_all_at` and stage 4 can
@@ -1048,12 +1022,9 @@ pub(crate) fn external_join_in(
             .min()
             .unwrap_or(0);
         let nonempty = slot_entry_counts.iter().filter(|&&c| c > 0).count();
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            crate::debug::emit_counter("extjoin_slot_bucket_max_entries", max_entries as i64);
-            crate::debug::emit_counter("extjoin_slot_bucket_min_entries", min_entries as i64);
-            crate::debug::emit_counter("extjoin_slot_buckets_nonempty", nonempty as i64);
-        }
+        crate::debug::emit_counter("extjoin_slot_bucket_max_entries", max_entries);
+        crate::debug::emit_counter("extjoin_slot_bucket_min_entries", min_entries);
+        crate::debug::emit_counter("extjoin_slot_buckets_nonempty", nonempty);
     }
     let slot_paths: Vec<std::path::PathBuf> = (0..slot_bucket_count)
         .map(|i| radix::slot_bucket_path(scratch, i).map(|p| p.to_path_buf()))
@@ -1177,18 +1148,12 @@ pub(crate) fn external_join_in(
             .stats
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            crate::debug::emit_counter("s3_router_num_worker", s.num_worker as i64);
-            crate::debug::emit_counter("s3_router_num_straddlers", s.num_straddlers as i64);
-            crate::debug::emit_counter("s3_router_num_empty", s.num_empty as i64);
-            crate::debug::emit_counter("s3_router_worker_bytes", s.worker_bytes as i64);
-            crate::debug::emit_counter("s3_router_straddler_bytes", s.straddler_bytes as i64);
-            crate::debug::emit_counter(
-                "s3_straddler_encode_ms",
-                (s.straddler_encode_ns / 1_000_000) as i64,
-            );
-        }
+        crate::debug::emit_counter("s3_router_num_worker", s.num_worker);
+        crate::debug::emit_counter("s3_router_num_straddlers", s.num_straddlers);
+        crate::debug::emit_counter("s3_router_num_empty", s.num_empty);
+        crate::debug::emit_counter("s3_router_worker_bytes", s.worker_bytes);
+        crate::debug::emit_counter("s3_router_straddler_bytes", s.straddler_bytes);
+        crate::debug::emit_counter("s3_straddler_encode_ms", s.straddler_encode_ns / 1_000_000);
         crate::host::diag!(
             host.diagnostics,
             Developer,

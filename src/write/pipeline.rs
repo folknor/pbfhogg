@@ -6,7 +6,6 @@
 //! All items here are internal wiring for the write path; nothing in this
 //! module is part of the public library API.
 
-use crate::elapsed::elapsed_ns_u64;
 use crate::error::{Error, Result};
 use crate::reorder_buffer::ReorderBuffer;
 use crate::tunables::{EXECUTOR_IDLE_RECV_TIMEOUT, PIPELINE_DISPATCH_PERMITS, WRITE_AHEAD};
@@ -133,33 +132,27 @@ impl OutputSink for FileOutputSink {
             OutputChunk::Framed(parts) => {
                 let len = parts.total_len();
                 let bytes = parts.into_vec();
-                let t_write = std::time::Instant::now();
+                let t_write = crate::counters::Stopwatch::start();
                 self.writer.write_all(&bytes)?;
-                WRITER_METRICS
-                    .write_ns
-                    .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                t_write.record_ns(&WRITER_METRICS.write_ns);
                 WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
                 Ok(())
             }
             OutputChunk::Raw(bytes) => {
                 let len = bytes.len() as u64;
-                let t_write = std::time::Instant::now();
+                let t_write = crate::counters::Stopwatch::start();
                 self.writer.write_all(&bytes)?;
-                WRITER_METRICS
-                    .write_ns
-                    .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                t_write.record_ns(&WRITER_METRICS.write_ns);
                 WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
                 Ok(())
             }
             OutputChunk::RawChunks(chunks) => {
                 let total_bytes: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
-                let t_write = std::time::Instant::now();
+                let t_write = crate::counters::Stopwatch::start();
                 for chunk in &chunks {
                     self.writer.write_all(chunk)?;
                 }
-                WRITER_METRICS
-                    .write_ns
-                    .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                t_write.record_ns(&WRITER_METRICS.write_ns);
                 WRITER_METRICS.bytes_written.fetch_add(total_bytes, Relaxed);
                 Ok(())
             }
@@ -169,16 +162,14 @@ impl OutputSink for FileOutputSink {
                 offset,
                 len,
             } => {
-                let t_write = std::time::Instant::now();
+                let t_write = crate::counters::Stopwatch::start();
                 let out_fd = self.writer.flush_and_raw_fd()?.ok_or_else(|| {
                     Error::invalid_argument("copy_file_range incompatible with O_DIRECT output")
                 })?;
                 super::copy_range::copy_range(&in_file, out_fd, offset, len, &self.cancel)?;
                 // Hold the input open until the splice has actually happened.
                 drop(in_file);
-                WRITER_METRICS
-                    .write_ns
-                    .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                t_write.record_ns(&WRITER_METRICS.write_ns);
                 WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
                 Ok(())
             }
@@ -272,7 +263,7 @@ pub(super) fn recv_permit(
     if !executor.on_worker() {
         return rx.recv();
     }
-    let start = std::time::Instant::now();
+    let start = crate::counters::Stopwatch::start();
     let result = loop {
         match rx.try_recv() {
             Ok(()) => break Ok(()),
@@ -288,9 +279,7 @@ pub(super) fn recv_permit(
             },
         }
     };
-    WRITER_METRICS
-        .coop_wait_ns
-        .fetch_add(elapsed_ns_u64(start), Relaxed);
+    start.record_ns(&WRITER_METRICS.coop_wait_ns);
     result
 }
 
@@ -481,10 +470,8 @@ pub(crate) fn check_stream_complete(
     Ok(())
 }
 
-pub(super) fn record_send_wait(send_start: std::time::Instant) {
-    WRITER_METRICS
-        .pipeline_send_wait_ns
-        .fetch_add(elapsed_ns_u64(send_start), Relaxed);
+pub(super) fn record_send_wait(send_start: crate::counters::Stopwatch) {
+    send_start.record_ns(&WRITER_METRICS.pipeline_send_wait_ns);
 }
 
 /// Writer thread: receives [`OutputChunk`]s and hands them to the sink in
@@ -502,7 +489,7 @@ pub(super) fn writer_thread<S: OutputSink>(
     let mut pending: ReorderBuffer<Result<OutputChunk>> = ReorderBuffer::with_capacity(WRITE_AHEAD);
 
     loop {
-        let t_recv = std::time::Instant::now();
+        let t_recv = crate::counters::Stopwatch::start();
         let item = match rx.recv() {
             Ok(item) => item,
             Err(_) => break,

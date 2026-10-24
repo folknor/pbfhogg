@@ -7,7 +7,6 @@ use super::blob::{BlobReader, BlobType, DecompressPool};
 use super::block::PrimitiveBlock;
 use super::pipeline_metrics::PIPELINE_METRICS;
 use crate::blob_meta::BlobFilter;
-use crate::elapsed::elapsed_ns_u64;
 use crate::error::Result;
 use crate::reorder_buffer::ReorderBuffer;
 use crate::tunables::{
@@ -21,7 +20,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::Instant;
 
 type RawItem = (usize, crate::error::Result<crate::blob::Blob>);
 
@@ -181,11 +179,9 @@ impl Default for PipelineConfig {
 }
 
 fn send_direct_error(tx: &SyncSender<DecodedItem>, seq: usize, e: crate::error::Error) -> bool {
-    let t_send = Instant::now();
+    let t_send = crate::counters::Stopwatch::start();
     let sent = tx.send((seq, Some(Err(e)), None)).is_ok();
-    PIPELINE_METRICS
-        .decoded_send_wait_ns
-        .fetch_add(elapsed_ns_u64(t_send), Relaxed);
+    t_send.record_ns(&PIPELINE_METRICS.decoded_send_wait_ns);
     sent
 }
 
@@ -271,13 +267,11 @@ fn spawn_decode_task<'scope>(scope: &rayon::Scope<'scope>, task: DecodeTask<'sco
         // true index and offset; `seq` is a pipeline-internal ordering key
         // and is never reported as a location.
         let item = item.map(|r| r.map_err(|e| blob.locate_error(source, e)));
-        let t_send = Instant::now();
+        let t_send = crate::counters::Stopwatch::start();
         if tx.send((seq, item, Some(permit))).is_err() {
             shutdown.store(true, Relaxed);
         }
-        PIPELINE_METRICS
-            .decoded_send_wait_ns
-            .fetch_add(elapsed_ns_u64(t_send), Relaxed);
+        t_send.record_ns(&PIPELINE_METRICS.decoded_send_wait_ns);
     });
 }
 
@@ -308,11 +302,9 @@ where
 
     loop {
         cancel.check()?;
-        let t_recv = Instant::now();
+        let t_recv = crate::counters::Stopwatch::start();
         let next = decoded_rx.recv();
-        PIPELINE_METRICS
-            .decoded_recv_wait_ns
-            .fetch_add(elapsed_ns_u64(t_recv), Relaxed);
+        t_recv.record_ns(&PIPELINE_METRICS.decoded_recv_wait_ns);
         let (seq, item, permit) = match next {
             Ok(pair) => pair,
             Err(_) => break,
@@ -404,11 +396,9 @@ where
         scope.spawn(move || {
             for (seq, blob_result) in blob_reader.enumerate() {
                 unindexed.observe(&blob_result, &diagnostics);
-                let t_send = Instant::now();
+                let t_send = crate::counters::Stopwatch::start();
                 let send_result = raw_tx.send((seq, blob_result));
-                PIPELINE_METRICS
-                    .raw_send_wait_ns
-                    .fetch_add(elapsed_ns_u64(t_send), Relaxed);
+                t_send.record_ns(&PIPELINE_METRICS.raw_send_wait_ns);
                 if send_result.is_err() {
                     break; // receiver dropped, pipeline shutting down
                 }
@@ -485,11 +475,9 @@ where
                     }
                     match blob_result {
                         Ok(blob) => {
-                            let t_admit = Instant::now();
+                            let t_admit = crate::counters::Stopwatch::start();
                             let blocked = gate.acquire();
-                            PIPELINE_METRICS
-                                .decode_admit_wait_ns
-                                .fetch_add(elapsed_ns_u64(t_admit), Relaxed);
+                            t_admit.record_ns(&PIPELINE_METRICS.decode_admit_wait_ns);
                             if blocked {
                                 PIPELINE_METRICS.decode_admit_blocked.fetch_add(1, Relaxed);
                             }
@@ -585,11 +573,9 @@ where
         scope.spawn(move || {
             for (seq, blob_result) in blob_reader.enumerate() {
                 unindexed.observe(&blob_result, &diagnostics);
-                let start = Instant::now();
+                let start = crate::counters::Stopwatch::start();
                 let send_result = raw_tx.send((seq, blob_result));
-                PIPELINE_METRICS
-                    .raw_send_wait_ns
-                    .fetch_add(elapsed_ns_u64(start), Relaxed);
+                start.record_ns(&PIPELINE_METRICS.raw_send_wait_ns);
                 if send_result.is_err() {
                     break;
                 }
@@ -626,11 +612,9 @@ where
                     }
                     match blob_result {
                         Ok(blob) => {
-                            let start = Instant::now();
+                            let start = crate::counters::Stopwatch::start();
                             let blocked = gate.acquire();
-                            PIPELINE_METRICS
-                                .decode_admit_wait_ns
-                                .fetch_add(elapsed_ns_u64(start), Relaxed);
+                            start.record_ns(&PIPELINE_METRICS.decode_admit_wait_ns);
                             if blocked {
                                 PIPELINE_METRICS.decode_admit_blocked.fetch_add(1, Relaxed);
                             }
@@ -685,26 +669,22 @@ where
                                 // location.
                                 let item =
                                     item.map(|r| r.map_err(|e| blob.locate_error(source, e)));
-                                let start = Instant::now();
+                                let start = crate::counters::Stopwatch::start();
                                 if tx.send((seq, item, Some(permit))).is_err() {
                                     shutdown.store(true, Relaxed);
                                 }
-                                PIPELINE_METRICS
-                                    .decoded_send_wait_ns
-                                    .fetch_add(elapsed_ns_u64(start), Relaxed);
+                                start.record_ns(&PIPELINE_METRICS.decoded_send_wait_ns);
                             });
                         }
                         Err(error) => {
-                            let start = Instant::now();
+                            let start = crate::counters::Stopwatch::start();
                             if dispatch_tx
                                 .send((seq, Some(Err(error)), None))
                                 .is_err()
                             {
                                 break;
                             }
-                            PIPELINE_METRICS
-                                .decoded_send_wait_ns
-                                .fetch_add(elapsed_ns_u64(start), Relaxed);
+                            start.record_ns(&PIPELINE_METRICS.decoded_send_wait_ns);
                         }
                     }
                 }
@@ -736,11 +716,9 @@ where
     let mut pending = ReorderBuffer::with_capacity(decode_ahead);
     loop {
         cancel.check()?;
-        let start = Instant::now();
+        let start = crate::counters::Stopwatch::start();
         let next = decoded_rx.recv();
-        PIPELINE_METRICS
-            .decoded_recv_wait_ns
-            .fetch_add(elapsed_ns_u64(start), Relaxed);
+        start.record_ns(&PIPELINE_METRICS.decoded_recv_wait_ns);
         let (seq, item, permit) = match next {
             Ok(item) => item,
             Err(_) => break,

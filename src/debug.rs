@@ -75,12 +75,53 @@ pub fn emit_marker(name: &str) {
 /// distinguishes counters from markers in the protocol.
 ///
 /// Format: `<timestamp_us> @<name>=<value>\n`
-pub fn emit_counter(name: &str, value: i64) {
+///
+/// The wire value is an `i64`. Signed values are sent exactly; unsigned ones
+/// (counts, byte totals, durations) saturate at `i64::MAX` rather than wrap,
+/// so callers pass them as they are instead of casting.
+pub fn emit_counter(name: &str, value: impl CounterValue) {
     write_fifo(|f, us| {
-        let line = Line::counter(us, name, value);
+        let line = Line::counter(us, name, value.to_counter());
         line.emit(f);
     });
 }
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// A value [`emit_counter`] accepts: the signed integers it sends exactly,
+/// the unsigned ones it saturates at `i64::MAX`, and `bool` as 0 or 1.
+pub trait CounterValue: sealed::Sealed {
+    /// The value on the wire.
+    fn to_counter(self) -> i64;
+}
+
+macro_rules! exact_counter_value {
+    ($($t:ty),*) => {$(
+        impl sealed::Sealed for $t {}
+        impl CounterValue for $t {
+            #[inline]
+            fn to_counter(self) -> i64 {
+                i64::from(self)
+            }
+        }
+    )*};
+}
+exact_counter_value!(i64, i32, u32, bool);
+
+macro_rules! saturating_counter_value {
+    ($($t:ty),*) => {$(
+        impl sealed::Sealed for $t {}
+        impl CounterValue for $t {
+            #[inline]
+            fn to_counter(self) -> i64 {
+                i64::try_from(self).unwrap_or(i64::MAX)
+            }
+        }
+    )*};
+}
+saturating_counter_value!(u64, usize);
 
 /// Snapshot glibc allocator state via `mallinfo2()` and emit the key fields
 /// as counters with `<prefix>_<field>` names.
@@ -109,15 +150,12 @@ pub fn emit_mallinfo2(prefix: &str) {
     }
     // SAFETY: mallinfo2 is a glibc function safe to call from any thread.
     let info = unsafe { libc::mallinfo2() };
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        emit_counter(&format!("{prefix}_arena"), info.arena as i64);
-        emit_counter(&format!("{prefix}_hblks"), info.hblks as i64);
-        emit_counter(&format!("{prefix}_hblkhd"), info.hblkhd as i64);
-        emit_counter(&format!("{prefix}_uordblks"), info.uordblks as i64);
-        emit_counter(&format!("{prefix}_fordblks"), info.fordblks as i64);
-        emit_counter(&format!("{prefix}_keepcost"), info.keepcost as i64);
-    }
+    emit_counter(&format!("{prefix}_arena"), info.arena);
+    emit_counter(&format!("{prefix}_hblks"), info.hblks);
+    emit_counter(&format!("{prefix}_hblkhd"), info.hblkhd);
+    emit_counter(&format!("{prefix}_uordblks"), info.uordblks);
+    emit_counter(&format!("{prefix}_fordblks"), info.fordblks);
+    emit_counter(&format!("{prefix}_keepcost"), info.keepcost);
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
@@ -154,8 +192,8 @@ pub(crate) fn emit_page_fault_deltas(
     after: Option<(u64, u64)>,
 ) {
     if let Some((minor, major)) = page_fault_deltas(before, after) {
-        emit_counter(names.0, i64::try_from(minor).unwrap_or(i64::MAX));
-        emit_counter(names.1, i64::try_from(major).unwrap_or(i64::MAX));
+        emit_counter(names.0, minor);
+        emit_counter(names.1, major);
     }
 }
 

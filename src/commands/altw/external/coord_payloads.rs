@@ -274,7 +274,7 @@ impl ConcurrentBlobLocationRouter {
         };
         // Both halves present - encode inline and publish.
         drop(map);
-        let t_enc = std::time::Instant::now();
+        let t_enc = crate::counters::Stopwatch::start();
         let mut coord_bytes = left_bytes;
         coord_bytes.extend_from_slice(&right_bytes);
         encode_scratch.clear();
@@ -286,8 +286,7 @@ impl ConcurrentBlobLocationRouter {
             encode_scratch,
         )
         .map_err(|e| e.context(format!("router straddler encode blob {blob_idx}")))?;
-        #[allow(clippy::cast_possible_truncation)]
-        let encode_ns = t_enc.elapsed().as_nanos() as u64;
+        let encode_ns = t_enc.elapsed_ns();
         let bytes = std::mem::take(encode_scratch);
         let byte_len = bytes.len() as u64;
         let mut slot_guard = self.slots[blob_idx]

@@ -231,16 +231,11 @@ pub(super) fn build_node_index_sparse(
     referenced: IdSet,
     host: &crate::host::Host,
 ) -> Result<SparseArrayIndex> {
-    let t_rank = std::time::Instant::now();
+    let t_rank = crate::counters::Stopwatch::start();
     let referenced = referenced.into_ranked();
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    crate::debug::emit_counter(
-        "altw_pass1_rank_index_ms",
-        t_rank.elapsed().as_millis() as i64,
-    );
+    crate::debug::emit_counter("altw_pass1_rank_index_ms", t_rank.elapsed_ms());
     let total_bytes = referenced.total_count().saturating_mul(8);
-    #[allow(clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("altw_pass1_store_bytes", total_bytes as i64);
+    crate::debug::emit_counter("altw_pass1_store_bytes", total_bytes);
 
     // No referenced nodes (e.g. every way has zero refs): posix_fallocate and
     // mmap both reject a zero length, so back the store with one unused slot.
@@ -272,15 +267,11 @@ pub(super) fn build_node_index_sparse(
     // sorted + indexed input it reads exactly 1.000 by construction - ranks
     // are assigned in ascending id order over disjoint blob id ranges - so it
     // only discriminates on unsorted input.
-    let tuples_scanned = std::sync::atomic::AtomicU64::new(0);
-    let coords_stored = std::sync::atomic::AtomicU64::new(0);
-    let rank_span_slots = std::sync::atomic::AtomicU64::new(0);
+    let counters = Pass1Counters::new();
 
     let referenced_ref = &referenced;
     let writer_ref = &writer;
-    let tuples_scanned_ref = &tuples_scanned;
-    let coords_stored_ref = &coords_stored;
-    let rank_span_slots_ref = &rank_span_slots;
+    let c = &counters;
     type Scratch = (Vec<crate::scan::node::NodeTuple>, Vec<(usize, usize)>);
     crate::scan::classify::parallel_scan_blobs_raw(
         &shared_input,
@@ -308,10 +299,12 @@ pub(super) fn build_node_index_sparse(
                     }
                 }
             }
-            tuples_scanned_ref.fetch_add(tuples.len() as u64, Ordering::Relaxed);
+            c.tuples_scanned
+                .fetch_add(tuples.len() as u64, Ordering::Relaxed);
             if blob_stored > 0 {
-                coords_stored_ref.fetch_add(blob_stored, Ordering::Relaxed);
-                rank_span_slots_ref.fetch_add(blob_max_rank - blob_min_rank + 1, Ordering::Relaxed);
+                c.coords_stored.fetch_add(blob_stored, Ordering::Relaxed);
+                c.rank_span_slots
+                    .fetch_add(blob_max_rank - blob_min_rank + 1, Ordering::Relaxed);
             }
             Ok(())
         },
@@ -319,21 +312,7 @@ pub(super) fn build_node_index_sparse(
         host,
     )?;
 
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter(
-            "altw_pass1_tuples_scanned",
-            tuples_scanned.load(Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "altw_pass1_coords_stored",
-            coords_stored.load(Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "altw_pass1_rank_span_slots",
-            rank_span_slots.load(Ordering::Relaxed) as i64,
-        );
-    }
+    counters.emit_all();
 
     advise_random_store(&mmap);
 
@@ -342,6 +321,19 @@ pub(super) fn build_node_index_sparse(
         mmap,
         _file: file,
     })
+}
+
+crate::counters::counter_set! {
+    /// Sparse pass-1 counters, bumped once per node blob. On sorted inputs
+    /// each blob's referenced nodes occupy one contiguous rank interval, so
+    /// `rank_span_slots / coords_stored` is the write amplification a
+    /// per-blob buffered-pwrite pass 1 would pay (see the accounting note
+    /// in `build_node_index_sparse`).
+    struct Pass1Counters {
+        tuples_scanned => "altw_pass1_tuples_scanned",
+        coords_stored => "altw_pass1_coords_stored",
+        rank_span_slots => "altw_pass1_rank_span_slots",
+    }
 }
 
 /// Advise the kernel that subsequent access to the store is random.

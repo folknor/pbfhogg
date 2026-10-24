@@ -33,6 +33,7 @@ use super::{
     BucketLayout, CLOSURE_FLAG, ID_RECORD_SIZE, IdRecord, LOCAL_ID_MASK, NodeBlobInfo,
     RESOLVED_ENTRY_SIZE, ResolvedEntry, slot_bucket_bounds,
 };
+use crate::counters::record_max;
 use crate::error::Error;
 use crate::scan::node::{NodeTuple, extract_node_tuples};
 use crate::scratch::RunScratch;
@@ -56,6 +57,51 @@ impl LoaderScratch {
             data_buf: Vec::new(),
             records: Vec::new(),
         }
+    }
+}
+
+crate::counters::counter_set! {
+    /// Stage 2 counters, shared by every node-join worker. Bumped per id
+    /// bucket, per node blob read, or per slot-buffer flush; never per
+    /// record. The `_ms` timers keep their historical per-sample
+    /// truncation; the `_ns` twins exist because that is lossy for
+    /// sub-millisecond blob phases (see `crate::counters::Stopwatch`).
+    struct Stage2Counters {
+        node_pread_ms => "s2_node_pread_ms",
+        node_decompress_ms => "s2_node_decompress_ms",
+        node_extract_ms => "s2_node_extract_ms",
+        node_walk_ms => "s2_node_walk_ms",
+        node_pread_ns => "s2_node_pread_ns",
+        node_decompress_ns => "s2_node_decompress_ns",
+        node_extract_ns => "s2_node_extract_ns",
+        node_walk_ns => "s2_node_walk_ns",
+        node_bytes_read => "s2_node_bytes_read",
+        node_blobs_read => "s2_node_blobs_read",
+        /// Node blobs read whose id range crosses the bucket boundary
+        /// (straddlers). Each straddler is re-decompressed by adjacent
+        /// workers; high values mean wasted decode work. With id-bucketing,
+        /// a node blob's id range can be wider than the bucket width, so
+        /// straddler density is expected to be high for sparse ID ranges.
+        /// Watch this metric when diagnosing repeated node decompression.
+        node_straddler_blobs => "s2_node_straddler_blobs",
+        resolve_ms => "s2_resolve_ms",
+        bucket_load_ms => "s2_bucket_load_ms",
+        bucket_loads => "s2_bucket_loads",
+        prepare_parse_ms => "s2_prepare_parse_ms",
+        prepare_sort_ms => "s2_prepare_sort_ms",
+        orphan_records => "s2_orphan_records",
+        slot_flush_lock_wait_ms => "s2_slot_flush_lock_wait_ms",
+        slot_flush_write_ms => "s2_slot_flush_write_ms",
+        slot_bytes_written => "s2_slot_bytes_written",
+        slot_flush_calls => "s2_slot_flush_calls",
+        nonempty_slot_buckets_total => "s2_nonempty_slot_buckets_total",
+        max_slot_buffer_bytes => "s2_max_slot_buffer_bytes",
+        max_worker_buf_bytes => "s2_max_worker_buf_bytes",
+        pread_calls => "s2_pread_calls",
+        open_calls => "s2_open_calls",
+        stat_calls => "s2_stat_calls",
+        fadvise_calls => "s2_fadvise_calls",
+        fadvise_bytes => "s2_fadvise_bytes",
     }
 }
 
@@ -134,22 +180,22 @@ fn prepare_bucket(
     }
 
     // Parse 12-byte chunks into IdRecords.
-    let t_parse = std::time::Instant::now();
+    let t_parse = crate::counters::Stopwatch::start();
     let count = loader.data_buf.len() / ID_RECORD_SIZE;
     loader.records.reserve(count);
     let (chunks, _rem) = loader.data_buf.as_chunks::<ID_RECORD_SIZE>();
     for buf in chunks {
         loader.records.push(IdRecord::read_from(buf));
     }
-    let parse_ms = t_parse.elapsed().as_millis() as u64;
+    let parse_ms = t_parse.elapsed_ms();
 
     // Sort by local_node_id so the merge walk against ID-sorted node
     // tuples advances both pointers monotonically.
-    let t_sort = std::time::Instant::now();
+    let t_sort = crate::counters::Stopwatch::start();
     loader
         .records
         .sort_unstable_by_key(|r| r.local_node_id & LOCAL_ID_MASK);
-    let sort_ms = t_sort.elapsed().as_millis() as u64;
+    let sort_ms = t_sort.elapsed_ms();
 
     Ok(PreparedBucket {
         records: std::mem::take(&mut loader.records),
@@ -267,76 +313,13 @@ pub(super) fn stage2_node_join(
 
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let resolved_total = std::sync::atomic::AtomicU64::new(0);
-    let s2_node_pread_ms = std::sync::atomic::AtomicU64::new(0);
-    let s2_node_decompress_ms = std::sync::atomic::AtomicU64::new(0);
-    let s2_node_extract_ms = std::sync::atomic::AtomicU64::new(0);
-    let s2_node_walk_ms = std::sync::atomic::AtomicU64::new(0);
-    let s2_node_pread_ns = std::sync::atomic::AtomicU64::new(0);
-    let s2_node_decompress_ns = std::sync::atomic::AtomicU64::new(0);
-    let s2_node_extract_ns = std::sync::atomic::AtomicU64::new(0);
-    let s2_node_walk_ns = std::sync::atomic::AtomicU64::new(0);
-    let s2_node_bytes_read = std::sync::atomic::AtomicU64::new(0);
-    let s2_node_blobs_read = std::sync::atomic::AtomicU64::new(0);
-    // Buckets for which we touched at least one straddler blob (a blob
-    // whose id range crosses the bucket boundary). Each straddler is
-    // re-decompressed by adjacent workers; high values mean wasted
-    // decode work. With id-bucketing, a node blob's id range can be
-    // wider than the bucket width, so straddler density is expected
-    // to be high for sparse ID ranges. Watch this metric when
-    // diagnosing repeated node decompression.
-    let s2_node_straddler_blobs = std::sync::atomic::AtomicU64::new(0);
-    let s2_resolve_ms = std::sync::atomic::AtomicU64::new(0);
-    let s2_bucket_load_ms = std::sync::atomic::AtomicU64::new(0);
-    let s2_bucket_loads = std::sync::atomic::AtomicU64::new(0);
-    let s2_prepare_parse_ms = std::sync::atomic::AtomicU64::new(0);
-    let s2_prepare_sort_ms = std::sync::atomic::AtomicU64::new(0);
-    let s2_orphan_records = std::sync::atomic::AtomicU64::new(0);
-    let s2_slot_flush_lock_wait_ms = std::sync::atomic::AtomicU64::new(0);
-    let s2_slot_flush_write_ms = std::sync::atomic::AtomicU64::new(0);
-    let s2_slot_bytes_written = std::sync::atomic::AtomicU64::new(0);
-    let s2_slot_flush_calls = std::sync::atomic::AtomicU64::new(0);
-    let s2_nonempty_slot_buckets_total = std::sync::atomic::AtomicU64::new(0);
-    let s2_max_slot_buffer_bytes = std::sync::atomic::AtomicU64::new(0);
-    let s2_max_worker_buf_bytes = std::sync::atomic::AtomicU64::new(0);
-    let s2_pread_calls = std::sync::atomic::AtomicU64::new(0);
-    let s2_open_calls = std::sync::atomic::AtomicU64::new(0);
-    let s2_stat_calls = std::sync::atomic::AtomicU64::new(0);
-    let s2_fadvise_calls = std::sync::atomic::AtomicU64::new(0);
-    let s2_fadvise_bytes = std::sync::atomic::AtomicU64::new(0);
+    let counters = Stage2Counters::new();
     let s2_error: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
 
     let next_ref = &next_idx;
     let resolved_ref = &resolved_total;
-    let node_pread_ref = &s2_node_pread_ms;
-    let node_decompress_ref = &s2_node_decompress_ms;
-    let node_extract_ref = &s2_node_extract_ms;
-    let node_walk_ref = &s2_node_walk_ms;
-    let node_pread_ns_ref = &s2_node_pread_ns;
-    let node_decompress_ns_ref = &s2_node_decompress_ns;
-    let node_extract_ns_ref = &s2_node_extract_ns;
-    let node_walk_ns_ref = &s2_node_walk_ns;
-    let node_bytes_ref = &s2_node_bytes_read;
-    let node_blobs_ref = &s2_node_blobs_read;
-    let node_straddler_ref = &s2_node_straddler_blobs;
+    let c = &counters;
     let mapping_ref = node_blob_mapping;
-    let resolve_ref = &s2_resolve_ms;
-    let load_ref = &s2_bucket_load_ms;
-    let loads_ref = &s2_bucket_loads;
-    let prepare_parse_ref = &s2_prepare_parse_ms;
-    let prepare_sort_ref = &s2_prepare_sort_ms;
-    let orphan_ref = &s2_orphan_records;
-    let flush_lock_ref = &s2_slot_flush_lock_wait_ms;
-    let flush_write_ref = &s2_slot_flush_write_ms;
-    let slot_bytes_ref = &s2_slot_bytes_written;
-    let flush_calls_ref = &s2_slot_flush_calls;
-    let nonempty_ref = &s2_nonempty_slot_buckets_total;
-    let max_buf_ref = &s2_max_slot_buffer_bytes;
-    let max_worker_buf_ref = &s2_max_worker_buf_bytes;
-    let pread_calls_ref = &s2_pread_calls;
-    let open_calls_ref = &s2_open_calls;
-    let stat_calls_ref = &s2_stat_calls;
-    let fadvise_calls_ref = &s2_fadvise_calls;
-    let fadvise_bytes_ref = &s2_fadvise_bytes;
     let err_ref = &s2_error;
     let layout_ref = bucket_layout;
     let slot_starts_ref = way_slot_starts;
@@ -376,19 +359,18 @@ pub(super) fn stage2_node_join(
                         // error slot like any bucket failure.
                         host.cancel.check()?;
                         // Load + sort id-bucket records.
-                        let t_load = std::time::Instant::now();
+                        let t_load = crate::counters::Stopwatch::start();
                         let bkt = prepare_bucket(
                             bucket_idx, scratch, num_shard_workers, &mut loader,
                         )?;
-                        #[allow(clippy::cast_possible_truncation)]
-                        load_ref.fetch_add(t_load.elapsed().as_millis() as u64, Relaxed);
-                        loads_ref.fetch_add(1, Relaxed);
-                        prepare_parse_ref.fetch_add(bkt.parse_ms, Relaxed);
-                        prepare_sort_ref.fetch_add(bkt.sort_ms, Relaxed);
-                        open_calls_ref.fetch_add(bkt.open_calls, Relaxed);
-                        stat_calls_ref.fetch_add(bkt.stat_calls, Relaxed);
-                        fadvise_calls_ref.fetch_add(bkt.fadvise_calls, Relaxed);
-                        fadvise_bytes_ref.fetch_add(bkt.fadvise_bytes, Relaxed);
+                        t_load.record_ms(&c.bucket_load_ms);
+                        c.bucket_loads.fetch_add(1, Relaxed);
+                        c.prepare_parse_ms.fetch_add(bkt.parse_ms, Relaxed);
+                        c.prepare_sort_ms.fetch_add(bkt.sort_ms, Relaxed);
+                        c.open_calls.fetch_add(bkt.open_calls, Relaxed);
+                        c.stat_calls.fetch_add(bkt.stat_calls, Relaxed);
+                        c.fadvise_calls.fetch_add(bkt.fadvise_calls, Relaxed);
+                        c.fadvise_bytes.fetch_add(bkt.fadvise_bytes, Relaxed);
 
                         if bkt.records.is_empty() {
                             return Ok(());
@@ -419,7 +401,7 @@ pub(super) fn stage2_node_join(
                             (b.min_id as u64) < bucket_hi
                         });
 
-                        let t_resolve = std::time::Instant::now();
+                        let t_resolve = crate::counters::Stopwatch::start();
                         let mut record_ptr = 0usize;
                         let resolved_before_bucket = local_resolved;
                         let mut bucket_blobs_read: u64 = 0;
@@ -439,7 +421,7 @@ pub(super) fn stage2_node_join(
                             }
 
                             // pread + decompress + extract.
-                            let t_pr = std::time::Instant::now();
+                            let t_pr = crate::counters::Stopwatch::start();
                             node_read_buf.resize(blob.data_size, 0);
                             // Input failures are located with the input and
                             // the blob's payload offset (cold).
@@ -447,42 +429,24 @@ pub(super) fn stage2_node_join(
                                 |e: Error| input_pbf.locate_at(blob.data_offset, e);
                             pbf_file.read_exact_at(&mut node_read_buf, blob.data_offset)
                                 .map_err(|e| in_input(Error::from(e).context("stage2 node pread")))?;
-                            #[allow(clippy::cast_possible_truncation)]
-                            node_pread_ref.fetch_add(
-                                t_pr.elapsed().as_millis() as u64, Relaxed,
-                            );
-                            #[allow(clippy::cast_possible_truncation)]
-                            node_pread_ns_ref.fetch_add(
-                                t_pr.elapsed().as_nanos() as u64, Relaxed,
-                            );
-                            node_bytes_ref.fetch_add(blob.data_size as u64, Relaxed);
+                            t_pr.record_ms(&c.node_pread_ms);
+                            t_pr.record_ns(&c.node_pread_ns);
+                            c.node_bytes_read.fetch_add(blob.data_size as u64, Relaxed);
 
-                            let t_dc = std::time::Instant::now();
+                            let t_dc = crate::counters::Stopwatch::start();
                             crate::blob::decompress_blob_raw(
                                 &node_read_buf, &mut node_decompress_buf,
                             ).map_err(|e| in_input(e.context("stage2 node decompress")))?;
-                            #[allow(clippy::cast_possible_truncation)]
-                            node_decompress_ref.fetch_add(
-                                t_dc.elapsed().as_millis() as u64, Relaxed,
-                            );
-                            #[allow(clippy::cast_possible_truncation)]
-                            node_decompress_ns_ref.fetch_add(
-                                t_dc.elapsed().as_nanos() as u64, Relaxed,
-                            );
+                            t_dc.record_ms(&c.node_decompress_ms);
+                            t_dc.record_ns(&c.node_decompress_ns);
 
-                            let t_ex = std::time::Instant::now();
+                            let t_ex = crate::counters::Stopwatch::start();
                             node_tuples.clear();
                             extract_node_tuples(
                                 &node_decompress_buf, &mut node_tuples, &mut node_group_starts,
                             ).map_err(|e| in_input(e.context("stage2 node extract")))?;
-                            #[allow(clippy::cast_possible_truncation)]
-                            node_extract_ref.fetch_add(
-                                t_ex.elapsed().as_millis() as u64, Relaxed,
-                            );
-                            #[allow(clippy::cast_possible_truncation)]
-                            node_extract_ns_ref.fetch_add(
-                                t_ex.elapsed().as_nanos() as u64, Relaxed,
-                            );
+                            t_ex.record_ms(&c.node_extract_ms);
+                            t_ex.record_ns(&c.node_extract_ns);
 
                             // Merge-walk: records are sorted by
                             // local_node_id; node_tuples are id-sorted
@@ -510,7 +474,7 @@ pub(super) fn stage2_node_join(
                             // any slot_pos not covered by a
                             // ResolvedEntry, matching the existing
                             // missing-ref behaviour.
-                            let t_walk = std::time::Instant::now();
+                            let t_walk = crate::counters::Stopwatch::start();
                             let blob_actual_upper: Option<u64> = node_tuples
                                 .last()
                                 .and_then(|t| u64::try_from(t.id).ok());
@@ -638,38 +602,21 @@ pub(super) fn stage2_node_join(
                                     // is not zero.
                                     local_resolved += 1;
                                     if slot_bufs[bucket].len() >= STAGE2_FLUSH_THRESHOLD {
-                                        let t_lock = std::time::Instant::now();
+                                        let t_lock = crate::counters::Stopwatch::start();
                                         let mut w = slot_buckets.writers[bucket]
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                        #[allow(clippy::cast_possible_truncation)]
-                                        flush_lock_ref.fetch_add(
-                                            t_lock.elapsed().as_millis() as u64, Relaxed,
-                                        );
-                                        let t_wr = std::time::Instant::now();
+                                        t_lock.record_ms(&c.slot_flush_lock_wait_ms);
+                                        let t_wr = crate::counters::Stopwatch::start();
                                         let flush_bytes = slot_bufs[bucket].len() as u64;
                                         w.write_all(&slot_bufs[bucket])
                                             .map_err(|e| slot_buckets.write_error(bucket, e))?;
                                         drop(w);
-                                        #[allow(clippy::cast_possible_truncation)]
-                                        flush_write_ref.fetch_add(
-                                            t_wr.elapsed().as_millis() as u64, Relaxed,
-                                        );
-                                        slot_bytes_ref.fetch_add(flush_bytes, Relaxed);
-                                        flush_calls_ref.fetch_add(1, Relaxed);
+                                        t_wr.record_ms(&c.slot_flush_write_ms);
+                                        c.slot_bytes_written.fetch_add(flush_bytes, Relaxed);
+                                        c.slot_flush_calls.fetch_add(1, Relaxed);
                                         // Track max buffer size before flush.
-                                        {
-                                            let buf_sz = flush_bytes;
-                                            let mut current = max_buf_ref.load(Relaxed);
-                                            while buf_sz > current {
-                                                match max_buf_ref.compare_exchange_weak(
-                                                    current, buf_sz, Relaxed, Relaxed,
-                                                ) {
-                                                    Ok(_) => break,
-                                                    Err(actual) => current = actual,
-                                                }
-                                            }
-                                        }
+                                        record_max(&c.max_slot_buffer_bytes, flush_bytes);
                                         slot_buckets.entry_counts[bucket]
                                             .fetch_add(slot_counts[bucket], Relaxed);
                                         slot_bufs[bucket].clear();
@@ -678,14 +625,8 @@ pub(super) fn stage2_node_join(
                                 }
                                 record_ptr += 1;
                             }
-                            #[allow(clippy::cast_possible_truncation)]
-                            node_walk_ref.fetch_add(
-                                t_walk.elapsed().as_millis() as u64, Relaxed,
-                            );
-                            #[allow(clippy::cast_possible_truncation)]
-                            node_walk_ns_ref.fetch_add(
-                                t_walk.elapsed().as_nanos() as u64, Relaxed,
-                            );
+                            t_walk.record_ms(&c.node_walk_ms);
+                            t_walk.record_ns(&c.node_walk_ns);
                             bucket_blobs_read += 1;
                         }
 
@@ -693,15 +634,12 @@ pub(super) fn stage2_node_join(
                         // within a blob range and past the last blob.
                         let bucket_resolved = local_resolved - resolved_before_bucket;
                         let orphans = (bkt.records.len() as u64).saturating_sub(bucket_resolved);
-                        orphan_ref.fetch_add(orphans, Relaxed);
+                        c.orphan_records.fetch_add(orphans, Relaxed);
 
-                        node_blobs_ref.fetch_add(bucket_blobs_read, Relaxed);
-                        node_straddler_ref.fetch_add(bucket_straddlers, Relaxed);
-                        #[allow(clippy::cast_possible_truncation)]
-                        resolve_ref.fetch_add(
-                            t_resolve.elapsed().as_millis() as u64, Relaxed,
-                        );
-                        pread_calls_ref.fetch_add(bucket_blobs_read, Relaxed);
+                        c.node_blobs_read.fetch_add(bucket_blobs_read, Relaxed);
+                        c.node_straddler_blobs.fetch_add(bucket_straddlers, Relaxed);
+                        t_resolve.record_ms(&c.resolve_ms);
+                        c.pread_calls.fetch_add(bucket_blobs_read, Relaxed);
 
                         // Track max live buffer bytes for this worker.
                         {
@@ -712,15 +650,7 @@ pub(super) fn stage2_node_join(
                                 + (node_tuples.capacity() * std::mem::size_of::<NodeTuple>()) as u64
                                 + (node_group_starts.capacity() * std::mem::size_of::<(usize, usize)>()) as u64
                                 + slot_bufs.iter().map(|b| b.capacity() as u64).sum::<u64>();
-                            let mut current = max_worker_buf_ref.load(Relaxed);
-                            while worker_bytes > current {
-                                match max_worker_buf_ref.compare_exchange_weak(
-                                    current, worker_bytes, Relaxed, Relaxed,
-                                ) {
-                                    Ok(_) => break,
-                                    Err(actual) => current = actual,
-                                }
-                            }
+                            record_max(&c.max_worker_buf_bytes, worker_bytes);
                         }
 
                         // Flush non-empty local buffers to shared writers.
@@ -728,31 +658,25 @@ pub(super) fn stage2_node_join(
                         for sb in 0..slot_bucket_count {
                             if slot_bufs[sb].is_empty() { continue; }
                             nonempty_count += 1;
-                            let t_lock = std::time::Instant::now();
+                            let t_lock = crate::counters::Stopwatch::start();
                             let mut w = slot_buckets.writers[sb]
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            #[allow(clippy::cast_possible_truncation)]
-                            flush_lock_ref.fetch_add(
-                                t_lock.elapsed().as_millis() as u64, Relaxed,
-                            );
-                            let t_wr = std::time::Instant::now();
+                            t_lock.record_ms(&c.slot_flush_lock_wait_ms);
+                            let t_wr = crate::counters::Stopwatch::start();
                             let flush_bytes = slot_bufs[sb].len() as u64;
                             w.write_all(&slot_bufs[sb])
                                 .map_err(|e| slot_buckets.write_error(sb, e))?;
                             drop(w);
-                            #[allow(clippy::cast_possible_truncation)]
-                            flush_write_ref.fetch_add(
-                                t_wr.elapsed().as_millis() as u64, Relaxed,
-                            );
-                            slot_bytes_ref.fetch_add(flush_bytes, Relaxed);
-                            flush_calls_ref.fetch_add(1, Relaxed);
+                            t_wr.record_ms(&c.slot_flush_write_ms);
+                            c.slot_bytes_written.fetch_add(flush_bytes, Relaxed);
+                            c.slot_flush_calls.fetch_add(1, Relaxed);
                             slot_buckets.entry_counts[sb]
                                 .fetch_add(slot_counts[sb], Relaxed);
                             slot_bufs[sb].clear();
                             slot_counts[sb] = 0;
                         }
-                        nonempty_ref.fetch_add(nonempty_count, Relaxed);
+                        c.nonempty_slot_buckets_total.fetch_add(nonempty_count, Relaxed);
 
                         // Recycle the records buffer for the next bucket.
                         loader.records = bkt.records;
@@ -782,126 +706,8 @@ pub(super) fn stage2_node_join(
         return Err(e);
     }
 
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter(
-            "s2_node_pread_ms",
-            s2_node_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_node_decompress_ms",
-            s2_node_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_node_extract_ms",
-            s2_node_extract_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_node_walk_ms",
-            s2_node_walk_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_node_pread_ns",
-            s2_node_pread_ns.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_node_decompress_ns",
-            s2_node_decompress_ns.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_node_extract_ns",
-            s2_node_extract_ns.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_node_walk_ns",
-            s2_node_walk_ns.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_node_bytes_read",
-            s2_node_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_node_blobs_read",
-            s2_node_blobs_read.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_node_straddler_blobs",
-            s2_node_straddler_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_resolve_ms",
-            s2_resolve_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_bucket_load_ms",
-            s2_bucket_load_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_bucket_loads",
-            s2_bucket_loads.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_prepare_parse_ms",
-            s2_prepare_parse_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_prepare_sort_ms",
-            s2_prepare_sort_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_orphan_records",
-            s2_orphan_records.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_slot_flush_lock_wait_ms",
-            s2_slot_flush_lock_wait_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_slot_flush_write_ms",
-            s2_slot_flush_write_ms.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_slot_bytes_written",
-            s2_slot_bytes_written.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_slot_flush_calls",
-            s2_slot_flush_calls.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_nonempty_slot_buckets_total",
-            s2_nonempty_slot_buckets_total.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_max_slot_buffer_bytes",
-            s2_max_slot_buffer_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_max_worker_buf_bytes",
-            s2_max_worker_buf_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_pread_calls",
-            s2_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_open_calls",
-            s2_open_calls.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_stat_calls",
-            s2_stat_calls.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_fadvise_calls",
-            s2_fadvise_calls.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s2_fadvise_bytes",
-            s2_fadvise_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        );
-        crate::debug::emit_counter("s2_num_workers", num_workers as i64);
-    }
+    counters.emit_all();
+    crate::debug::emit_counter("s2_num_workers", num_workers);
 
     let resolved_count = resolved_total.load(std::sync::atomic::Ordering::Relaxed);
     Ok(resolved_count)

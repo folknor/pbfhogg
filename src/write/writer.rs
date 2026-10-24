@@ -11,7 +11,6 @@
 //! back into sequence order. Raw passthrough blobs bypass compression entirely.
 
 use crate::blob_meta;
-use crate::elapsed::elapsed_ns_u64;
 use crate::error::{Error, Result, panic_error};
 use crate::output::Completion;
 use crate::write::Finish;
@@ -89,7 +88,7 @@ fn flush_wrapped_writer<W: Write>(writer: &mut W) -> Result<()> {
 
 fn sync_buffered_file(writer: &mut BufWriter<File>) -> Result<()> {
     writer.flush()?;
-    let t_sync = std::time::Instant::now();
+    let t_sync = crate::counters::Stopwatch::start();
     // `sync_file` decides on the original errno before anything converts it.
     let result = crate::write::file_writer::sync_file(writer.get_ref());
     WRITER_METRICS.record_sync_all(t_sync);
@@ -110,12 +109,10 @@ fn sync_buffered_file(writer: &mut BufWriter<File>) -> Result<()> {
 /// Every send path participates in the dispatch bound, including raw writes;
 /// see [`WRITE_AHEAD`] for how channel backpressure differs from that bound.
 fn acquire_permit(pipeline: &WritePipeline) -> Result<PermitGuard> {
-    let t_permit = std::time::Instant::now();
+    let t_permit = crate::counters::Stopwatch::start();
     recv_permit(&pipeline.permit_rx, &pipeline.executor)
         .map_err(|_| Error::internal("pipelined writer permit pool disconnected"))?;
-    WRITER_METRICS
-        .permit_wait_ns
-        .fetch_add(elapsed_ns_u64(t_permit), Relaxed);
+    t_permit.record_ns(&WRITER_METRICS.permit_wait_ns);
     Ok(PermitGuard::new(pipeline.permit_tx.clone()))
 }
 
@@ -729,7 +726,7 @@ impl<W: Write> PbfWriter<W> {
                         .payload_framed_bytes
                         .fetch_add(parts.total_len(), Relaxed);
                 }
-                let t_send = std::time::Instant::now();
+                let t_send = crate::counters::Stopwatch::start();
                 // A failed send means the writer thread has already exited,
                 // and this closure has no `Result` to return it in. Record it
                 // so the producer's next call can join and surface the real
@@ -828,7 +825,7 @@ impl<W: Write> PbfWriter<W> {
                         .payload_framed_bytes
                         .fetch_add(parts.total_len(), Relaxed);
                 }
-                let t_send = std::time::Instant::now();
+                let t_send = crate::counters::Stopwatch::start();
                 // A failed send means the writer thread has already exited,
                 // and this closure has no `Result` to return it in. Record it
                 // so the producer's next call can join and surface the real
@@ -930,7 +927,7 @@ impl<W: Write> PbfWriter<W> {
                         .payload_framed_bytes
                         .fetch_add(parts.total_len(), Relaxed);
                 }
-                let t_send = std::time::Instant::now();
+                let t_send = crate::counters::Stopwatch::start();
                 // A failed send means the writer thread has already exited,
                 // and this closure has no `Result` to return it in. Record it
                 // so the producer's next call can join and surface the real
@@ -990,7 +987,7 @@ impl<W: Write> PbfWriter<W> {
             WRITER_METRICS
                 .payload_raw_bytes
                 .fetch_add(raw_framed_bytes.len() as u64, Relaxed);
-            let t_send = std::time::Instant::now();
+            let t_send = crate::counters::Stopwatch::start();
             let sent = pipeline.tx.send(PipelineItem {
                 seq,
                 data: Ok(OutputChunk::Raw(raw_framed_bytes.to_vec())),
@@ -1035,7 +1032,7 @@ impl<W: Write> PbfWriter<W> {
             WRITER_METRICS
                 .payload_raw_bytes
                 .fetch_add(raw_framed_bytes.len() as u64, Relaxed);
-            let t_send = std::time::Instant::now();
+            let t_send = crate::counters::Stopwatch::start();
             let sent = pipeline.tx.send(PipelineItem {
                 seq,
                 data: Ok(OutputChunk::Raw(raw_framed_bytes)),
@@ -1080,7 +1077,7 @@ impl<W: Write> PbfWriter<W> {
             WRITER_METRICS
                 .payload_raw_chunk_bytes
                 .fetch_add(total_bytes, Relaxed);
-            let t_send = std::time::Instant::now();
+            let t_send = crate::counters::Stopwatch::start();
             let sent = pipeline.tx.send(PipelineItem {
                 seq,
                 data: Ok(OutputChunk::RawChunks(chunks)),
@@ -1143,7 +1140,7 @@ impl<W: Write> PbfWriter<W> {
 
     fn flush_inner(&mut self) -> Result<()> {
         self.mark_finished();
-        let t_flush = std::time::Instant::now();
+        let t_flush = crate::counters::Stopwatch::start();
         if let Some(mut pipeline) = self.pipeline.take() {
             // State the final item count BEFORE dropping the sender, so the
             // store is ordered ahead of the disconnect the writer thread
@@ -1168,9 +1165,7 @@ impl<W: Write> PbfWriter<W> {
         if let Some(ref mut w) = self.writer {
             (self.finalize_writer)(w)?;
         }
-        WRITER_METRICS
-            .flush_ns
-            .fetch_add(elapsed_ns_u64(t_flush), Relaxed);
+        t_flush.record_ns(&WRITER_METRICS.flush_ns);
         // Deliberately does NOT emit the writer counters. `WRITER_METRICS` is
         // process-global, so emitting here made a multi-writer command
         // (`multi-extract` opens one writer per region) publish the same
@@ -1270,13 +1265,11 @@ impl<W: Write> PbfWriter<W> {
             .writer
             .as_mut()
             .ok_or_else(|| Error::invalid_argument(WRITER_CONSUMED))?;
-        let t_write = std::time::Instant::now();
+        let t_write = crate::counters::Stopwatch::start();
         writer.write_all(&frame.prefix)?;
         writer.write_all(frame.header)?;
         writer.write_all(frame.blob)?;
-        WRITER_METRICS
-            .write_ns
-            .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+        t_write.record_ns(&WRITER_METRICS.write_ns);
         WRITER_METRICS
             .bytes_written
             .fetch_add(total_len as u64, Relaxed);
@@ -1421,7 +1414,7 @@ impl PbfWriter<FileWriter> {
             WRITER_METRICS
                 .payload_copy_range_bytes
                 .fetch_add(len, Relaxed);
-            let t_send = std::time::Instant::now();
+            let t_send = crate::counters::Stopwatch::start();
             let sent = pipeline.tx.send(PipelineItem {
                 seq,
                 data: Ok(OutputChunk::CopyRange {

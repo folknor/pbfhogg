@@ -33,8 +33,6 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use super::metrics::WRITER_METRICS;
 use crate::direct_io::{alloc_aligned_zeroed, round_up};
 
-use crate::elapsed::elapsed_ns_u64;
-
 /// Registered file descriptor index for the output file.
 const OUT_FD_IDX: u32 = 0;
 
@@ -263,15 +261,13 @@ impl UringState {
         // registered fd (OUT_FD_IDX). The buffer will not be touched until the
         // CQE is reaped (enforced by the free-list protocol).
         self.push_sqe(&sqe)?;
-        let t_submit = std::time::Instant::now();
+        let t_submit = crate::counters::Stopwatch::start();
         self.ring
             .submitter()
             .submit()
             .map_err(|e| Error::from(e).context("io_uring submit failed"))?;
         WRITER_METRICS.uring_submit_calls.fetch_add(1, Relaxed);
-        WRITER_METRICS
-            .uring_submit_ns
-            .fetch_add(elapsed_ns_u64(t_submit), Relaxed);
+        t_submit.record_ns(&WRITER_METRICS.uring_submit_ns);
 
         self.write_offset += aligned_len as u64;
         self.in_flight += 1;
@@ -328,12 +324,12 @@ impl UringState {
             return Ok(());
         }
         if wait {
-            let t_wait = std::time::Instant::now();
+            let t_wait = crate::counters::Stopwatch::start();
             self.ring
                 .submitter()
                 .submit_and_wait(1)
                 .map_err(|e| Error::from(e).context("io_uring submit_and_wait failed"))?;
-            let elapsed = elapsed_ns_u64(t_wait);
+            let elapsed = t_wait.elapsed_ns();
             WRITER_METRICS
                 .uring_submit_and_wait_calls
                 .fetch_add(1, Relaxed);
@@ -417,7 +413,7 @@ impl UringState {
         self.drain()?;
         file.set_len(self.logical_size)?;
         if finish == super::Finish::Durable {
-            let t_sync = std::time::Instant::now();
+            let t_sync = crate::counters::Stopwatch::start();
             // A path-constructor writer's own durability, recorded through
             // the writer-metrics funnel on the next line.
             #[allow(clippy::disallowed_methods)]
@@ -750,7 +746,7 @@ fn uring_main_loop(
     let mut pending: ReorderBuffer<Result<OutputChunk>> = ReorderBuffer::with_capacity(WRITE_AHEAD);
 
     loop {
-        let t_recv = std::time::Instant::now();
+        let t_recv = crate::counters::Stopwatch::start();
         let item = match rx.recv() {
             Ok(item) => item,
             Err(_) => break,
@@ -777,31 +773,25 @@ fn uring_main_loop(
                     // (registered-buffer copy is backend-local).
                     let bytes = parts.into_vec();
                     let len = bytes.len() as u64;
-                    let t_write = std::time::Instant::now();
+                    let t_write = crate::counters::Stopwatch::start();
                     state.write(&bytes)?;
-                    WRITER_METRICS
-                        .write_ns
-                        .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                    t_write.record_ns(&WRITER_METRICS.write_ns);
                     WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
                 }
                 OutputChunk::Raw(bytes) => {
                     let len = bytes.len() as u64;
-                    let t_write = std::time::Instant::now();
+                    let t_write = crate::counters::Stopwatch::start();
                     state.write(&bytes)?;
-                    WRITER_METRICS
-                        .write_ns
-                        .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                    t_write.record_ns(&WRITER_METRICS.write_ns);
                     WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
                 }
                 OutputChunk::RawChunks(chunks) => {
                     let total_bytes: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
-                    let t_write = std::time::Instant::now();
+                    let t_write = crate::counters::Stopwatch::start();
                     for chunk in &chunks {
                         state.write(chunk)?;
                     }
-                    WRITER_METRICS
-                        .write_ns
-                        .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                    t_write.record_ns(&WRITER_METRICS.write_ns);
                     WRITER_METRICS.bytes_written.fetch_add(total_bytes, Relaxed);
                 }
                 #[cfg(feature = "linux-direct-io")]
@@ -810,13 +800,11 @@ fn uring_main_loop(
                     offset,
                     len,
                 } => {
-                    let t_write = std::time::Instant::now();
+                    let t_write = crate::counters::Stopwatch::start();
                     handle_copy_range_uring(state, &in_file, offset, len, cancel)?;
                     // The Arc keeps the input open across the pread loop.
                     drop(in_file);
-                    WRITER_METRICS
-                        .write_ns
-                        .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                    t_write.record_ns(&WRITER_METRICS.write_ns);
                     WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
                 }
             }

@@ -282,7 +282,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
             Err(TryRecvError::Empty) => {}
         }
 
-        let start = std::time::Instant::now();
+        let start = crate::counters::Stopwatch::start();
         WRITER_METRICS
             .parallel_gzip_reorder_blocked
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -301,10 +301,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
                 }
             }
         };
-        WRITER_METRICS.parallel_gzip_reorder_wait_ns.fetch_add(
-            crate::elapsed::elapsed_ns_u64(start),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        start.record_ns(&WRITER_METRICS.parallel_gzip_reorder_wait_ns);
         result
     }
 
@@ -647,9 +644,10 @@ fn writer_loop<W: Write>(
             continue;
         }
         pending.insert(seq, out);
-        WRITER_METRICS
-            .parallel_gzip_reorder_high_water
-            .fetch_max(pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::counters::record_max(
+            &WRITER_METRICS.parallel_gzip_reorder_high_water,
+            pending.len() as u64,
+        );
         debug_assert!(
             pending.len() <= reorder_window,
             "parallel gzip reorder map exceeded its admitted sequence window"

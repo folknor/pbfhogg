@@ -28,10 +28,9 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
 
 use super::super::Result;
-use super::{StageCounters, add_ns};
+use super::StageCounters;
 use crate::blob_meta::BlobIndex;
 use crate::error::Error;
 
@@ -189,9 +188,9 @@ where
                     if idx >= n_tasks {
                         return;
                     }
-                    let t = Instant::now();
+                    let t = crate::counters::Stopwatch::start();
                     let admitted = gate.admit(idx, window);
-                    add_ns(&counters.window_wait_ns, t);
+                    t.record_ns(&counters.window_wait_ns);
                     if !admitted {
                         return;
                     }
@@ -210,9 +209,9 @@ where
         let mut reorder = crate::reorder_buffer::ReorderBuffer::with_max_window(window, window);
         loop {
             cancel.check()?;
-            let t = Instant::now();
+            let t = crate::counters::Stopwatch::start();
             let msg = rx.recv();
-            add_ns(&counters.consumer_recv_wait_ns, t);
+            t.record_ns(&counters.consumer_recv_wait_ns);
             let Ok((idx, item)) = msg else {
                 break;
             };
@@ -329,12 +328,12 @@ where
                 ))
             })?;
             if let Some((bytes, index)) = item.block {
-                let t = Instant::now();
+                let t = crate::counters::Stopwatch::start();
                 // Deliberately write no tagdata: terminal renumber output is not
                 // tag-filtered. Carrying headers or rebuilding keys would add per-blob
                 // or per-tag work and change the historical output bytes.
                 writer.write_primitive_block_owned(bytes, index, None, None)?;
-                add_ns(&counters.consumer_write_ns, t);
+                t.record_ns(&counters.consumer_write_ns);
             }
             // Counted after the write, so on a mid-stream error the totals cover
             // only output actually emitted.

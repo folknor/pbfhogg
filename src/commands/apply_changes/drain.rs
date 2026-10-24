@@ -274,7 +274,7 @@ pub(super) fn run_drain(
     // joined by `merge`), the same one a failed output write takes.
     let cancel = writer.cancel_token().clone();
     loop {
-        let recv_start = std::time::Instant::now();
+        let recv_start = crate::counters::Stopwatch::start();
         let item_opt = if drain_disconnected {
             None
         } else {
@@ -287,7 +287,7 @@ pub(super) fn run_drain(
                 }
             }
         };
-        let wait_ns = crate::elapsed::elapsed_ns_u64(recv_start);
+        let wait_ns = recv_start.elapsed_ns();
 
         // A failed worker never delivers its seq; waiting for it would
         // stall the reorder buffer forever (and under LOW, the barrier).

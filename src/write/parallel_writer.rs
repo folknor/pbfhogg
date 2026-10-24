@@ -167,7 +167,7 @@ fn parallel_writer_thread_inner(
     }
 
     if finish == super::Finish::Durable {
-        let t_sync = std::time::Instant::now();
+        let t_sync = crate::counters::Stopwatch::start();
         // A path-constructor writer's own durability, recorded through the
         // writer-metrics funnel on the next line.
         #[allow(clippy::disallowed_methods)]
@@ -275,7 +275,7 @@ fn dispatch_loop(
         // writer loops. This backend used to omit it, so a parallel-backend
         // run reported as never having waited on its producer - the same
         // one-backend-only counter shape as the `sync_all_calls` gap.
-        let t_recv = std::time::Instant::now();
+        let t_recv = crate::counters::Stopwatch::start();
         let item = match rx.recv() {
             Ok(item) => item,
             Err(_) => break,
@@ -461,7 +461,7 @@ fn worker_loop(
         #[cfg(feature = "test-hooks")]
         cancel.faults().on_pool_op(index);
 
-        let t = std::time::Instant::now();
+        let t = crate::counters::Stopwatch::start();
         let result = match op {
             WriteOp::Write { offset, bytes } => {
                 file.write_all_at(&bytes, offset).map_err(Error::from)
@@ -480,9 +480,7 @@ fn worker_loop(
                 r
             }
         };
-        WRITER_METRICS
-            .write_ns
-            .fetch_add(crate::elapsed::elapsed_ns_u64(t), Ordering::Relaxed);
+        t.record_ns(&WRITER_METRICS.write_ns);
         if let Err(e) = result {
             failure.record(e);
             return;

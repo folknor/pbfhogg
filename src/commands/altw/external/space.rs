@@ -47,10 +47,7 @@ pub(super) fn precheck(
 ) -> Result<()> {
     crate::debug::emit_marker("EXTJOIN_SPACE_PLAN_START");
     let bytes = remaining_scratch_bytes(total_slots, slot_buckets, payload_files)?;
-    crate::debug::emit_counter(
-        "extjoin_scratch_needed_bytes",
-        i64::try_from(bytes).unwrap_or(i64::MAX),
-    );
+    crate::debug::emit_counter("extjoin_scratch_needed_bytes", bytes);
     check_free_space(scratch, bytes)?;
     crate::debug::emit_marker("EXTJOIN_SPACE_PLAN_END");
     Ok(())

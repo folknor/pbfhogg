@@ -32,6 +32,29 @@ pub(super) struct IntegratedInputs<'a> {
     pub inject_prepass: bool,
 }
 
+crate::counters::counter_set! {
+    /// Stage 3 counters, shared by every slot-reorder worker; bumped per
+    /// slot bucket or per way blob it emits, never per slot.
+    struct Stage3Counters {
+        open_ms => "s3_open_ms",
+        read_ms => "s3_read_ms",
+        scatter_ms => "s3_scatter_ms",
+        buckets_loaded => "s3_buckets_loaded",
+        bytes_read => "s3_bytes_read",
+        scatter_stores => "s3_scatter_stores",
+        max_worker_buf_bytes => "s3_max_worker_buf_bytes",
+        /// Bumped only in `linux-direct-io` builds; zero otherwise.
+        fadvise_calls => "s3_fadvise_calls",
+        /// Bumped only in `linux-direct-io` builds; zero otherwise.
+        fadvise_bytes => "s3_fadvise_bytes",
+        encode_ms => "s3_encode_ms",
+        straddler_copy_ms => "s3_straddler_copy_ms",
+        worker_tmp_bytes => "s3_worker_tmp_bytes",
+        tmp_pwrite_ns => "s3_tmp_pwrite_ms" / 1_000_000,
+        tmp_pwrite_calls => "s3_tmp_pwrite_calls",
+    }
+}
+
 #[hotpath::measure]
 fn scatter_bucket_entries(
     data_buf: &[u8],
@@ -93,45 +116,14 @@ pub(super) fn stage3_slot_reorder(
     // `num_workers` is sized by the caller, which opens exactly that many
     // router worker files; `router.worker_file(worker_id)` relies on it.
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
-    let s3_open_ms = std::sync::atomic::AtomicU64::new(0);
-    let s3_read_ms = std::sync::atomic::AtomicU64::new(0);
-    let s3_scatter_ms = std::sync::atomic::AtomicU64::new(0);
-    let s3_buckets_loaded = std::sync::atomic::AtomicU64::new(0);
-    let s3_bytes_read = std::sync::atomic::AtomicU64::new(0);
-    let s3_scatter_stores = std::sync::atomic::AtomicU64::new(0);
-    let s3_max_worker_buf_bytes = std::sync::atomic::AtomicU64::new(0);
-    let s3_fadvise_calls = std::sync::atomic::AtomicU64::new(0);
-    let s3_fadvise_bytes = std::sync::atomic::AtomicU64::new(0);
+    let counters = Stage3Counters::new();
     let s3_error: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
 
-    // Integrated path counters.
-    let s3_integ_encode_ms = std::sync::atomic::AtomicU64::new(0);
-    let s3_integ_straddler_copy_ms = std::sync::atomic::AtomicU64::new(0);
-    let s3_integ_worker_tmp_bytes = std::sync::atomic::AtomicU64::new(0);
-    let s3_tmp_pwrite_ns = std::sync::atomic::AtomicU64::new(0);
-    let s3_tmp_pwrite_calls = std::sync::atomic::AtomicU64::new(0);
-
     let next_ref = &next_idx;
-    let s3_open_ref = &s3_open_ms;
-    let s3_read_ref = &s3_read_ms;
-    let s3_scatter_ref = &s3_scatter_ms;
-    let s3_loaded_ref = &s3_buckets_loaded;
-    let s3_bytes_read_ref = &s3_bytes_read;
-    let s3_scatter_stores_ref = &s3_scatter_stores;
-    let s3_max_worker_buf_ref = &s3_max_worker_buf_bytes;
-    // Only referenced under feature = "linux-direct-io".
-    #[allow(unused_variables)]
-    let s3_fadvise_calls_ref = &s3_fadvise_calls;
-    #[allow(unused_variables)]
-    let s3_fadvise_bytes_ref = &s3_fadvise_bytes;
+    let c = &counters;
     let err_ref = &s3_error;
     let entry_counts = &slot_buckets.entry_counts;
     let paths = &slot_buckets.paths;
-    let s3_integ_encode_ref = &s3_integ_encode_ms;
-    let s3_integ_straddler_copy_ref = &s3_integ_straddler_copy_ms;
-    let s3_integ_worker_tmp_bytes_ref = &s3_integ_worker_tmp_bytes;
-    let s3_tmp_pwrite_ns_ref = &s3_tmp_pwrite_ns;
-    let s3_tmp_pwrite_calls_ref = &s3_tmp_pwrite_calls;
 
     let ctx = integrated;
     let router = ctx.router;
@@ -228,10 +220,7 @@ pub(super) fn stage3_slot_reorder(
                                 total_slots, ctx, &mut encode_scratch,
                                 #[allow(clippy::cast_possible_truncation)]
                                 { worker_id as u32 },
-                                &mut tmp_byte_pos, tmp_file,
-                                s3_integ_encode_ref, s3_integ_straddler_copy_ref,
-                                s3_integ_worker_tmp_bytes_ref,
-                                s3_tmp_pwrite_ns_ref, s3_tmp_pwrite_calls_ref,
+                                &mut tmp_byte_pos, tmp_file, c,
                             )?;
                             Ok(())
                         })();
@@ -252,13 +241,12 @@ pub(super) fn stage3_slot_reorder(
                         scatter_buf.clear();
                         scatter_buf.resize(bucket_bytes, 0);
 
-                        let t_open = std::time::Instant::now();
+                        let t_open = crate::counters::Stopwatch::start();
                         data_buf.clear();
                         let bucket_file = crate::read::input::open(&paths[bucket_idx])?;
-                        #[allow(clippy::cast_possible_truncation)]
-                        s3_open_ref.fetch_add(t_open.elapsed().as_millis() as u64, Relaxed);
+                        t_open.record_ms(&c.open_ms);
 
-                        let t_read = std::time::Instant::now();
+                        let t_read = crate::counters::Stopwatch::start();
                         std::io::Read::read_to_end(&mut &bucket_file, &mut data_buf).map_err(
                             |e| {
                                 Error::from(e).context(format!(
@@ -269,41 +257,31 @@ pub(super) fn stage3_slot_reorder(
                         )?;
                         #[cfg(feature = "linux-direct-io")]
                         {
-                            s3_fadvise_calls_ref.fetch_add(1, Relaxed);
-                            s3_fadvise_bytes_ref.fetch_add(data_buf.len() as u64, Relaxed);
+                            c.fadvise_calls.fetch_add(1, Relaxed);
+                            c.fadvise_bytes.fetch_add(data_buf.len() as u64, Relaxed);
                             advise_dontneed_file(&bucket_file);
                         }
-                        #[allow(clippy::cast_possible_truncation)]
-                        s3_read_ref.fetch_add(t_read.elapsed().as_millis() as u64, Relaxed);
-                        s3_bytes_read_ref.fetch_add(data_buf.len() as u64, Relaxed);
+                        t_read.record_ms(&c.read_ms);
+                        c.bytes_read.fetch_add(data_buf.len() as u64, Relaxed);
 
                         // Direct scatter from raw bytes. This removes the
                         // bucket-local Vec<ResolvedEntry> materialization and
                         // its extra memory traffic; parsing happens in lockstep
                         // with the scatter stores.
-                        let t_scatter = std::time::Instant::now();
+                        let t_scatter = crate::counters::Stopwatch::start();
                         let stores =
                             scatter_bucket_entries(&data_buf, bucket_idx, &mut scatter_buf)?;
-                        #[allow(clippy::cast_possible_truncation)]
-                        s3_scatter_ref.fetch_add(t_scatter.elapsed().as_millis() as u64, Relaxed);
-                        s3_scatter_stores_ref.fetch_add(stores, Relaxed);
+                        t_scatter.record_ms(&c.scatter_ms);
+                        c.scatter_stores.fetch_add(stores, Relaxed);
 
                         // Track max live buffer bytes for this worker.
                         {
                             let worker_bytes = data_buf.capacity() as u64
                                 + scatter_buf.capacity() as u64;
-                            let mut current = s3_max_worker_buf_ref.load(Relaxed);
-                            while worker_bytes > current {
-                                match s3_max_worker_buf_ref.compare_exchange_weak(
-                                    current, worker_bytes, Relaxed, Relaxed,
-                                ) {
-                                    Ok(_) => break,
-                                    Err(actual) => current = actual,
-                                }
-                            }
+                            crate::counters::record_max(&c.max_worker_buf_bytes, worker_bytes);
                         }
 
-                        s3_loaded_ref.fetch_add(1, Relaxed);
+                        c.buckets_loaded.fetch_add(1, Relaxed);
 
                         // Classify blobs in this bucket and encode/stage them
                         // into worker temp files + straddler staging.
@@ -316,10 +294,7 @@ pub(super) fn stage3_slot_reorder(
                             total_slots, ctx, &mut encode_scratch,
                             #[allow(clippy::cast_possible_truncation)]
                             { worker_id as u32 },
-                            &mut tmp_byte_pos, tmp_file,
-                            s3_integ_encode_ref, s3_integ_straddler_copy_ref,
-                            s3_integ_worker_tmp_bytes_ref,
-                            s3_tmp_pwrite_ns_ref, s3_tmp_pwrite_calls_ref,
+                            &mut tmp_byte_pos, tmp_file, c,
                         )?;
 
                         Ok(())
@@ -376,39 +351,7 @@ pub(super) fn stage3_slot_reorder(
         return Err(e);
     }
 
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        use std::sync::atomic::Ordering::Relaxed;
-        crate::debug::emit_counter("s3_open_ms", s3_open_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter("s3_read_ms", s3_read_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter("s3_scatter_ms", s3_scatter_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter("s3_buckets_loaded", s3_buckets_loaded.load(Relaxed) as i64);
-        crate::debug::emit_counter("s3_bytes_read", s3_bytes_read.load(Relaxed) as i64);
-        crate::debug::emit_counter("s3_scatter_stores", s3_scatter_stores.load(Relaxed) as i64);
-        crate::debug::emit_counter(
-            "s3_max_worker_buf_bytes",
-            s3_max_worker_buf_bytes.load(Relaxed) as i64,
-        );
-        crate::debug::emit_counter("s3_fadvise_calls", s3_fadvise_calls.load(Relaxed) as i64);
-        crate::debug::emit_counter("s3_fadvise_bytes", s3_fadvise_bytes.load(Relaxed) as i64);
-        crate::debug::emit_counter("s3_encode_ms", s3_integ_encode_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter(
-            "s3_straddler_copy_ms",
-            s3_integ_straddler_copy_ms.load(Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s3_worker_tmp_bytes",
-            s3_integ_worker_tmp_bytes.load(Relaxed) as i64,
-        );
-        crate::debug::emit_counter(
-            "s3_tmp_pwrite_ms",
-            (s3_tmp_pwrite_ns.load(Relaxed) / 1_000_000) as i64,
-        );
-        crate::debug::emit_counter(
-            "s3_tmp_pwrite_calls",
-            s3_tmp_pwrite_calls.load(Relaxed) as i64,
-        );
-    }
+    counters.emit_all();
 
     Ok(())
 }
@@ -430,11 +373,7 @@ fn emit_integrated_intersections(
     worker_id: u32,
     tmp_byte_pos: &mut u64,
     tmp_file: &std::fs::File,
-    s3_integ_encode_ref: &std::sync::atomic::AtomicU64,
-    s3_integ_straddler_copy_ref: &std::sync::atomic::AtomicU64,
-    s3_integ_worker_tmp_bytes_ref: &std::sync::atomic::AtomicU64,
-    s3_tmp_pwrite_ns_ref: &std::sync::atomic::AtomicU64,
-    s3_tmp_pwrite_calls_ref: &std::sync::atomic::AtomicU64,
+    counters: &Stage3Counters,
 ) -> crate::Result<()> {
     use std::os::unix::fs::FileExt as _;
     use std::sync::atomic::Ordering::Relaxed;
@@ -458,7 +397,7 @@ fn emit_integrated_intersections(
                 let local_end = ((blob_end - bucket_start) as usize) * COORD_SLOT_SIZE;
                 let slice = &scatter_buf[local_start..local_end];
 
-                let t_enc = std::time::Instant::now();
+                let t_enc = crate::counters::Stopwatch::start();
                 encode_scratch.clear();
                 encode_blob_payload_from_record(
                     slice,
@@ -468,12 +407,11 @@ fn emit_integrated_intersections(
                     encode_scratch,
                 )
                 .map_err(|e| e.context(format!("encode blob {blob_idx}")))?;
-                #[allow(clippy::cast_possible_truncation)]
-                s3_integ_encode_ref.fetch_add(t_enc.elapsed().as_millis() as u64, Relaxed);
+                t_enc.record_ms(&counters.encode_ms);
 
                 let byte_offset = *tmp_byte_pos;
                 let byte_length = encode_scratch.len() as u64;
-                let t_pw = std::time::Instant::now();
+                let t_pw = crate::counters::Stopwatch::start();
                 tmp_file
                     .write_all_at(encode_scratch, byte_offset)
                     .map_err(|e| {
@@ -482,11 +420,10 @@ fn emit_integrated_intersections(
                             router.worker_path(worker_id as usize).display()
                         ))
                     })?;
-                #[allow(clippy::cast_possible_truncation)]
-                s3_tmp_pwrite_ns_ref.fetch_add(t_pw.elapsed().as_nanos() as u64, Relaxed);
-                s3_tmp_pwrite_calls_ref.fetch_add(1, Relaxed);
+                t_pw.record_ns(&counters.tmp_pwrite_ns);
+                counters.tmp_pwrite_calls.fetch_add(1, Relaxed);
                 *tmp_byte_pos += byte_length;
-                s3_integ_worker_tmp_bytes_ref.fetch_add(byte_length, Relaxed);
+                counters.worker_tmp_bytes.fetch_add(byte_length, Relaxed);
                 // Publish immediately: the pwrite has durably landed the
                 // bytes in the kernel page cache at [byte_offset, +byte_length),
                 // so stage 4's pread via the router's worker_files[worker_id]
@@ -502,10 +439,9 @@ fn emit_integrated_intersections(
                 let local_start = ((blob_start - bucket_start) as usize) * COORD_SLOT_SIZE;
                 let slice = &scatter_buf[local_start..bucket_bytes];
 
-                let t_copy = std::time::Instant::now();
+                let t_copy = crate::counters::Stopwatch::start();
                 let bytes = slice.to_vec();
-                #[allow(clippy::cast_possible_truncation)]
-                s3_integ_straddler_copy_ref.fetch_add(t_copy.elapsed().as_millis() as u64, Relaxed);
+                t_copy.record_ms(&counters.straddler_copy_ms);
                 router
                     .publish_straddler_half(
                         blob_idx,
@@ -528,10 +464,9 @@ fn emit_integrated_intersections(
                 let local_end = ((blob_end - bucket_start) as usize) * COORD_SLOT_SIZE;
                 let slice = &scatter_buf[..local_end];
 
-                let t_copy = std::time::Instant::now();
+                let t_copy = crate::counters::Stopwatch::start();
                 let bytes = slice.to_vec();
-                #[allow(clippy::cast_possible_truncation)]
-                s3_integ_straddler_copy_ref.fetch_add(t_copy.elapsed().as_millis() as u64, Relaxed);
+                t_copy.record_ms(&counters.straddler_copy_ms);
                 router
                     .publish_straddler_half(
                         blob_idx,

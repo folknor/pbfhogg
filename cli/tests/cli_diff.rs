@@ -2207,13 +2207,14 @@ fn derive_sequential_and_sharded_output_byte_identical() {
 
         // Deletes carry the old version (bumped under --increment-version)
         // when the source had one, and no version attribute when it did not.
-        // Metadata-less node 65 is not checked: in a dense block whose other
-        // nodes carry metadata the block builder stores version 0 for it, so
-        // both paths read and emit a version it never had - an encoding
-        // question for the writer, not a sequential/parallel difference.
+        // Node 65 has no metadata in a dense block whose other nodes do, so
+        // the block builder stores a padding slot (version 0) for it; that is
+        // not a version claim and must not print as version 0, or as 1 once
+        // bumped.
         let v = if increment_version { 2 } else { 1 };
         for want in [
             format!("<node id=\"35\" version=\"{v}\"/>"),
+            "<node id=\"65\"/>".to_owned(),
             format!("<node id=\"70\" version=\"{v}\"/>"),
             "<way id=\"22\"/>".to_owned(),
             format!("<relation id=\"6\" version=\"{v}\"/>"),

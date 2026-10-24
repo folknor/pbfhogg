@@ -139,9 +139,41 @@ historical version.
 **Consequence for library users:** Code consuming the public `DenseNodeInfo` API
 directly (not through pbfhogg's commands) will still observe raw `-1` values from
 Osmosis-generated PBFs. This is documented on the `DenseNodeInfo` struct. Library
-users who need to handle Osmosis input should check for `-1` themselves. The tradeoff
-is accepted: the dense iterator is too hot to add branches for a single producer's
-non-standard encoding.
+users who need to handle Osmosis input should check for `-1` themselves, or use
+`claimed_version()` (below). The tradeoff is accepted: the dense iterator is too
+hot to add branches for a single producer's non-standard encoding.
+
+### Version 0 is not a version claim either
+
+OSM versions start at 1, and the writers spell "no version" as 0. pbfhogg's
+`BlockBuilder` stores version 0 with zeroed fields in the `DenseInfo` slot of a
+node added without metadata to a block whose other nodes carry it (the arrays
+must stay aligned), and writes version 0 for a versionless element that carries
+other metadata (an apply-changes OSC element with a timestamp but no version).
+libosmium does the same: it writes 0 for any versionless object, reads both 0 and
+-1 back as its own "no version", and its XML writer omits a zero version. The
+encoding is left alone; outputs that print metadata read it instead:
+
+- **A version is printed only when it is 1 or more**, on `Info` and `DenseInfo`
+  alike: OSC from `diff --format osc` (creates, modifies and deletes, so a
+  metadata-less node no longer deletes as `version="0"`, or `version="1"` under
+  `--increment-version`), the text diff's `vN`, `inspect --show`, the
+  `inspect --extended` metadata census and `export --metadata`. `Info::claimed_version()` and
+  `DenseNodeInfo::claimed_version()` are the public form of the rule; `version()`
+  still returns the raw value.
+- **The other fields of an `Info`** keep their own presence, zeros included.
+- **The other fields of a `DenseInfo` slot** depend on its version, because a
+  packed column cannot mark one slot absent. Version 1 or more: every field is
+  present as decoded. Negative: no metadata (the Osmosis rule above). Version 0:
+  a field counts only with a value no padding slot holds - non-zero timestamp,
+  positive changeset and uid, a non-empty user, `visible` false - the same tests
+  as libosmium's `detect_available_metadata`. So the padding slot prints nothing,
+  and a real versionless node keeps its non-zero fields. A zero field in such a
+  slot (an anonymous `uid` 0, say) is dropped: on the wire it cannot be told
+  apart from padding.
+
+Re-encoding is unaffected: the conversions that feed a rewrite keep a version-0
+slot and its fields as they are, and drop only `-1` slots.
 
 ## Null Island ambiguity in coordinate indexes
 

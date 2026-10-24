@@ -34,7 +34,7 @@ use crate::ElementKind;
 use crate::coord_fmt::{format_coord, from_decimicro};
 use crate::osc::merge_join::{
     BlockMergeAction, BlockPairMergeState, MergeJoinAction, MergeJoinElement, StreamingBlocks,
-    block_pair_merge_phase, merge_join_phase,
+    block_pair_merge_phase, merge_join_phase, skip_phase,
 };
 use crate::osc::write::{OwnedMember, OwnedNode, OwnedRelation, OwnedWay};
 use crate::owned::TypeFilter;
@@ -476,8 +476,15 @@ fn diff_block_pair<W: Write>(
         (ElementKind::Relation, filter.relations, "REL"),
     ];
 
-    for (kind, enabled, tag) in phases {
+    // An excluded kind ahead of an enabled one is skipped undecoded, so the
+    // later phase starts at its own first blob; see `skip_phase`. An
+    // excluded kind after the last enabled one is never read at all.
+    let last_enabled = phases.iter().rposition(|&(_, enabled, _)| enabled);
+    for (i, (kind, enabled, tag)) in phases.into_iter().enumerate() {
         if !enabled {
+            if last_enabled.is_some_and(|last| i < last) {
+                skip_phase(&mut merge, kind)?;
+            }
             continue;
         }
 

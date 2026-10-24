@@ -94,67 +94,6 @@ during decode.
 
 Reported by: the extract passthrough fix.
 
-## BUG-133 - A metadata-less node in a dense block deletes as `version="0"`
-
-Anger: 7 - derive-changes output; the root is the block builder.
-
-`BlockBuilder` (`backfill_default_dense_metadata` /
-`push_default_dense_metadata`) stores version 0 for a node without metadata
-in a dense block whose other nodes carry metadata, so the reader sees 0, and
-`derive.rs::extract_delete_info`'s `!= -1` filter lets it through:
-derive-changes emits `<node id=".." version="0"/>`, which
-`write_delete_element`'s own comment calls a claim the input never made. A way
-without metadata correctly gets no version. Sequential and parallel paths
-agree, so it is not drift. Seen on `cli_diff`'s sharded-equivalence fixture
-(node 65 there is excluded from the checks with a comment). Open: whether the
-builder should write the dense "absent" sentinel, or readers treat 0 as
-absent (OSM versions start at 1).
-
-Needs research before a ruling:
-
-- What the PBF spec and `osmformat.proto` say a dense node without metadata
-  in a metadata-carrying block should store, and whether `-1` is the
-  sentinel for `DenseInfo.version` or only for `Info.version`.
-- What osmium (`research/libosmium/`) writes in that position, and what it
-  reads back from `0` and from `-1` (its version type is unsigned).
-- What osmium's OSC and XML writers emit for a version-0 object, so the
-  output convention matches the oracle.
-- Every pbfhogg output that prints a version (derive deletes,
-  `write_element_xml` creates and modifies, the text diff's `vN`, `inspect`,
-  `export`) and what each prints for these nodes today.
-- Whether anything in pbfhogg distinguishes absent from 0 on the read side
-  (`DenseNodeInfo::version`, `owned.rs`'s defaults) that a builder change
-  would break.
-
-Recommendation on the table, pending that: treat version 0 as absent on
-output (emit a version only above 0), leaving the encoding alone.
-
-Reported by: the diff helper dedupe.
-
-## BUG-138 - Sequential indexed `diff --type` without nodes fails on any file with nodes
-
-Anger: 7 - CLI behaviour on the diff core's sequential path.
-
-`diff_block_pair` (`commands/diff/mod.rs`) skips a disabled kind's phase
-outright, but `osc/merge_join.rs::next_blob_for_kind` treats an earlier-kind
-blob met during a later phase as an unsorted file. So `diff --type way`
-(or `way,relation`) with `-j 1` or `-v`, on indexed inputs that hold nodes,
-reads the first node blob in the way phase and fails with "found a node
-blob during the way phase ... not in canonical order". The parallel path
-buckets blobs by kind and is fine, and the unindexed element stream drains
-excluded phases. An indexed input holding negative IDs falls back to the
-same sequential merge, so it fails the same way at every `-j`. `-t node`
-alone is unaffected (the later kinds are stashed, never reached).
-Confirmed on a test fixture (probe in the parity test below, since
-removed). `diff_stats` inherits the same behaviour by design; the parity test
-`roundtrip_invariants::diff_stats_matches_text_diff_on_every_path` runs
-these cases and sees both fail identically. Open: how an excluded phase
-is skipped - drained through the merge (decoding, so the claimed-max and
-decode checks apply to kinds the user excluded) or skipped by blob header
-alone (what the parallel path effectively does).
-
-Reported by: the quiet-diff count-only work.
-
 ## BUG-142 - `--tmp-dir` help misstates what parallel diff writes
 
 Anger: 2 - help text.
@@ -168,4 +107,38 @@ page that repeats it) to say each shard writes its full text output.
 
 Reported by: the quiet-diff count-only work.
 
+## BUG-143 - Sequential block-pair diff answers wrongly on blobs out of order within a kind
 
+Anger: 8 - diff core; a correct check has to accept every valid mixed-sign
+layout.
+
+The sequential block-pair merge (`osc/merge_join.rs`, used by `diff` and
+`diff_stats` at `-j 1`, under `-v`, and for every negative-ID input at any
+`-j`) checks that kinds come in order but not that blobs within one enabled
+kind do. Old node blobs `[100,200]` then `[1,50]` against a correctly ordered
+new file with the same elements: `-j 1` reports 50 created and 50 deleted on
+identical content, while `-j N` refuses the file as unsorted. The parallel
+path's order check is not a drop-in fix: the sequential path also carries
+every negative-ID file, and that check rejects some valid mixed-sign layouts
+(blob `[-1]` followed by blob `[-2,1]`).
+
+Reported by: the BUG-138 fix.
+
+## BUG-146 - Unindexed derive-changes drops every metadata field but the version
+
+Anger: 7 - derive-changes output.
+
+On unindexed inputs derive goes through `osc/merge_join.rs`'s `convert_node`,
+`convert_way` and `convert_relation`, which build metadata with
+`OwnedMetadata::version_only`: creates and modifies carry the version and
+lose timestamp, changeset, uid and user, which the indexed path prints. The
+OSC therefore depends on which path ran, contradicting the lossless roundtrip
+claim in `docs/cli/deviations.md`. No test sees it, because
+`content::content_equal` ignores metadata; and for the same reason that
+page's "reproduces the new file exactly" is stronger than anything checked,
+since a metadata-only change is invisible to the diff. Fix: carry full
+metadata through `convert_*`, a cross-path test comparing the OSC text of
+indexed and unindexed derive, and wording in `deviations.md` that says what
+the roundtrip actually compares.
+
+Reported by: the BUG-133 fix.

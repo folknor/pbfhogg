@@ -140,23 +140,33 @@ fn write_node_header(out: &mut impl Write, id: i64, lat: f64, lon: f64) -> io::R
 }
 
 fn write_dense_node_info(out: &mut impl Write, dn: &crate::DenseNode<'_>) -> io::Result<()> {
+    // `claims` reads presence from the slot's values: a version of 0 or -1
+    // is not a claim, and the padding slot of a node without metadata in a
+    // block whose other nodes carry it claims nothing.
     if let Some(info) = dn.info()
-        && info.version() != -1
+        && let Some(claims) = info.claims()
     {
-        writeln!(out, "  version: {}", info.version())?;
-        let ts = info.milli_timestamp();
-        if ts != 0 {
+        if let Some(v) = claims.version {
+            writeln!(out, "  version: {v}")?;
+        }
+        if let Some(ts) = claims.milli_timestamp
+            && ts != 0
+        {
             writeln!(out, "  timestamp: {}", ts / 1000)?;
         }
-        let cs = info.changeset();
-        if cs != -1 && cs != 0 {
+        if let Some(cs) = claims.changeset
+            && cs != -1
+            && cs != 0
+        {
             writeln!(out, "  changeset: {cs}")?;
         }
-        let uid = info.uid();
-        if uid != 0 {
+        if let Some(uid) = claims.uid
+            && uid != 0
+        {
             writeln!(out, "  uid: {uid}")?;
         }
-        if let Ok(user) = info.user()
+        if claims.user
+            && let Ok(user) = info.user()
             && !user.is_empty()
         {
             writeln!(out, "  user: {user}")?;
@@ -166,7 +176,7 @@ fn write_dense_node_info(out: &mut impl Write, dn: &crate::DenseNode<'_>) -> io:
 }
 
 fn write_info(out: &mut impl Write, info: &crate::Info<'_>) -> io::Result<()> {
-    if let Some(v) = info.version() {
+    if let Some(v) = info.claimed_version() {
         writeln!(out, "  version: {v}")?;
     }
     if let Some(ts) = info.milli_timestamp()

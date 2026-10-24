@@ -16,7 +16,9 @@ pub(super) struct MetaView<'a> {
 impl<'a> MetaView<'a> {
     pub(super) fn from_info(info: &Info<'a>) -> Self {
         Self {
-            version: info.version(),
+            // A version of 0 is how PBF writers spell "no version"; the other
+            // fields keep their own presence.
+            version: info.claimed_version(),
             timestamp_millis: info.milli_timestamp(),
             changeset: info.changeset(),
             uid: info.uid(),
@@ -25,15 +27,20 @@ impl<'a> MetaView<'a> {
         }
     }
 
-    pub(super) fn from_dense(info: &'a DenseNodeInfo<'a>) -> Self {
-        Self {
-            version: Some(info.version()),
-            timestamp_millis: Some(info.milli_timestamp()),
-            changeset: Some(info.changeset()),
-            uid: Some(info.uid()),
-            user: Some(info.user()),
-            visible: Some(info.visible()),
-        }
+    /// `None` when the slot claims no metadata: a negative version, or the
+    /// all-zero padding slot of a node without metadata in a block whose
+    /// other nodes carry it. See `DenseNodeInfo::claims` for how a version-0
+    /// slot's fields are read.
+    pub(super) fn from_dense(info: &'a DenseNodeInfo<'a>) -> Option<Self> {
+        let claims = info.claims()?;
+        Some(Self {
+            version: claims.version,
+            timestamp_millis: claims.milli_timestamp,
+            changeset: claims.changeset,
+            uid: claims.uid,
+            user: claims.user.then(|| info.user()),
+            visible: claims.visible,
+        })
     }
 }
 

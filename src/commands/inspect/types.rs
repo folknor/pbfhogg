@@ -382,17 +382,27 @@ pub(super) fn update_extended_for_element(ext: &mut ExtendedStats, element: &Ele
 }
 
 fn update_extended_dense_node(ext: &mut ExtendedStats, dn: &crate::DenseNode<'_>) {
-    if let Some(info) = dn.info().filter(|i| i.version() != -1) {
-        ext.metadata.has_version += 1;
+    // Presence by value, as libosmium's `detect_available_metadata` reads
+    // it: a dense slot cannot mark a field absent. A negative version (the
+    // Osmosis -1 sentinel) is a slot with no metadata at all; 0 is a slot
+    // with no version - which is also what a node without metadata gets in
+    // a block whose other nodes carry it - whose other fields count only
+    // where non-zero, so padding counts as nothing.
+    if let Some(info) = dn.info()
+        && info.version() >= 0
+    {
+        if info.claimed_version().is_some() {
+            ext.metadata.has_version += 1;
+        }
         let ts = info.milli_timestamp();
         if ts != 0 {
             ext.metadata.has_timestamp += 1;
             ext.update_timestamp(ts);
         }
-        if info.changeset() != 0 {
+        if info.changeset() > 0 {
             ext.metadata.has_changeset += 1;
         }
-        if info.uid() != 0 {
+        if info.uid() > 0 {
             ext.metadata.has_uid += 1;
         }
         if info.raw_user_sid() > 0 {
@@ -402,7 +412,7 @@ fn update_extended_dense_node(ext: &mut ExtendedStats, dn: &crate::DenseNode<'_>
 }
 
 fn update_extended_info(ext: &mut ExtendedStats, info: &crate::Info<'_>) {
-    if info.version().is_some() {
+    if info.claimed_version().is_some() {
         ext.metadata.has_version += 1;
     }
     if let Some(ts) = info.milli_timestamp()

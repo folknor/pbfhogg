@@ -272,6 +272,12 @@ impl<'a> Iterator for DenseNodeIter<'a> {
 /// (see `dense_node_metadata`, `dense_node_raw_metadata`, sort's
 /// `read_dense_node`, and `osc::merge_join::convert_node`). Non-dense elements
 /// normalize -1 → None directly in `WireInfo::parse`. See CORRECTNESS.md.
+///
+/// A version of 0 is not a claim either: it is how pbfhogg's `BlockBuilder`
+/// and libosmium spell "no version", including the padding slot of a node
+/// without metadata in a block whose other nodes carry it. Outputs that
+/// print metadata go through [`claimed_version`](Self::claimed_version) and
+/// the crate's `claims`, which read 0 and -1 accordingly.
 #[derive(Clone, Debug)]
 pub struct DenseNodeInfo<'a> {
     block: &'a WireBlock<'static>,
@@ -341,6 +347,83 @@ impl<'a> DenseNodeInfo<'a> {
     pub fn deleted(&self) -> bool {
         !self.visible
     }
+
+    /// Returns the version this node claims, or `None` when it claims none.
+    ///
+    /// OSM versions start at 1. A `DenseInfo` column cannot mark one slot
+    /// absent, so writers spell "no version" in the value: 0 is what
+    /// pbfhogg's `BlockBuilder` and libosmium write for a node without a
+    /// version - including a node added without metadata to a block whose
+    /// other nodes carry it - and -1 is the Osmosis sentinel. Neither is a
+    /// claim. [`version`](Self::version) still returns the raw value.
+    #[inline]
+    pub fn claimed_version(&self) -> Option<i32> {
+        (self.version >= 1).then_some(self.version)
+    }
+
+    /// The metadata fields this slot claims, for outputs that print them;
+    /// `None` when it claims nothing.
+    ///
+    /// The packed columns decode a value for every field of every slot, so
+    /// presence has to be read from the values:
+    ///
+    /// - version >= 1: every field is claimed as decoded, zeros included.
+    /// - version 0: no version claim, and a zero in any other column is
+    ///   indistinguishable from the padding a writer stores for a node
+    ///   without metadata (pbfhogg's `BlockBuilder` and libosmium store all
+    ///   zeros there). So each other field is claimed only by a value no
+    ///   padding holds: timestamp non-zero, changeset and uid positive, a
+    ///   user name other than the empty string, `visible` only when false.
+    ///   The same tests as libosmium's `detect_available_metadata`. A real
+    ///   versionless node with a zero field (an anonymous `uid` 0, say)
+    ///   loses that field on output; on the wire it cannot be told apart.
+    ///   Non-zero fields survive, which is what an apply-changes element
+    ///   with a timestamp but no version, or `osmium cat --clean version`
+    ///   output, carries.
+    /// - version < 0: no metadata. -1 is the Osmosis "absent" sentinel, and
+    ///   the conversions that re-encode a dense node drop such a slot too,
+    ///   so printing and rewriting agree.
+    ///
+    /// Computed only where an output prints metadata; the dense iterator
+    /// and the re-encoding conversions do not call it.
+    pub(crate) fn claims(&self) -> Option<DenseClaims> {
+        if self.version >= 1 {
+            return Some(DenseClaims {
+                version: Some(self.version),
+                milli_timestamp: Some(self.milli_timestamp()),
+                changeset: Some(self.changeset),
+                uid: Some(self.uid),
+                user: true,
+                visible: Some(self.visible),
+            });
+        }
+        if self.version < 0 {
+            return None;
+        }
+        let milli_timestamp = self.milli_timestamp();
+        Some(DenseClaims {
+            version: None,
+            milli_timestamp: (milli_timestamp != 0).then_some(milli_timestamp),
+            changeset: (self.changeset > 0).then_some(self.changeset),
+            uid: (self.uid > 0).then_some(self.uid),
+            user: self.user_sid != 0,
+            visible: (!self.visible).then_some(false),
+        })
+    }
+}
+
+/// The metadata fields one dense slot claims; see [`DenseNodeInfo::claims`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DenseClaims {
+    pub(crate) version: Option<i32>,
+    pub(crate) milli_timestamp: Option<i64>,
+    pub(crate) changeset: Option<i64>,
+    pub(crate) uid: Option<i32>,
+    /// Whether a user name is claimed. Resolve it with
+    /// [`DenseNodeInfo::user`], which can fail on a corrupt string table;
+    /// a bool keeps that lookup out of callers that only count.
+    pub(crate) user: bool,
+    pub(crate) visible: Option<bool>,
 }
 
 /// An iterator over dense nodes info. It decodes the delta encoded values.

@@ -53,7 +53,13 @@ fn push_attribute_escaped<'a>(elem: &mut BytesStart<'a>, key: &'a str, value: &s
 // Owned and borrowed element writers deliberately retain separate metadata
 // adapters: owned attributes preserve lexical timestamp/number/visible strings,
 // while borrowed Info uses typed, independently optional fields and DenseInfo
-// has a per-element absence sentinel. A common element trait must preserve
+// reads presence from its values (`DenseNodeInfo::claims`). The owned writers
+// print an OSC element's version as given, because OSC can spell absence and
+// an explicit `version="0"` there was claimed by its input; the borrowed
+// writers print PBF metadata, where 0 is how writers spell "no version", so
+// they print only a claimed version. Owned metadata built from PBF elements
+// must take the claimed version when it is built, since the owned writers
+// cannot tell where it came from. A common element trait must preserve
 // those distinctions, attribute order, empty-element shape and scratch reuse;
 // converting borrowed elements to owned strings would add per-element work to
 // the measured diff/derive output path. Share the tag event loop below without
@@ -373,20 +379,21 @@ fn write_dense_node_xml<W: std::io::Write>(
     elem.push_attribute(("id", id_str.as_str()));
     elem.push_attribute(("lat", lat_str.as_str()));
     elem.push_attribute(("lon", coord_buf.as_str()));
+    // A DenseInfo block decodes every field for every element, so presence
+    // is read from the values: `claims` says which fields this slot claims
+    // (all of them for a positive version, none for a negative one, and
+    // only values no padding holds for version 0, which is how writers
+    // store a node without metadata in a block whose other nodes carry it).
     if let Some(info) = node.info()
-        && info.version() != -1
+        && let Some(claims) = info.claims()
     {
-        // A DenseInfo block delta-decodes every field for every element, so
-        // once past the `version() != -1` per-element absence sentinel above,
-        // all of these are genuinely present - unlike the non-dense path,
-        // where each field is independently optional.
         push_info_attrs(
             &mut elem,
-            Some(info.version()),
-            Some(info.milli_timestamp()),
-            Some(info.changeset()),
-            Some(info.uid()),
-            info.user().ok(),
+            claims.version,
+            claims.milli_timestamp,
+            claims.changeset,
+            claims.uid,
+            if claims.user { info.user().ok() } else { None },
         );
     }
 
@@ -419,10 +426,12 @@ fn write_borrowed_node_xml<W: std::io::Write>(
     // wire format, so gating the whole call on `version` being present would
     // discard a timestamp, changeset, uid or user carried by an Info block
     // that happens to omit `version`. `push_info_attrs` emits per field on
-    // presence, so an entirely empty Info contributes no attributes.
+    // presence, so an entirely empty Info contributes no attributes. The
+    // version alone is filtered to a claim: 0 is how PBF writers spell "no
+    // version" inside an Info that carries other fields.
     push_info_attrs(
         &mut elem,
-        info.version(),
+        info.claimed_version(),
         info.milli_timestamp(),
         info.changeset(),
         info.uid(),
@@ -452,7 +461,7 @@ fn write_borrowed_way_xml<W: std::io::Write>(
     // per field, not gated on `version`.
     push_info_attrs(
         &mut elem,
-        info.version(),
+        info.claimed_version(),
         info.milli_timestamp(),
         info.changeset(),
         info.uid(),
@@ -489,7 +498,7 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
     // per field, not gated on `version`.
     push_info_attrs(
         &mut elem,
-        info.version(),
+        info.claimed_version(),
         info.milli_timestamp(),
         info.changeset(),
         info.uid(),
@@ -911,6 +920,111 @@ mod tests {
             );
         }
         assert!(xml.contains("id=\"7\""), "the way itself must be emitted");
+        Ok(())
+    }
+
+    const META_ATTRS: [&str; 5] = ["version=", "timestamp=", "changeset=", "uid=", "user="];
+
+    fn meta(version: i32, uid: i32) -> crate::write::block_builder::Metadata<'static> {
+        crate::write::block_builder::Metadata {
+            version,
+            timestamp: 86_400,
+            changeset: 555,
+            uid,
+            user: "mapper",
+            visible: true,
+        }
+    }
+
+    /// Build one dense block through `BlockBuilder` from `(id, metadata)`
+    /// pairs and return the borrowed writers' XML for each node, in order.
+    fn borrowed_dense_xml(
+        nodes: &[(i64, Option<crate::write::block_builder::Metadata<'_>>)],
+    ) -> crate::Result<Vec<String>> {
+        let mut bb = crate::write::block_builder::BlockBuilder::new();
+        for (id, meta) in nodes {
+            bb.add_node(*id, 0, 0, Vec::<(&str, &str)>::new(), meta.as_ref());
+        }
+        let bytes = bb
+            .take()?
+            .ok_or_else(|| crate::Error::internal("block builder produced no block"))?
+            .to_vec();
+        let block = crate::PrimitiveBlock::from_vec(bytes)?;
+        let mut coord_buf = String::new();
+        let mut out = Vec::new();
+        for element in block.elements() {
+            assert!(matches!(element, crate::Element::DenseNode(_)));
+            let mut writer = Writer::new(Vec::new());
+            write_element_xml(&mut writer, &element, &mut coord_buf)?;
+            out.push(
+                String::from_utf8(writer.into_inner()).map_err(crate::Error::invalid_data_from)?,
+            );
+        }
+        Ok(out)
+    }
+
+    /// A node added without metadata to a dense block whose other nodes
+    /// carry it gets a padding slot - version 0 and zeros - both when it
+    /// comes first (backfilled) and when it follows (pushed). That slot
+    /// claims nothing, so the node prints with no metadata at all, not as
+    /// `version="0" timestamp="1970-01-01T00:00:00Z" changeset="0" uid="0"`.
+    #[test]
+    fn a_metadata_less_dense_node_prints_no_metadata() -> crate::Result<()> {
+        for nodes in [
+            [(1, None), (2, Some(meta(3, 9))), (3, None)],
+            [(1, Some(meta(3, 9))), (2, None), (3, Some(meta(4, 9)))],
+        ] {
+            let xml = borrowed_dense_xml(&nodes)?;
+            for (i, (_, m)) in nodes.iter().enumerate() {
+                if m.is_some() {
+                    assert!(xml[i].contains("version=\""), "got: {}", xml[i]);
+                    assert!(xml[i].contains("uid=\"9\""), "got: {}", xml[i]);
+                } else {
+                    for attr in META_ATTRS {
+                        assert!(
+                            !xml[i].contains(attr),
+                            "no {attr} expected; got: {}",
+                            xml[i]
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A versionless node that does carry other metadata - what apply-changes
+    /// writes for an OSC element with a timestamp but no version - keeps
+    /// those fields and gains no version. A zero field in such a slot is
+    /// indistinguishable from padding and is dropped (uid 0 here).
+    #[test]
+    fn a_versionless_dense_node_keeps_its_nonzero_fields() -> crate::Result<()> {
+        let xml = borrowed_dense_xml(&[
+            (1, Some(meta(2, 9))),
+            (2, Some(meta(0, 9))),
+            (3, Some(meta(0, 0))),
+        ])?;
+        for x in &xml[1..] {
+            assert!(!x.contains("version="), "got: {x}");
+            assert!(x.contains("changeset=\"555\""), "got: {x}");
+            assert!(x.contains("user=\"mapper\""), "got: {x}");
+            assert!(x.contains("timestamp=\"1970-01-02T00:00:00Z\""), "got: {x}");
+        }
+        assert!(xml[1].contains("uid=\"9\""), "got: {}", xml[1]);
+        assert!(!xml[2].contains("uid="), "got: {}", xml[2]);
+        Ok(())
+    }
+
+    /// An `Info` with version 0 prints no version, but its other fields keep
+    /// their own presence, zeros included - unlike a dense slot, an `Info`
+    /// can say which fields it carries.
+    #[test]
+    fn a_version_zero_info_prints_every_field_but_the_version() -> crate::Result<()> {
+        let xml = borrowed_way_xml(&meta(0, 0))?;
+        assert!(!xml.contains("version="), "got: {xml}");
+        assert!(xml.contains("uid=\"0\""), "got: {xml}");
+        assert!(xml.contains("changeset=\"555\""), "got: {xml}");
+        assert!(xml.contains("user=\"mapper\""), "got: {xml}");
         Ok(())
     }
 }

@@ -742,6 +742,207 @@ fn write_diff_stats_fixtures(dir: &Path) {
     std::fs::write(p("corrupt.osm.pbf"), corrupt).expect("write corrupt");
 }
 
+/// A type filter that excludes a kind ahead of an enabled one answers the
+/// same on every path: the sequential block-pair merge (`-j 1`, verbose,
+/// and every negative-ID run) skips the excluded kind's blobs, the parallel
+/// path never reads them, and the unindexed stream drains them by decoding.
+/// The sequential merge used to start the later phase on the excluded
+/// kind's first blob and refuse every such run as unsorted. The answer is
+/// also pinned to the single-kind runs, which skip nothing.
+#[test]
+fn diff_type_filter_excluding_an_earlier_kind_agrees_on_every_path() {
+    let dir = TempDir::new().expect("tempdir");
+    write_diff_stats_fixtures(dir.path());
+    write_negative_all_kinds_fixtures(dir.path());
+
+    let filter = |nodes, ways, relations| pbfhogg::TypeFilter {
+        nodes,
+        ways,
+        relations,
+    };
+    let run = |old: &str, new: &str, type_filter, jobs: usize, verbose: bool| {
+        diff_counts(dir.path(), old, new, type_filter, jobs, verbose)
+    };
+    let add = |a: (u64, u64, u64, u64), b: (u64, u64, u64, u64)| {
+        (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3)
+    };
+
+    let pairs = [
+        (
+            "old.osm.pbf",
+            "new.osm.pbf",
+            "old-u.osm.pbf",
+            "new-u.osm.pbf",
+        ),
+        (
+            "old-negk.osm.pbf",
+            "new-negk.osm.pbf",
+            "old-negk-u.osm.pbf",
+            "new-negk-u.osm.pbf",
+        ),
+    ];
+    for (old, new, old_u, new_u) in pairs {
+        let way = run(old, new, filter(false, true, false), 4, false);
+        let relation = run(old, new, filter(false, false, true), 4, false);
+        assert_ne!(
+            way.1 + way.2 + way.3,
+            0,
+            "{old}: the way fixture must differ"
+        );
+        assert_ne!(
+            relation.0 + relation.1 + relation.2 + relation.3,
+            0,
+            "{old}: the relation fixture must hold relations"
+        );
+        let expected = [
+            (filter(false, true, false), way),
+            (filter(false, false, true), relation),
+            (filter(false, true, true), add(way, relation)),
+            (
+                filter(true, false, true),
+                add(
+                    run(old, new, filter(true, false, false), 4, false),
+                    relation,
+                ),
+            ),
+        ];
+        for (type_filter, want) in expected {
+            for (jobs, verbose) in [(1, false), (1, true), (2, false), (4, false)] {
+                assert_eq!(
+                    run(old, new, type_filter, jobs, verbose),
+                    want,
+                    "{old}, {type_filter:?}, -j {jobs}, verbose {verbose}"
+                );
+            }
+            assert_eq!(
+                run(old_u, new_u, type_filter, 1, false),
+                want,
+                "{old_u} (unindexed), {type_filter:?}"
+            );
+        }
+    }
+}
+
+/// A mixed-sign pair holding every kind, indexed (`old-negk`, `new-negk`)
+/// and unindexed (`-u`), so the negative-ID fallback (the sequential merge
+/// at every -j) has an earlier kind to skip. Ways and relations differ.
+fn write_negative_all_kinds_fixtures(dir: &Path) {
+    use crate::common::{
+        generate_nodes_with_negatives, generate_relations_with_negatives,
+        generate_ways_with_negatives, write_test_pbf_non_indexed,
+    };
+    let p = |name: &str| dir.join(name);
+    let nodes = generate_nodes_with_negatives(20, 30);
+    let ways = generate_ways_with_negatives(10, 15, 3);
+    let rels = generate_relations_with_negatives(3, 4, 2);
+    // The fixture types are not `Clone`; the generators are deterministic.
+    let mut new_ways = generate_ways_with_negatives(10, 15, 3);
+    new_ways[1].tags.push(("highway", "service"));
+    new_ways.retain(|w| w.id != 7);
+    let mut new_rels = generate_relations_with_negatives(3, 4, 2);
+    new_rels[0].tags.push(("type", "route"));
+    write_multi_block_test_pbf(&p("old-negk.osm.pbf"), &nodes, &ways, &rels, 10);
+    write_multi_block_test_pbf(&p("new-negk.osm.pbf"), &nodes, &new_ways, &new_rels, 10);
+    write_test_pbf_non_indexed(&p("old-negk-u.osm.pbf"), &nodes, &ways, &rels);
+    write_test_pbf_non_indexed(&p("new-negk-u.osm.pbf"), &nodes, &new_ways, &new_rels);
+}
+
+/// `(common, created, modified, deleted)` of a text diff of two files in
+/// `dir`, panicking with the run's parameters on an error.
+fn diff_counts(
+    dir: &Path,
+    old: &str,
+    new: &str,
+    type_filter: pbfhogg::TypeFilter,
+    jobs: usize,
+    verbose: bool,
+) -> (u64, u64, u64, u64) {
+    let options = pbfhogg::diff::DiffOptions {
+        suppress_common: false,
+        verbose,
+        summary: false,
+        type_filter: Some(type_filter),
+        parallelism: pbfhogg::Parallelism::from_jobs(jobs),
+    };
+    let s = pbfhogg::diff::diff(
+        &dir.join(old),
+        &dir.join(new),
+        &mut Vec::new(),
+        &options,
+        false,
+        &crate::common::test_host(),
+        Some(crate::common::scratch_in(dir)),
+    )
+    .unwrap_or_else(|e| {
+        panic!("{old} vs {new}, {type_filter:?}, -j {jobs}, verbose {verbose}: {e}")
+    });
+    (s.common, s.created, s.modified, s.deleted)
+}
+
+/// Skipping an excluded kind does not wave a mis-ordered file through: a
+/// node blob after a way blob is still refused as unsorted when nodes are
+/// excluded, on the sequential path as on the parallel one.
+#[test]
+fn diff_type_filter_skip_still_refuses_an_earlier_kind_out_of_order() {
+    let dir = TempDir::new().expect("tempdir");
+    let p = |name: &str| dir.path().join(name);
+    write_multi_block_test_pbf(
+        &p("old.osm.pbf"),
+        &generate_nodes(100, 1),
+        &generate_ways(40, 1, 5, 1),
+        &generate_relations(5, 1, 2, 1),
+        25,
+    );
+    // Frames: the header, four node blobs, two way blobs, one relation blob.
+    // Move the last node blob between the two way blobs.
+    let bytes = std::fs::read(p("old.osm.pbf")).expect("read");
+    let frames = crate::common::adversarial::locate_blobs(&bytes);
+    assert_eq!(frames.len(), 8, "fixture layout");
+    let frame = |i: usize| &bytes[frames[i].frame_start..frames[i].blob_end];
+    let unsorted: Vec<u8> = [0, 1, 2, 3, 5, 4, 6, 7]
+        .iter()
+        .flat_map(|&i| frame(i).iter().copied())
+        .collect();
+    std::fs::write(p("unsorted.osm.pbf"), unsorted).expect("write unsorted");
+
+    for type_filter in [
+        pbfhogg::TypeFilter {
+            nodes: false,
+            ways: true,
+            relations: false,
+        },
+        pbfhogg::TypeFilter {
+            nodes: false,
+            ways: false,
+            relations: true,
+        },
+    ] {
+        for (jobs, verbose) in [(1, false), (1, true), (4, false)] {
+            let options = pbfhogg::diff::DiffOptions {
+                suppress_common: false,
+                verbose,
+                summary: false,
+                type_filter: Some(type_filter),
+                parallelism: pbfhogg::Parallelism::from_jobs(jobs),
+            };
+            let err = pbfhogg::diff::diff(
+                &p("unsorted.osm.pbf"),
+                &p("old.osm.pbf"),
+                &mut Vec::new(),
+                &options,
+                false,
+                &crate::common::test_host(),
+                Some(crate::common::scratch_in(dir.path())),
+            )
+            .expect_err("a node blob after a way blob must be refused");
+            assert!(
+                matches!(err.kind(), pbfhogg::ErrorKind::Unsorted { .. }),
+                "{type_filter:?}, -j {jobs}, verbose {verbose}: {err}"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Compression-level parity (Batch E)
 // ---------------------------------------------------------------------------

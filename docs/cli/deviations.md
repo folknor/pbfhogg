@@ -80,7 +80,12 @@ from two PBFs. In Denmark cross-validation, osmium's OSC is missing 1243 deletes
 that are present in the original diff.
 
 **pbfhogg behavior:** `diff --format osc` produces a perfect roundtrip - applying
-the derived OSC to the old PBF reproduces the new PBF exactly.
+the derived OSC to the old PBF reproduces the new PBF exactly. One margin: a
+dense node with no version (stored as version 0) prints only its non-zero
+metadata fields, because a zero there cannot be told apart from the padding a
+node without metadata gets (see
+[Correctness](/guide/correctness#version-0-is-not-a-version-claim-either)), so
+a zero-valued field on such a node does not survive the roundtrip.
 
 **Rationale:** Not a design choice - osmium simply cannot represent certain deletes
 when the deleted element is absent from both input files. pbfhogg's content-equality

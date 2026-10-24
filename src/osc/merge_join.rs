@@ -221,6 +221,12 @@ fn owned_tags<'a>(
         .collect()
 }
 
+/// The owned metadata carries only the version the element claims
+/// (`claimed_version`): the owned OSC writers print whatever version they
+/// are handed, and a PBF version below 1 - 0 from pbfhogg's `BlockBuilder`
+/// and libosmium, -1 from Osmosis - is "no version", not a claim. The
+/// version is printed (diff text, derive output) and never compared:
+/// content equality excludes metadata.
 pub(crate) fn convert_node(element: &Element<'_>) -> ConvertResult<OwnedNode> {
     Ok(match element {
         Element::DenseNode(dn) => Some(OwnedNode {
@@ -230,8 +236,7 @@ pub(crate) fn convert_node(element: &Element<'_>) -> ConvertResult<OwnedNode> {
             tags: owned_tags(dn.tags_checked())?,
             metadata: dn
                 .info()
-                .map(crate::dense::DenseNodeInfo::version)
-                .filter(|&v| v != -1)
+                .and_then(crate::dense::DenseNodeInfo::claimed_version)
                 .map(OwnedMetadata::version_only),
         }),
         Element::Node(n) => Some(OwnedNode {
@@ -239,7 +244,7 @@ pub(crate) fn convert_node(element: &Element<'_>) -> ConvertResult<OwnedNode> {
             decimicro_lat: n.decimicro_lat(),
             decimicro_lon: n.decimicro_lon(),
             tags: owned_tags(n.tags_checked())?,
-            metadata: n.info().version().map(OwnedMetadata::version_only),
+            metadata: n.info().claimed_version().map(OwnedMetadata::version_only),
         }),
         _ => None,
     })
@@ -251,7 +256,7 @@ pub(crate) fn convert_way(element: &Element<'_>) -> ConvertResult<OwnedWay> {
             id: w.id(),
             tags: owned_tags(w.tags_checked())?,
             refs: w.refs().collect(),
-            metadata: w.info().version().map(OwnedMetadata::version_only),
+            metadata: w.info().claimed_version().map(OwnedMetadata::version_only),
         }),
         _ => None,
     })
@@ -271,7 +276,7 @@ pub(crate) fn convert_relation(element: &Element<'_>) -> ConvertResult<OwnedRela
                     })
                 })
                 .collect::<crate::error::Result<_>>()?,
-            metadata: r.info().version().map(OwnedMetadata::version_only),
+            metadata: r.info().claimed_version().map(OwnedMetadata::version_only),
         }),
         _ => None,
     })
@@ -411,13 +416,15 @@ pub(crate) fn element_id(e: &Element<'_>) -> i64 {
     }
 }
 
-/// Extract version from any Element variant.
+/// The version any Element variant claims, for printing (the text diff's
+/// `vN`). A version below 1 is "no version" - 0 from pbfhogg's
+/// `BlockBuilder` and libosmium, -1 from Osmosis - so it is `None`.
 pub(crate) fn element_version(e: &Element<'_>) -> Option<i32> {
     match e {
-        Element::DenseNode(dn) => dn.info().map(crate::DenseNodeInfo::version),
-        Element::Node(n) => n.info().version(),
-        Element::Way(w) => w.info().version(),
-        Element::Relation(r) => r.info().version(),
+        Element::DenseNode(dn) => dn.info().and_then(crate::DenseNodeInfo::claimed_version),
+        Element::Node(n) => n.info().claimed_version(),
+        Element::Way(w) => w.info().claimed_version(),
+        Element::Relation(r) => r.info().claimed_version(),
     }
 }
 
@@ -523,8 +530,9 @@ fn next_blob_for_kind(
                 return Ok(None);
             }
             // An EARLIER kind at this point cannot be reached on sorted
-            // input: the phase for that kind ran first and drained every
-            // blob of it before stopping at the first later-kind blob. So
+            // input: the phase for that kind ran (or was skipped by
+            // `skip_phase`) first and drained every blob of it before
+            // stopping at the first later-kind blob. So
             // reaching here means the file's header claims
             // Sort.Type_then_ID while its blobs are not in canonical order -
             // exactly what `degrade --unsort` produces. This used to
@@ -720,6 +728,29 @@ fn drain_remaining(
         let bs = decode_pending(p, buf, st, gr)?;
         emit_block(&bs, is_old, on_action, stats)?;
     }
+    Ok(())
+}
+
+/// Advance both sides past every blob of `kind` without decompressing any,
+/// for a caller that excludes `kind` but still runs a later kind's phase.
+///
+/// A later phase cannot simply start where an earlier phase was never run:
+/// [`next_blob_for_kind`] would meet the excluded kind's first blob and
+/// report the file as out of canonical order. Draining through
+/// [`block_pair_merge_phase`] instead would decode every excluded blob, so
+/// the decode and claimed-max checks would refuse inputs for a kind the
+/// caller excluded - inputs the parallel path accepts, since its per-kind
+/// buckets never read an excluded kind's bodies, and the answer must not
+/// depend on the shard count. So the excluded blobs go through the same
+/// classifier as any phase (an earlier kind is still an unsorted file,
+/// missing indexdata is still an error, the first later-kind blob is
+/// stashed for the next phase) and are dropped undecoded. Each frame is
+/// still read and its Blob envelope parsed by the `BlobReader`, which also
+/// checks cancellation per frame.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn skip_phase(state: &mut BlockPairMergeState, kind: ElementKind) -> Result<()> {
+    while next_blob_for_kind(&mut state.old_reader, kind, &mut state.old_stash)?.is_some() {}
+    while next_blob_for_kind(&mut state.new_reader, kind, &mut state.new_stash)?.is_some() {}
     Ok(())
 }
 

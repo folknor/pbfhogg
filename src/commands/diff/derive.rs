@@ -302,7 +302,8 @@ impl ChangeSink {
 /// Extract just id + metadata from a borrowed element for delete output.
 /// Avoids full owned conversion (no tag/ref cloning - deletes only need id + version).
 /// Shared by the sequential sink and the parallel shard workers, so both
-/// paths emit the same delete for the same element.
+/// paths emit the same delete for the same element. The version is passed
+/// raw; `write_delete_element` decides whether it is a claim.
 pub(super) fn extract_delete_info(
     elem: &crate::Element<'_>,
     kind: ElementKind,
@@ -313,7 +314,6 @@ pub(super) fn extract_delete_info(
             dn.id(),
             dn.info()
                 .map(crate::dense::DenseNodeInfo::version)
-                .filter(|&v| v != -1)
                 .map(OwnedMetadata::version_only),
         )),
         (ElementKind::Node, crate::Element::Node(n)) => Some((
@@ -692,10 +692,16 @@ pub(super) fn write_delete_element<W: Write>(
     let mut elem = BytesStart::new(tag_name);
     let id_str = id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
-    // Emitted only when the source claimed a version. Absent is not
-    // zero, and `version="0"` on a delete is a claim the input never
-    // made.
-    if let Some(version) = metadata.and_then(|m| m.version) {
+    // Emitted only when the source claimed a version. OSM versions start
+    // at 1, and the PBF inputs spell "no version" as 0 (pbfhogg's
+    // BlockBuilder and libosmium, including the padding slot of a node
+    // without metadata in a dense block whose other nodes carry it) or -1
+    // (Osmosis). `version="0"` - or `version="1"` under
+    // `--increment-version` - would be a claim the input never made. The
+    // filter sits here rather than at extraction because every derive path
+    // funnels its deletes through this function, the element-stream
+    // fallback's owned metadata included.
+    if let Some(version) = metadata.and_then(|m| m.version).filter(|&v| v >= 1) {
         let version = if increment_version {
             version.saturating_add(1)
         } else {
@@ -726,6 +732,27 @@ mod scratch_tests {
         }
         let xml = String::from_utf8(writer.into_inner()).expect("XML");
         assert_eq!(xml.matches("timestamp=\"1970-01-01T00:00:00Z\"").count(), 2);
+    }
+
+    /// A delete carries a version only when the source claimed one: 0 and
+    /// -1 are how PBF writers spell "no version", so neither prints, not
+    /// even bumped by `--increment-version`.
+    #[test]
+    fn delete_versions_below_one_are_not_claims() {
+        for increment in [false, true] {
+            let mut writer = quick_xml::Writer::new(Vec::new());
+            for (id, version) in [(1, 0), (2, -1), (3, 3)] {
+                let meta = super::OwnedMetadata::version_only(version);
+                super::write_delete_element(&mut writer, "node", id, Some(&meta), increment, None)
+                    .expect("write delete");
+            }
+            let xml = String::from_utf8(writer.into_inner()).expect("XML");
+            let v = if increment { 4 } else { 3 };
+            assert_eq!(
+                xml,
+                format!("<node id=\"1\"/><node id=\"2\"/><node id=\"3\" version=\"{v}\"/>"),
+            );
+        }
     }
 
     #[test]

@@ -719,6 +719,20 @@ impl<'a> Info<'a> {
         self.info.version
     }
 
+    /// Returns the version this element claims, or `None` when it claims
+    /// none.
+    ///
+    /// OSM versions start at 1. A present version of 0 is how pbfhogg's
+    /// `BlockBuilder` and libosmium spell "no version" when they still write
+    /// an `Info` - an apply-changes element that carried a timestamp but no
+    /// version, for one - so it is not a claim. The Osmosis -1 sentinel is
+    /// already `None` from [`version`](Self::version). Only the version is
+    /// filtered: every other `Info` field keeps its own presence.
+    #[inline]
+    pub fn claimed_version(&self) -> Option<i32> {
+        self.info.version.filter(|&v| v >= 1)
+    }
+
     /// Returns the time stamp in milliseconds since the epoch.
     ///
     /// Scaling by `date_granularity` wraps on `i64` overflow: a timestamp

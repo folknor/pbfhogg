@@ -1014,51 +1014,6 @@ HYG-128 (no flag clears a header field) waits on this outcome.
 
 Reported by: the output-header policy work.
 
-## HYG-125 - Some phases have no cancellation checkpoint inside them
-
-Anger: 9 - every remaining gap sits in a measured hot loop or an in-memory
-rayon pass on the planet path.
-
-Cancellation is observed only where a run already passes a blob, a pool
-result, a stage boundary or an output write (ADR-0019), so these phases run to
-their end after the token trips. Each is reasoned, not measured:
-
-- Geocode builder: pass 2 admin assembly (`GEOCODE_PASS2_ADMIN_ASSEMBLY`),
-  interpolation resolve (`GEOCODE_PASS2_INTERP_RESOLVE`), the pass 2 data
-  file writes, pass 3 admin cell assignment and the admin index write. All
-  are in-memory or `par_iter` passes bounded by the boundary checks around
-  them; at planet scale admin assembly is the longest, on the order of the
-  span the sidecar reports for it.
-- `merge-changes --simplify`: the in-memory dedupe loop between its stage
-  boundaries.
-- `renumber`: each `into_ranked` rank-table build (checked only before and
-  after).
-- altw external: one stage 3 bucket per worker (at most 256 buckets in all,
-  so about 1/256 of stage 3's work per worker) and, in stage 2, one node blob
-  per worker.
-- `apply-changes`: the drain observes the token after each
-  `DRAIN_RECV_TIMEOUT` poll plus the item in hand; the barrier itself is not
-  split.
-- Raw blob copies: one `copy_file_range` call (the kernel copies up to about
-  2 GiB per call) between checks.
-- Cleanup itself: removing a large run directory after the token trips
-  completes unless a second signal arrives.
-
-A check inside any of these would be per element or per polygon, which the
-policy rules out. Fix only if an operator reports a stop that took too long:
-split the offending pass into chunks and check per chunk, with a matched A/B
-that the untripped check costs nothing. Enforce with the checkpoint-count
-test hook (`PBFHOGG_TEST_CANCEL_COUNT`): a pass that gains chunks should gain
-ordinals.
-
-Closing this under rule 3 was proposed and deferred, not declined: one short
-comment at each site above saying the phase runs to completion after the
-token trips, why (a check inside would be per element or per polygon), and
-that the fix is chunking plus a matched A/B. That is the expected end state
-unless an operator report makes a chunked check worth building first.
-
-Reported by: the cancellation work.
-
 ## HYG-128 - No flag clears a header field
 
 Anger: 3 - CLI behaviour, small.
@@ -1143,19 +1098,49 @@ and the normalisation matters to someone; otherwise it stays parked.
 
 Reported by: the BUG-113 implementation.
 
-## HYG-139 - The interruption table never interrupts sparse add-locations-to-ways
+## HYG-144 - Diff's paths refuse different malformed inputs
 
-Anger: 3 - test coverage.
+Anger: 8 - closing the gaps costs I/O on measured paths that work today.
 
-`cli/tests/cli_output_contract.rs` runs add-locations-to-ways only with
-`--index-type external`, because only that path leaves run scratch a paused
-run can observe. The default sparse path (and `auto` routing to it) is in
-neither the tier-1 sampled sweep nor the tier-3 every-ordinal sweep, so its
-exit code, staging cleanup and destination handling under SIGINT and SIGTERM
-are untested from the CLI. Fix: a sparse row, asserting no destination and no
-staging entry even though there is no scratch to see.
+Nothing promises that `diff -j 1` and `-j N` refuse the same malformed files,
+and they do not. The parallel path walks every blob header up front; the
+sequential block-pair merge never visits kinds after the last enabled one
+(`-t node`), so a truncated tail or missing indexdata there is refused only
+at `-j` above 1, even on negative-ID inputs. Excluded kinds before an enabled
+one are skipped by header (`skip_phase`), so their within-kind order goes
+unchecked on that path. A broken envelope on the first blob of the next kind
+is caught only by `-j 1`, whose lookahead parses it. Either state the
+divergence as accepted where diff's input contract is documented, or decide
+which checks every path owes.
 
-Reported by: the every-ordinal interruption sweep.
+Reported by: the BUG-138 fix.
+
+## HYG-147 - Test metadata helpers still read dense absence as `!= -1`
+
+Anger: 2 - test helpers only.
+
+Product printers now treat a dense version below 1 as no version claim, and a
+version-0 slot's other fields as present only when they hold a value padding
+never has (`DenseNodeInfo::claims`). `tests/common/mod.rs::meta_from_dense_node`
+and `cli/tests/cli_cat.rs` still test only `!= -1`, so a metadata comparison
+there can see a padding slot (all zeros) and a node with no metadata block as
+different. Fix: build the helpers on `claimed_version` / the same presence
+rule.
+
+Reported by: the BUG-133 fix.
+
+## HYG-145 - The unindexed diff decodes kinds the filter excludes
+
+Anger: 9 - measured path; skipping also stops refusals of corrupt data in
+the skipped kinds.
+
+`diff_element_stream` fully decodes excluded kinds even after the last
+enabled one, so `diff -t node` on unindexed inputs decodes every way and
+relation for nothing. Stopping after the last enabled kind (or skipping
+excluded blobs undecoded) removes the work, but those kinds' corrupt data
+would no longer be refused, which ties into HYG-144.
+
+Reported by: the BUG-138 fix.
 
 ## HYG-140 - Integration tests take scratch from the system temp dir
 

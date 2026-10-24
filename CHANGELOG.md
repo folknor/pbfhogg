@@ -1076,6 +1076,21 @@
 
 ### Fixed
 
+- **A version below 1 is no longer printed as a version.** A node written
+  without metadata into a dense block whose other nodes carry it is stored
+  as version 0 with zeroed fields (as libosmium also writes it), and
+  `diff --format osc` deleted it as `version="0"` (`version="1"` under
+  `--increment-version`), created or modified it with `version="0"
+  timestamp="1970-01-01T00:00:00Z" changeset="0" uid="0"`, and `export
+  --metadata` gave it `@version` 0 (or -1 for an Osmosis absent slot).
+  OSC output, the text diff's `vN`, `inspect --show`, the `inspect
+  --extended` metadata census and `export --metadata` now print a version
+  only when it is 1 or more. For a dense node without a version, the other
+  metadata fields print only where non-zero, so the padding prints nothing
+  while a real versionless node keeps its timestamp, changeset, uid and
+  user; an `Info` keeps every field it carries. New library accessors
+  `Info::claimed_version()` and `DenseNodeInfo::claimed_version()` apply
+  the same rule. See the correctness guide.
 - **`cat` indexes every blob it can decode.** A blob whose block no single
   index can describe (no elements, a group carrying more than one element
   kind, or kinds that change across groups - all legal PBF, written by other

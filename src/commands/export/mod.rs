@@ -212,7 +212,7 @@ pub fn export<W: Write>(
                     return;
                 }
                 write_point(&mut geometry, &mut coord_scratch, node.lon(), node.lat());
-                let meta = node.info().map(MetaView::from_dense);
+                let meta = node.info().and_then(MetaView::from_dense);
                 write_properties(
                     &mut properties,
                     node.id(),

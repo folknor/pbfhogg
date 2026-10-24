@@ -5409,35 +5409,6 @@ mod short_flag_tests {
     }
 }
 
-/// The library emits its process-global counter totals only from hooks the
-/// program calls once at exit (the library's own unit tests check that no
-/// library code path emits them). Those tests are satisfied by nothing
-/// emitting at all, so the call itself is checked here, in the package that
-/// owns it.
-#[cfg(test)]
-mod exit_hook_tests {
-    #[test]
-    fn the_exit_path_calls_the_counter_emission_hooks() {
-        // Strip `//` line comments before scanning: a commented-out call
-        // would otherwise satisfy the scan.
-        let source: String = include_str!("lib.rs")
-            .lines()
-            .map(|line| line.split("//").next().unwrap_or(""))
-            .flat_map(str::chars)
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        // The names are spelled without the call parentheses here, so this
-        // test's own literals cannot satisfy the scan.
-        for hook in ["write::emit_writer_counters", "read::emit_read_counters"] {
-            let call = format!("pbfhogg::{hook}()");
-            assert!(
-                source.contains(&call),
-                "the CLI must call {call} on its exit path, or no run emits those counters"
-            );
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::disallowed_methods)]
 mod scratch_location_tests {

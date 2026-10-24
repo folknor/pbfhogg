@@ -1396,20 +1396,8 @@ mod tests {
         let parent = crate::path_guard::tests::scratch();
         let live = RunScratch::create(parent.path(), &host()).expect("live");
         assert!(matches!(probe_lock(live.path()), Probe::Live));
-        let src = include_str!("scratch.rs");
-        let probe = src
-            .split("fn probe_lock(")
-            .nth(1)
-            .and_then(|rest| rest.split("\n}\n").next())
-            .expect("probe_lock source");
-        assert!(
-            probe.contains(".write(true)"),
-            "the probe must open read-write"
-        );
-        assert!(
-            !probe.contains(".create("),
-            "the probe must never create LOCK"
-        );
+        // That probe_lock opens read-write and never creates is enforced by
+        // scripts/check_source_invariants.py in the convention phase.
     }
 
     #[test]

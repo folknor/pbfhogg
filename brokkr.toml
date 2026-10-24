@@ -1355,6 +1355,52 @@ must_scan = [
 ]
 message = "emit_writer_counters is the once-per-process exit hook; only the CLI exit path calls it"
 
+# Read-side twin of the writer exit-hook rules. The pool-drop counters are
+# process totals, so only the one process-exit hook may emit them; a
+# per-pipeline emission would publish N samples of a total, and the latch
+# would turn the exit call into a no-op after the first. The per-pool emitter
+# is called only by the hook (read/mod.rs); the hook only by the CLI exit path.
+[[textlint]]
+name = "read-pool-counters-emitted-only-from-the-exit-hook"
+pattern = '\bemit_decompress_pool_counters\s*\('
+paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+exclude = ["src/read/mod.rs", "src/read/pipeline_metrics.rs"]
+region = "code"
+test_code = "skip"
+must_scan = [
+    "src/read/pipeline.rs",
+    "src/read/reader.rs",
+    "src/read/blob.rs",
+    "src/read/decompress.rs",
+    "src/scan/classify.rs",
+]
+message = "pool-drop counters are a process total; only pbfhogg::read::emit_read_counters (read/mod.rs) emits them"
+
+[[textlint]]
+name = "read-counter-hook-called-only-from-the-cli-exit-path"
+pattern = '\bemit_read_counters\s*\('
+paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+exclude = ["src/read/mod.rs", "cli/src/lib.rs"]
+region = "code"
+test_code = "skip"
+must_scan = [
+    "src/read/pipeline.rs",
+    "src/read/reader.rs",
+    "src/read/blob.rs",
+    "src/read/decompress.rs",
+    "src/scan/classify.rs",
+]
+message = "emit_read_counters is the once-per-process exit hook; only the CLI exit path calls it"
+
+# Presence of the CLI exit-path hook calls and the function-scoped probe_lock
+# open flags: neither fits a one-line forbid rule.
+[[script_check]]
+name = "source-invariants"
+command = "python3 scripts/check_source_invariants.py"
+expect = "source invariants ok"
+match = "last-line"
+stage = "pre-clippy"
+
 # Source-only guard: no build or test-harness startup.
 [[script_check]]
 name = "static-hook-test-isolation"

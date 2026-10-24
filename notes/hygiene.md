@@ -411,7 +411,7 @@ macro generating struct, `new` and `emit` from one list (see above on the
 max loops); a `Stopwatch` whose only exit is
 `record_into(&AtomicU64)`; the funnel's source scans moved to brokkr.toml
 textlint rules selected by glob, so no file escapes a hand-kept `SOURCES`
-list (HYG-135 is the general version).
+list.
 
 Reported by: altw and scanning, write path.
 
@@ -1033,37 +1033,6 @@ today's present-but-empty behaviour), or an explicit repeatable
 `--clear-header KEY` with a conflict rule against `--output-header KEY=...`.
 
 Reported by: the scratch-lifecycle review fixes.
-
-## HYG-135 - Source-scan tests built on `include_str!` belong in brokkr.toml
-
-Anger: 3 - test and convention plumbing; no product code.
-
-Several invariants are enforced by unit tests that `include_str!` source
-files and grep them: `src/read/pipeline_metrics.rs` (a hand-kept list of five
-read-path files), `src/scratch.rs` and `cli/src/lib.rs` (each scanning
-itself). The writer funnel's two scans in `src/write/metrics.rs` were the
-first moved: they are now the `writer-*` textlint rules in `brokkr.toml`,
-glob-selected with `must_scan` sentinels, and are the template for the rest.
-Some remaining uses may not be source scans at all; the inventory decides
-that per use. A hand-kept file list in a test is a list that a new file
-silently escapes (the writer funnel scanned six files and missed
-`framing.rs`, `parallel_gzip.rs` and `copy_range.rs`), whereas brokkr's `[[textlint]]` and `[[script_check]]`
-select files by glob, can scope to production code (`test_code = "skip"`)
-or to code outside comments and strings (`region = "code"`), and run in the
-convention phase of every `brokkr check`. Textlint matches one physical line
-at a time (no multiline matching beyond `use` statements), so a scan that
-squashes whitespace to catch a rustfmt-wrapped chain becomes a rule on a
-token that always lands on some line (forbid the field name outside its
-owner, not `field.fetch_add`), or a `script_check` where that is not
-enough.
-
-Fix: inventory every `include_str!` in the workspace; for each source scan,
-write the equivalent textlint or script_check rule in `brokkr.toml` (with
-`must_scan` sentinels on the files the old test named), confirm it fires on a
-reintroduced violation, and delete the test. Leave a use that embeds data
-rather than scanning source where it is.
-
-Reported by: the maintainer, reviewing the writer funnel completeness test.
 
 ## HYG-137 - `cat` could split unclassifiable blobs losslessly
 

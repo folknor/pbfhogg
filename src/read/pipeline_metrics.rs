@@ -228,35 +228,3 @@ fn cas_max(field: &AtomicU64, candidate: u64) {
 }
 
 pub(crate) static PIPELINE_METRICS: PipelineMetrics = PipelineMetrics::new();
-
-#[cfg(test)]
-mod tests {
-    /// The pool-drop counters are process totals, so only the one
-    /// process-exit hook may emit them; the read-side twin of the writer's
-    /// `writer_counters_are_emitted_only_from_the_process_exit_hook`. A
-    /// per-pipeline emission (where they used to live) would publish N
-    /// samples of a total, and the latch would turn the exit call into a
-    /// no-op after the first.
-    #[test]
-    fn pool_drop_counters_are_emitted_only_from_the_process_exit_hook() {
-        const SOURCES: [(&str, &str); 5] = [
-            ("pipeline.rs", include_str!("pipeline.rs")),
-            ("reader.rs", include_str!("reader.rs")),
-            ("blob.rs", include_str!("blob.rs")),
-            ("decompress.rs", include_str!("decompress.rs")),
-            ("scan/classify.rs", include_str!("../scan/classify.rs")),
-        ];
-        for (name, src) in SOURCES {
-            let squashed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
-            for spelling in ["emit_decompress_pool_counters(", "emit_read_counters("] {
-                assert!(
-                    !squashed.contains(spelling),
-                    "{name} emits the pool-drop counters via `{spelling}`; emission \
-                     belongs to pbfhogg::read::emit_read_counters, called once per process"
-                );
-            }
-        }
-        // That the CLI does call the hook on its exit path is checked by the
-        // CLI package's own unit tests, which own that source.
-    }
-}

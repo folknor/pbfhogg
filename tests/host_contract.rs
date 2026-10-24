@@ -524,7 +524,8 @@ fn scratch_backends_use_the_given_directory_and_leave_nothing() {
 }
 
 /// A diff that runs one shard writes no scratch and takes `None`; one that may
-/// run several refuses `None` before reading anything.
+/// run several refuses `None` before reading anything. `diff_stats` takes no
+/// scratch at all, however many shards it runs.
 #[test]
 fn diff_without_scratch_needs_a_single_shard() {
     let dir = tempfile::tempdir().expect("directory");
@@ -553,6 +554,21 @@ fn diff_without_scratch_needs_a_single_shard() {
     assert!(run(true, 0).is_ok());
     let err = run(false, 2).expect_err("two shards need scratch");
     assert!(err.to_string().contains("scratch directory"), "{err}");
+    // Counting takes no scratch at any shard count and writes nothing.
+    let before = crate::common::snapshot_dir(dir.path());
+    for jobs in [0, 2, 4] {
+        let stats = pbfhogg::diff::diff_stats(
+            &base,
+            &changed,
+            None,
+            pbfhogg::Parallelism::from_jobs(jobs),
+            false,
+            &crate::common::test_host(),
+        )
+        .expect("diff_stats");
+        assert!(stats.has_differences(), "jobs {jobs}: {stats:?}");
+    }
+    assert_eq!(crate::common::snapshot_dir(dir.path()), before);
 }
 
 /// The backends write their scratch into the run directory they are given

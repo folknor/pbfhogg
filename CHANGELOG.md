@@ -1126,13 +1126,18 @@
   negative IDs, which the external join cannot handle (the sparse index
   can). Ranges are exact by contract, so a file whose indexdata overstates
   `max_id` is refused too.
-- **`diff -j 1` and `diff -v` no longer need a writable current
-  directory.** A text diff whose command line guarantees the sequential path
-  makes no scratch directory, so it runs from a read-only directory and no
-  longer creates and removes a `.pbfhogg-run-*` there. Every run that may
-  shard (including a quiet diff without `-j 1`) still makes its directory at
-  startup and fails there when the location is unusable. Library callers of
-  `diff::diff` pass `None` for the scratch argument in the one-shard case.
+- **`diff -j 1`, `diff -v` and a quiet text `diff` no longer need a
+  writable current directory.** A text diff whose command line guarantees
+  the sequential path makes no scratch directory, so it runs from a
+  read-only directory and no longer creates and removes a `.pbfhogg-run-*`
+  there. A quiet text diff still shards, but only counts: it no longer
+  writes every shard's text to scratch (tens of GB at planet scale) to
+  throw it away, and it refuses `--tmp-dir`, which has nothing to place.
+  Every other run that may shard still makes its directory at startup and
+  fails there when the location is unusable. Library callers of
+  `diff::diff` pass `None` for the scratch argument in the one-shard case;
+  the new `diff::diff_stats` returns the same counts as an unsuppressed
+  `diff` without producing text, and takes no scratch at all.
 - **A file without a leading OSMHeader is the missing-header error in
   `check --index`, `check --refs` and `inspect --show`.** `check --index`
   reported a clean pass and `inspect --show` found or missed elements on

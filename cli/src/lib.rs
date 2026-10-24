@@ -695,13 +695,20 @@ fn validate_diff(command: &Command, quiet: bool) -> Result<(), Box<dyn std::erro
                 );
             }
             // A quiet text diff discards its text and summary: its answer is
-            // the exit code. The flags that only shape them are refused.
+            // the exit code. The flags that only shape them are refused, and
+            // so is --tmp-dir: a quiet diff only counts, sharded or not, and
+            // counting writes no scratch.
             if quiet {
                 for (set, flag, why) in [
                     (
                         output.is_some(),
                         "--output",
                         "a quiet text diff writes no diff text",
+                    ),
+                    (
+                        tmp.tmp_dir.is_some(),
+                        "--tmp-dir",
+                        "a quiet text diff only counts, which writes no scratch files",
                     ),
                     (
                         *suppress_common,
@@ -2699,12 +2706,11 @@ pub fn run() -> process::ExitCode {
                         })
                         .transpose()?;
                     // The sequential path writes no scratch: `-j 1`, and
-                    // `--verbose`, which is sequential-only. Any other text
-                    // diff may shard, so it gets its directory now, before
-                    // any input is opened. A quiet diff writes no output file
-                    // (`validate_diff` refuses -o with -q) but shards like any
-                    // other.
-                    let scratch = if verbose || jobs.fixed() == Some(1) {
+                    // `--verbose`, which is sequential-only. A quiet diff
+                    // only counts (`diff_stats`), which shards without
+                    // scratch. Any other text diff may shard, so it gets its
+                    // directory now, before any input is opened.
+                    let scratch = if quiet || verbose || jobs.fixed() == Some(1) {
                         None
                     } else {
                         Some(run_scratch(&tmp, output.as_deref(), &host)?)
@@ -3819,9 +3825,11 @@ fn leftover_dirs(command: &Command) -> Vec<PathBuf> {
             // Older versions wrote `diff-par-*` shards beside the old input.
             dirs.push(parent_of(old));
             dirs.extend(output.as_deref().map(parent_of));
-            // Where `run_scratch` puts this run's own directory: `--tmp-dir`,
-            // else the output's directory, else (text to stdout, or a quiet
-            // text diff, which takes no -o) the current directory.
+            // Where `run_scratch` puts a diff's run directory: `--tmp-dir`,
+            // else the output's directory, else (text to stdout) the current
+            // directory. A run that makes none (`-j 1`, `-v`, a quiet text
+            // diff, which takes no -o) still scans the current directory,
+            // where an earlier stdout diff's leftover would be.
             match &tmp.tmp_dir {
                 Some(dir) => dirs.push(dir.clone()),
                 None if output.is_none() => dirs.push(PathBuf::from(".")),
@@ -4212,8 +4220,10 @@ fn run_diff(
         parallelism,
     };
     let stats = if quiet {
-        let mut sink = std::io::sink();
-        pbfhogg::diff::diff(old, new, &mut sink, &options, direct_io, host, scratch)?
+        // The answer is the exit code: count, formatting nothing.
+        // `validate_diff` refused every flag that shapes the text, and the
+        // dispatch made no scratch directory.
+        pbfhogg::diff::diff_stats(old, new, type_filter, parallelism, direct_io, host)?
     } else if let Some(output) = output {
         let mut out = output.writer(&host.cancel)?;
         let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io, host, scratch)?;

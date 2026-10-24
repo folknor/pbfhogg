@@ -224,6 +224,19 @@ const REFUSALS: &[(&[&str], &str)] = &[
     ),
     (&["-q", "diff", "IN", "IN2", "-c"], "cannot be used with"),
     (&["-q", "diff", "IN", "IN2", "-s"], "cannot be used with"),
+    // A quiet text diff only counts, which writes no scratch.
+    (
+        &["diff", "IN", "IN2", "-q", "--tmp-dir", "DIR"],
+        "'--quiet' cannot be used with '--tmp-dir'",
+    ),
+    (
+        &["-q", "diff", "IN", "IN2", "-j", "4", "--tmp-dir", "DIR"],
+        "'--quiet' cannot be used with '--tmp-dir'",
+    ),
+    (
+        &["-q", "diff", "IN", "IN2", "-o", "OUT", "--tmp-dir", "DIR"],
+        "'--quiet' cannot be used with '--output'",
+    ),
     (
         &["getid", "IN", "-o", "OUT", "-v", "-q", "n1"],
         "cannot be used with",

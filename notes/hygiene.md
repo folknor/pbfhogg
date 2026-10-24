@@ -102,6 +102,15 @@ The judgement calls already known, to be checked first:
   `ErrorKind::InvalidData` rather than `Io` for every caller (getid ID files,
   extract configs and region files, the tags-filter expressions file), which
   library consumers matching on the kind will see.
+- The text diff's three drivers (sequential block-pair, element stream,
+  parallel shards) now take their writer as an `Option` so `diff_stats` can
+  share them without formatting: each write site gained an `if let Some`
+  branch, the shard writer became `Option<BufWriter<File>>`, and the
+  `diff` entry point moved its body into a shared `compare`. Argued
+  branch-predictable and below noise on the text path, not measured. The
+  count mode deliberately keeps the byte-equal fast path off (it follows
+  `suppress_common`, which `diff_stats` holds false) so its counts and
+  refusals equal an unsuppressed text diff's.
 
 ---
 
@@ -338,7 +347,11 @@ the loop is not backend logic; uring could be an `OutputSink` whose
 `write_chunk` does the opportunistic `reap_cqes(false)`. Meanings have
 diverged: `writer_write_ns` is wall time on the writer thread for buffered and
 uring, summed across 16 pool threads for parallel; parallel counts
-`writer_bytes_written` at dispatch, others after the write. Fix: `writer_thread<S: OutputSink>`
+`writer_bytes_written` at dispatch, others after the write; and
+`writer_sync_all_calls` / `_ns` count a failed fsync on the publication path
+(`WriterMetrics::sync_recorded` records success or failure) but not in the
+parallel and uring writers, whose `file.sync_all()?` returns before
+`record_sync_all`. Fix: `writer_thread<S: OutputSink>`
 as the only loop with an `on_idle()` hook; a source-scan test that only
 `pipeline.rs` calls `pop_ready()` under `src/write/`.
 
@@ -1046,24 +1059,6 @@ unless an operator report makes a chunked check worth building first.
 
 Reported by: the cancellation work.
 
-## HYG-130 - A quiet diff shards through scratch to discard the text
-
-Anger: 4 - CLI behaviour, small.
-
-`diff -q` hands the library a sink, so a quiet diff of indexed inputs still
-runs the parallel path, which writes each shard's text to scratch and then
-copies it into the sink. Planet scale that is tens of GB of disk written and
-read to produce a verdict and counts. A quiet run therefore needs a writable
-scratch location unless `-j 1` is given, which the `--tmp-dir` refusal and the
-scratch-free rule do not say for `-q`. Fix, if wanted: let the shard workers
-count without formatting when the caller discards the text (an option on
-`DiffOptions`), which would also make `-q` scratch-free; it touches the diff
-core (anger 9 territory), so it needs measuring first. Making quiet diff
-sequential was tried and reverted because it loses the sharding speedup; the
-fix is to keep sharding but count differences without formatting text.
-
-Reported by: the scratch-lifecycle review fixes.
-
 ## HYG-128 - No flag clears a header field
 
 Anger: 3 - CLI behaviour, small.
@@ -1147,4 +1142,48 @@ Worth doing only if a producer whose blocks fall in these shapes turns up
 and the normalisation matters to someone; otherwise it stays parked.
 
 Reported by: the BUG-113 implementation.
+
+## HYG-139 - The interruption table never interrupts sparse add-locations-to-ways
+
+Anger: 3 - test coverage.
+
+`cli/tests/cli_output_contract.rs` runs add-locations-to-ways only with
+`--index-type external`, because only that path leaves run scratch a paused
+run can observe. The default sparse path (and `auto` routing to it) is in
+neither the tier-1 sampled sweep nor the tier-3 every-ordinal sweep, so its
+exit code, staging cleanup and destination handling under SIGINT and SIGTERM
+are untested from the CLI. Fix: a sparse row, asserting no destination and no
+staging entry even though there is no scratch to see.
+
+Reported by: the every-ordinal interruption sweep.
+
+## HYG-140 - Integration tests take scratch from the system temp dir
+
+Anger: 3 - test plumbing; no product code.
+
+The `unit-test-scratch-via-path-guard` textlint in `brokkr.toml` keeps unit
+tests under `src/` on `path_guard::tests::scratch()` (random directories
+under the gitignored `data/test-scratch/`), but its `paths` cover `src/`
+only. Some forty files under `tests/` and `cli/tests/` still call
+`tempfile::TempDir::new()`, which lands in `/tmp`, against the project's
+"all data lives in the project" rule; `reference/testing.md` ("Scratch")
+records the gap without a plan. New tests already use
+`common::test_scratch()`. Fix: convert the remaining sites and widen the
+textlint's `paths` to `tests/**/*.rs` and `cli/tests/**/*.rs`.
+
+Reported by: the `cat --dedupe` pass-2 error tests.
+
+## HYG-141 - `DiffOptions::summary` does nothing in the library
+
+Anger: 5 - public API field; removing it is breaking.
+
+`DiffOptions::summary` is documented as selecting the osmium-style summary,
+which "the caller renders with `DiffStats::write_osmium_summary`". The
+field is read nowhere: the CLI sets it from `--summary` and then branches on
+its own local to render the summary. A library caller who sets it gets
+nothing. Fix:
+drop the field (the CLI keeps its flag and calls `write_osmium_summary`), or
+make the library honour it.
+
+Reported by: the quiet-diff count mode.
 

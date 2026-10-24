@@ -131,4 +131,41 @@ output (emit a version only above 0), leaving the encoding alone.
 
 Reported by: the diff helper dedupe.
 
+## BUG-138 - Sequential indexed `diff --type` without nodes fails on any file with nodes
+
+Anger: 7 - CLI behaviour on the diff core's sequential path.
+
+`diff_block_pair` (`commands/diff/mod.rs`) skips a disabled kind's phase
+outright, but `osc/merge_join.rs::next_blob_for_kind` treats an earlier-kind
+blob met during a later phase as an unsorted file. So `diff --type way`
+(or `way,relation`) with `-j 1` or `-v`, on indexed inputs that hold nodes,
+reads the first node blob in the way phase and fails with "found a node
+blob during the way phase ... not in canonical order". The parallel path
+buckets blobs by kind and is fine, and the unindexed element stream drains
+excluded phases. An indexed input holding negative IDs falls back to the
+same sequential merge, so it fails the same way at every `-j`. `-t node`
+alone is unaffected (the later kinds are stashed, never reached).
+Confirmed on a test fixture (probe in the parity test below, since
+removed). `diff_stats` inherits the same behaviour by design; the parity test
+`roundtrip_invariants::diff_stats_matches_text_diff_on_every_path` runs
+these cases and sees both fail identically. Open: how an excluded phase
+is skipped - drained through the merge (decoding, so the claimed-max and
+decode checks apply to kinds the user excluded) or skipped by blob header
+alone (what the parallel path effectively does).
+
+Reported by: the quiet-diff count-only work.
+
+## BUG-142 - `--tmp-dir` help misstates what parallel diff writes
+
+Anger: 2 - help text.
+
+`TmpDirArg`'s doc in `cli/src/lib.rs` says parallel diff "writes a copy of
+the changed text" to scratch. Without `-c` (suppress common) each shard
+writes all of its text, unchanged lines included, so scratch use is the size
+of the full text output, not of the changes. Anyone sizing `--tmp-dir` from
+the help underestimates it. Fix: reword the help (and any reference/docs
+page that repeats it) to say each shard writes its full text output.
+
+Reported by: the quiet-diff count-only work.
+
 

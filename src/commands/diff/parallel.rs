@@ -5,7 +5,9 @@
 //! it owns its slice of old-side blobs and new-side blobs, runs its
 //! merge loop with pread from a shared File, and streams output to a
 //! per-shard scratch temp file. Main thread concatenates those temp
-//! files to the caller's output in shard order.
+//! files to the caller's output in shard order. A count-only run
+//! (`diff_stats`) shards and merges the same way but formats nothing, so
+//! it writes no scratch and its shards hand back counts alone.
 //!
 //! The temp-file output shape keeps steady-state anon RSS flat; an
 //! earlier in-memory `Vec<u8>` shape buffered the full per-shard text
@@ -54,12 +56,21 @@ pub mod test_hooks {
 // Per-shard worker: in-memory block-pair merge
 // ---------------------------------------------------------------------------
 
+/// Where a text run's shard output goes: each shard formats into a file in
+/// `scratch`, and the driver streams the files to `out` in shard order. A
+/// count-only run has none of this; its shards format nothing and create no
+/// file.
+pub(super) struct ShardText<'a, W> {
+    pub(super) out: &'a mut W,
+    pub(super) scratch: &'a crate::scratch::RunScratch,
+}
+
 /// What one shard worker produces.
 struct ShardOutput {
     /// Path to the per-shard scratch temp file holding this shard's
-    /// formatted diff text. The driver streams it in shard order to the
-    /// caller's output and then removes it.
-    text_path: crate::scratch::ScratchPath,
+    /// formatted diff text, `None` for a count-only run. The driver streams
+    /// it in shard order to the caller's output and then removes it.
+    text_path: Option<crate::scratch::ScratchPath>,
     /// Per-shard stats, aggregated into the caller's `DiffStats`.
     stats: DiffStats,
 }
@@ -95,8 +106,10 @@ struct Side {
     index: BlobIndex,
 }
 
-/// Run one shard's block-pair merge. Streams formatted text to a
-/// per-shard scratch temp file and returns its path + stats.
+/// Run one shard's block-pair merge. With `scratch`, streams formatted text
+/// to a per-shard scratch temp file and returns its path + stats; without
+/// it (a count-only run), formats nothing, creates no file and returns the
+/// stats alone, having merged exactly the same elements.
 ///
 /// This is a self-contained reimplementation of the `block_pair_merge_phase`
 /// control flow, scoped to the shard's blob index ranges. It assumes both
@@ -114,7 +127,7 @@ fn run_shard(
     new_source: &Arc<Path>,
     kind: ElementKind,
     options: &DiffOptions,
-    scratch: &crate::scratch::RunScratch,
+    scratch: Option<&crate::scratch::RunScratch>,
     cancel: &crate::host::Cancel,
 ) -> Result<ShardOutput> {
     // Test-only: arm via `test_hooks::PANIC_AT_SHARD_IDX`. Simulates a
@@ -131,9 +144,14 @@ fn run_shard(
     }
 
     let type_char = kind.type_char();
-    let text_path = shard_text_path(scratch, kind, shard_idx)?;
-    let file = crate::scratch::create_file(&text_path)?;
-    let mut out = BufWriter::new(file);
+    let (text_path, mut out) = match scratch {
+        Some(scratch) => {
+            let text_path = shard_text_path(scratch, kind, shard_idx)?;
+            let file = crate::scratch::create_file(&text_path)?;
+            (Some(text_path), Some(BufWriter::new(file)))
+        }
+        None => (None, None),
+    };
 
     let mut stats = DiffStats::default();
 
@@ -234,17 +252,21 @@ fn run_shard(
 
     // BufWriter::into_inner propagates any deferred flush error; dropping
     // the unwrapped File closes it and the main thread reopens the path.
-    let _ = out
-        .into_inner()
-        .map_err(|e| crate::error::Error::from(e.into_error()))?;
+    if let Some(out) = out {
+        let _ = out
+            .into_inner()
+            .map_err(|e| crate::error::Error::from(e.into_error()))?;
+    }
     Ok(ShardOutput { text_path, stats })
 }
 
 /// Emit elements of a decoded block (single-sided: all OldOnly or all
-/// NewOnly) clipped to the shard's ID window `(t_low, t_high]`.
+/// NewOnly) clipped to the shard's ID window `(t_low, t_high]`. A
+/// count-only run (`out` is `None`) still walks the IDs: the clip is what
+/// decides which elements this shard counts.
 #[allow(clippy::too_many_arguments)]
 fn emit_side(
-    out: &mut impl Write,
+    out: &mut Option<impl Write>,
     side: &Side,
     is_old: bool,
     type_char: char,
@@ -261,8 +283,10 @@ fn emit_side(
         if id > t_high {
             break;
         }
-        let version = crate::osc::merge_join::element_version(&elem);
-        emit_element(out, prefix, type_char, id, version)?;
+        if let Some(out) = out.as_mut() {
+            let version = crate::osc::merge_join::element_version(&elem);
+            emit_element(out, prefix, type_char, id, version)?;
+        }
         if is_old {
             stats.deleted += 1;
         } else {
@@ -281,7 +305,7 @@ fn merge_decoded(
     t_low: i64,
     t_high: i64,
     options: &DiffOptions,
-    out: &mut impl Write,
+    out: &mut Option<impl Write>,
     stats: &mut DiffStats,
 ) -> Result<()> {
     let mut os = old_decoded.take().expect("checked");
@@ -314,7 +338,8 @@ fn merge_decoded(
 
 /// Two-pointer element merge over a pair of decoded blocks. Processes
 /// elements up to `merge_up_to` ID (inclusive). Returns consumed counts
-/// per side.
+/// per side. `out` is `None` for a count-only run: the merge, the content
+/// comparison and the counts are the same, only nothing is formatted.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn element_merge(
     old_block: &PrimitiveBlock,
@@ -325,7 +350,7 @@ fn element_merge(
     t_low: i64,
     type_char: char,
     options: &DiffOptions,
-    out: &mut impl Write,
+    out: &mut Option<impl Write>,
     stats: &mut DiffStats,
 ) -> Result<(usize, usize)> {
     use crate::osc::merge_join::{element_id, element_version};
@@ -359,13 +384,17 @@ fn element_merge(
             (false, false) => break,
             (true, false) => {
                 let o = old_iter.next().expect("checked peek");
-                emit_element(out, '-', type_char, element_id(&o), element_version(&o))?;
+                if let Some(w) = out.as_mut() {
+                    emit_element(w, '-', type_char, element_id(&o), element_version(&o))?;
+                }
                 stats.deleted += 1;
                 old_consumed += 1;
             }
             (false, true) => {
                 let n = new_iter.next().expect("checked peek");
-                emit_element(out, '+', type_char, element_id(&n), element_version(&n))?;
+                if let Some(w) = out.as_mut() {
+                    emit_element(w, '+', type_char, element_id(&n), element_version(&n))?;
+                }
                 stats.created += 1;
                 new_consumed += 1;
             }
@@ -375,13 +404,17 @@ fn element_merge(
                 match crate::osm_id::osm_id_cmp(o_id, n_id) {
                     std::cmp::Ordering::Less => {
                         let o = old_iter.next().expect("checked");
-                        emit_element(out, '-', type_char, element_id(&o), element_version(&o))?;
+                        if let Some(w) = out.as_mut() {
+                            emit_element(w, '-', type_char, element_id(&o), element_version(&o))?;
+                        }
                         stats.deleted += 1;
                         old_consumed += 1;
                     }
                     std::cmp::Ordering::Greater => {
                         let n = new_iter.next().expect("checked");
-                        emit_element(out, '+', type_char, element_id(&n), element_version(&n))?;
+                        if let Some(w) = out.as_mut() {
+                            emit_element(w, '+', type_char, element_id(&n), element_version(&n))?;
+                        }
                         stats.created += 1;
                         new_consumed += 1;
                     }
@@ -391,14 +424,18 @@ fn element_merge(
                         old_consumed += 1;
                         new_consumed += 1;
                         if crate::content::content_equal(&o, &n) {
-                            if !options.suppress_common {
-                                emit_element(out, ' ', type_char, o_id, element_version(&o))?;
+                            if !options.suppress_common
+                                && let Some(w) = out.as_mut()
+                            {
+                                emit_element(w, ' ', type_char, o_id, element_version(&o))?;
                             }
                             stats.common += 1;
                         } else {
-                            let old_ver = element_version(&o);
-                            let new_ver = element_version(&n);
-                            emit_modified(out, type_char, o_id, old_ver, new_ver)?;
+                            if let Some(w) = out.as_mut() {
+                                let old_ver = element_version(&o);
+                                let new_ver = element_version(&n);
+                                emit_modified(w, type_char, o_id, old_ver, new_ver)?;
+                            }
                             // Verbose details are not supported on the parallel
                             // path. The dispatcher in mod.rs routes verbose
                             // diffs to the sequential `diff_block_pair`, so
@@ -468,22 +505,25 @@ fn emit_modified(
 /// cases; drops the v1 byte-equal fast path (always zero fires on
 /// `diff-snapshots`, where this path is intended to be used).
 ///
+/// `text` is `None` for a count-only run, which shards and merges exactly
+/// as a text run but formats nothing and writes no scratch.
+///
 /// Returns `Ok(None)`, having written nothing, when either input holds a
 /// negative ID: the caller must run the sequential block-pair merge instead
 /// (see `shard`'s correctness contract).
 #[allow(clippy::too_many_lines)] // phase-orchestrator over 3 element kinds
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn diff_block_pair_parallel(
+pub(super) fn diff_block_pair_parallel<W: Write>(
     old_path: &Path,
     new_path: &Path,
-    output: &mut impl Write,
+    mut text: Option<ShardText<'_, W>>,
     options: &DiffOptions,
     _direct_io: bool,
     filter: &TypeFilter,
     shard_count: usize,
     host: &crate::host::Host,
-    scratch: &crate::scratch::RunScratch,
 ) -> Result<Option<DiffStats>> {
+    let scratch = text.as_ref().map(|t| t.scratch);
     // DIFF_SCAN_START/END and diff_common/created/modified/deleted counters
     // are emitted by the calling `diff()` function in `mod.rs`; do not
     // re-emit here.
@@ -618,8 +658,22 @@ pub(crate) fn diff_block_pair_parallel(
         }
 
         // All successful: emit shard outputs in shard order, streaming each
-        // per-shard temp file to the caller's output and removing it.
-        emit_shard_outputs(output, outputs, &mut total, scratch, &host.cancel)?;
+        // per-shard temp file to the caller's output and removing it. A
+        // count-only run has no files and folds the counts directly.
+        match text.as_mut() {
+            Some(text) => emit_shard_outputs(
+                &mut *text.out,
+                outputs,
+                &mut total,
+                text.scratch,
+                &host.cancel,
+            )?,
+            None => {
+                for shard_out in outputs {
+                    total.add(&shard_out.stats);
+                }
+            }
+        }
 
         crate::debug::emit_marker(&end_marker);
     }
@@ -644,18 +698,19 @@ fn emit_shard_outputs(
 ) -> Result<()> {
     let mut first_err = None;
     for shard_out in outputs {
+        let text_path = shard_out
+            .text_path
+            .as_ref()
+            .expect("every shard of a text run writes its text file");
         if first_err.is_some() {
-            scratch.remove(&shard_out.text_path);
+            scratch.remove(text_path);
             continue;
         }
-        if let Err(e) = append_and_cleanup(output, &shard_out.text_path, scratch, cancel) {
+        if let Err(e) = append_and_cleanup(output, text_path, scratch, cancel) {
             first_err = Some(e);
             continue;
         }
-        total.common += shard_out.stats.common;
-        total.created += shard_out.stats.created;
-        total.modified += shard_out.stats.modified;
-        total.deleted += shard_out.stats.deleted;
+        total.add(&shard_out.stats);
     }
     if let Some(e) = first_err {
         return Err(e);

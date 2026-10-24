@@ -167,17 +167,17 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
 
 ## Scratch files
 
-`add-locations-to-ways`, `diff` (parallel `-j`, and `--format osc`) and `build-geocode-index` write
-scratch: disposable files that can be very large (hundreds of GB for `add-locations-to-ways
---index-type external` at planet scale). Each run makes **one** hidden directory,
+`add-locations-to-ways`, `diff` (parallel `-j` text that is not `--quiet`, and `--format osc`) and
+`build-geocode-index` write scratch: disposable files that can be very large (hundreds of GB for
+`add-locations-to-ways --index-type external` at planet scale). Each run makes **one** hidden directory,
 `.pbfhogg-run-<pid>-<random>`, holds everything it writes in there and removes it when it ends,
 whether it succeeded, failed or was interrupted. If the directory cannot be removed the run
 says where the leftover is.
 
 - `--tmp-dir <DIR>` chooses the directory the run directory is made in. It must exist and be
   writable, and it is checked before any input is opened, so a bad value fails at once. Without
-  it the scratch goes in the output's directory (`diff` text to stdout, or with `--quiet`:
-  the current directory). `build-geocode-index` refuses a `--tmp-dir` inside the index
+  it the scratch goes in the output's directory (`diff` text to stdout: the current
+  directory). `build-geocode-index` refuses a `--tmp-dir` inside the index
   directory it replaces.
 - An output's own staging file (`.pbfhogg-tmp-*`) and a replaced output's backup
   (`.pbfhogg-backup-*`) stay beside the output whatever `--tmp-dir` says: publication is a
@@ -641,7 +641,7 @@ Compare two PBF files and show differences. Uses content equality (coordinates, 
 
 With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`. Either format exits `0` when the inputs are identical and `1` when they differ; an OSC diff publishes its `-o` in both cases.
 
-With the global `-q, --quiet` a text diff prints nothing, neither the diff text nor its summary, and the exit code is the answer (`0` identical, `1` different); `-o`, `-c`, `-v` and `-s`, which only shape that output, are refused with it. A quiet `--format osc` diff writes its `-o` as usual and drops only the summary.
+With the global `-q, --quiet` a text diff prints nothing, neither the diff text nor its summary, and the exit code is the answer (`0` identical, `1` different). It compares exactly as a text diff without `-c` does, sharding included, but formats nothing, so it writes no scratch. `-o`, `-c`, `-v` and `-s`, which only shape that output, are refused with it, and so is `--tmp-dir`. A quiet `--format osc` diff writes its `-o` as usual and drops only the summary.
 
 ```
 pbfhogg diff [OPTIONS] <OLD> <NEW>
@@ -656,10 +656,10 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `-o, --output <FILE>` | Write output to file (required for `--format osc`; refused with `-q` on a text diff) |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way. Requires `-o` |
 | `-t, --type <TYPE>` | Filter by element type (text only) |
-| `-j, --jobs <N>` | Worker threads and ID-range shard count. `0` (default) uses one shard per core; `1` takes the sequential path (for text, scratch-free). Applies to both `--format text` and `osc`; sharding requires both inputs indexed. **Refused with `-v/--verbose`**, which is sequential-only. The parallel path writes shard files to scratch, removed on completion; scratch demand varies by input. See `reference/performance.md` for measurements |
+| `-j, --jobs <N>` | Worker threads and ID-range shard count. `0` (default) uses one shard per core; `1` takes the sequential path (for text, scratch-free). Applies to both `--format text` and `osc`; sharding requires both inputs indexed. **Refused with `-v/--verbose`**, which is sequential-only. The parallel path writes shard files to scratch, removed on completion (a quiet text diff, which only counts, writes none); scratch demand varies by input. See `reference/performance.md` for measurements |
 | `--increment-version` | Bump version of deleted elements by 1 (osc only) |
 | `--update-timestamp` | Set delete timestamp to current time (osc only) |
-| `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read. Default: the output's directory, or the current directory without `-o`. Refused with text `-j 1` and with `-v`, which write no scratch |
+| `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read. Default: the output's directory, or the current directory without `-o`. Refused with text `-j 1`, with `-v` and with `-q` on a text diff, which write no scratch |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 
 With `--format osc`, produces a lossless roundtrip - applying the derived OSC to the old PBF reproduces the new PBF exactly (see [DEVIATIONS](/cli/deviations#derive-changes-lossless-delete-roundtrip)).

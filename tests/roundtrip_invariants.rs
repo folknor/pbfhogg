@@ -602,6 +602,146 @@ fn diff_blob_layout_independence() {
     }
 }
 
+/// `diff_stats` is `diff` without the text: on every path (parallel shards,
+/// the sequential block-pair merge, the unindexed element stream, the
+/// negative-ID fallback) and every type filter, it either returns the same
+/// four counts as an unsuppressed text diff of the same inputs, or fails
+/// with the same error. An identical pair of corrupt files must fail both
+/// ways, which a byte-equal shortcut in the count would not.
+#[test]
+fn diff_stats_matches_text_diff_on_every_path() {
+    let dir = TempDir::new().expect("tempdir");
+    let p = |name: &str| dir.path().join(name);
+    write_diff_stats_fixtures(dir.path());
+
+    let pairs = [
+        ("indexed", "old.osm.pbf", "new.osm.pbf"),
+        ("unindexed", "old-u.osm.pbf", "new-u.osm.pbf"),
+        ("mixed", "old.osm.pbf", "new-u.osm.pbf"),
+        ("negative ids", "old-neg.osm.pbf", "new-neg.osm.pbf"),
+        ("identical", "old.osm.pbf", "old.osm.pbf"),
+        ("identical corrupt", "corrupt.osm.pbf", "corrupt.osm.pbf"),
+    ];
+    let filters = [
+        None,
+        Some(pbfhogg::TypeFilter {
+            nodes: true,
+            ways: false,
+            relations: false,
+        }),
+        Some(pbfhogg::TypeFilter {
+            nodes: false,
+            ways: true,
+            relations: true,
+        }),
+    ];
+    let counts = |s: pbfhogg::diff::DiffStats| (s.common, s.created, s.modified, s.deleted);
+    let mut ok_runs = 0;
+    for (label, old, new) in pairs {
+        for type_filter in filters {
+            for jobs in [1, 2, 4] {
+                let parallelism = pbfhogg::Parallelism::from_jobs(jobs);
+                let host = crate::common::test_host();
+                let options = pbfhogg::diff::DiffOptions {
+                    suppress_common: false,
+                    verbose: false,
+                    summary: false,
+                    type_filter,
+                    parallelism,
+                };
+                let text = pbfhogg::diff::diff(
+                    &p(old),
+                    &p(new),
+                    &mut Vec::new(),
+                    &options,
+                    false,
+                    &host,
+                    Some(crate::common::scratch_in(dir.path())),
+                )
+                .map(counts)
+                .map_err(|e| e.to_string());
+                let stats = pbfhogg::diff::diff_stats(
+                    &p(old),
+                    &p(new),
+                    type_filter,
+                    parallelism,
+                    false,
+                    &host,
+                )
+                .map(counts)
+                .map_err(|e| e.to_string());
+                assert_eq!(
+                    text, stats,
+                    "{label}, filter {type_filter:?}, -j {jobs}: diff_stats disagrees with diff"
+                );
+                // The corrupt blob is the last one, a relation blob, so only
+                // an unfiltered run is bound to read it.
+                if label == "identical corrupt" && type_filter.is_none() {
+                    assert!(
+                        text.is_err(),
+                        "{label}, -j {jobs}: a corrupt blob must fail"
+                    );
+                }
+                ok_runs += usize::from(text.is_ok());
+            }
+        }
+    }
+    // The comparison above is vacuous if everything failed.
+    assert!(ok_runs > 30, "only {ok_runs} runs succeeded");
+}
+
+/// The inputs of [`diff_stats_matches_text_diff_on_every_path`]: an indexed
+/// pair with creates, deletes and modifies in every kind, the same content
+/// unindexed, a mixed-sign indexed pair, and the old file with its last
+/// blob's payload corrupted.
+fn write_diff_stats_fixtures(dir: &Path) {
+    use crate::common::{generate_nodes_with_negatives, write_test_pbf_non_indexed};
+    let p = |name: &str| dir.join(name);
+
+    let old_nodes = || generate_nodes(300, 1);
+    let new_nodes = || {
+        let mut nodes = generate_nodes(305, 1);
+        nodes.retain(|n| n.id != 13);
+        for n in &mut nodes {
+            if n.id % 7 == 0 {
+                n.lat = n.lat.saturating_add(1_000);
+            }
+        }
+        nodes
+    };
+    let old_ways = || generate_ways(40, 1, 5, 1);
+    let new_ways = || {
+        let mut ways = generate_ways(40, 1, 5, 1);
+        ways[2].tags.push(("highway", "residential"));
+        ways.retain(|w| w.id != 40);
+        ways
+    };
+    let rels = || generate_relations(5, 1, 2, 1);
+
+    write_multi_block_test_pbf(&p("old.osm.pbf"), &old_nodes(), &old_ways(), &rels(), 25);
+    write_multi_block_test_pbf(&p("new.osm.pbf"), &new_nodes(), &new_ways(), &rels(), 25);
+    write_test_pbf_non_indexed(&p("old-u.osm.pbf"), &old_nodes(), &old_ways(), &rels());
+    write_test_pbf_non_indexed(&p("new-u.osm.pbf"), &new_nodes(), &new_ways(), &rels());
+    let mut neg_new = generate_nodes_with_negatives(20, 30);
+    for n in neg_new.iter_mut().step_by(3) {
+        n.lon = n.lon.saturating_add(1_000);
+    }
+    write_multi_block_test_pbf(
+        &p("old-neg.osm.pbf"),
+        &generate_nodes_with_negatives(20, 30),
+        &[],
+        &[],
+        10,
+    );
+    write_multi_block_test_pbf(&p("new-neg.osm.pbf"), &neg_new, &[], &[], 10);
+    let bytes = std::fs::read(p("old.osm.pbf")).expect("read");
+    let last = crate::common::adversarial::locate_blobs(&bytes).len() - 1;
+    let corrupt = crate::common::adversarial::mutate_blob_payload(&bytes, last, |payload| {
+        *payload = vec![0xff; 16];
+    });
+    std::fs::write(p("corrupt.osm.pbf"), corrupt).expect("write corrupt");
+}
+
 // ---------------------------------------------------------------------------
 // Compression-level parity (Batch E)
 // ---------------------------------------------------------------------------

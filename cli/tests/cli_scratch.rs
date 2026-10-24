@@ -243,7 +243,14 @@ fn a_scratch_free_diff_needs_no_writable_directory() {
     let cwd = dir.path().join("cwd");
     std::fs::create_dir(&cwd).unwrap();
     std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o500)).unwrap();
-    for args in [vec!["-j", "1"], vec!["-j", "1", "-q"], vec!["-v"]] {
+    // A quiet text diff only counts, which shards without scratch.
+    for args in [
+        vec!["-j", "1"],
+        vec!["-j", "1", "-q"],
+        vec!["-v"],
+        vec!["-q"],
+        vec!["-q", "-j", "2"],
+    ] {
         let out = CliInvoker::new()
             .current_dir(&cwd)
             .args(

@@ -128,5 +128,27 @@ mod diff_parallel {
             added.is_empty(),
             "unexpected files added under scratch: {added:?}"
         );
+
+        // The count-only driver (`diff_stats`) runs the same shard workers
+        // without scratch: the panic surfaces as an error there too, and
+        // nothing appears on disk.
+        diff_hooks::PANIC_AT_SHARD_IDX.store(1, Ordering::Relaxed);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pbfhogg::diff::diff_stats(
+                &old,
+                &new,
+                None,
+                pbfhogg::Parallelism::from_jobs(3),
+                false,
+                &host,
+            )
+        }));
+        diff_hooks::reset();
+        let err = match result {
+            Ok(Err(e)) => e,
+            other => panic!("diff_stats with an armed shard panic must return Err: {other:?}"),
+        };
+        assert!(err.to_string().contains("shard worker"), "{err}");
+        assert_eq!(snapshot_dir(dir.path()), before);
     }
 }

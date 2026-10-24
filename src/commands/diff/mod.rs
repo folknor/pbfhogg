@@ -138,6 +138,14 @@ impl DiffStats {
         self.created > 0 || self.modified > 0 || self.deleted > 0
     }
 
+    /// Fold another run's (a shard's) counts into these.
+    pub(crate) fn add(&mut self, other: &Self) {
+        self.common += other.common;
+        self.created += other.created;
+        self.modified += other.modified;
+        self.deleted += other.deleted;
+    }
+
     /// Print default summary to stderr (pbfhogg format).
     pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         let total = self.created + self.modified + self.deleted;
@@ -219,8 +227,8 @@ impl DiffMeta for OwnedRelation {
 /// its shard files and removed when the call returns. A caller whose options
 /// run one shard (`Fixed(1)`, or `verbose`, which is sequential-only) writes
 /// no scratch and passes `None`; `None` with more than one shard is refused,
-/// before any input is read.
-#[allow(clippy::too_many_lines)]
+/// before any input is read. A caller that wants only the counts calls
+/// [`diff_stats`], which shards without scratch.
 #[hotpath::measure]
 pub fn diff(
     old_path: &Path,
@@ -245,6 +253,93 @@ pub fn diff(
              without one it must run a single shard",
         ));
     }
+    let result = compare(
+        old_path,
+        new_path,
+        Report::Text {
+            out: output,
+            scratch: scratch.as_ref(),
+        },
+        options,
+        jobs,
+        direct_io,
+        host,
+    );
+    // The scratch directory is removed before the completion decision, so a
+    // cancellation observed during that removal is still reported as one.
+    drop(scratch);
+    let stats = result?;
+    // The completion decision: a cancellation observed by now is reported
+    // as one, whatever reached the caller's writer.
+    host.cancel.check()?;
+    Ok(stats)
+}
+
+/// Count the differences between two sorted PBF files without producing
+/// any text.
+///
+/// The comparison is the one [`diff`] runs with `suppress_common` and
+/// `verbose` off and the same `type_filter` and `parallelism`: the same
+/// paths (parallel shards for indexed inputs, the sequential fallbacks
+/// otherwise), the same input checks and refusals, and on success the same
+/// counts. Only the formatting is skipped, so no output or scratch I/O
+/// happens at all, and a sharded comparison needs no scratch directory.
+#[hotpath::measure]
+pub fn diff_stats(
+    old_path: &Path,
+    new_path: &Path,
+    type_filter: Option<TypeFilter>,
+    parallelism: crate::host::Parallelism,
+    direct_io: bool,
+    host: &crate::host::Host,
+) -> Result<DiffStats> {
+    host.cancel.check()?;
+    let options = DiffOptions {
+        suppress_common: false,
+        verbose: false,
+        summary: false,
+        type_filter,
+        parallelism,
+    };
+    let jobs = options.shards(host);
+    let stats = compare(
+        old_path,
+        new_path,
+        Report::<std::io::Sink>::Count,
+        &options,
+        jobs,
+        direct_io,
+        host,
+    )?;
+    host.cancel.check()?;
+    Ok(stats)
+}
+
+/// What a comparison produces besides its counts.
+enum Report<'a, W> {
+    /// Diff text written to `out`. `scratch` holds the parallel path's shard
+    /// files; `None` only when the run is single-shard, which [`diff`]
+    /// enforces.
+    Text {
+        out: &'a mut W,
+        scratch: Option<&'a crate::scratch::RunScratch>,
+    },
+    /// Counts only: nothing is formatted and no scratch is written.
+    Count,
+}
+
+/// The comparison shared by [`diff`] and [`diff_stats`]: input checks, path
+/// selection and the per-path drivers. The caller owns the entry and
+/// completion cancellation checks.
+fn compare<W: Write>(
+    old_path: &Path,
+    new_path: &Path,
+    report: Report<'_, W>,
+    options: &DiffOptions,
+    jobs: usize,
+    direct_io: bool,
+    host: &crate::host::Host,
+) -> Result<DiffStats> {
     let filter = TypeFilter::or_all(options.type_filter);
 
     // Single-pass: check sorted headers + indexdata from one file open each.
@@ -281,15 +376,50 @@ pub fn diff(
     // would be worse than the wall-time cost of a sequential verbose
     // diff. Verbose is a human-inspection mode; the parallel default
     // serves the common non-verbose case.
-    let parallel_stats = match &scratch {
-        Some(scratch) if both_indexed && jobs > 1 => parallel::diff_block_pair_parallel(
-            old_path, new_path, output, options, direct_io, &filter, jobs, host, scratch,
-        )?,
-        _ => None,
+    //
+    // Path selection depends on the inputs and the shard count only, never on
+    // whether text is wanted: a count-only run shards exactly as a text run.
+    let output = match report {
+        Report::Text { out, scratch } => {
+            if both_indexed && jobs > 1 {
+                // `diff` refuses a multi-shard run without scratch before
+                // any input is read.
+                let scratch = scratch.ok_or_else(|| {
+                    crate::Error::invalid_argument(
+                        "diff: a run that may use more than one shard needs a scratch directory",
+                    )
+                })?;
+                if let Some(stats) = parallel::diff_block_pair_parallel(
+                    old_path,
+                    new_path,
+                    Some(parallel::ShardText {
+                        out: &mut *out,
+                        scratch,
+                    }),
+                    options,
+                    direct_io,
+                    &filter,
+                    jobs,
+                    host,
+                )? {
+                    return Ok(finish_scan(stats));
+                }
+            }
+            Some(out)
+        }
+        Report::Count => {
+            if both_indexed
+                && jobs > 1
+                && let Some(stats) = parallel::diff_block_pair_parallel::<W>(
+                    old_path, new_path, None, options, direct_io, &filter, jobs, host,
+                )?
+            {
+                return Ok(finish_scan(stats));
+            }
+            None
+        }
     };
-    let stats = if let Some(stats) = parallel_stats {
-        stats
-    } else if both_indexed {
+    let stats = if both_indexed {
         diff_block_pair(
             old_path, new_path, output, options, direct_io, &filter, host,
         )?
@@ -298,7 +428,11 @@ pub fn diff(
             old_path, new_path, output, options, direct_io, &filter, host,
         )?
     };
+    Ok(finish_scan(stats))
+}
 
+/// Close the scan: the end marker and the result counters, on every path.
+fn finish_scan(stats: DiffStats) -> DiffStats {
     crate::debug::emit_marker("DIFF_SCAN_END");
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -307,22 +441,21 @@ pub fn diff(
         crate::debug::emit_counter("diff_modified", stats.modified as i64);
         crate::debug::emit_counter("diff_deleted", stats.deleted as i64);
     }
-
-    drop(scratch);
-    // The completion decision: a cancellation observed by now is reported
-    // as one, whatever reached the caller's writer.
-    host.cancel.check()?;
-    Ok(stats)
+    stats
 }
 
 /// Optimized diff path using block-pair merge with borrowed elements.
 /// Requires both inputs to have indexdata. Zero String allocation for
 /// unchanged elements (98.8%+ of typical daily diffs).
+///
+/// `output` is `None` for a count-only run: every block is still read,
+/// decoded and merged exactly as for text (the byte-equal fast path follows
+/// `suppress_common`, not the absence of text), only nothing is formatted.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn diff_block_pair(
+fn diff_block_pair<W: Write>(
     old_path: &Path,
     new_path: &Path,
-    output: &mut impl Write,
+    mut output: Option<&mut W>,
     options: &DiffOptions,
     direct_io: bool,
     filter: &TypeFilter,
@@ -357,21 +490,28 @@ fn diff_block_pair(
                 BlockMergeAction::BlobEqual(count) => {
                     stats.common += count;
                 }
+                // A single-sided block's count is the claim the merge already
+                // decoded against; count-only runs skip the element walk
+                // that exists only to format each line.
                 BlockMergeAction::BlobOldOnly { block, count, skip } => {
-                    let type_char = kind.type_char();
-                    for elem in block.elements().skip(skip) {
-                        let id = crate::osc::merge_join::element_id(&elem);
-                        let ver = crate::osc::merge_join::element_version(&elem);
-                        write_compact_line(output, '-', type_char, id, ver)?;
+                    if let Some(out) = output.as_deref_mut() {
+                        let type_char = kind.type_char();
+                        for elem in block.elements().skip(skip) {
+                            let id = crate::osc::merge_join::element_id(&elem);
+                            let ver = crate::osc::merge_join::element_version(&elem);
+                            write_compact_line(out, '-', type_char, id, ver)?;
+                        }
                     }
                     stats.deleted += count;
                 }
                 BlockMergeAction::BlobNewOnly { block, count, skip } => {
-                    let type_char = kind.type_char();
-                    for elem in block.elements().skip(skip) {
-                        let id = crate::osc::merge_join::element_id(&elem);
-                        let ver = crate::osc::merge_join::element_version(&elem);
-                        write_compact_line(output, '+', type_char, id, ver)?;
+                    if let Some(out) = output.as_deref_mut() {
+                        let type_char = kind.type_char();
+                        for elem in block.elements().skip(skip) {
+                            let id = crate::osc::merge_join::element_id(&elem);
+                            let ver = crate::osc::merge_join::element_version(&elem);
+                            write_compact_line(out, '+', type_char, id, ver)?;
+                        }
                     }
                     stats.created += count;
                 }
@@ -380,34 +520,40 @@ fn diff_block_pair(
                     version,
                     type_char,
                 } => {
-                    if !options.suppress_common {
-                        write_compact_line(output, ' ', type_char, id, version)?;
+                    if !options.suppress_common
+                        && let Some(out) = output.as_deref_mut()
+                    {
+                        write_compact_line(out, ' ', type_char, id, version)?;
                     }
                     stats.common += 1;
                 }
                 BlockMergeAction::ElementModified { old, new } => {
-                    let type_char = kind.type_char();
-                    let id = crate::osc::merge_join::element_id(old);
-                    let old_ver = crate::osc::merge_join::element_version(old);
-                    let new_ver = crate::osc::merge_join::element_version(new);
-                    write_modified_line(output, type_char, id, old_ver, new_ver)?;
-                    if options.verbose {
-                        write_modified_details_borrowed(output, old, new)?;
+                    if let Some(out) = output.as_deref_mut() {
+                        let type_char = kind.type_char();
+                        let id = crate::osc::merge_join::element_id(old);
+                        let old_ver = crate::osc::merge_join::element_version(old);
+                        let new_ver = crate::osc::merge_join::element_version(new);
+                        write_modified_line(out, type_char, id, old_ver, new_ver)?;
+                        if options.verbose {
+                            write_modified_details_borrowed(out, old, new)?;
+                        }
                     }
                     stats.modified += 1;
                 }
                 BlockMergeAction::ElementOldOnly(o) => {
-                    let type_char = kind.type_char();
-                    let id = crate::osc::merge_join::element_id(o);
-                    let ver = crate::osc::merge_join::element_version(o);
-                    write_compact_line(output, '-', type_char, id, ver)?;
+                    if let Some(out) = output.as_deref_mut() {
+                        let id = crate::osc::merge_join::element_id(o);
+                        let ver = crate::osc::merge_join::element_version(o);
+                        write_compact_line(out, '-', kind.type_char(), id, ver)?;
+                    }
                     stats.deleted += 1;
                 }
                 BlockMergeAction::ElementNewOnly(n) => {
-                    let type_char = kind.type_char();
-                    let id = crate::osc::merge_join::element_id(n);
-                    let ver = crate::osc::merge_join::element_version(n);
-                    write_compact_line(output, '+', type_char, id, ver)?;
+                    if let Some(out) = output.as_deref_mut() {
+                        let id = crate::osc::merge_join::element_id(n);
+                        let ver = crate::osc::merge_join::element_version(n);
+                        write_compact_line(out, '+', kind.type_char(), id, ver)?;
+                    }
                     stats.created += 1;
                 }
             }
@@ -455,12 +601,13 @@ fn emit_merge_stats_counters(s: &crate::osc::merge_join::BlockPairMergeStats) {
 }
 
 /// Fallback diff path using element-level merge-join with owned elements.
-/// Used when either input lacks indexdata.
+/// Used when either input lacks indexdata. `output` is `None` for a
+/// count-only run, which merges exactly the same elements.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn diff_element_stream(
+fn diff_element_stream<W: Write>(
     old_path: &Path,
     new_path: &Path,
-    output: &mut impl Write,
+    mut output: Option<&mut W>,
     options: &DiffOptions,
     direct_io: bool,
     filter: &TypeFilter,
@@ -475,7 +622,7 @@ fn diff_element_stream(
         crate::debug::emit_marker("DIFF_PHASE_NODE_START");
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
         let mut ctx = DiffPhaseCtx {
-            output,
+            output: output.as_deref_mut(),
             opts: options,
             stats: &mut stats,
         };
@@ -496,7 +643,7 @@ fn diff_element_stream(
         crate::debug::emit_marker("DIFF_PHASE_WAY_START");
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
         let mut ctx = DiffPhaseCtx {
-            output,
+            output: output.as_deref_mut(),
             opts: options,
             stats: &mut stats,
         };
@@ -543,7 +690,8 @@ fn diff_element_stream(
 
 /// Context for a single diff phase (avoids too-many-arguments lint).
 struct DiffPhaseCtx<'a, W: Write> {
-    output: &'a mut W,
+    /// `None` for a count-only run.
+    output: Option<&'a mut W>,
     opts: &'a DiffOptions,
     stats: &'a mut DiffStats,
 }
@@ -565,23 +713,31 @@ fn run_diff_phase<T: MergeJoinElement + DiffMeta>(
     merge_join_phase(old_src, old_buf, new_src, new_buf, |action| {
         match action {
             MergeJoinAction::OldOnly(o) => {
-                write_compact_line(output, '-', T::type_char(), o.id(), o.version())?;
+                if let Some(out) = output.as_deref_mut() {
+                    write_compact_line(out, '-', T::type_char(), o.id(), o.version())?;
+                }
                 stats.deleted += 1;
             }
             MergeJoinAction::NewOnly(n) => {
-                write_compact_line(output, '+', T::type_char(), n.id(), n.version())?;
+                if let Some(out) = output.as_deref_mut() {
+                    write_compact_line(out, '+', T::type_char(), n.id(), n.version())?;
+                }
                 stats.created += 1;
             }
             MergeJoinAction::Modified(o, n) => {
-                write_modified_line(output, T::type_char(), o.id(), o.version(), n.version())?;
-                if opts.verbose {
-                    write_details(output, o, n)?;
+                if let Some(out) = output.as_deref_mut() {
+                    write_modified_line(out, T::type_char(), o.id(), o.version(), n.version())?;
+                    if opts.verbose {
+                        write_details(out, o, n)?;
+                    }
                 }
                 stats.modified += 1;
             }
             MergeJoinAction::Equal(o) => {
-                if !opts.suppress_common {
-                    write_compact_line(output, ' ', T::type_char(), o.id(), o.version())?;
+                if !opts.suppress_common
+                    && let Some(out) = output.as_deref_mut()
+                {
+                    write_compact_line(out, ' ', T::type_char(), o.id(), o.version())?;
                 }
                 stats.common += 1;
             }

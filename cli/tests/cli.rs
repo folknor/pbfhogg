@@ -343,9 +343,6 @@ fn cli_rejects_ambiguous_inspect_and_missing_extract_region() {
         vec!["inspect", "first.pbf", "tags", "second.pbf"],
         vec!["inspect"],
         vec!["extract", "input.pbf", "-o", "output.pbf"],
-        vec![
-            "diff", "old.pbf", "new.pbf", "-q", "-o", "out.osc", "--format", "osc",
-        ],
     ] {
         let output = Command::new(pbfhogg_bin())
             .args(&args)

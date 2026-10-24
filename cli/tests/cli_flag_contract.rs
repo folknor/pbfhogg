@@ -210,6 +210,28 @@ const REFUSALS: &[(&[&str], &str)] = &[
         &["check", "IN", "--quiet", "--show-ids"],
         "cannot be used with",
     ),
+    // `-q` is global: its conflicts hold whichever side of the subcommand
+    // it is given on.
+    (&["check", "IN", "-q", "--json"], "cannot be used with"),
+    (
+        &["check", "IN", "-q", "--max-errors", "5"],
+        "cannot be used with",
+    ),
+    (&["-q", "check", "IN", "--json"], "cannot be used with"),
+    (
+        &["diff", "IN", "IN2", "-q", "-o", "OUT"],
+        "cannot be used with",
+    ),
+    (&["-q", "diff", "IN", "IN2", "-c"], "cannot be used with"),
+    (&["-q", "diff", "IN", "IN2", "-s"], "cannot be used with"),
+    (
+        &["getid", "IN", "-o", "OUT", "-v", "-q", "n1"],
+        "cannot be used with",
+    ),
+    (
+        &["-q", "getid", "IN", "-o", "OUT", "-v", "n1"],
+        "cannot be used with",
+    ),
     // Nothing to work on, by clap.
     (&["getid", "IN", "-o", "OUT"], "required arguments"),
     (&["getparents", "IN", "-o", "OUT"], "required arguments"),

@@ -249,6 +249,7 @@ enum Prop {
     Failure,
     Published,
     TmpDir,
+    Quiet,
     #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
     Interrupted,
 }
@@ -1172,6 +1173,140 @@ fn scratch_lands_where_it_was_told(fx: &Fx, row: &Row) -> Result<(), String> {
     Ok(())
 }
 
+/// What an output holds, for comparing two runs: a file output's bytes, or
+/// the relative paths of every file under a directory output (the geocode
+/// index makes no promise that two builds are byte-identical, so its files
+/// are compared by name only).
+fn contents(path: &Path, kind: Kind) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                out.push((rel, Vec::new()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    match kind {
+        Kind::File => out.push((PathBuf::new(), std::fs::read(path).unwrap())),
+        Kind::Dir => walk(path, path, &mut out),
+    }
+    out.sort();
+    out
+}
+
+/// A bench command's key=value line, which `--quiet` leaves alone: brokkr
+/// reads it, and the decision was to keep those blocks as they are.
+fn is_bench_key_value(line: &str) -> bool {
+    line.split_once('=').is_some_and(|(key, value)| {
+        !key.is_empty()
+            && !value.is_empty()
+            && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+    })
+}
+
+/// `-q, --quiet`: a successful run prints only the warnings a run without it
+/// prints (and a bench command's key=value block), exits as it would without
+/// it, and writes
+/// exactly the outputs a run without it writes (see [`contents`]). `-q` goes
+/// after the row's own words, and before the subcommand on a second run:
+/// it is global. A text diff is not a row here: a quiet text diff takes no
+/// `-o` (`cli_quiet` covers it).
+fn quiet_run_prints_only_warnings(fx: &Fx, row: &Row) -> Result<(), String> {
+    let plain_dir = TempDir::new().unwrap();
+    let plain = (row.build)(
+        &Ctx {
+            fx,
+            out: plain_dir.path(),
+        },
+        Input::Good,
+    );
+    let reference = run(&plain, &[]);
+    ensure!(
+        exited_ok(row, &reference),
+        "the run without -q failed: exit {:?}; stderr:\n{}",
+        reference.status.code(),
+        reference.stderr_str()
+    );
+    ensure!(
+        !reference.stderr.is_empty(),
+        "the run without -q printed nothing, so -q has nothing to prove here"
+    );
+    for leading in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let inv = (row.build)(
+            &Ctx {
+                fx,
+                out: dir.path(),
+            },
+            Input::Good,
+        );
+        let out = if leading {
+            CliInvoker::new().arg("-q").args(&inv.args).run()
+        } else {
+            run(&inv, &["-q".into()])
+        };
+        let place = if leading { "before" } else { "after" };
+        quiet_streams(row, &out, &reference)
+            .map_err(|why| format!("-q {place} the subcommand: {why}"))?;
+        ensure!(
+            names(dir.path()) == output_names(&inv),
+            "-q {place} the subcommand: the output directory holds {:?}, wanted {:?}",
+            names(dir.path()),
+            output_names(&inv)
+        );
+        for (quiet_output, plain_output) in inv.outputs.iter().zip(&plain.outputs) {
+            ensure!(
+                contents(quiet_output, row.kind) == contents(plain_output, row.kind),
+                "-q {place} the subcommand changed what {} holds",
+                quiet_output.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A quiet run's exit status and streams: the status of the run without
+/// `-q`, nothing on stdout, and on stderr exactly the warnings the run
+/// without `-q` printed plus a bench command's key=value block, which must
+/// still be there.
+fn quiet_streams(row: &Row, out: &CliOutput, reference: &CliOutput) -> Result<(), String> {
+    let stderr = out.stderr_str();
+    ensure!(
+        out.status.code() == reference.status.code(),
+        "exit {:?}, without -q {:?}; stderr:\n{stderr}",
+        out.status.code(),
+        reference.status.code()
+    );
+    let bench = row.command.starts_with("bench-");
+    let reference_stderr = reference.stderr_str();
+    let warnings: Vec<&str> = reference_stderr
+        .lines()
+        .filter(|line| line.starts_with("Warning: "))
+        .collect();
+    let kept: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !(bench && is_bench_key_value(line)))
+        .collect();
+    ensure!(
+        kept == warnings,
+        "printed {kept:?}, wanted only the warnings {warnings:?}"
+    );
+    ensure!(
+        !bench || stderr.lines().any(|line| line.starts_with("elapsed_ms=")),
+        "dropped the bench key=value block; stderr:\n{stderr}"
+    );
+    ensure!(
+        out.stdout.is_empty(),
+        "wrote to stdout:\n{}",
+        out.stdout_str()
+    );
+    Ok(())
+}
+
 /// Run one property over every row it applies to, collect every violation,
 /// and honour the known-gap markers in both directions.
 fn run_property(prop: Prop, check: Check, applies: fn(&Row) -> bool) {
@@ -1296,6 +1431,13 @@ fn a_successful_run_leaves_only_its_outputs() {
 #[test]
 fn tmp_dir_is_checked_first_and_holds_the_scratch() {
     run_property(Prop::TmpDir, tmp_dir_contract, |row| row.tmp_dir);
+}
+
+#[test]
+fn a_quiet_run_prints_only_warnings_and_writes_the_same_outputs() {
+    run_property(Prop::Quiet, quiet_run_prints_only_warnings, |row| {
+        row.label != "diff (text)"
+    });
 }
 
 // ---------------------------------------------------------------------------

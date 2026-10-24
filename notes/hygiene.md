@@ -861,44 +861,29 @@ drain's last node item.
 
 Reported by: change application.
 
-## HYG-109 - No general `--quiet`
+## HYG-109 - No `--json` diagnostics mode
 
 Anger: 7 - CLI behaviour.
 
-Only `diff -q` and `check --quiet` exist. Library diagnostics are kinded,
-keyed events whose text carries no prefix, and `StderrSink::event` in
-`cli/src/host.rs` is the one place they become text, so a global `--quiet`
-is a kind filter there and `--json` a second sink serializing kind, key and
-arguments; neither needs library changes. Not yet events: the CLI's own raw
-`cli_eprintln!` lines (getid's requested and missing ID lists, the
-`elapsed_ms=` and `nodes=` key=value blocks, `Multi-extract: ...`,
-`distinct tag values`, the final `Error:` line), which a `--quiet` or
-`--json` covering them must route through the sink first; the key=value
-blocks may be parsed by brokkr.
+The global `-q, --quiet` landed (`reference/cli-reference.md` "Quiet": a kind
+filter in `StderrSink::event`, `cli/src/host.rs`). Still open: `--json`, a
+second sink serializing each event's kind, key and arguments, which needs no
+library changes. Facts it has to cope with:
 
-Decided: a global `-q, --quiet` with the existing flags' meaning, "the exit
-code is the answer". It drops Note and Progress events in `StderrSink` and
-the command's summary output (`summary_writer`, plus the raw closing lines
-such as `inspect tags`' count and apply-changes' block, gated or routed
-through the sink); it keeps Warnings and errors, which explain the exit
-code, and never touches data written to `-o`. `diff -q` and `check
---quiet` fold into it (a quiet diff still discards the diff text, its
-"output" being the verdict). The bench commands' key=value blocks are left
-as they are. `--json` stays open.
-
-More facts a quiet or JSON mode has to cope with. The `bench-read`,
-`bench-write` and `bench-merge` key=value blocks are raw `cli_eprintln!` lines
-too, and `inspect tags` ends with a raw `N distinct tag values` while every
-other command's closing line goes through `summary_writer`. `Progress` events
-exist only in sort, extract (single and multi), build-geocode-index,
-`cat --dedupe` and apply-changes, so a `--quiet` that drops Progress
-silences those five and no other command. Summary lines have no common
-shape: some lead with the command name (`time-filter:`,
-`add-locations-to-ways:`), some with a verb (`Wrote`, `Sorted`, `Renumbered`,
-`Merged`), apply-changes prints a multi-line block, `export` keys itself
-`export_to.summary`, and getid and `getid --invert` share the key
-`getid.summary` while `cat --dedupe` has its own. A `--json` sink would
-inherit all of it.
+- Raw `cli_eprintln!` lines that are not events: getid's `-v` requested and
+  missing ID lists (refused with `-q`, so quiet never had to cover them), the
+  `bench-read`, `bench-write` and `bench-merge` key=value blocks (brokkr may
+  parse them; the quiet ruling left them as they are), and the final `Error:`
+  line. A `--json` covering them routes them through the sink first.
+- Summary lines have no common shape: some lead with the command name
+  (`time-filter:`, `add-locations-to-ways:`), some with a verb (`Wrote`,
+  `Sorted`, `Renumbered`, `Merged`), apply-changes prints a multi-line block,
+  each `extract --config` region's line carries its own `  [i] path - `
+  label, `export` keys itself `export_to.summary`, and getid and
+  `getid --invert` share the key `getid.summary` while `cat --dedupe` has its
+  own. A `--json` sink would inherit all of it.
+- `Developer` events (`[altw external] ...`, the geocode hotpath counters)
+  carry `key=value` text or a bracketed prefix of their own.
 
 Reported by: split out of the diagnostic-wording item.
 

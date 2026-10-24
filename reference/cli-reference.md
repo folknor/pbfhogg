@@ -16,7 +16,37 @@ the command accepts.
 
 ## Global flags
 
-All commands support `-h, --help` and `-V, --version`.
+All commands support `-h, --help` and `-V, --version`, and
+[`-q, --quiet`](#quiet), which is accepted before or after the subcommand
+(`pbfhogg -q diff a b` and `pbfhogg diff a b -q` are the same).
+
+## Quiet
+
+`-q, --quiet` means one thing on every command: the exit code is the answer.
+
+- **Dropped:** every `Note:`, every progress line, the command's closing
+  summary (single- or multi-line, `apply-changes`' block, each region's line
+  of `extract --config` and its opening `Multi-extract:` line, `inspect tags`'
+  `N distinct tag values`), and the developer lines some backends print
+  (`[altw external] ...`, the geocode builder's hotpath counters).
+- **Kept:** every `Warning:` and the final `Error:` line, which explain the
+  exit code, and clap's usage errors.
+- **Never touched:** what a command writes to `-o` (a quiet run writes the
+  same bytes), and a report a command prints on stdout (`inspect`,
+  `inspect tags`, `digest`, `export` without `-o`), with two exceptions:
+  `diff` and `check`, whose answer is their exit code, print nothing at all.
+  A quiet text `diff` discards its diff text, so `-o`, `-c`, `-v` and `-s`,
+  which only shape that text or its summary, are refused with `-q`; a quiet
+  `diff --format osc` writes its `-o` like any other command. A quiet `check`
+  refuses `--json`, `--show-ids` and `--max-errors` for the same reason.
+  `getid -v` is refused with `-q`: the ID lists are all it adds.
+- **Not affected:** the `bench-read`, `bench-write` and `bench-merge`
+  key=value blocks, which benchmark harnesses parse, print as they always
+  have.
+
+`diff -q` and `check --quiet` used to be flags of those two commands alone;
+they are this flag now, with the same effect there (and `diff --format osc`
+now accepts it).
 
 ## Exit codes
 
@@ -41,7 +71,8 @@ the shell's `128 + signal` convention.
 
 Every command handles SIGINT and SIGTERM the same way. The first one prints
 `Note: SIGINT received; stopping and removing this run's staging and scratch
-files. ...`, and the run stops at its next checkpoint: its workers wind down,
+files. ...` (not under `-q`, which drops notes), and the run stops at its
+next checkpoint: its workers wind down,
 its output staging and scratch directory are removed, and nothing is
 published - an existing output stays byte-identical. It then prints `Error:
 interrupted by SIGINT: the run stopped before completing, removed its staging
@@ -108,7 +139,7 @@ short only where it has the long flag the short stands for.
 | `-o` | `--output`, `--output-dir` | every command that writes an output (`--output-dir` on build-geocode-index) |
 | `-O` | `--overwrite` | every command that writes an output |
 | `-p` | `--polygon` | extract |
-| `-q` | `--quiet` | diff, check |
+| `-q` | `--quiet` | every command (global) |
 | `-r` | `--add-referenced` | getid |
 | `-R` | `--omit-referenced` | tags-filter |
 | `-s` | `--osmium-summary` | diff |
@@ -560,8 +591,11 @@ pbfhogg check [OPTIONS] <FILE>
 | `--check-relations` | Also check relation member references (applies to ref check) |
 | `--show-ids` | Show IDs of missing objects, format: `n123 in w456` (applies to ref check) |
 | `--json` | Machine-readable JSON output |
-| `-q, --quiet` | Exit-code only, no output. Not combinable with the flags that only shape that output: `--json`, `--show-ids`, `--max-errors`. |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
+
+With the global [`-q, --quiet`](#quiet) `check` prints no report: the exit
+code is the answer. `--json`, `--show-ids` and `--max-errors`, which only
+shape the report, are refused with it.
 
 `--full` and `-t/--type` apply to the ID check and are rejected under
 `--refs` alone; `--check-relations` and `--show-ids` apply to the ref
@@ -912,7 +946,9 @@ geometry are skipped and reported in the stderr summary.
 
 Compare two PBF files and show differences. Uses content equality (coordinates, tags, refs, members) rather than version/timestamp ordering - deterministic regardless of metadata completeness (see [DEVIATIONS](../DEVIATIONS.md#diff-content-equality-vs-version-ordering)).
 
-With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`/`--osmium-summary`, `-q`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`.
+With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`/`--osmium-summary`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`.
+
+With the global [`-q, --quiet`](#quiet) a text diff prints nothing, neither the diff text nor its summary: the exit code is the answer (`0` identical, `1` different). `-o`, `-c`, `-v` and `-s`, which only shape that text or its summary, are refused with it. A quiet `--format osc` diff writes its `-o` as usual and drops only the summary.
 
 ```
 pbfhogg diff [OPTIONS] <OLD> <NEW>
@@ -923,9 +959,8 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `--format <FORMAT>` | Output format: `text` (default) or `osc` |
 | `-c, --suppress-common` | Hide unchanged elements (text only) |
 | `-v, --verbose` | Show detailed changes for modified elements (text only). Sequential-only, so not with `-j` or `--tmp-dir` |
-| `-s, --osmium-summary` | Print osmium-style summary (`Summary: left=N right=N same=N different=N`) on stderr instead of the default pbfhogg-format summary. Both formats fire on stderr unless `--quiet` (text only) |
-| `-q, --quiet` | Exit-code only, suppress output (text only). Not with the flags that only shape that output: `-o`, `-c`, `-v`, `-s` |
-| `-o, --output <FILE>` | Write output to file (required for `--format osc`) |
+| `-s, --osmium-summary` | Print osmium-style summary (`Summary: left=N right=N same=N different=N`) on stderr instead of the default pbfhogg-format summary. Both formats fire on stderr unless `-q` (text only; refused with `-q`) |
+| `-o, --output <FILE>` | Write output to file (required for `--format osc`; refused with `-q` on a text diff) |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way. Requires `-o`: stdout is never replaced |
 | `-t, --type <TYPE>` | Filter by element type (text only) |
 | `-j, --jobs <N>` | Worker threads, and the number of ID-range shards (see [`-j/--jobs`](#-j--jobs)). `0` (default) uses one shard per core; `1` takes the sequential path, which for text writes no scratch. Applies to both text and `--format osc`; parallel sharding requires both inputs to be indexed. **Refused with `-v/--verbose`**, which is sequential-only. The parallel path writes its shard files to the run's scratch directory (planet scale: ~30 GB text, ~45 GB osc XML), removed on completion. |
@@ -996,7 +1031,7 @@ pbfhogg getid [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 | `--invert` | Invert selection: remove listed IDs instead of keeping them |
 | `-r, --add-referenced` | Include referenced nodes of matching ways (two-pass; not with `--invert`) |
 | `--remove-tags` | Remove tags from referenced objects. Requires `-r`, which is what emits them (so not with `--invert`). (`-t` used to be its short; `-t` now refuses here, naming `--remove-tags`.) |
-| `-v, --verbose` | Print requested IDs, then report which were not found (not with `--invert`). Both lists go to stderr. The found set is collected on the write path, so this costs no extra pass over the output. |
+| `-v, --verbose` | Print requested IDs, then report which were not found (not with `--invert`, and not with `-q`, which would drop both lists). Both lists go to stderr. The found set is collected on the write path, so this costs no extra pass over the output. |
 | `-i, --id-file <FILE>` | Read IDs from text file (one per line) |
 | `-I, --id-osm-file <FILE>` | Read IDs from an OSM/PBF file (all element IDs are collected) |
 | `--default-type <TYPE>` | Type for bare numeric IDs: node, way, relation. No type is assumed when this option is omitted. |

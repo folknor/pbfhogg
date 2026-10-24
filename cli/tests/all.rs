@@ -59,6 +59,7 @@ mod cli_negative_id_invariants;
 mod cli_output_contract;
 mod cli_output_guard;
 mod cli_output_header;
+mod cli_quiet;
 mod cli_repack;
 mod cli_scratch;
 mod cli_sort;

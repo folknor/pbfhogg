@@ -4,7 +4,21 @@ Version 0.5.0. Generated from `pbfhogg --help` output.
 
 ## Global flags
 
-All commands support `-h, --help` and `-V, --version`.
+All commands support `-h, --help` and `-V, --version`, and `-q, --quiet`,
+accepted before or after the subcommand.
+
+`-q, --quiet` means the exit code is the answer. It drops every `Note:`,
+every progress line and the command's closing summary, and keeps every
+`Warning:` and the final `Error:` line. It never changes what a command
+writes to `-o`, nor a report it prints on stdout (`inspect`, `inspect tags`,
+`digest`, `export` without `-o`), except for `diff` and `check`: a quiet run
+of those prints nothing at all. The flags that only shape the output a quiet
+run drops are refused with it: `-o`, `-c`, `-v` and `-s` on a text `diff`
+(a quiet `diff --format osc` writes its `-o` as usual), `--json`,
+`--show-ids` and `--max-errors` on `check`, and `getid -v`. The `bench-*`
+commands' key=value blocks print as they always have. The full contract is
+in the
+[CLI reference](https://github.com/folknor/pbfhogg/blob/main/reference/cli-reference.md#quiet).
 
 ## Exit codes
 
@@ -308,8 +322,10 @@ pbfhogg check [OPTIONS] <FILE>
 | `--check-relations` | Also check relation member references (applies to ref check) |
 | `--show-ids` | Show IDs of missing objects, format: `n123 in w456` (applies to ref check) |
 | `--json` | Machine-readable JSON output |
-| `-q, --quiet` | Exit-code only, no output. Not combinable with `--json`, `--show-ids` or `--max-errors` |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
+
+With the global `-q, --quiet`, `check` prints no report and the exit code is
+the answer; `--json`, `--show-ids` and `--max-errors` are refused with it.
 
 For missing relation-to-relation members, reports unique missing IDs with occurrence count when they differ: `Missing relation members: 706 (777 references)`.
 
@@ -622,7 +638,9 @@ geometry are skipped and reported in the stderr summary.
 
 Compare two PBF files and show differences. Uses content equality (coordinates, tags, refs, members) rather than version/timestamp ordering - deterministic regardless of metadata completeness (see [DEVIATIONS](/cli/deviations#diff-content-equality-vs-version-ordering)).
 
-With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`, `-q`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`.
+With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`.
+
+With the global `-q, --quiet` a text diff prints nothing, neither the diff text nor its summary, and the exit code is the answer (`0` identical, `1` different); `-o`, `-c`, `-v` and `-s`, which only shape that output, are refused with it. A quiet `--format osc` diff writes its `-o` as usual and drops only the summary.
 
 ```
 pbfhogg diff [OPTIONS] <OLD> <NEW>
@@ -633,9 +651,8 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `--format <FORMAT>` | Output format: `text` (default) or `osc` |
 | `-c, --suppress-common` | Hide unchanged elements (text only) |
 | `-v, --verbose` | Show detailed changes for modified elements (text only). Sequential-only, so not with `-j` or `--tmp-dir` |
-| `-s, --osmium-summary` | Print osmium-style summary (left/right/same/different counts) to stderr instead of the default pbfhogg-format summary (text only). The pbfhogg-format summary always fires on stderr unless `--quiet` - this flag only swaps the format |
-| `-q, --quiet` | Exit-code only, suppress output (text only). Not with `-o`, `-c`, `-v` or `-s`, which only shape that output |
-| `-o, --output <FILE>` | Write output to file (required for `--format osc`) |
+| `-s, --osmium-summary` | Print osmium-style summary (left/right/same/different counts) to stderr instead of the default pbfhogg-format summary (text only). The pbfhogg-format summary always fires on stderr unless `-q` - this flag only swaps the format (refused with `-q`) |
+| `-o, --output <FILE>` | Write output to file (required for `--format osc`; refused with `-q` on a text diff) |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way. Requires `-o` |
 | `-t, --type <TYPE>` | Filter by element type (text only) |
 | `-j, --jobs <N>` | Worker threads and ID-range shard count. `0` (default) uses one shard per core; `1` takes the sequential path (for text, scratch-free). Applies to both `--format text` and `osc`; sharding requires both inputs indexed. **Refused with `-v/--verbose`**, which is sequential-only. The parallel path writes shard files to scratch, removed on completion; scratch demand varies by input. See `reference/performance.md` for measurements |
@@ -701,7 +718,7 @@ pbfhogg getid [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 | `--invert` | Invert selection: remove listed IDs instead of keeping them |
 | `-r, --add-referenced` | Include referenced nodes of matching ways (two-pass; not with `--invert`) |
 | `--remove-tags` | Remove tags from referenced objects. Requires `-r` (so not with `--invert`) |
-| `-v, --verbose` | Print requested IDs, then report which were not found (not with `--invert`). Both lists go to stderr. The found set is collected on the write path, so this costs no extra pass over the output |
+| `-v, --verbose` | Print requested IDs, then report which were not found (not with `--invert`, and not with `-q`, which would drop both lists). Both lists go to stderr. The found set is collected on the write path, so this costs no extra pass over the output |
 | `-i, --id-file <FILE>` | Read IDs from text file (one per line) |
 | `-I, --id-osm-file <FILE>` | Read IDs from an OSM/PBF file (all element IDs are collected) |
 | `--default-type <TYPE>` | Type for bare numeric IDs: node, way, relation. No type is assumed when this option is omitted. |

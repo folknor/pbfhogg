@@ -863,6 +863,17 @@
 
 ### Added
 
+- **A global `-q, --quiet` on every command: the exit code is the
+  answer.** It drops every `Note:`, progress line and closing summary
+  (including `inspect tags`' `N distinct tag values` and `extract --config`'s
+  per-region lines) and keeps every `Warning:` and the `Error:` line. It
+  never changes what is written to `-o`, nor a report on stdout (`inspect`,
+  `digest`, `export`, the `inspect tags` table); `diff -q` and
+  `check --quiet`, which already existed, are this flag now and still print
+  nothing at all. It goes before or after the subcommand. `diff --format osc`
+  now accepts it (it was refused) and writes its output without the summary;
+  `getid -v` refuses it. The `bench-*` key=value blocks are unchanged.
+
 - **`BlobReader::new_named(reader, path)`** builds a streaming reader whose
   errors name `path` and locate at byte offsets counted from the reader's
   first byte, without requiring `Seek`. **`Blob::locate_error`** is public,

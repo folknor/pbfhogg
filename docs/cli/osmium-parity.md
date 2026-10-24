@@ -94,8 +94,10 @@ pbfhogg diff --format osc old.pbf new.pbf -o changes.osc --update-timestamp
 ```
 
 Text diff (the default `--format text`) and OSC diff have separate flag sets.
-Text-only flags (`-c`, `-v`, `-s`, `-q`, `-t`) are rejected with `--format osc`,
-and vice versa for `--increment-version` / `--update-timestamp`.
+Text-only flags (`-c`, `-v`, `-s`, `-t`) are rejected with `--format osc`,
+and vice versa for `--increment-version` / `--update-timestamp`. The global
+`-q` works with both: a quiet text diff answers by exit code alone, a quiet
+OSC diff still writes its `-o`.
 
 **Lossless deletes:** pbfhogg's `diff --format osc` produces a perfect roundtrip
 - applying the derived OSC to the old PBF reproduces the new PBF exactly.

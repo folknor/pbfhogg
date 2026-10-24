@@ -124,6 +124,12 @@ fn clap_exit(err: &clap::Error) -> process::ExitCode {
 #[derive(Parser)]
 #[command(name = "pbfhogg", about = "OpenStreetMap PBF toolkit", version)]
 struct Cli {
+    /// The exit code is the answer: print only warnings and errors, no
+    /// notes, progress or summary. Never changes what is written to -o or
+    /// a report on stdout, except diff's text and check's report, which
+    /// it drops. Accepted before or after the subcommand
+    #[arg(short = 'q', long, global = true)]
+    quiet: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -227,6 +233,16 @@ fn usage(path: &[&str], message: impl std::fmt::Display) -> Box<dyn std::error::
     Box::new(UsageError(
         cmd.error(clap::error::ErrorKind::ArgumentConflict, message),
     ))
+}
+
+/// The refusal of `-q, --quiet` beside a flag whose only effect is on output
+/// a quiet run drops, `why` saying which. Worded like clap's own conflict
+/// errors.
+fn quiet_refused(path: &[&str], flag: &str, why: &str) -> Box<dyn std::error::Error> {
+    usage(
+        path,
+        format!("the argument '--quiet' cannot be used with '{flag}': {why}"),
+    )
 }
 
 /// A short flag a command used to have with a meaning that is not the
@@ -464,10 +480,21 @@ fn given(matches: &clap::ArgMatches, name: &str, id: &str) -> bool {
 fn validate_command(
     command: &Command,
     matches: &clap::ArgMatches,
+    quiet: bool,
 ) -> Result<Option<TagsFilterPlan>, Box<dyn std::error::Error>> {
     match command {
         Command::TagsFilter { .. } => validate_tags_filter(command, matches).map(Some),
-        Command::Diff { .. } => validate_diff(command).map(|()| None),
+        Command::Diff { .. } => validate_diff(command, quiet).map(|()| None),
+        // `-q` is global, so its conflicts are checked here rather than by
+        // clap: a clap conflict on a global flag is not seen when the flag is
+        // given before the subcommand.
+        Command::Getid {
+            verbose_ids: true, ..
+        } if quiet => Err(quiet_refused(
+            &["getid"],
+            "--verbose",
+            "it only prints the requested and missing IDs, which a quiet run drops",
+        )),
         Command::AddLocationsToWays {
             index_type, force, ..
         } => {
@@ -493,7 +520,7 @@ fn validate_command(
             "--unsort-intra needs --block-cap >= 2: an intra-blob inversion requires at least \
              two same-kind elements inside one output block",
         )),
-        Command::Check { .. } => validate_check(command).map(|()| None),
+        Command::Check { .. } => validate_check(command, matches, quiet).map(|()| None),
         Command::MergeChanges { output, .. } => {
             validate_osc_output(&["merge-changes"], &output.output).map(|()| None)
         }
@@ -600,12 +627,11 @@ fn validate_tags_filter(
     Ok((kind, expressions))
 }
 
-fn validate_diff(command: &Command) -> Result<(), Box<dyn std::error::Error>> {
+fn validate_diff(command: &Command, quiet: bool) -> Result<(), Box<dyn std::error::Error>> {
     let Command::Diff {
         suppress_common,
         verbose,
         osmium_summary,
-        quiet,
         output,
         type_filter,
         jobs,
@@ -622,7 +648,8 @@ fn validate_diff(command: &Command) -> Result<(), Box<dyn std::error::Error>> {
     match format {
         DiffFormat::Osc => {
             // Deliberately require output before rejecting text-only flags.
-            // Even -q without -o keeps this missing-output error first.
+            // `-q` is not one: it is global, and a quiet OSC diff writes its
+            // output like any other command, without the summary.
             let Some(output) = output else {
                 return refuse("--output is required with --format osc");
             };
@@ -630,7 +657,6 @@ fn validate_diff(command: &Command) -> Result<(), Box<dyn std::error::Error>> {
                 (*suppress_common, "--suppress-common"),
                 (*verbose, "--verbose"),
                 (*osmium_summary, "--osmium-summary"),
-                (*quiet, "--quiet"),
                 (type_filter.is_some(), "--type"),
             ] {
                 if set {
@@ -657,12 +683,46 @@ fn validate_diff(command: &Command) -> Result<(), Box<dyn std::error::Error>> {
                      scratch files",
                 );
             }
+            // A quiet text diff discards its text and summary: its answer is
+            // the exit code. The flags that only shape them are refused.
+            if quiet {
+                for (set, flag, why) in [
+                    (
+                        output.is_some(),
+                        "--output",
+                        "a quiet text diff writes no diff text",
+                    ),
+                    (
+                        *suppress_common,
+                        "--suppress-common",
+                        "it only shapes the diff text, which a quiet diff discards",
+                    ),
+                    (
+                        *verbose,
+                        "--verbose",
+                        "it only shapes the diff text, which a quiet diff discards",
+                    ),
+                    (
+                        *osmium_summary,
+                        "--osmium-summary",
+                        "it only shapes the summary, which a quiet diff drops",
+                    ),
+                ] {
+                    if set {
+                        return Err(quiet_refused(&["diff"], flag, why));
+                    }
+                }
+            }
         }
     }
     Ok(())
 }
 
-fn validate_check(command: &Command) -> Result<(), Box<dyn std::error::Error>> {
+fn validate_check(
+    command: &Command,
+    matches: &clap::ArgMatches,
+    quiet: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let Command::Check {
         ids,
         refs,
@@ -671,11 +731,30 @@ fn validate_check(command: &Command) -> Result<(), Box<dyn std::error::Error>> {
         show_ids,
         full,
         type_filter,
+        json,
         ..
     } = command
     else {
         return Ok(());
     };
+    // A quiet check prints no report: its answer is the exit code. The flags
+    // that only shape the report are refused, first, as clap refused them
+    // when `--quiet` was check's own flag.
+    if quiet {
+        for (set, flag) in [
+            (*json, "--json"),
+            (*show_ids, "--show-ids"),
+            (given(matches, "check", "max_errors"), "--max-errors"),
+        ] {
+            if set {
+                return Err(quiet_refused(
+                    &["check"],
+                    flag,
+                    "it only shapes the report, which a quiet check does not print",
+                ));
+            }
+        }
+    }
     // With no selector the --ids + --refs pair runs; --index alone runs only
     // the metadata verification.
     let any_selector = *ids || *refs || *index;
@@ -1446,17 +1525,11 @@ enum Command {
         /// summary. The pbfhogg-format summary always fires on
         /// stderr unless `--quiet` - this flag only swaps the
         /// format, it does not control whether a summary is shown.
+        /// Not with -q, which drops the summary
         #[arg(short = 's', long = "osmium-summary")]
         osmium_summary: bool,
-        /// Exit-code only, suppress diff output and summary. Not with the
-        /// flags that only shape that output (-o, -c, -v, -s)
-        #[arg(
-            short = 'q',
-            long,
-            conflicts_with_all = ["output", "suppress_common", "verbose", "osmium_summary"]
-        )]
-        quiet: bool,
-        /// Write diff output to file instead of stdout
+        /// Write diff output to file instead of stdout. Not with -q on a
+        /// text diff, which writes no diff text
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
         #[command(flatten)]
@@ -1919,13 +1992,9 @@ enum Command {
         /// the scan still runs to the end and the counts stay exact
         #[arg(long, default_value = "100")]
         max_errors: usize,
-        /// Machine-readable JSON output
+        /// Machine-readable JSON output. Not with -q, which drops the report
         #[arg(long)]
         json: bool,
-        /// Exit-code only, no output. Not with the flags that only shape that
-        /// output (--json, --show-ids, --max-errors)
-        #[arg(short = 'q', long, conflicts_with_all = ["json", "show_ids", "max_errors"])]
-        quiet: bool,
         #[command(flatten)]
         io: DirectIoArg,
     },
@@ -2307,6 +2376,11 @@ pub fn run() -> process::ExitCode {
         Err(err) => return clap_exit(&err),
     };
 
+    // From here on `--quiet` filters every diagnostic. The warnings printed
+    // above (a signal or marker FIFO setup failure) are warnings, which it
+    // keeps anyway.
+    let quiet = cli.quiet;
+    host::set_quiet(quiet);
     let advice = advice(&cli.command, &matches);
     let mut outcome = Outcome::Positive;
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
@@ -2314,7 +2388,7 @@ pub fn run() -> process::ExitCode {
         // the filesystem. Only tags-filter's autodetected input kind needs a
         // read (the four-byte sniff it always did), so its OSC-mode refusals
         // ride that read.
-        let tags_filter_kind = validate_command(&cli.command, &matches)?;
+        let tags_filter_kind = validate_command(&cli.command, &matches, quiet)?;
         validate_input_output_aliases(&cli.command)?;
         let mut leftovers = LeftoverScanner::default();
         leftovers.command(&cli.command, &host);
@@ -2565,7 +2639,6 @@ pub fn run() -> process::ExitCode {
                 suppress_common,
                 verbose,
                 osmium_summary,
-                quiet,
                 output,
                 overwrite,
                 type_filter,
@@ -2613,7 +2686,8 @@ pub fn run() -> process::ExitCode {
                     // `--verbose`, which is sequential-only. Any other text
                     // diff may shard, so it gets its directory now, before
                     // any input is opened. A quiet diff writes no output file
-                    // (clap refuses -o with -q) but shards like any other.
+                    // (`validate_diff` refuses -o with -q) but shards like any
+                    // other.
                     let scratch = if verbose || jobs.fixed() == Some(1) {
                         None
                     } else {
@@ -2987,7 +3061,6 @@ pub fn run() -> process::ExitCode {
                 type_filter,
                 max_errors,
                 json,
-                quiet,
                 io,
             } => accept_outcome(
                 &mut outcome,
@@ -3102,9 +3175,12 @@ pub fn run() -> process::ExitCode {
                 // The work and any publication had completed (every early
                 // stop is an error, and publication refuses once the token
                 // is tripped before its decision): the result stands.
-                output::cli_eprintln!(
-                    "Note: {} arrived after the run had completed; its result stands",
-                    signals::name(signo)
+                host::cli_note(
+                    "cli.signal_after_completion",
+                    format_args!(
+                        "{} arrived after the run had completed; its result stands",
+                        signals::name(signo)
+                    ),
                 );
             }
             process::ExitCode::from(outcome.code())
@@ -3475,7 +3551,11 @@ fn run_tags_count(
     }
     out.flush()?;
 
-    output::cli_eprintln!("{} distinct tag values", results.len());
+    writeln!(
+        host.diagnostics.summary_writer("tags_count.summary"),
+        "{} distinct tag values",
+        results.len()
+    )?;
     Ok(())
 }
 
@@ -3717,21 +3797,17 @@ fn leftover_dirs(command: &Command) -> Vec<PathBuf> {
             ..
         } => dirs.push(parent_of(output)),
         Command::Diff {
-            old,
-            output,
-            quiet,
-            tmp,
-            ..
+            old, output, tmp, ..
         } => {
             // Older versions wrote `diff-par-*` shards beside the old input.
             dirs.push(parent_of(old));
             dirs.extend(output.as_deref().map(parent_of));
             // Where `run_scratch` puts this run's own directory: `--tmp-dir`,
-            // else the output's directory, else (text to stdout, or `--quiet`,
-            // which writes no output) the current directory.
+            // else the output's directory, else (text to stdout, or a quiet
+            // text diff, which takes no -o) the current directory.
             match &tmp.tmp_dir {
                 Some(dir) => dirs.push(dir.clone()),
-                None if output.is_none() || *quiet => dirs.push(PathBuf::from(".")),
+                None if output.is_none() => dirs.push(PathBuf::from(".")),
                 None => {}
             }
         }
@@ -4355,7 +4431,10 @@ fn run_extract_config(
     let regions: Vec<pbfhogg::extract::Region> =
         slots.into_iter().map(|slot| slot.region).collect();
 
-    output::cli_eprintln!("Multi-extract: {} extracts from config", regions.len());
+    host::cli_progress(
+        "extract.multi.start",
+        format_args!("Multi-extract: {} extracts from config", regions.len()),
+    );
     // Extraction is all-or-nothing, and so, as far as failures allow, is
     // publication: the set is published as a group, rolling back members
     // already installed if a later one fails.
@@ -4363,8 +4442,12 @@ fn run_extract_config(
         file, &regions, outputs, strategy, set_bounds, clean, write, overrides, host,
     )?;
     for (i, stats) in all_stats.iter().enumerate() {
-        output::cli_eprint!("  [{}] {} - ", i + 1, destinations[i].display());
-        stats.write_summary(&mut host.diagnostics.summary_writer("extract.summary"))?;
+        // One summary writer per region, the region's label written into it
+        // ahead of the summary, so the label and the summary's first line
+        // are one event and `--quiet` drops both.
+        let mut summary = host.diagnostics.summary_writer("extract.summary");
+        write!(summary, "  [{}] {} - ", i + 1, destinations[i].display())?;
+        stats.write_summary(&mut summary)?;
     }
     Ok(())
 }

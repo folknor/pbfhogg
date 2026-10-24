@@ -115,11 +115,14 @@ fn report_stopping(signo: libc::c_int) {
                 if *finished {
                     return;
                 }
-                crate::output::cli_eprintln!(
-                    "Note: {} received; stopping and removing this run's staging and scratch \
-                     files. Send it again to exit at once and leave them for the next run to \
-                     report.",
-                    name(signo)
+                crate::host::cli_note(
+                    "cli.signal_stopping",
+                    format_args!(
+                        "{} received; stopping and removing this run's staging and scratch \
+                         files. Send it again to exit at once and leave them for the next run \
+                         to report.",
+                        name(signo)
+                    ),
                 );
             }),
     );

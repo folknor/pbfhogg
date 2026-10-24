@@ -3,6 +3,7 @@ use pbfhogg::host::{
 };
 use pbfhogg::process::FdAllowance;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) struct LegacyProcessActions;
 impl ProcessActions for LegacyProcessActions {
     fn cross_thread_alloc_pool(&self) {
@@ -51,6 +52,24 @@ pub(crate) fn init_marker_fifo() {
 
 pub(crate) struct StderrSink;
 
+/// Set once, right after the command line is parsed, by `-q, --quiet`.
+/// Process state of this binary: the library never sees it (ADR-0016).
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Record `-q, --quiet` for the rest of the run.
+pub(crate) fn set_quiet(quiet: bool) {
+    QUIET.store(quiet, Ordering::Relaxed);
+}
+
+/// Whether an event of `kind` reaches stderr. `-q, --quiet` means "the exit
+/// code is the answer": what stays is what explains that code, the warnings
+/// (the `Error:` line never passes through here). Notes, progress, summaries
+/// and developer lines go. A kind added later is dropped under `--quiet`
+/// until it is placed here.
+fn prints(kind: EventKind, quiet: bool) -> bool {
+    !quiet || matches!(kind, EventKind::Warning)
+}
+
 /// The one CLI prefix for each warning-class event kind.
 ///
 /// Only warnings and notes are prefixed, so an operator can grep one spelling
@@ -84,10 +103,14 @@ fn diagnostic_hint(key: &str) -> &'static str {
 
 impl pbfhogg::host::DiagnosticSink for StderrSink {
     /// The one place a diagnostic becomes stderr text. Library text carries no
-    /// kind prefix of its own, so the kind alone decides the rendering; a
-    /// `--quiet` kind filter or a `--json` sink (serializing kind, key and the
-    /// formatted arguments) belongs here and nowhere in the library.
+    /// kind prefix of its own, so the kind alone decides the rendering, and
+    /// whether it is rendered at all under `--quiet`; a `--json` sink
+    /// (serializing kind, key and the formatted arguments) belongs here too
+    /// and nowhere in the library.
     fn event(&self, event: &pbfhogg::host::Event<'_>) {
+        if !prints(event.kind, QUIET.load(Ordering::Relaxed)) {
+            return;
+        }
         let hint = diagnostic_hint(event.key);
         match diagnostic_prefix(event.kind) {
             Some(prefix) => {
@@ -104,6 +127,17 @@ pub(crate) fn cli_note(key: &'static str, args: std::fmt::Arguments<'_>) {
     use pbfhogg::host::DiagnosticSink as _;
     StderrSink.event(&Event {
         kind: EventKind::Note,
+        key,
+        args,
+    });
+}
+
+/// Report progress the CLI itself prints (a run's opening line), through the
+/// same sink as the library's progress, so `--quiet` drops it with theirs.
+pub(crate) fn cli_progress(key: &'static str, args: std::fmt::Arguments<'_>) {
+    use pbfhogg::host::DiagnosticSink as _;
+    StderrSink.event(&Event {
+        kind: EventKind::Progress,
         key,
         args,
     });
@@ -135,4 +169,30 @@ pub(crate) fn cli_warning(key: &'static str, args: std::fmt::Arguments<'_>) {
         key,
         args,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prints;
+    use pbfhogg::host::EventKind;
+
+    /// `--quiet` keeps the warnings and nothing else; without it every kind
+    /// prints.
+    #[test]
+    fn quiet_keeps_only_warnings() {
+        for kind in [
+            EventKind::Progress,
+            EventKind::Warning,
+            EventKind::Note,
+            EventKind::Summary,
+            EventKind::Developer,
+        ] {
+            assert!(prints(kind, false), "{kind:?} must print without --quiet");
+            assert_eq!(
+                prints(kind, true),
+                kind == EventKind::Warning,
+                "{kind:?} under --quiet"
+            );
+        }
+    }
 }

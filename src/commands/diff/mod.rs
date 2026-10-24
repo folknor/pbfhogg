@@ -283,7 +283,7 @@ pub fn diff(
     // serves the common non-verbose case.
     let parallel_stats = match &scratch {
         Some(scratch) if both_indexed && jobs > 1 => parallel::diff_block_pair_parallel(
-            old_path, new_path, output, options, direct_io, &filter, jobs, host, scratch,
+            old_path, new_path, output, options, &filter, jobs, host, scratch,
         )?,
         _ => None,
     };
@@ -421,8 +421,9 @@ fn diff_block_pair(
 }
 
 /// Emit `mergejoin_shadow_*` counters accumulated across all phases.
-/// Shadow-only - no code-path change. See `BlockPairMergeStats` and the
-/// diff-snapshots opportunity plan for how these feed the v3 decision.
+/// Shadow-only - no code-path change. Shared by the text diff and the
+/// derive (`--format osc`) sequential block-pair paths, which both drive
+/// `BlockPairMergeState` and report the same shadow view.
 #[allow(clippy::cast_possible_wrap)]
 fn emit_merge_stats_counters(s: &crate::osc::merge_join::BlockPairMergeStats) {
     crate::debug::emit_counter(

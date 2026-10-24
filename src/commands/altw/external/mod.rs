@@ -174,37 +174,22 @@ impl BucketLayout {
 
 /// Largest node id advertised by any node-kind blob's indexdata.
 ///
-/// This is the input to [`BucketLayout::new`]. Errors if any node
-/// blob has a malformed range (negative `max_id` or `max_id <
-/// min_id`); both are producer-side bugs that pass A would otherwise
-/// silently absorb. Returns 0 when there are no node blobs (degenerate
-/// input - bucket_layout will then reject any non-zero ref).
-fn max_node_id_from_blob_meta(blob_meta: &[blob_meta::BlobMeta]) -> Result<u64> {
-    let mut max_id: i64 = 0;
-    for meta in blob_meta {
-        if !matches!(meta.kind, crate::ElementKind::Node) {
-            continue;
-        }
-        if meta.max_id < meta.min_id {
-            return Err(crate::Error::invalid_data(format!(
-                "altw external: node blob at data_offset={} has reversed \
-                 indexdata range [min_id={}, max_id={}]",
-                meta.data_offset, meta.min_id, meta.max_id,
-            )));
-        }
-        if meta.max_id < 0 {
-            return Err(crate::Error::invalid_data(format!(
-                "altw external: node blob at data_offset={} has negative \
-                 max_id={}; pbfhogg rejects negative element ids",
-                meta.data_offset, meta.max_id,
-            )));
-        }
-        if meta.max_id > max_id {
-            max_id = meta.max_id;
-        }
-    }
-    #[allow(clippy::cast_sign_loss)]
-    Ok(max_id as u64)
+/// This is the input to [`BucketLayout::new`]. Returns 0 when there are no
+/// node blobs (degenerate input - the layout then rejects any non-zero ref).
+///
+/// Infallible because the ranges were validated where they entered:
+/// [`blob_meta::scan_blob_metadata`], the external join's one trust boundary
+/// for indexdata ranges, refuses a reversed range and a node range reaching
+/// below zero, located at the offending blob, before any meta reaches here.
+/// The fold starts at 0, so even an unvalidated negative `max_id` could not
+/// wrap the result.
+fn max_node_id_from_blob_meta(blob_meta: &[blob_meta::BlobMeta]) -> u64 {
+    blob_meta
+        .iter()
+        .filter(|meta| matches!(meta.kind, crate::ElementKind::Node))
+        .fold(0_u64, |max, meta| {
+            max.max(u64::try_from(meta.max_id).unwrap_or(0))
+        })
 }
 
 #[cfg(test)]
@@ -228,7 +213,7 @@ mod max_node_id_tests {
 
     #[test]
     fn empty_input_is_zero() {
-        assert_eq!(max_node_id_from_blob_meta(&[]).expect("ok"), 0);
+        assert_eq!(max_node_id_from_blob_meta(&[]), 0);
     }
 
     #[test]
@@ -237,7 +222,7 @@ mod max_node_id_tests {
             meta(ElementKind::Way, 1, 100),
             meta(ElementKind::Relation, 1, 50),
         ];
-        assert_eq!(max_node_id_from_blob_meta(&metas).expect("ok"), 0);
+        assert_eq!(max_node_id_from_blob_meta(&metas), 0);
     }
 
     #[test]
@@ -248,21 +233,7 @@ mod max_node_id_tests {
             meta(ElementKind::Node, 1000, 12_345),
             meta(ElementKind::Node, 12_346, 99_999),
         ];
-        assert_eq!(max_node_id_from_blob_meta(&metas).expect("ok"), 99_999);
-    }
-
-    #[test]
-    fn errors_on_reversed_range() {
-        let metas = [meta(ElementKind::Node, 100, 50)];
-        let err = max_node_id_from_blob_meta(&metas).expect_err("reversed range");
-        assert!(err.to_string().contains("reversed indexdata"));
-    }
-
-    #[test]
-    fn errors_on_negative_max() {
-        let metas = [meta(ElementKind::Node, -10, -5)];
-        let err = max_node_id_from_blob_meta(&metas).expect_err("negative max");
-        assert!(err.to_string().contains("negative max_id"));
+        assert_eq!(max_node_id_from_blob_meta(&metas), 99_999);
     }
 }
 
@@ -772,12 +743,12 @@ pub(crate) fn external_join_in(
 
     {
         let reader = ElementReader::open_in(input, direct_io, host)?;
-        if !reader.header().is_sorted() {
-            return Err(crate::Error::invalid_data(
-                "external join requires a sorted PBF (Sort.Type_then_ID). \
-                 The single-pass node merge depends on ascending node ID order.",
-            ));
-        }
+        crate::commands::require_sorted(
+            reader.header().is_sorted(),
+            input,
+            "Input PBF",
+            "The external join's single-pass node merge depends on ascending node ID order.",
+        )?;
     }
 
     let ref_count_sidecar = scratch.file("way-ref-counts")?;
@@ -801,7 +772,7 @@ pub(crate) fn external_join_in(
     // from the largest node-blob max_id in indexdata, not the
     // planet-wide constant - tighter buckets on smaller fixtures
     // and exact for any real input.
-    let max_node_id = max_node_id_from_blob_meta(&blob_meta)?;
+    let max_node_id = max_node_id_from_blob_meta(&blob_meta);
     let bucket_layout = BucketLayout::new(max_node_id, NUM_BUCKETS)?;
     #[allow(clippy::cast_possible_wrap)]
     {

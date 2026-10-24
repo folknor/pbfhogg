@@ -14,6 +14,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::NonNull;
 
+use super::copy_range::{retry_eintr, syscall_result};
 use super::{IO_BUF_BYTES, PAGE_SIZE, alloc_page_aligned};
 
 // ---------------------------------------------------------------------------
@@ -136,27 +137,23 @@ impl DirectWriter {
     fn flush_buf(&mut self) -> io::Result<()> {
         let mut written = 0;
         let total = self.buf.len;
+        let fd = self.file.as_raw_fd();
         while written < total {
-            // Safety: buf.as_ptr() is page-aligned, total is a multiple of
-            // PAGE_SIZE (ensured by callers), and the fd is open for writing.
-            let n = unsafe {
-                libc::write(
-                    self.file.as_raw_fd(),
-                    self.buf.as_ptr().add(written).cast(),
-                    total - written,
-                )
-            };
-            if n < 0 {
-                let err = io::Error::last_os_error();
-                // A signal delivered mid-write is not a write failure. The
-                // `pread` loop in `parallel_writer::copy_range_fallback_pwrite`
-                // has always retried it; this loop used to treat it as fatal.
-                if err.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(err);
+            // A signal delivered mid-write is not a write failure: the shared
+            // `EINTR` rule in `copy_range` retries it.
+            let n = retry_eintr(|| {
+                // Safety: buf.as_ptr() is page-aligned, total is a multiple of
+                // PAGE_SIZE (ensured by callers), and the fd is open for writing.
+                syscall_result(unsafe {
+                    libc::write(fd, self.buf.as_ptr().add(written).cast(), total - written)
+                })
+            })?;
+            if n == 0 {
+                // `write_all`'s rule: a write that takes nothing would loop
+                // here forever.
+                return Err(io::Error::from(io::ErrorKind::WriteZero));
             }
-            written += n.cast_unsigned();
+            written += n;
         }
         self.buf.clear();
         Ok(())

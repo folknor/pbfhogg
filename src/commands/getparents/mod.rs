@@ -198,7 +198,6 @@ fn getparents_walker(
 
     crate::debug::emit_marker("GETPARENTS_SCHEDULE_START");
     let mut walker = HeaderWalker::open(input, host)?;
-    let file_size = walker.file_size();
     let mut header_buf: Vec<u8> = Vec::new();
     let mut header_block: Option<crate::HeaderBlock> = None;
     let mut schedule: Vec<crate::scan::classify::ScheduledBlob> = Vec::new();
@@ -229,15 +228,8 @@ fn getparents_walker(
                     None => true,
                 };
                 if keep {
-                    if meta.data_offset + meta.data_size as u64 > file_size {
-                        return Err(walker.locate_meta(
-                            &meta,
-                            crate::error::Error::invalid_data(format!(
-                                "blob at offset {} claims data_size {} but file is only {} bytes",
-                                meta.data_offset, meta.data_size, file_size,
-                            )),
-                        ));
-                    }
+                    // The walk has already refused a payload running past
+                    // EOF, so the schedule's preads stay in the file.
                     schedule.push(crate::scan::classify::ScheduledBlob::from_meta(&meta)?);
                 } else {
                     blobs_skipped += 1;

@@ -101,12 +101,18 @@ impl Blob {
         self
     }
 
-    /// Attach this blob's true provenance to an error raised while decoding
-    /// it. `source` is the path of the reader the blob came from, which the
-    /// caller captures once per worker. Applied only when the error has no
-    /// location yet.
+    /// Attach this blob's true provenance - its index and byte offset, as
+    /// far as the reader knew them - to an error raised while decoding it.
+    /// `source` names the input the blob came from; when given, it must be
+    /// the file whose byte offsets [`Blob::offset`] counts, or the location
+    /// pairs a true offset with the wrong file. Applied only when the error
+    /// has no location yet.
+    ///
+    /// [`Blob::decode`] does not stamp its own errors: a blob decoded away
+    /// from its reader does not know which input it belongs to, so the caller
+    /// that does applies this on the error path.
     #[cold]
-    pub(crate) fn locate_error(&self, source: Option<&Arc<Path>>, err: Error) -> Error {
+    pub fn locate_error(&self, source: Option<&Arc<Path>>, err: Error) -> Error {
         err.locate(Location::new(source, self.blob_index, self.offset))
     }
 
@@ -489,6 +495,40 @@ impl<R: Read + Send> BlobReader<R> {
         }
     }
 
+    /// Creates a `BlobReader` over `reader` whose errors name `path` and
+    /// carry byte offsets in it, for a caller that wants its own I/O shape
+    /// (buffer size, wrapper) but the provenance of [`BlobReader::from_path`].
+    ///
+    /// The caller asserts that `reader` delivers the bytes of the file at
+    /// `path` starting at its first byte, so positions counted from 0 are
+    /// byte offsets in that file; and, if the reader can seek, that its seek
+    /// targets and reported positions use the same coordinates. Nothing
+    /// checks either claim: a reader positioned elsewhere makes every
+    /// reported location wrong. Construction issues no I/O.
+    ///
+    /// # Example
+    /// ```
+    /// use pbfhogg::*;
+    ///
+    /// # fn foo() -> Result<()> {
+    /// let path = "tests/test.osm.pbf";
+    /// let buf_reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    /// let mut reader = BlobReader::new_named(buf_reader, path);
+    /// let first_blob = reader.next().unwrap()?;
+    ///
+    /// assert_eq!(first_blob.offset(), Some(ByteOffset(0)));
+    /// # Ok(())
+    /// # }
+    /// # foo().unwrap();
+    /// ```
+    pub fn new_named<P: AsRef<Path>>(reader: R, path: P) -> BlobReader<R> {
+        BlobReader {
+            offset: Some(ByteOffset(0)),
+            source: Some(std::sync::Arc::from(path.as_ref())),
+            ..Self::new(reader)
+        }
+    }
+
     /// The path this reader was opened from, when it was opened from one.
     /// Workers that decode this reader's blobs capture it once and stamp
     /// their errors with [`Blob::locate_error`].
@@ -569,10 +609,13 @@ impl<R: Read + Send> BlobReader<R> {
                 }
                 Err(e) => {
                     // Propagate the original I/O error (broken pipe, permission
-                    // denied, etc.) instead of masking it as InvalidHeaderSize.
+                    // denied, etc.) instead of masking it as InvalidHeaderSize,
+                    // located at the frame start: the offset only advances
+                    // once the whole prefix is read.
+                    let at = self.offset;
                     self.offset = None;
                     self.last_blob_ok = false;
-                    return Some(Err(self.locate(e.into(), None)));
+                    return Some(Err(self.locate(e.into(), at)));
                 }
             }
             match self.reader.read_exact(&mut buf[1..]) {
@@ -589,10 +632,12 @@ impl<R: Read + Send> BlobReader<R> {
                 }
                 Err(e) => {
                     // Genuine I/O error (broken pipe, permission denied,
-                    // etc.) - propagate the real cause.
+                    // etc.) - propagate the real cause, located at the frame
+                    // start as above.
+                    let at = self.offset;
                     self.offset = None;
                     self.last_blob_ok = false;
-                    Some(Err(self.locate(e.into(), None)))
+                    Some(Err(self.locate(e.into(), at)))
                 }
             }
         }
@@ -629,22 +674,35 @@ impl<R: Read + Send> BlobReader<R> {
             // self.offset points at the start of the BlobHeader (after
             // the 4-byte length prefix). The truncation byte is at
             // `header_start + got` (the byte we couldn't read).
-            let header_start = self.offset.map_or(0, |x| x.0);
+            // A reader with no known position (`BlobReader::new`) names no
+            // byte at all rather than counting from an invented 0.
             let got = self.header_buf.len() as u64;
-            let trunc_at = header_start + got;
-            let err = Error::io_kind(
-                ::std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "BlobHeader truncated at byte {trunc_at} (shape 3): \
-                         declared {header_size} bytes from offset \
-                         {header_start}, got {got}"
+            let (text, trunc_at) = match self.offset {
+                Some(ByteOffset(header_start)) => {
+                    let trunc_at = header_start + got;
+                    (
+                        format!(
+                            "BlobHeader truncated at byte {trunc_at} (shape 3): \
+                             declared {header_size} bytes from offset \
+                             {header_start}, got {got}"
+                        ),
+                        Some(ByteOffset(trunc_at)),
+                    )
+                }
+                None => (
+                    format!(
+                        "BlobHeader truncated (shape 3): declared {header_size} bytes, \
+                         got {got}"
+                    ),
+                    None,
                 ),
-            );
+            };
+            let err = Error::io_kind(::std::io::ErrorKind::UnexpectedEof, text);
             // Build the complete location here, with the exact truncation
             // byte. `handle_error` would otherwise attach `header_start`,
             // which points at the start of the frame rather than at the byte
             // that failed - the message and the accessor would then disagree.
-            let err = self.locate(err, self.offset.map(|_| ByteOffset(trunc_at)));
+            let err = self.locate(err, trunc_at);
             return self.handle_error(err);
         }
 
@@ -909,20 +967,31 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
             // self.offset points at the start of the Blob payload (after
             // the BlobHeader). The truncation byte is at
             // `payload_start + got`.
-            let payload_start = self.offset.map_or(0, |x| x.0);
+            // As above, a reader with no known position names no byte.
             let got = blob_data.len() as u64;
-            let trunc_at = payload_start + got;
-            let err = Error::io_kind(
-                ::std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "Blob payload truncated at byte {trunc_at} (shape 4): \
-                         declared {} bytes from offset {payload_start}, got {got}",
-                    header.datasize
+            let declared = header.datasize;
+            let (text, trunc_at) = match self.offset {
+                Some(ByteOffset(payload_start)) => {
+                    let trunc_at = payload_start + got;
+                    (
+                        format!(
+                            "Blob payload truncated at byte {trunc_at} (shape 4): \
+                             declared {declared} bytes from offset {payload_start}, got {got}"
+                        ),
+                        Some(ByteOffset(trunc_at)),
+                    )
+                }
+                None => (
+                    format!(
+                        "Blob payload truncated (shape 4): declared {declared} bytes, got {got}"
+                    ),
+                    None,
                 ),
-            );
+            };
+            let err = Error::io_kind(::std::io::ErrorKind::UnexpectedEof, text);
             // As above: the exact truncation byte beats the payload start
             // that `handle_error` would otherwise attach.
-            let err = self.locate(err, self.offset.map(|_| ByteOffset(trunc_at)));
+            let err = self.locate(err, trunc_at);
             return self.handle_error(err);
         }
 
@@ -1039,10 +1108,17 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
     /// ```
     pub fn blob_from_offset(&mut self, pos: ByteOffset) -> Result<Blob> {
         self.seek(pos)?;
+        // A read at an explicit offset is a fresh start, as after `seek_raw`:
+        // an earlier failed read must not make `next` stop before reading,
+        // or a valid frame at `pos` would be reported as no blob there.
+        self.last_blob_ok = true;
         self.next().unwrap_or_else(|| {
-            Err(Error::io_kind(
-                ::std::io::ErrorKind::UnexpectedEof,
-                "no blob at this stream position",
+            Err(self.locate(
+                Error::io_kind(
+                    ::std::io::ErrorKind::UnexpectedEof,
+                    "no blob at this stream position",
+                ),
+                Some(pos),
             ))
         })
     }
@@ -1089,14 +1165,16 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
     }
 
     /// A failed seek, located in this reader's file (when it knows it) at
-    /// the target offset (when the target was absolute).
+    /// the target offset (when the target was absolute). Each part is
+    /// attached on its own: a reader with no path still reports an absolute
+    /// target, and with neither the error stays unlocated.
     #[cold]
     fn seek_error(&self, err: std::io::Error, target: Option<ByteOffset>) -> Error {
-        let err = Error::from(err);
-        match &self.source {
-            Some(path) => err.locate(crate::error::Location::new(Some(path), None, target)),
-            None => err,
-        }
+        Error::from(err).locate(crate::error::Location::new(
+            self.source.as_ref(),
+            None,
+            target,
+        ))
     }
 
     /// Seek to an offset in bytes. (See `std::io::Seek`)
@@ -1178,22 +1256,33 @@ impl<R: BlobReaderSource + Send> BlobReader<R> {
                 // declared payload didn't fit in the file. Wrap with
                 // offset-aware context per
                 // `reference/truncation-handling.md` shape 4.
-                let payload_start = self.offset.map_or(0, |x| x.0);
-                let trunc_at = payload_start + n - 1;
-                self.offset = None;
-                let err = Error::io_kind(
-                    ::std::io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "Blob payload truncated at byte {trunc_at} (shape 4): \
-                         declared {n} bytes from offset {payload_start}, \
-                         file ended early"
-                    ),
-                );
                 // The exact byte we failed to read, not the payload start -
-                // but only when the reader was actually tracking a position;
-                // `payload_start` falls back to 0 when it was not, and a
+                // but only when the reader was actually tracking a position.
+                // Without one the message names no byte either: a
                 // confidently wrong offset is worse than none.
-                Err(self.locate(err, at.map(|_| ByteOffset(trunc_at))))
+                self.offset = None;
+                let (text, trunc_at) = match at {
+                    Some(ByteOffset(payload_start)) => {
+                        let trunc_at = payload_start + n - 1;
+                        (
+                            format!(
+                                "Blob payload truncated at byte {trunc_at} (shape 4): \
+                                 declared {n} bytes from offset {payload_start}, \
+                                 file ended early"
+                            ),
+                            Some(ByteOffset(trunc_at)),
+                        )
+                    }
+                    None => (
+                        format!(
+                            "Blob payload truncated (shape 4): declared {n} bytes, \
+                             file ended early"
+                        ),
+                        None,
+                    ),
+                };
+                let err = Error::io_kind(::std::io::ErrorKind::UnexpectedEof, text);
+                Err(self.locate(err, trunc_at))
             }
             Err(e) => {
                 self.offset = None;
@@ -1614,6 +1703,197 @@ mod tests {
             }
             other => panic!("expected Io(UnexpectedEof) truncation, got {other:?}"),
         }
+    }
+
+    /// A header blob followed by one data blob, in memory.
+    fn one_block_pbf() -> Vec<u8> {
+        use crate::block_builder::{BlockBuilder, HeaderBuilder};
+        use crate::writer::{Compression, PbfWriter};
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut writer = PbfWriter::new(&mut buf, Compression::None);
+        writer
+            .write_header(&HeaderBuilder::new().build().expect("build header"))
+            .expect("write header");
+        let mut bb = BlockBuilder::new();
+        bb.add_node(1, 0, 0, std::iter::empty::<(&str, &str)>(), None);
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("block"))
+            .expect("write block");
+        writer.flush().expect("flush");
+        drop(writer);
+        buf
+    }
+
+    /// The second frame's start in [`one_block_pbf`] output.
+    fn second_frame_start(pbf: &[u8]) -> u64 {
+        let mut reader = BlobReader::new_seekable(Cursor::new(pbf)).unwrap();
+        reader.next().unwrap().unwrap();
+        reader.next().unwrap().unwrap().offset().unwrap().0
+    }
+
+    /// Reads succeed until `fail_at`, then fail with a non-EOF error; seeks
+    /// always fail. Drives the I/O-error branches no in-memory cursor can.
+    struct Failing {
+        data: Vec<u8>,
+        pos: usize,
+        fail_at: usize,
+    }
+
+    impl Read for Failing {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.fail_at {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            let end = self.fail_at.min(self.data.len()).min(self.pos + buf.len());
+            let n = end - self.pos;
+            buf[..n].copy_from_slice(&self.data[self.pos..end]);
+            self.pos = end;
+            Ok(n)
+        }
+    }
+
+    impl Seek for Failing {
+        fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+            Err(std::io::Error::from_raw_os_error(libc::ESPIPE))
+        }
+        fn stream_position(&mut self) -> std::io::Result<u64> {
+            Ok(self.pos as u64)
+        }
+    }
+
+    impl BlobReaderSource for Failing {}
+
+    /// An I/O error inside the 4-byte length prefix - on its first byte or
+    /// on the rest - is located at the frame start, like every other
+    /// framing error, not stripped of its offset.
+    #[test]
+    fn a_length_prefix_read_failure_is_located_at_the_frame_start() {
+        let pbf = one_block_pbf();
+        let frame = second_frame_start(&pbf);
+        for fail_at in [frame, frame + 2] {
+            let failing = Failing {
+                data: pbf.clone(),
+                pos: 0,
+                fail_at: usize::try_from(fail_at).unwrap(),
+            };
+            let mut reader = BlobReader::new_seekable(failing).unwrap();
+            reader.next().unwrap().unwrap();
+            let err = reader.next().unwrap().unwrap_err();
+            assert!(
+                matches!(err.kind(), crate::error::ErrorKind::Io(e) if e.raw_os_error() == Some(libc::EIO)),
+                "fail_at {fail_at}: {err}"
+            );
+            assert_eq!(
+                err.byte_offset(),
+                Some(ByteOffset(frame)),
+                "fail_at {fail_at}"
+            );
+            assert_eq!(err.blob_index(), Some(1), "fail_at {fail_at}");
+        }
+    }
+
+    /// A reader built with `BlobReader::new` knows no position, so its
+    /// truncation errors name no byte - neither in the text nor in the
+    /// location - rather than counting from an invented 0. The blob index
+    /// is still known and still reported.
+    #[test]
+    fn a_reader_with_no_position_names_no_offset_when_truncated() {
+        let pbf = one_block_pbf();
+        let frame = usize::try_from(second_frame_start(&pbf)).unwrap();
+        let header_len = u32::from_be_bytes(pbf[frame..frame + 4].try_into().unwrap()) as usize;
+        let header_cut = &pbf[..frame + 4 + header_len / 2];
+        let payload_cut = &pbf[..frame + 4 + header_len + 1];
+
+        let shape3 = {
+            let mut reader = BlobReader::new(Cursor::new(header_cut));
+            reader.next().unwrap().unwrap();
+            reader.next().unwrap().unwrap_err()
+        };
+        let shape4_read = {
+            let mut reader = BlobReader::new(Cursor::new(payload_cut));
+            reader.next().unwrap().unwrap();
+            reader.next().unwrap().unwrap_err()
+        };
+        let shape4_skip = {
+            let mut reader = BlobReader::new(Cursor::new(payload_cut));
+            reader.next_header_skip_blob().unwrap().unwrap();
+            reader.next_header_skip_blob().unwrap().unwrap_err()
+        };
+        for (name, err) in [
+            ("shape 3", shape3),
+            ("shape 4 read", shape4_read),
+            ("shape 4 skip", shape4_skip),
+        ] {
+            let text = err.to_string();
+            assert!(text.contains("truncated"), "{name}: {text}");
+            assert!(
+                !text.contains("offset") && !text.contains("at byte"),
+                "{name}: an unknown position must not be named: {text}"
+            );
+            assert_eq!(err.byte_offset(), None, "{name}");
+            assert_eq!(err.blob_index(), Some(1), "{name}");
+        }
+
+        // The same cut through a positioned reader still names the byte.
+        let mut reader = BlobReader::new_seekable(Cursor::new(payload_cut)).unwrap();
+        reader.next().unwrap().unwrap();
+        let err = reader.next().unwrap().unwrap_err();
+        let at = (frame + 4 + header_len + 1) as u64;
+        assert_eq!(err.byte_offset(), Some(ByteOffset(at)));
+        assert!(err.to_string().contains(&format!("at byte {at}")), "{err}");
+    }
+
+    /// `new_named` gives a caller-built reader the provenance of
+    /// `from_path`: the file and the byte offset, counted from 0.
+    #[test]
+    fn a_named_reader_locates_its_errors_in_the_named_file() {
+        let pbf = one_block_pbf();
+        let frame = usize::try_from(second_frame_start(&pbf)).unwrap();
+        let cut = &pbf[..pbf.len() - 1];
+        let path = std::path::Path::new("named.osm.pbf");
+        let mut reader = BlobReader::new_named(Cursor::new(cut), path);
+        assert_eq!(
+            reader.next().unwrap().unwrap().offset(),
+            Some(ByteOffset(0))
+        );
+        let err = reader.next().unwrap().unwrap_err();
+        assert_eq!(err.source_path(), Some(path));
+        assert_eq!(err.blob_index(), Some(1));
+        assert_eq!(err.byte_offset(), Some(ByteOffset(cut.len() as u64)));
+        assert!(frame < cut.len(), "the cut lands in the second frame");
+    }
+
+    /// A failed absolute seek reports its target even on a reader with no
+    /// path, and asking for a blob where the stream holds none names the
+    /// requested position.
+    #[test]
+    fn seek_failures_and_missing_blobs_keep_their_offset() {
+        let mut reader = BlobReader::new_seekable(Failing {
+            data: Vec::new(),
+            pos: 0,
+            fail_at: 0,
+        })
+        .unwrap();
+        let err = reader.seek(ByteOffset(7)).unwrap_err();
+        assert_eq!(err.byte_offset(), Some(ByteOffset(7)));
+        assert_eq!(err.source_path(), None);
+
+        let pbf = one_block_pbf();
+        let end = pbf.len() as u64;
+        let mut reader = BlobReader::new_seekable(Cursor::new(pbf)).unwrap();
+        let err = reader.blob_from_offset(ByteOffset(end)).unwrap_err();
+        assert!(err.to_string().contains("no blob"), "{err}");
+        assert_eq!(err.byte_offset(), Some(ByteOffset(end)));
+
+        // After a failed read, a valid frame at an explicit offset is still
+        // read, not reported as missing at that offset.
+        let pbf = one_block_pbf();
+        let mut reader = BlobReader::new_seekable(Cursor::new(&pbf[..pbf.len() - 1])).unwrap();
+        reader.next().unwrap().unwrap();
+        reader.next().unwrap().unwrap_err();
+        let header = reader.blob_from_offset(ByteOffset(0)).unwrap();
+        assert_eq!(header.get_type(), BlobType::OsmHeader);
     }
 
     #[test]

@@ -444,7 +444,7 @@ pub(crate) fn sort_to(
 
     crate::debug::emit_marker("SORT_FLUSH_START");
     // WAIT_WRITER spans the main thread's wait on the writer worker
-    // to drain the coalesced `copy_file_range` (or its uring / EXDEV
+    // to drain the coalesced `copy_file_range` (or its uring / userspace
     // fallback equivalent). On already-sorted input this is ~94 %
     // of wall, which `brokkr sidecar --durations` shows as the WAIT_WRITER
     // span (`--stalls` reads `*_wait_ns` counters, not marker pairs).

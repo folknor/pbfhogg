@@ -109,3 +109,21 @@ such a blob, or whether the gate should say the input cannot be indexed.
 
 Reported by: the re-encode and re-index advice check.
 
+## BUG-133 - A metadata-less node in a dense block deletes as `version="0"`
+
+Anger: 7 - derive-changes output; the root is the block builder.
+
+`BlockBuilder` (`backfill_default_dense_metadata` /
+`push_default_dense_metadata`) stores version 0 for a node without metadata
+in a dense block whose other nodes carry metadata, so the reader sees 0, and
+`derive.rs::extract_delete_info`'s `!= -1` filter lets it through:
+derive-changes emits `<node id=".." version="0"/>`, which
+`write_delete_element`'s own comment calls a claim the input never made. A way
+without metadata correctly gets no version. Sequential and parallel paths
+agree, so it is not drift. Seen on `cli_diff`'s sharded-equivalence fixture
+(node 65 there is excluded from the checks with a comment). Open: whether the
+builder should write the dense "absent" sentinel, or readers treat 0 as
+absent (OSM versions start at 1).
+
+Reported by: the diff helper dedupe.
+

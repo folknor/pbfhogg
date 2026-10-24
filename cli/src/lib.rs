@@ -4748,7 +4748,9 @@ fn bench_write_loop<W: std::io::Write>(
     // The leading OsmHeader is required like everywhere else: a zero-byte or
     // header-less file is the one missing-header error, not an empty run.
     drop(pbfhogg::ElementReader::open(path, false)?);
-    let reader = pbfhogg::BlobReader::new(BufReader::new(open_input(path)?))
+    // The same default-capacity BufReader this benchmark has always read
+    // through, named so its errors carry the file and byte offset.
+    let reader = pbfhogg::BlobReader::new_named(BufReader::new(open_input(path)?), path)
         .diagnostics(host.diagnostics.clone())
         .cancel(host.cancel.clone());
     let mut bb = BlockBuilder::new();
@@ -4758,7 +4760,12 @@ fn bench_write_loop<W: std::io::Write>(
 
     for blob_result in reader {
         let blob = blob_result?;
-        if let pbfhogg::BlobDecode::OsmData(block) = blob.decode()? {
+        // Decode errors carry no location of their own; the path is built
+        // only on that error path.
+        let decoded = blob
+            .decode()
+            .map_err(|e| blob.locate_error(Some(&std::sync::Arc::from(path)), e))?;
+        if let pbfhogg::BlobDecode::OsmData(block) = decoded {
             for el in block.elements() {
                 match el {
                     pbfhogg::Element::DenseNode(dn) => {

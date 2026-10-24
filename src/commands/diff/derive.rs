@@ -298,7 +298,9 @@ impl ChangeSink {
 
 /// Extract just id + metadata from a borrowed element for delete output.
 /// Avoids full owned conversion (no tag/ref cloning - deletes only need id + version).
-fn extract_delete_info(
+/// Shared by the sequential sink and the parallel shard workers, so both
+/// paths emit the same delete for the same element.
+pub(super) fn extract_delete_info(
     elem: &crate::Element<'_>,
     kind: ElementKind,
 ) -> Option<(&'static str, i64, Option<OwnedMetadata>)> {
@@ -368,41 +370,8 @@ fn derive_changes_block_pair(
     collect_phase_block_pair(&mut merge, ElementKind::Relation, sink)?;
     crate::debug::emit_marker("DERIVECHANGES_PHASE_REL_END");
 
-    emit_merge_stats_counters(&merge.stats);
+    super::emit_merge_stats_counters(&merge.stats);
     Ok(())
-}
-
-/// Emit `mergejoin_shadow_*` counters accumulated across all phases.
-/// Mirrors the helper in `diff/mod.rs` - both commands share
-/// `BlockPairMergeState` and benefit from the same shadow view.
-#[allow(clippy::cast_possible_wrap)]
-fn emit_merge_stats_counters(s: &crate::osc::merge_join::BlockPairMergeStats) {
-    crate::debug::emit_counter(
-        "mergejoin_shadow_pairs_byte_equal",
-        s.pairs_byte_equal as i64,
-    );
-    crate::debug::emit_counter(
-        "mergejoin_shadow_elements_byte_equal",
-        s.elements_byte_equal as i64,
-    );
-    crate::debug::emit_counter(
-        "mergejoin_shadow_pairs_overlapping_decoded",
-        s.pairs_overlapping_decoded as i64,
-    );
-    crate::debug::emit_counter(
-        "mergejoin_shadow_elements_overlapping_decoded",
-        s.elements_overlapping_decoded as i64,
-    );
-    crate::debug::emit_counter("mergejoin_shadow_blobs_old_only", s.blobs_old_only as i64);
-    crate::debug::emit_counter(
-        "mergejoin_shadow_elements_old_only",
-        s.elements_old_only as i64,
-    );
-    crate::debug::emit_counter("mergejoin_shadow_blobs_new_only", s.blobs_new_only as i64);
-    crate::debug::emit_counter(
-        "mergejoin_shadow_elements_new_only",
-        s.elements_new_only as i64,
-    );
 }
 
 /// Run one type phase of block-pair merge, streaming changed elements to temp files.
@@ -674,7 +643,10 @@ fn copy_section<W: Write>(
     Ok(())
 }
 
-fn write_delete_element<W: Write>(
+/// Write one `<node|way|relation id=".." [version=".."] [timestamp=".."]/>`
+/// delete entry. Shared by the sequential sink, the element-stream fallback
+/// and the parallel shard workers.
+pub(super) fn write_delete_element<W: Write>(
     writer: &mut Writer<W>,
     tag_name: &str,
     id: i64,

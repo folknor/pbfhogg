@@ -22,17 +22,16 @@ use crate::ElementKind;
 use crate::blob_meta::BlobIndex;
 use crate::error::Result;
 use crate::osc::merge_join::element_id;
-use crate::osc::write::{OwnedMetadata, write_element_xml};
+use crate::osc::write::write_element_xml;
 use crate::{Element, PrimitiveBlock};
 
-use super::derive::DeriveChangesStats;
+use super::derive::{DeriveChangesStats, extract_delete_info, write_delete_element};
 
 // Fault-injection hooks for tests. Gated behind the `static-test-hooks`
 // Cargo feature and `not(test)`: product builds and the library's own
 // unit-test harness never compile this module.
-// Mirror of `parallel::test_hooks`. Could unify in the future when
-// the shard planning infrastructure is hoisted into a shared
-// module (see the duplication note below).
+// Mirror of `parallel::test_hooks`; each driver keeps its own static so a
+// test can arm one without the other.
 #[cfg(all(feature = "static-test-hooks", not(test)))]
 pub mod test_hooks {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -484,70 +483,6 @@ fn emit_delete<W: Write>(
         return Ok(());
     };
     write_delete_element(writer, tag, id, meta.as_ref(), increment_version, timestamp)
-}
-
-fn extract_delete_info(
-    elem: &Element<'_>,
-    kind: ElementKind,
-) -> Option<(&'static str, i64, Option<OwnedMetadata>)> {
-    match (kind, elem) {
-        (ElementKind::Node, Element::DenseNode(dn)) => Some((
-            "node",
-            dn.id(),
-            dn.info()
-                .map(crate::dense::DenseNodeInfo::version)
-                .filter(|&v| v != -1)
-                .map(OwnedMetadata::version_only),
-        )),
-        (ElementKind::Node, Element::Node(n)) => Some((
-            "node",
-            n.id(),
-            n.info().version().map(OwnedMetadata::version_only),
-        )),
-        (ElementKind::Way, Element::Way(w)) => Some((
-            "way",
-            w.id(),
-            w.info().version().map(OwnedMetadata::version_only),
-        )),
-        (ElementKind::Relation, Element::Relation(r)) => Some((
-            "relation",
-            r.id(),
-            r.info().version().map(OwnedMetadata::version_only),
-        )),
-        _ => None,
-    }
-}
-
-fn write_delete_element<W: Write>(
-    writer: &mut Writer<W>,
-    tag_name: &str,
-    id: i64,
-    metadata: Option<&OwnedMetadata>,
-    increment_version: bool,
-    timestamp: Option<u64>,
-) -> crate::Result<()> {
-    use quick_xml::events::{BytesStart, Event};
-    let mut elem = BytesStart::new(tag_name);
-    let id_str = id.to_string();
-    elem.push_attribute(("id", id_str.as_str()));
-    // Emitted only when the source claimed a version. Absent is not
-    // zero, and `version="0"` on a delete is a claim the input never
-    // made.
-    if let Some(version) = metadata.and_then(|m| m.version) {
-        let version = if increment_version {
-            version.saturating_add(1)
-        } else {
-            version
-        };
-        let v_str = version.to_string();
-        elem.push_attribute(("version", v_str.as_str()));
-    }
-    if let Some(timestamp) = timestamp {
-        let ts = crate::commands::format_epoch_secs(i64::try_from(timestamp).unwrap_or(i64::MAX));
-        elem.push_attribute(("timestamp", ts.as_str()));
-    }
-    writer.write_event(Event::Empty(elem))?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -510,7 +510,6 @@ const fn round_up_to_page(n: usize) -> usize {
 /// so there is no user-space bounce buffer and no extra copy beyond what
 /// the kernel's read path already performs.
 #[cfg(feature = "linux-direct-io")]
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn handle_copy_range_uring(
     state: &mut UringState,
     input: &crate::read::input::InputFile,
@@ -536,37 +535,38 @@ fn handle_copy_range_uring(
         };
 
         let space = state.pool.buf_size - state.current_len;
-        let chunk = space.min(remaining as usize);
+        let chunk = space.min(super::copy_range::len_to_usize(remaining));
         // Safety: buf_idx is valid (acquired from pool), current_len is
         // within IO_BUF_BYTES, chunk <= remaining space, so dst is within the
         // buffer allocation.
         let dst = unsafe { state.pool.buf_ptr(buf_idx).add(state.current_len) };
 
+        // A short read is progress, as in every copy loop (the shared rules
+        // in `copy_range`): it fills the registered buffer at any byte count,
+        // because the input fd is an ordinary buffered one (no O_DIRECT
+        // alignment on `dst`, length or offset) and the alignment the
+        // O_DIRECT output needs is kept by `submit_current`, which fires only
+        // on a full buffer. A truncated input still fails: the next read
+        // returns 0.
         // Safety: dst points into a valid registered buffer of size IO_BUF_BYTES,
         // chunk <= remaining space in that buffer, and in_fd is a valid
         // readable file descriptor passed in from the caller.
-        let n = unsafe { libc::pread(in_fd, dst.cast::<libc::c_void>(), chunk, src_offset as i64) };
-        if n < 0 {
-            return Err(super::copy_range::read_error(
-                io::Error::last_os_error(),
-                input,
-                src_offset,
-            ));
-        }
-        if n.cast_unsigned() != chunk {
+        let n = unsafe { super::copy_range::pread_retrying(in_fd, dst, chunk, src_offset) }
+            .map_err(|err| super::copy_range::read_error(err, input, src_offset))?;
+        if n == 0 {
             return Err(super::copy_range::read_error(
                 io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    format!("io_uring CopyRange pread short: expected {chunk}, got {n}"),
+                    "io_uring CopyRange pread returned 0 inside the range",
                 ),
                 input,
                 src_offset,
             ));
         }
 
-        state.accept_buffered(chunk);
-        src_offset += chunk as u64;
-        remaining -= chunk as u64;
+        state.accept_buffered(n);
+        src_offset += n as u64;
+        remaining -= n as u64;
 
         if state.current_len == state.pool.buf_size {
             state.submit_current()?;

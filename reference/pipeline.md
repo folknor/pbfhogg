@@ -534,9 +534,9 @@ first-failure slot or a cross-thread channel carries the error itself.
   constructors only); they cannot catch every flattening. `src/error.rs` is the
   one file exempt, because it owns the constructors and the `io::Error`
   carrier.
-- Decisions that depend on an OS error (`copy_range` falling back to `pwrite`,
-  the parallel writer's `EXDEV` copy-range fallback and `EINTR` retry,
-  `sync_file` tolerating an
+- Decisions that depend on an OS error (both `copy_file_range` loops falling
+  back to userspace on the errnos `copy_range::kernel_copy_refused` names, the
+  shared `EINTR` retry in `copy_range::retry_eintr`, `sync_file` tolerating an
   unsupported fsync, classifying a failed `O_DIRECT` open) look at the original
   `io::Error` before it is converted. Once it is a `pbfhogg::Error`, the kind
   is the answer.

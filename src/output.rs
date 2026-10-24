@@ -749,6 +749,15 @@ fn noreplace_unsupported(e: &io::Error) -> bool {
 
 /// The filesystem cannot hard-link. `EPERM` is deliberately not on the
 /// list: it also means a permission problem, which must surface as one.
+///
+/// This is not the same decision as the passthrough copy's fallback set
+/// (`write::copy_range::kernel_copy_refused`), and the two lists are not
+/// meant to match. A refused `link(2)` ends publication with a typed
+/// refusal, so an errno on this list stops being reported as what it is;
+/// a refused `copy_file_range` instead retries the same bytes through
+/// `pread` + `write`, which surfaces any real permission or argument
+/// problem on its own. That is why the copy set can take `EPERM` and
+/// `EINVAL` and this one must not.
 fn link_unsupported(e: &io::Error) -> bool {
     if e.kind() == io::ErrorKind::Unsupported {
         return true;

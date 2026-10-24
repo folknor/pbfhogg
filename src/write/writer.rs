@@ -1443,8 +1443,8 @@ impl PbfWriter<FileWriter> {
                 .ok_or_else(|| {
                     Error::invalid_argument("copy_file_range incompatible with O_DIRECT output")
                 })?;
-            // `copy_range` decides on the original errno (EXDEV) before
-            // anything converts it.
+            // `copy_range` decides on the original errno (whether the
+            // userspace fallback takes over) before anything converts it.
             let result = copy_range(in_file, out_fd, offset, len, &self.cancel);
             if result.is_ok() {
                 self.mark_pending();

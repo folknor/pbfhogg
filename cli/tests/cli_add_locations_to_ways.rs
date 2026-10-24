@@ -1003,6 +1003,41 @@ fn altw_external_refuses_non_indexed_input() {
     );
 }
 
+/// An indexed input whose header does not claim Sort.Type_then_ID is refused
+/// by the external join as unsorted input: the file named, and the sort
+/// advice the CLI gives every unsorted refusal, not a bare invalid-data
+/// error.
+#[test]
+fn altw_external_refuses_an_unsorted_header_with_sort_advice() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("unsorted-header.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    let out = run_altw(&input, &output, true, IndexBackend::External, false);
+    let stderr = out.stderr_str();
+    assert!(
+        !out.status.success(),
+        "external must refuse; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("not sorted") && stderr.contains("Sort.Type_then_ID"),
+        "expected the unsorted refusal; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&input.display().to_string()),
+        "the refusal must name the file; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("pbfhogg sort"),
+        "expected the sort advice; stderr:\n{stderr}"
+    );
+    assert!(
+        !output.exists(),
+        "a refused run must publish no output file"
+    );
+}
+
 /// `--index-type dense` was removed (commit `b70dd8c`) after the
 /// rank-indexed flat sparse layout dominated dense at every measured
 /// scale. The parser must surface a clear migration hint pointing at

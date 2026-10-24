@@ -28,6 +28,15 @@ pub(crate) struct WriterMetrics {
     pub payload_raw_chunk_bytes: AtomicU64,
     pub payload_copy_range_items: AtomicU64,
     pub payload_copy_range_bytes: AtomicU64,
+    /// Passthrough ranges the kernel refused to `copy_file_range` (cross
+    /// filesystem, unsupported filesystem or kernel, seccomp, non-regular
+    /// output; see `copy_range::kernel_copy_refused`) and that were copied
+    /// through userspace instead. Non-zero on a planet run is a performance
+    /// cliff worth knowing about, not a failure.
+    pub copy_range_fallback_ranges: AtomicU64,
+    /// Bytes those ranges routed to the userspace fallback, counted when the
+    /// range is routed (a fallback that then fails is still counted).
+    pub copy_range_fallback_bytes: AtomicU64,
 
     pub buffered_write_calls: AtomicU64,
     pub buffered_write_bytes: AtomicU64,
@@ -99,6 +108,8 @@ impl WriterMetrics {
             payload_raw_chunk_bytes: AtomicU64::new(0),
             payload_copy_range_items: AtomicU64::new(0),
             payload_copy_range_bytes: AtomicU64::new(0),
+            copy_range_fallback_ranges: AtomicU64::new(0),
+            copy_range_fallback_bytes: AtomicU64::new(0),
             buffered_write_calls: AtomicU64::new(0),
             buffered_write_bytes: AtomicU64::new(0),
             direct_write_calls: AtomicU64::new(0),
@@ -240,6 +251,14 @@ impl WriterMetrics {
         emit!("writer_payload_raw_chunk_bytes", payload_raw_chunk_bytes);
         emit!("writer_payload_copy_range_items", payload_copy_range_items);
         emit!("writer_payload_copy_range_bytes", payload_copy_range_bytes);
+        emit!(
+            "writer_copy_range_fallback_ranges",
+            copy_range_fallback_ranges
+        );
+        emit!(
+            "writer_copy_range_fallback_bytes",
+            copy_range_fallback_bytes
+        );
 
         emit!("writer_buffered_write_calls", buffered_write_calls);
         emit!("writer_buffered_write_bytes", buffered_write_bytes);

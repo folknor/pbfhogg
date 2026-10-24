@@ -180,19 +180,24 @@ Reported by: re-encoding.
 
 Anger: 9 - diff core on a hot path.
 
-`diff/parallel.rs` and `diff/derive_parallel.rs` each define `BlobDesc`,
-`WalkedFile`, `walk_file`, `Shard`, `plan_shards`, `build_shard`,
-`pread_decode`, `Side`, `element_merge`, `kind_type_char`,
-`append_and_cleanup` and the driver. The equality predicate is no longer
-copied: every diff path, merge-join and `digest` call
-`crate::content::content_equal` (CORRECTNESS.md "Tag iterators end early..."
-describes it). `plan_shards` comments differ; `emit_merge_stats_counters` is
-duplicated between `diff/mod.rs` and `derive.rs`; `extract_delete_info` and
-`write_delete_element` between `derive.rs` and `derive_parallel.rs`. Because
-the CLI defaults `-j 0` to all cores, the parallel path is the default for
-indexed inputs and the sequential paths run only under `--verbose` or `-j 1`.
-Fix: one shared shard core; an equivalence test asserting byte-identical
-`-j1` and `-j8` output for diff and derive catches drift in any copy.
+Shard planning (`BlobDesc`, `WalkedFile`, `walk_file`, `Shard`,
+`plan_shards`, `build_shard`) lives once in `diff/shard.rs`, and the delete
+and merge-stats helpers have one owner each. `diff/parallel.rs` and
+`diff/derive_parallel.rs` still each carry `pread_decode`, `Side`,
+`element_merge`, `append_and_cleanup` and the driver loop, and
+`parallel.rs`'s `emit_element` / `emit_modified` copy `mod.rs`'s
+`write_compact_line` / `write_modified_line` (identical formatting, per
+element). The equality predicate is shared (`crate::content::content_equal`).
+Because the CLI defaults `-j 0` to all cores, the parallel path is the default
+for indexed inputs and the sequential paths run only under `--verbose` or
+`-j 1`. `cli_diff`'s `diff_sequential_and_sharded_output_byte_identical` and
+`derive_sequential_and_sharded_output_byte_identical` pin `-j1` against `-j8`
+(8 shards per kind) and fail on a shard-boundary drift. One known divergence
+they cannot see: the sequential merge (`osc/merge_join.rs`) decides a blob's
+leftover tail from what its iterator saw, the parallel copies from indexdata
+`max_id`, so an understated `max_id` could drop a tail on the parallel path
+only (within `shard.rs`'s "index claims are trusted" contract). Fix: one
+shared shard core.
 
 Reported by: re-encoding.
 
@@ -210,21 +215,9 @@ reimplements the EOF policy (1-3 trailing bytes tolerated), the datasize guard
 `parse_blob_header_with_index`"), the truncation messages (the "shape 3" /
 "shape 4" text is worded differently in `BlobReader` and `HeaderWalker`, and is
 jargon from `reference/truncation-handling.md` an operator cannot decode), and
-provenance stamping: `BlobReader` stamps path, blob index and offset except in
-its two length-prefix I/O-error branches (offset dropped); `HeaderWalker`
-stamps path and index but never the offset it holds as `frame_start`;
-`raw_frame.rs` returns `BoxResult` with no stamping, so `cat`, `extract`,
-`check --index` and `getid` raw paths report frame errors with no path or
-offset. `BlobReader`'s shape-4 errors use `self.offset.map_or(0, ..)`, so a
-reader built with `BlobReader::new` on a bare reader prints an invented "from
-offset 0"; `bench-write` (`bench_write_loop`) reads that way and names no
-file, the one gap in `cli_input_contract`'s payload-past-EOF table.
-`HeaderWalker` owns the payload-extent check; its `file_size` doc still
-invites callers to re-check before pread, which is how getparents' unchecked
-`+` duplicate and the unreachable reversed and negative-`max_id` checks in
-altw external's `max_node_id_from_blob_meta` came about (the latter's header-
-not-sorted refusal is also an unlocated `invalid_data`, not `new_unsorted`).
-Fix: one frame state machine over an abstract byte source (stream and
+provenance stamping, which now agrees: every decoder locates frame errors at
+the frame offset when it knows one and claims none when it does not;
+`raw_frame.rs` stamps path and offset but no blob index. Fix: one frame state machine over an abstract byte source (stream and
 pread-at-offset as two impls), returning a stamped `FrameHeader`. Enforce with
 a conformance test running every truncation shape through every source; the
 `blob.rs` test with `read_arm` / `skip_arm` / `walk_arm` is that test in
@@ -278,22 +271,18 @@ as the only loop with an `on_idle()` hook; a source-scan test that only
 
 Reported by: write path.
 
-## HYG-017 - `copy_file_range` and pread loops are written five times with three EINTR rules
+## HYG-017 - `copy_file_range` and pread loops are written five times
 
 Anger: 8 - I/O fallbacks, gating, alignment.
 
-`copy_range::copy_range` (implicit out offset), `parallel_writer::copy_range_to_fd`
-(explicit), fallbacks `copy_range_fallback` and `copy_range_fallback_pwrite`,
-and `uring_writer::handle_copy_range_uring`'s own pread loop. Diverged:
-`copy_range_fallback_pwrite` retries EINTR on pread, `copy_range_fallback` and
-the uring loop do not, neither `copy_file_range` loop does, and
-`DirectWriter::flush_buf` retries on write citing the pwrite fallback as
-precedent; copy_range loops on short pread, uring treats any short pread as a
-hard error; both fall back only on `EXDEV`, so `EINVAL`, `EOPNOTSUPP` and
-`ENOSYS` (FUSE, some NFS, older kernels) are hard errors; `copy_range` does
-`len as usize`, `copy_range_to_fd` uses `try_from(..).unwrap_or(usize::MAX)`.
-Fallback to userspace on `EXDEV` (a planet-scale performance cliff) is silent
-and uncounted. Fix: one module owning the syscall, retry rule and fallback set;
+The rules are now shared from `write/copy_range.rs` (`retry_eintr`,
+`pread_retrying`, `len_to_usize`, the one fallback decision
+`kernel_copy_refused`, the `writer_copy_range_fallback_*` counters), but the
+five loops are still five: `copy_range` (implicit out offset),
+`parallel_writer::copy_range_to_fd` (explicit), the fallbacks
+`copy_range_fallback` and `copy_range_fallback_pwrite`, and
+`uring_writer::handle_copy_range_uring`'s pread loop. Nothing stops a new raw
+loop bypassing the helpers. Fix: one module owning the loops too;
 `disallowed-methods` for `libc::pread`, `libc::copy_file_range`, `libc::write`
 elsewhere.
 
@@ -446,7 +435,9 @@ The parameter is taken and discarded in altw `stage1_way_pass(_direct_io)`,
 `collect_relation_member_ids` (every pread path, so the flag does nothing to
 reads in passes 0 and 1, stage 1 or stage 2), `sort::build_blob_index`
 (kept "for signature stability" in a private pre-1.0 function),
-`diff::parallel::diff_block_pair_parallel`,
+the parallel diff and derive paths (they pread through `HeaderWalker`, so
+`diff --direct-io` on indexed inputs with `-j` above 1 reads buffered, and
+the parameter is gone from them),
 `getid::parse_ids_from_pbf(_direct_io)` (the CLI threads `write.direct_io`
 into it), and `check_refs` (`let _ = direct_io;`). Extract's pread passes open
 buffered regardless (a comment explains alignment), `multi.rs` writes through

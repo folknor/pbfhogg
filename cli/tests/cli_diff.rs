@@ -1767,3 +1767,484 @@ fn diff_osc_output_is_gzip_whatever_its_name() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sequential vs parallel sharded equivalence
+// ---------------------------------------------------------------------------
+//
+// `-j 1` runs the sequential block-pair merge; `-j 8` runs the sharded
+// drivers, which reimplement that merge per ID-range shard. The two must
+// produce the same bytes. The fixture is laid out blob by blob so the
+// shard planner really splits every kind and the interesting cases sit on
+// shard boundaries.
+//
+// Shard count: the planner takes `n = min(-j, old blobs of the kind)` and
+// cuts after old blobs `k * len / n` for k in 1..n, at those blobs' maximum
+// IDs. 16 old node blobs and 16 old way blobs cut after blobs 2, 4, ..., 14
+// (1-based); 12 old relation blobs cut after blobs 2, 4, 5, 7, 8, 10, 11.
+// All maxima are distinct, so `-j 8` runs eight shards per kind:
+//   nodes      at 30, 50, 70, 90, 110, 130, 150
+//   ways       at 10, 20, 30, 40, 50, 60, 70
+//   relations  at 6, 12, 15, 21, 24, 30, 33
+
+/// One element kind's layout: every inner vector becomes one data blob.
+struct ShardFixture {
+    nodes: Vec<Vec<TestNode>>,
+    ways: Vec<Vec<TestWay>>,
+    relations: Vec<Vec<TestRelation>>,
+}
+
+fn shard_meta(version: i32) -> TestMeta {
+    TestMeta {
+        version,
+        ..TestMeta::default()
+    }
+}
+
+/// Node `id`, version 1 or (when `modified`) a moved version 2. Every 13th
+/// id carries no metadata, so deletes without a version are covered.
+fn shard_node(id: i64, modified: bool) -> TestNode {
+    let base = 1000 * i32::try_from(id % 10_000).unwrap();
+    TestNode {
+        id,
+        lat: base + i32::from(modified),
+        lon: base,
+        tags: if id % 7 == 0 {
+            vec![("amenity", "bench")]
+        } else {
+            vec![]
+        },
+        meta: (id % 13 != 0).then(|| shard_meta(if modified { 2 } else { 1 })),
+    }
+}
+
+/// Way `id`; every 11th carries no metadata.
+fn shard_way(id: i64, modified: bool) -> TestWay {
+    TestWay {
+        id,
+        refs: if modified {
+            vec![12 + id, 11 + id]
+        } else {
+            vec![11 + id, 12 + id]
+        },
+        tags: if modified {
+            vec![("highway", "primary")]
+        } else if id % 2 == 0 {
+            vec![("highway", "residential")]
+        } else {
+            vec![]
+        },
+        meta: (id % 11 != 0).then(|| shard_meta(if modified { 2 } else { 1 })),
+    }
+}
+
+fn shard_relation(id: i64, modified: bool) -> TestRelation {
+    let mut members = vec![
+        TestMember {
+            id: MemberId::Way(id),
+            role: "outer",
+        },
+        TestMember {
+            id: MemberId::Way(id + 1),
+            role: "outer",
+        },
+    ];
+    if modified {
+        members.push(TestMember {
+            id: MemberId::Node(id),
+            role: "label",
+        });
+    }
+    TestRelation {
+        id,
+        members,
+        tags: vec![("type", "multipolygon")],
+        meta: Some(shard_meta(if modified { 2 } else { 1 })),
+    }
+}
+
+/// A blob of `ids`, with `modified` ids at version 2 and changed content.
+fn shard_blob<T>(
+    ids: impl IntoIterator<Item = i64>,
+    modified: &[i64],
+    make: fn(i64, bool) -> T,
+) -> Vec<T> {
+    ids.into_iter()
+        .map(|id| make(id, modified.contains(&id)))
+        .collect()
+}
+
+fn without(range: std::ops::RangeInclusive<i64>, gone: &[i64]) -> Vec<i64> {
+    range.filter(|id| !gone.contains(id)).collect()
+}
+
+/// Old side: 16 node blobs of ids 11..=170 (51 and 105 absent), 16 way
+/// blobs of 1..=80 (33 absent), 12 relation blobs of 1..=36.
+fn shard_fixture_old() -> ShardFixture {
+    let nodes = (0..16)
+        .map(|b| {
+            let lo = 11 + 10 * b;
+            shard_blob(without(lo..=lo + 9, &[51, 105]), &[], shard_node)
+        })
+        .collect();
+    let ways = (0..16)
+        .map(|b| {
+            let lo = 1 + 5 * b;
+            shard_blob(without(lo..=lo + 4, &[33]), &[], shard_way)
+        })
+        .collect();
+    let relations = (0..12)
+        .map(|b| {
+            let lo = 1 + 3 * b;
+            shard_blob(lo..=lo + 2, &[], shard_relation)
+        })
+        .collect();
+    ShardFixture {
+        nodes,
+        ways,
+        relations,
+    }
+}
+
+/// New side. Per kind: untouched blobs, a lone interior delete in a blob
+/// whose neighbours are untouched, changes on and just above shard
+/// thresholds, a whole old blob gone, creates before the old minimum, in
+/// ID gaps and past the old maximum, and one re-chunked blob that spans
+/// several thresholds with changed and unchanged elements on both sides.
+fn shard_fixture_new() -> ShardFixture {
+    let nodes = vec![
+        shard_blob([5, 6].into_iter().chain(11..=20), &[], shard_node),
+        shard_blob(21..=30, &[], shard_node),
+        shard_blob(without(31..=40, &[35]), &[], shard_node),
+        shard_blob(41..=50, &[50], shard_node),
+        shard_blob(51..=60, &[], shard_node),
+        shard_blob(without(61..=70, &[65, 70]), &[], shard_node),
+        // Old 71..=80 is gone. 81..=130 spans thresholds 90, 110 and 130.
+        shard_blob(without(81..=130, &[100]), &[90, 111], shard_node),
+        shard_blob(131..=140, &[], shard_node),
+        shard_blob(141..=150, &[], shard_node),
+        shard_blob(151..=160, &[], shard_node),
+        shard_blob(161..=170, &[165], shard_node),
+        shard_blob((171..=175).chain([1000]), &[], shard_node),
+    ];
+    let ways = vec![
+        shard_blob(1..=5, &[], shard_way),
+        shard_blob(without(6..=10, &[8]), &[], shard_way),
+        shard_blob(11..=15, &[11], shard_way),
+        shard_blob(16..=19, &[], shard_way),
+        // Old 21..=25 is gone. 26..=45 spans thresholds 30 and 40.
+        shard_blob(26..=45, &[30], shard_way),
+        shard_blob(46..=50, &[], shard_way),
+        shard_blob(51..=55, &[], shard_way),
+        shard_blob(56..=60, &[], shard_way),
+        shard_blob(61..=65, &[63], shard_way),
+        shard_blob(66..=70, &[], shard_way),
+        shard_blob(71..=75, &[], shard_way),
+        shard_blob(76..=80, &[], shard_way),
+        shard_blob(81..=82, &[], shard_way),
+    ];
+    let relations = vec![
+        shard_blob(1..=3, &[], shard_relation),
+        shard_blob(4..=5, &[], shard_relation),
+        shard_blob(7..=9, &[8], shard_relation),
+        shard_blob(10..=12, &[], shard_relation),
+        // Old 13..=15 is gone. 16..=24 spans threshold 21 and ends on 24.
+        shard_blob(without(16..=24, &[18]), &[22], shard_relation),
+        shard_blob(25..=27, &[], shard_relation),
+        shard_blob(28..=30, &[], shard_relation),
+        shard_blob(31..=33, &[], shard_relation),
+        shard_blob(34..=36, &[], shard_relation),
+        shard_blob(37..=37, &[], shard_relation),
+    ];
+    ShardFixture {
+        nodes,
+        ways,
+        relations,
+    }
+}
+
+/// One kind's changed ids, ascending.
+struct ExpectedChanges {
+    kind: char,
+    created: Vec<i64>,
+    modified: Vec<i64>,
+    deleted: Vec<i64>,
+}
+
+/// The changes the two fixtures differ by, written out independently of
+/// either code path.
+fn shard_expected() -> [ExpectedChanges; 3] {
+    let mut node_deletes = vec![35, 65, 70];
+    node_deletes.extend(71..=80);
+    node_deletes.push(100);
+    let mut way_deletes = vec![8, 20];
+    way_deletes.extend(21..=25);
+    [
+        ExpectedChanges {
+            kind: 'n',
+            created: vec![5, 6, 51, 105, 171, 172, 173, 174, 175, 1000],
+            modified: vec![50, 90, 111, 165],
+            deleted: node_deletes,
+        },
+        ExpectedChanges {
+            kind: 'w',
+            created: vec![33, 81, 82],
+            modified: vec![11, 30, 63],
+            deleted: way_deletes,
+        },
+        ExpectedChanges {
+            kind: 'r',
+            created: vec![37],
+            modified: vec![8, 22],
+            deleted: vec![6, 13, 14, 15, 18],
+        },
+    ]
+}
+
+fn write_shard_fixture(path: &Path, fixture: &ShardFixture) {
+    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData, Metadata};
+    use pbfhogg::writer::{Compression, PbfWriter};
+
+    fn meta(m: Option<&TestMeta>) -> Option<Metadata<'static>> {
+        m.map(|m| Metadata {
+            version: m.version,
+            timestamp: m.timestamp,
+            changeset: m.changeset,
+            uid: m.uid,
+            user: m.user,
+            visible: m.visible,
+        })
+    }
+    fn end_blob(bb: &mut BlockBuilder, writer: &mut PbfWriter<std::io::BufWriter<std::fs::File>>) {
+        if let Some(bytes) = bb.take().expect("take") {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+    }
+
+    let file = std::fs::File::create(path).expect("create fixture");
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    let header = HeaderBuilder::new().sorted().build().expect("header");
+    writer.write_header(&header).expect("write header");
+    let mut bb = BlockBuilder::new();
+    for blob in &fixture.nodes {
+        for n in blob {
+            let m = meta(n.meta.as_ref());
+            bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), m.as_ref());
+        }
+        end_blob(&mut bb, &mut writer);
+    }
+    for blob in &fixture.ways {
+        for w in blob {
+            let m = meta(w.meta.as_ref());
+            bb.add_way(w.id, w.tags.iter().copied(), &w.refs, m.as_ref());
+        }
+        end_blob(&mut bb, &mut writer);
+    }
+    for blob in &fixture.relations {
+        for r in blob {
+            let members: Vec<MemberData<'_>> = r
+                .members
+                .iter()
+                .map(|m| MemberData {
+                    id: m.id,
+                    role: m.role,
+                })
+                .collect();
+            let m = meta(r.meta.as_ref());
+            bb.add_relation(r.id, r.tags.iter().copied(), &members, m.as_ref());
+        }
+        end_blob(&mut bb, &mut writer);
+    }
+    writer.flush().expect("flush");
+}
+
+/// Data blobs per kind as (nodes, ways, relations), read back from the
+/// file rather than trusted from the layout.
+fn data_blobs_per_kind(path: &Path) -> (usize, usize, usize) {
+    let mut counts = (0, 0, 0);
+    for blob in pbfhogg::BlobReader::from_path(path).expect("open fixture") {
+        let blob = blob.expect("read blob");
+        if !matches!(blob.get_type(), pbfhogg::BlobType::OsmData) {
+            continue;
+        }
+        let block = blob.to_primitiveblock().expect("decode blob");
+        match block.elements().next().expect("non-empty blob") {
+            pbfhogg::Element::DenseNode(_) | pbfhogg::Element::Node(_) => counts.0 += 1,
+            pbfhogg::Element::Way(_) => counts.1 += 1,
+            pbfhogg::Element::Relation(_) => counts.2 += 1,
+            _ => panic!("unexpected element kind in a data blob"),
+        }
+    }
+    counts
+}
+
+/// Build the fixture pair and pin that it is shaped to shard.
+fn write_shard_pair(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let old = dir.join("old.osm.pbf");
+    let new = dir.join("new.osm.pbf");
+    write_shard_fixture(&old, &shard_fixture_old());
+    write_shard_fixture(&new, &shard_fixture_new());
+    assert_indexed(&old);
+    assert_indexed(&new);
+    assert_eq!(
+        data_blobs_per_kind(&old),
+        (16, 16, 12),
+        "old fixture lost the blob layout the eight-shard plan relies on"
+    );
+    assert_eq!(data_blobs_per_kind(&new), (12, 13, 10));
+    (old, new)
+}
+
+/// The ids on `prefix` lines of kind `type_char` in diff text output.
+fn diff_line_ids(text: &str, prefix: char, type_char: char) -> Vec<i64> {
+    text.lines()
+        .filter_map(|line| {
+            let mut chars = line.chars();
+            if chars.next()? != prefix || chars.next()? != type_char {
+                return None;
+            }
+            let rest = chars.as_str();
+            let digits = rest.split(' ').next()?;
+            digits.parse().ok()
+        })
+        .collect()
+}
+
+#[test]
+fn diff_sequential_and_sharded_output_byte_identical() {
+    let dir = TempDir::new().expect("tempdir");
+    let (old, new) = write_shard_pair(dir.path());
+
+    for suppress_common in [false, true] {
+        let opts = |jobs| DiffOpts {
+            suppress_common,
+            jobs: Some(jobs),
+            ..DiffOpts::default()
+        };
+        let (text_seq, stats_seq) = run_diff(&old, &new, opts(1));
+        let (text_par, stats_par) = run_diff(&old, &new, opts(8));
+
+        let mut expected = DiffStats::default();
+        for ExpectedChanges {
+            kind,
+            created,
+            modified,
+            deleted,
+        } in shard_expected()
+        {
+            assert_eq!(
+                diff_line_ids(&text_seq, '+', kind),
+                created,
+                "{kind} creates"
+            );
+            assert_eq!(
+                diff_line_ids(&text_seq, '*', kind),
+                modified,
+                "{kind} modifies"
+            );
+            assert_eq!(
+                diff_line_ids(&text_seq, '-', kind),
+                deleted,
+                "{kind} deletes"
+            );
+            expected.created += created.len() as u64;
+            expected.modified += modified.len() as u64;
+            expected.deleted += deleted.len() as u64;
+        }
+        // 158 old nodes, 79 old ways, 36 old relations; everything neither
+        // modified nor deleted is common.
+        expected.common = 158 + 79 + 36 - expected.modified - expected.deleted;
+        assert_eq!(
+            stats_seq, expected,
+            "-c {suppress_common}: sequential stats"
+        );
+        assert_eq!(
+            diff_line_ids(&text_seq, ' ', 'n').len() as u64
+                + diff_line_ids(&text_seq, ' ', 'w').len() as u64
+                + diff_line_ids(&text_seq, ' ', 'r').len() as u64,
+            if suppress_common { 0 } else { expected.common },
+            "-c {suppress_common}: common lines"
+        );
+
+        assert_eq!(stats_seq, stats_par, "-c {suppress_common}: stats drift");
+        assert_eq!(
+            text_seq, text_par,
+            "-c {suppress_common}: -j 8 text diverges from -j 1"
+        );
+    }
+}
+
+#[test]
+fn derive_sequential_and_sharded_output_byte_identical() {
+    use std::io::Read as _;
+
+    let dir = TempDir::new().expect("tempdir");
+    let (old, new) = write_shard_pair(dir.path());
+
+    let derive = |jobs: usize, increment_version: bool| {
+        let osc = dir
+            .path()
+            .join(format!("j{jobs}-i{}.osc.gz", u8::from(increment_version)));
+        let mut cli = CliInvoker::new()
+            .arg("diff")
+            .arg("--format")
+            .arg("osc")
+            .arg("-o")
+            .arg(&osc)
+            .arg("-j")
+            .arg(jobs.to_string());
+        if increment_version {
+            cli = cli.arg("--increment-version");
+        }
+        let out = cli.arg(&old).arg(&new).run();
+        assert!(
+            out.status.success(),
+            "diff --format osc -j {jobs} failed; stderr:\n{}",
+            out.stderr_str()
+        );
+        let stderr = out.stderr_str();
+        assert!(
+            !stderr.contains("Using sequential comparison"),
+            "-j {jobs} fell back to the sequential path; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("49 changes: 14 creates, 9 modifies, 26 deletes"),
+            "-j {jobs} change counts; stderr:\n{stderr}"
+        );
+        let bytes = std::fs::read(&osc).expect("read osc");
+        let mut xml = String::new();
+        flate2::read::MultiGzDecoder::new(bytes.as_slice())
+            .read_to_string(&mut xml)
+            .expect("decompress osc");
+        (bytes, xml)
+    };
+
+    for increment_version in [false, true] {
+        let (gz_seq, xml_seq) = derive(1, increment_version);
+        let (gz_par, xml_par) = derive(8, increment_version);
+        assert_eq!(
+            xml_seq, xml_par,
+            "--increment-version {increment_version}: -j 8 XML diverges from -j 1"
+        );
+        assert!(
+            gz_seq == gz_par,
+            "--increment-version {increment_version}: identical XML, different gzip bytes"
+        );
+
+        // Deletes carry the old version (bumped under --increment-version)
+        // when the source had one, and no version attribute when it did not.
+        // Metadata-less node 65 is not checked: in a dense block whose other
+        // nodes carry metadata the block builder stores version 0 for it, so
+        // both paths read and emit a version it never had - an encoding
+        // question for the writer, not a sequential/parallel difference.
+        let v = if increment_version { 2 } else { 1 };
+        for want in [
+            format!("<node id=\"35\" version=\"{v}\"/>"),
+            format!("<node id=\"70\" version=\"{v}\"/>"),
+            "<way id=\"22\"/>".to_owned(),
+            format!("<relation id=\"6\" version=\"{v}\"/>"),
+        ] {
+            assert!(xml_seq.contains(&want), "missing {want} in:\n{xml_seq}");
+        }
+    }
+}

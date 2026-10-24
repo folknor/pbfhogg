@@ -826,6 +826,11 @@
 
 ### Added
 
+- **`BlobReader::new_named(reader, path)`** builds a streaming reader whose
+  errors name `path` and locate at byte offsets counted from the reader's
+  first byte, without requiring `Seek`. **`Blob::locate_error`** is public,
+  so a decode error on a blob can carry the same location.
+
 - **`BlobReader::cancel` and `ElementReader::cancel`** attach a
   `pbfhogg::host::Cancel` to a reader built by hand; it then stops with
   `ErrorKind::Cancelled` at the next blob once the token is tripped.
@@ -1005,6 +1010,24 @@
 
 ### Fixed
 
+- **Raw passthrough copies fall back to userspace wherever the kernel
+  refuses `copy_file_range`.** Only a cross-device copy (`EXDEV`) used to
+  fall back; on FUSE and some NFS mounts (`EOPNOTSUPP`), pre-4.5 kernels
+  (`ENOSYS`), container seccomp profiles (`EPERM`) and non-regular outputs
+  such as `/dev/null` (`EINVAL`) the run failed instead. The fallback is
+  taken only before any byte of a range has moved, never between two ends
+  that are the same file or onto an appending descriptor. Interrupted
+  reads, writes and copies are retried everywhere, and the io_uring copy
+  path accepts a short read instead of failing on it.
+- **Frame errors no longer invent an offset.** A `BlobReader` built with
+  `new` on a reader with no known position used to report truncation "from
+  offset 0"; it now names no offset. Its length-prefix read failures keep
+  the frame's offset, and a failed seek keeps its target.
+  `BlobReader::blob_from_offset` reads a valid frame after an earlier failed
+  read instead of reporting "no blob" there.
+- **`add-locations-to-ways --index-type external` on an input whose header
+  is not sorted** is the unsorted-input error naming the file, with the
+  CLI's sort advice.
 - **`add-locations-to-ways --index-type external` refuses indexdata ranges
   that contradict the sorted header.** Node blobs out of order or
   overlapping, under a header claiming `Sort.Type_then_ID`, used to surface

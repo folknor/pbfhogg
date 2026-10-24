@@ -289,11 +289,13 @@ impl HeaderWalker {
         &self.file
     }
 
-    /// Total file size captured at `open()` time. Callers can use this
-    /// to validate per-blob `data_offset + data_size <= file_size`
-    /// before handing a schedule to parallel pread workers, catching
-    /// truncation / corrupt-header cases up front rather than at
-    /// `read_exact_at`.
+    /// Total file size captured at `open()` time.
+    ///
+    /// The walk owns the payload-extent check: [`Self::next_header`] refuses
+    /// a frame whose declared payload runs past this size, located at that
+    /// frame, so every meta it returns already satisfies
+    /// `data_offset + data_size <= file_size`. Callers must not repeat the
+    /// check before a pread; a copy can only drift from the walk's.
     pub(crate) fn file_size(&self) -> u64 {
         self.file_size
     }

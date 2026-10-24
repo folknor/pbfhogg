@@ -276,14 +276,7 @@ const ROWS: &[Row] = &[
         ..row("check", "check --index", check_index)
     },
     row("bench-read", "bench-read", bench_read),
-    Row {
-        gaps: &[(
-            Prop::PayloadPastEof,
-            "reads through BlobReader::new on a bare reader, which knows neither \
-             the file nor where its frames start, so the error names neither",
-        )],
-        ..row("bench-write", "bench-write", bench_write)
-    },
+    row("bench-write", "bench-write", bench_write),
 ];
 
 fn out_pbf(c: &Ctx) -> PathBuf {

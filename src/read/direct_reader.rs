@@ -1,25 +1,25 @@
-//! O_DIRECT file reader with page-aligned buffering.
+//! O_DIRECT file reader with aligned buffering.
 //!
-//! [`DirectReader`] maintains a page-aligned internal buffer and reads in
-//! page-aligned chunks via `libc::read`. This bypasses the kernel page cache
-//! entirely, preventing cache pollution during planet-scale (80 GB+) PBF reads.
+//! [`DirectReader`] maintains an aligned internal buffer and reads in
+//! aligned chunks via `libc::read`, at the alignment `crate::direct_io`
+//! discovered for the file. This bypasses the kernel page cache entirely,
+//! preventing cache pollution during planet-scale (80 GB+) PBF reads.
 
 use std::alloc::{self, Layout};
 use std::fs::File;
 use std::io::{self, Read};
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::NonNull;
 
 use crate::error::{Error, Result};
-use crate::write::{IO_BUF_BYTES, PAGE_SIZE};
+use crate::write::IO_BUF_BYTES;
 
 // ---------------------------------------------------------------------------
-// AlignedReadBuffer - page-aligned heap allocation for reads
+// AlignedReadBuffer - aligned heap allocation for reads
 // ---------------------------------------------------------------------------
 
-/// A page-aligned byte buffer for O_DIRECT reads.
+/// An aligned byte buffer for O_DIRECT reads.
 struct AlignedReadBuffer {
     ptr: NonNull<u8>,
     layout: Layout,
@@ -34,9 +34,9 @@ struct AlignedReadBuffer {
 unsafe impl Send for AlignedReadBuffer {}
 
 impl AlignedReadBuffer {
-    /// Allocate a new buffer of `capacity` bytes aligned to `PAGE_SIZE`.
-    fn new(capacity: usize) -> Result<Self> {
-        let layout = Layout::from_size_align(capacity, PAGE_SIZE)
+    /// Allocate a new buffer of `capacity` bytes aligned to `align`.
+    fn new(capacity: usize, align: usize) -> Result<Self> {
+        let layout = Layout::from_size_align(capacity, align)
             .map_err(|e| Error::internal_with("invalid aligned read buffer layout", e))?;
         // Safety: layout has non-zero size (IO_BUF_BYTES > 0).
         let ptr = unsafe { alloc::alloc(layout) };
@@ -76,8 +76,10 @@ impl AlignedReadBuffer {
     fn fill_from(&mut self, fd: i32) -> io::Result<usize> {
         self.pos = 0;
         self.len = 0;
-        // Safety: ptr is page-aligned, capacity is a multiple of PAGE_SIZE,
-        // and fd is open with O_DIRECT.
+        // Safety: ptr is aligned to the file's alignment, capacity is a
+        // multiple of it, and fd is open with O_DIRECT. The fd offset is
+        // aligned too: `DirectReader::fill` never reads past a regular
+        // file's final short read, and `skip` seeks to aligned offsets only.
         let n = unsafe { libc::read(fd, self.ptr.as_ptr().cast(), self.capacity()) };
         if n < 0 {
             return Err(io::Error::last_os_error());
@@ -100,18 +102,31 @@ impl Drop for AlignedReadBuffer {
 
 /// A file reader that bypasses the page cache using `O_DIRECT`.
 ///
-/// All reads from the underlying file descriptor use a page-aligned buffer
-/// and page-aligned sizes. Data is served from the internal buffer, which
-/// is refilled via `libc::read` when exhausted.
+/// All reads from the underlying file descriptor use an aligned buffer,
+/// aligned sizes and aligned offsets, at the file's direct I/O alignment.
+/// Data is served from the internal buffer, which is refilled via
+/// `libc::read` when exhausted.
 pub struct DirectReader {
     file: File,
     buf: AlignedReadBuffer,
+    /// The direct I/O alignment `crate::direct_io` discovered for `file`: a
+    /// power of two dividing the buffer capacity.
+    align: usize,
     /// Whether we've hit EOF on the underlying fd.
     eof: bool,
     /// File length captured once at open. Input files are read-only for the
     /// reader's lifetime, so `skip` validates an aligned target against this
     /// instead of paying an `fstat` per skip.
     file_len: u64,
+    /// Where `fill` stops instead of issuing a read at the unaligned offset
+    /// the final short read left: `file_len` for a regular file, unbounded
+    /// otherwise, because a block device's metadata length is zero whatever
+    /// its capacity and its reads must still reach the device.
+    read_limit: u64,
+    /// The fd's file offset: the byte just past the data in `buf`. Advanced
+    /// by every successful fill and set by every successful seek, so the
+    /// logical position is `fd_pos - buf.remaining()`.
+    fd_pos: u64,
 }
 
 impl DirectReader {
@@ -139,25 +154,22 @@ impl DirectReader {
         #[allow(clippy::cast_possible_truncation)] // buffered <= buf capacity (usize)
         self.buf.consume(buffered as usize);
 
-        // `stream_position` returns the fd's absolute offset after the
-        // last aligned read, i.e. the byte immediately past the end of
-        // the data in `self.buf`. After the `consume(buffered)` above
-        // the buffer is logically at `current_pos - 0`, so adding
-        // `past_buf` gives the absolute target. Load-bearing: if this
-        // is ever refactored to use a non-page-aligned reader, the
-        // `current_pos` meaning shifts and the arithmetic below breaks.
+        // `fd_pos` is the byte immediately past the end of the data in
+        // `self.buf`. After the `consume(buffered)` above the buffer is
+        // logically at `fd_pos - 0`, so adding `past_buf` gives the
+        // absolute target.
         use std::io::{Seek, SeekFrom};
-        let current_pos = self.file.stream_position()?;
-        let target = current_pos + past_buf;
-        let aligned = target & !(PAGE_SIZE as u64 - 1);
+        let target = self.fd_pos + past_buf;
+        let aligned = target & !(self.align as u64 - 1);
         self.file.seek(SeekFrom::Start(aligned))?;
+        self.fd_pos = aligned;
 
         if aligned < target {
             // Refill buffer from the aligned position, then skip the gap.
-            // gap < PAGE_SIZE, so it always fits in usize.
+            // gap < align <= buffer capacity, so it always fits in usize.
             #[allow(clippy::cast_possible_truncation)]
             let gap = (target - aligned) as usize;
-            let filled = self.buf.fill_from(self.file.as_raw_fd())?;
+            let filled = self.fill()?;
             if filled < gap {
                 self.eof = true;
                 return Err(io::Error::new(
@@ -183,31 +195,49 @@ impl DirectReader {
         Ok(())
     }
 
+    /// Refill the buffer from the fd, tracking the fd offset. At or past
+    /// `read_limit` it returns 0 without a syscall: the final short read left
+    /// the fd at an unaligned offset, and a direct read there is not one the
+    /// alignment contract allows. A short read before the limit is not
+    /// guessed to be EOF; the next fill issues its read as before.
+    fn fill(&mut self) -> io::Result<usize> {
+        if self.fd_pos >= self.read_limit {
+            self.buf.pos = 0;
+            self.buf.len = 0;
+            return Ok(0);
+        }
+        let filled = self.buf.fill_from(self.file.as_raw_fd())?;
+        self.fd_pos += filled as u64;
+        Ok(filled)
+    }
+
     /// Open a file for reading with `O_DIRECT`.
     ///
-    /// A filesystem that refuses `O_DIRECT` at open fails with
+    /// A filesystem that refuses `O_DIRECT` at open, or whose reported
+    /// alignment the buffers cannot keep, fails with
     /// `ErrorKind::PlatformUnsupported` (feature `direct-io`).
     pub fn open(path: &Path) -> Result<Self> {
-        // The O_DIRECT open `crate::read::input` has no flag for; the error
-        // names the path just below, as the input helpers do.
-        #[allow(clippy::disallowed_methods)]
-        let opened = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(path);
-        let file = opened.map_err(|e| crate::error::direct_io_open_error_at(path, e))?;
-        let file_len = file
-            .metadata()
-            .map_err(|e| {
-                crate::Error::from(e).context(format!("failed to stat {}", path.display()))
-            })?
-            .len();
-        let buf = AlignedReadBuffer::new(IO_BUF_BYTES)?;
+        // Ordinary failures name the path in the caller (`FileReader::direct`),
+        // as the input helpers do; a platform refusal already names it.
+        let (file, align) = crate::direct_io::open_for_read(path)?;
+        let metadata = file.metadata().map_err(|e| {
+            crate::Error::from(e).context(format!("failed to stat {}", path.display()))
+        })?;
+        let file_len = metadata.len();
+        let read_limit = if metadata.is_file() {
+            file_len
+        } else {
+            u64::MAX
+        };
+        let buf = AlignedReadBuffer::new(IO_BUF_BYTES, align)?;
         Ok(Self {
             file,
             buf,
+            align,
             eof: false,
             file_len,
+            read_limit,
+            fd_pos: 0,
         })
     }
 }
@@ -230,7 +260,7 @@ impl Read for DirectReader {
             return Ok(0);
         }
 
-        let filled = self.buf.fill_from(self.file.as_raw_fd())?;
+        let filled = self.fill()?;
         if filled == 0 {
             self.eof = true;
             return Ok(0);
@@ -253,12 +283,14 @@ mod tests {
 
     #[test]
     fn aligned_read_buffer_basics() {
-        let buf = AlignedReadBuffer::new(PAGE_SIZE * 4).unwrap();
+        // Above the floor, so the test shows the buffer honours the alignment
+        // it is handed rather than a fixed page size.
+        const ALIGN: usize = crate::direct_io::DIO_ALIGN_FLOOR * 4;
+        let buf = AlignedReadBuffer::new(ALIGN * 4, ALIGN).unwrap();
         assert_eq!(buf.len, 0);
         assert_eq!(buf.pos, 0);
-        assert_eq!(buf.capacity(), PAGE_SIZE * 4);
+        assert_eq!(buf.capacity(), ALIGN * 4);
         assert_eq!(buf.remaining(), 0);
-        // Verify page alignment.
-        assert_eq!(buf.ptr.as_ptr() as usize % PAGE_SIZE, 0);
+        assert_eq!(buf.ptr.as_ptr() as usize % ALIGN, 0);
     }
 }

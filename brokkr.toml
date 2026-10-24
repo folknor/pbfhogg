@@ -1134,6 +1134,19 @@ exclude = ["src/host.rs"]
 region = "code"
 message = "Host probes must use Resources at the original program point"
 
+# Direct I/O must keep the alignment the file's device and filesystem
+# require, which `src/direct_io.rs` discovers at open (statx) and hands the
+# backend with the file. An `O_DIRECT` open anywhere else would skip that and
+# assume an alignment. Matching the identifier, not one call spelling,
+# also catches a flags variable built elsewhere.
+[[textlint]]
+name = "o-direct-opens-through-direct-io"
+pattern = '\bO_DIRECT\b'
+paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+exclude = ["src/direct_io.rs"]
+region = "code"
+message = "O_DIRECT files open through crate::direct_io (create_for_write, open_for_read), which also returns the alignment their I/O must keep"
+
 [[textlint]]
 name = "no-env-read"
 pattern = '\benv::(?:var|var_os|vars|vars_os)\b'

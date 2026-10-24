@@ -1081,6 +1081,16 @@
 
 ### Fixed
 
+- **`--direct-io` and `--io-uring` keep the alignment the device requires.**
+  Direct I/O assumed 4096-byte alignment everywhere, so on a device or
+  filesystem requiring more (a block device with a logical block size above
+  4 KiB) the open succeeded and the first transfer failed with a bare
+  `Invalid argument`. The alignment is now read per file from `statx`
+  (`STATX_DIOALIGN`, Linux 6.1+, glibc builds) and used when it exceeds
+  4096; every host requiring 4096 or less, or not reporting, does exactly the
+  I/O it did before. A reported alignment the 256 KiB direct I/O buffers
+  cannot keep (not a power of two, or larger than the buffer) is refused at
+  open as `platform feature direct-io unavailable` (exit 3).
 - **The sequential `diff` refuses blobs out of order within a kind instead
   of answering wrongly.** The sequential block-pair merge (`diff -j 1`,
   `-v`, every run on input holding negative IDs, and the sequential

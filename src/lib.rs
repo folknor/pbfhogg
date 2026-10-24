@@ -177,6 +177,8 @@ pub(crate) mod coord_pack;
 // FIFO through `debug::initialize_marker_fifo`; the library never reads
 // `BROKKR_MARKER_FIFO` itself.
 pub mod debug;
+// The one owner of `O_DIRECT` opens and of the alignment direct I/O keeps.
+pub(crate) mod direct_io;
 pub(crate) mod elapsed;
 mod element_kind;
 mod error;

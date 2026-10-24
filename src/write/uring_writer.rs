@@ -3,7 +3,7 @@
 //! Replaces the buffered sink used by
 //! [`super::pipeline::writer_thread`] with an io_uring submission loop. Uses
 //! `O_DIRECT` + `WriteFixed` with pre-registered
-//! page-aligned buffers for maximum throughput when the pipeline is I/O-bound
+//! aligned buffers for maximum throughput when the pipeline is I/O-bound
 //! (e.g. `Compression::None` on erofs).
 //!
 //! Data is accumulated into 256 KB registered buffers (same strategy as
@@ -24,7 +24,6 @@ use io_uring::types::Fixed;
 use std::alloc::{self, Layout};
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::ptr::NonNull;
@@ -32,7 +31,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{Receiver, SyncSender};
 
 use super::metrics::WRITER_METRICS;
-use super::{PAGE_SIZE, alloc_page_aligned};
+use crate::direct_io::{alloc_aligned_zeroed, round_up};
 
 use crate::elapsed::elapsed_ns_u64;
 
@@ -85,19 +84,25 @@ const fn ud_expected_len(ud: u64) -> u32 {
 // [`ud_buf_idx`]; widening the pool means widening that mask.
 
 // ---------------------------------------------------------------------------
-// AlignedBufferPool - contiguous page-aligned allocation with free-list
+// AlignedBufferPool - contiguous aligned allocation with free-list
 // ---------------------------------------------------------------------------
 
-/// A pool of page-aligned buffers for io_uring registered I/O.
+/// A pool of aligned buffers for io_uring registered I/O.
 ///
-/// Allocates a single contiguous block of `count × buf_size` bytes, page-aligned.
-/// Each buffer is addressed by index (0..count). A free-list tracks which indices
-/// are available for use.
+/// Allocates a single contiguous block of `count × buf_size` bytes, aligned
+/// to the output file's direct I/O alignment. `buf_size` is a multiple of
+/// that alignment, so every buffer starts aligned too. Each buffer is
+/// addressed by index (0..count). A free-list tracks which indices are
+/// available for use.
 struct AlignedBufferPool {
     base: NonNull<u8>,
     layout: Layout,
     count: u16,
     buf_size: usize,
+    /// The direct I/O alignment `crate::direct_io` discovered for the output
+    /// file: a power of two dividing `buf_size`. Every `WriteFixed` address,
+    /// offset and length is a multiple of it.
+    align: usize,
     free: VecDeque<u16>,
 }
 
@@ -106,10 +111,16 @@ struct AlignedBufferPool {
 unsafe impl Send for AlignedBufferPool {}
 
 impl AlignedBufferPool {
-    /// Allocate `count` page-aligned buffers of `buf_size` bytes each.
-    fn new(count: u16, buf_size: usize) -> Result<Self> {
+    /// Allocate `count` buffers of `buf_size` bytes each, aligned to `align`
+    /// (a power of two dividing `buf_size`).
+    fn new(count: u16, buf_size: usize, align: usize) -> Result<Self> {
+        if !align.is_power_of_two() || !buf_size.is_multiple_of(align) {
+            return Err(Error::internal(
+                "io_uring buffer size is not a multiple of the direct I/O alignment",
+            ));
+        }
         let total = buf_size * count as usize;
-        let (base, layout) = alloc_page_aligned(total)?;
+        let (base, layout) = alloc_aligned_zeroed(total, align)?;
         let mut free = VecDeque::with_capacity(count as usize);
         for i in 0..count {
             free.push_back(i);
@@ -119,6 +130,7 @@ impl AlignedBufferPool {
             layout,
             count,
             buf_size,
+            align,
             free,
         })
     }
@@ -174,7 +186,7 @@ struct UringState {
     current_buf: Option<u16>,
     /// Bytes filled in the current buffer.
     current_len: usize,
-    /// Physical write offset (always advances by page-aligned amounts).
+    /// Physical write offset (always advances by multiples of the alignment).
     write_offset: u64,
     /// Bytes accepted into registered buffers, excluding alignment padding.
     /// Updated only by `accept_buffered` after bytes have been copied/read.
@@ -247,7 +259,7 @@ impl UringState {
 
     /// Submit a registered buffer as a `WriteFixed` SQE.
     ///
-    /// Handles O_DIRECT page-alignment padding, advances `write_offset` and
+    /// Handles O_DIRECT alignment padding, advances `write_offset` and
     /// `in_flight`. Releases the buffer immediately if `data_len` is zero.
     /// Does **not** update `logical_size`: `accept_buffered` already counted
     /// payload bytes, and alignment padding must never contribute.
@@ -258,9 +270,9 @@ impl UringState {
             return Ok(());
         }
 
-        // Pad to page boundary for O_DIRECT. Zero-fill the padding region
-        // (buffer memory may have stale data from a previous use).
-        let aligned_len = round_up_to_page(data_len);
+        // Pad to the file's alignment for O_DIRECT. Zero-fill the padding
+        // region (buffer memory may have stale data from a previous use).
+        let aligned_len = round_up(data_len, self.pool.align);
         if aligned_len > data_len {
             // Safety: buf_idx is valid and not in-flight, padding is within
             // the buffer allocation (aligned_len <= buf_size).
@@ -478,31 +490,26 @@ impl Drop for UringState {
     }
 }
 
-/// Round `n` up to the next multiple of `PAGE_SIZE`.
-const fn round_up_to_page(n: usize) -> usize {
-    (n + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
-}
-
 // ---------------------------------------------------------------------------
 // CopyRange handling
 // ---------------------------------------------------------------------------
 
 /// Handle a `CopyRange` payload by `pread`ing input bytes directly into the
 /// current registered buffer, letting the normal accumulator submit full
-/// buffers via `submit_current` (always page-aligned, always safe).
+/// buffers via `submit_current` (always aligned, always safe).
 ///
 /// The previous design used linked `ReadFixed` → `WriteFixed` SQE chains to
 /// keep the data path fully async, but that submitted a `WriteFixed` whose
-/// length was `round_up_to_page(copy_len)` on every CopyRange call. When
-/// `copy_len` was not a multiple of `PAGE_SIZE`, the write padded out to the
-/// next page boundary on disk while `logical_size` tracked only the real
+/// length was `copy_len` rounded up to the alignment on every CopyRange call.
+/// When `copy_len` was not a multiple of the alignment, the write padded out
+/// to the next aligned boundary on disk while `logical_size` tracked only the real
 /// data bytes. The result: mid-stream zero-filled gaps in the output that
 /// `set_len(logical_size)` could not remove (the gaps were inside the file,
 /// not at the end). Readers saw `OSMHeader` followed by nulls where the next
 /// `OSMData` blob header should have been.
 ///
 /// The buffered path below preserves the writer's core invariant: mid-stream
-/// `WriteFixed` SQEs are always `IO_BUF_BYTES` (page-aligned) because
+/// `WriteFixed` SQEs are always `IO_BUF_BYTES` (a multiple of the alignment) because
 /// `submit_current` only fires when `current_len == IO_BUF_BYTES`; only the
 /// final flush_final SQE is partial, and its trailing zero-padding is then
 /// truncated by `set_len`.
@@ -581,7 +588,7 @@ fn handle_copy_range_uring(
 // ---------------------------------------------------------------------------
 
 /// io_uring writer thread: receives framed blobs via channel and writes them
-/// to disk using io_uring `WriteFixed` with registered page-aligned buffers.
+/// to disk using io_uring `WriteFixed` with registered aligned buffers.
 ///
 /// Opens the output file with `O_DIRECT`, creates an io_uring instance,
 /// registers the fd and buffer pool. Init errors are sent back via `init_tx`
@@ -657,9 +664,11 @@ fn uring_init_and_run(
     finish: super::Finish,
     cancel: &crate::host::Cancel,
 ) -> Result<()> {
-    // Step 1: Allocate buffer pool.
-    let pool = AlignedBufferPool::new(NUM_BUFS, IO_BUF_BYTES)?;
-    let iovecs = pool.iovecs();
+    // Step 1: Declare the buffer pool. It is allocated in step 3, once the
+    // output file has reported its direct I/O alignment, but declared here
+    // so that locals still drop ring first, pool second (as `UringState`'s
+    // field order does) on an error return before the state is built.
+    let pool: AlignedBufferPool;
 
     // Step 2: Create io_uring ring.
     let mut builder = IoUring::builder();
@@ -690,17 +699,12 @@ fn uring_init_and_run(
     // Step 2b: Probe supported opcodes for clear error messages on old kernels.
     require_write_fixed(&ring)?;
 
-    // Step 3: Open file with O_DIRECT.
-    // The io_uring backend's create, at the path its owner (an `Output`'s
-    // staging path, or a path constructor's caller) chose.
-    #[allow(clippy::disallowed_methods)]
-    let opened = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path);
-    let file = opened.map_err(crate::error::direct_io_open_error)?;
+    // Step 3: Open file with O_DIRECT, after the ring refusals above so they
+    // precede file creation, then allocate the pool at the alignment the
+    // file reported.
+    let (file, align) = crate::direct_io::create_for_write(path)?;
+    pool = AlignedBufferPool::new(NUM_BUFS, IO_BUF_BYTES, align)?;
+    let iovecs = pool.iovecs();
 
     // Step 4: Register the output fd so `WriteFixed` can reference it by slot.
     ring.submitter()
@@ -884,13 +888,15 @@ mod tests {
 
     #[test]
     fn aligned_buffer_pool_basics() {
-        let mut pool = AlignedBufferPool::new(4, PAGE_SIZE * 2).unwrap();
-        // Verify page alignment.
-        assert_eq!(pool.buf_ptr(0) as usize % PAGE_SIZE, 0);
-        assert_eq!(pool.buf_ptr(1) as usize % PAGE_SIZE, 0);
+        // Above the floor, so the test shows the pool honours the alignment
+        // it is handed rather than a fixed page size.
+        const ALIGN: usize = crate::direct_io::DIO_ALIGN_FLOOR * 4;
+        let mut pool = AlignedBufferPool::new(4, ALIGN * 2, ALIGN).unwrap();
+        assert_eq!(pool.buf_ptr(0) as usize % ALIGN, 0);
+        assert_eq!(pool.buf_ptr(1) as usize % ALIGN, 0);
         // Buffers are distinct.
         let diff = unsafe { pool.buf_ptr(1).offset_from(pool.buf_ptr(0)) };
-        assert_eq!(diff, (PAGE_SIZE * 2).cast_signed());
+        assert_eq!(diff, (ALIGN * 2).cast_signed());
         // Free-list.
         assert_eq!(pool.acquire(), Some(0));
         assert_eq!(pool.acquire(), Some(1));
@@ -902,11 +908,10 @@ mod tests {
     }
 
     #[test]
-    fn round_up_to_page_correctness() {
-        assert_eq!(round_up_to_page(0), 0);
-        assert_eq!(round_up_to_page(1), PAGE_SIZE);
-        assert_eq!(round_up_to_page(PAGE_SIZE), PAGE_SIZE);
-        assert_eq!(round_up_to_page(PAGE_SIZE + 1), PAGE_SIZE * 2);
+    fn pool_refuses_a_buffer_size_off_its_alignment() {
+        let floor = crate::direct_io::DIO_ALIGN_FLOOR;
+        assert!(AlignedBufferPool::new(2, floor * 3, floor * 2).is_err());
+        assert!(AlignedBufferPool::new(2, floor * 3, floor * 3).is_err());
     }
 
     #[test]

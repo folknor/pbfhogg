@@ -118,7 +118,7 @@ xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 serde_json = { workspace = true, optional = true }
 s2 = { version = "0.2.0", default-features = false, optional = true }
 io-uring = { version = "0.7.13", optional = true }
-libc = "0.2.186"
+libc = "0.2.189"
 
 
 [dev-dependencies]

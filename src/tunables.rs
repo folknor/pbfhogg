@@ -224,9 +224,12 @@ pub(crate) const NOFILE_PROBE_FAILED_ASSUMED_SOFT: u64 = 1024;
 // Write path
 // ---------------------------------------------------------------------------
 
-/// Shared buffered and aligned I/O transfer size.
+/// Shared buffered and aligned I/O transfer size. Every direct backend reads
+/// and writes in whole buffers of this size, so it bounds the direct I/O
+/// alignment a file may require (a larger one is refused at open; see
+/// `crate::direct_io`).
 pub(crate) const IO_BUF_BYTES: usize = 256 * 1024;
-const _: () = assert!(IO_BUF_BYTES.is_multiple_of(crate::write::PAGE_SIZE));
+const _: () = assert!(IO_BUF_BYTES.is_multiple_of(crate::direct_io::DIO_ALIGN_FLOOR));
 
 /// Default per-block element cap used by `BlockBuilder::new`.
 ///

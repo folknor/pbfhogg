@@ -143,6 +143,25 @@ The judgement calls already known, to be checked first:
   - `WireBlobHeader::parse` refuses a known field with the wrong wire type
     under every retention flag, so a header some read paths used to accept
     is refused everywhere.
+- O_DIRECT alignment is discovered per open (`src/direct_io.rs`, statx
+  `STATX_DIOALIGN`) with a 4096 floor, so every host that reports 4096 or
+  less, or nothing, keeps byte-identical I/O; only a larger requirement
+  changes buffer alignment, tail padding and skip arithmetic. Judgement calls
+  on measured paths, none measured:
+  - One `statx` per direct reader or writer open (several per run on cat,
+    extract and geocode paths, never per blob or worker).
+  - A reported alignment that is not a power of two or exceeds
+    `IO_BUF_BYTES` is a new `direct-io` platform refusal (exit 3) at open.
+  - The io_uring pool is now allocated after the output open instead of
+    before ring creation (binding declared first, so drop order is kept).
+  - `DirectReader` tracks its fd offset: `skip` uses it instead of a
+    `stream_position` syscall, and a regular file's final fill stops at
+    `file_len` instead of issuing a read at the unaligned offset the last
+    short read left (block devices keep reading to the device's EOF).
+  - The library's `libc` minimum went to 0.2.189 for
+    `stx_dio_read_offset_align`; the lockfile was already there.
+  - The io_uring path could not be run end to end here (the bench host's
+    `RLIMIT_MEMLOCK` refuses it, see ADR-0014); only unit tests cover it.
 
 ---
 
@@ -578,6 +597,13 @@ linux-direct-io feature", exit 2) depends on whether the command happens to
 open a reader with the flag set: `check --ids --direct-io` is refused,
 `check --refs --direct-io` runs and ignores it.
 
+Even an honoured open can be silently buffered: `statx(STATX_DIOALIGN)`
+reports zero alignment for a file whose filesystem falls back to buffered
+I/O (ext4 `data=journal`, inline-data or verity files; f2fs files whose
+writes are forced buffered). `src/direct_io.rs` treats that as "nothing
+reported" and keeps the 4096 floor, since the run stays correct; whether
+`--direct-io` should say so, or refuse, belongs with this entry.
+
 Fix: remove the parameters, and have the CLI refuse or say so where a command
 honours the flag on some passes only, so `--direct-io` help can say what it
 affects; regenerate the matrix from a per-command table in code (read passes
@@ -621,23 +647,6 @@ using the `evict_calls` call-count trick.
 
 Reported by: write path, read path, altw and scanning, re-encoding, change
 application.
-
-## HYG-039 - O_DIRECT alignment is a hardcoded 4096 and the O_DIRECT open is spelled three times
-
-Anger: 8 - I/O fallbacks, gating, alignment.
-
-`PAGE_SIZE = 4096` is "universally safe across Linux filesystems" on both the
-read and write sides. The real requirement is the device and filesystem DIO
-alignment that Linux reports via `statx(STATX_DIOALIGN)` (6.1+), which can be
-512 or larger than 4096; on a mismatching host the open succeeds and the first
-write fails with an unexplained `EINVAL`, and `DirectReader::skip` arithmetic
-assumes 4096 too. `DirectWriter::create`, `uring_init_and_run` and
-`read/direct_reader.rs` each build the same
-`OpenOptions::new()...custom_flags(libc::O_DIRECT)`. Fix: detect via `statx`
-with 4096 as fallback; one `open_direct_for_write`; a text rule on
-`custom_flags(libc::O_DIRECT)` outside it.
-
-Reported by: read path, write path.
 
 ## HYG-047 - Code aborts on caller-controlled input where a refusal was owed
 

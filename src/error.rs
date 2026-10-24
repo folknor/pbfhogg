@@ -1158,7 +1158,9 @@ impl fmt::Display for Message<'_> {
 /// at open are the filesystem refusing direct I/O (tmpfs, some overlay and
 /// network filesystems); every other errno stays an ordinary I/O failure.
 /// Only the open is classified this way: an `EINVAL` from a later read or
-/// write is an alignment bug, never a platform refusal.
+/// write is an alignment bug, never a platform refusal. (An alignment the
+/// file reports and the buffers cannot keep is refused at open, by
+/// `crate::direct_io`, before any transfer.)
 #[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
 pub(crate) fn direct_io_open_error(error: io::Error) -> Error {
     if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP)) {

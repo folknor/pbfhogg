@@ -1,7 +1,8 @@
-//! O_DIRECT file writer with page-aligned buffering.
+//! O_DIRECT file writer with aligned buffering.
 //!
-//! [`DirectWriter`] maintains a page-aligned internal buffer and flushes in
-//! page-aligned chunks via `libc::write`. On final flush, writes the padded
+//! [`DirectWriter`] maintains an aligned internal buffer and flushes in
+//! aligned chunks via `libc::write`, at the alignment `crate::direct_io`
+//! discovered for the file. On final flush, writes the padded
 //! tail and calls `ftruncate` to trim to the actual byte count. This bypasses
 //! the kernel page cache entirely, preventing cache pollution during
 //! planet-scale (80 GB+) PBF writes.
@@ -9,19 +10,19 @@
 use std::alloc::{self, Layout};
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::NonNull;
 
+use super::IO_BUF_BYTES;
 use super::copy_range::{retry_eintr, syscall_result};
-use super::{IO_BUF_BYTES, PAGE_SIZE, alloc_page_aligned};
+use crate::direct_io::{alloc_aligned_zeroed, round_up};
 
 // ---------------------------------------------------------------------------
-// AlignedBuffer - page-aligned heap allocation
+// AlignedBuffer - aligned heap allocation
 // ---------------------------------------------------------------------------
 
-/// A page-aligned byte buffer for O_DIRECT I/O.
+/// An aligned byte buffer for O_DIRECT I/O.
 struct AlignedBuffer {
     ptr: NonNull<u8>,
     layout: Layout,
@@ -33,9 +34,9 @@ struct AlignedBuffer {
 unsafe impl Send for AlignedBuffer {}
 
 impl AlignedBuffer {
-    /// Allocate a new buffer of `capacity` bytes aligned to `PAGE_SIZE`.
-    fn new(capacity: usize) -> io::Result<Self> {
-        let (ptr, layout) = alloc_page_aligned(capacity)?;
+    /// Allocate a new buffer of `capacity` bytes aligned to `align`.
+    fn new(capacity: usize, align: usize) -> io::Result<Self> {
+        let (ptr, layout) = alloc_aligned_zeroed(capacity, align)?;
         Ok(Self {
             ptr,
             layout,
@@ -69,7 +70,8 @@ impl AlignedBuffer {
         self.len += data.len();
     }
 
-    /// Zero-fill from `self.len` up to `new_len`. Used for padding the final page.
+    /// Zero-fill from `self.len` up to `new_len`. Used for padding the final
+    /// aligned block.
     fn zero_pad_to(&mut self, new_len: usize) {
         debug_assert!(new_len <= self.capacity());
         if new_len > self.len {
@@ -99,12 +101,16 @@ impl Drop for AlignedBuffer {
 
 /// A file writer that bypasses the page cache using `O_DIRECT`.
 ///
-/// All writes to the underlying file descriptor are page-aligned in address,
-/// offset, and size. The final partial page is zero-padded and written, then
-/// `ftruncate` trims the file to the actual byte count.
+/// All writes to the underlying file descriptor are aligned in address,
+/// offset, and size to the file's direct I/O alignment. The final partial
+/// block is zero-padded and written, then `ftruncate` trims the file to the
+/// actual byte count.
 pub struct DirectWriter {
     file: File,
     buf: AlignedBuffer,
+    /// The direct I/O alignment `crate::direct_io` discovered for `file`: a
+    /// power of two dividing the buffer capacity.
+    align: usize,
     /// Total logical bytes written (for ftruncate at the end).
     logical_size: u64,
     /// Whether flush_final has already been called.
@@ -116,21 +122,15 @@ impl DirectWriter {
     ///
     /// A filesystem that refuses `O_DIRECT` at open fails with
     /// `ErrorKind::PlatformUnsupported` (feature `direct-io`).
+    /// A file whose reported alignment the buffers cannot keep is refused the
+    /// same way.
     pub fn create(path: &Path) -> crate::Result<Self> {
-        // The O_DIRECT backend's create, at the path its owner (an `Output`'s
-        // staging path, or a path constructor's caller) chose.
-        #[allow(clippy::disallowed_methods)]
-        let opened = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(path);
-        let file = opened.map_err(crate::error::direct_io_open_error)?;
-        let buf = AlignedBuffer::new(IO_BUF_BYTES)?;
+        let (file, align) = crate::direct_io::create_for_write(path)?;
+        let buf = AlignedBuffer::new(IO_BUF_BYTES, align)?;
         Ok(Self {
             file,
             buf,
+            align,
             logical_size: 0,
             flushed: false,
         })
@@ -145,8 +145,10 @@ impl DirectWriter {
             // A signal delivered mid-write is not a write failure: the shared
             // `EINTR` rule in `copy_range` retries it.
             let n = retry_eintr(|| {
-                // Safety: buf.as_ptr() is page-aligned, total is a multiple of
-                // PAGE_SIZE (ensured by callers), and the fd is open for writing.
+                // Safety: the range lies inside the buffer and the fd is open
+                // for writing. The first write is aligned (buffer address,
+                // fd offset and `total` are multiples of `align`, the last
+                // ensured by callers).
                 syscall_result(unsafe {
                     libc::write(fd, self.buf.as_ptr().add(written).cast(), total - written)
                 })
@@ -157,12 +159,18 @@ impl DirectWriter {
                 return Err(io::Error::from(io::ErrorKind::WriteZero));
             }
             written += n;
+            // A short write that stopped off an aligned boundary makes the
+            // retry of the remainder misaligned. It is still issued, on
+            // purpose: a filesystem with a buffered fallback for misaligned
+            // direct writes (btrfs) completes it correctly, and a strict one
+            // refuses it with `EINVAL`, which surfaces as this flush's error.
+            // Refusing here instead would fail the first case for nothing.
         }
         self.buf.clear();
         Ok(())
     }
 
-    /// Final flush: pad the remaining data to a page boundary, write it,
+    /// Final flush: pad the remaining data to an aligned boundary, write it,
     /// then truncate the file to the actual logical size.
     fn flush_final(&mut self) -> io::Result<()> {
         if self.flushed {
@@ -171,8 +179,8 @@ impl DirectWriter {
         self.flushed = true;
 
         if self.buf.len > 0 {
-            // Round up to the next page boundary.
-            let aligned = (self.buf.len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            // Round up to the next aligned boundary.
+            let aligned = round_up(self.buf.len, self.align);
             self.buf.zero_pad_to(aligned);
             self.flush_buf()?;
         }
@@ -192,8 +200,9 @@ impl DirectWriter {
 
 impl Write for DirectWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        // `flush` is final for this type: it pads the buffer to a page,
-        // writes it, and `ftruncate`s the file back to the logical size.
+        // `flush` is final for this type: it pads the buffer to an aligned
+        // block, writes it, and `ftruncate`s the file back to the logical
+        // size.
         // The fd offset is then past zero padding that the truncation just
         // removed, so anything written afterwards would land after a
         // mid-file zero gap - readers see nulls where a BlobHeader belongs -
@@ -248,22 +257,23 @@ impl Drop for DirectWriter {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::direct_io::DIO_ALIGN_FLOOR;
 
     #[test]
     fn aligned_buffer_basics() {
-        let mut buf = AlignedBuffer::new(PAGE_SIZE * 4).unwrap();
+        const ALIGN: usize = DIO_ALIGN_FLOOR;
+        let mut buf = AlignedBuffer::new(ALIGN * 4, ALIGN).unwrap();
         assert_eq!(buf.len, 0);
-        assert_eq!(buf.capacity(), PAGE_SIZE * 4);
-        assert_eq!(buf.remaining(), PAGE_SIZE * 4);
-        // Verify page alignment.
-        assert_eq!(buf.as_ptr() as usize % PAGE_SIZE, 0);
+        assert_eq!(buf.capacity(), ALIGN * 4);
+        assert_eq!(buf.remaining(), ALIGN * 4);
+        assert_eq!(buf.as_ptr() as usize % ALIGN, 0);
 
         buf.extend(&[1, 2, 3, 4, 5]);
         assert_eq!(buf.len, 5);
-        assert_eq!(buf.remaining(), PAGE_SIZE * 4 - 5);
+        assert_eq!(buf.remaining(), ALIGN * 4 - 5);
 
-        buf.zero_pad_to(PAGE_SIZE);
-        assert_eq!(buf.len, PAGE_SIZE);
+        buf.zero_pad_to(ALIGN);
+        assert_eq!(buf.len, ALIGN);
 
         buf.clear();
         assert_eq!(buf.len, 0);
@@ -286,7 +296,8 @@ mod tests {
         let path = dir.path().join("direct.bin");
         let mut w = DirectWriter {
             file: File::create(&path).unwrap(),
-            buf: AlignedBuffer::new(IO_BUF_BYTES).unwrap(),
+            buf: AlignedBuffer::new(IO_BUF_BYTES, DIO_ALIGN_FLOOR).unwrap(),
+            align: DIO_ALIGN_FLOOR,
             logical_size: 0,
             flushed: false,
         };

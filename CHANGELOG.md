@@ -1005,6 +1005,16 @@
 
 ### Fixed
 
+- **`add-locations-to-ways --index-type external` refuses indexdata ranges
+  that contradict the sorted header.** Node blobs out of order or
+  overlapping, under a header claiming `Sort.Type_then_ID`, used to surface
+  as "node references could not be resolved" (or zeroed coordinates under
+  `--ignore-missing-nodes`); they are now the unsorted-input error, located
+  at the offending blob, before any join work. The same scan refuses way
+  and relation blobs out of order and a node blob whose range holds
+  negative IDs, which the external join cannot handle (the sparse index
+  can). Ranges are exact by contract, so a file whose indexdata overstates
+  `max_id` is refused too.
 - **`diff -j 1` and `diff -v` no longer need a writable current
   directory.** A text diff whose command line guarantees the sequential path
   makes no scratch directory, so it runs from a read-only directory and no

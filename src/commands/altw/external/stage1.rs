@@ -524,10 +524,12 @@ pub(super) fn stage1_pass_a(
 /// Replaces the historical 82 GB `coords_by_rank` file. No decompression
 /// happens here - for each node blob we read its indexdata `(min_id, max_id)`
 /// Stage 2 partitions this slice by `[min_id, max_id]` to find blobs
-/// that intersect each id bucket; the ranges are non-overlapping and
-/// monotonic in id because the input PBF is sorted by node id.
+/// that intersect each id bucket. The ranges are well-formed, non-negative
+/// and in non-decreasing id order (equal boundaries allowed) because
+/// `blob_meta::scan_blob_metadata` refused the input otherwise; that scan
+/// is the trust boundary, so nothing is re-checked here.
 #[hotpath::measure]
-pub(super) fn build_node_blob_mapping(blob_meta: &[BlobMeta]) -> Result<Vec<NodeBlobInfo>> {
+pub(super) fn build_node_blob_mapping(blob_meta: &[BlobMeta]) -> Vec<NodeBlobInfo> {
     crate::debug::emit_marker("EXTJOIN_S1_NODE_MAP_START");
     let t0 = std::time::Instant::now();
 
@@ -536,17 +538,6 @@ pub(super) fn build_node_blob_mapping(blob_meta: &[BlobMeta]) -> Result<Vec<Node
     for meta in blob_meta {
         if !matches!(meta.kind, crate::ElementKind::Node) {
             continue;
-        }
-        // Reject malformed indexdata at the trust boundary - a blob
-        // whose metadata advertises max_id < min_id is a producer bug
-        // and stage 2's id-range partition would otherwise consume
-        // some other blob's records as if they belonged here.
-        if meta.max_id < meta.min_id {
-            return Err(Error::invalid_data(format!(
-                "altw stage 1: blob at data_offset={} has reversed \
-                 indexdata range [min_id={}, max_id={}]",
-                meta.data_offset, meta.min_id, meta.max_id,
-            )));
         }
         mapping.push(NodeBlobInfo {
             data_offset: meta.data_offset,
@@ -562,7 +553,7 @@ pub(super) fn build_node_blob_mapping(blob_meta: &[BlobMeta]) -> Result<Vec<Node
         crate::debug::emit_counter("s1_node_map_build_ms", t0.elapsed().as_millis() as i64);
     }
     crate::debug::emit_marker("EXTJOIN_S1_NODE_MAP_END");
-    Ok(mapping)
+    mapping
 }
 
 /// Stage 1 entry point: pass A + node-blob mapping construction.
@@ -669,7 +660,7 @@ pub(super) fn stage1_way_pass(
     )?;
 
     // Build the per-blob mapping (header-only walk - no decompression).
-    let node_blob_mapping = build_node_blob_mapping(blob_meta)?;
+    let node_blob_mapping = build_node_blob_mapping(blob_meta);
 
     Ok(Stage1Output {
         total_slots: total_refs,

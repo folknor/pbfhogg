@@ -1229,6 +1229,11 @@ enum Command {
     ///
     /// Input must be sorted. Negative IDs (JOSM editor-local staging
     /// identifiers) are rejected - they must be resolved before renumbering.
+    ///
+    /// Unlike the other commands, the --compression default here is zlib:1
+    /// (the measured external-renumber write path), not zlib:6. An explicit
+    /// `--compression zlib` or `zlib:6` also yields level 1; any other
+    /// value is honoured as given.
     Renumber {
         /// Input PBF file (must be sorted)
         file: PathBuf,

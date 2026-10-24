@@ -129,7 +129,8 @@ thread_local! {
 ///
 /// Allocates fresh buffers - use only for one-off calls (e.g. header framing).
 /// For hot-path data blocks, use `frame_blob_into` (pipelined) or
-/// `write_framed_blob` (sync) which reuse scratch buffers.
+/// `write_framed_blob` (sync), which reuse scratch buffers through
+/// `frame_in_scratch`.
 pub(crate) fn frame_blob(
     blob_type: &str,
     uncompressed: &[u8],
@@ -177,6 +178,7 @@ pub(crate) fn frame_blob_pipelined(
 /// Compress and frame a blob using reusable scratch buffers.
 ///
 /// Returns owned buffers suitable for sending through a pipeline channel.
+/// The framing itself is [`frame_in_scratch`]; this adds the hand-off.
 ///
 /// # Per-call cost
 ///
@@ -220,6 +222,66 @@ pub(super) fn frame_blob_into(
     way_members: Option<&[u8]>,
     scratch: &mut FrameScratch,
 ) -> Result<FramedBlobParts> {
+    let prefix = frame_in_scratch(
+        blob_type,
+        uncompressed,
+        compression,
+        indexdata,
+        tagdata,
+        way_members,
+        scratch,
+    )?
+    .prefix;
+
+    // Swap out, do not clone. A plain `swap` would leave the scratch holding
+    // empty Vecs that re-grow from zero on every subsequent blob, which is why
+    // this used to clone; `take_with_capacity` preserves the warmed capacity
+    // for ordinary blocks, while the retention cap lets outliers warm up again
+    // on demand. The two per-blob memcpys stay gone.
+    let header = FrameScratch::take_with_capacity(&mut scratch.header_buf, &mut scratch.header_cap);
+    let blob = FrameScratch::take_with_capacity(&mut scratch.blob_buf, &mut scratch.blob_cap);
+    Ok(FramedBlobParts {
+        prefix,
+        header,
+        blob,
+    })
+}
+
+/// A blob framed in place: the three wire parts, the header and body still
+/// borrowed from the [`FrameScratch`] that produced them.
+pub(super) struct ScratchFrame<'a> {
+    /// The 4-byte big-endian `BlobHeader` length.
+    pub(super) prefix: [u8; 4],
+    pub(super) header: &'a [u8],
+    pub(super) blob: &'a [u8],
+}
+
+/// Compress and frame a blob into `scratch.header_buf` / `scratch.blob_buf`,
+/// leaving both in place. The one owner of the framing rules - size limits,
+/// header encoding and the `compress_ns` / `frame_ns` / `bytes_framed`
+/// metrics - for both write paths, which differ only in what they do with
+/// the result:
+///
+/// - [`frame_blob_into`] (pipelined, and `frame_blob`) swaps the two buffers
+///   out, because the parts cross a channel to the writer thread.
+/// - `PbfWriter::write_framed_blob` (sync) writes the parts straight from the
+///   scratch, so after warmup it allocates nothing per blob. Routing it
+///   through `frame_blob_into` would cost it the two replacement buffers
+///   `take_with_capacity` installs on every call.
+///
+/// On an error return, oversize retained buffers have been trimmed (except
+/// after the two integer-conversion checks, which the format limits checked
+/// before them make unreachable; the caller's or the next call's trim covers
+/// them).
+pub(super) fn frame_in_scratch<'a>(
+    blob_type: &str,
+    uncompressed: &[u8],
+    compression: &Compression,
+    indexdata: Option<&[u8]>,
+    tagdata: Option<&[u8]>,
+    way_members: Option<&[u8]>,
+    scratch: &'a mut FrameScratch,
+) -> Result<ScratchFrame<'a>> {
     let t_compress = std::time::Instant::now();
     scratch.trim_oversize_retained_buffers();
     if let Err(error) = encode_blob_body(uncompressed, compression, scratch) {
@@ -263,9 +325,9 @@ pub(super) fn frame_blob_into(
         scratch.trim_oversize_retained_buffers();
         return Err(error);
     }
-    // `compress_buf` is not handed off, so drop an outlier before the next
-    // blob can reuse this thread-local scratch. If header encoding failed
-    // above, the next call's entry trim handles it instead.
+    // `compress_buf` is never handed off, so drop an outlier before the next
+    // blob can reuse this scratch. The error returns above ran the full trim
+    // already.
     scratch.trim_oversize_compress_buffer();
 
     let header_len = u32::try_from(scratch.header_buf.len()).map_err(|_| {
@@ -281,18 +343,10 @@ pub(super) fn frame_blob_into(
     WRITER_METRICS
         .bytes_framed
         .fetch_add(total_len as u64, Relaxed);
-
-    // Swap out, do not clone. A plain `swap` would leave the scratch holding
-    // empty Vecs that re-grow from zero on every subsequent blob, which is why
-    // this used to clone; `take_with_capacity` preserves the warmed capacity
-    // for ordinary blocks, while the retention cap lets outliers warm up again
-    // on demand. The two per-blob memcpys stay gone.
-    let header = FrameScratch::take_with_capacity(&mut scratch.header_buf, &mut scratch.header_cap);
-    let blob = FrameScratch::take_with_capacity(&mut scratch.blob_buf, &mut scratch.blob_cap);
-    Ok(FramedBlobParts {
+    Ok(ScratchFrame {
         prefix: header_len.to_be_bytes(),
-        header,
-        blob,
+        header: &scratch.header_buf,
+        blob: &scratch.blob_buf,
     })
 }
 
@@ -317,7 +371,7 @@ pub(super) fn frame_blob_into(
 /// This is the sibling of `encode_blob_header_fields`, where the opposite rule
 /// holds: there the optional hint fields are genuinely optional and absence is
 /// meaningful. Here absence is not a spelling of anything.
-pub(super) fn encode_blob_body(
+fn encode_blob_body(
     uncompressed: &[u8],
     compression: &Compression,
     scratch: &mut FrameScratch,

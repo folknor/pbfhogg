@@ -406,12 +406,12 @@ fn cat_rejects_oversized_header_length() {
     );
 }
 
-/// `build_classify_schedule*` rejects a schedule entry whose blob
-/// body extends past EOF, rather than accepting the entry and then
-/// failing at `read_exact_at` in a pread worker much later. The fix
-/// adds an explicit `meta.data_offset + meta.data_size <= file_size`
-/// check in both schedule builders. This test drives the check via
-/// `check_refs`, which routes through `build_classify_schedules_split`.
+/// A schedule builder never accepts an entry whose blob body extends
+/// past EOF, to fail later at `read_exact_at` in a pread worker: the
+/// `HeaderWalker` every builder walks with refuses the frame first,
+/// naming the file and the frame's byte offset. Driven through
+/// `check_refs`, which routes through `build_classify_schedules_split`;
+/// `cli_input_contract` pins the same refusal for every command.
 #[cfg(feature = "commands")]
 #[test]
 fn check_refs_rejects_schedule_entry_past_eof() {
@@ -431,10 +431,6 @@ fn check_refs_rejects_schedule_entry_past_eof() {
     let truncated = &full[..full.len() - 20];
     std::fs::write(&input, truncated).unwrap();
 
-    // `check --refs` routes through `build_classify_schedules_split`.
-    // Pre-fix: the schedule gets built cleanly, workers fail later
-    // with an opaque `read_exact_at` UnexpectedEof. Post-fix: the
-    // schedule builder catches the mismatch up front.
     let opts = pbfhogg::check::refs::CheckRefsOptions {
         check: pbfhogg::check::CheckOptions {
             max_errors: 0,
@@ -449,17 +445,17 @@ fn check_refs_rejects_schedule_entry_past_eof() {
         Err(e) => e,
     };
     let msg = format!("{err}");
-    // Pre-fix: schedule built cleanly, workers later failed with opaque
-    // `read_exact_at` UnexpectedEof. Post-truncation-alignment: the
-    // `HeaderWalker` payload-extent check fires up front (shape 4 per
-    // `reference/truncation-handling.md`), so the schedule never gets
-    // built. Either error class is acceptable - both pin "truncation
-    // hard-errors before workers see corrupt bytes".
+    // Shape 4 per `reference/truncation-handling.md`, refused by the walk
+    // itself, so the schedule never gets built.
+    let frame_start = crate::common::adversarial::locate_blobs(&full)
+        .last()
+        .expect("fixture has frames")
+        .frame_start;
     assert!(
-        msg.contains("data_size")
-            || msg.contains("file is only")
-            || msg.contains("blob payload truncated"),
-        "expected schedule-builder or walker truncation error, got: {msg}",
+        msg.contains("blob payload truncated")
+            && msg.contains(&input.display().to_string())
+            && msg.contains(&format!("at byte offset {frame_start}")),
+        "expected the walker's located truncation error, got: {msg}",
     );
 }
 

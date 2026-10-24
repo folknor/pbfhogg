@@ -244,7 +244,7 @@ These osmium flags have no pbfhogg equivalent:
 | `--force` | Most commands | Run without indexdata (slower fallback) |
 | `--direct-io` | Most commands | Bypass page cache via O_DIRECT |
 | `--io-uring` | apply-changes, cat --dedupe, sort | io_uring output I/O |
-| `--compression` | Most write commands | `none`, `zlib` (default), `zstd`, with optional level (`zlib:9`) |
+| `--compression` | Most write commands | `none`, `zlib` (default; `renumber` defaults to `zlib:1`), `zstd`, with optional level (`zlib:9`) |
 | `--generator` | Most write commands | Set writing program name in output header |
 | `--output-header` | Most write commands | Set replication header fields |
 | `--json` | inspect, check | Machine-readable output |

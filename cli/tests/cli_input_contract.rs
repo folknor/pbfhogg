@@ -87,6 +87,11 @@ impl Fx {
         let mut twice = bytes[..blobs[0].blob_end].to_vec();
         twice.extend_from_slice(&bytes);
         std::fs::write(p.join("two-headers.osm.pbf"), twice).unwrap();
+        // The same file cut halfway through its last blob's payload: that
+        // blob's header declares a datasize running past EOF.
+        let last = blobs.last().unwrap();
+        let cut = last.blob_start + (last.blob_end - last.blob_start) / 2;
+        std::fs::write(p.join("payload-past-eof.osm.pbf"), &bytes[..cut]).unwrap();
         // The same two-header shape without indexdata on any data blob: the
         // only input getid's streaming full-scan arm reaches from the CLI
         // (with --force).
@@ -152,6 +157,7 @@ enum Prop {
     HeaderOnly,
     ZeroByte,
     Headerless,
+    PayloadPastEof,
 }
 
 struct Row {
@@ -270,7 +276,14 @@ const ROWS: &[Row] = &[
         ..row("check", "check --index", check_index)
     },
     row("bench-read", "bench-read", bench_read),
-    row("bench-write", "bench-write", bench_write),
+    Row {
+        gaps: &[(
+            Prop::PayloadPastEof,
+            "reads through BlobReader::new on a bare reader, which knows neither \
+             the file nor where its frames start, so the error names neither",
+        )],
+        ..row("bench-write", "bench-write", bench_write)
+    },
 ];
 
 fn out_pbf(c: &Ctx) -> PathBuf {
@@ -671,6 +684,36 @@ fn headerless_is_missing_header(fx: &Fx, row: &Row) -> Result<(), String> {
     missing_header_is_one_error(fx, row, "headerless.osm.pbf")
 }
 
+/// See [`STOPS_BEFORE_LAST_PAYLOAD`]: a row exempt as stopping early must
+/// still succeed, so a stale exemption fails.
+fn payload_past_eof_is_located(fx: &Fx, row: &Row) -> Result<(), String> {
+    let file = "payload-past-eof.osm.pbf";
+    let dir = TempDir::new().unwrap();
+    let out = run(&built(fx, row, dir.path(), &fx.path(file)));
+    let stderr = out.stderr_str();
+    if STOPS_BEFORE_LAST_PAYLOAD
+        .iter()
+        .any(|(label, _)| *label == row.label)
+    {
+        ensure!(
+            exited_ok(row, &out),
+            "exempt as stopping early, but exit {:?}: drop the exemption; stderr:\n{stderr}",
+            out.status.code()
+        );
+        return Ok(());
+    }
+    ensure!(
+        out.status.code() == Some(2),
+        "exit {:?}, wanted 2; stderr:\n{stderr}",
+        out.status.code()
+    );
+    ensure!(
+        stderr.contains(file) && stderr.contains("at byte offset"),
+        "the error must name {file} and a byte offset; stderr:\n{stderr}"
+    );
+    Ok(())
+}
+
 type Check = fn(&Fx, &Row) -> Result<(), String>;
 
 /// Run one property over every row, collect every violation, and honour the
@@ -987,6 +1030,28 @@ fn a_second_header_is_refused_by_the_commands_that_walk_frames_themselves() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// Rows that legitimately stop reading before the last blob's payload, with
+/// where they stop. `reference/truncation-handling.md` allows an early stop;
+/// what it forbids is reading a short payload as though it were whole.
+const STOPS_BEFORE_LAST_PAYLOAD: &[(&str, &str)] = &[
+    ("inspect --indexed", "stops at the first data blob's header"),
+    ("inspect --get", "stops after the file header"),
+    (
+        "inspect --show",
+        "stops at the blob holding the element, which precedes the last",
+    ),
+];
+
+/// A data blob whose declared payload runs past EOF is refused by every
+/// command that reads that far: exit 2, the file named, and a byte offset
+/// named. The schedule builders get this from the header walk, which refuses
+/// the frame before any pread worker sees it, so no builder carries a check
+/// of its own. An exempt row must still succeed, so a stale exemption fails.
+#[test]
+fn a_payload_running_past_eof_is_refused_with_its_location_by_every_command() {
+    run_property(Prop::PayloadPastEof, payload_past_eof_is_located);
 }
 
 /// getid's streaming full-scan arm reads frames through its own loop and is

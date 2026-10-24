@@ -1390,6 +1390,174 @@ fn missing_node_refs_get_zero_coordinates_external() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// External join: indexdata ranges under a sorted header
+// ---------------------------------------------------------------------------
+
+/// The external join's metadata scan refuses ranges that contradict the
+/// sorted header. Its stage 2 partitions node blobs by range and walks
+/// records forward through them, so out-of-order or overlapping node blobs
+/// used to come out as "missing locations" for nodes that are in the file
+/// (zeroed under `--ignore-missing-nodes`). Every fixture here declares
+/// Sort.Type_then_ID and carries exact indexdata, three elements per blob.
+fn node_at(id: i64) -> TestNode {
+    TestNode {
+        id,
+        lat: 550_000_000 + i32::try_from(id).unwrap() * 1_000,
+        lon: 120_000_000 + i32::try_from(id).unwrap() * 1_000,
+        tags: vec![],
+        meta: None,
+    }
+}
+
+fn way_over(id: i64, refs: &[i64]) -> TestWay {
+    TestWay {
+        id,
+        refs: refs.to_vec(),
+        tags: vec![("highway", "primary")],
+        meta: None,
+    }
+}
+
+fn write_three_per_blob(path: &Path, node_ids: &[i64], ways: &[TestWay]) {
+    let nodes: Vec<TestNode> = node_ids.iter().copied().map(node_at).collect();
+    write_multi_block_test_pbf(path, &nodes, ways, &[], 3);
+}
+
+/// Both external runs (refusing and `--ignore-missing-nodes`) fail on
+/// `needle`, name the file and the blob, and publish nothing; sparse joins
+/// the same file with every referenced node's real coordinates.
+fn assert_external_refuses_and_sparse_joins(input: &Path, needle: &str, way_refs: &[i64]) {
+    let dir = input.parent().unwrap();
+    let output = dir.join("external.osm.pbf");
+    for out in [
+        run_altw(input, &output, true, IndexBackend::External, false),
+        run_altw_ignoring_missing(input, &output, true, IndexBackend::External),
+    ] {
+        let stderr = out.stderr_str();
+        assert!(
+            !out.status.success(),
+            "external must refuse; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(needle),
+            "wanted {needle:?}; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(&input.display().to_string()) && stderr.contains("blob "),
+            "the refusal must name the file and the blob; stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("could not be resolved"),
+            "refused as missing locations instead; stderr:\n{stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "a refused run must publish no output file"
+        );
+    }
+
+    let sparse_out = dir.join("sparse.osm.pbf");
+    let out = run_altw(input, &sparse_out, true, IndexBackend::Sparse, false);
+    assert!(
+        out.status.success(),
+        "sparse must join the same file; stderr:\n{}",
+        out.stderr_str()
+    );
+    let expected: Vec<(i32, i32)> = way_refs
+        .iter()
+        .map(|&id| {
+            let n = node_at(id);
+            (n.lat, n.lon)
+        })
+        .collect();
+    assert_eq!(read_way_locations(&sparse_out), vec![(10, expected)]);
+}
+
+#[test]
+fn external_refuses_node_blobs_in_descending_order() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("descending.osm.pbf");
+    let refs = [1, 4];
+    write_three_per_blob(&input, &[4, 5, 6, 1, 2, 3], &[way_over(10, &refs)]);
+    assert_external_refuses_and_sparse_joins(&input, "contradict the sorted header", &refs);
+}
+
+/// Ranges [1, 5] then [2, 6]: both bounds rise, so a check on monotone
+/// minima and maxima alone passes it, yet node 2 sits in the second blob
+/// while the walk over the first already consumed its record.
+#[test]
+fn external_refuses_interleaved_overlapping_node_blobs() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("interleaved.osm.pbf");
+    let refs = [2, 5];
+    write_three_per_blob(&input, &[1, 3, 5, 2, 4, 6], &[way_over(10, &refs)]);
+    assert_external_refuses_and_sparse_joins(&input, "contradict the sorted header", &refs);
+}
+
+/// The order checked is the header's whole claim, not just the node blobs':
+/// the external join writes blobs in input order under that header.
+#[test]
+fn external_refuses_way_blobs_in_descending_order() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("ways-descending.osm.pbf");
+    let ways: Vec<TestWay> = [14, 15, 16, 11, 12, 10]
+        .iter()
+        .map(|&id| way_over(id, &[1, 2]))
+        .collect();
+    write_three_per_blob(&input, &[1, 2, 3], &ways);
+    let output = dir.path().join("external.osm.pbf");
+    let out = run_altw(&input, &output, true, IndexBackend::External, false);
+    let stderr = out.stderr_str();
+    assert!(
+        !out.status.success(),
+        "external must refuse; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("contradict the sorted header") && stderr.contains("a way blob"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        !output.exists(),
+        "a refused run must publish no output file"
+    );
+}
+
+/// A node blob whose range spans zero: stage 2 compares node ids unsigned,
+/// so the external index refuses it outright rather than losing nodes.
+#[test]
+fn external_refuses_a_node_blob_reaching_below_zero() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("mixed-sign.osm.pbf");
+    let refs = [1, 2];
+    write_three_per_blob(&input, &[-1, 1, 2], &[way_over(10, &refs)]);
+    assert_external_refuses_and_sparse_joins(&input, "negative node ids", &refs);
+}
+
+/// Equal boundaries are in order: a node id may end one blob and start the
+/// next, as `OrderWatermark` allows everywhere else.
+#[test]
+fn external_accepts_node_blobs_sharing_a_boundary_id() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("shared-boundary.osm.pbf");
+    write_three_per_blob(&input, &[1, 2, 3, 3, 4, 5], &[way_over(10, &[1, 3, 5])]);
+    let output = dir.path().join("external.osm.pbf");
+    let out = run_altw(&input, &output, true, IndexBackend::External, false);
+    assert!(
+        out.status.success(),
+        "equal boundaries are in order; stderr:\n{}",
+        out.stderr_str()
+    );
+    let expected: Vec<(i32, i32)> = [1, 3, 5]
+        .iter()
+        .map(|&id| {
+            let n = node_at(id);
+            (n.lat, n.lon)
+        })
+        .collect();
+    assert_eq!(read_way_locations(&output), vec![(10, expected)]);
+}
+
 #[test]
 fn plain_nodes_supply_coordinates_to_both_backends() {
     fn varint(mut value: u64, out: &mut Vec<u8>) {

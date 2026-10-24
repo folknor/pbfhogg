@@ -338,8 +338,8 @@ fn new_permit_pool() -> (SyncSender<()>, Receiver<()>) {
 /// is a counting semaphore with no other source of tokens - so after
 /// [`PIPELINE_DISPATCH_PERMITS`] such panics the next
 /// `write_primitive_block` blocks forever on `permit_rx.recv()` with no
-/// timeout and no diagnostic. Constructing the guard first in the closure
-/// body also puts the release after the `tx.send` of the framed result, which
+/// timeout and no diagnostic. Binding the guard first in the closure body
+/// also puts the release after the `tx.send` of the framed result, which
 /// is where it must be so the in-flight count stays correct while the result
 /// waits in the writer channel.
 pub(super) struct PermitGuard(SyncSender<()>);

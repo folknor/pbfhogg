@@ -157,12 +157,6 @@ use crate::tunables::{
     WILLNEED_COALESCE_GAP_BYTES, WILLNEED_WINDOW_BYTES,
 };
 
-fn blob_body_within_file(data_offset: u64, data_size: usize, file_size: u64) -> bool {
-    data_offset
-        .checked_add(data_size as u64)
-        .is_some_and(|end| end <= file_size)
-}
-
 /// Coalesce body ranges in a walker-derived schedule. Schedule entries retain
 /// file order, so bodies separated by up to a BlobHeader-sized gap are joined.
 /// A zero-sized body has no range to advise: passing length zero to
@@ -413,7 +407,6 @@ pub(crate) fn build_classify_schedule_blob_filtered(
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
-    let file_size = walker.file_size();
     let mut schedule: Vec<ScheduledBlob> = Vec::new();
     let mut blobs_skipped_by_tag: u64 = 0;
     while let Some(meta) = walker.next_header()? {
@@ -442,21 +435,10 @@ pub(crate) fn build_classify_schedule_blob_filtered(
             }
             continue;
         }
-        // Reject bogus blob-header data_size before it flows to pread
-        // workers: a truncated file or a corrupt BlobHeader advertising
-        // a data_size that extends past EOF would otherwise fail much
-        // later in `read_exact_at` with an opaque UnexpectedEof, after
-        // workers have already accepted the schedule. Cheap integer
-        // check here catches the whole family.
-        if !blob_body_within_file(meta.data_offset, meta.data_size, file_size) {
-            return Err(walker.locate_meta(
-                &meta,
-                Error::invalid_data(format!(
-                    "blob at offset {} claims data_size {} but file is only {} bytes",
-                    meta.data_offset, meta.data_size, file_size,
-                )),
-            ));
-        }
+        // No payload-extent check here: `next_header` already refused a
+        // body running past EOF, located at this blob's frame (see
+        // `reference/truncation-handling.md`, shape 4). Every walker-built
+        // schedule inherits that, so no builder repeats it.
         schedule.push(ScheduledBlob::from_meta(&meta)?);
     }
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_END");
@@ -509,7 +491,6 @@ pub(crate) fn build_classify_schedules_split(
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
     crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
-    let file_size = walker.file_size();
     let mut nodes: Vec<ScheduledBlob> = Vec::new();
     let mut ways: Vec<ScheduledBlob> = Vec::new();
     let mut rels: Vec<ScheduledBlob> = Vec::new();
@@ -517,19 +498,6 @@ pub(crate) fn build_classify_schedules_split(
     while let Some(meta) = walker.next_header()? {
         if !matches!(meta.blob_type, crate::blob::BlobKind::OsmData) {
             continue;
-        }
-        // See `build_classify_schedule` for the rationale: reject
-        // past-EOF blob bodies before the schedule is handed to pread
-        // workers. Replicated across both schedule builders since they
-        // share the same downstream consumer pattern.
-        if !blob_body_within_file(meta.data_offset, meta.data_size, file_size) {
-            return Err(walker.locate_meta(
-                &meta,
-                Error::invalid_data(format!(
-                    "blob at offset {} claims data_size {} but file is only {} bytes",
-                    meta.data_offset, meta.data_size, file_size,
-                )),
-            ));
         }
         let reported_max = meta.index.as_ref().map_or(0, |i| i.max_id);
         let entry = ScheduledBlob::from_meta(&meta)?;
@@ -1238,7 +1206,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{ScheduledBlob, WillneedPrefetch, blob_body_within_file, coalesce_willneed_ranges};
+    use super::{ScheduledBlob, WillneedPrefetch, coalesce_willneed_ranges};
 
     /// Write a PBF with `blobs` single-node OSMData blobs and return its path.
     fn write_many_blob_pbf(dir: &std::path::Path, blobs: usize) -> std::path::PathBuf {
@@ -1554,16 +1522,5 @@ mod tests {
             coalesce_willneed_ranges(&schedule),
             vec![(100, 4_155), (8_352, 10)]
         );
-    }
-
-    /// The unchecked form was `data_offset + data_size as u64 > file_size`,
-    /// which wraps in release for a corrupt header advertising a huge size -
-    /// so the check that exists specifically to catch corrupt blobs passed.
-    #[test]
-    fn corrupt_blob_body_range_cannot_wrap_past_eof() {
-        assert!(!blob_body_within_file(u64::MAX - 4, 8, u64::MAX));
-        assert!(!blob_body_within_file(0, usize::MAX, 100));
-        assert!(blob_body_within_file(92, 8, 100));
-        assert!(!blob_body_within_file(93, 8, 100));
     }
 }

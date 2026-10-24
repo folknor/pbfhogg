@@ -29,10 +29,10 @@ use std::sync::mpsc::sync_channel;
 pub use crate::write::compression::{Compression, ParseCompressionError};
 
 // Blob framing / encoding helpers live in the sibling `framing` module.
-use super::framing::{FrameScratch, PIPELINE_SCRATCH, encode_blob_body, frame_blob_into};
+use super::framing::{FrameScratch, PIPELINE_SCRATCH, frame_blob_into, frame_in_scratch};
 pub(crate) use super::framing::{
-    encode_blob_header_into, frame_blob, frame_blob_pipelined, reframe_raw_with_index,
-    strip_blob_header_fields, strip_header_block_fields,
+    frame_blob, frame_blob_pipelined, reframe_raw_with_index, strip_blob_header_fields,
+    strip_header_block_fields,
 };
 
 // Pipeline plumbing (ordered channel items, sink trait, permit pool, writer
@@ -98,27 +98,24 @@ fn sync_buffered_file(writer: &mut BufWriter<File>) -> Result<()> {
 /// Take one dispatch permit, blocking until one is free, and return the guard
 /// that gives it back.
 ///
-/// Used by the producer's own send paths (`write_raw*`). The rayon framing
-/// closures build their [`PermitGuard`] inside the closure instead, because
-/// the permit has to outlive the spawn rather than the call.
+/// The wait goes through [`recv_permit`] and is timed into
+/// `writer_permit_wait_ns`.
+///
+/// The producer's own send paths (`write_raw*`) hold the guard across their
+/// send. The `write_primitive_block*` framing paths move it into the spawned
+/// closure and bind it there first, so the permit outlives the spawn and is
+/// released after the closure's `tx.send` (or on its unwind).
 ///
 /// Every send path participates in the dispatch bound, including raw writes;
 /// see [`WRITE_AHEAD`] for how channel backpressure differs from that bound.
 fn acquire_permit(pipeline: &WritePipeline) -> Result<PermitGuard> {
-    take_permit(pipeline)?;
-    Ok(PermitGuard::new(pipeline.permit_tx.clone()))
-}
-
-/// Take one dispatch permit through [`recv_permit`], timing the wait into
-/// `writer_permit_wait_ns`. The caller owns giving it back.
-fn take_permit(pipeline: &WritePipeline) -> Result<()> {
     let t_permit = std::time::Instant::now();
     recv_permit(&pipeline.permit_rx, &pipeline.executor)
         .map_err(|_| Error::internal("pipelined writer permit pool disconnected"))?;
     WRITER_METRICS
         .permit_wait_ns
         .fetch_add(elapsed_ns_u64(t_permit), Relaxed);
-    Ok(())
+    Ok(PermitGuard::new(pipeline.permit_tx.clone()))
 }
 
 /// Test hook: whether the framing closure for `seq` should panic.
@@ -690,20 +687,19 @@ impl<W: Write> PbfWriter<W> {
             if pipeline.writer_gone.observed() {
                 return Err(pipeline_send_error(pipeline));
             }
-            take_permit(pipeline)?;
+            let permit = acquire_permit(pipeline)?;
             let seq = pipeline.seq;
             pipeline.seq += 1;
             let compression = self.compression;
             let uncompressed = block_bytes.to_vec();
             let tx = pipeline.tx.clone();
-            let permit_tx = pipeline.permit_tx.clone();
             let writer_gone = pipeline.writer_gone.clone();
             let panic_here = framing_panics_at(pipeline, seq);
             pipeline.executor.spawn(move || {
-                // Constructed first so it drops last - the permit is released
+                // Bound first so it drops last - the permit is released
                 // after `tx.send` below, and also on the unwind path if any
                 // of the framing work panics. See `PermitGuard`.
-                let _permit = PermitGuard::new(permit_tx);
+                let _permit = permit;
                 assert!(!panic_here, "test hook: framing panic at seq {seq}");
                 // Keep scanner failures on the existing ordered error channel.
                 // Scanning still happens once, inside the framing worker.
@@ -798,19 +794,18 @@ impl<W: Write> PbfWriter<W> {
             if pipeline.writer_gone.observed() {
                 return Err(pipeline_send_error(pipeline));
             }
-            take_permit(pipeline)?;
+            let permit = acquire_permit(pipeline)?;
             let seq = pipeline.seq;
             pipeline.seq += 1;
             let compression = self.compression;
             let uncompressed = block_bytes.to_vec();
             let tx = pipeline.tx.clone();
-            let permit_tx = pipeline.permit_tx.clone();
             let writer_gone = pipeline.writer_gone.clone();
             let panic_here = framing_panics_at(pipeline, seq);
             pipeline.executor.spawn(move || {
                 // Drops last - releases the permit after `tx.send`, and on
                 // the unwind path too. See `PermitGuard`.
-                let _permit = PermitGuard::new(permit_tx);
+                let _permit = permit;
                 assert!(!panic_here, "test hook: framing panic at seq {seq}");
                 let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
                     frame_blob_into(
@@ -900,20 +895,19 @@ impl<W: Write> PbfWriter<W> {
             if pipeline.writer_gone.observed() {
                 return Err(pipeline_send_error(pipeline));
             }
-            take_permit(pipeline)?;
+            let permit = acquire_permit(pipeline)?;
             let seq = pipeline.seq;
             pipeline.seq += 1;
             let compression = self.compression;
             let tx = pipeline.tx.clone();
             let tagdata_owned = tagdata.map(<[u8]>::to_vec);
             let way_members_owned = way_members.map(<[u8]>::to_vec);
-            let permit_tx = pipeline.permit_tx.clone();
             let writer_gone = pipeline.writer_gone.clone();
             let panic_here = framing_panics_at(pipeline, seq);
             pipeline.executor.spawn(move || {
                 // Drops last - releases the permit after `tx.send`, and on
                 // the unwind path too. See `PermitGuard`.
-                let _permit = PermitGuard::new(permit_tx);
+                let _permit = permit;
                 assert!(!panic_here, "test hook: framing panic at seq {seq}");
                 let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
                     frame_blob_into(
@@ -1227,6 +1221,10 @@ impl<W: Write> PbfWriter<W> {
     /// scratch buffers. Eliminates all intermediate `Vec` allocations after
     /// warmup, except that a scratch buffer grown past the framing module's
     /// 4 MiB retention limit is dropped after its blob and regrown on demand.
+    ///
+    /// The framing is the pipelined path's own (`frame_in_scratch`); only the
+    /// hand-off differs, writing the parts from the scratch instead of
+    /// swapping them out, so the size guards cannot drift apart again.
     fn write_framed_blob(
         &mut self,
         blob_type: &str,
@@ -1235,7 +1233,10 @@ impl<W: Write> PbfWriter<W> {
         tagdata: Option<&[u8]>,
         way_members: Option<&[u8]>,
     ) -> Result<()> {
-        self.scratch.trim_oversize_retained_buffers();
+        // `frame_in_scratch` trims on entry. Trim again on every exit, error
+        // or not, because this path keeps its buffers in the scratch rather
+        // than handing them off, so an outlier would otherwise stay pinned in
+        // this writer until its next blob.
         let result =
             self.write_framed_blob_inner(blob_type, uncompressed, indexdata, tagdata, way_members);
         self.scratch.trim_oversize_retained_buffers();
@@ -1250,59 +1251,25 @@ impl<W: Write> PbfWriter<W> {
         tagdata: Option<&[u8]>,
         way_members: Option<&[u8]>,
     ) -> Result<()> {
-        let t_compress = std::time::Instant::now();
-        encode_blob_body(uncompressed, &self.compression, &mut self.scratch)?;
-        WRITER_METRICS
-            .compress_ns
-            .fetch_add(elapsed_ns_u64(t_compress), Relaxed);
-        let t_frame = std::time::Instant::now();
-        // Same guard as `frame_blob_into`: the format caps a Blob body at
-        // `MAX_BLOB_DATASIZE` and our own reader enforces it, so the sync
-        // path must refuse here too or a `PbfWriter::new` writer emits a file
-        // that only fails when somebody tries to read it.
-        if self.scratch.blob_buf.len() as u64 >= crate::read::blob_wire::MAX_BLOB_DATASIZE {
-            return Err(crate::error::new_blob_too_large(
-                crate::OversizePart::Body,
-                self.scratch.blob_buf.len() as u64,
-                crate::read::blob_wire::MAX_BLOB_DATASIZE,
-            ));
-        }
-        let datasize = i32::try_from(self.scratch.blob_buf.len()).map_err(|_| {
-            Error::internal(format!(
-                "blob datasize overflow: {} bytes",
-                self.scratch.blob_buf.len()
-            ))
-        })?;
-        encode_blob_header_into(
+        let frame = frame_in_scratch(
             blob_type,
-            datasize,
+            uncompressed,
+            &self.compression,
             indexdata,
             tagdata,
             way_members,
-            &mut self.scratch.header_buf,
+            &mut self.scratch,
         )?;
-        let header_len = u32::try_from(self.scratch.header_buf.len()).map_err(|_| {
-            Error::internal(format!(
-                "header too large: {} bytes",
-                self.scratch.header_buf.len()
-            ))
-        })?;
-        let total_len = 4 + self.scratch.header_buf.len() + self.scratch.blob_buf.len();
-        WRITER_METRICS
-            .frame_ns
-            .fetch_add(elapsed_ns_u64(t_frame), Relaxed);
-        WRITER_METRICS
-            .bytes_framed
-            .fetch_add(total_len as u64, Relaxed);
+        let total_len = 4 + frame.header.len() + frame.blob.len();
         // Write the 3 frame parts directly - no intermediate `out` Vec.
         let writer = self
             .writer
             .as_mut()
             .ok_or_else(|| Error::invalid_argument(WRITER_CONSUMED))?;
         let t_write = std::time::Instant::now();
-        writer.write_all(&header_len.to_be_bytes())?;
-        writer.write_all(&self.scratch.header_buf)?;
-        writer.write_all(&self.scratch.blob_buf)?;
+        writer.write_all(&frame.prefix)?;
+        writer.write_all(frame.header)?;
+        writer.write_all(frame.blob)?;
         WRITER_METRICS
             .write_ns
             .fetch_add(elapsed_ns_u64(t_write), Relaxed);
@@ -1664,10 +1631,11 @@ mod tests {
     ///
     /// The `MAX_BLOB_DATASIZE` guard first landed in `frame_blob_into`, which
     /// covers every pipelined constructor plus `frame_blob` - but
-    /// `write_framed_blob` duplicates the framing inline for the
+    /// `write_framed_blob` then carried its own copy of the framing for the
     /// `PbfWriter::new` sync path, so a sync-mode writer kept emitting a body
     /// the crate's own reader refuses ("blob header declares datasize too
-    /// big"), with exit zero. Same cap, same knob-naming error message.
+    /// big"), with exit zero. Both paths now share `frame_in_scratch`; this
+    /// pins the sync end of that. Same cap, same knob-naming error message.
     #[test]
     fn the_sync_path_refuses_an_oversize_blob_body() {
         let cap = usize::try_from(crate::read::blob_wire::MAX_BLOB_DATASIZE).unwrap();

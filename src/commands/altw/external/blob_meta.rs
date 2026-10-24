@@ -27,6 +27,25 @@ pub(super) struct BlobMeta {
 /// `HeaderWalker` so blob bodies stay out of the page cache during the
 /// scan - stage 1 / stage 4 open their own fds and pread the bodies they
 /// need.
+///
+/// This is the external join's one trust boundary for indexdata ranges,
+/// so every range check lives here, located at the offending blob:
+///
+/// - a reversed range (`max_id < min_id`) is malformed indexdata;
+/// - a node range reaching below zero is refused because stage 2's bucket
+///   partition and merge walk compare node ids as unsigned values;
+/// - the ranges must follow canonical `Sort.Type_then_ID` order. Stage 2
+///   partitions the node blobs by range with `partition_point` and walks
+///   bucket records forward through them, so node blobs out of order or
+///   overlapping turn present nodes into missing locations (zeroed, under
+///   `--ignore-missing-nodes`); stage 4 also writes blobs in input order
+///   under the input's sorted header. Equal boundaries pass, as in
+///   `OrderWatermark`: duplicate ids are a separate concern. Indexdata
+///   ranges are exact by contract (`check --index`), so ranges that break
+///   the order mean the header's claim, or the indexdata, is false.
+///
+/// Header-level only: the order of elements inside one blob is not visible
+/// here.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn scan_blob_metadata(
     input: &Path,
@@ -40,6 +59,7 @@ pub(super) fn scan_blob_metadata(
         .ok_or_else(|| crate::error::new_missing_header(input))?;
 
     let mut metas = Vec::new();
+    let mut order = crate::osm_id::OrderWatermark::default();
     let mut node_blobs: u64 = 0;
     let mut way_blobs: u64 = 0;
     let mut relation_blobs: u64 = 0;
@@ -55,6 +75,7 @@ pub(super) fn scan_blob_metadata(
                 ),
             )
         })?;
+        check_range(idx, &mut order).map_err(|e| walker.locate_meta(&meta, e))?;
         let tag_index = if parse_tagdata {
             meta.tagdata
                 .as_deref()
@@ -94,4 +115,42 @@ pub(super) fn scan_blob_metadata(
         crate::debug::emit_counter("altw_meta_relation_blobs", relation_blobs as i64);
     }
     Ok(metas)
+}
+
+/// The range checks [`scan_blob_metadata`] documents, for one blob in file
+/// order. Unlocated: the caller locates the error at the blob.
+fn check_range(
+    idx: &crate::blob_meta::BlobIndex,
+    order: &mut crate::osm_id::OrderWatermark,
+) -> Result<()> {
+    if idx.max_id < idx.min_id {
+        return Err(crate::Error::invalid_data(format!(
+            "altw external: {} blob has reversed indexdata range [min_id={}, max_id={}]",
+            idx.kind.as_str(),
+            idx.min_id,
+            idx.max_id,
+        )));
+    }
+    if matches!(idx.kind, ElementKind::Node) && idx.min_id < 0 {
+        return Err(crate::Error::invalid_data(format!(
+            "altw external: node blob indexdata range [min_id={}, max_id={}] holds \
+             negative node ids, which the external index cannot join; the sparse \
+             index can",
+            idx.min_id, idx.max_id,
+        )));
+    }
+    if let Err((previous_kind, previous_id)) =
+        order.observe(idx.kind.ordinal(), idx.min_id, idx.max_id)
+    {
+        return Err(crate::error::new_unsorted(format!(
+            "altw external: indexdata ranges contradict the sorted header - a {} blob \
+             starting at id {} follows {} blobs already reaching id {previous_id}. \
+             The external join needs Sort.Type_then_ID input with exact indexdata \
+             ranges, and one of the two is false here.",
+            idx.kind.as_str(),
+            crate::osm_id::blob_osm_first_id(idx.min_id, idx.max_id),
+            ElementKind::from_ordinal(previous_kind).map_or("unknown", ElementKind::as_str),
+        )));
+    }
+    Ok(())
 }

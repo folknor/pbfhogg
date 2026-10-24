@@ -494,7 +494,9 @@ full file per step: passthrough saves little there.
 **PbfWriter** - `src/write/writer.rs`:
 - `FrameScratch` - `blob_buf`, `header_buf`, `compress_buf`, lazy-init `Compress`/`zstd::Compressor`
 - Thread-local `PIPELINE_SCRATCH` - per-rayon-thread, reused across blobs
-- `frame_blob_into()` - allocates **one Vec per blob** for final framed output (exact capacity)
+- `frame_in_scratch()` - the one framing implementation (size guards, header encoding, metrics); frames into the scratch in place
+- `frame_blob_into()` - pipelined hand-off: moves the framed header and body out of the scratch, leaving two replacement buffers at the warmed capacity (capped by the retention limit); no copy
+- `write_framed_blob()` - sync hand-off: writes the parts straight from the scratch, no per-blob allocation after warmup
 - `compress_zlib()` - `flate2::Compress` with `reset()`, reuses `compress_buf`
 - Pipelined writer thread - VecDeque reorder buffer, `WRITE_AHEAD` =
   `PIPELINE_DISPATCH_PERMITS` (64). The channel is deliberately not the

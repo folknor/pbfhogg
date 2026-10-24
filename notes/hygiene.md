@@ -135,10 +135,6 @@ Divergence across copies is already fact:
   bucket, classify relies on channel drop, stage 1 runs until the schedule
   drains, getparents breaks the scan on first error with a comment on why
   that matters at planet scale.
-- Validation: `blob_body_within_file` runs in the classify and getparents
-  schedule builders; the external `scan_blob_metadata`, passthrough
-  `build_schedule`, extract and tags-filter scans skip it, so a past-EOF
-  `data_size` fails late as a bare `UnexpectedEof` with no offset.
 - Prefetch: only classify gets the sliding WILLNEED window.
 - Stall counters: no hand pool emits `*_wait_ns`, so `--stalls` is blind to
   extract, tags-filter pass 2 and most altw stages.
@@ -220,7 +216,16 @@ its two length-prefix I/O-error branches (offset dropped); `HeaderWalker`
 stamps path and index but never the offset it holds as `frame_start`;
 `raw_frame.rs` returns `BoxResult` with no stamping, so `cat`, `extract`,
 `check --index` and `getid` raw paths report frame errors with no path or
-offset. Fix: one frame state machine over an abstract byte source (stream and
+offset. `BlobReader`'s shape-4 errors use `self.offset.map_or(0, ..)`, so a
+reader built with `BlobReader::new` on a bare reader prints an invented "from
+offset 0"; `bench-write` (`bench_write_loop`) reads that way and names no
+file, the one gap in `cli_input_contract`'s payload-past-EOF table.
+`HeaderWalker` owns the payload-extent check; its `file_size` doc still
+invites callers to re-check before pread, which is how getparents' unchecked
+`+` duplicate and the unreachable reversed and negative-`max_id` checks in
+altw external's `max_node_id_from_blob_meta` came about (the latter's header-
+not-sorted refusal is also an unlocated `invalid_data`, not `new_unsorted`).
+Fix: one frame state machine over an abstract byte source (stream and
 pread-at-offset as two impls), returning a stamped `FrameHeader`. Enforce with
 a conformance test running every truncation shape through every source; the
 `blob.rs` test with `read_arm` / `skip_arm` / `walk_arm` is that test in
@@ -232,24 +237,22 @@ Reported by: read path.
 
 Anger: 9 - writer framing on a hot path.
 
-- `PbfWriter::write_framed_blob` (sync path) reimplements `frame_blob_into`
-  line for line; the test `the_sync_path_refuses_an_oversize_blob_body` records
-  that they diverged once (the size guard landed in one copy).
-  `reframe_raw_with_index_scratch` is a third framing assembly that skips the
+- The sync and pipelined paths share `frame_in_scratch`;
+  `reframe_raw_with_index_scratch` is a second framing assembly that skips the
   `MAX_BLOB_DATASIZE` check (arguably right for passthrough, but nobody
   decided). `encode_blob_header_into`'s WayMembers culprit heuristic
   (`len > 1024`) guesses which field overflowed instead of computing sizes.
 - `write_primitive_block`, `write_primitive_block_no_indexdata` and
   `write_primitive_block_owned` each carry about 70 identical lines; the test
   `every_primitive_block_variant_stops_once_the_writer_thread_is_dead` exists
-  because a fix to one missed the others. The permit acquire duplicates
-  `acquire_permit` instead of calling it.
+  because a fix to one missed the others. They now differ only in where the
+  index comes from (scanned in the closure, precomputed, none).
 - `to_path_uring` and `to_path_parallel` carry the same spawn plus `init_rx`
   match (messages differ by one word), all four constructors build the same
   `WritePipeline` literal, and a test helper builds a fifth.
   `to_path_uring`'s unbounded `init_rx.recv()` is documented and left.
 
-Fix: one `frame_parts` every path calls; one `dispatch_framed(FrameRequest)`
+Fix: one `dispatch_framed(FrameRequest)`
 with `IndexSource::{Scan, Precomputed, None}`; one `WritePipeline::spawn`.
 Structural.
 
@@ -654,11 +657,12 @@ trust `parallel_classify_phase`'s schedule; apply-changes trusts `count` for
 stats and `id_range` for routing, using `infer_kind_and_range` only when
 indexdata is absent, so a forged or stale `min/max` routes a blob as "no
 overlap" and splices it unchanged past a delete (silent data loss); altw scan
-filtering relies on indexdata `kind` being honest, and stage 2's merge walk
-assumes node blobs are sorted and non-overlapping, checking monotonicity only
-under `debug_assertions`, so an unsorted file flagged sorted produces a
-misleading "missing locations" error instead of "input not sorted" (stage 1
-could check `prev.max_id < next.min_id` in `build_node_blob_mapping` for free);
+filtering relies on indexdata `kind` being honest; altw external's metadata
+scan refuses ranges that break the sorted order, but element order inside one
+blob is unchecked, so a node blob holding `[2, 1]` with honest indexdata
+`[1, 2]` makes stage 2 drop present nodes (its `debug_assert` sees only the
+tuples the inner loop steps over; a per-blob monotonicity pass over the
+extracted tuples would catch it, `degrade --unsort-intra` is the fixture);
 the geocode builder trusts indexdata kind to schedule node blobs, so a node
 in a blob labelled way or relation is never seen by Pass 2a. `CORRECTNESS.md`
 partly states this for sort. `has_indexdata` decides whether a whole file is
@@ -858,33 +862,6 @@ magic against one table (only `diff --format osc` is pinned), and the two
 rules remain two. Choosing one new rule (gzip unless the name ends `.osc`)
 would change two outputs; it is a decision for the maintainer, and without it
 the entry ends as the table test.
-
-Reported by: the command-matrix audit.
-
-## HYG-115 - `renumber` quietly writes zlib:1; every other PBF writer defaults to zlib:6
-
-Anger: 9 - the measured write path and a documented default.
-
-`--compression` is documented as `[default: zlib]` on every PBF writer, and
-`Compression::default()` is `Zlib(6)` with a comment saying every CLI
-default is spelled "zlib" so that the write benchmark measures the level the
-commands write. `renumber_external_to` maps `compression ==
-Compression::default()` to `Zlib(1)`, and says why (the external-renumber
-default in `reference/performance.md`, a measured path). Consequences: an
-explicit `--compression zlib` or `zlib:6` on renumber also yields level 1,
-because the value-based API cannot tell omission from an explicit default;
-the renumber section of both CLI references states the generic default and
-does not mention level 1; and renumber's blobs are compressed at a different
-level than the same data written by any other command. The code comment
-documents the choice; the user documents do not.
-
-Fix: per rules 3 and 6 this should end as documentation: the renumber
-section says "default zlib:1" and why, and the `[default]` column in the flag
-table is per command. The code change (an `Option<Compression>` carried from
-clap through `WriteOptions`, so an explicit level 6 is honoured) is the
-migration the comment already describes; do it only with the measured default
-kept. Enforce with a test that `renumber --compression zlib:6` and no flag
-produce different blob compression, once the Option exists.
 
 Reported by: the command-matrix audit.
 

@@ -71,11 +71,18 @@ impl Drop for PathGuard {
             // Best-effort. A failure here is less important than the
             // error the caller is about to return; swallowing avoids
             // masking that original error with a cleanup error.
-            match self.kind {
-                Kind::File => drop(fs::remove_file(&self.path)),
-                Kind::Dir => drop(fs::remove_dir_all(&self.path)),
-            }
+            remove_best_effort(&self.path, self.kind);
         }
+    }
+}
+
+/// The guard's one removal: of a path the run itself created, so it is not a
+/// second scratch or output mechanism.
+#[allow(clippy::disallowed_methods)]
+fn remove_best_effort(path: &Path, kind: Kind) {
+    match kind {
+        Kind::File => drop(fs::remove_file(path)),
+        Kind::Dir => drop(fs::remove_dir_all(path)),
     }
 }
 

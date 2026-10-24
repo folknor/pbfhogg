@@ -61,6 +61,11 @@
 //! The exact names, and which of them an external tool may delete, are
 //! defined in `reference/cli-reference.md`, "Names pbfhogg leaves behind".
 
+// This module is the scratch choke point the crate-root deny points at: the
+// run directory, its lock, scratch files and their removal are the calls
+// `clippy.toml` refuses everywhere else.
+#![allow(clippy::disallowed_methods)]
+
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
@@ -408,7 +413,6 @@ pub(crate) fn create_file(path: &ScratchPath) -> crate::Result<File> {
 /// Open a scratch file the run wrote, for reading back. The caller names
 /// the path in its error (it knows what the file holds); a `NotFound` stays
 /// matchable for the scratch a stage may legitimately not have written.
-#[allow(clippy::disallowed_methods)]
 pub(crate) fn open(path: &ScratchPath) -> io::Result<File> {
     File::open(&path.path)
 }

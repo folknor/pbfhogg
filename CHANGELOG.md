@@ -4,6 +4,16 @@
 
 ### Breaking
 
+- **A text input that is not UTF-8 is `ErrorKind::InvalidData`, not `Io`.**
+  The `getid` / `getparents` ID files, `extract` configs and region files
+  used to report non-UTF-8 content as an I/O error; they now report it as
+  malformed input, as the `tags-filter` expressions file already did, still
+  naming the path and keeping the decoder's error as the cause. A library
+  caller matching on `ErrorKind::Io` for that case must match
+  `InvalidData`. The expressions file's message now reads `reading the
+  expressions file: failed to read <path>: ...` instead of `could not read
+  expressions file '<path>'`.
+
 - **`diff --format osc` exits 1 when the inputs differ.** It used to exit 0
   whatever it found, unlike a text `diff`; it now answers the same way
   (`0` identical, `1` different) and still publishes its `-o` in both

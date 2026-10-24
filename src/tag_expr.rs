@@ -274,15 +274,9 @@ pub fn validate_expressions(inputs: &[String]) -> Result<()> {
 /// builds a matcher for the empty key; pbfhogg rejects an empty key outright
 /// (see [`parse_expression`]), and erroring on a blank line would be hostile.
 pub fn read_expressions_file(path: &Path) -> Result<Vec<String>> {
-    let contents = std::fs::read_to_string(path).map_err(|e| {
-        let msg = format!("could not read expressions file '{}'", path.display());
-        // Content that is not UTF-8 is malformed input, not an I/O failure.
-        if e.kind() == std::io::ErrorKind::InvalidData {
-            Error::invalid_data_with(msg, e)
-        } else {
-            Error::from(e).context(msg)
-        }
-    })?;
+    // Names the path, and reports content that is not UTF-8 as invalid data.
+    let contents = crate::read::input::read_to_string(path)
+        .map_err(|e| e.context("reading the expressions file"))?;
     Ok(contents
         .split('\n')
         .filter_map(expression_line)

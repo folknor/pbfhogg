@@ -750,3 +750,174 @@ fn merge_rejects_a_corrupt_frame_prefix_without_allocating() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// An input that changes between the two passes
+// ---------------------------------------------------------------------------
+
+/// Runs `mutate` once, when the merge reports that pass 2 begins: after pass
+/// 1 has indexed every input and before pass 2 opens any of them.
+struct BetweenPasses {
+    mutate: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl pbfhogg::host::DiagnosticSink for BetweenPasses {
+    fn event(&self, event: &pbfhogg::host::Event<'_>) {
+        if event.key == "cat.dedupe.pass2"
+            && let Some(mutate) = self.mutate.lock().expect("sink lock").take()
+        {
+            mutate();
+        }
+    }
+}
+
+/// Input A: nodes 1..=3 and way 10; input B: nodes 2..=4, whose blob
+/// overlaps A's (decoded in pass 2), and relation 100, which overlaps
+/// nothing (copied through).
+fn between_pass_fixtures(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let node = |id| TestNode {
+        id,
+        lat: 0,
+        lon: 0,
+        tags: vec![],
+        meta: None,
+    };
+    let a = dir.join("a.osm.pbf");
+    let b = dir.join("b.osm.pbf");
+    write_test_pbf_sorted(
+        &a,
+        &[node(1), node(2), node(3)],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![],
+            meta: None,
+        }],
+        &[],
+    );
+    write_test_pbf_sorted(
+        &b,
+        &[node(2), node(3), node(4)],
+        &[],
+        &[TestRelation {
+            id: 100,
+            members: vec![],
+            tags: vec![],
+            meta: None,
+        }],
+    );
+    (a, b)
+}
+
+/// Every frame of `path`: (frame start, blob payload length), in file order.
+fn frames(path: &std::path::Path) -> Vec<(u64, u64)> {
+    let file = std::fs::File::open(path).expect("open fixture");
+    let mut reader = pbfhogg::BlobReader::new_seekable(file).expect("blob reader");
+    let mut frames = Vec::new();
+    while let Some(next) = reader.next_header_skip_blob() {
+        let (header, offset) = next.expect("frame header");
+        let size = u64::try_from(header.get_blob_size()).expect("blob size");
+        frames.push((offset.expect("offset").0, size));
+    }
+    frames
+}
+
+/// Merge A and B with `mutate` applied between the passes; the error.
+fn merge_changed_between_passes(
+    dir: &std::path::Path,
+    a: &std::path::Path,
+    b: &std::path::Path,
+    mutate: impl FnOnce() + Send + 'static,
+) -> pbfhogg::Error {
+    let sink = std::sync::Arc::new(BetweenPasses {
+        mutate: std::sync::Mutex::new(Some(Box::new(mutate))),
+    });
+    let mut host = crate::common::test_host();
+    host.diagnostics =
+        pbfhogg::host::Diagnostics::new(std::sync::Arc::<BetweenPasses>::clone(&sink));
+    let result = merge_pbf(
+        &[a, b],
+        crate::common::out(dir.join("output.osm.pbf")),
+        &default_opts(),
+        &pbfhogg::HeaderOverrides::default(),
+        &host,
+    );
+    assert!(
+        sink.mutate.lock().expect("sink lock").is_none(),
+        "the input must have been changed between the passes"
+    );
+    match result {
+        Ok(_) => panic!("an input changed between the passes must fail the merge"),
+        Err(err) => err,
+    }
+}
+
+/// A blob of an overlap run that no longer decodes when pass 2 re-reads it
+/// fails located at its input and frame - the second input, at a nonzero
+/// offset, so first-input attribution cannot pass.
+#[test]
+fn a_blob_corrupted_between_passes_is_located() {
+    let dir = crate::common::test_scratch();
+    let (a, b) = between_pass_fixtures(dir.path());
+    // Header, nodes, relation.
+    let frames = frames(&b);
+    assert_eq!(frames.len(), 3);
+    let (node_frame, _) = frames[1];
+    let node_end = frames[2].0;
+    let payload = node_end - frames[1].1;
+
+    let target = b.clone();
+    let err = merge_changed_between_passes(dir.path(), &a, &b, move || {
+        // Keep every length and the BlobHeader; make the Blob unparseable.
+        let mut bytes = std::fs::read(&target).expect("read B");
+        let range = usize::try_from(payload).expect("payload")
+            ..usize::try_from(node_end).expect("frame end");
+        bytes[range].fill(0xff);
+        std::fs::write(&target, bytes).expect("corrupt B");
+    });
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::WireFormat { .. }),
+        "expected the Blob decode failure, got {}",
+        err.report()
+    );
+    assert_eq!(err.source_path(), Some(b.as_path()), "{}", err.report());
+    assert_eq!(
+        err.byte_offset(),
+        Some(pbfhogg::ByteOffset(node_frame)),
+        "{}",
+        err.report()
+    );
+}
+
+/// A passthrough frame that is gone when pass 2 re-reads it fails located at
+/// its input and frame.
+#[test]
+fn a_frame_truncated_between_passes_is_located() {
+    let dir = crate::common::test_scratch();
+    let (a, b) = between_pass_fixtures(dir.path());
+    let frames = frames(&b);
+    assert_eq!(frames.len(), 3);
+    let (relation_frame, _) = frames[2];
+
+    let target = b.clone();
+    let err = merge_changed_between_passes(dir.path(), &a, &b, move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .expect("open B")
+            .set_len(relation_frame)
+            .expect("truncate B at the relation frame");
+    });
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+        "expected the frame read to hit end of file, got {}",
+        err.report()
+    );
+    assert_eq!(err.source_path(), Some(b.as_path()), "{}", err.report());
+    assert_eq!(
+        err.byte_offset(),
+        Some(pbfhogg::ByteOffset(relation_frame)),
+        "{}",
+        err.report()
+    );
+}

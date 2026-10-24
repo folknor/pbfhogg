@@ -7,7 +7,8 @@
 //! a command with several inputs (a config naming thirty region files, an ID
 //! list, an expressions file, a geocode index's dozen data files) it says
 //! nothing usable. Every open of a caller-named input goes through here
-//! (`clippy.toml` refuses the bare `std` calls in the command layer), and
+//! (`clippy.toml` refuses the bare `std` calls across the library and the
+//! CLI, which has its own path-naming opens), and
 //! every pool that preads blobs a schedule names holds an [`InputFile`], so a
 //! failure is located with the file, the blob ordinal and the byte offset.
 //!
@@ -38,10 +39,20 @@ pub(crate) fn read(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).map_err(|e| named("read", path, e))
 }
 
-/// `fs::read_to_string`, naming `path` in the error.
+/// `fs::read_to_string`, naming `path` in the error. Content that is not
+/// UTF-8 is malformed input, not an I/O failure: every text input read here
+/// (an expressions file, an ID list, an extract config or region file) has
+/// to be text, so it is reported as invalid data, with the original error as
+/// its cause.
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn read_to_string(path: &Path) -> Result<String> {
-    std::fs::read_to_string(path).map_err(|e| named("read", path, e))
+    std::fs::read_to_string(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::InvalidData {
+            Error::invalid_data_with(format!("failed to read {}", path.display()), e)
+        } else {
+            named("read", path, e)
+        }
+    })
 }
 
 /// `fs::metadata`, naming `path` in the error.
@@ -108,5 +119,44 @@ impl InputFile {
             None,
             Some(crate::ByteOffset(offset)),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ErrorKind;
+
+    /// A text input that is not UTF-8 is malformed input, named, with the
+    /// decoder's error kept as the cause; a missing one stays an I/O error.
+    #[test]
+    fn read_to_string_classifies_non_utf8_as_invalid_data() {
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("ids.txt");
+        std::fs::write(&path, [b'n', b'1', b'\n', 0xff, 0xfe]).expect("write fixture");
+        let err = super::read_to_string(&path).expect_err("not UTF-8");
+        assert!(
+            matches!(
+                err.kind(),
+                ErrorKind::InvalidData {
+                    source: Some(_),
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(
+            err.report().contains(&path.display().to_string()),
+            "{}",
+            err.report()
+        );
+
+        let missing = dir.path().join("missing.txt");
+        let err = super::read_to_string(&missing).expect_err("missing");
+        assert!(matches!(err.kind(), ErrorKind::Io(_)), "{err:?}");
+        assert!(
+            err.report().contains(&missing.display().to_string()),
+            "{}",
+            err.report()
+        );
     }
 }

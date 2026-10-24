@@ -155,6 +155,16 @@ writer.flush()?;
 // library target only (not pbfhogg-cli, examples, benches or `tests/`, which are
 // separate crates); `not(test)` leaves the library's own unit tests free to print.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+// The filesystem choke points `clippy.toml` lists (outputs through
+// `crate::output`, scratch through `crate::scratch`, inputs through
+// `crate::read::input`, which names the path in a failure) bind the whole
+// library, so a module added anywhere is covered without anyone remembering to
+// opt it in. `output` and `scratch` are the owners and allow the lint
+// module-wide; every other exemption sits on the one statement or the
+// one-call helper that makes the privileged call, with its reason beside it.
+// `not(test)`: unit-test fixtures build their inputs directly; `--all-targets`
+// still lints the shipped library target under the deny.
+#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
 
 // Module tree
 pub(crate) mod blob_meta;

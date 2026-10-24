@@ -241,7 +241,10 @@ fn build_geocode_index_to(
 
 /// Create (or truncate) one of the build's data files, buffered, naming the
 /// file in a failure: a bare "Permission denied" or "No space left on
-/// device" does not say which of the index's files it was.
+/// device" does not say which of the index's files it was. Every path is
+/// inside the build's own directories (the output's staging directory or a
+/// run-scratch bucket tree), so this is not a second output mechanism.
+#[allow(clippy::disallowed_methods)]
 pub(super) fn create_data_file(
     path: &std::path::Path,
 ) -> Result<std::io::BufWriter<std::fs::File>> {
@@ -250,7 +253,9 @@ pub(super) fn create_data_file(
         .map_err(|e| Error::from(e).context(format!("failed to create {}", path.display())))
 }
 
-/// Write a whole data file, naming it in a failure.
+/// Write a whole data file into the output's staging directory, naming it
+/// in a failure.
+#[allow(clippy::disallowed_methods)]
 pub(super) fn write_data_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(path, bytes)
         .map_err(|e| Error::from(e).context(format!("failed to write {}", path.display())))
@@ -352,7 +357,8 @@ fn build_generation(
 
     let start_time = std::time::Instant::now();
 
-    std::fs::create_dir_all(output_dir)?;
+    // `output_dir` is the output's staging directory, which `OutputDir`
+    // created when it was staged; it is not created again here.
 
     // Validate input
     crate::commands::require_indexdata(

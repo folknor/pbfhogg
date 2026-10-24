@@ -847,7 +847,17 @@ fn run_stage_b(
                         return Ok(Vec::new());
                     }
                     let data = crate::read::input::read(&bucket_path)?;
-                    std::fs::remove_file(&bucket_path)?;
+                    // A file in a run-scratch bucket tree, freed as soon as it
+                    // is read to give the space back; `RunScratch` removes
+                    // the tree afterwards and names only its direct children.
+                    #[allow(clippy::disallowed_methods)]
+                    let removed = std::fs::remove_file(&bucket_path);
+                    removed.map_err(|e| {
+                        Error::from(e).context(format!(
+                            "failed to remove scratch bucket {}",
+                            bucket_path.display()
+                        ))
+                    })?;
                     if data.is_empty() {
                         return Ok(Vec::new());
                     }

@@ -145,6 +145,8 @@ impl WriterMetrics {
     /// show up in the sidecar like the writers' own.
     pub(crate) fn sync_recorded(&self, file: &std::fs::File) -> std::io::Result<()> {
         let start = std::time::Instant::now();
+        // The funnel itself.
+        #[allow(clippy::disallowed_methods)]
         let result = file.sync_all();
         self.record_sync_all(start);
         result

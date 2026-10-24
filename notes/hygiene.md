@@ -94,6 +94,14 @@ The judgement calls already known, to be checked first:
   scan, and `build_node_blob_mapping` lost its reversed-range check.
 - The diff and derive delete and merge-stats helpers were merged to one owner
   each across modules, argued inlining-neutral under fat LTO.
+- The geocode build no longer runs `create_dir_all` on its output directory,
+  argued redundant because `OutputDir` creates the staging directory it
+  hands the build; a staging directory that vanished mid-run now fails at
+  the first data-file create (naming the file) instead of being recreated.
+- `read::input::read_to_string` now reports non-UTF-8 content as
+  `ErrorKind::InvalidData` rather than `Io` for every caller (getid ID files,
+  extract configs and region files, the tags-filter expressions file), which
+  library consumers matching on the kind will see.
 
 ---
 
@@ -356,28 +364,6 @@ range and byte counts (the errno would need one more cold-path counter). Fix: on
 elsewhere.
 
 Reported by: write path.
-
-## HYG-022 - Errors that reach the operator name no file, offset or subject
-
-Anger: 7 - message content.
-
-Inputs open and read through `read::input` (path-naming), pread pools locate
-failures with file, blob ordinal and offset, writers name their output
-(`writing <path>`), and `cli/tests/cli_error_naming.rs` forces an open failure
-per input kind and a write failure per writer family. What remains:
-
-- The `disallowed-methods` entries for `File::open`, `fs::read` and
-  `fs::read_to_string` are denied only in `src/commands/` and the CLI, the
-  same scope as the write-side entries. The library modules outside it that
-  open caller-named inputs (`read/`, `osc/`, `geocode_index/`,
-  `tag_expr.rs`) were converted by hand and nothing keeps them so.
-- No test forces a failure in `cat --dedupe`'s second pass (it re-reads
-  frames pass 1 indexed, so the file would have to change between passes);
-  its read and decode errors are located at the frame offset by inspection
-  only.
-
-Reported by: write path, CLI and plumbing, altw and scanning, geocode index,
-re-encoding, filtering and spatial, read path.
 
 ## HYG-024 - Counter declaration and emission is hand-written boilerplate
 
@@ -848,7 +834,7 @@ Anger: 8 - clippy.toml with expect_used denied means hundreds of edits.
 
 `clippy.toml` exists but carries only the filesystem choke points for
 output publication, run scratch and path-naming input opens (`disallowed-methods`, allowed
-workspace-wide and denied in `src/commands/` and the CLI);
+workspace-wide and denied across the library and the CLI);
 `disallowed-types` and `disallowed-macros` are unused; `expect_used`,
 `arithmetic_side_effects`, `panic`, `unreachable` and `exit` are not enabled;
 `allow_attributes_without_reason` is not enabled, so `#[allow(dead_code)]` and

@@ -110,7 +110,7 @@ output any other way.
   consumed is not seen), and the parent directory after the renames. Every
   one of those syncs goes through `WriterMetrics::sync_recorded`, so the
   sidecar's `writer_sync_all_*` counters see them; clippy.toml bans
-  `File::sync_all` and `sync_data` in the command layer and the CLI so a
+  `File::sync_all` and `sync_data` across the library and the CLI so a
   hand-rolled sync cannot return. `O_DIRECT` and `io_uring` outputs are
   synced too: bypassing the page cache is not stable storage.
   What changed at the end of a run, for anyone reading the counters or the
@@ -161,8 +161,11 @@ output any other way.
   flag; the library's error text names no flag. `build-geocode-index`'s
   legacy `--force` keeps granting both overwrite and unindexed input.
 - **Enforcement.** clippy.toml disallows the path-writing `std::fs`
-  methods; the lint is switched on for `src/commands/` and the CLI, where
+  methods; the lint is switched on for the whole library and the CLI, where
   outputs go through `crate::output` and scratch through `crate::scratch`.
+  Those two modules own the calls and allow it; the few other owners (the
+  write backends' creates and syncs, the path guard, procfs reads) allow it
+  on the single statement or one-call helper, with the reason beside it.
 
 Under `Replace`, another process mutating the destination entry between the
 final inspection and the rename is outside the contract (the rename never

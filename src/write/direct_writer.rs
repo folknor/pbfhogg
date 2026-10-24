@@ -117,13 +117,16 @@ impl DirectWriter {
     /// A filesystem that refuses `O_DIRECT` at open fails with
     /// `ErrorKind::PlatformUnsupported` (feature `direct-io`).
     pub fn create(path: &Path) -> crate::Result<Self> {
-        let file = std::fs::OpenOptions::new()
+        // The O_DIRECT backend's create, at the path its owner (an `Output`'s
+        // staging path, or a path constructor's caller) chose.
+        #[allow(clippy::disallowed_methods)]
+        let opened = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .custom_flags(libc::O_DIRECT)
-            .open(path)
-            .map_err(crate::error::direct_io_open_error)?;
+            .open(path);
+        let file = opened.map_err(crate::error::direct_io_open_error)?;
         let buf = AlignedBuffer::new(IO_BUF_BYTES)?;
         Ok(Self {
             file,
@@ -179,7 +182,9 @@ impl DirectWriter {
         Ok(())
     }
 
-    /// Fsync the underlying file to ensure durability.
+    /// Fsync the underlying file to ensure durability. The caller records it
+    /// through the writer-metrics funnel.
+    #[allow(clippy::disallowed_methods)]
     pub(crate) fn sync_all(&self) -> io::Result<()> {
         self.file.sync_all()
     }

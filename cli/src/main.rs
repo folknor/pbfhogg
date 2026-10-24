@@ -1,6 +1,10 @@
 //! The `pbfhogg` binary. The program is the package's library target
 //! (`cli/src/lib.rs`), so its tests can reach the parsed command tree.
 
+// A separate crate root from `lib.rs`, so it needs its own copy of the
+// filesystem choke-point deny (see `clippy.toml`).
+#![deny(clippy::disallowed_methods)]
+
 // hotpath 0.15 installed CountingAllocator internally under hotpath-alloc; as
 // of 0.16 it is a plain generic type the consumer must declare - the crate no
 // longer wires it up on its own. Without this, hotpath-alloc builds fall back

@@ -1,10 +1,13 @@
 # Methods that write, or open for reading, a file by path. The lint is off workspace-wide
-# (`disallowed_methods = "allow"` in Cargo.toml) and switched on only where a
-# single choke point is the rule: the command layer (`src/commands/`) and the
-# CLI. There, an output is a `pbfhogg::output::Output` - staged, refused if it
-# exists without overwrite permission, published only on success - and a
-# scratch file the run owns goes through `crate::scratch`. A bare
-# `File::create` in either place is a write that bypasses both.
+# (`disallowed_methods = "allow"` in Cargo.toml) and denied by crate attribute in
+# the shipped code: the whole library (`src/lib.rs`, outside `cfg(test)`) and the
+# CLI (`cli/src/lib.rs`, `cli/src/main.rs`). Examples, benches and integration
+# tests are separate crates and stay free. An output is a
+# `pbfhogg::output::Output` - staged, refused if it exists without overwrite
+# permission, published only on success - and a scratch file the run owns goes
+# through `crate::scratch`; those two modules own the calls below and allow the
+# lint module-wide. Any other exemption sits on the single statement, or the
+# one-call helper, that makes the privileged call, and says why.
 disallowed-methods = [
     { path = "std::fs::File::create", reason = "outputs go through pbfhogg::output::Output, scratch through crate::scratch" },
     { path = "std::fs::File::create_new", reason = "outputs go through pbfhogg::output::Output, scratch through crate::scratch" },

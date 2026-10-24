@@ -437,6 +437,9 @@ impl UringState {
         file.set_len(self.logical_size)?;
         if finish == super::Finish::Durable {
             let t_sync = std::time::Instant::now();
+            // A path-constructor writer's own durability, recorded through
+            // the writer-metrics funnel on the next line.
+            #[allow(clippy::disallowed_methods)]
             file.sync_all()?;
             WRITER_METRICS.record_sync_all(t_sync);
         }
@@ -688,13 +691,16 @@ fn uring_init_and_run(
     require_write_fixed(&ring)?;
 
     // Step 3: Open file with O_DIRECT.
-    let file = std::fs::OpenOptions::new()
+    // The io_uring backend's create, at the path its owner (an `Output`'s
+    // staging path, or a path constructor's caller) chose.
+    #[allow(clippy::disallowed_methods)]
+    let opened = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .custom_flags(libc::O_DIRECT)
-        .open(path)
-        .map_err(crate::error::direct_io_open_error)?;
+        .open(path);
+    let file = opened.map_err(crate::error::direct_io_open_error)?;
 
     // Step 4: Register the output fd so `WriteFixed` can reference it by slot.
     ring.submitter()

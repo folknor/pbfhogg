@@ -188,11 +188,14 @@ impl DirectReader {
     /// A filesystem that refuses `O_DIRECT` at open fails with
     /// `ErrorKind::PlatformUnsupported` (feature `direct-io`).
     pub fn open(path: &Path) -> Result<Self> {
-        let file = std::fs::OpenOptions::new()
+        // The O_DIRECT open `crate::read::input` has no flag for; the error
+        // names the path just below, as the input helpers do.
+        #[allow(clippy::disallowed_methods)]
+        let opened = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT)
-            .open(path)
-            .map_err(|e| crate::error::direct_io_open_error_at(path, e))?;
+            .open(path);
+        let file = opened.map_err(|e| crate::error::direct_io_open_error_at(path, e))?;
         let file_len = file
             .metadata()
             .map_err(|e| {

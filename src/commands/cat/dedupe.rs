@@ -165,7 +165,6 @@ pub fn merge_pbf(
 }
 
 /// [`merge_pbf`] writing to a borrowed output it does not publish.
-#[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub(crate) fn merge_pbf_to(
     inputs: &[&Path],
@@ -174,6 +173,30 @@ pub(crate) fn merge_pbf_to(
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<MergePbfStats> {
+    let plan = plan_merge(inputs, opts, host)?;
+    write_merge(plan, output, opts, overrides, host)
+}
+
+/// What pass 1 learned, and everything pass 2 needs from it. The inputs
+/// travel with the entries, so an entry's `file_index` can only ever be
+/// resolved against the list it was indexed from.
+struct MergePlan {
+    inputs: Vec<std::path::PathBuf>,
+    headers: Vec<crate::HeaderBlock>,
+    /// Every OSMData blob of every input, in (type, first ID) order.
+    entries: Vec<BlobEntry>,
+    /// Per entry: whether it belongs to an overlap run (decode, merge,
+    /// dedupe) rather than passing through.
+    overlaps: Vec<bool>,
+}
+
+/// Pass 1: check the inputs, index every blob, order the index and find the
+/// overlap runs.
+fn plan_merge(
+    inputs: &[&Path],
+    opts: &WriteOptions,
+    host: &crate::host::Host,
+) -> Result<MergePlan> {
     if inputs.is_empty() {
         return Err(Error::invalid_argument("no input files specified"));
     }
@@ -228,6 +251,32 @@ pub(crate) fn merge_pbf_to(
         );
     }
 
+    Ok(MergePlan {
+        inputs: inputs.iter().map(|p| p.to_path_buf()).collect(),
+        headers,
+        entries,
+        overlaps,
+    })
+}
+
+/// Pass 2: write the planned blobs in order, re-reading each frame from the
+/// input pass 1 found it in. A frame that no longer reads or decodes (the
+/// file changed between passes) fails located at that input and the frame's
+/// offset.
+fn write_merge(
+    plan: MergePlan,
+    output: &crate::output::Output,
+    opts: &WriteOptions,
+    overrides: &HeaderOverrides,
+    host: &crate::host::Host,
+) -> Result<MergePbfStats> {
+    let MergePlan {
+        inputs,
+        headers,
+        entries,
+        overlaps,
+    } = plan;
+
     // Pass 2: Write in sorted order
     crate::host::diag!(
         host.diagnostics,
@@ -259,17 +308,7 @@ pub(crate) fn merge_pbf_to(
     let mut writer =
         writer_from_header_bytes(output, opts.compression, &header.bytes, opts.backend, host)?;
 
-    // Open all input files for random access, each with its path so a
-    // failed read or decode in this pass names the file.
-    let mut files: Vec<Source<'_>> = inputs
-        .iter()
-        .map(|path| {
-            Ok(Source {
-                file: crate::read::input::open(path)?,
-                path,
-            })
-        })
-        .collect::<Result<_>>()?;
+    let mut files = open_sources(&inputs)?;
 
     let mut stats = MergePbfStats {
         nodes: 0,
@@ -554,6 +593,20 @@ struct Source<'a> {
     path: &'a Path,
 }
 
+/// Open every input for pass 2's random access, each with its path so a
+/// failed read or decode in this pass names the file.
+fn open_sources(inputs: &[std::path::PathBuf]) -> Result<Vec<Source<'_>>> {
+    inputs
+        .iter()
+        .map(|path| {
+            Ok(Source {
+                file: crate::read::input::open(path)?,
+                path: path.as_path(),
+            })
+        })
+        .collect()
+}
+
 impl Source<'_> {
     /// Locate a failure on `entry`'s frame in this input. Cold: built only
     /// on the error path.
@@ -598,6 +651,19 @@ fn read_frame_into(source: &mut Source<'_>, entry: &BlobEntry, buf: &mut Vec<u8>
         .seek(SeekFrom::Start(entry.file_offset))
         .and_then(|_| source.file.read_exact(buf))
         .map_err(|e| source.locate(entry, Error::from(e)))
+}
+
+/// Re-read and decode the frame of an overlap-run `entry`, locating a read
+/// or decode failure at its input and frame offset.
+fn read_block(
+    source: &mut Source<'_>,
+    entry: &BlobEntry,
+    buf: &mut Vec<u8>,
+) -> Result<crate::PrimitiveBlock> {
+    read_frame_into(source, entry, buf)?;
+    extract_blob_bytes(buf)
+        .and_then(decode_blob_to_primitiveblock)
+        .map_err(|e| source.locate(entry, e))
 }
 
 fn extract_blob_bytes(frame: &[u8]) -> Result<&[u8]> {
@@ -736,11 +802,7 @@ fn sweep_merge_dedup<T: Ord + HasId>(
             },
         )?;
 
-        let source = &mut files[entry.file_index];
-        read_frame_into(source, entry, &mut frame_buf)?;
-        let block = extract_blob_bytes(&frame_buf)
-            .and_then(decode_blob_to_primitiveblock)
-            .map_err(|e| source.locate(entry, e))?;
+        let block = read_block(&mut files[entry.file_index], entry, &mut frame_buf)?;
         for element in block.elements() {
             extract(&element, &mut heap);
         }
@@ -890,6 +952,178 @@ mod tests {
         count_entry(&scanned, &mut stats);
         assert_eq!(stats.ways, 7, "a pass-1 scan count is observed");
         assert_eq!(stats.passthrough_claimed, 1_000_000);
+    }
+
+    /// Kind of the one data blob a fixture writes into its own block.
+    enum Blob<'a> {
+        Nodes(&'a [i64]),
+        Way(i64),
+        Relation(i64),
+    }
+
+    /// A sorted, indexed PBF holding `blobs`, one block each, in order.
+    fn write_fixture(path: &Path, blobs: &[Blob<'_>]) {
+        use crate::block_builder::HeaderBuilder;
+        use crate::writer::Compression;
+        let file = std::fs::File::create(path).expect("create fixture");
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::default(),
+        );
+        writer
+            .write_header(&HeaderBuilder::new().sorted().build().expect("header"))
+            .expect("write header");
+        let none = std::iter::empty::<(&str, &str)>;
+        let mut bb = BlockBuilder::new();
+        for blob in blobs {
+            match blob {
+                Blob::Nodes(ids) => {
+                    for &id in *ids {
+                        bb.add_node(id, 0, 0, none(), None);
+                    }
+                }
+                Blob::Way(id) => bb.add_way(*id, none(), &[1, 2], None),
+                Blob::Relation(id) => bb.add_relation(*id, none(), &[], None),
+            }
+            let bytes = bb.take().expect("encode").expect("non-empty block");
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        writer.flush().expect("flush fixture");
+    }
+
+    /// Input A: nodes 1..=3 and a way, input B: nodes 2..=4 (overlapping
+    /// A's node blob) and a relation that overlaps nothing.
+    fn fixtures(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let a = dir.join("a.osm.pbf");
+        let b = dir.join("b.osm.pbf");
+        write_fixture(&a, &[Blob::Nodes(&[1, 2, 3]), Blob::Way(10)]);
+        write_fixture(&b, &[Blob::Nodes(&[2, 3, 4]), Blob::Relation(100)]);
+        (a, b)
+    }
+
+    fn plan(a: &Path, b: &Path) -> MergePlan {
+        plan_merge(
+            &[a, b],
+            &WriteOptions::default(),
+            &crate::host::Host::for_tests(),
+        )
+        .expect("pass 1")
+    }
+
+    fn run_pass2(dir: &Path, plan: MergePlan) -> Result<MergePbfStats> {
+        let output = crate::output::Output::new(
+            dir.join("merged.osm.pbf"),
+            crate::output::Overwrite::Refuse,
+            &crate::host::Diagnostics::discard(),
+        )?;
+        write_merge(
+            plan,
+            &output,
+            &WriteOptions::default(),
+            &HeaderOverrides::default(),
+            &crate::host::Host::for_tests(),
+        )
+    }
+
+    /// The entry of `kind` that pass 1 indexed from input `file_index`, and
+    /// whether it is in an overlap run.
+    fn entry_of(plan: &MergePlan, kind: ElementKind, file_index: usize) -> (&BlobEntry, bool) {
+        let (entry, &overlap) = plan
+            .entries
+            .iter()
+            .zip(&plan.overlaps)
+            .find(|(e, _)| e.index.kind == kind && e.file_index == file_index)
+            .expect("planned entry");
+        (entry, overlap)
+    }
+
+    /// The untouched plan merges: the two shared nodes are deduped.
+    #[test]
+    fn pass2_merges_an_unchanged_plan() {
+        let dir = crate::path_guard::tests::scratch();
+        let (a, b) = fixtures(dir.path());
+        let stats = run_pass2(dir.path(), plan(&a, &b)).expect("pass 2");
+        assert_eq!(stats.nodes, 4);
+        assert_eq!(stats.duplicates_removed, 2);
+        assert_eq!(stats.blobs_rewritten, 2);
+        assert_eq!(stats.blobs_passthrough, 2);
+    }
+
+    // The two failure cases drive pass 2's frame reads (`read_block` for an
+    // overlap run, `read_frame_into` for a passthrough blob) over a real
+    // pass-1 plan rather than `write_merge` itself: an error return drops
+    // pass 2's `PbfWriter` unflushed, which this crate's unit-test builds
+    // assert against (see the writer's `Drop`).
+
+    /// A blob of an overlap run that no longer decodes when pass 2 re-reads
+    /// it fails located at its input and its frame's offset - the second
+    /// input, at a nonzero offset, so first-input attribution cannot pass.
+    #[test]
+    fn pass2_decode_failure_names_the_input_and_frame() {
+        let dir = crate::path_guard::tests::scratch();
+        let (a, b) = fixtures(dir.path());
+        let plan = plan(&a, &b);
+        let (entry, overlap) = entry_of(&plan, ElementKind::Node, 1);
+        assert!(overlap, "B's node blob overlaps A's");
+        assert!(entry.file_offset > 0, "the header blob precedes it");
+
+        // Keep the length and the BlobHeader; make the Blob unparseable.
+        let mut bytes = std::fs::read(&b).expect("read B");
+        let start = usize::try_from(entry.file_offset).expect("offset");
+        let header_len = u32::from_be_bytes(bytes[start..start + 4].try_into().expect("prefix"));
+        let payload = start + 4 + header_len as usize;
+        let end = start + usize::try_from(entry.frame_len).expect("frame len");
+        bytes[payload..end].fill(0xff);
+        std::fs::write(&b, &bytes).expect("corrupt B");
+
+        let mut sources = open_sources(&plan.inputs).expect("open inputs");
+        let err = match read_block(&mut sources[entry.file_index], entry, &mut Vec::new()) {
+            Ok(_) => panic!("a corrupt blob must fail pass 2"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::WireFormat { .. }),
+            "expected the Blob decode failure, got {err:?}"
+        );
+        assert_eq!(err.source_path(), Some(b.as_path()));
+        assert_eq!(
+            err.byte_offset(),
+            Some(crate::ByteOffset(entry.file_offset))
+        );
+    }
+
+    /// A passthrough frame that is gone when pass 2 re-reads it (the input
+    /// was truncated between passes) fails located at its input and offset.
+    #[test]
+    fn pass2_read_failure_names_the_input_and_frame() {
+        let dir = crate::path_guard::tests::scratch();
+        let (a, b) = fixtures(dir.path());
+        let plan = plan(&a, &b);
+        let (entry, overlap) = entry_of(&plan, ElementKind::Relation, 1);
+        assert!(!overlap, "B's relation blob passes through");
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&b)
+            .expect("open B");
+        file.set_len(entry.file_offset)
+            .expect("truncate B at the relation frame");
+        drop(file);
+
+        let mut sources = open_sources(&plan.inputs).expect("open inputs");
+        let err = match read_frame_into(&mut sources[entry.file_index], entry, &mut Vec::new()) {
+            Ok(()) => panic!("a missing frame must fail pass 2"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err.kind(), crate::ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+            "expected the frame read to hit end of file, got {err:?}"
+        );
+        assert_eq!(err.source_path(), Some(b.as_path()));
+        assert_eq!(
+            err.byte_offset(),
+            Some(crate::ByteOffset(entry.file_offset))
+        );
     }
 
     #[test]

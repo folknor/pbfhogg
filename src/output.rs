@@ -74,6 +74,11 @@
 //! rollback step that cannot complete keeps the previous output in a
 //! `.pbfhogg-backup-*` sibling and says so in the error.
 
+// This module is the output choke point the crate-root deny points at: the
+// staging, publication, rollback and directory syncs it owns are the calls
+// `clippy.toml` refuses everywhere else.
+#![allow(clippy::disallowed_methods)]
+
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;

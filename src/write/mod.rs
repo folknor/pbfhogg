@@ -122,6 +122,16 @@ pub(crate) enum Finish {
     Deferred,
 }
 
+/// Create (or truncate) the file a buffered or `pwrite` backend writes: an
+/// [`Output`](crate::Output)'s staging path, or the path a library caller
+/// handed a public path constructor. The backends' one plain create; the
+/// `O_DIRECT` and `io_uring` backends open with their own flags. Each caller
+/// names the path in its error.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn create_backend_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(path)
+}
+
 /// Page size for alignment. 4096 is universally safe across Linux filesystems.
 pub(crate) const PAGE_SIZE: usize = 4096;
 

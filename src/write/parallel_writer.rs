@@ -260,7 +260,7 @@ fn parallel_writer_thread_inner(
     finish: super::Finish,
     cancel: &crate::host::Cancel,
 ) -> Result<()> {
-    let file = match File::create(&path) {
+    let file = match super::create_backend_file(&path) {
         Ok(f) => f,
         Err(e) => {
             // The same typed error goes to the constructor waiting on init
@@ -293,6 +293,9 @@ fn parallel_writer_thread_inner(
 
     if finish == super::Finish::Durable {
         let t_sync = std::time::Instant::now();
+        // A path-constructor writer's own durability, recorded through the
+        // writer-metrics funnel on the next line.
+        #[allow(clippy::disallowed_methods)]
         file.sync_all()?;
         WRITER_METRICS.record_sync_all(t_sync);
     }

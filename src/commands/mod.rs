@@ -1,9 +1,6 @@
 // The command layer writes outputs only through `crate::output` (the writer
 // factory below takes an `Output`) and scratch only through
-// `crate::scratch`; clippy.toml lists the path-writing methods this refuses.
-// Unit-test fixtures build their inputs directly, so the rule holds for the
-// shipped code, which `--all-targets` lints without `cfg(test)`.
-#![cfg_attr(not(test), deny(clippy::disallowed_methods))]
+// `crate::scratch`; the crate root denies the methods clippy.toml lists.
 
 pub mod altw;
 pub mod apply_changes;

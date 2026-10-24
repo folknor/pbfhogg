@@ -21,7 +21,8 @@ staged beside their destination because publication is a rename.
   created at a `ScratchPath`, which only a `RunScratch` hands out and which
   names a single component of its own directory; clippy.toml bans the
   directory- and file-removing and renaming `std::fs` functions,
-  `std::process::id` and `std::env::temp_dir` in the command layer and the CLI.
+  `std::process::id` and `std::env::temp_dir` across the library (outside
+  `crate::scratch` and `crate::output`, which own them) and the CLI.
 - **Ownership.** The public entry points that use scratch
   (`add_locations_to_ways`, `external_join`, `diff`, `derive_changes`,
   `build_geocode_index`) take the `RunScratch` by value; the engines under

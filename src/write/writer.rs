@@ -1286,7 +1286,7 @@ impl PbfWriter<BufWriter<File>> {
     /// [`Output`](crate::Output): like [`to_path_sync`](Self::to_path_sync),
     /// but `flush` only flushes, because publication syncs the file.
     pub(crate) fn to_staged_file(path: &Path, compression: Compression) -> Result<Self> {
-        let file = File::create(path)?;
+        let file = super::create_backend_file(path)?;
         let buffered = BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file);
         Ok(Self::new(buffered, compression))
     }
@@ -1300,7 +1300,7 @@ impl PbfWriter<BufWriter<File>> {
     /// arbitrary `Write` value and only needs its ordinary `Write::flush`
     /// behavior.
     pub fn to_path_sync(path: &Path, compression: Compression) -> Result<Self> {
-        let file = File::create(path).map_err(|e| Error::from(e).writing(path))?;
+        let file = super::create_backend_file(path).map_err(|e| Error::from(e).writing(path))?;
         let buffered = BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file);
         let mut writer = Self::new(buffered, compression);
         writer.finalize_writer = sync_buffered_file;

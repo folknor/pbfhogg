@@ -8,13 +8,30 @@
 
 use crate::tunables::{NOFILE_PROBE_FAILED_ASSUMED_SOFT, NOFILE_SOFT_LIMIT_CLAMP};
 
+/// Read a file the kernel provides (procfs, cgroupfs). Not a caller-named
+/// input, so it bypasses `crate::read::input`: the path is the kernel's, and
+/// each caller decides what a failure means - most fold it into an absent
+/// sample, [`is_mount_point`] returns it with the path as context.
+#[allow(clippy::disallowed_methods)]
+pub(crate) fn read_kernel_file(path: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    std::fs::read_to_string(path)
+}
+
+/// [`read_kernel_file`] as raw bytes, for a table whose fields need not be
+/// UTF-8 (mountinfo paths).
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)]
+fn read_kernel_bytes(path: &str) -> std::io::Result<Vec<u8>> {
+    std::fs::read(path)
+}
+
 /// Read cumulative minor and major page faults from `/proc/self/stat`.
 ///
 /// Returns `None` when procfs is unavailable or the process-stat record is
 /// missing either counter. Non-Linux targets have no procfs implementation.
 #[cfg(target_os = "linux")]
 pub(crate) fn read_page_faults() -> Option<(u64, u64)> {
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let stat = read_kernel_file("/proc/self/stat").ok()?;
     parse_page_faults(&stat)
 }
 
@@ -42,7 +59,7 @@ fn parse_page_faults(stat: &str) -> Option<(u64, u64)> {
 /// time is unavailable. Non-Linux targets return `None`.
 #[cfg(target_os = "linux")]
 pub(crate) fn micros_since_process_start() -> Option<u64> {
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let stat = read_kernel_file("/proc/self/stat").ok()?;
     // `comm` (field 2) is parenthesised and may contain spaces; fields after
     // the closing paren are space-separated, so field 22 is index 19 there.
     let after_comm = stat.rsplit_once(')')?.1;
@@ -54,7 +71,7 @@ pub(crate) fn micros_since_process_start() -> Option<u64> {
     }
     #[allow(clippy::cast_sign_loss)]
     let ticks_per_sec = ticks_per_sec as u64;
-    let uptime = std::fs::read_to_string("/proc/uptime").ok()?;
+    let uptime = read_kernel_file("/proc/uptime").ok()?;
     let uptime_secs: f64 = uptime.split_whitespace().next()?.parse().ok()?;
     let start_secs = starttime_ticks as f64 / ticks_per_sec as f64;
     let alive = uptime_secs - start_secs;
@@ -76,7 +93,7 @@ pub(crate) fn micros_since_process_start() -> Option<u64> {
 /// value is malformed. Non-Linux targets return `None`.
 #[cfg(target_os = "linux")]
 pub fn read_peak_rss_kb() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let status = read_kernel_file("/proc/self/status").ok()?;
     parse_peak_rss_kb(&status)
 }
 
@@ -110,7 +127,7 @@ pub(crate) fn is_mount_point(path: &std::path::Path) -> crate::Result<bool> {
     use std::os::unix::ffi::OsStrExt;
 
     let canonical = std::fs::canonicalize(path)?;
-    let mountinfo = std::fs::read("/proc/self/mountinfo")
+    let mountinfo = read_kernel_bytes("/proc/self/mountinfo")
         .map_err(|e| crate::Error::from(e).context("cannot read /proc/self/mountinfo"))?;
     for line in mountinfo.split(|byte| *byte == b'\n') {
         // Fields: mount ID, parent ID, major:minor, root, mount point, ...

@@ -313,7 +313,7 @@ impl Resources for MachineProbe {
         std::thread::available_parallelism().ok()
     }
     fn memory_available(&self) -> Option<u64> {
-        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let meminfo = crate::process::read_kernel_file("/proc/meminfo").ok()?;
         let line = meminfo.lines().find(|l| l.starts_with("MemAvailable:"))?;
         let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
         let available = kb.saturating_mul(1024);
@@ -329,11 +329,11 @@ impl Resources for MachineProbe {
 // outside the mount namespace cannot be observed by this best-effort probe.
 #[cfg(target_os = "linux")]
 fn machine_memory_available(mut available: u64) -> Option<u64> {
-    let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let membership = crate::process::read_kernel_file("/proc/self/cgroup").ok()?;
     let Some(group) = membership.lines().find_map(|line| line.strip_prefix("0::")) else {
         return Some(available); // cgroup v1 has no unified memory controller
     };
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mounts = crate::process::read_kernel_file("/proc/self/mountinfo").ok()?;
     let mut found = false;
     for line in mounts.lines() {
         let Some((fields, fs)) = line.split_once(" - ") else {
@@ -380,10 +380,10 @@ fn cap_by_cgroup_ancestors(
     mut available: u64,
 ) -> Option<u64> {
     loop {
-        match std::fs::read_to_string(path.join("memory.max")) {
+        match crate::process::read_kernel_file(path.join("memory.max")) {
             Ok(maximum) if maximum.trim() == "max" => {}
             Ok(maximum) => {
-                let current = std::fs::read_to_string(path.join("memory.current")).ok()?;
+                let current = crate::process::read_kernel_file(path.join("memory.current")).ok()?;
                 available = cgroup_memory_available(available, &maximum, &current)?;
             }
             // The hierarchy root or a disabled memory controller has no

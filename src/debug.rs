@@ -31,7 +31,10 @@ pub fn initialize_marker_fifo(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The sidecar FIFO is the caller's instrumentation channel, not an input or
+/// an output; the bare `io::Error` goes back to the caller, which names it.
 #[cfg(unix)]
+#[allow(clippy::disallowed_methods)]
 fn open_marker_fifo(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()

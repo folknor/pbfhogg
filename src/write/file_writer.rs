@@ -32,7 +32,7 @@ pub enum FileWriter {
 impl FileWriter {
     /// Create a buffered file writer (default path).
     pub fn buffered(path: &Path) -> crate::Result<Self> {
-        let file = File::create(path)?;
+        let file = super::create_backend_file(path)?;
         Ok(FileWriter::Buffered(BufWriter::with_capacity(
             crate::write::IO_BUF_BYTES,
             file,
@@ -81,7 +81,11 @@ impl FileWriter {
 /// synchronization" as success. Only consulted after `sync_all` has already
 /// failed, so the regular-file success path is exactly one `fsync`.
 pub(super) fn sync_file(file: &File) -> io::Result<()> {
-    match file.sync_all() {
+    // The buffered backend's durability; callers record it through the
+    // writer-metrics funnel.
+    #[allow(clippy::disallowed_methods)]
+    let synced = file.sync_all();
+    match synced {
         Err(e) if sync_unsupported(e.raw_os_error(), || file_type(file)) => Ok(()),
         other => other,
     }

@@ -23,3 +23,30 @@ pub(crate) mod xml_parse;
 type ParseResult<T> = crate::Result<T>;
 
 pub use parse::*;
+
+/// The one rule every OSC producer (`merge-changes`, `tags-filter` on an OSC,
+/// `diff --format osc`) uses to frame its output, from the name the caller
+/// chose: a name ending `.osc` is written plain (`Ok(false)`), a name ending
+/// `.osc.gz` is gzipped (`Ok(true)`), and any other name is refused with an
+/// `InvalidArgument` error naming both suffixes.
+///
+/// The match is on the final path component's raw bytes, so a non-UTF-8 name
+/// is judged like any other, and it is case-sensitive: `.OSC` is refused.
+/// Producers call this before any work, and never with a staging name.
+///
+/// # Errors
+///
+/// `InvalidArgument` when `destination` ends in neither suffix.
+pub fn output_is_gzip(destination: &std::path::Path) -> crate::Result<bool> {
+    let name = destination.as_os_str().as_encoded_bytes();
+    if name.ends_with(b".osc.gz") {
+        Ok(true)
+    } else if name.ends_with(b".osc") {
+        Ok(false)
+    } else {
+        Err(crate::Error::invalid_argument(format!(
+            "OSC output name {} must end in .osc (written plain) or .osc.gz (gzipped)",
+            destination.display()
+        )))
+    }
+}

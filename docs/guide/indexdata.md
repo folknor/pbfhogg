@@ -93,10 +93,14 @@ The escape, and whether a command refuses at all, is decided per command:
   `--invert` or `--distrust-metadata`.
 
 Except for renumber's scan, the check reads only the first data blob's
-header. A file whose first data blob is indexed passes it even if later blobs
-are not; what happens on those later blobs depends on the command (some decode
-them on a fallback path, others stop with an error mid-run). It is not a
-whole-file validation.
+header. It is not a whole-file validation: a file whose first data blob is
+indexed passes it even if later blobs are not. Such a partially indexed file
+is refused, with the same missing-indexdata error and advice, by every command
+that reads all blob headers to plan its work (among them `sort`,
+`apply-changes`, `repack`, `tags-filter`, `extract`, `add-locations-to-ways`,
+`build-geocode-index`, `digest` and `diff`), at the first data blob without
+indexdata; `--force` does not lift that refusal. `pbfhogg cat` indexes every
+blob of such a file. Commands that do not read every header first run on it.
 
 ## The --force flag
 
@@ -138,4 +142,6 @@ Exit code 0 means indexed, exit code 1 means not indexed. This is useful in scri
 
 The answer comes from the first data blob only, the same probe the commands
 above use: a file whose first data blob carries indexdata reports indexed even
-if later blobs do not, and a file with no data blobs reports not indexed.
+if later blobs do not, and a file with no data blobs reports indexed (no blob
+lacks indexdata). `check --index` reports a partially indexed file as a
+violation.

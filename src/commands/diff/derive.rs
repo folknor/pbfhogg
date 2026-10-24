@@ -55,7 +55,8 @@ impl DeriveChangesStats {
 ///
 /// Streams through both files using pipelined block iterators and performs
 /// a merge-join by (type, id). Changes are buffered by action type and
-/// written as gzipped OsmChange XML. Memory is bounded by the number of
+/// written as OsmChange XML, gzipped when the output name ends `.osc.gz` and
+/// plain when it ends `.osc` (any other name is refused before any work). Memory is bounded by the number of
 /// changed elements, not total input size.
 ///
 /// `timestamp` overrides every emitted delete timestamp with the same Unix second.
@@ -106,6 +107,8 @@ pub(crate) fn derive_changes_to(
     host: &crate::host::Host,
     scratch: &crate::scratch::RunScratch,
 ) -> Result<DeriveChangesStats> {
+    // The name rule every OSC producer shares, applied before any work.
+    crate::osc::output_is_gzip(output.destination())?;
     let jobs = super::resolve_shards(parallelism, host);
     // Single-pass: check sorted headers + indexdata from one file open each.
     let (old_sorted, old_indexed) = super::check_sorted_and_indexed(old_path, direct_io, host)?;
@@ -570,13 +573,10 @@ pub(crate) fn assemble_osc_from_paths(
     // thread records that as its failure and every later `write` returns it).
     host.cancel.check()?;
 
-    // OSC document framing has no shared owner: merge_changes chooses gzip
-    // from the output name, tags-filter always gzips, and this path emits
-    // ordered gzip chunks (CORRECTNESS.md, OSC emission contracts).
-    // Extracting only this framing would leave the other owners split, while
-    // replacing chunk compression risks changing member boundaries and output
-    // bytes. Preserve this assembler until all paths can share an owner
-    // without changing their established output bytes.
+    // Framing follows the output name, the rule every OSC producer shares
+    // (`crate::osc::output_is_gzip`): `.osc.gz` is written as ordered gzip
+    // chunks, `.osc` as plain XML.
+    let gzip = crate::osc::output_is_gzip(output.destination())?;
     // The three XML fragments remain live throughout gzip assembly. Their
     // exact lengths are now known, but are not the compressed output size:
     // refusing unless that much space remains would reject compressible XML.
@@ -600,8 +600,44 @@ pub(crate) fn assemble_osc_from_paths(
         crate::tunables::DERIVE_GZIP_WORKERS_MIN,
         crate::tunables::DERIVE_GZIP_WORKERS_FALLBACK,
     );
-    let gz = ParallelGzipWriter::new(buf, DEFAULT_CHUNK_SIZE, worker_count);
-    let mut writer = Writer::new_with_indent(gz, b' ', 2);
+    if gzip {
+        let gz = ParallelGzipWriter::new(buf, DEFAULT_CHUNK_SIZE, worker_count);
+        let gz = write_document(
+            gz,
+            creates_path,
+            modifies_path,
+            deletes_path,
+            create_count,
+            modify_count,
+            delete_count,
+        )?;
+        gz.finish()?.finish()
+    } else {
+        write_document(
+            buf,
+            creates_path,
+            modifies_path,
+            deletes_path,
+            create_count,
+            modify_count,
+            delete_count,
+        )?
+        .finish()
+    }
+}
+
+/// Write the OsmChange document around the three fragments into `sink` and
+/// hand the sink back for the caller to finish.
+fn write_document<W: Write>(
+    sink: W,
+    creates_path: &Path,
+    modifies_path: &Path,
+    deletes_path: &Path,
+    create_count: u64,
+    modify_count: u64,
+    delete_count: u64,
+) -> Result<W> {
+    let mut writer = Writer::new_with_indent(sink, b' ', 2);
 
     writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
     writer.write_event(Event::Text(BytesText::new("\n")))?;
@@ -616,8 +652,7 @@ pub(crate) fn assemble_osc_from_paths(
 
     writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
 
-    let gz = writer.into_inner();
-    gz.finish()?.finish()
+    Ok(writer.into_inner())
 }
 
 /// Copy a temp file's raw XML bytes into an action section.

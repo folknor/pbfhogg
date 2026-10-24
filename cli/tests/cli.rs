@@ -436,11 +436,11 @@ fn cli_check_json_preserves_non_utf8_filename_lossily() {
 }
 
 #[test]
-fn cli_osc_outputs_keep_legacy_transport_and_metadata() {
+fn cli_osc_outputs_are_plain_under_osc_and_keep_metadata() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osc");
     std::fs::write(&input, b"<osmChange version=\"0.6\"><create><node id=\"7\" lat=\"1\" lon=\"2\" timestamp=\"yesterday\" changeset=\"no\" uid=\"&#48;\" visible=\"False\"><tag k=\"name\" v=\"test\"/></node></create></osmChange>").expect("XML");
-    for (command, gzip) in [("tags-filter", true), ("merge-changes", false)] {
+    for command in ["tags-filter", "merge-changes"] {
         let output = dir.path().join(format!("{command}.osc"));
         let mut cli = Command::new(pbfhogg_bin());
         cli.arg(command).arg(&input);
@@ -454,10 +454,7 @@ fn cli_osc_outputs_keep_legacy_transport_and_metadata() {
             String::from_utf8_lossy(&result.stderr)
         );
         let bytes = std::fs::read(&output).expect("output");
-        assert_eq!(bytes.starts_with(b"\x1f\x8b"), gzip);
-        if gzip {
-            continue;
-        }
+        assert!(!bytes.starts_with(b"\x1f\x8b"), "{command}: .osc is plain");
         let xml = String::from_utf8(bytes).expect("XML");
         for attribute in [
             "timestamp=\"yesterday\"",
@@ -472,7 +469,7 @@ fn cli_osc_outputs_keep_legacy_transport_and_metadata() {
 
 #[cfg(unix)]
 #[test]
-fn cli_merge_changes_non_utf8_gz_path_stays_plain() {
+fn cli_merge_changes_non_utf8_osc_gz_path_is_gzipped() {
     use std::os::unix::ffi::OsStrExt;
     let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osc");
@@ -497,8 +494,8 @@ fn cli_merge_changes_non_utf8_gz_path_stays_plain() {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        let xml = std::fs::read(&output).expect("output");
-        assert!(xml.starts_with(b"<?xml"));
+        let bytes = std::fs::read(&output).expect("output");
+        assert!(bytes.starts_with(b"\x1f\x8b"), "simplify={simplify}");
     }
 }
 
@@ -528,7 +525,7 @@ fn cli_osc_counters_keep_historical_name_and_per_file_values() {
         }
         let result = cli
             .arg("-o")
-            .arg(dir.path().join(format!("{command}.out")))
+            .arg(dir.path().join(format!("{command}-out.osc")))
             .output()
             .expect("command");
         assert!(

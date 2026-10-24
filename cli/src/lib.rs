@@ -434,8 +434,22 @@ fn validate_command(
              two same-kind elements inside one output block",
         )),
         Command::Check { .. } => validate_check(command).map(|()| None),
+        Command::MergeChanges { output, .. } => {
+            validate_osc_output(&["merge-changes"], &output.output).map(|()| None)
+        }
         _ => Ok(None),
     }
+}
+
+/// The name rule every OSC producer shares: `.osc` is written plain,
+/// `.osc.gz` gzipped, anything else is a usage error before any work.
+fn validate_osc_output(
+    path: &[&str],
+    output: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    pbfhogg::osc::output_is_gzip(output)
+        .map(|_| ())
+        .map_err(|e| usage(path, e))
 }
 
 fn validate_tags_filter(
@@ -454,6 +468,7 @@ fn validate_tags_filter(
         io,
         force,
         header,
+        output,
         ..
     } = command
     else {
@@ -506,7 +521,7 @@ fn validate_tags_filter(
         (
             given(matches, "tags-filter", "compression"),
             "--compression",
-            "OSC output is not a PBF and is always gzipped",
+            "OSC output is not a PBF; its framing comes from the output name",
         ),
         (
             io.direct_io,
@@ -521,6 +536,7 @@ fn validate_tags_filter(
             format!("{flag} is not valid in OSC mode ({how}): {why}"),
         ));
     }
+    validate_osc_output(&["tags-filter"], &output.output)?;
     Ok((kind, expressions))
 }
 
@@ -547,9 +563,9 @@ fn validate_diff(command: &Command) -> Result<(), Box<dyn std::error::Error>> {
         DiffFormat::Osc => {
             // Deliberately require output before rejecting text-only flags.
             // Even -q without -o keeps this missing-output error first.
-            if output.is_none() {
+            let Some(output) = output else {
                 return refuse("--output is required with --format osc");
-            }
+            };
             for (set, flag) in [
                 (*suppress_common, "--suppress-common"),
                 (*verbose, "--verbose"),
@@ -561,6 +577,7 @@ fn validate_diff(command: &Command) -> Result<(), Box<dyn std::error::Error>> {
                     return refuse(&format!("{flag} is not valid with --format osc"));
                 }
             }
+            validate_osc_output(&["diff"], output)?;
         }
         DiffFormat::Text => {
             for (set, flag) in [

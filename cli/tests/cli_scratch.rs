@@ -45,11 +45,15 @@ fn a_bad_tmp_dir_fails_before_any_input_is_read() {
     let missing_other = dir.path().join("no-such-other.osm.pbf");
     let tmp = dir.path().join("no-such-dir");
     let output = dir.path().join("out");
-    let (input, other, tmp_arg, output_arg) = (
+    // An OSC output must carry one of the two accepted suffixes, or the name
+    // is refused before the --tmp-dir check this test is about.
+    let osc_output = dir.path().join("out.osc");
+    let (input, other, tmp_arg, output_arg, osc_arg) = (
         missing_input.to_str().unwrap(),
         missing_other.to_str().unwrap(),
         tmp.to_str().unwrap(),
         output.to_str().unwrap(),
+        osc_output.to_str().unwrap(),
     );
     let runs: Vec<Vec<&str>> = vec![
         vec![
@@ -68,7 +72,7 @@ fn a_bad_tmp_dir_fails_before_any_input_is_read() {
             "--format",
             "osc",
             "-o",
-            output_arg,
+            osc_arg,
             "--tmp-dir",
             tmp_arg,
         ],

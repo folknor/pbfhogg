@@ -4,6 +4,32 @@
 
 ### Breaking
 
+- **Every OSC producer frames its output by the output name, and refuses
+  other names.** `merge-changes`, `tags-filter --input-kind osc` and
+  `diff --format osc` (and the library functions behind them) write plain XML
+  to a name ending `.osc`, gzip to a name ending `.osc.gz`, and refuse any
+  other name before any work, with a usage error naming both suffixes. This
+  breaks `tags-filter --input-kind osc` and `diff --format osc` runs that
+  wrote gzip to an `.osc` name (they now write plain XML), `merge-changes`
+  runs whose name ended `.gz` but not `.osc.gz`, and every run that wrote to
+  some other suffix. The match is case-sensitive: `.OSC` is refused. A
+  non-UTF-8 name is judged like any other (it used to be written plain by
+  `merge-changes`). New public function `osc::output_is_gzip` carries the
+  rule.
+
+- **A partially indexed input is refused instead of run on an index it
+  lacks.** A file whose first data blob carries indexdata and a later one
+  does not used to pass the first-blob indexdata check. Every command that
+  already reads every blob header to plan its work now refuses it with the
+  missing-indexdata error, located at the first data blob without
+  indexdata: sort, apply-changes, repack, degrade, tags-filter, tags-count,
+  extract, add-locations-to-ways, build-geocode-index, time-filter,
+  `cat --clean`, `inspect --nodes`, `inspect tags`, `check --refs`,
+  `check --ids` and digest. `--force` and `--allow-unindexed` do not lift
+  this refusal; `pbfhogg cat` re-indexes such a file. A wholly unindexed
+  input is handled as before. `ErrorKind::MissingIndexdata` gains a
+  `partial` field that marks this case.
+
 - **Element caps are `NonZeroUsize`.** `repack::repack`'s
   `elements_per_blob`, `degrade::degrade`'s `block_cap`,
   `BlockBuilder::with_element_cap_prealloc` and

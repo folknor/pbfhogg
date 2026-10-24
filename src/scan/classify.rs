@@ -346,7 +346,12 @@ pub(crate) fn blob_filter_check(
 ///
 /// Only OsmData blobs are included. When `kind_filter` is `Some`, only blobs
 /// whose indexdata matches the given element type (plus blobs without
-/// indexdata) are included.
+/// indexdata) are included. A file whose data blobs carry indexdata on some
+/// and not others is refused with the missing-indexdata error
+/// ([`HeaderWalker::refusing_partial_index`]); a wholly unindexed one is
+/// scheduled.
+///
+/// [`HeaderWalker::refusing_partial_index`]: crate::read::header_walker::HeaderWalker::refusing_partial_index
 ///
 /// Walks headers via [`HeaderWalker`](crate::read::header_walker::HeaderWalker)
 /// so blob bodies are not dragged into the page cache during the scan. The
@@ -395,7 +400,8 @@ pub(crate) fn build_classify_schedule_blob_filtered(
     host: &crate::host::Host,
 ) -> Result<(Vec<ScheduledBlob>, InputFile, u64)> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
+    let mut walker =
+        crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
     // Consume the first blob, which must be the OSMHeader: an empty file or
     // one that opens with anything else is MissingHeader.
     // `HeaderWalker::next_header` enforces header position (an OSMHeader
@@ -462,7 +468,8 @@ pub(crate) fn build_classify_schedule_blob_filtered(
 ///
 /// Blobs lacking indexdata are included in all three schedules (matching
 /// the per-kind behaviour of `build_classify_schedule(.., Some(kind))`,
-/// which only skips blobs whose indexdata reports a mismatched kind).
+/// which only skips blobs whose indexdata reports a mismatched kind). A
+/// partially indexed file is refused, as there.
 /// Positions are local to each schedule (each is a contiguous 0..n range
 /// for `parallel_classify_phase`).
 ///
@@ -486,7 +493,8 @@ pub(crate) fn build_classify_schedules_split(
     [i64; 3],
 )> {
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
+    let mut walker =
+        crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
     consume_leading_header(&mut walker, input)?;
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 

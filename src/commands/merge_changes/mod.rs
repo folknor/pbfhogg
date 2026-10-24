@@ -171,6 +171,9 @@ pub(crate) fn merge_changes_to(
     allow_version_regression: bool,
     host: &crate::host::Host,
 ) -> Result<MergeChangesStats> {
+    // Gzip or plain XML is decided by the name the caller chose (never the
+    // staging name), and a name that is neither is refused before any work.
+    let is_gz = crate::osc::output_is_gzip(output.destination())?;
     if inputs.is_empty() {
         return Err(crate::Error::invalid_argument(
             "at least one input OSC file is required",
@@ -216,9 +219,6 @@ pub(crate) fn merge_changes_to(
         host.executor.clone()
     };
 
-    // Gzip or plain XML is decided by the name the caller chose, never by
-    // the staging name.
-    let is_gz = gz_requested(output.destination());
     // The one whole-body executor install in the library. Everywhere else
     // `install` wraps only a parallel computation, so that no `PbfWriter`
     // producer ends up on a pool worker; this body writes OSC XML and drives
@@ -525,15 +525,6 @@ impl<W: io::Write> OscWriter<W> {
             Self::Plain(w) => Ok(w.into_inner()),
         }
     }
-}
-
-/// Whether a merged OSC goes out gzipped: a UTF-8 destination name ending in
-/// `.gz`. Decided from the destination the caller named, never from the
-/// staging file the bytes are written to.
-fn gz_requested(destination: &Path) -> bool {
-    // Deliberately require a UTF-8 name ending in .gz. Extension-only
-    // detection changes the historical output contract.
-    destination.to_str().is_some_and(|s| s.ends_with(".gz"))
 }
 
 impl OscWriter<crate::output::OutputWriter> {

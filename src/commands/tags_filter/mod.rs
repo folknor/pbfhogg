@@ -748,7 +748,8 @@ fn tags_filter_two_pass(
         // Avoids pulling blob bodies into the page cache for blobs we'll decide
         // to skip on the tag-index filter anyway.
         crate::debug::emit_marker("TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_START");
-        let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
+        let mut walker =
+            crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
         let _ = walker
             .next_header()?
             .ok_or_else(|| crate::error::new_missing_header(input))?;
@@ -963,7 +964,8 @@ fn tags_filter_two_pass(
     };
 
     crate::debug::emit_marker("TAGSFILTER_PASS2_SCHEDULE_SCAN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
+    let mut walker =
+        crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input))?;

@@ -199,7 +199,8 @@ pub(super) fn build_blob_schedule_with_passthrough(
     host: &crate::host::Host,
 ) -> Result<Vec<BlobDesc>> {
     crate::debug::emit_marker("EXTRACT_SCHEDULE_SCAN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
+    let mut walker =
+        crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input))?;

@@ -170,6 +170,41 @@ pub(crate) struct HeaderWalker {
     header_buf: Vec<u8>,
     /// 0-based index of the blob whose header was last returned.
     blob_index: u64,
+    /// Present when this walk refuses a partially indexed file; see
+    /// [`Self::refusing_partial_index`].
+    partial_index: Option<PartialIndexGuard>,
+}
+
+/// The state behind [`HeaderWalker::refusing_partial_index`]: what the first
+/// data blob said about indexdata, and where the first data blob without it
+/// sits.
+#[derive(Default)]
+struct PartialIndexGuard {
+    /// Whether the first data blob carried readable indexdata; `None` until
+    /// the walk has seen one.
+    first_indexed: Option<bool>,
+    /// `(blob ordinal, frame start)` of the first data blob without readable
+    /// indexdata.
+    first_unindexed: Option<(u64, u64)>,
+}
+
+impl PartialIndexGuard {
+    /// Record one data blob. Returns the location of the first unindexed
+    /// data blob once the file has shown both kinds.
+    fn observe(&mut self, meta: &BlobHeaderMeta) -> Option<(u64, u64)> {
+        let indexed = meta.index.is_some();
+        if !indexed && self.first_unindexed.is_none() {
+            self.first_unindexed = Some((meta.blob_index, meta.frame_start));
+        }
+        match self.first_indexed {
+            None => {
+                self.first_indexed = Some(indexed);
+                None
+            }
+            Some(first) if first != indexed => self.first_unindexed,
+            Some(_) => None,
+        }
+    }
 }
 
 impl HeaderWalker {
@@ -217,7 +252,31 @@ impl HeaderWalker {
             file_size,
             header_buf: Vec::new(),
             blob_index: 0,
+            partial_index: None,
         })
+    }
+
+    /// Make this walk refuse a partially indexed file: once the data blobs
+    /// seen so far include one with readable indexdata and one without,
+    /// [`Self::next_header`] returns the typed missing-indexdata error
+    /// located at the first data blob without it. Indexdata that is present
+    /// but unreadable counts as absent, as it does for every consumer. A
+    /// wholly indexed file and a wholly unindexed one both pass; whether a
+    /// wholly unindexed one is acceptable stays the caller's first-blob gate.
+    ///
+    /// For walks that already visit every header to build a command's
+    /// schedule, so the refusal costs no extra read. The first-blob probe
+    /// (`has_indexdata`) is what decides elsewhere whether a file is indexed,
+    /// so a file indexed on its first blob and not on a later one would
+    /// otherwise pass as indexed and run on an index it does not have.
+    /// Walks that do not build a schedule (inspect's description, the blob
+    /// count probe) or that sit on one arm of a size-dispatched command
+    /// (getid, getparents) do not opt in, so the verdict never depends on
+    /// input size.
+    #[must_use]
+    pub(crate) fn refusing_partial_index(mut self) -> Self {
+        self.partial_index = Some(PartialIndexGuard::default());
+        self
     }
 
     /// Attach this walker's input identity, the blob it was reading and that
@@ -316,6 +375,20 @@ impl HeaderWalker {
         match self.next_header_inner() {
             Ok(Some(meta)) => {
                 self.blob_index += 1;
+                if meta.blob_type == BlobKind::OsmData
+                    && let Some(guard) = self.partial_index.as_mut()
+                    && let Some((blob, frame_start)) = guard.observe(&meta)
+                {
+                    return Err(crate::error::new_partial_indexdata(
+                        "the file is partially indexed: indexdata on some data blobs and not \
+                         others, and this is the first data blob without indexdata",
+                    )
+                    .locate(crate::error::Location::new(
+                        Some(&self.path),
+                        Some(blob),
+                        Some(crate::ByteOffset(frame_start)),
+                    )));
+                }
                 Ok(Some(meta))
             }
             Ok(None) => Ok(None),
@@ -515,6 +588,83 @@ mod tests {
                 .expect("write block");
         }
         writer.flush().expect("flush fixture");
+    }
+
+    /// A header, then one single-node data blob per entry of `indexed`,
+    /// carrying indexdata where the entry is true.
+    fn write_index_pattern(path: &std::path::Path, indexed: &[bool]) {
+        let file = std::fs::File::create(path).expect("create fixture");
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::default(),
+        );
+        writer
+            .write_header(&HeaderBuilder::new().build().expect("header"))
+            .expect("write header");
+        let mut block = BlockBuilder::new();
+        for (id, &with_index) in (1_i64..).zip(indexed) {
+            block.add_node(id, 0, 0, std::iter::empty::<(&str, &str)>(), None);
+            let bytes = block.take().expect("take").expect("block");
+            if with_index {
+                writer.write_primitive_block(bytes).expect("write block");
+            } else {
+                writer
+                    .write_primitive_block_no_indexdata(bytes)
+                    .expect("write block");
+            }
+        }
+        writer.flush().expect("flush fixture");
+    }
+
+    fn walk_all(path: &std::path::Path, refusing: bool) -> super::Result<usize> {
+        let mut walker = super::HeaderWalker::open(path, &crate::host::Host::for_tests())?;
+        if refusing {
+            walker = walker.refusing_partial_index();
+        }
+        let mut n = 0;
+        while walker.next_header()?.is_some() {
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// A partially indexed file is the typed missing-indexdata error, located
+    /// at the first data blob without indexdata, whichever kind comes first.
+    /// Uniform files pass, and a walk that did not opt in never refuses.
+    #[test]
+    fn a_refusing_walk_stops_a_partially_indexed_file_at_its_first_unindexed_blob() {
+        let dir = crate::path_guard::tests::scratch();
+        // (pattern, blob ordinal of the first unindexed data blob; the header
+        // is blob 0).
+        for (pattern, first_unindexed) in [
+            (&[true, true, false, true][..], 3_u64),
+            (&[false, true][..], 1),
+            (&[false, false, true][..], 1),
+        ] {
+            let path = dir.path().join("partial.pbf");
+            write_index_pattern(&path, pattern);
+            let err = walk_all(&path, true).expect_err("a partial index must be refused");
+            assert!(
+                matches!(err.kind(), crate::error::ErrorKind::MissingIndexdata { .. }),
+                "{pattern:?}: {err:?}"
+            );
+            assert_eq!(err.blob_index(), Some(first_unindexed), "{pattern:?}");
+            assert_eq!(err.source_path(), Some(path.as_path()), "{pattern:?}");
+            assert_eq!(
+                walk_all(&path, false).expect("an ordinary walk passes"),
+                pattern.len() + 1,
+                "{pattern:?}"
+            );
+        }
+        for pattern in [&[true, true][..], &[false, false][..], &[][..]] {
+            let path = dir.path().join("uniform.pbf");
+            write_index_pattern(&path, pattern);
+            assert_eq!(
+                walk_all(&path, true).expect("a uniform file passes"),
+                pattern.len() + 1,
+                "{pattern:?}"
+            );
+        }
     }
 
     /// The walk's own spelling of the shared EOF policy, pinned at the call

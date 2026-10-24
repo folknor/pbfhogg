@@ -490,7 +490,9 @@ fn build_blob_index(
     _direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<(crate::HeaderBlock, Vec<BlobEntry>)> {
-    let mut walker = HeaderWalker::open(input, host)?;
+    // The walk visits every header anyway, so it refuses a partially indexed
+    // input at no extra read; a wholly unindexed one takes the decode below.
+    let mut walker = HeaderWalker::open(input, host)?.refusing_partial_index();
     let mut entries = Vec::new();
     let mut header: Option<crate::HeaderBlock> = None;
     let mut data_buf: Vec<u8> = Vec::new();

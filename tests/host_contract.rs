@@ -503,7 +503,7 @@ fn scratch_backends_use_the_given_directory_and_leave_nothing() {
     let changed = dir.path().join("changed.osm.pbf");
     crate::common::write_changed_pbf(&changed);
     for (command, jobs) in [("sparse", 1), ("text", 2), ("osc", 1), ("osc", 2)] {
-        let output = dir.path().join(format!("{command}-{jobs}.out"));
+        let output = dir.path().join(format!("{command}-{jobs}.osc"));
         let host = crate::common::test_host();
         run_scratch_backend(
             command,
@@ -579,7 +579,7 @@ fn scratch_backends_write_inside_the_run_directory() {
             std::os::unix::fs::PermissionsExt::from_mode(0o500),
         )
         .expect("lock the run directory");
-        let output = dir.path().join(format!("locked-{command}-{jobs}.out"));
+        let output = dir.path().join(format!("locked-{command}-{jobs}.osc"));
         let host = crate::common::test_host();
         let result = run_scratch_backend(command, jobs, &base, &changed, &output, &host, scratch);
         std::fs::set_permissions(

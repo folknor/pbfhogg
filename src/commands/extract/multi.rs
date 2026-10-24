@@ -186,7 +186,8 @@ pub(super) fn try_extract_multi_single_pass(
     // page cache during the scan - the per-kind classification passes open
     // fresh fds and pread only the blobs they need.
     crate::debug::emit_marker("MULTI_SCHEDULE_SCAN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
+    let mut walker =
+        crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input))?;

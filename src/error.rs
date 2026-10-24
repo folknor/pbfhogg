@@ -87,6 +87,17 @@ pub(crate) fn new_missing_feature(feature: &'static str) -> Error {
 pub(crate) fn new_missing_indexdata(reason: &str) -> Error {
     new_error(ErrorKind::MissingIndexdata {
         reason: Cow::Owned(reason.to_owned()),
+        partial: false,
+    })
+}
+
+/// A file indexed on some data blobs and not others; see
+/// [`ErrorKind::MissingIndexdata`].
+#[cold]
+pub(crate) fn new_partial_indexdata(reason: &'static str) -> Error {
+    new_error(ErrorKind::MissingIndexdata {
+        reason: Cow::Borrowed(reason),
+        partial: true,
     })
 }
 
@@ -592,7 +603,13 @@ pub enum ErrorKind {
     /// run without it. `reason` is a complete sentence saying why it
     /// matters. Whether the caller can grant a slower fallback, and how, is
     /// the caller's business: the text names no flag and no command.
-    MissingIndexdata { reason: Cow<'static, str> },
+    /// `partial` is set when the file carries indexdata on some data blobs
+    /// and not others; no fallback runs on such a file, so a caller has no
+    /// slower path to grant and only re-indexing helps.
+    MissingIndexdata {
+        reason: Cow<'static, str>,
+        partial: bool,
+    },
     /// The input is not in `Sort.Type_then_ID` order (its header does not
     /// declare it, or its blobs or elements contradict the declaration) and
     /// the operation needs that order. `reason` says what was found.
@@ -1045,7 +1062,7 @@ impl fmt::Display for Message<'_> {
             // These name no command and no flag: how to index, sort or
             // check a file, and which switch grants what, is the front end's
             // advice to give (the CLI maps each kind to its own).
-            ErrorKind::MissingIndexdata { ref reason }
+            ErrorKind::MissingIndexdata { ref reason, .. }
             | ErrorKind::Unsorted { ref reason }
             | ErrorKind::IndexdataMismatch { ref reason } => f.write_str(reason),
             ErrorKind::MissingNodeLocations { count } => write!(

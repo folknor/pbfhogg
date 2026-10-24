@@ -474,9 +474,11 @@ Unifying these policies would reject accepted input or add per-element work.
 A delete remains pending until a re-create is accepted; a rejected stale
 re-create must not erase it.
 
-`tags-filter --input-kind osc` always writes gzip, regardless of output suffix.
-`merge-changes` writes gzip only when the entire output path is valid UTF-8 and
-ends in `.gz`. Changing these decisions changes the output transport contract.
+Every OSC producer (`merge-changes`, `tags-filter --input-kind osc`,
+`diff --format osc`) frames its output by name through
+`pbfhogg::osc::output_is_gzip`: `.osc` is plain, `.osc.gz` is gzip, anything
+else is refused before any work. Changing that rule changes the output
+transport contract.
 Integer decimicrodegree conversion for diff text and OSC output deliberately
 divides by `1e7`; multiplication can change rounding and therefore output bytes.
 `diff --format osc -q` without `-o` deliberately errors with

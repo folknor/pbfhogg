@@ -664,10 +664,12 @@ fn route_sorted_indexed(store_bytes: Option<u64>, budget_bytes: Option<u64>) -> 
 /// way-referenced ids only) - tight when most nodes are way-referenced and
 /// looser when that share is lower, which errs toward external, the cheap
 /// direction. Returns
-/// `None` when any OsmData blob lacks indexdata, since the sum would
-/// silently undercount.
+/// `None` when the first OsmData blob lacks indexdata, since the sum would
+/// silently undercount; an input that is indexed on its first OsmData blob
+/// and not on a later one is refused by the walk.
 fn estimate_sparse_store_bytes(input: &Path, host: &crate::host::Host) -> Result<Option<u64>> {
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
+    let mut walker =
+        crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
     let mut node_count: u64 = 0;
     while let Some(meta) = walker.next_header()? {
         if meta.blob_type != crate::blob::BlobKind::OsmData {

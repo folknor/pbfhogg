@@ -316,12 +316,13 @@ Every output a command writes - PBF, OSC, diff text, GeoJSON, every file of
   target. An existing directory (or device, FIFO) where a file output is
   named, or a non-directory where a directory output is named, is refused
   the same way.
-- **Whether an OSC output is gzipped depends on the command, not only the
-  name.** `merge-changes` gzips exactly when the output name is UTF-8 and
-  ends in `.gz` (`merged.osc.gz` is gzip; `merged.osc` and `merged.osc.gzip` are plain XML).
-  `tags-filter --input-kind osc` and `diff --format osc` always gzip, whatever
-  the name, so `-o changes.osc` holds gzip bytes there. Every OSC reader here
-  sniffs the gzip magic, so either form is read back.
+- **An OSC output is framed by its name, the same way for every command**
+  (`merge-changes`, `tags-filter --input-kind osc`, `diff --format osc`). A
+  name ending `.osc` is written as plain XML, a name ending `.osc.gz` is
+  gzipped, and any other name is refused before any work with a usage error
+  naming both suffixes, exit `2`. The match is case-sensitive (`.OSC` is
+  refused). Every OSC reader here sniffs the gzip magic, so either form is
+  read back.
 - **Nothing appears under the output name until the run has succeeded.**
   The command writes a hidden staging file beside the output
   (`.pbfhogg-tmp-<pid>-<n>.<name>`), syncs it and renames it into place after
@@ -814,7 +815,7 @@ pbfhogg extract [OPTIONS] <FILE>
 
 Filter elements by tag expressions. Default mode resolves relation members transitively (matched relations pull in member ways, nodes, and nested relations). With `-R`, only directly matched elements are emitted.
 
-With `--input-kind osc` (or autodetected from `.osc`/`.osc.gz` extension), filters an OSC change file instead, always preserving deletes. Every flag that only means something for a PBF is refused in OSC mode: `-R`, `--invert-match`, `--remove-tags`, `--distrust-metadata`, an explicit `-j`, `--generator`, `--output-header`, an explicit `--compression` (OSC output is always gzipped), `--direct-io` and `--force`. With `--input-kind osc` the refusal comes before the input is opened; an autodetected kind comes from the four-byte sniff that decides it.
+With `--input-kind osc` (or autodetected from `.osc`/`.osc.gz` extension), filters an OSC change file instead, always preserving deletes. Every flag that only means something for a PBF is refused in OSC mode: `-R`, `--invert-match`, `--remove-tags`, `--distrust-metadata`, an explicit `-j`, `--generator`, `--output-header`, an explicit `--compression` (OSC output is not a PBF; its framing comes from the output name, see "Output files"), `--direct-io` and `--force`. With `--input-kind osc` the refusal comes before the input is opened; an autodetected kind comes from the four-byte sniff that decides it.
 
 At least one expression is required, positional or from `-e`; an `-e` file holding none is refused, and so is a malformed expression, before the input is opened.
 

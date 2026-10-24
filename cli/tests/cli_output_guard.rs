@@ -1,6 +1,5 @@
 //! The output contract, end to end through the binary, for the properties
-//! that are not the same on every command: the gzip suffix `merge-changes`
-//! keys on, the aliasing check, error wording for bad inputs, the failures
+//! that are not the same on every command: the aliasing check, error wording for bad inputs, the failures
 //! that land after a writer has finished, and who performs the `fsync`.
 //!
 //! The properties every writing subcommand shares - an existing output is
@@ -86,39 +85,6 @@ fn assert_output_published(dir: &Path, dest: &Path, args: &[&str]) {
     assert!(len > 0, "output at {} is empty", dest.display());
     let strays = scratch_leftovers(dir);
     assert!(strays.is_empty(), "scratch file leaked: {strays:?}");
-}
-
-/// `merge-changes` picks gzip from the output name ending in `.gz`. The
-/// scratch file therefore has to keep that suffix, or the committed file
-/// is plain XML under a `.gz` name - a bug the guard would have introduced
-/// rather than fixed.
-#[test]
-fn merge_changes_output_is_still_gzipped_through_the_guard() {
-    let dir = TempDir::new().unwrap();
-    let osc = dir.path().join("a.osc");
-    std::fs::write(
-        &osc,
-        b"<?xml version='1.0' encoding='UTF-8'?>\n\
-          <osmChange version=\"0.6\">\n\
-          <create><node id=\"1\" version=\"1\" lat=\"1.0\" lon=\"2.0\"/></create>\n\
-          </osmChange>\n",
-    )
-    .unwrap();
-    let dest = dir.path().join("merged.osc.gz");
-    CliInvoker::new()
-        .args([
-            "merge-changes",
-            osc.to_str().unwrap(),
-            "-o",
-            dest.to_str().unwrap(),
-        ])
-        .assert_success();
-    let bytes = std::fs::read(&dest).unwrap();
-    assert!(
-        bytes.starts_with(&[0x1f, 0x8b]),
-        "merge-changes output is not gzipped: first bytes {:?}",
-        &bytes[..bytes.len().min(8)]
-    );
 }
 
 /// A nonexistent input must be reported as a missing input, by name. The

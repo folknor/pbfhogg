@@ -150,10 +150,16 @@ fn input_word(error: &pbfhogg::Error, placeholder: &str) -> String {
 fn hint_for(error: &pbfhogg::Error, advice: &Advice) -> Option<String> {
     use pbfhogg::ErrorKind;
     match error.kind() {
-        ErrorKind::MissingIndexdata { .. } => Some(format!(
+        // A partially indexed file has no fallback to grant, so the escape
+        // switch is not advice there.
+        ErrorKind::MissingIndexdata { partial, .. } => Some(format!(
             "\n\nGenerate an indexed PBF first:\n\n  pbfhogg cat {} -o indexed.osm.pbf{}",
             input_word(error, "input.osm.pbf"),
-            advice.indexdata.unwrap_or("")
+            if *partial {
+                ""
+            } else {
+                advice.indexdata.unwrap_or("")
+            }
         )),
         ErrorKind::Unsorted { .. } => Some(format!(
             "\n\nSort the input first:\n\n  pbfhogg sort {} -o sorted.osm.pbf",

@@ -281,10 +281,31 @@ fn node_without_usable_coords_is_refused() {
 }
 
 #[test]
-fn legacy_output_is_gzip_without_suffix_and_metadata_is_normalized() {
-    let dir = tempfile::tempdir_in(".").expect("directory");
+fn an_unrecognised_output_name_is_refused_before_any_work() {
+    let dir = tempfile::tempdir().expect("tempdir");
     let input = dir.path().join("in.osc");
     let output = dir.path().join("out.unknown");
+    std::fs::write(&input, b"<osmChange version=\"0.6\"/>").expect("XML");
+    let err = tags_filter_osc(
+        &input,
+        crate::common::out(&output),
+        &exprs(&["name"]),
+        &crate::common::test_host(),
+    )
+    .expect_err("only .osc and .osc.gz are accepted");
+    let text = err.to_string();
+    assert!(
+        text.contains(".osc") && text.contains(".osc.gz"),
+        "refusal must name both suffixes; got: {text}"
+    );
+    assert!(!output.exists());
+}
+
+#[test]
+fn metadata_is_normalized() {
+    let dir = tempfile::tempdir_in(".").expect("directory");
+    let input = dir.path().join("in.osc");
+    let output = dir.path().join("out.osc.gz");
     std::fs::write(&input, b"<osmChange version=\"0.6\"><create><node id=\"7\" lat=\"1\" lon=\"2\" timestamp=\"yesterday\" changeset=\"no\" uid=\"&#48;\" visible=\"False\"><tag k=\"name\" v=\"test\"/></node></create></osmChange>").expect("XML");
     tags_filter_osc(
         &input,

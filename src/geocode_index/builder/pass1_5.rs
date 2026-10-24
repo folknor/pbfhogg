@@ -359,7 +359,8 @@ pub(super) fn build_pass2_schedules(
     i64,                // max_node_id
     InputFile,
 )> {
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input_path, host)?;
+    let mut walker =
+        crate::read::header_walker::HeaderWalker::open(input_path, host)?.refusing_partial_index();
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input_path))?;

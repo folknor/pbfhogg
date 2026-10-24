@@ -239,7 +239,8 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
 
     // Build per-type schedules from header-only scan via pread-only HeaderWalker.
     crate::debug::emit_marker("SMART_PASS1_SCHEDULE_SCAN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
+    let mut walker =
+        crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input))?;

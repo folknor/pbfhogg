@@ -1380,31 +1380,55 @@ enum Mixed {
     Violates(&'static str),
     /// Exit 2 with this text.
     Fails(&'static str),
+    /// Exit 2 with the refusal a schedule-building header walk gives a
+    /// partially indexed file: the typed missing-indexdata error, so the
+    /// CLI's indexing advice follows it.
+    RefusesPartial,
 }
+
+/// How the schedule walks' partial-index refusal reads.
+const PARTIAL_INDEX: &str = "the file is partially indexed";
+
+/// The CLI's advice after a missing-indexdata error.
+const INDEXING_ADVICE: &str = "Generate an indexed PBF first";
 
 /// One row: label, invocation builder, expected outcome.
 type MixedRow = (&'static str, fn(&Ctx, &Path) -> Invocation, Mixed);
 
 /// Every gate above looks at the first data blob only, so this file passes
-/// all of them. Rows pin what happens after that.
+/// all of them. Rows pin what happens after that: a command whose schedule is
+/// built by walking every blob header refuses the file at that walk, and
+/// the others run on it.
 const FIRST_BLOB_ONLY: &[MixedRow] = &[
-    ("sort", sort, Mixed::Accepts),
-    ("repack", repack, Mixed::Accepts),
-    ("tags-filter", tags_filter, Mixed::Accepts),
+    ("sort", sort, Mixed::RefusesPartial),
+    ("repack", repack, Mixed::RefusesPartial),
+    ("tags-filter", tags_filter, Mixed::RefusesPartial),
+    // getid's walker and full-scan arms are chosen by input size, so neither
+    // refuses: the verdict must not depend on how big the file is.
     ("getid", getid, Mixed::Accepts),
     ("getid --invert", getid_invert, Mixed::Accepts),
-    ("apply-changes", apply_changes, Mixed::Accepts),
-    ("extract (complete)", extract_complete, Mixed::Accepts),
-    ("extract --smart", extract_smart, Mixed::Accepts),
+    ("apply-changes", apply_changes, Mixed::RefusesPartial),
+    (
+        "extract (complete)",
+        extract_complete,
+        Mixed::RefusesPartial,
+    ),
+    ("extract --simple", extract_simple, Mixed::RefusesPartial),
+    ("extract --smart", extract_smart, Mixed::RefusesPartial),
+    ("time-filter", time_filter, Mixed::RefusesPartial),
+    // These stream frames rather than walk headers for a schedule.
     ("cat --type node", cat_type, Mixed::Accepts),
-    ("cat --clean", cat_clean, Mixed::Accepts),
     ("cat --dedupe", cat_dedupe, Mixed::Accepts),
-    ("degrade --strip-locations", degrade, Mixed::Accepts),
-    ("inspect --nodes", inspect_nodes, Mixed::Accepts),
-    ("inspect tags", inspect_tags, Mixed::Accepts),
-    // Needs no flag any more: the first-blob probe says indexed.
-    ("build-geocode-index", geocode, Mixed::Accepts),
-    // Per-blob checks catch it where the first-blob probe cannot.
+    ("cat --clean", cat_clean, Mixed::RefusesPartial),
+    ("degrade --strip-locations", degrade, Mixed::RefusesPartial),
+    ("inspect --nodes", inspect_nodes, Mixed::RefusesPartial),
+    ("inspect tags", inspect_tags, Mixed::RefusesPartial),
+    ("altw", altw, Mixed::RefusesPartial),
+    // Refused at the Pass 1.5 schedule walk, after Pass 1 has run.
+    ("build-geocode-index", geocode, Mixed::RefusesPartial),
+    ("digest", digest, Mixed::RefusesPartial),
+    // These refuse any unindexed data blob at their own walk, with their own
+    // reason.
     (
         "renumber",
         renumber,
@@ -1414,12 +1438,6 @@ const FIRST_BLOB_ONLY: &[MixedRow] = &[
         "altw --index-type external",
         altw_external,
         Mixed::Fails("OsmData blob missing indexdata"),
-    ),
-    // digest refuses a partial index with a neutral message.
-    (
-        "digest",
-        digest,
-        Mixed::Fails("refusing a partially indexed file"),
     ),
     // diff chooses its arm from the first blob, so a partial index is neither
     // the sequential fallback it takes for a wholly unindexed file nor
@@ -1501,6 +1519,22 @@ fn first_blob_only_holds(
                 text.contains(wanted),
                 "[{label}] wanted {wanted:?}; output:\n{text}"
             );
+        }
+        Mixed::RefusesPartial => {
+            ensure!(code == Some(2), "[{label}] exit {code:?}; output:\n{text}");
+            for wanted in [PARTIAL_INDEX, INDEXING_ADVICE] {
+                ensure!(
+                    text.contains(wanted),
+                    "[{label}] wanted {wanted:?}; output:\n{text}"
+                );
+            }
+            // No escape switch lifts this refusal, so none is advised.
+            for unwanted in ["--force", "--allow-unindexed"] {
+                ensure!(
+                    !text.contains(unwanted),
+                    "[{label}] advises {unwanted:?}; output:\n{text}"
+                );
+            }
         }
     }
     Ok(())

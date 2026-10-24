@@ -182,6 +182,7 @@ pub(crate) fn tags_filter_osc_to(
     expression_strs: &[String],
     host: &crate::host::Host,
 ) -> Result<TagsFilterOscStats> {
+    crate::osc::output_is_gzip(output.destination())?;
     let expressions = parse_expressions(expression_strs)?;
     crate::debug::emit_marker("TAGSFILTEROSC_START");
     let (filtered, stats) = parse_and_filter_osc(input, &expressions, &host.cancel)?;
@@ -401,10 +402,15 @@ fn write_filtered_osc(
     filtered: &FilteredOsc,
     cancel: &crate::host::Cancel,
 ) -> Result<()> {
-    // Deliberately gzip every OSC output regardless of its name. Inferring the
-    // transport from an extension would change this command's output contract.
-    let gz = GzEncoder::new(output.writer(cancel)?, flate2::Compression::fast());
-    let mut writer = Writer::new_with_indent(gz, b' ', 2);
+    // Framing follows the output name, the rule every OSC producer shares
+    // (`crate::osc::output_is_gzip`); the name was vetted before any work.
+    let out = output.writer(cancel)?;
+    let sink = if crate::osc::output_is_gzip(output.destination())? {
+        OscByteSink::Gz(Box::new(GzEncoder::new(out, flate2::Compression::fast())))
+    } else {
+        OscByteSink::Plain(out)
+    };
+    let mut writer = Writer::new_with_indent(sink, b' ', 2);
 
     writer.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))?;
     let mut root = BytesStart::new("osmChange");
@@ -465,8 +471,32 @@ fn write_filtered_osc(
     writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
     // Finish the gzip stream, then the output's writer, whose checked flush
     // is what lets the output be published.
-    let gz = writer.into_inner();
-    gz.finish()?.finish()
+    match writer.into_inner() {
+        OscByteSink::Gz(gz) => gz.finish()?.finish(),
+        OscByteSink::Plain(out) => out.finish(),
+    }
+}
+
+/// The OSC document's byte sink: gzip-framed or plain, per the output name.
+enum OscByteSink {
+    Gz(Box<GzEncoder<crate::output::OutputWriter>>),
+    Plain(crate::output::OutputWriter),
+}
+
+impl std::io::Write for OscByteSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Gz(w) => std::io::Write::write(w, buf),
+            Self::Plain(w) => std::io::Write::write(w, buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Gz(w) => std::io::Write::flush(w),
+            Self::Plain(w) => std::io::Write::flush(w),
+        }
+    }
 }
 
 // The local `write_node` / `write_way` / `write_relation` /

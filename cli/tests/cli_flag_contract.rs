@@ -49,6 +49,8 @@ fn argv(dir: &Path, words: &[&str]) -> Vec<OsString> {
             "IN2" => dir.join(format!("{MISSING}-2.osm.pbf")).into(),
             "OSC" => dir.join(format!("{MISSING}.osc.gz")).into(),
             "OUT" => dir.join("out.osm.pbf").into(),
+            // An OSC output name must end `.osc` or `.osc.gz`.
+            "OSCOUT" => dir.join("out.osc").into(),
             "DIR" => dir.as_os_str().to_owned(),
             other => OsString::from(other),
         })
@@ -473,7 +475,7 @@ const JOBS: &[JobsRow] = &[
             "--input-kind",
             "osc",
             "-o",
-            "OUT",
+            "OSCOUT",
             "x",
             "-j",
             "J",
@@ -503,7 +505,7 @@ const JOBS: &[JobsRow] = &[
     JobsRow {
         label: "diff --format osc",
         words: &[
-            "diff", "IN", "IN2", "--format", "osc", "-o", "OUT", "-j", "J",
+            "diff", "IN", "IN2", "--format", "osc", "-o", "OSCOUT", "-j", "J",
         ],
         accepts: [true, true, true],
     },
@@ -519,7 +521,7 @@ const JOBS: &[JobsRow] = &[
     },
     JobsRow {
         label: "merge-changes",
-        words: &["merge-changes", "OSC", "-o", "OUT", "-j", "J"],
+        words: &["merge-changes", "OSC", "-o", "OSCOUT", "-j", "J"],
         accepts: [true, true, true],
     },
     JobsRow {
@@ -836,7 +838,7 @@ fn the_gate_advises_only_a_switch_the_mode_accepts() {
 #[test]
 fn merge_changes_names_a_missing_input() {
     let dir = TempDir::new().unwrap();
-    let out = run(&argv(dir.path(), &["merge-changes", "OSC", "-o", "OUT"]));
+    let out = run(&argv(dir.path(), &["merge-changes", "OSC", "-o", "OSCOUT"]));
     reached_input(&out).unwrap_or_else(|why| panic!("{why}"));
 }
 

@@ -1807,7 +1807,7 @@ fn a_command_without_an_output_is_interrupted_too() {
 }
 
 // ---------------------------------------------------------------------------
-// OSC framing: which producers gzip, by output name
+// OSC framing: one name rule for every producer
 // ---------------------------------------------------------------------------
 
 /// One OSC producer: how to invoke it given the fixtures and an output name.
@@ -1815,10 +1815,6 @@ struct OscProducer {
     label: &'static str,
     /// Words after the subcommand name's inputs, built per output path.
     build: fn(&Path, &Path, &Path) -> Vec<OsString>,
-    /// Whether the output is gzip when named `x.osc`.
-    gzip_when_plain_name: bool,
-    /// Whether the output is gzip when named `x.osc.gz`.
-    gzip_when_gz_name: bool,
 }
 
 fn osc_args(words: &[&str], paths: &[&Path], tail: &[&str]) -> Vec<OsString> {
@@ -1831,14 +1827,12 @@ fn osc_args(words: &[&str], paths: &[&Path], tail: &[&str]) -> Vec<OsString> {
 /// Every command that writes OSC. `diff --format osc` is the only route to
 /// the derive-changes writer (it has no subcommand of its own) and it needs
 /// `-o`, so there is no stdout form; `diff` has a sequential and a sharded
-/// driver, selected by `-j`, and both are listed. `merge-changes` gzips
-/// exactly when the name ends `.gz`; the other two always gzip.
+/// driver, selected by `-j`, and both are listed. All follow one rule: `.osc`
+/// plain, `.osc.gz` gzip, any other name refused before any work.
 const OSC_PRODUCERS: &[OscProducer] = &[
     OscProducer {
         label: "merge-changes",
         build: |osc, _, out| osc_args(&["merge-changes"], &[osc, Path::new("-o"), out], &[]),
-        gzip_when_plain_name: false,
-        gzip_when_gz_name: true,
     },
     OscProducer {
         label: "tags-filter --input-kind osc",
@@ -1855,20 +1849,14 @@ const OSC_PRODUCERS: &[OscProducer] = &[
                 ],
             )
         },
-        gzip_when_plain_name: true,
-        gzip_when_gz_name: true,
     },
     OscProducer {
         label: "diff --format osc -j 1",
         build: |_, pbfs, out| diff_osc_args(pbfs, out, "1"),
-        gzip_when_plain_name: true,
-        gzip_when_gz_name: true,
     },
     OscProducer {
         label: "diff --format osc -j 2",
         build: |_, pbfs, out| diff_osc_args(pbfs, out, "2"),
-        gzip_when_plain_name: true,
-        gzip_when_gz_name: true,
     },
 ];
 
@@ -1881,10 +1869,10 @@ fn diff_osc_args(pbfs: &Path, out: &Path, jobs: &str) -> Vec<OsString> {
     )
 }
 
-#[test]
-fn osc_gzip_framing_follows_each_producers_rule() {
-    let dir = TempDir::new().unwrap();
-    let osc = dir.path().join("in.osc");
+/// Writes the fixtures every producer reads: `in.osc`, `old.osm.pbf`,
+/// `new.osm.pbf`.
+fn write_osc_fixtures(dir: &Path) -> PathBuf {
+    let osc = dir.join("in.osc");
     std::fs::write(
         &osc,
         b"<osmChange version=\"0.6\"><create>\
@@ -1893,24 +1881,63 @@ fn osc_gzip_framing_follows_each_producers_rule() {
     )
     .unwrap();
     crate::common::write_test_pbf_sorted(
-        &dir.path().join("old.osm.pbf"),
+        &dir.join("old.osm.pbf"),
         &crate::common::generate_nodes(4, 1),
         &[],
         &[],
     );
     crate::common::write_test_pbf_sorted(
-        &dir.path().join("new.osm.pbf"),
+        &dir.join("new.osm.pbf"),
         &crate::common::generate_nodes(5, 1),
         &[],
         &[],
     );
+    osc
+}
+
+/// Names that are neither `.osc` nor `.osc.gz`. `x.OSC` pins the provisional
+/// case-sensitive match (HYG-114 leaves that open).
+const REFUSED_OSC_NAMES: &[&str] = &["x", "x.gz", "x.xml", "x.osc.gzip", "x.OSC", "x.osc.bz2"];
+
+#[test]
+fn every_osc_producer_refuses_a_name_that_is_neither_osc_nor_osc_gz() {
+    let dir = TempDir::new().unwrap();
+    let osc = write_osc_fixtures(dir.path());
+    for producer in OSC_PRODUCERS {
+        for name in REFUSED_OSC_NAMES {
+            let out_dir = TempDir::new().unwrap();
+            let dest = out_dir.path().join(name);
+            let args = (producer.build)(&osc, dir.path(), &dest);
+            let result = CliInvoker::new().args(&args).run();
+            let label = format!("{} -> {name}", producer.label);
+            assert_eq!(
+                result.status.code(),
+                Some(2),
+                "{label}: {}",
+                result.stderr_str()
+            );
+            let stderr = result.stderr_str();
+            assert!(
+                stderr.contains(".osc.gz") && stderr.contains("must end in .osc"),
+                "{label}: refusal does not name both suffixes: {stderr}"
+            );
+            assert_eq!(
+                std::fs::read_dir(out_dir.path()).unwrap().count(),
+                0,
+                "{label}: refused run left files behind"
+            );
+        }
+    }
+}
+
+#[test]
+fn osc_gzip_framing_follows_the_output_name_for_every_producer() {
+    let dir = TempDir::new().unwrap();
+    let osc = write_osc_fixtures(dir.path());
 
     let mut failures = Vec::new();
     for producer in OSC_PRODUCERS {
-        for (name, expect_gzip) in [
-            ("x.osc", producer.gzip_when_plain_name),
-            ("x.osc.gz", producer.gzip_when_gz_name),
-        ] {
+        for (name, expect_gzip) in [("x.osc", false), ("x.osc.gz", true)] {
             let out_dir = TempDir::new().unwrap();
             let dest = out_dir.path().join(name);
             let args = (producer.build)(&osc, dir.path(), &dest);

@@ -678,7 +678,8 @@ in a blob labelled way or relation is never seen by Pass 2a. `CORRECTNESS.md`
 partly states this for sort. `has_indexdata` decides whether a whole file is
 indexed from its first data blob alone, so a file with indexdata on the first
 blob and not on a later one passes every gate; the output-header policy had to
-add its own check for that case on the raw-copy paths.
+add its own check for that case on the raw-copy paths, and the schedule walks
+now refuse it (below).
 
 The second half of the model is what a command does when indexdata is absent,
 and that is decided per command too. It is now pinned, as observed, by two
@@ -695,12 +696,33 @@ back with which note, and who verifies. Pinned oddities worth a ruling:
   first-blob probe's note instead.
 - renumber has no `--force`; altw `--index-type external` refuses `--force`
   at parse time.
-- digest digests a wholly unindexed file and refuses only a partially indexed
-  one, with a message that says "diff refuses".
-- Every gate reads the first data blob only, so a file indexed on its first
-  blob passes all of them: sort, altw, apply-changes and the rest accept it,
-  `inspect --indexed` says yes while plain `inspect` says no, and diff
-  hard-fails mid-merge (see `notes/bugs.md`).
+- A partially indexed file is refused, with the typed missing-indexdata
+  error at its first unindexed data blob, by every command whose schedule
+  comes from a walk over every header (`HeaderWalker::refusing_partial_index`):
+  sort, apply-changes, digest, the classify-based schedule builders and the
+  bespoke schedule walks of tags-filter, extract, altw and the geocode
+  builder. diff, renumber and altw external refuse any unindexed blob. What
+  is left:
+  - Still trusting the first blob: getid and getparents (their walker and
+    full-scan arms are chosen by input size, so neither walk opts in),
+    `cat --type`, `cat --dedupe`, `tags-filter -R`, time-filter's history
+    path, and `getid --add-referenced` unless way IDs are asked for (its
+    classify walk runs only then). `inspect --indexed` says yes while plain
+    `inspect` says no.
+  - `apply-changes --force` on an unindexed base writes a partially indexed
+    output: a blob the diff does not touch is copied without indexdata, a
+    rewritten one gets it. Every walk above then refuses that output.
+  - check, inspect and time-filter now refuse a partial file through their
+    classify walks (`check --refs`, `check --ids`, `inspect --nodes`,
+    `inspect tags`, non-history time-filter), though check answers "is this
+    file right?" and `check --index` reports the same file as a violation
+    (exit 1). time-filter and `extract --simple` never needed indexdata.
+  - The walks see headers only, so they cannot tell an unindexable blob
+    (empty, or mixed kinds) without indexdata from an unindexed one, where
+    `check --index` exempts the former; such a blob among indexed ones is
+    refused. Since `cat` indexes those blobs, only a hand-made file has one.
+  - The geocode builder refuses at its Pass 1.5 schedule walk, after Pass 1
+    has decoded the whole file once.
 - Only tags-filter and plain inspect have `--distrust-metadata`; getid, cat
   `--type`, apply-changes and altw trust the metadata with no way to turn
   that off.
@@ -715,11 +737,6 @@ Decided:
 - Every forced run on unindexed input emits the same keyed Note once (the
   run proceeds without indexdata and is slower), so `--force` says the same
   thing on every command.
-- No new header walks. A command that already walks every header for its
-  schedule (sort, apply-changes' `HeaderWalker`, the classify-based
-  builders, digest) refuses a partially indexed file at that walk with the
-  typed missing-indexdata error BUG-136 uses; the others keep trusting the
-  first blob.
 - No action: renumber's missing `--force` and altw external's parse-time
   `--force` refusal are guards; `--distrust-metadata` stays where it is.
 
@@ -890,34 +907,6 @@ shape: some lead with the command name (`time-filter:`,
 inherit all of it.
 
 Reported by: split out of the diagnostic-wording item.
-
-## HYG-114 - OSC output is gzipped by two different rules
-
-Anger: 6 - CLI behaviour.
-
-The rules are documented in the "Output files" section of both CLI
-references: `merge-changes` gzips exactly when the UTF-8 output name ends
-`.gz`; `tags-filter --input-kind osc` and `diff --format osc` always gzip,
-whatever the name. Each site carries a "Deliberately ..." comment saying the
-contract is historical and framing has no shared owner (`osc/write.rs`,
-`tags_filter/osc.rs`, `diff/derive.rs`, `merge_changes`). Every producer is
-pinned to its rule by `osc_gzip_framing_follows_each_producers_rule` in
-`cli/tests/cli_output_contract.rs` (both diff drivers, `x.osc` and
-`x.osc.gz`); `cli_diff`'s `diff_osc_output_is_gzip_whatever_its_name` and
-`cli_output_guard`'s `merge_changes_output_is_still_gzipped_through_the_guard`
-now overlap with it.
-
-Decided: one name-based rule for every OSC producer, strict. An output name
-ending `.osc` is written plain, one ending `.osc.gz` is gzipped, and any
-other name is refused before any work (a usage error naming both accepted
-suffixes). Breaking for `tags-filter --input-kind osc` and `diff --format
-osc` users who wrote gzip to an `.osc` name, and for any producer writing
-to some other suffix; CHANGELOG under Breaking. The pinning table moves to
-the new rule, plus refusal rows. Details to settle while implementing:
-whether the suffix match is case-sensitive (`.OSC`), and whether a producer
-that can write to stdout keeps doing so (no name to judge), plain.
-
-Reported by: the command-matrix audit.
 
 ## HYG-116 - Run scratch is placed and sized by hand, per command
 

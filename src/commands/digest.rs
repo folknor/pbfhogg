@@ -144,11 +144,13 @@ fn digest_inner(path: &Path, direct_io: bool, host: &crate::host::Host) -> Resul
 
 /// Check the blob envelope (domain rule 1, minus the sorted claim, which the
 /// reader's decoded header answers) and collect each data blob's parsed
-/// index in file order.
+/// index in file order. A partially indexed file is refused here, before any
+/// decode, with the missing-indexdata error located at its first unindexed
+/// data blob; a wholly unindexed one is digested.
 fn walk_envelope(path: &Path, host: &crate::host::Host) -> Result<Vec<Option<BlobIndex>>> {
     use crate::blob::BlobKind;
 
-    let mut walker = HeaderWalker::open(path, host)?;
+    let mut walker = HeaderWalker::open(path, host)?.refusing_partial_index();
     let mut indexes = Vec::new();
     let mut seen_header = false;
     while let Some(meta) = walker.next_header()? {
@@ -284,8 +286,6 @@ fn check_user(element: &Element<'_>) -> crate::error::Result<()> {
 /// refusal anywhere in the file prints no digest at all.
 struct DigestState {
     indexes: std::vec::IntoIter<Option<BlobIndex>>,
-    /// Whether the data blobs carry indexdata, fixed by the first one.
-    indexed: Option<bool>,
     /// Kind and ID of the last element seen.
     last: Option<(ElementKind, i64)>,
     all: Xxh3,
@@ -296,7 +296,6 @@ impl DigestState {
     fn new(indexes: Vec<Option<BlobIndex>>) -> Self {
         Self {
             indexes: indexes.into_iter(),
-            indexed: None,
             last: None,
             all: Xxh3::new(),
             kinds: [(0, Xxh3::new()), (0, Xxh3::new()), (0, Xxh3::new())],
@@ -309,7 +308,7 @@ impl DigestState {
         let index = self.indexes.next().ok_or_else(|| {
             Error::internal("the file has more data blobs than its envelope walk found")
         })?;
-        self.check_index(index, summary.content.as_ref())?;
+        Self::check_index(index, summary.content.as_ref())?;
         let Some(content) = summary.content else {
             return Ok(());
         };
@@ -340,22 +339,9 @@ impl DigestState {
         Ok(())
     }
 
-    fn check_index(
-        &mut self,
-        index: Option<BlobIndex>,
-        content: Option<&BlockContent>,
-    ) -> crate::Result<()> {
-        let present = index.is_some();
-        match self.indexed {
-            None => self.indexed = Some(present),
-            Some(expected) if expected != present => {
-                return Err(Error::invalid_data(
-                    "indexdata is present on some data blobs and absent (or \
-                     unreadable) on others; refusing a partially indexed file",
-                ));
-            }
-            Some(_) => {}
-        }
+    /// Check one blob's indexdata against its decoded block. Whether the
+    /// file is indexed throughout was settled by the envelope walk.
+    fn check_index(index: Option<BlobIndex>, content: Option<&BlockContent>) -> crate::Result<()> {
         let Some(index) = index else {
             return Ok(());
         };

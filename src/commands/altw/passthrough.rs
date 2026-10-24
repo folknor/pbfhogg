@@ -120,7 +120,7 @@ fn build_schedule(
     host: &crate::host::Host,
 ) -> Result<(Vec<BlobDescriptor>, Vec<u8>, std::sync::Arc<std::fs::File>)> {
     crate::debug::emit_marker("ALTW_PASS2_SCHEDULE_WALK_START");
-    let mut walker = HeaderWalker::open(input, host)?;
+    let mut walker = HeaderWalker::open(input, host)?.refusing_partial_index();
     let mut header_bytes: Option<Vec<u8>> = None;
     let mut schedule: Vec<BlobDescriptor> = Vec::new();
     let mut seq: usize = 0;

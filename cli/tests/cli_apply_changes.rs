@@ -1786,13 +1786,15 @@ fn merge_locations_on_ways_fails_loudly_on_undecodable_node_coordinates() {
     assert!(!output.exists(), "failed merge must leave no output");
 }
 
-/// A way reaching a worker before the node coordinate map exists must be
-/// an error. Here the way blob lacks indexdata, so the scanner routes it
-/// with the node blobs, ahead of the barrier; the rewrite used to fall
-/// back to writing every way in it without coordinates, under a header
-/// that still claims LocationsOnWays.
+/// A base whose way blob lacks indexdata while its node blob carries it is
+/// partially indexed, and the scanner's header walk refuses it at the way
+/// blob. Without that refusal the scanner would route the unindexed way blob
+/// with the node blobs, ahead of the node-to-way barrier, where the rewrite
+/// used to write every way in it without coordinates under a header that
+/// still claims LocationsOnWays (the worker now refuses that too, as a
+/// backstop this fixture can no longer reach).
 #[test]
-fn merge_locations_on_ways_refuses_to_strip_ways_routed_before_the_barrier() {
+fn merge_locations_on_ways_refuses_a_partially_indexed_base() {
     let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
@@ -1824,12 +1826,15 @@ fn merge_locations_on_ways_refuses_to_strip_ways_routed_before_the_barrier() {
     write_osc(&osc, LOW_WAY_EDIT_OSC);
 
     let out = run_apply_changes(&base, &osc, &output, low_opts());
-    assert!(
-        !out.status.success(),
-        "ways must not be written without coordinates; stderr:\n{}",
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a partially indexed base must be refused; stderr:\n{}",
         out.stderr_str()
     );
-    out.assert_stderr_contains("before the node coordinate map was published");
+    out.assert_stderr_contains("the file is partially indexed");
+    // Located at the way blob: the header is blob 0, the node blob blob 1.
+    out.assert_stderr_contains("base.osm.pbf, blob 2, at byte offset");
     assert!(!output.exists(), "failed merge must leave no output");
 }
 

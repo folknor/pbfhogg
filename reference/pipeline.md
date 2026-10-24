@@ -295,7 +295,9 @@ The budget is unknown when `/proc/meminfo` or `/proc/self/cgroup` cannot be
 read (every non-Linux target), when the process is in a unified hierarchy
 but no `cgroup2` mount covering its group is visible, or when a limited
 group's `memory.max` or `memory.current` cannot be read or parsed. The store
-estimate is unknown when any OsmData blob lacks indexdata. If either is
+estimate's header walk refuses a partially indexed input (some OsmData blobs
+indexed, others not) with the missing-indexdata error, so a sorted input
+whose first data blob is indexed always gets an estimate. If the budget is
 unknown, sorted and indexed inputs fall back to external, and the auto-select
 note says which estimate was missing. Unsorted or unindexed inputs always
 select sparse, since external cannot run on them. Whether the input is

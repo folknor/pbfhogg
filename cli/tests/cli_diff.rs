@@ -1740,34 +1740,6 @@ fn diff_single_job_needs_no_writable_current_directory() {
     );
 }
 
-/// `diff --format osc` gzips whatever the output is named.
-#[test]
-fn diff_osc_output_is_gzip_whatever_its_name() {
-    let dir = TempDir::new().unwrap();
-    let old = dir.path().join("old.osm.pbf");
-    let new = dir.path().join("new.osm.pbf");
-    write_test_pbf_sorted(&old, &generate_nodes(4, 1), &[], &[]);
-    write_test_pbf_sorted(&new, &generate_nodes(5, 1), &[], &[]);
-    for name in ["x.osc", "x.osc.gz"] {
-        let dest = dir.path().join(name);
-        CliInvoker::new()
-            .arg("diff")
-            .arg(&old)
-            .arg(&new)
-            .arg("--format")
-            .arg("osc")
-            .arg("-o")
-            .arg(&dest)
-            .assert_success();
-        let bytes = std::fs::read(&dest).unwrap();
-        assert_eq!(
-            bytes.get(..2),
-            Some(&[0x1f, 0x8b][..]),
-            "{name} is not gzip"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Sequential vs parallel sharded equivalence
 // ---------------------------------------------------------------------------

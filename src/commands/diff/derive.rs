@@ -525,7 +525,7 @@ pub(crate) fn assemble_osc_from_paths(
         crate::tunables::DERIVE_GZIP_WORKERS_FALLBACK,
     );
     if gzip {
-        let gz = ParallelGzipWriter::new(buf, DEFAULT_CHUNK_SIZE, worker_count);
+        let gz = ParallelGzipWriter::new(buf, DEFAULT_CHUNK_SIZE, worker_count, &host.cancel);
         let gz = write_document(
             gz,
             creates_path,

@@ -16,19 +16,6 @@ pub(crate) mod derive_parallel;
 pub(crate) mod parallel;
 mod shard;
 
-// Under the `static-test-hooks` feature, expose the shard-panic hook so
-// an integration-test target of its own can arm it. The rest of `parallel` stays
-// crate-private.
-#[cfg(all(feature = "static-test-hooks", not(test)))]
-pub mod parallel_test_hooks {
-    pub use super::parallel::test_hooks::{PANIC_AT_SHARD_IDX, reset};
-}
-
-#[cfg(all(feature = "static-test-hooks", not(test)))]
-pub mod derive_parallel_test_hooks {
-    pub use super::derive_parallel::test_hooks::{PANIC_AT_SHARD_IDX, reset};
-}
-
 use super::Result;
 use crate::ElementKind;
 use crate::coord_fmt::{format_coord, from_decimicro};

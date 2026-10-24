@@ -7,17 +7,13 @@
 //! not. This test drives ONE fixed 20-region config through both paths on the
 //! same input and asserts the per-region output files are byte-for-byte equal.
 //!
-//! Under the `static-test-hooks` feature a process-global
-//! `region_grid::FORCE_LINEAR` makes `RegionGrid::build` return `None`, so the
-//! at/above-threshold config that would normally build a grid instead runs the
-//! verbatim linear scan. This file is its own `[[test]]` target in `Cargo.toml`,
-//! so the static is per-process; the single test below toggles it serially.
+//! The fault plan's `force_linear_region_grid` (`pbfhogg::test_hooks`) makes
+//! multi-extract decline the grid, so the at/above-threshold config that
+//! would normally build one instead runs the verbatim linear scan. Each arm
+//! runs under its own token: only the linear run's is armed.
 
 #![allow(clippy::unwrap_used)]
 
-mod common;
-
-#[cfg(feature = "static-test-hooks")]
 mod grid_parity {
     use std::sync::atomic::Ordering;
 
@@ -26,7 +22,6 @@ mod grid_parity {
     use pbfhogg::commands::extract::{
         Bbox, ExtractStrategy, PolygonRings, Region, extract_multi, parse_bbox,
     };
-    use pbfhogg::read::region_grid_test_hooks as grid_hooks;
     use pbfhogg::write::WriteOptions;
 
     use crate::common::{TestMember, TestNode, TestRelation, TestWay, write_indexed_pbf};
@@ -120,6 +115,7 @@ mod grid_parity {
         input: &std::path::Path,
         dir: &std::path::Path,
         region: F,
+        host: &pbfhogg::host::Host,
     ) -> Vec<std::path::PathBuf>
     where
         F: Fn(usize) -> Region,
@@ -145,7 +141,7 @@ mod grid_parity {
                 ..WriteOptions::default()
             },
             &pbfhogg::HeaderOverrides::default(),
-            &crate::common::test_host(),
+            host,
         )
         .expect("extract_multi");
         outputs
@@ -161,14 +157,27 @@ mod grid_parity {
         std::fs::create_dir_all(&grid_dir).unwrap();
         std::fs::create_dir_all(&lin_dir).unwrap();
 
-        // Grid engaged (n = 20 >= threshold, within budget).
-        grid_hooks::reset();
-        let grid_outs = run_config(input, &grid_dir, region);
+        // Grid engaged (n = 20 >= threshold, within budget), unarmed token.
+        let grid_outs = run_config(input, &grid_dir, region, &crate::common::test_host());
 
-        // Same config, grid build forced off -> verbatim linear scan.
-        grid_hooks::FORCE_LINEAR.store(true, Ordering::Relaxed);
-        let lin_outs = run_config(input, &lin_dir, region);
-        grid_hooks::reset();
+        // Same config, grid declined on a token of its own -> verbatim
+        // linear scan.
+        let linear_host = crate::common::test_host();
+        linear_host
+            .cancel
+            .faults()
+            .force_linear_region_grid
+            .store(true, Ordering::Relaxed);
+        let lin_outs = run_config(input, &lin_dir, region, &linear_host);
+        assert_eq!(
+            linear_host
+                .cancel
+                .faults()
+                .region_grids_declined
+                .load(Ordering::Relaxed),
+            1,
+            "the linear arm must have declined the grid, or this compares two grid runs"
+        );
 
         for (g, l) in grid_outs.iter().zip(lin_outs.iter()) {
             let gb = std::fs::read(g).unwrap();

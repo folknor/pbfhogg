@@ -27,26 +27,6 @@ use crate::{Element, PrimitiveBlock};
 
 use super::derive::{DeriveChangesStats, extract_delete_info, write_delete_element};
 
-// Fault-injection hooks for tests. Gated behind the `static-test-hooks`
-// Cargo feature and `not(test)`: product builds and the library's own
-// unit-test harness never compile this module.
-// Mirror of `parallel::test_hooks`; each driver keeps its own static so a
-// test can arm one without the other.
-#[cfg(all(feature = "static-test-hooks", not(test)))]
-pub mod test_hooks {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// Shard index at which `run_shard` panics. `usize::MAX` =
-    /// disarmed (default). Call [`reset`] at the start AND end of
-    /// any test that arms this so sibling tests don't inherit state.
-    pub static PANIC_AT_SHARD_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
-
-    /// Disarm the hook.
-    pub fn reset() {
-        PANIC_AT_SHARD_IDX.store(usize::MAX, Ordering::Relaxed);
-    }
-}
-
 use super::shard::{BlobDesc, Shard, plan_shards, walk_pair};
 
 // ---------------------------------------------------------------------------
@@ -138,18 +118,20 @@ fn run_shard(
     timestamp: Option<u64>,
     cancel: &crate::host::Cancel,
 ) -> Result<ShardOutput> {
-    // Test-only: arm via `test_hooks::PANIC_AT_SHARD_IDX`. Simulates
-    // a mid-phase shard crash; the caller's `scope.spawn(...).join()`
+    // Test-only: the fault plan's `derive_shard_panic`. Simulates a
+    // mid-phase shard crash; the caller's `scope.spawn(...).join()`
     // turns the panic into an `Err("derive shard worker panicked: ..")`
     // and the post-join cleanup sweeps every possible per-shard
     // scratch file (creates / modifies / deletes). Release builds
     // compile this out entirely.
-    #[cfg(all(feature = "static-test-hooks", not(test)))]
+    #[cfg(feature = "test-hooks")]
+    if cancel
+        .faults()
+        .derive_shard_panic
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == shard_idx
     {
-        use std::sync::atomic::Ordering;
-        if test_hooks::PANIC_AT_SHARD_IDX.load(Ordering::Relaxed) == shard_idx {
-            panic!("test-hooks: derive_parallel shard {shard_idx} panicking");
-        }
+        panic!("test-hooks: derive_parallel shard {shard_idx} panicking");
     }
 
     let (cp, mp, dp) = shard_xml_paths(scratch, kind, shard_idx)?;

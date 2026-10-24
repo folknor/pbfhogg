@@ -1,14 +1,9 @@
 //! Fault-injection test for `apply_changes::merge` worker panic
-//! recovery (per-instance hook).
-//!
-//! Uses the per-instance `MergeOptions::panic_at_blob_seq` hook
-//! (carried on the public config struct), so it cannot fire in a
-//! sibling test and lives in the shared `all` binary. The static-hook
-//! fault tests are the ones that need a process of their own.
+//! recovery, through the fault plan on the run's token
+//! (`apply_changes_panic_at_blob_seq`, see `pbfhogg::test_hooks`).
 //!
 //! Companion: `fault_parallel_writer.rs` covers apply-changes'
-//! default output backend via the static atomic in
-//! `parallel_writer::test_hooks`, in its own binary.
+//! default output backend.
 
 #![allow(clippy::unwrap_used)]
 
@@ -104,7 +99,8 @@ mod apply_changes {
         // changed.
         let before = common::snapshot_dir(dir.path());
 
-        // Arm the hook at blob seq 3 (an arbitrary early-middle blob that
+        // Arm the hook (below, on the run's token) at blob seq 3 (an
+        // arbitrary early-middle blob that
         // corresponds to a Candidate dispatched to the worker pool).
         //
         // Two workers is the minimum supported worker count.
@@ -122,8 +118,12 @@ mod apply_changes {
             ignore_missing_nodes: false,
             parallelism: pbfhogg::Parallelism::from_jobs(2),
             allow_version_regression: false,
-            panic_at_blob_seq: Some(3),
         };
+        let host = crate::common::test_host();
+        host.cancel
+            .faults()
+            .apply_changes_panic_at_blob_seq
+            .store(3, std::sync::atomic::Ordering::Relaxed);
 
         // Catch only as a guard: the public API must return an error,
         // including when a missing node seq would otherwise hang the barrier.
@@ -134,7 +134,7 @@ mod apply_changes {
                 common::out(&output),
                 &opts,
                 &pbfhogg::HeaderOverrides::default(),
-                &crate::common::test_host(),
+                &host,
             )
         }));
         let err = match result {

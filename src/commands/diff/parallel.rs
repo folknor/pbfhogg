@@ -29,29 +29,6 @@ use crate::owned::TypeFilter;
 use super::shard::{BlobDesc, Shard, plan_shards, walk_pair};
 use super::{DiffOptions, DiffStats};
 
-// Fault-injection hooks for tests. Gated behind the `static-test-hooks`
-// Cargo feature and `not(test)`: product builds and the library's own
-// unit-test harness never compile this module.
-// Static atomics rather than per-instance config because the hook
-// wants to fire on a specific shard index, inside the per-shard
-// scope.spawn closure, and threading a config through every entry
-// point would be invasive. The test that arms it owns its own process
-// (a `[[test]]` target of its own, see Cargo.toml).
-#[cfg(all(feature = "static-test-hooks", not(test)))]
-pub mod test_hooks {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// Shard index at which `run_shard` panics. `usize::MAX` =
-    /// disarmed (default). Call [`reset`] at the start AND end of
-    /// any test that arms this so sibling tests don't inherit state.
-    pub static PANIC_AT_SHARD_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
-
-    /// Disarm the hook.
-    pub fn reset() {
-        PANIC_AT_SHARD_IDX.store(usize::MAX, Ordering::Relaxed);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Per-shard worker: in-memory block-pair merge
 // ---------------------------------------------------------------------------
@@ -130,17 +107,19 @@ fn run_shard(
     scratch: Option<&crate::scratch::RunScratch>,
     cancel: &crate::host::Cancel,
 ) -> Result<ShardOutput> {
-    // Test-only: arm via `test_hooks::PANIC_AT_SHARD_IDX`. Simulates a
+    // Test-only: the fault plan's `diff_shard_panic`. Simulates a
     // mid-phase shard crash. The caller's `scope.spawn(...).join()`
     // path turns the panic into an `Err("shard worker panicked: ..")` and
     // the surrounding cleanup pass sweeps every possible per-shard
     // scratch file. Release builds compile this out entirely.
-    #[cfg(all(feature = "static-test-hooks", not(test)))]
+    #[cfg(feature = "test-hooks")]
+    if cancel
+        .faults()
+        .diff_shard_panic
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == shard_idx
     {
-        use std::sync::atomic::Ordering;
-        if test_hooks::PANIC_AT_SHARD_IDX.load(Ordering::Relaxed) == shard_idx {
-            panic!("test-hooks: diff/parallel shard {shard_idx} panicking");
-        }
+        panic!("test-hooks: diff/parallel shard {shard_idx} panicking");
     }
 
     let type_char = kind.type_char();

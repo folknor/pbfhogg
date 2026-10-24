@@ -112,7 +112,9 @@ pub(super) struct StreamingConfig {
     /// Shared with the drain; see the module doc's "Failure" section.
     pub failure: Arc<FailureSlot>,
     /// Test-only: panic in the worker loop when the dequeued blob's
-    /// `seq` matches. Only compiled under the `test-hooks` feature.
+    /// `seq` matches: the run's fault plan's
+    /// `apply_changes_panic_at_blob_seq`, read once by the caller. Only
+    /// compiled under the `test-hooks` feature.
     #[cfg(feature = "test-hooks")]
     pub panic_at_blob_seq: Option<u64>,
 }
@@ -376,7 +378,8 @@ fn worker_loop(
             }
         };
 
-        // Test-only: arm this from `MergeOptions::with_panic_at_blob_seq`
+        // Test-only: arm this through the fault plan's
+        // `apply_changes_panic_at_blob_seq` (`crate::test_hooks`)
         // to trigger a mid-stream worker panic at a deterministic point,
         // exercising panic publication, barrier shutdown and scratch cleanup.
         // Production builds don't compile this block.

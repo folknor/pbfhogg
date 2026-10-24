@@ -228,9 +228,6 @@ pub(super) struct WritePipeline {
     /// poisons it, so the later `flush` (which finds no thread left to join
     /// and would otherwise succeed) cannot certify the output.
     pub(super) completion: Option<crate::output::Completion>,
-    /// Test hook: the framing closure for this seq panics before framing.
-    #[cfg(feature = "test-hooks")]
-    pub(super) framing_panic_at: Option<usize>,
 }
 
 impl WritePipeline {
@@ -253,8 +250,6 @@ impl WritePipeline {
             writer_gone: WriterGone::new(),
             executor,
             completion: None,
-            #[cfg(feature = "test-hooks")]
-            framing_panic_at: None,
         }
     }
 }

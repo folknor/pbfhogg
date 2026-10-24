@@ -29,29 +29,6 @@ use crate::error::Error;
 
 use super::super::format::*;
 
-// Fault-injection hooks for tests. Gated behind the `static-test-hooks`
-// Cargo feature and `not(test)`: product builds and the library's own
-// unit-test harness never compile this module.
-// Static atomic fired inside the rayon streets par_iter closure on
-// a matching way_idx. Verifies that the run scratch directory's
-// cleanup (see ADR-0003) fires correctly when a rayon worker
-// panics during Pass 3 Stage A.
-#[cfg(all(feature = "static-test-hooks", not(test)))]
-pub mod test_hooks {
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    /// Way index at which the streets Stage A rayon worker panics.
-    /// `u32::MAX` = disarmed (default). Call [`reset`] at the start
-    /// AND end of any test that arms this so sibling tests don't
-    /// inherit state.
-    pub static PANIC_AT_STREETS_WAY_IDX: AtomicU32 = AtomicU32::new(u32::MAX);
-
-    /// Disarm the hook.
-    pub fn reset() {
-        PANIC_AT_STREETS_WAY_IDX.store(u32::MAX, Ordering::Relaxed);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Cell entry types
 // ---------------------------------------------------------------------------
@@ -526,16 +503,18 @@ pub(super) fn bucketed_cell_assignment_fused(
             (chunk_start..chunk_end)
                 .into_par_iter()
                 .flat_map_iter(|way_idx| {
-                    // Test-only: arm via
-                    // `test_hooks::PANIC_AT_STREETS_WAY_IDX`. Simulates a
+                    // Test-only: the fault plan's
+                    // `geocode_streets_panic_at_way`. Simulates a
                     // mid-Stage-A crash inside a rayon worker. Rayon
                     // propagates the panic to the `.collect()` call site
                     // on the main thread; the run scratch directory
                     // holding `fine_bucket_dir` / `coarse_bucket_dir`
                     // (ADR-0003) is swept on the unwind.
                     // Release builds compile this out entirely.
-                    #[cfg(all(feature = "static-test-hooks", not(test)))]
-                    if test_hooks::PANIC_AT_STREETS_WAY_IDX
+                    #[cfg(feature = "test-hooks")]
+                    if cancel
+                        .faults()
+                        .geocode_streets_panic_at_way
                         .load(std::sync::atomic::Ordering::Relaxed)
                         == way_idx
                     {

@@ -1677,67 +1677,78 @@ impl Output {
         let completion = self.begin_write()?;
         let path = self.path();
         let finish = crate::write::Finish::Deferred;
-        let writer = match backend {
-            OutputBackend::Uring => {
-                #[cfg(feature = "linux-io-uring")]
-                {
-                    PbfWriter::to_path_uring_in(
-                        path,
-                        compression,
-                        header_block_bytes,
-                        host.executor.clone(),
-                        host.diagnostics.clone(),
-                        finish,
-                        host.cancel.clone(),
-                    )
-                }
-                #[cfg(not(feature = "linux-io-uring"))]
-                {
-                    Err(Error::invalid_argument(
-                        "the io_uring output backend needs the linux-io-uring feature, \
+        // A test can make every backend refuse as a platform would; the
+        // refusal is the constructor's result, so the failure handling below
+        // runs exactly as for a real one.
+        #[cfg(feature = "test-hooks")]
+        let refused = host.cancel.faults().output_backend_refusal();
+        #[cfg(not(feature = "test-hooks"))]
+        let refused: Option<Error> = None;
+        let writer = if let Some(refusal) = refused {
+            Err(refusal)
+        } else {
+            match backend {
+                OutputBackend::Uring => {
+                    #[cfg(feature = "linux-io-uring")]
+                    {
+                        PbfWriter::to_path_uring_in(
+                            path,
+                            compression,
+                            header_block_bytes,
+                            host.executor.clone(),
+                            host.diagnostics.clone(),
+                            finish,
+                            host.cancel.clone(),
+                        )
+                    }
+                    #[cfg(not(feature = "linux-io-uring"))]
+                    {
+                        Err(Error::invalid_argument(
+                            "the io_uring output backend needs the linux-io-uring feature, \
                          which this build was compiled without",
-                    ))
+                        ))
+                    }
                 }
-            }
-            OutputBackend::Direct => {
-                #[cfg(feature = "linux-direct-io")]
-                {
-                    PbfWriter::to_path_direct_in(
-                        path,
-                        compression,
-                        header_block_bytes,
-                        host.executor.clone(),
-                        host.diagnostics.clone(),
-                        finish,
-                        host.cancel.clone(),
-                    )
-                }
-                #[cfg(not(feature = "linux-direct-io"))]
-                {
-                    Err(Error::invalid_argument(
-                        "the O_DIRECT output backend needs the linux-direct-io feature, \
+                OutputBackend::Direct => {
+                    #[cfg(feature = "linux-direct-io")]
+                    {
+                        PbfWriter::to_path_direct_in(
+                            path,
+                            compression,
+                            header_block_bytes,
+                            host.executor.clone(),
+                            host.diagnostics.clone(),
+                            finish,
+                            host.cancel.clone(),
+                        )
+                    }
+                    #[cfg(not(feature = "linux-direct-io"))]
+                    {
+                        Err(Error::invalid_argument(
+                            "the O_DIRECT output backend needs the linux-direct-io feature, \
                          which this build was compiled without",
-                    ))
+                        ))
+                    }
                 }
+                OutputBackend::Parallel => PbfWriter::to_path_parallel_in(
+                    path,
+                    compression,
+                    header_block_bytes,
+                    host.executor.clone(),
+                    host.diagnostics.clone(),
+                    finish,
+                    host.cancel.clone(),
+                ),
+                OutputBackend::Buffered => PbfWriter::to_path_in(
+                    path,
+                    compression,
+                    header_block_bytes,
+                    host.executor.clone(),
+                    host.diagnostics.clone(),
+                    finish,
+                    host.cancel.clone(),
+                ),
             }
-            OutputBackend::Parallel => PbfWriter::to_path_parallel_in(
-                path,
-                compression,
-                header_block_bytes,
-                host.executor.clone(),
-                host.diagnostics.clone(),
-                finish,
-                host.cancel.clone(),
-            ),
-            OutputBackend::Buffered => PbfWriter::to_path_in(
-                path,
-                compression,
-                header_block_bytes,
-                host.executor.clone(),
-                host.diagnostics.clone(),
-                finish,
-                host.cancel.clone(),
-            ),
         };
         // A constructor failure (the staging file, the writer thread's
         // start, the header write) names the output like every later one.

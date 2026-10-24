@@ -409,8 +409,6 @@ fn apply_changes_non_indexed_parity() {
         ignore_missing_nodes: false,
         parallelism: pbfhogg::Parallelism::Auto,
         allow_version_regression: false,
-        #[cfg(feature = "test-hooks")]
-        panic_at_blob_seq: None,
     };
     pbfhogg::apply_changes::merge(
         &in_idx,

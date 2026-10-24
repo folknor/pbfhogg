@@ -53,46 +53,12 @@ fn coverage_is_within_budget(total_pairs: u64) -> bool {
     total_pairs <= GRID_MAX_PAIRS && total_pairs <= u64::from(u32::MAX)
 }
 
-/// Test-only hook: force [`RegionGrid::build`] to return `None` so that
-/// classification runs the linear scan even at/above the region threshold.
-/// Lets a test drive one identical config down both the grid and the linear
-/// code paths and compare their output byte-for-byte. Process-global, so
-/// gated behind `static-test-hooks` and `not(test)`: only an
-/// integration-test target of its own can arm it.
-#[cfg(all(feature = "static-test-hooks", not(test)))]
-pub mod test_hooks {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    /// When set, `RegionGrid::build` returns `None`.
-    pub static FORCE_LINEAR: AtomicBool = AtomicBool::new(false);
-
-    /// Clear the force-linear flag.
-    pub fn reset() {
-        FORCE_LINEAR.store(false, Ordering::Relaxed);
-    }
-}
-
-#[cfg(all(feature = "static-test-hooks", not(test)))]
-#[inline]
-fn force_linear() -> bool {
-    test_hooks::FORCE_LINEAR.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-#[cfg(not(all(feature = "static-test-hooks", not(test))))]
-#[inline]
-fn force_linear() -> bool {
-    false
-}
-
 impl RegionGrid {
     /// Rasterize region bounding boxes as inclusive cell rectangles.
     ///
     /// Returns `None` before allocating the grid when its coverage would exceed
     /// the bounded index budget. The caller must then retain its linear scan.
     pub(crate) fn build(region_bboxes: &[(i32, i32, i32, i32)]) -> Option<Self> {
-        if force_linear() {
-            return None;
-        }
         let mut total_pairs = 0_u64;
         for &(min_lat, max_lat, min_lon, max_lon) in region_bboxes {
             let min_col = cell_lon(min_lon);

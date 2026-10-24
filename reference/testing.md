@@ -27,10 +27,10 @@ Tests go where they couple least.
   profile and target, and hands its path as `CARGO_BIN_EXE_pbfhogg`.
   The root package's tests get no such path, so they have no way to
   reach the binary at all.
-- **Fault-injection tests** in `tests/fault_*.rs` - the ones that arm
-  a process-global static hook each own a process (see "Test
-  binaries"); a fault test on a per-instance hook may live in `all`.
-  Partially coupled to internal hook surfaces by design.
+- **Fault-injection tests** in `tests/fault_*.rs`, modules of `all`
+  like every other library test (plus a few unit tests beside the
+  code they fault, such as `write::parallel_gzip`'s). Coupled to the
+  `pbfhogg::test_hooks` surface by design.
 - **External cross-validation** in `brokkr verify`
   (`verify_<command>.rs` modules in brokkr) - compares pbfhogg
   output against osmium / osmosis / osmconvert.
@@ -77,11 +77,8 @@ NAME` list each harness in turn to find one test.
   reports it.** Add the `mod` line with the file.
 - **A test that must own its process** gets its own `[[test]]` target
   in `Cargo.toml` with the reason written beside it; the `[[test]]`
-  entries are the list. Those that arm a process-global static hook
-  (the `fault_*` targets) hold one test each and carry
-  `required-features = ["static-test-hooks", ...]`, so they are built
-  and run only by the `faults` check sweep. A fault test on a
-  per-instance hook (`fault_apply_changes`) is a module of `all`.
+  entries are the list. Arming a fault is not such a reason: fault
+  state is per run (see "Conventions").
 - **Moving tests between the packages: `scripts/test_inventory.py`.**
   It compares the tests a plan lists against the tests the tree now
   has (see its docstring for the exact brokkr command that produces the
@@ -97,47 +94,13 @@ NAME` list each harness in turn to find one test.
   swaps the panic hook to silence its deliberate worker panic. While the
   replacement is installed, it can also suppress panic output from another
   concurrently running unit test.
-- **Static hooks cannot reach a shared harness.** The process-global
-  hooks exist only under the `static-test-hooks` feature, and the
-  root package's two shared harnesses are excluded by construction:
-  `tests/all.rs` carries `#![cfg(not(feature = "static-test-hooks"))]`,
-  so any build that has the statics compiles `all` to an empty harness;
-  and the library gates every static (module, facade re-export and call
-  site) on `all(feature = "static-test-hooks", not(test))`, so its
-  unit-test harness never has them. A test naming a static from either
-  is therefore a compile error or compiled out, never a race; a text
-  rule used to approximate this and could be spelled around. The
-  `faults` sweep (`all`'s features plus `static-test-hooks`, unfiltered)
-  is the one shape where the statics exist; every target requiring the
-  feature runs there whatever it is named, and the gate audits the
-  whole shape. The CLI package's two shared harnesses (its lib
-  unit tests and `cli/tests/all.rs`) link the library too but cannot
-  see its features as a `cfg`, so they cannot compile themselves
-  empty; instead each asserts `pbfhogg::STATIC_TEST_HOOKS` (a hidden
-  constant, `cfg!(feature = "static-test-hooks")` inside the library)
-  false at compile time, and any feature graph that unifies the statics
-  onto the library they link fails to build them. That is why the
-  `faults` sweep stays root-only and `pbfhogg-cli` declares no
-  `static-test-hooks` feature. `scripts/check_static_hook_targets.py`
-  (a `brokkr check` script check) requires the assertion as an active
-  top-level item in every CLI harness, refuses a CLI bin with a unit-test
-  harness of its own, and counts exactly one `#[test]` per static-hook
-  target in the source. Limits: a new shared harness in the root
-  package needs the same `cfg` line by hand; the script reads source
-  text, so a block comment or a macro can still fool it; and doctests
-  are outside the boundary (the doc-only sweep enables no hook feature).
-- **Why the static-hook tests are not one lock-serialized binary.**
-  Mutual exclusion inside one process is only equivalent to a process
-  each if every thread that can read a hook has exited before the next
-  test arms one. The write pools now guarantee that for themselves
-  (`write::parallel_writer` and `write::parallel_gzip` join every
-  thread they started before returning, and `fault_parallel_writer`
-  asserts it), but no audit has established it for every other
-  hooked pipeline; and the check watchdog ages a test from its
-  libtest start, so tests queued on a lock spend their 20 s budget
-  waiting. Per-instance hooks (one fault plan carried
-  in each command's options) would let these tests fold into `all`
-  with no lock at all.
+- **Fault hooks are per run, so fault tests share the harness.** No
+  fault hook is process-global: their state lives in the fault plan
+  carried by the run's cancellation token (see "Conventions"), so an
+  armed fault reaches only the run handed that token, and a fault test
+  runs concurrently with everything else in `all`. Two textlint rules
+  in `brokkr.toml` keep it that way (`no-static-fault-hook-state`,
+  `fault-hooks-only-in-test-hooks`).
 
 The `pbfhogg-cli` program is its library target (`cli/src/lib.rs`,
 `pbfhogg_cli`); the `pbfhogg` bin is only `main` calling
@@ -152,10 +115,9 @@ The `all`, `consumer` and `musl` check sweeps select both packages, so
 the CLI tests run against a binary with `test-hooks` and both platform
 features, one without the platform features (pbfhogg-cli's default
 build), and one for musl. No sweep pre-builds the binary
-(`build_packages`): cargo builds it for each test build. The `minimal`,
-`geocode-reader` and `faults` sweeps stay root-only: the CLI's lib dep
-would turn `commands` back on in the first two, and its harnesses refuse
-the statics `faults` enables. `brokkr test NAME` searches one package,
+(`build_packages`): cargo builds it for each test build. The `minimal`
+and `geocode-reader` sweeps stay root-only: the CLI's lib dep would turn
+`commands` back on. `brokkr test NAME` searches one package,
 `[test] default_package = "pbfhogg"`; a CLI test needs
 `brokkr test -p pbfhogg-cli NAME`.
 
@@ -256,8 +218,8 @@ Each `cli/tests/cli_<command>.rs` splits intent inside the file:
 - **`platform`**: `--direct-io`, `--io-uring`, MEMLOCK, feature
   surface - keep out of tier 1 unless cheap and reliable on the
   reference host.
-- **`serial`**: requires `--test-threads=1`. Static fault-injection
-  state is not a `serial` case: it takes its own `[[test]]` target.
+- **`serial`**: requires `--test-threads=1`. Fault injection is not a
+  `serial` case: its state is per run.
 
 `cli/tests/cli_sort.rs` is the canonical template for new `cli_*.rs`
 files.
@@ -293,22 +255,30 @@ exception, not a tier - should not survive across many PRs.
 
 ## Conventions
 
-- **`test-hooks` and `static-test-hooks` Cargo features.** One per
-  hook shape (below). Both off by default and never on in a product
-  build, which therefore never sees the hook code. `test-hooks` is
-  enabled by the `all` and `faults` check sweeps; `static-test-hooks`
-  only by `faults`, and is required by the static-hook `fault_*`
-  targets.
-- **Two hook shapes.** Per-instance field on a public config struct
-  (race-free with sibling tests, so the test lives in `all`; gated on
-  `test-hooks`) vs. process-global static atomics (gated on
-  `all(feature = "static-test-hooks", not(test))`). Picker:
-  per-instance when the pipeline has a public config struct on its
-  entry path, static atomics otherwise. A static-atomic hook's test
-  gets its own `[[test]]` target holding that one test (see "Test
-  binaries"), which makes it race-free without `#[ignore]` or
-  `--test-threads=1`. A new static hook must use the static gate; one
-  put under `test-hooks` instead would reach `all`.
+- **`test-hooks` Cargo feature.** Off by default and never on in a
+  product build, which therefore never sees the hook code; the `all`
+  check sweep enables it.
+- **Fault plans ride the token.** `pbfhogg::test_hooks` is the one
+  answer to "what can a test inject". Its `FaultPlan` holds every
+  token-scoped hook (arming fields and observation counters, public
+  atomics, disarmed as a `MAX` sentinel); one lives in each
+  `host::Cancel` and `Cancel::faults()` reaches it. The token is what
+  an invocation already hands every worker loop it starts (the read
+  pipeline, the output writers, the diff and derive shards, altw's
+  stages, the geocode passes), so a new hook is a `FaultPlan` field
+  read at the site through the token in hand, gated on
+  `cfg(feature = "test-hooks")`. A test arms the plan of the token in
+  the `Host` it passes; `common::test_host()` mints a fresh token per
+  call. One token is one fault scenario: everything run under it shares
+  its plan (sequence numbers, worker indices, counters), so an armed and
+  an unarmed run use two tokens. A reader takes its token through
+  `ElementReader::cancel`; a public path constructor mints its own,
+  reached through `PbfWriter::test_faults`. Per-token isolation does not
+  stop an armed run's own parked workers: a test that parks them still
+  releases and joins on every exit path. Per-object hooks stay with
+  their owner and are listed in the module docs: `PublishFault` on an
+  output, the geocode reader's counter, and the cancellation hooks
+  below.
 - **Cancellation hooks.** `Cancel::on_check` (per-instance, `test-hooks`)
   runs a callback with each checkpoint's 1-based ordinal and may block;
   `Cancel::checks_passed` counts them. Library tests trip the token from
@@ -367,11 +337,6 @@ exception, not a tier - should not survive across many PRs.
 - **Property tests.** `tests/proptests.rs`, 64 cases per property.
   `proptest-regressions/` is gitignored to avoid committing
   case-specific reproducers.
-- **Hook consolidation (explicitly don't).** Static-atomic submodules
-  across parallel_writer / parallel_gzip / uring_writer /
-  diff-parallel / derive-parallel / altw-stage3 / geocode-pass3 /
-  read-pipeline / region-grid must stay per-module. Per-target
-  isolation depends on each fault binary arming only its own atomics.
 - **Policy proposal (not-yet-adopted).** Every new parallel pipeline
   should ship with three tests: a worker-panic test, a `-j N` vs
   `-j 2` parity test, and a scratch-leak test. Worth considering as

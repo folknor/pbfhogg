@@ -21,16 +21,6 @@
 //! `common` is the library package's `tests/common`, mounted by path, so its
 //! `cfg(feature = ...)` gates read this package's features (the same names).
 
-// The library's process-global fault hooks (`static-test-hooks`) fire in every
-// concurrent test of a process. This package cannot see its dependency's
-// features as a cfg, so where the library package compiles its shared
-// harnesses empty, this one refuses to compile against a `pbfhogg` built with
-// them: no feature graph, sweep or `--all-features` run can link them here.
-const _: () = assert!(
-    !pbfhogg::STATIC_TEST_HOOKS,
-    "pbfhogg-cli's test harnesses must not link a pbfhogg built with static-test-hooks"
-);
-
 #[path = "../../tests/common/mod.rs"]
 mod common;
 mod invoker;

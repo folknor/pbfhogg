@@ -1131,7 +1131,12 @@ mod platform {
     /// way the run can fail with a refusal is stage 4's output open. A host
     /// whose filesystem accepts O_DIRECT output completes the run instead, so
     /// the test cannot force the refusal; it then passes without exercising
-    /// the join, and only a failure is held to the contract.
+    /// the join, and only a failure is held to the contract. The
+    /// deterministic version, which injects the refusal through the fault
+    /// plan on every host, is
+    /// `external_join_stage4_backend_refusal_stays_typed_across_the_join` in
+    /// the library's `tests/host_contract.rs`; this one keeps the real
+    /// O_DIRECT refusal path covered where a host produces it.
     #[test]
     fn external_backend_output_refusal_stays_typed_across_stage_join() {
         let dir = crate::common::test_scratch();

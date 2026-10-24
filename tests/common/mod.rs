@@ -1682,7 +1682,9 @@ pub(crate) fn test_host() -> pbfhogg::host::Host {
         resources: std::sync::Arc::new(fixed_resources()),
         page_cache: pbfhogg::host::PageCachePolicy::Keep,
         executor: pbfhogg::host::Executor::Ambient,
-        // A fresh token per call: a test that trips one cancels only itself.
+        // A fresh token per call: a test that trips one cancels only itself,
+        // and one that arms its fault plan (`pbfhogg::test_hooks`) faults
+        // only its own run.
         cancel: pbfhogg::host::Cancel::new(),
     }
 }

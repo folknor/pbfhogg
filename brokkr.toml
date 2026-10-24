@@ -7,10 +7,9 @@ capture_env = ["PBFHOGG*", "MALLOC*"]
 # test) pass with its own feature shape. Profiles in [test.profiles]
 # reference these by name and layer libtest filters on top.
 #
-#  - "all"      = test-hooks (per-instance fault-injection hooks; the
-#                 process-global ones are `static-test-hooks`, which only
-#                 the "faults" sweep enables) + linux-direct-io
-#                 + linux-io-uring. Mirrors what --all-features used to
+#  - "all"      = test-hooks (fault injection, `pbfhogg::test_hooks`; the
+#                 fault tests run here with every other test) +
+#                 linux-direct-io + linux-io-uring. Mirrors what --all-features used to
 #                 pull in MINUS hotpath (#[hotpath::measure] turns into
 #                 runtime measurement that emits a banner to stdout at
 #                 process exit, contaminating stdout-output commands
@@ -41,9 +40,8 @@ capture_env = ["PBFHOGG*", "MALLOC*"]
 # pre-build and no binary from another sweep to pick up. Both packages
 # declare test-hooks, linux-direct-io and linux-io-uring under the same
 # names, so one feature list serves both. A sweep that must keep the
-# library alone (minimal, geocode-reader, faults) leaves pbfhogg-cli out:
-# its lib dep would turn `commands` back on, and faults would hand it
-# static-test-hooks, which its harnesses refuse at compile time.
+# library alone (minimal, geocode-reader) leaves pbfhogg-cli out: its lib
+# dep would turn `commands` back on.
 
 [[check]]
 name = "all"
@@ -60,22 +58,7 @@ features = ["test-hooks", "linux-direct-io", "linux-io-uring"]
 # sweep's binaries are each package's lib unit tests and `all` binary, and
 # the process_nofile target; the fan-out therefore parallelizes mostly
 # inside the two `all` binaries, and shared scratch between concurrent
-# cli_* modules is the class to suspect first if a test flakes. The static-hook fault_* targets run in
-# the `faults` sweep below.
-parallel = {}
-
-# "faults" = `all` plus `static-test-hooks`: the only shape in which the
-# library's process-global fault hooks exist, and so the only sweep that
-# builds the [[test]] targets requiring them (each its own process). In
-# this shape tests/all.rs is cfg'd out to an empty harness and the lib
-# unit tests compile without the statics (they are gated on `not(test)`),
-# so neither of the root package's shared harnesses can hold one. Unfiltered on purpose: every target
-# requiring the feature runs whatever it is named, and the gate audits the
-# whole shape. The lib unit tests run here a second time, as the same code
-# the `all` sweep runs.
-[[check]]
-name = "faults"
-features = ["test-hooks", "static-test-hooks", "linux-direct-io", "linux-io-uring"]
+# cli_* modules is the class to suspect first if a test flakes.
 parallel = {}
 
 [[check]]
@@ -194,6 +177,26 @@ paths = ["tests/common/**/*.rs"]
 except = ['^\s*//']
 message = "tests/common is shared with pbfhogg-cli, where `commands` means something else; gate the mod line in tests/all.rs instead, never a shared helper"
 
+# Fault injection is per-run: every hook's state lives in the fault plan the
+# run's token carries (src/test_hooks.rs), so an armed fault cannot reach a
+# sibling test in a shared harness. A `static` there, or a `test_hooks`
+# module anywhere else, would bring back process-global hooks and the
+# one-process-per-test machinery they needed.
+[[textlint]]
+name = "no-static-fault-hook-state"
+pattern = '^\s*(?:pub(?:\([^)]*\))?\s+)?static\s'
+paths = ["src/test_hooks.rs"]
+region = "code"
+message = "fault-hook state lives in FaultPlan, carried by the run's Cancel token; a static would fire in every concurrent test of the process"
+
+[[textlint]]
+name = "fault-hooks-only-in-test-hooks"
+pattern = '\bmod\s+\w*test_hooks\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/lib.rs"]
+region = "code"
+message = "fault hooks go in pbfhogg::test_hooks (src/test_hooks.rs) as FaultPlan fields, not in a module of their own"
+
 [[textlint]]
 name = "no-print-macro"
 pattern = '\b(?:print|println)!\s*[\(\[\{]'
@@ -242,7 +245,7 @@ gate_profile = "gate"
 # themselves out there.
 [test.profiles.tier1]
 description = "Fast edit loop used by brokkr check (tier 1)"
-sweeps = ["all", "faults", "consumer", "minimal", "geocode-reader", "musl"]
+sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl"]
 skip = ["tier2::", "tier3::", "platform::", "serial::"]
 include_ignored = false
 
@@ -264,7 +267,7 @@ include_ignored = false
 # it; before naming a new test, check it does not contain an entry below.
 [test.profiles.full]
 description = "Full in-project correctness gate (tier 3, pre-merge); over-watchdog tests run individually via brokkr test"
-sweeps = ["all", "faults"]
+sweeps = ["all"]
 skip = [
     "platform::",
     "sort_cross_validate_osmium",
@@ -280,9 +283,9 @@ sweeps = ["all"]
 only = ["platform::"]
 include_ignored = true
 
-# Tests requiring --test-threads=1. The fault-injection split
-# (2026-04-25) made the previously-serial fault tests per-binary and
-# race-free; this profile is reserved for any future serial-only test.
+# Tests requiring --test-threads=1. Fault tests are not a serial case
+# (their hooks are per-run, see `pbfhogg::test_hooks`); this profile is
+# reserved for any future serial-only test.
 # Note the entries now carry `parallel` (2026-09-02): if a serial:: test
 # ever materializes, give this profile a parallel-free twin of `all`
 # (same build shape, clippy dedupes) rather than running it through the
@@ -301,11 +304,11 @@ test_threads = 1
 # land - per testing.md, there is no generic tier2 profile.
 #
 # The sweeps are named rather than inherited from tier1: cli_sort lives in
-# pbfhogg-cli, so the root-only sweeps (faults, minimal, geocode-reader)
-# hold no cli_sort test. Verified with `brokkr check --profile sort` and the
-# tier1 sweep list: the run stops at `faults` with "cargo test: zero tests
-# ran (sweep: faults)", and the sweeps after it never run (the later
-# root-only sweeps were not reached, so not observed). These three are every
+# pbfhogg-cli, so the root-only sweeps (minimal, geocode-reader) hold no
+# cli_sort test. Verified with `brokkr check --profile sort` and the tier1
+# sweep list at a time it held a root-only sweep ahead of these: the run
+# stopped there with "cargo test: zero tests ran", and the sweeps after it
+# never ran. These three are every
 # shape the CLI tests run in.
 [test.profiles.sort]
 description = "Tier 2: expanded sort command tests"
@@ -323,7 +326,7 @@ skip = ["platform::", "serial::"]
 # a test that stops running cannot go unnoticed here.
 [test.profiles.gate-tests]
 description = "Every sweep, unfiltered"
-sweeps = ["all", "faults", "consumer", "minimal", "geocode-reader", "musl"]
+sweeps = ["all", "consumer", "minimal", "geocode-reader", "musl"]
 
 [test.profiles.doc-twin]
 description = "The doc-only carrier"
@@ -1415,13 +1418,5 @@ message = "emit_read_counters is the once-per-process exit hook; only the CLI ex
 name = "source-invariants"
 command = "python3 scripts/check_source_invariants.py"
 expect = "source invariants ok"
-match = "last-line"
-stage = "pre-clippy"
-
-# Source-only guard: no build or test-harness startup.
-[[script_check]]
-name = "static-hook-test-isolation"
-command = "python3 scripts/check_static_hook_targets.py"
-expect = "static hook targets ok"
 match = "last-line"
 stage = "pre-clippy"

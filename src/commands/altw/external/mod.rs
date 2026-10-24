@@ -39,14 +39,6 @@ mod stage2;
 mod stage3;
 mod stage4;
 
-// Under the `static-test-hooks` feature, expose the stage 3 bucket-panic
-// hook so an integration-test target of its own can arm it. Other stages can add
-// sibling re-exports here as they grow hooks.
-#[cfg(all(feature = "static-test-hooks", not(test)))]
-pub mod test_hooks {
-    pub use super::stage3::test_hooks as stage3;
-}
-
 use crate::tunables::{
     ALTW_STAGE3_WORKERS_CAP, DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN, DECODE_WORKERS_RESERVED,
     MAX_BUCKET_WIDTH, NUM_BUCKETS,

@@ -309,6 +309,15 @@ pub(super) fn try_extract_multi_single_pass(
         .map(|bi| (bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon))
         .collect();
     let grid = if n >= GRID_REGION_THRESHOLD {
+        // A test can decline the grid to drive the same config down the
+        // linear scan and compare output byte for byte.
+        #[cfg(feature = "test-hooks")]
+        let grid = if host.cancel.faults().forces_linear_region_grid() {
+            None
+        } else {
+            RegionGrid::build(&region_bboxes)
+        };
+        #[cfg(not(feature = "test-hooks"))]
         let grid = RegionGrid::build(&region_bboxes);
         if grid.is_none() {
             // Output is unchanged (the linear classifier tests every

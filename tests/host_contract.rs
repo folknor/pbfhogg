@@ -307,7 +307,7 @@ fn swallowed_framing_panic_surfaces_at_flush() {
         pbfhogg::host::Executor::Pool(pool),
     )
     .expect("writer");
-    writer.test_panic_in_framing_at(3);
+    writer.test_faults().framing_panic_at.store(3, Relaxed);
     for _ in 0..10 {
         writer.write_primitive_block(&EMPTY_BLOCK).expect("write");
     }
@@ -351,7 +351,10 @@ fn swallowed_framing_panics_on_one_worker_fail_flush() {
                 pbfhogg::host::Executor::Pool(Arc::clone(&pool)),
             )
             .expect("writer");
-            writer.test_panic_in_framing_at(panic_at);
+            writer
+                .test_faults()
+                .framing_panic_at
+                .store(panic_at, Relaxed);
             for _ in 0..count {
                 writer.write_primitive_block(&EMPTY_BLOCK).expect("write");
             }
@@ -383,6 +386,49 @@ fn run_external_join(
     )
     .map(drop)
     .map_err(|e| e.to_string())
+}
+/// altw external builds its output writer in stage 4, on a scoped thread of
+/// its own. A backend setup refusal there must reach the caller as the typed
+/// `PlatformUnsupported` (the CLI's exit 3), not flattened at the stage join.
+/// The CLI test of the same contract cannot force the refusal without a host
+/// assumption, so the fault plan injects it at the one place a backend becomes
+/// a writer. Buffered reads, so no genuine input-side refusal can stand in for
+/// the injected one; its source message proves which refusal arrived.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn external_join_stage4_backend_refusal_stays_typed_across_the_join() {
+    let dir = crate::common::test_scratch();
+    let base = input(dir.path());
+    let host = crate::common::test_host();
+    let faults = host.cancel.faults();
+    faults.refuse_output_backend.store(true, Relaxed);
+    let output = dir.path().join("refused.pbf");
+    let Err(err) = pbfhogg::altw::external::external_join(
+        &base,
+        crate::common::out(&output),
+        true,
+        &Default::default(),
+        &Default::default(),
+        false,
+        &host,
+        crate::common::scratch_in(dir.path()),
+    ) else {
+        panic!("an injected backend refusal must fail the run");
+    };
+    match err.kind() {
+        pbfhogg::ErrorKind::PlatformUnsupported { source, .. } => assert_eq!(
+            source.to_string(),
+            pbfhogg::test_hooks::INJECTED_BACKEND_REFUSAL,
+            "a different platform refusal arrived: {err}"
+        ),
+        other => panic!("the stage 4 refusal lost its type at the join: {other:?} ({err})"),
+    }
+    assert_eq!(
+        faults.output_backend_refusals.load(Relaxed),
+        1,
+        "the refusal must come from stage 4's single writer construction"
+    );
+    assert!(!output.exists(), "a refused run published an output");
 }
 #[test]
 fn concurrent_external_joins_use_distinct_scratch() {

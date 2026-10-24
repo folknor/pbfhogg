@@ -8,18 +8,6 @@
 // refuses.
 #![deny(clippy::disallowed_methods)]
 
-// The library's process-global fault hooks (`static-test-hooks`) fire in every
-// concurrent test of a process, so they must never reach a shared harness.
-// The root package compiles its shared harnesses empty when they exist; this
-// crate cannot see its dependency's features as a cfg, so its unit-test
-// harness refuses to compile against a `pbfhogg` built with them instead.
-// `tests/all.rs` carries the same assertion.
-#[cfg(test)]
-const _: () = assert!(
-    !pbfhogg::STATIC_TEST_HOOKS,
-    "pbfhogg-cli's test harnesses must not link a pbfhogg built with static-test-hooks"
-);
-
 mod command_paths;
 mod exit_code;
 mod host;
@@ -3049,8 +3037,6 @@ pub fn run() -> process::ExitCode {
                     ignore_missing_nodes,
                     parallelism: jobs,
                     allow_version_regression,
-                    #[cfg(feature = "test-hooks")]
-                    panic_at_blob_seq: None,
                 };
                 opts.validate()?;
                 run_apply_changes(
@@ -4834,8 +4820,6 @@ fn run_bench_merge(
         ignore_missing_nodes: false,
         parallelism: pbfhogg::Parallelism::Auto,
         allow_version_regression: false,
-        #[cfg(feature = "test-hooks")]
-        panic_at_blob_seq: None,
     };
     let stats = pbfhogg::apply_changes::merge(
         base,

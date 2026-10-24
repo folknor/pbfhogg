@@ -186,6 +186,24 @@ The judgement calls already known, to be checked first:
   - Unindexed verbose diff details switched from the owned linear tag scan
     to the borrowed `HashMap` one the indexed path uses (differs only on
     duplicate keys).
+- Fault injection moved from process-global statics (the
+  `static-test-hooks` feature, its sweep, check script and one-process
+  test targets, all deleted) to one `FaultPlan` per cancellation token
+  (`src/test_hooks.rs`), and the fault tests folded into `tests/all.rs`
+  and gzip's unit tests. Every hook site is gated on `test-hooks`, so
+  product builds compile none of it, except two always-compiled shape
+  changes: `ParallelGzipWriter::new` takes the invocation's `&Cancel`
+  (unused without the feature), and `Output::pbf_writer` matches on the
+  backend inside an `if let` whose condition is a constant `None`
+  without the feature. Argued codegen-neutral, not measured. Also:
+  `MergeOptions` lost its test-only field and derives `Default`;
+  `PbfWriter::test_panic_in_framing_at` became a plan field reached
+  through `PbfWriter::test_faults`; the read pipeline's decode gate lost
+  its reset/epoch machinery (a plan is fresh per token). Two migrated
+  tests had been passing vacuously and were fixed on the way: the altw
+  stage 3 test set `force`, which the external index refuses before
+  stage 3, and the derive test re-staged the output its clean run had
+  just published, which is refused before any shard runs.
 
 ---
 
@@ -866,51 +884,6 @@ is what a missing index does), have each command cite it, and move the
 contract tables' rows when a ruling changes one.
 
 Reported by: change application, re-encoding, altw and scanning, geocode index.
-
-## HYG-062 - Fault-injection hooks are process-global statics
-
-Anger: 8 - fault plans in options structs.
-
-Hooks live as statics in `read/pipeline.rs`,
-`read/region_grid.rs`, `write/parallel_writer.rs`, `write/parallel_gzip.rs`,
-`write/uring_writer.rs`, `commands/diff/parallel.rs`,
-`commands/diff/derive_parallel.rs`, `commands/altw/external/stage3.rs` and
-`geocode_index/builder/pass3.rs` (the hooks in `geocode_index/reader.rs`,
-`write/writer.rs` and `commands/apply_changes/` are per-instance),
-re-exported through several `mod.rs` files under differing naming schemes (`read::pipeline_test_hooks`,
-`read::region_grid_test_hooks`, a `write::` re-export, an `altw::` re-export),
-so nothing answers "what can a test inject". Reset discipline differs:
-`parallel_writer` says reset at start and end, `region_grid`
-resets both sides, stage 3's `PANIC_AT_BUCKET_IDX` doc says reset "at the start
-AND end of any test". The statics now sit behind their own
-`static-test-hooks` feature, which keeps them out of the shared `all` and
-lib unit-test harnesses by construction (reference/testing.md, "Test
-binaries"), and `scripts/check_static_hook_targets.py` enforces one test
-per target. The
-`read/pipeline.rs` test now arms through a guard
-that releases, joins and resets on every exit path; the other hooks still rely
-on manual reset at start and end. Apply-changes is the one seam with an injection
-point (`MergeOptions::panic_at_blob_seq`), and that field forces every struct
-literal to carry a `#[cfg(feature = "test-hooks")]` line and a hand-written
-`Default` with `#[allow(clippy::derivable_impls)]`. Fix: one `FaultPlan` type
-(zero-sized without `test-hooks`) carried in each command's options, cloned to
-workers as an `Arc`, behind a single `pbfhogg::test_hooks` facade; until then, a
-`HookGuard` returned by arming that resets on `Drop`. Enforce with a text rule
-banning `static` inside `mod test_hooks`.
-
-A concrete untested contract waiting on such a seam: altw external's stage 4
-builds the output writer on a worker thread, and a `--direct-io` /
-`--io-uring` setup refusal there must reach the caller as the typed
-`PlatformUnsupported` (exit 3, not 2). Nothing can force that refusal today
-without a host assumption: the CLI's `--direct-io` also makes reads direct, so
-an input-side refusal fires first on the main thread, and
-`external_backend_output_refusal_stays_typed_across_stage_join` in
-`cli/tests/cli_add_locations_to_ways.rs` passes without exercising the join on any
-host whose filesystem accepts O_DIRECT output. An injection point that makes
-stage 4's writer construction fail would make it deterministic.
-
-Reported by: test harness, read path, write path, altw and scanning, geocode
-index, change application, CLI and plumbing.
 
 ## HYG-077 - The enforcement levers most of these findings need are unused
 

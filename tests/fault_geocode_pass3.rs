@@ -1,22 +1,14 @@
-//! Per-binary fault-injection test for geocode builder Pass 3 Stage A.
-//!
-//! Split out of the former `fault_injection.rs` (2026-04-25). This file is
-//! its own `[[test]]` target in `Cargo.toml`,
-//! so the static `PANIC_AT_STREETS_WAY_IDX` is per-process and
-//! race-free without `#[ignore]` or `--test-threads=1`.
+//! Fault injection into geocode builder Pass 3 Stage A, through the fault
+//! plan on the run's token (`geocode_streets_panic_at_way`, see
+//! `pbfhogg::test_hooks`).
 
 #![allow(clippy::unwrap_used)]
 
-mod common;
-
-#[cfg(feature = "static-test-hooks")]
 mod geocode_pass3 {
     use std::sync::atomic::Ordering;
 
     use pbfhogg::block_builder::{self, BlockBuilder};
-    use pbfhogg::geocode_index::builder::{
-        BuildConfig, build_geocode_index, index_output, pass3_test_hooks as pass3_hooks,
-    };
+    use pbfhogg::geocode_index::builder::{BuildConfig, build_geocode_index, index_output};
     use pbfhogg::writer::{Compression, PbfWriter};
 
     use crate::common::snapshot_dir;
@@ -27,8 +19,6 @@ mod geocode_pass3 {
     /// scratch trees (see ADR-0003) must sweep them on the unwind.
     #[test]
     fn fault_injection_geocode_pass3_streets_panic_sweeps_bucket_dirs() {
-        pass3_hooks::reset();
-
         let dir = crate::common::test_scratch();
         let input = dir.path().join("input.osm.pbf");
         let index_dir = dir.path().join("index");
@@ -41,7 +31,11 @@ mod geocode_pass3 {
 
         let before = snapshot_dir(dir.path());
 
-        pass3_hooks::PANIC_AT_STREETS_WAY_IDX.store(2, Ordering::Relaxed);
+        let host = crate::common::test_host();
+        host.cancel
+            .faults()
+            .geocode_streets_panic_at_way
+            .store(2, Ordering::Relaxed);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             build_geocode_index(
@@ -55,12 +49,10 @@ mod geocode_pass3 {
                     &pbfhogg::host::Diagnostics::discard(),
                 )
                 .expect("stage output"),
-                &crate::common::test_host(),
+                &host,
                 crate::common::scratch_in(dir.path()),
             )
         }));
-
-        pass3_hooks::reset();
 
         // The failure must be the armed hook, not something earlier.
         let message = match &result {

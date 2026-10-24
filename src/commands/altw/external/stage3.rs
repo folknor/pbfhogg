@@ -6,29 +6,6 @@ use super::super::Result;
 use super::radix::advise_dontneed_file;
 use crate::error::Error;
 
-// Fault-injection hooks for tests. Gated behind the `static-test-hooks`
-// Cargo feature and `not(test)`: product builds and the library's own
-// unit-test harness never compile this module.
-// Static atomics (same shape as `diff/parallel::test_hooks`): fire
-// at a specific bucket index inside the stage 3 worker loop.
-// Verifies the `AbortOnDrop` panic-safety pattern propagates to
-// stage 4 waiters and that `ScratchDir`'s Drop cleans up on the
-// error path.
-#[cfg(all(feature = "static-test-hooks", not(test)))]
-pub mod test_hooks {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// Bucket index at which the stage 3 worker that claims it
-    /// panics. `usize::MAX` = disarmed (default). Call [`reset`] at
-    /// the start AND end of any test that arms this so sibling
-    /// tests don't inherit state.
-    pub static PANIC_AT_BUCKET_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
-
-    /// Disarm the hook.
-    pub fn reset() {
-        PANIC_AT_BUCKET_IDX.store(usize::MAX, Ordering::Relaxed);
-    }
-}
 use super::blob_bucket_index::{BlobBucketIntersection, classify_blobs_in_bucket};
 use super::coord_payloads::{
     AbortOnDrop, ConcurrentBlobLocationRouter, PerWayRcs, StraddlerSide,
@@ -209,14 +186,15 @@ pub(super) fn stage3_slot_reorder(
                         return Err(e);
                     }
 
-                    // Test-only: arm via `test_hooks::PANIC_AT_BUCKET_IDX`.
-                    // Simulates a mid-phase stage 3 worker crash. The
-                    // surrounding `AbortOnDrop` guard calls
-                    // `router.abort(...)` on unwind, waking stage 4
-                    // waiters; `ScratchDir::drop` cleans up the scratch
-                    // tree. Release builds compile this out entirely.
-                    #[cfg(all(feature = "static-test-hooks", not(test)))]
-                    if test_hooks::PANIC_AT_BUCKET_IDX.load(Relaxed) == bucket_idx {
+                    // Test-only: the fault plan's
+                    // `altw_stage3_panic_at_bucket`. Simulates a mid-phase
+                    // stage 3 worker crash. The surrounding `AbortOnDrop`
+                    // guard calls `router.abort(...)` on unwind, waking
+                    // stage 4 waiters; `ScratchDir::drop` cleans up the
+                    // scratch tree. Release builds compile this out
+                    // entirely.
+                    #[cfg(feature = "test-hooks")]
+                    if cancel.faults().altw_stage3_panic_at_bucket.load(Relaxed) == bucket_idx {
                         panic!(
                             "test-hooks: altw stage 3 worker {worker_id} panicking at bucket {bucket_idx}"
                         );

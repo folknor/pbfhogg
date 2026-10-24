@@ -22,14 +22,10 @@
 //! any of this state to itself gets its own `[[test]]` target in
 //! `Cargo.toml` with the reason beside it.
 //!
-//! The library's process-global fault hooks cannot be armed from here at
-//! all: they exist only under `static-test-hooks`, and the `cfg` below
-//! empties this whole binary whenever that feature is on. A build that has
-//! the statics therefore has no tests here, and a build that has tests here
-//! has no statics to name. A test that arms one gets its own `[[test]]`
-//! target requiring `static-test-hooks` - see the `fault_*` targets.
-//! Per-instance hooks (`test-hooks`) are fine here.
-#![cfg(not(feature = "static-test-hooks"))]
+//! Fault tests live here too: the library's fault hooks
+//! (`pbfhogg::test_hooks`) ride the token each run is handed, so an armed
+//! fault reaches only the run that armed it. The `fault_*` modules exist only
+//! under `test-hooks`.
 
 mod common;
 
@@ -48,7 +44,23 @@ mod inspect;
 
 mod corrupt_input;
 mod edge_cases;
+#[cfg(feature = "test-hooks")]
+mod fault_altw_stage3;
 mod fault_apply_changes;
+#[cfg(feature = "test-hooks")]
+mod fault_derive_parallel;
+#[cfg(feature = "test-hooks")]
+mod fault_diff_parallel;
+#[cfg(all(feature = "test-hooks", feature = "commands"))]
+mod fault_extract_grid;
+#[cfg(all(feature = "test-hooks", feature = "commands"))]
+mod fault_geocode_pass3;
+#[cfg(feature = "test-hooks")]
+mod fault_parallel_writer;
+#[cfg(feature = "test-hooks")]
+mod fault_read_pipeline;
+#[cfg(all(feature = "test-hooks", feature = "linux-io-uring"))]
+mod fault_uring_writer;
 mod fixture_helpers;
 mod getid;
 mod getparents;

@@ -33,6 +33,7 @@ use crate::tunables::{
 };
 
 /// Public command options.
+#[derive(Default)]
 pub struct MergeOptions {
     /// Output compression, backend and the shared input flags. The parallel
     /// writer is this command's default backend, so a `Buffered` backend
@@ -54,35 +55,6 @@ pub struct MergeOptions {
     /// held for that object in the overlay. Off by default; see
     /// [`crate::osc::CompactDiffOverlay::allow_version_regression`].
     pub allow_version_regression: bool,
-    /// Test-only: panic in the worker loop when a blob with this seq
-    /// is dequeued, to exercise panic publication through the failure
-    /// slot, barrier shutdown and scratch cleanup. Only compiled when the
-    /// `test-hooks` feature is enabled. Set via
-    /// `MergeOptions::with_panic_at_blob_seq` from tests; production
-    /// callers never touch this field (and never see it on non-
-    /// `test-hooks` builds).
-    #[cfg(feature = "test-hooks")]
-    pub panic_at_blob_seq: Option<u64>,
-}
-
-// clippy `derivable_impls` only holds when `test-hooks` is off. With the
-// feature enabled the `panic_at_blob_seq` field is present and the
-// derive would also need to default it - which Default *does* handle
-// for Option, but we keep the manual impl for symmetry across feature
-// configurations.
-#[allow(clippy::derivable_impls)]
-impl Default for MergeOptions {
-    fn default() -> Self {
-        Self {
-            write: WriteOptions::default(),
-            locations_on_ways: false,
-            ignore_missing_nodes: false,
-            parallelism: crate::host::Parallelism::Auto,
-            allow_version_regression: false,
-            #[cfg(feature = "test-hooks")]
-            panic_at_blob_seq: None,
-        }
-    }
 }
 
 impl MergeOptions {
@@ -115,17 +87,6 @@ impl MergeOptions {
             ));
         }
         Ok(())
-    }
-}
-
-#[cfg(feature = "test-hooks")]
-impl MergeOptions {
-    /// Arm the worker-panic hook at the given seq. Only available with
-    /// the `test-hooks` feature. See field docs on `panic_at_blob_seq`.
-    #[must_use]
-    pub fn with_panic_at_blob_seq(mut self, seq: u64) -> Self {
-        self.panic_at_blob_seq = Some(seq);
-        self
     }
 }
 
@@ -273,8 +234,6 @@ pub(crate) fn merge_to(
         ignore_missing_nodes,
         parallelism,
         allow_version_regression,
-        #[cfg(feature = "test-hooks")]
-        panic_at_blob_seq,
     } = *opts;
     // `validate` refused `force` with `locations_on_ways`: under force the
     // scanner tags every unindexed blob as a placeholder `Node` (its real
@@ -514,7 +473,7 @@ pub(crate) fn merge_to(
         route: worker_route,
         failure: Arc::clone(&failure),
         #[cfg(feature = "test-hooks")]
-        panic_at_blob_seq,
+        panic_at_blob_seq: host.cancel.faults().apply_changes_panic_seq(),
     };
     let streaming_channels = StreamingChannels {
         candidate_rx,

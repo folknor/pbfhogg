@@ -218,8 +218,6 @@ fn derive_then_apply_roundtrip() {
         ignore_missing_nodes: false,
         parallelism: pbfhogg::Parallelism::Auto,
         allow_version_regression: false,
-        #[cfg(feature = "test-hooks")]
-        panic_at_blob_seq: None,
     };
     pbfhogg::apply_changes::merge(
         &base,
@@ -347,8 +345,6 @@ fn derive_then_apply_preserves_metadata() {
         ignore_missing_nodes: false,
         parallelism: pbfhogg::Parallelism::Auto,
         allow_version_regression: false,
-        #[cfg(feature = "test-hooks")]
-        panic_at_blob_seq: None,
     };
     pbfhogg::apply_changes::merge(
         &base,

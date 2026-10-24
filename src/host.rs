@@ -50,6 +50,10 @@ struct CancelState {
     hook: std::sync::OnceLock<CheckHook>,
     #[cfg(feature = "test-hooks")]
     checks: std::sync::atomic::AtomicU64,
+    /// The invocation's fault plan: every worker loop already holds the
+    /// token, so this is where a test's injected faults reach them.
+    #[cfg(feature = "test-hooks")]
+    faults: crate::test_hooks::FaultPlan,
 }
 
 /// A test-only callback run at every checkpoint with the checkpoint's
@@ -148,6 +152,15 @@ impl Cancel {
     #[must_use]
     pub fn checks_passed(&self) -> u64 {
         self.0.checks.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test hook: this token's fault plan, shared by every clone. Arm it on
+    /// the token a test passes in its `Host`; see [`crate::test_hooks`].
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn faults(&self) -> &crate::test_hooks::FaultPlan {
+        &self.0.faults
     }
 }
 

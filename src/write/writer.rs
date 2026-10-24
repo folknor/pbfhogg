@@ -119,13 +119,14 @@ fn acquire_permit(pipeline: &WritePipeline) -> Result<PermitGuard> {
     Ok(PermitGuard::new(pipeline.permit_tx.clone()))
 }
 
-/// Test hook: whether the framing closure for `seq` should panic.
+/// Test hook: whether the framing closure for `seq` should panic (the
+/// fault plan's `framing_panic_at`, see `crate::test_hooks`).
 #[cfg(feature = "test-hooks")]
-fn framing_panics_at(pipeline: &WritePipeline, seq: usize) -> bool {
-    pipeline.framing_panic_at == Some(seq)
+fn framing_panics_at(cancel: &crate::host::Cancel, seq: usize) -> bool {
+    cancel.faults().framing_panics_at(seq)
 }
 #[cfg(not(feature = "test-hooks"))]
-fn framing_panics_at(_pipeline: &WritePipeline, _seq: usize) -> bool {
+fn framing_panics_at(_cancel: &crate::host::Cancel, _seq: usize) -> bool {
     false
 }
 
@@ -576,16 +577,18 @@ impl<W: Write> PbfWriter<W> {
     #[inline(always)]
     fn mark_finished(&mut self) {}
 
-    /// Test hook: make the framing work for the `seq`-th data blob (0-based,
-    /// counting every blob sent through the pipeline) panic before it frames.
-    /// Per instance; a no-op on a sync [`PbfWriter::new`] writer, which has no
-    /// framing work.
+    /// Test hook: the fault plan of the token this writer observes (see
+    /// [`crate::test_hooks`]). The public path constructors mint a token per
+    /// writer, so this is how a test reaches their worker loops; a writer
+    /// built for an `Output` shares its invocation's token. Its
+    /// `framing_panic_at` makes the framing work for that data blob (0-based,
+    /// counting every blob sent through the pipeline) panic before it frames;
+    /// a sync [`PbfWriter::new`] writer has no framing work.
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
-    pub fn test_panic_in_framing_at(&mut self, seq: usize) {
-        if let Some(pipeline) = self.pipeline.as_mut() {
-            pipeline.framing_panic_at = Some(seq);
-        }
+    #[must_use]
+    pub fn test_faults(&self) -> &crate::test_hooks::FaultPlan {
+        self.cancel.faults()
     }
 
     /// Tie this writer to the writing session of the [`Output`](crate::Output)
@@ -695,7 +698,7 @@ impl<W: Write> PbfWriter<W> {
             let uncompressed = block_bytes.to_vec();
             let tx = pipeline.tx.clone();
             let writer_gone = pipeline.writer_gone.clone();
-            let panic_here = framing_panics_at(pipeline, seq);
+            let panic_here = framing_panics_at(&self.cancel, seq);
             pipeline.executor.spawn(move || {
                 // Bound first so it drops last - the permit is released
                 // after `tx.send` below, and also on the unwind path if any
@@ -802,7 +805,7 @@ impl<W: Write> PbfWriter<W> {
             let uncompressed = block_bytes.to_vec();
             let tx = pipeline.tx.clone();
             let writer_gone = pipeline.writer_gone.clone();
-            let panic_here = framing_panics_at(pipeline, seq);
+            let panic_here = framing_panics_at(&self.cancel, seq);
             pipeline.executor.spawn(move || {
                 // Drops last - releases the permit after `tx.send`, and on
                 // the unwind path too. See `PermitGuard`.
@@ -904,7 +907,7 @@ impl<W: Write> PbfWriter<W> {
             let tagdata_owned = tagdata.map(<[u8]>::to_vec);
             let way_members_owned = way_members.map(<[u8]>::to_vec);
             let writer_gone = pipeline.writer_gone.clone();
-            let panic_here = framing_panics_at(pipeline, seq);
+            let panic_here = framing_panics_at(&self.cancel, seq);
             pipeline.executor.spawn(move || {
                 // Drops last - releases the permit after `tx.send`, and on
                 // the unwind path too. See `PermitGuard`.

@@ -260,11 +260,6 @@ pub mod host;
 pub use host::Parallelism;
 pub mod process;
 
-/// Whether this build of the library was compiled with the `static-test-hooks`
-/// feature, whose process-global fault hooks must never reach a test harness
-/// that runs tests concurrently. A compile-time fact for test harnesses in
-/// other packages, which cannot see this crate's features as a `cfg`: they
-/// assert it false. True for the library's own unit-test build too, where the
-/// hooks are additionally gated out by `not(test)`.
+#[cfg(feature = "test-hooks")]
 #[doc(hidden)]
-pub const STATIC_TEST_HOOKS: bool = cfg!(feature = "static-test-hooks");
+pub mod test_hooks;

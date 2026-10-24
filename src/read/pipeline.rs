@@ -147,183 +147,6 @@ impl Drop for Permit {
     }
 }
 
-/// Fault-injection hooks for the pipelined reader's decode stage.
-///
-/// The decode gate parks the decode task for one armed sequence number
-/// until the test releases it. Its state lives under one mutex so that
-/// "is this seq armed" and "publish that a decode is parked" happen
-/// atomically with respect to `reset()`.
-///
-/// Lifecycle contract, one controller at a time: `reset()`, then
-/// `arm_block_decode(seq)`, then poll `blocked_decode_ready()`, then
-/// `release_blocked_decode()`, then join the pipeline, then `reset()`.
-/// `reset()` cancels any parked decode and waits for it to leave the
-/// hook, so it is safe on every exit path. It does not stop a pipeline
-/// that is still running: a pipeline that has not been joined can still
-/// record reorder levels or reach a re-armed seq, so join before
-/// re-arming or reading the filled high-water mark.
-///
-/// Every wait here is bounded and panics with a named message rather
-/// than hanging until the check watchdog reports an unrelated-looking
-/// futex wait.
-///
-/// Process-global, so gated behind `static-test-hooks` and `not(test)`:
-/// only an integration-test target of its own can arm it.
-#[cfg(all(feature = "static-test-hooks", not(test)))]
-pub(crate) mod test_hooks {
-    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-    use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
-    use std::time::{Duration, Instant};
-
-    pub static REORDER_FILLED_HIGH_WATER: AtomicUsize = AtomicUsize::new(0);
-
-    /// How long an armed decode stays parked before it gives up and
-    /// panics. Shorter than the 20 s check watchdog so the failure names
-    /// the hook; longer than any legitimate park in the fault test.
-    const PARK_LIMIT: Duration = Duration::from_secs(10);
-    /// How long `reset()` waits for a cancelled decode to leave the hook.
-    const RESET_LIMIT: Duration = Duration::from_secs(5);
-
-    struct DecodeGate {
-        armed_seq: Option<usize>,
-        ready: bool,
-        released: bool,
-        /// Decodes currently inside the park loop.
-        parked: usize,
-        /// Bumped by `reset()`; a parked decode exits when it changes.
-        epoch: u64,
-        /// Set while `reset()` waits for parked decodes to drain, so an
-        /// `arm_block_decode` cannot slip in while the lock is released.
-        resetting: bool,
-    }
-
-    static GATE: Mutex<DecodeGate> = Mutex::new(DecodeGate {
-        armed_seq: None,
-        ready: false,
-        released: false,
-        parked: 0,
-        epoch: 0,
-        resetting: false,
-    });
-    static GATE_CV: Condvar = Condvar::new();
-
-    fn lock() -> MutexGuard<'static, DecodeGate> {
-        GATE.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn wait_until(
-        guard: MutexGuard<'static, DecodeGate>,
-        deadline: Instant,
-    ) -> MutexGuard<'static, DecodeGate> {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        GATE_CV
-            .wait_timeout(guard, remaining)
-            .unwrap_or_else(PoisonError::into_inner)
-            .0
-    }
-
-    /// Park the decode task for `seq` until released or reset. The gate
-    /// must be idle: call `reset()` first.
-    pub fn arm_block_decode(seq: usize) {
-        let mut g = lock();
-        if g.resetting || g.armed_seq.is_some() || g.parked != 0 {
-            let (armed, parked, resetting) = (g.armed_seq, g.parked, g.resetting);
-            drop(g);
-            panic!(
-                "test-hooks: arm_block_decode({seq}) on a gate that is not idle \
-                 (armed {armed:?}, parked {parked}, resetting {resetting}); call reset() first"
-            );
-        }
-        g.armed_seq = Some(seq);
-        g.ready = false;
-        g.released = false;
-    }
-
-    /// True once the armed decode has reached the hook and parked.
-    pub fn blocked_decode_ready() -> bool {
-        lock().ready
-    }
-
-    /// Let the parked decode (and any later one for the armed seq) go.
-    pub fn release_blocked_decode() {
-        lock().released = true;
-        GATE_CV.notify_all();
-    }
-
-    /// Cancel any parked decode, wait for it to leave the hook, then clear
-    /// all hook state. Safe to call when nothing is armed.
-    pub fn reset() {
-        let mut g = lock();
-        g.epoch = g.epoch.wrapping_add(1);
-        g.armed_seq = None;
-        g.ready = false;
-        g.released = false;
-        g.resetting = true;
-        GATE_CV.notify_all();
-        let deadline = Instant::now() + RESET_LIMIT;
-        while g.parked != 0 {
-            if Instant::now() >= deadline {
-                let parked = g.parked;
-                g.resetting = false;
-                drop(g);
-                panic!(
-                    "test-hooks: reset() cancelled the read-pipeline decode gate but \
-                     {parked} decode(s) did not leave maybe_block_decode within {RESET_LIMIT:?}"
-                );
-            }
-            g = wait_until(g, deadline);
-        }
-        g.resetting = false;
-        drop(g);
-        REORDER_FILLED_HIGH_WATER.store(0, Relaxed);
-    }
-
-    pub(crate) fn maybe_block_decode(seq: usize) {
-        let mut g = lock();
-        if g.armed_seq != Some(seq) {
-            return;
-        }
-        g.ready = true;
-        g.parked += 1;
-        let epoch = g.epoch;
-        GATE_CV.notify_all();
-        let deadline = Instant::now() + PARK_LIMIT;
-        loop {
-            if g.released || g.epoch != epoch {
-                break;
-            }
-            if Instant::now() >= deadline {
-                g.parked -= 1;
-                drop(g);
-                GATE_CV.notify_all();
-                panic!(
-                    "test-hooks: read-pipeline decode for seq {seq} parked in \
-                     maybe_block_decode for {PARK_LIMIT:?} and was never released; \
-                     the test must call release_blocked_decode() or reset()"
-                );
-            }
-            g = wait_until(g, deadline);
-        }
-        g.parked -= 1;
-        drop(g);
-        GATE_CV.notify_all();
-    }
-
-    pub(crate) fn record_reorder_filled(filled: usize) {
-        cas_max_usize(&REORDER_FILLED_HIGH_WATER, filled);
-    }
-
-    fn cas_max_usize(field: &AtomicUsize, candidate: usize) {
-        let mut current = field.load(Relaxed);
-        while candidate > current {
-            match field.compare_exchange_weak(current, candidate, Relaxed, Relaxed) {
-                Ok(_) => break,
-                Err(observed) => current = observed,
-            }
-        }
-    }
-}
-
 /// Runtime-tunable pipeline buffering configuration.
 ///
 /// Depths stay nonzero because `sync_channel(0)` is a rendezvous channel, not
@@ -378,6 +201,9 @@ struct DecodeTask<'scope> {
     /// dispatcher (captured once per pipeline, no per-blob refcounting) so a
     /// decode failure can be located with the blob's true provenance.
     source: Option<&'scope Arc<Path>>,
+    /// The run's fault plan (the decode gate), borrowed like `source`.
+    #[cfg(feature = "test-hooks")]
+    faults: &'scope crate::test_hooks::FaultPlan,
 }
 
 fn spawn_decode_task<'scope>(scope: &rayon::Scope<'scope>, task: DecodeTask<'scope>) {
@@ -390,6 +216,8 @@ fn spawn_decode_task<'scope>(scope: &rayon::Scope<'scope>, task: DecodeTask<'sco
         permit,
         shutdown,
         source,
+        #[cfg(feature = "test-hooks")]
+        faults,
     } = task;
     scope.spawn(move |_| {
         // Thread-local scratch buffers for parse_and_inline. Avoids allocating
@@ -402,8 +230,8 @@ fn spawn_decode_task<'scope>(scope: &rayon::Scope<'scope>, task: DecodeTask<'sco
             // Inside catch_unwind so the hook's park-timeout panic becomes a
             // decode error on the pipeline instead of escaping the rayon
             // spawn, which has no panic handler and would abort the process.
-            #[cfg(all(feature = "static-test-hooks", not(test)))]
-            test_hooks::maybe_block_decode(seq);
+            #[cfg(feature = "test-hooks")]
+            faults.maybe_block_decode(seq);
             match blob.get_type() {
                 BlobType::OsmData => {
                     if let Some(ref filter) = blob_filter
@@ -492,8 +320,8 @@ where
         cancel.check()?;
         pending.push(seq, (item, permit));
         PIPELINE_METRICS.record_reorder_levels(pending.filled_len(), pending.pending_len());
-        #[cfg(all(feature = "static-test-hooks", not(test)))]
-        test_hooks::record_reorder_filled(pending.filled_len());
+        #[cfg(feature = "test-hooks")]
+        cancel.faults().record_reorder_filled(pending.filled_len());
 
         while let Some((item, permit)) = pending.pop_ready() {
             match item {
@@ -564,6 +392,10 @@ where
     let blob_filter = blob_filter.map(Arc::new);
     let source = blob_reader.source().cloned();
     let cancel = blob_reader.cancel_token().clone();
+    // Borrowed into the decode tasks; the dispatcher closure moves the
+    // reference, not the token.
+    #[cfg(feature = "test-hooks")]
+    let faults = cancel.faults();
     let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead.get());
     let (decoded_tx, decoded_rx) = sync_channel::<DecodedItem>(pipeline_config.decode_ahead.get());
 
@@ -674,6 +506,8 @@ where
                                     permit,
                                     shutdown: Arc::clone(&shutdown),
                                     source,
+                                    #[cfg(feature = "test-hooks")]
+                                    faults,
                                 },
                             );
                         }
@@ -914,8 +748,8 @@ where
         cancel.check()?;
         pending.push(seq, (item, permit));
         PIPELINE_METRICS.record_reorder_levels(pending.filled_len(), pending.pending_len());
-        #[cfg(all(feature = "static-test-hooks", not(test)))]
-        test_hooks::record_reorder_filled(pending.filled_len());
+        #[cfg(feature = "test-hooks")]
+        cancel.faults().record_reorder_filled(pending.filled_len());
         while let Some((item, permit)) = pending.pop_ready() {
             match item {
                 Some(Ok(item)) => {

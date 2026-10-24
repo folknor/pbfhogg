@@ -81,131 +81,6 @@ enum WriteOp {
     },
 }
 
-// Fault-injection hooks for tests. Gated behind the `static-test-hooks`
-// Cargo feature and `not(test)`: product builds and the library's own
-// unit-test harness never compile this module.
-// Plumbed via process-global atomics rather than a per-instance
-// config because pool workers are spawned deep inside
-// `parallel_writer_thread_inner` - threading a config field through
-// every entry point (PbfWriter::to_path_parallel, merge(), etc.)
-// would be invasive. A test that arms them owns its own `[[test]]`
-// binary (see reference/testing.md, "Test binaries").
-#[cfg(all(feature = "static-test-hooks", not(test)))]
-pub mod test_hooks {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
-    use std::time::{Duration, Instant};
-
-    /// Index of the pool worker that panics on the first op it pops.
-    /// `u64::MAX` = disarmed (default). Worker 0 deterministically gets the
-    /// first dispatched op (round-robin starts at 0). With
-    /// [`HOLD_OTHER_POOL_WORKERS`] set, the panic waits until at least one
-    /// sibling is held mid-op, so the failure provably lands while another
-    /// worker is alive.
-    pub static PANIC_IN_POOL_WORKER: AtomicU64 = AtomicU64::new(u64::MAX);
-
-    /// When set, every worker other than [`PANIC_IN_POOL_WORKER`] parks on
-    /// each op it pops (counted in [`HELD_POOL_WORKERS`]) until the owner
-    /// starts joining a non-panicked worker ([`JOIN_REACHED_HELD_WORKER`]) or
-    /// the test sets [`RELEASE_POOL_WORKERS`]. A writer that returns without
-    /// joining its pool therefore returns while a worker is still parked,
-    /// which [`LIVE_POOL_WORKERS`] shows deterministically.
-    pub static HOLD_OTHER_POOL_WORKERS: AtomicBool = AtomicBool::new(false);
-
-    /// Number of workers currently parked by [`HOLD_OTHER_POOL_WORKERS`].
-    pub static HELD_POOL_WORKERS: AtomicU64 = AtomicU64::new(0);
-
-    /// Test-side release for parked workers (cleanup after the assertion).
-    pub static RELEASE_POOL_WORKERS: AtomicBool = AtomicBool::new(false);
-
-    /// Set when the owner is about to join a worker other than the panicked
-    /// one while some worker is still parked - i.e. the owner is waiting for
-    /// its pool rather than walking away from it. Releases parked workers.
-    pub static JOIN_REACHED_HELD_WORKER: AtomicBool = AtomicBool::new(false);
-
-    /// Pool worker threads currently running: incremented on worker entry,
-    /// decremented as the very last thing the worker does. Zero once the
-    /// writer has returned, or a worker outlived the call.
-    pub static LIVE_POOL_WORKERS: AtomicU64 = AtomicU64::new(0);
-
-    /// Monotonic total of `WriteOp`s popped and executed across the pool.
-    /// Ops a worker discards after the pool has stopped are not counted.
-    pub static POOL_OP_COUNT: AtomicU64 = AtomicU64::new(0);
-
-    /// Set if a bounded hook wait expired: the handshake did not happen, so
-    /// a test relying on it proved nothing and must fail.
-    pub static HOOK_TIMED_OUT: AtomicBool = AtomicBool::new(false);
-
-    /// Upper bound on every hook wait, so a broken writer fails the test
-    /// instead of hanging it. Well under the 20 s check watchdog.
-    const HOOK_WAIT: Duration = Duration::from_secs(10);
-
-    /// Disarm and zero everything. Call at the start AND end of any test
-    /// that touches these hooks.
-    pub fn reset() {
-        PANIC_IN_POOL_WORKER.store(u64::MAX, SeqCst);
-        HOLD_OTHER_POOL_WORKERS.store(false, SeqCst);
-        HELD_POOL_WORKERS.store(0, SeqCst);
-        RELEASE_POOL_WORKERS.store(false, SeqCst);
-        JOIN_REACHED_HELD_WORKER.store(false, SeqCst);
-        POOL_OP_COUNT.store(0, SeqCst);
-        HOOK_TIMED_OUT.store(false, SeqCst);
-    }
-
-    fn wait_until(cond: impl Fn() -> bool) {
-        let deadline = Instant::now() + HOOK_WAIT;
-        while !cond() {
-            if Instant::now() >= deadline {
-                HOOK_TIMED_OUT.store(true, SeqCst);
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    /// Called by a pool worker after it pops an op and before it runs it.
-    pub(super) fn on_pool_op(worker: usize) {
-        POOL_OP_COUNT.fetch_add(1, SeqCst);
-        let hold = HOLD_OTHER_POOL_WORKERS.load(SeqCst);
-        if worker as u64 == PANIC_IN_POOL_WORKER.load(SeqCst) {
-            if hold {
-                wait_until(|| HELD_POOL_WORKERS.load(SeqCst) >= 1);
-            }
-            panic!("test-hooks: parallel_writer pool worker {worker} panicking");
-        }
-        if hold {
-            HELD_POOL_WORKERS.fetch_add(1, SeqCst);
-            wait_until(|| {
-                JOIN_REACHED_HELD_WORKER.load(SeqCst) || RELEASE_POOL_WORKERS.load(SeqCst)
-            });
-            HELD_POOL_WORKERS.fetch_sub(1, SeqCst);
-        }
-    }
-
-    /// Called by the owner just before it joins worker `worker`.
-    pub(super) fn before_join(worker: usize) {
-        if worker as u64 != PANIC_IN_POOL_WORKER.load(SeqCst) && HELD_POOL_WORKERS.load(SeqCst) > 0
-        {
-            JOIN_REACHED_HELD_WORKER.store(true, SeqCst);
-        }
-    }
-
-    /// [`LIVE_POOL_WORKERS`] membership for one worker thread.
-    pub(super) struct LiveWorker;
-
-    impl LiveWorker {
-        pub(super) fn enter() -> Self {
-            LIVE_POOL_WORKERS.fetch_add(1, SeqCst);
-            Self
-        }
-    }
-
-    impl Drop for LiveWorker {
-        fn drop(&mut self) {
-            LIVE_POOL_WORKERS.fetch_sub(1, SeqCst);
-        }
-    }
-}
-
 /// Writer-thread entry point. Opens the output file, writes the header
 /// synchronously at offset 0, spawns `POOL_SIZE` workers, then loops
 /// reading pipeline items in seq order and dispatching per-worker work.
@@ -357,9 +232,9 @@ fn run_pool<'scope, 'env>(
     // output after the caller had been handed the result.
     drop(worker_txs);
     for (index, handle) in worker_handles.into_iter().enumerate() {
-        #[cfg(all(feature = "static-test-hooks", not(test)))]
-        test_hooks::before_join(index);
-        #[cfg(not(all(feature = "static-test-hooks", not(test))))]
+        #[cfg(feature = "test-hooks")]
+        cancel.faults().before_pool_join(index);
+        #[cfg(not(feature = "test-hooks"))]
         let _ = index;
         // `pool_worker` catches its own panics, so this is a backstop for a
         // panic outside that catch (in the payload's own destructor, say).
@@ -547,8 +422,8 @@ fn pool_worker(
     failure: &FirstFailure,
     cancel: &crate::host::Cancel,
 ) {
-    #[cfg(all(feature = "static-test-hooks", not(test)))]
-    let _live = test_hooks::LiveWorker::enter();
+    #[cfg(feature = "test-hooks")]
+    let _live = cancel.faults().live_pool_worker();
     let caught = std::panic::catch_unwind(AssertUnwindSafe(|| {
         worker_loop(index, &rx, file, failure, cancel);
     }));
@@ -569,9 +444,9 @@ fn worker_loop(
     failure: &FirstFailure,
     cancel: &crate::host::Cancel,
 ) {
-    #[cfg(not(all(feature = "static-test-hooks", not(test))))]
+    #[cfg(not(feature = "test-hooks"))]
     let _ = index;
-    #[cfg(not(feature = "linux-direct-io"))]
+    #[cfg(not(any(feature = "linux-direct-io", feature = "test-hooks")))]
     let _ = cancel;
     while let Ok(op) = rx.recv() {
         // One Acquire load per op - next to two Relaxed RMWs on the shared
@@ -580,10 +455,11 @@ fn worker_loop(
             return;
         }
 
-        // Test-only: see `test_hooks`. Simulates an OOM or internal unwrap
-        // inside a pool worker. Release builds compile this out entirely.
-        #[cfg(all(feature = "static-test-hooks", not(test)))]
-        test_hooks::on_pool_op(index);
+        // Test-only: the run's fault plan (`crate::test_hooks`). Simulates
+        // an OOM or internal unwrap inside a pool worker, and parks siblings
+        // for the join handshake. Release builds compile this out entirely.
+        #[cfg(feature = "test-hooks")]
+        cancel.faults().on_pool_op(index);
 
         let t = std::time::Instant::now();
         let result = match op {

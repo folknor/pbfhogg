@@ -15,8 +15,8 @@ categories = ["command-line-utilities", "science::geo"]
 # a [[test]] of its own with the reason beside it, never a silent extra
 # binary.
 autotests = false
-# Nor are bins, examples or benches: a stray src/bin/x.rs would get a unit-test
-# harness that scripts/check_static_hook_targets.py never inspects.
+# Nor are bins, examples or benches: a stray src/bin/x.rs would be a silent
+# extra binary with a unit-test harness of its own.
 autobins = false
 autoexamples = false
 autobenches = false
@@ -56,12 +56,9 @@ hotpath = ["pbfhogg/hotpath"]
 hotpath-alloc = ["pbfhogg/hotpath-alloc"]
 linux-direct-io = ["pbfhogg/linux-direct-io"]
 linux-io-uring = ["pbfhogg/linux-io-uring"]
-# pbfhogg's per-instance test hooks, and the CLI's own (the cancellation
-# pause and count read from the environment, src/signals.rs). The `all` check
-# sweep enables it; production builds never do. There is
-# deliberately no `static-test-hooks` here: no CLI-driving test needs a
-# process-global hook, and this package's test harnesses refuse to compile
-# against a pbfhogg built with them (see the assertion in cli/src/lib.rs).
+# pbfhogg's fault plans (`pbfhogg::test_hooks`), and the CLI's own hooks (the
+# cancellation pause and count read from the environment, src/signals.rs).
+# The `all` check sweep enables it; production builds never do.
 test-hooks = ["pbfhogg/test-hooks"]
 
 [dependencies]

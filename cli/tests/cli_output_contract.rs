@@ -1805,3 +1805,134 @@ fn a_command_without_an_output_is_interrupted_too() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// OSC framing: which producers gzip, by output name
+// ---------------------------------------------------------------------------
+
+/// One OSC producer: how to invoke it given the fixtures and an output name.
+struct OscProducer {
+    label: &'static str,
+    /// Words after the subcommand name's inputs, built per output path.
+    build: fn(&Path, &Path, &Path) -> Vec<OsString>,
+    /// Whether the output is gzip when named `x.osc`.
+    gzip_when_plain_name: bool,
+    /// Whether the output is gzip when named `x.osc.gz`.
+    gzip_when_gz_name: bool,
+}
+
+fn osc_args(words: &[&str], paths: &[&Path], tail: &[&str]) -> Vec<OsString> {
+    let mut args: Vec<OsString> = words.iter().map(OsString::from).collect();
+    args.extend(paths.iter().map(|p| p.as_os_str().to_owned()));
+    args.extend(tail.iter().map(OsString::from));
+    args
+}
+
+/// Every command that writes OSC. `diff --format osc` is the only route to
+/// the derive-changes writer (it has no subcommand of its own) and it needs
+/// `-o`, so there is no stdout form; `diff` has a sequential and a sharded
+/// driver, selected by `-j`, and both are listed. `merge-changes` gzips
+/// exactly when the name ends `.gz`; the other two always gzip.
+const OSC_PRODUCERS: &[OscProducer] = &[
+    OscProducer {
+        label: "merge-changes",
+        build: |osc, _, out| osc_args(&["merge-changes"], &[osc, Path::new("-o"), out], &[]),
+        gzip_when_plain_name: false,
+        gzip_when_gz_name: true,
+    },
+    OscProducer {
+        label: "tags-filter --input-kind osc",
+        build: |osc, _, out| {
+            osc_args(
+                &["tags-filter"],
+                &[osc],
+                &[
+                    "--input-kind",
+                    "osc",
+                    "-o",
+                    &out.to_string_lossy(),
+                    "amenity",
+                ],
+            )
+        },
+        gzip_when_plain_name: true,
+        gzip_when_gz_name: true,
+    },
+    OscProducer {
+        label: "diff --format osc -j 1",
+        build: |_, pbfs, out| diff_osc_args(pbfs, out, "1"),
+        gzip_when_plain_name: true,
+        gzip_when_gz_name: true,
+    },
+    OscProducer {
+        label: "diff --format osc -j 2",
+        build: |_, pbfs, out| diff_osc_args(pbfs, out, "2"),
+        gzip_when_plain_name: true,
+        gzip_when_gz_name: true,
+    },
+];
+
+/// `pbfs` is the directory holding `old.osm.pbf` and `new.osm.pbf`.
+fn diff_osc_args(pbfs: &Path, out: &Path, jobs: &str) -> Vec<OsString> {
+    osc_args(
+        &["diff"],
+        &[&pbfs.join("old.osm.pbf"), &pbfs.join("new.osm.pbf")],
+        &["--format", "osc", "-j", jobs, "-o", &out.to_string_lossy()],
+    )
+}
+
+#[test]
+fn osc_gzip_framing_follows_each_producers_rule() {
+    let dir = TempDir::new().unwrap();
+    let osc = dir.path().join("in.osc");
+    std::fs::write(
+        &osc,
+        b"<osmChange version=\"0.6\"><create>\
+          <node id=\"1000\" version=\"1\" lat=\"0.001\" lon=\"0.002\">\
+          <tag k=\"amenity\" v=\"cafe\"/></node></create></osmChange>",
+    )
+    .unwrap();
+    crate::common::write_test_pbf_sorted(
+        &dir.path().join("old.osm.pbf"),
+        &crate::common::generate_nodes(4, 1),
+        &[],
+        &[],
+    );
+    crate::common::write_test_pbf_sorted(
+        &dir.path().join("new.osm.pbf"),
+        &crate::common::generate_nodes(5, 1),
+        &[],
+        &[],
+    );
+
+    let mut failures = Vec::new();
+    for producer in OSC_PRODUCERS {
+        for (name, expect_gzip) in [
+            ("x.osc", producer.gzip_when_plain_name),
+            ("x.osc.gz", producer.gzip_when_gz_name),
+        ] {
+            let out_dir = TempDir::new().unwrap();
+            let dest = out_dir.path().join(name);
+            let args = (producer.build)(&osc, dir.path(), &dest);
+            let result = CliInvoker::new().args(&args).run();
+            if !result.status.success() {
+                failures.push(format!(
+                    "{} -> {name}: exited {:?}: {}",
+                    producer.label,
+                    result.status.code(),
+                    result.stderr_str()
+                ));
+                continue;
+            }
+            let bytes = std::fs::read(&dest).unwrap();
+            let is_gzip = bytes.starts_with(&[0x1f, 0x8b]);
+            if is_gzip != expect_gzip {
+                failures.push(format!(
+                    "{} -> {name}: gzip magic present = {is_gzip}, expected {expect_gzip}",
+                    producer.label
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

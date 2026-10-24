@@ -2108,3 +2108,9 @@ mod tests {
         );
     }
 }
+
+// Every truncation shape and frame guard through every frame decoder
+// (`BlobReader` read and skip, the raw-frame helpers, `HeaderWalker`).
+#[cfg(test)]
+#[path = "frame_conformance_tests.rs"]
+mod frame_conformance_tests;

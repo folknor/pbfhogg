@@ -64,6 +64,71 @@ fn write_history_header_only(path: &Path) {
     writer.flush().unwrap();
 }
 
+/// Nodes 1..=5, two street ways over nodes 1..=3 and one relation over both
+/// ways: every element kind, a tag `tags-filter highway` matches and enough
+/// for the geocode builder to have a street to index.
+fn policy_elements(
+    first_node: i64,
+) -> (
+    Vec<crate::common::TestNode>,
+    Vec<crate::common::TestWay>,
+    Vec<crate::common::TestRelation>,
+) {
+    // Real metadata: time-filter refuses an input stripped of it.
+    let meta = Some(crate::common::TestMeta {
+        version: 1,
+        timestamp: 1_600_000_000,
+        changeset: 1,
+        uid: 1,
+        user: "u",
+        visible: true,
+    });
+    let mut nodes = crate::common::generate_nodes(5, first_node);
+    for node in &mut nodes {
+        node.meta = meta;
+        // `export` has nothing to write for an untagged node.
+        node.tags = vec![("amenity", "cafe")];
+    }
+    let mut ways = crate::common::generate_ways(2, 1, 3, 1);
+    for way in &mut ways {
+        way.tags = vec![("highway", "residential"), ("name", "Main Street")];
+        way.meta = meta;
+    }
+    let mut relations = crate::common::generate_relations(1, 1, 2, 1);
+    for relation in &mut relations {
+        relation.meta = meta;
+    }
+    (nodes, ways, relations)
+}
+
+/// The two inputs [`POLICY`] and [`FIRST_BLOB_ONLY`] read.
+///
+/// `no-index.osm.pbf` has indexdata on no data blob. `first-blob-only.osm.pbf`
+/// has it on its first data blob (nodes 1..=5) and on none after (nodes 6..=10,
+/// the ways, the relation): the one shape `has_indexdata`, which reads the
+/// first data blob alone, calls indexed.
+fn write_policy_fixtures(dir: &Path) {
+    let (nodes, ways, relations) = policy_elements(1);
+    crate::common::write_test_pbf_non_indexed(
+        &dir.join("no-index.osm.pbf"),
+        &nodes,
+        &ways,
+        &relations,
+    );
+
+    let head = dir.join("head-indexed.osm.pbf");
+    crate::common::write_test_pbf_sorted(&head, &policy_elements(1).0, &[], &[]);
+    let tail = dir.join("tail-unindexed.osm.pbf");
+    let (nodes, ways, relations) = policy_elements(6);
+    crate::common::write_test_pbf_non_indexed(&tail, &nodes, &ways, &relations);
+    let mut bytes = std::fs::read(&head).unwrap();
+    let tail_bytes = std::fs::read(&tail).unwrap();
+    let blobs = crate::common::adversarial::locate_blobs(&tail_bytes);
+    assert!(blobs.len() >= 2, "fixture must hold a header and data");
+    bytes.extend_from_slice(&tail_bytes[blobs[1].frame_start..]);
+    std::fs::write(dir.join("first-blob-only.osm.pbf"), bytes).unwrap();
+}
+
 /// The inputs every row draws from.
 struct Fx {
     dir: TempDir,
@@ -110,6 +175,7 @@ impl Fx {
         // A header-only file whose header declares a history file, which
         // time-filter reads through its other path.
         write_history_header_only(&p.join("header-only-history.osm.pbf"));
+        write_policy_fixtures(p);
         std::fs::write(p.join("a.osc"), OSC).unwrap();
         std::fs::write(p.join("b.osc"), OSC).unwrap();
         std::fs::write(p.join("good.osc"), OSC).unwrap();
@@ -933,6 +999,488 @@ fn alias_extract_config_polygon(fx: &Fx, dir: &Path) -> (Vec<OsString>, PathBuf)
 }
 
 // ---------------------------------------------------------------------------
+// What a command does with unindexed input
+// ---------------------------------------------------------------------------
+//
+// The decision is made per command, and nowhere else is it stated in one
+// place. Each row is one command line and the outcome today: refused (and what
+// lifts the refusal), fallen back from (silently or with a note), or verified.
+// A change to any of them is a decision, and fails here until the row says so.
+
+/// Present in every refusal of a missing index (a few say `base PBF`).
+const NO_INDEXDATA: &str = "no blob-level indexdata";
+/// The indexing recipe every missing-indexdata refusal prints.
+const RECIPE: &str = "Generate an indexed PBF first";
+/// The note most fallbacks print.
+const BLOBS_NOTE: &str = "Input contains blobs without indexdata";
+
+/// What lifts a refusal.
+#[derive(Clone, Copy)]
+enum Escape {
+    /// `--force`; the forced run exits 0 and, when given, says this.
+    Force(Option<&'static str>),
+    /// A command-specific flag in place of `--force`; the run with it exits 0
+    /// and, when given, says this.
+    Flag(&'static str, Option<&'static str>),
+    /// Nothing: `--force` is refused by the parser, with this text, before
+    /// the input is opened.
+    Rejected(&'static str),
+}
+
+/// What a fallback tells the operator.
+#[derive(Clone, Copy)]
+enum Says {
+    /// No `Note:` and no `Warning:`.
+    Nothing,
+    /// This text.
+    Text(&'static str),
+}
+
+#[derive(Clone, Copy)]
+enum Policy {
+    /// Exit 2 with `reason`, the indexing recipe, and advice naming exactly
+    /// the switch `escape` offers.
+    Refuses {
+        reason: &'static str,
+        escape: Escape,
+    },
+    /// The command runs anyway, on the slow path, saying `says`.
+    FallsBack(Says),
+    /// The command reads the index (or its absence) and reports on it.
+    Verifies(&'static str),
+}
+
+struct PolicyRow {
+    label: &'static str,
+    build: fn(&Ctx, &Path) -> Invocation,
+    /// Exit codes that mean the command ran (`diff` exits 1 on differences,
+    /// `inspect --indexed` exits 1 for no).
+    exit: &'static [i32],
+    policy: Policy,
+}
+
+const fn refuses(
+    label: &'static str,
+    build: fn(&Ctx, &Path) -> Invocation,
+    escape: Escape,
+) -> PolicyRow {
+    PolicyRow {
+        label,
+        build,
+        exit: &[0],
+        policy: Policy::Refuses {
+            reason: NO_INDEXDATA,
+            escape,
+        },
+    }
+}
+
+const fn falls_back(
+    label: &'static str,
+    build: fn(&Ctx, &Path) -> Invocation,
+    says: Says,
+) -> PolicyRow {
+    PolicyRow {
+        label,
+        build,
+        exit: &[0],
+        policy: Policy::FallsBack(says),
+    }
+}
+
+const FORCE_QUIET: Escape = Escape::Force(None);
+const FORCE_NOTED: Escape = Escape::Force(Some(BLOBS_NOTE));
+
+/// Every command line the unindexed input meets, with today's outcome.
+const POLICY: &[PolicyRow] = &[
+    // Refuse unless `--force`.
+    refuses(
+        "sort",
+        sort,
+        Escape::Force(Some("sorting without indexdata")),
+    ),
+    refuses("repack", repack, FORCE_NOTED),
+    refuses("tags-filter", tags_filter, FORCE_NOTED),
+    // Unlike plain tags-filter, the forced `-R` run says nothing about the
+    // missing indexdata.
+    refuses("tags-filter -R", tags_filter_omit, FORCE_QUIET),
+    refuses("getid", getid, FORCE_QUIET),
+    refuses("getid --invert", getid_invert, FORCE_QUIET),
+    // The forced run names a different note than the other getid arms: its
+    // reference-collecting scan reports the first-blob probe.
+    refuses(
+        "getid --add-referenced",
+        getid_add_referenced,
+        Escape::Force(Some("Input has no indexdata on its first data blob")),
+    ),
+    refuses("apply-changes", apply_changes, FORCE_QUIET),
+    refuses("altw", altw, FORCE_NOTED),
+    refuses("extract (complete)", extract_complete, FORCE_NOTED),
+    refuses("extract --smart", extract_smart, FORCE_NOTED),
+    refuses("cat --type node", cat_type, FORCE_QUIET),
+    refuses("cat --type way", cat_type_way, FORCE_QUIET),
+    refuses("cat --clean", cat_clean, FORCE_NOTED),
+    refuses("cat --dedupe", cat_dedupe, FORCE_QUIET),
+    // degrade's decode path (a transformation that re-encodes elements).
+    refuses("degrade --strip-locations", degrade, FORCE_NOTED),
+    refuses("inspect --nodes", inspect_nodes, FORCE_NOTED),
+    refuses("inspect tags", inspect_tags, FORCE_QUIET),
+    // Refuse with no escape.
+    PolicyRow {
+        label: "renumber",
+        build: renumber,
+        exit: &[0],
+        policy: Policy::Refuses {
+            reason: "renumber requires indexdata on every OsmData blob",
+            escape: Escape::Rejected("unexpected argument '--force'"),
+        },
+    },
+    // The parser refuses `--force` here; the entry's "accepts --force and
+    // then refuses" is not what the binary does.
+    PolicyRow {
+        label: "altw --index-type external",
+        build: altw_external,
+        exit: &[0],
+        policy: Policy::Refuses {
+            reason: "external join requires indexdata",
+            escape: Escape::Rejected("--force has no effect with --index-type external"),
+        },
+    },
+    // Refuse unless `--allow-unindexed`.
+    PolicyRow {
+        label: "build-geocode-index",
+        build: geocode,
+        exit: &[0],
+        policy: Policy::Refuses {
+            reason: NO_INDEXDATA,
+            escape: Escape::Flag(
+                "--allow-unindexed",
+                Some("Input has no indexdata on its first data blob"),
+            ),
+        },
+    },
+    // The legacy spelling grants the same and also overwrite, and says so.
+    PolicyRow {
+        label: "build-geocode-index --force",
+        build: geocode_legacy_force,
+        exit: &[0],
+        policy: Policy::FallsBack(Says::Text("--force also grants --overwrite")),
+    },
+    // No gate: these do not ask for an index.
+    falls_back(
+        "tags-filter --invert-match",
+        tags_filter_invert,
+        Says::Text(BLOBS_NOTE),
+    ),
+    falls_back(
+        "tags-filter --distrust-metadata",
+        tags_filter_distrust,
+        Says::Nothing,
+    ),
+    falls_back("extract --simple", extract_simple, Says::Text(BLOBS_NOTE)),
+    falls_back("cat", cat, Says::Nothing),
+    falls_back("degrade --strip-indexdata", degrade_strip, Says::Nothing),
+    falls_back("time-filter", time_filter, Says::Nothing),
+    falls_back("getparents", getparents, Says::Text(BLOBS_NOTE)),
+    falls_back("export", export, Says::Nothing),
+    PolicyRow {
+        label: "diff",
+        build: diff_old,
+        exit: &[0, 1],
+        policy: Policy::FallsBack(Says::Nothing),
+    },
+    PolicyRow {
+        label: "diff --format osc",
+        build: diff_osc_old,
+        exit: &[0, 1],
+        policy: Policy::FallsBack(Says::Text("Using sequential comparison: missing indexdata")),
+    },
+    falls_back(
+        "check",
+        check,
+        Says::Text("Warning: input has no blob-level indexdata"),
+    ),
+    falls_back(
+        "check --ids",
+        check_ids,
+        Says::Text("Warning: input has no blob-level indexdata"),
+    ),
+    falls_back("check --refs", check_refs, Says::Text(BLOBS_NOTE)),
+    // Verify rather than trust.
+    PolicyRow {
+        label: "digest",
+        build: digest,
+        exit: &[0],
+        policy: Policy::Verifies("xxh128 v1"),
+    },
+    PolicyRow {
+        label: "check --index",
+        build: check_index,
+        exit: &[0],
+        policy: Policy::Verifies("0 with indexdata"),
+    },
+    PolicyRow {
+        label: "inspect --indexed",
+        build: inspect_indexed,
+        exit: &[1],
+        policy: Policy::Verifies("Indexed: no"),
+    },
+    PolicyRow {
+        label: "inspect",
+        build: inspect_full,
+        exit: &[0],
+        policy: Policy::Verifies("Indexed:  no"),
+    },
+];
+
+fn tags_filter_invert(c: &Ctx, input: &Path) -> Invocation {
+    tags_filter(c, input).words(&["--invert-match"])
+}
+
+fn tags_filter_distrust(c: &Ctx, input: &Path) -> Invocation {
+    tags_filter(c, input).words(&["--distrust-metadata"])
+}
+
+fn geocode_legacy_force(c: &Ctx, input: &Path) -> Invocation {
+    geocode(c, input).words(&["--force"])
+}
+
+/// A run in a fresh output directory, with `extra` words last.
+fn run_policy_row(fx: &Fx, row: &PolicyRow, input: &Path, extra: &[&str]) -> (CliOutput, String) {
+    let dir = TempDir::new().unwrap();
+    let inv = (row.build)(
+        &Ctx {
+            fx,
+            out: dir.path(),
+        },
+        input,
+    )
+    .words(extra);
+    let out = run(&inv);
+    let text = format!("{}{}", out.stdout_str(), out.stderr_str());
+    (out, text)
+}
+
+fn ran_with(row: &PolicyRow, out: &CliOutput, text: &str, extra: &str) -> Result<(), String> {
+    ensure!(
+        out.status.code().is_some_and(|c| row.exit.contains(&c)),
+        "{extra}exit {:?}, wanted one of {:?}; output:\n{text}",
+        out.status.code(),
+        row.exit
+    );
+    Ok(())
+}
+
+fn says_what_it_says(says: Says, text: &str) -> Result<(), String> {
+    match says {
+        Says::Text(wanted) => ensure!(text.contains(wanted), "wanted {wanted:?}; output:\n{text}"),
+        Says::Nothing => ensure!(
+            !text.contains("Note:") && !text.contains("Warning:"),
+            "wanted silence; output:\n{text}"
+        ),
+    }
+    Ok(())
+}
+
+fn policy_holds(fx: &Fx, row: &PolicyRow) -> Result<(), String> {
+    let input = fx.path("no-index.osm.pbf");
+    let (out, text) = run_policy_row(fx, row, &input, &[]);
+    match row.policy {
+        Policy::FallsBack(says) => {
+            ran_with(row, &out, &text, "")?;
+            says_what_it_says(says, &text)
+        }
+        Policy::Verifies(wanted) => {
+            ran_with(row, &out, &text, "")?;
+            ensure!(text.contains(wanted), "wanted {wanted:?}; output:\n{text}");
+            Ok(())
+        }
+        Policy::Refuses { reason, escape } => {
+            ensure!(
+                out.status.code() == Some(2),
+                "exit {:?}, wanted the refusal (2); output:\n{text}",
+                out.status.code()
+            );
+            ensure!(text.contains(reason), "wanted {reason:?}; output:\n{text}");
+            ensure!(text.contains(RECIPE), "wanted the recipe; output:\n{text}");
+            let advice = match escape {
+                Escape::Force(_) => Some("Or pass --force to proceed anyway."),
+                Escape::Flag(flag, _) => {
+                    // Checked below against the flag itself.
+                    ensure!(
+                        text.contains(&format!("Or pass {flag} to proceed anyway.")),
+                        "wanted advice naming {flag}; output:\n{text}"
+                    );
+                    None
+                }
+                Escape::Rejected(_) => {
+                    ensure!(
+                        !text.contains("Or pass"),
+                        "advised a switch that does not exist; output:\n{text}"
+                    );
+                    None
+                }
+            };
+            if let Some(advice) = advice {
+                ensure!(text.contains(advice), "wanted {advice:?}; output:\n{text}");
+            }
+            match escape {
+                Escape::Force(note) => lifted_by(fx, row, &input, "--force", note),
+                Escape::Flag(flag, note) => lifted_by(fx, row, &input, flag, note),
+                Escape::Rejected(parser_text) => {
+                    let (out, text) = run_policy_row(fx, row, &input, &["--force"]);
+                    ensure!(
+                        out.status.code() == Some(2) && text.contains(parser_text),
+                        "`--force` must be refused with {parser_text:?}; exit {:?}, output:\n{text}",
+                        out.status.code()
+                    );
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+fn lifted_by(
+    fx: &Fx,
+    row: &PolicyRow,
+    input: &Path,
+    flag: &str,
+    note: Option<&str>,
+) -> Result<(), String> {
+    let (out, text) = run_policy_row(fx, row, input, &[flag]);
+    ran_with(row, &out, &text, &format!("with {flag}: "))?;
+    if let Some(note) = note {
+        ensure!(
+            text.contains(note),
+            "with {flag}: wanted {note:?}; output:\n{text}"
+        );
+    }
+    Ok(())
+}
+
+/// What commands do with a file whose first data blob is indexed and later
+/// ones are not.
+#[derive(Clone, Copy)]
+enum Mixed {
+    /// Runs; no word about missing indexdata.
+    Accepts,
+    /// Runs and reports this.
+    Reports(&'static str),
+    /// Exit 2 with this text.
+    Fails(&'static str),
+}
+
+/// One row: label, invocation builder, expected outcome.
+type MixedRow = (&'static str, fn(&Ctx, &Path) -> Invocation, Mixed);
+
+/// Every gate above looks at the first data blob only, so this file passes
+/// all of them. Rows pin what happens after that.
+const FIRST_BLOB_ONLY: &[MixedRow] = &[
+    ("sort", sort, Mixed::Accepts),
+    ("repack", repack, Mixed::Accepts),
+    ("tags-filter", tags_filter, Mixed::Accepts),
+    ("getid", getid, Mixed::Accepts),
+    ("getid --invert", getid_invert, Mixed::Accepts),
+    ("apply-changes", apply_changes, Mixed::Accepts),
+    ("extract (complete)", extract_complete, Mixed::Accepts),
+    ("extract --smart", extract_smart, Mixed::Accepts),
+    ("cat --type node", cat_type, Mixed::Accepts),
+    ("cat --clean", cat_clean, Mixed::Accepts),
+    ("cat --dedupe", cat_dedupe, Mixed::Accepts),
+    ("degrade --strip-locations", degrade, Mixed::Accepts),
+    ("inspect --nodes", inspect_nodes, Mixed::Accepts),
+    ("inspect tags", inspect_tags, Mixed::Accepts),
+    // Needs no flag any more: the first-blob probe says indexed.
+    ("build-geocode-index", geocode, Mixed::Accepts),
+    // Per-blob checks catch it where the first-blob probe cannot.
+    (
+        "renumber",
+        renumber,
+        Mixed::Fails("renumber requires indexdata on every OsmData blob"),
+    ),
+    (
+        "altw --index-type external",
+        altw_external,
+        Mixed::Fails("OsmData blob missing indexdata"),
+    ),
+    // digest refuses a partial index, but its message names `diff`, which is
+    // the other command that shares the check. Pinned as it prints today.
+    (
+        "digest",
+        digest,
+        Mixed::Fails("diff refuses a partially indexed file"),
+    ),
+    // diff chooses its arm from the first blob, so a partial index is neither
+    // the sequential fallback it takes for a wholly unindexed file nor
+    // accepted: it fails mid-merge. Pinned as it behaves today.
+    (
+        "diff",
+        diff_old,
+        Mixed::Fails("block-pair merge requires indexdata but blob has none"),
+    ),
+    (
+        "diff --format osc",
+        diff_osc_old,
+        Mixed::Fails("block-pair merge requires indexdata but blob has none"),
+    ),
+    (
+        "inspect --indexed",
+        inspect_indexed,
+        Mixed::Reports("Indexed: yes"),
+    ),
+    (
+        "check --index",
+        check_index,
+        Mixed::Reports("1 with indexdata"),
+    ),
+];
+
+fn first_blob_only_holds(
+    fx: &Fx,
+    label: &str,
+    build: fn(&Ctx, &Path) -> Invocation,
+    mixed: Mixed,
+) -> Result<(), String> {
+    let dir = TempDir::new().unwrap();
+    let inv = build(
+        &Ctx {
+            fx,
+            out: dir.path(),
+        },
+        &fx.path("first-blob-only.osm.pbf"),
+    );
+    let out = run(&inv);
+    let text = format!("{}{}", out.stdout_str(), out.stderr_str());
+    let code = out.status.code();
+    match mixed {
+        Mixed::Accepts => {
+            // `diff` and friends exit 1 on findings; none of these rows do.
+            ensure!(code == Some(0), "[{label}] exit {code:?}; output:\n{text}");
+            ensure!(
+                !text.contains(NO_INDEXDATA),
+                "[{label}] refused a file the first-blob probe calls indexed; output:\n{text}"
+            );
+        }
+        Mixed::Reports(wanted) => {
+            ensure!(code == Some(0), "[{label}] exit {code:?}; output:\n{text}");
+            ensure!(
+                text.contains(wanted),
+                "[{label}] wanted {wanted:?}; output:\n{text}"
+            );
+        }
+        Mixed::Fails(wanted) => {
+            ensure!(code == Some(2), "[{label}] exit {code:?}; output:\n{text}");
+            ensure!(
+                text.contains(wanted),
+                "[{label}] wanted {wanted:?}; output:\n{text}"
+            );
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1156,4 +1704,34 @@ fn every_secondary_input_flag_has_an_alias_case() {
         }
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// What each command does with a file that has no indexdata on any data blob:
+/// refuse (and what lifts it), fall back (and what it says), or verify. One
+/// table is the only place this is stated; the rows follow the code.
+#[test]
+fn what_each_command_does_with_unindexed_input_is_pinned() {
+    let fx = Fx::new();
+    let failures: Vec<String> = POLICY
+        .iter()
+        .filter_map(|row| {
+            policy_holds(&fx, row)
+                .err()
+                .map(|why| format!("[{}] {why}", row.label))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// The probe behind every gate reads the first data blob only, so a file
+/// indexed there and nowhere else passes them all; this is what the commands
+/// do next.
+#[test]
+fn what_each_command_does_with_input_indexed_on_its_first_blob_only_is_pinned() {
+    let fx = Fx::new();
+    let failures: Vec<String> = FIRST_BLOB_ONLY
+        .iter()
+        .filter_map(|(label, build, mixed)| first_blob_only_holds(&fx, label, *build, *mixed).err())
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }

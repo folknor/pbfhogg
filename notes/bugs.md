@@ -127,3 +127,18 @@ absent (OSM versions start at 1).
 
 Reported by: the diff helper dedupe.
 
+## BUG-136 - `diff` on a file indexed on its first blob only fails mid-merge
+
+Anger: 7 - diff behaviour on a malformed-but-plausible input.
+
+On a wholly unindexed input, `diff` and `diff --format osc` fall back to the
+sequential element stream. On a file whose first data blob carries indexdata
+and later ones do not, the first-blob probe picks the block-pair path, which
+then exits 2 partway through with a generic "block-pair merge requires
+indexdata but blob has none", naming no file or blob. digest detects the same
+file up front ("present on some data blobs and absent on others"), so the
+check exists. Pinned as-is in `cli_input_contract`'s first-blob-only table.
+Open: refuse up front like digest, or fall back like the unindexed case.
+
+Reported by: the unindexed-input contract table.
+

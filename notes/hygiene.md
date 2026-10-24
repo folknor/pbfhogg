@@ -215,9 +215,25 @@ reimplements the EOF policy (1-3 trailing bytes tolerated), the datasize guard
 `parse_blob_header_with_index`"), the truncation messages (the "shape 3" /
 "shape 4" text is worded differently in `BlobReader` and `HeaderWalker`, and is
 jargon from `reference/truncation-handling.md` an operator cannot decode), and
-provenance stamping, which now agrees: every decoder locates frame errors at
-the frame offset when it knows one and claims none when it does not;
-`raw_frame.rs` stamps path and offset but no blob index. Fix: one frame state machine over an abstract byte source (stream and
+provenance stamping. `src/read/frame_conformance_tests.rs` now pins every
+truncation shape through five sources (`BlobReader` read and skip,
+`read_raw_frame`, `read_blob_header_only` plus `FileReader::skip`, and
+`HeaderWalker`), and the disagreements it pins are: `BlobReader` locates
+header-level refusals at frame start + 4 where every other source uses the
+frame start, and its skip path names the last declared payload byte where
+its read path names the first missing one; `read_raw_frame` and
+`read_blob_header_only` never give a blob index; the caller-side
+`FileReader::skip` raises a payload truncation with no path, blob or offset;
+only the `BlobReader` read path parses the Blob envelope, so a garbage
+payload is refused there and passed by the other four; only `BlobReader`
+says "(shape N)". `reference/truncation-handling.md` is wrong in four
+places: it says stderr names the offset and shape for every break (false
+for all but `BlobReader`), it lists stale `FileReader::skip` consumers (the
+only callers are the indexdata probe in `commands/mod.rs` and the `cat
+--dedupe` loop), it says skips pay the sentinel read only near EOF (every
+nonzero skip reads one), and it says `read::frame` owns the shape-1 EOF
+policy for every decoder (`BlobReader` and `HeaderWalker` each implement
+it). Fix: one frame state machine over an abstract byte source (stream and
 pread-at-offset as two impls), returning a stamped `FrameHeader`. Enforce with
 a conformance test running every truncation shape through every source; the
 `blob.rs` test with `read_arm` / `skip_arm` / `walk_arm` is that test in
@@ -345,9 +361,9 @@ hand-rolled at about ten sites. Elapsed nanoseconds have one owner,
 because truncating and saturating differ. Fix: a derive or
 macro generating struct, `new` and `emit` from one list (see above on the
 max loops); a `Stopwatch` whose only exit is
-`record_into(&AtomicU64)`; a test
-that fails when a `.rs` file under `src/write/` is missing from the funnel's
-`SOURCES`.
+`record_into(&AtomicU64)`; the funnel's source scans moved to brokkr.toml
+textlint rules selected by glob, so no file escapes a hand-kept `SOURCES`
+list (HYG-135 is the general version).
 
 Reported by: altw and scanning, write path.
 
@@ -672,31 +688,39 @@ blob and not on a later one passes every gate; the output-header policy had to
 add its own check for that case on the raw-copy paths.
 
 The second half of the model is what a command does when indexdata is absent,
-and that is decided per command too. Refuse unless `--force`: sort, repack,
-tags-filter (not with `-i` or `--distrust-metadata`), getid and `getid
---invert`, apply-changes, altw, extract complete and smart (not simple), cat
-with `--type`, `--clean` or `--dedupe`, degrade's decode path (not its
-passthrough path), `inspect --nodes`, `inspect tags`. Refuse with no escape:
-renumber (its schedule scan hard-errors on an unindexed blob), altw
-`--index-type external` (accepts `--force`, then refuses it). Refuse unless
-`--allow-unindexed` (whose legacy `--force` also grants overwrite):
-build-geocode-index. Fall back silently or with a `Note`: diff and `diff
---format osc` (sequential element stream, `diff.sequential_fallback`),
-getparents (the probe only picks the scan arm), time-filter, plain cat (which
-adds indexdata), check (`verify_ids` warns instead of refusing). Verify rather
-than trust: digest (refuses partial or inaccurate indexdata), `check --index`.
-Only tags-filter and inspect have a `--distrust-metadata` switch; getid, cat
-`--type`, apply-changes and altw trust the metadata with no way to turn that
-off. The sortedness the same commands require is read from the header flag
-alone (renumber and digest additionally check order while reading), and a
+and that is decided per command too. It is now pinned, as observed, by two
+tables in `cli/tests/cli_input_contract.rs`
+(`what_each_command_does_with_unindexed_input_is_pinned` and
+`..._with_input_indexed_on_its_first_blob_only_is_pinned`); the tables are
+the current statement of who refuses, who escapes with which flag, who falls
+back with which note, and who verifies. Pinned oddities worth a ruling:
+
+- The `--force` escape is not uniform in what it says: some forced runs print
+  the "blobs without indexdata" note, some are silent (getid, apply-changes,
+  `cat --type`, `cat --dedupe`, `inspect tags`, and `tags-filter -R`, though
+  plain tags-filter prints it), and `getid --add-referenced` prints the
+  first-blob probe's note instead.
+- renumber has no `--force`; altw `--index-type external` refuses `--force`
+  at parse time.
+- digest digests a wholly unindexed file and refuses only a partially indexed
+  one, with a message that says "diff refuses".
+- Every gate reads the first data blob only, so a file indexed on its first
+  blob passes all of them: sort, altw, apply-changes and the rest accept it,
+  `inspect --indexed` says yes while plain `inspect` says no, and diff
+  hard-fails mid-merge (see `notes/bugs.md`).
+- Only tags-filter and plain inspect have `--distrust-metadata`; getid, cat
+  `--type`, apply-changes and altw trust the metadata with no way to turn
+  that off.
+
+The sortedness the same commands require is read from the header flag alone
+(renumber and digest additionally check order while reading), and a
 header-only input counts as indexed (no blob lacks indexdata). No sentence
 anywhere says which of refuse, fall back or verify a command is meant to be.
 
 Fix: state the trust model once in `reference/` (indexdata is a hint; these
 properties are verified, these are believed, this is the consequence, and this
-is what a missing index does: refuse with `--force`, or fall back with a
-`Note`) and have each command cite it. Enforce with a contract test table,
-unindexed input times command, expecting refuse, fall back or ok.
+is what a missing index does), have each command cite it, and move the
+contract tables' rows when a ruling changes one.
 
 Reported by: change application, re-encoding, altw and scanning, geocode index.
 
@@ -848,21 +872,23 @@ inherit all of it.
 
 Reported by: split out of the diagnostic-wording item.
 
-## HYG-114 - OSC output is gzipped by two different rules, and no test covers every producer
+## HYG-114 - OSC output is gzipped by two different rules
 
-Anger: 6 - CLI behaviour; likely ends as a test.
+Anger: 6 - CLI behaviour.
 
 The rules are documented in the "Output files" section of both CLI
 references: `merge-changes` gzips exactly when the UTF-8 output name ends
 `.gz`; `tags-filter --input-kind osc` and `diff --format osc` always gzip,
 whatever the name. Each site carries a "Deliberately ..." comment saying the
 contract is historical and framing has no shared owner (`osc/write.rs`,
-`tags_filter/osc.rs`, `diff/derive.rs`, `merge_changes`). What is open: no
-test writes every OSC producer to `x.osc` and `x.osc.gz` and asserts the gzip
-magic against one table (only `diff --format osc` is pinned), and the two
-rules remain two. Choosing one new rule (gzip unless the name ends `.osc`)
-would change two outputs; it is a decision for the maintainer, and without it
-the entry ends as the table test.
+`tags_filter/osc.rs`, `diff/derive.rs`, `merge_changes`). Every producer is
+pinned to its rule by `osc_gzip_framing_follows_each_producers_rule` in
+`cli/tests/cli_output_contract.rs` (both diff drivers, `x.osc` and
+`x.osc.gz`); `cli_diff`'s `diff_osc_output_is_gzip_whatever_its_name` and
+`cli_output_guard`'s `merge_changes_output_is_still_gzipped_through_the_guard`
+now overlap with it. What is open: the two rules remain two. Choosing one new
+rule (gzip unless the name ends `.osc`) would change two outputs; it is a
+decision for the maintainer.
 
 Reported by: the command-matrix audit.
 
@@ -1038,6 +1064,35 @@ exception for the doc-example input, or the doctests build their input
 
 Reported by: the CLI test move.
 
+## HYG-135 - Source-scan tests built on `include_str!` belong in brokkr.toml
+
+Anger: 3 - test and convention plumbing; no product code.
+
+Several invariants are enforced by unit tests that `include_str!` source
+files and grep them: `src/write/metrics.rs` (the writer-counter emission and
+paired-counter funnel scans), `src/read/pipeline_metrics.rs`,
+`src/scratch.rs` and `cli/src/lib.rs`. Some of these uses may not be
+source scans at all; the inventory decides that per use. A hand-kept file
+list in a test is a list that a new file silently escapes (the writer funnel
+scans six files and misses `framing.rs`, `parallel_gzip.rs` and
+`copy_range.rs`), whereas brokkr's `[[textlint]]` and `[[script_check]]`
+select files by glob, can scope to production code (`test_code = "skip"`)
+or to code outside comments and strings (`region = "code"`), and run in the
+convention phase of every `brokkr check`. Textlint matches one physical line
+at a time (no multiline matching beyond `use` statements), so a scan that
+squashes whitespace to catch a rustfmt-wrapped chain becomes a rule on a
+token that always lands on some line (forbid the field name outside its
+owner, not `field.fetch_add`), or a `script_check` where that is not
+enough.
+
+Fix: inventory every `include_str!` in the workspace; for each source scan,
+write the equivalent textlint or script_check rule in `brokkr.toml` (with
+`must_scan` sentinels on the files the old test named), confirm it fires on a
+reintroduced violation, and delete the test. Leave a use that embeds data
+rather than scanning source where it is.
+
+Reported by: the maintainer, reviewing the writer funnel completeness test.
+
 ## HYG-134 - The first hygiene drain round needs an independent review
 
 Anger: 6 - review only; what it finds may be anything.
@@ -1049,8 +1104,8 @@ deliberate plumbing as dead code, and the one removal that landed (the
 parallel diff's `_direct_io`) was put back. That makes every other change in
 the round suspect of the same mistake - undoing something deliberate, or
 costing time or memory on a measured path - and none of it has been
-measured. Before any more drain work, a reviewer with no stake in the
-round's conclusions reads those commits against the code and history they
+measured. A reviewer with no stake in the round's conclusions reads those
+commits against the code and history they
 changed and reports, per change, whether it undid a deliberate choice, and
 whether it can cost wall time, RAM or memory pressure.
 

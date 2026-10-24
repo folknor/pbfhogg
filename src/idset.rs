@@ -905,6 +905,12 @@ impl IdSet {
     /// every borrow the writer threads held has ended. The chunks are moved,
     /// not copied; the index is built while they are borrowed, so peak
     /// memory is the set plus the index.
+    ///
+    /// The build has no cancellation checkpoint: callers check only before
+    /// and after it, so a tripped token waits for the pass to finish. A check
+    /// inside would be per chunk of a tight in-memory loop; if a stop ever
+    /// proves too slow, chunk the build and check per chunk, with a matched
+    /// A/B showing the untripped check costs nothing.
     pub fn into_ranked(self) -> RankedIdSet {
         let mut chunk_prefix = Vec::with_capacity(self.chunks.len() + 1);
         let mut block_prefix = Vec::with_capacity(self.chunks.len());

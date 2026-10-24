@@ -193,6 +193,12 @@ pub(super) fn stage3_slot_reorder(
                     // Cancellation, once per bucket, leaves through the same
                     // path as a bucket failure: record the cause first, then
                     // abort the router (waking stage 4's `wait_ready`).
+                    // There is no check inside a bucket: after the token
+                    // trips each worker finishes the bucket in hand (at most
+                    // 256 buckets in all, about 1/256 of this stage's work
+                    // per worker). A check inside would be per element in
+                    // the hot loop; if a stop proves too slow, split the
+                    // bucket and check per chunk, with a matched A/B.
                     if let Err(e) = cancel.check() {
                         err_ref
                             .lock()

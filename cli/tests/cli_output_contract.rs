@@ -420,6 +420,15 @@ const ROWS: &[Row] = &[
         gaps: &[],
     },
     Row {
+        command: "add-locations-to-ways",
+        label: SPARSE_ALTW_LABEL,
+        build: add_locations_to_ways_sparse,
+        kind: Kind::File,
+        tmp_dir: true,
+        ok_codes: &[0],
+        gaps: &[],
+    },
+    Row {
         command: "time-filter",
         label: "time-filter",
         build: time_filter,
@@ -597,6 +606,16 @@ fn add_locations_to_ways(c: &Ctx, i: Input) -> Invocation {
     Invocation::new(&["add-locations-to-ways"])
         .arg(c.fx.pbf(i))
         .out("-o", pbf_out(c))
+}
+
+/// The label of the add-locations-to-ways row pinned to the sparse store.
+/// That store is unlinked as soon as it is mapped, so a paused run never
+/// shows scratch payload; the interruption sweeps still require it to leave
+/// no destination and no staging entry.
+const SPARSE_ALTW_LABEL: &str = "add-locations-to-ways --index-type sparse";
+
+fn add_locations_to_ways_sparse(c: &Ctx, i: Input) -> Invocation {
+    add_locations_to_ways(c, i).words(&["--index-type", "sparse"])
 }
 
 fn time_filter(c: &Ctx, i: Input) -> Invocation {
@@ -1545,7 +1564,7 @@ mod interrupted {
     /// that store is unlinked as soon as it is mapped, so only the external
     /// join leaves scratch files a pause can observe.
     pub(super) fn visible_scratch_args(row: &Row) -> Vec<OsString> {
-        if row.command == "add-locations-to-ways" {
+        if row.command == "add-locations-to-ways" && row.label != SPARSE_ALTW_LABEL {
             vec!["--index-type".into(), "external".into()]
         } else {
             Vec::new()
@@ -1782,7 +1801,7 @@ fn interrupted_run_leaves_nothing(fx: &Fx, row: &Row) -> Result<(), String> {
         "no pause observed a populated staging entry ({count} checkpoints, pauses at {ks:?})"
     );
     ensure!(
-        !row.tmp_dir || scratch_seen,
+        !row.tmp_dir || row.label == SPARSE_ALTW_LABEL || scratch_seen,
         "no pause observed scratch payload in the run directory ({count} checkpoints, pauses \
          at {ks:?})"
     );

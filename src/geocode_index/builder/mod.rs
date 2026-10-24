@@ -514,7 +514,16 @@ fn build_generation(
     crate::debug::emit_marker("GEOCODE_PASS2_SCAN_END");
     host.cancel.check()?;
 
-    // Ring assembly + simplification
+    // Ring assembly + simplification.
+    //
+    // No cancellation checkpoint inside this pass, interpolation resolve,
+    // the pass 2 data file writes, pass 3 admin cell assignment or the admin
+    // index write: after the token trips each runs to its end, bounded by
+    // the `host.cancel.check()` calls around it (admin assembly is the
+    // longest at planet scale). A check inside would be per element or per
+    // polygon in a hot loop. If a stop ever proves too slow, the fix is to
+    // chunk the pass and check per chunk, with a matched A/B showing the
+    // untripped check costs nothing.
     crate::debug::emit_marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_START");
     let (admin_polygons, dropped_admin) =
         admin::assemble_admin_polygons(&admin_relations, &way_geom, config, &host.executor);

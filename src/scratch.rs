@@ -300,6 +300,11 @@ impl RunScratch {
     /// Remove everything in the run directory and then the directory. The
     /// lock and ready files go last, and only if everything else went, so a
     /// partial cleanup leaves a directory a later scan can still classify.
+    ///
+    /// Not cancellable: it runs after the token has tripped, and removing a
+    /// large run directory runs to its end unless a second signal ends the
+    /// process. A check inside would be per file; chunking it is the fix only
+    /// if an operator reports a stop that took too long.
     fn cleanup(&mut self) {
         let result = remove_contents(&self.path).and_then(|()| {
             for name in [READY_NAME, LOCK_NAME] {

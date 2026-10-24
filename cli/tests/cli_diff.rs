@@ -2169,9 +2169,11 @@ fn derive_sequential_and_sharded_output_byte_identical() {
             cli = cli.arg("--increment-version");
         }
         let out = cli.arg(&old).arg(&new).run();
-        assert!(
-            out.status.success(),
-            "diff --format osc -j {jobs} failed; stderr:\n{}",
+        // The pair differs, so the OSC diff answers 1, as a text diff does.
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "diff --format osc -j {jobs}; stderr:\n{}",
             out.stderr_str()
         );
         let stderr = out.stderr_str();

@@ -305,7 +305,8 @@ fn successful_runs_clean_up_after_themselves() {
     assert!(names(&tmp).is_empty(), "{:?}", names(&tmp));
 
     let osc = dir.path().join("delta.osc.gz");
-    CliInvoker::new()
+    // The inputs differ, so the OSC diff completes with exit 1.
+    let out = CliInvoker::new()
         .args([
             "diff",
             "--format",
@@ -319,7 +320,8 @@ fn successful_runs_clean_up_after_themselves() {
             "--tmp-dir",
             tmp_arg,
         ])
-        .assert_success();
+        .run();
+    assert_eq!(out.status.code(), Some(1), "{}", out.stderr_str());
     assert!(osc.exists());
     assert!(names(&tmp).is_empty(), "{:?}", names(&tmp));
 

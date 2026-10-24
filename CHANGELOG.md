@@ -4,6 +4,12 @@
 
 ### Breaking
 
+- **`diff --format osc` exits 1 when the inputs differ.** It used to exit 0
+  whatever it found, unlike a text `diff`; it now answers the same way
+  (`0` identical, `1` different) and still publishes its `-o` in both
+  cases. A script that treated any non-zero exit from an OSC diff as a
+  failure must accept `1`.
+
 - **`--type` is one comma-list grammar on every command, and `getid
   --verbose-ids` is now `-v, --verbose`.** `--type` takes any subset of
   `node,way,relation` through a single parser. `inspect tags`, which counts
@@ -870,7 +876,9 @@
   never changes what is written to `-o`, nor a report on stdout (`inspect`,
   `digest`, `export`, the `inspect tags` table); `diff -q` and
   `check --quiet`, which already existed, are this flag now and still print
-  nothing at all. It goes before or after the subcommand. `diff --format osc`
+  nothing at all, and a quiet `inspect --indexed` prints no verdict line
+  either (it refuses `--json` with `-q`). It goes before or after the
+  subcommand. `diff --format osc`
   now accepts it (it was refused) and writes its output without the summary;
   `getid -v` refuses it. The `bench-*` key=value blocks are unchanged.
 

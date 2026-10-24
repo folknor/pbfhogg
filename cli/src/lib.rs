@@ -521,6 +521,17 @@ fn validate_command(
              two same-kind elements inside one output block",
         )),
         Command::Check { .. } => validate_check(command, matches, quiet).map(|()| None),
+        // A quiet `inspect --indexed` prints nothing: its answer is the exit
+        // code, as for check and diff.
+        Command::Inspect {
+            indexed: true,
+            json: true,
+            ..
+        } if quiet => Err(quiet_refused(
+            &["inspect"],
+            "--json",
+            "it only shapes the --indexed verdict line, which a quiet run does not print",
+        )),
         Command::MergeChanges { output, .. } => {
             validate_osc_output(&["merge-changes"], &output.output).map(|()| None)
         }
@@ -2171,6 +2182,8 @@ struct InspectFlags {
     json: bool,
     force: bool,
     distrust_metadata: bool,
+    /// `-q, --quiet`: `--indexed` prints no verdict line.
+    quiet: bool,
 }
 
 /// `diff`'s output-shape booleans.
@@ -2657,16 +2670,19 @@ pub fn run() -> process::ExitCode {
                     let output_handle =
                         pbfhogg::Output::new(&output, overwrite.intent(), &host.diagnostics)?;
                     let scratch = run_scratch(&tmp, Some(&output), &host)?;
-                    run_derive_changes(
-                        &old,
-                        &new,
-                        output_handle,
-                        io.direct_io,
-                        increment_version,
-                        update_timestamp,
-                        jobs,
-                        &host,
-                        scratch,
+                    accept_outcome(
+                        &mut outcome,
+                        run_derive_changes(
+                            &old,
+                            &new,
+                            output_handle,
+                            io.direct_io,
+                            increment_version,
+                            update_timestamp,
+                            jobs,
+                            &host,
+                            scratch,
+                        ),
                     )
                 }
                 DiffFormat::Text => {
@@ -2986,6 +3002,7 @@ pub fn run() -> process::ExitCode {
                                 json,
                                 force,
                                 distrust_metadata: distrust.distrust_metadata,
+                                quiet,
                             },
                             jobs,
                             blocks,
@@ -4241,7 +4258,7 @@ fn run_derive_changes(
     parallelism: pbfhogg::Parallelism,
     host: &pbfhogg::host::Host,
     scratch: pbfhogg::scratch::RunScratch,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Outcome, Box<dyn std::error::Error>> {
     let timestamp = if update_timestamp {
         Some(
             std::time::SystemTime::now()
@@ -4263,7 +4280,13 @@ fn run_derive_changes(
         scratch,
     )?;
     stats.write_summary(&mut host.diagnostics.summary_writer("derive.summary"))?;
-    Ok(())
+    // The same verdict as a text diff: an OSC diff that holds changes is a
+    // completed answer whose output is published, and exits 1.
+    Ok(if stats.creates + stats.modifies + stats.deletes > 0 {
+        Outcome::Negative
+    } else {
+        Outcome::Positive
+    })
 }
 
 fn run_getid(
@@ -4581,6 +4604,7 @@ fn run_inspect(
         json,
         force,
         distrust_metadata,
+        quiet,
     } = flags;
 
     // `--distrust-metadata` only means something for the scanning report:
@@ -4613,7 +4637,9 @@ fn run_inspect(
             let has_index = pbfhogg::has_indexdata(path, direct_io, &host.diagnostics)?;
             host.cancel.check()?;
             let mut out = output::buffered();
-            let printed = if json {
+            let printed = if quiet {
+                Ok(())
+            } else if json {
                 writeln!(out, "{}", serde_json::json!({"indexed": has_index}))
             } else if has_index {
                 writeln!(out, "Indexed: yes")

@@ -33,12 +33,13 @@ All commands support `-h, --help` and `-V, --version`, and
   exit code, and clap's usage errors.
 - **Never touched:** what a command writes to `-o` (a quiet run writes the
   same bytes), and a report a command prints on stdout (`inspect`,
-  `inspect tags`, `digest`, `export` without `-o`), with two exceptions:
-  `diff` and `check`, whose answer is their exit code, print nothing at all.
-  A quiet text `diff` discards its diff text, so `-o`, `-c`, `-v` and `-s`,
-  which only shape that text or its summary, are refused with `-q`; a quiet
-  `diff --format osc` writes its `-o` like any other command. A quiet `check`
-  refuses `--json`, `--show-ids` and `--max-errors` for the same reason.
+  `inspect tags`, `digest`, `export` without `-o`), with three exceptions:
+  `diff`, `check` and `inspect --indexed`, whose answer is their exit code,
+  print nothing at all. A quiet text `diff` discards its diff text, so `-o`,
+  `-c`, `-v` and `-s`, which only shape that text or its summary, are refused
+  with `-q`; a quiet `diff --format osc` writes its `-o` like any other
+  command. A quiet `check` refuses `--json`, `--show-ids` and `--max-errors`,
+  and a quiet `inspect --indexed` refuses `--json`, for the same reason.
   `getid -v` is refused with `-q`: the ID lists are all it adds.
 - **Not affected:** the `bench-read`, `bench-write` and `bench-merge`
   key=value blocks, which benchmark harnesses parse, print as they always
@@ -946,7 +947,7 @@ geometry are skipped and reported in the stderr summary.
 
 Compare two PBF files and show differences. Uses content equality (coordinates, tags, refs, members) rather than version/timestamp ordering - deterministic regardless of metadata completeness (see [DEVIATIONS](../DEVIATIONS.md#diff-content-equality-vs-version-ordering)).
 
-With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`/`--osmium-summary`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`.
+With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`/`--osmium-summary`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`. Either format exits `0` when the inputs are identical and `1` when they differ; an OSC diff publishes its `-o` in both cases.
 
 With the global [`-q, --quiet`](#quiet) a text diff prints nothing, neither the diff text nor its summary: the exit code is the answer (`0` identical, `1` different). `-o`, `-c`, `-v` and `-s`, which only shape that text or its summary, are refused with it. A quiet `--format osc` diff writes its `-o` as usual and drops only the summary.
 

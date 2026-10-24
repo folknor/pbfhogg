@@ -11,11 +11,12 @@ accepted before or after the subcommand.
 every progress line and the command's closing summary, and keeps every
 `Warning:` and the final `Error:` line. It never changes what a command
 writes to `-o`, nor a report it prints on stdout (`inspect`, `inspect tags`,
-`digest`, `export` without `-o`), except for `diff` and `check`: a quiet run
-of those prints nothing at all. The flags that only shape the output a quiet
-run drops are refused with it: `-o`, `-c`, `-v` and `-s` on a text `diff`
-(a quiet `diff --format osc` writes its `-o` as usual), `--json`,
-`--show-ids` and `--max-errors` on `check`, and `getid -v`. The `bench-*`
+`digest`, `export` without `-o`), except for `diff`, `check` and
+`inspect --indexed`: a quiet run of those prints nothing at all. The flags
+that only shape the output a quiet run drops are refused with it: `-o`, `-c`,
+`-v` and `-s` on a text `diff` (a quiet `diff --format osc` writes its `-o`
+as usual), `--json`, `--show-ids` and `--max-errors` on `check`, `--json` on
+`inspect --indexed`, and `getid -v`. The `bench-*`
 commands' key=value blocks print as they always have. The full contract is
 in the
 [CLI reference](https://github.com/folknor/pbfhogg/blob/main/reference/cli-reference.md#quiet).
@@ -638,7 +639,7 @@ geometry are skipped and reported in the stderr summary.
 
 Compare two PBF files and show differences. Uses content equality (coordinates, tags, refs, members) rather than version/timestamp ordering - deterministic regardless of metadata completeness (see [DEVIATIONS](/cli/deviations#diff-content-equality-vs-version-ordering)).
 
-With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`.
+With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`. Either format exits `0` when the inputs are identical and `1` when they differ; an OSC diff publishes its `-o` in both cases.
 
 With the global `-q, --quiet` a text diff prints nothing, neither the diff text nor its summary, and the exit code is the answer (`0` identical, `1` different); `-o`, `-c`, `-v` and `-s`, which only shape that output, are refused with it. A quiet `--format osc` diff writes its `-o` as usual and drops only the summary.
 

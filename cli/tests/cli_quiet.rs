@@ -206,17 +206,20 @@ fn a_quiet_run_keeps_the_error_line() {
     );
 }
 
-/// `diff` and `check` answer by exit code alone: a quiet run prints nothing
-/// on either stream and exits as the run without `-q` does.
+/// `diff`, `check` and `inspect --indexed` answer by exit code alone: a
+/// quiet run prints nothing on either stream and exits as the run without
+/// `-q` does.
 #[test]
-fn quiet_diff_and_check_answer_by_exit_code_alone() {
+fn quiet_verdict_commands_answer_by_exit_code_alone() {
     let fx = Fx::new();
-    let cases: [(&[&str], i32); 5] = [
+    let cases: [(&[&str], i32); 7] = [
         (&["diff", "@base.osm.pbf", "@base.osm.pbf"], 0),
         (&["diff", "@base.osm.pbf", "@changed.osm.pbf"], 1),
         (&["diff", "-j", "1", "@base.osm.pbf", "@changed.osm.pbf"], 1),
         (&["check", "@base.osm.pbf"], 0),
         (&["check", "--refs", "@dangling.osm.pbf"], 1),
+        (&["inspect", "--indexed", "@base.osm.pbf"], 0),
+        (&["inspect", "--indexed", "@unindexed.osm.pbf"], 1),
     ];
     for (words, code) in cases {
         let args = fx.args(words);
@@ -254,15 +257,81 @@ fn quiet_diff_and_check_answer_by_exit_code_alone() {
     }
 }
 
+/// An OSC diff answers like a text diff: exit 1 when the inputs differ, 0
+/// when they do not, quiet or not, and it writes its `-o` either way.
+#[test]
+fn osc_diff_exits_like_a_text_diff() {
+    let fx = Fx::new();
+    for (new, code) in [("@base.osm.pbf", 0), ("@changed.osm.pbf", 1)] {
+        for q in [false, true] {
+            let name = format!("@out-{code}-{q}.osc");
+            let mut words = vec![
+                "diff",
+                "--format",
+                "osc",
+                "@base.osm.pbf",
+                new,
+                "-o",
+                name.as_str(),
+            ];
+            if q {
+                words.push("-q");
+            }
+            let out = run(&fx.args(&words));
+            assert_eq!(
+                out.status.code(),
+                Some(code),
+                "{words:?}; stderr:\n{}",
+                out.stderr_str()
+            );
+            assert!(
+                fx.path(&name[1..]).exists(),
+                "{words:?} published no output"
+            );
+            if q {
+                assert!(
+                    out.stderr.is_empty(),
+                    "{words:?} wrote to stderr:\n{}",
+                    out.stderr_str()
+                );
+            }
+        }
+    }
+}
+
+/// A quiet `inspect --indexed` prints no verdict, so `--json`, which only
+/// shapes it, is refused beside `-q`.
+#[test]
+fn quiet_inspect_indexed_refuses_json() {
+    let fx = Fx::new();
+    for leading in [true, false] {
+        let args = fx.args(&["inspect", "--indexed", "--json", "@base.osm.pbf"]);
+        let out = run(&quiet(&args, leading));
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{}: {}",
+            place(leading),
+            out.stderr_str()
+        );
+        assert!(
+            out.stderr_str()
+                .contains("'--quiet' cannot be used with '--json'"),
+            "{}: {}",
+            place(leading),
+            out.stderr_str()
+        );
+    }
+}
+
 /// A report on stdout is the command's output, not a summary: `-q` leaves it
 /// byte-identical and silences only stderr (`inspect tags`' count of
 /// distinct values included).
 #[test]
 fn a_quiet_run_leaves_a_stdout_report_alone() {
     let fx = Fx::new();
-    let commands: [&[&str]; 4] = [
+    let commands: [&[&str]; 3] = [
         &["inspect", "@base.osm.pbf"],
-        &["inspect", "--indexed", "@base.osm.pbf"],
         &["inspect", "tags", "@base.osm.pbf"],
         &["digest", "@base.osm.pbf"],
     ];

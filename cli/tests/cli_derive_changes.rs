@@ -63,12 +63,22 @@ fn run_derive(
 
 fn run_derive_simple(old: &Path, new: &Path, osc: &Path) -> CliOutput {
     let out = run_derive(old, new, osc, false, false, Some(1));
-    assert!(
-        out.status.success(),
-        "diff --format osc failed; stderr:\n{}",
-        out.stderr_str(),
-    );
+    assert_derive_answered(&out, "diff --format osc");
     out
+}
+
+/// A completed OSC diff answers like a text diff: exit 1 when it found
+/// changes, 0 when it found none, as its summary counts them.
+fn assert_derive_answered(out: &CliOutput, label: &str) {
+    let stderr = out.stderr_str();
+    let (creates, modifies, deletes) = parse_derive_stats(&stderr)
+        .unwrap_or_else(|| panic!("{label} failed: exit {:?}; stderr:\n{stderr}", out.status));
+    let want = i32::from(creates + modifies + deletes > 0);
+    assert_eq!(
+        out.status.code(),
+        Some(want),
+        "{label}: the exit code must say whether changes were found; stderr:\n{stderr}"
+    );
 }
 
 fn run_apply(base: &Path, osc: &Path, output: &Path) -> CliOutput {
@@ -794,7 +804,7 @@ fn increment_version_bumps_delete_versions() {
     write_versioned_pbf(&new, &[(1, 100_000_000, 200_000_000, 3)], &[]);
 
     let out = run_derive(&old, &new, &osc, true, false, Some(1));
-    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    assert_derive_answered(&out, "diff --format osc --increment-version");
 
     let xml = read_osc(&osc);
     assert!(
@@ -858,7 +868,10 @@ fn increment_version_and_update_timestamp_combined() {
     write_versioned_pbf(&new, &[], &[]);
 
     let out = run_derive(&old, &new, &osc, true, true, Some(1));
-    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    assert_derive_answered(
+        &out,
+        "diff --format osc --increment-version --update-timestamp",
+    );
 
     let xml = read_osc(&osc);
     assert!(
@@ -896,17 +909,9 @@ fn derive_changes_jobs_parity_roundtrips_to_same_output() {
     write_roundtrip_multiblob_pair(&old, &new);
 
     let seq = run_derive(&old, &new, &osc_seq, false, false, Some(1));
-    assert!(
-        seq.status.success(),
-        "derive seq; stderr:\n{}",
-        seq.stderr_str()
-    );
+    assert_derive_answered(&seq, "derive seq");
     let par = run_derive(&old, &new, &osc_par, false, false, Some(4));
-    assert!(
-        par.status.success(),
-        "derive par; stderr:\n{}",
-        par.stderr_str()
-    );
+    assert_derive_answered(&par, "derive par");
 
     let seq_stats = parse_derive_stats(&seq.stderr_str()).expect("seq stats");
     let par_stats = parse_derive_stats(&par.stderr_str()).expect("par stats");

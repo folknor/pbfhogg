@@ -2084,7 +2084,10 @@ fn osc_gzip_framing_follows_the_output_name_for_every_producer() {
             let dest = out_dir.path().join(name);
             let args = (producer.build)(&osc, dir.path(), &dest);
             let result = CliInvoker::new().args(&args).run();
-            if !result.status.success() {
+            // A diff that found changes is a completed run that exits 1.
+            let completed = result.status.success()
+                || (producer.label.starts_with("diff") && result.status.code() == Some(1));
+            if !completed {
                 failures.push(format!(
                     "{} -> {name}: exited {:?}: {}",
                     producer.label,

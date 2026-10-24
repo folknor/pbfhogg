@@ -16,6 +16,7 @@ pub mod export;
 pub mod extract;
 pub mod getid;
 pub mod getparents;
+pub(crate) mod input_front;
 pub mod inspect;
 pub mod merge_changes;
 pub(crate) mod output_header;
@@ -465,6 +466,18 @@ pub(crate) fn require_indexdata(
     host: &crate::host::Host,
 ) -> Result<bool> {
     let present = has_indexdata(path, direct_io, &host.diagnostics)?;
+    indexdata_policy(present, path, force, reason, host)
+}
+
+/// The acceptance half of [`require_indexdata`], for a caller that already
+/// holds the first-data-blob hint (an [`input_front::InputFront`]).
+pub(crate) fn indexdata_policy(
+    present: bool,
+    path: &Path,
+    force: bool,
+    reason: &str,
+    host: &crate::host::Host,
+) -> Result<bool> {
     if !force && !present {
         return Err(crate::error::new_missing_indexdata(reason)
             .locate(crate::error::Location::in_file(path)));
@@ -580,25 +593,48 @@ fn probe_first_data_blob(
 ) -> Result<(bool, bool)> {
     let mut reader = FileReader::open(path, direct_io)?;
     let mut offset = 0u64;
-    let mut first = true;
+    // The header comes first or the file is not a PBF: a zero-byte or
+    // header-less file gets the one missing-header error here, ahead of any
+    // question about indexdata. Its payload is skipped, not read.
+    let header_size = leading_header_frame(&mut reader, &mut offset, diagnostics, path)?;
+    reader.skip(header_size as u64)?;
+    offset += header_size as u64;
+    probe_to_first_data_blob(&mut reader, &mut offset, diagnostics, path)
+}
+
+/// Read the first frame's header and return its payload size, leaving the
+/// reader at the payload. A zero-byte file, or one whose first frame is not
+/// an OsmHeader, is the missing-header error, decided before any payload is
+/// read.
+pub(crate) fn leading_header_frame(
+    reader: &mut FileReader,
+    offset: &mut u64,
+    diagnostics: &crate::host::Diagnostics,
+    path: &Path,
+) -> Result<usize> {
+    match crate::read::raw_frame::read_blob_header_only(reader, offset, diagnostics, path)? {
+        Some(info) if matches!(info.blob_type, BlobKind::OsmHeader) => Ok(info.data_size),
+        _ => Err(crate::error::new_missing_header(path)),
+    }
+}
+
+/// Continue a front-of-file read from the frame after the header to the
+/// first OsmData frame's header, returning its `(indexdata, tagdata)`
+/// presence. Frames in between are skipped, not read.
+pub(crate) fn probe_to_first_data_blob(
+    reader: &mut FileReader,
+    offset: &mut u64,
+    diagnostics: &crate::host::Diagnostics,
+    path: &Path,
+) -> Result<(bool, bool)> {
     while let Some(info) =
-        crate::read::raw_frame::read_blob_header_only(&mut reader, &mut offset, diagnostics, path)?
+        crate::read::raw_frame::read_blob_header_only(reader, offset, diagnostics, path)?
     {
-        // The header comes first or the file is not a PBF: a zero-byte or
-        // header-less file gets the one missing-header error here, ahead of
-        // any question about indexdata.
-        if first && !matches!(info.blob_type, BlobKind::OsmHeader) {
-            return Err(crate::error::new_missing_header(path));
-        }
-        first = false;
         if matches!(info.blob_type, BlobKind::OsmData) {
             return Ok((info.index.is_some(), info.has_tagdata));
         }
         reader.skip(info.data_size as u64)?;
-        offset += info.data_size as u64;
-    }
-    if first {
-        return Err(crate::error::new_missing_header(path));
+        *offset += info.data_size as u64;
     }
     // No data blob: nothing lacks indexdata, so the file counts as indexed.
     // It carries no tagdata, which is a statement about presence, not a

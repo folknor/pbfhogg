@@ -185,6 +185,13 @@ pub(super) fn try_extract_multi_single_pass(
     // Walk via the pread-only HeaderWalker so blob bodies stay out of the
     // page cache during the scan - the per-kind classification passes open
     // fresh fds and pread only the blobs they need.
+    //
+    // This second open is deliberate too: the probe above is the sole judge
+    // of the leading header (it decides the decline contract, honouring
+    // direct I/O), and the walk wants its own FADV_RANDOM descriptor. The walk
+    // starts at the beginning and consumes the leading frame without
+    // re-judging it; the walker would accept a data blob there, so it is
+    // not a second missing-header check.
     crate::debug::emit_marker("MULTI_SCHEDULE_SCAN_START");
     let mut walker =
         crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();

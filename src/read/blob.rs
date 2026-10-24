@@ -547,7 +547,17 @@ impl<R: Read + Send> BlobReader<R> {
     /// that opens with anything else, is the one missing-header error naming
     /// this reader's input; a data blob is never silently consumed in the
     /// header's place.
-    pub(crate) fn leading_header(&mut self) -> Result<Blob> {
+    ///
+    /// Call it before iterating, for a pass that reads the whole input
+    /// itself and must refuse a header-less file rather than read it as
+    /// empty. The blob comes back undecoded: decode it to validate its
+    /// content.
+    ///
+    /// # Errors
+    ///
+    /// The missing-header error, or the framing error reading the first
+    /// blob.
+    pub fn leading_header(&mut self) -> Result<Blob> {
         match self.next() {
             Some(Ok(blob)) if matches!(blob.get_type(), BlobType::OsmHeader) => Ok(blob),
             Some(Ok(_)) | None => Err(crate::error::new_missing_header_in(self.source())),

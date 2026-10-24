@@ -147,8 +147,8 @@ fn read_raw_frame_inner<R: Read>(
 
 /// Parsed blob header without the blob data payload.
 ///
-/// Used by lightweight header-only probes (`check_sorted_and_indexed`,
-/// indexed-check short-circuit). For random-access pread-based header
+/// Used by lightweight header-only probes (`has_indexdata` and the
+/// commands' input front read). For random-access pread-based header
 /// walks use `crate::read::header_walker::HeaderWalker` instead - it
 /// skips the `BufReader` buffer-passthrough amplification on cold
 /// caches.

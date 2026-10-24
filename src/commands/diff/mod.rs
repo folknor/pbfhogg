@@ -17,6 +17,7 @@ pub(crate) mod parallel;
 mod shard;
 
 use super::Result;
+use super::input_front::sorted_and_indexed;
 use crate::ElementKind;
 use crate::coord_fmt::{format_coord, from_decimicro};
 use crate::osc::merge_join::{
@@ -32,32 +33,6 @@ use std::path::Path;
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Check if a PBF is sorted and has indexdata.
-/// Returns `(is_sorted, has_indexdata)`.
-///
-/// The sorted flag comes from the OsmHeader blob (first blob, needs full
-/// read + decompress). Indexdata is probed from the first OsmData blob
-/// only - O(1) header read. Partially-indexed PBFs surface as a mid-run
-/// error at the consuming site rather than being detected up front.
-pub(crate) fn check_sorted_and_indexed(
-    path: &Path,
-    direct_io: bool,
-    host: &crate::host::Host,
-) -> Result<(bool, bool)> {
-    // Pass 1: read the sorted flag from the OsmHeader (reads ~1 blob). A
-    // file without a leading header is the missing-header error here, ahead
-    // of any question about sortedness.
-    let sorted = crate::ElementReader::open_in(path, direct_io, host)?
-        .header()
-        .is_sorted();
-
-    // Pass 2: O(1) header-only probe of the first OsmData blob. A file with
-    // no data blob counts as indexed.
-    let indexed = super::has_indexdata(path, direct_io, &host.diagnostics)?;
-
-    Ok((sorted, indexed))
-}
 
 // `require_sorted` is defined in `super::mod` and re-used here.
 
@@ -288,9 +263,9 @@ fn compare<W: Write>(
 ) -> Result<DiffStats> {
     let filter = TypeFilter::or_all(options.type_filter);
 
-    // Single-pass: check sorted headers + indexdata from one file open each.
-    let (old_sorted, old_indexed) = check_sorted_and_indexed(old_path, direct_io, host)?;
-    let (new_sorted, new_indexed) = check_sorted_and_indexed(new_path, direct_io, host)?;
+    // Sorted headers + indexdata from one front read of each input.
+    let (old_sorted, old_indexed) = sorted_and_indexed(old_path, direct_io, host)?;
+    let (new_sorted, new_indexed) = sorted_and_indexed(new_path, direct_io, host)?;
     super::require_sorted(
         old_sorted,
         old_path,

@@ -897,6 +897,11 @@
   now accepts it (it was refused) and writes its output without the summary;
   `getid -v` refuses it. The `bench-*` key=value blocks are unchanged.
 
+- **`BlobReader::leading_header` is public.** It takes the first blob and
+  returns the missing-header error for an empty input or one that opens with
+  anything other than an OsmHeader, so a caller iterating blobs itself can
+  refuse a header-less file instead of reading it as empty.
+
 - **`BlobReader::new_named(reader, path)`** builds a streaming reader whose
   errors name `path` and locate at byte offsets counted from the reader's
   first byte, without requiring `Seek`. **`Blob::locate_error`** is public,
@@ -1080,6 +1085,15 @@
   makes the decision before the header is read.
 
 ### Fixed
+
+- **`add-locations-to-ways --index-type auto` judges indexdata the way the
+  backends do.** It used to look at the frame right after the header, of any
+  type, while the indexdata check that follows looks at the first data blob,
+  so the two could disagree: a header-only file was "indexed=false" to the
+  selection note, and an extension frame ahead of the data decided the
+  answer. Both now read the first data blob's indexdata. The selection no
+  longer reads that blob's payload, so a malformed payload there is no longer
+  refused at selection; it is up to whichever pass reads it.
 
 - **`diff --format osc` on input without indexdata keeps every metadata
   field.** Creates and modifies derived from a file without blob indexdata

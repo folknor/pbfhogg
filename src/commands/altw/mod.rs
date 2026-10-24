@@ -15,8 +15,9 @@ use crate::{Element, ElementReader, MemberId, PrimitiveBlock};
 
 use super::{
     HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
-    ensure_way_capacity_local, require_indexdata, writer_from_header,
+    ensure_way_capacity_local, writer_from_header,
 };
+use crate::commands::input_front::InputFront;
 use crate::idset::IdSet;
 
 use super::Result;
@@ -381,18 +382,27 @@ pub(crate) fn add_locations_to_ways_to(
     scratch: &crate::scratch::RunScratch,
 ) -> Result<Stats> {
     options.validate()?;
+    // Every precondition that depends on the input (sorted, indexed, the
+    // header) is answered by this one front read, whichever backend runs.
+    // The header walks that follow are separate and deliberate (see
+    // `passthrough::build_schedule`). Scratch free space is not judged here:
+    // both backends size their scratch from counts only their first pass
+    // learns (sparse from the referenced-node set, external from stage 1),
+    // and check it then.
+    let mut front = InputFront::open(input, options.write.direct_reads, host)?;
     // Auto-select: sparse unless the input qualifies for external AND the
     // estimated store exceeds the page-cache budget (see IndexType::Auto).
     let backend = match options.index_type {
         IndexType::Sparse => ResolvedBackend::Sparse,
         IndexType::External => ResolvedBackend::External,
-        IndexType::Auto => auto_select_backend(input, options.write.direct_reads, host)?,
+        IndexType::Auto => auto_select_backend(input, &mut front, host)?,
     };
 
     // External join has its own pipeline - dispatch early.
     if backend == ResolvedBackend::External {
         let stats = external::external_join_in(
             input,
+            front,
             output,
             options.keep_untagged_nodes,
             &options.write,
@@ -405,9 +415,7 @@ pub(crate) fn add_locations_to_ways_to(
         return Ok(stats);
     }
 
-    let indexdata_present = require_indexdata(
-        input,
-        options.write.direct_reads,
+    let indexdata_present = front.require_indexdata(
         options.write.force,
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed and re-encoded (significantly slower).",
@@ -418,20 +426,20 @@ pub(crate) fn add_locations_to_ways_to(
     // selection only. When auto resolved to sparse it did so because the
     // store fits the page-cache budget; hinting external there would
     // contradict the routing it just explained on stderr.
-    if options.index_type == IndexType::Sparse && indexdata_present {
-        let reader = crate::ElementReader::open_in(input, options.write.direct_reads, host)?;
-        if reader.header().is_sorted() {
-            crate::host::diag!(
-                host.diagnostics,
-                Note,
-                "altw.external_hint",
-                "this sorted indexed PBF is eligible for the external index, \
-                 which uses bounded working memory and sequential I/O. Sparse is faster \
-                 while its node store fits in the page cache; external avoids the \
-                 page-cache thrashing sparse hits when it does not. The automatic \
-                 choice picks between them from the estimated store size."
-            );
-        }
+    let hint_external =
+        options.index_type == IndexType::Sparse && indexdata_present && front.is_sorted()?;
+    drop(front);
+    if hint_external {
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "altw.external_hint",
+            "this sorted indexed PBF is eligible for the external index, \
+             which uses bounded working memory and sequential I/O. Sparse is faster \
+             while its node store fits in the page cache; external avoids the \
+             page-cache thrashing sparse hits when it does not. The automatic \
+             choice picks between them from the estimated store size."
+        );
     }
 
     // Pass 0: collect the set of node IDs referenced by ways. Only these
@@ -542,24 +550,20 @@ fn enforce_missing_locations_policy(stats: &Stats, ignore_missing_nodes: bool) -
 // The threshold is relative to runtime RAM, never a hardcoded byte
 // constant: the knee is defined by store-vs-cache, and a constant fitted
 // to one host misroutes every other machine.
+//
+// Eligibility comes from the header and the first OsmData blob's indexdata,
+// the same hint the sparse path's indexdata check reads from this front, so
+// the two can never disagree (a header-only file is indexed to both; an
+// extension frame before the data is skipped by both). Selection judges
+// header claims, not blob payloads: a malformed data blob is the business
+// of whichever pass reads it.
 fn auto_select_backend(
     input: &Path,
-    direct_io: bool,
+    front: &mut InputFront<'_>,
     host: &crate::host::Host,
 ) -> Result<ResolvedBackend> {
-    let reader = crate::ElementReader::open_in(input, direct_io, host)?;
-    let sorted = reader.header().is_sorted();
-    drop(reader);
-    // Absence of indexdata permits sparse, but an unreadable or malformed
-    // blob is an input error, not evidence for a different backend.
-    let mut probe = crate::blob::BlobReader::open_in(input, direct_io, host)?;
-    probe.set_parse_indexdata(true);
-    probe.next().transpose()?; // header was validated by ElementReader
-    let has_index = probe
-        .next()
-        .transpose()?
-        .is_some_and(|blob| blob.index().is_some());
-    drop(probe);
+    let sorted = front.is_sorted()?;
+    let has_index = front.indexed()?;
 
     if !(sorted && has_index) {
         // External cannot run (it requires sorted + indexdata); no

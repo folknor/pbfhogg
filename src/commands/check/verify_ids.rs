@@ -2,7 +2,6 @@
 
 use std::path::Path;
 
-use crate::ElementReader;
 use crate::error::Result;
 use crate::idset::IdSet;
 use crate::osm_id::osm_id_cmp;
@@ -379,10 +378,8 @@ fn verify_ids_streaming_parallel(
     // reused across blobs) doesn't apply here.
     host.process.cross_thread_alloc_pool();
 
-    let header_sorted = ElementReader::open_in(path, opts.check.direct_io, host)?
-        .header()
-        .is_sorted();
-    let indexed = crate::commands::has_indexdata(path, opts.check.direct_io, &host.diagnostics)?;
+    let (header_sorted, indexed) =
+        crate::commands::input_front::sorted_and_indexed(path, opts.check.direct_io, host)?;
     warn_unindexed_triple_scan(indexed, host);
 
     let type_filter = TypeFilter::or_all(opts.type_filter);
@@ -638,13 +635,11 @@ fn verify_ids_full_parallel(
     // Pread worker pool; same motivation as check_refs step #2.
     host.process.cross_thread_alloc_pool();
 
-    // Cheap: ElementReader::open reads the header and stops. Drop it
-    // immediately; parallel_classify_phase reopens the file internally via
-    // the shared_file from build_classify_schedules_split.
-    let header_sorted = ElementReader::open_in(path, opts.check.direct_io, host)?
-        .header()
-        .is_sorted();
-    let indexed = crate::commands::has_indexdata(path, opts.check.direct_io, &host.diagnostics)?;
+    // Cheap: one front read of the header and the first data blob's header.
+    // parallel_classify_phase reads through its own descriptor, the
+    // shared_file from build_classify_schedules_split.
+    let (header_sorted, indexed) =
+        crate::commands::input_front::sorted_and_indexed(path, opts.check.direct_io, host)?;
     warn_unindexed_triple_scan(indexed, host);
 
     let type_filter = TypeFilter::or_all(opts.type_filter);

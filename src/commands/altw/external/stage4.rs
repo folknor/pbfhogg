@@ -151,6 +151,9 @@ fn load_ref_count_sidecar_in(path: &Path, total_slots: u64) -> Result<Vec<u64>> 
 pub(super) fn stage4_assembly(
     input: &Path,
     output: &crate::output::Output,
+    // The input's header, from the run's one front read; stage 4 does not
+    // reopen the input for it.
+    header: &crate::HeaderBlock,
     blob_meta: &[BlobMeta],
     coord_payloads_reader: &super::coord_payloads::ConcurrentBlobLocationRouter,
     per_way_rcs: &super::coord_payloads::PerWayRcs,
@@ -170,18 +173,11 @@ pub(super) fn stage4_assembly(
     let WriteOptions {
         compression,
         backend,
-        direct_reads: direct_io,
         ..
     } = *write;
     // Build the blob schedule from the shared metadata scan.
     crate::debug::emit_marker("EXTJOIN_S4_SCHEDULE_START");
     let t_schedule = crate::counters::Stopwatch::start();
-
-    // Also read the header for the writer (need a regular BlobReader for this).
-    let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
-    let header_blob = header_reader.leading_header()?;
-    let header = header_blob.to_headerblock()?;
-    drop(header_reader);
 
     let mut schedule: Vec<BlobDescriptor> = Vec::new();
     let mut way_sidecar_idx: usize = 0;
@@ -279,7 +275,7 @@ pub(super) fn stage4_assembly(
     let mut writer = writer_from_header(
         output,
         compression,
-        &header,
+        header,
         &super::super::altw_output_facts(inject_prepass),
         overrides,
         backend,

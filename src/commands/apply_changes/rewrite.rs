@@ -6,13 +6,11 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use rustc_hash::FxHashMap;
 
-use crate::blob::{BlobKind, decode_blob_to_headerblock};
-use crate::file_reader::FileReader;
 use crate::write::WriteOptions;
 
+use crate::commands::input_front::InputFront;
 use crate::commands::output_header::{Bbox, OutputFacts, Ways};
-use crate::commands::{HeaderOverrides, require_indexdata, writer_from_header_bytes};
-use crate::read::raw_frame::read_raw_frame;
+use crate::commands::{HeaderOverrides, writer_from_header_bytes};
 
 use super::descriptor::{DrainItem, Route};
 use super::diff_ranges::DiffRanges;
@@ -135,26 +133,6 @@ fn build_header_bytes(
     Ok(crate::commands::output_header::build_one(header, &facts, overrides, host)?.bytes)
 }
 
-fn read_header(
-    base_pbf: &Path,
-    direct_io: bool,
-    locations_on_ways: bool,
-    overrides: &HeaderOverrides,
-    host: &crate::host::Host,
-) -> Result<Vec<u8>> {
-    let mut reader = FileReader::open(base_pbf, direct_io)?;
-    let mut offset: u64 = 0;
-    // The header is the first frame; a later one is refused by the decoder.
-    match read_raw_frame(&mut reader, &mut offset, host, base_pbf)? {
-        Some(frame) if frame.blob_type == BlobKind::OsmHeader => {
-            let header = decode_blob_to_headerblock(frame.blob_bytes())?;
-            build_header_bytes(&header, locations_on_ways, overrides, host)
-                .map_err(|e| e.locate(crate::error::Location::in_file(base_pbf)))
-        }
-        _ => Err(crate::error::new_missing_header(base_pbf)),
-    }
-}
-
 /// Apply an OSC diff to a base PBF, producing an updated sorted PBF.
 ///
 /// Descriptor-first streaming pipeline: scanner walks blob headers via
@@ -240,9 +218,15 @@ pub(crate) fn merge_to(
     // kind is not known until decompress), which defeats the node-to-way
     // barrier that gates the worker pool until the node-coord loc_map is
     // published. So with `-l` an unindexed base is always refused here.
-    require_indexdata(
-        base_pbf,
-        direct_io,
+    //
+    // One open answers both the indexdata question and the header, in that
+    // order, so a forced run's Note and the missing-indexdata refusal still
+    // precede a header decode failure. `merge_header_read_ms` therefore
+    // times the whole front read: the open, the header frame, the probe to
+    // the first data blob's header and the decode, not the header alone.
+    let header_start = std::time::Instant::now();
+    let mut front = InputFront::open(base_pbf, direct_io, host)?;
+    front.require_indexdata(
         force,
         "base PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed to classify elements (significantly slower).",
@@ -253,8 +237,9 @@ pub(crate) fn merge_to(
     // LocationsOnWays) come before the OSC is parsed: the header read
     // happens either way, so ordering it first costs nothing and keeps a
     // multi-minute OSC parse from preceding a refusal it cannot change.
-    let header_start = std::time::Instant::now();
-    let header_bytes = read_header(base_pbf, direct_io, locations_on_ways, overrides, host)?;
+    let header_bytes = build_header_bytes(front.header()?, locations_on_ways, overrides, host)
+        .map_err(|e| e.locate(crate::error::Location::in_file(base_pbf)))?;
+    drop(front);
     let header_read_ms = header_start
         .elapsed()
         .as_millis()
@@ -361,6 +346,16 @@ pub(crate) fn merge_to(
     // the input has to stay open past the point this function returns from the
     // call. This used to be a bare `RawFd` kept alive by a `_copy_fd_file`
     // binding whose only job was to not be dropped.
+    //
+    // The base is opened again by the scanner's header walker
+    // (`FADV_RANDOM`) and once for the whole worker pool (plain preads of
+    // candidate bodies), besides this plain splice source. Those are
+    // separate open file descriptions on purpose: fadvise advice and
+    // readahead state live on the description, so sharing one would put
+    // the walker's RANDOM advice on the workers' body reads. Each open
+    // resolves the path again, so a base replaced on disk between them is
+    // not detected; keeping the descriptions separate while closing that
+    // gap needs an identity check on each later open, not one shared file.
     let input_file = crate::read::input::InputFile::open(base_pbf)?;
     let splice = backend.supports_copy_range();
 

@@ -264,6 +264,53 @@ The judgement calls already known, to be checked first:
     whose `FaultPlan::sync_calls` counts the fsyncs, which made the
     writer, file-writer and publication fsync tests exact (they now run
     only under `test-hooks`, i.e. the `all` sweep).
+- Input preconditions read through one front read
+  (`src/commands/input_front.rs`, `InputFront`): one `FileReader` open
+  (direct I/O honoured) reads the header frame, decodes the header only when
+  asked and probes to the first data blob's header only when asked, so each
+  caller keeps its refusal order. Apply-changes lost its second open
+  (`require_indexdata` plus `read_header`), altw its `auto_select_backend`
+  `ElementReader` and `BlobReader`, the explicit-sparse hint reader, the
+  external path's `require_indexdata` and `is_sorted` reader and stage 4's
+  header `BlobReader` (the header is handed down), diff, derive and
+  `check --ids` their second open each; inspect and bench-write dropped the
+  probe opens whose only job was the missing-header error, and each scan
+  refuses a header-less file itself (`BlobReader::leading_header` became
+  public for bench-write; an `altw auto` row joined the input contract).
+  Judgement calls, none measured:
+  - Argued below noise, not nil: each removed front open re-read the
+    file's prefix (the header frame and the frame headers up to the first
+    data blob) from a description closed straight after, mostly right after
+    another probe had read it; stage 4's removed header read came after
+    stages 1 to 3, so its pages were not necessarily cached, and it no
+    longer DONTNEEDs them under the eviction policy.
+  - Auto selection now judges indexed from the first OsmData blob (the hint
+    every backend's own check reads) instead of the frame right after the
+    header, so a header-only file is "indexed=true" in its note and an
+    extension frame before the data no longer decides; it no longer reads
+    or validates that blob's payload.
+  - Apply-changes and altw read the header payload into memory before the
+    indexdata verdict (the old probe skipped it); `merge_header_read_ms` now
+    times the whole front read, probe included.
+  - Inspect's index-only path no longer refuses `direct_io = true` in a
+    library build without `linux-direct-io` (the CLI refuses the flag at
+    parse time there), and its `inspect.direct_io_ignored` note now follows
+    the header decode. Bench-write reports a header-less file whose first
+    data blob's PrimitiveBlock is malformed as missing header, not the
+    decode error; a truncated payload or malformed Blob envelope in that
+    first frame still wins, as it did through the old probe (which read and
+    decoded the first blob before judging its type). Inspect's in-scan
+    guards judge the frame type before parsing the Blob envelope, so a
+    header-less file whose first data frame has a malformed envelope, bad
+    compressed data or a malformed PrimitiveBlock is now missing header in
+    both scans, where the old probe reported that error; a truncated first
+    payload still reports truncation. So for a malformed first envelope
+    bench-write and inspect now differ. The missing-header contract
+    supports the new verdicts.
+  - Separate descriptions stay where they were (walker `FADV_RANDOM`,
+    worker pools, the splice source): sharing one would merge advice and
+    readahead state. Comments at apply-changes' opens, renumber's schedule
+    walk and multi-extract's walk say so.
 
 ---
 
@@ -898,30 +945,6 @@ not as a sweep.
 
 Reported by: all nine scopes.
 
-## HYG-078 - Inputs are opened and their headers read several times per run
-
-Anger: 8 - open the input once in altw and apply-changes.
-
-Altw checks sorted and indexed preconditions through four separate opens
-(`auto_select_index_type` opens an `ElementReader` and a `BlobReader`, the
-explicit-sparse hint another `ElementReader`, `external_join` calls
-`require_indexdata` and opens another for `is_sorted`, stage 4 a `BlobReader`
-for the header), each with its own failure message. Apply-changes opens the
-base PBF five times by path (`require_indexdata`, `read_header`, `File::open`
-for copy, `HeaderWalker::open`, `run_workers`), so a file replaced mid-run gives
-mixed reads. Renumber opens and parses the header twice in a row. `multi.rs`
-reads the header via `BlobReader` and again via `HeaderWalker`, and the first
-decides sortedness. `inspect`, `bench-write`, `renumber` and `diff` also open
-a reader (or run a probe) whose only job is to make a header-less file fail
-with the missing-header error before the scan proper, which would otherwise
-read it as empty. Fix: open once and hand the `File` and parsed header down
-(for altw, a plan that opens the input once, checks every option combination
-that depends on it and the scratch filesystem, and chooses the backend; the
-input-free combinations are already refused by `AltwOptions::validate`).
-
-Reported by: altw and scanning, change application, re-encoding, filtering and
-spatial.
-
 ## HYG-081 - The apply-changes node-to-way barrier is a three-party protocol held together by polling
 
 Anger: 10 - rewrites apply-changes' barrier.
@@ -1116,3 +1139,30 @@ value feeds two counters, and no new atomic on a single-threaded consumer.
 A source scan could then forbid `as i64` inside `emit_counter(` calls.
 
 Reported by: the HYG-024 implementation.
+
+## HYG-151 - Every pass reopens its input by path, so a replaced input gives mixed reads
+
+Anger: 8 - an input-handle contract across every multi-pass command.
+
+Every multi-pass command takes `&Path` and opens the input once per pass or
+per access pattern: apply-changes four times (front read, scanner walker,
+worker pool, splice source), altw once per pass and stage, and likewise
+sort, extract, tags-filter, getid, getparents, renumber, cat and geocode.
+Each open resolves the path again, so a file renamed over the input mid-run
+(an atomic replace by a downloader, say) is read partly from each inode:
+the header and schedule from one, blob bodies or `copy_file_range` splices
+from the other, with no error. Sharing one descriptor is not the fix:
+`posix_fadvise` advice and readahead state belong to the open file
+description, and the separations are deliberate (the header walker's
+`FADV_RANDOM` must not reach worker body preads; see the comments at
+apply-changes' opens). The fix that keeps them is an identity anchor: the
+first open records `(st_dev, st_ino)`, and every later open of the same
+input is verified against it with `fstat` after opening (a check of the path
+before opening races), refusing a different inode with a typed error. That
+needs a per-run input handle passed down in place of `&Path`; the `Host` is
+the wrong owner, since a library caller may reuse one across runs between
+which replacing the file is legitimate. An identity check does not catch an
+in-place rewrite of the same inode (truncate and write), which nothing short
+of a snapshot does; the entry is about replacement consistency only.
+
+Reported by: the HYG-078 resolution.

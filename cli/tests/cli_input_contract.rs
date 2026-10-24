@@ -296,6 +296,7 @@ const ROWS: &[Row] = &[
     row("extract", "extract --config", extract_config),
     row("add-locations-to-ways", "altw", altw),
     row("add-locations-to-ways", "altw external", altw_external),
+    row("add-locations-to-ways", "altw auto", altw_auto),
     row("time-filter", "time-filter", time_filter),
     row("time-filter", "time-filter (history)", time_filter_history),
     row("apply-changes", "apply-changes", apply_changes),
@@ -549,6 +550,10 @@ fn altw(c: &Ctx, input: &Path) -> Invocation {
 
 fn altw_external(c: &Ctx, input: &Path) -> Invocation {
     altw(c, input).words(&["--index-type", "external"])
+}
+
+fn altw_auto(c: &Ctx, input: &Path) -> Invocation {
+    altw(c, input).words(&["--index-type", "auto"])
 }
 
 fn time_filter(c: &Ctx, input: &Path) -> Invocation {

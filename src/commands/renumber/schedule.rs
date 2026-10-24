@@ -62,6 +62,14 @@ pub(super) fn build_all_blob_schedules(
     input: &Path,
     host: &crate::host::Host,
 ) -> Result<(Vec<BlobTask>, Vec<BlobTask>, Vec<BlobTask>)> {
+    // Its own open, on purpose: this walk's descriptor carries FADV_RANDOM,
+    // which must not reach the workers' shared body descriptor, and the
+    // caller's header reader (which established that the file opens with an
+    // OsmHeader and is sorted) is a sequential read, O_DIRECT under direct
+    // I/O, already closed. The walk
+    // starts at the beginning and consumes the leading frame itself; the
+    // walker would accept a data blob there, so the leading-header contract
+    // is the caller's earlier read, not this check.
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     drop(
         walker

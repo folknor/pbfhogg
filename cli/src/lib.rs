@@ -4638,14 +4638,19 @@ fn bench_write_loop<W: std::io::Write>(
     use pbfhogg::block_builder::{BlockBuilder, MemberData};
     use std::io::BufReader;
 
-    // The leading OsmHeader is required like everywhere else: a zero-byte or
-    // header-less file is the one missing-header error, not an empty run.
-    drop(pbfhogg::ElementReader::open(path, false)?);
     // The same default-capacity BufReader this benchmark has always read
     // through, named so its errors carry the file and byte offset.
-    let reader = pbfhogg::BlobReader::new_named(BufReader::new(open_input(path)?), path)
+    let mut reader = pbfhogg::BlobReader::new_named(BufReader::new(open_input(path)?), path)
         .diagnostics(host.diagnostics.clone())
         .cancel(host.cancel.clone());
+    // The leading OsmHeader is required like everywhere else: a zero-byte or
+    // header-less file is the one missing-header error, not an empty run.
+    // Taken from this pass's own reader rather than a second open, and
+    // decoded so a corrupt header still fails before any data blob.
+    let header = reader.leading_header()?;
+    header
+        .decode()
+        .map_err(|e| header.locate_error(Some(&std::sync::Arc::from(path)), e))?;
     let mut bb = BlockBuilder::new();
     let mut nodes = 0u64;
     let mut ways = 0u64;

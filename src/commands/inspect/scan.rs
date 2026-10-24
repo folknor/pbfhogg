@@ -58,8 +58,7 @@ fn inspect_inner(
     host: &crate::host::Host,
 ) -> Result<InspectReport> {
     // A zero-byte or header-less file is the one missing-header error, not an
-    // empty report; neither scan below insists on a leading header itself.
-    drop(crate::ElementReader::open_in(path, opts.direct_io, host)?);
+    // empty report: each scan below refuses it itself, from its own read.
     // Index-only fast path: skip decompression when all blobs have indexdata.
     // --locations and --extended require per-element data, so they need full decode.
     if !opts.show_locations
@@ -112,24 +111,14 @@ fn try_index_only_scan(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<Option<InspectReport>> {
-    if direct_io {
-        crate::host::diag!(
-            host.diagnostics,
-            Note,
-            "inspect.direct_io_ignored",
-            "direct I/O is not used on the index-only fast path; \
-             HeaderWalker avoids page-cache pollution via \
-             posix_fadvise(POSIX_FADV_RANDOM). If any blob lacks indexdata \
-             this scan falls back to full decode and uses direct I/O there."
-        );
-    }
-    let meta = crate::read::input::metadata(path)?;
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
 
     let mut walker = HeaderWalker::open(path, host)?;
+    let file_size = walker.file_size();
+    let mut saw_header = false;
     let mut header_meta = HeaderMeta::default();
     let mut data_buf: Vec<u8> = Vec::new();
 
@@ -139,11 +128,33 @@ fn try_index_only_scan(
     let mut total_data_blobs = 0u64;
 
     while let Some(header) = walker.next_header()? {
+        // The walker refuses a second OsmHeader but not a missing first
+        // one; this scan is the file's only reader, so it refuses that.
+        if !saw_header && header.blob_type != BlobKind::OsmHeader {
+            return Err(crate::error::new_missing_header(path));
+        }
         match header.blob_type {
             BlobKind::OsmHeader => {
-                walker.pread_data(header.data_offset, header.data_size, &mut data_buf)?;
-                let block = decode_blob_to_headerblock(&data_buf)?;
+                walker
+                    .pread_data(header.data_offset, header.data_size, &mut data_buf)
+                    .map_err(|e| walker.locate_meta(&header, e))?;
+                let block = decode_blob_to_headerblock(&data_buf)
+                    .map_err(|e| walker.locate_meta(&header, e))?;
                 header_meta = extract_header_metadata(&block);
+                saw_header = true;
+                // Only once the header has decoded, so the note never
+                // precedes a refusal of the file itself.
+                if direct_io {
+                    crate::host::diag!(
+                        host.diagnostics,
+                        Note,
+                        "inspect.direct_io_ignored",
+                        "direct I/O is not used on the index-only fast path; \
+                         HeaderWalker avoids page-cache pollution via \
+                         posix_fadvise(POSIX_FADV_RANDOM). If any blob lacks indexdata \
+                         this scan falls back to full decode and uses direct I/O there."
+                    );
+                }
             }
             BlobKind::OsmData => {
                 total_data_blobs += 1;
@@ -165,10 +176,14 @@ fn try_index_only_scan(
             }
         }
     }
+    // A zero-byte file (or one too short for a frame) yields no frame.
+    if !saw_header {
+        return Err(crate::error::new_missing_header(path));
+    }
 
     Ok(Some(InspectReport {
         file_name,
-        file_size: meta.len(),
+        file_size,
         header_meta,
         is_indexed: true,
         total_blocks: total_data_blobs,
@@ -275,13 +290,14 @@ fn full_decode_scan(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<InspectReport> {
-    let meta = crate::read::input::metadata(path)?;
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
 
     let mut reader = FileReader::open(path, direct_io)?;
+    let meta = crate::read::input::metadata(path)?;
+    let mut saw_header = false;
     let mut offset = 0u64;
     let mut decompress_buf = Vec::new();
     let mut header_meta = HeaderMeta::default();
@@ -297,10 +313,24 @@ fn full_decode_scan(
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
     while let Some(frame) = read_raw_frame(&mut reader, &mut offset, host, path)? {
+        // This scan is the file's only reader: it refuses a file that does
+        // not open with an OsmHeader itself.
+        if !saw_header && frame.blob_type != BlobKind::OsmHeader {
+            return Err(crate::error::new_missing_header(path));
+        }
         match frame.blob_type {
             BlobKind::OsmHeader => {
-                let header = decode_blob_to_headerblock(frame.blob_bytes())?;
+                let header = decode_blob_to_headerblock(frame.blob_bytes()).map_err(|e| {
+                    // The header is blob 0: the frame reader refuses a
+                    // later one.
+                    e.locate(crate::error::Location::new(
+                        Some(&std::sync::Arc::from(path)),
+                        Some(0),
+                        Some(crate::ByteOffset(frame.file_offset)),
+                    ))
+                })?;
                 header_meta = extract_header_metadata(&header);
+                saw_header = true;
             }
             BlobKind::OsmData => {
                 total_data_blobs += 1;
@@ -320,6 +350,10 @@ fn full_decode_scan(
             }
             BlobKind::Unknown(_) => {}
         }
+    }
+    // A zero-byte file yields no frame.
+    if !saw_header {
+        return Err(crate::error::new_missing_header(path));
     }
 
     let is_indexed = total_data_blobs > 0 && indexed_blobs == total_data_blobs;

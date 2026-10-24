@@ -21,11 +21,11 @@
 
 use std::path::Path;
 
-use crate::ElementReader;
 use crate::write::WriteOptions;
 
 use super::Stats;
-use crate::commands::{HeaderOverrides, require_indexdata};
+use crate::commands::HeaderOverrides;
+use crate::commands::input_front::InputFront;
 use crate::error::Result;
 
 mod blob_bucket_index;
@@ -633,8 +633,10 @@ pub fn external_join(
     scratch: crate::scratch::RunScratch,
 ) -> Result<Stats> {
     host.cancel.check()?;
+    let front = InputFront::open(input, write.direct_reads, host)?;
     let result = external_join_in(
         input,
+        front,
         &output,
         keep_untagged_nodes,
         write,
@@ -698,6 +700,7 @@ mod slot_layout_tests {
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) fn external_join_in(
     input: &Path,
+    mut front: InputFront<'_>,
     output: &crate::output::Output,
     keep_untagged_nodes: bool,
     write: &WriteOptions,
@@ -707,9 +710,10 @@ pub(crate) fn external_join_in(
     scratch: &crate::scratch::RunScratch,
 ) -> Result<Stats> {
     let (direct_io, force) = (write.direct_reads, write.force);
-    let has_indexdata = require_indexdata(
-        input,
-        direct_io,
+    // `front` is the caller's one read of the input's preconditions; it
+    // answers the indexdata and sortedness refusals here and supplies the
+    // header stage 4 writes from.
+    let has_indexdata = front.require_indexdata(
         force,
         "external join requires indexdata for efficient blob filtering",
         host,
@@ -733,15 +737,13 @@ pub(crate) fn external_join_in(
         .locate(crate::error::Location::in_file(input)));
     }
 
-    {
-        let reader = ElementReader::open_in(input, direct_io, host)?;
-        crate::commands::require_sorted(
-            reader.header().is_sorted(),
-            input,
-            "Input PBF",
-            "The external join's single-pass node merge depends on ascending node ID order.",
-        )?;
-    }
+    let header = front.into_header()?;
+    crate::commands::require_sorted(
+        header.is_sorted(),
+        input,
+        "Input PBF",
+        "The external join's single-pass node merge depends on ascending node ID order.",
+    )?;
 
     let ref_count_sidecar = scratch.file("way-ref-counts")?;
     let per_way_refcount_sidecar = scratch.file("per-way-refcounts")?;
@@ -1058,6 +1060,7 @@ pub(crate) fn external_join_in(
     let router_ref = &router;
     let per_way_rcs_ref = &per_way_rcs;
     let blob_meta_ref = &blob_meta;
+    let header_ref = &header;
     let way_slot_starts_ref = way_slot_starts.as_slice();
     let rel_ids_ref = relation_member_node_ids
         .as_ref()
@@ -1100,6 +1103,7 @@ pub(crate) fn external_join_in(
             stage4_assembly(
                 input,
                 output,
+                header_ref,
                 blob_meta_ref,
                 router_ref,
                 per_way_rcs_ref,

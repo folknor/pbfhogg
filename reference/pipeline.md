@@ -301,8 +301,11 @@ whose first data blob is indexed always gets an estimate. If the budget is
 unknown, sorted and indexed inputs fall back to external, and the auto-select
 note says which estimate was missing. Unsorted or unindexed inputs always
 select sparse, since external cannot run on them. Whether the input is
-indexed is read from the first data blob's indexdata; an unreadable or malformed blob there is an input error,
-not a reason to pick sparse. This runtime rule follows the measured
+indexed is read from the first data blob's indexdata, the same hint the
+backends' own indexdata check reads, so a header-only file counts as indexed
+and frames before the first data blob are skipped. An unreadable or malformed
+frame header up to there is an input error, not a reason to pick sparse; the
+data blob payloads are not read by the selection. This runtime rule follows the measured
 store-versus-cache behavior documented in [performance.md](performance.md).
 
 Sparse, not auto, is the default, and the docs recommend neither over the

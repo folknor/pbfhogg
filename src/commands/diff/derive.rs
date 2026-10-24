@@ -13,6 +13,7 @@ use quick_xml::Writer;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 
 use crate::ElementKind;
+use crate::commands::input_front::sorted_and_indexed;
 use crate::error::{Error, Result};
 use crate::osc::merge_join::{
     BlockMergeAction, BlockPairMergeState, StreamingBlocks, block_pair_merge_phase,
@@ -108,9 +109,9 @@ pub(crate) fn derive_changes_to(
     // The name rule every OSC producer shares, applied before any work.
     crate::osc::output_is_gzip(output.destination())?;
     let jobs = super::resolve_shards(parallelism, host);
-    // Single-pass: check sorted headers + indexdata from one file open each.
-    let (old_sorted, old_indexed) = super::check_sorted_and_indexed(old_path, direct_io, host)?;
-    let (new_sorted, new_indexed) = super::check_sorted_and_indexed(new_path, direct_io, host)?;
+    // Sorted headers + indexdata from one front read of each input.
+    let (old_sorted, old_indexed) = sorted_and_indexed(old_path, direct_io, host)?;
+    let (new_sorted, new_indexed) = sorted_and_indexed(new_path, direct_io, host)?;
     crate::commands::require_sorted(
         old_sorted,
         old_path,

@@ -264,6 +264,10 @@ pub(super) fn run_workers(
 
     crate::debug::emit_marker("MERGE_STREAMING_START");
 
+    // One plain description for the whole pool, separate from the scanner
+    // walker's FADV_RANDOM one and the drain's splice source: advice and
+    // readahead state are per description (see the copy-input comment in
+    // `rewrite::merge_to`).
     let shared_file = match crate::read::input::open(&base_pbf) {
         Ok(file) => file,
         Err(e) => {

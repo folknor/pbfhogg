@@ -93,3 +93,20 @@ building a `PrimitiveBlock` validates, not metadata arithmetic done later
 during decode.
 
 Reported by: the extract passthrough fix.
+
+## BUG-152 - `bench-read --mode blobreader` reads a header-less file as data
+
+Anger: 3 - a synthetic benchmark command.
+
+The `blobreader` arm of `run_bench_read` (`cli/src/lib.rs`) iterates
+`BlobReader::from_path` directly: a zero-byte file prints zero counts and
+exits 0, and a file that opens with a data blob is counted, where every other
+command (and the other three bench-read modes, through `ElementReader`) gives
+the missing-header error. The input contract's `bench-read` row runs the
+default mode only, so nothing catches it. Fix: take
+`BlobReader::leading_header` (now public) and decode it, as bench-write
+does. Bench-read starts its timer after opening the reader, so taking the
+header there moves one header decode out of the timed region (bench-write
+times it).
+
+Reported by: the HYG-078 resolution.

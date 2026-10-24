@@ -391,7 +391,7 @@ where
     let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead.get());
     let (decoded_tx, decoded_rx) = sync_channel::<DecodedItem>(pipeline_config.decode_ahead.get());
 
-    std::thread::scope(|scope| {
+    let result = std::thread::scope(|scope| {
         // Stage 1: Sequential I/O reader thread
         scope.spawn(move || {
             for (seq, blob_result) in blob_reader.enumerate() {
@@ -513,19 +513,22 @@ where
         // Drop the original so the channel closes when all rayon task clones are done
         drop(decoded_tx);
 
-        let result = drain_decoded(
+        drain_decoded(
             decoded_rx,
             pipeline_config.decode_ahead.get(),
             &cancel,
             &mut block_fn,
-        );
-
-        // Emit reader-pipeline counters before returning so that even
-        // an error path produces sidecar data. Process-wide pool-drop
-        // totals are emitted separately by the host after dispatch.
-        PIPELINE_METRICS.emit();
-        result
-    })
+        )
+    });
+    // After the scope has joined every stage, on every returning path (a
+    // stage thread's panic re-raised by the scope emits nothing), so the
+    // snapshot includes the waits recorded while the stages shut down
+    // (an error, a cancellation or an early drop wakes blocked senders,
+    // which record their waits after the consumer has returned).
+    // Process-wide pool-drop totals are emitted separately by the host
+    // after dispatch.
+    PIPELINE_METRICS.emit();
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -569,7 +572,7 @@ where
         pipeline_config.decode_ahead.get(),
     );
 
-    std::thread::scope(|scope| {
+    let result = std::thread::scope(|scope| {
         scope.spawn(move || {
             for (seq, blob_result) in blob_reader.enumerate() {
                 unindexed.observe(&blob_result, &diagnostics);
@@ -691,15 +694,16 @@ where
             });
         });
         drop(decoded_tx);
-        let result = drain_fused(
+        drain_fused(
             decoded_rx,
             pipeline_config.decode_ahead.get(),
             &cancel,
             &mut consume,
-        );
-        PIPELINE_METRICS.emit();
-        result
-    })
+        )
+    });
+    // After the join, as in `run_pipeline`.
+    PIPELINE_METRICS.emit();
+    result
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::type_complexity)]

@@ -11,8 +11,8 @@ implementations behind the `OutputSink` boundary. We do not collapse them
 into one buffering-and-alignment core parameterized by submit strategy.
 What they must share, they share explicitly and by name: the
 `SeqTotal`/`check_stream_complete` end-of-stream handshake, the
-`PermitGuard` write-ahead discipline, `WriterMetrics::record_sync_all` and
-`record_recv_wait`, and the `flush`-versus-`sync` split. Adding a fifth
+`PermitGuard` write-ahead discipline, `WriterMetrics::sync_recorded` (the
+one recorded fsync) and `record_recv_wait`, and the `flush`-versus-`sync` split. Adding a fifth
 backend, or changing any of those four shared contracts, is the trigger to
 revisit this.
 

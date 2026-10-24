@@ -235,6 +235,35 @@ The judgement calls already known, to be checked first:
     static; its six pool-drop fields moved to a second static,
     `DECOMPRESS_POOL_METRICS`, still emitted only through
     `emit_decompress_pool_counters` from the exit hook.
+- Per-run ownership of `PIPELINE_METRICS` and `WRITER_METRICS` was
+  adjudicated against: the sidecar reads both as process totals
+  (`--stalls` takes the maximum of each monotonic `*_wait_ns`), so per-run
+  emission would undercount multi-pass processes and per-run instances
+  folded back into a total would change nothing observable; the reasons
+  are in `pipeline_metrics.rs`, beside `WRITER_METRICS`, in
+  `reference/pipelined-reader-paths.md` and `reference/testing.md`.
+  Changes made instead, none measured:
+  - Both read engines emit `PIPELINE_METRICS` after `thread::scope` has
+    joined instead of inside it, so waits recorded while stages shut down
+    on an error, cancellation or early drop are in the snapshot. One emit
+    per pipelined read either way; a stage panic re-raised by the scope now
+    emits nothing (it used to emit, then panic).
+  - `WriterMetrics::sync_recorded` is now the crate's only output fsync:
+    `sync_file` (buffered, also `to_path_sync`'s finalizer),
+    `DirectWriter::sync_all`, the `pwrite` pool and io_uring call it, and
+    `record_sync_all` became private. The parallel and io_uring durable
+    syncs now count a failed fsync (they returned before recording); the
+    timed span of `FileWriter::sync` and of `to_path_sync`'s finalizer
+    shrank to the fsync itself (the buffered `EINVAL` fstat now falls
+    outside it).
+  - `with_sync_observer(&Cancel, f)` wraps `FileOutputSink::flush`, the
+    `pwrite` pool's durable sync, io_uring's `flush_final`,
+    `PbfWriter::flush`'s synchronous finalizer and the three `publish`
+    methods. Without `test-hooks` it is an `#[inline(always)]` `f()`;
+    argued codegen-neutral. With it, a thread-local selects the token
+    whose `FaultPlan::sync_calls` counts the fsyncs, which made the
+    writer, file-writer and publication fsync tests exact (they now run
+    only under `test-hooks`, i.e. the `all` sweep).
 
 ---
 
@@ -476,12 +505,8 @@ ADR `0014-output-backends-stay-separate` argues against unifying backends, but
 the loop is not backend logic; uring could be an `OutputSink` whose
 `write_chunk` does the opportunistic `reap_cqes(false)`. Meanings have
 diverged: `writer_write_ns` is wall time on the writer thread for buffered and
-uring, summed across 16 pool threads for parallel; parallel counts
-`writer_bytes_written` at dispatch, others after the write; and
-`writer_sync_all_calls` / `_ns` count a failed fsync on the publication path
-(`WriterMetrics::sync_recorded` records success or failure) but not in the
-parallel and uring writers, whose `file.sync_all()?` returns before
-`record_sync_all`. Fix: `writer_thread<S: OutputSink>`
+uring, summed across 16 pool threads for parallel; and parallel counts
+`writer_bytes_written` at dispatch, others after the write. Fix: `writer_thread<S: OutputSink>`
 as the only loop with an `on_idle()` hook; a source-scan test that only
 `pipeline.rs` calls `pop_ready()` under `src/write/`.
 
@@ -725,34 +750,6 @@ deltas).
 
 Reported by: write path, read path, CLI and plumbing, filtering and spatial,
 re-encoding, altw and scanning.
-
-## HYG-051 - Per-run metrics live in process-global statics
-
-Anger: 8 - counter machinery and semantics.
-
-`PIPELINE_METRICS` is a `static` never reset, and `emit()` runs at the end of
-every `run_pipeline` / `run_pipeline_fused`: a command running two pipelines
-sequentially emits cumulative counters twice (the second includes the first
-pass's waits and counts, high-water marks are max over the process); two
-concurrent pipelines (`into_blocks_pipelined` on two files, `diff`) add into
-the same atomics; `par_map_reduce` and sequential `for_each` emit nothing, so
-the sidecar has no read-side counters for commands built on them. An early
-`PipelinedBlocks` drop returns "pipeline consumer dropped" as an `Err`, so a
-normal early exit runs the error path and emits like a failed run.
-`WRITER_METRICS` is written from every layer and emitted once by `main` after
-dispatch (per-flush emission double-counted), so a library consumer or a test
-running two commands gets cumulative totals; the writer tests
-`end_of_stream_finalization_still_fsyncs` and
-`flush_pushes_bytes_onward_without_fsyncing` assert on deltas of a global that
-concurrent tests also bump, with bounds "loose enough to tolerate" it.
-`Instant::now()` is called directly at about 25
-write-path and 60 altw sites for these, which is part of why none can be
-asserted deterministically. Fix: a metrics value owned by each run or writer
-(`Arc` handed to stages), emitted with a pass label or returned in stats.
-Enforce with a test running two pipelines and asserting the second emit is not
-cumulative.
-
-Reported by: read path, write path, CLI and plumbing, altw and scanning.
 
 ## HYG-053 - Reorder buffers are bounded only statistically
 
@@ -1109,7 +1106,8 @@ repack, merge-changes, tags-filter, sort, cat, diff and derive, extract
 common, smart and multi, getid, getparents, time-filter, geocode pass 1.5,
 `scan/classify.rs`), which need only the cast dropped - never a new atomic.
 Raw `elapsed().as_millis()` / `as_nanos()` conversions remain in the
-geocode builder, check refs and renumber's `emit_elapsed_ms`.
+geocode builder, check refs, renumber's `emit_elapsed_ms` and the CLI's
+`run_bench_read` (raw `Instant` and `as_millis`).
 Renumber's `StageCounters` builds its names with `format!` from a prefix,
 so its sidecar names are not greppable verbatim. Every one sits on a
 measured path, so each move owes the same care the altw move did: no

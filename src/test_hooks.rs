@@ -124,6 +124,13 @@ pub struct FaultPlan {
     /// Items the uring writer thread has dispatched.
     pub uring_dispatch_count: AtomicU64,
 
+    // --- output fsyncs (`write::metrics::with_sync_observer`) ---
+    /// Fsyncs recorded through the writer-metrics funnel on a thread while
+    /// it observed this token: an output backend's finish (durable or
+    /// deferred) and publication. Exact per run, unlike the process-wide
+    /// `writer_sync_all_calls` total that concurrent tests also move.
+    pub sync_calls: AtomicU64,
+
     // --- pipelined `PbfWriter` framing (`write::writer`) ---
     /// Sequence number whose framing job panics on the executor.
     pub framing_panic_at: AtomicUsize,
@@ -201,6 +208,7 @@ impl FaultPlan {
             gzip_hook_timed_out: AtomicBool::new(false),
             uring_panic_at_dispatch: AtomicU64::new(u64::MAX),
             uring_dispatch_count: AtomicU64::new(0),
+            sync_calls: AtomicU64::new(0),
             framing_panic_at: AtomicUsize::new(usize::MAX),
             refuse_output_backend: AtomicBool::new(false),
             output_backend_refusals: AtomicU64::new(0),

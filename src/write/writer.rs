@@ -88,11 +88,9 @@ fn flush_wrapped_writer<W: Write>(writer: &mut W) -> Result<()> {
 
 fn sync_buffered_file(writer: &mut BufWriter<File>) -> Result<()> {
     writer.flush()?;
-    let t_sync = crate::counters::Stopwatch::start();
-    // `sync_file` decides on the original errno before anything converts it.
-    let result = crate::write::file_writer::sync_file(writer.get_ref());
-    WRITER_METRICS.record_sync_all(t_sync);
-    Ok(result?)
+    // `sync_file` records the fsync and decides on the original errno before
+    // anything converts it.
+    Ok(crate::write::file_writer::sync_file(writer.get_ref())?)
 }
 
 /// Take one dispatch permit, blocking until one is free, and return the guard
@@ -1163,7 +1161,8 @@ impl<W: Write> PbfWriter<W> {
             }
         }
         if let Some(ref mut w) = self.writer {
-            (self.finalize_writer)(w)?;
+            let finalize = self.finalize_writer;
+            crate::write::metrics::with_sync_observer(&self.cancel, || finalize(w))?;
         }
         t_flush.record_ns(&WRITER_METRICS.flush_ns);
         // Deliberately does NOT emit the writer counters. `WRITER_METRICS` is
@@ -1717,25 +1716,41 @@ mod tests {
     /// `FileOutputSink::flush` to `self.writer.flush()` and every pipelined
     /// write silently loses its fsync with a green suite - which is precisely
     /// the "tested the producer, forgot the consumer" shape.
+    ///
+    /// Counted on the writer's own token, so exactly one fsync is required:
+    /// the process-wide total also moves with every concurrent test that
+    /// syncs, and could satisfy a weaker bound with this writer syncing
+    /// nothing. `to_path_sync`'s synchronous finalizer is held to the same.
+    #[cfg(feature = "test-hooks")]
     #[test]
     fn end_of_stream_finalization_still_fsyncs() {
-        use crate::write::metrics::WRITER_METRICS;
         use std::sync::atomic::Ordering::Relaxed;
 
         let dir = crate::path_guard::tests::scratch();
-        let path = dir.path().join("durable.osm.pbf");
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
 
-        let before = WRITER_METRICS.sync_all_calls.load(Relaxed);
+        let path = dir.path().join("durable.osm.pbf");
         let mut w =
             PbfWriter::to_path(&path, Compression::None, &header, Executor::Ambient).unwrap();
         w.write_primitive_block(&[0x12u8, 0x00]).unwrap();
         w.flush().unwrap();
-        assert!(
-            WRITER_METRICS.sync_all_calls.load(Relaxed) > before,
-            "a completed pipelined write must fsync its output; \
+        assert_eq!(
+            w.test_faults().sync_calls.load(Relaxed),
+            1,
+            "a completed pipelined write must fsync its output exactly once; \
              FileOutputSink::flush has to call FileWriter::sync, not \
              FileWriter::flush"
+        );
+
+        let path = dir.path().join("durable-sync.osm.pbf");
+        let mut w = PbfWriter::to_path_sync(&path, Compression::None).unwrap();
+        w.write_header(&header).unwrap();
+        w.write_primitive_block(&[0x12u8, 0x00]).unwrap();
+        w.flush().unwrap();
+        assert_eq!(
+            w.test_faults().sync_calls.load(Relaxed),
+            1,
+            "a completed synchronous path write must fsync its output exactly once"
         );
     }
 

@@ -88,8 +88,15 @@ NAME` list each harness in turn to find one test.
   concurrently in one process with: the global rayon pool; and
   `RLIMIT_NOFILE`, raised once per process by `common::test_host()`.
   Child processes inherit that limit. `WRITER_METRICS` and `PIPELINE_METRICS` are process-global
-  accumulators, so concurrent tests can contribute to the same totals.
-  A test that needs any of this to itself takes a target of its own.
+  accumulators by design (the sidecar reads them as process totals), so
+  concurrent tests contribute to the same totals and a delta of one
+  can be moved, either way, by another test. A test that needs one
+  run's exact count reads it from its token's fault plan instead:
+  `FaultPlan::sync_calls` for the fsyncs a run's output finish and
+  publication perform (`write::metrics::with_sync_observer`),
+  `reorder_filled_high_water` for the read pipeline's reorder bound.
+  A test that needs anything else here to itself takes a target of its
+  own.
 - **Process-wide panic hook.** The reader pipeline-death unit test temporarily
   swaps the panic hook to silence its deliberate worker panic. While the
   replacement is installed, it can also suppress panic output from another

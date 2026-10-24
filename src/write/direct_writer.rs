@@ -190,11 +190,10 @@ impl DirectWriter {
         Ok(())
     }
 
-    /// Fsync the underlying file to ensure durability. The caller records it
-    /// through the writer-metrics funnel.
-    #[allow(clippy::disallowed_methods)]
+    /// Fsync the underlying file to ensure durability, through the
+    /// writer-metrics funnel.
     pub(crate) fn sync_all(&self) -> io::Result<()> {
-        self.file.sync_all()
+        super::metrics::WRITER_METRICS.sync_recorded(&self.file)
     }
 }
 

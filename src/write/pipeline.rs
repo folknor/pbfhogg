@@ -107,8 +107,8 @@ pub(crate) trait OutputSink {
 pub(crate) struct FileOutputSink {
     writer: FileWriter,
     finish: super::Finish,
-    /// Checked between `copy_file_range` calls of a queued splice.
-    #[cfg_attr(not(feature = "linux-direct-io"), allow(dead_code))]
+    /// Checked between `copy_file_range` calls of a queued splice; observes
+    /// the finish's fsyncs for tests (`with_sync_observer`).
     cancel: crate::host::Cancel,
 }
 
@@ -187,10 +187,11 @@ impl OutputSink for FileOutputSink {
     /// A `Deferred` sink only finishes the file (for `O_DIRECT`, the tail
     /// padding and truncation); its owner syncs it.
     fn flush(&mut self) -> Result<()> {
-        match self.finish {
-            super::Finish::Durable => self.writer.sync(),
-            super::Finish::Deferred => Ok(self.writer.flush()?),
-        }
+        let (writer, finish) = (&mut self.writer, self.finish);
+        crate::write::metrics::with_sync_observer(&self.cancel, || match finish {
+            super::Finish::Durable => writer.sync(),
+            super::Finish::Deferred => Ok(writer.flush()?),
+        })
     }
 }
 

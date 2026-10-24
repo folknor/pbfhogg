@@ -66,25 +66,21 @@ impl FileWriter {
     /// `fsync` error, `EINVAL` included.
     pub fn sync(&mut self) -> crate::Result<()> {
         self.flush()?;
-        let t_sync = crate::counters::Stopwatch::start();
         let result = match self {
             FileWriter::Buffered(w) => sync_file(w.get_ref()),
             #[cfg(feature = "linux-direct-io")]
             FileWriter::Direct(w) => w.sync_all(),
         };
-        WRITER_METRICS.record_sync_all(t_sync);
         Ok(result?)
     }
 }
 
-/// `fsync` a buffered output, treating "this target does not support
-/// synchronization" as success. Only consulted after `sync_all` has already
-/// failed, so the regular-file success path is exactly one `fsync`.
+/// `fsync` a buffered output through the writer-metrics funnel, treating
+/// "this target does not support synchronization" as success. The file type
+/// is only consulted after the `fsync` has already failed, so the
+/// regular-file success path is exactly one `fsync`.
 pub(super) fn sync_file(file: &File) -> io::Result<()> {
-    // The buffered backend's durability; callers record it through the
-    // writer-metrics funnel.
-    #[allow(clippy::disallowed_methods)]
-    let synced = file.sync_all();
+    let synced = WRITER_METRICS.sync_recorded(file);
     match synced {
         Err(e) if sync_unsupported(e.raw_os_error(), || file_type(file)) => Ok(()),
         other => other,
@@ -197,8 +193,11 @@ impl Write for FileWriter {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{FileWriter, WRITER_METRICS};
+    use super::FileWriter;
+    #[cfg(feature = "test-hooks")]
+    use crate::write::metrics::with_sync_observer;
     use std::io::Write;
+    #[cfg(feature = "test-hooks")]
     use std::sync::atomic::Ordering::Relaxed;
 
     /// `Write::flush` must push bytes onward, and must not `fsync`.
@@ -206,27 +205,30 @@ mod tests {
     /// `FileWriter::flush` used to call `sync_all()`, so every incidental
     /// flush - a wrapping `BufWriter`, a generic helper, a library consumer
     /// following `Write` semantics - bought a full fsync. The loop below is
-    /// exactly that kind of caller. The bound is deliberately loose enough to
-    /// tolerate an unrelated `sync()` from a concurrent test and still bite:
-    /// if `flush` synced, the delta would be at least one per iteration.
+    /// exactly that kind of caller. The fsyncs are counted on this test's own
+    /// token (`with_sync_observer`), so the counts are exact; the process
+    /// total in `WRITER_METRICS` moves with every concurrent test that syncs.
+    #[cfg(feature = "test-hooks")]
     #[test]
     fn flush_pushes_bytes_onward_without_fsyncing() {
         let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("flush-is-not-fsync.bin");
         let mut w = FileWriter::buffered(&path).unwrap();
+        let token = crate::host::Cancel::new();
+        let syncs = || token.faults().sync_calls.load(Relaxed);
 
         const FLUSHES: usize = 64;
-        let before = WRITER_METRICS.sync_all_calls.load(Relaxed);
-        for i in 0..FLUSHES {
-            w.write_all(&[u8::try_from(i % 256).unwrap()]).unwrap();
-            w.flush().unwrap();
-        }
-        let after_flushes = WRITER_METRICS.sync_all_calls.load(Relaxed);
-        assert!(
-            after_flushes - before < FLUSHES as u64,
-            "Write::flush must not fsync; {FLUSHES} flushes produced \
-             {} fsync calls",
-            after_flushes - before
+        with_sync_observer(&token, || {
+            for i in 0..FLUSHES {
+                w.write_all(&[u8::try_from(i % 256).unwrap()]).unwrap();
+                w.flush().unwrap();
+            }
+        });
+        assert_eq!(
+            syncs(),
+            0,
+            "Write::flush must not fsync; {FLUSHES} flushes produced {} fsync calls",
+            syncs()
         );
 
         // ...and flush must actually have pushed the bytes out, or "does not
@@ -238,11 +240,8 @@ mod tests {
         );
 
         // The durability that `flush` gave up is available by name.
-        w.sync().unwrap();
-        assert!(
-            WRITER_METRICS.sync_all_calls.load(Relaxed) > after_flushes,
-            "sync() must fsync"
-        );
+        with_sync_observer(&token, || w.sync()).unwrap();
+        assert_eq!(syncs(), 1, "sync() must fsync exactly once");
     }
 
     /// `/dev/null` cannot be synchronized; the write to it succeeded, so

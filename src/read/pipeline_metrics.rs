@@ -1,15 +1,38 @@
-//! Sidecar counters for the 3-stage pipelined PBF reader (`run_pipeline`).
+//! Sidecar counters for the 3-stage pipelined PBF reader (`run_pipeline`
+//! and `run_pipeline_fused`).
 //!
-//! Pipeline counters are emitted at pipeline completion. Pool-drop counters
-//! are process totals, emitted by the host after dispatch through
-//! [`crate::read::emit_read_counters`], including pools outside this pipeline.
-//! Existing `pipeline_*` counter names remain stable for sidecar consumers.
+//! # Process totals, re-emitted at the end of every pipelined read
 //!
-//! Bench scope: every command that consumes blocks via
-//! `for_each_pipelined` / `into_blocks_pipelined` gets these counters
-//! for free. Current production users include geocode pass 1, getid
-//! referenced-node collection, tags-filter `-R`, the non-indexed
-//! add-locations-to-ways fallback, and the history time-filter path.
+//! [`PIPELINE_METRICS`] is one process-global set that is never reset. Every
+//! pipelined read in the process adds into it (sums for the counts and
+//! waits, the maximum for the high-water and peak counters), and every
+//! pipelined read emits the whole set once its stages have joined, on
+//! success and error alike. Every counter only grows, so for pipelined
+//! reads that run one after another each emission is a snapshot of the
+//! process so far and the last is the process total. Concurrent reads can
+//! emit out of order (one loads a value, the other emits a later total
+//! first), but the maximum of each name is still the total, and that is
+//! what the sidecar reads: `brokkr sidecar --stalls` takes the maximum of
+//! each `*_wait_ns` name as its total. The CLI runs one command per process,
+//! and a command that ran several pipelined reads still reports their sum.
+//!
+//! One instance per pipeline was weighed and declined. Emitting per-run
+//! values would make `--stalls` report only the largest pass of a process
+//! that reads twice and change what every stored run's counters mean;
+//! per-pass names would split each stall category by pass and break
+//! name-keyed comparisons; folding per-run instances back into a process
+//! total before emitting would change nothing a reader sees. A library
+//! embedding that runs pipelined reads concurrently gets their combined
+//! totals (`docs/guide/advanced.md` says so). A test that needs one run's
+//! exact numbers observes them on its token's fault plan, as the reorder
+//! bound tests do with `FaultPlan::reorder_filled_high_water`.
+//!
+//! Only the pipelined engines record here: `par_map_reduce` and the
+//! sequential `for_each` have none of these stages and emit nothing.
+//! Pool-drop counters are process totals of every decompression pool, not
+//! only this pipeline's, emitted by the host after dispatch through
+//! [`crate::read::emit_read_counters`]. Existing `pipeline_*` counter names
+//! remain stable for sidecar consumers.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -36,19 +59,20 @@ crate::counters::counter_set! {
         /// Combined with `block_fn`'s own time this localises whether the
         /// consumer is starved by decode or by its own work.
         pub decoded_recv_wait_ns => "pipeline_decoded_recv_wait_ns",
-        /// Maximum filled slots the in-order reorder buffer reached during
-        /// the run. This is the live decoded-block memory diagnostic. For
+        /// Maximum filled slots any in-order reorder buffer in the process
+        /// has reached. This is the live decoded-block memory diagnostic. For
         /// cross-run comparison with pre-change UUIDs, use
         /// `reorder_window_high_water` instead; old runs recorded window
         /// length including gaps under this counter name.
         pub reorder_high_water => "pipeline_reorder_high_water",
-        /// Maximum window length the in-order reorder buffer reached during
-        /// the run, including gaps. This preserves the old
+        /// Maximum window length any in-order reorder buffer in the process
+        /// has reached, including gaps. This preserves the old
         /// `reorder_high_water` meaning as a completion-skew diagnostic.
         pub reorder_window_high_water => "pipeline_reorder_window_high_water",
         /// Maximum retained capacity (bytes) of the per-decode-thread
-        /// `ST_SCRATCH` Vec (string-table kv pairs in `parse_and_inline`).
-        /// Sum across all decode threads at end of run. The iter-5 alloc
+        /// `ST_SCRATCH` Vec (string-table kv pairs in `parse_and_inline`):
+        /// the largest any one decode thread has retained, not a sum across
+        /// threads (see [`PipelineMetrics::record_scratch_capacity`]). The iter-5 alloc
         /// profile fingered this as the dominant residual alloc bucket
         /// (~70 % at Japan, retained per-thread max-block-size capacity).
         pub scratch_st_capacity_peak_bytes => "pipeline_scratch_st_capacity_peak_bytes",
@@ -86,8 +110,8 @@ impl PipelineMetrics {
         record_max(&self.scratch_gr_capacity_peak_bytes, gr_bytes as u64);
     }
 
-    /// Emit the pipeline counters, at the end of every `run_pipeline` /
-    /// `run_pipeline_fused`.
+    /// Emit the process totals so far (see the module docs), after every
+    /// `run_pipeline` / `run_pipeline_fused` has joined its stages.
     pub fn emit(&self) {
         self.emit_all();
     }

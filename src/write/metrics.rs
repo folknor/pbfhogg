@@ -50,13 +50,13 @@ crate::counters::counter_set! {
         /// "did anything fsync at all" is a correctness question - `Write::flush`
         /// must not - while the nanosecond total is a performance one.
         ///
-        /// Every backend that fsyncs must record it through
-        /// [`WriterMetrics::record_sync_all`]; there is no correct way to bump
-        /// `sync_all_ns` alone. The pair used to be maintained by hand at each
-        /// site and the parallel and io_uring backends bumped only the
-        /// nanoseconds, so `writer_sync_all_calls` reported zero fsyncs for two
-        /// of the three backends - a benchmark counter that silently disagreed
-        /// with its own documentation.
+        /// Every fsync goes through [`WriterMetrics::sync_recorded`]; there is
+        /// no correct way to bump `sync_all_ns` alone. The pair used to be
+        /// maintained by hand at each site and the parallel and io_uring
+        /// backends bumped only the nanoseconds, so `writer_sync_all_calls`
+        /// reported zero fsyncs for two of the three backends - a benchmark
+        /// counter that silently disagreed with its own documentation.
+        /// Failed calls are counted too.
         pub sync_all_calls => "writer_sync_all_calls",
 
         pub uring_submit_calls => "writer_uring_submit_calls",
@@ -90,20 +90,25 @@ crate::counters::counter_set! {
 }
 
 impl WriterMetrics {
-    /// Record one completed `fsync` and how long it took.
-    ///
-    /// The single funnel for the `sync_all_ns` / `sync_all_calls` pair. Call
-    /// this from every backend that syncs, rather than touching either field
-    /// directly, so the two cannot drift apart again.
-    pub fn record_sync_all(&self, start: Stopwatch) {
+    /// Record one `fsync` and how long it took: the `sync_all_ns` /
+    /// `sync_all_calls` pair, which used to be bumped by hand at each site
+    /// and drifted apart. Only [`sync_recorded`](Self::sync_recorded) calls
+    /// it.
+    fn record_sync_all(&self, start: Stopwatch) {
         start.record_ns(&self.sync_all_ns);
         self.sync_all_calls.fetch_add(1, Relaxed);
+        #[cfg(feature = "test-hooks")]
+        sync_observer::observe();
     }
 
-    /// `fsync` `file` and record it through [`record_sync_all`]
-    /// (Self::record_sync_all), success or failure. The one way publication
-    /// (`crate::output`) syncs a staged file or a directory, so those syncs
-    /// show up in the sidecar like the writers' own.
+    /// `fsync` `file` and record it, success or failure.
+    ///
+    /// The crate's only `fsync` of an output: every backend's durable finish
+    /// (buffered and `O_DIRECT` through `FileWriter::sync`, the `pwrite`
+    /// pool, io_uring, `to_path_sync`'s finalizer) and publication's syncs of
+    /// staged files and directories call it, so a call is counted at the
+    /// syscall rather than trusted to its caller, and a failed `fsync` is
+    /// counted like a successful one.
     pub(crate) fn sync_recorded(&self, file: &std::fs::File) -> std::io::Result<()> {
         let start = Stopwatch::start();
         // The funnel itself.
@@ -178,51 +183,127 @@ impl WriterMetrics {
 ///
 /// # These are process totals, not per-writer numbers
 ///
-/// Every `writer_*` sidecar counter is a sum across every `PbfWriter` the
-/// process ever constructed. For the single-writer commands - which is nearly
-/// all of them - that distinction is invisible. For `multi-extract`, which
-/// opens one `PbfWriter` per region and writes to all of them interleaved
-/// from parallel scopes, it means per-region attribution is simply not
-/// available: `writer_frame_ns` for a five-region run is the five regions'
-/// framing time added together.
+/// Every `writer_*` sidecar counter is a total across every `PbfWriter` and
+/// output backend the process ever ran, plus publication's syncs of staged
+/// outputs (`writer_sync_all_*`): sums for the counts and times, the maximum
+/// for the `*_high_water` counters. For the single-writer commands - which is
+/// nearly all of them - that distinction is invisible. For `multi-extract`,
+/// which opens one `PbfWriter` per region and writes to all of them
+/// interleaved from parallel scopes, it means per-region attribution is
+/// simply not available: `writer_frame_ns` for a five-region run is the five
+/// regions' framing time added together. A library embedding that runs
+/// several commands in one process, or concurrently, gets their combined
+/// totals (`docs/guide/advanced.md` says so).
 ///
 /// Emitting once per process ([`WriterMetrics::emit_once`]) makes that
-/// reading unambiguous rather than merely true. Real per-writer attribution
-/// is a separate, larger change and is **not** done: it needs a
-/// `&WriterMetrics` handle threaded through every recording site - roughly
-/// 85 of them across `framing.rs`, `writer.rs`, `pipeline.rs`,
-/// `file_writer.rs`, `parallel_writer.rs` and `uring_writer.rs` - including
-/// the rayon-worker framing path, which reaches its scratch through a
-/// thread-local and today has no way to name the writer it is framing for.
-/// A per-instance scheme would also have to answer what the emitted counter
-/// names look like when N writers are live, since the current names are
-/// unsuffixed and every existing sidecar comparison depends on them.
+/// reading unambiguous rather than merely true.
+///
+/// # Why not one instance per writer
+///
+/// Weighed and declined. The sidecar reads these names as process totals
+/// (`*_wait_ns` are summed into `brokkr sidecar --stalls` as strictly
+/// monotonic values, maximum per name), so per-writer instances would have
+/// to be folded back into one process total before emission and would
+/// change nothing a sidecar reader sees; emitting them per writer, or under
+/// per-writer names, would break `--stalls` and every name-keyed comparison
+/// against stored runs. What per-instance ownership would buy is
+/// attribution nobody consumes, at the price of a handle at every recording
+/// site, including the framing jobs on the executor, which reach their
+/// scratch through a thread-local and have no writer to name. Tests that
+/// need an exact count of one run's fsyncs observe it per token instead
+/// (see [`with_sync_observer`]) rather than reading deltas of this total,
+/// which concurrent tests also move.
 pub(crate) static WRITER_METRICS: WriterMetrics = WriterMetrics::new();
+
+/// Run `f` with every `fsync` recorded on this thread also counted into
+/// `cancel`'s fault plan (`FaultPlan::sync_calls`), so a test can assert the
+/// exact number of fsyncs one run performed while other tests sync
+/// concurrently. Installed by each scope that finishes or publishes an
+/// output on its own thread: `FileOutputSink::flush`, the `pwrite` pool's
+/// and io_uring's durable finish, `PbfWriter`'s synchronous finalizer, and
+/// the three `publish` methods. A thread-local selects the active plan; the
+/// plan owns the count. The scope is a closure so the previous selection is
+/// always restored, on unwind too.
+///
+/// Without `test-hooks` this is `f()` and compiles to nothing.
+#[cfg(feature = "test-hooks")]
+pub(crate) fn with_sync_observer<R>(cancel: &crate::host::Cancel, f: impl FnOnce() -> R) -> R {
+    sync_observer::with(cancel, f)
+}
+
+/// See the `test-hooks` twin.
+#[cfg(not(feature = "test-hooks"))]
+#[inline(always)]
+pub(crate) fn with_sync_observer<R>(_cancel: &crate::host::Cancel, f: impl FnOnce() -> R) -> R {
+    f()
+}
+
+#[cfg(feature = "test-hooks")]
+mod sync_observer {
+    use std::cell::RefCell;
+
+    use crate::host::Cancel;
+
+    thread_local! {
+        /// The token whose plan counts this thread's fsyncs, if any. An owned
+        /// clone, so nothing can dangle.
+        static ACTIVE: RefCell<Option<Cancel>> = const { RefCell::new(None) };
+    }
+
+    /// Puts the previous selection back when the scope ends.
+    struct Restore(Option<Cancel>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            ACTIVE.with_borrow_mut(|active| *active = previous);
+        }
+    }
+
+    pub(super) fn with<R>(cancel: &Cancel, f: impl FnOnce() -> R) -> R {
+        let previous = ACTIVE.with_borrow_mut(|active| active.replace(cancel.clone()));
+        let _restore = Restore(previous);
+        // No borrow is held while `f` runs.
+        f()
+    }
+
+    pub(super) fn observe() {
+        ACTIVE.with_borrow(|active| {
+            if let Some(cancel) = active {
+                cancel
+                    .faults()
+                    .sync_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::WRITER_METRICS;
     use std::sync::atomic::Ordering::Relaxed;
 
     /// `record_sync_all` moves both halves of the pair.
     ///
     /// Tested on the funnel rather than on one backend on purpose: a counter
     /// verified through a single backend is exactly how `sync_all_calls` came
-    /// to be right in `FileWriter` and zero in the other two.
+    /// to be right in `FileWriter` and zero in the other two. On a fresh
+    /// instance, so the counts are exact: the global total moves with every
+    /// concurrent test that syncs.
     #[test]
     fn record_sync_all_bumps_calls_and_nanos_together() {
-        let calls_before = WRITER_METRICS.sync_all_calls.load(Relaxed);
-        let ns_before = WRITER_METRICS.sync_all_ns.load(Relaxed);
+        let metrics = super::WriterMetrics::new();
         let start = crate::counters::Stopwatch::start();
         std::thread::sleep(std::time::Duration::from_millis(2));
-        WRITER_METRICS.record_sync_all(start);
-        assert!(
-            WRITER_METRICS.sync_all_calls.load(Relaxed) > calls_before,
+        metrics.record_sync_all(start);
+        assert_eq!(
+            metrics.sync_all_calls.load(Relaxed),
+            1,
             "record_sync_all must count the call"
         );
         assert!(
-            WRITER_METRICS.sync_all_ns.load(Relaxed) > ns_before,
+            metrics.sync_all_ns.load(Relaxed) >= 2_000_000,
             "record_sync_all must accumulate the elapsed time"
         );
     }

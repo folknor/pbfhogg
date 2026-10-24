@@ -12,7 +12,7 @@
 //! What the backends must share, they share by name rather than by
 //! inheritance: the `SeqTotal` / `check_stream_complete` end-of-stream
 //! handshake, the `PermitGuard` write-ahead discipline, the
-//! `WriterMetrics::record_sync_all` / `record_recv_wait` funnels, and the
+//! `WriterMetrics::sync_recorded` / `record_recv_wait` funnels, and the
 //! `flush`-versus-`sync` split. Each of those is enforced or asserted
 //! somewhere concrete; changing one is the trigger to re-read the ADR.
 
@@ -80,7 +80,7 @@ pub use options::{OutputBackend, WriteOptions};
 /// Only the `fsync` differs. A writer driven by an [`Output`](crate::Output)
 /// is `Deferred`: the output's publication syncs the staged file, after every
 /// in-process timer has stopped, through the same
-/// [`WriterMetrics::record_sync_all`](metrics::WriterMetrics::record_sync_all)
+/// [`WriterMetrics::sync_recorded`](metrics::WriterMetrics::sync_recorded)
 /// funnel. The public path constructors (`PbfWriter::to_path` and friends)
 /// stay `Durable`, because a library caller that owns the path has no
 /// publication to do it for them.

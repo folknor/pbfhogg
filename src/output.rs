@@ -299,11 +299,8 @@ impl Drop for PublishSpan {
             .sync_all_ns
             .load(Relaxed)
             .saturating_sub(self.sync_ns);
-        crate::debug::emit_counter(
-            "publish_sync_calls",
-            i64::try_from(calls).unwrap_or(i64::MAX),
-        );
-        crate::debug::emit_counter("publish_sync_ns", i64::try_from(ns).unwrap_or(i64::MAX));
+        crate::debug::emit_counter("publish_sync_calls", calls);
+        crate::debug::emit_counter("publish_sync_ns", ns);
         crate::debug::emit_marker("PUBLISH_END");
     }
 }
@@ -1848,7 +1845,9 @@ impl Output {
     pub fn publish(mut self, cancel: &crate::host::Cancel) -> Result<()> {
         cancel.check()?;
         let faults = self.faults();
-        publish_all(std::slice::from_mut(&mut self.target), &faults)
+        crate::write::metrics::with_sync_observer(cancel, || {
+            publish_all(std::slice::from_mut(&mut self.target), &faults)
+        })
     }
 
     #[cfg(feature = "test-hooks")]
@@ -1943,7 +1942,9 @@ impl OutputDir {
         let faults = self.faults.clone();
         #[cfg(not(feature = "test-hooks"))]
         let faults = Faults;
-        publish_all(std::slice::from_mut(&mut self.target), &faults)
+        crate::write::metrics::with_sync_observer(cancel, || {
+            publish_all(std::slice::from_mut(&mut self.target), &faults)
+        })
     }
 
     /// Test hook: inject a publication fault.
@@ -2062,7 +2063,7 @@ impl OutputSet {
         for member in self.members.drain(..) {
             targets.push(member.into_target());
         }
-        publish_all(&mut targets, &faults)
+        crate::write::metrics::with_sync_observer(cancel, || publish_all(&mut targets, &faults))
     }
 
     /// Test hook: inject a publication fault.
@@ -2803,18 +2804,21 @@ mod tests {
         assert!(!*ran.lock().unwrap());
     }
 
+    /// Counted on the run's token, so exact: publication syncs the staged
+    /// file and its directory (Unix only: elsewhere `sync_dir` is a no-op).
+    /// The process-wide `WRITER_METRICS` total moves with concurrent tests.
+    #[cfg(all(feature = "test-hooks", unix))]
     #[test]
     fn publication_syncs_through_the_writer_metrics_funnel() {
         use std::sync::atomic::Ordering::Relaxed;
         let dir = scratch();
-        let before = WRITER_METRICS.sync_all_calls.load(Relaxed);
+        let token = crate::host::Cancel::new();
         let out = Output::new(dir.path().join("out"), Overwrite::Refuse, &discard()).unwrap();
-        let mut writer = out.writer(&crate::host::Cancel::new()).unwrap();
+        let mut writer = out.writer(&token).unwrap();
         writer.write_all(b"data").unwrap();
         writer.finish().unwrap();
-        out.publish(&crate::host::Cancel::new()).unwrap();
-        // The file and its directory; other tests only add to the counter.
-        assert!(WRITER_METRICS.sync_all_calls.load(Relaxed) >= before + 2);
+        out.publish(&token).unwrap();
+        assert_eq!(token.faults().sync_calls.load(Relaxed), 2);
     }
 
     /// The walk before a backup's recursive removal: something pbfhogg

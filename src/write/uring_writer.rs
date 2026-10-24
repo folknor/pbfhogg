@@ -413,12 +413,8 @@ impl UringState {
         self.drain()?;
         file.set_len(self.logical_size)?;
         if finish == super::Finish::Durable {
-            let t_sync = crate::counters::Stopwatch::start();
-            // A path-constructor writer's own durability, recorded through
-            // the writer-metrics funnel on the next line.
-            #[allow(clippy::disallowed_methods)]
-            file.sync_all()?;
-            WRITER_METRICS.record_sync_all(t_sync);
+            // A path-constructor writer's own durability.
+            WRITER_METRICS.sync_recorded(file)?;
         }
         Ok(())
     }
@@ -728,7 +724,7 @@ fn uring_init_and_run(
     uring_main_loop(rx, &mut state, expected, cancel)?;
 
     // Step 9: Flush and finalize.
-    state.flush_final(&file, finish)?;
+    crate::write::metrics::with_sync_observer(cancel, || state.flush_final(&file, finish))?;
 
     Ok(())
 }

@@ -1279,9 +1279,10 @@ exclude = ["src/error.rs"]
 message = "Do not interpolate an error into a new error's message; keep it as the typed source or add context to it"
 
 # Writer counter funnel. `sync_all_ns` / `sync_all_calls` are a pair and
-# `recv_wait_ns` is fed by one funnel; `WriterMetrics::record_sync_all` and
-# `record_recv_wait` in write/metrics.rs are the only places that may move
-# them. A backend that hand-rolled `sync_all_ns.fetch_add` left
+# `recv_wait_ns` is fed by one funnel; `WriterMetrics::sync_recorded` (the
+# crate's one output fsync, which records through a private
+# `record_sync_all`) and `record_recv_wait` in write/metrics.rs are the only
+# places that may move them. A backend that hand-rolled `sync_all_ns.fetch_add` left
 # `writer_sync_all_calls` reading zero for two of three backends, which no
 # test of the funnel can see. The names are forbidden outright in production
 # code (a rustfmt-wrapped `WRITER_METRICS\n.sync_all_ns\n.fetch_add` always
@@ -1304,7 +1305,7 @@ must_scan = [
     "src/write/pipeline.rs",
     "src/write/writer.rs",
 ]
-message = "writer counters sync_all_ns, sync_all_calls and recv_wait_ns are moved only by WriterMetrics::record_sync_all and record_recv_wait in write/metrics.rs, so the paired counters cannot drift apart"
+message = "writer counters sync_all_ns, sync_all_calls and recv_wait_ns are moved only by WriterMetrics::sync_recorded and record_recv_wait in write/metrics.rs, so the paired counters cannot drift apart"
 
 # Writer counter emission. `WRITER_METRICS` is a process-global total, so
 # emitting it from a per-writer path (`PbfWriter::flush` once did) publishes N

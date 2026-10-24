@@ -167,12 +167,8 @@ fn parallel_writer_thread_inner(
     }
 
     if finish == super::Finish::Durable {
-        let t_sync = crate::counters::Stopwatch::start();
-        // A path-constructor writer's own durability, recorded through the
-        // writer-metrics funnel on the next line.
-        #[allow(clippy::disallowed_methods)]
-        file.sync_all()?;
-        WRITER_METRICS.record_sync_all(t_sync);
+        // A path-constructor writer's own durability.
+        crate::write::metrics::with_sync_observer(cancel, || WRITER_METRICS.sync_recorded(&file))?;
     }
 
     Ok(())

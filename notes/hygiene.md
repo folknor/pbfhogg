@@ -291,7 +291,11 @@ five loops are still five: `copy_range` (implicit out offset),
 `parallel_writer::copy_range_to_fd` (explicit), the fallbacks
 `copy_range_fallback` and `copy_range_fallback_pwrite`, and
 `uring_writer::handle_copy_range_uring`'s pread loop. Nothing stops a new raw
-loop bypassing the helpers. Fix: one module owning the loops too;
+loop bypassing the helpers. A fallback to userspace is counted only in
+sidecar counters, so outside brokkr it is silent; proposed, not decided: a
+once-per-run `Note` from the fallback counters, called beside
+`report_writer_index_loss` after dispatch (the same pattern), naming the
+range and byte counts (the errno would need one more cold-path counter). Fix: one module owning the loops too;
 `disallowed-methods` for `libc::pread`, `libc::copy_file_range`, `libc::write`
 elsewhere.
 
@@ -306,10 +310,6 @@ failures with file, blob ordinal and offset, writers name their output
 (`writing <path>`), and `cli/tests/cli_error_naming.rs` forces an open failure
 per input kind and a write failure per writer family. What remains:
 
-- `path_guard::same_file` (the input/output alias check) now names the path
-  it could not resolve, but still aborts the run on a permission error that
-  has nothing to do with aliasing; whether it should treat that as "not the
-  same file" and let the real open report it is undecided.
 - The `disallowed-methods` entries for `File::open`, `fs::read` and
   `fs::read_to_string` are denied only in `src/commands/` and the CLI, the
   same scope as the write-side entries. The library modules outside it that
@@ -710,6 +710,24 @@ The sortedness the same commands require is read from the header flag alone
 header-only input counts as indexed (no blob lacks indexdata). No sentence
 anywhere says which of refuse, fall back or verify a command is meant to be.
 
+Decided:
+
+- Every forced run on unindexed input emits the same keyed Note once (the
+  run proceeds without indexdata and is slower), so `--force` says the same
+  thing on every command.
+- No new header walks. A command that already walks every header for its
+  schedule (sort, apply-changes' `HeaderWalker`, the classify-based
+  builders, digest) refuses a partially indexed file at that walk with the
+  typed missing-indexdata error BUG-136 uses; the others keep trusting the
+  first blob.
+- `inspect --indexed` stays the documented first-blob probe (`inspect`
+  describes what a file claims). `check --index` (`check` verifies) treats a
+  partially indexed file as a violation and exits 1.
+- digest's partial-index refusal stops naming `diff` (library errors name no
+  command).
+- No action: renumber's missing `--force` and altw external's parse-time
+  `--force` refusal are guards; `--distrust-metadata` stays where it is.
+
 Fix: state the trust model once in `reference/` (indexdata is a hint; these
 properties are verified, these are believed, this is the consequence, and this
 is what a missing index does), have each command cite it, and move the
@@ -776,6 +794,11 @@ the many `too_many_*` exemptions (HYG-036) need no justification; the existing
 `include_str!` source-scan tests in `write/metrics.rs` are the in-repo template
 for text rules. Every hunter independently pointed most of its "enforceable
 by" answers at one of these.
+
+Decided: deny `clippy::print_stdout` and `clippy::print_stderr` in the
+library (not the CLI, which prints by design), alongside the existing
+`no-print-macro` textlint rule. Every other lever waits for the entry that
+needs it and arrives with that work, not as a sweep.
 
 Reported by: all nine scopes.
 
@@ -845,9 +868,17 @@ arguments; neither needs library changes. Not yet events: the CLI's own raw
 `elapsed_ms=` and `nodes=` key=value blocks, `Multi-extract: ...`,
 `distinct tag values`, the final `Error:` line), which a `--quiet` or
 `--json` covering them must route through the sink first; the key=value
-blocks may be parsed by brokkr. Which kinds `--quiet` drops (Note and
-Progress, presumably; never Warning) and how it interacts with the two
-existing flags is the maintainer's call.
+blocks may be parsed by brokkr.
+
+Decided: a global `-q, --quiet` with the existing flags' meaning, "the exit
+code is the answer". It drops Note and Progress events in `StderrSink` and
+the command's summary output (`summary_writer`, plus the raw closing lines
+such as `inspect tags`' count and apply-changes' block, gated or routed
+through the sink); it keeps Warnings and errors, which explain the exit
+code, and never touches data written to `-o`. `diff -q` and `check
+--quiet` fold into it (a quiet diff still discards the diff text, its
+"output" being the verdict). The bench commands' key=value blocks are left
+as they are. `--json` stays open.
 
 More facts a quiet or JSON mode has to cope with. The `bench-read`,
 `bench-write` and `bench-merge` key=value blocks are raw `cli_eprintln!` lines
@@ -879,9 +910,17 @@ pinned to its rule by `osc_gzip_framing_follows_each_producers_rule` in
 `cli/tests/cli_output_contract.rs` (both diff drivers, `x.osc` and
 `x.osc.gz`); `cli_diff`'s `diff_osc_output_is_gzip_whatever_its_name` and
 `cli_output_guard`'s `merge_changes_output_is_still_gzipped_through_the_guard`
-now overlap with it. What is open: the two rules remain two. Choosing one new
-rule (gzip unless the name ends `.osc`) would change two outputs; it is a
-decision for the maintainer.
+now overlap with it.
+
+Decided: one name-based rule for every OSC producer, strict. An output name
+ending `.osc` is written plain, one ending `.osc.gz` is gzipped, and any
+other name is refused before any work (a usage error naming both accepted
+suffixes). Breaking for `tags-filter --input-kind osc` and `diff --format
+osc` users who wrote gzip to an `.osc` name, and for any producer writing
+to some other suffix; CHANGELOG under Breaking. The pinning table moves to
+the new rule, plus refusal rows. Details to settle while implementing:
+whether the suffix match is case-sensitive (`.OSC`), and whether a producer
+that can write to stdout keeps doing so (no name to judge), plain.
 
 Reported by: the command-matrix audit.
 
@@ -924,9 +963,13 @@ is grammar, not letters:
 - Verbosity: `diff -v` and `getid --verbose-ids` are different long flags for
   the same idea; only diff and check have `--quiet`.
 
-Fix: an owner ruling on whether `--type` is one grammar everywhere (a comma
-list, with commands that take one kind refusing more) and on one verbosity
-spelling.
+Decided: unify. `--type` is one comma-list grammar with one shared parser
+on every command that takes it; a command acting on one kind refuses more
+than one, and `export` refuses `relation`, each with a message naming what
+it accepts. "Say more" is spelled `-v, --verbose` everywhere: `getid
+--verbose-ids` becomes `--verbose`, with `--verbose-ids` kept as a refusing
+alias naming the new flag (as `-s` was retired). CLI breaks for scripts
+using the old spellings; CHANGELOG under Breaking.
 
 Reported by: the command-matrix audit.
 
@@ -947,6 +990,32 @@ honest options are to drop the timestamp and sequence number (osmium) or keep
 them and document them as the base's; which one depends on how nidhogg's
 `update.rs` reads them, which the maintainer has to check. bench-merge shares
 the path.
+
+What nidhogg does today (nidhogg may be changed freely): only `update::init`
+reads the header, to bootstrap its state file; afterwards the state file is
+authoritative. With no replication fields, `init` falls back to Geofabrik's
+current state, which silently skips diffs if the PBF is not current - so
+today's carry is the safe direction for it (a re-init replays, which is
+idempotent). `merge.rs` passes a `HeaderOverrides` with every replication
+field `None`. Proposed, not decided: pbfhogg drops the fields unless the
+caller supplies them, nidhogg's merge stamps the sequence and timestamp of
+the last diff it applied, and `init`'s fallback stops being silent.
+
+Needs research before a ruling:
+
+- What osmium `apply-changes` writes, exactly, and whether osmium or
+  osmosis ever advance replication fields across a merge (and from what).
+- What other consumers of pbfhogg output read these fields (osm2pgsql's
+  replication init, pyosmium's `pyosmium-up-to-date`, Overpass, imposm),
+  and what each does with a stale value versus a missing one.
+- Whether an OSC's companion `state.txt`, or the OSC's own content (newest
+  element timestamp), is a sound source pbfhogg could derive the true state
+  from.
+- Which other pbfhogg commands carry replication state (`Replication::Carry`
+  in `output_header.rs`) onto outputs whose content no longer matches it,
+  so one rule covers them all.
+
+HYG-128 (no flag clears a header field) waits on this outcome.
 
 Reported by: the output-header policy work.
 
@@ -1040,22 +1109,15 @@ URL or the writing program from an output header (`degrade --strip-bbox` is
 the only removal, and only of the bbox). Whether removal is wanted, and with
 what spelling, is the maintainer's call; no syntax is reserved today.
 
+Needs research, together with HYG-121: the one concrete use seen so far is
+stripping stale replication state, which HYG-121 is deciding the default
+for. If its outcome drops the fields from apply-changes output unless the
+caller supplies them, the main reason for a removal flag goes away. Options
+on the table for whatever remains: an empty value meaning absent (changes
+today's present-but-empty behaviour), or an explicit repeatable
+`--clear-header KEY` with a conflict rule against `--output-header KEY=...`.
+
 Reported by: the scratch-lifecycle review fixes.
-
-## HYG-131 - A fixture PBF is checked in, against the no-checked-in-input rule
-
-Anger: 3 - doctests and a few unit tests read it.
-
-AGENTS.md and `reference/testing.md` say fixture PBFs are built at test time
-and never checked in, but `tests/test.osm.pbf` is tracked. It is the input the
-library's doc examples open by relative path (`src/lib.rs`, `src/read/blob.rs`,
-`src/read/reader.rs`, `docs/guide/reading.md`, `docs/guide/writing.md`) and
-that unit tests in `src/read/blob.rs` and `src/read/reader.rs` read, and
-`examples/gen_test_pbf.rs` regenerates it. Either the rule gains a stated
-exception for the doc-example input, or the doctests build their input
-(a hidden `# ` setup line) and the unit tests use the `tests/common` writers.
-
-Reported by: the CLI test move.
 
 ## HYG-135 - Source-scan tests built on `include_str!` belong in brokkr.toml
 
@@ -1108,7 +1170,8 @@ The judgement calls the round already knows it made, to be checked first:
 
 - altw external's metadata scan refuses indexdata that overstates `max_id`
   (as part of the new order check), reversing the tolerance commit
-  `2fabb026` built into stage 2's walk on purpose.
+  `2fabb026` built into stage 2's walk on purpose. Reviewed and kept by the
+  maintainer; the reason is in `scan_blob_metadata`'s doc.
 - The same scan refuses node blobs whose range holds negative IDs.
 - The `blob_body_within_file` checks in the classify builders were deleted
   as unreachable behind `HeaderWalker`'s extent check, as was getparents'
@@ -1120,7 +1183,8 @@ The judgement calls the round already knows it made, to be checked first:
   before spawning, and the guard moves into the closure.
 - `EPERM` and `EINVAL` joined `EXDEV`, `ENOSYS` and `EOPNOTSUPP` in the
   `copy_file_range` userspace-fallback set, with fstat and fcntl guards on
-  the cold path.
+  the cold path. Kept by the maintainer: targets that used to fail now
+  work, slower.
 - The io_uring CopyRange loop accepts a short pread as progress instead of
   failing.
 - Two public APIs were added (`BlobReader::new_named`, a now-public

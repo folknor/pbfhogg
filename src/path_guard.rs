@@ -101,6 +101,11 @@ pub fn same_file(a: &Path, b: &Path) -> std::io::Result<bool> {
             format!("failed to {what} {}: {e}", path.display()),
         )
     };
+    // Any error but not-found fails the check rather than answering "not the
+    // same file": resolving and stat-ing need the same directory search
+    // permission the command's own open or staging create needs, so a path
+    // this cannot resolve is one the run cannot use either, and failing here
+    // is earlier and names the path.
     let canonical = |path: &Path| match fs::canonicalize(path) {
         Ok(path) => Ok(Some(path)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),

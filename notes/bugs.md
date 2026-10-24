@@ -104,8 +104,18 @@ indexed.osm.pbf` (tested to work for an ordinary unindexed input). Plain
 (`scan_block_ids_and_tags` returns no index) through unchanged and still
 unindexed, so on an input holding such a blob the recipe succeeds, the
 refused command is refused again, and the advice loops. Not run on such a
-fixture; read from `cat_passthrough`. Open: whether `cat` should refuse
-such a blob, or whether the gate should say the input cannot be indexed.
+fixture; read from `cat_passthrough`. Per the scanner's contract
+(`blob_meta/scan.rs`) the unclassifiable shapes are: no groups or no
+elements, a group carrying more than one element field, and different
+element kinds across groups - all legal PBF, none written by pbfhogg.
+
+Decided: plain `cat` re-encodes such a blob into single-kind blocks (groups
+re-emitted in order, split at each change of kind) and indexes those; a
+block holding no elements is dropped. Condition: no performance cost on
+ordinary PBFs - the work lives only on the unclassifiable-blob arm, and the
+indexed passthrough and ordinary reindex paths are untouched. Test with a
+fixture holding a mixed-kind block, a multi-field group and an empty block,
+asserting the recipe's output passes the gate that refused the input.
 
 Reported by: the re-encode and re-index advice check.
 
@@ -125,6 +135,25 @@ agree, so it is not drift. Seen on `cli_diff`'s sharded-equivalence fixture
 builder should write the dense "absent" sentinel, or readers treat 0 as
 absent (OSM versions start at 1).
 
+Needs research before a ruling:
+
+- What the PBF spec and `osmformat.proto` say a dense node without metadata
+  in a metadata-carrying block should store, and whether `-1` is the
+  sentinel for `DenseInfo.version` or only for `Info.version`.
+- What osmium (`research/libosmium/`) writes in that position, and what it
+  reads back from `0` and from `-1` (its version type is unsigned).
+- What osmium's OSC and XML writers emit for a version-0 object, so the
+  output convention matches the oracle.
+- Every pbfhogg output that prints a version (derive deletes,
+  `write_element_xml` creates and modifies, the text diff's `vN`, `inspect`,
+  `export`) and what each prints for these nodes today.
+- Whether anything in pbfhogg distinguishes absent from 0 on the read side
+  (`DenseNodeInfo::version`, `owned.rs`'s defaults) that a builder change
+  would break.
+
+Recommendation on the table, pending that: treat version 0 as absent on
+output (emit a version only above 0), leaving the encoding alone.
+
 Reported by: the diff helper dedupe.
 
 ## BUG-136 - `diff` on a file indexed on its first blob only fails mid-merge
@@ -138,7 +167,15 @@ then exits 2 partway through with a generic "block-pair merge requires
 indexdata but blob has none", naming no file or blob. digest detects the same
 file up front ("present on some data blobs and absent on others"), so the
 check exists. Pinned as-is in `cli_input_contract`'s first-blob-only table.
-Open: refuse up front like digest, or fall back like the unindexed case.
+
+Decided: refuse with the typed missing-indexdata error, located at the
+first unindexed blob, on both block-pair paths, so the CLI prints its `cat`
+recipe. The parallel path's up-front `walk_file` refuses before any output;
+the sequential `-j 1` path (`osc/merge_join.rs`) still discovers it
+mid-merge but with the same kind and advice. No fallback: only the parallel
+path could fall back without an extra header walk, and `-j 1` and `-j 8`
+must not diverge on the same file. Move the contract table's rows to the new
+outcome.
 
 Reported by: the unindexed-input contract table.
 

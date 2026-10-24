@@ -211,6 +211,12 @@ kept rather than removed, and the error names it. Library callers get the same s
 
 Inspect PBF file: metadata, block breakdown, ordering analysis.
 
+`inspect` describes a file: what it is and what it claims. By default it
+reports counts, ID ranges and per-block stats from the blobs' own indexdata
+(`--distrust-metadata` decodes instead). What it finds is not a verdict: a
+readable file exits 0 (`--indexed` alone answers yes or no in its exit code).
+Whether the contents match the claims is [`check`](#check)'s question.
+
 On indexed PBFs, uses an index-only fast path that reads blob headers without decompression (~36ms on 473 MB vs ~4s for full decode).
 
 ```
@@ -220,7 +226,7 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 
 | Flag | Description |
 |------|-------------|
-| `--indexed` | Check if PBF has blob-level indexdata (exit code 0 = yes, 1 = no). Reads the first data blob only; later blobs are not checked. A header-only file (no data blobs) is indexed; a file without a leading OSMHeader is an error (exit 2), not a "no" |
+| `--indexed` | Check if PBF has blob-level indexdata (exit code 0 = yes, 1 = no). Reads the first data blob only; later blobs are not checked (to verify every blob's indexdata against its payload, use `check --index`). A header-only file (no data blobs) is indexed; a file without a leading OSMHeader is an error (exit 2), not a "no" |
 | `--nodes` | Analyze node coordinate statistics for FOR compression sizing |
 | `-j, --jobs <N>` | Worker threads for `--nodes`. **Requires `--nodes`**: no other inspect mode has a worker pool, so passing it elsewhere is an error rather than a no-op |
 | `--blocks [N]` | Show per-block distribution stats and optional block listing (N limits to first/last N blocks) |
@@ -277,6 +283,10 @@ global map. No approximate counts or silent truncation are used.
 ### check
 
 Validate PBF file integrity (IDs + referential integrity).
+
+`check` verifies a file: its contents against its claims and against the
+format's invariants, exiting 1 on a violation. Describing a file - what it
+claims, cheaply - is [`inspect`](#inspect)'s job.
 
 With no flags, runs the ID and referential integrity checks. Use `--ids`,
 `--refs` or `--index` to select. `--index` is not part of the default pair: it

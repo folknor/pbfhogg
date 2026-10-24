@@ -42,7 +42,12 @@ pub(super) struct BlobMeta {
 ///   under the input's sorted header. Equal boundaries pass, as in
 ///   `OrderWatermark`: duplicate ids are a separate concern. Indexdata
 ///   ranges are exact by contract (`check --index`), so ranges that break
-///   the order mean the header's claim, or the indexdata, is false.
+///   the order mean the header's claim, or the indexdata, is false. That
+///   includes an overstated `max_id` overlapping the next blob, which stage
+///   2's walk alone would tolerate (it bounds each blob by its last decoded
+///   id). Refusing it is deliberate: tolerating it while still catching
+///   interleaved blobs would need each blob's true last id, a per-blob
+///   decode in this header-only scan.
 ///
 /// Header-level only: the order of elements inside one blob is not visible
 /// here.

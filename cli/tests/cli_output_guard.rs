@@ -28,7 +28,6 @@ use std::path::Path;
 use crate::invoker::CliInvoker;
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};
-use tempfile::TempDir;
 
 fn write_fixture(path: &Path) {
     let file = std::fs::File::create(path).unwrap();
@@ -93,7 +92,7 @@ fn assert_output_published(dir: &Path, dest: &Path, args: &[&str]) {
 /// the check itself - before the command ran, and without naming the file.
 #[test]
 fn missing_input_is_reported_as_a_missing_input() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let missing = dir.path().join("nowhere.osm.pbf");
     let dest = dir.path().join("out.osm.pbf");
     let out = CliInvoker::new()
@@ -116,7 +115,7 @@ fn missing_input_is_reported_as_a_missing_input() {
 /// not have turned it off for inputs that do exist.
 #[test]
 fn input_output_alias_is_still_rejected() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_fixture(&input);
     let out = CliInvoker::new()
@@ -190,7 +189,7 @@ fn a_geocode_index_directory_holding_an_input_is_refused() {
 /// indexes.
 #[test]
 fn framing_error_names_the_input_file() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let good = dir.path().join("in.osm.pbf");
     let bad = dir.path().join("corrupt.osm.pbf");
     write_fixture(&good);
@@ -231,7 +230,7 @@ fn framing_error_names_the_input_file() {
 /// would leave the seeded file gone.
 #[test]
 fn cat_failure_leaves_preexisting_destination_intact() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let good = dir.path().join("in.osm.pbf");
     let bad = dir.path().join("corrupt.osm.pbf");
     write_fixture(&good);
@@ -294,7 +293,7 @@ fn write_dangling_ref_fixture(path: &Path) {
 /// PBF full of fabricated `(0, 0)` vertices.
 #[test]
 fn altw_missing_nodes_leave_preexisting_destination_intact() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_dangling_ref_fixture(&input);
     let dest = dir.path().join("precious.osm.pbf");
@@ -329,7 +328,7 @@ fn altw_missing_nodes_leave_preexisting_destination_intact() {
 /// replaces the destination through the guard, leaving no scratch behind.
 #[test]
 fn altw_publishes_through_the_guard() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_dangling_ref_fixture(&input);
     let dest = dir.path().join("out.osm.pbf");
@@ -452,7 +451,7 @@ fn empty_osc(dir: &Path) -> std::path::PathBuf {
 
 #[test]
 fn pbf_writers_leave_every_sync_to_publication() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     crate::common::write_base_pbf(&input);
     let osc = empty_osc(dir.path());
@@ -485,7 +484,7 @@ fn pbf_writers_leave_every_sync_to_publication() {
 /// container and the parent), two more each.
 #[test]
 fn a_group_publication_does_every_sync_once() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     crate::common::write_base_pbf(&input);
     let out_dir = dir.path().join("out");
@@ -535,7 +534,7 @@ mod platform {
     /// syncs their files like any other.
     #[test]
     fn direct_and_uring_writers_leave_every_sync_to_publication() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         let input = dir.path().join("in.osm.pbf");
         crate::common::write_base_pbf(&input);
         let osc = empty_osc(dir.path());

@@ -5,7 +5,6 @@
 
 use crate::common::{TestMember, TestNode, TestRelation, TestWay, write_test_pbf_sorted};
 use pbfhogg::MemberId;
-use tempfile::TempDir;
 
 /// Build a node-only sorted fixture with the given IDs, in the given order.
 fn write_nodes_in_order(path: &std::path::Path, ids: &[i64]) {
@@ -66,7 +65,7 @@ fn run_check_refs(
 /// five IDs - is what separates them.
 #[test]
 fn check_ids_uses_canonical_osm_order_for_negative_ids() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
 
     // `sort`'s own output order. Raw `<=` calls the step from 0 to -1
     // non-monotonic and rejects a file the sorter just produced.
@@ -101,7 +100,7 @@ fn check_ids_uses_canonical_osm_order_for_negative_ids() {
 
 #[test]
 fn check_ids_zero_max_errors_retains_all_violation_details() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("raw_sorted.osm.pbf");
     write_nodes_in_order(&input, &[-2, -1, 0, 1, 2]);
 
@@ -127,7 +126,7 @@ fn check_ids_zero_max_errors_retains_all_violation_details() {
 /// genuinely dangling reference.
 #[test]
 fn check_refs_reports_untrackable_ids_separately_from_missing_refs() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
 
     let untrackable = dir.path().join("negative.osm.pbf");
     write_test_pbf_sorted(
@@ -198,7 +197,7 @@ fn check_refs_reports_untrackable_ids_separately_from_missing_refs() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn check_refs_show_ids_reports_unique_counts_and_occurrences() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
 
     write_test_pbf_sorted(

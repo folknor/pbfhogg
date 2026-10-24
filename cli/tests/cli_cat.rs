@@ -58,7 +58,7 @@ fn run_cat(
 
 #[test]
 fn cat_passthrough_buffered() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -128,7 +128,7 @@ fn cat_passthrough_buffered() {
 
 #[test]
 fn cat_type_filter_nodes_only() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -185,7 +185,7 @@ fn cat_type_filter_nodes_only() {
 
 #[test]
 fn cat_type_filter_ways_only() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -242,7 +242,7 @@ fn cat_type_filter_ways_only() {
 
 #[test]
 fn cat_type_filter_node_way() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -290,7 +290,7 @@ fn cat_type_filter_node_way() {
 
 #[test]
 fn cat_rejects_unknown_type_without_creating_output() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &[], &[], &[]);
@@ -303,7 +303,7 @@ fn cat_rejects_unknown_type_without_creating_output() {
 
 #[test]
 fn cat_rejects_input_output_alias_before_truncation() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     write_test_pbf(&input, &[], &[], &[]);
     let before = std::fs::read(&input).expect("read input before command");
@@ -320,7 +320,7 @@ fn cat_rejects_input_output_alias_before_truncation() {
 
 #[test]
 fn cat_multi_file() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input1 = dir.path().join("a.osm.pbf");
     let input2 = dir.path().join("b.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -412,7 +412,7 @@ fn write_pbf_with_header(
 /// first.
 #[test]
 fn cat_multi_file_unions_the_bbox_and_reconciles_replication() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let west = dir.path().join("west.osm.pbf");
     let east = dir.path().join("east.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -480,7 +480,7 @@ fn cat_multi_file_unions_the_bbox_and_reconciles_replication() {
 /// header for every `cat` would pass the test above.
 #[test]
 fn cat_single_file_preserves_the_input_header() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -514,7 +514,7 @@ fn cat_single_file_preserves_the_input_header() {
 /// demands the same header.
 #[test]
 fn cat_reconciles_the_header_on_every_output_path() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let west = dir.path().join("west.osm.pbf");
     let east = dir.path().join("east.osm.pbf");
 
@@ -578,7 +578,7 @@ fn cat_reconciles_the_header_on_every_output_path() {
 /// declare no bbox rather than the boxes it happens to know about.
 #[test]
 fn cat_multi_file_drops_the_bbox_when_an_input_declares_none() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let boxed = dir.path().join("boxed.osm.pbf");
     let unboxed = dir.path().join("unboxed.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -672,7 +672,7 @@ fn write_clean_fixture(path: &Path) {
 /// Run cat with the supplied `-c` flag list and return the normalized
 /// output PBF. Shared by every `clean_*` test.
 fn cat_with_clean(clean_attrs: &[&str]) -> NormalizedPbf {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_clean_fixture(&input);
@@ -800,7 +800,7 @@ fn clean_all_fields() {
 /// synthesise a zeroed metadata block.
 #[test]
 fn clean_does_not_fabricate_metadata_on_meta_less_elements() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -852,7 +852,7 @@ fn clean_does_not_fabricate_metadata_on_meta_less_elements() {
 
 #[test]
 fn cat_type_way_passthrough_across_multiple_blobs() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -899,7 +899,7 @@ fn cat_type_way_passthrough_across_multiple_blobs() {
 /// `--type` alone and let `--clean` past silently.
 #[test]
 fn clean_on_an_unindexed_input_refuses_without_force() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let indexed = dir.path().join("indexed.osm.pbf");
     let unindexed = dir.path().join("unindexed.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -1004,7 +1004,7 @@ fn run_dedupe(inputs: &[&Path], output: &Path) -> crate::invoker::CliOutput {
 /// `HistoricalInformation` declared only by a later input.
 #[test]
 fn cat_dedupe_reconciles_the_header_across_every_input() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let west = dir.path().join("west.osm.pbf");
     let east = dir.path().join("east.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -1087,7 +1087,7 @@ fn cat_dedupe_reconciles_the_header_across_every_input() {
 /// declared.
 #[test]
 fn cat_dedupe_refuses_an_input_without_exactly_one_leading_header() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let good = dir.path().join("good.osm.pbf");
     let other = dir.path().join("other.osm.pbf");
     write_sorted_pbf_with(&good, 1, |hb| hb);
@@ -1137,7 +1137,7 @@ fn cat_dedupe_refuses_an_input_without_exactly_one_leading_header() {
 /// headline used to report the inflated figure as fact.
 #[test]
 fn cat_dedupe_keeps_indexdata_claims_out_of_the_observed_count() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     let lying = dir.path().join("lying.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -1174,7 +1174,7 @@ fn cat_dedupe_keeps_indexdata_claims_out_of_the_observed_count() {
 /// observed, and an all-decoded run prints no claimed line.
 #[test]
 fn cat_dedupe_counts_decoded_overlap_runs_as_observed() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let a = dir.path().join("a.osm.pbf");
     let b = dir.path().join("b.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
@@ -1212,7 +1212,7 @@ mod platform {
 
     #[test]
     fn cat_passthrough_direct_io() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let input = dir.path().join("input.osm.pbf");
         let output = dir.path().join("output.osm.pbf");
 

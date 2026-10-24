@@ -21,7 +21,6 @@ use crate::invoker::CliInvoker;
 use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
-use tempfile::TempDir;
 
 fn write_osc_gz(path: &Path, xml: &str) {
     let file = File::create(path).expect("create osc file");
@@ -70,7 +69,7 @@ fn run_merge_changes(inputs: &[&Path], output: &Path, simplify: bool) -> String 
 
 #[test]
 fn merge_changes_keeps_full_stream_by_default() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in1 = dir.path().join("001.osc.gz");
     let in2 = dir.path().join("002.osc.gz");
     let out = dir.path().join("out.osc.gz");
@@ -128,7 +127,7 @@ fn merge_changes_keeps_full_stream_by_default() {
 
 #[test]
 fn simplify_keeps_only_last_change_per_object() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in1 = dir.path().join("001.osc.gz");
     let in2 = dir.path().join("002.osc.gz");
     let out = dir.path().join("out.osc.gz");
@@ -182,7 +181,7 @@ fn simplify_keeps_only_last_change_per_object() {
 
 #[test]
 fn plain_osc_input_supported() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in1 = dir.path().join("001.osc");
     let out = dir.path().join("out.osc");
 
@@ -205,7 +204,7 @@ fn plain_osc_input_supported() {
 
 #[test]
 fn relation_roundtrip() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in1 = dir.path().join("001.osc.gz");
     let out = dir.path().join("out.osc.gz");
 
@@ -237,7 +236,7 @@ fn relation_roundtrip() {
 
 #[test]
 fn simplify_multiple_same_type_different_ids() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in1 = dir.path().join("001.osc.gz");
     let out = dir.path().join("out.osc.gz");
 
@@ -270,7 +269,7 @@ fn simplify_multiple_same_type_different_ids() {
 
 #[test]
 fn simplify_preserves_metadata() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in1 = dir.path().join("001.osc.gz");
     let out = dir.path().join("out.osc.gz");
 
@@ -304,7 +303,7 @@ fn simplify_preserves_metadata() {
 
 #[test]
 fn empty_osc_produces_empty_output() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in1 = dir.path().join("001.osc.gz");
     let out = dir.path().join("out.osc.gz");
 
@@ -327,7 +326,7 @@ fn empty_osc_produces_empty_output() {
 
 #[test]
 fn simplify_create_then_delete_yields_only_delete() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in1 = dir.path().join("001.osc.gz");
     let in2 = dir.path().join("002.osc.gz");
     let out = dir.path().join("out.osc.gz");
@@ -416,7 +415,7 @@ fn merge_changes_failure(inputs: &[&Path], output: &Path, extra: &[&str]) -> Str
 /// an element whose producer never claimed a version.
 #[test]
 fn metadata_survives_an_absent_version() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in1 = dir.path().join("001.osc.gz");
     let out = dir.path().join("out.osc");
 
@@ -470,7 +469,7 @@ fn metadata_survives_an_absent_version() {
 /// not, because it was a second copy.
 #[test]
 fn merge_changes_refuses_a_node_without_usable_coords() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let out = dir.path().join("out.osc.gz");
 
     for (name, attrs) in [
@@ -502,7 +501,7 @@ fn merge_changes_refuses_a_node_without_usable_coords() {
 /// satisfied by refusing every node.
 #[test]
 fn merge_changes_delete_needs_no_coords() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("001.osc.gz");
     let out = dir.path().join("out.osc");
     write_osc_gz(
@@ -523,7 +522,7 @@ fn merge_changes_delete_needs_no_coords() {
 /// must be refused rather than merged as though it were whole.
 #[test]
 fn merge_changes_refuses_a_truncated_input() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("cut.osc.gz");
     let out = dir.path().join("out.osc.gz");
     write_osc_gz(
@@ -548,7 +547,7 @@ fn merge_changes_refuses_a_truncated_input() {
 /// success. That is data corruption, and it is now refused.
 #[test]
 fn simplify_refuses_a_version_regression() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let newer = dir.path().join("002.osc.gz");
     let older = dir.path().join("001.osc.gz");
     let out = dir.path().join("out.osc.gz");
@@ -614,7 +613,7 @@ fn simplify_refuses_a_version_regression() {
 /// it.
 #[test]
 fn simplify_admits_equal_versions_from_overlapping_diffs() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let first = dir.path().join("4705.osc.gz");
     let second = dir.path().join("4706.osc.gz");
     let out = dir.path().join("out.osc.gz");
@@ -703,7 +702,7 @@ fn simplify_admits_equal_versions_from_overlapping_diffs() {
 /// a usage error instead, refused before any input is read.
 #[test]
 fn allow_version_regression_requires_simplify() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let out = dir.path().join("out.osc.gz");
     let result = CliInvoker::new()
         .arg("merge-changes")
@@ -738,7 +737,7 @@ fn allow_version_regression_requires_simplify() {
 /// Both shapes: several actions inside one OSC, and one per file.
 #[test]
 fn simplify_gates_a_stale_change_after_a_delete() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let out = dir.path().join("out.osc.gz");
 
     let one_file = dir.path().join("one.osc.gz");
@@ -805,7 +804,7 @@ fn simplify_gates_a_stale_change_after_a_delete() {
 /// the floor set by a live modify.
 #[test]
 fn simplify_floor_survives_an_unversioned_change() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let out = dir.path().join("out.osc.gz");
 
     for (case, first) in [
@@ -871,7 +870,7 @@ fn simplify_floor_survives_an_unversioned_change() {
 /// deduped positionally, because there is nothing to compare.
 #[test]
 fn simplify_still_dedupes_unversioned_elements() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("001.osc.gz");
     let out = dir.path().join("out.osc");
     write_osc_gz(

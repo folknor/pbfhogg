@@ -16,7 +16,6 @@ use pbfhogg::MemberId;
 use pbfhogg::write::WriteOptions;
 use pbfhogg::writer::Compression;
 use std::path::Path;
-use tempfile::TempDir;
 
 /// Default backend with `force` set, at the given compression.
 fn forced(compression: Compression) -> WriteOptions {
@@ -67,7 +66,7 @@ fn sample_fixture(path: &Path) {
 /// layout; the element set must not drift.
 #[test]
 fn sort_idempotence() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let once = dir.path().join("once.osm.pbf");
     let twice = dir.path().join("twice.osm.pbf");
@@ -105,7 +104,7 @@ fn sort_idempotence() {
 #[cfg(feature = "commands")] // uses pbfhogg::extract, gated behind `commands`
 #[test]
 fn extract_simple_idempotence() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let once = dir.path().join("once.osm.pbf");
     let twice = dir.path().join("twice.osm.pbf");
@@ -151,7 +150,7 @@ fn extract_simple_idempotence() {
 /// to route a `modify` op correctly.
 #[test]
 fn derive_then_apply_roundtrip() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let modified = dir.path().join("modified.osm.pbf");
     let osc = dir.path().join("delta.osc.gz");
@@ -250,7 +249,7 @@ fn derive_then_apply_roundtrip() {
 fn derive_then_apply_preserves_metadata() {
     use crate::common::TestMeta;
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let modified = dir.path().join("modified.osm.pbf");
     let osc = dir.path().join("delta.osc.gz");
@@ -391,7 +390,7 @@ fn derive_then_apply_preserves_metadata() {
 /// (second pass sees only the already-kept nodes).
 #[test]
 fn tags_filter_idempotence() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let once = dir.path().join("once.osm.pbf");
     let twice = dir.path().join("twice.osm.pbf");
@@ -463,7 +462,7 @@ fn write_at_block_size(path: &Path, block_size: usize) {
 /// the same normalized element set.
 #[test]
 fn read_path_blob_layout_independence() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let b1 = dir.path().join("bs1.osm.pbf");
     let b5 = dir.path().join("bs5.osm.pbf");
     let b100 = dir.path().join("bs100.osm.pbf");
@@ -480,7 +479,7 @@ fn read_path_blob_layout_independence() {
 /// closure at different shard-work distributions.
 #[test]
 fn tags_filter_blob_layout_independence() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let b1 = dir.path().join("bs1.osm.pbf");
     let b5 = dir.path().join("bs5.osm.pbf");
     let b100 = dir.path().join("bs100.osm.pbf");
@@ -537,7 +536,7 @@ fn tags_filter_blob_layout_independence() {
 /// otherwise - both yielding the same element-level stats.
 #[test]
 fn diff_blob_layout_independence() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old_b1 = dir.path().join("old_bs1.osm.pbf");
     let old_b100 = dir.path().join("old_bs100.osm.pbf");
     let new_b1 = dir.path().join("new_bs1.osm.pbf");
@@ -609,7 +608,7 @@ fn diff_blob_layout_independence() {
 /// ways, which a byte-equal shortcut in the count would not.
 #[test]
 fn diff_stats_matches_text_diff_on_every_path() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let p = |name: &str| dir.path().join(name);
     write_diff_stats_fixtures(dir.path());
 
@@ -749,7 +748,7 @@ fn write_diff_stats_fixtures(dir: &Path) {
 /// also pinned to the single-kind runs, which skip nothing.
 #[test]
 fn diff_type_filter_excluding_an_earlier_kind_agrees_on_every_path() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     write_diff_stats_fixtures(dir.path());
     write_negative_all_kinds_fixtures(dir.path());
 
@@ -881,7 +880,7 @@ fn diff_counts(
 /// excluded, on the sequential path as on the parallel one.
 #[test]
 fn diff_type_filter_skip_still_refuses_an_earlier_kind_out_of_order() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let p = |name: &str| dir.path().join(name);
     write_multi_block_test_pbf(
         &p("old.osm.pbf"),
@@ -952,7 +951,7 @@ fn diff_type_filter_skip_still_refuses_an_earlier_kind_out_of_order() {
 
 #[test]
 fn sort_compression_level_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     sample_fixture(&input);
 
@@ -989,7 +988,7 @@ fn sort_compression_level_parity() {
 
 #[test]
 fn tags_filter_compression_level_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     sample_fixture(&input);
 
@@ -1038,7 +1037,7 @@ fn tags_filter_compression_level_parity() {
 /// back identically to a zlib-compressed twin.
 #[test]
 fn none_compression_reads_back_identical() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let out_none = dir.path().join("out_none.osm.pbf");
     let out_zlib = dir.path().join("out_zlib.osm.pbf");

@@ -25,7 +25,6 @@ use crate::common::{
 };
 use crate::invoker::CliInvoker;
 use pbfhogg::MemberId;
-use tempfile::TempDir;
 
 #[derive(Default, Clone, Copy)]
 struct DiffOpts {
@@ -162,7 +161,7 @@ fn first_u64(line: &str) -> Option<u64> {
 
 #[test]
 fn identical_files_empty_output() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -210,7 +209,7 @@ fn identical_files_empty_output() {
 
 #[test]
 fn identical_files_shows_common() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -252,7 +251,7 @@ fn identical_files_shows_common() {
 
 #[test]
 fn added_elements() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -316,7 +315,7 @@ fn added_elements() {
 
 #[test]
 fn deleted_elements() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -380,7 +379,7 @@ fn deleted_elements() {
 
 #[test]
 fn modified_node_coordinates() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -426,7 +425,7 @@ fn modified_node_coordinates() {
 
 #[test]
 fn modified_node_tags() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -469,7 +468,7 @@ fn modified_node_tags() {
 
 #[test]
 fn modified_way_refs() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -510,7 +509,7 @@ fn modified_way_refs() {
 
 #[test]
 fn modified_relation_members() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -563,7 +562,7 @@ fn modified_relation_members() {
 
 #[test]
 fn suppress_common_hides_unchanged() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -652,7 +651,7 @@ fn suppress_common_hides_unchanged() {
 
 #[test]
 fn verbose_shows_tag_details() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -707,7 +706,7 @@ fn verbose_shows_tag_details() {
 
 #[test]
 fn verbose_shows_coordinate_details() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -754,7 +753,7 @@ fn verbose_shows_coordinate_details() {
 
 #[test]
 fn type_filter_restricts_output() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -836,7 +835,7 @@ fn type_filter_restricts_output() {
 
 #[test]
 fn unsorted_input_rejected() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -879,7 +878,7 @@ fn unsorted_input_rejected() {
 
 #[test]
 fn empty_files_no_data_blocks() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -897,7 +896,7 @@ fn empty_files_no_data_blocks() {
 
 #[test]
 fn multi_block_boundary_asymmetric() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -955,7 +954,7 @@ fn multi_block_boundary_asymmetric() {
 
 #[test]
 fn type_filter_way_skips_phases() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -1059,7 +1058,7 @@ fn type_filter_way_skips_phases() {
 
 #[test]
 fn osmium_summary_format() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -1231,7 +1230,7 @@ fn assert_fallback_stats(stats: &DiffStats) {
 
 #[test]
 fn fallback_old_non_indexed() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     fallback_fixture_old(&old, true);
@@ -1244,7 +1243,7 @@ fn fallback_old_non_indexed() {
 
 #[test]
 fn fallback_new_non_indexed() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     fallback_fixture_old(&old, false);
@@ -1257,7 +1256,7 @@ fn fallback_new_non_indexed() {
 
 #[test]
 fn fallback_both_non_indexed() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     fallback_fixture_old(&old, true);
@@ -1270,7 +1269,7 @@ fn fallback_both_non_indexed() {
 
 #[test]
 fn fallback_parity_with_indexed_path() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let oi = dir.path().join("old_indexed.osm.pbf");
     let on = dir.path().join("old_nonindexed.osm.pbf");
     let ni = dir.path().join("new_indexed.osm.pbf");
@@ -1297,7 +1296,7 @@ fn fallback_parity_with_indexed_path() {
 
 #[test]
 fn fallback_verbose_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let oi = dir.path().join("old_indexed.osm.pbf");
     let on = dir.path().join("old_nonindexed.osm.pbf");
     let ni = dir.path().join("new_indexed.osm.pbf");
@@ -1337,7 +1336,7 @@ fn meta(v: i32, user: &'static str) -> TestMeta {
 
 #[test]
 fn diff_compact_line_shows_version_when_meta_present() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -1360,7 +1359,7 @@ fn diff_compact_line_shows_version_when_meta_present() {
 
 #[test]
 fn diff_modified_line_shows_version_bump_on_payload_change() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -1397,7 +1396,7 @@ fn diff_modified_line_shows_version_bump_on_payload_change() {
 
 #[test]
 fn diff_pure_metadata_bump_is_common_not_modified() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -1440,7 +1439,7 @@ fn diff_pure_metadata_bump_is_common_not_modified() {
 
 #[test]
 fn diff_created_deleted_lines_carry_version() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -1484,7 +1483,7 @@ fn diff_created_deleted_lines_carry_version() {
 
 #[test]
 fn diff_mixed_metadata_sides() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -1523,7 +1522,7 @@ fn diff_mixed_metadata_sides() {
 
 #[test]
 fn diff_verbose_emits_payload_deltas_not_metadata_deltas() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -1586,7 +1585,7 @@ fn diff_verbose_emits_payload_deltas_not_metadata_deltas() {
 
 #[test]
 fn diff_block_pair_covers_all_four_branches() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -1623,7 +1622,7 @@ fn diff_block_pair_covers_all_four_branches() {
 /// ordinary path; do not read it as covering seq-vs-parallel generally.
 #[test]
 fn diff_block_pair_parallel_matches_sequential_on_multi_blob() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
@@ -1668,7 +1667,7 @@ fn diff_block_pair_parallel_matches_sequential_on_multi_blob() {
 /// explicit value is a conflict.
 #[test]
 fn diff_rejects_explicit_jobs_with_verbose() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     let nodes = generate_nodes(4, 1);
@@ -1710,7 +1709,7 @@ fn diff_rejects_explicit_jobs_with_verbose() {
 fn diff_single_job_needs_no_writable_current_directory() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     write_test_pbf_sorted(&old, &generate_nodes(4, 1), &[], &[]);
@@ -2084,7 +2083,7 @@ fn diff_line_ids(text: &str, prefix: char, type_char: char) -> Vec<i64> {
 
 #[test]
 fn diff_sequential_and_sharded_output_byte_identical() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let (old, new) = write_shard_pair(dir.path());
 
     for suppress_common in [false, true] {
@@ -2150,7 +2149,7 @@ fn diff_sequential_and_sharded_output_byte_identical() {
 fn derive_sequential_and_sharded_output_byte_identical() {
     use std::io::Read as _;
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let (old, new) = write_shard_pair(dir.path());
 
     let derive = |jobs: usize, increment_version: bool| {

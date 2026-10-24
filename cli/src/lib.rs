@@ -27,6 +27,8 @@ mod host;
 mod library_text_rule;
 mod output;
 mod signals;
+#[cfg(test)]
+mod test_scratch;
 
 use command_paths::{CommandPaths, LeftoverScanner, parent_of, reject_aliases};
 use exit_code::{Hinted, error_report, is_cancelled, is_platform_unsupported, output_hint};

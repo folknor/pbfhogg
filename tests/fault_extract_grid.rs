@@ -28,7 +28,6 @@ mod grid_parity {
     };
     use pbfhogg::read::region_grid_test_hooks as grid_hooks;
     use pbfhogg::write::WriteOptions;
-    use tempfile::TempDir;
 
     use crate::common::{TestMember, TestNode, TestRelation, TestWay, write_indexed_pbf};
 
@@ -180,7 +179,7 @@ mod grid_parity {
 
     #[test]
     fn forced_linear_vs_grid_produces_identical_bytes() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         let input = dir.path().join("input.osm.pbf");
         write_indexed_pbf(&input, &build_nodes(), &build_ways(), &build_relations());
 

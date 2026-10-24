@@ -36,7 +36,6 @@ mod parallel_writer {
     use pbfhogg::apply_changes::{MergeOptions, merge};
     use pbfhogg::write::WriteOptions;
     use pbfhogg::write::parallel_writer_test_hooks as pw_hooks;
-    use tempfile::TempDir;
 
     use crate::common::{self, generate_nodes, write_multi_block_test_pbf};
 
@@ -68,7 +67,7 @@ mod parallel_writer {
         // are none, but keep the discipline).
         pw_hooks::reset();
 
-        let dir = TempDir::new().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let base = dir.path().join("base.osm.pbf");
         let osc = dir.path().join("diff.osc.gz");
         let output = dir.path().join("output.osm.pbf");

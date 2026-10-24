@@ -8,7 +8,6 @@ use crate::common::{
 use pbfhogg::MemberId;
 use pbfhogg::cat::dedupe::merge_pbf;
 use pbfhogg::write::WriteOptions;
-use tempfile::TempDir;
 
 fn default_opts() -> WriteOptions {
     WriteOptions {
@@ -23,7 +22,7 @@ fn default_opts() -> WriteOptions {
 
 #[test]
 fn merge_disjoint_node_files() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let a = dir.path().join("a.osm.pbf");
     let b = dir.path().join("b.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -92,7 +91,7 @@ fn merge_disjoint_node_files() {
 
 #[test]
 fn merge_overlapping_nodes_dedup() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let a = dir.path().join("a.osm.pbf");
     let b = dir.path().join("b.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -173,7 +172,7 @@ fn merge_overlapping_nodes_dedup() {
 
 #[test]
 fn merge_with_ways_and_relations() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let a = dir.path().join("a.osm.pbf");
     let b = dir.path().join("b.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -258,7 +257,7 @@ fn merge_with_ways_and_relations() {
 
 #[test]
 fn merge_single_file() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let a = dir.path().join("a.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -303,7 +302,7 @@ fn merge_single_file() {
 
 #[test]
 fn merge_three_files() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let a = dir.path().join("a.osm.pbf");
     let b = dir.path().join("b.osm.pbf");
     let c_file = dir.path().join("c.osm.pbf");
@@ -365,7 +364,7 @@ fn merge_three_files() {
 
 #[test]
 fn merge_empty_files() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let a = dir.path().join("a.osm.pbf");
     let b = dir.path().join("b.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -402,7 +401,7 @@ fn merge_empty_files() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn merge_same_input_preserves_ways_and_relations() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let a = dir.path().join("a.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -554,7 +553,7 @@ fn merge_same_input_preserves_ways_and_relations() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn merge_three_files_overlapping_ids() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let a = dir.path().join("a.osm.pbf");
     let b = dir.path().join("b.osm.pbf");
     let c_file = dir.path().join("c.osm.pbf");
@@ -704,7 +703,7 @@ fn merge_rejects_a_corrupt_frame_prefix_without_allocating() {
         ),
         ("zero-length", [0u8, 0, 0, 0], "blob header size is zero"),
     ] {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let a = dir.path().join("a.osm.pbf");
         let output = dir.path().join("output.osm.pbf");
 

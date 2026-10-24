@@ -13,7 +13,6 @@ use crate::common::{
 use pbfhogg::MemberId;
 use pbfhogg::renumber::{RenumberOptions, RenumberStats, renumber_external};
 use pbfhogg::write::WriteOptions;
-use tempfile::TempDir;
 
 fn default_opts() -> RenumberOptions {
     RenumberOptions {
@@ -31,7 +30,7 @@ fn default_opts() -> RenumberOptions {
 fn renumber_nodes_sequentially() {
     // Nodes-only input: verifies wire-format rewriter assigns sequential
     // ids and preserves coords + tags.
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -93,7 +92,7 @@ fn renumber_nodes_sequentially() {
 
 #[test]
 fn renumber_custom_start_node_id() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -148,7 +147,7 @@ fn renumber_custom_start_node_id() {
 
 #[test]
 fn renumber_preserves_sorted_header_and_type_order() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -228,7 +227,7 @@ fn renumber_preserves_sorted_header_and_type_order() {
 #[test]
 fn renumber_relations_end_to_end() {
     // All member types + tag preservation + node/way/relation remap.
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -337,7 +336,7 @@ fn renumber_relations_end_to_end() {
 fn renumber_relation_forward_ref() {
     // Rel 500 references rel 600 (forward ref - target appears later
     // in sort order). R1 collects all IDs before R2d resolves.
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -394,7 +393,7 @@ fn renumber_relation_forward_ref() {
 
 #[test]
 fn renumber_relation_self_reference() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -435,7 +434,7 @@ fn renumber_relation_mixed_member_types_interleaved() {
     // Relation with members in non-type-sorted order (node, way, node,
     // relation, way, node) to stress the interleaved types + memids
     // cursor walk in the wire-format splice rewriter.
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -560,7 +559,7 @@ fn renumber_nodes_and_ways_end_to_end() {
     // Input deliberately includes:
     // - A duplicate ref (way 100 refs [1, 2, 2])
     // - A way with refs in non-sorted order (way 300 [3, 4, 1])
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -654,7 +653,7 @@ fn renumber_nodes_and_ways_end_to_end() {
 
 #[test]
 fn renumber_custom_start_ids() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -724,7 +723,7 @@ fn renumber_custom_start_ids() {
 
 #[test]
 fn renumber_rejects_negative_node_id() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -764,7 +763,7 @@ fn renumber_rejects_negative_node_id() {
 
 #[test]
 fn renumber_rejects_negative_way_ref() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -824,7 +823,7 @@ fn renumber_rejects_negative_way_ref() {
 fn renumber_orphan_way_ref_is_shifted_past_the_new_range() {
     // Way references a node id that doesn't exist in the input. The orphan
     // becomes old id + start + node count: 99999 + 1 + 2.
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -888,7 +887,7 @@ fn renumber_orphan_way_ref_is_shifted_past_the_new_range() {
 /// every member, preserving order.
 #[test]
 fn renumber_orphan_relation_members_are_shifted_past_the_new_range() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -1001,7 +1000,7 @@ fn relation_of(id: i64, members: Vec<TestMember>) -> TestRelation {
 /// relation, and no orphan ref names any element in the output.
 #[test]
 fn renumber_orphans_whose_old_id_is_a_new_id_do_not_alias() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -1087,7 +1086,7 @@ fn renumber_orphans_whose_old_id_is_a_new_id_do_not_alias() {
 /// (base 3).
 #[test]
 fn renumber_orphan_way_ref_shift_overflow_is_an_error() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf_sorted(
@@ -1105,7 +1104,7 @@ fn renumber_orphan_way_ref_shift_overflow_is_an_error() {
 /// The relation-member half: a relation member to relation `i64::MAX`.
 #[test]
 fn renumber_orphan_relation_member_shift_overflow_is_an_error() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf_sorted(
@@ -1131,7 +1130,7 @@ fn renumber_orphan_relation_member_shift_overflow_is_an_error() {
 /// the third (negative relation-member ref).
 #[test]
 fn renumber_rejects_negative_relation_member_ref() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -1282,7 +1281,7 @@ fn frame(kind_offset: i64, i: i64) -> usize {
 }
 
 fn assert_fails_promptly(mutate: impl FnOnce(&[u8]) -> Vec<u8>, expect: &str) {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_many_blob_fixture(&input);
@@ -1358,7 +1357,7 @@ fn assert_order_refused(
     block_size: usize,
     expect: &str,
 ) {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     let nodes: Vec<TestNode> = nodes.iter().copied().map(plain_node).collect();
@@ -1451,7 +1450,7 @@ fn a_duplicate_relation_is_refused() {
 /// ids renumber with every reference landing on the right element.
 #[test]
 fn increasing_ids_across_many_blobs_renumber_consistently() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     let node_ids: Vec<i64> = (1..=40).map(|i| i * 7).collect();
@@ -1486,7 +1485,7 @@ fn increasing_ids_across_many_blobs_renumber_consistently() {
 /// the output must match the honest file's exactly.
 #[test]
 fn an_overstated_indexdata_max_id_does_not_size_the_node_set() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     let lying = dir.path().join("lying.osm.pbf");
     let out_honest = dir.path().join("out_honest.osm.pbf");
@@ -1520,7 +1519,7 @@ fn an_overstated_indexdata_max_id_does_not_size_the_node_set() {
 /// them would refuse every small extract of real OSM data.
 #[test]
 fn node_ids_far_above_the_file_size_bound_still_renumber() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     let (a, b, c) = (5_i64, 1_i64 << 40, 1_i64 << 50);
@@ -1554,7 +1553,7 @@ fn node_ids_far_above_the_file_size_bound_still_renumber() {
 
 #[test]
 fn a_start_id_below_one_is_refused() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf_sorted(&input, &[plain_node(1), plain_node(2)], &[], &[]);

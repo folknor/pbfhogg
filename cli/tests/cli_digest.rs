@@ -20,7 +20,6 @@ use crate::common::{
 };
 use crate::invoker::{CliInvoker, CliOutput};
 use pbfhogg::MemberId;
-use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -241,7 +240,7 @@ fn digest_equality_agrees_with_diff_on_every_field() {
         ("relation removed", false, |f| f.relations.clear()),
     ];
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     for indexed in [true, false] {
         let base = dir.path().join(format!("base-{indexed}.osm.pbf"));
         write(&base, &base_fixture(), indexed);
@@ -274,7 +273,7 @@ fn digest_equality_agrees_with_diff_on_every_field() {
 /// file against a non-indexed one goes through diff's element-stream path.
 #[test]
 fn digest_is_independent_of_encoding() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let f = base_fixture();
     let indexed = dir.path().join("indexed.osm.pbf");
     let plain = dir.path().join("plain.osm.pbf");
@@ -307,7 +306,7 @@ fn digest_is_independent_of_encoding() {
 /// A change to one kind moves that kind's line and the overall line only.
 #[test]
 fn per_kind_lines_isolate_the_changed_kind() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let changed = dir.path().join("changed.osm.pbf");
     write(&base, &base_fixture(), true);
@@ -326,7 +325,7 @@ fn per_kind_lines_isolate_the_changed_kind() {
 /// A sorted file with no data blocks is valid and has the empty digest.
 #[test]
 fn header_only_file_has_the_empty_digest() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let empty = dir.path().join("empty.osm.pbf");
     write_test_pbf_sorted(&empty, &[], &[], &[]);
     let d = digest_ok(&empty);
@@ -341,7 +340,7 @@ fn header_only_file_has_the_empty_digest() {
 
 #[test]
 fn refuses_unsorted_header() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("unsorted.osm.pbf");
     let f = base_fixture();
     write_test_pbf(&path, &f.nodes, &f.ways, &f.relations);
@@ -353,7 +352,7 @@ fn refuses_unsorted_header() {
 
 #[test]
 fn refuses_empty_and_headerless_input() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let zero = dir.path().join("zero.osm.pbf");
     std::fs::write(&zero, b"").expect("write");
     assert_refused(&zero, "a zero-byte file");
@@ -369,7 +368,7 @@ fn refuses_empty_and_headerless_input() {
 
 #[test]
 fn refuses_a_second_header_blob() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let sorted = dir.path().join("sorted.osm.pbf");
     write(&sorted, &base_fixture(), true);
     let bytes = std::fs::read(&sorted).expect("read");
@@ -385,7 +384,7 @@ fn refuses_a_second_header_blob() {
 
 #[test]
 fn refuses_duplicate_and_descending_ids() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
 
     // Within one block.
     let dup = dir.path().join("dup.osm.pbf");
@@ -411,7 +410,7 @@ fn refuses_duplicate_and_descending_ids() {
 
 #[test]
 fn refuses_partial_indexdata() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let sorted = dir.path().join("sorted.osm.pbf");
     write(&sorted, &base_fixture(), true);
     let bytes = std::fs::read(&sorted).expect("read");
@@ -428,7 +427,7 @@ fn refuses_partial_indexdata() {
 /// created. The digest refuses any claim that disagrees with the block.
 #[test]
 fn refuses_indexdata_that_misdescribes_its_block() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     write_test_pbf_sorted(&honest, &[node(1, 0, 0, vec![])], &[], &[]);
     let bytes = std::fs::read(&honest).expect("read");
@@ -494,7 +493,7 @@ fn drop_last_string(payload: &mut Vec<u8>) {
 
 #[test]
 fn refuses_an_unresolvable_string_reference() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let sorted = dir.path().join("sorted.osm.pbf");
     // A way-only file: blob 1 is the way block, whose last-interned string
     // is the value of its last tag.
@@ -522,7 +521,7 @@ fn refuses_an_unresolvable_string_reference() {
 /// "mixed", which the streaming merge refuses. Empty groups are neutral.
 #[test]
 fn empty_group_beside_ways_is_not_a_mixed_block() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let sorted = dir.path().join("sorted.osm.pbf");
     write_test_pbf_non_indexed(
         &sorted,
@@ -545,7 +544,7 @@ fn empty_group_beside_ways_is_not_a_mixed_block() {
 /// it - while the digest, rightly, saw the same elements on both sides.
 #[test]
 fn empty_dense_block_between_kinds_loses_nothing() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let without = dir.path().join("without.osm.pbf");
     write_test_pbf_non_indexed(
         &without,
@@ -580,7 +579,7 @@ fn empty_dense_block_between_kinds_loses_nothing() {
 /// changes the answer.
 #[test]
 fn negative_fallback_is_decided_before_either_order_check() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     write_multi_block_test_pbf(
@@ -600,7 +599,7 @@ fn negative_fallback_is_decided_before_either_order_check() {
 /// paired them as one object and, ignoring the id, reported them common.
 #[test]
 fn extreme_negative_ids_are_distinct_objects() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let a = dir.path().join("a.osm.pbf");
     let b = dir.path().join("b.osm.pbf");
     write_test_pbf_non_indexed(&a, &[node(i64::MIN, 5, 5, vec![])], &[], &[]);
@@ -615,7 +614,7 @@ fn extreme_negative_ids_are_distinct_objects() {
 /// not order negative IDs the way the merge does.
 #[test]
 fn negative_ids_diff_correctly_at_default_jobs() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let nodes = generate_nodes_with_negatives(6, 6);
     let base = dir.path().join("base.osm.pbf");
     let same = dir.path().join("same.osm.pbf");
@@ -639,7 +638,7 @@ fn negative_ids_diff_correctly_at_default_jobs() {
 /// Large enough to give the parallel planner several shards.
 #[test]
 fn many_blocks_agree_with_parallel_diff() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let nodes = generate_nodes(400, 1);
     let a = dir.path().join("a.osm.pbf");
     let b = dir.path().join("b.osm.pbf");
@@ -670,7 +669,7 @@ fn osmium_reencodings_digest_equal() {
         crate::common::skip("osmium not found in PATH");
         return;
     }
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let source = dir.path().join("source.osm.pbf");
     let mut f = base_fixture();
     f.nodes[0].meta = Some(TestMeta::default());

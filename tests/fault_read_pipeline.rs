@@ -25,7 +25,6 @@ mod read_pipeline {
         REORDER_FILLED_HIGH_WATER, arm_block_decode, blocked_decode_ready, release_blocked_decode,
         reset,
     };
-    use tempfile::TempDir;
 
     use crate::common::write_many_block_pbf;
 
@@ -58,7 +57,7 @@ mod read_pipeline {
     #[test]
     fn admission_high_water_bounded_under_slow_first_decode() {
         reset();
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         let path = dir.path().join("many.osm.pbf");
         write_many_block_pbf(&path, 16);
 

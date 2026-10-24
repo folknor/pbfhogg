@@ -31,7 +31,7 @@ mod uring_writer {
     fn fault_injection_uring_writer_dispatch_panic_surfaces_via_flush() {
         uring_hooks::reset();
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let path = dir.path().join("uring_fault.osm.pbf");
 
         let header = block_builder::HeaderBuilder::new().build().expect("header");

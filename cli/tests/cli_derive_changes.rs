@@ -29,7 +29,6 @@ use crate::invoker::{CliInvoker, CliOutput};
 use pbfhogg::MemberId;
 use pbfhogg::block_builder::{self, BlockBuilder, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
-use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -262,7 +261,7 @@ fn write_roundtrip_multiblob_pair(old: &Path, new: &Path) {
 
 #[test]
 fn identical_files_no_changes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
@@ -299,7 +298,7 @@ fn identical_files_no_changes() {
 
 #[test]
 fn create_only() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
@@ -349,7 +348,7 @@ fn create_only() {
 
 #[test]
 fn delete_only() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
@@ -399,7 +398,7 @@ fn delete_only() {
 
 #[test]
 fn modify_node_coords() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
@@ -435,7 +434,7 @@ fn modify_node_coords() {
 
 #[test]
 fn modify_node_tags() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
@@ -472,7 +471,7 @@ fn modify_node_tags() {
 
 #[test]
 fn modify_way_refs() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
@@ -507,7 +506,7 @@ fn modify_way_refs() {
 
 #[test]
 fn modify_relation_members() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
@@ -554,7 +553,7 @@ fn modify_relation_members() {
 
 #[test]
 fn mixed_create_modify_delete() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
@@ -636,7 +635,7 @@ fn mixed_create_modify_delete() {
 
 #[test]
 fn roundtrip_with_merge() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
@@ -739,7 +738,7 @@ fn roundtrip_with_merge() {
 
 #[test]
 fn unsorted_input_rejected() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
@@ -788,7 +787,7 @@ fn unsorted_input_rejected() {
 
 #[test]
 fn increment_version_bumps_delete_versions() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
@@ -827,7 +826,7 @@ fn increment_version_bumps_delete_versions() {
 
 #[test]
 fn no_increment_version_preserves_delete_versions() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
@@ -855,7 +854,7 @@ fn no_increment_version_preserves_delete_versions() {
 
 #[test]
 fn increment_version_and_update_timestamp_combined() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
@@ -898,7 +897,7 @@ fn increment_version_and_update_timestamp_combined() {
 
 #[test]
 fn derive_changes_jobs_parity_roundtrips_to_same_output() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     let osc_seq = dir.path().join("changes_seq.osc.gz");
@@ -931,7 +930,7 @@ fn derive_changes_jobs_parity_roundtrips_to_same_output() {
 /// roundtrip.
 #[test]
 fn merge_stats_match_output_counts_after_roundtrip() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");

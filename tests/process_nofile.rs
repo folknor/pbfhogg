@@ -32,7 +32,7 @@ fn external_join(
 fn no_process_actions_leave_rlimit_nofile_unchanged() {
     use pbfhogg::host::{Host, NoProcessActions};
     use std::sync::Arc;
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = common::test_scratch();
     let input = dir.path().join("base.osm.pbf");
     common::write_base_pbf(&input);
     // Not common::test_host(): that raises the descriptor limit this test

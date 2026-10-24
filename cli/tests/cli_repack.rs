@@ -95,7 +95,7 @@ fn write_repack_fixture(path: &Path) -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRe
 /// shrink (cap=10 vs input 25/blob).
 #[test]
 fn repack_round_trip_preserves_elements_on_shrink() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -117,7 +117,7 @@ fn repack_round_trip_preserves_elements_on_shrink() {
 /// blob must be single-kind (PBF interop convention).
 #[test]
 fn repack_respects_element_cap() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -154,7 +154,7 @@ fn repack_respects_element_cap() {
 /// direct full blocks, which is what fragments non-dividing tails).
 #[test]
 fn repack_blob_count_matches_prediction() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -181,7 +181,7 @@ fn repack_blob_count_matches_prediction() {
 /// is built via `write_multi_block_test_pbf` which sets the sorted flag.
 #[test]
 fn repack_propagates_sorted_flag() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -197,7 +197,7 @@ fn repack_propagates_sorted_flag() {
 /// `--elements-per-blob 0` is rejected up front.
 #[test]
 fn repack_rejects_zero_cap() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -221,7 +221,7 @@ fn repack_rejects_zero_cap() {
 /// effect.
 #[test]
 fn repack_grow_collapses_to_one_blob_per_kind() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -262,7 +262,7 @@ fn repack_grow_collapses_to_one_blob_per_kind() {
 /// plus all 20 of blob 3 = second output blob).
 #[test]
 fn repack_round_trip_preserves_elements_on_grow() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -285,7 +285,7 @@ fn repack_round_trip_preserves_elements_on_grow() {
 /// 3 relations -> 1 partial.
 #[test]
 fn repack_grow_blob_count_matches_prediction() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -307,7 +307,7 @@ fn repack_grow_blob_count_matches_prediction() {
 /// global warning.
 #[test]
 fn repack_grow_no_warning_when_cap_fires() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -325,7 +325,7 @@ fn repack_grow_no_warning_when_cap_fires() {
 /// against false positives on the cap-fires path.
 #[test]
 fn repack_no_warning_when_cap_fires() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -384,7 +384,7 @@ fn relation_ids_in_output_order(path: &Path) -> Vec<i64> {
 /// this ordering assertion is what pins the bug.
 #[test]
 fn repack_output_is_monotonic_across_coalesced_blob_boundaries() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -485,7 +485,7 @@ fn assert_strictly_increasing(ids: &[i64], kind: &str) {
 /// small blob) and only keep the fixture a well-formed multi-kind PBF.
 #[test]
 fn repack_output_is_monotonic_for_nodes_and_ways() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -626,7 +626,7 @@ fn write_pbf_with_relation_blob_sizes(
 /// entry, which the existing regression does not.
 #[test]
 fn repack_output_is_monotonic_with_pending_prepopulated_at_guard() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -753,7 +753,7 @@ fn way_locations_in_output(path: &Path) -> Vec<(i64, Vec<(i32, i32)>)> {
 /// (Owned-way) path carry coordinates.
 #[test]
 fn repack_preserves_locations_on_ways() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -804,7 +804,7 @@ fn repack_preserves_locations_on_ways() {
 /// synthesize inline way coordinates. The standard fixture has no LOW.
 #[test]
 fn repack_strips_no_low_when_input_has_none() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -842,7 +842,7 @@ fn repack_strips_no_low_when_input_has_none() {
 /// happens to carry locations - controls the output.
 #[test]
 fn repack_strips_coords_when_input_flag_absent() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 

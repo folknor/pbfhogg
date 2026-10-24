@@ -32,7 +32,7 @@ struct Fx {
 
 impl Fx {
     fn new() -> Self {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         let p = dir.path();
         crate::common::write_base_pbf(&p.join("base.osm.pbf"));
         crate::common::write_changed_pbf(&p.join("changed.osm.pbf"));
@@ -79,7 +79,7 @@ impl Fx {
 /// Run `args` with the current directory in a scratch directory of its own:
 /// a text diff without `-o` puts its scratch there.
 fn run(args: &[OsString]) -> CliOutput {
-    let cwd = TempDir::new().unwrap();
+    let cwd = crate::common::test_scratch();
     CliInvoker::new().current_dir(cwd.path()).args(args).run()
 }
 

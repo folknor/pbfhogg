@@ -24,7 +24,6 @@ use std::path::Path;
 
 use crate::common::{TestNode, write_test_pbf_sorted};
 use crate::invoker::CliInvoker;
-use tempfile::TempDir;
 
 const EXIT_SUCCESS: i32 = 0;
 const EXIT_ANSWER_NEGATIVE: i32 = 1;
@@ -63,7 +62,7 @@ fn code(out: &crate::invoker::CliOutput) -> i32 {
 /// on three different codes.
 #[test]
 fn diff_separates_identical_differing_and_failure() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let a = dir.path().join("a.osm.pbf");
     let b = dir.path().join("b.osm.pbf");
     let c = dir.path().join("c.osm.pbf");
@@ -104,7 +103,7 @@ fn diff_separates_identical_differing_and_failure() {
 /// before and while it writes its output, so it is the case that used to die.
 #[test]
 fn a_closed_stderr_does_not_kill_the_run() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("sorted.osm.pbf");
     let nodes = crate::common::generate_nodes(50, 1);
@@ -136,7 +135,7 @@ fn a_closed_stderr_does_not_kill_the_run() {
 /// summary goes to the closed stderr after the diff itself went to stdout.
 #[test]
 fn a_closed_stderr_keeps_the_differences_status() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let a = dir.path().join("a.osm.pbf");
     let c = dir.path().join("c.osm.pbf");
     write_two_nodes(&a, 110_000_000);
@@ -152,7 +151,7 @@ fn a_closed_stderr_keeps_the_differences_status() {
 /// A failure is still a failure when nobody can read its message.
 #[test]
 fn a_closed_stderr_keeps_the_failure_status() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let missing = dir.path().join("does-not-exist.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -172,7 +171,7 @@ fn a_closed_stderr_keeps_the_failure_status() {
 /// invocation is 2.
 #[test]
 fn inspect_indexed_answer_and_failure_differ() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_two_nodes(&input, 110_000_000);
 
@@ -197,7 +196,7 @@ fn inspect_indexed_answer_and_failure_differ() {
 /// negative answer, not a failure.
 #[test]
 fn inspect_show_missing_element_is_the_negative_answer() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_two_nodes(&input, 110_000_000);
 
@@ -243,7 +242,7 @@ fn inspect_show_missing_element_is_the_negative_answer() {
 /// can act on it.
 #[test]
 fn inspect_show_rejects_every_other_mode_flag() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_two_nodes(&input, 110_000_000);
 
@@ -284,7 +283,7 @@ fn inspect_show_rejects_every_other_mode_flag() {
 /// Passing them to any other inspect mode did nothing and said nothing.
 #[test]
 fn inspect_force_and_jobs_require_nodes() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_two_nodes(&input, 110_000_000);
 

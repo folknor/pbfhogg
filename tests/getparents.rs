@@ -9,7 +9,6 @@ use pbfhogg::MemberId;
 use pbfhogg::getid::parse_ids;
 use pbfhogg::getparents::{GetparentsOptions, getparents};
 use pbfhogg::write::WriteOptions;
-use tempfile::TempDir;
 
 fn ids(strs: &[&str]) -> Vec<String> {
     strs.iter().map(ToString::to_string).collect()
@@ -25,7 +24,7 @@ fn default_opts() -> GetparentsOptions {
 
 #[test]
 fn ways_referencing_node() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -100,7 +99,7 @@ fn ways_referencing_node() {
 
 #[test]
 fn relations_referencing_way() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -164,7 +163,7 @@ fn relations_referencing_way() {
 
 #[test]
 fn add_self_includes_queried_objects() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -219,7 +218,7 @@ fn add_self_includes_queried_objects() {
 
 #[test]
 fn no_transitive_relations() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -272,7 +271,7 @@ fn no_transitive_relations() {
 
 #[test]
 fn empty_result() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 

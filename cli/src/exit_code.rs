@@ -218,15 +218,8 @@ pub fn output_hint(err: &(dyn std::error::Error + 'static), advice: &Advice) -> 
 #[allow(clippy::disallowed_methods)] // fixture files in test scratch, not operator input
 mod tests {
     use super::{Hinted, error_report, is_platform_unsupported};
+    use crate::test_scratch::scratch;
     use std::io;
-
-    /// A scratch directory under the workspace's data/test-scratch, never the
-    /// system temp directory.
-    fn scratch() -> tempfile::TempDir {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/test-scratch");
-        std::fs::create_dir_all(&root).expect("create test scratch root");
-        tempfile::TempDir::new_in(root).expect("create test scratch directory")
-    }
 
     fn platform() -> pbfhogg::Error {
         pbfhogg::Error::platform_unsupported("io-uring", io::Error::other("refused"))

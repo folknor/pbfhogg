@@ -591,7 +591,7 @@ fn roundtrip_uncompressed() {
 #[cfg(feature = "linux-direct-io")]
 #[test]
 fn roundtrip_direct_io() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("direct_io.osm.pbf");
 
     // Write with O_DIRECT (pipelined)
@@ -688,7 +688,7 @@ fn roundtrip_direct_io() {
 #[cfg(feature = "linux-direct-io")]
 #[test]
 fn roundtrip_pipelined_direct_io() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("pipelined_direct_io.osm.pbf");
 
     let header = block_builder::HeaderBuilder::new().build().unwrap();
@@ -768,7 +768,7 @@ fn roundtrip_pipelined_direct_io() {
 #[cfg(feature = "linux-io-uring")]
 #[test]
 fn roundtrip_uring_tiny_output() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("uring_tiny.osm.pbf");
 
     let header = block_builder::HeaderBuilder::new().build().unwrap();
@@ -837,7 +837,7 @@ fn roundtrip_uring_tiny_output() {
 fn roundtrip_uring_small_size_sweep() {
     let node_counts = [1usize, 10, 100, 500, 2_000, 8_000, 16_000];
     for &n in &node_counts {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::common::test_scratch();
         let path = dir.path().join(format!("uring_sweep_{n}.osm.pbf"));
 
         let header = block_builder::HeaderBuilder::new().build().unwrap();

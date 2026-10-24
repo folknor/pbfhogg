@@ -136,7 +136,7 @@ struct Fx {
 
 impl Fx {
     fn new() -> Self {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         let p = dir.path();
         crate::common::write_base_pbf(&p.join("good.osm.pbf"));
         crate::common::write_changed_pbf(&p.join("changed.osm.pbf"));
@@ -699,7 +699,7 @@ fn built(fx: &Fx, row: &Row, dir: &Path, input: &Path) -> Invocation {
 /// A header-only file is a valid PBF: every command accepts it without
 /// `--force`, and none says a word about indexdata.
 fn header_only_is_accepted(fx: &Fx, row: &Row) -> Result<(), String> {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let inv = built(fx, row, dir.path(), &fx.path("header-only.osm.pbf"));
     let out = run(&inv);
     let stderr = out.stderr_str();
@@ -719,7 +719,7 @@ fn header_only_is_accepted(fx: &Fx, row: &Row) -> Result<(), String> {
 /// Not a PBF at all: exit 2, the one missing-header error, the file named,
 /// and nothing about indexdata.
 fn missing_header_is_one_error(fx: &Fx, row: &Row, file: &str) -> Result<(), String> {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = fx.path(file);
     let inv = built(fx, row, dir.path(), &input);
     let out = run(&inv);
@@ -756,7 +756,7 @@ fn headerless_is_missing_header(fx: &Fx, row: &Row) -> Result<(), String> {
 /// still succeed, so a stale exemption fails.
 fn payload_past_eof_is_located(fx: &Fx, row: &Row) -> Result<(), String> {
     let file = "payload-past-eof.osm.pbf";
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let out = run(&built(fx, row, dir.path(), &fx.path(file)));
     let stderr = out.stderr_str();
     if STOPS_BEFORE_LAST_PAYLOAD
@@ -1244,7 +1244,7 @@ fn geocode_legacy_force(c: &Ctx, input: &Path) -> Invocation {
 
 /// A run in a fresh output directory, with `extra` words last.
 fn run_policy_row(fx: &Fx, row: &PolicyRow, input: &Path, extra: &[&str]) -> (CliOutput, String) {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let inv = (row.build)(
         &Ctx {
             fx,
@@ -1467,7 +1467,7 @@ fn first_blob_only_holds(
     build: fn(&Ctx, &Path) -> Invocation,
     mixed: Mixed,
 ) -> Result<(), String> {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let inv = build(
         &Ctx {
             fx,
@@ -1594,7 +1594,7 @@ fn a_second_header_is_refused_by_the_commands_that_walk_frames_themselves() {
             "getid" | "apply-changes" | "altw" | "altw external"
         )
     }) {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         let out = run(&built(
             &fx,
             row,
@@ -1649,7 +1649,7 @@ fn a_payload_running_past_eof_is_refused_with_its_location_by_every_command() {
 #[test]
 fn getid_streaming_arm_refuses_a_second_header() {
     let fx = Fx::new();
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let output = dir.path().join("out.osm.pbf");
     let out = CliInvoker::new()
         .arg("getid")
@@ -1689,7 +1689,7 @@ fn an_output_that_is_any_input_the_command_reads_is_refused_before_any_work() {
     let fx = Fx::new();
     let mut failures = Vec::new();
     for alias in ALIASES {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         let (args, protected) = (alias.build)(&fx, dir.path());
         let before = std::fs::read(&protected).unwrap();
         let out = CliInvoker::new().args(&args).run();

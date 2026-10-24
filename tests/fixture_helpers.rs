@@ -11,7 +11,6 @@ use crate::common::{
     read_header, read_normalized, write_multi_block_test_pbf, write_test_pbf_sorted,
 };
 use pbfhogg::{BlobDecode, BlobReader, BlobType};
-use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
 // Multi-block fixture
@@ -21,7 +20,7 @@ use tempfile::TempDir;
 /// `block_size` elements within each type section, plus the header.
 #[test]
 fn multi_block_fixture_splits_at_block_size() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("multi.osm.pbf");
 
     // 100 nodes + 20 ways + 5 relations at block_size=25 should produce:
@@ -69,7 +68,7 @@ fn multi_block_fixture_splits_at_block_size() {
 /// ids, so consumers can rely on them as a one-line fixture source.
 #[test]
 fn generator_roundtrip() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("gen.osm.pbf");
 
     let nodes = generate_nodes(50, 1);
@@ -109,7 +108,7 @@ fn generator_roundtrip() {
 /// back via `read_normalized` with matching fields.
 #[test]
 fn test_meta_roundtrips_through_writer() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("meta.osm.pbf");
 
     let meta = TestMeta {
@@ -169,7 +168,7 @@ fn test_meta_roundtrips_through_writer() {
 /// `cli/tests/cli_sort.rs`.)
 #[test]
 fn assert_indexed_passes_for_standard_fixture() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("indexed.osm.pbf");
     write_test_pbf_sorted(
         &path,
@@ -199,7 +198,7 @@ fn assert_indexed_passes_for_standard_fixture() {
 /// it by exactly the documented edits.
 #[test]
 fn base_and_changed_fixtures_differ_by_the_documented_edits() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let changed = dir.path().join("changed.osm.pbf");
     crate::common::write_base_pbf(&base);

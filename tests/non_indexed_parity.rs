@@ -28,7 +28,6 @@ use pbfhogg::write::WriteOptions;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
-use tempfile::TempDir;
 
 /// Default compression and backend with `force` set: these tests feed the
 /// commands non-indexed input on purpose.
@@ -185,7 +184,7 @@ fn write_smart_both(indexed: &Path, non_indexed: &Path) {
 
 #[test]
 fn sort_non_indexed_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in_idx = dir.path().join("in_idx.osm.pbf");
     let in_non = dir.path().join("in_non.osm.pbf");
     let out_idx = dir.path().join("out_idx.osm.pbf");
@@ -219,7 +218,7 @@ fn sort_non_indexed_parity() {
 
 #[test]
 fn tags_filter_non_indexed_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in_idx = dir.path().join("in_idx.osm.pbf");
     let in_non = dir.path().join("in_non.osm.pbf");
     let out_idx = dir.path().join("out_idx.osm.pbf");
@@ -271,7 +270,7 @@ fn tags_filter_non_indexed_parity() {
 #[cfg(feature = "commands")] // uses pbfhogg::extract, gated behind `commands`
 #[test]
 fn extract_simple_non_indexed_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in_idx = dir.path().join("in_idx.osm.pbf");
     let in_non = dir.path().join("in_non.osm.pbf");
     let out_idx = dir.path().join("out_idx.osm.pbf");
@@ -310,7 +309,7 @@ fn extract_simple_non_indexed_parity() {
 
 #[test]
 fn getid_include_non_indexed_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in_idx = dir.path().join("in_idx.osm.pbf");
     let in_non = dir.path().join("in_non.osm.pbf");
     let out_idx = dir.path().join("out_idx.osm.pbf");
@@ -377,7 +376,7 @@ fn write_osc_gz(path: &Path, xml: &str) {
 
 #[test]
 fn apply_changes_non_indexed_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in_idx = dir.path().join("in_idx.osm.pbf");
     let in_non = dir.path().join("in_non.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
@@ -449,7 +448,7 @@ fn apply_changes_non_indexed_parity() {
 #[cfg(feature = "commands")] // uses pbfhogg::check, gated behind `commands`
 #[test]
 fn check_refs_non_indexed_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in_idx = dir.path().join("in_idx.osm.pbf");
     let in_non = dir.path().join("in_non.osm.pbf");
     write_both(&in_idx, &in_non);
@@ -503,7 +502,7 @@ fn check_refs_non_indexed_parity() {
 
 #[test]
 fn show_element_non_indexed_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in_idx = dir.path().join("in_idx.osm.pbf");
     let in_non = dir.path().join("in_non.osm.pbf");
     write_both(&in_idx, &in_non);
@@ -569,7 +568,7 @@ fn show_element_non_indexed_parity() {
 #[cfg(feature = "commands")] // uses pbfhogg::check, gated behind `commands`
 #[test]
 fn check_ids_non_indexed_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in_idx = dir.path().join("in_idx.osm.pbf");
     let in_non = dir.path().join("in_non.osm.pbf");
     write_both(&in_idx, &in_non);
@@ -647,7 +646,7 @@ fn write_derive_pair(old_idx: &Path, old_non: &Path, new_idx: &Path, new_non: &P
 
 #[test]
 fn derive_changes_non_indexed_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old_idx = dir.path().join("old_idx.osm.pbf");
     let old_non = dir.path().join("old_non.osm.pbf");
     let new_idx = dir.path().join("new_idx.osm.pbf");
@@ -704,7 +703,7 @@ fn derive_changes_non_indexed_parity() {
 
 #[test]
 fn renumber_external_rejects_non_indexed() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in_idx = dir.path().join("in_idx.osm.pbf");
     let in_non = dir.path().join("in_non.osm.pbf");
     let out_idx = dir.path().join("out_idx.osm.pbf");
@@ -767,7 +766,7 @@ fn renumber_external_rejects_non_indexed() {
 #[cfg(feature = "commands")] // uses pbfhogg::extract, gated behind `commands`
 #[test]
 fn extract_multi_complete_ways_non_indexed_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in_idx = dir.path().join("in_idx.osm.pbf");
     let in_non = dir.path().join("in_non.osm.pbf");
     write_both(&in_idx, &in_non);
@@ -823,7 +822,7 @@ fn extract_multi_complete_ways_non_indexed_parity() {
 #[cfg(feature = "commands")] // uses pbfhogg::extract, gated behind `commands`
 #[test]
 fn extract_smart_non_indexed_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let in_idx = dir.path().join("in_idx.osm.pbf");
     let in_non = dir.path().join("in_non.osm.pbf");
     let out_idx = dir.path().join("out_idx.osm.pbf");
@@ -925,7 +924,7 @@ fn write_disjoint_pair(path_a: &Path, path_b: &Path) {
 
 #[test]
 fn merge_pbf_non_indexed_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
 
     // Build indexed twins of a disjoint pair, then rebuild as
     // non-indexed twins via the non-indexed writer's helper by

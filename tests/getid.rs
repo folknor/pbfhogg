@@ -9,7 +9,6 @@ use crate::common::{
 use pbfhogg::getid::{GetidOptions, getid, parse_ids, removeid};
 use pbfhogg::write::WriteOptions;
 use pbfhogg::{BlobDecode, BlobReader, Element};
-use tempfile::TempDir;
 
 /// Default compression and backend with `force` set: the fixtures here are
 /// written without indexdata.
@@ -144,7 +143,7 @@ fn read_raw_way_meta(path: &std::path::Path) -> Vec<RawWayMeta> {
 /// distinguishable from "requested, found nothing".
 #[test]
 fn getid_reports_found_ids_without_rereading_output() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -219,7 +218,7 @@ fn getid_reports_found_ids_without_rereading_output() {
 /// worker threads, so it exercises the parallel collection route.
 #[test]
 fn getid_found_ids_exclude_referenced_pull_ins() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -283,7 +282,7 @@ fn getid_found_ids_exclude_referenced_pull_ins() {
 
 #[test]
 fn getid_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -335,7 +334,7 @@ fn getid_nodes() {
 
 #[test]
 fn getid_mixed_types() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -402,7 +401,7 @@ fn getid_mixed_types() {
 
 #[test]
 fn getid_add_referenced() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -486,7 +485,7 @@ fn getid_add_referenced() {
 
 #[test]
 fn removeid_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -537,7 +536,7 @@ fn removeid_nodes() {
 
 #[test]
 fn removeid_mixed_types() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -611,7 +610,7 @@ fn removeid_mixed_types() {
 
 #[test]
 fn getid_empty_result() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -647,7 +646,7 @@ fn getid_empty_result() {
 
 #[test]
 fn getid_preserves_tags() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -700,7 +699,7 @@ fn getid_preserves_tags() {
 
 #[test]
 fn getid_normalizes_dense_node_version_minus_one_to_absent_metadata() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -753,7 +752,7 @@ fn getid_normalizes_dense_node_version_minus_one_to_absent_metadata() {
 
 #[test]
 fn getid_normalizes_dense_node_changeset_minus_one_to_zero() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -806,7 +805,7 @@ fn getid_normalizes_dense_node_changeset_minus_one_to_zero() {
 
 #[test]
 fn getid_normalizes_way_version_minus_one_to_absent_metadata() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -873,7 +872,7 @@ fn getid_normalizes_way_version_minus_one_to_absent_metadata() {
 
 #[test]
 fn getid_normalizes_way_changeset_minus_one_to_zero() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -940,7 +939,7 @@ fn getid_normalizes_way_changeset_minus_one_to_zero() {
 
 #[test]
 fn getid_from_id_file() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     let id_file = dir.path().join("ids.txt");
@@ -1002,7 +1001,7 @@ fn getid_from_id_file() {
 
 #[test]
 fn getid_add_referenced_plus_direct_node() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -1069,7 +1068,7 @@ fn getid_add_referenced_plus_direct_node() {
 
 #[test]
 fn getid_remove_tags_strips_referenced_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -1176,7 +1175,7 @@ fn getid_remove_tags_strips_referenced_nodes() {
 
 #[test]
 fn removeid_multi_blob_passthrough() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 

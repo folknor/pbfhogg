@@ -36,7 +36,6 @@ use crate::invoker::{CliInvoker, CliOutput};
 use pbfhogg::MemberId;
 use pbfhogg::block_builder::{self, BlockBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};
-use tempfile::TempDir;
 
 const BBOX_STR: &str = "12.4,55.6,12.7,55.8";
 
@@ -203,7 +202,7 @@ fn write_geojson(path: &Path, content: &str) {
 
 #[test]
 fn simple_filters_nodes_by_bbox() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &test_nodes(), &[], &[]);
@@ -220,7 +219,7 @@ fn simple_filters_nodes_by_bbox() {
 
 #[test]
 fn simple_includes_ways_with_nodes_in_bbox() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
@@ -238,7 +237,7 @@ fn simple_includes_ways_with_nodes_in_bbox() {
 
 #[test]
 fn simple_does_not_add_extra_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
@@ -256,7 +255,7 @@ fn simple_does_not_add_extra_nodes() {
 
 #[test]
 fn complete_ways_includes_all_way_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
@@ -277,7 +276,7 @@ fn complete_ways_includes_all_way_nodes() {
 
 #[test]
 fn complete_ways_includes_relations() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &test_nodes(), &test_ways(), &test_relations());
@@ -296,7 +295,7 @@ fn complete_ways_includes_relations() {
 
 #[test]
 fn simple_includes_relations_with_matched_ways() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -324,7 +323,7 @@ fn simple_includes_relations_with_matched_ways() {
 
 #[test]
 fn empty_extract() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &test_nodes(), &test_ways(), &test_relations());
@@ -344,7 +343,7 @@ fn empty_extract() {
 
 #[test]
 fn tags_preserved_in_extract() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
@@ -379,7 +378,7 @@ fn tags_preserved_in_extract() {
 
 #[test]
 fn polygon_simple_filters_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     let geojson = dir.path().join("region.geojson");
@@ -399,7 +398,7 @@ fn polygon_simple_filters_nodes() {
 
 #[test]
 fn polygon_complete_ways_includes_all_way_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     let geojson = dir.path().join("region.geojson");
@@ -420,7 +419,7 @@ fn polygon_complete_ways_includes_all_way_nodes() {
 
 #[test]
 fn polygon_with_hole_excludes_interior() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     let geojson = dir.path().join("region.geojson");
@@ -443,7 +442,7 @@ fn polygon_with_hole_excludes_interior() {
 
 #[test]
 fn polygon_from_geojson_file() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     let geojson = dir.path().join("region.geojson");
@@ -463,7 +462,7 @@ fn polygon_from_geojson_file() {
 
 #[test]
 fn polygon_rejects_degenerate_exterior_without_publishing_output() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     let geojson = dir.path().join("region.geojson");
@@ -497,7 +496,7 @@ fn polygon_rejects_degenerate_exterior_without_publishing_output() {
 
 #[test]
 fn smart_includes_multipolygon_way_members() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -530,7 +529,7 @@ fn smart_includes_multipolygon_way_members() {
 
 #[test]
 fn smart_includes_boundary_node_members() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -572,7 +571,7 @@ fn smart_includes_boundary_node_members() {
 
 #[test]
 fn smart_ignores_non_qualifying_relations() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -668,7 +667,7 @@ fn write_multi_blob_pbf(path: &Path) {
 
 #[test]
 fn spatial_filter_skips_distant_blobs() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("multi_blob.osm.pbf");
     let output = dir.path().join("extracted.osm.pbf");
 
@@ -765,7 +764,7 @@ fn write_ways_before_nodes_pbf(path: &Path) {
 #[test]
 fn unsorted_way_before_its_nodes_is_still_extracted() {
     for strategy in [Strategy::Simple, Strategy::CompleteWays, Strategy::Smart] {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let input = dir.path().join("ways_before_nodes.osm.pbf");
         let output = dir.path().join("output.osm.pbf");
         write_ways_before_nodes_pbf(&input);
@@ -805,7 +804,7 @@ fn unsorted_way_before_its_nodes_is_still_extracted() {
 
 #[test]
 fn simple_sorted_filters_nodes_by_bbox() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf_sorted(&input, &test_nodes(), &[], &[]);
@@ -822,7 +821,7 @@ fn simple_sorted_filters_nodes_by_bbox() {
 
 #[test]
 fn simple_sorted_includes_ways_with_nodes_in_bbox() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &[]);
@@ -839,7 +838,7 @@ fn simple_sorted_includes_ways_with_nodes_in_bbox() {
 
 #[test]
 fn simple_sorted_does_not_add_extra_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &[]);
@@ -856,7 +855,7 @@ fn simple_sorted_does_not_add_extra_nodes() {
 
 #[test]
 fn simple_sorted_includes_relations() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
@@ -873,7 +872,7 @@ fn simple_sorted_includes_relations() {
 
 #[test]
 fn simple_sorted_includes_relations_with_matched_ways() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -900,7 +899,7 @@ fn simple_sorted_includes_relations_with_matched_ways() {
 
 #[test]
 fn simple_sorted_empty_extract() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
@@ -919,7 +918,7 @@ fn simple_sorted_empty_extract() {
 
 #[test]
 fn simple_sorted_output_declares_sorted() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
@@ -939,7 +938,7 @@ fn simple_sorted_output_declares_sorted() {
 
 #[test]
 fn simple_sorted_polygon_filters_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     let geojson = dir.path().join("region.geojson");
@@ -969,7 +968,7 @@ fn simple_sorted_polygon_filters_nodes() {
 /// pairwise check does.
 #[test]
 fn multi_extract_rejects_outputs_that_normalize_to_one_path() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let config = dir.path().join("config.json");
     std::fs::create_dir(dir.path().join("sub")).expect("create subdir");
@@ -1009,7 +1008,7 @@ fn multi_extract_rejects_outputs_that_normalize_to_one_path() {
 #[cfg(unix)]
 #[test]
 fn multi_extract_rejects_symlinked_output_paths() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let config = dir.path().join("config.json");
     let real = dir.path().join("a.osm.pbf");
@@ -1059,7 +1058,7 @@ fn multi_extract_rejects_symlinked_output_paths() {
 /// by then.
 #[test]
 fn multi_extract_refuses_when_a_destination_cannot_be_published() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let config = dir.path().join("config.json");
     let out_a = dir.path().join("a.osm.pbf");
@@ -1108,7 +1107,7 @@ fn multi_extract_refuses_when_a_destination_cannot_be_published() {
 
 #[test]
 fn multi_extract_two_bbox_regions() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let out_a = dir.path().join("a.osm.pbf");
     let out_b = dir.path().join("b.osm.pbf");
@@ -1146,7 +1145,7 @@ fn multi_extract_two_bbox_regions() {
 
 #[test]
 fn multi_extract_diagnostics_use_final_output_paths() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let config = dir.path().join("config.json");
     write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
@@ -1199,7 +1198,7 @@ fn multi_extract_diagnostics_use_final_output_paths() {
 
 #[test]
 fn multi_extract_config_paths_resolve_from_config_and_directory_override() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let config_dir = dir.path().join("config");
     let configured_dir = config_dir.join("configured");
     let override_dir = dir.path().join("override");
@@ -1273,7 +1272,7 @@ fn multi_extract_config_paths_resolve_from_config_and_directory_override() {
 /// bounds into point membership.
 #[test]
 fn config_bbox_floats_parse_identically_to_cli_bbox() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let out_cli = dir.path().join("cli.osm.pbf");
     let config = dir.path().join("config.json");
@@ -1352,7 +1351,7 @@ fn config_bbox_floats_parse_identically_to_cli_bbox() {
 /// would copy the whole blob through untouched and smuggle the node in.
 #[test]
 fn bbox_lower_boundary_excludes_the_node_the_f64_comparison_rejects() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
 
     // Node 1 sits exactly on the integer column division produces for
@@ -1426,7 +1425,7 @@ fn bbox_lower_boundary_excludes_the_node_the_f64_comparison_rejects() {
 
 #[test]
 fn multi_extract_grid_matches_linear_bbox() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let config = dir.path().join("config.json");
     write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
@@ -1456,7 +1455,7 @@ fn multi_extract_grid_matches_linear_bbox() {
 
 #[test]
 fn multi_extract_grid_matches_linear_mixed_regions() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let config = dir.path().join("config.json");
     write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
@@ -1492,7 +1491,7 @@ fn multi_extract_grid_matches_linear_mixed_regions() {
 
 #[test]
 fn multi_extract_from_config_file() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let out_cph = dir.path().join("copenhagen.osm.pbf");
     let out_east = dir.path().join("east.osm.pbf");
@@ -1527,7 +1526,7 @@ fn multi_extract_from_config_file() {
 
 #[test]
 fn simple_multi_blob_bbox_partitioning() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -1611,7 +1610,7 @@ fn single_region_config(dir: &Path) -> std::path::PathBuf {
 /// verbatim - and the summary must still say 20.
 #[test]
 fn passthrough_counts_observed_nodes_not_the_indexdata_count() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -1675,7 +1674,7 @@ fn passthrough_counts_observed_nodes_not_the_indexdata_count() {
 /// against its decoded payload and filters the ones that fail.
 #[test]
 fn a_lying_indexdata_bbox_does_not_smuggle_nodes_through() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");

@@ -29,7 +29,6 @@ use crate::invoker::CliInvoker;
 use pbfhogg::MemberId;
 use pbfhogg::block_builder::{self, BlockBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};
-use tempfile::TempDir;
 
 const LAT: i32 = 550_000_000;
 const LON: i32 = 120_000_000;
@@ -68,7 +67,7 @@ fn write_lying_sorted_pbf(path: &Path) {
 /// resolution agree only when IDs increase in file order.
 #[test]
 fn renumber_survives_lying_sorted_header_out_of_order_blobs() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_lying_sorted_pbf(&input);
@@ -103,7 +102,7 @@ fn renumber_survives_lying_sorted_header_out_of_order_blobs() {
 
 #[test]
 fn renumber_unsorted_header_error_explains_renumber_requirement() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &[], &[], &[]);
@@ -139,7 +138,7 @@ fn renumber_unsorted_header_error_explains_renumber_requirement() {
 /// drop upsert creates.
 #[test]
 fn apply_changes_rejects_unsorted_header() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let diff = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -287,7 +286,7 @@ fn write_three_kind_fixture(path: &Path) {
 /// indexdata, before stage 1's own reversed-range check is reached.
 #[test]
 fn altw_external_rejects_reversed_indexdata_range() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_three_kind_fixture(&input);
@@ -355,7 +354,7 @@ fn altw_external_rejects_reversed_indexdata_range() {
 /// only the strict walk can detect.
 #[test]
 fn renumber_rejects_truncated_relation_blob_payload() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_three_kind_fixture(&input);
@@ -412,7 +411,7 @@ fn renumber_rejects_truncated_relation_blob_payload() {
 /// without requiring a bespoke granularity-overflow fixture.
 #[test]
 fn cat_rejects_truncated_node_blob_payload() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_three_kind_fixture(&input);
@@ -462,7 +461,7 @@ fn cat_rejects_truncated_node_blob_payload() {
 /// fail with a different message.
 #[test]
 fn getparents_rejects_zero_full_scan_min_blobs() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let output = dir.path().join("out.osm.pbf");
     // Every other argument is well-formed, so the range check is the only
     // thing left that can reject this invocation.
@@ -485,7 +484,7 @@ fn getparents_rejects_zero_full_scan_min_blobs() {
 /// commands that construct their readers through the host.
 #[test]
 fn bench_commands_report_unrecognised_indexdata() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("bad-indexdata.osm.pbf");
     crate::common::write_bad_indexdata_pbf(&path);
     let input = path.to_str().expect("utf-8 scratch path");

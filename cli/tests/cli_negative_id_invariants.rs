@@ -38,7 +38,6 @@ use crate::common::{
     way_ids_id_only, write_test_pbf, write_test_pbf_sorted,
 };
 use crate::invoker::CliInvoker;
-use tempfile::TempDir;
 
 const N_NEG: usize = 3;
 const N_POS: usize = 3;
@@ -70,7 +69,7 @@ fn build_unsorted_fixture(path: &Path) {
 /// amount. Mixed-sign ids must survive end-to-end.
 #[test]
 fn cat_preserves_mixed_sign_ids() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     build_fixture(&input);
@@ -115,7 +114,7 @@ fn cat_preserves_mixed_sign_ids() {
 /// downstream assertion; pinning panic-freedom is enough.
 #[test]
 fn inspect_handles_mixed_sign_ids() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     build_fixture(&input);
 
@@ -132,7 +131,7 @@ fn inspect_handles_mixed_sign_ids() {
 /// which sorts internally - so we only verify count+presence.
 #[test]
 fn sort_preserves_mixed_sign_ids() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     build_unsorted_fixture(&input);
@@ -182,7 +181,7 @@ fn sort_preserves_mixed_sign_ids() {
 /// list.
 #[test]
 fn tags_filter_handles_mixed_sign_ids() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -244,7 +243,7 @@ fn tags_filter_handles_mixed_sign_ids() {
 /// (`non-negative`) and the specific id (`-1`).
 #[test]
 fn renumber_rejects_mixed_sign_ids_with_named_id() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     build_fixture(&input);
@@ -288,7 +287,7 @@ fn renumber_rejects_mixed_sign_ids_with_named_id() {
 /// substring "non-negative", same shape as renumber's reject.
 #[test]
 fn getid_rejects_negative_ids_with_named_id_and_kind() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     build_fixture(&input);
@@ -351,7 +350,7 @@ fn getid_rejects_negative_ids_with_named_id_and_kind() {
 /// that fix even if the clamp ever changes.)
 #[test]
 fn getid_id_osm_file_passes_through_negative_source_ids() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let source = dir.path().join("source.osm.pbf");
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");

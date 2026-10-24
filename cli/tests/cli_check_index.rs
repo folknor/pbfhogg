@@ -78,7 +78,7 @@ fn degrade_with(dir: &Path, input: &Path, flag: &str, name: &str) -> std::path::
 /// file this crate itself just wrote is worse than no check at all.
 #[test]
 fn an_honest_file_passes_and_exits_zero() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("honest.osm.pbf");
     write_fixture(&input);
 
@@ -110,7 +110,7 @@ fn an_honest_file_passes_and_exits_zero() {
 /// fallback payload scan, so this verifies the producer path in question.
 #[test]
 fn repacked_empty_tag_key_passes_index_check() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let repacked = dir.path().join("repacked.osm.pbf");
     let nodes = [TestNode {
@@ -144,7 +144,7 @@ fn repacked_empty_tag_key_passes_index_check() {
 /// useless on exactly the inputs most worth checking.
 #[test]
 fn a_file_that_makes_no_claims_passes() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let stripped = dir.path().join("stripped.osm.pbf");
     write_fixture(&input);
@@ -183,7 +183,7 @@ fn a_file_that_makes_no_claims_passes() {
 /// that lies. `check --index` must catch both fields.
 #[test]
 fn an_inflated_count_and_id_range_are_detected() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_fixture(&input);
     let corrupt = degrade_with(dir.path(), &input, "--corrupt-indexdata", "count.osm.pbf");
@@ -218,7 +218,7 @@ fn an_inflated_count_and_id_range_are_detected() {
 /// outright rather than merely misreport it.
 #[test]
 fn a_rotated_element_kind_is_detected() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_fixture(&input);
     let corrupt = degrade_with(
@@ -250,7 +250,7 @@ fn a_rotated_element_kind_is_detected() {
 /// blob holding matches.
 #[test]
 fn a_replaced_tag_key_set_is_detected() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_fixture(&input);
     let corrupt = degrade_with(dir.path(), &input, "--corrupt-tagdata", "tags.osm.pbf");
@@ -291,7 +291,7 @@ fn a_replaced_tag_key_set_is_detected() {
 /// ever sees it).
 #[test]
 fn indexdata_that_cannot_be_read_is_reported_rather_than_ignored() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_fixture(&input);
     let pbf = std::fs::read(&input).expect("read fixture");
@@ -370,7 +370,7 @@ fn indexdata_that_cannot_be_read_is_reported_rather_than_ignored() {
 /// blob on the strength of that index.
 #[test]
 fn a_tag_index_over_an_unindexable_blob_is_reported() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_fixture(&input);
     let pbf = std::fs::read(&input).expect("read fixture");
@@ -459,7 +459,7 @@ fn mixed_kind_block() -> Vec<u8> {
 /// the entire file.
 #[test]
 fn index_is_opt_in_and_a_bare_check_does_not_run_it() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_fixture(&input);
     let corrupt = degrade_with(dir.path(), &input, "--corrupt-indexdata", "count.osm.pbf");
@@ -492,7 +492,7 @@ fn index_is_opt_in_and_a_bare_check_does_not_run_it() {
 /// `--index` selects, so it suppresses the default `--ids` + `--refs` pair.
 #[test]
 fn index_alone_runs_only_the_index_check() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_fixture(&input);
 
@@ -526,7 +526,7 @@ fn index_alone_runs_only_the_index_check() {
 /// The JSON surface carries the same verdict as the human one.
 #[test]
 fn json_output_reports_the_verdict_and_the_violations() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_fixture(&input);
     let corrupt = degrade_with(dir.path(), &input, "--corrupt-indexdata", "count.osm.pbf");
@@ -566,7 +566,7 @@ fn json_output_reports_the_verdict_and_the_violations() {
 /// A missing input is a failure to run (exit 2), not a negative answer.
 #[test]
 fn an_unreadable_input_is_exit_two_not_exit_one() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let out = check_index(&dir.path().join("nope.osm.pbf"));
     assert_eq!(
         out.status.code(),

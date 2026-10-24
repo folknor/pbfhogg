@@ -148,7 +148,7 @@ fn header_too_big() {
 /// 90 GB planet file is unactionable without it.
 #[test]
 fn framing_error_carries_byte_offset() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("header-too-big.osm.pbf");
     std::fs::write(&path, 65536u32.to_be_bytes()).expect("write fixture");
     let mut reader = BlobReader::from_path(&path).expect("open fixture");
@@ -358,7 +358,7 @@ fn truncated_blob_data() {
 /// allocation.
 #[test]
 fn has_indexdata_rejects_oversized_header_length() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("adversarial.osm.pbf");
     // 4-byte length prefix only, value = MAX_BLOB_HEADER_SIZE (64 KiB).
     // The file has no header payload; pre-fix the function would
@@ -381,7 +381,7 @@ fn has_indexdata_rejects_oversized_header_length() {
 /// with HeaderTooBig rather than attempting a huge allocation.
 #[test]
 fn cat_rejects_oversized_header_length() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("adversarial.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     std::fs::write(&input, 65536u32.to_be_bytes()).unwrap();
@@ -415,7 +415,7 @@ fn cat_rejects_oversized_header_length() {
 #[cfg(feature = "commands")]
 #[test]
 fn check_refs_rejects_schedule_entry_past_eof() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("truncated.osm.pbf");
 
     // Write a valid header-only PBF plus one data blob, then truncate
@@ -465,7 +465,7 @@ fn check_refs_rejects_schedule_entry_past_eof() {
 #[cfg(feature = "commands")]
 #[test]
 fn inspect_rejects_oversized_header_length_via_walker() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("adversarial.osm.pbf");
     std::fs::write(&path, 65536u32.to_be_bytes()).unwrap();
 
@@ -577,7 +577,7 @@ fn blob_reader_rejects_oversized_datasize() {
 /// datasize before the `vec![0u8; frame_len]` frame allocation.
 #[test]
 fn cat_rejects_oversized_datasize() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("adversarial.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     let mut data = write_header_only_pbf();
@@ -609,7 +609,7 @@ fn cat_rejects_oversized_datasize() {
 /// the guard trips on that second header.
 #[test]
 fn has_indexdata_rejects_oversized_datasize() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("adversarial.osm.pbf");
     let mut data = write_header_only_pbf();
     append_oversized_datasize_frame(&mut data, MAX_BLOB_DATASIZE);
@@ -625,7 +625,7 @@ fn has_indexdata_rejects_oversized_datasize() {
 #[cfg(feature = "commands")]
 #[test]
 fn inspect_rejects_oversized_datasize_via_walker() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("adversarial.osm.pbf");
     let mut data = write_header_only_pbf();
     append_oversized_datasize_frame(&mut data, MAX_BLOB_DATASIZE);

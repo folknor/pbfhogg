@@ -100,7 +100,7 @@ fn inspect_opts(show_id_ranges: bool, distrust_metadata: bool) -> pbfhogg::inspe
 /// the way to make it measure instead.
 #[test]
 fn inspect_distrust_metadata_measures_instead_of_quoting_the_index() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     let lying = dir.path().join("lying.osm.pbf");
 
@@ -217,7 +217,7 @@ fn write_indexed_simple_pbf(path: &std::path::Path) {
 
 #[test]
 fn inspect_json_base() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
@@ -280,7 +280,7 @@ fn inspect_json_base() {
 
 #[test]
 fn inspect_json_with_id_ranges() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
@@ -321,7 +321,7 @@ fn inspect_json_with_id_ranges() {
 
 #[test]
 fn inspect_json_with_blocks() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
@@ -355,7 +355,7 @@ fn inspect_json_with_blocks() {
 
 #[test]
 fn inspect_json_blocks_limit_honored() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
@@ -389,7 +389,7 @@ fn inspect_json_blocks_limit_honored() {
 
 #[test]
 fn inspect_json_combined_flags() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
@@ -436,7 +436,7 @@ fn inspect_json_combined_flags() {
 
 #[test]
 fn inspect_json_blocks_anomalies_only() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("anomalies.osm.pbf");
     // Three node blocks with element counts [100, 100, 10].
     // Median=100, so the 10-element block is anomalously small (<50% of median).
@@ -468,7 +468,7 @@ fn inspect_json_blocks_anomalies_only() {
 
 #[test]
 fn inspect_extended() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
@@ -504,7 +504,7 @@ fn inspect_extended() {
 
 #[test]
 fn inspect_get_value() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
@@ -550,7 +550,7 @@ fn inspect_get_value() {
 
 #[test]
 fn node_stats_parallel_classify_parity() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
 
     // 40 sequential nodes at block_size=10 -> 4 node blobs. No ways,
@@ -611,7 +611,7 @@ fn node_stats_parallel_classify_parity() {
 /// Target: node 51 - pre-fix: returns false; post-fix: returns true.
 #[test]
 fn show_element_unsorted_pbf_finds_target_in_later_blob() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("unsorted.osm.pbf");
 
     // Emit nodes in order 100, 101, 50, 51 with block_size=2 and the

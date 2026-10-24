@@ -23,7 +23,6 @@ mod apply_changes {
     use pbfhogg::block_builder::{self, BlockBuilder};
     use pbfhogg::write::WriteOptions;
     use pbfhogg::writer::{Compression, PbfWriter};
-    use tempfile::TempDir;
 
     use crate::common::{self, TestNode, generate_nodes, write_multi_block_test_pbf};
 
@@ -66,7 +65,7 @@ mod apply_changes {
     }
 
     fn check_worker_panic(locations_on_ways: bool) {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let base = dir.path().join("base.osm.pbf");
         let osc = dir.path().join("diff.osc.gz");
         let output = dir.path().join("output.osm.pbf");

@@ -32,7 +32,6 @@ use crate::common::{
 };
 use crate::invoker::{CliInvoker, CliOutput};
 use flate2::write::GzEncoder;
-use tempfile::TempDir;
 
 fn write_osc(path: &Path, xml: &str) {
     let file = File::create(path).expect("create osc file");
@@ -174,7 +173,7 @@ fn stats_block(stderr: &str) -> Vec<&str> {
 
 #[test]
 fn interior_create_in_false_positive_blob_stays_sorted() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -243,7 +242,7 @@ fn interior_create_in_false_positive_blob_stays_sorted() {
 
 #[test]
 fn interior_create_in_final_false_positive_blob_stays_sorted() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -308,7 +307,7 @@ fn interior_create_in_final_false_positive_blob_stays_sorted() {
 /// downstream consumer a file that lies about its ordering.
 #[test]
 fn unsorted_base_under_a_sorted_stamp_is_refused() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -365,7 +364,7 @@ fn unsorted_base_under_a_sorted_stamp_is_refused() {
 /// multi-blob input.
 #[test]
 fn sorted_multi_blob_base_still_succeeds() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -404,7 +403,7 @@ fn sorted_multi_blob_base_still_succeeds() {
 
 #[test]
 fn merge_jobs_parity_on_multiblob_input() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base_raw = dir.path().join("base_raw.osm.pbf");
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
@@ -431,7 +430,7 @@ fn merge_jobs_parity_on_multiblob_input() {
 
 #[test]
 fn merge_jobs_parity_without_locations_on_ways() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let out_seq = dir.path().join("out_seq.osm.pbf");
@@ -457,7 +456,7 @@ fn merge_jobs_parity_without_locations_on_ways() {
 
 #[test]
 fn empty_base_pbf_flushes_all_three_kinds() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -495,7 +494,7 @@ fn empty_base_pbf_flushes_all_three_kinds() {
 
 #[test]
 fn empty_base_pbf_noop_on_empty_diff() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -522,7 +521,7 @@ fn empty_base_pbf_noop_on_empty_diff() {
 
 #[test]
 fn trailing_creates_after_node_blob_flush_way_and_relation() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -570,7 +569,7 @@ fn trailing_creates_after_node_blob_flush_way_and_relation() {
 
 #[test]
 fn trailing_creates_after_way_blob_flush_relation_only() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -624,7 +623,7 @@ fn trailing_creates_after_way_blob_flush_relation_only() {
 
 #[test]
 fn modify_on_missing_id_silently_inserts() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -664,7 +663,7 @@ fn modify_on_missing_id_silently_inserts() {
 
 #[test]
 fn delete_on_missing_id_is_noop() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");
@@ -702,7 +701,7 @@ fn delete_on_missing_id_is_noop() {
 
 #[test]
 fn create_on_existing_id_overwrites_base() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
     let output = dir.path().join("output.osm.pbf");

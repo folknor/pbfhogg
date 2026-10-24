@@ -1167,18 +1167,22 @@ exclude = ["cli/src/output.rs"]
 region = "code"
 message = "Library diagnostics must use the caller's Diagnostics handle; the CLI writes stderr through output::cli_eprintln! and cli_eprint!, which survive a closed stderr"
 
-# Unit-test scratch under src/ comes from `path_guard::tests::scratch()`,
-# which mounts tests/common/scratch.rs: random directories under the
-# gitignored data/test-scratch/, removed when the guard drops. Fixed names in the
-# system temp dir let concurrent check sweeps delete each other's fixtures.
+# Test scratch comes from one implementation, tests/common/scratch.rs:
+# random directories under the gitignored data/test-scratch/, removed when
+# the guard drops. Unit tests under src/ reach it as
+# `path_guard::tests::scratch()`, integration tests as
+# `common::test_scratch()`, and the CLI crate's unit tests as
+# `test_scratch::scratch()` (cli/src/test_scratch.rs, same body). Fixed names
+# in the system temp dir let concurrent check sweeps delete each other's
+# fixtures.
 # The `_in` forms (`tempfile_in`, `tempdir_in`, `TempDir::new_in`) stay legal
 # so a test can place a file inside its guard's directory.
 [[textlint]]
 name = "unit-test-scratch-via-path-guard"
 pattern = '\benv::temp_dir\b|\btempfile::(?:tempdir|tempfile|NamedTempFile|Builder)\b|\bTempDir::new\b'
-paths = ["src/**/*.rs"]
+paths = ["src/**/*.rs", "tests/**/*.rs", "cli/tests/**/*.rs", "cli/src/**/*.rs"]
 region = "code"
-message = "Unit-test scratch must come from path_guard::tests::scratch(), never the system temp dir or a fixed name"
+message = "Test scratch must come from the shared scratch helper (path_guard::tests::scratch(), common::test_scratch() or the CLI's test_scratch::scratch()), never the system temp dir or a fixed name"
 
 # Error propagation (reference/pipeline.md, "Error propagation and
 # provenance"). A typed error keeps its kind and

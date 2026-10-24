@@ -7,7 +7,6 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use pbfhogg::tags_filter::osc::tags_filter_osc;
-use tempfile::TempDir;
 
 fn exprs(strs: &[&str]) -> Vec<String> {
     strs.iter().map(ToString::to_string).collect()
@@ -30,7 +29,7 @@ fn read_osc_gz(path: &std::path::Path) -> String {
 
 #[test]
 fn create_and_modify_are_filtered_but_deletes_are_preserved() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osc.gz");
     let output = dir.path().join("out.osc.gz");
 
@@ -96,7 +95,7 @@ fn create_and_modify_are_filtered_but_deletes_are_preserved() {
 
 #[test]
 fn type_prefix_applies_to_create_modify_only() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osc.gz");
     let output = dir.path().join("out.osc.gz");
 
@@ -146,7 +145,7 @@ fn type_prefix_applies_to_create_modify_only() {
 
 #[test]
 fn multiple_expressions_use_or_semantics() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osc.gz");
     let output = dir.path().join("out.osc.gz");
 
@@ -198,7 +197,7 @@ fn multiple_expressions_use_or_semantics() {
 /// raw "invalid gzip header".
 #[test]
 fn plain_osc_input_is_accepted() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osc");
     let output = dir.path().join("out.osc.gz");
     std::fs::write(
@@ -228,7 +227,7 @@ fn plain_osc_input_is_accepted() {
 /// success.
 #[test]
 fn truncated_osc_is_refused() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("cut.osc.gz");
     let output = dir.path().join("out.osc.gz");
     write_osc_gz(
@@ -254,7 +253,7 @@ fn truncated_osc_is_refused() {
 /// a node was re-emitted at 0/0 - a real place in the Gulf of Guinea.
 #[test]
 fn node_without_usable_coords_is_refused() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osc.gz");
     let output = dir.path().join("out.osc.gz");
     write_osc_gz(
@@ -282,7 +281,7 @@ fn node_without_usable_coords_is_refused() {
 
 #[test]
 fn an_unrecognised_output_name_is_refused_before_any_work() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osc");
     let output = dir.path().join("out.unknown");
     std::fs::write(&input, b"<osmChange version=\"0.6\"/>").expect("XML");
@@ -303,7 +302,7 @@ fn an_unrecognised_output_name_is_refused_before_any_work() {
 
 #[test]
 fn metadata_is_normalized() {
-    let dir = tempfile::tempdir_in(".").expect("directory");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osc");
     let output = dir.path().join("out.osc.gz");
     std::fs::write(&input, b"<osmChange version=\"0.6\"><create><node id=\"7\" lat=\"1\" lon=\"2\" timestamp=\"yesterday\" changeset=\"no\" uid=\"&#48;\" visible=\"False\"><tag k=\"name\" v=\"test\"/></node></create></osmChange>").expect("XML");

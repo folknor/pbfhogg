@@ -36,7 +36,6 @@ use crate::invoker::CliInvoker;
 use pbfhogg::MemberId;
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
-use tempfile::TempDir;
 
 /// What one blob in a hand-laid fixture holds.
 enum Blob {
@@ -136,7 +135,7 @@ fn assert_both_paths_refuse(old: &Path, new: &Path) {
 /// it, and no later phase ever sees it again.
 #[test]
 fn node_blob_after_way_blobs_is_rejected_not_dropped() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     let liar = dir.path().join("liar.osm.pbf");
 
@@ -178,7 +177,7 @@ fn node_blob_after_way_blobs_is_rejected_not_dropped() {
 /// separate stashes).
 #[test]
 fn out_of_order_blob_on_the_old_side_is_rejected_too() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     let liar = dir.path().join("liar.osm.pbf");
 
@@ -214,7 +213,7 @@ fn out_of_order_blob_on_the_old_side_is_rejected_too() {
 /// sidecar metadata no longer describes its own contents.
 #[test]
 fn understated_max_id_is_rejected_not_silently_truncated() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let honest_new = dir.path().join("new.osm.pbf");
     let lying_new = dir.path().join("lying.osm.pbf");
@@ -261,7 +260,7 @@ fn understated_max_id_is_rejected_not_silently_truncated() {
 /// on.
 #[test]
 fn backwards_id_spans_within_one_kind_are_rejected() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let honest = dir.path().join("honest.osm.pbf");
     let liar = dir.path().join("liar.osm.pbf");
 
@@ -289,7 +288,7 @@ fn backwards_id_spans_within_one_kind_are_rejected() {
 /// and the residual bookkeeping would go unexercised.
 #[test]
 fn honestly_sorted_misaligned_blob_boundaries_still_diff_clean() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 

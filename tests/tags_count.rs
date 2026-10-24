@@ -7,7 +7,6 @@
 
 use crate::common::{generate_nodes, generate_ways, write_multi_block_test_pbf};
 use pbfhogg::tags_count::{TagCount, TagCountOptions, TagCountSort, tags_count};
-use tempfile::TempDir;
 
 fn default_opts() -> TagCountOptions<'static> {
     TagCountOptions {
@@ -25,7 +24,7 @@ fn default_opts() -> TagCountOptions<'static> {
 /// Tag key=value counts from a tiny hand-crafted fixture.
 #[test]
 fn basic_tag_counting() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
 
     // 5 nodes with two distinct tags, 3 ways with one common tag.
@@ -64,7 +63,7 @@ fn basic_tag_counting() {
 /// to actually split work across workers.
 #[test]
 fn tags_count_parallel_classify_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
 
     // 40 nodes, each alternating between two keys; block_size=10 -> 4
@@ -125,7 +124,7 @@ fn tags_count_parallel_classify_parity() {
 /// blobs the unconstrained one still matches - the filter is a union.
 #[test]
 fn an_unconstrainable_key_matcher_does_not_skip_blobs() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
 
     let mut nodes = generate_nodes(40, 1);

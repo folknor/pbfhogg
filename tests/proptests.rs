@@ -30,7 +30,6 @@ use crate::common::{
 };
 use pbfhogg::{BlobReader, PrimitiveBlock};
 use proptest::prelude::*;
-use tempfile::TempDir;
 
 proptest! {
     #![proptest_config(ProptestConfig {
@@ -74,7 +73,7 @@ proptest! {
     /// has to surface as Err, not panic.
     #[test]
     fn blob_reader_truncated_fixture_never_panics(seed in 0u64..1024) {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let path = dir.path().join("fixture.osm.pbf");
         let nodes = generate_nodes(20, 1);
         write_test_pbf_sorted(&path, &nodes, &[], &[]);
@@ -117,7 +116,7 @@ proptest! {
         count in 1usize..50,
         start in 1i64..1_000_000,
     ) {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let path = dir.path().join("fixture.osm.pbf");
         let input_nodes = generate_nodes(count, start);
         write_test_pbf_sorted(&path, &input_nodes, &[], &[]);
@@ -157,7 +156,7 @@ proptest! {
         way_count in 1usize..20,
         refs_per_way in 2usize..5,
     ) {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let path = dir.path().join("fixture.osm.pbf");
         let nodes = generate_nodes(node_count, 1);
         let ways = generate_ways(way_count, 1_000, refs_per_way, 1);
@@ -189,7 +188,7 @@ proptest! {
         rel_count in 1usize..10,
         members_per_rel in 1usize..4,
     ) {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let path = dir.path().join("fixture.osm.pbf");
         let nodes = generate_nodes(node_count, 1);
         let ways = generate_ways(way_count, 1_000, 2, 1);
@@ -238,7 +237,7 @@ proptest! {
         n_neg in 1usize..20,
         n_pos in 1usize..20,
     ) {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let path = dir.path().join("fixture.osm.pbf");
         let input_nodes = generate_nodes_with_negatives(n_neg, n_pos);
         write_test_pbf_sorted(&path, &input_nodes, &[], &[]);

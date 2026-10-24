@@ -25,7 +25,7 @@ mod diff_parallel {
     fn fault_injection_diff_parallel_shard_panic_surfaces_and_sweeps_scratch() {
         diff_hooks::reset();
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let old = dir.path().join("old.osm.pbf");
         let new = dir.path().join("new.osm.pbf");
 

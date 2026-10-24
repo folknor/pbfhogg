@@ -1092,25 +1092,6 @@ would no longer be refused, which ties into HYG-144.
 
 Reported by: the BUG-138 fix.
 
-## HYG-140 - Integration tests take scratch from the system temp dir
-
-Anger: 3 - test plumbing; no product code.
-
-The `unit-test-scratch-via-path-guard` textlint in `brokkr.toml` keeps unit
-tests under `src/` on `path_guard::tests::scratch()` (random directories
-under the gitignored `data/test-scratch/`), but its `paths` cover `src/`
-only. Some forty files under `tests/` and `cli/tests/` still call
-`tempfile::TempDir::new()`, which lands in `/tmp`, against the project's
-"all data lives in the project" rule; `reference/testing.md` ("Scratch")
-records the gap without a plan. New tests already use
-`common::test_scratch()`. The CLI crate's own unit tests
-(`cli/src/command_paths.rs`) also use `tempfile::tempdir()`: `cli/src` has
-no scratch helper of its own. Fix: convert the remaining sites and widen the
-textlint's `paths` to `tests/**/*.rs`, `cli/tests/**/*.rs` and
-`cli/src/**/*.rs`.
-
-Reported by: the `cat --dedupe` pass-2 error tests.
-
 ## HYG-148 - Geocode pass 3 bucket write failures do not name the file
 
 Anger: 7 - geocode builder, Stage A hot loop.

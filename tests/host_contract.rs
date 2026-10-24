@@ -28,7 +28,7 @@ fn input(dir: &std::path::Path) -> std::path::PathBuf {
 }
 #[test]
 fn process_actions_fire_once_at_each_hook_site() {
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     let base = input(dir.path());
     let actions = Arc::new(Actions::default());
     let mut host = crate::common::test_host();
@@ -96,7 +96,7 @@ impl Resources for CountingResources {
 }
 #[test]
 fn resources_provider_is_consulted() {
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     let base = input(dir.path());
     let resources = Arc::new(CountingResources(AtomicUsize::new(0)));
     let mut host = crate::common::test_host();
@@ -128,7 +128,7 @@ fn diagnostics_are_per_run() {
     std::thread::scope(|scope| {
         for count in [3, 5] {
             scope.spawn(move || {
-                let dir = tempfile::tempdir().expect("directory");
+                let dir = crate::common::test_scratch();
                 let raw = dir.path().join("raw.pbf");
                 let indexed = dir.path().join("indexed.pbf");
                 let nodes: Vec<_> = (1..=count)
@@ -186,7 +186,7 @@ fn unrecognised_indexdata_warning_is_per_handle() {
     let second = pbfhogg::host::Diagnostics::new(
         Arc::clone(&sink) as Arc<dyn pbfhogg::host::DiagnosticSink>
     );
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     let bad = dir.path().join("bad-indexdata.osm.pbf");
     crate::common::write_bad_indexdata_pbf(&bad);
     for (diagnostics, expected) in [(first.clone(), 1), (second, 2), (first, 2)] {
@@ -225,7 +225,7 @@ fn count_data_blobs(path: &std::path::Path) -> usize {
 const POOL_BLOCKS: usize = 200;
 #[test]
 fn writer_on_a_one_thread_pool_flushes() {
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("pool.pbf");
     let pool = one_thread_pool();
     pool.install(|| -> pbfhogg::Result<()> {
@@ -245,7 +245,7 @@ fn writer_on_a_one_thread_pool_flushes() {
 }
 #[test]
 fn writer_on_a_one_thread_pool_drops_unflushed() {
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("dropped.pbf");
     let pool = one_thread_pool();
     // Completing at all is the assertion: a blocking join from the pool's
@@ -271,7 +271,7 @@ fn writer_on_a_one_thread_pool_drops_unflushed() {
 }
 #[test]
 fn ambient_writer_inside_a_foreign_pool_flushes() {
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("ambient.pbf");
     one_thread_pool()
         .install(|| -> pbfhogg::Result<()> {
@@ -292,7 +292,7 @@ fn ambient_writer_inside_a_foreign_pool_flushes() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn swallowed_framing_panic_surfaces_at_flush() {
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(2)
@@ -326,7 +326,7 @@ fn swallowed_framing_panic_surfaces_at_flush() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn swallowed_framing_panics_on_one_worker_fail_flush() {
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     let panics = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&panics);
     let pool = Arc::new(
@@ -386,7 +386,7 @@ fn run_external_join(
 }
 #[test]
 fn concurrent_external_joins_use_distinct_scratch() {
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     let base = input(dir.path());
     let host = crate::common::test_host();
     let reference = dir.path().join("reference.pbf");
@@ -436,7 +436,7 @@ fn concurrent_external_joins_use_distinct_scratch() {
 }
 #[test]
 fn a_missing_scratch_parent_is_refused_before_anything_is_created() {
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     let missing = dir.path().join("missing");
     let host = crate::common::test_host();
     let err = pbfhogg::scratch::RunScratch::create(&missing, &host)
@@ -452,7 +452,7 @@ fn a_missing_scratch_parent_is_refused_before_anything_is_created() {
 /// budget and routes external.
 #[test]
 fn fixed_memory_routes_auto() {
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     let base = input(dir.path());
     for (memory, backend) in [(8 << 30, "sparse"), (0, "external")] {
         let sink = Arc::new(Recording::default());
@@ -496,7 +496,7 @@ fn fixed_memory_routes_auto() {
 /// and leaves its parent exactly as it found it.
 #[test]
 fn scratch_backends_use_the_given_directory_and_leave_nothing() {
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     let scratch = dir.path().join("scratch");
     std::fs::create_dir(&scratch).expect("scratch directory");
     let base = input(dir.path());
@@ -528,7 +528,7 @@ fn scratch_backends_use_the_given_directory_and_leave_nothing() {
 /// scratch at all, however many shards it runs.
 #[test]
 fn diff_without_scratch_needs_a_single_shard() {
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     let base = input(dir.path());
     let changed = dir.path().join("changed.osm.pbf");
     crate::common::write_changed_pbf(&changed);
@@ -580,7 +580,7 @@ fn scratch_backends_write_inside_the_run_directory() {
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     let base = input(dir.path());
     let changed = dir.path().join("changed.osm.pbf");
     crate::common::write_changed_pbf(&changed);

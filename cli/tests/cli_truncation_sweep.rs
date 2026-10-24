@@ -21,14 +21,13 @@ use crate::common::{
     generate_nodes, generate_relations, generate_ways, write_multi_block_test_pbf,
 };
 use crate::invoker::CliInvoker;
-use tempfile::TempDir;
 
 /// Wall clock cap per truncation × command invocation.
 const PER_INVOCATION_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[test]
 fn truncation_sweep_no_panic() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let truncated = dir.path().join("truncated.osm.pbf");
     let output = dir.path().join("output.osm.pbf");

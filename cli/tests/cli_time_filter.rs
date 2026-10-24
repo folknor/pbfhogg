@@ -57,7 +57,7 @@ fn run_time_filter(input: &Path, output: &Path, cutoff: i64) -> String {
 
 #[test]
 fn snapshot_keeps_latest_version_at_cutoff() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("history.osm.pbf");
     let output = dir.path().join("snapshot.osm.pbf");
 
@@ -84,7 +84,7 @@ fn snapshot_keeps_latest_version_at_cutoff() {
 
 #[test]
 fn snapshot_omits_objects_deleted_at_cutoff() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("history.osm.pbf");
     let output = dir.path().join("snapshot.osm.pbf");
 
@@ -104,7 +104,7 @@ fn snapshot_omits_objects_deleted_at_cutoff() {
 
 #[test]
 fn output_header_replication_timestamp_is_cutoff() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("history.osm.pbf");
     let output = dir.path().join("snapshot.osm.pbf");
 
@@ -118,7 +118,7 @@ fn output_header_replication_timestamp_is_cutoff() {
 
 #[test]
 fn snapshot_path_filters_non_history_input() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("snapshot_input.osm.pbf");
     let output = dir.path().join("snapshot_output.osm.pbf");
 
@@ -195,7 +195,7 @@ fn snapshot_path_filters_non_history_input() {
 
 #[test]
 fn snapshot_ways_and_relations() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("history.osm.pbf");
     let output = dir.path().join("snapshot.osm.pbf");
 
@@ -320,7 +320,7 @@ fn write_metadata_stripped_input(path: &Path) {
 /// it apart from a cutoff that genuinely kept everything.
 #[test]
 fn time_filter_refuses_metadata_stripped_input() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("stripped.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     write_metadata_stripped_input(&input);

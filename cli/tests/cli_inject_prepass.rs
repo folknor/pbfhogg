@@ -22,7 +22,6 @@ use std::path::Path;
 use crate::common::{TestMember, TestNode, TestRelation, TestWay, read_header, write_indexed_pbf};
 use crate::invoker::CliInvoker;
 use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
-use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -128,7 +127,7 @@ fn pins_for(ways: &WayPins, id: i64) -> Option<Vec<u8>> {
 /// a field-20 bitmap only when a way has resolved shared references.
 #[test]
 fn inject_prepass_sparse_emits_feature_flags_and_bitmaps() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     let nodes: Vec<TestNode> = (1..=4).map(node).collect();
@@ -151,7 +150,7 @@ fn inject_prepass_sparse_emits_feature_flags_and_bitmaps() {
 
 #[test]
 fn inject_prepass_external_emits_feature_flags() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     let nodes: Vec<TestNode> = (1..=3).map(node).collect();
@@ -183,7 +182,7 @@ fn inject_prepass_external_emits_feature_flags() {
 /// `ceil(ref_count/8)` field-20 bitmap (sparse otherwise truncates it).
 #[test]
 fn backend_parity_inject_prepass() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let nodes: Vec<TestNode> = (1..=12).map(node).collect();
     let ways = vec![
@@ -345,7 +344,7 @@ fn inject_prepass_oracle_roundtrip() {
         },
     ];
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     write_indexed_pbf(&input, &nodes, &ways, &relations);
 

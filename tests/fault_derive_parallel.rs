@@ -26,7 +26,7 @@ mod derive_parallel {
     fn fault_injection_derive_parallel_shard_panic_surfaces_and_sweeps_scratch() {
         derive_hooks::reset();
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let old = dir.path().join("old.osm.pbf");
         let new = dir.path().join("new.osm.pbf");
         let osc = dir.path().join("changes.osc.gz");

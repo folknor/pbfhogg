@@ -29,7 +29,7 @@ mod geocode_pass3 {
     fn fault_injection_geocode_pass3_streets_panic_sweeps_bucket_dirs() {
         pass3_hooks::reset();
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let input = dir.path().join("input.osm.pbf");
         let index_dir = dir.path().join("index");
 

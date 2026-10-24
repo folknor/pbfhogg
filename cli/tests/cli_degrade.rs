@@ -696,7 +696,7 @@ fn declared_index_bytes(path: &Path) -> Vec<Vec<u8>> {
 /// asserts the property directly.
 #[test]
 fn a_written_index_spells_an_absent_bbox_as_an_inverted_box() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_degrade_fixture(&input);
 
@@ -763,7 +763,7 @@ fn a_written_index_spells_an_absent_bbox_as_an_inverted_box() {
 /// for an unrelated reason.
 #[test]
 fn degrade_corrupt_indexdata_writes_a_valid_but_overstated_index() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -803,7 +803,7 @@ fn degrade_corrupt_indexdata_writes_a_valid_but_overstated_index() {
 /// that makes a consumer skip a blob rather than merely misreport it.
 #[test]
 fn degrade_corrupt_indexdata_kind_rotates_only_the_declared_kind() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -859,7 +859,7 @@ fn degrade_corrupt_indexdata_kind_rotates_only_the_declared_kind() {
 /// what makes the corruption a *lie* rather than damage.
 #[test]
 fn degrade_corrupt_tagdata_keeps_indexdata_and_elements_intact() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -907,7 +907,7 @@ fn degrade_corrupt_tagdata_keeps_indexdata_and_elements_intact() {
 /// question. All four are rejected, not resolved.
 #[test]
 fn degrade_rejects_contradictory_corruption_combinations() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     write_degrade_fixture(&input);
 
@@ -960,7 +960,7 @@ fn degrade_rejects_contradictory_corruption_combinations() {
 /// not touched.
 #[test]
 fn degrade_strip_indexdata_drops_indexdata() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1004,7 +1004,7 @@ fn degrade_strip_indexdata_drops_indexdata() {
 /// members) round-trips through the BlockBuilder re-encode.
 #[test]
 fn degrade_strip_locations_clears_low_and_preserves_elements() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1048,7 +1048,7 @@ fn degrade_strip_locations_clears_low_and_preserves_elements() {
 /// intact - a tagdata-stripped file is still indexed.
 #[test]
 fn degrade_strip_tagdata_drops_tagdata() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1105,7 +1105,7 @@ fn degrade_strip_tagdata_drops_tagdata() {
 /// sortedness, and the element multiset all survive.
 #[test]
 fn degrade_strip_bbox_clears_header_bbox() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1166,7 +1166,7 @@ fn degrade_strip_bbox_clears_header_bbox() {
 /// the OsmData frames are copied verbatim.
 #[test]
 fn degrade_strip_bbox_no_indexdata_uses_passthrough() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1206,7 +1206,7 @@ fn degrade_strip_bbox_no_indexdata_uses_passthrough() {
 /// OsmData blob, while sortedness and the element multiset survive.
 #[test]
 fn degrade_strip_bbox_and_strip_indexdata_compose() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1241,7 +1241,7 @@ fn degrade_strip_bbox_and_strip_indexdata_compose() {
 /// passthrough path's.
 #[test]
 fn degrade_strip_bbox_and_strip_locations_compose() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1281,7 +1281,7 @@ fn degrade_strip_bbox_and_strip_locations_compose() {
 /// invariant end-to-end: the degraded file stays a valid extract input.
 #[test]
 fn degrade_strip_bbox_extract_bbox_matches_original() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let stripped = dir.path().join("stripped.osm.pbf");
     let extract_orig = dir.path().join("extract_orig.osm.pbf");
@@ -1343,7 +1343,7 @@ fn degrade_strip_bbox_extract_bbox_matches_original() {
 /// survives an override is pinned by `cli/tests/cli_output_header.rs`.
 #[test]
 fn degrade_strip_bbox_with_generator_override_replaces_only_its_field() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1407,7 +1407,7 @@ fn degrade_strip_bbox_with_generator_override_replaces_only_its_field() {
 /// the inter-blob seam, not inside a blob.
 #[test]
 fn degrade_unsort_creates_adjacent_overlap_per_kind() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1497,7 +1497,7 @@ fn assert_unsort_cross_blob_shape(output: &Path, input: &Path) {
 /// non-overlapping ranges.
 #[test]
 fn degrade_unsort_intra_creates_intra_blob_inversion() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1525,7 +1525,7 @@ fn degrade_unsort_intra_creates_intra_blob_inversion() {
 /// elements so it lands at the start of the first output block.
 #[test]
 fn degrade_unsort_intra_large_input_blobs_stay_intra_blob() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1595,7 +1595,7 @@ fn assert_unsort_intra_shape(output: &Path, input: &Path) {
 /// `--unsort` and `--unsort-intra` are mutually exclusive.
 #[test]
 fn degrade_unsort_and_unsort_intra_are_mutually_exclusive() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1618,7 +1618,7 @@ fn degrade_unsort_and_unsort_intra_are_mutually_exclusive() {
 /// reach `sort`'s overlap-rewrite path.
 #[test]
 fn degrade_unsort_then_sort_round_trips() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let unsorted = dir.path().join("unsorted.osm.pbf");
     let resorted = dir.path().join("resorted.osm.pbf");
@@ -1673,7 +1673,7 @@ fn degrade_unsort_then_sort_round_trips() {
 /// unindexed.
 #[test]
 fn degrade_unsort_and_strip_indexdata_compose() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1705,7 +1705,7 @@ fn degrade_unsort_and_strip_indexdata_compose() {
 /// still fires when the ways go through the coordinate-dropping re-encode.
 #[test]
 fn degrade_unsort_and_strip_locations_compose() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1733,7 +1733,7 @@ fn degrade_unsort_and_strip_locations_compose() {
 /// shape is preserved *and* `LocationsOnWays` is cleared.
 #[test]
 fn degrade_unsort_intra_and_strip_locations_compose() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1761,7 +1761,7 @@ fn degrade_unsort_intra_and_strip_locations_compose() {
 /// unsorted *and* unindexed.
 #[test]
 fn degrade_unsort_intra_and_strip_indexdata_compose() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1787,7 +1787,7 @@ fn degrade_unsort_intra_and_strip_indexdata_compose() {
 /// pass through untouched.
 #[test]
 fn degrade_strip_tagdata_and_strip_indexdata_compose() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1822,7 +1822,7 @@ fn degrade_strip_tagdata_and_strip_indexdata_compose() {
 /// merge thread uses under either unsort mode.
 #[test]
 fn degrade_unsort_and_strip_tagdata_compose() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1858,7 +1858,7 @@ fn degrade_unsort_and_strip_tagdata_compose() {
 /// blob carries tagdata.
 #[test]
 fn degrade_strip_locations_and_strip_tagdata_compose() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -1917,7 +1917,7 @@ fn assert_transformation_flags(text: &str) {
 /// Running `degrade` with no transformation flags is rejected.
 #[test]
 fn degrade_requires_at_least_one_flag() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -2069,7 +2069,7 @@ fn assert_check_refs_matches_output(path: &Path) -> u64 {
 /// and way 2 (a member of every relation), so the four-field sum is > 0.
 #[test]
 fn degrade_drop_ids_dangling_refs_match_check_refs() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     write_degrade_fixture(&input);
@@ -2093,7 +2093,7 @@ fn degrade_drop_ids_dangling_refs_match_check_refs() {
 
 #[test]
 fn degrade_drop_ids_removes_exactly_n() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     write_degrade_fixture(&input);
@@ -2114,7 +2114,7 @@ fn degrade_drop_ids_removes_exactly_n() {
 
 #[test]
 fn degrade_drop_ids_is_reproducible_and_seed_changes_selection() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let first = dir.path().join("first.osm.pbf");
     let second = dir.path().join("second.osm.pbf");
@@ -2142,7 +2142,7 @@ fn degrade_drop_ids_is_reproducible_and_seed_changes_selection() {
 
 #[test]
 fn degrade_drop_ids_validates_arguments_and_total() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     write_degrade_fixture(&input);
@@ -2166,7 +2166,7 @@ fn degrade_drop_ids_validates_arguments_and_total() {
 /// `--block-cap 0` is rejected up front.
 #[test]
 fn degrade_rejects_zero_block_cap() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -2187,7 +2187,7 @@ fn degrade_rejects_zero_block_cap() {
 /// A cap larger than the input must not drive builder preallocation.
 #[test]
 fn degrade_bounds_preallocation_by_input_size() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -2211,7 +2211,7 @@ fn degrade_bounds_preallocation_by_input_size() {
 
 #[test]
 fn degrade_unsort_counts_a_trailing_held_element_once() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     let (nodes, ways, relations) = write_degrade_fixture(&input);
@@ -2239,7 +2239,7 @@ fn degrade_unsort_counts_a_trailing_held_element_once() {
 /// clear Sort.Type_then_ID.
 #[test]
 fn degrade_unsort_intra_rejects_block_cap_one() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -2263,7 +2263,7 @@ fn degrade_unsort_intra_rejects_block_cap_one() {
 /// the same overlap shape sort's detect_overlaps fires on.
 #[test]
 fn degrade_unsort_accepts_block_cap_one() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
 
@@ -2287,7 +2287,7 @@ mod tier2 {
 
     #[test]
     fn degrade_drop_ids_and_strip_locations_compose() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let input = dir.path().join("in.osm.pbf");
         let output = dir.path().join("out.osm.pbf");
         write_degrade_fixture(&input);
@@ -2306,7 +2306,7 @@ mod tier2 {
 
     #[test]
     fn degrade_drop_ids_and_strip_indexdata_compose() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let input = dir.path().join("in.osm.pbf");
         let output = dir.path().join("out.osm.pbf");
         write_degrade_fixture(&input);
@@ -2324,7 +2324,7 @@ mod tier2 {
 
     #[test]
     fn degrade_drop_ids_and_unsort_compose() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let input = dir.path().join("in.osm.pbf");
         let output = dir.path().join("out.osm.pbf");
         write_unsort_fixture(&input);

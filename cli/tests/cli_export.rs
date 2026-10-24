@@ -7,7 +7,6 @@ use std::path::Path;
 use crate::invoker::CliInvoker;
 use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
-use tempfile::TempDir;
 
 fn write_block<W: std::io::Write>(writer: &mut PbfWriter<W>, builder: &mut BlockBuilder) {
     if let Some(bytes) = builder.take().unwrap() {
@@ -121,7 +120,7 @@ fn features(output: &[u8]) -> Vec<serde_json::Value> {
 
 #[test]
 fn default_sequence_is_exact_and_escaped() {
-    let temp = TempDir::new().unwrap();
+    let temp = crate::common::test_scratch();
     let input = temp.path().join("input.pbf");
     write_fixture(&input, true);
 
@@ -145,7 +144,7 @@ fn default_sequence_is_exact_and_escaped() {
 
 #[test]
 fn way_geometry_and_area_heuristic() {
-    let temp = TempDir::new().unwrap();
+    let temp = crate::common::test_scratch();
     let input = temp.path().join("input.pbf");
     write_fixture(&input, true);
     let output = CliInvoker::new()
@@ -168,7 +167,7 @@ fn way_geometry_and_area_heuristic() {
 
 #[test]
 fn filters_properties_bbox_and_collection_compose() {
-    let temp = TempDir::new().unwrap();
+    let temp = crate::common::test_scratch();
     let input = temp.path().join("input.pbf");
     write_fixture(&input, true);
 
@@ -239,7 +238,7 @@ fn filters_properties_bbox_and_collection_compose() {
 
 #[test]
 fn metadata_types_and_locations_gate() {
-    let temp = TempDir::new().unwrap();
+    let temp = crate::common::test_scratch();
     let enriched = temp.path().join("enriched.pbf");
     write_fixture(&enriched, true);
     let output = CliInvoker::new()
@@ -311,7 +310,7 @@ fn metadata_types_and_locations_gate() {
 
 #[test]
 fn file_output_is_guarded_against_input_aliases() {
-    let temp = TempDir::new().unwrap();
+    let temp = crate::common::test_scratch();
     let input = temp.path().join("input.pbf");
     write_fixture(&input, true);
     let before = std::fs::read(&input).unwrap();

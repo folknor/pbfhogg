@@ -351,11 +351,12 @@ exception, not a tier - should not survive across many PRs.
   one implementation for every harness: integration tests reach it as
   `common::test_scratch()`, and unit tests under `src/` as
   `path_guard::tests::scratch()`, which mounts the same file by `#[path]`
-  so the library's unit tests never link the integration harness. Every
-  unit-test scratch site under `src/` goes through it (enforced by the
-  `unit-test-scratch-via-path-guard` textlint in `brokkr.toml`); many integration
-  tests still take `tempfile::TempDir::new()` in the system temp dir,
-  which is collision-free but outside the project tree. Keep the guard
+  so the library's unit tests never link the integration harness. The CLI
+  crate's own unit tests use `test_scratch::scratch()` (`cli/src/test_scratch.rs`),
+  which cannot mount the integration file but has the same body. Every
+  test scratch site goes through one of these (enforced by the
+  `unit-test-scratch-via-path-guard` textlint in `brokkr.toml`, which covers
+  `src/`, `tests/`, `cli/tests/` and `cli/src/`). Keep the guard
   alive for the fixture lifetime (the `TempDir` drop is the cleanup, so no
   manual `remove_dir_all` is needed). Never use benchmark scratch or
   fixed shared names.

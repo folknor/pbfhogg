@@ -28,7 +28,7 @@ struct Inputs {
 
 impl Inputs {
     fn new() -> Self {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         crate::common::write_base_pbf(&dir.path().join("base.osm.pbf"));
         crate::common::write_changed_pbf(&dir.path().join("changed.osm.pbf"));
         #[cfg(feature = "commands")]
@@ -266,8 +266,8 @@ fn run_once(
     inputs: &Inputs,
     cancel: pbfhogg::host::Cancel,
 ) -> Result<bool, String> {
-    let out = TempDir::new().unwrap();
-    let scratch = TempDir::new().unwrap();
+    let out = crate::common::test_scratch();
+    let scratch = crate::common::test_scratch();
     let host = host_with(cancel);
     match command(inputs, out.path(), scratch.path(), &host) {
         Ok(()) => Ok(false),
@@ -365,7 +365,7 @@ fn a_token_tripped_mid_run_stops_with_the_typed_error_and_leaves_nothing() {
 /// does not interrupt it.
 #[test]
 fn a_decided_publication_completes() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let dest = dir.path().join("out.osm.pbf");
     let host = crate::common::test_host();
     let output = crate::common::out(&dest);
@@ -395,7 +395,7 @@ fn a_decided_publication_completes() {
 /// publication: `Cancelled`, nothing installed, the staging entry gone.
 #[test]
 fn publication_refuses_once_the_token_is_tripped() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let dest = dir.path().join("out.osc");
     let output = crate::common::out(&dest);
     let cancel = pbfhogg::host::Cancel::new();
@@ -412,7 +412,7 @@ fn publication_refuses_once_the_token_is_tripped() {
 /// caller that ignores the error cannot publish what it wrote.
 #[test]
 fn a_cancelled_output_writer_cannot_be_published() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let output = crate::common::out(dir.path().join("out.txt"));
     let cancel = pbfhogg::host::Cancel::new();
     let writer = output.writer(&cancel).unwrap();
@@ -437,7 +437,7 @@ fn a_cancelled_output_writer_cannot_be_published() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn a_publication_failure_after_the_decision_is_not_a_cancellation() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let dest = dir.path().join("out.osc");
     let mut output = crate::common::out(&dest);
     output.inject_fault(pbfhogg::output::PublishFault::DirSync);

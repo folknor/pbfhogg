@@ -12,7 +12,6 @@
 use std::path::{Path, PathBuf};
 
 use crate::invoker::CliInvoker;
-use tempfile::TempDir;
 
 fn names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
@@ -40,7 +39,7 @@ fn plant_dead_run_dir(parent: &Path) -> PathBuf {
 
 #[test]
 fn a_bad_tmp_dir_fails_before_any_input_is_read() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let missing_input = dir.path().join("no-such-input.osm.pbf");
     let missing_other = dir.path().join("no-such-other.osm.pbf");
     let tmp = dir.path().join("no-such-dir");
@@ -101,7 +100,7 @@ fn a_bad_tmp_dir_fails_before_any_input_is_read() {
 
 #[test]
 fn a_tmp_dir_that_is_a_file_or_unwritable_is_refused() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("missing.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     let file = dir.path().join("a-file");
@@ -148,7 +147,7 @@ fn a_tmp_dir_that_is_a_file_or_unwritable_is_refused() {
 
 #[test]
 fn a_failed_run_leaves_no_scratch_in_the_tmp_dir_or_beside_the_output() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let work = dir.path().join("work");
     let tmp = dir.path().join("tmp");
     std::fs::create_dir(&work).unwrap();
@@ -187,7 +186,7 @@ fn a_failed_run_leaves_no_scratch_in_the_tmp_dir_or_beside_the_output() {
 /// payload fails the run with scratch files already on disk.
 #[test]
 fn a_run_that_fails_after_writing_scratch_leaves_none_behind() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let work = dir.path().join("work");
     let tmp = dir.path().join("tmp");
     std::fs::create_dir(&work).unwrap();
@@ -235,7 +234,7 @@ fn a_scratch_free_diff_needs_no_writable_directory() {
     if unsafe { libc::geteuid() } == 0 {
         return;
     }
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
     crate::common::write_base_pbf(&old);
@@ -283,7 +282,7 @@ fn a_scratch_free_diff_needs_no_writable_directory() {
 
 #[test]
 fn successful_runs_clean_up_after_themselves() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let tmp = dir.path().join("tmp");
     std::fs::create_dir(&tmp).unwrap();
     let old = dir.path().join("old.osm.pbf");
@@ -353,7 +352,7 @@ fn successful_runs_clean_up_after_themselves() {
 
 #[test]
 fn a_tmp_dir_inside_a_replaced_index_is_refused() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     crate::common::write_base_pbf(&input);
     let index = dir.path().join("index");
@@ -397,7 +396,7 @@ fn a_tmp_dir_inside_a_replaced_index_is_refused() {
 
 #[test]
 fn leftovers_of_crashed_runs_are_reported_and_never_removed() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let work = dir.path().join("work");
     let tmp = dir.path().join("tmp");
     std::fs::create_dir(&work).unwrap();
@@ -458,7 +457,7 @@ fn leftovers_of_crashed_runs_are_reported_and_never_removed() {
 fn a_live_run_directory_is_not_reported() {
     // A second process's run directory holds its lock; here the lock is held
     // by this test's own descriptor, which is what a live run looks like.
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let live = plant_dead_run_dir(dir.path());
     let lock = std::fs::File::open(live.join("LOCK")).unwrap();
     // SAFETY: valid descriptor, standard flock call.
@@ -495,7 +494,7 @@ fn occurrences(haystack: &str, needle: &Path) -> usize {
 
 #[test]
 fn extract_config_scans_every_destination_directory_once() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let (first, second) = (dir.path().join("first"), dir.path().join("second"));
     std::fs::create_dir(&first).unwrap();
     std::fs::create_dir(&second).unwrap();
@@ -548,7 +547,7 @@ fn extract_config_scans_every_destination_directory_once() {
 /// output (`--format osc`).
 #[test]
 fn diff_reports_what_older_versions_left_where_they_left_it() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let (inputs, out_dir, tmp) = (
         dir.path().join("inputs"),
         dir.path().join("out"),
@@ -592,7 +591,7 @@ fn diff_reports_what_older_versions_left_where_they_left_it() {
 
 #[test]
 fn geocode_reports_old_scratch_inside_the_index_and_in_old_staging() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     crate::common::write_base_pbf(&input);
     let index = dir.path().join("index");
@@ -644,7 +643,7 @@ fn geocode_reports_old_scratch_inside_the_index_and_in_old_staging() {
 /// may be live - is refused before any work, and nothing in it is touched.
 #[test]
 fn an_index_holding_leftovers_is_not_replaced() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     crate::common::write_synthetic_indexed_input(&input);
     let index = dir.path().join("index");
@@ -691,7 +690,7 @@ fn a_backup_that_cannot_be_removed_is_reported_by_the_cli() {
     if is_root() {
         return;
     }
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     // The builder refuses an input with nothing to index.
     crate::common::write_synthetic_indexed_input(&input);

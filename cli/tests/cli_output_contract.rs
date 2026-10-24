@@ -98,7 +98,7 @@ struct Fx {
 
 impl Fx {
     fn new() -> Self {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         let p = dir.path();
         crate::common::write_base_pbf(&p.join("good.osm.pbf"));
         crate::common::write_changed_pbf(&p.join("changed.osm.pbf"));
@@ -747,7 +747,7 @@ fn is_root() -> bool {
 type Check = fn(&Fx, &Row) -> Result<(), String>;
 
 fn refused_before_any_work(fx: &Fx, row: &Row) -> Result<(), String> {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let inv = (row.build)(
         &Ctx {
             fx,
@@ -786,7 +786,7 @@ fn refused_before_any_work(fx: &Fx, row: &Row) -> Result<(), String> {
 
 fn overwrite_replaces(fx: &Fx, row: &Row) -> Result<(), String> {
     for flag in ["--overwrite", "-O"] {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         let inv = (row.build)(
             &Ctx {
                 fx,
@@ -822,8 +822,8 @@ fn overwrite_replaces(fx: &Fx, row: &Row) -> Result<(), String> {
 }
 
 fn symlink_refused(fx: &Fx, row: &Row) -> Result<(), String> {
-    let dir = TempDir::new().unwrap();
-    let keep = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
+    let keep = crate::common::test_scratch();
     let inv = (row.build)(
         &Ctx {
             fx,
@@ -874,11 +874,11 @@ fn failure_leaves_nothing(fx: &Fx, row: &Row) -> Result<(), String> {
     // Fresh destination: nothing at all may be left, under any name.
     let mut scratch_homes: Vec<Option<TempDir>> = vec![None];
     if row.tmp_dir {
-        scratch_homes.push(Some(TempDir::new().unwrap()));
+        scratch_homes.push(Some(crate::common::test_scratch()));
     }
     for tmp in &scratch_homes {
         let tmp_path = tmp.as_ref().map(TempDir::path);
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         let inv = (row.build)(
             &Ctx {
                 fx,
@@ -914,7 +914,7 @@ fn failure_leaves_nothing(fx: &Fx, row: &Row) -> Result<(), String> {
     }
 
     // Replacing: the failed run must leave what was there as it was.
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let inv = (row.build)(
         &Ctx {
             fx,
@@ -947,7 +947,7 @@ fn failure_leaves_nothing(fx: &Fx, row: &Row) -> Result<(), String> {
 }
 
 fn success_leaves_only_outputs(fx: &Fx, row: &Row) -> Result<(), String> {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let inv = (row.build)(
         &Ctx {
             fx,
@@ -1062,7 +1062,7 @@ fn run_dirs_of(events: &[(PathBuf, String)], dir: &Path) -> usize {
 fn bad_tmp_dir_is_refused_first(fx: &Fx, row: &Row) -> Result<(), String> {
     // A bad --tmp-dir is refused before any input is read: the input here
     // does not exist, and must not be the error reported.
-    let base = TempDir::new().unwrap();
+    let base = crate::common::test_scratch();
     let a_file = base.path().join("a-file");
     std::fs::write(&a_file, b"x").unwrap();
     let locked = base.path().join("locked");
@@ -1077,7 +1077,7 @@ fn bad_tmp_dir_is_refused_first(fx: &Fx, row: &Row) -> Result<(), String> {
     }
     let mut result = Ok(());
     for (what, tmp, wording) in &bad {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         let inv = (row.build)(
             &Ctx {
                 fx,
@@ -1133,8 +1133,8 @@ fn tmp_dir_contract(fx: &Fx, row: &Row) -> Result<(), String> {
 /// Scratch lands in --tmp-dir and only there; without it, beside the output.
 fn scratch_lands_where_it_was_told(fx: &Fx, row: &Row) -> Result<(), String> {
     for with_tmp in [true, false] {
-        let out_dir = TempDir::new().unwrap();
-        let tmp = TempDir::new().unwrap();
+        let out_dir = crate::common::test_scratch();
+        let tmp = crate::common::test_scratch();
         let inv = (row.build)(
             &Ctx {
                 fx,
@@ -1235,7 +1235,7 @@ fn is_bench_key_value(line: &str) -> bool {
 /// it is global. A text diff is not a row here: a quiet text diff takes no
 /// `-o` (`cli_quiet` covers it).
 fn quiet_run_prints_only_warnings(fx: &Fx, row: &Row) -> Result<(), String> {
-    let plain_dir = TempDir::new().unwrap();
+    let plain_dir = crate::common::test_scratch();
     let plain = (row.build)(
         &Ctx {
             fx,
@@ -1255,7 +1255,7 @@ fn quiet_run_prints_only_warnings(fx: &Fx, row: &Row) -> Result<(), String> {
         "the run without -q printed nothing, so -q has nothing to prove here"
     );
     for leading in [false, true] {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         let inv = (row.build)(
             &Ctx {
                 fx,
@@ -1582,8 +1582,8 @@ mod interrupted {
 
     impl Run {
         fn new(fx: &Fx, row: &Row) -> Self {
-            let out = TempDir::new().unwrap();
-            let tmp = row.tmp_dir.then(|| TempDir::new().unwrap());
+            let out = crate::common::test_scratch();
+            let tmp = row.tmp_dir.then(crate::common::test_scratch);
             let inv = (row.build)(
                 &Ctx {
                     fx,
@@ -1612,7 +1612,7 @@ mod interrupted {
     /// passes.
     pub(super) fn checkpoint_count(fx: &Fx, row: &Row) -> Result<u64, String> {
         let run = Run::new(fx, row);
-        let control = TempDir::new().unwrap();
+        let control = crate::common::test_scratch();
         let count_file = control.path().join("count");
         let out = run
             .invoker(&[])
@@ -1657,7 +1657,7 @@ mod interrupted {
                 seed(output, row.kind);
             }
         }
-        let control = TempDir::new().unwrap();
+        let control = crate::common::test_scratch();
         let ready = control.path().join("ready");
         let mut pause = OsString::from(format!("{k}:"));
         pause.push(ready.as_os_str());
@@ -1932,9 +1932,9 @@ fn a_second_signal_exits_at_once_and_the_next_run_reports_the_leftovers() {
         (libc::SIGTERM, libc::SIGTERM),
         (libc::SIGINT, libc::SIGTERM),
     ] {
-        let out_dir = TempDir::new().unwrap();
-        let tmp = TempDir::new().unwrap();
-        let control = TempDir::new().unwrap();
+        let out_dir = crate::common::test_scratch();
+        let tmp = crate::common::test_scratch();
+        let control = crate::common::test_scratch();
         let inv = (row.build)(
             &Ctx {
                 fx: &fx,
@@ -2035,8 +2035,8 @@ fn a_command_without_an_output_is_interrupted_too() {
         } else {
             libc::SIGTERM
         };
-        let cwd = TempDir::new().unwrap();
-        let control = TempDir::new().unwrap();
+        let cwd = crate::common::test_scratch();
+        let control = crate::common::test_scratch();
         let ready = control.path().join("ready");
         let mut pause = OsString::from("2:");
         pause.push(ready.as_os_str());
@@ -2166,11 +2166,11 @@ const REFUSED_OSC_NAMES: &[&str] = &["x", "x.gz", "x.xml", "x.osc.gzip", "x.OSC"
 
 #[test]
 fn every_osc_producer_refuses_a_name_that_is_neither_osc_nor_osc_gz() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let osc = write_osc_fixtures(dir.path());
     for producer in OSC_PRODUCERS {
         for name in REFUSED_OSC_NAMES {
-            let out_dir = TempDir::new().unwrap();
+            let out_dir = crate::common::test_scratch();
             let dest = out_dir.path().join(name);
             let args = (producer.build)(&osc, dir.path(), &dest);
             let result = CliInvoker::new().args(&args).run();
@@ -2197,13 +2197,13 @@ fn every_osc_producer_refuses_a_name_that_is_neither_osc_nor_osc_gz() {
 
 #[test]
 fn osc_gzip_framing_follows_the_output_name_for_every_producer() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let osc = write_osc_fixtures(dir.path());
 
     let mut failures = Vec::new();
     for producer in OSC_PRODUCERS {
         for (name, expect_gzip) in [("x.osc", false), ("x.osc.gz", true)] {
-            let out_dir = TempDir::new().unwrap();
+            let out_dir = crate::common::test_scratch();
             let dest = out_dir.path().join(name);
             let args = (producer.build)(&osc, dir.path(), &dest);
             let result = CliInvoker::new().args(&args).run();

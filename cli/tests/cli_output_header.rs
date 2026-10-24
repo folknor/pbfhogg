@@ -104,7 +104,7 @@ struct Fx {
 
 impl Fx {
     fn new(fixtures: &[Fixture]) -> Self {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         let fx = Self {
             dir,
             counter: std::cell::Cell::new(0),

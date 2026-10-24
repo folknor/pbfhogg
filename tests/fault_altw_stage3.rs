@@ -30,7 +30,7 @@ mod altw_external_stage3 {
     fn fault_injection_altw_stage3_bucket_panic_surfaces_and_cleans_scratch() {
         altw_hooks::stage3::reset();
 
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let input = dir.path().join("in.osm.pbf");
         let output = dir.path().join("out.osm.pbf");
 

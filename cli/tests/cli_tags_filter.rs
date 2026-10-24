@@ -28,7 +28,6 @@ use crate::common::{
 };
 use crate::invoker::CliInvoker;
 use pbfhogg::MemberId;
-use tempfile::TempDir;
 
 /// Invoke `pbfhogg tags-filter <input> -o <output> [-R] [--invert-match]
 /// [--remove-tags] [-j N] <expressions...> [--force]` and assert success.
@@ -87,7 +86,7 @@ fn run_filter(input: &Path, output: &Path, expressions: &[&str], omit_referenced
 /// the highway node would keep that blob eligible whatever its tag index said.
 #[test]
 fn repacked_empty_key_is_not_skipped_by_tag_filter() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let repacked = dir.path().join("repacked.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -137,7 +136,7 @@ fn repacked_empty_key_is_not_skipped_by_tag_filter() {
 /// escape hatch that gets the right answer back out of it.
 #[test]
 fn distrust_metadata_recovers_matches_a_lying_tag_index_would_hide() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let pristine = dir.path().join("pristine.osm.pbf");
     let corrupt = dir.path().join("corrupt.osm.pbf");
 
@@ -232,7 +231,7 @@ fn distrust_metadata_recovers_matches_a_lying_tag_index_would_hide() {
 /// narrowed schedule comes back empty.
 #[test]
 fn distrust_metadata_holds_through_reference_expansion() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let pristine = dir.path().join("pristine.osm.pbf");
     let corrupt = dir.path().join("corrupt.osm.pbf");
 
@@ -345,7 +344,7 @@ fn distrust_metadata_holds_through_reference_expansion() {
 /// says so instead of accepting a flag that would do nothing.
 #[test]
 fn distrust_metadata_is_rejected_on_osc_input() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let osc = dir.path().join("changes.osc.gz");
     {
         use std::io::Write;
@@ -379,7 +378,7 @@ fn distrust_metadata_is_rejected_on_osc_input() {
 
 #[test]
 fn key_only_filter() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -423,7 +422,7 @@ fn key_only_filter() {
 /// plain key instead.
 #[test]
 fn expressions_file_keeps_a_tab_led_key_and_strips_inline_comments() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     let exprs = dir.path().join("exprs.txt");
@@ -484,7 +483,7 @@ fn expressions_file_keeps_a_tab_led_key_and_strips_inline_comments() {
 /// silent zero-match literal key `w/highway`.
 #[test]
 fn expressions_file_rejects_an_indented_type_prefix() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     let exprs = dir.path().join("exprs.txt");
@@ -510,7 +509,7 @@ fn expressions_file_rejects_an_indented_type_prefix() {
 
 #[test]
 fn exact_value_filter() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -570,7 +569,7 @@ fn exact_value_filter() {
 
 #[test]
 fn multi_value_filter() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -607,7 +606,7 @@ fn multi_value_filter() {
 
 #[test]
 fn negation_filter() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -647,7 +646,7 @@ fn negation_filter() {
 
 #[test]
 fn wildcard_prefix_filter() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -687,7 +686,7 @@ fn wildcard_prefix_filter() {
 
 #[test]
 fn type_prefix_filter() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -718,7 +717,7 @@ fn type_prefix_filter() {
 
 #[test]
 fn combined_type_prefix_nw() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -754,7 +753,7 @@ fn combined_type_prefix_nw() {
 
 #[test]
 fn two_pass_includes_way_dep_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -814,7 +813,7 @@ fn two_pass_includes_way_dep_nodes() {
 
 #[test]
 fn omit_referenced_excludes_way_dep_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -854,7 +853,7 @@ fn omit_referenced_excludes_way_dep_nodes() {
 
 #[test]
 fn two_pass_direct_node_match_plus_way_deps() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -913,7 +912,7 @@ fn two_pass_direct_node_match_plus_way_deps() {
 
 #[test]
 fn empty_result_produces_valid_pbf() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -939,7 +938,7 @@ fn empty_result_produces_valid_pbf() {
 
 #[test]
 fn multiple_expressions_or_semantics() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -980,7 +979,7 @@ fn multiple_expressions_or_semantics() {
 
 #[test]
 fn relation_match_includes_member_way_and_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -1053,7 +1052,7 @@ fn relation_match_includes_member_way_and_nodes() {
 
 #[test]
 fn relation_match_includes_nested_relation_members() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -1112,7 +1111,7 @@ fn relation_match_includes_nested_relation_members() {
 
 #[test]
 fn relation_cycle_terminates_and_includes_each_once() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -1149,7 +1148,7 @@ fn relation_cycle_terminates_and_includes_each_once() {
 
 #[test]
 fn omit_referenced_does_not_expand_relation_members() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -1201,7 +1200,7 @@ fn omit_referenced_does_not_expand_relation_members() {
 
 #[test]
 fn invert_match_excludes_matching_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -1243,7 +1242,7 @@ fn invert_match_excludes_matching_nodes() {
 
 #[test]
 fn invert_match_excludes_matching_ways() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -1301,7 +1300,7 @@ fn invert_match_excludes_matching_ways() {
 
 #[test]
 fn remove_tags_strips_tags_from_referenced_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -1379,7 +1378,7 @@ fn remove_tags_strips_tags_from_referenced_nodes() {
 // counter the library tracks.
 
 fn run_parity(input: &Path, jobs: usize) -> (PbfContentsIdOnly, String) {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let output = dir.path().join("output.osm.pbf");
     let stderr = run_filter_full(
         input,
@@ -1395,7 +1394,7 @@ fn run_parity(input: &Path, jobs: usize) -> (PbfContentsIdOnly, String) {
 
 #[test]
 fn tags_filter_parallel_classify_parity() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
 
     // 40 nodes + 20 ways (half tagged highway=primary, half building=yes)

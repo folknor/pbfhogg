@@ -436,7 +436,7 @@ const REFUSALS: &[(&[&str], &str)] = &[
 
 #[test]
 fn every_refusal_happens_before_any_input_is_opened() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let mut failures = Vec::new();
     for (words, expect) in REFUSALS {
         let out = run(&argv(dir.path(), words));
@@ -459,7 +459,7 @@ fn every_refusal_happens_before_any_input_is_opened() {
 /// arguments are parsed, not when a reader or writer first opens.
 #[test]
 fn a_platform_switch_the_build_lacks_is_refused_before_any_input() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     for (switch, compiled) in [
         (
             "--direct-io",
@@ -568,7 +568,7 @@ const JOBS: &[JobsRow] = &[
 
 #[test]
 fn jobs_is_accepted_or_refused_per_command_and_value() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let mut failures = Vec::new();
     for row in JOBS {
         for (value, accepts) in ["0", "1", "2"].into_iter().zip(row.accepts) {
@@ -655,7 +655,7 @@ struct Fx {
 
 impl Fx {
     fn new() -> Self {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         let p = dir.path();
         crate::common::write_base_pbf(&p.join("indexed.osm.pbf"));
         strip_indexdata(&p.join("indexed.osm.pbf"), &p.join("unindexed.osm.pbf"));
@@ -872,7 +872,7 @@ fn the_gate_advises_only_a_switch_the_mode_accepts() {
 /// `merge-changes` names an input OSC it cannot open.
 #[test]
 fn merge_changes_names_a_missing_input() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let out = run(&argv(dir.path(), &["merge-changes", "OSC", "-o", "OSCOUT"]));
     reached_input(&out).unwrap_or_else(|why| panic!("{why}"));
 }
@@ -940,7 +940,7 @@ fn the_printed_indexing_recipe_makes_the_refused_command_succeed() {
             failures.push(format!("[{label}] no recipe printed; stderr:\n{stderr}"));
             continue;
         };
-        let cwd = TempDir::new().unwrap();
+        let cwd = crate::common::test_scratch();
         let ran = CliInvoker::new()
             .current_dir(cwd.path())
             .args(&recipe)
@@ -1005,7 +1005,7 @@ fn the_printed_sort_recipe_makes_the_refused_diff_succeed() {
     let stderr = refused.stderr_str();
     assert_eq!(refused.status.code(), Some(2), "{stderr}");
     let recipe = printed_recipe(&stderr).unwrap_or_else(|| panic!("no recipe printed:\n{stderr}"));
-    let cwd = TempDir::new().unwrap();
+    let cwd = crate::common::test_scratch();
     CliInvoker::new()
         .current_dir(cwd.path())
         .args(&recipe)

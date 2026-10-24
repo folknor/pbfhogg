@@ -77,7 +77,7 @@ fn cli_help() {
 
 #[test]
 fn cli_cat_passthrough() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -107,7 +107,7 @@ fn cli_cat_passthrough() {
 
 #[test]
 fn cli_sort() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -133,7 +133,7 @@ fn cli_sort() {
 
 #[test]
 fn cli_inspect() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
 
     write_minimal_pbf(&input);
@@ -157,7 +157,7 @@ fn cli_inspect() {
 
 #[test]
 fn cli_check() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
 
     write_minimal_pbf(&input);
@@ -180,7 +180,7 @@ fn cli_check() {
 
 #[test]
 fn cli_renumber() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -211,7 +211,7 @@ fn cli_renumber() {
 
 #[test]
 fn cli_renumber_custom_start_id() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -277,7 +277,7 @@ fn cli_renumber_custom_start_id() {
 #[cfg(not(feature = "linux-direct-io"))]
 #[test]
 fn cli_direct_io_rejected_without_feature() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -309,7 +309,7 @@ fn cli_direct_io_rejected_without_feature() {
 #[cfg(not(feature = "linux-io-uring"))]
 #[test]
 fn cli_io_uring_rejected_without_feature() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -354,7 +354,7 @@ fn cli_rejects_ambiguous_inspect_and_missing_extract_region() {
 
 #[test]
 fn cli_tags_filter_ambiguous_content_uses_legacy_fallback() {
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     for (name, bytes) in [
         ("unknown.pbf", b"not a PBF".as_slice()),
         ("unknown.osc.gz", b"\x1f\x8bnot OSC".as_slice()),
@@ -377,7 +377,7 @@ fn cli_tags_filter_ambiguous_content_uses_legacy_fallback() {
 
 #[test]
 fn cli_tags_filter_unknown_extension_does_not_skip_bom_and_whitespace() {
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("changes.unknown");
     std::fs::write(
         &input,
@@ -412,7 +412,7 @@ fn cli_diff_quiet_osc_without_output_retains_error() {
 #[test]
 fn cli_check_json_preserves_non_utf8_filename_lossily() {
     use std::os::unix::ffi::OsStringExt;
-    let dir = tempfile::tempdir().expect("directory");
+    let dir = crate::common::test_scratch();
     let name = std::ffi::OsString::from_vec(b"actual-\xff.pbf".to_vec());
     let input = dir.path().join(&name);
     write_minimal_pbf(&input);

@@ -33,7 +33,6 @@ use std::path::{Path, PathBuf};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use pbfhogg::tags_filter::osc::tags_filter_osc;
-use tempfile::TempDir;
 
 fn write_gz(path: &Path, xml: &str) {
     let file = File::create(path).unwrap();
@@ -144,7 +143,7 @@ fn assert_all_accept(dir: &Path, input: &Path, case: &str) {
 /// either extension.
 #[test]
 fn every_consumer_reads_plain_and_gzipped_osc() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
   <create>
@@ -178,7 +177,7 @@ fn every_consumer_reads_plain_and_gzipped_osc() {
 /// copies had no truncation check at all.
 #[test]
 fn every_consumer_refuses_a_truncated_osc() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("cut.osc.gz");
     write_gz(
         &input,
@@ -195,7 +194,7 @@ fn every_consumer_refuses_a_truncated_osc() {
 /// unrepresentable and out-of-range are one rule now, in one function.
 #[test]
 fn every_consumer_refuses_an_unusable_coordinate() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     for (case, attrs) in [
         ("absent", r#"id="1" version="1""#),
         ("empty", r#"id="1" lat="" lon="2.0" version="1""#),
@@ -239,7 +238,7 @@ fn every_consumer_refuses_an_unusable_coordinate() {
 /// sink can inherit half the rule.
 #[test]
 fn every_consumer_refuses_an_exotic_member_type() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("member.osc.gz");
     write_gz(
         &input,
@@ -277,7 +276,7 @@ fn every_consumer_refuses_an_exotic_member_type() {
 /// version-precedence gate.
 #[test]
 fn every_consumer_agrees_on_metadata_leniency() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
 
     let input = dir.path().join("meta.osc.gz");
     write_gz(
@@ -370,7 +369,7 @@ fn every_consumer_agrees_on_metadata_leniency() {
 /// requires unanimity for that one and this one does not.
 #[test]
 fn only_the_overlay_interprets_changeset_uid_and_timestamp() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     for attrs in [
         r#"id="1" lat="1.0" lon="2.0" version="1" changeset="not-a-number""#,
         r#"id="1" lat="1.0" lon="2.0" version="1" uid="x""#,
@@ -436,7 +435,7 @@ fn only_the_overlay_interprets_changeset_uid_and_timestamp() {
 /// verdict-only parity check cannot see, since both commands exit 0.
 #[test]
 fn re_emit_sinks_escape_user_data_identically() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("escape.osc.gz");
     // Raw `&amp;` / `&quot;` / `&#10;` in the source decode to `&`, `"`
     // and a newline in the parsed value; the writers must re-escape all
@@ -700,7 +699,7 @@ const REFUSED: &[(&str, &[&str], i32)] = &[
 /// claim.
 #[test]
 fn both_version_gates_refuse_a_claim_below_the_highest_ever_made() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let out = dir.path().join("simplify-out.osc.gz");
     for &(case, bodies, floor) in REFUSED {
         let inputs = write_sequence(dir.path(), case, bodies);
@@ -824,7 +823,7 @@ const ACCEPTED: &[(&str, &[&str])] = &[
 
 #[test]
 fn both_version_gates_admit_a_claim_above_the_highest_ever_made() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let out = dir.path().join("simplify-out.osc.gz");
     for &(case, bodies) in ACCEPTED {
         let inputs = write_sequence(dir.path(), case, bodies);
@@ -843,7 +842,7 @@ fn both_version_gates_admit_a_claim_above_the_highest_ever_made() {
 /// change `--simplify` emits.
 #[test]
 fn both_version_gates_let_the_later_equal_claim_win() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let out = dir.path().join("simplify-out.osc.gz");
 
     let inputs = write_sequence(

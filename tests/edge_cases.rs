@@ -15,7 +15,6 @@ use crate::common::{
 use pbfhogg::block_builder;
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobReader, BlobType, ElementReader, MemberId};
-use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
 // Empty PBF (header only, no data blobs)
@@ -35,7 +34,7 @@ fn write_empty_pbf(path: &std::path::Path) {
 
 #[test]
 fn empty_pbf_reads_cleanly() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("empty.osm.pbf");
     write_empty_pbf(&path);
 
@@ -69,7 +68,7 @@ fn empty_pbf_reads_cleanly() {
 /// another empty PBF, not panic and not produce a malformed file.
 #[test]
 fn empty_pbf_survives_sort() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("empty.osm.pbf");
     let output = dir.path().join("sorted.osm.pbf");
     write_empty_pbf(&input);
@@ -96,7 +95,7 @@ fn empty_pbf_survives_sort() {
 
 #[test]
 fn zero_ref_way_roundtrips() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("noref.osm.pbf");
 
     write_test_pbf_sorted(
@@ -134,7 +133,7 @@ fn zero_ref_way_roundtrips() {
 
 #[test]
 fn zero_member_relation_roundtrips() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("nomember.osm.pbf");
 
     write_test_pbf_sorted(
@@ -175,7 +174,7 @@ fn zero_member_relation_roundtrips() {
 
 #[test]
 fn empty_string_tag_value_roundtrips() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("emptytag.osm.pbf");
 
     write_test_pbf_sorted(
@@ -206,7 +205,7 @@ fn empty_string_tag_value_roundtrips() {
 /// silently corrupt.
 #[test]
 fn empty_string_tag_key_behaviour() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("emptykey.osm.pbf");
 
     write_test_pbf_sorted(
@@ -239,7 +238,7 @@ fn empty_string_tag_key_behaviour() {
 
 #[test]
 fn relation_referencing_relation_roundtrips() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("rel_of_rel.osm.pbf");
 
     write_test_pbf_sorted(
@@ -297,7 +296,7 @@ fn relation_referencing_relation_roundtrips() {
 /// CHANGELOG; roundtrip at the reader/writer layer should still work.)
 #[test]
 fn large_positive_id_roundtrips() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("bigid.osm.pbf");
 
     let big_id: i64 = 12_345_678_901; // well above current osm ceiling
@@ -329,7 +328,7 @@ fn large_positive_id_roundtrips() {
 /// via the single writer and verifying they all round-trip.
 #[test]
 fn block_builder_capacity_boundary() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("cap.osm.pbf");
     let nodes = crate::common::generate_nodes(8_001, 1);
     write_test_pbf_sorted(&path, &nodes, &[], &[]);
@@ -402,7 +401,7 @@ fn altw_options() -> pbfhogg::altw::AltwOptions {
 /// entry point publishes only after the gate passes.
 #[test]
 fn altw_refusal_writes_no_output_for_a_library_caller() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
     write_unresolvable_way_pbf(&input);
@@ -450,7 +449,7 @@ fn altw_refusal_writes_no_output_for_a_library_caller() {
 /// destroyed it before the gate ever ran.
 #[test]
 fn altw_refusal_leaves_a_preexisting_destination_intact() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let output = dir.path().join("precious.osm.pbf");
     write_unresolvable_way_pbf(&input);

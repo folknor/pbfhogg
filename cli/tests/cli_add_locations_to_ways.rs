@@ -28,7 +28,6 @@ use crate::common::{
 };
 use crate::invoker::{CliInvoker, CliOutput};
 use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
-use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -191,7 +190,7 @@ fn out_of_domain_node_coordinates_are_refused_by_both_backends() {
                 tags: vec![],
                 meta: None,
             }];
-            let dir = TempDir::new().expect("tempdir");
+            let dir = crate::common::test_scratch();
             let input = dir.path().join("input.osm.pbf");
             let output = dir.path().join("output.osm.pbf");
             write_indexed_pbf(&input, &nodes, &ways, &[]);
@@ -293,7 +292,7 @@ fn read_relation_ids(path: &Path) -> Vec<i64> {
 
 #[test]
 fn basic_locations_added_to_ways() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -316,7 +315,7 @@ fn basic_locations_added_to_ways() {
 
 #[test]
 fn header_has_locations_on_ways_feature() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -344,7 +343,7 @@ fn header_has_locations_on_ways_feature() {
 
 #[test]
 fn drop_untagged_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -366,7 +365,7 @@ fn drop_untagged_nodes() {
 
 #[test]
 fn keep_untagged_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -392,7 +391,7 @@ fn keep_untagged_nodes() {
 /// geometry, so the guard is a policy change and not a capability loss.
 #[test]
 fn missing_node_refs_get_zero_coordinates() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -433,7 +432,7 @@ fn missing_node_refs_get_zero_coordinates() {
 
 #[test]
 fn relations_preserved() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -459,7 +458,7 @@ fn relations_preserved() {
 
 #[test]
 fn passthrough_basic_with_indexdata() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -491,7 +490,7 @@ fn passthrough_basic_with_indexdata() {
 
 #[test]
 fn passthrough_relations_preserved() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -519,7 +518,7 @@ fn passthrough_relations_preserved() {
 
 #[test]
 fn passthrough_drop_untagged_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -536,7 +535,7 @@ fn passthrough_drop_untagged_nodes() {
 
 #[test]
 fn passthrough_keep_untagged_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -558,7 +557,7 @@ fn passthrough_keep_untagged_nodes() {
 
 #[test]
 fn drop_untagged_keeps_relation_member_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -607,7 +606,7 @@ fn drop_untagged_keeps_relation_member_nodes() {
 
 #[test]
 fn passthrough_drop_untagged_keeps_relation_member_nodes() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -660,7 +659,7 @@ fn passthrough_drop_untagged_keeps_relation_member_nodes() {
 
 #[test]
 fn basic_locations_added_sparse() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -688,7 +687,7 @@ fn basic_locations_added_sparse() {
 
 #[test]
 fn passthrough_basic_with_indexdata_sparse() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -722,7 +721,7 @@ fn passthrough_basic_with_indexdata_sparse() {
 
 #[test]
 fn missing_node_refs_get_zero_coordinates_sparse() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -767,7 +766,7 @@ fn missing_node_refs_get_zero_coordinates_sparse() {
 #[test]
 #[allow(clippy::cast_possible_wrap)]
 fn backend_parity_sparse_external_auto() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let out_sparse = dir.path().join("out_sparse.osm.pbf");
     let out_external = dir.path().join("out_external.osm.pbf");
@@ -829,7 +828,7 @@ fn zero_ref_ways_survive_sparse_and_external_assembly() {
     // Mixed blobs exercise refcount alignment on both sides of a nonempty
     // way; all-empty blobs exercise the router's pre-populated Empty slot.
     for all_empty in [false, true] {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         let input = dir.path().join("input.osm.pbf");
         let sparse = dir.path().join("sparse.osm.pbf");
         let external = dir.path().join("external.osm.pbf");
@@ -865,7 +864,7 @@ fn zero_ref_ways_survive_sparse_and_external_assembly() {
 /// by `host_contract::fixed_memory_routes_auto`, which supplies the memory.
 #[test]
 fn auto_on_sorted_indexed_input_reports_its_choice() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -893,7 +892,7 @@ fn auto_on_sorted_indexed_input_reports_its_choice() {
 /// entirely and route to sparse via the eligibility check.
 #[test]
 fn auto_routes_non_indexed_input_to_sparse_without_estimate() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -924,7 +923,7 @@ fn auto_routes_non_indexed_input_to_sparse_without_estimate() {
 /// before any input is opened.
 #[test]
 fn altw_external_refuses_force_before_any_input() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let out = CliInvoker::new()
         .arg("add-locations-to-ways")
         .arg(dir.path().join("no-such-input.osm.pbf"))
@@ -946,7 +945,7 @@ fn altw_external_refuses_force_before_any_input() {
 /// the indexdata gate, which points at the indexed-generation workflow.
 #[test]
 fn altw_external_refuses_non_indexed_input() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -1009,7 +1008,7 @@ fn altw_external_refuses_non_indexed_input() {
 /// error.
 #[test]
 fn altw_external_refuses_an_unsorted_header_with_sort_advice() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("unsorted-header.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
@@ -1046,7 +1045,7 @@ fn altw_external_refuses_an_unsorted_header_with_sort_advice() {
 /// and what to switch to.
 #[test]
 fn altw_dense_index_type_rejected_with_migration_hint() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -1090,7 +1089,7 @@ mod platform {
 
     #[test]
     fn basic_locations_added_direct_io() {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let input = dir.path().join("input.osm.pbf");
         let output = dir.path().join("output.osm.pbf");
 
@@ -1135,7 +1134,7 @@ mod platform {
     /// the join, and only a failure is held to the contract.
     #[test]
     fn external_backend_output_refusal_stays_typed_across_stage_join() {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let input = dir.path().join("input.osm.pbf");
         let output = dir.path().join("output.osm.pbf");
 
@@ -1213,7 +1212,7 @@ fn null_island_real_node_is_not_reported_missing() {
     }];
 
     for backend in [IndexBackend::Sparse, IndexBackend::External] {
-        let dir = TempDir::new().expect("tempdir");
+        let dir = crate::common::test_scratch();
         let input = dir.path().join("input.osm.pbf");
         let output = dir.path().join("output.osm.pbf");
         // External needs indexdata to build its I/O schedule; sparse is
@@ -1265,7 +1264,7 @@ fn way_ref_near_i64_max_is_a_missing_location_not_an_abort() {
         meta: None,
     }];
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
     write_test_pbf(&input, &test_nodes(), &ways, &relations);
@@ -1332,7 +1331,7 @@ fn node_id_beyond_external_encoding_limit_is_an_error_and_sparse_handles_it() {
         meta: None,
     }];
 
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     write_indexed_pbf(&input, &nodes, &ways, &[]);
 
@@ -1379,7 +1378,7 @@ fn node_id_beyond_external_encoding_limit_is_an_error_and_sparse_handles_it() {
 /// to disagree.
 #[test]
 fn missing_node_refs_get_zero_coordinates_external() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
@@ -1511,7 +1510,7 @@ fn assert_external_refuses_and_sparse_joins(input: &Path, needle: &str, way_refs
 
 #[test]
 fn external_refuses_node_blobs_in_descending_order() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("descending.osm.pbf");
     let refs = [1, 4];
     write_three_per_blob(&input, &[4, 5, 6, 1, 2, 3], &[way_over(10, &refs)]);
@@ -1523,7 +1522,7 @@ fn external_refuses_node_blobs_in_descending_order() {
 /// while the walk over the first already consumed its record.
 #[test]
 fn external_refuses_interleaved_overlapping_node_blobs() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("interleaved.osm.pbf");
     let refs = [2, 5];
     write_three_per_blob(&input, &[1, 3, 5, 2, 4, 6], &[way_over(10, &refs)]);
@@ -1534,7 +1533,7 @@ fn external_refuses_interleaved_overlapping_node_blobs() {
 /// the external join writes blobs in input order under that header.
 #[test]
 fn external_refuses_way_blobs_in_descending_order() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("ways-descending.osm.pbf");
     let ways: Vec<TestWay> = [14, 15, 16, 11, 12, 10]
         .iter()
@@ -1562,7 +1561,7 @@ fn external_refuses_way_blobs_in_descending_order() {
 /// so the external index refuses it outright rather than losing nodes.
 #[test]
 fn external_refuses_a_node_blob_reaching_below_zero() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("mixed-sign.osm.pbf");
     let refs = [1, 2];
     write_three_per_blob(&input, &[-1, 1, 2], &[way_over(10, &refs)]);
@@ -1573,7 +1572,7 @@ fn external_refuses_a_node_blob_reaching_below_zero() {
 /// next, as `OrderWatermark` allows everywhere else.
 #[test]
 fn external_accepts_node_blobs_sharing_a_boundary_id() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("shared-boundary.osm.pbf");
     write_three_per_blob(&input, &[1, 2, 3, 3, 4, 5], &[way_over(10, &[1, 3, 5])]);
     let output = dir.path().join("external.osm.pbf");

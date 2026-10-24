@@ -21,7 +21,6 @@ use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{
     BlobFilter, BlobReader, BlobType, ByteOffset, Element, ElementReader, Info, MemberId,
 };
-use tempfile::TempDir;
 
 use crate::common::write_many_block_pbf;
 
@@ -348,7 +347,7 @@ fn collect_sequential(path: &Path) -> Vec<(char, i64)> {
 /// Pipelined reading produces elements in the same order as sequential reading.
 #[test]
 fn pipelined_matches_sequential() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("test.osm.pbf");
     write_test_pbf(&path);
 
@@ -387,7 +386,7 @@ fn for_each_matches_pipelined_across_compressions() {
         Compression::Zlib(6),
         Compression::Zstd(3),
     ] {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::common::test_scratch();
         let path = dir.path().join("test.osm.pbf");
         write_materialization_pbf(&path, compression);
 
@@ -423,7 +422,7 @@ fn for_each_matches_pipelined_across_compressions() {
 /// into_blocks_pipelined yields the same elements as for_each_pipelined.
 #[test]
 fn block_iterator_matches_pipelined() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("test.osm.pbf");
     write_test_pbf(&path);
 
@@ -444,7 +443,7 @@ fn block_iterator_matches_pipelined() {
 /// into_blocks_pipelined handles early drop without hanging.
 #[test]
 fn block_iterator_early_drop() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("test.osm.pbf");
     write_test_pbf(&path);
 
@@ -458,7 +457,7 @@ fn block_iterator_early_drop() {
 
 #[test]
 fn block_iterator_early_drop_under_pressure() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("many.osm.pbf");
     write_many_block_pbf(&path, 64);
 
@@ -481,7 +480,7 @@ fn block_iterator_early_drop_under_pressure() {
 
 #[test]
 fn block_fn_error_stops_pipeline() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("many.osm.pbf");
     write_many_block_pbf(&path, 64);
 
@@ -508,7 +507,7 @@ fn block_fn_error_stops_pipeline() {
 /// gated batched twin that also covered this was removed.
 #[test]
 fn decode_error_surfaces_after_prior_blocks() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let good = dir.path().join("good.osm.pbf");
     let broken = dir.path().join("broken.osm.pbf");
     write_test_pbf(&good);
@@ -540,7 +539,7 @@ fn decode_error_surfaces_after_prior_blocks() {
 
 #[test]
 fn pipelined_matches_sequential_tiny_caps() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("many.osm.pbf");
     write_many_block_pbf(&path, 16);
 
@@ -561,7 +560,7 @@ fn pipelined_matches_sequential_tiny_caps() {
 
 #[test]
 fn pipelined_block_iterator_matches_sequential_with_tiny_count_bounds() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("many.osm.pbf");
     write_many_block_pbf(&path, 16);
 
@@ -583,7 +582,7 @@ fn pipelined_block_iterator_matches_sequential_with_tiny_count_bounds() {
 
 #[test]
 fn early_exit_does_not_read_whole_file() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("many.osm.pbf");
     write_many_block_pbf(&path, 256);
     let bytes = std::fs::read(&path).unwrap();
@@ -623,7 +622,7 @@ fn early_exit_does_not_read_whole_file() {
 fn block_type_classification() {
     use pbfhogg::BlockType;
 
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("test.osm.pbf");
     write_test_pbf(&path);
 
@@ -656,7 +655,7 @@ fn block_type_classification() {
 /// par_map_reduce counts match sequential counts.
 #[test]
 fn par_map_reduce_count() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("test.osm.pbf");
     write_test_pbf(&path);
 
@@ -687,7 +686,7 @@ fn par_map_reduce_count() {
 /// par_map_reduce collects the same set of element IDs as sequential (order may differ).
 #[test]
 fn par_map_reduce_collect_ids() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("test.osm.pbf");
     write_test_pbf(&path);
 
@@ -717,7 +716,7 @@ fn par_map_reduce_collect_ids() {
 /// Seeking back to the start re-reads the first blob.
 #[test]
 fn blobreader_seek_to_start() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("test.osm.pbf");
     write_test_pbf(&path);
 
@@ -736,7 +735,7 @@ fn blobreader_seek_to_start() {
 /// blob_from_offset can random-access any blob by its recorded offset.
 #[test]
 fn blobreader_blob_from_offset() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("test.osm.pbf");
     write_test_pbf(&path);
 
@@ -759,7 +758,7 @@ fn blobreader_blob_from_offset() {
 /// seek_raw with SeekFrom::Start(0) restarts; SeekFrom::End(0) reaches EOF.
 #[test]
 fn blobreader_seek_raw() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("test.osm.pbf");
     write_test_pbf(&path);
 
@@ -791,7 +790,7 @@ fn blobreader_seek_raw_clears_error_state() {
     //  - Seeking back to the start should reset the state and let
     //    iteration resume on the leading OSMHeader (an OSMHeader is only
     //    accepted as the first frame, so the junk cannot come first).
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let good_path = dir.path().join("good.osm.pbf");
     write_test_pbf(&good_path);
     let mut bytes = std::fs::read(&good_path).unwrap();
@@ -814,7 +813,7 @@ fn blobreader_seek_raw_clears_error_state() {
 /// next_header_skip_blob scans all headers without decoding blob content.
 #[test]
 fn blobreader_next_header_skip_blob() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("test.osm.pbf");
     write_test_pbf(&path);
 
@@ -889,7 +888,7 @@ fn write_sorted_pbf(path: &Path) {
 /// ElementReader exposes the parsed header via header().
 #[test]
 fn header_accessor() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("test.osm.pbf");
     write_test_pbf(&path);
 
@@ -911,7 +910,7 @@ fn header_accessor() {
 /// header().is_sorted() returns true when Sort.Type_then_ID is set.
 #[test]
 fn header_is_sorted_true() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("sorted.osm.pbf");
     write_sorted_pbf(&path);
 
@@ -922,7 +921,7 @@ fn header_is_sorted_true() {
 /// header().is_sorted() returns false when Sort.Type_then_ID is absent.
 #[test]
 fn header_is_sorted_false() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("unsorted.osm.pbf");
     write_test_pbf(&path);
 
@@ -933,7 +932,7 @@ fn header_is_sorted_false() {
 /// Elements are still delivered correctly after header is consumed at construction.
 #[test]
 fn header_consumed_elements_still_work() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("test.osm.pbf");
     write_sorted_pbf(&path);
 
@@ -953,7 +952,7 @@ fn header_consumed_elements_still_work() {
 /// Sorted PBF iterates without assertion failure (nodes in ascending ID order).
 #[test]
 fn sorted_pbf_no_assertion_failure() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("sorted.osm.pbf");
     write_sorted_pbf(&path);
 
@@ -980,7 +979,7 @@ fn sorted_pbf_no_assertion_failure() {
 #[test]
 #[should_panic(expected = "Sort.Type_then_ID violated")]
 fn sorted_flag_but_unsorted_nodes_panics() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("liar.osm.pbf");
 
     // Write a PBF that declares Sort.Type_then_ID but has nodes out of order
@@ -1037,7 +1036,7 @@ fn sorted_flag_but_unsorted_nodes_panics() {
 
 #[test]
 fn blobfilter_only_ways_skips_node_blobs_on_indexed_input() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("indexed.osm.pbf");
     crate::common::write_test_pbf_sorted(
         &path,
@@ -1073,7 +1072,7 @@ fn blobfilter_only_ways_skips_node_blobs_on_indexed_input() {
 
 #[test]
 fn blobfilter_only_ways_passes_through_on_non_indexed_input() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("non_indexed.osm.pbf");
     crate::common::write_test_pbf_non_indexed(
         &path,
@@ -1119,7 +1118,7 @@ fn blobfilter_only_ways_passes_through_on_non_indexed_input() {
 
 #[test]
 fn trailing_partial_length_prefix_returns_ok_none() {
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("good.osm.pbf");
     write_test_pbf(&path);
     let good_bytes = std::fs::read(&path).unwrap();
@@ -1157,7 +1156,7 @@ fn trailing_partial_length_prefix_4_bytes_is_committed_frame() {
     // 4 bytes is exactly a complete length prefix; that's NOT shape 1
     // anymore - the reader is committed to a frame and must hard-error
     // because the declared header bytes don't follow.
-    let dir = TempDir::new().unwrap();
+    let dir = crate::common::test_scratch();
     let path = dir.path().join("good.osm.pbf");
     write_test_pbf(&path);
     let good_bytes = std::fs::read(&path).unwrap();

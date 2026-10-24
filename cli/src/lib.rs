@@ -163,8 +163,8 @@ impl OutputArg {
 #[derive(Args)]
 struct TmpDirArg {
     /// Directory for this run's scratch files, which can be large (add-locations-to-ways
-    /// needs up to hundreds of GB with `--index-type external`; parallel diff writes a copy of
-    /// the changed text). The directory must exist and be writable; it is checked before any
+    /// needs up to hundreds of GB with `--index-type external`; a parallel text diff has
+    /// each shard write its full text output, unchanged lines included unless `-c`). The directory must exist and be writable; it is checked before any
     /// work starts. Each run makes one hidden `.pbfhogg-run-*` directory in it and removes it
     /// at the end. Default: the output's directory, or the current directory when there is
     /// no output file. Output staging files stay beside the output regardless.
@@ -4215,7 +4215,6 @@ fn run_diff(
     let options = pbfhogg::diff::DiffOptions {
         suppress_common,
         verbose,
-        summary: osmium_summary,
         type_filter,
         parallelism,
     };

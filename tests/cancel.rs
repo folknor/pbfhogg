@@ -171,7 +171,6 @@ fn diff_parallel(
         &pbfhogg::diff::DiffOptions {
             suppress_common: false,
             verbose: false,
-            summary: false,
             type_filter: None,
             parallelism: pbfhogg::Parallelism::from_jobs(2),
         },

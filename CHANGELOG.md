@@ -4,6 +4,11 @@
 
 ### Breaking
 
+- **`DiffOptions::summary` is removed.** The library never read it: the
+  caller chooses between `DiffStats::write_summary` and
+  `DiffStats::write_osmium_summary` itself. Delete the field from any
+  `DiffOptions` literal.
+
 - **A text input that is not UTF-8 is `ErrorKind::InvalidData`, not `Io`.**
   The `getid` / `getparents` ID files, `extract` configs and region files
   used to report non-UTF-8 content as an I/O error; they now report it as

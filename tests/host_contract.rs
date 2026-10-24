@@ -536,7 +536,6 @@ fn diff_without_scratch_needs_a_single_shard() {
         let options = pbfhogg::diff::DiffOptions {
             suppress_common: false,
             verbose,
-            summary: false,
             type_filter: None,
             parallelism: pbfhogg::Parallelism::from_jobs(jobs),
         };
@@ -625,7 +624,6 @@ fn run_scratch_backend(
             let options = pbfhogg::diff::DiffOptions {
                 suppress_common: false,
                 verbose: false,
-                summary: false,
                 type_filter: None,
                 parallelism: pbfhogg::Parallelism::from_jobs(jobs),
             };

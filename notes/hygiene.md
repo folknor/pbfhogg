@@ -1158,17 +1158,3 @@ textlint's `paths` to `tests/**/*.rs` and `cli/tests/**/*.rs`.
 
 Reported by: the `cat --dedupe` pass-2 error tests.
 
-## HYG-141 - `DiffOptions::summary` does nothing in the library
-
-Anger: 5 - public API field; removing it is breaking.
-
-`DiffOptions::summary` is documented as selecting the osmium-style summary,
-which "the caller renders with `DiffStats::write_osmium_summary`". The
-field is read nowhere: the CLI sets it from `--summary` and then branches on
-its own local to render the summary. A library caller who sets it gets
-nothing. Fix:
-drop the field (the CLI keeps its flag and calls `write_osmium_summary`), or
-make the library honour it.
-
-Reported by: the quiet-diff count mode.
-

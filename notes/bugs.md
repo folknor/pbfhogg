@@ -94,19 +94,6 @@ during decode.
 
 Reported by: the extract passthrough fix.
 
-## BUG-142 - `--tmp-dir` help misstates what parallel diff writes
-
-Anger: 2 - help text.
-
-`TmpDirArg`'s doc in `cli/src/lib.rs` says parallel diff "writes a copy of
-the changed text" to scratch. Without `-c` (suppress common) each shard
-writes all of its text, unchanged lines included, so scratch use is the size
-of the full text output, not of the changes. Anyone sizing `--tmp-dir` from
-the help underestimates it. Fix: reword the help (and any reference/docs
-page that repeats it) to say each shard writes its full text output.
-
-Reported by: the quiet-diff count-only work.
-
 ## BUG-143 - Sequential block-pair diff answers wrongly on blobs out of order within a kind
 
 Anger: 8 - diff core; a correct check has to accept every valid mixed-sign

@@ -550,7 +550,6 @@ fn diff_blob_layout_independence() {
     let opts = pbfhogg::diff::DiffOptions {
         suppress_common: false,
         verbose: false,
-        summary: false,
         type_filter: None,
         parallelism: pbfhogg::Parallelism::from_jobs(1),
     };
@@ -645,7 +644,6 @@ fn diff_stats_matches_text_diff_on_every_path() {
                 let options = pbfhogg::diff::DiffOptions {
                     suppress_common: false,
                     verbose: false,
-                    summary: false,
                     type_filter,
                     parallelism,
                 };
@@ -860,7 +858,6 @@ fn diff_counts(
     let options = pbfhogg::diff::DiffOptions {
         suppress_common: false,
         verbose,
-        summary: false,
         type_filter: Some(type_filter),
         parallelism: pbfhogg::Parallelism::from_jobs(jobs),
     };
@@ -921,7 +918,6 @@ fn diff_type_filter_skip_still_refuses_an_earlier_kind_out_of_order() {
             let options = pbfhogg::diff::DiffOptions {
                 suppress_common: false,
                 verbose,
-                summary: false,
                 type_filter: Some(type_filter),
                 parallelism: pbfhogg::Parallelism::from_jobs(jobs),
             };

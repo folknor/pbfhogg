@@ -85,9 +85,6 @@ pub struct DiffOptions {
     pub suppress_common: bool,
     /// Show detailed changes for modified elements.
     pub verbose: bool,
-    /// Select the osmium-style summary (left/right/same/different counts).
-    /// The caller renders it with `DiffStats::write_osmium_summary`.
-    pub summary: bool,
     /// Restrict the comparison to these element types. `None` = all.
     pub type_filter: Option<TypeFilter>,
     /// Number of parallel shards (and worker threads) for the block-pair
@@ -297,7 +294,6 @@ pub fn diff_stats(
     let options = DiffOptions {
         suppress_common: false,
         verbose: false,
-        summary: false,
         type_filter,
         parallelism,
     };

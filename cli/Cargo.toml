@@ -15,36 +15,53 @@ categories = ["command-line-utilities", "science::geo"]
 # a [[test]] of its own with the reason beside it, never a silent extra
 # binary.
 autotests = false
+# Nor are bins, examples or benches: a stray src/bin/x.rs would get a unit-test
+# harness that scripts/check_static_hook_targets.py never inspects.
+autobins = false
+autoexamples = false
+autobenches = false
 
-# The unit tests in cli/src walk the clap command tree itself (the short-flag
-# vocabulary, the retired shorts), which only code inside the binary can
-# reach.
+# The program is a library target so this package's tests reach the command
+# tree production parses (`cli_command`): the unit tests in src/ walk it (the
+# short-flag vocabulary, the retired shorts) and the integration tests take
+# the subcommand list from it. Not an API, so no doctests.
+[lib]
+name = "pbfhogg_cli"
+path = "src/lib.rs"
+doctest = false
+
+# Only `main` calling `pbfhogg_cli::run`; nothing to unit-test.
 [[bin]]
 name = "pbfhogg"
 path = "src/main.rs"
+test = false
 
-# Drives the binary through cargo's CARGO_BIN_EXE_pbfhogg, which only this
-# package's tests receive.
+# Every CLI-driving integration test, as modules of one binary (the root
+# package's tests/all.rs is the library's twin). They live here because cargo
+# builds the binary with this test build's features and hands its path as
+# CARGO_BIN_EXE_pbfhogg only to this package's tests.
 [[test]]
-name = "cli"
-path = "tests/cli.rs"
+name = "all"
+path = "tests/all.rs"
 
 [features]
 default = []
 # No-op passthrough. pbfhogg-cli's lib dep always pulls in
 # `pbfhogg/commands`, so this feature does nothing semantic; it
-# exists so brokkr.toml `[[check]]` sweeps can apply the same
-# `--features commands` flag to both `cargo test -p pbfhogg` and
-# `cargo build -p pbfhogg-cli` without the latter rejecting the
-# unknown feature.
+# exists so brokkr.toml `[[check]]` sweeps that select both packages
+# can apply the same `--features commands` flag to each without
+# pbfhogg-cli rejecting the unknown feature.
 commands = []
 hotpath = ["pbfhogg/hotpath"]
 hotpath-alloc = ["pbfhogg/hotpath-alloc"]
 linux-direct-io = ["pbfhogg/linux-direct-io"]
 linux-io-uring = ["pbfhogg/linux-io-uring"]
-# Re-exports pbfhogg's test-only fault-injection hooks so the CLI
-# compiles cleanly under `cargo ... --all-features`. Production
-# builds don't enable this.
+# pbfhogg's per-instance test hooks, and the CLI's own (the cancellation
+# pause and count read from the environment, src/signals.rs). The `all` check
+# sweep enables it; production builds never do. There is
+# deliberately no `static-test-hooks` here: no CLI-driving test needs a
+# process-global hook, and this package's test harnesses refuse to compile
+# against a pbfhogg built with them (see the assertion in cli/src/lib.rs).
 test-hooks = ["pbfhogg/test-hooks"]
 
 [dependencies]
@@ -57,6 +74,8 @@ libc = "0.2.186"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
+zstd = "0.14.0"
 
 [lints]
 workspace = true

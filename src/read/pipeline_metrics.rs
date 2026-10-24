@@ -261,16 +261,7 @@ mod tests {
                 );
             }
         }
-        // Strip `//` line comments so a commented-out call cannot satisfy it.
-        let main_rs: String = include_str!("../../cli/src/main.rs")
-            .lines()
-            .map(|line| line.split("//").next().unwrap_or(""))
-            .flat_map(str::chars)
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        assert!(
-            main_rs.contains("emit_read_counters()"),
-            "the CLI must call pbfhogg::read::emit_read_counters on its exit path"
-        );
+        // That the CLI does call the hook on its exit path is checked by the
+        // CLI package's own unit tests, which own that source.
     }
 }

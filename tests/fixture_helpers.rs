@@ -165,8 +165,8 @@ fn test_meta_roundtrips_through_writer() {
 
 /// Smoke-check that `assert_indexed` passes for a file written with the
 /// standard sorted writer. (`assert_non_indexed` is exercised by
-/// `tests/non_indexed_parity.rs`, `tests/cli_diff.rs` and
-/// `tests/cli_sort.rs`.)
+/// `tests/non_indexed_parity.rs`, `cli/tests/cli_diff.rs` and
+/// `cli/tests/cli_sort.rs`.)
 #[test]
 fn assert_indexed_passes_for_standard_fixture() {
     let dir = TempDir::new().expect("tempdir");
@@ -189,41 +189,6 @@ fn assert_indexed_passes_for_standard_fixture() {
         }
     }
     assert!(saw_data, "expected at least one decodeable data blob");
-}
-
-// ---------------------------------------------------------------------------
-// CliInvoker
-// ---------------------------------------------------------------------------
-
-/// Smoke test for the CliInvoker helper - confirms it can find the
-/// compiled `pbfhogg` binary and that stdout capture / assertion
-/// helpers work on a trivial invocation. If this test fails with a
-/// "binary not found" panic, the workspace build did not produce the
-/// CLI binary before tests ran; see the panic message in
-/// `tests/common/cli.rs::pbfhogg_bin` for the recovery recipe.
-#[cfg(feature = "commands")]
-#[test]
-fn cli_invoker_runs_version_command() {
-    let out = crate::common::cli::CliInvoker::new()
-        .arg("--version")
-        .assert_success();
-    out.assert_stdout_contains("pbfhogg");
-}
-
-#[cfg(all(unix, feature = "commands"))]
-#[test]
-fn unrelated_failures_are_never_platform_skips() {
-    use crate::common::cli::CliOutput;
-    use std::os::unix::process::ExitStatusExt;
-    for code in [1, 2, 3] {
-        let output = CliOutput {
-            status: std::process::ExitStatus::from_raw(code << 8),
-            stdout: Vec::new(),
-            stderr: b"Invalid argument EINVAL: not supported; io_uring creation failed".to_vec(),
-        };
-        assert!(!output.is_o_direct_unsupported());
-        assert!(!output.is_uring_unsupported());
-    }
 }
 
 // ---------------------------------------------------------------------------

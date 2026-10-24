@@ -18,32 +18,37 @@ capture_env = ["PBFHOGG*", "MALLOC*"]
 #                 stays opt-in via `brokkr <cmd> --hotpath`) and MINUS
 #                 `commands` because pbfhogg's `default = ["commands"]`
 #                 already enables it whenever no_default_features is
-#                 false. `commands` is also not a pbfhogg-cli feature
-#                 (the CLI always pulls in pbfhogg with `commands`
-#                 via its lib dep) so listing it would break the
-#                 build_packages step.
+#                 false, and pbfhogg-cli always pulls it in via its lib
+#                 dep.
 #  - "consumer" = no-default-features view; what a downstream library
 #                 user builds with `default-features = false, features =
 #                 ["commands"]`. Catches lints in always-compiled code
 #                 that proc-macros silently mask (e.g. #[hotpath::measure]
-#                 swallowing function bodies). Also rebuilds the CLI
-#                 binary without linux-direct-io / linux-io-uring so
-#                 the cli_sort.rs feature_missing tests (gated on
+#                 swallowing function bodies). Also tests pbfhogg-cli
+#                 built without linux-direct-io / linux-io-uring, so the
+#                 cli_sort.rs feature_missing tests (gated on
 #                 `cfg(not(feature = "linux-..."))`) fire in this sweep
-#                 against a CLI that doesn't support the flag.
-#                 pbfhogg-cli has a no-op `commands` feature in
-#                 `cli/Cargo.toml` purely so brokkr can apply
-#                 `--features commands` symmetrically to both crates.
+#                 against a CLI that doesn't support the flag; for
+#                 pbfhogg-cli this shape is its default build (default =
+#                 [], and its `commands` feature is a no-op that exists
+#                 purely so brokkr can apply `--features commands` to
+#                 both crates).
 #
-# build_packages rebuilds the named cargo packages with the entry's
-# feature flags before the test phase. Required for tests/cli_*.rs:
-# without it, `cargo test -p pbfhogg` leaves whatever pbfhogg-cli was
-# last built and CliInvoker silently hits a stale binary.
+# The sweeps that test the CLI select both packages. Every test that
+# drives the `pbfhogg` binary lives in pbfhogg-cli (cli/tests/all.rs),
+# where cargo builds the binary with that test build's features and hands
+# its path as CARGO_BIN_EXE_pbfhogg - so there is no build_packages
+# pre-build and no binary from another sweep to pick up. Both packages
+# declare test-hooks, linux-direct-io and linux-io-uring under the same
+# names, so one feature list serves both. A sweep that must keep the
+# library alone (minimal, geocode-reader, faults) leaves pbfhogg-cli out:
+# its lib dep would turn `commands` back on, and faults would hand it
+# static-test-hooks, which its harnesses refuse at compile time.
 
 [[check]]
 name = "all"
+packages = ["pbfhogg", "pbfhogg-cli"]
 features = ["test-hooks", "linux-direct-io", "linux-io-uring"]
-build_packages = ["pbfhogg-cli"]
 # `parallel = {}` runs the sweep's test binaries concurrently - prebuilt
 # binaries executed directly, budget = tests in flight, defaulting to the L3
 # cache domain (the right default for a compute-bound suite). Until 2026-09-02
@@ -52,10 +57,10 @@ build_packages = ["pbfhogg-cli"]
 # ritual to judge it: the first run weights by test count (always the slow
 # one), and `claims 1-1` on the second means the budget needs raising (see
 # brokkr man config parallel). Since the test fold (autotests = false) the
-# sweep's binaries are the lib unit tests, the one `all` binary, and the
-# process_nofile target; the fan-out therefore parallelizes mostly inside
-# `all`, and shared scratch between concurrent cli_* modules is the class
-# to suspect first if a test flakes. The static-hook fault_* targets run in
+# sweep's binaries are each package's lib unit tests and `all` binary, and
+# the process_nofile target; the fan-out therefore parallelizes mostly
+# inside the two `all` binaries, and shared scratch between concurrent
+# cli_* modules is the class to suspect first if a test flakes. The static-hook fault_* targets run in
 # the `faults` sweep below.
 parallel = {}
 
@@ -75,9 +80,9 @@ parallel = {}
 
 [[check]]
 name = "consumer"
+packages = ["pbfhogg", "pbfhogg-cli"]
 no_default_features = true
 features = ["commands"]
-build_packages = ["pbfhogg-cli"]
 parallel = {}
 
 # "minimal" = the configuration the crate advertises but never built.
@@ -85,7 +90,7 @@ parallel = {}
 # until this entry existed no sweep ever compiled pbfhogg without it and
 # `default-features = false` was an untested claim.
 #
-# No build_packages, deliberately. pbfhogg-cli pins its lib dep as
+# No pbfhogg-cli, deliberately. pbfhogg-cli pins its lib dep as
 # `default-features = false, features = ["commands"]`, so the moment the
 # CLI joins the build cargo's feature unification turns `commands` back
 # on and the sweep silently stops testing what it is named for. This
@@ -93,8 +98,8 @@ parallel = {}
 #
 # Integration tests that reach into the feature-gated modules
 # (`check`, `export`, `extract`, `inspect::json`, `geocode_index`) carry
-# a file-level `#![cfg(feature = "commands")]` so they drop out here and
-# still run in full under `all` and `consumer`.
+# a `#[cfg(feature = "commands")]` on their `mod` line in tests/all.rs so
+# they drop out here and still run in full under `all` and `consumer`.
 [[check]]
 name = "minimal"
 no_default_features = true
@@ -109,25 +114,14 @@ no_default_features = true
 features = ["geocode-reader"]
 parallel = {}
 
-# The CLI crate's own tests (cli/tests/cli.rs). Every other sweep selects only
-# the root package - `build_packages` builds pbfhogg-cli but never tests it -
-# so until this entry existed these tests ran under no sweep at all, and the
-# gate's coverage audit could not see them either. Default features on
-# purpose: the `cfg(not(feature = "linux-..."))` rejection tests only compile
-# in a CLI built without the platform features.
-[[check]]
-name = "cli"
-packages = ["pbfhogg-cli"]
-parallel = {}
-
 # The glibc-only allocator calls (mallopt, mallinfo2, malloc_trim) are gated
 # on target_env = "gnu"; this sweep builds, lints and runs the suite against
 # musl so an ungated call fails here rather than in a downstream musl build.
 # x86_64 musl binaries run natively on the glibc host.
 [[check]]
 name = "musl"
+packages = ["pbfhogg", "pbfhogg-cli"]
 target = "x86_64-unknown-linux-musl"
-build_packages = ["pbfhogg-cli"]
 parallel = {}
 
 # Doctests live in cargo's `--doc` pseudo-target, which a `parallel` sweep
@@ -136,8 +130,9 @@ parallel = {}
 # comment was invisible. Workspace-shaped (no `packages`) on purpose: a gate
 # needs at least one doctest carrier that spans the whole workspace. Run
 # through the gate profile only, to keep tier1 fast.
-# pbfhogg-cli is bin-only, and `cargo test --doc` fails outright on a bin-only
-# package, so it is excluded rather than the lane being package-scoped.
+# pbfhogg-cli's library target is the program, not an API, and sets
+# `doctest = false`, so it is excluded rather than the lane being
+# package-scoped.
 [[check]]
 name = "doctests"
 doc_only = true
@@ -174,7 +169,7 @@ stage = "pre-clippy"
 [[textlint]]
 name = "glibc-allocator-calls-live-in-debug"
 pattern = '\blibc::(?:mallopt|mallinfo2?|malloc_trim|malloc_stats|malloc_info|M_[A-Z_]+)\b'
-paths = ["src/**/*.rs", "cli/src/**/*.rs", "tests/**/*.rs", "benches/**/*.rs"]
+paths = ["src/**/*.rs", "cli/src/**/*.rs", "tests/**/*.rs", "cli/tests/**/*.rs", "benches/**/*.rs"]
 exclude = ["src/debug.rs", "src/process.rs"]
 region = "code"
 message = "glibc-only allocator calls belong in target_env gnu gated debug/process wrappers"
@@ -187,6 +182,18 @@ message = "glibc-only allocator calls belong in target_env gnu gated debug/proce
 # `use std::io::stdout as out;` cannot rename its way past it.
 # `region = "code"` keeps doc examples, comments and
 # clap help strings out of scope. `eprintln!` stays legal.
+# tests/common is mounted by path into pbfhogg (where `commands` is on by
+# default) and into pbfhogg-cli (where `commands` is a no-op feature, off in
+# the `all` and `musl` sweeps). A gate on either feature in a shared helper
+# would silently drop CLI tests out of those sweeps. Comment lines are exempt
+# so the explanation can name the features.
+[[textlint]]
+name = "no-library-feature-gates-in-tests-common"
+pattern = 'feature\s*=\s*"(?:commands|geocode-reader)"'
+paths = ["tests/common/**/*.rs"]
+except = ['^\s*//']
+message = "tests/common is shared with pbfhogg-cli, where `commands` means something else; gate the mod line in tests/all.rs instead, never a shared helper"
+
 [[textlint]]
 name = "no-print-macro"
 pattern = '\b(?:print|println)!\s*[\(\[\{]'
@@ -235,7 +242,7 @@ gate_profile = "gate"
 # themselves out there.
 [test.profiles.tier1]
 description = "Fast edit loop used by brokkr check (tier 1)"
-sweeps = ["all", "faults", "consumer", "minimal", "geocode-reader", "cli", "musl"]
+sweeps = ["all", "faults", "consumer", "minimal", "geocode-reader", "musl"]
 skip = ["tier2::", "tier3::", "platform::", "serial::"]
 include_ignored = false
 
@@ -243,7 +250,9 @@ include_ignored = false
 # picks up fast ignored tests that #[ignore] keeps out of tier 1.
 # Platform tier handled separately. Tests slower than brokkr check's fixed
 # 20 s per-test kill are skipped here BY NAME and must be run
-# individually via `brokkr test <name> --timeout <secs>`; without the
+# individually via `brokkr test <name> --timeout <secs>` (add
+# `-p pbfhogg-cli` when the test is a CLI one, as sort_cross_validate_osmium
+# is); without the
 # skip the profile could never pass, by construction.
 #
 # WARNING, and it has bitten once (2026-08-20): these entries are SUBSTRING
@@ -285,14 +294,23 @@ only = ["serial::"]
 include_ignored = true
 test_threads = 1
 
-# Tier 2 command-slice precedent. cli_sort.rs is already split into
+# Tier 2 command-slice precedent. cli/tests/cli_sort.rs is already split into
 # root (tier 1) + mod platform; once it grows a mod tier2 (many-blob
 # boundary fixtures, scratch-leak sweeps), this profile picks them up.
 # Add similar entries for other commands as their tier-2 matrices
 # land - per testing.md, there is no generic tier2 profile.
+#
+# The sweeps are named rather than inherited from tier1: cli_sort lives in
+# pbfhogg-cli, so the root-only sweeps (faults, minimal, geocode-reader)
+# hold no cli_sort test. Verified with `brokkr check --profile sort` and the
+# tier1 sweep list: the run stops at `faults` with "cargo test: zero tests
+# ran (sweep: faults)", and the sweeps after it never run (the later
+# root-only sweeps were not reached, so not observed). These three are every
+# shape the CLI tests run in.
 [test.profiles.sort]
 description = "Tier 2: expanded sort command tests"
 extends = "tier1"
+sweeps = ["all", "consumer", "musl"]
 tests = ["all"]
 only = ["cli_sort::"]
 skip = ["platform::", "serial::"]
@@ -305,7 +323,7 @@ skip = ["platform::", "serial::"]
 # a test that stops running cannot go unnoticed here.
 [test.profiles.gate-tests]
 description = "Every sweep, unfiltered"
-sweeps = ["all", "faults", "consumer", "minimal", "geocode-reader", "cli", "musl"]
+sweeps = ["all", "faults", "consumer", "minimal", "geocode-reader", "musl"]
 
 [test.profiles.doc-twin]
 description = "The doc-only carrier"

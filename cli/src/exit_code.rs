@@ -1,7 +1,4 @@
-//! How a failed command is reported and which exit status it earns. Kept in
-//! a file of its own, free of the rest of the binary, so the CLI integration
-//! tests can compile it directly (`#[path]`) and test the error walk without
-//! a unit-test harness in `src/`.
+//! How a failed command is reported and which exit status it earns.
 
 /// Whether `err` is, or wraps, a platform setup refusal. Walks `source()`
 /// chains, continuing through foreign errors, and looks inside `io::Error`
@@ -112,7 +109,7 @@ pub fn error_report(err: &(dyn std::error::Error + 'static)) -> String {
 
 /// What the invoked command line can be advised to do after a typed library
 /// refusal: each field is the switch this command and mode actually offer
-/// (and do not already have set), or nothing. Computed by `main` from the
+/// (and do not already have set), or nothing. Computed by `run` from the
 /// parsed command and its matches; the library names no flag and no command.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Advice {
@@ -209,4 +206,148 @@ pub fn output_hint(err: &(dyn std::error::Error + 'static), advice: &Advice) -> 
         };
     }
     None
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)] // fixture files in test scratch, not operator input
+mod tests {
+    use super::{Hinted, error_report, is_platform_unsupported};
+    use std::io;
+
+    /// A scratch directory under the workspace's data/test-scratch, never the
+    /// system temp directory.
+    fn scratch() -> tempfile::TempDir {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data/test-scratch");
+        std::fs::create_dir_all(&root).expect("create test scratch root");
+        tempfile::TempDir::new_in(root).expect("create test scratch directory")
+    }
+
+    fn platform() -> pbfhogg::Error {
+        pbfhogg::Error::platform_unsupported("io-uring", io::Error::other("refused"))
+    }
+
+    #[test]
+    fn bare_and_context_wrapped_refusals_exit_3() {
+        assert!(is_platform_unsupported(&platform()));
+        assert!(is_platform_unsupported(&platform().context("opening")));
+    }
+
+    #[test]
+    fn io_carrier_and_double_wrapping_exit_3() {
+        let carried = io::Error::from(platform());
+        assert!(is_platform_unsupported(&carried));
+        let once = pbfhogg::Error::from(carried);
+        assert!(is_platform_unsupported(&once));
+        // An Io error holding an io::Error that holds the refusal, which a
+        // plain source() walk skips.
+        let twice = pbfhogg::Error::from(io::Error::other(io::Error::from(platform())));
+        assert!(is_platform_unsupported(&twice));
+    }
+
+    #[test]
+    fn refusal_under_external_exits_3() {
+        let external = pbfhogg::Error::external(platform());
+        assert!(is_platform_unsupported(&external));
+        let boxed: Box<dyn std::error::Error> = Box::new(external);
+        assert!(is_platform_unsupported(boxed.as_ref()));
+    }
+
+    #[test]
+    fn ordinary_errors_do_not() {
+        assert!(!is_platform_unsupported(&pbfhogg::Error::from(
+            io::Error::other("x")
+        )));
+        assert!(!is_platform_unsupported(&pbfhogg::Error::external(
+            io::Error::other("x")
+        )));
+        assert!(!is_platform_unsupported(&io::Error::other("x")));
+    }
+
+    #[test]
+    fn report_covers_bare_carried_and_foreign_errors() {
+        assert_eq!(
+            error_report(&platform()),
+            "platform feature io-uring unavailable: refused"
+        );
+        let carried = io::Error::from(platform().context("opening"));
+        assert_eq!(
+            error_report(&carried),
+            "opening: platform feature io-uring unavailable: refused"
+        );
+        assert_eq!(error_report(&io::Error::other("plain")), "plain");
+    }
+
+    #[test]
+    fn hinted_error_keeps_the_typed_cause_reachable_and_prints_cause_then_advice() {
+        let hinted = Hinted::new(platform().context("opening"), "; try again");
+        // The advice never hides the refusal from the exit-code walk.
+        assert!(is_platform_unsupported(&hinted));
+        assert_eq!(
+            error_report(&hinted),
+            "opening: platform feature io-uring unavailable: refused; try again"
+        );
+        assert_eq!(hinted.to_string(), "try again");
+    }
+
+    /// An existing output earns the advice naming the flag that grants the
+    /// replacement, however deep in the chain the refusal sits; nothing
+    /// else does.
+    #[test]
+    fn output_refusal_earns_the_overwrite_advice() {
+        use super::output_hint;
+        let dir = scratch();
+        let existing = dir.path().join("out.osm.pbf");
+        std::fs::write(&existing, b"user data").expect("write existing output");
+        let refused = pbfhogg::Output::new(
+            &existing,
+            pbfhogg::Overwrite::Refuse,
+            &pbfhogg::host::Diagnostics::discard(),
+        )
+        .expect_err("an existing output is refused");
+        assert!(matches!(
+            refused.kind(),
+            pbfhogg::ErrorKind::Output(pbfhogg::OutputError::Exists { .. })
+        ));
+        let advice = super::Advice::default();
+        assert_eq!(
+            output_hint(&refused, &advice).as_deref(),
+            Some("; pass --overwrite (-O) to replace it")
+        );
+        let carried = io::Error::from(refused.context("publishing"));
+        assert!(output_hint(&carried, &advice).is_some());
+        assert_eq!(output_hint(&platform(), &advice), None);
+    }
+
+    /// A cancellation earns the interrupted status as the error itself or
+    /// through the transparent carriers, never as a cause buried under
+    /// another error.
+    #[test]
+    fn cancellation_is_classified_only_as_the_authoritative_cause() {
+        use super::is_cancelled;
+        let dir = scratch();
+        let output = pbfhogg::Output::new(
+            dir.path().join("out.osm.pbf"),
+            pbfhogg::Overwrite::Refuse,
+            &pbfhogg::host::Diagnostics::discard(),
+        )
+        .expect("fresh output");
+        let cancel = pbfhogg::host::Cancel::new();
+        cancel.cancel();
+        let cancelled = output
+            .publish(&cancel)
+            .expect_err("a tripped token refuses publication");
+        assert!(cancelled.is_cancelled());
+        assert!(is_cancelled(&cancelled));
+        assert!(is_cancelled(&cancelled.clone().context("stage 3")));
+        assert!(is_cancelled(&io::Error::from(cancelled.clone())));
+        assert!(is_cancelled(&Hinted::new(cancelled.clone(), "; advice")));
+        let boxed: Box<dyn std::error::Error> = Box::new(cancelled.clone());
+        assert!(is_cancelled(boxed.as_ref()));
+        // Buried as the cause of another failure: that failure stands.
+        assert!(!is_cancelled(&pbfhogg::Error::external(cancelled)));
+        assert!(!is_cancelled(&platform()));
+        assert!(!is_platform_unsupported(&pbfhogg::Error::from(
+            io::Error::other("x")
+        )));
+    }
 }

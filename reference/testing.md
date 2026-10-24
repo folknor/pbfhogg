@@ -19,8 +19,14 @@ Tests go where they couple least.
 - **Stable-API integration tests** in `tests/<topic>.rs` (e.g.
   `tests/roundtrip.rs`, `read_paths.rs`, `edge_cases.rs`) - use
   only the stable allowlist below.
-- **CLI integration tests** in `tests/cli_*.rs` - drive the
-  `pbfhogg` binary via `CliInvoker`; internal modules are invisible.
+- **CLI integration tests** in `cli/tests/cli_*.rs`, in the
+  `pbfhogg-cli` package - drive the `pbfhogg` binary via `CliInvoker`;
+  internal modules are invisible. Every test that spawns the binary
+  lives there and nowhere else: cargo builds the binary for that
+  package's integration tests with the test build's own features,
+  profile and target, and hands its path as `CARGO_BIN_EXE_pbfhogg`.
+  The root package's tests get no such path, so they have no way to
+  reach the binary at all.
 - **Fault-injection tests** in `tests/fault_*.rs` - the ones that arm
   a process-global static hook each own a process (see "Test
   binaries"); a fault test on a per-instance hook may live in `all`.
@@ -38,28 +44,49 @@ declared in its `Cargo.toml`. One binary per file made every check
 sweep link and start one harness per file, and a focused `brokkr test
 NAME` list each harness in turn to find one test.
 
-- **`tests/all.rs`** mounts every integration test file that can share
-  a process as a module, and mounts `tests/common/` once. A test's full
-  libtest name is `<file>::<path in file>` (`cli_sort::platform::...`),
-  so tier filters (`tier2::`, `platform::`, ...) and leaf-name filters
-  keep matching; a brokkr profile that named a test *target*
-  (`tests = ["cli_sort"]`) now names `all` plus an `only` filter on
-  the module (`cli_sort::`). Files gated on a feature carry the
-  `#[cfg]` on their `mod` line in `all.rs`, so `all.rs` alone shows
-  what drops out of the `minimal` sweep.
-- **A new test file not declared in `tests/all.rs` (or as its own
-  `[[test]]`) is never compiled, and no test or coverage audit
+- **`tests/all.rs`** (the library package) mounts every integration
+  test file that can share a process as a module, and mounts
+  `tests/common/` once. **`cli/tests/all.rs`** (the `pbfhogg-cli`
+  package) is its twin for every CLI-driving test: the `cli_*.rs`
+  files, `cli.rs`, and `invoker.rs` (the `CliInvoker`), with
+  `tests/common/` mounted by `#[path]`. A test's full libtest name is
+  `<file>::<path in file>` (`cli_sort::platform::...`) and carries no
+  package, so tier filters (`tier2::`, `platform::`, ...) and leaf-name
+  filters match in both binaries; a brokkr profile names the target
+  `all` plus an `only` filter on the module (`cli_sort::`). Library
+  test files gated on a feature carry the `#[cfg]` on their `mod` line
+  in `tests/all.rs`, so it alone shows what drops out of the `minimal`
+  sweep; the CLI binary has no such gates, since `pbfhogg-cli` always
+  links the library with `commands`.
+- **`tests/common/` is shared by path, not by a crate.** Each package
+  compiles it with its own features, which carry the same names
+  (`linux-direct-io`, `linux-io-uring`, `test-hooks`), so a `cfg` gate
+  on those means the same thing in both. `commands` does not: in
+  `pbfhogg` it is on by default, in `pbfhogg-cli` it is a no-op feature
+  that is off in the `all` and `musl` sweeps. A
+  `cfg(feature = "commands")` (or `geocode-reader`) gate in a shared
+  helper would therefore silently drop CLI tests out of those sweeps, so
+  the `no-library-feature-gates-in-tests-common` textlint rule in
+  `brokkr.toml` bans both gates under `tests/common/`; gate the `mod`
+  line in `tests/all.rs` instead. A helper crate would see only its
+  own features, and its dependency on the library would have to keep
+  `commands` off for the `minimal` sweep. `tests/common/` holds fixtures
+  only; nothing in it spawns the binary.
+- **A new test file not declared in its package's `tests/all.rs` (or as
+  its own `[[test]]`) is never compiled, and no test or coverage audit
   reports it.** Add the `mod` line with the file.
 - **A test that must own its process** gets its own `[[test]]` target
-  in `Cargo.toml` with the reason written beside it. Today that is the
-  static-hook fault tests: `fault_parallel_writer`,
-  `fault_parallel_gzip`, `fault_parallel_gzip_flush`,
-  `fault_diff_parallel`, `fault_derive_parallel`, `fault_altw_stage3`,
-  `fault_geocode_pass3`, `fault_extract_grid`, `fault_uring_writer` and
-  `fault_read_pipeline`, one test each, each with
+  in `Cargo.toml` with the reason written beside it; the `[[test]]`
+  entries are the list. Those that arm a process-global static hook
+  (the `fault_*` targets) hold one test each and carry
   `required-features = ["static-test-hooks", ...]`, so they are built
-  and run only by the `faults` check sweep. `fault_apply_changes` uses a
-  per-instance hook and is a module of `all`.
+  and run only by the `faults` check sweep. A fault test on a
+  per-instance hook (`fault_apply_changes`) is a module of `all`.
+- **Moving tests between the packages: `scripts/test_inventory.py`.**
+  It compares the tests a plan lists against the tests the tree now
+  has (see its docstring for the exact brokkr command that produces the
+  plan). It matches by test name only, so a lost test can be masked by a
+  same-named test in the other package.
 - **What the shared binary shares.** Every module of `all` runs
   concurrently in one process with: the global rayon pool; and
   `RLIMIT_NOFILE`, raised once per process by `common::test_host()`.
@@ -84,13 +111,22 @@ NAME` list each harness in turn to find one test.
   `faults` sweep (`all`'s features plus `static-test-hooks`, unfiltered)
   is the one shape where the statics exist; every target requiring the
   feature runs there whatever it is named, and the gate audits the
-  whole shape. Limits: a new shared harness in the root package needs
-  the same crate-level `cfg` line; the CLI crate's `cli/tests/cli.rs`
-  links the library too and is protected by configuration only
-  (`pbfhogg-cli` does not forward `static-test-hooks` and no sweep
-  enables it there); doctests are outside the boundary (the doc-only
-  sweep enables no hook feature); and nothing enforces one test per
-  static-hook target.
+  whole shape. The CLI package's two shared harnesses (its lib
+  unit tests and `cli/tests/all.rs`) link the library too but cannot
+  see its features as a `cfg`, so they cannot compile themselves
+  empty; instead each asserts `pbfhogg::STATIC_TEST_HOOKS` (a hidden
+  constant, `cfg!(feature = "static-test-hooks")` inside the library)
+  false at compile time, and any feature graph that unifies the statics
+  onto the library they link fails to build them. That is why the
+  `faults` sweep stays root-only and `pbfhogg-cli` declares no
+  `static-test-hooks` feature. `scripts/check_static_hook_targets.py`
+  (a `brokkr check` script check) requires the assertion as an active
+  top-level item in every CLI harness, refuses a CLI bin with a unit-test
+  harness of its own, and counts exactly one `#[test]` per static-hook
+  target in the source. Limits: a new shared harness in the root
+  package needs the same `cfg` line by hand; the script reads source
+  text, so a block comment or a macro can still fool it; and doctests
+  are outside the boundary (the doc-only sweep enables no hook feature).
 - **Why the static-hook tests are not one lock-serialized binary.**
   Mutual exclusion inside one process is only equivalent to a process
   each if every thread that can read a hook has exited before the next
@@ -104,11 +140,25 @@ NAME` list each harness in turn to find one test.
   in each command's options) would let these tests fold into `all`
   with no lock at all.
 
-The `pbfhogg-cli` crate's own tests are `cli/tests/cli.rs`, declared as
-its `cli` target; the `pbfhogg` bin sets `test = false` (no inline
-tests). No check sweep in `brokkr.toml` selects `pbfhogg-cli` - the
-sweeps test the root package and only *build* the CLI - so that target
-runs only under an explicit `-p pbfhogg-cli`.
+The `pbfhogg-cli` program is its library target (`cli/src/lib.rs`,
+`pbfhogg_cli`); the `pbfhogg` bin is only `main` calling
+`pbfhogg_cli::run` and sets `test = false`. The library target exists
+so the package's tests reach the command tree production parses,
+`pbfhogg_cli::cli_command()`: the unit tests in `cli/src/` walk it, and
+the command-table tests in `cli/tests/` take their subcommand lists
+from it (`invoker::subcommands`, `invoker::subcommand_paths`), never
+from `--help` text. It is not an API and sets `doctest = false`.
+
+The `all`, `consumer` and `musl` check sweeps select both packages, so
+the CLI tests run against a binary with `test-hooks` and both platform
+features, one without the platform features (pbfhogg-cli's default
+build), and one for musl. No sweep pre-builds the binary
+(`build_packages`): cargo builds it for each test build. The `minimal`,
+`geocode-reader` and `faults` sweeps stay root-only: the CLI's lib dep
+would turn `commands` back on in the first two, and its harnesses refuse
+the statics `faults` enables. `brokkr test NAME` searches one package,
+`[test] default_package = "pbfhogg"`; a CLI test needs
+`brokkr test -p pbfhogg-cli NAME`.
 
 ## Validation tiers
 
@@ -134,7 +184,7 @@ than that can never pass a `check` profile, so `brokkr.toml`'s
 over-watchdog tests - without it the profile could never pass, by
 construction. Those tests are `#[ignore]`d out of `check`'s reach and
 must be exercised individually via `brokkr test <name> --timeout
-<secs>`, which raises the per-test timeout up to 280 s.
+<secs>` (`brokkr test -p pbfhogg-cli <name> ...` for a CLI test), which raises the per-test timeout up to 280 s.
 
 **No test reads a downloaded dataset.** Every test builds its own
 input in scratch. Real-data coverage (Denmark, planet, replication
@@ -192,7 +242,7 @@ Everything else is non-stable and requires CLI conversion.
 
 ### Per-command CLI test split
 
-Each `tests/cli_<command>.rs` splits intent inside the file:
+Each `cli/tests/cli_<command>.rs` splits intent inside the file:
 
 - **Root or `tier1` module**: small CLI contracts; runs in
   `brokkr check`.
@@ -205,7 +255,7 @@ Each `tests/cli_<command>.rs` splits intent inside the file:
 - **`serial`**: requires `--test-threads=1`. Static fault-injection
   state is not a `serial` case: it takes its own `[[test]]` target.
 
-`tests/cli_sort.rs` is the canonical template for new `cli_*.rs`
+`cli/tests/cli_sort.rs` is the canonical template for new `cli_*.rs`
 files.
 
 ## External cross-validation
@@ -223,7 +273,7 @@ Lives in `brokkr verify`, not the in-tree test crate:
   machinery and act as a gravity well.
 
 **One in-tree test is a migration candidate:**
-`tests/cli_sort.rs::sort_cross_validate_osmium` - handcrafted
+`cli/tests/cli_sort.rs::sort_cross_validate_osmium` - handcrafted
 overlapping-blob fixture; `brokkr verify sort` on a configured
 dataset runs against real data only and doesn't exercise the
 streaming sweep merge's overlap-run path. `brokkr verify
@@ -265,18 +315,18 @@ exception, not a tier - should not survive across many PRs.
   reaching checkpoint `k`, writes the ready file, and waits for the token;
   `stuck` writes `<ready file>.ack` once tripped and never returns, so only
   a second signal ends the run. The interruption tests in
-  `tests/cli_output_contract.rs` count a command's checkpoints, park it at
+  `cli/tests/cli_output_contract.rs` count a command's checkpoints, park it at
   sampled ordinals, signal it, and assert the exit code and an empty
   directory, with no sleeps. `CliInvoker::spawn` returns a `RunningCli`
   that can be signalled and is killed on drop.
-- **CliInvoker for CLI-driven tests.** `tests/common/cli.rs`. Every
-  new `tests/cli_*.rs` goes through it. Default wall-clock timeout
+- **CliInvoker for CLI-driven tests.** `cli/tests/invoker.rs`. Every
+  new `cli/tests/cli_*.rs` goes through it. Default wall-clock timeout
   set below `brokkr check`'s 20 s watchdog, override via
   `.timeout(Duration)`. Platform-skip
   predicates `is_o_direct_unsupported`, `is_uring_unsupported` require
   exit code 3 and a typed setup error.
-  Binary located via `BROKKR_TEST_BIN_DIR` (set per sweep) with
-  fallback to `CARGO_TARGET_DIR + cfg!(debug_assertions)`.
+  Binary located by cargo: `env!("CARGO_BIN_EXE_pbfhogg")`
+  (`invoker::pbfhogg_bin`), nothing read at run time.
 - **Skips.** A test that cannot run on this host (no O_DIRECT, no
   io_uring, no osmium in PATH) calls `common::skip(reason)` and returns.
 - **Adversarial fixtures.** `tests/common/adversarial.rs` provides
@@ -289,8 +339,9 @@ exception, not a tier - should not survive across many PRs.
   `generate_relations_with_negatives` for mixed-sign fixtures (per
   `decisions/0002-negative-ids-rejected-project-wide.md`).
 - **Test scratch.** `tests/common/scratch.rs` owns random, RAII-cleaned
-  directories under `data/test-scratch/`. It is the one implementation
-  for both harnesses: integration tests reach it as
+  directories under the workspace's `data/test-scratch/` (also when the
+  CLI package mounts it, whose manifest directory is `cli/`). It is the
+  one implementation for every harness: integration tests reach it as
   `common::test_scratch()`, and unit tests under `src/` as
   `path_guard::tests::scratch()`, which mounts the same file by `#[path]`
   so the library's unit tests never link the integration harness. Every

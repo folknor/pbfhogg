@@ -1,0 +1,1101 @@
+//! The input contract, enforced on every subcommand by one table.
+//!
+//! What a command does with the PBF it is given is the same everywhere, so
+//! one table says it for all of them:
+//!
+//! - A header-only file (a valid PBF with no data blobs) counts as indexed:
+//!   no blob lacks indexdata. Every command accepts it without `--force`, and
+//!   `inspect --indexed` answers yes and exits 0.
+//! - A zero-byte file, and any file whose first blob is not an OSMHeader,
+//!   gets the one missing-header error: exit 2, the file named, and no word
+//!   about indexdata. `inspect --indexed` is no exception; it exits 2 like
+//!   every other command, because the file is unreadable, not unindexed.
+//! - An output may not be any file the command reads. The refusal happens
+//!   before any work and covers the secondary inputs (`-I`, `-i`, `-e`,
+//!   `--polygon`, an `extract --config` file and the polygon files it names),
+//!   not only the positional ones.
+//!
+//! ## Complete by construction
+//!
+//! The list of subcommands is read from the binary's own `--help`. One that
+//! is in neither [`ROWS`] nor [`NO_PBF_INPUT`] fails
+//! `every_subcommand_is_in_the_table_or_reads_no_pbf`, as does a table entry
+//! the binary no longer has.
+
+#![allow(clippy::unwrap_used, clippy::unwrap_in_result)]
+
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+
+use crate::invoker::{CliInvoker, CliOutput, subcommands};
+use tempfile::TempDir;
+
+/// The one spelling of the missing-header error.
+const MISSING_HEADER: &str = "does not start with an OsmHeader blob";
+
+macro_rules! ensure {
+    ($cond:expr, $($arg:tt)*) => {
+        if !$cond {
+            return Err(format!($($arg)*));
+        }
+    };
+}
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+/// A one-node OSC file.
+const OSC: &[u8] = b"<osmChange version=\"0.6\"><create>\
+    <node id=\"1000\" version=\"1\" lat=\"0.001\" lon=\"0.002\">\
+    <tag k=\"amenity\" v=\"cafe\"/></node></create></osmChange>";
+
+/// A valid PBF holding only a header that declares a history file.
+fn write_history_header_only(path: &Path) {
+    use pbfhogg::writer::{Compression, PbfWriter};
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    let header = pbfhogg::block_builder::HeaderBuilder::new()
+        .sorted()
+        .historical()
+        .build()
+        .unwrap();
+    writer.write_header(&header).unwrap();
+    writer.flush().unwrap();
+}
+
+/// The inputs every row draws from.
+struct Fx {
+    dir: TempDir,
+}
+
+impl Fx {
+    fn new() -> Self {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path();
+        crate::common::write_base_pbf(&p.join("good.osm.pbf"));
+        crate::common::write_changed_pbf(&p.join("changed.osm.pbf"));
+        // A valid PBF: a header and no data blob.
+        crate::common::write_test_pbf_sorted(&p.join("header-only.osm.pbf"), &[], &[], &[]);
+        std::fs::write(p.join("zero.osm.pbf"), b"").unwrap();
+        // The data blobs of a good file with its header cut off.
+        let bytes = std::fs::read(p.join("good.osm.pbf")).unwrap();
+        let blobs = crate::common::adversarial::locate_blobs(&bytes);
+        assert!(blobs.len() >= 2, "fixture must hold a header and data");
+        std::fs::write(p.join("headerless.osm.pbf"), &bytes[blobs[1].frame_start..]).unwrap();
+        // The same file with its header frame repeated: a second OSMHeader.
+        let mut twice = bytes[..blobs[0].blob_end].to_vec();
+        twice.extend_from_slice(&bytes);
+        std::fs::write(p.join("two-headers.osm.pbf"), twice).unwrap();
+        // The same two-header shape without indexdata on any data blob: the
+        // only input getid's streaming full-scan arm reaches from the CLI
+        // (with --force).
+        crate::common::write_test_pbf_non_indexed(
+            &p.join("unindexed.osm.pbf"),
+            &crate::common::generate_nodes(5, 1),
+            &[],
+            &[],
+        );
+        let unindexed = std::fs::read(p.join("unindexed.osm.pbf")).unwrap();
+        let blobs = crate::common::adversarial::locate_blobs(&unindexed);
+        assert!(blobs.len() >= 2, "fixture must hold a header and data");
+        let mut twice = unindexed[..blobs[0].blob_end].to_vec();
+        twice.extend_from_slice(&unindexed);
+        std::fs::write(p.join("two-headers-unindexed.osm.pbf"), twice).unwrap();
+        // A header-only file whose header declares a history file, which
+        // time-filter reads through its other path.
+        write_history_header_only(&p.join("header-only-history.osm.pbf"));
+        std::fs::write(p.join("a.osc"), OSC).unwrap();
+        std::fs::write(p.join("b.osc"), OSC).unwrap();
+        std::fs::write(p.join("good.osc"), OSC).unwrap();
+        Self { dir }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.path().join(name)
+    }
+}
+
+struct Ctx<'a> {
+    fx: &'a Fx,
+    out: &'a Path,
+}
+
+struct Invocation {
+    args: Vec<OsString>,
+}
+
+impl Invocation {
+    fn new(words: &[&str]) -> Self {
+        Self {
+            args: words.iter().map(OsString::from).collect(),
+        }
+    }
+
+    fn arg(mut self, arg: impl AsRef<OsStr>) -> Self {
+        self.args.push(arg.as_ref().to_owned());
+        self
+    }
+
+    fn words(mut self, words: &[&str]) -> Self {
+        self.args.extend(words.iter().map(OsString::from));
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The table
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Prop {
+    HeaderOnly,
+    ZeroByte,
+    Headerless,
+}
+
+struct Row {
+    command: &'static str,
+    label: &'static str,
+    /// The invocation with `input` as the PBF the command reads first.
+    build: fn(&Ctx, &Path) -> Invocation,
+    /// Exit codes that mean success (`diff` exits 1 on differences).
+    ok_codes: &'static [i32],
+    /// Properties this row is known to violate, with the reason.
+    gaps: &'static [(Prop, &'static str)],
+}
+
+/// Subcommands that read no PBF, with the reason.
+const NO_PBF_INPUT: &[(&str, &str)] = &[("merge-changes", "reads OSC files only")];
+
+const fn row(
+    command: &'static str,
+    label: &'static str,
+    build: fn(&Ctx, &Path) -> Invocation,
+) -> Row {
+    Row {
+        command,
+        label,
+        build,
+        ok_codes: &[0],
+        gaps: &[],
+    }
+}
+
+const ROWS: &[Row] = &[
+    row("cat", "cat", cat),
+    row("cat", "cat --type node", cat_type),
+    row("cat", "cat --type way", cat_type_way),
+    row("cat", "cat --type relation", cat_type_relation),
+    row("cat", "cat --clean", cat_clean),
+    row("cat", "cat --dedupe", cat_dedupe),
+    row("sort", "sort", sort),
+    row("repack", "repack", repack),
+    row("degrade", "degrade", degrade),
+    row("degrade", "degrade --strip-indexdata", degrade_strip),
+    row("renumber", "renumber", renumber),
+    row("tags-filter", "tags-filter", tags_filter),
+    row("tags-filter", "tags-filter -R", tags_filter_omit),
+    row("export", "export", export),
+    Row {
+        ok_codes: &[0, 1],
+        ..row("diff", "diff old", diff_old)
+    },
+    Row {
+        ok_codes: &[0, 1],
+        ..row("diff", "diff new", diff_new)
+    },
+    Row {
+        ok_codes: &[0, 1],
+        ..row("diff", "diff --format osc old", diff_osc_old)
+    },
+    Row {
+        ok_codes: &[0, 1],
+        ..row("diff", "diff --format osc new", diff_osc_new)
+    },
+    row("getid", "getid", getid),
+    row("getid", "getid --add-referenced", getid_add_referenced),
+    row("getid", "getid --invert", getid_invert),
+    row("getparents", "getparents", getparents),
+    row("getparents", "getparents --add-self", getparents_add_self),
+    row("extract", "extract (complete)", extract_complete),
+    row("extract", "extract --simple", extract_simple),
+    row("extract", "extract --smart", extract_smart),
+    row("extract", "extract --config", extract_config),
+    row("add-locations-to-ways", "altw", altw),
+    row("add-locations-to-ways", "altw external", altw_external),
+    row("time-filter", "time-filter", time_filter),
+    row("time-filter", "time-filter (history)", time_filter_history),
+    row("apply-changes", "apply-changes", apply_changes),
+    row("bench-merge", "bench-merge", bench_merge),
+    // An index with nothing queryable in it is refused on purpose (exit 2);
+    // what this row pins is that the header-only file is read, not held
+    // against indexdata first.
+    Row {
+        ok_codes: &[2],
+        ..row("build-geocode-index", "build-geocode-index", geocode)
+    },
+    row("digest", "digest", digest),
+    row("inspect", "inspect", inspect_full),
+    row("inspect", "inspect --indexed", inspect_indexed),
+    row("inspect", "inspect --nodes", inspect_nodes),
+    row("inspect", "inspect --get", inspect_get),
+    // Exits 1 when the element is not in the file, which a header-only file
+    // never holds.
+    Row {
+        ok_codes: &[0, 1],
+        ..row("inspect", "inspect --show", inspect_show)
+    },
+    row("inspect", "inspect --blocks", inspect_blocks),
+    row("inspect", "inspect --extended", inspect_extended),
+    row("inspect", "inspect --locations", inspect_locations),
+    row("inspect", "inspect --id-ranges", inspect_id_ranges),
+    row("inspect", "inspect --anomalies", inspect_anomalies),
+    row("inspect", "inspect tags", inspect_tags),
+    row("inspect", "inspect tags --type", inspect_tags_typed),
+    Row {
+        ok_codes: &[0, 1],
+        ..row("check", "check", check)
+    },
+    Row {
+        ok_codes: &[0, 1],
+        ..row("check", "check --ids", check_ids)
+    },
+    Row {
+        ok_codes: &[0, 1],
+        ..row("check", "check --refs", check_refs)
+    },
+    Row {
+        ok_codes: &[0, 1],
+        ..row("check", "check --index", check_index)
+    },
+    row("bench-read", "bench-read", bench_read),
+    row("bench-write", "bench-write", bench_write),
+];
+
+fn out_pbf(c: &Ctx) -> PathBuf {
+    c.out.join("out.osm.pbf")
+}
+
+fn cat(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["cat"])
+        .arg(input)
+        .arg("-o")
+        .arg(out_pbf(c))
+}
+
+fn cat_type(c: &Ctx, input: &Path) -> Invocation {
+    cat(c, input).words(&["--type", "node"])
+}
+
+fn cat_type_way(c: &Ctx, input: &Path) -> Invocation {
+    cat(c, input).words(&["--type", "way"])
+}
+
+fn cat_type_relation(c: &Ctx, input: &Path) -> Invocation {
+    cat(c, input).words(&["--type", "relation"])
+}
+
+fn cat_clean(c: &Ctx, input: &Path) -> Invocation {
+    cat(c, input).words(&["--clean", "version"])
+}
+
+fn cat_dedupe(c: &Ctx, input: &Path) -> Invocation {
+    cat(c, input).words(&["--dedupe"])
+}
+
+fn sort(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["sort"])
+        .arg(input)
+        .arg("-o")
+        .arg(out_pbf(c))
+}
+
+fn repack(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["repack"])
+        .arg(input)
+        .arg("-o")
+        .arg(out_pbf(c))
+}
+
+fn degrade(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["degrade"])
+        .arg(input)
+        .words(&["--strip-locations"])
+        .arg("-o")
+        .arg(out_pbf(c))
+}
+
+fn degrade_strip(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["degrade"])
+        .arg(input)
+        .words(&["--strip-indexdata"])
+        .arg("-o")
+        .arg(out_pbf(c))
+}
+
+fn renumber(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["renumber"])
+        .arg(input)
+        .arg("-o")
+        .arg(out_pbf(c))
+}
+
+fn tags_filter(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["tags-filter"])
+        .arg(input)
+        .arg("-o")
+        .arg(out_pbf(c))
+        .arg("highway")
+}
+
+fn tags_filter_omit(c: &Ctx, input: &Path) -> Invocation {
+    tags_filter(c, input).words(&["-R"])
+}
+
+fn export(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["export"])
+        .arg(input)
+        .words(&["--type", "node"])
+        .arg("-o")
+        .arg(c.out.join("out.geojsonseq"))
+}
+
+fn diff_old(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["diff"])
+        .arg(input)
+        .arg(c.fx.path("changed.osm.pbf"))
+        .words(&["-j", "1"])
+        .arg("-o")
+        .arg(c.out.join("diff.txt"))
+}
+
+fn diff_new(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["diff"])
+        .arg(c.fx.path("changed.osm.pbf"))
+        .arg(input)
+        .words(&["-j", "1"])
+        .arg("-o")
+        .arg(c.out.join("diff.txt"))
+}
+
+fn diff_osc_old(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["diff"])
+        .arg(input)
+        .arg(c.fx.path("changed.osm.pbf"))
+        .words(&["--format", "osc"])
+        .arg("-o")
+        .arg(c.out.join("diff.osc"))
+}
+
+fn diff_osc_new(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["diff"])
+        .arg(c.fx.path("changed.osm.pbf"))
+        .arg(input)
+        .words(&["--format", "osc"])
+        .arg("-o")
+        .arg(c.out.join("diff.osc"))
+}
+
+fn getid(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["getid"])
+        .arg(input)
+        .arg("-o")
+        .arg(out_pbf(c))
+        .arg("n1")
+}
+
+fn getid_add_referenced(c: &Ctx, input: &Path) -> Invocation {
+    getid(c, input).words(&["--add-referenced"])
+}
+
+fn getid_invert(c: &Ctx, input: &Path) -> Invocation {
+    getid(c, input).words(&["--invert"])
+}
+
+fn getparents(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["getparents"])
+        .arg(input)
+        .arg("-o")
+        .arg(out_pbf(c))
+        .arg("n1")
+}
+
+fn getparents_add_self(c: &Ctx, input: &Path) -> Invocation {
+    getparents(c, input).words(&["--add-self"])
+}
+
+fn extract_complete(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["extract"])
+        .arg(input)
+        .arg("--bbox=-1,-1,1,1")
+        .arg("-o")
+        .arg(out_pbf(c))
+}
+
+fn extract_simple(c: &Ctx, input: &Path) -> Invocation {
+    extract_complete(c, input).words(&["--simple"])
+}
+
+fn extract_smart(c: &Ctx, input: &Path) -> Invocation {
+    extract_complete(c, input).words(&["--smart"])
+}
+
+fn extract_config(c: &Ctx, input: &Path) -> Invocation {
+    let config = c.fx.path("extract-config.json");
+    std::fs::write(
+        &config,
+        format!(
+            r#"{{"directory":"{}","extracts":[
+                {{"output":"a.osm.pbf","bbox":[-1.0,-1.0,1.0,1.0]}}]}}"#,
+            c.out.display()
+        ),
+    )
+    .unwrap();
+    Invocation::new(&["extract"])
+        .arg(input)
+        .arg("--config")
+        .arg(&config)
+        .arg("--simple")
+}
+
+fn altw(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["add-locations-to-ways"])
+        .arg(input)
+        .arg("-o")
+        .arg(out_pbf(c))
+}
+
+fn altw_external(c: &Ctx, input: &Path) -> Invocation {
+    altw(c, input).words(&["--index-type", "external"])
+}
+
+fn time_filter(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["time-filter"])
+        .arg(input)
+        .arg("-o")
+        .arg(out_pbf(c))
+        .arg("2030-01-01T00:00:00Z")
+}
+
+/// The header-only input becomes the history header-only file, so the history
+/// path is the one that reads it; a file that is not a PBF stays as given.
+fn time_filter_history(c: &Ctx, input: &Path) -> Invocation {
+    let history = c.fx.path("header-only-history.osm.pbf");
+    let input = if input == c.fx.path("header-only.osm.pbf") {
+        history.as_path()
+    } else {
+        input
+    };
+    time_filter(c, input)
+}
+
+fn apply_changes(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["apply-changes"])
+        .arg(input)
+        .arg(c.fx.path("good.osc"))
+        .arg("-o")
+        .arg(out_pbf(c))
+}
+
+fn bench_merge(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["bench-merge"])
+        .arg(input)
+        .arg(c.fx.path("good.osc"))
+        .arg("-o")
+        .arg(out_pbf(c))
+}
+
+fn geocode(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["build-geocode-index"])
+        .arg(input)
+        .arg("--output-dir")
+        .arg(c.out.join("index"))
+}
+
+fn digest(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["digest"]).arg(input)
+}
+
+fn inspect_full(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["inspect"]).arg(input)
+}
+
+fn inspect_indexed(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["inspect"]).arg(input).arg("--indexed")
+}
+
+fn inspect_nodes(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["inspect"]).arg(input).arg("--nodes")
+}
+
+fn inspect_get(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["inspect"])
+        .arg(input)
+        .words(&["--get", "file.format"])
+}
+
+fn inspect_show(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["inspect"])
+        .arg(input)
+        .words(&["--show", "n1"])
+}
+
+fn inspect_blocks(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["inspect"]).arg(input).arg("--blocks")
+}
+
+fn inspect_extended(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["inspect"]).arg(input).arg("--extended")
+}
+
+fn inspect_locations(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["inspect"]).arg(input).arg("--locations")
+}
+
+fn inspect_id_ranges(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["inspect"]).arg(input).arg("--id-ranges")
+}
+
+fn inspect_anomalies(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["inspect"]).arg(input).arg("--anomalies")
+}
+
+fn inspect_tags(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["inspect", "tags"]).arg(input)
+}
+
+fn inspect_tags_typed(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["inspect", "tags"])
+        .arg(input)
+        .words(&["--type", "way"])
+}
+
+fn check(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["check"]).arg(input)
+}
+
+fn check_ids(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["check"]).arg(input).arg("--ids")
+}
+
+fn check_refs(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["check"]).arg(input).arg("--refs")
+}
+
+fn check_index(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["check"]).arg(input).arg("--index")
+}
+
+fn bench_read(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["bench-read"])
+        .arg(input)
+        .words(&["--mode", "sequential"])
+}
+
+fn bench_write(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["bench-write"]).arg(input)
+}
+
+// ---------------------------------------------------------------------------
+// Properties
+// ---------------------------------------------------------------------------
+
+fn run(inv: &Invocation) -> CliOutput {
+    CliInvoker::new().args(&inv.args).run()
+}
+
+fn exited_ok(row: &Row, out: &CliOutput) -> bool {
+    out.status
+        .code()
+        .is_some_and(|code| row.ok_codes.contains(&code))
+}
+
+fn built(fx: &Fx, row: &Row, dir: &Path, input: &Path) -> Invocation {
+    (row.build)(&Ctx { fx, out: dir }, input)
+}
+
+/// A header-only file is a valid PBF: every command accepts it without
+/// `--force`, and none says a word about indexdata.
+fn header_only_is_accepted(fx: &Fx, row: &Row) -> Result<(), String> {
+    let dir = TempDir::new().unwrap();
+    let inv = built(fx, row, dir.path(), &fx.path("header-only.osm.pbf"));
+    let out = run(&inv);
+    let stderr = out.stderr_str();
+    ensure!(
+        exited_ok(row, &out),
+        "exit {:?}, wanted one of {:?}; stderr:\n{stderr}",
+        out.status.code(),
+        row.ok_codes
+    );
+    ensure!(
+        !stderr.contains("Generate an indexed PBF"),
+        "the empty file was held against indexdata; stderr:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// Not a PBF at all: exit 2, the one missing-header error, the file named,
+/// and nothing about indexdata.
+fn missing_header_is_one_error(fx: &Fx, row: &Row, file: &str) -> Result<(), String> {
+    let dir = TempDir::new().unwrap();
+    let input = fx.path(file);
+    let inv = built(fx, row, dir.path(), &input);
+    let out = run(&inv);
+    let stderr = out.stderr_str();
+    ensure!(
+        out.status.code() == Some(2),
+        "exit {:?}, wanted 2; stderr:\n{stderr}",
+        out.status.code()
+    );
+    ensure!(
+        stderr.contains(MISSING_HEADER),
+        "wanted {MISSING_HEADER:?}; stderr:\n{stderr}"
+    );
+    ensure!(
+        stderr.contains(file),
+        "the error must name {file}; stderr:\n{stderr}"
+    );
+    ensure!(
+        !stderr.contains("Generate an indexed PBF"),
+        "an indexdata refusal came before the missing-header error; stderr:\n{stderr}"
+    );
+    Ok(())
+}
+
+fn zero_byte_is_missing_header(fx: &Fx, row: &Row) -> Result<(), String> {
+    missing_header_is_one_error(fx, row, "zero.osm.pbf")
+}
+
+fn headerless_is_missing_header(fx: &Fx, row: &Row) -> Result<(), String> {
+    missing_header_is_one_error(fx, row, "headerless.osm.pbf")
+}
+
+type Check = fn(&Fx, &Row) -> Result<(), String>;
+
+/// Run one property over every row, collect every violation, and honour the
+/// known-gap markers in both directions.
+fn run_property(prop: Prop, check: Check) {
+    let fx = Fx::new();
+    let mut failures = Vec::new();
+    for row in ROWS {
+        let verdict = check(&fx, row);
+        let gap = row.gaps.iter().find(|(p, _)| *p == prop);
+        match (verdict, gap) {
+            (Ok(()), None) => {}
+            (Err(why), None) => failures.push(format!("[{}] {why}", row.label)),
+            (Err(why), Some((_, reason))) => {
+                eprintln!("known gap [{}] {prop:?}: {reason}\n  {why}", row.label);
+            }
+            (Ok(()), Some((_, reason))) => failures.push(format!(
+                "[{}] is marked as a known {prop:?} gap ({reason}) but passes: remove the marker",
+                row.label
+            )),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{prop:?} violations:\n\n{}",
+        failures.join("\n\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Output aliasing each secondary input
+// ---------------------------------------------------------------------------
+
+/// One input flag besides the positional PBF. `build` lays out its files in
+/// `dir` and returns the invocation, whose output is the protected file
+/// (with `--overwrite`, so only the alias check can refuse it), and that file.
+struct Alias {
+    command: &'static str,
+    flag: &'static str,
+    build: fn(&Fx, &Path) -> (Vec<OsString>, PathBuf),
+}
+
+const ALIASES: &[Alias] = &[
+    Alias {
+        command: "getid",
+        flag: "-i",
+        build: alias_getid_ids,
+    },
+    Alias {
+        command: "getid",
+        flag: "-I",
+        build: alias_getid_pbf,
+    },
+    Alias {
+        command: "getparents",
+        flag: "-i",
+        build: alias_getparents_ids,
+    },
+    Alias {
+        command: "getparents",
+        flag: "-I",
+        build: alias_getparents_pbf,
+    },
+    Alias {
+        command: "tags-filter",
+        flag: "-e",
+        build: alias_tags_filter_expressions,
+    },
+    Alias {
+        command: "export",
+        flag: "-e",
+        build: alias_export_expressions,
+    },
+    Alias {
+        command: "extract",
+        flag: "--polygon",
+        build: alias_extract_polygon,
+    },
+    Alias {
+        command: "extract",
+        flag: "--config",
+        build: alias_extract_config_file,
+    },
+    Alias {
+        command: "extract",
+        flag: "--config (polygon_file)",
+        build: alias_extract_config_polygon,
+    },
+    Alias {
+        command: "merge-changes",
+        flag: "first OSC input",
+        build: alias_merge_changes_first,
+    },
+    Alias {
+        command: "merge-changes",
+        flag: "second OSC input",
+        build: alias_merge_changes_second,
+    },
+];
+
+/// Two OSC inputs, the output being the one at `protected`.
+fn merge_changes_aliasing(dir: &Path, protected: &str) -> (Vec<OsString>, PathBuf) {
+    for name in ["a.osc", "b.osc"] {
+        std::fs::write(dir.join(name), OSC).unwrap();
+    }
+    let mut args = os(&["merge-changes"]);
+    args.push(dir.join("a.osc").into());
+    args.push(dir.join("b.osc").into());
+    args.extend(os(&["-O", "-o"]));
+    args.push(dir.join(protected).into());
+    (args, dir.join(protected))
+}
+
+fn alias_merge_changes_first(_: &Fx, dir: &Path) -> (Vec<OsString>, PathBuf) {
+    merge_changes_aliasing(dir, "a.osc")
+}
+
+fn alias_merge_changes_second(_: &Fx, dir: &Path) -> (Vec<OsString>, PathBuf) {
+    merge_changes_aliasing(dir, "b.osc")
+}
+
+const POLYGON: &str = r#"{"type":"Polygon","coordinates":[[[-1,-1],[1,-1],[1,1],[-1,1],[-1,-1]]]}"#;
+
+fn os(words: &[&str]) -> Vec<OsString> {
+    words.iter().map(OsString::from).collect()
+}
+
+fn alias_getid_ids(fx: &Fx, dir: &Path) -> (Vec<OsString>, PathBuf) {
+    let ids = dir.join("ids.txt");
+    std::fs::write(&ids, "n1\n").unwrap();
+    let mut args = os(&["getid"]);
+    args.push(fx.path("good.osm.pbf").into());
+    args.extend(os(&["-i"]));
+    args.push(ids.clone().into());
+    args.extend(os(&["-O", "-o"]));
+    args.push(ids.clone().into());
+    (args, ids)
+}
+
+fn alias_getid_pbf(fx: &Fx, dir: &Path) -> (Vec<OsString>, PathBuf) {
+    let ids = dir.join("ids.osm.pbf");
+    std::fs::copy(fx.path("good.osm.pbf"), &ids).unwrap();
+    let mut args = os(&["getid"]);
+    args.push(fx.path("good.osm.pbf").into());
+    args.extend(os(&["-I"]));
+    args.push(ids.clone().into());
+    args.extend(os(&["-O", "-o"]));
+    args.push(ids.clone().into());
+    (args, ids)
+}
+
+fn alias_getparents_ids(fx: &Fx, dir: &Path) -> (Vec<OsString>, PathBuf) {
+    let (mut args, ids) = alias_getid_ids(fx, dir);
+    args[0] = "getparents".into();
+    (args, ids)
+}
+
+fn alias_getparents_pbf(fx: &Fx, dir: &Path) -> (Vec<OsString>, PathBuf) {
+    let (mut args, ids) = alias_getid_pbf(fx, dir);
+    args[0] = "getparents".into();
+    (args, ids)
+}
+
+fn alias_tags_filter_expressions(fx: &Fx, dir: &Path) -> (Vec<OsString>, PathBuf) {
+    let expressions = dir.join("expressions.txt");
+    std::fs::write(&expressions, "highway\n").unwrap();
+    let mut args = os(&["tags-filter"]);
+    args.push(fx.path("good.osm.pbf").into());
+    args.extend(os(&["-e"]));
+    args.push(expressions.clone().into());
+    args.extend(os(&["-O", "-o"]));
+    args.push(expressions.clone().into());
+    (args, expressions)
+}
+
+fn alias_export_expressions(fx: &Fx, dir: &Path) -> (Vec<OsString>, PathBuf) {
+    let (mut args, expressions) = alias_tags_filter_expressions(fx, dir);
+    args[0] = "export".into();
+    (args, expressions)
+}
+
+fn alias_extract_polygon(fx: &Fx, dir: &Path) -> (Vec<OsString>, PathBuf) {
+    let polygon = dir.join("area.geojson");
+    std::fs::write(&polygon, POLYGON).unwrap();
+    let mut args = os(&["extract"]);
+    args.push(fx.path("good.osm.pbf").into());
+    args.extend(os(&["--simple", "--polygon"]));
+    args.push(polygon.clone().into());
+    args.extend(os(&["-O", "-o"]));
+    args.push(polygon.clone().into());
+    (args, polygon)
+}
+
+/// A config whose only output is the config file itself.
+fn alias_extract_config_file(fx: &Fx, dir: &Path) -> (Vec<OsString>, PathBuf) {
+    let config = dir.join("config.json");
+    std::fs::write(
+        &config,
+        r#"{"extracts":[{"output":"config.json","bbox":[-1.0,-1.0,1.0,1.0]}]}"#,
+    )
+    .unwrap();
+    let mut args = os(&["extract"]);
+    args.push(fx.path("good.osm.pbf").into());
+    args.extend(os(&["--simple", "-O", "--config"]));
+    args.push(config.clone().into());
+    (args, config)
+}
+
+/// A config whose only output is the polygon file it reads.
+fn alias_extract_config_polygon(fx: &Fx, dir: &Path) -> (Vec<OsString>, PathBuf) {
+    let polygon = dir.join("area.geojson");
+    std::fs::write(&polygon, POLYGON).unwrap();
+    let config = dir.join("config.json");
+    std::fs::write(
+        &config,
+        r#"{"extracts":[{"output":"area.geojson","polygon_file":"area.geojson"}]}"#,
+    )
+    .unwrap();
+    let mut args = os(&["extract"]);
+    args.push(fx.path("good.osm.pbf").into());
+    args.extend(os(&["--simple", "-O", "--config"]));
+    args.push(config.into());
+    (args, polygon)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_subcommand_is_in_the_table_or_reads_no_pbf() {
+    let commands = subcommands();
+    assert!(
+        commands.len() >= 20,
+        "the clap tree lists only {commands:?}"
+    );
+    let mut problems = Vec::new();
+    for command in &commands {
+        let in_table = ROWS.iter().any(|row| row.command == command);
+        let no_pbf = NO_PBF_INPUT.iter().any(|(name, _)| name == command);
+        match (in_table, no_pbf) {
+            (false, false) => problems.push(format!(
+                "`{command}` is in neither ROWS nor NO_PBF_INPUT: add a row for it, or say why it reads no PBF"
+            )),
+            (true, true) => problems.push(format!("`{command}` is in both ROWS and NO_PBF_INPUT")),
+            _ => {}
+        }
+    }
+    for name in ROWS
+        .iter()
+        .map(|row| row.command)
+        .chain(NO_PBF_INPUT.iter().map(|(name, _)| *name))
+    {
+        if !commands.iter().any(|c| c == name) {
+            problems.push(format!(
+                "`{name}` is in the table but the binary has no such subcommand"
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn a_header_only_file_is_accepted_by_every_command_without_force() {
+    run_property(Prop::HeaderOnly, header_only_is_accepted);
+}
+
+#[test]
+fn a_zero_byte_file_is_the_missing_header_error_in_every_command() {
+    run_property(Prop::ZeroByte, zero_byte_is_missing_header);
+}
+
+#[test]
+fn a_file_without_a_leading_header_is_the_missing_header_error_in_every_command() {
+    run_property(Prop::Headerless, headerless_is_missing_header);
+}
+
+/// The frame decoder owns the one-header policy, so the commands that walk
+/// frames themselves carry no guard of their own (getid's walker, altw's
+/// schedule build, apply-changes' header read). This is the proof they still
+/// refuse a second OSMHeader: exit 2, the one error, and no output published.
+#[test]
+fn a_second_header_is_refused_by_the_commands_that_walk_frames_themselves() {
+    let fx = Fx::new();
+    let mut failures = Vec::new();
+    for row in ROWS.iter().filter(|row| {
+        matches!(
+            row.label,
+            "getid" | "apply-changes" | "altw" | "altw external"
+        )
+    }) {
+        let dir = TempDir::new().unwrap();
+        let out = run(&built(
+            &fx,
+            row,
+            dir.path(),
+            &fx.path("two-headers.osm.pbf"),
+        ));
+        let stderr = out.stderr_str();
+        if out.status.code() != Some(2) || !stderr.contains("a second OSMHeader blob") {
+            failures.push(format!(
+                "[{}] exit {:?}; stderr:\n{stderr}",
+                row.label,
+                out.status.code()
+            ));
+        }
+        if out_pbf(&Ctx {
+            fx: &fx,
+            out: dir.path(),
+        })
+        .exists()
+        {
+            failures.push(format!("[{}] published an output", row.label));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// getid's streaming full-scan arm reads frames through its own loop and is
+/// reached from the CLI only by unindexed input with `--force`; it refuses a
+/// second OSMHeader like the arms above.
+#[test]
+fn getid_streaming_arm_refuses_a_second_header() {
+    let fx = Fx::new();
+    let dir = TempDir::new().unwrap();
+    let output = dir.path().join("out.osm.pbf");
+    let out = CliInvoker::new()
+        .arg("getid")
+        .arg(fx.path("two-headers-unindexed.osm.pbf"))
+        .arg("--force")
+        .arg("-o")
+        .arg(&output)
+        .arg("n1")
+        .run();
+    let stderr = out.stderr_str();
+    assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+    assert!(stderr.contains("a second OSMHeader blob"), "{stderr}");
+    assert!(!output.exists(), "published an output");
+}
+
+#[test]
+fn inspect_indexed_says_yes_for_a_header_only_file_and_fails_a_zero_byte_one() {
+    let fx = Fx::new();
+    let out = CliInvoker::new()
+        .args(["inspect", "--indexed"])
+        .arg(fx.path("header-only.osm.pbf"))
+        .run();
+    assert_eq!(out.status.code(), Some(0), "stderr:\n{}", out.stderr_str());
+    assert!(out.stdout_str().contains("Indexed: yes"));
+
+    let out = CliInvoker::new()
+        .args(["inspect", "--indexed"])
+        .arg(fx.path("zero.osm.pbf"))
+        .run();
+    assert_eq!(out.status.code(), Some(2), "stdout:\n{}", out.stdout_str());
+    assert!(out.stderr_str().contains(MISSING_HEADER));
+    assert!(!out.stdout_str().contains("Indexed"));
+}
+
+#[test]
+fn an_output_that_is_any_input_the_command_reads_is_refused_before_any_work() {
+    let fx = Fx::new();
+    let mut failures = Vec::new();
+    for alias in ALIASES {
+        let dir = TempDir::new().unwrap();
+        let (args, protected) = (alias.build)(&fx, dir.path());
+        let before = std::fs::read(&protected).unwrap();
+        let out = CliInvoker::new().args(&args).run();
+        let stderr = out.stderr_str();
+        let label = format!("{} {}", alias.command, alias.flag);
+        if out.status.code() != Some(2) {
+            failures.push(format!(
+                "[{label}] exit {:?}, wanted 2; stderr:\n{stderr}",
+                out.status.code()
+            ));
+        } else if !stderr.contains("aliases input") {
+            failures.push(format!(
+                "[{label}] the refusal must say the output aliases an input; stderr:\n{stderr}"
+            ));
+        }
+        if std::fs::read(&protected).ok().as_deref() != Some(&before[..]) {
+            failures.push(format!("[{label}] the input file was replaced"));
+        }
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".pbfhogg-"))
+            .collect();
+        if !names.is_empty() {
+            failures.push(format!("[{label}] left behind {names:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn every_secondary_input_flag_has_an_alias_case() {
+    // The flags that name an input file besides the positional PBF, read from
+    // each command's own `--help`; one without a case in ALIASES fails here.
+    let expected: &[(&str, &[&str])] = &[
+        ("getid", &["-i", "-I"]),
+        ("getparents", &["-i", "-I"]),
+        ("tags-filter", &["-e"]),
+        ("export", &["-e"]),
+        ("extract", &["--polygon", "--config"]),
+    ];
+    // merge-changes reads only OSC files, positional; its two inputs have
+    // their own cases above.
+    let mut problems = Vec::new();
+    for (command, flags) in expected {
+        let help = CliInvoker::new()
+            .args([command, "--help"])
+            .assert_success()
+            .stdout_str();
+        for flag in *flags {
+            if !help.contains(flag) {
+                problems.push(format!("`{command} --help` no longer offers {flag}"));
+            }
+            if !ALIASES
+                .iter()
+                .any(|a| a.command == *command && a.flag.starts_with(flag))
+            {
+                problems.push(format!("`{command} {flag}` has no alias case"));
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}

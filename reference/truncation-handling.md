@@ -449,7 +449,7 @@ on partial input.
   property-based: arbitrary truncation length is finite Ok/Err,
   never panics.
 
-**Command layer** (`tests/cli_truncation_sweep.rs::truncation_sweep_no_panic`)
+**Command layer** (`cli/tests/cli_truncation_sweep.rs::truncation_sweep_no_panic`)
 drives `cat`, `inspect`, `sort`, `getid`, `add-locations-to-ways`,
 and `renumber` through ~50 truncation offsets covering every
 blob's length-prefix midpoint, header midpoint, header end,
@@ -548,5 +548,5 @@ lives in `decompress.rs`, which the list did not mention until
 the decompressors were added on 2026-08-20.
 
 `mutate_blob_payload`-based regression tests
-(`tests/cli_defensive_input.rs`) exercise shape 5 (decompression
+(`cli/tests/cli_defensive_input.rs`) exercise shape 5 (decompression
 failure on a byte-valid frame whose inner protobuf is corrupt).

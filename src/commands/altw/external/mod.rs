@@ -98,7 +98,7 @@ fn bucket_width(max_node_id: u64, num_buckets: usize) -> u64 {
 /// matches ALTW's existing behaviour for way refs to nodes that
 /// aren't in the input - common with extracts and node-sparse
 /// fixtures. See `missing_node_refs_get_zero_coordinates` in
-/// `tests/cli_add_locations_to_ways.rs` for the contract canary.
+/// `cli/tests/cli_add_locations_to_ways.rs` for the contract canary.
 pub(super) struct BucketLayout {
     pub(super) max_node_id: u64,
     pub(super) bucket_width: u64,

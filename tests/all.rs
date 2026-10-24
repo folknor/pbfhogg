@@ -7,8 +7,12 @@
 //! that is not declared here (or as its own `[[test]]` target) is never
 //! compiled, and nothing reports it.
 //!
+//! Nothing here drives the `pbfhogg` binary: those tests are the CLI
+//! package's (`cli/tests/all.rs`), where cargo builds the binary with the
+//! test build's features and hands its path.
+//!
 //! A test's full libtest name is now `<file module>::<path inside the file>`
-//! (`cli_sort::platform::...`). The tier submodules (`tier2`, `tier3`,
+//! (`host_contract::platform::...`). The tier submodules (`tier2`, `tier3`,
 //! `platform`, `serial`) keep matching brokkr's substring filters because
 //! the module prefix only prepends.
 //!
@@ -38,68 +42,10 @@ mod cancel;
 #[cfg(feature = "commands")]
 mod check;
 #[cfg(feature = "commands")]
-mod cli_check_index;
-#[cfg(feature = "commands")]
-mod cli_error_naming;
-#[cfg(feature = "commands")]
-mod cli_export;
-#[cfg(feature = "commands")]
-mod cli_extract;
-#[cfg(feature = "commands")]
-mod cli_flag_contract;
-#[cfg(feature = "commands")]
-mod cli_input_contract;
-#[cfg(feature = "commands")]
-mod cli_output_contract;
-#[cfg(feature = "commands")]
-mod cli_output_guard;
-#[cfg(feature = "commands")]
-mod cli_output_header;
-#[cfg(feature = "commands")]
-mod cli_scratch;
-#[cfg(feature = "commands")]
 mod geocode_index;
 #[cfg(feature = "commands")]
 mod inspect;
 
-#[cfg(feature = "commands")]
-mod cli_add_locations_to_ways;
-#[cfg(feature = "commands")]
-mod cli_apply_changes;
-#[cfg(feature = "commands")]
-mod cli_apply_changes_invariants;
-#[cfg(feature = "commands")]
-mod cli_cat;
-#[cfg(feature = "commands")]
-mod cli_defensive_input;
-#[cfg(feature = "commands")]
-mod cli_degrade;
-#[cfg(feature = "commands")]
-mod cli_derive_changes;
-#[cfg(feature = "commands")]
-mod cli_diff;
-#[cfg(feature = "commands")]
-mod cli_digest;
-#[cfg(feature = "commands")]
-mod cli_exit_codes;
-#[cfg(feature = "commands")]
-mod cli_inject_prepass;
-#[cfg(feature = "commands")]
-mod cli_merge_changes;
-#[cfg(feature = "commands")]
-mod cli_merge_join_trust;
-#[cfg(feature = "commands")]
-mod cli_negative_id_invariants;
-#[cfg(feature = "commands")]
-mod cli_repack;
-#[cfg(feature = "commands")]
-mod cli_sort;
-#[cfg(feature = "commands")]
-mod cli_tags_filter;
-#[cfg(feature = "commands")]
-mod cli_time_filter;
-#[cfg(feature = "commands")]
-mod cli_truncation_sweep;
 mod corrupt_input;
 mod edge_cases;
 mod fault_apply_changes;

@@ -418,22 +418,9 @@ mod tests {
                 );
             }
         }
-        // ...and the hook must actually be wired up, or "nothing emits" is
-        // satisfied by nothing emitting at all.
-        // Strip `//` line comments before scanning: a commented-out call
-        // would otherwise satisfy the scan, which is the vacuous-assertion
-        // trap this whole check exists to avoid.
-        let main_rs: String = include_str!("../../cli/src/main.rs")
-            .lines()
-            .map(|line| line.split("//").next().unwrap_or(""))
-            .flat_map(str::chars)
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        assert!(
-            main_rs.contains("emit_writer_counters()"),
-            "the CLI must call pbfhogg::write::emit_writer_counters on its \
-             exit path, or no run emits writer_* counters at all"
-        );
+        // That the CLI does call the hook on its exit path (or "nothing
+        // emits" is satisfied by nothing emitting at all) is checked by the
+        // CLI package's own unit tests, which own that source.
     }
 
     /// No backend may touch `sync_all_ns` or `recv_wait_ns` directly.

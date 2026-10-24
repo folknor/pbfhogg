@@ -317,7 +317,7 @@ osmium compatibility for incomplete regional change streams.
 No `throw`, `std::cerr` warning, or validation is raised on any of
 the four scenarios in the osmium apply-changes code path.
 
-**Test coverage (pbfhogg):** `tests/cli_apply_changes_invariants.rs`
+**Test coverage (pbfhogg):** `cli/tests/cli_apply_changes_invariants.rs`
 pins the three non-ALTW scenarios as regression anchors:
 `modify_on_missing_id_silently_inserts`,
 `delete_on_missing_id_is_noop`,

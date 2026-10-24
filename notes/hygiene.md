@@ -303,7 +303,7 @@ Anger: 7 - message content.
 
 Inputs open and read through `read::input` (path-naming), pread pools locate
 failures with file, blob ordinal and offset, writers name their output
-(`writing <path>`), and `tests/cli_error_naming.rs` forces an open failure
+(`writing <path>`), and `cli/tests/cli_error_naming.rs` forces an open failure
 per input kind and a write failure per writer family. What remains:
 
 - `path_guard::same_file` (the input/output alias check) now names the path
@@ -733,36 +733,12 @@ builds the output writer on a worker thread, and a `--direct-io` /
 without a host assumption: the CLI's `--direct-io` also makes reads direct, so
 an input-side refusal fires first on the main thread, and
 `external_backend_output_refusal_stays_typed_across_stage_join` in
-`tests/cli_add_locations_to_ways.rs` passes without exercising the join on any
+`cli/tests/cli_add_locations_to_ways.rs` passes without exercising the join on any
 host whose filesystem accepts O_DIRECT output. An injection point that makes
 stage 4's writer construction fail would make it deterministic.
 
 Reported by: test harness, read path, write path, altw and scanning, geocode
 index, change application, CLI and plumbing.
-
-## HYG-070 - CLI-driving tests live in the library crate, so binary resolution is restated and guessed
-
-Anger: 8 - moves every CLI test.
-
-`tests/common/cli.rs::pbfhogg_bin()` resolves `BROKKR_TEST_BIN_DIR`, else
-`CARGO_TARGET_DIR`, else `CARGO_MANIFEST_DIR/target`, plus a
-`cfg!(debug_assertions)` profile guess its own doc admits can pick the wrong
-subdir, and joins `"pbfhogg"` with no `EXE_SUFFIX`. The module doc at the top of
-the same file states a different rule that never mentions
-`BROKKR_TEST_BIN_DIR`, so the two copies disagree. `BROKKR_TEST_BIN_DIR=""`
-resolves to `./pbfhogg` relative to the test's cwd and then asserts with a
-message blaming the sweep config. `cli/tests/cli.rs` uses
-`env!("CARGO_BIN_EXE_pbfhogg")`, cargo's own and always correct, but only
-inside the `pbfhogg-cli` package (its tests now run under the `cli` sweep); that
-is the reason for the forced duplication. Fix: move every `cli_*.rs` into `cli/tests/`, where cargo builds
-the binary with the test's features and hands its path, which removes
-`BROKKR_TEST_BIN_DIR`, the profile heuristic, the `build_packages`
-stale-binary class and the `minimal` sweep's cfg gates on CLI tests;
-`tests/common` becomes a shared path or dev-only
-crate. If the split stays, keep the rule in one place and treat empty as
-unset.
-
-Reported by: test harness, CLI and plumbing.
 
 ## HYG-077 - The enforcement levers most of these findings need are unused
 
@@ -777,9 +753,7 @@ workspace-wide and denied in `src/commands/` and the CLI);
 the many `too_many_*` exemptions (HYG-036) need no justification; the existing
 `include_str!` source-scan tests in `write/metrics.rs` are the in-repo template
 for text rules. Every hunter independently pointed most of its "enforceable
-by" answers at one of these. One related coupling: those `metrics.rs` tests
-`include_str!("../../cli/src/main.rs")` from the library crate, which breaks
-when the library is built alone from a published tarball.
+by" answers at one of these.
 
 Reported by: all nine scopes.
 
@@ -928,7 +902,7 @@ Anger: 6 - CLI behaviour, small.
   diff and derive deliberately have none (a comment in `derive.rs` explains);
   the geocode builder has none, though its `.buckets-level*` trees are
   hundreds of GB at planet scale.
-- `leftover_dirs` in `main.rs` is a hand-kept per-command list of where
+- `leftover_dirs` in `cli/src/lib.rs` is a hand-kept per-command list of where
   leftovers may be, ending in `_ => {}`, beside `validate_input_output_aliases`
   (which is exhaustive) and the clap structs; a command that gains scratch
   compiles without being scanned.
@@ -968,7 +942,7 @@ Reported by: the command-matrix audit.
 Anger: 7 - CLI behaviour; any change breaks scripts.
 
 The short-flag vocabulary is settled (`reference/cli-reference.md`, "Short
-flags"; enforced by the clap-tree tests in `cli/src/main.rs`). What remains
+flags"; enforced by the clap-tree tests in `cli/src/lib.rs`). What remains
 is grammar, not letters:
 
 - `--type`: a comma list on cat, diff and check, exactly one on
@@ -1045,7 +1019,7 @@ Reported by: the cancellation work.
 
 Anger: 3 - test coverage.
 
-`tests/cli_output_contract.rs` counts each output-writing command's
+`cli/tests/cli_output_contract.rs` counts each output-writing command's
 checkpoints on a small fixture and interrupts it at a fixed number of evenly
 spread ordinals, asserting the exit code, no destination and no
 `.pbfhogg-*` entry. A checkpoint between two samples whose exit path leaks
@@ -1087,4 +1061,34 @@ the only removal, and only of the bbox). Whether removal is wanted, and with
 what spelling, is the maintainer's call; no syntax is reserved today.
 
 Reported by: the scratch-lifecycle review fixes.
+
+## HYG-131 - A fixture PBF is checked in, against the no-checked-in-input rule
+
+Anger: 3 - doctests and a few unit tests read it.
+
+AGENTS.md and `reference/testing.md` say fixture PBFs are built at test time
+and never checked in, but `tests/test.osm.pbf` is tracked. It is the input the
+library's doc examples open by relative path (`src/lib.rs`, `src/read/blob.rs`,
+`src/read/reader.rs`, `docs/guide/reading.md`, `docs/guide/writing.md`) and
+that unit tests in `src/read/blob.rs` and `src/read/reader.rs` read, and
+`examples/gen_test_pbf.rs` regenerates it. Either the rule gains a stated
+exception for the doc-example input, or the doctests build their input
+(a hidden `# ` setup line) and the unit tests use the `tests/common` writers.
+
+Reported by: the CLI test move.
+
+## HYG-132 - CliInvoker builders nothing calls
+
+Anger: 1 - test helper.
+
+`cli/tests/invoker.rs` defines `CliInvoker::clean_env`, `child_limits` and
+`stdin_bytes`, and no test calls any of them; the file-level
+`#![allow(dead_code)]` (needed because feature-gated modules drop other
+callers in some sweeps) hides it, as the `tests/common` one did before the
+move. `reference/testing.md` and `cli/tests/all.rs` cite `child_limits` as the
+way to give a child its own descriptor limit. Fix: delete the three, or keep
+them with a test each; narrow the allow to the items that are genuinely
+feature-dependent.
+
+Reported by: the CLI test move.
 

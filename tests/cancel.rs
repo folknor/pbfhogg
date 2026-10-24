@@ -32,7 +32,7 @@ impl Inputs {
         crate::common::write_base_pbf(&dir.path().join("base.osm.pbf"));
         crate::common::write_changed_pbf(&dir.path().join("changed.osm.pbf"));
         #[cfg(feature = "commands")]
-        crate::geocode_index::write_synthetic_indexed_input(&dir.path().join("geo.osm.pbf"));
+        crate::common::write_synthetic_indexed_input(&dir.path().join("geo.osm.pbf"));
         std::fs::write(
             dir.path().join("change.osc"),
             b"<osmChange version=\"0.6\"><create>\

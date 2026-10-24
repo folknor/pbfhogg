@@ -1,7 +1,17 @@
-// Mounted once by `tests/all.rs` and once by each separate fault-test
-// binary. Every binary uses only a subset of helpers, and feature-gated
-// modules drop out of some sweeps, so unused warnings are expected and
-// harmless.
+// Mounted once by `tests/all.rs`, once by each separate fault-test binary,
+// and once by the CLI package's `cli/tests/all.rs` (by `#[path]`, so its
+// `cfg(feature = ...)` gates read the mounting package's features, which
+// carry the same names). Every binary uses only a subset of helpers, and
+// feature-gated modules drop out of some sweeps, so unused warnings are
+// expected and harmless.
+//
+// CAUTION: the features do NOT all mean the same in both packages.
+// `commands` is on by default in `pbfhogg` but is a no-op feature in
+// `pbfhogg-cli`, off in the `all` and `musl` sweeps; `geocode-reader` is
+// likewise absent there. A gate on either in anything under tests/common/
+// would silently drop CLI tests out of those sweeps. Gate the `mod` line in
+// tests/all.rs instead; the `no-library-feature-gates-in-tests-common`
+// textlint rule in brokkr.toml enforces this.
 #![allow(dead_code)]
 //! Shared test helpers used across integration tests.
 //!
@@ -17,14 +27,11 @@
 //! - [`PbfContentsIdOnly`] / [`read_all_elements_id_only`]: used by extract,
 //!   getid, and tags_filter tests that only need element IDs and tags.
 //!
-//! [`cli`] hosts [`CliInvoker`] for tests that drive the pbfhogg
-//! binary via `std::process::Command` instead of calling into the
-//! library directly.
-//!
-//! [`CliInvoker`]: cli::CliInvoker
+//! Fixtures only: nothing here spawns the `pbfhogg` binary. Tests that drive
+//! it live in the CLI package, whose `cli/tests/invoker.rs` holds the
+//! `CliInvoker`.
 
 pub mod adversarial;
-pub mod cli;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -1623,4 +1630,47 @@ pub(crate) fn test_host() -> pbfhogg::host::Host {
         // A fresh token per call: a test that trips one cancels only itself.
         cancel: pbfhogg::host::Cancel::new(),
     }
+}
+
+/// A small sorted, indexed PBF with one addressed node on one named street:
+/// the geocode builder's minimal input, shared by the library's geocode
+/// tests and the CLI tests that run `build-geocode-index`.
+pub fn write_synthetic_indexed_input(path: &Path) {
+    write_test_pbf_sorted(
+        path,
+        &[
+            TestNode {
+                id: 1,
+                lat: 557_000_000,
+                lon: 125_000_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 557_000_000,
+                lon: 125_010_000,
+                tags: vec![],
+                meta: None,
+            },
+            TestNode {
+                id: 3,
+                lat: 557_000_500,
+                lon: 125_005_000,
+                tags: vec![
+                    ("addr:housenumber", "10"),
+                    ("addr:street", "Main Street"),
+                    ("addr:postcode", "1234"),
+                ],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "residential"), ("name", "Main Street")],
+            meta: None,
+        }],
+        &[],
+    );
 }

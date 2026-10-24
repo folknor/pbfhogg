@@ -154,7 +154,7 @@ Fixed sites:
   rather than read as an unwritten slot.
 
 The altw sites are pinned by `null_island_real_node_is_not_reported_missing`
-in `tests/cli_add_locations_to_ways.rs`, which runs on both backends; the
+in `cli/tests/cli_add_locations_to_ways.rs`, which runs on both backends; the
 geocode site by `null_island_street_vertex_is_not_treated_as_absent` in
 `tests/geocode_index.rs`.
 

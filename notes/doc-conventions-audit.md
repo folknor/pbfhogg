@@ -39,7 +39,7 @@ exist, so the class cannot regress.
 
 Still open: durable files cite `TODO.md`, transient by the same argument
 (`src/geocode_index/reader.rs`, `src/commands/extract/common.rs`,
-`tests/cli_sort.rs`, and others). The script does not claim root-level
+`cli/tests/cli_sort.rs`, and others). The script does not claim root-level
 `TODO.md`, so nothing enforces this half; it is coupled to item 2.
 
 ## 2. `TODO.md` is `notes/todo.md` by the convention's own wording

@@ -6,7 +6,10 @@
 
 use std::path::Path;
 
-use crate::common::{TestMember, TestNode, TestRelation, TestWay, write_test_pbf_sorted};
+use crate::common::{
+    TestMember, TestNode, TestRelation, TestWay, write_synthetic_indexed_input,
+    write_test_pbf_sorted,
+};
 use pbfhogg::MemberId;
 
 /// Build an index into `output_dir`, replacing an existing one when
@@ -29,46 +32,6 @@ pub(crate) fn build_index(
         host,
         crate::common::scratch_in(output_dir.parent().unwrap_or(Path::new("."))),
     )
-}
-
-pub(crate) fn write_synthetic_indexed_input(path: &Path) {
-    write_test_pbf_sorted(
-        path,
-        &[
-            TestNode {
-                id: 1,
-                lat: 557_000_000,
-                lon: 125_000_000,
-                tags: vec![],
-                meta: None,
-            },
-            TestNode {
-                id: 2,
-                lat: 557_000_000,
-                lon: 125_010_000,
-                tags: vec![],
-                meta: None,
-            },
-            TestNode {
-                id: 3,
-                lat: 557_000_500,
-                lon: 125_005_000,
-                tags: vec![
-                    ("addr:housenumber", "10"),
-                    ("addr:street", "Main Street"),
-                    ("addr:postcode", "1234"),
-                ],
-                meta: None,
-            },
-        ],
-        &[TestWay {
-            id: 10,
-            refs: vec![1, 2],
-            tags: vec![("highway", "residential"), ("name", "Main Street")],
-            meta: None,
-        }],
-        &[],
-    );
 }
 
 fn assert_invalid_queries_are_rejected(reader: &pbfhogg::geocode_index::reader::Reader) {

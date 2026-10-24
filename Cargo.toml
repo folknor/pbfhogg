@@ -51,7 +51,7 @@ cast_possible_wrap = "deny"
 unwrap_used = "deny"
 too_many_lines = "deny"
 # Configured in clippy.toml and enabled only where the output choke point is
-# the rule: src/commands/mod.rs and cli/src/main.rs deny it at module level.
+# the rule: src/commands/mod.rs and cli/src/lib.rs deny it at module level.
 disallowed_methods = "allow"
 
 [package]
@@ -95,9 +95,11 @@ linux-io-uring = ["dep:io-uring"]
 # tests/all.rs is crate-level cfg'd out whenever this feature is on, and
 # the library gates every static on `not(test)` as well, so its unit-test
 # harness never has them. In this package only the [[test]] targets below
-# that require it can arm one, each in a process of its own (the CLI
-# crate's own test harness is kept clear by configuration: nothing builds
-# it with this feature). The `faults` check sweep in brokkr.toml enables it.
+# that require it can arm one, each in a process of its own. The CLI
+# crate's test harnesses link this library too; they assert the
+# `STATIC_TEST_HOOKS` constant false at compile time, so any build that
+# hands them the statics fails instead. The `faults` check sweep in
+# brokkr.toml enables it.
 test-hooks = []
 static-test-hooks = []
 
@@ -120,7 +122,6 @@ libc = "0.2.186"
 
 
 [dev-dependencies]
-regex = "1"
 tempfile = "3.27.0"
 proptest = "1"
 

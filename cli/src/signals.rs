@@ -7,7 +7,7 @@
 //! - **The first SIGINT or SIGTERM** requests cancellation. The run stops at
 //!   its next checkpoint, its workers wind down, every guard drops (output
 //!   staging and the run's scratch directory are removed, nothing is
-//!   published), and `main` exits `128 + signo` - `130` for SIGINT, `143` for
+//!   published), and `run` exits `128 + signo` - `130` for SIGINT, `143` for
 //!   SIGTERM - after reporting the interruption.
 //! - **A second signal** while that is under way exits at once with
 //!   `128 + signo` of the second signal, skipping the cleanup still in
@@ -31,21 +31,21 @@ use std::sync::{Mutex, PoisonError};
 use pbfhogg::host::Cancel;
 
 /// The first signal taken, or 0. Written once, by the waiter, before it
-/// trips the token (`Release` there); read by `main` after an `Acquire`
+/// trips the token (`Release` there); read by `run` after an `Acquire`
 /// observation of the token.
 static FIRST_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
-/// Set by `main` before it reports the outcome, so a reporter thread
+/// Set by `run` before it reports the outcome, so a reporter thread
 /// scheduled late does not print a "stopping" notice after the run's final
 /// line. A lock, not a flag: the reporter holds it across its check and its
 /// print, so `finish` either sees the notice already printed or stops it from
-/// printing at all. Only `main` and the reporter take it, never the waiter,
+/// printing at all. Only `run` and the reporter take it, never the waiter,
 /// so a reporter stuck on a full stderr cannot keep the second signal from
 /// being taken.
 static FINISHED: Mutex<bool> = Mutex::new(false);
 
 /// Block SIGINT and SIGTERM in the calling thread and start the waiter that
-/// trips `cancel`. Call first thing in `main`, before any other thread is
+/// trips `cancel`. Call first thing in `run`, before any other thread is
 /// spawned: a thread started earlier keeps the default disposition and would
 /// be killed by the signal instead.
 pub(crate) fn install(cancel: Cancel) -> std::io::Result<()> {
@@ -136,7 +136,7 @@ pub(crate) fn first_signal(cancel: &Cancel) -> Option<libc::c_int> {
     }
 }
 
-/// `main` is about to report the outcome; a notice still queued is stale.
+/// `run` is about to report the outcome; a notice still queued is stale.
 pub(crate) fn finish() {
     *FINISHED.lock().unwrap_or_else(PoisonError::into_inner) = true;
 }

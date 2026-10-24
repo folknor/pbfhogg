@@ -1,0 +1,1270 @@
+//! CLI-driven integration tests for `pbfhogg sort`.
+//!
+//! Pattern-setter for the CLI-decoupled test layout (see
+//! `reference/testing.md` > "Test placement"). Fixture PBFs are written
+//! with the stable-allowlist writer helpers; the sort command runs
+//! via the compiled `pbfhogg` binary through `CliInvoker`; output
+//! is verified by reading the resulting PBF with the stable-allowlist
+//! reader helpers. No imports from `pbfhogg::commands::sort` or any
+//! other internal module - a rewrite of `src/commands/sort/` cannot
+//! break these tests by type changes alone.
+
+use std::path::Path;
+
+use crate::common::{
+    PbfContentsWithCoords, TestNode, TestRelation, TestWay, assert_indexed, assert_non_indexed,
+    assert_sorted_file, read_all_elements_with_coords, read_header, write_test_pbf,
+    write_test_pbf_non_indexed,
+};
+use crate::invoker::CliInvoker;
+use pbfhogg::block_builder::{self, BlockBuilder, Metadata};
+use pbfhogg::writer::{Compression, PbfWriter};
+use pbfhogg::{BlobDecode, BlobReader, Element};
+
+/// Invoke `pbfhogg sort --force -o <output> <input>`.
+fn run_sort(input: &Path, output: &Path) {
+    CliInvoker::new()
+        .arg("sort")
+        .arg(input)
+        .arg("-o")
+        .arg(output)
+        .arg("--force")
+        .assert_success();
+}
+
+// ---------------------------------------------------------------------------
+// Fixture writers - all use stable-allowlist types (BlockBuilder,
+// PbfWriter, Compression). No internal-module imports.
+// ---------------------------------------------------------------------------
+
+/// Write a PBF with deliberately overlapping node blobs.
+///
+/// Two node blobs with interleaving IDs (blob 1: odd, blob 2: even),
+/// followed by ways and relations. Forces the sort command to decode
+/// and re-encode the node blobs rather than passing them through.
+#[allow(clippy::cast_possible_truncation)]
+fn write_unsorted_overlapping_pbf(path: &Path) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    // Blob 1: odd node IDs
+    for id in (1..=9).step_by(2) {
+        bb.add_node(
+            id,
+            id as i32 * 1_000_000,
+            id as i32 * 2_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Blob 2: even node IDs (overlapping range with blob 1)
+    for id in (2..=10).step_by(2) {
+        bb.add_node(
+            id,
+            id as i32 * 1_000_000,
+            id as i32 * 2_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    bb.add_way(100, [("highway", "residential")], &[1, 2, 3], None);
+    bb.add_way(200, [("highway", "primary")], &[4, 5, 6], None);
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    bb.add_relation(
+        300,
+        [("type", "route")],
+        &[pbfhogg::block_builder::MemberData {
+            id: pbfhogg::MemberId::Way(100),
+            role: "outer",
+        }],
+        None,
+    );
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
+/// Write a PBF with mixed element types out of order: ways, then
+/// nodes, then relations. Each type is internally sorted but the
+/// type order is wrong.
+#[allow(clippy::cast_possible_truncation)]
+fn write_type_unsorted_pbf(path: &Path) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    // Ways first (wrong order - should come after nodes)
+    bb.add_way(100, [("highway", "residential")], &[1, 2, 3], None);
+    bb.add_way(200, [("highway", "primary")], &[4, 5, 6], None);
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    for id in 1..=6 {
+        bb.add_node(
+            id,
+            id as i32 * 1_000_000,
+            id as i32 * 2_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    bb.add_relation(
+        300,
+        [("type", "route")],
+        &[pbfhogg::block_builder::MemberData {
+            id: pbfhogg::MemberId::Way(100),
+            role: "outer",
+        }],
+        None,
+    );
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
+/// Write a NON-INDEXED PBF whose first node blob is internally unsorted
+/// (elements 2, 1, 3 in wire order) while every blob's `(min_id, max_id)`
+/// range stays disjoint from its neighbours. This is the exact shape
+/// `degrade --unsort-intra --strip-indexdata` produces: a genuinely
+/// out-of-order stream that a blob-range overlap check cannot see. Because
+/// the blobs carry no indexdata, `sort`'s pass 1 decodes the payload and can
+/// (post-fix) observe the intra-blob inversion.
+///
+/// Blob layout (all blobs written without indexdata):
+///   node blob 0: ids 2, 1, 3   (internally unsorted, range 1..=3)
+///   node blob 1: ids 4, 5, 6   (sorted, range 4..=6, no overlap with blob 0)
+///   way  blob 2: ids 100, 200  (sorted)
+///   rel  blob 3: id  300
+#[allow(clippy::cast_possible_truncation)]
+fn write_intra_unsorted_non_indexed_pbf(path: &Path) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    // Genuinely-unsorted third-party file: header does not claim sortedness.
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    // Node blob 0: insertion order 2, 1, 3 => internal ID inversion.
+    for id in [2_i64, 1, 3] {
+        bb.add_node(
+            id,
+            id as i32 * 1_000_000,
+            id as i32 * 2_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write block");
+    }
+
+    // Node blob 1: sorted, disjoint range 4..=6.
+    for id in [4_i64, 5, 6] {
+        bb.add_node(
+            id,
+            id as i32 * 1_000_000,
+            id as i32 * 2_000_000,
+            std::iter::empty::<(&str, &str)>(),
+            None,
+        );
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write block");
+    }
+
+    bb.add_way(100, [("highway", "residential")], &[1, 2, 3], None);
+    bb.add_way(200, [("highway", "primary")], &[4, 5, 6], None);
+    if let Some(bytes) = bb.take().expect("take") {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write block");
+    }
+
+    bb.add_relation(
+        300,
+        [("type", "route")],
+        &[pbfhogg::block_builder::MemberData {
+            id: pbfhogg::MemberId::Way(100),
+            role: "outer",
+        }],
+        None,
+    );
+    if let Some(bytes) = bb.take().expect("take") {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
+fn assert_sorted(contents: &PbfContentsWithCoords) {
+    for w in contents.nodes.windows(2) {
+        assert!(
+            w[0].0 < w[1].0,
+            "nodes not sorted: {} >= {}",
+            w[0].0,
+            w[1].0
+        );
+    }
+    for w in contents.ways.windows(2) {
+        assert!(w[0].0 < w[1].0, "ways not sorted: {} >= {}", w[0].0, w[1].0);
+    }
+    for w in contents.relations.windows(2) {
+        assert!(
+            w[0].0 < w[1].0,
+            "relations not sorted: {} >= {}",
+            w[0].0,
+            w[1].0
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RawNodeMeta {
+    id: i64,
+    version: Option<i32>,
+    changeset: Option<i64>,
+    uid: Option<i32>,
+    user: Option<String>,
+    visible: Option<bool>,
+}
+
+fn read_raw_node_meta(path: &Path) -> Vec<RawNodeMeta> {
+    let reader = BlobReader::from_path(path).expect("open pbf");
+    let mut metas = Vec::new();
+
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
+            for element in block.elements() {
+                match element {
+                    Element::DenseNode(dn) => {
+                        let info = dn.info();
+                        metas.push(RawNodeMeta {
+                            id: dn.id(),
+                            version: info.as_ref().map(|i| i.version()),
+                            changeset: info.as_ref().map(|i| i.changeset()),
+                            uid: info.as_ref().map(|i| i.uid()),
+                            user: info.as_ref().map(|i| i.user().unwrap_or("").to_string()),
+                            visible: info.as_ref().map(|i| i.visible()),
+                        });
+                    }
+                    Element::Node(n) => {
+                        let info = n.info();
+                        metas.push(RawNodeMeta {
+                            id: n.id(),
+                            version: info.version(),
+                            changeset: info.changeset(),
+                            uid: info.uid(),
+                            user: info
+                                .user()
+                                .and_then(std::result::Result::ok)
+                                .map(ToString::to_string),
+                            visible: Some(info.visible()),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    metas
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// Sort a PBF with overlapping node blobs (forces rewrite path).
+/// Output must be correctly sorted with all elements preserved.
+#[test]
+fn sort_overlapping_blobs() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("overlapping.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+
+    write_unsorted_overlapping_pbf(&input);
+    run_sort(&input, &output);
+
+    let result = read_all_elements_with_coords(&output);
+
+    assert_eq!(result.nodes.len(), 10);
+    assert_eq!(result.ways.len(), 2);
+    assert_eq!(result.relations.len(), 1);
+    assert_sorted(&result);
+    assert!(
+        read_header(&output).is_sorted(),
+        "output missing Sort.Type_then_ID"
+    );
+
+    let node_ids: Vec<i64> = result.nodes.iter().map(|(id, _, _, _)| *id).collect();
+    assert_eq!(node_ids, (1..=10).collect::<Vec<_>>());
+
+    #[allow(clippy::cast_possible_truncation)]
+    for (id, lat, lon, _) in &result.nodes {
+        assert_eq!(*lat, *id as i32 * 1_000_000);
+        assert_eq!(*lon, *id as i32 * 2_000_000);
+    }
+}
+
+/// Sort a PBF with types in wrong order (ways before nodes).
+/// Output must have correct type order: nodes, ways, relations.
+#[test]
+fn sort_wrong_type_order() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("type_unsorted.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+
+    write_type_unsorted_pbf(&input);
+    run_sort(&input, &output);
+
+    let result = read_all_elements_with_coords(&output);
+
+    assert_eq!(result.nodes.len(), 6);
+    assert_eq!(result.ways.len(), 2);
+    assert_eq!(result.relations.len(), 1);
+    assert_sorted(&result);
+    assert!(
+        read_header(&output).is_sorted(),
+        "output missing Sort.Type_then_ID"
+    );
+
+    let way_tags: Vec<&str> = result
+        .ways
+        .iter()
+        .map(|(_, _, tags)| tags[0].1.as_str())
+        .collect();
+    assert_eq!(way_tags, vec!["residential", "primary"]);
+}
+
+/// Overlap-rewrite must normalize the `changeset=-1` sentinel (used by
+/// osmosis-produced history extracts) to 0 on the re-encoded output.
+/// Regression: overlapping blobs that force rewrite previously
+/// propagated the -1 verbatim.
+#[allow(clippy::cast_possible_truncation)]
+#[test]
+fn sort_overlap_rewrite_normalizes_dense_node_changeset_minus_one() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let file = std::fs::File::create(&input).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let meta = Metadata {
+        version: 5,
+        timestamp: 1_700_000_000,
+        changeset: -1,
+        uid: 9,
+        user: "osmosis",
+        visible: false,
+    };
+
+    let mut bb = BlockBuilder::new();
+    for id in [1_i64, 3] {
+        bb.add_node(
+            id,
+            id as i32 * 1_000_000,
+            id as i32 * 2_000_000,
+            [("name", "sentinel")],
+            Some(&meta),
+        );
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    bb.add_node(2, 2_000_000, 4_000_000, [("name", "sentinel")], Some(&meta));
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+    writer.flush().expect("flush");
+
+    run_sort(&input, &output);
+
+    let nodes = read_raw_node_meta(&output);
+    assert_eq!(nodes.len(), 3);
+    assert_eq!(
+        nodes,
+        vec![
+            RawNodeMeta {
+                id: 1,
+                version: Some(5),
+                changeset: Some(0),
+                uid: Some(9),
+                user: Some("osmosis".to_string()),
+                visible: Some(false),
+            },
+            RawNodeMeta {
+                id: 2,
+                version: Some(5),
+                changeset: Some(0),
+                uid: Some(9),
+                user: Some("osmosis".to_string()),
+                visible: Some(false),
+            },
+            RawNodeMeta {
+                id: 3,
+                version: Some(5),
+                changeset: Some(0),
+                uid: Some(9),
+                user: Some("osmosis".to_string()),
+                visible: Some(false),
+            },
+        ]
+    );
+}
+
+/// Sort an already-sorted PBF (passthrough path).
+/// Output must be element-equivalent to input.
+#[test]
+fn sort_already_sorted() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("sorted_input.osm.pbf");
+    let output = dir.path().join("sorted_output.osm.pbf");
+
+    write_test_pbf(
+        &input,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("name", "a")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![("name", "b")],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "path")],
+            meta: None,
+        }],
+        &[TestRelation {
+            id: 20,
+            members: vec![crate::common::TestMember {
+                id: pbfhogg::MemberId::Way(10),
+                role: "outer",
+            }],
+            tags: vec![("type", "multipolygon")],
+            meta: None,
+        }],
+    );
+
+    run_sort(&input, &output);
+
+    let before = read_all_elements_with_coords(&input);
+    let after = read_all_elements_with_coords(&output);
+
+    assert_eq!(before.nodes.len(), after.nodes.len());
+    assert_eq!(before.ways.len(), after.ways.len());
+    assert_eq!(before.relations.len(), after.relations.len());
+    assert!(
+        read_header(&output).is_sorted(),
+        "output missing Sort.Type_then_ID"
+    );
+
+    for (a, b) in before.nodes.iter().zip(after.nodes.iter()) {
+        assert_eq!(a, b);
+    }
+    for (a, b) in before.ways.iter().zip(after.ways.iter()) {
+        assert_eq!(a, b);
+    }
+    for (a, b) in before.relations.iter().zip(after.relations.iter()) {
+        assert_eq!(a, b);
+    }
+}
+
+/// Cross-validate pbfhogg sort against osmium sort on the same
+/// handcrafted overlapping-blob fixture.
+///
+/// **Escape hatch**, `#[ignore = "external"]`d. External
+/// cross-validation lives in `brokkr verify`, not the in-tree
+/// suite (see `reference/testing.md` > "External cross-validation").
+/// `brokkr verify sort` already covers the real-dataset case;
+/// this fixture is the pathological overlap-run input that
+/// real Denmark data does not exercise. Migration target: when
+/// `brokkr verify sort --input <path>` already exists; once a fixture
+/// builder under `examples/` writes this fixture, move the comparison
+/// there and retire this test.
+/// Skip-on-missing-osmium kept so the test still passes if
+/// invoked via `--include-ignored` on a host without osmium.
+#[test]
+#[ignore = "external"]
+fn sort_cross_validate_osmium() {
+    let osmium_check = std::process::Command::new("osmium")
+        .arg("--version")
+        .output();
+    if osmium_check.is_err() {
+        crate::common::skip("osmium not found in PATH");
+        return;
+    }
+
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("overlapping.osm.pbf");
+    let pbfhogg_out = dir.path().join("pbfhogg_sorted.osm.pbf");
+    let osmium_out = dir.path().join("osmium_sorted.osm.pbf");
+
+    write_unsorted_overlapping_pbf(&input);
+    CliInvoker::new()
+        .timeout(std::time::Duration::from_secs(110))
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&pbfhogg_out)
+        .arg("--force")
+        .assert_success();
+
+    let status = std::process::Command::new("osmium")
+        .args(["sort", input.to_str().expect("path"), "-o"])
+        .arg(&osmium_out)
+        .arg("--overwrite")
+        .status()
+        .expect("run osmium");
+    assert!(status.success(), "osmium sort failed");
+
+    let pbfhogg_result = read_all_elements_with_coords(&pbfhogg_out);
+    let osmium_result = read_all_elements_with_coords(&osmium_out);
+
+    assert_eq!(
+        pbfhogg_result.nodes.len(),
+        osmium_result.nodes.len(),
+        "node count mismatch"
+    );
+    assert_eq!(
+        pbfhogg_result.ways.len(),
+        osmium_result.ways.len(),
+        "way count mismatch"
+    );
+    assert_eq!(
+        pbfhogg_result.relations.len(),
+        osmium_result.relations.len(),
+        "relation count mismatch"
+    );
+
+    for (p, o) in pbfhogg_result.nodes.iter().zip(osmium_result.nodes.iter()) {
+        assert_eq!(p.0, o.0, "node ID mismatch");
+        assert_eq!(p.1, o.1, "node lat mismatch for id {}", p.0);
+        assert_eq!(p.2, o.2, "node lon mismatch for id {}", p.0);
+    }
+
+    for (p, o) in pbfhogg_result.ways.iter().zip(osmium_result.ways.iter()) {
+        assert_eq!(p.0, o.0, "way ID mismatch");
+        assert_eq!(p.1, o.1, "way refs mismatch for id {}", p.0);
+        assert_eq!(p.2, o.2, "way tags mismatch for id {}", p.0);
+    }
+
+    for (p, o) in pbfhogg_result
+        .relations
+        .iter()
+        .zip(osmium_result.relations.iter())
+    {
+        assert_eq!(p.0, o.0, "relation ID mismatch");
+        assert_eq!(p.1, o.1, "relation members mismatch for id {}", p.0);
+        assert_eq!(p.2, o.2, "relation tags mismatch for id {}", p.0);
+    }
+}
+
+/// Sort a PBF with 10 interleaving node blobs (deep overlap run).
+/// Each blob has IDs `i, i+10, i+20, ..., i+90` for `i in 1..=10`.
+/// Forces a 10-blob overlap run through the streaming sweep merge.
+#[allow(clippy::cast_possible_truncation)]
+#[test]
+fn sort_many_overlapping_blobs() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("many_overlap.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+
+    let file = std::fs::File::create(&input).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+    for blob_idx in 1..=10_i64 {
+        for step in 0..10_i64 {
+            let id = blob_idx + step * 10;
+            bb.add_node(
+                id,
+                id as i32 * 100_000,
+                id as i32 * 200_000,
+                std::iter::empty::<(&str, &str)>(),
+                None,
+            );
+        }
+        if let Some(bytes) = bb.take().expect("take") {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+    }
+    writer.flush().expect("flush");
+
+    run_sort(&input, &output);
+
+    let result = read_all_elements_with_coords(&output);
+
+    assert_eq!(result.nodes.len(), 100);
+    assert_sorted(&result);
+
+    let node_ids: Vec<i64> = result.nodes.iter().map(|(id, _, _, _)| *id).collect();
+    assert_eq!(node_ids, (1..=100).collect::<Vec<_>>());
+
+    for (id, lat, lon, _) in &result.nodes {
+        assert_eq!(*lat, *id as i32 * 100_000);
+        assert_eq!(*lon, *id as i32 * 200_000);
+    }
+
+    assert!(
+        read_header(&output).is_sorted(),
+        "output missing Sort.Type_then_ID"
+    );
+}
+
+/// Overlap-runs must not cross element-kind boundaries.
+///
+/// Fixture layout (four blobs, two adjacent same-kind overlap pairs
+/// separated by a kind boundary):
+///   blob 0: Nodes ids 1,3,5,7,9     (odd)
+///   blob 1: Nodes ids 2,4,6,8,10    (even, overlaps blob 0)
+///   blob 2: Ways  ids 101,103,105   (odd)
+///   blob 3: Ways  ids 102,104,106   (even, overlaps blob 2)
+///
+/// `detect_overlaps` is kind-gated, so only (0,1) and (2,3) overlap.
+/// A past bug in the pass-2 walker consumed consecutive
+/// `overlaps[i]=true` entries without checking kind, then handed a
+/// cross-kind slice to the kind-gated sweep - ways got silently
+/// dropped because the extract closure's `_ => {}` arm ate every way
+/// element when the run was classified as Node. Twin of the
+/// `cat::dedupe::merge_pbf` bug fixed in commit `486d4d1`.
+#[test]
+fn sort_overlap_runs_scoped_to_single_kind() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("kind_boundary.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+
+    let file = std::fs::File::create(&input).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    for id in (1..=9).step_by(2) {
+        bb.add_node(id, 0, 0, std::iter::empty::<(&str, &str)>(), None);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    for id in (2..=10).step_by(2) {
+        bb.add_node(id, 0, 0, std::iter::empty::<(&str, &str)>(), None);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    for id in (101..=105).step_by(2) {
+        bb.add_way(id, std::iter::empty::<(&str, &str)>(), &[1, 2], None);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    for id in (102..=106).step_by(2) {
+        bb.add_way(id, std::iter::empty::<(&str, &str)>(), &[1, 2], None);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+
+    run_sort(&input, &output);
+
+    let result = read_all_elements_with_coords(&output);
+    assert_eq!(
+        result.nodes.len(),
+        10,
+        "expected 10 nodes, got {}",
+        result.nodes.len()
+    );
+    assert_eq!(
+        result.ways.len(),
+        6,
+        "expected 6 ways, got {}",
+        result.ways.len()
+    );
+    assert_sorted(&result);
+
+    let node_ids: Vec<i64> = result.nodes.iter().map(|(id, _, _, _)| *id).collect();
+    assert_eq!(node_ids, (1..=10).collect::<Vec<_>>());
+    let way_ids: Vec<i64> = result.ways.iter().map(|w| w.0).collect();
+    assert_eq!(way_ids, (101..=106).collect::<Vec<_>>());
+}
+
+#[test]
+fn sort_preserves_historical_information_feature() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("history-input.osm.pbf");
+    let output = dir.path().join("history-output.osm.pbf");
+
+    let file = std::fs::File::create(&input).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .historical()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+    bb.add_node(
+        2,
+        20_000_000,
+        20_000_000,
+        std::iter::empty::<(&str, &str)>(),
+        Some(&Metadata {
+            version: 2,
+            timestamp: 1_700_000_000,
+            changeset: 10,
+            uid: 1,
+            user: "u",
+            visible: false,
+        }),
+    );
+    bb.add_node(
+        1,
+        10_000_000,
+        10_000_000,
+        std::iter::empty::<(&str, &str)>(),
+        Some(&Metadata {
+            version: 1,
+            timestamp: 1_700_000_001,
+            changeset: 11,
+            uid: 1,
+            user: "u",
+            visible: true,
+        }),
+    );
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+    writer.flush().expect("flush");
+
+    run_sort(&input, &output);
+
+    let header = read_header(&output);
+    assert!(
+        header.has_historical_information(),
+        "output header must declare HistoricalInformation",
+    );
+}
+
+/// A non-indexed blob that is internally unsorted but whose ID range does
+/// not overlap its neighbours must be repaired, not passed through.
+///
+/// This is the intra-blob-disorder correctness hole (ruling in
+/// CORRECTNESS.md): pass 1's blob-range overlap check sees nothing to fix, so
+/// pre-fix `sort` emitted a byte-identical copy stamped `Sort.Type_then_ID` -
+/// silent corruption. The non-indexed pass-1 fallback now tracks intra-blob
+/// monotonicity while it scans element IDs and routes any internally
+/// out-of-order blob into the decode + re-encode path.
+#[test]
+fn sort_repairs_intra_blob_disorder_in_non_indexed_input() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("intra_unsorted.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+
+    write_intra_unsorted_non_indexed_pbf(&input);
+    // Precondition: the disorder is only observable because the blobs carry
+    // no indexdata, forcing the payload-decoding pass-1 fallback.
+    assert_non_indexed(&input);
+
+    let run = CliInvoker::new()
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--force")
+        .assert_success();
+
+    // The disordered blob must be routed to rewrite, not passed through.
+    // (Pre-fix this printed nothing: detect_overlaps saw no range overlap and
+    // every blob went through the raw-passthrough copy path.)
+    run.assert_stderr_contains("internally unsorted");
+
+    // Output is genuinely sorted in file order with a truthful header, not
+    // merely element-equivalent. assert_sorted_file walks the file in blob
+    // order and checks the Sort.Type_then_ID flag plus per-type monotonicity.
+    assert_sorted_file(&output);
+
+    // Element set preserved: the internally-swapped node ids come back in order.
+    let result = read_all_elements_with_coords(&output);
+    let node_ids: Vec<i64> = result.nodes.iter().map(|(id, _, _, _)| *id).collect();
+    assert_eq!(node_ids, (1..=6).collect::<Vec<_>>());
+    assert_eq!(result.ways.len(), 2);
+    assert_eq!(result.relations.len(), 1);
+}
+
+/// The unsorted -> `cat` -> `sort` composition must not launder a false
+/// `Sort.Type_then_ID` claim (external review finding, 2026-07-11).
+///
+/// `cat` attaches indexdata to non-indexed blobs WITHOUT reordering their
+/// elements, so an internally-unsorted file emerges from `cat` indexed but
+/// still unsorted. Pre-fix, `sort` treated indexdata presence as proof of
+/// intra-blob order: pass 1 classified the catted blobs header-only, the
+/// range-disjoint disordered blob passed through byte-identical, and the
+/// output header claimed `Sort.Type_then_ID` - silent corruption. Post-fix,
+/// pass 1 keys its trust on the input header's sorted claim instead of on
+/// indexdata: the catted file does not declare `Sort.Type_then_ID`, so its
+/// payloads are decoded and checked, and the disordered blob is routed to
+/// decode + re-encode.
+#[test]
+fn sort_repairs_intra_blob_disorder_in_catted_indexed_input() {
+    let dir = crate::common::test_scratch();
+    let raw = dir.path().join("intra_unsorted_raw.osm.pbf");
+    let catted = dir.path().join("intra_unsorted_catted.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+
+    write_intra_unsorted_non_indexed_pbf(&raw);
+    assert_non_indexed(&raw);
+
+    // cat indexes the blobs but never reorders elements.
+    CliInvoker::new()
+        .arg("cat")
+        .arg(&raw)
+        .arg("-o")
+        .arg(&catted)
+        .assert_success();
+    assert_indexed(&catted);
+    // The composition premise: indexdata present, sorted claim absent.
+    assert!(
+        !read_header(&catted).is_sorted(),
+        "cat must not add a Sort.Type_then_ID claim the input never had"
+    );
+
+    // Indexed input: no --force needed. Pre-fix this run passed the
+    // disordered blob through and stamped a false sorted claim.
+    let run = CliInvoker::new()
+        .arg("sort")
+        .arg(&catted)
+        .arg("-o")
+        .arg(&output)
+        .assert_success();
+
+    // Pass 1 must announce the payload-verification path (indexed input
+    // without a sorted claim) and must catch the intra-blob inversion.
+    run.assert_stderr_contains("does not declare Sort.Type_then_ID");
+    run.assert_stderr_contains("internally unsorted");
+
+    // Output is genuinely sorted in file order with a truthful header.
+    assert_sorted_file(&output);
+
+    let result = read_all_elements_with_coords(&output);
+    let node_ids: Vec<i64> = result.nodes.iter().map(|(id, _, _, _)| *id).collect();
+    assert_eq!(node_ids, (1..=6).collect::<Vec<_>>());
+    assert_eq!(result.ways.len(), 2);
+    assert_eq!(result.relations.len(), 1);
+}
+
+/// A declared-sorted indexed input keeps the header-only pass 1: no
+/// payload-verification notice, no rewrites. Guards the passthrough fast
+/// path the header-claim-keyed trust ruling deliberately preserves.
+#[test]
+fn sort_declared_sorted_indexed_input_skips_payload_verification() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("declared_sorted.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+
+    crate::common::write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("name", "a")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![("name", "b")],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "path")],
+            meta: None,
+        }],
+        &[],
+    );
+    assert_indexed(&input);
+    assert!(read_header(&input).is_sorted(), "fixture must claim sorted");
+
+    let run = CliInvoker::new()
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .assert_success();
+
+    let stderr = run.stderr_str();
+    assert!(
+        !stderr.contains("does not declare Sort.Type_then_ID"),
+        "declared-sorted input must keep the header-only pass 1; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("internally unsorted"),
+        "declared-sorted input must not trip the intra-disorder detector; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("0 rewritten"),
+        "declared-sorted indexed input must pass through with zero rewrites; stderr:\n{stderr}"
+    );
+    assert_sorted_file(&output);
+}
+
+/// A fully-sorted non-indexed input must still take the passthrough fast
+/// path: the intra-blob monotonicity check added for the disorder case must
+/// not flag well-formed blobs (no false positives, no rewrite regression).
+#[test]
+fn sort_sorted_non_indexed_input_stays_on_passthrough() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("sorted_non_indexed.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+
+    write_test_pbf_non_indexed(
+        &input,
+        &[
+            TestNode {
+                id: 1,
+                lat: 100_000_000,
+                lon: 200_000_000,
+                tags: vec![("name", "a")],
+                meta: None,
+            },
+            TestNode {
+                id: 2,
+                lat: 110_000_000,
+                lon: 210_000_000,
+                tags: vec![("name", "b")],
+                meta: None,
+            },
+        ],
+        &[TestWay {
+            id: 10,
+            refs: vec![1, 2],
+            tags: vec![("highway", "path")],
+            meta: None,
+        }],
+        &[TestRelation {
+            id: 20,
+            members: vec![crate::common::TestMember {
+                id: pbfhogg::MemberId::Way(10),
+                role: "outer",
+            }],
+            tags: vec![("type", "multipolygon")],
+            meta: None,
+        }],
+    );
+    assert_non_indexed(&input);
+
+    let run = CliInvoker::new()
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--force")
+        .assert_success();
+
+    // No blob was internally out of order, so none is routed to rewrite: the
+    // summary reports zero rewritten blobs and the intra-disorder line is
+    // absent.
+    let stderr = run.stderr_str();
+    assert!(
+        !stderr.contains("internally unsorted"),
+        "sorted input must not trip the intra-disorder detector; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("0 rewritten"),
+        "sorted non-indexed input must pass through with zero rewrites; stderr:\n{stderr}"
+    );
+
+    assert_sorted_file(&output);
+}
+
+// ---------------------------------------------------------------------------
+// Platform tier
+// ---------------------------------------------------------------------------
+//
+// Tests that exercise platform-gated CLI flags (`--direct-io`,
+// `--io-uring`). Wrapped in `mod platform` so the brokkr platform
+// profile (T11) can target them via `cargo test platform::` without
+// also pulling in the rest of the file. Cargo builds the binary these
+// tests invoke with the test build's own features, so it carries exactly
+// the flags the cfg gate sees.
+
+#[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
+mod platform {
+    use super::*;
+
+    /// `--direct-io` on a filesystem that supports O_DIRECT must
+    /// produce the same sorted output as the default path. Skipped
+    /// (via stderr inspection) on filesystems that reject O_DIRECT
+    /// with EINVAL.
+    #[cfg(feature = "linux-direct-io")]
+    #[test]
+    fn sort_overlapping_blobs_direct_io() {
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("overlapping.osm.pbf");
+        let output = dir.path().join("sorted.osm.pbf");
+
+        write_unsorted_overlapping_pbf(&input);
+
+        let run = CliInvoker::new()
+            .arg("sort")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .arg("--direct-io")
+            .arg("--force")
+            .run();
+
+        if run.is_o_direct_unsupported() {
+            crate::common::skip("O_DIRECT not supported on this filesystem");
+            return;
+        }
+        assert!(
+            run.status.success(),
+            "sort --direct-io failed unexpectedly; stderr:\n{}",
+            run.stderr_str(),
+        );
+
+        let contents = read_all_elements_with_coords(&output);
+        assert_eq!(contents.nodes.len(), 10);
+        assert_eq!(contents.ways.len(), 2);
+        assert_eq!(contents.relations.len(), 1);
+        assert_sorted(&contents);
+        assert!(
+            read_header(&output).is_sorted(),
+            "output missing Sort.Type_then_ID"
+        );
+
+        let node_ids: Vec<i64> = contents.nodes.iter().map(|(id, _, _, _)| *id).collect();
+        assert_eq!(node_ids, (1..=10).collect::<Vec<_>>());
+
+        #[allow(clippy::cast_possible_truncation)]
+        for (id, lat, lon, _) in &contents.nodes {
+            assert_eq!(*lat, *id as i32 * 1_000_000);
+            assert_eq!(*lon, *id as i32 * 2_000_000);
+        }
+    }
+
+    #[cfg(feature = "linux-io-uring")]
+    #[test]
+    #[ignore = "pre-existing io_uring writer bug for small outputs; see TODO.md"]
+    fn sort_overlapping_blobs_uring() {
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("overlapping.osm.pbf");
+        let output = dir.path().join("sorted.osm.pbf");
+
+        write_unsorted_overlapping_pbf(&input);
+
+        let run = CliInvoker::new()
+            .arg("sort")
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .arg("--io-uring")
+            .arg("--force")
+            .run();
+
+        if run.is_uring_unsupported() {
+            crate::common::skip("io_uring not available on this host");
+            return;
+        }
+        assert!(
+            run.status.success(),
+            "sort --io-uring failed unexpectedly; stderr:\n{}",
+            run.stderr_str(),
+        );
+
+        let contents = read_all_elements_with_coords(&output);
+        assert_eq!(contents.nodes.len(), 10);
+        assert_eq!(contents.ways.len(), 2);
+        assert_eq!(contents.relations.len(), 1);
+        assert_sorted(&contents);
+        assert!(
+            read_header(&output).is_sorted(),
+            "output missing Sort.Type_then_ID"
+        );
+
+        let node_ids: Vec<i64> = contents.nodes.iter().map(|(id, _, _, _)| *id).collect();
+        assert_eq!(node_ids, (1..=10).collect::<Vec<_>>());
+
+        #[allow(clippy::cast_possible_truncation)]
+        for (id, lat, lon, _) in &contents.nodes {
+            assert_eq!(*lat, *id as i32 * 1_000_000);
+            assert_eq!(*lon, *id as i32 * 2_000_000);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Feature-missing error paths
+// ---------------------------------------------------------------------------
+//
+// Negative tests: `--direct-io` and `--io-uring` must emit a clear
+// error when the corresponding Cargo feature is absent. These compile
+// only when the feature is OFF, so they fire under the `consumer`
+// sweep in `brokkr.toml` (`no_default_features = true, features =
+// ["commands"]`, which builds pbfhogg-cli and its binary without the linux
+// features) and the `musl` sweep (default features). Under the
+// `all` sweep both features are on and these tests are excluded by
+// cfg, so the positive tests in `mod platform` cover that path.
+
+#[cfg(not(feature = "linux-direct-io"))]
+#[test]
+fn sort_direct_io_feature_missing_error() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_unsorted_overlapping_pbf(&input);
+
+    let run = CliInvoker::new()
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--direct-io")
+        .arg("--force")
+        .run();
+
+    assert!(
+        !run.status.success(),
+        "sort --direct-io must fail without linux-direct-io feature",
+    );
+    let stderr = run.stderr_str();
+    assert!(
+        stderr.contains("--direct-io requires the linux-direct-io feature"),
+        "stderr must name the missing feature; got:\n{stderr}",
+    );
+}
+
+#[cfg(not(feature = "linux-io-uring"))]
+#[test]
+fn sort_io_uring_feature_missing_error() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_unsorted_overlapping_pbf(&input);
+
+    let run = CliInvoker::new()
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .arg("--io-uring")
+        .arg("--force")
+        .run();
+
+    assert!(
+        !run.status.success(),
+        "sort --io-uring must fail without linux-io-uring feature",
+    );
+    let stderr = run.stderr_str();
+    assert!(
+        stderr.contains("--io-uring requires the linux-io-uring feature"),
+        "stderr must name the missing feature; got:\n{stderr}",
+    );
+}
+
+#[test]
+fn sort_refuses_non_leading_header_frames() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    write_unsorted_overlapping_pbf(&input);
+    let bytes = std::fs::read(&input).expect("read fixture");
+    let frames = crate::common::adversarial::locate_blobs(&bytes);
+    let header = &bytes[..frames[0].blob_end];
+    for insertion in [frames[0].blob_end, bytes.len()] {
+        let bad = dir.path().join(format!("header-at-{insertion}.osm.pbf"));
+        let doubled = [&bytes[..insertion], header, &bytes[insertion..]].concat();
+        std::fs::write(&bad, doubled).expect("write repeated header");
+        let out = CliInvoker::new()
+            .arg("sort")
+            .arg(&bad)
+            .arg("-o")
+            .arg(dir.path().join(format!("out-{insertion}.osm.pbf")))
+            .arg("--force")
+            .run();
+        assert!(!out.status.success(), "{}", out.stderr_str());
+        assert!(out.stderr_str().contains("a second OSMHeader blob"));
+    }
+}

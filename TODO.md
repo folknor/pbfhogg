@@ -100,7 +100,7 @@ Picked 2026-07-30, right after the 0.5.0 release.
 
   What was done here instead: the command was exercised by hand against
   the real Denmark files (the 464 MB v1-indexdata extract among them) and
-  by the CLI integration tests in `tests/cli_check_index.rs`, which cover
+  by the CLI integration tests in `cli/tests/cli_check_index.rs`, which cover
   the honest, corrupt, unreadable and unindexable cases plus both exit
   codes. What remains merely disclosed: there is no recorded timing for
   `check --index` at any scale, and no automated run of it over a
@@ -445,7 +445,7 @@ real Denmark indexdata by any verify run. Everything it does that the
 parallel path does not - `check_claimed_max`, the `osm_id_cmp` merge
 boundary and non-overlap tests, the residual bookkeeping in
 `merge_decoded_pair` - is covered only by synthetic fixtures in
-`tests/cli_merge_join_trust.rs` and `tests/cli_diff.rs`.
+`cli/tests/cli_merge_join_trust.rs` and `cli/tests/cli_diff.rs`.
 
 This is not hypothetical. The two paths genuinely disagreed until
 2026-08-20: on a PBF whose header stamps `Sort.Type_then_ID` while its blobs
@@ -578,7 +578,7 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   from a genuine user 0 or a genuine epoch timestamp. Same collapse already
   fixed for coordinates, for `push_info_attrs` and for OSC `version`; it
   survives here because absence and zero share one representation through the
-  whole PBF write path. `tests/cli_apply_changes.rs::merge_metadata_preservation`
+  whole PBF write path. `cli/tests/cli_apply_changes.rs::merge_metadata_preservation`
   currently asserts the bug - it is documented to record the collapse rather
   than endorse it, and its assertion message says what must change. The fix is
   per-field presence in both types plus `Option`-shaped fields through
@@ -606,7 +606,7 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
   do not, because verifying each one is concurrency reasoning and a bound set
   too low turns a memory-growth smell into a production panic.
 
-- [ ] **`cli/src/main.rs` argument splatting is partially cleaned up.** Round 4
+- [ ] **`cli/src/lib.rs` argument splatting is partially cleaned up.** Round 4
   introduced `WriteOpts` and per-command flag structs for `getid`,
   `tags-filter`, `check`, `inspect`, `diff` and the geocode-index levels, which
   removed every run of three or more adjacent same-typed parameters - the class
@@ -731,7 +731,7 @@ Three new docs capturing a cross-cutting insight and two new commands that fall 
 - [x] ~~**repack** - new command: re-encode a PBF with a configurable `--elements-per-blob N` cap.~~ **v1 + v2.1 + v2.2 LANDED** (`BlockBuilder::with_element_cap(n)`; cross-input-blob coalescing so grow caps fire correctly across input-blob boundaries; LocationsOnWays preservation - the input's inline way coordinates and feature flag round-trip exactly, no implicit conversion either direction). Planet 8k bench ~380-390 s, peak RSS under 1.5 GB at planet. Still deferred: **v2.3 osmium cross-validation** (`brokkr verify repack` against osmium's re-block; cheap, pick up when a measurement run needs the third-party check) and the out-of-scope list (`--blob-size-bytes`, densify/undensify, `--normalize-compression`, progress feedback). Known limitation: repack drops `pbfhogg.WayMembers-v1` / `SharedNodePins-v1` and warns. Design note retired to git history 2026-07-16 (notes/repack.md).
 
   **Correctness follow-up (found 2026-07-12 during the shape-3 8k sweep):**
-  - [x] ~~**`repack` emits non-monotonic relations across blob boundaries (CONFIRMED bug, found + fixed 2026-07-12).**~~ Root cause (`run_kind_phase` in `src/commands/repack/mod.rs`): worker "full" blocks wrote directly via `write_raw_owned` in seq order, while the central builder's coalesced tail-blocks went through a `pending` buffer that only flushed every 32 blocks, so low-ID coalesced tails could land after later high-ID direct blocks. Fix: in each `pop_ready` iteration, when the incoming blob carries direct full-blocks and the central stream (`bb` or `pending`) is non-empty, flush the central stream first. **Accepted density trade:** on a coalescing shrink, output blob count is no longer the general `ceil(elements / cap)` - it now depends on input-blob boundaries, since each input blob whose count isn't a multiple of the cap emits its tail as its own possibly-under-cap block (documented at the `repack_blob_count_matches_prediction` test). Regression tests in `tests/cli_repack.rs`: `repack_output_is_monotonic_across_coalesced_blob_boundaries`, `repack_output_is_monotonic_for_nodes_and_ways`, `repack_output_is_monotonic_with_pending_prepopulated_at_guard`.
+  - [x] ~~**`repack` emits non-monotonic relations across blob boundaries (CONFIRMED bug, found + fixed 2026-07-12).**~~ Root cause (`run_kind_phase` in `src/commands/repack/mod.rs`): worker "full" blocks wrote directly via `write_raw_owned` in seq order, while the central builder's coalesced tail-blocks went through a `pending` buffer that only flushed every 32 blocks, so low-ID coalesced tails could land after later high-ID direct blocks. Fix: in each `pop_ready` iteration, when the incoming blob carries direct full-blocks and the central stream (`bb` or `pending`) is non-empty, flush the central stream first. **Accepted density trade:** on a coalescing shrink, output blob count is no longer the general `ceil(elements / cap)` - it now depends on input-blob boundaries, since each input blob whose count isn't a multiple of the cap emits its tail as its own possibly-under-cap block (documented at the `repack_blob_count_matches_prediction` test). Regression tests in `cli/tests/cli_repack.rs`: `repack_output_is_monotonic_across_coalesced_blob_boundaries`, `repack_output_is_monotonic_for_nodes_and_ways`, `repack_output_is_monotonic_with_pending_prepopulated_at_guard`.
 
   **Release / measurement follow-ups:**
   - [x] ~~**Register the 8 k-packed planet as a snapshot.**~~ Done 2026-07-10: UUID `8027765b` (377.5 s at `8c1cf03`, plantasjen) promoted its output to `data/planet-8k-with-indexdata.osm.pbf`, registered as `snapshot.8k` `pbf.indexed`. The two earlier bench runs (`0ae01c09`, `a4791ddc`) wrote to scratch and kept nothing. The snapshot is the input for every same-corpus-different-encoding pair the `reference/blob-density.md` matrix needs, and for the deferred `getparents` HeaderWalker dispatch decision (europe-regressing / planet-winning along the same blob-count axis); consumer commands reach it via `--snapshot 8k`.
@@ -1225,7 +1225,7 @@ membership, not spatial).
   bidirectionally with controlled bboxes before touching code. Fixed by
   enabling serde_json `float_roundtrip` (root + cli Cargo.toml);
   regression test `config_bbox_floats_parse_identically_to_cli_bbox`
-  (tests/cli_extract.rs) pins config/CLI parse equivalence and was
+  (cli/tests/cli_extract.rs) pins config/CLI parse equivalence and was
   confirmed to fail without the feature. `brokkr verify multi-extract
   --dataset denmark --regions 5` now PASSES. Also hardens GeoJSON
   polygon coordinates, which parse through the same serde_json path.
@@ -1608,7 +1608,7 @@ re-attempting stay greppable in one place.
 
 ### Item-level completions
 
-- [x] ~~**`sort` correctness hole: intra-blob disorder is invisible**~~ **FIXED 2026-07-11.** Pass 1 now tracks intra-blob monotonicity (`scan_block_ids_checked`) keyed on the header's `Sort.Type_then_ID` claim, not indexdata presence, and routes any out-of-order blob into pass 2's decode + re-encode path. Recorded in CORRECTNESS.md; tests in `tests/cli_sort.rs`.
+- [x] ~~**`sort` correctness hole: intra-blob disorder is invisible**~~ **FIXED 2026-07-11.** Pass 1 now tracks intra-blob monotonicity (`scan_block_ids_checked`) keyed on the header's `Sort.Type_then_ID` claim, not indexdata presence, and routes any out-of-order blob into pass 2's decode + re-encode path. Recorded in CORRECTNESS.md; tests in `cli/tests/cli_sort.rs`.
 
 - [x] ~~**`read` parallel variant OOM**~~ **FIXED 2026-07-11.** Rewritten as a one-pass byte-and-count-bounded worker-resident parallel fold (256 MiB in-flight budget). Planet: SIGKILL -> 54 s / 616 MB peak anon, exact element-count parity with sequential. Zero production consumers of `par_map_reduce` existed, so no planet-safe pipeline was touched. Full numbers and the fadvise follow-up aside are in [reference/performance-history.md](reference/performance-history.md) "Env-gated read-path batch".
 

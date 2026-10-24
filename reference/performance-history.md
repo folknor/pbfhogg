@@ -500,7 +500,7 @@ and stamped `Sort.Type_then_ID` - silent corruption. Fixed by
 `scan_block_ids_checked` (tracks intra-blob monotonicity during the min/max
 scan), keyed on the header's `Sort.Type_then_ID` claim rather than
 indexdata presence; any out-of-order blob is folded into pass 2's decode +
-re-encode. Full ruling in CORRECTNESS.md; tests in `tests/cli_sort.rs`.
+re-encode. Full ruling in CORRECTNESS.md; tests in `cli/tests/cli_sort.rs`.
 
 ---
 

@@ -10,10 +10,10 @@
 //! value, and every write site propagates it with `?` so the command stops
 //! producing output it can no longer deliver.
 //!
-//! The reader going away is recorded here, process-wide, so `main` can tell
+//! The reader going away is recorded here, process-wide, so `run` can tell
 //! "stdout's reader left" apart from a failure and end the run silently with
 //! success - the convention of `head`-friendly tools, and the same choice
-//! `main` already makes for clap's `--help` / `--version` output, whose write
+//! `run` already makes for clap's `--help` / `--version` output, whose write
 //! result it discards. The record is a flag rather than an inspection of the
 //! returned error because the error crosses library boundaries that may wrap
 //! or re-type it on the way up; the flag is set at the one place the `EPIPE`

@@ -7,149 +7,7 @@
 use std::path::Path;
 use std::process::Command;
 
-/// Path to the compiled `pbfhogg` binary (set by cargo test).
-fn pbfhogg_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_pbfhogg")
-}
-
-/// The binary's own error walk and report, compiled directly so it can be
-/// tested without a unit-test harness in `src/`.
-#[path = "../src/exit_code.rs"]
-mod exit_code;
-
-mod exit_code_walker {
-    use super::exit_code::{Hinted, error_report, is_platform_unsupported};
-    use std::io;
-
-    fn platform() -> pbfhogg::Error {
-        pbfhogg::Error::platform_unsupported("io-uring", io::Error::other("refused"))
-    }
-
-    #[test]
-    fn bare_and_context_wrapped_refusals_exit_3() {
-        assert!(is_platform_unsupported(&platform()));
-        assert!(is_platform_unsupported(&platform().context("opening")));
-    }
-
-    #[test]
-    fn io_carrier_and_double_wrapping_exit_3() {
-        let carried = io::Error::from(platform());
-        assert!(is_platform_unsupported(&carried));
-        let once = pbfhogg::Error::from(carried);
-        assert!(is_platform_unsupported(&once));
-        // An Io error holding an io::Error that holds the refusal, which a
-        // plain source() walk skips.
-        let twice = pbfhogg::Error::from(io::Error::other(io::Error::from(platform())));
-        assert!(is_platform_unsupported(&twice));
-    }
-
-    #[test]
-    fn refusal_under_external_exits_3() {
-        let external = pbfhogg::Error::external(platform());
-        assert!(is_platform_unsupported(&external));
-        let boxed: Box<dyn std::error::Error> = Box::new(external);
-        assert!(is_platform_unsupported(boxed.as_ref()));
-    }
-
-    #[test]
-    fn ordinary_errors_do_not() {
-        assert!(!is_platform_unsupported(&pbfhogg::Error::from(
-            io::Error::other("x")
-        )));
-        assert!(!is_platform_unsupported(&pbfhogg::Error::external(
-            io::Error::other("x")
-        )));
-        assert!(!is_platform_unsupported(&io::Error::other("x")));
-    }
-
-    #[test]
-    fn report_covers_bare_carried_and_foreign_errors() {
-        assert_eq!(
-            error_report(&platform()),
-            "platform feature io-uring unavailable: refused"
-        );
-        let carried = io::Error::from(platform().context("opening"));
-        assert_eq!(
-            error_report(&carried),
-            "opening: platform feature io-uring unavailable: refused"
-        );
-        assert_eq!(error_report(&io::Error::other("plain")), "plain");
-    }
-
-    #[test]
-    fn hinted_error_keeps_the_typed_cause_reachable_and_prints_cause_then_advice() {
-        let hinted = Hinted::new(platform().context("opening"), "; try again");
-        // The advice never hides the refusal from the exit-code walk.
-        assert!(is_platform_unsupported(&hinted));
-        assert_eq!(
-            error_report(&hinted),
-            "opening: platform feature io-uring unavailable: refused; try again"
-        );
-        assert_eq!(hinted.to_string(), "try again");
-    }
-
-    /// An existing output earns the advice naming the flag that grants the
-    /// replacement, however deep in the chain the refusal sits; nothing
-    /// else does.
-    #[test]
-    fn output_refusal_earns_the_overwrite_advice() {
-        use super::exit_code::output_hint;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let existing = dir.path().join("out.osm.pbf");
-        std::fs::write(&existing, b"user data").expect("write existing output");
-        let refused = pbfhogg::Output::new(
-            &existing,
-            pbfhogg::Overwrite::Refuse,
-            &pbfhogg::host::Diagnostics::discard(),
-        )
-        .expect_err("an existing output is refused");
-        assert!(matches!(
-            refused.kind(),
-            pbfhogg::ErrorKind::Output(pbfhogg::OutputError::Exists { .. })
-        ));
-        let advice = super::exit_code::Advice::default();
-        assert_eq!(
-            output_hint(&refused, &advice).as_deref(),
-            Some("; pass --overwrite (-O) to replace it")
-        );
-        let carried = io::Error::from(refused.context("publishing"));
-        assert!(output_hint(&carried, &advice).is_some());
-        assert_eq!(output_hint(&platform(), &advice), None);
-    }
-
-    /// A cancellation earns the interrupted status as the error itself or
-    /// through the transparent carriers, never as a cause buried under
-    /// another error.
-    #[test]
-    fn cancellation_is_classified_only_as_the_authoritative_cause() {
-        use super::exit_code::is_cancelled;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let output = pbfhogg::Output::new(
-            dir.path().join("out.osm.pbf"),
-            pbfhogg::Overwrite::Refuse,
-            &pbfhogg::host::Diagnostics::discard(),
-        )
-        .expect("fresh output");
-        let cancel = pbfhogg::host::Cancel::new();
-        cancel.cancel();
-        let cancelled = output
-            .publish(&cancel)
-            .expect_err("a tripped token refuses publication");
-        assert!(cancelled.is_cancelled());
-        assert!(is_cancelled(&cancelled));
-        assert!(is_cancelled(&cancelled.clone().context("stage 3")));
-        assert!(is_cancelled(&io::Error::from(cancelled.clone())));
-        assert!(is_cancelled(&Hinted::new(cancelled.clone(), "; advice")));
-        let boxed: Box<dyn std::error::Error> = Box::new(cancelled.clone());
-        assert!(is_cancelled(boxed.as_ref()));
-        // Buried as the cause of another failure: that failure stands.
-        assert!(!is_cancelled(&pbfhogg::Error::external(cancelled)));
-        assert!(!is_cancelled(&platform()));
-        assert!(!is_platform_unsupported(&pbfhogg::Error::from(
-            io::Error::other("x")
-        )));
-    }
-}
+use crate::invoker::pbfhogg_bin;
 
 /// Write a minimal valid PBF file using the library API.
 fn write_minimal_pbf(path: &Path) {
@@ -579,7 +437,7 @@ fn cli_check_json_preserves_non_utf8_filename_lossily() {
 
 #[test]
 fn cli_osc_outputs_keep_legacy_transport_and_metadata() {
-    let dir = tempfile::tempdir_in(".").expect("directory");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osc");
     std::fs::write(&input, b"<osmChange version=\"0.6\"><create><node id=\"7\" lat=\"1\" lon=\"2\" timestamp=\"yesterday\" changeset=\"no\" uid=\"&#48;\" visible=\"False\"><tag k=\"name\" v=\"test\"/></node></create></osmChange>").expect("XML");
     for (command, gzip) in [("tags-filter", true), ("merge-changes", false)] {
@@ -616,7 +474,7 @@ fn cli_osc_outputs_keep_legacy_transport_and_metadata() {
 #[test]
 fn cli_merge_changes_non_utf8_gz_path_stays_plain() {
     use std::os::unix::ffi::OsStrExt;
-    let dir = tempfile::tempdir_in(".").expect("directory");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osc");
     std::fs::write(&input, b"<osmChange version=\"0.6\"></osmChange>").expect("XML");
     for simplify in [false, true] {
@@ -647,7 +505,7 @@ fn cli_merge_changes_non_utf8_gz_path_stays_plain() {
 #[cfg(unix)]
 #[test]
 fn cli_osc_counters_keep_historical_name_and_per_file_values() {
-    let dir = tempfile::tempdir_in(".").expect("directory");
+    let dir = crate::common::test_scratch();
     let input = dir.path().join("input.osc");
     let base = dir.path().join("base.pbf");
     write_minimal_sorted_pbf(&base);

@@ -15,7 +15,7 @@ release-mode failure mode is silent data corruption.
 
 When a new defensive check lands, a regression test exercising the
 malformation pattern lands in the same commit if feasible; otherwise
-the module doc of `tests/cli_defensive_input.rs` records the check as
+the module doc of `cli/tests/cli_defensive_input.rs` records the check as
 pending coverage, naming the byte-level fixture helper that would make
 the test writable.
 

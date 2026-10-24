@@ -368,7 +368,7 @@ no-op on negative ids, where osmium's equivalent paths abs-fold via
 - `tags-filter`'s parallel-classify path silently **drops**
   negative-id ways from the output, where osmium's `tags-filter`
   silently **abs-converts** them. Pinned as the current state by
-  `tests/cli_negative_id_invariants.rs::tags_filter_handles_mixed_sign_ids`.
+  `cli/tests/cli_negative_id_invariants.rs::tags_filter_handles_mixed_sign_ids`.
 - `add-locations-to-ways` silently **omits** relation-member
   retention for any relation member whose id is negative (the member
   id is dropped at `IdSet::set` time, so the write pass doesn't know

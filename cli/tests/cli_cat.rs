@@ -780,9 +780,18 @@ fn clean_timestamp_and_changeset() {
 fn clean_all_fields() {
     let c = cat_with_clean(&["version", "changeset", "timestamp", "uid", "user"]);
 
-    // Every cleanable field is zero / empty on every element type.
+    // A dense node with every field cleaned is version 0 with all-zero
+    // fields, which on the wire is indistinguishable from a metadata-less
+    // padding slot, so it reads back as no metadata (the product's dense
+    // presence rule, `DenseNodeInfo::claims`).
+    assert!(
+        c.nodes[0].meta.is_none(),
+        "an all-zero dense slot reads as no metadata"
+    );
+
+    // Every cleanable field is zero / empty on ways and relations, whose
+    // Info carries presence per field.
     for (what, meta) in [
-        ("node", c.nodes[0].meta.as_ref()),
         ("way", c.ways[0].meta.as_ref()),
         ("relation", c.relations[0].meta.as_ref()),
     ] {
@@ -1564,7 +1573,18 @@ fn ordered_elements(path: &Path) -> Vec<String> {
         for element in block.elements() {
             out.push(match element {
                 Element::DenseNode(n) => {
-                    let meta = n.info().filter(|i| i.version() != -1).map(|i| {
+                    // The product's presence rule (`DenseNodeInfo::claims`):
+                    // a padding slot (version 0, all zeros) is no metadata.
+                    let claims = |i: &pbfhogg::DenseNodeInfo<'_>| {
+                        i.claimed_version().is_some()
+                            || (i.version() == 0
+                                && (i.milli_timestamp() != 0
+                                    || i.changeset() > 0
+                                    || i.uid() > 0
+                                    || !i.user().unwrap_or("").is_empty()
+                                    || !i.visible()))
+                    };
+                    let meta = n.info().filter(|i| claims(i)).map(|i| {
                         (
                             i.version(),
                             i.milli_timestamp(),

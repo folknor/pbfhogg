@@ -1222,7 +1222,18 @@ fn meta_from_info(info: &pbfhogg::Info<'_>) -> Option<NormalizedMeta> {
 /// block is present (matching `commands::dense_node_metadata`).
 fn meta_from_dense_node(dn: &pbfhogg::DenseNode<'_>) -> Option<NormalizedMeta> {
     dn.info()
-        .filter(|i| i.version() != -1)
+        .filter(|i| {
+            // The product's presence rule (`DenseNodeInfo::claims`): version
+            // >= 1 claims metadata; version 0 only through a value padding
+            // never holds; below 0 is the "absent" sentinel.
+            i.claimed_version().is_some()
+                || (i.version() == 0
+                    && (i.milli_timestamp() != 0
+                        || i.changeset() > 0
+                        || i.uid() > 0
+                        || !i.user().unwrap_or("").is_empty()
+                        || !i.visible()))
+        })
         .map(|i| NormalizedMeta {
             version: i.version(),
             timestamp: i.milli_timestamp() / 1000,

@@ -41,6 +41,62 @@ behaviour; below that the work is progressively more contained.
 
 ---
 
+## Review once drained
+
+Not a finding: a standing list of changes made while draining this file and
+`notes/bugs.md` that need a thorough, independent review once both are
+drained (rule 8's measurement gate lifts at the same point). Rule 4's
+deletion waits on this list too: it is reviewed, or moved somewhere that
+outlives this file, before the file goes. Add to it whenever a drain change
+is a judgement call on a measured or deliberate path.
+
+The first drain round (commits `1db71d8a`, `9cce24b3`, `1dd2ea09`) was done
+by agents on items picked as "no-brainers". One pick was wrong: removing the
+unused `direct_io` parameters treated deliberate plumbing as dead code, and
+the one removal that landed (the parallel diff's `_direct_io`) was put back.
+That makes every other change in the round suspect of the same mistake -
+undoing something deliberate, or costing time or memory on a measured path -
+and none of it has been measured. A reviewer with no stake in the round's
+conclusions reads those commits against the code and history they changed
+and reports, per change, whether it undid a deliberate choice, and whether it
+can cost wall time, RAM or memory pressure.
+
+The judgement calls already known, to be checked first:
+
+- altw external's metadata scan refuses indexdata that overstates `max_id`
+  (as part of the new order check), reversing the tolerance commit
+  `2fabb026` built into stage 2's walk on purpose. Reviewed and kept by the
+  maintainer; the reason is in `scan_blob_metadata`'s doc.
+- The same scan refuses node blobs whose range holds negative IDs.
+- The `blob_body_within_file` checks in the classify builders were deleted
+  as unreachable behind `HeaderWalker`'s extent check, as was getparents'
+  duplicate.
+- The writer framing refactor (`frame_in_scratch`) moved the sync path's
+  entry trim inside `compress_ns` and an oversize `compress_buf` free ahead of
+  the write; argued allocation-neutral, not measured.
+- `write_primitive_block*` now take their permit through `acquire_permit`
+  before spawning, and the guard moves into the closure.
+- `EPERM` and `EINVAL` joined `EXDEV`, `ENOSYS` and `EOPNOTSUPP` in the
+  `copy_file_range` userspace-fallback set, with fstat and fcntl guards on
+  the cold path. Kept by the maintainer: targets that used to fail now
+  work, slower.
+- The io_uring CopyRange loop accepts a short pread as progress instead of
+  failing.
+- Two public APIs were added (`BlobReader::new_named`, a now-public
+  `Blob::locate_error`), and `blob_from_offset` reads after an earlier failed
+  read instead of reporting no blob.
+- `CliInvoker::child_limits` was deleted with the other unused builders, and
+  the docs that cited it reworded.
+- Degrade's sort-preservation guard now also checks `pending`, which was
+  argued always empty there.
+- altw external's `max_node_id_from_blob_meta` lost its reversed-range and
+  negative-`max_id` checks (and their tests) as unreachable behind the new
+  scan, and `build_node_blob_mapping` lost its reversed-range check.
+- The diff and derive delete and merge-stats helpers were merged to one owner
+  each across modules, argued inlining-neutral under fat LTO.
+
+---
+
 ## HYG-002 - Tunables are centralized but not injectable
 
 Anger: 10 - tunables, including POOL_SIZE, which was measured at 16.
@@ -1004,23 +1060,6 @@ unless an operator report makes a chunked check worth building first.
 
 Reported by: the cancellation work.
 
-## HYG-126 - The interruption table samples checkpoints, it does not cover each one
-
-Anger: 3 - test coverage.
-
-`cli/tests/cli_output_contract.rs` counts each output-writing command's
-checkpoints on a small fixture and interrupts it at a fixed number of evenly
-spread ordinals, asserting the exit code, no destination and no
-`.pbfhogg-*` entry. A checkpoint between two samples whose exit path leaks
-(a receiver kept alive past a scope, a guard moved out of reach) is not
-exercised, and the fixture's ordinals are not the planet's: a phase that
-has one checkpoint on the fixture may have thousands on real data. The
-library sweep in `tests/cancel.rs` covers every ordinal up to 64 and a
-spread of 64 beyond, and only for the commands it lists. Fix: run every ordinal for every row under the `full`
-profile (the table already knows the count), keeping the tier-1 sampling.
-
-Reported by: the cancellation work.
-
 ## HYG-130 - A quiet diff shards through scratch to discard the text
 
 Anger: 4 - CLI behaviour, small.
@@ -1122,56 +1161,4 @@ Worth doing only if a producer whose blocks fall in these shapes turns up
 and the normalisation matters to someone; otherwise it stays parked.
 
 Reported by: the BUG-113 implementation.
-
-## HYG-134 - The first hygiene drain round needs an independent review
-
-Anger: 6 - review only; what it finds may be anything.
-
-The first round of draining this file and `notes/bugs.md` (commits `1db71d8a`,
-`9cce24b3`, `1dd2ea09`) was done by agents on items picked as "no-brainers".
-One pick was wrong: removing the unused `direct_io` parameters treated
-deliberate plumbing as dead code, and the one removal that landed (the
-parallel diff's `_direct_io`) was put back. That makes every other change in
-the round suspect of the same mistake - undoing something deliberate, or
-costing time or memory on a measured path - and none of it has been
-measured. A reviewer with no stake in the round's conclusions reads those
-commits against the code and history they
-changed and reports, per change, whether it undid a deliberate choice, and
-whether it can cost wall time, RAM or memory pressure.
-
-The judgement calls the round already knows it made, to be checked first:
-
-- altw external's metadata scan refuses indexdata that overstates `max_id`
-  (as part of the new order check), reversing the tolerance commit
-  `2fabb026` built into stage 2's walk on purpose. Reviewed and kept by the
-  maintainer; the reason is in `scan_blob_metadata`'s doc.
-- The same scan refuses node blobs whose range holds negative IDs.
-- The `blob_body_within_file` checks in the classify builders were deleted
-  as unreachable behind `HeaderWalker`'s extent check, as was getparents'
-  duplicate.
-- The writer framing refactor (`frame_in_scratch`) moved the sync path's
-  entry trim inside `compress_ns` and an oversize `compress_buf` free ahead of
-  the write; argued allocation-neutral, not measured.
-- `write_primitive_block*` now take their permit through `acquire_permit`
-  before spawning, and the guard moves into the closure.
-- `EPERM` and `EINVAL` joined `EXDEV`, `ENOSYS` and `EOPNOTSUPP` in the
-  `copy_file_range` userspace-fallback set, with fstat and fcntl guards on
-  the cold path. Kept by the maintainer: targets that used to fail now
-  work, slower.
-- The io_uring CopyRange loop accepts a short pread as progress instead of
-  failing.
-- Two public APIs were added (`BlobReader::new_named`, a now-public
-  `Blob::locate_error`), and `blob_from_offset` reads after an earlier failed
-  read instead of reporting no blob.
-- `CliInvoker::child_limits` was deleted with the other unused builders, and
-  the docs that cited it reworded.
-- Degrade's sort-preservation guard now also checks `pending`, which was
-  argued always empty there.
-- altw external's `max_node_id_from_blob_meta` lost its reversed-range and
-  negative-`max_id` checks (and their tests) as unreachable behind the new
-  scan, and `build_node_blob_mapping` lost its reversed-range check.
-- The diff and derive delete and merge-stats helpers were merged to one owner
-  each across modules, argued inlining-neutral under fat LTO.
-
-Reported by: the maintainer, after the `direct_io` removal.
 

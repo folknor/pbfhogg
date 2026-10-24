@@ -320,8 +320,11 @@ exception, not a tier - should not survive across many PRs.
   `stuck` writes `<ready file>.ack` once tripped and never returns, so only
   a second signal ends the run. The interruption tests in
   `cli/tests/cli_output_contract.rs` count a command's checkpoints, park it at
-  sampled ordinals, signal it, and assert the exit code and an empty
-  directory, with no sleeps. `CliInvoker::spawn` returns a `RunningCli`
+  sampled ordinals (tier 1) or at every ordinal of the counting run (its
+  `tier3` shards, run by `--profile full` and the gate), signal it, and
+  assert the exit code and an empty directory, with no sleeps. Ordinals are
+  positions, not sites, and the fixture's counts are not real data's, so
+  neither sweep proves every checkpoint site of a planet run unwinds. `CliInvoker::spawn` returns a `RunningCli`
   that can be signalled and is killed on drop.
 - **CliInvoker for CLI-driven tests.** `cli/tests/invoker.rs`. Every
   new `cli/tests/cli_*.rs` goes through it. Default wall-clock timeout

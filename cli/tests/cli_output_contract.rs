@@ -1310,9 +1310,14 @@ fn quiet_streams(row: &Row, out: &CliOutput, reference: &CliOutput) -> Result<()
 /// Run one property over every row it applies to, collect every violation,
 /// and honour the known-gap markers in both directions.
 fn run_property(prop: Prop, check: Check, applies: fn(&Row) -> bool) {
+    run_property_on(prop, check, ROWS.iter().filter(|row| applies(row)));
+}
+
+/// [`run_property`] over an explicit selection of rows.
+fn run_property_on<'a>(prop: Prop, check: Check, rows: impl Iterator<Item = &'a Row>) {
     let fx = Fx::new();
     let mut failures = Vec::new();
-    for row in ROWS.iter().filter(|row| applies(row)) {
+    for row in rows {
         let verdict = check(&fx, row);
         let gap = row.gaps.iter().find(|(p, _)| *p == prop);
         match (verdict, gap) {
@@ -1454,8 +1459,9 @@ fn a_quiet_run_prints_only_warnings_and_writes_the_same_outputs() {
 // cancellation checkpoint writes `<file>` and parks until the token trips.
 // The test waits for the file, looks at what exists, sends the signal, and
 // checks what is left. A counting run (`PBFHOGG_TEST_CANCEL_COUNT`) first
-// learns how many checkpoints a run of the row passes, and the sweep pauses
-// at ordinal positions spread over that range. Ordinals are positions, not
+// learns how many checkpoints a run of the row passes, and the tier-1 sweep
+// pauses at ordinal positions spread over that range (`mod tier3` pauses at
+// every one of them). Ordinals are positions, not
 // sites: which checkpoint is the k-th varies with scheduling, so the claim is
 // that every pause, wherever it lands, unwinds cleanly - and the sweep must
 // have observed populated staging (and, for scratch-writing rows, a scratch
@@ -1787,6 +1793,104 @@ fn interrupted_run_leaves_nothing(fx: &Fx, row: &Row) -> Result<(), String> {
 #[test]
 fn an_interrupted_run_publishes_nothing_and_leaves_nothing() {
     run_property(Prop::Interrupted, interrupted_run_leaves_nothing, |_| true);
+}
+
+/// Every row, a pause at every ordinal of its counting run rather than a
+/// sample: a checkpoint between two tier-1 samples whose exit path leaks (a
+/// receiver kept alive past a scope, a guard moved out of reach) is caught
+/// here. Each ordinal gets one signal, alternating SIGINT and SIGTERM; both
+/// go through the same cancellation, and the replace path and the
+/// observed-staging and observed-scratch requirements stay with the tier-1
+/// sweep.
+///
+/// What this does not cover. "Every ordinal" is not "every site": which
+/// checkpoint is the k-th varies with scheduling, and a paused run may pass
+/// fewer checkpoints than the counting run did, so a pause can find the run
+/// already finished. Such a run had no k-th checkpoint to interrupt, but the
+/// k-th checkpoint of runs that do have one goes untested; those ordinals
+/// are reported, not failed, because independent runs need not agree on
+/// their counts. And the fixture's ordinals are not real data's: a phase
+/// with one checkpoint here may pass thousands on a planet, which no
+/// in-tree fixture reproduces.
+#[cfg(feature = "test-hooks")]
+fn every_ordinal_unwinds(fx: &Fx, row: &Row) -> Result<(), String> {
+    use interrupted::{checkpoint_count, interrupt_at};
+    let count = checkpoint_count(fx, row)?;
+    let mut failures = Vec::new();
+    let mut completed = Vec::new();
+    // No early return: a known gap must not hide the ordinals after the
+    // first failing one, so the row's verdict is taken over all of them.
+    for k in 1..=count {
+        let signal = if k % 2 == 1 {
+            libc::SIGINT
+        } else {
+            libc::SIGTERM
+        };
+        match interrupt_at(fx, row, k, signal, false) {
+            Ok(seen) if seen.completed => completed.push(k),
+            Ok(_) => {}
+            Err(why) => failures.push(why),
+        }
+    }
+    let finished = if completed.is_empty() {
+        String::new()
+    } else {
+        format!("; the run finished before the pause at {completed:?}")
+    };
+    ensure!(
+        failures.is_empty(),
+        "{} of {count} ordinals failed{finished}:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    ensure!(
+        completed.len() < usize::try_from(count).unwrap_or(usize::MAX),
+        "no pause landed before the run completed ({count} checkpoints counted)"
+    );
+    if !completed.is_empty() {
+        eprintln!("[{}] {count} checkpoints counted{finished}", row.label);
+    }
+    Ok(())
+}
+
+/// The exhaustive sweep, split so each test stays well inside the check
+/// watchdog. Rows are dealt to shards by their index in [`ROWS`], so a new
+/// row is covered without touching this module.
+#[cfg(feature = "test-hooks")]
+mod tier3 {
+    use super::*;
+
+    fn shard(n: usize, of: usize) {
+        run_property_on(
+            Prop::Interrupted,
+            every_ordinal_unwinds,
+            ROWS.iter()
+                .enumerate()
+                .filter(|(i, _)| i % of == n)
+                .map(|(_, row)| row),
+        );
+    }
+
+    /// One test per listed shard; the shard count is the length of the
+    /// list, so the two cannot drift apart.
+    macro_rules! shards {
+        ($($name:ident = $n:literal),* $(,)?) => {
+            const SHARDS: usize = [$($n),*].len();
+            $(
+                #[test]
+                fn $name() {
+                    shard($n, SHARDS);
+                }
+            )*
+        };
+    }
+
+    shards! {
+        an_interrupt_at_every_checkpoint_unwinds_shard_0 = 0,
+        an_interrupt_at_every_checkpoint_unwinds_shard_1 = 1,
+        an_interrupt_at_every_checkpoint_unwinds_shard_2 = 2,
+        an_interrupt_at_every_checkpoint_unwinds_shard_3 = 3,
+    }
 }
 
 /// A second signal while the first is still being acted on exits at once,

@@ -672,7 +672,7 @@ fn diff_stats_matches_text_diff_on_every_path() {
                     "{label}, filter {type_filter:?}, -j {jobs}: diff_stats disagrees with diff"
                 );
                 // The corrupt blob is the last one, a relation blob, so only
-                // an unfiltered run is bound to read it.
+                // a run selecting relations is bound to decode it.
                 if label == "identical corrupt" && type_filter.is_none() {
                     assert!(
                         text.is_err(),
@@ -742,7 +742,8 @@ fn write_diff_stats_fixtures(dir: &Path) {
 /// A type filter that excludes a kind ahead of an enabled one answers the
 /// same on every path: the sequential block-pair merge (`-j 1`, verbose,
 /// and every negative-ID run) skips the excluded kind's blobs, the parallel
-/// path never reads them, and the unindexed stream drains them by decoding.
+/// path never reads them, and the unindexed stream decodes them to classify
+/// them and drops them unconverted.
 /// The sequential merge used to start the later phase on the excluded
 /// kind's first blob and refuse every such run as unsorted. The answer is
 /// also pinned to the single-kind runs, which skip nothing.

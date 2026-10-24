@@ -118,6 +118,31 @@ The judgement calls already known, to be checked first:
   refusal, as the alias check does for every other command; the directory
   rule deliberately allows a path that only passes through a symlinked
   directory inside the output.
+- Diff's input checks were made path-independent (the sequential blob
+  order and tail fixes). Judgement calls on measured paths:
+  - `BlobReader::next` is now `next_frame` plus `RawFrame::into_blob`, on
+    every sequential read in the crate; the envelope parse is unchanged but
+    page-cache eviction now runs before it rather than after. Argued
+    cost-neutral, not measured.
+  - `OrderWatermark` (shared by the diff guard, apply-changes' output guard
+    and altw external's metadata scan) takes a mixed-sign range's first
+    element as `min_id` rather than 0, so it accepts valid mixed-sign
+    layouts it used to refuse; it can no longer certify order inside such a
+    range.
+  - The sequential block-pair merge runs the order guard on every blob it
+    reads and, under a filter excluding the trailing kinds, walks the rest
+    of both files' headers with a `HeaderWalker` (a pread per remaining
+    blob, nothing for unfiltered runs).
+  - The unindexed element stream now checks element order per converted
+    element (one key compare), classifies each block not of the phase's
+    kind by iterating its elements, and drops excluded kinds' blocks
+    without converting them; it still decompresses every block of both
+    files, deliberately, since that is what refuses a misplaced block.
+    Expected faster under `--type`, slightly slower per element otherwise;
+    not measured.
+  - `WireBlobHeader::parse` refuses a known field with the wrong wire type
+    under every retention flag, so a header some read paths used to accept
+    is refused everywhere.
 
 ---
 
@@ -276,8 +301,14 @@ for indexed inputs and the sequential paths run only under `--verbose` or
 they cannot see: the sequential merge (`osc/merge_join.rs`) decides a blob's
 leftover tail from what its iterator saw, the parallel copies from indexdata
 `max_id`, so an understated `max_id` could drop a tail on the parallel path
-only (within `shard.rs`'s "index claims are trusted" contract). Fix: one
-shared shard core.
+only (within `shard.rs`'s "index claims are trusted" contract). A second:
+the parallel copies have no byte-equal fast path, so they decode every
+selected blob where the sequential merge skips a byte-identical pair under
+`-c` and `--format osc`. That is a refusal difference (a corrupt body inside
+an identical pair passes `-j 1` and fails `-j N`; `diff`'s input-checks
+paragraph in both CLI references states it) and a likely cost on the
+default path for inputs that share blobs, such as an `apply-changes` output
+against its base. Fix: one shared shard core.
 
 Reported by: re-encoding.
 
@@ -1047,33 +1078,3 @@ Worth doing only if a producer whose blocks fall in these shapes turns up
 and the normalisation matters to someone; otherwise it stays parked.
 
 Reported by: the BUG-113 implementation.
-
-## HYG-144 - Diff's paths refuse different malformed inputs
-
-Anger: 8 - closing the gaps costs I/O on measured paths that work today.
-
-Nothing promises that `diff -j 1` and `-j N` refuse the same malformed files,
-and they do not. The parallel path walks every blob header up front; the
-sequential block-pair merge never visits kinds after the last enabled one
-(`-t node`), so a truncated tail or missing indexdata there is refused only
-at `-j` above 1, even on negative-ID inputs. Excluded kinds before an enabled
-one are skipped by header (`skip_phase`), so their within-kind order goes
-unchecked on that path. A broken envelope on the first blob of the next kind
-is caught only by `-j 1`, whose lookahead parses it. Either state the
-divergence as accepted where diff's input contract is documented, or decide
-which checks every path owes.
-
-Reported by: the BUG-138 fix.
-
-## HYG-145 - The unindexed diff decodes kinds the filter excludes
-
-Anger: 9 - measured path; skipping also stops refusals of corrupt data in
-the skipped kinds.
-
-`diff_element_stream` fully decodes excluded kinds even after the last
-enabled one, so `diff -t node` on unindexed inputs decodes every way and
-relation for nothing. Stopping after the last enabled kind (or skipping
-excluded blobs undecoded) removes the work, but those kinds' corrupt data
-would no longer be refused, which ties into HYG-144.
-
-Reported by: the BUG-138 fix.

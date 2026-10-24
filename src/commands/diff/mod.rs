@@ -34,7 +34,7 @@ use crate::ElementKind;
 use crate::coord_fmt::{format_coord, from_decimicro};
 use crate::osc::merge_join::{
     BlockMergeAction, BlockPairMergeState, MergeJoinAction, MergeJoinElement, StreamingBlocks,
-    block_pair_merge_phase, merge_join_phase, skip_phase,
+    block_pair_merge_phase, merge_join_phase, skip_phase, verify_rest,
 };
 use crate::osc::write::{OwnedMember, OwnedNode, OwnedRelation, OwnedWay};
 use crate::owned::TypeFilter;
@@ -473,8 +473,9 @@ fn diff_block_pair<W: Write>(
     ];
 
     // An excluded kind ahead of an enabled one is skipped undecoded, so the
-    // later phase starts at its own first blob; see `skip_phase`. An
-    // excluded kind after the last enabled one is never read at all.
+    // later phase starts at its own first blob; see `skip_phase`. Excluded
+    // kinds after the last enabled one get a header-only walk, `verify_rest`,
+    // after the loop.
     let last_enabled = phases.iter().rposition(|&(_, enabled, _)| enabled);
     for (i, (kind, enabled, tag)) in phases.into_iter().enumerate() {
         if !enabled {
@@ -565,6 +566,12 @@ fn diff_block_pair<W: Write>(
         crate::debug::emit_marker(&end_marker);
     }
 
+    // The structure the parallel path's header walk checks over the whole
+    // of both files, checked here for the part no phase read.
+    if last_enabled.is_none_or(|last| last + 1 < phases.len()) {
+        verify_rest(&mut merge, host)?;
+    }
+
     emit_merge_stats_counters(&merge.stats);
     Ok(stats)
 }
@@ -639,7 +646,7 @@ fn diff_element_stream<W: Write>(
         )?;
         crate::debug::emit_marker("DIFF_PHASE_NODE_END");
     } else {
-        drain_phase::<OwnedNode>(&mut old_src, &mut new_src)?;
+        skip_kind(&mut old_src, &mut new_src, ElementKind::Node)?;
     }
 
     if filter.ways {
@@ -660,7 +667,7 @@ fn diff_element_stream<W: Write>(
         )?;
         crate::debug::emit_marker("DIFF_PHASE_WAY_END");
     } else {
-        drain_phase::<OwnedWay>(&mut old_src, &mut new_src)?;
+        skip_kind(&mut old_src, &mut new_src, ElementKind::Way)?;
     }
 
     if filter.relations {
@@ -681,7 +688,7 @@ fn diff_element_stream<W: Write>(
         )?;
         crate::debug::emit_marker("DIFF_PHASE_REL_END");
     } else {
-        drain_phase::<OwnedRelation>(&mut old_src, &mut new_src)?;
+        skip_kind(&mut old_src, &mut new_src, ElementKind::Relation)?;
     }
 
     Ok(stats)
@@ -749,17 +756,19 @@ fn run_diff_phase<T: MergeJoinElement + DiffMeta>(
     })
 }
 
-/// Drain remaining elements of type `T` from both cursors without processing.
-///
-/// Called to advance past a skipped phase (e.g. when type_filter excludes
-/// nodes) so the cursors are positioned for the next phase.
-fn drain_phase<T: MergeJoinElement>(
+/// Advance both cursors past a kind the type filter excludes, wherever it
+/// sits: before a selected kind, so the next phase starts at its own first
+/// block, or after the last one, so a misplaced block of a selected kind in
+/// the tail is refused rather than left unread. Excluded blocks are
+/// classified and dropped without converting their elements; see
+/// [`StreamingBlocks::skip_kind`] for what that does and does not check.
+fn skip_kind(
     old_src: &mut StreamingBlocks,
     new_src: &mut StreamingBlocks,
+    kind: ElementKind,
 ) -> Result<()> {
-    merge_join_phase::<T>(old_src, &mut Vec::new(), new_src, &mut Vec::new(), |_| {
-        Ok(())
-    })
+    old_src.skip_kind(kind)?;
+    new_src.skip_kind(kind)
 }
 
 // ---------------------------------------------------------------------------

@@ -10,11 +10,12 @@
 //! the merge cannot take the stamp as proof.
 //!
 //! The two `diff` paths reach the same conclusion by different routes. The
-//! SEQUENTIAL path (`-j 1`) discovers the disorder structurally, while
-//! walking blobs in file order. The PARALLEL path buckets blobs by kind in
-//! `walk_file` before any ordering is examined, so file order never reaches
-//! its planner; it needs an explicit guard at the walk, which is what
-//! `BlobOrderGuard` is.
+//! SEQUENTIAL path (`-j 1`) runs `BlobOrderGuard` on each blob as it reads
+//! it, and walks the headers of a tail its phases never read. The PARALLEL
+//! path buckets blobs by kind in `walk_file`, so file order never reaches its
+//! planner; it runs the same guard at the walk, before bucketing. The
+//! unindexed element stream, which has no blob ranges, classifies every
+//! block by its elements and checks element order as it converts.
 //!
 //! Every rejection test here therefore runs at BOTH `-j 1` and the default
 //! `-j`. That is load-bearing, not thoroughness: this divergence is how the
@@ -56,6 +57,29 @@ fn write_blobs(path: &Path, blobs: &[Blob]) {
         pbfhogg::host::Executor::Ambient,
     )
     .expect("create writer");
+    fill_blobs(blobs, |bytes| {
+        writer.write_primitive_block(bytes).expect("write block");
+    });
+    writer.flush().expect("flush");
+}
+
+/// [`write_blobs`] without indexdata on any data blob, so `diff` takes the
+/// unindexed element stream.
+fn write_blobs_unindexed(path: &Path, blobs: &[Blob]) {
+    let header = HeaderBuilder::new().sorted().build().expect("build header");
+    let file = std::fs::File::create(path).expect("create fixture");
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    writer.write_header(&header).expect("write header");
+    fill_blobs(blobs, |bytes| {
+        writer
+            .write_primitive_block_no_indexdata(bytes)
+            .expect("write block");
+    });
+    writer.flush().expect("flush");
+}
+
+/// Encode each entry of `blobs` as one block and hand it to `write`.
+fn fill_blobs(blobs: &[Blob], mut write: impl FnMut(&[u8])) {
     let mut bb = BlockBuilder::new();
 
     for blob in blobs {
@@ -84,25 +108,51 @@ fn write_blobs(path: &Path, blobs: &[Blob]) {
         // One `take()` per entry in `blobs` - this is what puts each group
         // in its own blob, in the order given.
         if let Some(bytes) = bb.take().expect("take") {
-            writer.write_primitive_block(bytes).expect("write block");
+            write(bytes);
         }
     }
-
-    writer.flush().expect("flush");
 }
 
 /// Run `pbfhogg diff` at an explicit job count and return (exit code,
 /// stderr). `jobs` is always spelled out: see the module doc for why a
 /// default-`-j`-only test proved nothing here.
 fn run_diff_jobs(old: &Path, new: &Path, jobs: &str) -> (Option<i32>, String) {
-    let out = CliInvoker::new()
+    run_diff_args(old, new, jobs, &[])
+}
+
+/// [`run_diff_jobs`] with extra arguments (a type filter).
+fn run_diff_args(old: &Path, new: &Path, jobs: &str, args: &[&str]) -> (Option<i32>, String) {
+    let mut invoker = CliInvoker::new()
         .arg("diff")
         .arg(old)
         .arg(new)
         .arg("-j")
-        .arg(jobs)
-        .run();
+        .arg(jobs);
+    for arg in args {
+        invoker = invoker.arg(arg);
+    }
+    let out = invoker.run();
     (out.status.code(), out.stderr_str())
+}
+
+/// Assert `diff` with `args` exits `code` at `-j 1` and `-j 4`, the
+/// sequential and the parallel path (an unindexed or negative-ID input runs
+/// the sequential path at both), with `needle` in stderr when given.
+fn assert_both_paths(old: &Path, new: &Path, args: &[&str], code: i32, needle: Option<&str>) {
+    for jobs in ["1", "4"] {
+        let (got, stderr) = run_diff_args(old, new, jobs, args);
+        assert_eq!(
+            got,
+            Some(code),
+            "-j {jobs} {args:?}: expected exit {code}; stderr:\n{stderr}"
+        );
+        if let Some(needle) = needle {
+            assert!(
+                stderr.contains(needle),
+                "-j {jobs} {args:?}: expected {needle:?} in stderr; got:\n{stderr}"
+            );
+        }
+    }
 }
 
 /// Sequential path only, for the assertions that name a
@@ -254,10 +304,10 @@ fn understated_max_id_is_rejected_not_silently_truncated() {
 
 /// A same-kind ID regression, which is the layout `degrade --unsort`
 /// actually produces: two adjacent node blobs whose ID spans go backwards.
-/// The sequential merge sees only kind transitions, so it cannot notice
-/// this one at all - the parallel planner is the path that must, because an
-/// unsorted per-kind list breaks the binary searches its sharding is built
-/// on.
+/// The sequential merge used to see only kind transitions and answered
+/// wrongly here - against a correctly ordered file with the same elements it
+/// reported the backwards blob's elements as created and deleted - while the
+/// parallel planner refused the file. Both run the blob order guard now.
 #[test]
 fn backwards_id_spans_within_one_kind_are_rejected() {
     let dir = crate::common::test_scratch();
@@ -268,16 +318,373 @@ fn backwards_id_spans_within_one_kind_are_rejected() {
     // Same elements, blobs swapped: 3..4 then 1..2, still stamped sorted.
     write_blobs(&liar, &[Blob::Nodes(&[3, 4]), Blob::Nodes(&[1, 2])]);
 
-    let (code, stderr) = run_diff_jobs(&honest, &liar, "4");
-    assert_eq!(
-        code,
-        Some(2),
-        "backwards ID spans within a kind must be refused; stderr:\n{stderr}"
+    assert_both_paths_refuse(&honest, &liar);
+    assert_both_paths_refuse(&liar, &honest);
+}
+
+/// The same regression inside a kind the type filter excludes: the
+/// sequential merge skips the excluded blobs by header, and still checks
+/// their order, as the parallel walk does.
+#[test]
+fn backwards_id_spans_in_an_excluded_kind_are_rejected() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    let liar = dir.path().join("liar.osm.pbf");
+
+    write_blobs(
+        &honest,
+        &[
+            Blob::Nodes(&[1, 2]),
+            Blob::Nodes(&[3, 4]),
+            Blob::Ways(&[100]),
+        ],
     );
+    write_blobs(
+        &liar,
+        &[
+            Blob::Nodes(&[3, 4]),
+            Blob::Nodes(&[1, 2]),
+            Blob::Ways(&[100]),
+        ],
+    );
+
+    assert_both_paths(
+        &liar,
+        &honest,
+        &["-t", "way"],
+        2,
+        Some("blobs are not in canonical order"),
+    );
+}
+
+/// Negative IDs order 0, -1, -2, ..., then 1, 2, ..., so a blob holding -2
+/// and 1 legitimately follows a blob holding -1. Its numeric range
+/// `[-2, 1]` proves only that it holds -2 and 1; an order check that took
+/// 0 as its first element refused this valid layout.
+#[test]
+fn valid_mixed_sign_blob_layouts_are_accepted() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+
+    write_blobs(&old, &[Blob::Nodes(&[-1]), Blob::Nodes(&[-2, 1])]);
+    write_blobs(&new, &[Blob::Nodes(&[-1, -2]), Blob::Nodes(&[1])]);
+
+    assert_both_paths(&old, &new, &[], 0, Some("Files are identical"));
+    assert_both_paths(&new, &old, &[], 0, Some("Files are identical"));
+}
+
+/// The same order check guards what `apply-changes` writes under its sorted
+/// header. It took 0 as the first element of the `[-2, 1]` blob and refused
+/// to write this valid base back out, even with an empty change file.
+#[test]
+fn apply_changes_writes_a_valid_mixed_sign_layout() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("empty.osc.gz");
+    let out = dir.path().join("out.osm.pbf");
+    write_blobs(&base, &[Blob::Nodes(&[-1]), Blob::Nodes(&[-2, 1])]);
+    crate::cli_apply_changes::write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6"></osmChange>"#,
+    );
+
+    let applied = CliInvoker::new()
+        .arg("apply-changes")
+        .arg(&base)
+        .arg(&osc)
+        .arg("-o")
+        .arg(&out)
+        .run();
     assert!(
-        stderr.contains("blobs are not in canonical order"),
-        "error should name the ordering problem; got:\n{stderr}"
+        applied.status.success(),
+        "apply-changes must write a valid mixed-sign layout; stderr:\n{}",
+        applied.stderr_str()
     );
+    assert_both_paths(&out, &base, &[], 0, Some("Files are identical"));
+}
+
+/// Frame `idx` of `bytes` with every byte of its Blob body set to 0xff,
+/// which no envelope parse accepts; the frame and its header stay intact.
+fn with_garbage_body(bytes: &[u8], idx: usize) -> Vec<u8> {
+    let frames = crate::common::adversarial::locate_blobs(bytes);
+    let frame = frames[idx];
+    let mut out = bytes.to_vec();
+    out[frame.blob_start..frame.blob_end].fill(0xff);
+    out
+}
+
+/// The structure of the tail after the last selected kind is checked on
+/// both paths: the parallel path walks every header up front, and the
+/// sequential merge, whose phases stop at the first blob after the last
+/// selected kind, walks the rest of the headers. `diff -t node` used to
+/// refuse these files only at `-j` above one.
+#[test]
+fn tail_after_the_last_selected_kind_is_checked_on_both_paths() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let layout = [
+        Blob::Nodes(&[1, 2]),
+        Blob::Ways(&[10]),
+        Blob::Ways(&[20]),
+        Blob::Relations(&[100]),
+    ];
+    write_blobs(&base, &layout);
+    let bytes = std::fs::read(&base).expect("read base");
+    // Frames: the header, a node blob, two way blobs, one relation blob.
+    assert_eq!(crate::common::adversarial::locate_blobs(&bytes).len(), 5);
+
+    let truncated = dir.path().join("truncated.osm.pbf");
+    std::fs::write(&truncated, &bytes[..bytes.len() - 5]).expect("write truncated");
+    let unindexed_tail = dir.path().join("unindexed-tail.osm.pbf");
+    std::fs::write(
+        &unindexed_tail,
+        crate::common::adversarial::mutate_blob_header_indexdata(&bytes, 3, Vec::clear),
+    )
+    .expect("write unindexed tail");
+    let backwards_tail = dir.path().join("backwards-tail.osm.pbf");
+    write_blobs(
+        &backwards_tail,
+        &[
+            Blob::Nodes(&[1, 2]),
+            Blob::Ways(&[20]),
+            Blob::Ways(&[10]),
+            Blob::Relations(&[100]),
+        ],
+    );
+
+    // Control: the intact file diffs clean against itself at every filter.
+    assert_both_paths(&base, &base, &["-t", "node"], 0, None);
+    assert_both_paths(&truncated, &base, &["-t", "node"], 2, Some("truncated"));
+    assert_both_paths(
+        &unindexed_tail,
+        &base,
+        &["-t", "node"],
+        2,
+        Some("indexdata"),
+    );
+    assert_both_paths(
+        &backwards_tail,
+        &base,
+        &["-t", "node"],
+        2,
+        Some("blobs are not in canonical order"),
+    );
+}
+
+/// No path interprets the body of an excluded kind's blob: the parallel path
+/// never reads it, and the sequential merge reads past it without parsing
+/// its envelope - including the first blob after the last selected kind,
+/// which the sequential merge reads to find where that kind ends and used to
+/// parse, so `-j 1` refused a malformed envelope there that `-j 4` never saw.
+#[test]
+fn excluded_kind_bodies_are_never_interpreted() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    write_blobs(
+        &base,
+        &[
+            Blob::Nodes(&[1, 2]),
+            Blob::Ways(&[10]),
+            Blob::Relations(&[100]),
+        ],
+    );
+    let bytes = std::fs::read(&base).expect("read base");
+    let bad_way = dir.path().join("bad-way.osm.pbf");
+    std::fs::write(&bad_way, with_garbage_body(&bytes, 2)).expect("write bad way");
+    let bad_node = dir.path().join("bad-node.osm.pbf");
+    std::fs::write(&bad_node, with_garbage_body(&bytes, 1)).expect("write bad node");
+
+    assert_both_paths(
+        &bad_way,
+        &base,
+        &["-t", "node"],
+        0,
+        Some("Files are identical"),
+    );
+    assert_both_paths(
+        &bad_way,
+        &base,
+        &["-t", "relation"],
+        0,
+        Some("Files are identical"),
+    );
+    assert_both_paths(
+        &bad_node,
+        &base,
+        &["-t", "way"],
+        0,
+        Some("Files are identical"),
+    );
+    // Selected, the same blob is refused.
+    assert_both_paths(&bad_way, &base, &["-t", "way"], 2, None);
+}
+
+/// Without indexdata a block's kind is known only once it is decoded. A
+/// node block after the ways used to be stashed by the way phase, stashed
+/// again by the relation phase, and dropped at the end: the diff answered
+/// without node 3. It is refused now, in every phase and whatever the type
+/// filter, because excluded kinds are classified to the end of the file
+/// rather than left unread.
+#[test]
+fn unindexed_block_of_an_earlier_kind_is_refused_not_dropped() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    let liar = dir.path().join("liar.osm.pbf");
+    write_blobs_unindexed(
+        &honest,
+        &[
+            Blob::Nodes(&[1, 2, 3]),
+            Blob::Ways(&[100]),
+            Blob::Relations(&[7]),
+        ],
+    );
+    write_blobs_unindexed(
+        &liar,
+        &[
+            Blob::Nodes(&[1, 2]),
+            Blob::Ways(&[100]),
+            Blob::Relations(&[7]),
+            Blob::Nodes(&[3]),
+        ],
+    );
+
+    for args in [
+        &[][..],
+        &["-t", "node"],
+        &["-t", "way"],
+        &["-t", "relation"],
+    ] {
+        assert_both_paths(
+            &liar,
+            &honest,
+            args,
+            2,
+            Some("blobs are not in canonical order"),
+        );
+    }
+    // Control: the honest file against itself.
+    assert_both_paths(
+        &honest,
+        &honest,
+        &["-t", "node"],
+        0,
+        Some("Files are identical"),
+    );
+}
+
+/// The unindexed stream has no blob ranges to check, so it checks element
+/// order as it converts: node blocks going backwards used to give the same
+/// wrong answer as the indexed sequential merge did.
+#[test]
+fn unindexed_elements_out_of_order_are_refused() {
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    let liar = dir.path().join("liar.osm.pbf");
+    write_blobs_unindexed(&honest, &[Blob::Nodes(&[1, 2]), Blob::Nodes(&[3, 4])]);
+    write_blobs_unindexed(&liar, &[Blob::Nodes(&[3, 4]), Blob::Nodes(&[1, 2])]);
+
+    assert_both_paths(
+        &liar,
+        &honest,
+        &[],
+        2,
+        Some("elements are not in canonical order"),
+    );
+    assert_both_paths(
+        &honest,
+        &liar,
+        &[],
+        2,
+        Some("elements are not in canonical order"),
+    );
+}
+
+/// The protobuf fields of `buf` as `(field number, wire type, whole field,
+/// value)` byte ranges; only the varint and length-delimited wire types,
+/// which is all a `PrimitiveBlock` written by `BlockBuilder` holds.
+fn proto_fields(buf: &[u8]) -> Vec<(u64, u64, std::ops::Range<usize>, std::ops::Range<usize>)> {
+    use crate::common::adversarial::read_varint;
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < buf.len() {
+        let start = pos;
+        let (tag, n) = read_varint(&buf[pos..]).expect("tag");
+        pos += n;
+        let (field, wire) = (tag >> 3, tag & 7);
+        let value = match wire {
+            0 => {
+                let (_, n) = read_varint(&buf[pos..]).expect("varint");
+                pos..pos + n
+            }
+            2 => {
+                let (len, n) = read_varint(&buf[pos..]).expect("length");
+                let begin = pos + n;
+                begin..begin + usize::try_from(len).expect("length fits")
+            }
+            other => panic!("unexpected wire type {other} in a fixture block"),
+        };
+        pos = value.end;
+        out.push((field, wire, start..pos, value));
+    }
+    out
+}
+
+/// A block's group classification reads only the first field of each
+/// group, so a group holding a way and then a node is a "way block" by its
+/// type while its elements are a node and a way. Skipping an excluded kind
+/// by that classification would drop the node with the way; the skip
+/// classifies by the elements instead and refuses the block.
+#[test]
+fn unindexed_group_hiding_another_kind_is_refused() {
+    use crate::common::adversarial::{locate_blobs, mutate_blob_payload, write_varint};
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    write_blobs_unindexed(&base, &[Blob::Nodes(&[2]), Blob::Ways(&[10])]);
+    let bytes = std::fs::read(&base).expect("read base");
+    assert_eq!(
+        locate_blobs(&bytes).len(),
+        3,
+        "header, node block, way block"
+    );
+
+    // The node block's group content (one DenseNodes field).
+    let mut node_group = Vec::new();
+    mutate_blob_payload(&bytes, 1, |payload| {
+        let group = proto_fields(payload)
+            .into_iter()
+            .find(|f| f.0 == 2)
+            .expect("node block group");
+        node_group = payload[group.3].to_vec();
+    });
+    // The way block with that content appended to its group, after the way.
+    let hybrid = mutate_blob_payload(&bytes, 2, |payload| {
+        let mut out = Vec::new();
+        for (field, _, whole, value) in proto_fields(payload) {
+            if field == 2 {
+                let mut group = payload[value].to_vec();
+                group.extend_from_slice(&node_group);
+                out.push(0x12);
+                write_varint(&mut out, u64::try_from(group.len()).expect("length fits"));
+                out.extend_from_slice(&group);
+            } else {
+                out.extend_from_slice(&payload[whole]);
+            }
+        }
+        *payload = out;
+    });
+    let frames = locate_blobs(&hybrid);
+    let mut spliced = bytes[..frames[1].frame_start].to_vec();
+    spliced.extend_from_slice(&hybrid[frames[2].frame_start..frames[2].blob_end]);
+    let hidden = dir.path().join("hidden.osm.pbf");
+    std::fs::write(&hidden, spliced).expect("write hidden");
+
+    let honest = dir.path().join("honest.osm.pbf");
+    write_blobs_unindexed(&honest, &[Blob::Nodes(&[2]), Blob::Ways(&[10])]);
+    for args in [&["-t", "node"][..], &["-t", "way"], &["-t", "relation"]] {
+        assert_both_paths(&hidden, &honest, args, 2, Some("mixed-type block"));
+    }
 }
 
 /// Non-regression: honestly-sorted multi-blob files still diff cleanly, and -

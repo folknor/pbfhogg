@@ -14,11 +14,26 @@
 //!   negative. [`walk_pair`] therefore returns `None` when either file holds
 //!   a blob whose `min_id` is negative, and the caller runs the sequential
 //!   block-pair merge for the whole comparison instead. The order guard is
-//!   not consulted for such a file: its numeric-range keys are conservative
-//!   for mixed-sign blobs and would reject valid layouts.
+//!   not consulted for such a file here: the sequential merge runs the same
+//!   guard over every blob of both files as it reads them, so the verdict
+//!   does not depend on which path saw the file first.
 //! - **Blobs in canonical order.** [`walk_pair`] runs `BlobOrderGuard` over
 //!   each file in file order before bucketing by kind, so the per-kind lists
 //!   ascend and the planner's binary-search-style scans are well defined.
+//!   The guard refuses disorder the indexdata ranges prove; within a blob,
+//!   and inside a mixed-sign range, order is trusted.
+//! - **The same structural refusals as the sequential merge.** Both paths
+//!   check framing, indexdata on every data blob and blob order over the
+//!   whole of both files, whatever the type filter (the sequential merge
+//!   walks the headers of a tail its phases never read), and neither
+//!   interprets the body of an excluded kind's blob. Checks on the bodies of
+//!   selected kinds are not identical: the sequential merge does not decode
+//!   a byte-identical blob pair when it may skip equal blobs (`-c` and
+//!   `--format osc`), so a corrupt body inside such a pair passes there
+//!   while these drivers, which decode every selected blob, refuse it; and
+//!   these drivers decide a block's leftover tail from its claimed `max_id`
+//!   where the sequential merge checks the claim against what the block
+//!   holds.
 //! - **Shard upper bounds are old-side blob maxima.** With strictly ordered
 //!   input no old blob straddles a threshold, so every old element falls in
 //!   exactly one shard window, and new blobs that straddle are read by each

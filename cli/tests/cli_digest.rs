@@ -574,11 +574,14 @@ fn empty_dense_block_between_kinds_loses_nothing() {
     assert_eq!(digest_ok(&with), digest_ok(&without));
 }
 
-/// The negative-ID fallback covers the whole comparison: an order-guard
-/// error on one side must not preempt a negative ID on the other, or `-j`
-/// changes the answer.
+/// A negative ID on one side sends the whole comparison to the sequential
+/// merge at any `-j`, and the other side's backwards node blobs (`[2]` then
+/// `[1]`) are refused there just as the parallel walk refuses them, so the
+/// verdict does not depend on `-j`. The sequential merge used to see only
+/// kind transitions and answered with a diff here, which is why the parallel
+/// walk had to decide the fallback before its own order check.
 #[test]
-fn negative_fallback_is_decided_before_either_order_check() {
+fn negative_fallback_refuses_the_same_disorder_at_every_job_count() {
     let dir = crate::common::test_scratch();
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
@@ -591,8 +594,8 @@ fn negative_fallback_is_decided_before_either_order_check() {
     );
     write_test_pbf_sorted(&new, &[node(-1, 0, 0, vec![])], &[], &[]);
 
-    assert_eq!(diff_code(&old, &new, Some(1)), Some(1));
-    assert_eq!(diff_code(&old, &new, Some(2)), Some(1));
+    assert_eq!(diff_code(&old, &new, Some(1)), Some(2));
+    assert_eq!(diff_code(&old, &new, Some(2)), Some(2));
 }
 
 /// `i64::MIN` and `-i64::MAX` used to share a sort key, so the merge-join

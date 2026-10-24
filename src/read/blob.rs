@@ -150,6 +150,13 @@ impl Blob {
         self.offset
     }
 
+    /// The blob's 0-based index in its stream, when the reader could count;
+    /// the ordinal [`Blob::locate_error`] stamps.
+    #[inline]
+    pub(crate) fn blob_index(&self) -> Option<u64> {
+        self.blob_index
+    }
+
     /// Raw way-member bitmap from BlobHeader field 5 (`pbfhogg.WayMembers-v1`).
     /// The version byte and encoded way count are validated and stripped.
     /// Returns `None` when absent, parsing was disabled, or the payload is malformed.
@@ -933,11 +940,71 @@ impl BlobReader<FileReader> {
     }
 }
 
-impl<R: Read + Send> Iterator for BlobReader<R> {
-    type Item = Result<Blob>;
+/// One frame read in full - length prefix, `BlobHeader` and body bytes - with
+/// the body's `Blob` envelope not yet parsed.
+///
+/// For a consumer that classifies a blob by its header and has no use for
+/// some blobs' bodies: it reads past them without interpreting a byte of
+/// them, which is what lets the sequential block-pair merge treat an
+/// excluded kind's blobs exactly as the header walk of the parallel path
+/// does. [`RawFrame::into_blob`] parses the envelope with the failure
+/// located where [`BlobReader`]'s iterator would have located it.
+pub(crate) struct RawFrame {
+    header: WireBlobHeader,
+    body: Bytes,
+    /// Frame start.
+    offset: Option<ByteOffset>,
+    /// Body start: where an envelope failure is located.
+    body_offset: Option<ByteOffset>,
+    blob_index: Option<u64>,
+}
 
+impl RawFrame {
+    pub(crate) fn is_osm_data(&self) -> bool {
+        matches!(self.header.blob_type, BlobKind::OsmData)
+    }
+
+    /// The header's indexdata, as [`Blob::index`] reads it.
+    pub(crate) fn index(&self) -> Option<crate::blob_meta::BlobIndex> {
+        self.header
+            .indexdata
+            .as_ref()
+            .and_then(|d| crate::blob_meta::BlobIndex::deserialize(d))
+    }
+
+    /// Attach this frame's provenance to an error, as [`Blob::locate_error`]
+    /// does for a parsed blob.
+    #[cold]
+    pub(crate) fn locate_error(&self, source: Option<&Arc<Path>>, err: Error) -> Error {
+        err.locate(Location::new(source, self.blob_index, self.offset))
+    }
+
+    /// Parse the body's `Blob` envelope. `source` names the input the frame
+    /// came from, as for [`Blob::locate_error`].
+    pub(crate) fn into_blob(self, source: Option<&Arc<Path>>) -> Result<Blob> {
+        match WireBlob::parse(&self.body) {
+            Ok(blob) => {
+                Ok(Blob::new(self.header, blob, self.offset).with_blob_index(self.blob_index))
+            }
+            Err(e) => Err(e.locate(Location::new(source, self.blob_index, self.body_offset))),
+        }
+    }
+}
+
+impl<R: Read + Send> BlobReader<R> {
+    /// Where the next frame starts and its 0-based ordinal, when this reader
+    /// knows them; `None` once a failure has cleared the position. For a
+    /// caller that hands the rest of the file to a header walk.
+    pub(crate) fn position(&self) -> Option<(ByteOffset, Option<u64>)> {
+        self.offset.map(|offset| (offset, self.blob_index))
+    }
+
+    /// Read the next frame without parsing its body's envelope. The framing
+    /// checks, cancellation, offset and ordinal bookkeeping and page-cache
+    /// eviction are the iterator's, which is this plus
+    /// [`RawFrame::into_blob`].
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    fn next(&mut self) -> Option<Self::Item> {
+    pub(crate) fn next_frame(&mut self) -> Option<Result<RawFrame>> {
         // Stop iteration if there was an error.
         if !self.last_blob_ok {
             return None;
@@ -995,12 +1062,7 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
             return self.handle_error(err);
         }
 
-        let blob_bytes = Bytes::from(blob_data);
-        let blob = match WireBlob::parse(&blob_bytes) {
-            Ok(blob) => blob,
-            Err(e) => return self.handle_error(e),
-        };
-
+        let body_offset = self.offset;
         self.offset = self
             .offset
             .map(|x| ByteOffset(x.0 + header.datasize as u64));
@@ -1032,9 +1094,35 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
 
         let this_blob = self.blob_index;
         self.blob_index = self.blob_index.map(|i| i + 1);
-        Some(Ok(
-            Blob::new(header, blob, prev_offset).with_blob_index(this_blob)
-        ))
+        Some(Ok(RawFrame {
+            header,
+            body: Bytes::from(blob_data),
+            offset: prev_offset,
+            body_offset,
+            blob_index: this_blob,
+        }))
+    }
+}
+
+impl<R: Read + Send> Iterator for BlobReader<R> {
+    type Item = Result<Blob>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let frame = match self.next_frame()? {
+            Ok(frame) => frame,
+            Err(e) => return Some(Err(e)),
+        };
+        match frame.into_blob(self.source.as_ref()) {
+            Ok(blob) => Some(Ok(blob)),
+            Err(e) => {
+                // A malformed envelope ends iteration, like every other
+                // failure: the reader does not resume past a blob it could
+                // not read.
+                self.offset = None;
+                self.last_blob_ok = false;
+                Some(Err(e))
+            }
+        }
     }
 }
 

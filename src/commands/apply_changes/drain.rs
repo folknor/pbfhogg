@@ -533,10 +533,11 @@ impl DrainState {
 /// previous end bound is sufficient too, since accepted bounds cannot move
 /// backwards. The shared watermark expresses this invariant directly.
 ///
-/// The bound compared is the blob's OSM-order *first* id, via
-/// `osm_id_key`, so negative IDs (0, -1, -2, ..., 1, 2, ...) order the
-/// same way `osm_id_cmp` orders them everywhere else. Equality is allowed
-/// through: a shared boundary ID between two blobs is a duplicate-ID
+/// The bound compared is the OSM-order first id the blob's range proves
+/// present (`osm_id::blob_osm_present_first_key`), so negative IDs (0, -1,
+/// -2, ..., 1, 2, ...) order the way `osm_id_cmp` orders them everywhere
+/// else and a valid mixed-sign blob after a negative one passes. Equality is
+/// allowed through: a shared boundary ID between two blobs is a duplicate-ID
 /// problem, not an ordering one, and is not this guard's business.
 fn check_output_order(
     state: &mut DrainState,
@@ -544,19 +545,19 @@ fn check_output_order(
     min_id: i64,
     max_id: i64,
 ) -> Result<()> {
-    if let Err((previous_kind, previous_id)) =
-        state
-            .order_watermark
-            .observe(kind.ordinal(), min_id, max_id)
+    if let Err(v) = state
+        .order_watermark
+        .observe(kind.ordinal(), min_id, max_id)
     {
         return Err(crate::error::new_unsorted(format!(
             "apply-changes: refusing to write an unsorted PBF under a Sort.Type_then_ID \
-             header - a {} blob starting at id {} follows {} output \
-             already reaching id {previous_id}; the base is not in the order its header \
+             header - a {} blob holding id {} follows {} output \
+             already reaching id {}; the base is not in the order its header \
              declares.",
             kind.as_str(),
-            crate::osm_id::blob_osm_first_id(min_id, max_id),
-            ElementKind::from_ordinal(previous_kind).map_or("unknown", ElementKind::as_str),
+            v.first_id,
+            ElementKind::from_ordinal(v.previous_kind).map_or("unknown", ElementKind::as_str),
+            v.previous_id,
         )));
     }
     Ok(())

@@ -1,9 +1,11 @@
 //! Streaming element cursor and merge-join for sorted PBF operations.
 //!
-//! Provides [`StreamingBlocks`] - a block-level cursor over a pipelined PBF
-//! reader that yields owned elements one at a time, handling block boundaries
-//! transparently. [`merge_join_phase`] runs a generic two-pointer merge-join
-//! over two cursors, used by `diff` and `derive_changes`.
+//! Provides [`StreamingBlocks`] - a block-level cursor over a sequential
+//! `BlobReader` that yields owned elements one at a time, handling block
+//! boundaries transparently, for inputs without indexdata.
+//! [`merge_join_phase`] runs a generic two-pointer merge-join over two
+//! cursors, and [`block_pair_merge_phase`] the blob-level merge over two
+//! indexed inputs; both are used by `diff` and `derive_changes`.
 
 use crate::ElementKind;
 use crate::{BlockType, Element, PrimitiveBlock};
@@ -15,14 +17,32 @@ use crate::error::Result;
 // StreamingBlocks - block-level cursor with stashing
 // ---------------------------------------------------------------------------
 
-/// Block source shared across all type phases of a streaming merge-join.
+/// Block source shared across all type phases of a streaming merge-join over
+/// an input without indexdata.
 ///
-/// Wraps a [`PipelinedBlocks`] iterator and manages stashing: when a block's
-/// type doesn't match the current phase, it is stashed for the next phase
-/// rather than being dropped.
+/// Without indexdata a block's kind is known only once it is decoded, so
+/// every block of the file is decompressed and parsed, whatever the caller
+/// selects: that is what lets a block of an earlier kind turning up late be
+/// refused instead of lost. What a caller does not select is classified and
+/// dropped without converting its elements ([`StreamingBlocks::skip_kind`]).
+/// A block of a later kind than the running phase is stashed for the phase
+/// or skip that takes it next, which classifies it again.
 pub(crate) struct StreamingBlocks {
-    blocks: Box<dyn Iterator<Item = crate::error::Result<PrimitiveBlock>>>,
+    reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
+    /// Captured once; failures are located with the blob's true index and
+    /// offset in this input.
+    source: Option<std::sync::Arc<std::path::Path>>,
+    decompress_buf: Vec<u8>,
+    st_scratch: Vec<(u32, u32)>,
+    gr_scratch: Vec<(u32, u32)>,
     stashed: Option<PrimitiveBlock>,
+    /// `(blob index, offset)` of the block read last. The stash, when there
+    /// is one, is that block, and so is any block being classified or
+    /// converted, so errors about a block are located here.
+    last_blob: (Option<u64>, Option<crate::blob::ByteOffset>),
+    /// Kind ordinal and key of the last element converted, for the element
+    /// order check of the selected kinds.
+    last_element: Option<(u8, crate::osm_id::OsmIdKey)>,
 }
 
 impl StreamingBlocks {
@@ -33,40 +53,19 @@ impl StreamingBlocks {
         direct_io: bool,
         host: &crate::host::Host,
     ) -> crate::error::Result<Self> {
-        let mut blob_reader = crate::blob::BlobReader::open_in(path, direct_io, host)?;
-        blob_reader.set_parse_indexdata(true);
-        blob_reader.leading_header()?;
-        let mut decompress_buf: Vec<u8> = Vec::new();
-        let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-        let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-        // Captured once; a decode failure is located with the blob's true
-        // index and offset.
-        let source = blob_reader.source().cloned();
-        let iter = std::iter::from_fn(move || {
-            loop {
-                let blob = match blob_reader.next()? {
-                    Ok(b) => b,
-                    Err(e) => return Some(Err(e)),
-                };
-                if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-                    continue;
-                }
-                if let Err(e) = blob.decompress_into(&mut decompress_buf) {
-                    return Some(Err(blob.locate_error(source.as_ref(), e)));
-                }
-                return Some(
-                    crate::block::PrimitiveBlock::from_vec_with_scratch(
-                        std::mem::take(&mut decompress_buf),
-                        &mut st_scratch,
-                        &mut gr_scratch,
-                    )
-                    .map_err(|e| blob.locate_error(source.as_ref(), e)),
-                );
-            }
-        });
+        let mut reader = crate::blob::BlobReader::open_in(path, direct_io, host)?;
+        reader.set_parse_indexdata(true);
+        reader.leading_header()?;
+        let source = reader.source().cloned();
         Ok(Self {
-            blocks: Box::new(iter),
+            reader,
+            source,
+            decompress_buf: Vec::new(),
+            st_scratch: Vec::new(),
+            gr_scratch: Vec::new(),
             stashed: None,
+            last_blob: (None, None),
+            last_element: None,
         })
     }
 
@@ -74,92 +73,222 @@ impl StreamingBlocks {
         if let Some(b) = self.stashed.take() {
             return Ok(Some(b));
         }
-        match self.blocks.next() {
-            Some(Ok(b)) => Ok(Some(b)),
-            Some(Err(e)) => Err(e),
-            None => Ok(None),
+        loop {
+            let blob = match self.reader.next() {
+                Some(r) => r?,
+                None => return Ok(None),
+            };
+            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+                continue;
+            }
+            self.last_blob = (blob.blob_index(), blob.offset());
+            if let Err(e) = blob.decompress_into(&mut self.decompress_buf) {
+                return Err(blob.locate_error(self.source.as_ref(), e));
+            }
+            return PrimitiveBlock::from_vec_with_scratch(
+                std::mem::take(&mut self.decompress_buf),
+                &mut self.st_scratch,
+                &mut self.gr_scratch,
+            )
+            .map(Some)
+            .map_err(|e| blob.locate_error(self.source.as_ref(), e));
         }
     }
+
+    /// Locate an error at the block read last.
+    #[cold]
+    fn locate(&self, err: crate::Error) -> crate::Error {
+        err.locate(crate::error::Location::new(
+            self.source.as_ref(),
+            self.last_blob.0,
+            self.last_blob.1,
+        ))
+    }
+
+    /// Read past every block of `kind`, a kind the caller excludes, up to
+    /// the first block of a later kind (stashed) or the end of the file.
+    ///
+    /// Each block is classified by the element kinds it actually yields,
+    /// never by [`PrimitiveBlock::block_type`], which reads only the first
+    /// field of each group: a group starting with a way and holding a node
+    /// after it classifies as ways, and dropping it as a way block would lose
+    /// the node. So a block of `kind` alone is dropped; an empty one is
+    /// neutral; a later kind ends the skip; an earlier kind, or a block
+    /// holding several, is refused as unsorted - the same verdicts the
+    /// selected phases give, so no element of a selected kind can leave the
+    /// stream unseen.
+    ///
+    /// The elements of a dropped block are iterated to classify it but never
+    /// converted, so element-level faults a conversion would refuse (a tag
+    /// or role whose string index is out of range) and the order of elements
+    /// within an excluded kind go unchecked: they cannot change an answer
+    /// about the selected kinds. Decompression and block parsing still run
+    /// on every block, because without indexdata they are the only way to
+    /// know where a kind ends.
+    pub(crate) fn skip_kind(&mut self, kind: ElementKind) -> Result<()> {
+        loop {
+            let Some(block) = self.next_block()? else {
+                return Ok(());
+            };
+            match element_kinds(&block) {
+                BlockKinds::Empty => {}
+                BlockKinds::One(k) if k == kind => {}
+                BlockKinds::One(k) if k > kind => {
+                    self.stashed = Some(block);
+                    return Ok(());
+                }
+                BlockKinds::One(k) => return Err(self.locate(unsorted_block(k, kind))),
+                BlockKinds::Several => return Err(self.locate(mixed_block())),
+            }
+        }
+    }
+}
+
+/// The element kinds a block's elements actually are.
+enum BlockKinds {
+    Empty,
+    One(ElementKind),
+    Several,
+}
+
+/// Classify `block` by the elements [`PrimitiveBlock::elements`] yields - what
+/// a conversion would see - rather than by the first field of each group.
+fn element_kinds(block: &PrimitiveBlock) -> BlockKinds {
+    let mut found: Option<ElementKind> = None;
+    for element in block.elements_skip_metadata() {
+        let kind = element_kind(&element);
+        match found {
+            None => found = Some(kind),
+            Some(k) if k == kind => {}
+            Some(_) => return BlockKinds::Several,
+        }
+    }
+    found.map_or(BlockKinds::Empty, BlockKinds::One)
+}
+
+fn element_kind(element: &Element<'_>) -> ElementKind {
+    match element {
+        Element::DenseNode(_) | Element::Node(_) => ElementKind::Node,
+        Element::Way(_) => ElementKind::Way,
+        Element::Relation(_) => ElementKind::Relation,
+    }
+}
+
+/// The single kind a [`BlockType`] names, when it names one.
+fn block_type_kind(bt: BlockType) -> Option<ElementKind> {
+    if bt.is_nodes() {
+        Some(ElementKind::Node)
+    } else if bt.is_ways() {
+        Some(ElementKind::Way)
+    } else if bt.is_relations() {
+        Some(ElementKind::Relation)
+    } else {
+        None
+    }
+}
+
+/// A block holding more than one kind, in a merge that requires one kind per
+/// block. Consuming it in one phase would discard its other-kind elements for
+/// good: the block is gone by the time the later phase for its kind runs, and
+/// a partially-consumed block cannot be stashed. This used to be waved
+/// through with a comment calling it "acceptable lossy behavior", which made
+/// a mixed block silently shorten the diff.
+fn mixed_block() -> crate::Error {
+    crate::error::new_unsorted(
+        "streaming merge-join: input contains a mixed-type block, so elements \
+         of a later type would be consumed and discarded by an earlier phase. \
+         This merge requires Sort.Type_then_ID input with one element type per \
+         block.",
+    )
+}
+
+/// A block of an earlier kind than the phase or skip running. It used to be
+/// stashed like a later kind's block and then dropped when no later phase
+/// wanted it, so a node block after the ways vanished from the comparison.
+fn unsorted_block(found: ElementKind, phase: ElementKind) -> crate::Error {
+    crate::error::new_unsorted(format!(
+        "streaming merge-join: found a {} block during the {} phase. The input's header \
+         claims Sort.Type_then_ID but its blobs are not in canonical order (nodes, then \
+         ways, then relations).",
+        found.as_str(),
+        phase.as_str(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
 // Typed element extraction
 // ---------------------------------------------------------------------------
 
-/// Fill `buffer` with owned elements of type `T` from the next matching block.
+/// Fill `buffer` with owned elements of type `T` from the next block of the
+/// phase's kind.
 ///
-/// Uses [`BlockType`] as a fast path (1-byte classification, no element parsing)
-/// to skip blocks of the wrong type. `Mixed` and `Empty` blocks fall through to
-/// element-level conversion, which is where a file claiming `Sort.Type_then_ID`
-/// while carrying mixed blocks is caught: a mixed block is an error, because
-/// consuming it here would discard its other-kind elements for good.
+/// A block whose [`BlockType`] names this phase's kind is converted directly
+/// (the normal sorted case); a wrong-kind element found in it is the
+/// mixed-block error. Any other block is classified by the element kinds it
+/// actually yields (see [`StreamingBlocks::skip_kind`] for why the block type
+/// cannot decide): no elements is skipped, this kind alone is converted, a
+/// later kind is stashed and ends the phase, an earlier kind or several kinds
+/// is refused as unsorted. The classification also accepts a block whose
+/// block type says `Mixed` while every element is one kind (dense and plain
+/// node groups side by side, an empty dense group beside ways) in that kind,
+/// where the conversion alone refused it in whichever phase met it first.
 ///
-/// When a non-matching block is encountered, it is stashed for the next phase.
+/// Converted elements must not go backwards in OSM order within the kind;
+/// an equal id passes, as in the blob-order checks (duplicates are a separate
+/// concern). Without indexdata this is the only order evidence the stream
+/// has, and a merge over a backwards stream pairs the wrong elements.
+///
 /// Returns `true` if elements were added to the buffer, `false` if the phase
-/// is exhausted (EOF or only non-matching blocks remain).
-///
-/// A block with no elements is skipped before it is classified, whatever its
-/// groups' first field says. An empty `DenseNodes` message classifies as a
-/// node block, so after the node phase it used to be stashed as "a later
-/// phase's block" - and then end the relation phase when it turned up there,
-/// silently dropping every relation after it.
+/// is exhausted (EOF or a later kind's block).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn fill_buffer<T>(
+fn fill_buffer<T: MergeJoinElement>(
     source: &mut StreamingBlocks,
     buffer: &mut Vec<T>,
-    is_phase_type: fn(BlockType) -> bool,
-    convert: fn(&Element<'_>) -> ConvertResult<T>,
 ) -> Result<bool> {
+    let kind = T::KIND;
     loop {
-        let block = match source.next_block()? {
-            Some(b) => b,
-            None => return Ok(false),
+        let Some(block) = source.next_block()? else {
+            return Ok(false);
         };
 
-        if block.elements().next().is_none() {
-            continue;
-        }
-
-        let bt = block.block_type();
-
-        // Fast path: block type doesn't match this phase and isn't ambiguous.
-        if bt != BlockType::Empty && bt != BlockType::Mixed && !is_phase_type(bt) {
-            source.stashed = Some(block);
-            return Ok(false);
-        }
-
-        // Convert elements. For single-type blocks (the normal sorted case),
-        // every element converts. For Mixed/Empty, some may not.
-        buffer.clear();
-        let mut wrong_type_seen = false;
-        for element in block.elements() {
-            match convert(&element)? {
-                Some(owned) => buffer.push(owned),
-                None => {
-                    wrong_type_seen = true;
+        if block_type_kind(block.block_type()) != Some(kind) {
+            match element_kinds(&block) {
+                BlockKinds::Empty => continue,
+                BlockKinds::One(k) if k == kind => {}
+                BlockKinds::One(k) if k > kind => {
+                    source.stashed = Some(block);
+                    return Ok(false);
                 }
+                BlockKinds::One(k) => return Err(source.locate(unsorted_block(k, kind))),
+                BlockKinds::Several => return Err(source.locate(mixed_block())),
             }
         }
 
-        // A wrong-type element in a block this phase consumed is an element
-        // that leaves the stream entirely: the block is gone by the time the
-        // later phase for its kind runs, and a partially-consumed block
-        // cannot be stashed. This used to be waved through with a comment
-        // calling it "acceptable lossy behavior", which made a mixed block
-        // silently shorten the diff. Sorted input is a documented
-        // precondition of this merge, so a mixed block means the input does
-        // not meet it - say so rather than quietly dropping elements.
-        if wrong_type_seen {
-            return Err(crate::error::new_unsorted(
-                "streaming merge-join: input contains a mixed-type block, so elements \
-                 of a later type would be consumed and discarded by an earlier phase. \
-                 This merge requires Sort.Type_then_ID input with one element type per \
-                 block.",
-            ));
+        buffer.clear();
+        let ordinal = kind.ordinal();
+        for element in block.elements() {
+            let Some(owned) = T::convert(&element)? else {
+                return Err(source.locate(mixed_block()));
+            };
+            let key = crate::osm_id::osm_id_key(owned.id());
+            if let Some((last_kind, last_key)) = source.last_element
+                && last_kind == ordinal
+                && key < last_key
+            {
+                return Err(source.locate(crate::error::new_unsorted(format!(
+                    "streaming merge-join: {} {} follows {} {}. The input's header claims \
+                     Sort.Type_then_ID but its elements are not in canonical order.",
+                    kind.as_str(),
+                    owned.id(),
+                    kind.as_str(),
+                    crate::osm_id::osm_id_from_key(last_key),
+                ))));
+            }
+            source.last_element = Some((ordinal, key));
+            buffer.push(owned);
         }
 
         if buffer.is_empty() {
-            // Truly empty block - keep going.
             continue;
         }
 
@@ -172,36 +301,18 @@ fn fill_buffer<T>(
 /// Yield the next owned element of type `T` from the stream.
 ///
 /// Returns `None` when the current type phase is exhausted.
-pub(crate) fn next_element<T>(
+pub(crate) fn next_element<T: MergeJoinElement>(
     source: &mut StreamingBlocks,
     buffer: &mut Vec<T>,
-    is_phase_type: fn(BlockType) -> bool,
-    convert: fn(&Element<'_>) -> ConvertResult<T>,
 ) -> Result<Option<T>> {
     loop {
         if let Some(elem) = buffer.pop() {
             return Ok(Some(elem));
         }
-        if !fill_buffer(source, buffer, is_phase_type, convert)? {
+        if !fill_buffer(source, buffer)? {
             return Ok(None);
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Block type predicates
-// ---------------------------------------------------------------------------
-
-pub(crate) fn is_node_block(bt: BlockType) -> bool {
-    bt.is_nodes()
-}
-
-pub(crate) fn is_way_block(bt: BlockType) -> bool {
-    bt.is_ways()
-}
-
-pub(crate) fn is_relation_block(bt: BlockType) -> bool {
-    bt.is_relations()
 }
 
 // ---------------------------------------------------------------------------
@@ -290,17 +401,16 @@ pub(crate) fn convert_relation(element: &Element<'_>) -> ConvertResult<OwnedRela
 /// through [`crate::content::content_equal`], the one definition of element
 /// content.
 pub(crate) trait MergeJoinElement: Sized + crate::content::Content {
+    /// The kind whose phase produces this element type.
+    const KIND: ElementKind;
     fn id(&self) -> i64;
-    fn is_block_type(bt: BlockType) -> bool;
     fn convert(element: &Element<'_>) -> ConvertResult<Self>;
 }
 
 impl MergeJoinElement for OwnedNode {
+    const KIND: ElementKind = ElementKind::Node;
     fn id(&self) -> i64 {
         self.id
-    }
-    fn is_block_type(bt: BlockType) -> bool {
-        is_node_block(bt)
     }
     fn convert(element: &Element<'_>) -> ConvertResult<Self> {
         convert_node(element)
@@ -308,11 +418,9 @@ impl MergeJoinElement for OwnedNode {
 }
 
 impl MergeJoinElement for OwnedWay {
+    const KIND: ElementKind = ElementKind::Way;
     fn id(&self) -> i64 {
         self.id
-    }
-    fn is_block_type(bt: BlockType) -> bool {
-        is_way_block(bt)
     }
     fn convert(element: &Element<'_>) -> ConvertResult<Self> {
         convert_way(element)
@@ -320,11 +428,9 @@ impl MergeJoinElement for OwnedWay {
 }
 
 impl MergeJoinElement for OwnedRelation {
+    const KIND: ElementKind = ElementKind::Relation;
     fn id(&self) -> i64 {
         self.id
-    }
-    fn is_block_type(bt: BlockType) -> bool {
-        is_relation_block(bt)
     }
     fn convert(element: &Element<'_>) -> ConvertResult<Self> {
         convert_relation(element)
@@ -359,8 +465,8 @@ pub(crate) fn merge_join_phase<T: MergeJoinElement>(
     new_buf: &mut Vec<T>,
     mut on_action: impl FnMut(MergeJoinAction<'_, T>) -> Result<()>,
 ) -> Result<()> {
-    let mut old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
-    let mut new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
+    let mut old_elem = next_element(old_src, old_buf)?;
+    let mut new_elem = next_element(new_src, new_buf)?;
 
     loop {
         match (&old_elem, &new_elem) {
@@ -368,23 +474,23 @@ pub(crate) fn merge_join_phase<T: MergeJoinElement>(
             (Some(o), None) => {
                 on_action(MergeJoinAction::OldOnly(o))?;
 
-                old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
+                old_elem = next_element(old_src, old_buf)?;
             }
             (None, Some(n)) => {
                 on_action(MergeJoinAction::NewOnly(n))?;
 
-                new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
+                new_elem = next_element(new_src, new_buf)?;
             }
             (Some(o), Some(n)) => match crate::osm_id::osm_id_cmp(o.id(), n.id()) {
                 std::cmp::Ordering::Less => {
                     on_action(MergeJoinAction::OldOnly(o))?;
 
-                    old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
+                    old_elem = next_element(old_src, old_buf)?;
                 }
                 std::cmp::Ordering::Greater => {
                     on_action(MergeJoinAction::NewOnly(n))?;
 
-                    new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
+                    new_elem = next_element(new_src, new_buf)?;
                 }
                 std::cmp::Ordering::Equal => {
                     if crate::content::content_equal(o, n) {
@@ -393,8 +499,8 @@ pub(crate) fn merge_join_phase<T: MergeJoinElement>(
                         on_action(MergeJoinAction::Modified(o, n))?;
                     }
 
-                    old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
-                    new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
+                    old_elem = next_element(old_src, old_buf)?;
+                    new_elem = next_element(new_src, new_buf)?;
                 }
             },
         }
@@ -485,108 +591,219 @@ struct PendingBlob {
     index: crate::blob_meta::BlobIndex,
 }
 
-/// Read the next OsmData blob matching `kind` without decompressing it.
-/// Returns None at EOF or when the next blob's type doesn't match `kind`
-/// (which means we've moved past this type phase in a sorted PBF).
-///
-/// **Important:** In a sorted PBF, element types appear in order:
-/// nodes → ways → relations. Once we encounter a blob of a different
-/// (later) kind, this phase is done. We must NOT consume that blob
-/// because the next phase needs it. We store it in `stash` for the
-/// next phase to pick up.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn next_blob_for_kind(
-    reader: &mut crate::blob::BlobReader<crate::file_reader::FileReader>,
-    kind: ElementKind,
-    stash: &mut Option<crate::blob::Blob>,
-) -> Result<Option<PendingBlob>> {
-    loop {
-        let blob = if let Some(stashed) = stash.take() {
-            stashed
-        } else {
-            match reader.next() {
-                Some(result) => result?,
-                None => return Ok(None),
-            }
-        };
+/// One input of the block-pair merge: its reader, decode scratch, and the
+/// state that carries across phases.
+struct MergeSide {
+    reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
+    buf: Vec<u8>,
+    st: Vec<(u32, u32)>,
+    gr: Vec<(u32, u32)>,
+    /// The first data frame of a later kind, read during an earlier phase
+    /// (or skip). Already classified and observed by `order`; its body has
+    /// not been interpreted.
+    stash: Option<(crate::blob::RawFrame, crate::blob_meta::BlobIndex)>,
+    /// A blob of the running phase handed back undecoded by
+    /// [`block_pair_merge_phase`]'s non-overlap fast path, so the next round
+    /// can still try the byte comparison on it. Taken first by
+    /// [`MergeSide::next_blob`]; never outlives the phase.
+    held: Option<PendingBlob>,
+    /// Canonical blob order over every data blob this side reads, whatever
+    /// the phase, so an excluded kind's blobs are checked as the parallel
+    /// path's header walk checks them.
+    order: BlobOrderGuard,
+}
 
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-            continue;
+impl MergeSide {
+    fn new(reader: crate::blob::BlobReader<crate::file_reader::FileReader>) -> Self {
+        Self {
+            reader,
+            buf: Vec::new(),
+            st: Vec::new(),
+            gr: Vec::new(),
+            stash: None,
+            held: None,
+            order: BlobOrderGuard::new(),
         }
-        let index = match blob.index() {
-            Some(idx) => idx,
-            None => {
-                return Err(blob.locate_error(
-                    reader.source(),
+    }
+
+    /// The next data frame of `kind`, body uninterpreted, or `None` at the
+    /// end of the file or at the first frame of a later kind (stashed for
+    /// the phase that wants it).
+    ///
+    /// Every data frame read fresh from the file is checked here, once:
+    /// indexdata present, not of a kind earlier than `kind`, and in
+    /// canonical order after everything this side read before (the order
+    /// guard, which is what catches blobs out of order within one kind). A
+    /// stashed frame passed those checks when it was read and is not
+    /// observed again.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    fn next_frame(
+        &mut self,
+        kind: ElementKind,
+    ) -> Result<Option<(crate::blob::RawFrame, crate::blob_meta::BlobIndex)>> {
+        let (frame, index) = match self.stash.take() {
+            Some(stashed) => stashed,
+            None => loop {
+                let frame = match self.reader.next_frame() {
+                    Some(result) => result?,
+                    None => return Ok(None),
+                };
+                if !frame.is_osm_data() {
+                    continue;
+                }
+                let source = self.reader.source();
+                let Some(index) = frame.index() else {
+                    return Err(frame.locate_error(
+                        source,
+                        crate::error::new_missing_indexdata(
+                            "block-pair merge requires indexdata on every data blob",
+                        ),
+                    ));
+                };
+                if index.kind < kind {
+                    // A phase (or skip) for the earlier kind ran first and
+                    // read every blob of it up to the first later-kind blob,
+                    // so this blob proves the header's Sort.Type_then_ID
+                    // claim false - what `degrade --unsort` produces. This
+                    // used to `continue`, discarding the blob and every
+                    // element in it with no error and no count anomaly.
+                    return Err(frame.locate_error(
+                        source,
+                        crate::error::new_unsorted(format!(
+                            "block-pair merge: found a {} blob during the {} phase. The \
+                             input's header claims Sort.Type_then_ID but its blobs are not \
+                             in canonical order (nodes, then ways, then relations).",
+                            index.kind.as_str(),
+                            kind.as_str(),
+                        )),
+                    ));
+                }
+                self.order
+                    .observe(&index)
+                    .map_err(|e| frame.locate_error(source, e))?;
+                break (frame, index);
+            },
+        };
+        if index.kind > kind {
+            self.stash = Some((frame, index));
+            return Ok(None);
+        }
+        Ok(Some((frame, index)))
+    }
+
+    /// The next blob of `kind` with its envelope parsed, undecompressed; see
+    /// [`MergeSide::next_frame`].
+    fn next_blob(&mut self, kind: ElementKind) -> Result<Option<PendingBlob>> {
+        if let Some(held) = self.held.take() {
+            return Ok(Some(held));
+        }
+        match self.next_frame(kind)? {
+            Some((frame, index)) => Ok(Some(PendingBlob {
+                blob: frame.into_blob(self.reader.source())?,
+                index,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Decompress and parse a pending blob. The compressed bytes are
+    /// dropped once it is decoded.
+    fn decode(&mut self, pending: PendingBlob) -> Result<BlockState> {
+        let blob = pending.blob;
+        let block = decode_blob(&blob, &mut self.buf, &mut self.st, &mut self.gr)
+            .map_err(|e| blob.locate_error(self.reader.source(), e))?;
+        Ok(BlockState {
+            block,
+            skip_count: 0,
+            index: pending.index,
+        })
+    }
+
+    /// The next blob of `kind`, decoded.
+    fn next_decoded(&mut self, kind: ElementKind) -> Result<Option<BlockState>> {
+        match self.next_blob(kind)? {
+            Some(pending) => Ok(Some(self.decode(pending)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read past every blob of `kind` without interpreting a body.
+    fn skip(&mut self, kind: ElementKind) -> Result<()> {
+        while self.next_frame(kind)?.is_some() {}
+        Ok(())
+    }
+
+    /// Check the structure of the rest of the file - framing, indexdata on
+    /// every data blob, canonical blob order - with a header-only walk from
+    /// where this side's reader stands. A stashed frame was checked when it
+    /// was read; the walk starts after it.
+    fn verify_rest(&mut self, host: &crate::host::Host) -> Result<()> {
+        let internal = || {
+            crate::Error::invalid_argument(
+                "block-pair merge: the reader's position is unknown, so the rest of the \
+                 file cannot be walked",
+            )
+        };
+        let source = self.reader.source().cloned().ok_or_else(internal)?;
+        let (offset, blob_index) = self.reader.position().ok_or_else(internal)?;
+        let blob_index = blob_index.ok_or_else(internal)?;
+        let mut walker = crate::read::header_walker::HeaderWalker::open(&source, host)?
+            .resume_at(offset.0, blob_index);
+        while let Some(meta) = walker.next_header()? {
+            if meta.blob_type != crate::blob::BlobKind::OsmData {
+                continue;
+            }
+            let Some(index) = meta.index else {
+                return Err(walker.locate_meta(
+                    &meta,
                     crate::error::new_missing_indexdata(
                         "block-pair merge requires indexdata on every data blob",
                     ),
                 ));
-            }
-        };
-        if index.kind != kind {
-            if index.kind > kind {
-                *stash = Some(blob);
-                return Ok(None);
-            }
-            // An EARLIER kind at this point cannot be reached on sorted
-            // input: the phase for that kind ran (or was skipped by
-            // `skip_phase`) first and drained every blob of it before
-            // stopping at the first later-kind blob. So
-            // reaching here means the file's header claims
-            // Sort.Type_then_ID while its blobs are not in canonical order -
-            // exactly what `degrade --unsort` produces. This used to
-            // `continue`, which discarded the blob and every element in it
-            // for the rest of the run, with no error and no count anomaly.
-            return Err(crate::error::new_unsorted(format!(
-                "block-pair merge: found a {} blob during the {} phase. The input's header \
-                 claims Sort.Type_then_ID but its blobs are not in canonical order \
-                 (nodes, then ways, then relations).",
-                index.kind.as_str(),
-                kind.as_str(),
-            )));
+            };
+            self.order
+                .observe(&index)
+                .map_err(|e| walker.locate_meta(&meta, e))?;
         }
-        return Ok(Some(PendingBlob { blob, index }));
+        Ok(())
     }
 }
 
-/// Decompress a pending blob into a decoded BlockState.
+/// Decompress and parse a blob's block. Unlocated; the caller locates.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-#[allow(clippy::needless_pass_by_value)] // consumes blob to drop compressed bytes after decode
-fn decode_pending(
-    pending: PendingBlob,
+fn decode_blob(
+    blob: &crate::blob::Blob,
     buf: &mut Vec<u8>,
     st_scratch: &mut Vec<(u32, u32)>,
     gr_scratch: &mut Vec<(u32, u32)>,
-) -> crate::error::Result<BlockState> {
-    pending.blob.decompress_into(buf)?;
-    let block = PrimitiveBlock::from_vec_with_scratch(std::mem::take(buf), st_scratch, gr_scratch)?;
-    Ok(BlockState {
-        block,
-        skip_count: 0,
-        index: pending.index,
-    })
+) -> crate::error::Result<PrimitiveBlock> {
+    blob.decompress_into(buf)?;
+    PrimitiveBlock::from_vec_with_scratch(std::mem::take(buf), st_scratch, gr_scratch)
 }
 
 /// Running canonical-order check over one file's blob sequence, in FILE
 /// order.
 ///
-/// The sequential block-pair merge discovers a mis-ordered file structurally:
-/// it walks blobs in file order, so an earlier-kind blob turning up after
-/// that kind's phase closed is unmissable ([`next_blob_for_kind`]). The
-/// parallel planners cannot discover it that way, because `walk_file`
-/// buckets every blob by kind before any ordering is looked at - file order
-/// never reaches them. That asymmetry made `diff` answer differently
-/// depending on `-j`: `-j 1` refused the file while the default `-j`
-/// reported "Files are identical", on the same pair of inputs.
+/// Both block-pair paths run it over every data blob of each input: the
+/// parallel walk before bucketing by kind, which throws file order away, and
+/// the sequential merge as it reads each blob ([`MergeSide::next_frame`],
+/// and [`MergeSide::verify_rest`] for a tail no phase reads). Without it the
+/// paths answered differently depending on `-j`: the sequential merge saw
+/// only kind transitions, so blobs out of order within one kind gave it a
+/// wrong answer (50 created and 50 deleted on identical content) where the
+/// parallel walk refused the file, and before the walk had the guard,
+/// `-j 1` refused a misplaced kind while the default `-j` reported "Files
+/// are identical".
 ///
 /// Sorted blob order is also a precondition of the shard planners
-/// themselves, which binary-search each per-kind list assuming it ascends.
-/// So this is not only about agreeing with the sequential path; an
-/// unsorted bucket is an input the planner has no defined answer for.
+/// themselves, which binary-search each per-kind list assuming it ascends,
+/// and of the sequential merge, which decides from blob ranges which blobs
+/// overlap.
 ///
-/// Both checks use `osm_id` blob-range keys, not raw `i64`, so negative IDs
-/// order the way `osm_id_cmp` orders them everywhere else.
+/// The ranges are compared by `osm_id` keys, not raw `i64`, so negative IDs
+/// order the way `osm_id_cmp` orders them everywhere else, and only disorder
+/// the ranges prove is refused (`OrderWatermark`): every valid layout passes,
+/// mixed-sign ones included.
 pub(crate) struct BlobOrderGuard {
     watermark: crate::osm_id::OrderWatermark,
 }
@@ -601,17 +818,18 @@ impl BlobOrderGuard {
     /// Observe the next blob in file order. Returns the error message a
     /// caller should surface, or `Ok(())`.
     pub(crate) fn observe(&mut self, index: &crate::blob_meta::BlobIndex) -> crate::Result<()> {
-        if let Err((previous_kind, previous_id)) =
-            self.watermark
-                .observe(index.kind.ordinal(), index.min_id, index.max_id)
+        if let Err(v) = self
+            .watermark
+            .observe(index.kind.ordinal(), index.min_id, index.max_id)
         {
             return Err(crate::error::new_unsorted(format!(
-                "block-pair merge: a {} blob starting at id {} follows {} \
-                 output already reaching id {previous_id}. The input's header claims \
+                "block-pair merge: a {} blob holding id {} follows {} \
+                 output already reaching id {}. The input's header claims \
                  Sort.Type_then_ID but its blobs are not in canonical order.",
                 index.kind.as_str(),
-                crate::osm_id::blob_osm_first_id(index.min_id, index.max_id),
-                ElementKind::from_ordinal(previous_kind).map_or("unknown", ElementKind::as_str),
+                v.first_id,
+                ElementKind::from_ordinal(v.previous_kind).map_or("unknown", ElementKind::as_str),
+                v.previous_id,
             )));
         }
         Ok(())
@@ -647,17 +865,8 @@ pub(crate) struct BlockPairMergeStats {
 
 /// State for the block-pair merge engine (one per diff/derive_changes call).
 pub(crate) struct BlockPairMergeState {
-    pub old_reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
-    pub new_reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
-    pub old_buf: Vec<u8>,
-    pub new_buf: Vec<u8>,
-    pub old_st: Vec<(u32, u32)>,
-    pub old_gr: Vec<(u32, u32)>,
-    pub new_st: Vec<(u32, u32)>,
-    pub new_gr: Vec<(u32, u32)>,
-    /// Stashed blob from a prior phase (consumed but belongs to a later kind).
-    old_stash: Option<crate::blob::Blob>,
-    new_stash: Option<crate::blob::Blob>,
+    old: MergeSide,
+    new: MergeSide,
     /// Shadow counters accumulated across all phases of this merge run.
     pub stats: BlockPairMergeStats,
 }
@@ -668,90 +877,63 @@ impl BlockPairMergeState {
         new_reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
     ) -> Self {
         Self {
-            old_reader,
-            new_reader,
-            old_buf: Vec::new(),
-            new_buf: Vec::new(),
-            old_st: Vec::new(),
-            old_gr: Vec::new(),
-            new_st: Vec::new(),
-            new_gr: Vec::new(),
-            old_stash: None,
-            new_stash: None,
+            old: MergeSide::new(old_reader),
+            new: MergeSide::new(new_reader),
             stats: BlockPairMergeStats::default(),
         }
-    }
-}
-
-/// Decode the next blob from a reader into a BlockState, or return None at EOF.
-fn next_decoded_block(
-    reader: &mut crate::blob::BlobReader<crate::file_reader::FileReader>,
-    buf: &mut Vec<u8>,
-    st: &mut Vec<(u32, u32)>,
-    gr: &mut Vec<(u32, u32)>,
-    kind: ElementKind,
-    stash: &mut Option<crate::blob::Blob>,
-) -> Result<Option<BlockState>> {
-    match next_blob_for_kind(reader, kind, stash)? {
-        Some(p) => Ok(Some(decode_pending(p, buf, st, gr)?)),
-        None => Ok(None),
     }
 }
 
 /// Drain all remaining blobs of `kind` from one side of a merge.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn drain_remaining(
-    state: &mut BlockPairMergeState,
+    side: &mut MergeSide,
+    stats: &mut BlockPairMergeStats,
     kind: ElementKind,
     is_old: bool,
     on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
 ) -> Result<()> {
-    let stats = &mut state.stats;
-    let (reader, buf, st, gr, stash) = if is_old {
-        (
-            &mut state.old_reader,
-            &mut state.old_buf,
-            &mut state.old_st,
-            &mut state.old_gr,
-            &mut state.old_stash,
-        )
-    } else {
-        (
-            &mut state.new_reader,
-            &mut state.new_buf,
-            &mut state.new_st,
-            &mut state.new_gr,
-            &mut state.new_stash,
-        )
-    };
-    while let Some(p) = next_blob_for_kind(reader, kind, stash)? {
-        let bs = decode_pending(p, buf, st, gr)?;
+    while let Some(bs) = side.next_decoded(kind)? {
         emit_block(&bs, is_old, on_action, stats)?;
     }
     Ok(())
 }
 
-/// Advance both sides past every blob of `kind` without decompressing any,
-/// for a caller that excludes `kind` but still runs a later kind's phase.
+/// Advance both sides past every blob of `kind` without interpreting any
+/// body, for a caller that excludes `kind` but still runs a later kind's
+/// phase.
 ///
 /// A later phase cannot simply start where an earlier phase was never run:
-/// [`next_blob_for_kind`] would meet the excluded kind's first blob and
-/// report the file as out of canonical order. Draining through
-/// [`block_pair_merge_phase`] instead would decode every excluded blob, so
-/// the decode and claimed-max checks would refuse inputs for a kind the
-/// caller excluded - inputs the parallel path accepts, since its per-kind
-/// buckets never read an excluded kind's bodies, and the answer must not
-/// depend on the shard count. So the excluded blobs go through the same
-/// classifier as any phase (an earlier kind is still an unsorted file,
-/// missing indexdata is still an error, the first later-kind blob is
-/// stashed for the next phase) and are dropped undecoded. Each frame is
-/// still read and its Blob envelope parsed by the `BlobReader`, which also
-/// checks cancellation per frame.
+/// it would meet the excluded kind's first blob and report the file as out
+/// of canonical order. Draining through [`block_pair_merge_phase`] instead
+/// would decode every excluded blob, so the decode and claimed-max checks
+/// would refuse inputs for a kind the caller excluded - inputs the parallel
+/// path accepts, since its per-kind buckets never read an excluded kind's
+/// bodies, and the answer must not depend on the shard count. So the
+/// excluded blobs go through the same classifier as any phase (missing
+/// indexdata, an earlier kind and blob order are checked; the first
+/// later-kind blob is stashed for the next phase) and are dropped with
+/// their bodies read past but not interpreted - not even the Blob envelope
+/// is parsed, which is what the parallel path's header walk does with them.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn skip_phase(state: &mut BlockPairMergeState, kind: ElementKind) -> Result<()> {
-    while next_blob_for_kind(&mut state.old_reader, kind, &mut state.old_stash)?.is_some() {}
-    while next_blob_for_kind(&mut state.new_reader, kind, &mut state.new_stash)?.is_some() {}
-    Ok(())
+    state.old.skip(kind)?;
+    state.new.skip(kind)
+}
+
+/// Check the structure of the rest of both files after the last phase a
+/// caller runs, when it excludes the kinds after that one.
+///
+/// The parallel path walks every blob header of both files before it
+/// starts, so a truncated tail, a data blob without indexdata or blobs out
+/// of order there are refused at any filter. The sequential merge never
+/// reads past the first blob of the first kind after its last phase, so
+/// without this `diff -t node` refused those files only at `-j` above one.
+/// The walk reads headers only (no body is read), so it costs a pread per
+/// remaining blob and nothing for a caller that runs the relation phase.
+pub(crate) fn verify_rest(state: &mut BlockPairMergeState, host: &crate::host::Host) -> Result<()> {
+    state.old.verify_rest(host)?;
+    state.new.verify_rest(host)
 }
 
 /// Emit a decoded block as BlobOldOnly or BlobNewOnly, accounting for skip.
@@ -910,56 +1092,36 @@ pub(crate) fn block_pair_merge_phase(
         // Fast path: both sides need fresh blobs (no residuals).
         // Read without decompressing so we can compare compressed bytes.
         if old_decoded.is_none() && new_decoded.is_none() {
-            let op = next_blob_for_kind(&mut state.old_reader, kind, &mut state.old_stash)?;
-            let np = next_blob_for_kind(&mut state.new_reader, kind, &mut state.new_stash)?;
+            let op = state.old.next_blob(kind)?;
+            let np = state.new.next_blob(kind)?;
 
             match (op, np) {
                 (None, None) => break,
                 (Some(op), None) => {
-                    let os = decode_pending(
-                        op,
-                        &mut state.old_buf,
-                        &mut state.old_st,
-                        &mut state.old_gr,
-                    )?;
+                    let os = state.old.decode(op)?;
                     emit_block(&os, true, on_action, &mut state.stats)?;
-                    drain_remaining(state, kind, true, on_action)?;
+                    drain_remaining(&mut state.old, &mut state.stats, kind, true, on_action)?;
                     break;
                 }
                 (None, Some(np)) => {
-                    let ns = decode_pending(
-                        np,
-                        &mut state.new_buf,
-                        &mut state.new_st,
-                        &mut state.new_gr,
-                    )?;
+                    let ns = state.new.decode(np)?;
                     emit_block(&ns, false, on_action, &mut state.stats)?;
-                    drain_remaining(state, kind, false, on_action)?;
+                    drain_remaining(&mut state.new, &mut state.stats, kind, false, on_action)?;
                     break;
                 }
                 (Some(op), Some(np)) => {
                     if blob_entirely_before(&op.index, &np.index) {
-                        let os = decode_pending(
-                            op,
-                            &mut state.old_buf,
-                            &mut state.old_st,
-                            &mut state.old_gr,
-                        )?;
+                        let os = state.old.decode(op)?;
                         emit_block(&os, true, on_action, &mut state.stats)?;
-                        // Stash new blob undecoded - next iteration can try v1 byte comparison.
-                        state.new_stash = Some(np.blob);
+                        // Hold the new blob undecoded - next iteration can try v1 byte comparison.
+                        state.new.held = Some(np);
                         continue;
                     }
                     if blob_entirely_before(&np.index, &op.index) {
-                        let ns = decode_pending(
-                            np,
-                            &mut state.new_buf,
-                            &mut state.new_st,
-                            &mut state.new_gr,
-                        )?;
+                        let ns = state.new.decode(np)?;
                         emit_block(&ns, false, on_action, &mut state.stats)?;
-                        // Stash old blob undecoded - next iteration can try v1 byte comparison.
-                        state.old_stash = Some(op.blob);
+                        // Hold the old blob undecoded - next iteration can try v1 byte comparison.
+                        state.old.held = Some(op);
                         continue;
                     }
                     // Overlapping - try compressed byte comparison (v1).
@@ -971,42 +1133,18 @@ pub(crate) fn block_pair_merge_phase(
                     }
                     state.stats.pairs_overlapping_decoded += 1;
                     state.stats.elements_overlapping_decoded += op.index.count + np.index.count;
-                    old_decoded = Some(decode_pending(
-                        op,
-                        &mut state.old_buf,
-                        &mut state.old_st,
-                        &mut state.old_gr,
-                    )?);
-                    new_decoded = Some(decode_pending(
-                        np,
-                        &mut state.new_buf,
-                        &mut state.new_st,
-                        &mut state.new_gr,
-                    )?);
+                    old_decoded = Some(state.old.decode(op)?);
+                    new_decoded = Some(state.new.decode(np)?);
                 }
             }
         }
 
         // Slow path: at least one side has a decoded residual block.
         if old_decoded.is_none() {
-            old_decoded = next_decoded_block(
-                &mut state.old_reader,
-                &mut state.old_buf,
-                &mut state.old_st,
-                &mut state.old_gr,
-                kind,
-                &mut state.old_stash,
-            )?;
+            old_decoded = state.old.next_decoded(kind)?;
         }
         if new_decoded.is_none() {
-            new_decoded = next_decoded_block(
-                &mut state.new_reader,
-                &mut state.new_buf,
-                &mut state.new_st,
-                &mut state.new_gr,
-                kind,
-                &mut state.new_stash,
-            )?;
+            new_decoded = state.new.next_decoded(kind)?;
         }
 
         match (&old_decoded, &new_decoded) {

@@ -71,6 +71,15 @@ impl WireBlobHeader {
     /// When `parse_indexdata` is `false`, field 2 (indexdata) is skipped instead
     /// of copied. Hot read paths that never call `Blob::index()` (e.g.
     /// `par_map_reduce`, unfiltered pipeline) can skip the 42-byte per-blob copy.
+    ///
+    /// The retention flags decide copy versus skip and nothing else: every
+    /// field this parser knows must carry its schema's wire type whether or
+    /// not it is retained, so one header is accepted or refused the same way
+    /// by every caller. A header walk (which retains tagdata) and a
+    /// `BlobReader` (which by default does not) used to disagree about a
+    /// tagdata field with the varint wire type - the walk read its value as a
+    /// length and refused the frame, the reader skipped it - so whether a file
+    /// was refused depended on which read path met that blob.
     #[hotpath::measure]
     pub fn parse(
         data: &[u8],
@@ -78,7 +87,7 @@ impl WireBlobHeader {
         parse_indexdata: bool,
         parse_waymembers: bool,
     ) -> Result<Self> {
-        use super::wire::Cursor;
+        use super::wire::{Cursor, WIRE_LEN, WIRE_VARINT};
         let mut cursor = Cursor::new(data);
         let mut blob_type = BlobKind::Unknown(String::new());
         let mut datasize: i32 = 0;
@@ -90,6 +99,21 @@ impl WireBlobHeader {
         let mut waymembers: Option<Box<[u8]>> = None;
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
+            let expected = match field {
+                blob_header::DATASIZE => Some(WIRE_VARINT),
+                blob_header::TYPE
+                | blob_header::INDEXDATA
+                | blob_header::TAGDATA
+                | blob_header::WAYMEMBERS => Some(WIRE_LEN),
+                _ => None,
+            };
+            if expected.is_some_and(|w| w != wire_type) {
+                return Err(new_wire_error(
+                    "BlobHeader field carries a wire type its schema does not allow \
+                     (type, indexdata, tagdata and waymembers are length-delimited, \
+                     datasize is a varint)",
+                ));
+            }
             match field {
                 blob_header::TYPE => {
                     // type: string (len-delimited)
@@ -601,6 +625,46 @@ mod tests {
                     .contains("BlobHeader.datasize exceeds int32")
             );
         }
+    }
+
+    /// A known field with the wrong wire type is refused under every
+    /// combination of retention flags, so a header walk (which retains
+    /// tagdata) and a `BlobReader` (which does not) agree on the frame. A
+    /// tagdata field encoded as a varint used to be skipped by the reader and
+    /// read as a length by the walk.
+    #[test]
+    fn known_field_with_wrong_wire_type_is_refused_whatever_is_retained() {
+        let valid = header_with_datasize(10);
+        // (field 2, varint), (field 4, varint), (field 5, varint),
+        // (field 1, varint) and (field 3, length-delimited).
+        let bad_fields: [&[u8]; 5] = [
+            &[0x10, 0x01],
+            &[0x20, 0x01],
+            &[0x28, 0x01],
+            &[0x08, 0x01],
+            &[0x1A, 0x01, 0x05],
+        ];
+        for bad in bad_fields {
+            let mut bytes = valid.clone();
+            bytes.extend_from_slice(bad);
+            for flags in 0..8u8 {
+                let (tagdata, indexdata, waymembers) =
+                    (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
+                assert!(
+                    WireBlobHeader::parse(&bytes, tagdata, indexdata, waymembers).is_err(),
+                    "{bad:02x?} with flags {flags:03b} must be refused"
+                );
+            }
+            assert!(
+                parse_blob_header_with_index(&bytes, &crate::host::Diagnostics::discard()).is_err(),
+                "{bad:02x?} must be refused by the header walk's parser"
+            );
+        }
+        // An unknown field keeps its old treatment: skipped whatever its type.
+        let mut unknown = valid;
+        unknown.extend_from_slice(&[0x30, 0x01, 0x3A, 0x01, 0x00]);
+        assert!(WireBlobHeader::parse(&unknown, true, true, true).is_ok());
+        assert!(WireBlobHeader::parse(&unknown, false, false, false).is_ok());
     }
 
     #[test]

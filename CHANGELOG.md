@@ -1081,6 +1081,40 @@
 
 ### Fixed
 
+- **The sequential `diff` refuses blobs out of order within a kind instead
+  of answering wrongly.** The sequential block-pair merge (`diff -j 1`,
+  `-v`, every run on input holding negative IDs, and the sequential
+  `--format osc`) checked that kinds come in order but not that blobs within
+  a kind do: old node blobs `[100,200]` then `[1,50]` against a correctly
+  ordered file with the same nodes reported 50 created and 50 deleted on
+  identical content, where the parallel path refused the file. Both paths
+  now refuse it as unsorted, also inside a kind a `--type` filter excludes.
+- **The unindexed `diff` and `diff --format osc` no longer drop a misplaced
+  block.** Without indexdata, a block of an earlier kind after a later one
+  (a node block after the ways) was passed over by every phase and silently
+  left out of the answer, and element order within a kind was never
+  checked. Both are refused as unsorted now, whatever `--type` selects.
+- **`diff --type` refuses the same malformed files at every `-j`.** A filter
+  excluding the last kinds (`-t node`) made the sequential path stop reading
+  after the selected kinds, so a truncated tail, a later data blob without
+  indexdata or tail blobs out of order were refused only at `-j` above 1;
+  the sequential path now walks the remaining blob headers. In the other
+  direction, `-j 1` parsed the envelope of an excluded kind's blob it read
+  past and refused a malformed one the parallel path never reads; no path
+  interprets an excluded kind's blob bodies now.
+- **Valid blob layouts with mixed-sign IDs are no longer refused as
+  unsorted.** The blob order check took 0 as the first element of a blob
+  whose ID range spans negative and positive IDs, so a blob holding -2 and 1
+  after a blob holding -1 (canonical order 0, -1, -2, ..., 1, 2, ...) was
+  refused: `apply-changes` refused to write such output and the
+  `add-locations-to-ways` external join refused such way and relation blobs.
+  Only disorder the ID ranges prove is refused now.
+- **A `BlobHeader` field with the wrong wire type is refused by every
+  reader.** A known field (type, indexdata, datasize, tagdata, waymembers)
+  carrying a wire type its schema does not allow was skipped by some read
+  paths and misread or refused by others, so whether a file was refused
+  depended on the command and its flags. It is a wire-format error on every
+  path now.
 - **`build-geocode-index --overwrite` no longer deletes an input kept
   inside the index directory.** Replacing an index swaps the whole
   directory and deletes the old one, and the alias check never ran for

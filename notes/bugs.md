@@ -94,23 +94,6 @@ during decode.
 
 Reported by: the extract passthrough fix.
 
-## BUG-143 - Sequential block-pair diff answers wrongly on blobs out of order within a kind
-
-Anger: 8 - diff core; a correct check has to accept every valid mixed-sign
-layout.
-
-The sequential block-pair merge (`osc/merge_join.rs`, used by `diff` and
-`diff_stats` at `-j 1`, under `-v`, and for every negative-ID input at any
-`-j`) checks that kinds come in order but not that blobs within one enabled
-kind do. Old node blobs `[100,200]` then `[1,50]` against a correctly ordered
-new file with the same elements: `-j 1` reports 50 created and 50 deleted on
-identical content, while `-j N` refuses the file as unsorted. The parallel
-path's order check is not a drop-in fix: the sequential path also carries
-every negative-ID file, and that check rejects some valid mixed-sign layouts
-(blob `[-1]` followed by blob `[-2,1]`).
-
-Reported by: the BUG-138 fix.
-
 ## BUG-146 - Unindexed derive-changes drops every metadata field but the version
 
 Anger: 7 - derive-changes output.

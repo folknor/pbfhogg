@@ -144,17 +144,16 @@ fn check_range(
             idx.min_id, idx.max_id,
         )));
     }
-    if let Err((previous_kind, previous_id)) =
-        order.observe(idx.kind.ordinal(), idx.min_id, idx.max_id)
-    {
+    if let Err(v) = order.observe(idx.kind.ordinal(), idx.min_id, idx.max_id) {
         return Err(crate::error::new_unsorted(format!(
             "altw external: indexdata ranges contradict the sorted header - a {} blob \
-             starting at id {} follows {} blobs already reaching id {previous_id}. \
+             holding id {} follows {} blobs already reaching id {}. \
              The external join needs Sort.Type_then_ID input with exact indexdata \
              ranges, and one of the two is false here.",
             idx.kind.as_str(),
-            crate::osm_id::blob_osm_first_id(idx.min_id, idx.max_id),
-            ElementKind::from_ordinal(previous_kind).map_or("unknown", ElementKind::as_str),
+            v.first_id,
+            ElementKind::from_ordinal(v.previous_kind).map_or("unknown", ElementKind::as_str),
+            v.previous_id,
         )));
     }
     Ok(())

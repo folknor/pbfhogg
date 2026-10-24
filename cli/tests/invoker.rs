@@ -1,7 +1,3 @@
-// Feature-gated test modules (the `test-hooks` interruption tests, the
-// platform tiers) drop out of some sweeps and take their callers with them,
-// so some builds leave parts of this helper unused.
-#![allow(dead_code)]
 //! Invoke the `pbfhogg` binary from integration tests.
 //!
 //! Integration tests that drive the CLI (rather than the library
@@ -94,7 +90,6 @@ fn capture(mut reader: impl Read) -> Vec<u8> {
 /// stdout/stderr, returns a [`CliOutput`] that assertions read from.
 pub struct CliInvoker {
     cmd: Command,
-    stdin: Option<Vec<u8>>,
     timeout: Duration,
     stderr_closed: bool,
 }
@@ -105,7 +100,6 @@ impl CliInvoker {
     pub fn new() -> Self {
         Self {
             cmd: Command::new(pbfhogg_bin()),
-            stdin: None,
             timeout: DEFAULT_TIMEOUT,
             stderr_closed: false,
         }
@@ -139,57 +133,12 @@ impl CliInvoker {
         self
     }
 
-    /// Start the child without inherited environment variables.
-    pub fn clean_env(mut self) -> Self {
-        self.cmd.env_clear();
-        self
-    }
-
     /// Give stderr a pipe whose reader has already gone away.
     pub fn stderr_closed(mut self) -> Self {
         let (reader, writer) = std::io::pipe().expect("stderr pipe");
         drop(reader);
         self.cmd.stderr(writer);
         self.stderr_closed = true;
-        self
-    }
-
-    /// Pin the child to the first CPUs in our mask and explicit fd limits.
-    /// Child processes otherwise inherit the test binary's current
-    /// `RLIMIT_NOFILE`. Keep descriptors below `FD_SETSIZE` in tests that
-    /// exercise libraries using `select(2)`, or set a controlled limit here.
-    #[cfg(target_os = "linux")]
-    pub fn child_limits(mut self, cpus: usize, nofile: (u64, u64)) -> Self {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            let mut available: libc::cpu_set_t = std::mem::zeroed();
-            assert_eq!(
-                libc::sched_getaffinity(0, std::mem::size_of_val(&available), &mut available),
-                0
-            );
-            let mut mask: libc::cpu_set_t = std::mem::zeroed();
-            let mut count = 0;
-            for cpu in 0..libc::CPU_SETSIZE as usize {
-                if count < cpus && libc::CPU_ISSET(cpu, &available) {
-                    libc::CPU_SET(cpu, &mut mask);
-                    count += 1;
-                }
-            }
-            assert_eq!(count, cpus, "child_limits needs at least {cpus} CPUs");
-            self.cmd.pre_exec(move || {
-                if libc::sched_setaffinity(0, std::mem::size_of_val(&mask), &mask) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let limit = libc::rlimit {
-                    rlim_cur: nofile.0,
-                    rlim_max: nofile.1,
-                };
-                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
         self
     }
 
@@ -223,12 +172,6 @@ impl CliInvoker {
         self
     }
 
-    /// Set bytes to feed on the binary's stdin.
-    pub fn stdin_bytes(mut self, bytes: impl Into<Vec<u8>>) -> Self {
-        self.stdin = Some(bytes.into());
-        self
-    }
-
     /// Override the wall-clock timeout. On expiry the child is
     /// `SIGKILL`ed and the test panics. The default is sized for small
     /// fixtures.
@@ -241,22 +184,12 @@ impl CliInvoker {
     /// Does NOT assert on exit status - the caller does that.
     /// Panics on timeout (see [`Self::timeout`]).
     pub fn run(mut self) -> CliOutput {
-        if self.stdin.is_some() {
-            self.cmd.stdin(Stdio::piped());
-        }
         self.cmd.stdout(Stdio::piped());
         if !self.stderr_closed {
             self.cmd.stderr(Stdio::piped());
         }
 
         let mut child = self.cmd.spawn().expect("spawn pbfhogg binary");
-
-        if let Some(bytes) = self.stdin {
-            use std::io::Write;
-            let mut stdin = child.stdin.take().expect("stdin piped");
-            stdin.write_all(&bytes).expect("write stdin");
-            drop(stdin);
-        }
 
         // Drain stdout/stderr in background threads so a chatty
         // child can't block on a full pipe buffer while we poll
@@ -305,12 +238,18 @@ impl CliInvoker {
         }
     }
 
+    #[cfg_attr(
+        not(feature = "test-hooks"),
+        allow(
+            dead_code,
+            reason = "only the test-hooks interruption tests start a child without waiting"
+        )
+    )]
     /// Start the binary without waiting for it, for a test that signals it
     /// mid-run. Stdout and stderr are captured as for [`Self::run`]. The
     /// child is killed and reaped if the handle drops while it still runs, so
     /// a failing assertion never leaves one behind.
     pub fn spawn(mut self) -> RunningCli {
-        assert!(self.stdin.is_none(), "spawn does not feed stdin");
         self.cmd.stdout(Stdio::piped());
         self.cmd.stderr(Stdio::piped());
         let mut child = self.cmd.spawn().expect("spawn pbfhogg binary");
@@ -357,6 +296,13 @@ impl Default for CliInvoker {
     }
 }
 
+#[cfg_attr(
+    not(feature = "test-hooks"),
+    allow(
+        dead_code,
+        reason = "only the test-hooks interruption tests start a child without waiting"
+    )
+)]
 /// A `pbfhogg` child started by [`CliInvoker::spawn`].
 pub struct RunningCli {
     child: Option<std::process::Child>,
@@ -365,6 +311,13 @@ pub struct RunningCli {
     timeout: Duration,
 }
 
+#[cfg_attr(
+    not(feature = "test-hooks"),
+    allow(
+        dead_code,
+        reason = "only the test-hooks interruption tests start a child without waiting"
+    )
+)]
 impl RunningCli {
     /// Send `signal` (a `libc::SIG*` number) to the child.
     pub fn signal(&self, signal: libc::c_int) {

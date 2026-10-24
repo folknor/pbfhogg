@@ -16,8 +16,7 @@
 //!
 //! Every module here shares one process with every other, concurrently: the
 //! global rayon pool and `RLIMIT_NOFILE`, raised once by
-//! `common::test_host()` and inherited by every spawned binary unless
-//! `CliInvoker::child_limits` changes it.
+//! `common::test_host()` and inherited by every spawned binary.
 //!
 //! `common` is the library package's `tests/common`, mounted by path, so its
 //! `cfg(feature = ...)` gates read this package's features (the same names).

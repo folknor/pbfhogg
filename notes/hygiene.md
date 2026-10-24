@@ -107,10 +107,9 @@ slot) is built in:
 - `repack` and `degrade`: each defines `FRAME_BATCH`, `KindPayload`,
   `WorkerOutput`, `PhaseStats`, `run_kind_phase`, `frame_owned`,
   `frame_and_write_batch`; `cat/mod.rs::run_kind_phase` is a third member.
-  Degrade's copies have diverged from repack's in the sort-preservation guard (repack drains when
-  `!bb.is_empty() || !pending.is_empty()`, degrade only on `!bb.is_empty()`;
-  the hunter could not construct a failing path, so it is latent and rests on
-  an unstated flush-before-add property).
+  The sort-preservation guards now agree; repack fires its guard only when
+  the worker produced full frames, degrade on every input blob (it mirrors
+  input blobs one to one).
 - `extract/common.rs::pread_execute` (whose `ConsumerItem` match is written
   twice verbatim in the same function for the post-drain tail),
   `extract/simple.rs` (node and way classify), `extract/multi.rs` (node write,
@@ -891,29 +890,6 @@ on that function. The run directory stays eager (ADR-0018).
 
 Reported by: the command-matrix audit.
 
-## HYG-118 - The cross-thread allocator cap is requested by some block-producing commands and not others
-
-Anger: 9 - measured memory behaviour on the planet path.
-
-`ProcessActions::cross_thread_alloc_pool` (glibc arena cap; `renumber`'s
-comment attributes about 26 GB of anonymous RSS on planet to blocks allocated on
-worker threads and freed on compression threads) is called by repack, degrade's
-decode path, cat's decode path, renumber, time-filter's snapshot path, `check
---ids` and `check --refs`, and the geocode builder. It is not called by sort,
-tags-filter, extract, getid, getparents, add-locations-to-ways, apply-changes,
-diff, tags-count or `inspect --nodes`, which also run worker pools. Whether each
-of those allocates on one thread and frees on another, and whether it needs the
-cap, was not checked here. Each call site is a per-command decision that the
-CLI's `ProcessActions` could make once.
-
-Fix: measure the omitted commands (rule 8: not until the documents are drained),
-and if the cap is harmless, call it once from `main` as CLI process policy and delete
-the per-command calls; if it is harmful on some, keep the calls and write down which
-and why next to `ProcessActions`. Enforce with a text rule that the hook is
-called from one place.
-
-Reported by: the command-matrix audit.
-
 ## HYG-119 - The same long flag takes a different value grammar per command
 
 Anger: 7 - CLI behaviour; any change breaks scripts.
@@ -1051,21 +1027,6 @@ that unit tests in `src/read/blob.rs` and `src/read/reader.rs` read, and
 `examples/gen_test_pbf.rs` regenerates it. Either the rule gains a stated
 exception for the doc-example input, or the doctests build their input
 (a hidden `# ` setup line) and the unit tests use the `tests/common` writers.
-
-Reported by: the CLI test move.
-
-## HYG-132 - CliInvoker builders nothing calls
-
-Anger: 1 - test helper.
-
-`cli/tests/invoker.rs` defines `CliInvoker::clean_env`, `child_limits` and
-`stdin_bytes`, and no test calls any of them; the file-level
-`#![allow(dead_code)]` (needed because feature-gated modules drop other
-callers in some sweeps) hides it, as the `tests/common` one did before the
-move. `reference/testing.md` and `cli/tests/all.rs` cite `child_limits` as the
-way to give a child its own descriptor limit. Fix: delete the three, or keep
-them with a test each; narrow the allow to the items that are genuinely
-feature-dependent.
 
 Reported by: the CLI test move.
 

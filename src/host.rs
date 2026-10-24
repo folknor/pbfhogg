@@ -261,6 +261,19 @@ impl Executor {
 /// Invocation count and position are part of the contract, never deduplicated or hoisted.
 pub trait ProcessActions: Send + Sync {
     /// A pool will allocate and free buffers on different threads.
+    ///
+    /// The motivating measurement is renumber on planet: blocks allocated on
+    /// worker threads and freed on compression threads grew glibc arenas to
+    /// tens of GB of anonymous RSS uncapped, under 1 GB with the cap (the
+    /// figures are in renumber's call site).
+    ///
+    /// Only some commands that run worker pools request it. The others were
+    /// never checked for cross-thread alloc/free patterns, so not calling it
+    /// is not a decision that the cap is unneeded or harmful there. To
+    /// settle it, measure those commands on a large input, then either call
+    /// this once from the CLI's `main` as process policy and drop the
+    /// per-command calls, or document here, per command, why it must not be
+    /// capped.
     fn cross_thread_alloc_pool(&self);
     /// Request permission to hold `wanted` descriptors. The answer is how
     /// many the run may open on top of those already open in the process.

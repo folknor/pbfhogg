@@ -1127,7 +1127,15 @@ fn run_kind_phase(
                 // because it swaps the first two same-kind elements, which
                 // always land inside the first output block - not because
                 // of this flush.)
-                if !flags.suppress_boundary_flush() && !bb.is_empty() {
+                //
+                // The guard protects output blob order under a sorted
+                // header: this blob's full frames are written directly,
+                // so any earlier lower-ID block still buffered in `bb`
+                // or queued in `pending` must be written first, or a
+                // later batch would land after higher IDs. Both are
+                // checked (as in repack) so correctness does not rest on
+                // `pending` being empty whenever `bb` is.
+                if !flags.suppress_boundary_flush() && (!bb.is_empty() || !pending.is_empty()) {
                     if let Err(e) = flush_local(&mut bb, &mut output) {
                         classify_error.get_or_insert(e);
                         continue;

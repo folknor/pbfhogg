@@ -90,8 +90,7 @@ NAME` list each harness in turn to find one test.
 - **What the shared binary shares.** Every module of `all` runs
   concurrently in one process with: the global rayon pool; and
   `RLIMIT_NOFILE`, raised once per process by `common::test_host()`.
-  Child processes inherit that limit unless `CliInvoker::child_limits`
-  changes it. `WRITER_METRICS` and `PIPELINE_METRICS` are process-global
+  Child processes inherit that limit. `WRITER_METRICS` and `PIPELINE_METRICS` are process-global
   accumulators, so concurrent tests can contribute to the same totals.
   A test that needs any of this to itself takes a target of its own.
 - **Process-wide panic hook.** The reader pipeline-death unit test temporarily

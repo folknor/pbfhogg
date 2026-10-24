@@ -1081,6 +1081,18 @@
 
 ### Fixed
 
+- **`diff --format osc` on input without indexdata keeps every metadata
+  field.** Creates and modifies derived from a file without blob indexdata
+  carried only the version and lost timestamp, changeset, uid and user, which
+  the indexed path printed, so the OSC depended on whether the inputs were
+  indexed. Both sequential paths now print elements the same way, byte for
+  byte, and the text `diff` (verbose details included) likewise. Two edge
+  behaviours moved with it: a derived element whose tag, role or user name
+  points past its block's string table, or a modified element whose tag or
+  role does in a verbose diff, is now refused on every path (the indexed path
+  used to print it shortened); and on unindexed input an element with a bad
+  tag or role index that is only compared or deleted is no longer refused:
+  it is reported as different (or deleted), as on indexed input.
 - **`--direct-io` and `--io-uring` keep the alignment the device requires.**
   Direct I/O assumed 4096-byte alignment everywhere, so on a device or
   filesystem requiring more (a block device with a logical block size above

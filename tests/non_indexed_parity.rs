@@ -19,8 +19,9 @@
 //! element-level content contract.
 
 use crate::common::{
-    TestMember, TestNode, TestRelation, TestWay, assert_elements_equivalent, assert_indexed,
-    assert_non_indexed, generate_nodes, generate_ways, write_test_pbf_non_indexed,
+    TestMember, TestMeta, TestNode, TestRelation, TestWay, assert_elements_equivalent,
+    assert_indexed, assert_non_indexed, generate_nodes, generate_ways,
+    write_multi_block_non_indexed_pbf, write_multi_block_test_pbf, write_test_pbf_non_indexed,
     write_test_pbf_sorted,
 };
 use pbfhogg::MemberId;
@@ -613,82 +614,225 @@ fn check_ids_non_indexed_parity() {
 // derive_changes
 // ---------------------------------------------------------------------------
 //
-// `derive_changes` requires sorted input, accepts non-indexed. The
-// sequential (`jobs=1`) path is taken whenever either input lacks
-// indexdata. Compare `DeriveChangesStats` on twins. Output is
-// `.osc.gz` - not element-compared here; stats parity is the
-// meaningful pin.
+// `derive_changes` and `diff` require sorted input and accept non-indexed.
+// The sequential (`jobs=1`) block-pair merge runs when both inputs carry
+// indexdata, the element-level stream when either lacks it; the two must
+// print the same text, metadata included. Every element carries full
+// metadata, and the old and new files use different block sizes, so the
+// stream crosses block boundaries on one side while the other side's
+// block is half consumed.
 
-fn write_derive_pair(old_idx: &Path, old_non: &Path, new_idx: &Path, new_non: &Path) {
-    // Old: the shared baseline.
-    write_both(old_idx, old_non);
+fn meta(version: i32) -> TestMeta {
+    TestMeta {
+        version,
+        timestamp: 1_700_000_000 + i64::from(version),
+        changeset: 9_000 + i64::from(version),
+        uid: 42,
+        user: "mapper & co",
+        visible: true,
+    }
+}
 
-    // New: same 10 nodes as old, but node 2 has a tag changed (modify),
-    // node 3 removed (delete), and a new node 100 added (create).
-    // One way unchanged; relation unchanged.
-    let mut new_nodes = shared_nodes();
-    new_nodes[1].tags = vec![("amenity", "restaurant")];
-    new_nodes.remove(2);
-    new_nodes.push(TestNode {
+fn derive_old_elements() -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+    let mut nodes = generate_nodes(20, 1);
+    for (i, n) in nodes.iter_mut().enumerate() {
+        n.meta = Some(meta(1));
+        if i % 3 == 0 {
+            n.tags = vec![("amenity", "cafe")];
+        }
+    }
+    let mut ways = generate_ways(6, 1_000, 3, 1);
+    for w in &mut ways {
+        w.tags = vec![("highway", "primary")];
+        w.meta = Some(meta(2));
+    }
+    let relations = (0..3)
+        .map(|i| TestRelation {
+            id: 100 + i,
+            members: vec![TestMember {
+                id: MemberId::Way(1_000 + i),
+                role: "outer",
+            }],
+            tags: vec![("type", "multipolygon")],
+            meta: Some(meta(3)),
+        })
+        .collect();
+    (nodes, ways, relations)
+}
+
+/// The old elements with every change kind applied to every element kind,
+/// each changed element bumping its version.
+fn derive_new_elements() -> (Vec<TestNode>, Vec<TestWay>, Vec<TestRelation>) {
+    let (mut nodes, mut ways, mut relations) = derive_old_elements();
+    nodes[1].tags = vec![("amenity", "restaurant")];
+    nodes[1].meta = Some(meta(2));
+    nodes[7].lat += 1_000;
+    nodes[7].meta = Some(meta(2));
+    nodes.retain(|n| n.id != 3 && n.id != 12);
+    nodes.push(TestNode {
         id: 100,
         lat: 555_000_000,
         lon: 120_000_000,
-        tags: vec![],
-        meta: None,
+        tags: vec![("name", "new\nline")],
+        meta: Some(meta(1)),
     });
-    let ways = shared_ways();
-    let relations = shared_relations();
-    write_test_pbf_sorted(new_idx, &new_nodes, &ways, &relations);
-    write_test_pbf_non_indexed(new_non, &new_nodes, &ways, &relations);
-    assert_indexed(new_idx);
-    assert_non_indexed(new_non);
+    ways[2].refs.push(1);
+    ways[2].meta = Some(meta(3));
+    ways.remove(4);
+    ways.push(TestWay {
+        id: 2_000,
+        refs: vec![1, 2],
+        tags: vec![("building", "yes")],
+        meta: Some(meta(1)),
+    });
+    relations[0].members[0].role = "inner";
+    relations[0].meta = Some(meta(4));
+    relations.remove(2);
+    relations.push(TestRelation {
+        id: 200,
+        members: vec![TestMember {
+            id: MemberId::Node(1),
+            role: "label",
+        }],
+        tags: vec![("type", "boundary")],
+        meta: Some(meta(1)),
+    });
+    (nodes, ways, relations)
 }
 
+/// Write the old and new files, each once with indexdata and once without,
+/// returning `(old_idx, old_non, new_idx, new_non)`.
+fn write_derive_pair(dir: &Path) -> [std::path::PathBuf; 4] {
+    let paths = ["old_idx", "old_non", "new_idx", "new_non"]
+        .map(|name| dir.join(format!("{name}.osm.pbf")));
+    let (nodes, ways, relations) = derive_old_elements();
+    write_multi_block_test_pbf(&paths[0], &nodes, &ways, &relations, 3);
+    write_multi_block_non_indexed_pbf(&paths[1], &nodes, &ways, &relations, 3);
+    let (nodes, ways, relations) = derive_new_elements();
+    write_multi_block_test_pbf(&paths[2], &nodes, &ways, &relations, 4);
+    write_multi_block_non_indexed_pbf(&paths[3], &nodes, &ways, &relations, 4);
+    assert_indexed(&paths[0]);
+    assert_non_indexed(&paths[1]);
+    assert_indexed(&paths[2]);
+    assert_non_indexed(&paths[3]);
+    paths
+}
+
+fn derive_text(dir: &Path, old: &Path, new: &Path, name: &str) -> String {
+    let osc = dir.join(name);
+    pbfhogg::diff::derive::derive_changes(
+        old,
+        new,
+        crate::common::out(&osc),
+        false,
+        false,
+        None,
+        pbfhogg::Parallelism::from_jobs(1),
+        &crate::common::test_host(),
+        crate::common::scratch_in(dir),
+    )
+    .expect("derive_changes");
+    std::fs::read_to_string(&osc).expect("read derived OSC")
+}
+
+fn diff_text(dir: &Path, old: &Path, new: &Path) -> String {
+    let mut out = Vec::new();
+    pbfhogg::diff::diff(
+        old,
+        new,
+        &mut out,
+        &pbfhogg::diff::DiffOptions {
+            suppress_common: false,
+            verbose: true,
+            type_filter: None,
+            parallelism: pbfhogg::Parallelism::from_jobs(1),
+        },
+        false,
+        &crate::common::test_host(),
+        Some(crate::common::scratch_in(dir)),
+    )
+    .expect("diff");
+    String::from_utf8(out).expect("diff text is UTF-8")
+}
+
+/// The OSC derive prints does not depend on which sequential path ran: a
+/// pair without indexdata on either side, or on one side only, prints the
+/// indexed pair's text byte for byte, full metadata on creates and
+/// modifies included.
 #[test]
 fn derive_changes_non_indexed_parity() {
     let dir = crate::common::test_scratch();
-    let old_idx = dir.path().join("old_idx.osm.pbf");
-    let old_non = dir.path().join("old_non.osm.pbf");
-    let new_idx = dir.path().join("new_idx.osm.pbf");
-    let new_non = dir.path().join("new_non.osm.pbf");
-    let osc_ii = dir.path().join("ii.osc.gz");
-    let osc_nn = dir.path().join("nn.osc.gz");
-    write_derive_pair(&old_idx, &old_non, &new_idx, &new_non);
+    let [old_idx, old_non, new_idx, new_non] = write_derive_pair(dir.path());
 
-    let stats_ii = pbfhogg::diff::derive::derive_changes(
-        &old_idx,
-        &new_idx,
-        crate::common::out(&osc_ii),
-        false,
-        false,
-        None,
-        pbfhogg::Parallelism::from_jobs(1),
-        &crate::common::test_host(),
-        crate::common::scratch_in(dir.path()),
-    )
-    .expect("derive_changes indexed");
-    let stats_nn = pbfhogg::diff::derive::derive_changes(
-        &old_non,
-        &new_non,
-        crate::common::out(&osc_nn),
-        false,
-        false,
-        None,
-        pbfhogg::Parallelism::from_jobs(1),
-        &crate::common::test_host(),
-        crate::common::scratch_in(dir.path()),
-    )
-    .expect("derive_changes non-indexed");
+    let indexed = derive_text(dir.path(), &old_idx, &new_idx, "ii.osc");
+    for (old, new, name) in [
+        (&old_non, &new_non, "nn.osc"),
+        (&old_idx, &new_non, "in.osc"),
+        (&old_non, &new_idx, "ni.osc"),
+    ] {
+        let text = derive_text(dir.path(), old, new, name);
+        assert_eq!(text, indexed, "{name} differs from the indexed derive");
+    }
 
-    assert_eq!(stats_ii.creates, stats_nn.creates, "creates parity");
-    assert_eq!(stats_ii.modifies, stats_nn.modifies, "modifies parity");
-    assert_eq!(stats_ii.deletes, stats_nn.deletes, "deletes parity");
+    // The fixture exercises every action, and every created and modified
+    // element - each kind, dense nodes included - carries its full
+    // metadata, so a writer that dropped it on both paths alike still fails.
+    for section in ["<create>", "<modify>", "<delete>"] {
+        assert!(indexed.contains(section), "no {section} in: {indexed}");
+    }
+    let (changed, _deletes) = indexed
+        .split_once("<delete>")
+        .expect("the delete section follows creates and modifies");
+    let mut seen = Vec::new();
+    for element in changed.split('<') {
+        let Some(kind) = ["node ", "way ", "relation "]
+            .into_iter()
+            .find(|k| element.starts_with(k))
+        else {
+            continue;
+        };
+        seen.push(kind);
+        for attr in [
+            "version=\"",
+            "timestamp=\"",
+            "changeset=\"",
+            "uid=\"42\"",
+            "user=\"mapper &amp; co\"",
+        ] {
+            assert!(element.contains(attr), "no {attr} on <{element}");
+        }
+    }
+    for kind in ["node ", "way ", "relation "] {
+        assert!(
+            seen.iter().filter(|&&k| k == kind).count() >= 2,
+            "expected a created and a modified {kind}in: {indexed}"
+        );
+    }
+    assert!(changed.contains("timestamp=\"2023-11-14T22:13:24Z\" changeset=\"9004\""));
+}
 
-    // Sanity: the change set should be non-trivial.
-    assert!(
-        stats_ii.creates + stats_ii.modifies + stats_ii.deletes > 0,
-        "derive change fixture must produce at least one op"
-    );
+/// The same for the text diff, verbose details included.
+#[test]
+fn diff_non_indexed_parity() {
+    let dir = crate::common::test_scratch();
+    let [old_idx, old_non, new_idx, new_non] = write_derive_pair(dir.path());
+
+    let indexed = diff_text(dir.path(), &old_idx, &new_idx);
+    for (old, new) in [
+        (&old_non, &new_non),
+        (&old_idx, &new_non),
+        (&old_non, &new_idx),
+    ] {
+        assert_eq!(diff_text(dir.path(), old, new), indexed);
+    }
+    for line in [
+        "*n2 v1 -> v2",
+        "  +amenity=restaurant",
+        "-n3 v1",
+        "+n100 v1",
+    ] {
+        assert!(indexed.contains(line), "no {line:?} in: {indexed}");
+    }
 }
 
 // ---------------------------------------------------------------------------

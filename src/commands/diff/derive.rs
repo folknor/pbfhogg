@@ -15,12 +15,10 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use crate::ElementKind;
 use crate::error::{Error, Result};
 use crate::osc::merge_join::{
-    BlockMergeAction, BlockPairMergeState, MergeJoinAction, StreamingBlocks,
-    block_pair_merge_phase, merge_join_phase,
+    BlockMergeAction, BlockPairMergeState, StreamingBlocks, block_pair_merge_phase,
+    stream_merge_phase,
 };
-use crate::osc::write::{
-    OwnedMetadata, write_element_xml, write_node_xml, write_relation_xml, write_way_xml,
-};
+use crate::osc::write::{OwnedMetadata, write_element_xml};
 
 // ---------------------------------------------------------------------------
 // Stats
@@ -283,6 +281,29 @@ impl ChangeSink {
         Ok(())
     }
 
+    /// Record one merge action, from either sequential path. The one place
+    /// a sequential derive turns an action into OSC, so the output does not
+    /// depend on whether the inputs carried indexdata.
+    fn record(&mut self, kind: ElementKind, action: &BlockMergeAction<'_>) -> Result<()> {
+        match *action {
+            BlockMergeAction::BlobEqual(_) | BlockMergeAction::ElementEqual { .. } => {}
+            BlockMergeAction::BlobOldOnly { block, skip, .. } => {
+                for elem in block.elements().skip(skip) {
+                    self.write_delete(&elem, kind)?;
+                }
+            }
+            BlockMergeAction::BlobNewOnly { block, skip, .. } => {
+                for elem in block.elements().skip(skip) {
+                    self.write_create(&elem)?;
+                }
+            }
+            BlockMergeAction::ElementModified { new, .. } => self.write_modify(new)?,
+            BlockMergeAction::ElementOldOnly(o) => self.write_delete(o, kind)?,
+            BlockMergeAction::ElementNewOnly(n) => self.write_create(n)?,
+        }
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<()> {
         self.creates.get_mut().flush()?;
         self.modifies.get_mut().flush()?;
@@ -384,35 +405,12 @@ fn collect_phase_block_pair(
     kind: ElementKind,
     sink: &mut ChangeSink,
 ) -> Result<()> {
-    block_pair_merge_phase(merge, kind, true, &mut |action| {
-        match action {
-            BlockMergeAction::BlobEqual(_) | BlockMergeAction::ElementEqual { .. } => {}
-            BlockMergeAction::BlobOldOnly { block, skip, .. } => {
-                for elem in block.elements().skip(skip) {
-                    sink.write_delete(&elem, kind)?;
-                }
-            }
-            BlockMergeAction::BlobNewOnly { block, skip, .. } => {
-                for elem in block.elements().skip(skip) {
-                    sink.write_create(&elem)?;
-                }
-            }
-            BlockMergeAction::ElementModified { new, .. } => {
-                sink.write_modify(new)?;
-            }
-            BlockMergeAction::ElementOldOnly(o) => {
-                sink.write_delete(o, kind)?;
-            }
-            BlockMergeAction::ElementNewOnly(n) => {
-                sink.write_create(n)?;
-            }
-        }
-        Ok(())
-    })
+    block_pair_merge_phase(merge, kind, true, &mut |action| sink.record(kind, &action))
 }
 
-/// Fallback path using element-level merge-join with owned elements.
-/// Streams changes directly to temp files via `ChangeSink`.
+/// Fallback path for inputs without indexdata: the element-level streaming
+/// merge, borrowed elements straight from each side's current block, fed
+/// through the same [`ChangeSink::record`] as the block-pair path.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn derive_changes_element_stream(
     old_path: &Path,
@@ -421,107 +419,33 @@ fn derive_changes_element_stream(
     sink: &mut ChangeSink,
     host: &crate::host::Host,
 ) -> Result<()> {
-    use crate::osc::write::{OwnedNode, OwnedRelation, OwnedWay};
-
     let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io, host)?;
     let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io, host)?;
 
-    let iv = sink.increment_version;
-    let ut = sink.timestamp;
-
-    // Phase 1: Nodes
-    crate::debug::emit_marker("DERIVECHANGES_PHASE_NODE_START");
-    {
-        let (mut ob, mut nb): (Vec<OwnedNode>, Vec<OwnedNode>) = (Vec::new(), Vec::new());
-        merge_join_phase(&mut old_src, &mut ob, &mut new_src, &mut nb, |action| {
-            match action {
-                MergeJoinAction::OldOnly(n) => {
-                    write_delete_element(
-                        &mut sink.deletes,
-                        "node",
-                        n.id,
-                        n.metadata.as_ref(),
-                        iv,
-                        ut,
-                    )?;
-                    sink.delete_count += 1;
-                }
-                MergeJoinAction::NewOnly(n) => {
-                    write_node_xml(&mut sink.creates, n)?;
-                    sink.create_count += 1;
-                }
-                MergeJoinAction::Modified(_, n) => {
-                    write_node_xml(&mut sink.modifies, n)?;
-                    sink.modify_count += 1;
-                }
-                MergeJoinAction::Equal(_) => {}
-            }
-            Ok(())
+    let phases = [
+        (
+            ElementKind::Node,
+            "DERIVECHANGES_PHASE_NODE_START",
+            "DERIVECHANGES_PHASE_NODE_END",
+        ),
+        (
+            ElementKind::Way,
+            "DERIVECHANGES_PHASE_WAY_START",
+            "DERIVECHANGES_PHASE_WAY_END",
+        ),
+        (
+            ElementKind::Relation,
+            "DERIVECHANGES_PHASE_REL_START",
+            "DERIVECHANGES_PHASE_REL_END",
+        ),
+    ];
+    for (kind, start, end) in phases {
+        crate::debug::emit_marker(start);
+        stream_merge_phase(&mut old_src, &mut new_src, kind, &mut |action| {
+            sink.record(kind, &action)
         })?;
+        crate::debug::emit_marker(end);
     }
-    crate::debug::emit_marker("DERIVECHANGES_PHASE_NODE_END");
-    // Phase 2: Ways
-    crate::debug::emit_marker("DERIVECHANGES_PHASE_WAY_START");
-    {
-        let (mut ob, mut nb): (Vec<OwnedWay>, Vec<OwnedWay>) = (Vec::new(), Vec::new());
-        merge_join_phase(&mut old_src, &mut ob, &mut new_src, &mut nb, |action| {
-            match action {
-                MergeJoinAction::OldOnly(w) => {
-                    write_delete_element(
-                        &mut sink.deletes,
-                        "way",
-                        w.id,
-                        w.metadata.as_ref(),
-                        iv,
-                        ut,
-                    )?;
-                    sink.delete_count += 1;
-                }
-                MergeJoinAction::NewOnly(w) => {
-                    write_way_xml(&mut sink.creates, w)?;
-                    sink.create_count += 1;
-                }
-                MergeJoinAction::Modified(_, w) => {
-                    write_way_xml(&mut sink.modifies, w)?;
-                    sink.modify_count += 1;
-                }
-                MergeJoinAction::Equal(_) => {}
-            }
-            Ok(())
-        })?;
-    }
-    crate::debug::emit_marker("DERIVECHANGES_PHASE_WAY_END");
-    // Phase 3: Relations
-    crate::debug::emit_marker("DERIVECHANGES_PHASE_REL_START");
-    {
-        let (mut ob, mut nb): (Vec<OwnedRelation>, Vec<OwnedRelation>) = (Vec::new(), Vec::new());
-        merge_join_phase(&mut old_src, &mut ob, &mut new_src, &mut nb, |action| {
-            match action {
-                MergeJoinAction::OldOnly(r) => {
-                    write_delete_element(
-                        &mut sink.deletes,
-                        "relation",
-                        r.id,
-                        r.metadata.as_ref(),
-                        iv,
-                        ut,
-                    )?;
-                    sink.delete_count += 1;
-                }
-                MergeJoinAction::NewOnly(r) => {
-                    write_relation_xml(&mut sink.creates, r)?;
-                    sink.create_count += 1;
-                }
-                MergeJoinAction::Modified(_, r) => {
-                    write_relation_xml(&mut sink.modifies, r)?;
-                    sink.modify_count += 1;
-                }
-                MergeJoinAction::Equal(_) => {}
-            }
-            Ok(())
-        })?;
-    }
-    crate::debug::emit_marker("DERIVECHANGES_PHASE_REL_END");
 
     Ok(())
 }
@@ -679,8 +603,8 @@ fn copy_section<W: Write>(
 }
 
 /// Write one `<node|way|relation id=".." [version=".."] [timestamp=".."]/>`
-/// delete entry. Shared by the sequential sink, the element-stream fallback
-/// and the parallel shard workers.
+/// delete entry. Shared by the sequential sink (both sequential paths) and
+/// the parallel shard workers.
 pub(super) fn write_delete_element<W: Write>(
     writer: &mut Writer<W>,
     tag_name: &str,
@@ -699,8 +623,7 @@ pub(super) fn write_delete_element<W: Write>(
     // (Osmosis). `version="0"` - or `version="1"` under
     // `--increment-version` - would be a claim the input never made. The
     // filter sits here rather than at extraction because every derive path
-    // funnels its deletes through this function, the element-stream
-    // fallback's owned metadata included.
+    // funnels its deletes through this function.
     if let Some(version) = metadata.and_then(|m| m.version).filter(|&v| v >= 1) {
         let version = if increment_version {
             version.saturating_add(1)

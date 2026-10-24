@@ -24,14 +24,34 @@
 //!
 //! Every string is resolved through the fallible string-table lookup, so a
 //! bad index is an `Err` token, never a silently shortened tag list. An
-//! `Err` token compares unequal to everything, including another `Err`.
+//! `Err` token the comparison reaches compares unequal to everything,
+//! including another `Err`; a comparison that already differs on an
+//! earlier token stops before it.
+//!
+//! Diff and derive validate string indices in exactly three places, the
+//! same on every path:
+//!
+//! - **Comparison** sees only content tokens: a bad tag or role index it
+//!   reaches makes the pair unequal. Metadata (the user name) is not
+//!   content, so a bad user index never affects equality.
+//! - **Derive's OSC writers** resolve every string they print - tags,
+//!   roles and the user name - through the checked lookups and refuse a bad
+//!   index, so a created or modified element is never printed shortened.
+//!   A delete prints only id and version and validates nothing else.
+//! - **Diff's verbose details** for a modified pair resolve the tags and
+//!   roles they print through the checked lookups. The compact text lines
+//!   print only kind, id and version.
+//!
+//! Anything else - a bad index in an element only deleted, created in a
+//! text diff, or in a pair decided unequal before the bad token - is not
+//! validated by diff or derive; that is `check`'s job. The indexed
+//! byte-equal blob fast path does not decode at all.
 //!
 //! Changing what is content, or how [`write_record`] serializes it, changes
 //! what `digest` prints: bump `digest::CANONICAL_VERSION` with it.
 
 use crate::ElementKind;
 use crate::error::Result;
-use crate::osc::write::{OwnedNode, OwnedRelation, OwnedWay};
 use crate::{Element, MemberId};
 
 /// One unit of element content.
@@ -52,8 +72,9 @@ pub(crate) enum Token<'a> {
     },
 }
 
-/// Something with element content: a borrowed [`Element`] or an owned
-/// element from the merge-join's buffers.
+/// Something with element content. Only borrowed [`Element`]s implement it:
+/// every diff and derive path compares elements straight from their
+/// decoded blocks.
 pub(crate) trait Content {
     fn content_kind(&self) -> ElementKind;
     fn content_tokens(&self) -> impl Iterator<Item = Result<Token<'_>>>;
@@ -177,52 +198,6 @@ impl<'a> Iterator for ElementTokens<'a> {
             },
         }
     }
-}
-
-impl Content for OwnedNode {
-    fn content_kind(&self) -> ElementKind {
-        ElementKind::Node
-    }
-
-    fn content_tokens(&self) -> impl Iterator<Item = Result<Token<'_>>> {
-        std::iter::once(Token::Coord {
-            lat: self.decimicro_lat,
-            lon: self.decimicro_lon,
-        })
-        .chain(owned_tags(&self.tags))
-        .map(Ok)
-    }
-}
-
-impl Content for OwnedWay {
-    fn content_kind(&self) -> ElementKind {
-        ElementKind::Way
-    }
-
-    fn content_tokens(&self) -> impl Iterator<Item = Result<Token<'_>>> {
-        owned_tags(&self.tags)
-            .chain(self.refs.iter().map(|&r| Token::Ref(r)))
-            .map(Ok)
-    }
-}
-
-impl Content for OwnedRelation {
-    fn content_kind(&self) -> ElementKind {
-        ElementKind::Relation
-    }
-
-    fn content_tokens(&self) -> impl Iterator<Item = Result<Token<'_>>> {
-        owned_tags(&self.tags)
-            .chain(self.members.iter().map(|m| Token::Member {
-                id: m.id,
-                role: m.role.as_str(),
-            }))
-            .map(Ok)
-    }
-}
-
-fn owned_tags(tags: &[(String, String)]) -> impl Iterator<Item = Token<'_>> {
-    tags.iter().map(|(k, v)| Token::Tag(k.as_str(), v.as_str()))
 }
 
 // ---------------------------------------------------------------------------

@@ -133,10 +133,10 @@ The judgement calls already known, to be checked first:
     reads and, under a filter excluding the trailing kinds, walks the rest
     of both files' headers with a `HeaderWalker` (a pread per remaining
     blob, nothing for unfiltered runs).
-  - The unindexed element stream now checks element order per converted
+  - The unindexed element stream now checks element order per merged
     element (one key compare), classifies each block not of the phase's
     kind by iterating its elements, and drops excluded kinds' blocks
-    without converting them; it still decompresses every block of both
+    without merging their elements; it still decompresses every block of both
     files, deliberately, since that is what refuses a misplaced block.
     Expected faster under `--type`, slightly slower per element otherwise;
     not measured.
@@ -162,6 +162,30 @@ The judgement calls already known, to be checked first:
     `stx_dio_read_offset_align`; the lockfile was already there.
   - The io_uring path could not be run end to end here (the bench host's
     `RLIMIT_MEMLOCK` refuses it, see ADR-0014); only unit tests cover it.
+- The unindexed diff and derive paths (sequential, inputs without
+  indexdata) no longer convert every element to owned strings: the
+  element-level merge (`osc::merge_join::stream_merge_phase`) compares and
+  prints borrowed elements straight from each side's current block, through
+  the same action handler as the block-pair path, so the derived OSC now
+  carries full metadata on both paths. Judgement calls on measured paths,
+  none measured:
+  - Per side the decoded block now stays alive while its elements are
+    merged, instead of being dropped after conversion to an owned buffer.
+    Each side's peak is no higher than before (conversion held block plus
+    buffer), but the two sides' peaks can now coincide: a large block on one
+    side stays resident while the other side walks many small blocks. Bounded
+    by two decoded blocks, the same shape as the indexed block-pair merge.
+  - Derive's borrowed OSC writers (every path, the parallel shards included)
+    now resolve tags, roles and the user name, and diff's verbose details
+    tags and roles, through the checked lookups and refuse a bad string
+    index; argued cost-neutral (the lookups were already done, only the
+    error is kept).
+  - The unindexed text diff no longer errors on a corrupt string index in an
+    element it only compares or deletes; it reports it as different, as the
+    indexed path always did (contract in `content.rs`).
+  - Unindexed verbose diff details switched from the owned linear tag scan
+    to the borrowed `HashMap` one the indexed path uses (differs only on
+    duplicate keys).
 
 ---
 
@@ -1087,3 +1111,16 @@ Worth doing only if a producer whose blocks fall in these shapes turns up
 and the normalisation matters to someone; otherwise it stays parked.
 
 Reported by: the BUG-113 implementation.
+
+## HYG-149 - The sequential merges allocate a fresh decompress buffer per block
+
+Anger: 9 - buffer reuse on the diff and derive sequential paths.
+
+Both sequential merges in `osc/merge_join.rs` (the indexed block-pair merge
+and the unindexed `stream_merge_phase`) hand the decompress buffer to each
+decoded block and never get it back, so every block allocates a new, often
+large, buffer. The pipelined readers recycle theirs. Whether this costs
+anything measurable at planet scale is unknown (rule 8); a fix would return
+the buffer when the block drops, or decode into a pooled buffer.
+
+Reported by: the BUG-146 fix.

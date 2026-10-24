@@ -99,8 +99,9 @@ and vice versa for `--increment-version` / `--update-timestamp`. The global
 `-q` works with both: a quiet text diff answers by exit code alone, a quiet
 OSC diff still writes its `-o`.
 
-**Lossless deletes:** pbfhogg's `diff --format osc` produces a perfect roundtrip
-- applying the derived OSC to the old PBF reproduces the new PBF exactly.
+**Lossless deletes:** pbfhogg's `diff --format osc` roundtrips content -
+applying the derived OSC to the old PBF gives a file `diff` finds identical to
+the new PBF (metadata, which `diff` ignores, is outside that check).
 osmium's `derive-changes` can lose deletes when the deleted element is absent
 from both input files (see [DEVIATIONS](/cli/deviations#derive-changes-lossless-delete-roundtrip)).
 

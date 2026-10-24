@@ -130,11 +130,12 @@ historical version.
    stores `version: i32` and `changeset: i64` as plain non-optional values decoded
    from packed arrays in the dense node iterator - the tightest loop in the library
    (~8 billion iterations for planet). Changing these to `Option` would add per-element
-   overhead on a path where every nanosecond matters. Instead, the four conversion
-   sites that bridge dense reads to writes guard against -1:
+   overhead on a path where every nanosecond matters. Instead, the sites that
+   bridge dense reads to writes guard against -1:
    - `dense_node_metadata`, `dense_node_raw_metadata` and `read_dense_node` in
      `src/owned.rs`
-   - `convert_node` in `src/osc/merge_join.rs`
+   - the derive OSC writer in `src/osc/write.rs`, through
+     `DenseNodeInfo::claims`
 
 **Consequence for library users:** Code consuming the public `DenseNodeInfo` API
 directly (not through pbfhogg's commands) will still observe raw `-1` values from

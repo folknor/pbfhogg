@@ -191,6 +191,50 @@ pub fn write_test_pbf_impl(
     sorted: bool,
     block_size_override: Option<usize>,
 ) {
+    write_blocks(
+        path,
+        nodes,
+        ways,
+        relations,
+        sorted,
+        block_size_override,
+        true,
+    );
+}
+
+/// [`write_multi_block_test_pbf`] without `indexdata` on any blob: the same
+/// blocks, so a fixture pair from the two writers differs only in whether
+/// the merge paths can use indexdata.
+pub fn write_multi_block_non_indexed_pbf(
+    path: &Path,
+    nodes: &[TestNode],
+    ways: &[TestWay],
+    relations: &[TestRelation],
+    block_size: usize,
+) {
+    assert!(block_size > 0, "block_size must be > 0");
+    write_blocks(path, nodes, ways, relations, true, Some(block_size), false);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_blocks(
+    path: &Path,
+    nodes: &[TestNode],
+    ways: &[TestWay],
+    relations: &[TestRelation],
+    sorted: bool,
+    block_size_override: Option<usize>,
+    indexdata: bool,
+) {
+    let write = |writer: &mut PbfWriter<std::io::BufWriter<std::fs::File>>, bytes: &[u8]| {
+        if indexdata {
+            writer.write_primitive_block(bytes).expect("write block");
+        } else {
+            writer
+                .write_primitive_block_no_indexdata(bytes)
+                .expect("write block");
+        }
+    };
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
@@ -210,7 +254,7 @@ pub fn write_test_pbf_impl(
         if (!bb.can_add_node() || hit_override)
             && let Some(bytes) = bb.take().expect("take")
         {
-            writer.write_primitive_block(bytes).expect("write block");
+            write(&mut writer, bytes);
             batch_count = 0;
         }
         let meta = n.meta.as_ref().map(to_block_meta);
@@ -220,7 +264,7 @@ pub fn write_test_pbf_impl(
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
     {
-        writer.write_primitive_block(bytes).expect("write block");
+        write(&mut writer, bytes);
     }
     batch_count = 0;
 
@@ -230,7 +274,7 @@ pub fn write_test_pbf_impl(
         if (!bb.can_add_way() || hit_override)
             && let Some(bytes) = bb.take().expect("take")
         {
-            writer.write_primitive_block(bytes).expect("write block");
+            write(&mut writer, bytes);
             batch_count = 0;
         }
         let meta = w.meta.as_ref().map(to_block_meta);
@@ -240,7 +284,7 @@ pub fn write_test_pbf_impl(
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
     {
-        writer.write_primitive_block(bytes).expect("write block");
+        write(&mut writer, bytes);
     }
     batch_count = 0;
 
@@ -250,7 +294,7 @@ pub fn write_test_pbf_impl(
         if (!bb.can_add_relation() || hit_override)
             && let Some(bytes) = bb.take().expect("take")
         {
-            writer.write_primitive_block(bytes).expect("write block");
+            write(&mut writer, bytes);
             batch_count = 0;
         }
         let members: Vec<MemberData<'_>> = r
@@ -268,7 +312,7 @@ pub fn write_test_pbf_impl(
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
     {
-        writer.write_primitive_block(bytes).expect("write block");
+        write(&mut writer, bytes);
     }
 
     writer.flush().expect("flush");

@@ -93,22 +93,3 @@ building a `PrimitiveBlock` validates, not metadata arithmetic done later
 during decode.
 
 Reported by: the extract passthrough fix.
-
-## BUG-146 - Unindexed derive-changes drops every metadata field but the version
-
-Anger: 7 - derive-changes output.
-
-On unindexed inputs derive goes through `osc/merge_join.rs`'s `convert_node`,
-`convert_way` and `convert_relation`, which build metadata with
-`OwnedMetadata::version_only`: creates and modifies carry the version and
-lose timestamp, changeset, uid and user, which the indexed path prints. The
-OSC therefore depends on which path ran, contradicting the lossless roundtrip
-claim in `docs/cli/deviations.md`. No test sees it, because
-`content::content_equal` ignores metadata; and for the same reason that
-page's "reproduces the new file exactly" is stronger than anything checked,
-since a metadata-only change is invisible to the diff. Fix: carry full
-metadata through `convert_*`, a cross-path test comparing the OSC text of
-indexed and unindexed derive, and wording in `deviations.md` that says what
-the roundtrip actually compares.
-
-Reported by: the BUG-133 fix.

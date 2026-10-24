@@ -1,16 +1,16 @@
-//! Streaming element cursor and merge-join for sorted PBF operations.
+//! Sequential merge-joins for sorted PBF operations, used by `diff` and
+//! `derive_changes`.
 //!
-//! Provides [`StreamingBlocks`] - a block-level cursor over a sequential
-//! `BlobReader` that yields owned elements one at a time, handling block
-//! boundaries transparently, for inputs without indexdata.
-//! [`merge_join_phase`] runs a generic two-pointer merge-join over two
-//! cursors, and [`block_pair_merge_phase`] the blob-level merge over two
-//! indexed inputs; both are used by `diff` and `derive_changes`.
+//! [`block_pair_merge_phase`] is the blob-level merge over two indexed
+//! inputs. [`stream_merge_phase`] is the element-level merge over two
+//! [`StreamingBlocks`] cursors, for inputs without indexdata. Both hand the
+//! caller borrowed elements through the same [`BlockMergeAction`] variants,
+//! so each command has one action handler for both paths and prints an
+//! element the same way whichever path found it.
 
 use crate::ElementKind;
 use crate::{BlockType, Element, PrimitiveBlock};
 
-use super::write::{OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay};
 use crate::error::Result;
 
 // ---------------------------------------------------------------------------
@@ -119,10 +119,10 @@ impl StreamingBlocks {
     /// stream unseen.
     ///
     /// The elements of a dropped block are iterated to classify it but never
-    /// converted, so element-level faults a conversion would refuse (a tag
-    /// or role whose string index is out of range) and the order of elements
-    /// within an excluded kind go unchecked: they cannot change an answer
-    /// about the selected kinds. Decompression and block parsing still run
+    /// compared or printed, so element-level faults (a tag or role whose
+    /// string index is out of range) and the order of elements within an
+    /// excluded kind go unchecked: they cannot change an answer about the
+    /// selected kinds. Decompression and block parsing still run
     /// on every block, because without indexdata they are the only way to
     /// know where a kind ends.
     pub(crate) fn skip_kind(&mut self, kind: ElementKind) -> Result<()> {
@@ -141,6 +141,72 @@ impl StreamingBlocks {
                 BlockKinds::Several => return Err(self.locate(mixed_block())),
             }
         }
+    }
+
+    /// The next block of the phase's `kind`, or `None` when this side's
+    /// phase is over (end of file, or the first block of a later kind,
+    /// stashed for the phase or skip that takes it next).
+    ///
+    /// A block whose [`BlockType`] names `kind` is taken directly (the
+    /// normal sorted case); a wrong-kind element inside it is refused when
+    /// [`StreamingBlocks::admit`] meets it. Any other block is classified by
+    /// the element kinds it actually yields (see
+    /// [`StreamingBlocks::skip_kind`] for why the block type cannot decide):
+    /// no elements is skipped, `kind` alone is taken, a later kind is
+    /// stashed and ends the phase, an earlier kind or several kinds is
+    /// refused as unsorted. The classification also accepts a block whose
+    /// block type says `Mixed` while every element is one kind (dense and
+    /// plain node groups side by side, an empty dense group beside ways).
+    fn next_phase_block(&mut self, kind: ElementKind) -> Result<Option<PrimitiveBlock>> {
+        loop {
+            let Some(block) = self.next_block()? else {
+                return Ok(None);
+            };
+            if block_type_kind(block.block_type()) == Some(kind) {
+                return Ok(Some(block));
+            }
+            match element_kinds(&block) {
+                BlockKinds::Empty => {}
+                BlockKinds::One(k) if k == kind => return Ok(Some(block)),
+                BlockKinds::One(k) if k > kind => {
+                    self.stashed = Some(block);
+                    return Ok(None);
+                }
+                BlockKinds::One(k) => return Err(self.locate(unsorted_block(k, kind))),
+                BlockKinds::Several => return Err(self.locate(mixed_block())),
+            }
+        }
+    }
+
+    /// Check an element just pulled from this side's current block before
+    /// the merge may look at it: it must be of the phase's `kind` (anything
+    /// else is the mixed-block error), and it must not go backwards in OSM
+    /// order within the kind. An equal id passes, as in the blob-order
+    /// checks (duplicates are a separate concern). Without indexdata this is
+    /// the only order evidence the stream has, and a merge over a backwards
+    /// stream pairs the wrong elements.
+    fn admit<'b>(&mut self, element: Element<'b>, kind: ElementKind) -> Result<Element<'b>> {
+        if element_kind(&element) != kind {
+            return Err(self.locate(mixed_block()));
+        }
+        let id = element_id(&element);
+        let key = crate::osm_id::osm_id_key(id);
+        let ordinal = kind.ordinal();
+        if let Some((last_kind, last_key)) = self.last_element
+            && last_kind == ordinal
+            && key < last_key
+        {
+            return Err(self.locate(crate::error::new_unsorted(format!(
+                "streaming merge-join: {} {} follows {} {}. The input's header claims \
+                 Sort.Type_then_ID but its elements are not in canonical order.",
+                kind.as_str(),
+                id,
+                kind.as_str(),
+                crate::osm_id::osm_id_from_key(last_key),
+            ))));
+        }
+        self.last_element = Some((ordinal, key));
+        Ok(element)
     }
 }
 
@@ -216,296 +282,114 @@ fn unsorted_block(found: ElementKind, phase: ElementKind) -> crate::Error {
 }
 
 // ---------------------------------------------------------------------------
-// Typed element extraction
+// Element-level streaming merge (inputs without indexdata)
 // ---------------------------------------------------------------------------
 
-/// Fill `buffer` with owned elements of type `T` from the next block of the
-/// phase's kind.
+/// Pull the next element of one side, refilling its block as needed, and
+/// admit it ([`StreamingBlocks::admit`]). `None` once this side's phase is
+/// over, which also sets `ended` so the phase never asks this side again.
 ///
-/// A block whose [`BlockType`] names this phase's kind is converted directly
-/// (the normal sorted case); a wrong-kind element found in it is the
-/// mixed-block error. Any other block is classified by the element kinds it
-/// actually yields (see [`StreamingBlocks::skip_kind`] for why the block type
-/// cannot decide): no elements is skipped, this kind alone is converted, a
-/// later kind is stashed and ends the phase, an earlier kind or several kinds
-/// is refused as unsorted. The classification also accepts a block whose
-/// block type says `Mixed` while every element is one kind (dense and plain
-/// node groups side by side, an empty dense group beside ways) in that kind,
-/// where the conversion alone refused it in whichever phase met it first.
-///
-/// Converted elements must not go backwards in OSM order within the kind;
-/// an equal id passes, as in the blob-order checks (duplicates are a separate
-/// concern). Without indexdata this is the only order evidence the stream
-/// has, and a merge over a backwards stream pairs the wrong elements.
-///
-/// Returns `true` if elements were added to the buffer, `false` if the phase
-/// is exhausted (EOF or a later kind's block).
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn fill_buffer<T: MergeJoinElement>(
-    source: &mut StreamingBlocks,
-    buffer: &mut Vec<T>,
-) -> Result<bool> {
-    let kind = T::KIND;
-    loop {
-        let Some(block) = source.next_block()? else {
-            return Ok(false);
-        };
-
-        if block_type_kind(block.block_type()) != Some(kind) {
-            match element_kinds(&block) {
-                BlockKinds::Empty => continue,
-                BlockKinds::One(k) if k == kind => {}
-                BlockKinds::One(k) if k > kind => {
-                    source.stashed = Some(block);
-                    return Ok(false);
-                }
-                BlockKinds::One(k) => return Err(source.locate(unsorted_block(k, kind))),
-                BlockKinds::Several => return Err(source.locate(mixed_block())),
-            }
-        }
-
-        buffer.clear();
-        let ordinal = kind.ordinal();
-        for element in block.elements() {
-            let Some(owned) = T::convert(&element)? else {
-                return Err(source.locate(mixed_block()));
-            };
-            let key = crate::osm_id::osm_id_key(owned.id());
-            if let Some((last_kind, last_key)) = source.last_element
-                && last_kind == ordinal
-                && key < last_key
+/// A macro rather than a function because the side's block and the
+/// iterator borrowing it are separate locals of [`stream_merge_phase`]: the
+/// block is replaced while the other side's iterator, borrowing the other
+/// side's block, stays alive. On every path below, `$iter` and `$head` are
+/// written before they are read again once `$block` is reassigned, which is
+/// what lets the borrow checker see that no borrow of the old block
+/// survives its replacement. The exhausted block is dropped before the next
+/// one is decoded, so a side never holds two decoded blocks.
+macro_rules! pull_head {
+    ($src:expr, $block:ident, $iter:ident, $ended:ident, $kind:expr) => {
+        loop {
+            if let Some(it) = $iter.as_mut()
+                && let Some(element) = it.next()
             {
-                return Err(source.locate(crate::error::new_unsorted(format!(
-                    "streaming merge-join: {} {} follows {} {}. The input's header claims \
-                     Sort.Type_then_ID but its elements are not in canonical order.",
-                    kind.as_str(),
-                    owned.id(),
-                    kind.as_str(),
-                    crate::osm_id::osm_id_from_key(last_key),
-                ))));
+                break Some($src.admit(element, $kind)?);
             }
-            source.last_element = Some((ordinal, key));
-            buffer.push(owned);
+            drop($block.take());
+            $block = $src.next_phase_block($kind)?;
+            $iter = $block.as_ref().map(PrimitiveBlock::elements);
+            if $iter.is_none() {
+                $ended = true;
+                break None;
+            }
         }
-
-        if buffer.is_empty() {
-            continue;
-        }
-
-        // Reverse so pop() yields ascending ID order.
-        buffer.reverse();
-        return Ok(true);
-    }
+    };
 }
 
-/// Yield the next owned element of type `T` from the stream.
+/// Run one type phase of the element-level merge over two inputs without
+/// indexdata, handing each element to `on_action` borrowed, through the
+/// same [`BlockMergeAction`] element variants [`block_pair_merge_phase`]
+/// emits (never the blob variants: without indexdata no block's range is
+/// known before it is decoded).
 ///
-/// Returns `None` when the current type phase is exhausted.
-pub(crate) fn next_element<T: MergeJoinElement>(
-    source: &mut StreamingBlocks,
-    buffer: &mut Vec<T>,
-) -> Result<Option<T>> {
-    loop {
-        if let Some(elem) = buffer.pop() {
-            return Ok(Some(elem));
-        }
-        if !fill_buffer(source, buffer)? {
-            return Ok(None);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Conversion functions: Element -> Option<Owned*>
-// ---------------------------------------------------------------------------
-
-/// `Ok(None)` for an element of another kind; `Err` for a string-table
-/// lookup that fails. Conversion is strict so that a corrupt tag or role is
-/// an error here rather than a silently shortened owned element whose
-/// comparison then cannot see the corruption.
-pub(crate) type ConvertResult<T> = crate::error::Result<Option<T>>;
-
-fn owned_tags<'a>(
-    tags: impl Iterator<Item = crate::error::Result<(&'a str, &'a str)>>,
-) -> crate::error::Result<Vec<(String, String)>> {
-    tags.map(|tag| tag.map(|(k, v)| (k.to_owned(), v.to_owned())))
-        .collect()
-}
-
-/// The owned metadata carries only the version the element claims
-/// (`claimed_version`): the owned OSC writers print whatever version they
-/// are handed, and a PBF version below 1 - 0 from pbfhogg's `BlockBuilder`
-/// and libosmium, -1 from Osmosis - is "no version", not a claim. The
-/// version is printed (diff text, derive output) and never compared:
-/// content equality excludes metadata.
-pub(crate) fn convert_node(element: &Element<'_>) -> ConvertResult<OwnedNode> {
-    Ok(match element {
-        Element::DenseNode(dn) => Some(OwnedNode {
-            id: dn.id(),
-            decimicro_lat: dn.decimicro_lat(),
-            decimicro_lon: dn.decimicro_lon(),
-            tags: owned_tags(dn.tags_checked())?,
-            metadata: dn
-                .info()
-                .and_then(crate::dense::DenseNodeInfo::claimed_version)
-                .map(OwnedMetadata::version_only),
-        }),
-        Element::Node(n) => Some(OwnedNode {
-            id: n.id(),
-            decimicro_lat: n.decimicro_lat(),
-            decimicro_lon: n.decimicro_lon(),
-            tags: owned_tags(n.tags_checked())?,
-            metadata: n.info().claimed_version().map(OwnedMetadata::version_only),
-        }),
-        _ => None,
-    })
-}
-
-pub(crate) fn convert_way(element: &Element<'_>) -> ConvertResult<OwnedWay> {
-    Ok(match element {
-        Element::Way(w) => Some(OwnedWay {
-            id: w.id(),
-            tags: owned_tags(w.tags_checked())?,
-            refs: w.refs().collect(),
-            metadata: w.info().claimed_version().map(OwnedMetadata::version_only),
-        }),
-        _ => None,
-    })
-}
-
-pub(crate) fn convert_relation(element: &Element<'_>) -> ConvertResult<OwnedRelation> {
-    Ok(match element {
-        Element::Relation(r) => Some(OwnedRelation {
-            id: r.id(),
-            tags: owned_tags(r.tags_checked())?,
-            members: r
-                .members()
-                .map(|m| {
-                    Ok(OwnedMember {
-                        id: m.id,
-                        role: m.role()?.to_owned(),
-                    })
-                })
-                .collect::<crate::error::Result<_>>()?,
-            metadata: r.info().claimed_version().map(OwnedMetadata::version_only),
-        }),
-        _ => None,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// MergeJoinElement trait - shared accessors for the generic merge-join
-// ---------------------------------------------------------------------------
-
-/// Equality is not a member of this trait: every element type compares
-/// through [`crate::content::content_equal`], the one definition of element
-/// content.
-pub(crate) trait MergeJoinElement: Sized + crate::content::Content {
-    /// The kind whose phase produces this element type.
-    const KIND: ElementKind;
-    fn id(&self) -> i64;
-    fn convert(element: &Element<'_>) -> ConvertResult<Self>;
-}
-
-impl MergeJoinElement for OwnedNode {
-    const KIND: ElementKind = ElementKind::Node;
-    fn id(&self) -> i64 {
-        self.id
-    }
-    fn convert(element: &Element<'_>) -> ConvertResult<Self> {
-        convert_node(element)
-    }
-}
-
-impl MergeJoinElement for OwnedWay {
-    const KIND: ElementKind = ElementKind::Way;
-    fn id(&self) -> i64 {
-        self.id
-    }
-    fn convert(element: &Element<'_>) -> ConvertResult<Self> {
-        convert_way(element)
-    }
-}
-
-impl MergeJoinElement for OwnedRelation {
-    const KIND: ElementKind = ElementKind::Relation;
-    fn id(&self) -> i64 {
-        self.id
-    }
-    fn convert(element: &Element<'_>) -> ConvertResult<Self> {
-        convert_relation(element)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Generic streaming merge-join
-// ---------------------------------------------------------------------------
-
-/// Result of comparing one pair in the merge-join.
-pub(crate) enum MergeJoinAction<'a, T> {
-    /// Element exists only in old (deleted).
-    OldOnly(&'a T),
-    /// Element exists only in new (created).
-    NewOnly(&'a T),
-    /// Element exists in both but differs (old, new).
-    Modified(&'a T, &'a T),
-    /// Element exists in both and is identical.
-    Equal(&'a T),
-}
-
-/// Streaming two-pointer merge-join for one element type phase.
+/// Each side holds its current decoded block and one validated head
+/// element. A head is pulled only when the side has none, and is admitted
+/// (kind and order checks) before the merge compares it, so nothing the
+/// checks would refuse can influence what is emitted. "No head" has two
+/// states, needs-refill and phase-ended; once a side's phase has ended
+/// (end of file, or a later kind's block stashed) it is never asked again in
+/// this phase, so the stashed block is not reclassified per remaining
+/// element of the other side.
 ///
-/// Pulls elements one at a time from both cursors and classifies each pair
-/// by ID comparison + content equality. The caller provides a single callback
-/// that receives a [`MergeJoinAction`] for each pair.
-pub(crate) fn merge_join_phase<T: MergeJoinElement>(
+/// Only the current block of each side is held; elements are compared and
+/// printed straight from it, never converted to owned values. A failure
+/// found mid-block (a wrong-kind element, a backwards id) surfaces after
+/// the earlier elements of that block were handed to `on_action`; the run
+/// still fails.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn stream_merge_phase(
     old_src: &mut StreamingBlocks,
-    old_buf: &mut Vec<T>,
     new_src: &mut StreamingBlocks,
-    new_buf: &mut Vec<T>,
-    mut on_action: impl FnMut(MergeJoinAction<'_, T>) -> Result<()>,
+    kind: ElementKind,
+    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
 ) -> Result<()> {
-    let mut old_elem = next_element(old_src, old_buf)?;
-    let mut new_elem = next_element(new_src, new_buf)?;
+    let type_char = kind.type_char();
+    let mut old_block: Option<PrimitiveBlock> = None;
+    let mut new_block: Option<PrimitiveBlock> = None;
+    let mut old_iter: Option<crate::BlockElementsIter<'_>> = None;
+    let mut new_iter: Option<crate::BlockElementsIter<'_>> = None;
+    let mut old_head: Option<Element<'_>> = None;
+    let mut new_head: Option<Element<'_>> = None;
+    let mut old_ended = false;
+    let mut new_ended = false;
 
     loop {
-        match (&old_elem, &new_elem) {
-            (None, None) => break,
-            (Some(o), None) => {
-                on_action(MergeJoinAction::OldOnly(o))?;
-
-                old_elem = next_element(old_src, old_buf)?;
-            }
-            (None, Some(n)) => {
-                on_action(MergeJoinAction::NewOnly(n))?;
-
-                new_elem = next_element(new_src, new_buf)?;
-            }
-            (Some(o), Some(n)) => match crate::osm_id::osm_id_cmp(o.id(), n.id()) {
-                std::cmp::Ordering::Less => {
-                    on_action(MergeJoinAction::OldOnly(o))?;
-
-                    old_elem = next_element(old_src, old_buf)?;
-                }
-                std::cmp::Ordering::Greater => {
-                    on_action(MergeJoinAction::NewOnly(n))?;
-
-                    new_elem = next_element(new_src, new_buf)?;
-                }
-                std::cmp::Ordering::Equal => {
-                    if crate::content::content_equal(o, n) {
-                        on_action(MergeJoinAction::Equal(o))?;
-                    } else {
-                        on_action(MergeJoinAction::Modified(o, n))?;
+        if old_head.is_none() && !old_ended {
+            old_head = pull_head!(old_src, old_block, old_iter, old_ended, kind);
+        }
+        if new_head.is_none() && !new_ended {
+            new_head = pull_head!(new_src, new_block, new_iter, new_ended, kind);
+        }
+        match (old_head.take(), new_head.take()) {
+            (None, None) => return Ok(()),
+            (Some(o), None) => on_action(BlockMergeAction::ElementOldOnly(&o))?,
+            (None, Some(n)) => on_action(BlockMergeAction::ElementNewOnly(&n))?,
+            (Some(o), Some(n)) => {
+                let o_id = element_id(&o);
+                match crate::osm_id::osm_id_cmp(o_id, element_id(&n)) {
+                    std::cmp::Ordering::Less => {
+                        on_action(BlockMergeAction::ElementOldOnly(&o))?;
+                        new_head = Some(n);
                     }
-
-                    old_elem = next_element(old_src, old_buf)?;
-                    new_elem = next_element(new_src, new_buf)?;
+                    std::cmp::Ordering::Greater => {
+                        on_action(BlockMergeAction::ElementNewOnly(&n))?;
+                        old_head = Some(o);
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if crate::content::content_equal(&o, &n) {
+                            on_action(BlockMergeAction::ElementEqual {
+                                id: o_id,
+                                version: element_version(&o),
+                                type_char,
+                            })?;
+                        } else {
+                            on_action(BlockMergeAction::ElementModified { old: &o, new: &n })?;
+                        }
+                    }
                 }
-            },
+            }
         }
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -33,10 +33,9 @@ use super::Result;
 use crate::ElementKind;
 use crate::coord_fmt::{format_coord, from_decimicro};
 use crate::osc::merge_join::{
-    BlockMergeAction, BlockPairMergeState, MergeJoinAction, MergeJoinElement, StreamingBlocks,
-    block_pair_merge_phase, merge_join_phase, skip_phase, verify_rest,
+    BlockMergeAction, BlockPairMergeState, StreamingBlocks, block_pair_merge_phase, skip_phase,
+    stream_merge_phase, verify_rest,
 };
-use crate::osc::write::{OwnedMember, OwnedNode, OwnedRelation, OwnedWay};
 use crate::owned::TypeFilter;
 use crate::{Element, MemberType};
 use std::collections::{HashMap, HashSet};
@@ -171,42 +170,6 @@ impl DiffStats {
         )?;
 
         Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Per-type diff helpers
-// ---------------------------------------------------------------------------
-
-trait DiffMeta {
-    fn version(&self) -> Option<i32>;
-    fn type_char() -> char;
-}
-
-impl DiffMeta for OwnedNode {
-    fn version(&self) -> Option<i32> {
-        self.metadata.as_ref().and_then(|m| m.version)
-    }
-    fn type_char() -> char {
-        'n'
-    }
-}
-
-impl DiffMeta for OwnedWay {
-    fn version(&self) -> Option<i32> {
-        self.metadata.as_ref().and_then(|m| m.version)
-    }
-    fn type_char() -> char {
-        'w'
-    }
-}
-
-impl DiffMeta for OwnedRelation {
-    fn version(&self) -> Option<i32> {
-        self.metadata.as_ref().and_then(|m| m.version)
-    }
-    fn type_char() -> char {
-        'r'
     }
 }
 
@@ -451,7 +414,7 @@ fn finish_scan(stats: DiffStats) -> DiffStats {
 fn diff_block_pair<W: Write>(
     old_path: &Path,
     new_path: &Path,
-    mut output: Option<&mut W>,
+    output: Option<&mut W>,
     options: &DiffOptions,
     direct_io: bool,
     filter: &TypeFilter,
@@ -465,6 +428,11 @@ fn diff_block_pair<W: Write>(
     let mut merge = BlockPairMergeState::new(old_reader, new_reader);
 
     let mut stats = DiffStats::default();
+    let mut sink = DiffSink {
+        output,
+        options,
+        stats: &mut stats,
+    };
 
     let phases: [(ElementKind, bool, &str); 3] = [
         (ElementKind::Node, filter.nodes, "NODE"),
@@ -490,78 +458,7 @@ fn diff_block_pair<W: Write>(
         crate::debug::emit_marker(&start_marker);
 
         block_pair_merge_phase(&mut merge, kind, options.suppress_common, &mut |action| {
-            match action {
-                BlockMergeAction::BlobEqual(count) => {
-                    stats.common += count;
-                }
-                // A single-sided block's count is the claim the merge already
-                // decoded against; count-only runs skip the element walk
-                // that exists only to format each line.
-                BlockMergeAction::BlobOldOnly { block, count, skip } => {
-                    if let Some(out) = output.as_deref_mut() {
-                        let type_char = kind.type_char();
-                        for elem in block.elements().skip(skip) {
-                            let id = crate::osc::merge_join::element_id(&elem);
-                            let ver = crate::osc::merge_join::element_version(&elem);
-                            write_compact_line(out, '-', type_char, id, ver)?;
-                        }
-                    }
-                    stats.deleted += count;
-                }
-                BlockMergeAction::BlobNewOnly { block, count, skip } => {
-                    if let Some(out) = output.as_deref_mut() {
-                        let type_char = kind.type_char();
-                        for elem in block.elements().skip(skip) {
-                            let id = crate::osc::merge_join::element_id(&elem);
-                            let ver = crate::osc::merge_join::element_version(&elem);
-                            write_compact_line(out, '+', type_char, id, ver)?;
-                        }
-                    }
-                    stats.created += count;
-                }
-                BlockMergeAction::ElementEqual {
-                    id,
-                    version,
-                    type_char,
-                } => {
-                    if !options.suppress_common
-                        && let Some(out) = output.as_deref_mut()
-                    {
-                        write_compact_line(out, ' ', type_char, id, version)?;
-                    }
-                    stats.common += 1;
-                }
-                BlockMergeAction::ElementModified { old, new } => {
-                    if let Some(out) = output.as_deref_mut() {
-                        let type_char = kind.type_char();
-                        let id = crate::osc::merge_join::element_id(old);
-                        let old_ver = crate::osc::merge_join::element_version(old);
-                        let new_ver = crate::osc::merge_join::element_version(new);
-                        write_modified_line(out, type_char, id, old_ver, new_ver)?;
-                        if options.verbose {
-                            write_modified_details_borrowed(out, old, new)?;
-                        }
-                    }
-                    stats.modified += 1;
-                }
-                BlockMergeAction::ElementOldOnly(o) => {
-                    if let Some(out) = output.as_deref_mut() {
-                        let id = crate::osc::merge_join::element_id(o);
-                        let ver = crate::osc::merge_join::element_version(o);
-                        write_compact_line(out, '-', kind.type_char(), id, ver)?;
-                    }
-                    stats.deleted += 1;
-                }
-                BlockMergeAction::ElementNewOnly(n) => {
-                    if let Some(out) = output.as_deref_mut() {
-                        let id = crate::osc::merge_join::element_id(n);
-                        let ver = crate::osc::merge_join::element_version(n);
-                        write_compact_line(out, '+', kind.type_char(), id, ver)?;
-                    }
-                    stats.created += 1;
-                }
-            }
-            Ok(())
+            sink.record(kind, &action)
         })?;
         crate::debug::emit_marker(&end_marker);
     }
@@ -574,6 +471,86 @@ fn diff_block_pair<W: Write>(
 
     emit_merge_stats_counters(&merge.stats);
     Ok(stats)
+}
+
+/// Where a sequential diff's merge actions go: the counts, and the text when
+/// there is an output. Shared by both sequential paths, so a difference
+/// prints the same line (and, under `verbose`, the same details) whether or
+/// not the inputs carried indexdata.
+struct DiffSink<'a, W: Write> {
+    /// `None` for a count-only run.
+    output: Option<&'a mut W>,
+    options: &'a DiffOptions,
+    stats: &'a mut DiffStats,
+}
+
+impl<W: Write> DiffSink<'_, W> {
+    fn record(&mut self, kind: ElementKind, action: &BlockMergeAction<'_>) -> Result<()> {
+        use crate::osc::merge_join::{element_id, element_version};
+        let type_char = kind.type_char();
+        match *action {
+            BlockMergeAction::BlobEqual(count) => {
+                self.stats.common += count;
+            }
+            // A single-sided block's count is the claim the merge already
+            // decoded against; count-only runs skip the element walk
+            // that exists only to format each line.
+            BlockMergeAction::BlobOldOnly { block, count, skip } => {
+                if let Some(out) = self.output.as_deref_mut() {
+                    for elem in block.elements().skip(skip) {
+                        let ver = element_version(&elem);
+                        write_compact_line(out, '-', type_char, element_id(&elem), ver)?;
+                    }
+                }
+                self.stats.deleted += count;
+            }
+            BlockMergeAction::BlobNewOnly { block, count, skip } => {
+                if let Some(out) = self.output.as_deref_mut() {
+                    for elem in block.elements().skip(skip) {
+                        let ver = element_version(&elem);
+                        write_compact_line(out, '+', type_char, element_id(&elem), ver)?;
+                    }
+                }
+                self.stats.created += count;
+            }
+            BlockMergeAction::ElementEqual {
+                id,
+                version,
+                type_char,
+            } => {
+                if !self.options.suppress_common
+                    && let Some(out) = self.output.as_deref_mut()
+                {
+                    write_compact_line(out, ' ', type_char, id, version)?;
+                }
+                self.stats.common += 1;
+            }
+            BlockMergeAction::ElementModified { old, new } => {
+                if let Some(out) = self.output.as_deref_mut() {
+                    let old_ver = element_version(old);
+                    let new_ver = element_version(new);
+                    write_modified_line(out, type_char, element_id(old), old_ver, new_ver)?;
+                    if self.options.verbose {
+                        write_modified_details_borrowed(out, old, new)?;
+                    }
+                }
+                self.stats.modified += 1;
+            }
+            BlockMergeAction::ElementOldOnly(o) => {
+                if let Some(out) = self.output.as_deref_mut() {
+                    write_compact_line(out, '-', type_char, element_id(o), element_version(o))?;
+                }
+                self.stats.deleted += 1;
+            }
+            BlockMergeAction::ElementNewOnly(n) => {
+                if let Some(out) = self.output.as_deref_mut() {
+                    write_compact_line(out, '+', type_char, element_id(n), element_version(n))?;
+                }
+                self.stats.created += 1;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Emit `mergejoin_shadow_*` counters accumulated across all phases.
@@ -610,14 +587,15 @@ fn emit_merge_stats_counters(s: &crate::osc::merge_join::BlockPairMergeStats) {
     );
 }
 
-/// Fallback diff path using element-level merge-join with owned elements.
-/// Used when either input lacks indexdata. `output` is `None` for a
-/// count-only run, which merges exactly the same elements.
+/// Fallback diff path for inputs without indexdata: the element-level
+/// streaming merge, fed through the same [`DiffSink`] as the block-pair
+/// path. `output` is `None` for a count-only run, which merges exactly the
+/// same elements.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn diff_element_stream<W: Write>(
     old_path: &Path,
     new_path: &Path,
-    mut output: Option<&mut W>,
+    output: Option<&mut W>,
     options: &DiffOptions,
     direct_io: bool,
     filter: &TypeFilter,
@@ -627,133 +605,45 @@ fn diff_element_stream<W: Write>(
     let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io, host)?;
 
     let mut stats = DiffStats::default();
+    let mut sink = DiffSink {
+        output,
+        options,
+        stats: &mut stats,
+    };
 
-    if filter.nodes {
-        crate::debug::emit_marker("DIFF_PHASE_NODE_START");
-        let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        let mut ctx = DiffPhaseCtx {
-            output: output.as_deref_mut(),
-            opts: options,
-            stats: &mut stats,
-        };
-        run_diff_phase(
-            &mut old_src,
-            &mut ob,
-            &mut new_src,
-            &mut nb,
-            &mut ctx,
-            write_node_details,
-        )?;
-        crate::debug::emit_marker("DIFF_PHASE_NODE_END");
-    } else {
-        skip_kind(&mut old_src, &mut new_src, ElementKind::Node)?;
-    }
-
-    if filter.ways {
-        crate::debug::emit_marker("DIFF_PHASE_WAY_START");
-        let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        let mut ctx = DiffPhaseCtx {
-            output: output.as_deref_mut(),
-            opts: options,
-            stats: &mut stats,
-        };
-        run_diff_phase(
-            &mut old_src,
-            &mut ob,
-            &mut new_src,
-            &mut nb,
-            &mut ctx,
-            write_way_details,
-        )?;
-        crate::debug::emit_marker("DIFF_PHASE_WAY_END");
-    } else {
-        skip_kind(&mut old_src, &mut new_src, ElementKind::Way)?;
-    }
-
-    if filter.relations {
-        crate::debug::emit_marker("DIFF_PHASE_REL_START");
-        let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        let mut ctx = DiffPhaseCtx {
-            output,
-            opts: options,
-            stats: &mut stats,
-        };
-        run_diff_phase(
-            &mut old_src,
-            &mut ob,
-            &mut new_src,
-            &mut nb,
-            &mut ctx,
-            write_relation_details,
-        )?;
-        crate::debug::emit_marker("DIFF_PHASE_REL_END");
-    } else {
-        skip_kind(&mut old_src, &mut new_src, ElementKind::Relation)?;
+    let phases = [
+        (
+            ElementKind::Node,
+            filter.nodes,
+            "DIFF_PHASE_NODE_START",
+            "DIFF_PHASE_NODE_END",
+        ),
+        (
+            ElementKind::Way,
+            filter.ways,
+            "DIFF_PHASE_WAY_START",
+            "DIFF_PHASE_WAY_END",
+        ),
+        (
+            ElementKind::Relation,
+            filter.relations,
+            "DIFF_PHASE_REL_START",
+            "DIFF_PHASE_REL_END",
+        ),
+    ];
+    for (kind, enabled, start, end) in phases {
+        if enabled {
+            crate::debug::emit_marker(start);
+            stream_merge_phase(&mut old_src, &mut new_src, kind, &mut |action| {
+                sink.record(kind, &action)
+            })?;
+            crate::debug::emit_marker(end);
+        } else {
+            skip_kind(&mut old_src, &mut new_src, kind)?;
+        }
     }
 
     Ok(stats)
-}
-
-// ---------------------------------------------------------------------------
-// Diff phase wrappers over generic merge-join
-// ---------------------------------------------------------------------------
-
-/// Context for a single diff phase (avoids too-many-arguments lint).
-struct DiffPhaseCtx<'a, W: Write> {
-    /// `None` for a count-only run.
-    output: Option<&'a mut W>,
-    opts: &'a DiffOptions,
-    stats: &'a mut DiffStats,
-}
-
-/// Run one diff phase using the shared merge-join, emitting output immediately.
-fn run_diff_phase<T: MergeJoinElement + DiffMeta>(
-    old_src: &mut StreamingBlocks,
-    old_buf: &mut Vec<T>,
-    new_src: &mut StreamingBlocks,
-    new_buf: &mut Vec<T>,
-    ctx: &mut DiffPhaseCtx<'_, impl Write>,
-    write_details: fn(&mut dyn Write, &T, &T) -> Result<()>,
-) -> Result<()> {
-    let DiffPhaseCtx {
-        output,
-        opts,
-        stats,
-    } = ctx;
-    merge_join_phase(old_src, old_buf, new_src, new_buf, |action| {
-        match action {
-            MergeJoinAction::OldOnly(o) => {
-                if let Some(out) = output.as_deref_mut() {
-                    write_compact_line(out, '-', T::type_char(), o.id(), o.version())?;
-                }
-                stats.deleted += 1;
-            }
-            MergeJoinAction::NewOnly(n) => {
-                if let Some(out) = output.as_deref_mut() {
-                    write_compact_line(out, '+', T::type_char(), n.id(), n.version())?;
-                }
-                stats.created += 1;
-            }
-            MergeJoinAction::Modified(o, n) => {
-                if let Some(out) = output.as_deref_mut() {
-                    write_modified_line(out, T::type_char(), o.id(), o.version(), n.version())?;
-                    if opts.verbose {
-                        write_details(out, o, n)?;
-                    }
-                }
-                stats.modified += 1;
-            }
-            MergeJoinAction::Equal(o) => {
-                if !opts.suppress_common
-                    && let Some(out) = output.as_deref_mut()
-                {
-                    write_compact_line(out, ' ', T::type_char(), o.id(), o.version())?;
-                }
-                stats.common += 1;
-            }
-        }
-        Ok(())
-    })
 }
 
 /// Advance both cursors past a kind the type filter excludes, wherever it
@@ -806,86 +696,7 @@ pub(super) fn write_modified_line(
 }
 
 // ---------------------------------------------------------------------------
-// Output formatting -- verbose details
-// ---------------------------------------------------------------------------
-
-fn write_node_details(output: &mut dyn Write, old: &OwnedNode, new: &OwnedNode) -> Result<()> {
-    if old.decimicro_lat != new.decimicro_lat || old.decimicro_lon != new.decimicro_lon {
-        let mut buf = String::new();
-        format_coord(&mut buf, from_decimicro(old.decimicro_lat));
-        let old_lat = buf.clone();
-        format_coord(&mut buf, from_decimicro(old.decimicro_lon));
-        let old_lon = buf.clone();
-        format_coord(&mut buf, from_decimicro(new.decimicro_lat));
-        let new_lat = buf.clone();
-        format_coord(&mut buf, from_decimicro(new.decimicro_lon));
-        writeln!(
-            output,
-            "  coordinates: ({old_lat}, {old_lon}) -> ({new_lat}, {buf})",
-        )?;
-    }
-    write_tag_diff(output, &old.tags, &new.tags)?;
-    Ok(())
-}
-
-fn write_way_details(output: &mut dyn Write, old: &OwnedWay, new: &OwnedWay) -> Result<()> {
-    if old.refs != new.refs {
-        writeln!(
-            output,
-            "  refs: {} -> {} nodes",
-            old.refs.len(),
-            new.refs.len(),
-        )?;
-    }
-    write_tag_diff(output, &old.tags, &new.tags)?;
-    Ok(())
-}
-
-fn write_relation_details(
-    output: &mut dyn Write,
-    old: &OwnedRelation,
-    new: &OwnedRelation,
-) -> Result<()> {
-    write_member_diff(output, &old.members, &new.members)?;
-    write_tag_diff(output, &old.tags, &new.tags)?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Tag diff
-// ---------------------------------------------------------------------------
-
-fn write_tag_diff(
-    output: &mut dyn Write,
-    old_tags: &[(String, String)],
-    new_tags: &[(String, String)],
-) -> Result<()> {
-    // Linear scan - elements typically have 2-5 tags, faster than HashMap.
-    // Removed: in old but not in new
-    for (k, v) in old_tags {
-        if !new_tags.iter().any(|(nk, _)| nk == k) {
-            writeln!(output, "  -{k}={v}")?;
-        }
-    }
-    // Added: in new but not in old
-    for (k, v) in new_tags {
-        if !old_tags.iter().any(|(ok, _)| ok == k) {
-            writeln!(output, "  +{k}={v}")?;
-        }
-    }
-    // Changed: same key, different value
-    for (k, v) in new_tags {
-        if let Some((_, old_v)) = old_tags.iter().find(|(ok, _)| ok == k)
-            && old_v != v
-        {
-            writeln!(output, "  ~{k}: {old_v} -> {v}")?;
-        }
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Member diff
+// Verbose details
 // ---------------------------------------------------------------------------
 
 fn member_type_str(mt: MemberType) -> &'static str {
@@ -897,52 +708,11 @@ fn member_type_str(mt: MemberType) -> &'static str {
     }
 }
 
-fn write_member_diff(
-    output: &mut dyn Write,
-    old_members: &[OwnedMember],
-    new_members: &[OwnedMember],
-) -> Result<()> {
-    let new_set: HashSet<(crate::MemberId, &str)> = new_members
-        .iter()
-        .map(|m| (m.id, m.role.as_str()))
-        .collect();
-    let old_set: HashSet<(crate::MemberId, &str)> = old_members
-        .iter()
-        .map(|m| (m.id, m.role.as_str()))
-        .collect();
-
-    // Removed members (in old but not in new)
-    for old_m in old_members {
-        if !new_set.contains(&(old_m.id, old_m.role.as_str())) {
-            writeln!(
-                output,
-                "  -member {}/{} \"{}\"",
-                member_type_str(old_m.id.member_type()),
-                old_m.id.id(),
-                old_m.role,
-            )?;
-        }
-    }
-    // Added members (in new but not in old)
-    for new_m in new_members {
-        if !old_set.contains(&(new_m.id, new_m.role.as_str())) {
-            writeln!(
-                output,
-                "  +member {}/{} \"{}\"",
-                member_type_str(new_m.id.member_type()),
-                new_m.id.id(),
-                new_m.role,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Borrowed-element verbose details (block-pair path)
-// ---------------------------------------------------------------------------
-
 /// Write verbose modification details using borrowed element references.
+///
+/// Every string is resolved through the checked lookups: a tag key, value
+/// or member role whose string index is past the block's string table is an
+/// error, not a silently shortened detail list.
 pub(super) fn write_modified_details_borrowed(
     output: &mut dyn Write,
     old: &Element<'_>,
@@ -1008,7 +778,7 @@ fn write_way_details_borrowed(
             new_refs.len(),
         )?;
     }
-    write_tag_diff_iter(output, old.tags(), new.tags())?;
+    write_tag_diff_iter(output, old.tags_checked(), new.tags_checked())?;
     Ok(())
 }
 
@@ -1018,18 +788,19 @@ fn write_relation_details_borrowed(
     new: &crate::Relation<'_>,
 ) -> Result<()> {
     write_member_diff_borrowed(output, old, new)?;
-    write_tag_diff_iter(output, old.tags(), new.tags())?;
+    write_tag_diff_iter(output, old.tags_checked(), new.tags_checked())?;
     Ok(())
 }
 
-/// Tag diff using borrowed tag iterators. No String allocation for key/value data.
+/// Tag diff using borrowed, checked tag iterators. No String allocation for
+/// key/value data.
 fn write_tag_diff_iter<'a>(
     output: &mut dyn Write,
-    old_tags: impl Iterator<Item = (&'a str, &'a str)>,
-    new_tags: impl Iterator<Item = (&'a str, &'a str)>,
+    old_tags: impl Iterator<Item = Result<(&'a str, &'a str)>>,
+    new_tags: impl Iterator<Item = Result<(&'a str, &'a str)>>,
 ) -> Result<()> {
-    let old_vec: Vec<(&str, &str)> = old_tags.collect();
-    let new_vec: Vec<(&str, &str)> = new_tags.collect();
+    let old_vec: Vec<(&str, &str)> = old_tags.collect::<Result<_>>()?;
+    let new_vec: Vec<(&str, &str)> = new_tags.collect::<Result<_>>()?;
     let old_map: HashMap<&str, &str> = old_vec.iter().copied().collect();
     let new_map: HashMap<&str, &str> = new_vec.iter().copied().collect();
 
@@ -1061,15 +832,17 @@ fn write_tag_diff_borrowed(
 ) -> Result<()> {
     match (old, new) {
         (Element::DenseNode(da), Element::DenseNode(db)) => {
-            write_tag_diff_iter(output, da.tags(), db.tags())
+            write_tag_diff_iter(output, da.tags_checked(), db.tags_checked())
         }
         (Element::DenseNode(da), Element::Node(nb)) => {
-            write_tag_diff_iter(output, da.tags(), nb.tags())
+            write_tag_diff_iter(output, da.tags_checked(), nb.tags_checked())
         }
         (Element::Node(na), Element::DenseNode(db)) => {
-            write_tag_diff_iter(output, na.tags(), db.tags())
+            write_tag_diff_iter(output, na.tags_checked(), db.tags_checked())
         }
-        (Element::Node(na), Element::Node(nb)) => write_tag_diff_iter(output, na.tags(), nb.tags()),
+        (Element::Node(na), Element::Node(nb)) => {
+            write_tag_diff_iter(output, na.tags_checked(), nb.tags_checked())
+        }
         _ => Ok(()),
     }
 }
@@ -1082,12 +855,12 @@ fn write_member_diff_borrowed(
 ) -> Result<()> {
     let old_members: Vec<(crate::MemberId, &str)> = old
         .members()
-        .map(|m| (m.id, m.role().unwrap_or("")))
-        .collect();
+        .map(|m| m.role().map(|role| (m.id, role)))
+        .collect::<Result<_>>()?;
     let new_members: Vec<(crate::MemberId, &str)> = new
         .members()
-        .map(|m| (m.id, m.role().unwrap_or("")))
-        .collect();
+        .map(|m| m.role().map(|role| (m.id, role)))
+        .collect::<Result<_>>()?;
 
     let new_set: HashSet<(crate::MemberId, &str)> = new_members.iter().copied().collect();
     let old_set: HashSet<(crate::MemberId, &str)> = old_members.iter().copied().collect();

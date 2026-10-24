@@ -57,9 +57,10 @@ fn push_attribute_escaped<'a>(elem: &mut BytesStart<'a>, key: &'a str, value: &s
 // print an OSC element's version as given, because OSC can spell absence and
 // an explicit `version="0"` there was claimed by its input; the borrowed
 // writers print PBF metadata, where 0 is how writers spell "no version", so
-// they print only a claimed version. Owned metadata built from PBF elements
-// must take the claimed version when it is built, since the owned writers
-// cannot tell where it came from. A common element trait must preserve
+// they print only a claimed version. Every PBF element derive prints goes
+// through the borrowed writers, whatever path found it; owned metadata
+// built from a PBF element (derive's deletes, `version_only`) carries the
+// raw version and its writer filters it. A common element trait must preserve
 // those distinctions, attribute order, empty-element shape and scratch reuse;
 // converting borrowed elements to owned strings would add per-element work to
 // the measured diff/derive output path. Share the tag event loop below without
@@ -288,7 +289,17 @@ fn write_borrowed_tags_xml<'a, W: std::io::Write>(
     writer: &mut Writer<W>,
     tags: impl Iterator<Item = (&'a str, &'a str)>,
 ) -> crate::Result<()> {
-    for (k, v) in tags {
+    write_checked_tags_xml(writer, tags.map(Ok))
+}
+
+/// The tag event loop over checked tags: a tag whose key or value index is
+/// past the block's string table is an error, never a shortened tag list.
+fn write_checked_tags_xml<'a, W: std::io::Write>(
+    writer: &mut Writer<W>,
+    tags: impl Iterator<Item = crate::Result<(&'a str, &'a str)>>,
+) -> crate::Result<()> {
+    for tag in tags {
+        let (k, v) = tag?;
         let mut tag = BytesStart::new("tag");
         push_attribute_escaped(&mut tag, "k", k);
         push_attribute_escaped(&mut tag, "v", v);
@@ -352,7 +363,16 @@ fn push_info_attrs(
 
 /// Write a borrowed `Element` as XML. Avoids the owned conversion path
 /// (no tag/ref/member String cloning). Used by derive_changes for the
-/// create/modify paths.
+/// create/modify paths, on every path (block-pair, element stream and
+/// parallel shards), so a derived element prints the same whichever path
+/// found it.
+///
+/// Every string the element prints is resolved through the checked
+/// lookups: a tag key or value, member role or user name whose string index
+/// is past the block's string table is an error. An element that is
+/// printed is therefore never silently shortened; an element that is only
+/// compared, or only deleted (which prints id and version), is not
+/// validated here. See `crate::content` for the comparison side.
 pub(crate) fn write_element_xml<W: std::io::Write>(
     writer: &mut Writer<W>,
     elem: &crate::Element<'_>,
@@ -393,16 +413,20 @@ fn write_dense_node_xml<W: std::io::Write>(
             claims.milli_timestamp,
             claims.changeset,
             claims.uid,
-            if claims.user { info.user().ok() } else { None },
+            if claims.user {
+                Some(info.user()?)
+            } else {
+                None
+            },
         );
     }
 
-    let mut tags = node.tags().peekable();
+    let mut tags = node.tags_checked().peekable();
     if tags.peek().is_none() {
         writer.write_event(Event::Empty(elem))?;
     } else {
         writer.write_event(Event::Start(elem))?;
-        write_borrowed_tags_xml(writer, tags)?;
+        write_checked_tags_xml(writer, tags)?;
         writer.write_event(Event::End(BytesEnd::new(ElementKind::Node.as_str())))?;
     }
     Ok(())
@@ -435,15 +459,15 @@ fn write_borrowed_node_xml<W: std::io::Write>(
         info.milli_timestamp(),
         info.changeset(),
         info.uid(),
-        info.user().and_then(Result::ok),
+        info.user().transpose()?,
     );
 
-    let mut tags = node.tags().peekable();
+    let mut tags = node.tags_checked().peekable();
     if tags.peek().is_none() {
         writer.write_event(Event::Empty(elem))?;
     } else {
         writer.write_event(Event::Start(elem))?;
-        write_borrowed_tags_xml(writer, tags)?;
+        write_checked_tags_xml(writer, tags)?;
         writer.write_event(Event::End(BytesEnd::new(ElementKind::Node.as_str())))?;
     }
     Ok(())
@@ -465,11 +489,11 @@ fn write_borrowed_way_xml<W: std::io::Write>(
         info.milli_timestamp(),
         info.changeset(),
         info.uid(),
-        info.user().and_then(Result::ok),
+        info.user().transpose()?,
     );
 
     let mut refs = way.refs().peekable();
-    let mut tags = way.tags().peekable();
+    let mut tags = way.tags_checked().peekable();
     if refs.peek().is_none() && tags.peek().is_none() {
         writer.write_event(Event::Empty(elem))?;
     } else {
@@ -480,7 +504,7 @@ fn write_borrowed_way_xml<W: std::io::Write>(
             nd.push_attribute(("ref", r_str.as_str()));
             writer.write_event(Event::Empty(nd))?;
         }
-        write_borrowed_tags_xml(writer, tags)?;
+        write_checked_tags_xml(writer, tags)?;
         writer.write_event(Event::End(BytesEnd::new(ElementKind::Way.as_str())))?;
     }
     Ok(())
@@ -502,11 +526,11 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
         info.milli_timestamp(),
         info.changeset(),
         info.uid(),
-        info.user().and_then(Result::ok),
+        info.user().transpose()?,
     );
 
     let mut members = rel.members().peekable();
-    let mut tags = rel.tags().peekable();
+    let mut tags = rel.tags_checked().peekable();
     if members.peek().is_none() && tags.peek().is_none() {
         writer.write_event(Event::Empty(elem))?;
     } else {
@@ -517,10 +541,10 @@ fn write_borrowed_relation_xml<W: std::io::Write>(
             let member_id = m.id.id().to_string();
             member.push_attribute(("type", type_str));
             member.push_attribute(("ref", member_id.as_str()));
-            push_attribute_escaped(&mut member, "role", m.role().unwrap_or(""));
+            push_attribute_escaped(&mut member, "role", m.role()?);
             writer.write_event(Event::Empty(member))?;
         }
-        write_borrowed_tags_xml(writer, tags)?;
+        write_checked_tags_xml(writer, tags)?;
         writer.write_event(Event::End(BytesEnd::new(ElementKind::Relation.as_str())))?;
     }
     Ok(())

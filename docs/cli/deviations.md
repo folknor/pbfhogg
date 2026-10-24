@@ -79,11 +79,20 @@ It answers "did anything actually change?" rather than "which version is newer?"
 from two PBFs. In Denmark cross-validation, osmium's OSC is missing 1243 deletes
 that are present in the original diff.
 
-**pbfhogg behavior:** `diff --format osc` produces a perfect roundtrip - applying
-the derived OSC to the old PBF reproduces the new PBF exactly. One margin: a
-dense node with no version (stored as version 0) prints only its non-zero
-metadata fields, because a zero there cannot be told apart from the padding a
-node without metadata gets (see
+**pbfhogg behavior:** `diff --format osc` roundtrips content: applying the
+derived OSC to the old PBF gives a file whose content - coordinates, tags, way
+refs and relation members, exactly what `diff` compares - equals the new PBF's,
+so a `diff` of the result against the new PBF reports no differences. Creates
+and modifies carry each element's metadata (version, timestamp, changeset, uid,
+user) and deletes carry its version, the same whether or not the inputs have
+indexdata.
+
+What that check cannot see is metadata. `diff` ignores it, so an element whose
+only change is its metadata (a version bump with identical content) is not a
+change at all: it gets no OSC entry, and the applied result keeps the old
+file's metadata for it. A further margin: a dense node with no version (stored
+as version 0) prints only its non-zero metadata fields, because a zero there
+cannot be told apart from the padding a node without metadata gets (see
 [Correctness](/guide/correctness#version-0-is-not-a-version-claim-either)), so
 a zero-valued field on such a node does not survive the roundtrip.
 

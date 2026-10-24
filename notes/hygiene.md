@@ -320,21 +320,32 @@ Anger: 8 - counter machinery and semantics.
 
 Altw stages each declare 10 to 35 `AtomicU64` locals, a `_ref` binding for
 each, and an emit block repeating `emit_counter("x", x.load(Relaxed) as i64)`
-under `#[allow(clippy::cast_possible_wrap)]`, about 300 lines; the
-compare-exchange "track the max" loop is open-coded at least five times while
-`AtomicU64::fetch_max` exists and stage 4 already uses it once;
-`passthrough.rs` has a `Pass2Counters` struct and stages 1 to 4 do not.
+under `#[allow(clippy::cast_possible_wrap)]`, about 300 lines;
+`passthrough.rs` has a `Pass2Counters` struct and stages 1 to 4 do not. The
+compare-exchange "track the max" loops (altw stages 2 to 4, `cas_max` in
+`read/pipeline_metrics.rs`, `write/metrics.rs`) were proposed for
+`fetch_max` (already used in renumber's pool, altw stage 4's readiness wait
+and `parallel_gzip`), but they are probably not a candidate: they load and
+store only when the candidate is larger, so in steady state a call is a
+plain read and the cache line stays shared across workers, while
+`fetch_max` on x86-64 compiles to a locked read-modify-write on every call,
+which on these per-blob paths would take the line exclusively once per blob
+per worker. Unmeasured (rule 8). Comments at the loops recording why they
+are hand-written were proposed and deferred, not declined; whoever picks
+this up should settle both the comment and whether the existing `fetch_max`
+sites are hot enough to matter.
 `write/metrics.rs` spells its field list three times (struct, `new`, `emit`)
 with hand-kept name strings; its `include_str!` funnel tests scan six files but
 not `framing.rs` (which writes `compress_ns`, `frame_ns`, `bytes_framed`,
 `tagdata_dropped_oversize`) or `parallel_gzip.rs`, and cover only the
 `sync_all` pair and `recv_wait_ns`, while `write_ns` and `bytes_written` are
-hand-rolled at about ten sites. `elapsed_ns_u64` exists three times
-(`write/pipeline.rs`, `uring_writer.rs`, `read/pipeline_metrics.rs`) plus
-`apply_changes/streaming.rs::elapsed_ns` and two open-coded
-`u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)`. Fix: a derive or
-macro generating struct, `new` and `emit` from one list; `fetch_max`
-everywhere; a `Stopwatch` whose only exit is `record_into(&AtomicU64)`; a test
+hand-rolled at about ten sites. Elapsed nanoseconds have one owner,
+`crate::elapsed::elapsed_ns_u64`, except the altw sites that truncate with
+`as u64` (stages 1 to 4, `passthrough.rs`, `coord_payloads`), which were left
+because truncating and saturating differ. Fix: a derive or
+macro generating struct, `new` and `emit` from one list (see above on the
+max loops); a `Stopwatch` whose only exit is
+`record_into(&AtomicU64)`; a test
 that fails when a `.rs` file under `src/write/` is missing from the funnel's
 `SOURCES`.
 
@@ -435,9 +446,9 @@ The parameter is taken and discarded in altw `stage1_way_pass(_direct_io)`,
 `collect_relation_member_ids` (every pread path, so the flag does nothing to
 reads in passes 0 and 1, stage 1 or stage 2), `sort::build_blob_index`
 (kept "for signature stability" in a private pre-1.0 function),
-the parallel diff and derive paths (they pread through `HeaderWalker`, so
-`diff --direct-io` on indexed inputs with `-j` above 1 reads buffered, and
-the parameter is gone from them),
+`diff::parallel::diff_block_pair_parallel` and the parallel derive path
+(both pread through `HeaderWalker`, so `diff --direct-io` on indexed inputs
+with `-j` above 1 reads buffered; derive never receives the flag),
 `getid::parse_ids_from_pbf(_direct_io)` (the CLI threads `write.direct_io`
 into it), and `check_refs` (`let _ = direct_io;`). Extract's pread passes open
 buffered regardless (a comment explains alignment), `multi.rs` writes through
@@ -957,6 +968,12 @@ that the untripped check costs nothing. Enforce with the checkpoint-count
 test hook (`PBFHOGG_TEST_CANCEL_COUNT`): a pass that gains chunks should gain
 ordinals.
 
+Closing this under rule 3 was proposed and deferred, not declined: one short
+comment at each site above saying the phase runs to completion after the
+token trips, why (a check inside would be per element or per polygon), and
+that the fix is chunking plus a matched A/B. That is the expected end state
+unless an operator report makes a chunked check worth building first.
+
 Reported by: the cancellation work.
 
 ## HYG-126 - The interruption table samples checkpoints, it does not cover each one
@@ -1020,4 +1037,54 @@ exception for the doc-example input, or the doctests build their input
 (a hidden `# ` setup line) and the unit tests use the `tests/common` writers.
 
 Reported by: the CLI test move.
+
+## HYG-134 - The first hygiene drain round needs an independent review
+
+Anger: 6 - review only; what it finds may be anything.
+
+The first round of draining this file and `notes/bugs.md` (commits `1db71d8a`,
+`9cce24b3`, `1dd2ea09`) was done by agents on items picked as "no-brainers".
+One pick was wrong: removing the unused `direct_io` parameters treated
+deliberate plumbing as dead code, and the one removal that landed (the
+parallel diff's `_direct_io`) was put back. That makes every other change in
+the round suspect of the same mistake - undoing something deliberate, or
+costing time or memory on a measured path - and none of it has been
+measured. Before any more drain work, a reviewer with no stake in the
+round's conclusions reads those commits against the code and history they
+changed and reports, per change, whether it undid a deliberate choice, and
+whether it can cost wall time, RAM or memory pressure.
+
+The judgement calls the round already knows it made, to be checked first:
+
+- altw external's metadata scan refuses indexdata that overstates `max_id`
+  (as part of the new order check), reversing the tolerance commit
+  `2fabb026` built into stage 2's walk on purpose.
+- The same scan refuses node blobs whose range holds negative IDs.
+- The `blob_body_within_file` checks in the classify builders were deleted
+  as unreachable behind `HeaderWalker`'s extent check, as was getparents'
+  duplicate.
+- The writer framing refactor (`frame_in_scratch`) moved the sync path's
+  entry trim inside `compress_ns` and an oversize `compress_buf` free ahead of
+  the write; argued allocation-neutral, not measured.
+- `write_primitive_block*` now take their permit through `acquire_permit`
+  before spawning, and the guard moves into the closure.
+- `EPERM` and `EINVAL` joined `EXDEV`, `ENOSYS` and `EOPNOTSUPP` in the
+  `copy_file_range` userspace-fallback set, with fstat and fcntl guards on
+  the cold path.
+- The io_uring CopyRange loop accepts a short pread as progress instead of
+  failing.
+- Two public APIs were added (`BlobReader::new_named`, a now-public
+  `Blob::locate_error`), and `blob_from_offset` reads after an earlier failed
+  read instead of reporting no blob.
+- `CliInvoker::child_limits` was deleted with the other unused builders, and
+  the docs that cited it reworded.
+- Degrade's sort-preservation guard now also checks `pending`, which was
+  argued always empty there.
+- altw external's `max_node_id_from_blob_meta` lost its reversed-range and
+  negative-`max_id` checks (and their tests) as unreachable behind the new
+  scan, and `build_node_blob_mapping` lost its reversed-range check.
+- The diff and derive delete and merge-stats helpers were merged to one owner
+  each across modules, argued inlining-neutral under fat LTO.
+
+Reported by: the maintainer, after the `direct_io` removal.
 

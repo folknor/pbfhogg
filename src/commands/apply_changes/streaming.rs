@@ -845,6 +845,4 @@ fn blob_err(desc: &BlobDescriptor, source: &Arc<Path>, e: Error) -> Error {
         ))
 }
 
-fn elapsed_ns(t: std::time::Instant) -> u64 {
-    u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX)
-}
+use crate::elapsed::elapsed_ns_u64 as elapsed_ns;

@@ -23,7 +23,8 @@ use std::sync::atomic::Ordering::Relaxed;
 use crate::read::wire_schema::{BlobHeaderField, HeaderBlockField, blob, blob_header};
 
 use super::compression::Compression;
-use super::pipeline::{FramedBlobParts, elapsed_ns_u64};
+use super::pipeline::FramedBlobParts;
+use crate::elapsed::elapsed_ns_u64;
 
 use crate::tunables::{MAX_RETAINED_SCRATCH_CAPACITY, ZLIB_RESERVE_SHIFT, ZLIB_RESERVE_SLACK};
 

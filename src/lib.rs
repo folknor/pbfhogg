@@ -162,6 +162,7 @@ pub(crate) mod coord_pack;
 // FIFO through `debug::initialize_marker_fifo`; the library never reads
 // `BROKKR_MARKER_FIFO` itself.
 pub mod debug;
+pub(crate) mod elapsed;
 mod element_kind;
 mod error;
 pub mod geo;

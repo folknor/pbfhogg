@@ -342,7 +342,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
             }
         };
         WRITER_METRICS.parallel_gzip_reorder_wait_ns.fetch_add(
-            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            crate::elapsed::elapsed_ns_u64(start),
             std::sync::atomic::Ordering::Relaxed,
         );
         result

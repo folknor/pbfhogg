@@ -34,9 +34,7 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use super::metrics::WRITER_METRICS;
 use super::{PAGE_SIZE, alloc_page_aligned};
 
-fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
-    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
-}
+use crate::elapsed::elapsed_ns_u64;
 
 // Fault-injection hooks for tests. Gated behind the `static-test-hooks`
 // Cargo feature and `not(test)`: product builds and the library's own

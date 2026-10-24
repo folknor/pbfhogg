@@ -11,6 +11,7 @@
 //! back into sequence order. Raw passthrough blobs bypass compression entirely.
 
 use crate::blob_meta;
+use crate::elapsed::elapsed_ns_u64;
 use crate::error::{Error, Result, panic_error};
 use crate::output::Completion;
 use crate::write::Finish;
@@ -39,7 +40,7 @@ pub(crate) use super::framing::{
 // thread) lives in the sibling `pipeline` module.
 use super::pipeline::{
     FileOutputSink, OutputChunk, PermitGuard, PipelineItem, SeqTotal, WritePipeline, drain_permits,
-    elapsed_ns_u64, record_send_wait, recv_permit, writer_thread,
+    record_send_wait, recv_permit, writer_thread,
 };
 use crate::host::{Diagnostics, Executor};
 use crate::tunables::WRITE_AHEAD;

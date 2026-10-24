@@ -283,7 +283,7 @@ pub fn diff(
     // serves the common non-verbose case.
     let parallel_stats = match &scratch {
         Some(scratch) if both_indexed && jobs > 1 => parallel::diff_block_pair_parallel(
-            old_path, new_path, output, options, &filter, jobs, host, scratch,
+            old_path, new_path, output, options, direct_io, &filter, jobs, host, scratch,
         )?,
         _ => None,
     };

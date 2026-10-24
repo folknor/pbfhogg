@@ -478,6 +478,7 @@ pub(crate) fn diff_block_pair_parallel(
     new_path: &Path,
     output: &mut impl Write,
     options: &DiffOptions,
+    _direct_io: bool,
     filter: &TypeFilter,
     shard_count: usize,
     host: &crate::host::Host,

@@ -601,10 +601,9 @@ fn worker_loop(
                 r
             }
         };
-        WRITER_METRICS.write_ns.fetch_add(
-            u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
+        WRITER_METRICS
+            .write_ns
+            .fetch_add(crate::elapsed::elapsed_ns_u64(t), Ordering::Relaxed);
         if let Err(e) = result {
             failure.record(e);
             return;

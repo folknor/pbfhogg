@@ -6,6 +6,7 @@
 //! All items here are internal wiring for the write path; nothing in this
 //! module is part of the public library API.
 
+use crate::elapsed::elapsed_ns_u64;
 use crate::error::{Error, Result};
 use crate::reorder_buffer::ReorderBuffer;
 use crate::tunables::{EXECUTOR_IDLE_RECV_TIMEOUT, PIPELINE_DISPATCH_PERMITS, WRITE_AHEAD};
@@ -489,10 +490,6 @@ pub(super) fn record_send_wait(send_start: std::time::Instant) {
     WRITER_METRICS
         .pipeline_send_wait_ns
         .fetch_add(elapsed_ns_u64(send_start), Relaxed);
-}
-
-pub(crate) fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
-    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Writer thread: receives [`OutputChunk`]s and hands them to the sink in

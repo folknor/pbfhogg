@@ -5,8 +5,9 @@
 
 use super::blob::{BlobReader, BlobType, DecompressPool};
 use super::block::PrimitiveBlock;
-use super::pipeline_metrics::{PIPELINE_METRICS, elapsed_ns_u64};
+use super::pipeline_metrics::PIPELINE_METRICS;
 use crate::blob_meta::BlobFilter;
+use crate::elapsed::elapsed_ns_u64;
 use crate::error::Result;
 use crate::reorder_buffer::ReorderBuffer;
 use crate::tunables::{

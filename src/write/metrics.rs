@@ -134,10 +134,8 @@ impl WriterMetrics {
     /// this from every backend that syncs, rather than touching either field
     /// directly, so the two cannot drift apart again.
     pub fn record_sync_all(&self, start: std::time::Instant) {
-        self.sync_all_ns.fetch_add(
-            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            Relaxed,
-        );
+        self.sync_all_ns
+            .fetch_add(crate::elapsed::elapsed_ns_u64(start), Relaxed);
         self.sync_all_calls.fetch_add(1, Relaxed);
     }
 
@@ -158,10 +156,8 @@ impl WriterMetrics {
     /// convention. Every backend's writer loop must call it, or that backend
     /// reports as never having stalled on its input.
     pub fn record_recv_wait(&self, start: std::time::Instant) {
-        self.recv_wait_ns.fetch_add(
-            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            Relaxed,
-        );
+        self.recv_wait_ns
+            .fetch_add(crate::elapsed::elapsed_ns_u64(start), Relaxed);
     }
 
     pub fn record_reorder_high_water(&self, len: usize) {

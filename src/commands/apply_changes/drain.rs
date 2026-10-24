@@ -287,7 +287,7 @@ pub(super) fn run_drain(
                 }
             }
         };
-        let wait_ns = u64::try_from(recv_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let wait_ns = crate::elapsed::elapsed_ns_u64(recv_start);
 
         // A failed worker never delivers its seq; waiting for it would
         // stall the reorder buffer forever (and under LOW, the barrier).

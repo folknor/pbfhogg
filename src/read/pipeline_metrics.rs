@@ -229,11 +229,6 @@ fn cas_max(field: &AtomicU64, candidate: u64) {
 
 pub(crate) static PIPELINE_METRICS: PipelineMetrics = PipelineMetrics::new();
 
-#[inline]
-pub(crate) fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
-    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     /// The pool-drop counters are process totals, so only the one

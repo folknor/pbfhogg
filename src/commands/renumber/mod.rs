@@ -138,8 +138,7 @@ use crate::tunables::{RENUMBER_PREALLOC_IDS_PER_BYTE, RENUMBER_STAGE2D_WORKERS};
 /// a planet node blob's pread is well under a millisecond, so per-blob
 /// `as_millis()` summed truncated zeros.
 fn add_ns(counter: &AtomicU64, since: Instant) {
-    let ns = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    counter.fetch_add(ns, Relaxed);
+    counter.fetch_add(crate::elapsed::elapsed_ns_u64(since), Relaxed);
 }
 
 /// Per-stage timing counters, summed across workers and emitted once the

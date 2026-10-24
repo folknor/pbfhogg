@@ -363,11 +363,71 @@ fn mut_subcommand_at(
     }
 }
 
+/// A long flag renamed to a different spelling. The old spelling stays as a
+/// hidden argument whose only job is to refuse, naming the new flag.
+struct RetiredLong {
+    path: &'static [&'static str],
+    id: &'static str,
+    long: &'static str,
+    now: &'static str,
+}
+
+const RETIRED_LONGS: &[RetiredLong] = &[RetiredLong {
+    path: &["getid"],
+    id: "retired-long-verbose-ids",
+    long: "verbose-ids",
+    now: "-v, --verbose",
+}];
+
+#[derive(Clone)]
+struct RetiredLongParser {
+    long: &'static str,
+    now: &'static str,
+}
+
+impl clap::builder::TypedValueParser for RetiredLongParser {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        _value: &std::ffi::OsStr,
+    ) -> Result<String, clap::Error> {
+        Err(cmd.clone().error(
+            clap::error::ErrorKind::UnknownArgument,
+            format!(
+                "--{} was renamed (every command spells \"say more\" the same way); \
+                 spell it {}",
+                self.long, self.now
+            ),
+        ))
+    }
+}
+
+impl RetiredLong {
+    fn arg(&self) -> clap::Arg {
+        clap::Arg::new(self.id)
+            .long(self.long)
+            .hide(true)
+            .action(clap::ArgAction::Set)
+            .num_args(0..=1)
+            .default_missing_value("")
+            .value_parser(RetiredLongParser {
+                long: self.long,
+                now: self.now,
+            })
+    }
+}
+
 /// The command tree production parses: the derived one, plus the retired
-/// shorts.
+/// shorts and longs.
 #[must_use]
 pub fn cli_command() -> clap::Command {
     let mut cmd = <Cli as clap::CommandFactory>::command();
+    for retired in RETIRED_LONGS {
+        cmd = mut_subcommand_at(cmd, retired.path, &|sub| sub.arg(retired.arg()));
+    }
     for retired in RETIRED_SHORTS {
         cmd = mut_subcommand_at(cmd, retired.path, &|sub| sub.arg(retired.arg()));
     }
@@ -654,14 +714,34 @@ fn parse_type_filter(value: &str) -> Result<TypeFilter, String> {
     value.parse::<TypeFilter>().map_err(|e| e.to_string())
 }
 
+/// `--type` on a command that acts on one element kind: the shared
+/// comma-list grammar, refusing a list of more than one kind.
 fn parse_single_type(value: &str) -> Result<TypeFilter, String> {
     let filter = parse_type_filter(value)?;
     if filter.count() != 1 {
         return Err(format!(
-            "invalid element type '{value}' (expected exactly one of node, way, or relation)"
+            "this command acts on one element type, so --type takes exactly one of \
+             node, way, or relation (got '{value}')"
         ));
     }
     Ok(filter)
+}
+
+/// `--type` on export: the shared grammar, refusing `relation`, which export
+/// cannot write. `node,way` is both kinds, i.e. no restriction.
+fn parse_export_type(value: &str) -> Result<pbfhogg::export::ExportTypes, String> {
+    let filter = parse_type_filter(value)?;
+    if filter.relations {
+        return Err(format!(
+            "export cannot export relations, so --type takes node, way, or node,way \
+             (got '{value}')"
+        ));
+    }
+    Ok(match (filter.nodes, filter.ways) {
+        (true, false) => pbfhogg::export::ExportTypes::NodesOnly,
+        (false, true) => pbfhogg::export::ExportTypes::WaysOnly,
+        _ => pbfhogg::export::ExportTypes::All,
+    })
 }
 
 fn parse_compression(value: &str) -> Result<Compression, String> {
@@ -910,21 +990,6 @@ impl From<DefaultTypeArg> for ElementKind {
 enum ExportFormatArg {
     Geojsonseq,
     Geojson,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum ExportTypeArg {
-    Node,
-    Way,
-}
-
-impl From<ExportTypeArg> for pbfhogg::export::ExportTypes {
-    fn from(arg: ExportTypeArg) -> Self {
-        match arg {
-            ExportTypeArg::Node => Self::NodesOnly,
-            ExportTypeArg::Way => Self::WaysOnly,
-        }
-    }
 }
 
 /// Metadata attribute accepted by `--clean`. The set is closed, so it is
@@ -1340,9 +1405,10 @@ enum Command {
         /// Output format: geojsonseq or geojson.
         #[arg(long = "format", default_value = "geojsonseq")]
         format: ExportFormatArg,
-        /// Only export this element type.
-        #[arg(short = 't', long = "type")]
-        type_filter: Option<ExportTypeArg>,
+        /// Only export these element types (comma-separated: node, way;
+        /// relations cannot be exported)
+        #[arg(short = 't', long = "type", value_parser = parse_export_type)]
+        type_filter: Option<pbfhogg::export::ExportTypes>,
         /// Read filter expressions from file, one per line.
         #[arg(short = 'e', long = "expressions")]
         expressions_file: Option<PathBuf>,
@@ -1467,7 +1533,7 @@ enum Command {
         #[arg(long = "remove-tags", requires = "add_referenced")]
         remove_tags: bool,
         /// Print requested IDs and report which were not found
-        #[arg(long, conflicts_with = "invert")]
+        #[arg(short = 'v', long = "verbose", conflicts_with = "invert")]
         verbose_ids: bool,
         /// Read IDs from text file (one per line, e.g. n123 or node/123)
         #[arg(short = 'i', long = "id-file")]
@@ -3862,7 +3928,7 @@ fn export_error(err: pbfhogg::Error) -> Box<dyn std::error::Error> {
 
 fn export_options(
     format: ExportFormatArg,
-    type_filter: Option<ExportTypeArg>,
+    type_filter: Option<pbfhogg::export::ExportTypes>,
     expressions_file: Option<&std::path::Path>,
     expressions: &[String],
     properties: Option<Vec<String>>,
@@ -3874,10 +3940,7 @@ fn export_options(
         ExportFormatArg::Geojsonseq => pbfhogg::export::ExportFormat::GeoJsonSeq,
         ExportFormatArg::Geojson => pbfhogg::export::ExportFormat::GeoJson,
     };
-    let types = type_filter.map_or(
-        pbfhogg::export::ExportTypes::All,
-        pbfhogg::export::ExportTypes::from,
-    );
+    let types = type_filter.unwrap_or(pbfhogg::export::ExportTypes::All);
     // Only the expressions can fail here, and a malformed one is a usage
     // error like any other malformed flag value.
     pbfhogg::export::ExportOptions::new(format, types, &expressions, properties, bbox, metadata)
@@ -5000,7 +5063,10 @@ fn run_bench_merge(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod short_flag_tests {
-    use super::{RETIRED_SHORTS, cli_command};
+    use super::{
+        RETIRED_LONGS, RETIRED_SHORTS, cli_command, parse_export_type, parse_single_type,
+        parse_type_filter,
+    };
 
     /// Letter, then the long flag(s) it stands for. `-o` is the output
     /// location: `--output`, or build-geocode-index's `--output-dir`.
@@ -5138,6 +5204,41 @@ mod short_flag_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_retired_long_is_refused_naming_its_replacement() {
+        for retired in RETIRED_LONGS {
+            let valid = valid_argv(retired.path);
+            let flag = format!("--{}", retired.long);
+            let argv: Vec<&str> = valid.iter().copied().chain([flag.as_str()]).collect();
+            let err = parse(&argv).expect_err("a retired long flag must be refused");
+            assert!(
+                err.contains(retired.now) && err.contains(&flag),
+                "{argv:?}: the refusal must name {flag} and {}:\n{err}",
+                retired.now
+            );
+        }
+    }
+
+    #[test]
+    fn type_parsers_share_one_grammar_and_refuse_by_command() {
+        assert_eq!(
+            parse_type_filter("node,way").map(pbfhogg::TypeFilter::count),
+            Ok(2)
+        );
+        assert!(parse_single_type("node,way").is_err());
+        assert!(parse_single_type("way").is_ok());
+        assert!(parse_export_type("relation").is_err());
+        assert!(parse_export_type("node,relation").is_err());
+        assert!(matches!(
+            parse_export_type("node,way"),
+            Ok(pbfhogg::export::ExportTypes::All)
+        ));
+        assert!(matches!(
+            parse_export_type("way"),
+            Ok(pbfhogg::export::ExportTypes::WaysOnly)
+        ));
     }
 
     #[test]

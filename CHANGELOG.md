@@ -4,6 +4,17 @@
 
 ### Breaking
 
+- **`--type` is one comma-list grammar on every command, and `getid
+  --verbose-ids` is now `-v, --verbose`.** `--type` takes any subset of
+  `node,way,relation` through a single parser. `inspect tags`, which counts
+  one kind, now refuses a list of more than one with a message saying it
+  takes exactly one; `export` no longer takes an enum and accepts `node`,
+  `way` or `node,way`, refusing `relation` with a message naming what it
+  accepts. `getid --verbose-ids` is renamed `--verbose` (short `-v`, the
+  spelling `diff` already used); the old name stays as a hidden flag that
+  refuses and names `-v, --verbose`, so a script fails loudly instead of
+  silently losing the diagnostic.
+
 - **Every OSC producer frames its output by the output name, and refuses
   other names.** `merge-changes`, `tags-filter --input-kind osc` and
   `diff --format osc` (and the library functions behind them) write plain XML
@@ -1939,6 +1950,13 @@
   bitset message. It is now an input error naming the problem.
 
 ### Changed
+
+- **`--force` on unindexed input says the same thing on every command.** A
+  forced run, or `build-geocode-index --allow-unindexed`, prints one note
+  that the run proceeds without indexdata and is slower. getid,
+  apply-changes, `cat --type`, `cat --dedupe`, `inspect tags` and
+  `tags-filter -R` used to say nothing, and the others each worded it
+  their own way.
 
 - **CLI warnings and notes now carry one prefix each.** Every warning on
   stderr starts with `Warning:` (previously also `warning:`, `Warning!` or an

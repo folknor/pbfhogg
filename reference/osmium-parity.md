@@ -101,7 +101,7 @@ pbfhogg getid --invert -o out.pbf input.pbf n123 w456
 ```
 
 All ID source flags (`-i`, `-I`, `--default-type`) work in both normal and
-inverted mode. The getid-only flags (`-r`, `-t`, `--verbose-ids`) are not
+inverted mode. The getid-only flags (`-r`, `-t`, `-v, --verbose`) are not
 available with `--invert`.
 
 ### derive-changes is now `diff --format osc`

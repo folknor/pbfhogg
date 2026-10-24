@@ -689,11 +689,6 @@ tables in `cli/tests/cli_input_contract.rs`
 the current statement of who refuses, who escapes with which flag, who falls
 back with which note, and who verifies. Pinned oddities worth a ruling:
 
-- The `--force` escape is not uniform in what it says: some forced runs print
-  the "blobs without indexdata" note, some are silent (getid, apply-changes,
-  `cat --type`, `cat --dedupe`, `inspect tags`, and `tags-filter -R`, though
-  plain tags-filter prints it), and `getid --add-referenced` prints the
-  first-blob probe's note instead.
 - renumber has no `--force`; altw `--index-type external` refuses `--force`
   at parse time.
 - A partially indexed file is refused, with the typed missing-indexdata
@@ -732,11 +727,10 @@ The sortedness the same commands require is read from the header flag alone
 header-only input counts as indexed (no blob lacks indexdata). No sentence
 anywhere says which of refuse, fall back or verify a command is meant to be.
 
-Decided:
+Decided (the first ruling, a uniform forced-run Note, is implemented in
+`require_indexdata`, keyed `reader.filter_without_indexdata` so the reader's
+own filter notes fold into it):
 
-- Every forced run on unindexed input emits the same keyed Note once (the
-  run proceeds without indexdata and is slower), so `--force` says the same
-  thing on every command.
 - No action: renumber's missing `--force` and altw external's parse-time
   `--force` refusal are guards; `--distrust-metadata` stays where it is.
 
@@ -931,29 +925,6 @@ Anger: 6 - CLI behaviour, small.
 Fix: give `Command` accessors for its outputs, inputs and scratch parent
 used by the alias check, the leftover scan and `run_scratch` alike. The run
 directory stays eager (ADR-0018).
-
-Reported by: the command-matrix audit.
-
-## HYG-119 - The same long flag takes a different value grammar per command
-
-Anger: 7 - CLI behaviour; any change breaks scripts.
-
-The short-flag vocabulary is settled (`reference/cli-reference.md`, "Short
-flags"; enforced by the clap-tree tests in `cli/src/lib.rs`). What remains
-is grammar, not letters:
-
-- `--type`: a comma list on cat, diff and check, exactly one on
-  `inspect tags`, a `node|way` enum on export (which cannot name a relation).
-- Verbosity: `diff -v` and `getid --verbose-ids` are different long flags for
-  the same idea; only diff and check have `--quiet`.
-
-Decided: unify. `--type` is one comma-list grammar with one shared parser
-on every command that takes it; a command acting on one kind refuses more
-than one, and `export` refuses `relation`, each with a message naming what
-it accepts. "Say more" is spelled `-v, --verbose` everywhere: `getid
---verbose-ids` becomes `--verbose`, with `--verbose-ids` kept as a refusing
-alias naming the new flag (as `-s` was retired). CLI breaks for scripts
-using the old spellings; CHANGELOG under Breaking.
 
 Reported by: the command-matrix audit.
 

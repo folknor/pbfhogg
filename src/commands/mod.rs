@@ -450,7 +450,8 @@ pub(crate) fn clean_metadata<'a>(
 
 /// Check for indexdata and return an error if missing (unless `force` is set).
 ///
-/// Returns `true` if indexdata is present, `false` if absent but `force` is set.
+/// Returns `true` if indexdata is present, `false` if absent but `force` is set;
+/// the forced case emits the one keyed Note every forced run shares.
 /// The `reason` should be a complete sentence explaining why indexdata matters,
 /// e.g. "input PBF has no blob-level indexdata. Without indexdata, the type
 /// filter is a no-op - all blobs are decompressed (significantly slower)."
@@ -470,6 +471,17 @@ pub(crate) fn require_indexdata(
     if !force && !present {
         return Err(crate::error::new_missing_indexdata(reason)
             .locate(crate::error::Location::in_file(path)));
+    }
+    if !present {
+        // The one statement every forced run on unindexed input makes. It
+        // shares the reader's key, so the filter notes that would follow
+        // from the same run are folded into it.
+        crate::host::diag_once!(
+            host.diagnostics,
+            Note,
+            "reader.filter_without_indexdata",
+            "Input contains blobs without indexdata; proceeding without it, this run is slower"
+        );
     }
     Ok(present)
 }

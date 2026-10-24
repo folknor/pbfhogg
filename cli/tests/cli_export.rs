@@ -306,7 +306,7 @@ fn metadata_types_and_locations_gate() {
     CliInvoker::new()
         .args(["export", raw.to_str().unwrap(), "--type", "relation"])
         .assert_failure()
-        .assert_stderr_contains("possible values: node, way");
+        .assert_stderr_contains("export cannot export relations");
 }
 
 #[test]

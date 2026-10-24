@@ -1097,7 +1097,6 @@ const fn falls_back(
     }
 }
 
-const FORCE_QUIET: Escape = Escape::Force(None);
 const FORCE_NOTED: Escape = Escape::Force(Some(BLOBS_NOTE));
 
 /// Every command line the unindexed input meets, with today's outcome.
@@ -1110,30 +1109,22 @@ const POLICY: &[PolicyRow] = &[
     ),
     refuses("repack", repack, FORCE_NOTED),
     refuses("tags-filter", tags_filter, FORCE_NOTED),
-    // Unlike plain tags-filter, the forced `-R` run says nothing about the
-    // missing indexdata.
-    refuses("tags-filter -R", tags_filter_omit, FORCE_QUIET),
-    refuses("getid", getid, FORCE_QUIET),
-    refuses("getid --invert", getid_invert, FORCE_QUIET),
-    // The forced run names a different note than the other getid arms: its
-    // reference-collecting scan reports the first-blob probe.
-    refuses(
-        "getid --add-referenced",
-        getid_add_referenced,
-        Escape::Force(Some("Input has no indexdata on its first data blob")),
-    ),
-    refuses("apply-changes", apply_changes, FORCE_QUIET),
+    refuses("tags-filter -R", tags_filter_omit, FORCE_NOTED),
+    refuses("getid", getid, FORCE_NOTED),
+    refuses("getid --invert", getid_invert, FORCE_NOTED),
+    refuses("getid --add-referenced", getid_add_referenced, FORCE_NOTED),
+    refuses("apply-changes", apply_changes, FORCE_NOTED),
     refuses("altw", altw, FORCE_NOTED),
     refuses("extract (complete)", extract_complete, FORCE_NOTED),
     refuses("extract --smart", extract_smart, FORCE_NOTED),
-    refuses("cat --type node", cat_type, FORCE_QUIET),
-    refuses("cat --type way", cat_type_way, FORCE_QUIET),
+    refuses("cat --type node", cat_type, FORCE_NOTED),
+    refuses("cat --type way", cat_type_way, FORCE_NOTED),
     refuses("cat --clean", cat_clean, FORCE_NOTED),
-    refuses("cat --dedupe", cat_dedupe, FORCE_QUIET),
+    refuses("cat --dedupe", cat_dedupe, FORCE_NOTED),
     // degrade's decode path (a transformation that re-encodes elements).
     refuses("degrade --strip-locations", degrade, FORCE_NOTED),
     refuses("inspect --nodes", inspect_nodes, FORCE_NOTED),
-    refuses("inspect tags", inspect_tags, FORCE_QUIET),
+    refuses("inspect tags", inspect_tags, FORCE_NOTED),
     // Refuse with no escape.
     PolicyRow {
         label: "renumber",
@@ -1162,10 +1153,7 @@ const POLICY: &[PolicyRow] = &[
         exit: &[0],
         policy: Policy::Refuses {
             reason: NO_INDEXDATA,
-            escape: Escape::Flag(
-                "--allow-unindexed",
-                Some("Input has no indexdata on its first data blob"),
-            ),
+            escape: Escape::Flag("--allow-unindexed", Some(BLOBS_NOTE)),
         },
     },
     // The legacy spelling grants the same and also overwrite, and says so.

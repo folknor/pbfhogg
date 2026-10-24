@@ -8,6 +8,12 @@ Every enumerated flag value (`--compression`, `--type`, `--index-type`,
 the argument boundary, so `--help` lists the accepted values and shell
 completion offers them.
 
+`--type` is one comma-list grammar (`node,way,relation`, any subset) with a
+single parser on every command that takes it. A command that acts on one
+kind (`inspect tags`) refuses a list of more than one, and `export` refuses
+`relation` (it accepts `node`, `way` or `node,way`); each refusal names what
+the command accepts.
+
 ## Global flags
 
 All commands support `-h, --help` and `-V, --version`.
@@ -107,7 +113,7 @@ short only where it has the long flag the short stands for.
 | `-R` | `--omit-referenced` | tags-filter |
 | `-s` | `--osmium-summary` | diff |
 | `-t` | `--type` | cat, diff, check, export, inspect tags |
-| `-v` | `--verbose` | diff |
+| `-v` | `--verbose` | diff, getid |
 | `-V` | `--version` | `pbfhogg` |
 
 Where a letter used to mean something else on a command, it now refuses on
@@ -493,7 +499,7 @@ Count tag key=value frequencies (subcommand of `inspect`).
 | `-M, --max-count <N>` | Only show tags with at most this many occurrences |
 | `--sort <ORDER>` | Sort order: count-desc (default), count-asc, name-asc, name-desc. `count` and `name` are accepted as aliases for `count-desc` and `name-asc`. (`-s` used to be its short; `-s` now refuses here, naming `--sort`.) |
 | `-e, --expressions <FILE>` | Read tag expressions from file (one per line, # comments) |
-| `-t, --type <TYPE>` | Filter by element type: node, way, or relation |
+| `-t, --type <TYPE>` | Count one element type: exactly one of node, way, or relation (a list is refused) |
 | `-j, --jobs <N>` | Worker threads (see [`-j/--jobs`](#-j--jobs)) |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed on unindexed input with the slower fallback (see [`--force`](#--force)) |
@@ -891,7 +897,7 @@ pbfhogg export [OPTIONS] <FILE> [EXPRESSIONS]...
 | `-o, --output <FILE>` | Write to a file instead of stdout |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way. Requires `-o`: stdout is never replaced |
 | `--format <FORMAT>` | `geojsonseq` (default) or `geojson` |
-| `-t, --type <TYPE>` | Export only `node` or `way` |
+| `-t, --type <TYPE>` | Export only these kinds: `node`, `way` or `node,way`. `relation` is refused |
 | `-e, --expressions <FILE>` | Read tag expressions from a file, one per line |
 | `--properties <KEYS>` | Comma-separated whitelist of tag property keys |
 | `-b, --bbox <BBOX>` | `min_lon,min_lat,max_lon,max_lat`; ways match by vertex containment only, so crossing or enclosing geometry without an inside vertex is omitted |
@@ -990,7 +996,7 @@ pbfhogg getid [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 | `--invert` | Invert selection: remove listed IDs instead of keeping them |
 | `-r, --add-referenced` | Include referenced nodes of matching ways (two-pass; not with `--invert`) |
 | `--remove-tags` | Remove tags from referenced objects. Requires `-r`, which is what emits them (so not with `--invert`). (`-t` used to be its short; `-t` now refuses here, naming `--remove-tags`.) |
-| `--verbose-ids` | Print requested IDs, then report which were not found (not with `--invert`). Both lists go to stderr. The found set is collected on the write path, so this costs no extra pass over the output. |
+| `-v, --verbose` | Print requested IDs, then report which were not found (not with `--invert`). Both lists go to stderr. The found set is collected on the write path, so this costs no extra pass over the output. |
 | `-i, --id-file <FILE>` | Read IDs from text file (one per line) |
 | `-I, --id-osm-file <FILE>` | Read IDs from an OSM/PBF file (all element IDs are collected) |
 | `--default-type <TYPE>` | Type for bare numeric IDs: node, way, relation. No type is assumed when this option is omitted. |
@@ -1000,12 +1006,13 @@ pbfhogg getid [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
-`--verbose-ids` is an exhaustive diagnostic with no output cap. Requested
+`--verbose` is an exhaustive diagnostic with no output cap (`--verbose-ids`,
+its former name, now refuses, naming `-v, --verbose`). Requested
 IDs are space-separated on one line per kind; missing IDs are printed one
 per line. With `-I`, every ID from that input participates, so large inputs
 can produce very large stderr output. The missing-ID report also collects
 three vectors, one per kind, requiring O(M) additional ID storage for M
-missing objects. Omit `--verbose-ids` when that output and storage are unwanted;
+missing objects. Omit `--verbose` when that output and storage are unwanted;
 the normal command summary remains available.
 
 ### getparents

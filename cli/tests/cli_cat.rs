@@ -1365,3 +1365,597 @@ fn every_cat_path_refuses_non_leading_header_frames() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Unclassifiable blocks: plain cat re-encodes them into indexed blocks
+// ---------------------------------------------------------------------------
+
+/// Minimal protobuf emitter for blocks the crate's writers never produce.
+mod pb {
+    use crate::common::adversarial::write_varint;
+
+    pub fn zz(v: i64) -> u64 {
+        ((v << 1) ^ (v >> 63)).cast_unsigned()
+    }
+
+    pub fn key(buf: &mut Vec<u8>, field: u64, wire: u64) {
+        write_varint(buf, (field << 3) | wire);
+    }
+
+    pub fn uint(buf: &mut Vec<u8>, field: u64, v: u64) {
+        key(buf, field, 0);
+        write_varint(buf, v);
+    }
+
+    pub fn bytes(buf: &mut Vec<u8>, field: u64, data: &[u8]) {
+        key(buf, field, 2);
+        write_varint(buf, u64::try_from(data.len()).expect("length fits u64"));
+        buf.extend_from_slice(data);
+    }
+
+    /// A packed field of raw varints.
+    pub fn packed(buf: &mut Vec<u8>, field: u64, vals: impl IntoIterator<Item = u64>) {
+        let mut body = Vec::new();
+        for v in vals {
+            write_varint(&mut body, v);
+        }
+        bytes(buf, field, &body);
+    }
+
+    /// A packed sint64 field of the deltas of `vals`.
+    pub fn deltas(buf: &mut Vec<u8>, field: u64, vals: &[i64]) {
+        let mut prev = 0i64;
+        packed(
+            buf,
+            field,
+            vals.iter().map(|&v| {
+                let d = v - prev;
+                prev = v;
+                zz(d)
+            }),
+        );
+    }
+
+    /// An `Info` with every field set; `user` is a string-table index.
+    pub fn info(version: i32, user: u64) -> Vec<u8> {
+        let mut b = Vec::new();
+        uint(&mut b, 1, u64::from(version.cast_unsigned()));
+        uint(&mut b, 2, 1_600_000_000);
+        uint(&mut b, 3, 77);
+        uint(&mut b, 4, 5);
+        uint(&mut b, 5, user);
+        uint(&mut b, 6, 1);
+        b
+    }
+
+    /// `DenseNodes` for `(id, version)` pairs; version -1 means no metadata.
+    /// Node `id` sits at `(id * 10, id * 20)` and the first node is tagged
+    /// `name=a` (string indices 1 and 2).
+    pub fn dense(nodes: &[(i64, i32)], user: u64) -> Vec<u8> {
+        let ids: Vec<i64> = nodes.iter().map(|n| n.0).collect();
+        let mut b = Vec::new();
+        deltas(&mut b, 1, &ids);
+        let mut di = Vec::new();
+        packed(
+            &mut di,
+            1,
+            nodes.iter().map(|n| i64::from(n.1).cast_unsigned()),
+        );
+        deltas(&mut di, 2, &vec![1_600_000_000; nodes.len()]);
+        deltas(&mut di, 3, &vec![77; nodes.len()]);
+        deltas(&mut di, 4, &vec![5; nodes.len()]);
+        let user = i64::try_from(user).expect("string index fits i64");
+        deltas(&mut di, 5, &vec![user; nodes.len()]);
+        packed(&mut di, 6, nodes.iter().map(|_| 1));
+        bytes(&mut b, 5, &di);
+        deltas(&mut b, 8, &ids.iter().map(|id| id * 10).collect::<Vec<_>>());
+        deltas(&mut b, 9, &ids.iter().map(|id| id * 20).collect::<Vec<_>>());
+        let mut kv = vec![1, 2, 0];
+        kv.extend(std::iter::repeat_n(0, nodes.len() - 1));
+        packed(&mut b, 10, kv);
+        b
+    }
+
+    /// A plain `Node` at `(id * 10, id * 20)`, tagged `name=a`.
+    pub fn node(id: i64, info: Option<&[u8]>) -> Vec<u8> {
+        let mut b = Vec::new();
+        uint(&mut b, 1, zz(id));
+        packed(&mut b, 2, [1]);
+        packed(&mut b, 3, [2]);
+        if let Some(info) = info {
+            bytes(&mut b, 4, info);
+        }
+        uint(&mut b, 8, zz(id * 10));
+        uint(&mut b, 9, zz(id * 20));
+        b
+    }
+
+    /// A `Way` tagged `highway=path` (indices 3 and 4), with inline
+    /// locations when given.
+    pub fn way(id: i64, refs: &[i64], locations: Option<&[(i64, i64)]>, info: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        uint(&mut b, 1, id.cast_unsigned());
+        packed(&mut b, 2, [3]);
+        packed(&mut b, 3, [4]);
+        bytes(&mut b, 4, info);
+        deltas(&mut b, 8, refs);
+        if let Some(locations) = locations {
+            deltas(
+                &mut b,
+                9,
+                &locations.iter().map(|l| l.0).collect::<Vec<_>>(),
+            );
+            deltas(
+                &mut b,
+                10,
+                &locations.iter().map(|l| l.1).collect::<Vec<_>>(),
+            );
+        }
+        b
+    }
+
+    /// A `Relation` tagged `type=route` (indices 5 and 6) with members
+    /// `(id, type, role index)`.
+    pub fn relation(id: i64, members: &[(i64, u64, u64)], info: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        uint(&mut b, 1, id.cast_unsigned());
+        packed(&mut b, 2, [5]);
+        packed(&mut b, 3, [6]);
+        bytes(&mut b, 4, info);
+        packed(&mut b, 8, members.iter().map(|m| m.2));
+        deltas(&mut b, 9, &members.iter().map(|m| m.0).collect::<Vec<_>>());
+        packed(&mut b, 10, members.iter().map(|m| m.1));
+        b
+    }
+
+    /// A `PrimitiveBlock` over the shared string table, one entry per group;
+    /// each group is a list of `(field, message)` pairs.
+    pub fn block(groups: &[Vec<(u64, Vec<u8>)>]) -> Vec<u8> {
+        let mut st = Vec::new();
+        for s in [
+            "", "name", "a", "highway", "path", "type", "route", "outer", "alice",
+        ] {
+            bytes(&mut st, 1, s.as_bytes());
+        }
+        let mut b = Vec::new();
+        bytes(&mut b, 1, &st);
+        for group in groups {
+            let mut g = Vec::new();
+            for (field, msg) in group {
+                bytes(&mut g, *field, msg);
+            }
+            bytes(&mut b, 2, &g);
+        }
+        b
+    }
+}
+
+fn tag_list<'a>(tags: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<(String, String)> {
+    tags.map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
+type MetaRepr = Option<(i32, i64, i64, i32, Option<String>, bool)>;
+
+fn info_meta(i: &pbfhogg::Info<'_>) -> MetaRepr {
+    i.version().map(|v| {
+        (
+            v,
+            i.milli_timestamp().unwrap_or(0),
+            i.changeset().unwrap_or(0),
+            i.uid().unwrap_or(0),
+            i.user().map(|u| u.expect("user").to_string()),
+            i.visible(),
+        )
+    })
+}
+
+/// Every element of a PBF in file order, with everything a re-encode must
+/// keep: kind, id, coordinates, tags in order, refs, inline locations,
+/// members, and metadata.
+fn ordered_elements(path: &Path) -> Vec<String> {
+    use pbfhogg::{BlobDecode, BlobReader, Element};
+
+    let mut out = Vec::new();
+    for blob in BlobReader::from_path(path).expect("open pbf") {
+        let blob = blob.expect("read blob");
+        let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") else {
+            continue;
+        };
+        for element in block.elements() {
+            out.push(match element {
+                Element::DenseNode(n) => {
+                    let meta = n.info().filter(|i| i.version() != -1).map(|i| {
+                        (
+                            i.version(),
+                            i.milli_timestamp(),
+                            i.changeset(),
+                            i.uid(),
+                            Some(i.user().expect("user").to_string()),
+                            i.visible(),
+                        )
+                    });
+                    format!(
+                        "node {} {} {} {:?} {meta:?}",
+                        n.id(),
+                        n.decimicro_lat(),
+                        n.decimicro_lon(),
+                        tag_list(n.tags()),
+                    )
+                }
+                Element::Node(n) => format!(
+                    "node {} {} {} {:?} {:?}",
+                    n.id(),
+                    n.decimicro_lat(),
+                    n.decimicro_lon(),
+                    tag_list(n.tags()),
+                    info_meta(&n.info()),
+                ),
+                Element::Way(w) => format!(
+                    "way {} {:?} {:?} {:?} {:?}",
+                    w.id(),
+                    tag_list(w.tags()),
+                    w.refs().collect::<Vec<_>>(),
+                    w.node_locations()
+                        .map(|l| (l.decimicro_lat(), l.decimicro_lon()))
+                        .collect::<Vec<_>>(),
+                    info_meta(&w.info()),
+                ),
+                Element::Relation(r) => format!(
+                    "relation {} {:?} {:?} {:?}",
+                    r.id(),
+                    tag_list(r.tags()),
+                    r.members()
+                        .map(|m| (m.id, m.role().expect("role").to_string()))
+                        .collect::<Vec<_>>(),
+                    info_meta(&r.info()),
+                ),
+                other => panic!("unexpected element {other:?}"),
+            });
+        }
+    }
+    out
+}
+
+/// Every data block's kind, first and last id, and element count, in file
+/// order.
+fn block_layout(path: &Path) -> Vec<(&'static str, i64, i64, usize)> {
+    use pbfhogg::{BlobDecode, BlobReader, Element};
+
+    let mut out = Vec::new();
+    for blob in BlobReader::from_path(path).expect("open pbf") {
+        let blob = blob.expect("read blob");
+        let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") else {
+            continue;
+        };
+        let elements: Vec<(&'static str, i64)> = block
+            .elements()
+            .map(|e| match e {
+                Element::DenseNode(n) => ("node", n.id()),
+                Element::Node(n) => ("node", n.id()),
+                Element::Way(w) => ("way", w.id()),
+                Element::Relation(r) => ("relation", r.id()),
+                other => panic!("unexpected element {other:?}"),
+            })
+            .collect();
+        let (first, last) = (elements[0], elements[elements.len() - 1]);
+        assert!(
+            elements.iter().all(|e| e.0 == first.0),
+            "a block holds more than one kind: {elements:?}"
+        );
+        out.push((first.0, first.1, last.1, elements.len()));
+    }
+    out
+}
+
+/// Write a PBF whose header declares `features` (and `Sort.Type_then_ID`
+/// when `sorted`) and whose data blobs are `blocks`, each `(indexed, bytes)`.
+fn write_raw_block_pbf(path: &Path, sorted: bool, features: &[&str], blocks: &[(bool, Vec<u8>)]) {
+    use pbfhogg::block_builder::HeaderBuilder;
+    use pbfhogg::writer::{Compression, PbfWriter};
+
+    let mut hb = HeaderBuilder::new();
+    if sorted {
+        hb = hb.sorted();
+    }
+    for feature in features {
+        hb = hb.optional_feature(*feature);
+    }
+    let header = hb.build().expect("header");
+    let file = std::fs::File::create(path).expect("create input");
+    let mut writer = PbfWriter::new(file, Compression::default());
+    writer.write_header(&header).expect("write header");
+    for (indexed, bytes) in blocks {
+        if *indexed {
+            writer.write_primitive_block(bytes).expect("write block");
+        } else {
+            writer
+                .write_primitive_block_no_indexdata(bytes)
+                .expect("write block");
+        }
+    }
+    writer.flush().expect("flush fixture");
+}
+
+/// For every OsmData frame, whether its `BlobHeader` carries indexdata
+/// (field 2). Parsed independently of the crate's own frame reader.
+fn data_blob_indexdata(path: &Path) -> Vec<bool> {
+    use crate::common::adversarial::{locate_blobs, read_varint};
+
+    let bytes = std::fs::read(path).expect("read pbf");
+    let mut out = Vec::new();
+    for frame in locate_blobs(&bytes) {
+        let header = &bytes[frame.header_start..frame.header_end];
+        let (mut pos, mut is_data, mut indexed) = (0, false, false);
+        while pos < header.len() {
+            let (tag, n) = read_varint(&header[pos..]).expect("tag");
+            pos += n;
+            let (field, wire) = (tag >> 3, tag & 7);
+            let (v, n) = read_varint(&header[pos..]).expect("value");
+            pos += n;
+            if wire == 2 {
+                let len = usize::try_from(v).expect("len");
+                if field == 1 {
+                    is_data = &header[pos..pos + len] == b"OSMData";
+                }
+                indexed |= field == 2;
+                pos += len;
+            }
+        }
+        if is_data {
+            out.push(indexed);
+        }
+    }
+    out
+}
+
+/// The advised indexing recipe, `pbfhogg cat <input> -o indexed.osm.pbf`,
+/// must index a blob whose block no single index can describe instead of
+/// copying it through unindexed - otherwise the command that refused the
+/// input refuses the recipe's output again. Plain cat re-encodes such a
+/// block into single-kind blocks, in element order, splitting at a change of
+/// kind, at the block cap and where node metadata presence flips (one
+/// builder block cannot hold both without inventing metadata), and drops an
+/// element-less block.
+#[test]
+fn passthrough_reencodes_unclassifiable_blocks_into_indexed_ones() {
+    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
+    use pbfhogg::writer::{Compression, PbfWriter};
+
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("unclassifiable.osm.pbf");
+    let output = dir.path().join("indexed.osm.pbf");
+
+    let alice = 8;
+    let meta = pb::info(3, alice);
+    let header = HeaderBuilder::new().sorted().build().expect("header");
+    let file = std::fs::File::create(&input).expect("create input");
+    let mut writer = PbfWriter::new(file, Compression::default());
+    writer.write_header(&header).expect("write header");
+
+    // 1. No elements: one empty group. First, so the first-blob probe sees
+    //    an unindexed blob too.
+    writer
+        .write_primitive_block_no_indexdata(&pb::block(&[vec![]]))
+        .expect("write empty block");
+    // 2. One group carrying two element fields: dense nodes 1 and 2 with
+    //    metadata, then plain node 3 without (a Some -> None flip).
+    writer
+        .write_primitive_block_no_indexdata(&pb::block(&[vec![
+            (2, pb::dense(&[(1, 3), (2, 3)], alice)),
+            (1, pb::node(3, None)),
+        ]]))
+        .expect("write multi-field block");
+    // 3. An ordinary unindexed node block: the reindex arm.
+    let mut bb = BlockBuilder::new();
+    bb.add_node(4, 40, 80, [("name", "a")], None);
+    bb.add_node(5, 50, 100, [], None);
+    let bytes = bb.take().expect("take").expect("block").to_vec();
+    writer
+        .write_primitive_block_no_indexdata(&bytes)
+        .expect("write ordinary block");
+    // 4. Kinds mixed across groups: node 6 without metadata, then 8001
+    //    nodes with it (a None -> Some flip, and a run over the 8000 cap),
+    //    then two ways.
+    let mut nodes = vec![(6, -1), (7, 3)];
+    nodes.extend((100..8100).map(|id| (id, 3)));
+    writer
+        .write_primitive_block_no_indexdata(&pb::block(&[
+            vec![(2, pb::dense(&nodes, alice))],
+            vec![
+                (3, pb::way(10, &[1, 2], None, &meta)),
+                (3, pb::way(11, &[2, 3], None, &meta)),
+            ],
+        ]))
+        .expect("write mixed node/way block");
+    // 5. An ordinary indexed way block: the raw-copy arm.
+    bb.add_way(12, [("highway", "path")], &[4, 5], None);
+    let bytes = bb.take().expect("take").expect("block").to_vec();
+    writer
+        .write_primitive_block(&bytes)
+        .expect("write indexed block");
+    // 6. Kinds mixed across groups: a way with inline locations, then a
+    //    relation with roles.
+    writer
+        .write_primitive_block_no_indexdata(&pb::block(&[
+            vec![(3, pb::way(13, &[4, 5], Some(&[(40, 80), (50, 100)]), &meta))],
+            vec![(4, pb::relation(20, &[(10, 1, 7), (1, 0, 0)], &meta))],
+        ]))
+        .expect("write mixed way/relation block");
+    writer.flush().expect("flush fixture");
+    drop(writer);
+
+    // Only the ordinary way block carries indexdata in the input.
+    assert_eq!(
+        data_blob_indexdata(&input),
+        [false, false, false, false, true, false]
+    );
+
+    // A command that needs indexdata on every blob refuses the input.
+    let refused = CliInvoker::new()
+        .arg("renumber")
+        .arg(&input)
+        .arg("-o")
+        .arg(dir.path().join("renumbered-input.osm.pbf"))
+        .run();
+    assert!(!refused.status.success(), "{}", refused.stderr_str());
+    refused.assert_stderr_contains("indexdata");
+
+    let out = CliInvoker::new()
+        .arg("cat")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .run();
+    assert!(out.status.success(), "cat failed:\n{}", out.stderr_str());
+    out.assert_stderr_contains("Decoded 4 blobs, wrote 8009 elements; 2 blobs passed through");
+
+    // Every data blob is indexed, and the splits are the expected ones. The
+    // empty block is gone.
+    assert_eq!(data_blob_indexdata(&output), [true; 10]);
+    assert_eq!(
+        block_layout(&output),
+        [
+            ("node", 1, 2, 2),
+            ("node", 3, 3, 1),
+            ("node", 4, 5, 2),
+            ("node", 6, 6, 1),
+            ("node", 7, 8098, 8000),
+            ("node", 8099, 8099, 1),
+            ("way", 10, 11, 2),
+            ("way", 12, 12, 1),
+            ("way", 13, 13, 1),
+            ("relation", 20, 20, 1),
+        ]
+    );
+
+    // Same elements, same order, same content.
+    assert_eq!(ordered_elements(&output), ordered_elements(&input));
+
+    // The recipe's output passes the gate that refused its input.
+    CliInvoker::new()
+        .arg("renumber")
+        .arg(&output)
+        .arg("-o")
+        .arg(dir.path().join("renumbered-output.osm.pbf"))
+        .assert_success();
+}
+
+/// The re-encode keeps the input's element order, not type-then-ID order:
+/// an unsorted block with repeated kind changes and descending ids within a
+/// run comes out in the same sequence, one block per run.
+#[test]
+fn passthrough_reencode_keeps_unsorted_element_order() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("unsorted.osm.pbf");
+    let output = dir.path().join("indexed.osm.pbf");
+    let meta = pb::info(1, 8);
+    write_raw_block_pbf(
+        &input,
+        false,
+        &[],
+        &[(
+            false,
+            pb::block(&[
+                vec![(3, pb::way(31, &[9, 5], None, &meta))],
+                vec![(1, pb::node(9, Some(&meta))), (1, pb::node(5, Some(&meta)))],
+                vec![
+                    (3, pb::way(30, &[5, 9], None, &meta)),
+                    (3, pb::way(2, &[9], None, &meta)),
+                ],
+                vec![(1, pb::node(1, Some(&meta)))],
+            ]),
+        )],
+    );
+
+    let out = CliInvoker::new()
+        .arg("cat")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .run();
+    assert!(out.status.success(), "cat failed:\n{}", out.stderr_str());
+    assert_eq!(ordered_elements(&output), ordered_elements(&input));
+    assert_eq!(
+        block_layout(&output),
+        [
+            ("way", 31, 31, 1),
+            ("node", 9, 5, 2),
+            ("way", 30, 2, 2),
+            ("node", 1, 1, 1),
+        ]
+    );
+    assert_eq!(data_blob_indexdata(&output), [true; 4]);
+}
+
+/// The re-encode cannot write `WayMembers-v1` (blob field 5) or
+/// `SharedNodePins-v1` (way field 20). Where the output header declares one,
+/// a way in an unclassifiable block is refused, located at its input frame,
+/// rather than written without the enrichment the header promised.
+#[test]
+fn passthrough_reencode_refuses_to_drop_a_declared_way_enrichment() {
+    let dir = crate::common::test_scratch();
+    let meta = pb::info(1, 8);
+    let mut pinned = pb::way(10, &[1, 2], None, &meta);
+    pb::bytes(&mut pinned, 20, &[1]);
+    let mixed =
+        |way: Vec<u8>| pb::block(&[vec![(2, pb::dense(&[(1, 1), (2, 1)], 8))], vec![(3, way)]]);
+    let indexed_node = {
+        let mut bb = pbfhogg::block_builder::BlockBuilder::new();
+        bb.add_node(100, 0, 0, [], None);
+        bb.take().expect("take").expect("block").to_vec()
+    };
+
+    // WayMembers-v1 is declared only when every blob is copied whole, so the
+    // first data blob is indexed.
+    let members = dir.path().join("way-members.osm.pbf");
+    write_raw_block_pbf(
+        &members,
+        false,
+        &["pbfhogg.WayMembers-v1"],
+        &[
+            (true, indexed_node),
+            (false, mixed(pb::way(10, &[1, 2], None, &meta))),
+        ],
+    );
+    // SharedNodePins-v1 survives a reframe, so an unindexed first blob keeps
+    // it declared.
+    let pins = dir.path().join("pins.osm.pbf");
+    write_raw_block_pbf(
+        &pins,
+        false,
+        &["pbfhogg.SharedNodePins-v1"],
+        &[(false, mixed(pinned))],
+    );
+
+    for (input, feature) in [
+        (&members, "pbfhogg.WayMembers-v1"),
+        (&pins, "pbfhogg.SharedNodePins-v1"),
+    ] {
+        let output = dir.path().join("out.osm.pbf");
+        let out = CliInvoker::new()
+            .arg("cat")
+            .arg(input)
+            .arg("-o")
+            .arg(&output)
+            .run();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{feature}: {}",
+            out.stderr_str()
+        );
+        let stderr = out.stderr_str();
+        assert!(
+            stderr.contains(feature) && stderr.contains("re-encoding"),
+            "{feature}: {stderr}"
+        );
+        assert!(
+            stderr.contains(&input.display().to_string()) && stderr.contains("at byte offset"),
+            "{feature}: the refusal must name its input frame; stderr:\n{stderr}"
+        );
+        assert!(
+            !output.exists(),
+            "{feature}: a refused cat published output"
+        );
+    }
+}

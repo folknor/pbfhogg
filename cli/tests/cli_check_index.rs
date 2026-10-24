@@ -404,9 +404,13 @@ fn a_tag_index_over_an_unindexable_blob_is_reported() {
     );
 
     // Paired counterpart: the identical rewrite path, with the payload left
-    // alone, must verify clean. Dropping the indexdata is legal - it is what
+    // alone, must verify clean. A file without indexdata is legal - it is what
     // every third-party PBF looks like - so nothing here should be reported.
-    let stripped = crate::common::adversarial::mutate_blob_header_indexdata(&pbf, last, Vec::clear);
+    // Every data blob is stripped, not just the last: a file indexed on some
+    // blobs and not others is partially indexed, which is its own violation.
+    let stripped = (1..=last).fold(pbf.clone(), |bytes, blob| {
+        crate::common::adversarial::mutate_blob_header_indexdata(&bytes, blob, Vec::clear)
+    });
     let stripped_path = dir.path().join("stripped-index.osm.pbf");
     std::fs::write(&stripped_path, &stripped).expect("write");
     let out = check_index(&stripped_path);

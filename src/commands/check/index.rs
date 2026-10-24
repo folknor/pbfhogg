@@ -146,6 +146,11 @@ pub enum IndexViolationKind {
     /// The stored tag index lists keys the blob does not carry. Sound but
     /// false: it costs a decode that the index existed to avoid.
     TagKeysSpurious { spurious: usize, example: String },
+    /// Some data blobs carry indexdata and this one, which could carry it,
+    /// does not. Consumers that read indexdata from the first blob alone take
+    /// the file as indexed and then fail or misbehave at this blob. A wholly
+    /// unindexed file is not this.
+    MissingAmongIndexed,
 }
 
 /// A single disagreement, located in the file.
@@ -222,6 +227,11 @@ impl std::fmt::Display for IndexViolation {
             IndexViolationKind::TagKeysSpurious { spurious, example } => write!(
                 f,
                 "tagdata lists {spurious} key(s) the blob does not carry (e.g. {example:?})"
+            ),
+            IndexViolationKind::MissingAmongIndexed => write!(
+                f,
+                "no indexdata, but other blobs in this file carry it: the file is \
+                 partially indexed (first such blob shown)"
             ),
         }
     }
@@ -468,6 +478,8 @@ fn check_index_inner(
     let mut block = Vec::new();
     let mut report = IndexReport::default();
     let mut found = Vec::new();
+    // The first indexable blob with no indexdata, for the partial-index verdict.
+    let mut first_unindexed: Option<(u64, u64)> = None;
 
     crate::debug::emit_marker("CHECK_INDEX_START");
     let mut first = true;
@@ -512,6 +524,8 @@ fn check_index_inner(
             .map(|(index, _sorted)| index);
         if observed.is_none() {
             report.blobs_unindexable += 1;
+        } else if !frame.index_present && first_unindexed.is_none() {
+            first_unindexed = Some((ordinal, frame.file_offset));
         }
 
         found.clear();
@@ -543,6 +557,19 @@ fn check_index_inner(
         return Err(crate::error::new_missing_header(path));
     }
     crate::debug::emit_marker("CHECK_INDEX_END");
+
+    if let Some((blob_ordinal, file_offset)) = first_unindexed
+        && report.blobs_with_index > 0
+    {
+        report.total_violations += 1;
+        if opts.max_errors == 0 || report.violations.len() < opts.max_errors {
+            report.violations.push(IndexViolation {
+                blob_ordinal,
+                file_offset,
+                kind: IndexViolationKind::MissingAmongIndexed,
+            });
+        }
+    }
 
     Ok(report)
 }

@@ -150,6 +150,11 @@ writer.flush()?;
 // and still fail on genuinely unreachable code. Scoped to the library; the
 // binary is never built without `commands`.
 #![cfg_attr(not(feature = "commands"), allow(dead_code))]
+// Library code never writes stdout or stderr (ADR-0016): diagnostics go through
+// the host, debug output through `crate::debug`. Crate-level so it binds the
+// library target only (not pbfhogg-cli, examples, benches or `tests/`, which are
+// separate crates); `not(test)` leaves the library's own unit tests free to print.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 // Module tree
 pub(crate) mod blob_meta;

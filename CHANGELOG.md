@@ -1010,6 +1010,28 @@
 
 ### Fixed
 
+- **`cat` indexes every blob it can decode.** A blob whose block no single
+  index can describe (no elements, a group carrying more than one element
+  kind, or kinds that change across groups - all legal PBF, written by other
+  tools) used to pass through `cat` unindexed, so following the "generate an
+  indexed PBF first" advice on such a file got the same refusal again. Those
+  blobs are now re-encoded into single-kind blocks, in decoder order, and
+  indexed; an element-less block is dropped. Re-encoding goes through the
+  block builder, so these blobs take the same normalisation as `cat --type`
+  and `--clean` (dense nodes, coordinates at decimicrodegree granularity,
+  whole-second timestamps). A block the decoder rejects is a located error
+  instead of a silent pass-through. When a run both decodes and copies
+  blobs, its summary reads `Decoded N blobs, wrote M elements; K blobs
+  passed through`.
+- **`diff` on a partially indexed input is the missing-indexdata error.** A
+  file indexed on its first data blob but not on a later one used to fail
+  mid-merge with a generic "block-pair merge requires indexdata"; both diff
+  paths (and `--format osc`) now refuse it with the same error and advice
+  as an unindexed input, located at the first unindexed blob.
+- **`check --index` fails a partially indexed file.** A file whose data
+  blobs carry indexdata on some and not others now exits 1 with a violation
+  at the first unindexed blob, instead of exiting 0 with a count. A wholly
+  unindexed file still passes, and so do blobs no index could describe.
 - **Raw passthrough copies fall back to userspace wherever the kernel
   refuses `copy_file_range`.** Only a cross-device copy (`EXDEV`) used to
   fall back; on FUSE and some NFS mounts (`EOPNOTSUPP`), pre-4.5 kernels

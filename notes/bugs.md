@@ -94,31 +94,6 @@ during decode.
 
 Reported by: the extract passthrough fix.
 
-## BUG-113 - The advised indexing recipe leaves an unclassifiable blob unindexed
-
-Anger: 4 - CLI behaviour, contained.
-
-The CLI's `MissingIndexdata` advice is `pbfhogg cat <input> -o
-indexed.osm.pbf` (tested to work for an ordinary unindexed input). Plain
-`cat` writes a blob whose block the index scan cannot classify
-(`scan_block_ids_and_tags` returns no index) through unchanged and still
-unindexed, so on an input holding such a blob the recipe succeeds, the
-refused command is refused again, and the advice loops. Not run on such a
-fixture; read from `cat_passthrough`. Per the scanner's contract
-(`blob_meta/scan.rs`) the unclassifiable shapes are: no groups or no
-elements, a group carrying more than one element field, and different
-element kinds across groups - all legal PBF, none written by pbfhogg.
-
-Decided: plain `cat` re-encodes such a blob into single-kind blocks (groups
-re-emitted in order, split at each change of kind) and indexes those; a
-block holding no elements is dropped. Condition: no performance cost on
-ordinary PBFs - the work lives only on the unclassifiable-blob arm, and the
-indexed passthrough and ordinary reindex paths are untouched. Test with a
-fixture holding a mixed-kind block, a multi-field group and an empty block,
-asserting the recipe's output passes the gate that refused the input.
-
-Reported by: the re-encode and re-index advice check.
-
 ## BUG-133 - A metadata-less node in a dense block deletes as `version="0"`
 
 Anger: 7 - derive-changes output; the root is the block builder.
@@ -156,26 +131,4 @@ output (emit a version only above 0), leaving the encoding alone.
 
 Reported by: the diff helper dedupe.
 
-## BUG-136 - `diff` on a file indexed on its first blob only fails mid-merge
-
-Anger: 7 - diff behaviour on a malformed-but-plausible input.
-
-On a wholly unindexed input, `diff` and `diff --format osc` fall back to the
-sequential element stream. On a file whose first data blob carries indexdata
-and later ones do not, the first-blob probe picks the block-pair path, which
-then exits 2 partway through with a generic "block-pair merge requires
-indexdata but blob has none", naming no file or blob. digest detects the same
-file up front ("present on some data blobs and absent on others"), so the
-check exists. Pinned as-is in `cli_input_contract`'s first-blob-only table.
-
-Decided: refuse with the typed missing-indexdata error, located at the
-first unindexed blob, on both block-pair paths, so the CLI prints its `cat`
-recipe. The parallel path's up-front `walk_file` refuses before any output;
-the sequential `-j 1` path (`osc/merge_join.rs`) still discovers it
-mid-merge but with the same kind and advice. No fallback: only the parallel
-path could fall back without an extra header walk, and `-j 1` and `-j 8`
-must not diverge on the same file. Move the contract table's rows to the new
-outcome.
-
-Reported by: the unindexed-input contract table.
 

@@ -442,6 +442,15 @@ fn diff_old(c: &Ctx, input: &Path) -> Invocation {
         .arg(c.out.join("diff.txt"))
 }
 
+fn diff_old_parallel(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["diff"])
+        .arg(input)
+        .arg(c.fx.path("changed.osm.pbf"))
+        .words(&["-j", "2"])
+        .arg("-o")
+        .arg(c.out.join("diff.txt"))
+}
+
 fn diff_new(c: &Ctx, input: &Path) -> Invocation {
     Invocation::new(&["diff"])
         .arg(c.fx.path("changed.osm.pbf"))
@@ -1367,6 +1376,8 @@ enum Mixed {
     Accepts,
     /// Runs and reports this.
     Reports(&'static str),
+    /// Exit 1 (a finding) with this text.
+    Violates(&'static str),
     /// Exit 2 with this text.
     Fails(&'static str),
 }
@@ -1404,35 +1415,43 @@ const FIRST_BLOB_ONLY: &[MixedRow] = &[
         altw_external,
         Mixed::Fails("OsmData blob missing indexdata"),
     ),
-    // digest refuses a partial index, but its message names `diff`, which is
-    // the other command that shares the check. Pinned as it prints today.
+    // digest refuses a partial index with a neutral message.
     (
         "digest",
         digest,
-        Mixed::Fails("diff refuses a partially indexed file"),
+        Mixed::Fails("refusing a partially indexed file"),
     ),
     // diff chooses its arm from the first blob, so a partial index is neither
     // the sequential fallback it takes for a wholly unindexed file nor
-    // accepted: it fails mid-merge. Pinned as it behaves today.
+    // accepted: both block-pair paths refuse it with the typed missing-indexdata
+    // error, located at the first unindexed blob, and the CLI adds its
+    // indexing advice.
     (
-        "diff",
+        "diff -j 1",
         diff_old,
-        Mixed::Fails("block-pair merge requires indexdata but blob has none"),
+        Mixed::Fails("Generate an indexed PBF first"),
+    ),
+    (
+        "diff -j 2",
+        diff_old_parallel,
+        Mixed::Fails("Generate an indexed PBF first"),
     ),
     (
         "diff --format osc",
         diff_osc_old,
-        Mixed::Fails("block-pair merge requires indexdata but blob has none"),
+        Mixed::Fails("Generate an indexed PBF first"),
     ),
     (
         "inspect --indexed",
         inspect_indexed,
         Mixed::Reports("Indexed: yes"),
     ),
+    // Some blobs indexed and some not is a violation, unlike a wholly
+    // unindexed file.
     (
         "check --index",
         check_index,
-        Mixed::Reports("1 with indexdata"),
+        Mixed::Violates("partially indexed"),
     ),
 ];
 
@@ -1464,6 +1483,13 @@ fn first_blob_only_holds(
         }
         Mixed::Reports(wanted) => {
             ensure!(code == Some(0), "[{label}] exit {code:?}; output:\n{text}");
+            ensure!(
+                text.contains(wanted),
+                "[{label}] wanted {wanted:?}; output:\n{text}"
+            );
+        }
+        Mixed::Violates(wanted) => {
+            ensure!(code == Some(1), "[{label}] exit {code:?}; output:\n{text}");
             ensure!(
                 text.contains(wanted),
                 "[{label}] wanted {wanted:?}; output:\n{text}"

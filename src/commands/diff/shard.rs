@@ -111,7 +111,9 @@ fn walk_file(path: &Path, host: &crate::host::Host) -> Result<RawWalk> {
         let Some(index) = meta.index else {
             return Err(walker.locate_meta(
                 &meta,
-                crate::Error::invalid_data("block-pair merge requires indexdata but blob has none"),
+                crate::error::new_missing_indexdata(
+                    "block-pair merge requires indexdata on every data blob",
+                ),
             ));
         };
         has_negative |= index.min_id < 0;

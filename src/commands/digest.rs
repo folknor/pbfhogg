@@ -351,7 +351,7 @@ impl DigestState {
             Some(expected) if expected != present => {
                 return Err(Error::invalid_data(
                     "indexdata is present on some data blobs and absent (or \
-                     unreadable) on others; diff refuses a partially indexed file",
+                     unreadable) on others; refusing a partially indexed file",
                 ));
             }
             Some(_) => {}

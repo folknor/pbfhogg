@@ -720,11 +720,6 @@ Decided:
   builders, digest) refuses a partially indexed file at that walk with the
   typed missing-indexdata error BUG-136 uses; the others keep trusting the
   first blob.
-- `inspect --indexed` stays the documented first-blob probe (`inspect`
-  describes what a file claims). `check --index` (`check` verifies) treats a
-  partially indexed file as a violation and exits 1.
-- digest's partial-index refusal stops naming `diff` (library errors name no
-  command).
 - No action: renumber's missing `--force` and altw external's parse-time
   `--force` refusal are guards; `--distrust-metadata` stays where it is.
 
@@ -787,7 +782,7 @@ Anger: 8 - clippy.toml with expect_used denied means hundreds of edits.
 `clippy.toml` exists but carries only the filesystem choke points for
 output publication, run scratch and path-naming input opens (`disallowed-methods`, allowed
 workspace-wide and denied in `src/commands/` and the CLI);
-`disallowed-types` and `disallowed-macros` are unused; `expect_used`, `print_stderr`, `print_stdout`,
+`disallowed-types` and `disallowed-macros` are unused; `expect_used`,
 `arithmetic_side_effects`, `panic`, `unreachable` and `exit` are not enabled;
 `allow_attributes_without_reason` is not enabled, so `#[allow(dead_code)]` and
 the many `too_many_*` exemptions (HYG-036) need no justification; the existing
@@ -795,10 +790,10 @@ the many `too_many_*` exemptions (HYG-036) need no justification; the existing
 for text rules. Every hunter independently pointed most of its "enforceable
 by" answers at one of these.
 
-Decided: deny `clippy::print_stdout` and `clippy::print_stderr` in the
-library (not the CLI, which prints by design), alongside the existing
-`no-print-macro` textlint rule. Every other lever waits for the entry that
-needs it and arrives with that work, not as a sweep.
+`clippy::print_stdout` and `clippy::print_stderr` are denied in the library
+(a crate attribute in `src/lib.rs`, outside `cfg(test)`). Decided: every
+other lever waits for the entry that needs it and arrives with that work,
+not as a sweep.
 
 Reported by: all nine scopes.
 
@@ -1149,6 +1144,39 @@ reintroduced violation, and delete the test. Leave a use that embeds data
 rather than scanning source where it is.
 
 Reported by: the maintainer, reviewing the writer funnel completeness test.
+
+## HYG-137 - `cat` could split unclassifiable blobs losslessly
+
+Anger: 4 - cold path only; speculative.
+
+Speculative: nothing is known to need it. Plain `cat` re-encodes a blob
+the index scan cannot classify (no elements, a group carrying more than
+one element field, kinds changing across groups) through the block builder
+(`reencode_unclassifiable` in `src/commands/cat/mod.rs`), so those blobs
+take the builder's normalisation, the same `cat --type` and `--clean`
+apply: every node comes out dense, coordinates finer than the default
+granularity are rounded to decimicrodegrees, timestamps are truncated to
+whole seconds, an `Info` with a version gains explicit defaults for its
+absent fields, an `Info` without a version loses its metadata, and
+unknown protobuf fields are dropped. Every other blob `cat` writes is
+byte-preserved or reframed without re-encoding, so these are the only
+blobs plain `cat` alters.
+
+A lossless split is possible at the byte level: copy the block's string
+table (and granularity, offsets and date granularity) verbatim into each
+output block, and regroup the raw element messages by kind, splitting at
+each change of kind and at the element cap. Element bytes would then pass
+through untouched, and each output block would be scanned and indexed as
+the ordinary reindex arm does. Costs: a protobuf-level regrouper the crate
+does not have today (the builder works from decoded elements), dense-node
+groups that must be split by re-delta-encoding their packed arrays when a
+cap split falls inside one, and string tables carried whole into every
+piece (wasted bytes, unless pruned, which is a re-encode of its own).
+
+Worth doing only if a producer whose blocks fall in these shapes turns up
+and the normalisation matters to someone; otherwise it stays parked.
+
+Reported by: the BUG-113 implementation.
 
 ## HYG-134 - The first hygiene drain round needs an independent review
 

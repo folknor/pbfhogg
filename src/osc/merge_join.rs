@@ -9,7 +9,7 @@ use crate::ElementKind;
 use crate::{BlockType, Element, PrimitiveBlock};
 
 use super::write::{OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay};
-use crate::error::{Error, Result};
+use crate::error::Result;
 
 // ---------------------------------------------------------------------------
 // StreamingBlocks - block-level cursor with stashing
@@ -509,8 +509,11 @@ fn next_blob_for_kind(
         let index = match blob.index() {
             Some(idx) => idx,
             None => {
-                return Err(Error::invalid_data(
-                    "block-pair merge requires indexdata but blob has none",
+                return Err(blob.locate_error(
+                    reader.source(),
+                    crate::error::new_missing_indexdata(
+                        "block-pair merge requires indexdata on every data blob",
+                    ),
                 ));
             }
         };

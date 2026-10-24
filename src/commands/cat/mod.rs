@@ -17,7 +17,7 @@ use crate::write::WriteOptions;
 use crate::writer::{Compression, PbfWriter, reframe_raw_with_index};
 use crate::{BlobFilter, Element, PrimitiveBlock};
 
-use super::output_header::{OutputFacts, OutputHeader, Ways};
+use super::output_header::{Declared, OutputFacts, OutputHeader, Ways};
 use super::{Result, flush_local};
 use crate::error::Error;
 use crate::read::raw_frame::{frame_location, read_raw_frame};
@@ -49,7 +49,13 @@ pub struct CatStats {
 
 impl CatStats {
     pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
-        if self.blobs_decoded > 0 {
+        if self.blobs_decoded > 0 && self.blobs_passthrough > 0 {
+            writeln!(
+                w,
+                "Decoded {} blobs, wrote {} elements; {} blobs passed through",
+                self.blobs_decoded, self.elements_written, self.blobs_passthrough,
+            )?;
+        } else if self.blobs_decoded > 0 {
             writeln!(
                 w,
                 "Decoded {} blobs, wrote {} elements",
@@ -67,7 +73,9 @@ impl CatStats {
 ///
 /// If `type_filter` is set, only elements of matching types are included
 /// (requires full decode). Without a filter, blobs are passed through as
-/// raw bytes (zero decode).
+/// raw bytes (zero decode); an unindexed blob is scanned and reframed with
+/// indexdata, and one whose block no single index can describe is
+/// re-encoded into single-kind blocks (see `reencode_unclassifiable`).
 pub fn cat(
     files: &[&Path],
     output: crate::output::Output,
@@ -240,7 +248,11 @@ fn cat_passthrough(
 ) -> Result<CatStats> {
     let direct_io = write.direct_reads;
     // Every payload is copied byte for byte; an unindexed blob's header is
-    // rebuilt to add indexdata, which drops its field 5.
+    // rebuilt to add indexdata, which drops its field 5. The exception is a
+    // blob whose block the index scan cannot classify: it is re-encoded, and
+    // `reencode_unclassifiable` keeps every declaration `PayloadsCopied`
+    // makes true of its ways (inline locations carried, a declared pin or
+    // way-membership loss refused).
     let headers = read_headers(files, direct_io, host)?;
     let ways = raw_copy_ways(files, &headers, direct_io, Ways::PayloadsCopied, host)?;
     let header = cat_output_header(&headers, ways, overrides, host)?;
@@ -254,6 +266,9 @@ fn cat_passthrough(
         host,
     )?;
     let mut blobs: u64 = 0;
+    // Touched only by the unclassifiable-block arm.
+    let mut blobs_reencoded: u64 = 0;
+    let mut elements_reencoded: u64 = 0;
     let mut decompress_buf: Vec<u8> = Vec::new();
 
     for file in files {
@@ -282,10 +297,32 @@ fn cat_passthrough(
                         let index = match index {
                             Some(idx) => idx,
                             None => {
-                                // Unrecognized block - pass through without indexdata.
-                                writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
+                                // No single index describes the block (no
+                                // elements, a multi-field group, kinds mixed
+                                // across groups). Copying it would leave the
+                                // output unindexed, and the indexing recipe
+                                // this command is would loop: re-encode it
+                                // into single-kind indexed blocks instead.
+                                let (blocks, count) =
+                                    reencode_unclassifiable(&decompress_buf, declared)
+                                        .map_err(locate)?;
                                 decompress_buf.clear();
-                                blobs += 1;
+                                for OwnedBlock {
+                                    bytes: block_bytes,
+                                    index,
+                                    tagdata,
+                                    way_members,
+                                } in blocks
+                                {
+                                    writer.write_primitive_block_owned(
+                                        block_bytes,
+                                        index,
+                                        tagdata.as_deref(),
+                                        way_members.as_deref(),
+                                    )?;
+                                }
+                                blobs_reencoded += 1;
+                                elements_reencoded += count;
                                 continue;
                             }
                         };
@@ -315,9 +352,185 @@ fn cat_passthrough(
     writer.flush()?;
     Ok(CatStats {
         blobs_passthrough: blobs,
-        blobs_decoded: 0,
-        elements_written: 0,
+        blobs_decoded: blobs_reencoded,
+        elements_written: elements_reencoded,
     })
+}
+
+/// Re-encode a block the index scan cannot classify into single-kind blocks,
+/// each carrying its own index and tagdata. Returns the blocks in output
+/// order and the number of elements they hold.
+///
+/// Elements are re-emitted in decoder order (groups in order; within a group
+/// dense nodes, nodes, ways, relations - protobuf gives the interleaving of
+/// distinct fields in one message no meaning). A new block starts at every
+/// change of kind and at the builder's element cap; a block with no elements
+/// yields nothing. Adjacent groups of one kind share a block.
+///
+/// Content is what the builder normally writes: every node dense, coordinates
+/// in decimicrodegrees, metadata through
+/// [`Metadata`](crate::block_builder::Metadata) (whole seconds, absent
+/// optional fields as defaults). Beyond that nothing is lost or invented:
+///
+/// - A node run is also split where metadata presence flips. One builder
+///   block holding nodes with and without metadata would backfill zeroed
+///   metadata onto the ones that had none.
+/// - Tags, relation roles and the user of re-encoded metadata are resolved
+///   through the fallible accessors. The lossy ones would turn a bad string
+///   index into a missing tag or an empty string.
+/// - Inline way locations (`LocationsOnWays`) are carried whenever a way has
+///   them; the decoder has already checked they match its refs one for one.
+/// - The builder cannot write field 20, so a way carrying pins under a
+///   declared `SharedNodePins-v1` is refused, as is any way under a declared
+///   `WayMembers-v1` (the ordinary reindex arm refuses an unindexed way blob
+///   there too). Pins the header does not declare are dropped.
+///
+/// The cold arm owns everything it allocates: a copy of the payload (so the
+/// caller's decompression buffer keeps its capacity), the builder and the
+/// scratch vectors all live here.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_lines)]
+fn reencode_unclassifiable(
+    payload: &[u8],
+    declared: Declared,
+) -> crate::Result<(Vec<OwnedBlock>, u64)> {
+    let block = PrimitiveBlock::from_vec(payload.to_vec())?;
+    let mut bb = BlockBuilder::new();
+    let mut output: Vec<OwnedBlock> = Vec::new();
+    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut locations_buf: Vec<(i32, i32)> = Vec::new();
+    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+    // Whether the nodes in the builder carry metadata; read only while the
+    // builder holds nodes.
+    let mut node_run_has_meta = false;
+    let mut count: u64 = 0;
+
+    for element in block.elements() {
+        match &element {
+            Element::DenseNode(dn) => {
+                check_tags(dn.tags_checked())?;
+                let meta = dense_node_metadata(dn);
+                if meta.is_some()
+                    && let Some(info) = dn.info()
+                {
+                    info.user()?;
+                }
+                start_node(&mut bb, &mut output, &mut node_run_has_meta, meta.is_some())?;
+                bb.add_node(
+                    dn.id(),
+                    dn.decimicro_lat(),
+                    dn.decimicro_lon(),
+                    dn.tags(),
+                    meta.as_ref(),
+                );
+            }
+            Element::Node(n) => {
+                check_tags(n.tags_checked())?;
+                let info = n.info();
+                let meta = element_metadata(&info);
+                check_user(meta.is_some(), &info)?;
+                start_node(&mut bb, &mut output, &mut node_run_has_meta, meta.is_some())?;
+                bb.add_node(
+                    n.id(),
+                    n.decimicro_lat(),
+                    n.decimicro_lon(),
+                    n.tags(),
+                    meta.as_ref(),
+                );
+            }
+            Element::Way(w) => {
+                if declared.way_members {
+                    return Err(declared.broken_by_unindexed_way_blob("re-encoding it"));
+                }
+                if declared.shared_node_pins && w.shared_node_pins().is_some() {
+                    return Err(Error::invalid_data(format!(
+                        "way {} sits in a block no single index can describe, and \
+                         re-encoding the block into single-kind blocks would drop its \
+                         {} pins after the output header already declared them. \
+                         Strip the enrichment from the input, and rerun",
+                        w.id(),
+                        crate::HeaderBlock::SHARED_NODE_PINS_V1,
+                    )));
+                }
+                check_tags(w.tags_checked())?;
+                let info = w.info();
+                let meta = element_metadata(&info);
+                check_user(meta.is_some(), &info)?;
+                ensure_way_capacity_local(&mut bb, &mut output)?;
+                refs_buf.clear();
+                refs_buf.extend(w.refs());
+                locations_buf.clear();
+                locations_buf.extend(
+                    w.node_locations()
+                        .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon())),
+                );
+                if locations_buf.is_empty() {
+                    bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
+                } else {
+                    bb.add_way_with_locations(
+                        w.id(),
+                        w.tags(),
+                        &refs_buf,
+                        &locations_buf,
+                        meta.as_ref(),
+                    );
+                }
+            }
+            Element::Relation(r) => {
+                check_tags(r.tags_checked())?;
+                let info = r.info();
+                let meta = element_metadata(&info);
+                check_user(meta.is_some(), &info)?;
+                ensure_relation_capacity_local(&mut bb, &mut output)?;
+                members_buf.clear();
+                for m in r.members() {
+                    members_buf.push(MemberData {
+                        id: m.id,
+                        role: m.role()?,
+                    });
+                }
+                bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
+            }
+        }
+        count += 1;
+    }
+    flush_local(&mut bb, &mut output)?;
+    Ok((output, count))
+}
+
+/// Make room for a node whose metadata presence is `has_meta`: flush at the
+/// cap, on a change of kind, and where the run's metadata presence flips.
+fn start_node(
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlock>,
+    node_run_has_meta: &mut bool,
+    has_meta: bool,
+) -> crate::Result<()> {
+    if !bb.can_add_node() || (!bb.is_empty() && *node_run_has_meta != has_meta) {
+        flush_local(bb, output)?;
+    }
+    *node_run_has_meta = has_meta;
+    Ok(())
+}
+
+/// Resolve every tag string, failing on the first bad string index.
+fn check_tags<'t>(
+    tags: impl Iterator<Item = crate::Result<(&'t str, &'t str)>>,
+) -> crate::Result<()> {
+    for tag in tags {
+        tag?;
+    }
+    Ok(())
+}
+
+/// Resolve the user of metadata that is re-encoded (`kept`), failing on a
+/// bad string index instead of writing an empty user.
+fn check_user(kept: bool, info: &crate::Info<'_>) -> crate::Result<()> {
+    if kept && let Some(user) = info.user() {
+        user?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

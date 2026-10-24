@@ -13,8 +13,14 @@ succeeded silently, none were guaranteed.
 
 A truncation that splits any structural element of the wire format
 in two is a hard error. The reader returns `Err`; the command
-exits non-zero; stderr names the byte offset and the shape of the
-break. Silent recovery from partial input is **not** supported.
+exits non-zero with the error on stderr. How precisely that error
+locates the break depends on which decoder found it: only `BlobReader`
+words its messages by shape ("(shape N)"), and the other decoders
+word theirs differently; `BlobReader` names the byte when it tracks a
+position, and
+`FileReader::skip` raises a bare I/O error carrying no path, blob or
+offset (see "What gets pinned"). Silent recovery from partial input is
+**not** supported.
 
 The single exception is a clean cut at a frame boundary: a file
 that ends with the previous frame fully written and either zero
@@ -108,15 +114,19 @@ data.
 Every command that reads PBF input adheres to the same contract -
 there is no per-command relaxation. The contract sites are:
 
-- `read::frame` (`src/read/frame.rs`) - the frame decoder. Owns
-  the length prefix, the shape-1 EOF policy, and both size guards
-  (zero-length and `MAX_BLOB_HEADER_SIZE`) for every decoder in
-  the crate. The streaming decoders (`read_raw_frame`,
-  `read_blob_header_only`, and the `cat --dedupe` pass-1 loop)
-  call it end to end; the two that cannot share the I/O -
-  `BlobReader::read_blob_header`, which stamps a byte offset
-  between each step, and `HeaderWalker::next_header`, which preads
-  - call `check_header_len` and keep only their own reads.
+- `read::frame` (`src/read/frame.rs`) - the shared frame helper. It
+  owns the length prefix, the shape-1 EOF policy and both size
+  guards (zero-length and `MAX_BLOB_HEADER_SIZE`) for the decoders
+  that call it end to end: `read_raw_frame`, `read_blob_header_only`
+  and the `cat --dedupe` pass-1 loop. It does not own the EOF policy
+  for the other two. `BlobReader::read_length_prefix` and
+  `HeaderWalker::next_header` each implement shape 1 themselves
+  (`BlobReader` reads the first prefix byte alone, then the other
+  three, and treats an EOF in either as end of input; the walker
+  treats fewer than four bytes remaining as end of input). Both do
+  call `check_header_len` for the size guards and keep their own
+  reads, because `BlobReader` stamps a byte offset between each step
+  and the walker preads.
 - `BlobReader::next` (`src/read/blob.rs`) - shapes 2-4 on the
   sequential path, including the byte-offset stamping
 - `BlobReader::skip_blob_body` (`src/read/blob.rs`) - the
@@ -124,26 +134,54 @@ there is no per-command relaxation. The contract sites are:
 - `HeaderWalker::next_header` (`src/read/header_walker.rs`) -
   shape 4 against the file size captured at `open()`
 - `FileReader::skip` (`src/read/file_reader.rs`) - the
-  caller-side payload-skip used by `read_blob_header_only`
-  consumers (`has_indexdata`, `diff::process`, `cat::dedupe`,
-  `altw::passthrough`)
+  caller-side payload-skip that follows `read_blob_header_only`.
+  Its callers are the indexdata probe in `src/commands/mod.rs`
+  (which returns at the first OSMData header, so it skips only
+  non-data blobs) and the `cat --dedupe` frame loop.
 
 Shape 4 is the one shape `read::frame` could not unify, because
 each site has only the mechanism its I/O shape offers: a streaming
 reader counts the bytes `read_to_end` delivered against the
-declared `datasize`, a seeking reader skips the payload and reads
-one sentinel byte to find out whether the seek landed inside the
-file, and a pread walker compares the payload extent against the
-file size it captured at `open()`. Unifying them needs a
-seekable-source abstraction that answers "how many bytes are
+declared `datasize` (`BlobReader::next`) or demands them with
+`read_exact` (`read_raw_frame`); a seeking reader skips the payload
+and reads one sentinel byte to find out whether the seek landed
+inside the file (`skip_blob_body`, and `FileReader::skip` over a
+buffered file); and a pread walker compares the payload extent
+against the file size it captured at `open()`. Unifying them needs
+a seekable-source abstraction that answers "how many bytes are
 available from here" and degrades to the read-and-count arm when
 the source cannot say - a refactor rather than a guard, and not
 one worth doing for its own sake while nothing is wrong at any of
 the three. What keeps them from drifting in the meantime is
 `all_three_shape_four_detectors_reject_the_same_file` in
 `src/read/blob.rs`, which walks one payload-truncated file through
-all three and fails if any of them stops hard-erroring. The three
-messages still differ; only the outcome is pinned.
+`BlobReader`'s read path, its skip path and `HeaderWalker` and fails
+if any of them stops hard-erroring.
+
+The decoders agree on the outcome and disagree on how they report
+it, and the disagreements are pinned rather than hidden. The full
+matrix, every truncation shape and size guard against every decoder,
+is `src/read/frame_conformance_tests.rs`; a change to a cell there
+is a behaviour change at that decoder. In summary:
+
+- Wording and offset. Only `BlobReader` says "(shape N)". For a
+  truncated payload its read path names the first missing byte, its
+  skip path names the last declared payload byte (the sentinel), and
+  its header-level refusals (size guards, header parse, header
+  position) sit at the frame start plus 4, past the length prefix.
+  `read_raw_frame`, `read_blob_header_only` and `HeaderWalker` word
+  their errors their own way and locate every refusal at the frame
+  start.
+- Blob index. `BlobReader` and `HeaderWalker` name the blob;
+  `read_raw_frame` and `read_blob_header_only` do not.
+- `FileReader::skip` raises a bare I/O error with no path, blob or
+  offset, so a payload truncation found by the caller-side skip is
+  the least informative of all.
+- Envelope parsing. Only `BlobReader`'s read path parses the Blob
+  message, so a payload that is not a Blob message is refused there
+  and passed by the other decoders; it surfaces at decode.
+- Shape 5 is invisible to every frame decoder; it surfaces when the
+  payload is decompressed.
 - `zlib_decompress_into` / `zstd_decompress_into`
   (`src/read/decompress.rs`) for shape 5 - the actual
   decompressors, reached by every `decompress_*` entry point
@@ -163,10 +201,14 @@ messages still differ; only the outcome is pinned.
 A truncation that reaches any of those entry points must surface
 as `Err(ErrorKind::Io)` (or a more specific variant) before the
 caller sees decoded output. The two skip-path sites
-(`skip_blob_body`, `FileReader::skip`) preserve their `BufReader`
-seek-relative optimization for in-range targets and only pay the
-sentinel-read cost when the skip would otherwise pass EOF
-silently.
+(`skip_blob_body`, `FileReader::skip`) keep their `BufReader`
+seek-relative optimization: they seek `n - 1` bytes and then read one
+sentinel byte. That sentinel read is paid on every nonzero skip, not
+only when the skip would pass EOF, because a seek past EOF succeeds
+and only the read can tell. A zero-byte skip returns without
+reading. `FileReader::skip` over an O_DIRECT file does not use a
+sentinel: `DirectReader::skip` validates the target against EOF
+itself.
 
 Commands that consume `BlobReader` / `ElementReader` inherit the contract
 automatically: an `Err` from
@@ -430,7 +472,14 @@ Shape 5 is enforced during decompression, not after it:
 
 ## Tests
 
-The contract is pinned at two layers:
+The contract is pinned at several layers:
+
+**Frame conformance** (`src/read/frame_conformance_tests.rs`): every
+truncation shape, size guard and boundary case driven through every
+frame decoder, with each decoder's outcome, error kind, file, blob
+index and byte offset pinned cell by cell. It is the ground truth for
+where the decoders disagree, and the acceptance test for unifying
+them.
 
 **Reader layer** (`tests/read_paths.rs`): unit tests on
 `BlobReader::next` directly, independent of any command's policy
@@ -451,13 +500,11 @@ on partial input.
 
 **Command layer** (`cli/tests/cli_truncation_sweep.rs::truncation_sweep_no_panic`)
 drives `cat`, `inspect`, `sort`, `getid`, `add-locations-to-ways`,
-and `renumber` through ~50 truncation offsets covering every
-blob's length-prefix midpoint, header midpoint, header end,
-payload midpoint, and payload end. The six commands exercise
-distinct read-path shapes - passthrough, header-only fast scan,
-indexed-decode, header-walk-with-pread, `altw::passthrough`
-through `FileReader::skip`, and full-read + pass-2 reframe - so
-between them they touch every contract site listed above. For
+and `renumber` through truncation offsets inside every blob's
+length prefix, header and payload, plus uniformly spaced offsets
+across the file. The commands read the input by different routes, so
+between them they reach several of the contract sites listed above;
+the sweep does not map each command to a site. For
 shape 2-4 offsets, asserts non-zero exit. For shape 1 offsets,
 asserts no-panic + bounded stderr only - command-level outcome on
 a partial-input file is per-command policy (sort may legitimately

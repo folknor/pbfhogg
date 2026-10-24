@@ -3604,6 +3604,8 @@ fn parent_of(path: &std::path::Path) -> PathBuf {
 /// output it writes (staging and backups sit beside it), the scratch
 /// location, and where older versions of the same command put their scratch
 /// (`diff` shards beside the old input).
+// A new `Command` variant must be considered here, not swallowed by `_`.
+#[deny(clippy::wildcard_enum_match_arm)]
 fn leftover_dirs(command: &Command) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     match command {
@@ -3656,7 +3658,14 @@ fn leftover_dirs(command: &Command) -> Vec<PathBuf> {
             dirs.push(parent_of(output_dir));
             dirs.extend(tmp.tmp_dir.clone());
         }
-        _ => {}
+        // These leave no run scratch to scan for.
+        Command::Export { output: None, .. }
+        | Command::Extract { output: None, .. }
+        | Command::Inspect { .. }
+        | Command::Digest { .. }
+        | Command::Check { .. }
+        | Command::BenchRead { .. }
+        | Command::BenchWrite { .. } => {}
     }
     dirs
 }

@@ -1258,6 +1258,103 @@ paths = ["src/**/*.rs"]
 exclude = ["src/error.rs"]
 message = "Do not interpolate an error into a new error's message; keep it as the typed source or add context to it"
 
+# Writer counter funnel. `sync_all_ns` / `sync_all_calls` are a pair and
+# `recv_wait_ns` is fed by one funnel; `WriterMetrics::record_sync_all` and
+# `record_recv_wait` in write/metrics.rs are the only places that may move
+# them. A backend that hand-rolled `sync_all_ns.fetch_add` left
+# `writer_sync_all_calls` reading zero for two of three backends, which no
+# test of the funnel can see. The names are forbidden outright in production
+# code (a rustfmt-wrapped `WRITER_METRICS\n.sync_all_ns\n.fetch_add` always
+# lands the field name on some line); tests may still read the counters.
+# src/output.rs is excused: `PublishSpan` takes read-only snapshots of the
+# pair to report the syncs a publication did, and never writes them. The
+# scan covers every library file, so a new writer file cannot escape it.
+[[textlint]]
+name = "writer-paired-counters-only-through-the-funnel"
+pattern = '\b(?:sync_all_ns|sync_all_calls|recv_wait_ns)\b'
+paths = ["src/**/*.rs"]
+exclude = ["src/write/metrics.rs", "src/output.rs"]
+region = "code"
+test_code = "skip"
+must_scan = [
+    "src/write/direct_writer.rs",
+    "src/write/file_writer.rs",
+    "src/write/parallel_writer.rs",
+    "src/write/uring_writer.rs",
+    "src/write/pipeline.rs",
+    "src/write/writer.rs",
+]
+message = "writer counters sync_all_ns, sync_all_calls and recv_wait_ns are moved only by WriterMetrics::record_sync_all and record_recv_wait in write/metrics.rs, so the paired counters cannot drift apart"
+
+# Writer counter emission. `WRITER_METRICS` is a process-global total, so
+# emitting it from a per-writer path (`PbfWriter::flush` once did) publishes N
+# sidecar samples of one process total that a reader takes for N per-writer
+# numbers, and the `emit_once` latch then turns the real process-exit call into
+# a no-op. Only the process-exit hook (`pbfhogg::write::emit_writer_counters`,
+# called once from the CLI's exit path) may emit. Both spellings are covered:
+# the direct `WRITER_METRICS.emit*` call and the hook call. Owners are
+# write/metrics.rs (defines emit and emit_once), write/mod.rs (the hook) and
+# cli/src/lib.rs (the exit path that calls it).
+[[textlint]]
+name = "writer-counters-emitted-only-from-the-exit-hook"
+pattern = '\bWRITER_METRICS\s*\.\s*emit'
+paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+exclude = ["src/write/metrics.rs", "src/write/mod.rs"]
+region = "code"
+test_code = "skip"
+must_scan = [
+    "src/write/direct_writer.rs",
+    "src/write/file_writer.rs",
+    "src/write/parallel_writer.rs",
+    "src/write/uring_writer.rs",
+    "src/write/pipeline.rs",
+    "src/write/writer.rs",
+]
+message = "writer counters are a process-global total; emit them only from the process-exit hook pbfhogg::write::emit_writer_counters, never from a per-writer path"
+
+# The rustfmt-wrapped spelling of the rule above. Every other `WRITER_METRICS`
+# chain in the writer files is wrapped (the long ones put `.field` on the next
+# line), so a wrapped `WRITER_METRICS\n    .emit_once()` is realistic. Textlint
+# sees one physical line, so match a line that begins with `.emit(` or
+# `.emit_once(` in any file that mentions WRITER_METRICS.
+[[textlint]]
+name = "writer-counters-emitted-only-from-the-exit-hook-wrapped"
+pattern = '^\s*\.emit(?:_once)?\('
+paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+exclude = ["src/write/metrics.rs", "src/write/mod.rs"]
+only_if_file_matches = '\bWRITER_METRICS\b'
+region = "code"
+test_code = "skip"
+# direct_writer.rs never mentions WRITER_METRICS, so this rule cannot admit it.
+must_scan = [
+    "src/write/file_writer.rs",
+    "src/write/parallel_writer.rs",
+    "src/write/uring_writer.rs",
+    "src/write/pipeline.rs",
+    "src/write/writer.rs",
+]
+message = "writer counters are a process-global total; emit them only from the process-exit hook pbfhogg::write::emit_writer_counters, never from a per-writer path"
+
+# The hook spelling: a backend calling `emit_writer_counters()` (qualified or
+# imported) re-creates per-writer emission by the other route. Only the CLI's
+# exit path calls it; write/mod.rs defines it.
+[[textlint]]
+name = "writer-counter-hook-called-only-from-the-cli-exit-path"
+pattern = '\bemit_writer_counters\s*\('
+paths = ["src/**/*.rs", "cli/src/**/*.rs"]
+exclude = ["src/write/mod.rs", "cli/src/lib.rs"]
+region = "code"
+test_code = "skip"
+must_scan = [
+    "src/write/direct_writer.rs",
+    "src/write/file_writer.rs",
+    "src/write/parallel_writer.rs",
+    "src/write/uring_writer.rs",
+    "src/write/pipeline.rs",
+    "src/write/writer.rs",
+]
+message = "emit_writer_counters is the once-per-process exit hook; only the CLI exit path calls it"
+
 # Source-only guard: no build or test-harness startup.
 [[script_check]]
 name = "static-hook-test-isolation"

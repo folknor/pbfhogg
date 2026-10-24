@@ -226,18 +226,11 @@ its read path names the first missing one; `read_raw_frame` and
 `FileReader::skip` raises a payload truncation with no path, blob or offset;
 only the `BlobReader` read path parses the Blob envelope, so a garbage
 payload is refused there and passed by the other four; only `BlobReader`
-says "(shape N)". `reference/truncation-handling.md` is wrong in four
-places: it says stderr names the offset and shape for every break (false
-for all but `BlobReader`), it lists stale `FileReader::skip` consumers (the
-only callers are the indexdata probe in `commands/mod.rs` and the `cat
---dedupe` loop), it says skips pay the sentinel read only near EOF (every
-nonzero skip reads one), and it says `read::frame` owns the shape-1 EOF
-policy for every decoder (`BlobReader` and `HeaderWalker` each implement
-it). Fix: one frame state machine over an abstract byte source (stream and
-pread-at-offset as two impls), returning a stamped `FrameHeader`. Enforce with
-a conformance test running every truncation shape through every source; the
-`blob.rs` test with `read_arm` / `skip_arm` / `walk_arm` is that test in
-embryo.
+says "(shape N)". `reference/truncation-handling.md` states these
+disagreements. Fix: one frame state machine over an abstract byte source
+(stream and pread-at-offset as two impls), returning a stamped
+`FrameHeader`; the conformance test's disagreement rows then collapse to one
+expectation per shape.
 
 Reported by: read path.
 
@@ -907,14 +900,14 @@ Anger: 6 - CLI behaviour, small.
   the geocode builder has none, though its `.buckets-level*` trees are
   hundreds of GB at planet scale.
 - `leftover_dirs` in `cli/src/lib.rs` is a hand-kept per-command list of where
-  leftovers may be, ending in `_ => {}`, beside `validate_input_output_aliases`
-  (which is exhaustive) and the clap structs; a command that gains scratch
-  compiles without being scanned.
+  leftovers may be, beside `validate_input_output_aliases` and the clap
+  structs. It is now exhaustive (`clippy::wildcard_enum_match_arm` denied on
+  the function), so a new command cannot compile unconsidered, but the three
+  remain three hand-kept views of the same per-command facts.
 
 Fix: give `Command` accessors for its outputs, inputs and scratch parent
-used by the alias check, the leftover scan and `run_scratch` alike, and make
-`leftover_dirs` exhaustive, enforced with `clippy::wildcard_enum_match_arm`
-on that function. The run directory stays eager (ADR-0018).
+used by the alias check, the leftover scan and `run_scratch` alike. The run
+directory stays eager (ADR-0018).
 
 Reported by: the command-matrix audit.
 
@@ -1069,13 +1062,15 @@ Reported by: the CLI test move.
 Anger: 3 - test and convention plumbing; no product code.
 
 Several invariants are enforced by unit tests that `include_str!` source
-files and grep them: `src/write/metrics.rs` (the writer-counter emission and
-paired-counter funnel scans), `src/read/pipeline_metrics.rs`,
-`src/scratch.rs` and `cli/src/lib.rs`. Some of these uses may not be
-source scans at all; the inventory decides that per use. A hand-kept file
-list in a test is a list that a new file silently escapes (the writer funnel
-scans six files and misses `framing.rs`, `parallel_gzip.rs` and
-`copy_range.rs`), whereas brokkr's `[[textlint]]` and `[[script_check]]`
+files and grep them: `src/read/pipeline_metrics.rs` (a hand-kept list of five
+read-path files), `src/scratch.rs` and `cli/src/lib.rs` (each scanning
+itself). The writer funnel's two scans in `src/write/metrics.rs` were the
+first moved: they are now the `writer-*` textlint rules in `brokkr.toml`,
+glob-selected with `must_scan` sentinels, and are the template for the rest.
+Some remaining uses may not be source scans at all; the inventory decides
+that per use. A hand-kept file list in a test is a list that a new file
+silently escapes (the writer funnel scanned six files and missed
+`framing.rs`, `parallel_gzip.rs` and `copy_range.rs`), whereas brokkr's `[[textlint]]` and `[[script_check]]`
 select files by glob, can scope to production code (`test_code = "skip"`)
 or to code outside comments and strings (`region = "code"`), and run in the
 convention phase of every `brokkr check`. Textlint matches one physical line

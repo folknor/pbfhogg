@@ -1179,18 +1179,20 @@ impl<W: Write> PbfWriter<W> {
     /// In pipelined mode, the writer was moved to the writer thread and is
     /// not recoverable. Use [`flush`](Self::flush) before dropping instead.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the writer was consumed by a pipeline. This is a programming
-    /// error (misuse of the API), not a runtime condition.
-    pub fn into_inner(mut self) -> W {
+    /// Returns an invalid-argument error if the writer was consumed by a
+    /// pipeline, as every other write method does.
+    pub fn into_inner(mut self) -> Result<W> {
         // The inner writer leaves without end-of-stream finalization, so a
         // writer filling an output can no longer certify it.
         if let Some(completion) = &self.completion {
             completion.fail();
         }
         self.mark_finished();
-        self.writer.take().expect("writer consumed by pipeline")
+        self.writer
+            .take()
+            .ok_or_else(|| Error::invalid_argument(WRITER_CONSUMED))
     }
 
     /// The inner writer, for the non-pipelined path.

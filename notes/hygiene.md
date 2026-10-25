@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-25. HYG-158
 26. HYG-159
 27. HYG-160
 28. HYG-180
@@ -1225,21 +1224,6 @@ reports zero alignment.
 
 Reported by: altw and scanning, re-encoding, filtering and spatial, CLI and
 plumbing.
-
-## HYG-158 - `PbfWriter::into_inner` panics on a pipelined writer
-
-Anger: 6 - public API.
-
-Split out of an entry on aborts where a refusal was owed (2026-10-25). `into_inner` panics on a pipelined writer, while
-`writer_mut` returns an error for the same state.
-
-Recommendation (2026-10-25): return a `Result`, as `writer_mut` does; a
-breaking API change before 1.0, CHANGELOG line. The original entry's typestate
-alternative (`PbfWriter<Sync>` / `PbfWriter<Pipelined>`) is not needed for
-this.
-
-Reported by: write path, read path, CLI and plumbing, filtering and spatial,
-re-encoding, altw and scanning.
 
 ## HYG-159 - `check --ids` expects every classify slot filled
 

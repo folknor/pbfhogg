@@ -4,6 +4,9 @@
 
 ### Breaking
 
+- **`PbfWriter::into_inner` returns a `Result`.** On a pipelined writer,
+  whose output file lives on the writer thread, it used to panic; it now
+  returns an invalid-argument error, as the writer's other methods do.
 - **apply-changes no longer claims the base's replication position.** Its
   output used to carry the base's `osmosis_replication_timestamp` and
   sequence number although it holds a later state. It now drops both (as

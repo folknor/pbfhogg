@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-16. HYG-163
 17. HYG-034
 18. HYG-164
 19. HYG-165
@@ -841,20 +840,6 @@ as the only loop with an `on_idle()` hook; a source-scan test that only
 `pipeline.rs` calls `pop_ready()` under `src/write/`.
 
 Reported by: write path.
-
-## HYG-163 - altw external's records have no shared codec
-
-Anger: 8 - altw external stage 3, per entry.
-
-Split out of the geocode record-codec entry. `IdRecord::read_from` and `ResolvedEntry::write_to`
-have no shared codec, and stage 3 decodes `ResolvedEntry` by slicing
-`chunk[0..4]`, `[4..8]`, `[8..12]`.
-
-Recommendation (2026-10-25): constants only, as done for the OSC arena metadata layout in `osc/compact.rs` (per-field width constants, derived offsets, `const` asserts): record sizes and
-field offsets derived from width constants with `const` asserts, logic
-unchanged.
-
-Reported by: altw and scanning.
 
 ## HYG-034 - Element metadata accessors turn a decode failure into defaults
 

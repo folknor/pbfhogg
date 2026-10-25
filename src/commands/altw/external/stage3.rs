@@ -10,7 +10,7 @@ use super::coord_payloads::{
     AbortOnDrop, ConcurrentBlobLocationRouter, PerWayRcs, StraddlerSide,
     encode_blob_payload_from_record,
 };
-use super::{COORD_SLOT_SIZE, RESOLVED_ENTRY_SIZE};
+use super::{COORD_SLOT_SIZE, RE_OFF_LAT, RE_OFF_LOCAL_SLOT_POS, RE_OFF_LON, RESOLVED_ENTRY_SIZE};
 
 /// Lightweight reference to slot bucket paths + counts for stage 3.
 pub(super) struct SlotBucketRef {
@@ -72,7 +72,12 @@ fn scatter_bucket_entries(
     let mut stores: u64 = 0;
     let (chunks, _rem) = data_buf.as_chunks::<RESOLVED_ENTRY_SIZE>();
     for chunk in chunks {
-        let local_slot_pos = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as usize;
+        let local_slot_pos = u32::from_le_bytes([
+            chunk[RE_OFF_LOCAL_SLOT_POS],
+            chunk[RE_OFF_LOCAL_SLOT_POS + 1],
+            chunk[RE_OFF_LOCAL_SLOT_POS + 2],
+            chunk[RE_OFF_LOCAL_SLOT_POS + 3],
+        ]) as usize;
         if local_slot_pos >= bucket_slots {
             return Err(Error::internal(format!(
                 "slot bucket {bucket_idx} local_pos {local_slot_pos} outside bucket slot span {bucket_slots}"
@@ -83,8 +88,9 @@ fn scatter_bucket_entries(
         // Zero-filled unwritten slots deliberately yield unpinned (0, 0)
         // orphan vertices. Presence/missing counts come from the stage-2
         // join, not a test of these bytes, so Null Island remains resolved.
-        scatter_buf[offset..offset + 4].copy_from_slice(&chunk[4..8]);
-        scatter_buf[offset + 4..offset + 8].copy_from_slice(&chunk[8..12]);
+        scatter_buf[offset..offset + 4].copy_from_slice(&chunk[RE_OFF_LAT..RE_OFF_LON]);
+        scatter_buf[offset + 4..offset + 8]
+            .copy_from_slice(&chunk[RE_OFF_LON..RESOLVED_ENTRY_SIZE]);
         stores += 1;
     }
 

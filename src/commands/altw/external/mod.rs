@@ -422,12 +422,32 @@ impl Drop for StallGuard<'_> {
     }
 }
 
-/// Size of an id-bucketed occurrence record:
-/// `(local_node_id: u32, blob_idx: u32, blob_local_slot: u32)` = 12 bytes.
-pub(super) const ID_RECORD_SIZE: usize = 12;
+// Field widths and offsets of an id-bucketed occurrence record
+// `(local_node_id: u32, blob_idx: u32, blob_local_slot: u32)`.
+const ID_W_LOCAL_NODE_ID: usize = size_of::<u32>();
+const ID_W_BLOB_IDX: usize = size_of::<u32>();
+const ID_W_BLOB_LOCAL_SLOT: usize = size_of::<u32>();
+const ID_OFF_LOCAL_NODE_ID: usize = 0;
+const ID_OFF_BLOB_IDX: usize = ID_OFF_LOCAL_NODE_ID + ID_W_LOCAL_NODE_ID;
+const ID_OFF_BLOB_LOCAL_SLOT: usize = ID_OFF_BLOB_IDX + ID_W_BLOB_IDX;
 
-/// Size of a resolved entry: `(local_slot_pos: u32, lat: i32, lon: i32)` = 12 bytes.
-pub(super) const RESOLVED_ENTRY_SIZE: usize = 12;
+/// Size of an id-bucketed occurrence record.
+pub(super) const ID_RECORD_SIZE: usize = ID_OFF_BLOB_LOCAL_SLOT + ID_W_BLOB_LOCAL_SLOT;
+const _: () = assert!(ID_RECORD_SIZE == 12);
+
+// Field widths and offsets of a resolved entry
+// `(local_slot_pos: u32, lat: i32, lon: i32)`. Stage 3 decodes these
+// records by the same offsets.
+const RE_W_LOCAL_SLOT_POS: usize = size_of::<u32>();
+const RE_W_LAT: usize = size_of::<i32>();
+const RE_W_LON: usize = size_of::<i32>();
+pub(super) const RE_OFF_LOCAL_SLOT_POS: usize = 0;
+pub(super) const RE_OFF_LAT: usize = RE_OFF_LOCAL_SLOT_POS + RE_W_LOCAL_SLOT_POS;
+pub(super) const RE_OFF_LON: usize = RE_OFF_LAT + RE_W_LAT;
+
+/// Size of a resolved entry.
+pub(super) const RESOLVED_ENTRY_SIZE: usize = RE_OFF_LON + RE_W_LON;
+const _: () = assert!(RESOLVED_ENTRY_SIZE == 12);
 
 /// Size of a coordinate slot: `(lat: i32, lon: i32)` = 8 bytes.
 pub(super) const COORD_SLOT_SIZE: usize = 8;
@@ -475,15 +495,29 @@ pub(super) const LOCAL_ID_MASK: u32 = 0x7fff_ffff;
 
 impl IdRecord {
     pub(super) fn write_to(&self, buf: &mut [u8; ID_RECORD_SIZE]) {
-        buf[..4].copy_from_slice(&self.local_node_id.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.blob_idx.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.blob_local_slot.to_le_bytes());
+        buf[ID_OFF_LOCAL_NODE_ID..][..ID_W_LOCAL_NODE_ID]
+            .copy_from_slice(&self.local_node_id.to_le_bytes());
+        buf[ID_OFF_BLOB_IDX..][..ID_W_BLOB_IDX].copy_from_slice(&self.blob_idx.to_le_bytes());
+        buf[ID_OFF_BLOB_LOCAL_SLOT..][..ID_W_BLOB_LOCAL_SLOT]
+            .copy_from_slice(&self.blob_local_slot.to_le_bytes());
     }
 
     pub(super) fn read_from(buf: &[u8; ID_RECORD_SIZE]) -> Self {
-        let local_node_id = u32::from_le_bytes(buf[..4].try_into().expect("4 bytes"));
-        let blob_idx = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes"));
-        let blob_local_slot = u32::from_le_bytes(buf[8..12].try_into().expect("4 bytes"));
+        let local_node_id = u32::from_le_bytes(
+            buf[ID_OFF_LOCAL_NODE_ID..][..ID_W_LOCAL_NODE_ID]
+                .try_into()
+                .expect("4 bytes"),
+        );
+        let blob_idx = u32::from_le_bytes(
+            buf[ID_OFF_BLOB_IDX..][..ID_W_BLOB_IDX]
+                .try_into()
+                .expect("4 bytes"),
+        );
+        let blob_local_slot = u32::from_le_bytes(
+            buf[ID_OFF_BLOB_LOCAL_SLOT..][..ID_W_BLOB_LOCAL_SLOT]
+                .try_into()
+                .expect("4 bytes"),
+        );
         Self {
             local_node_id,
             blob_idx,
@@ -575,9 +609,10 @@ impl ResolvedEntry {
     fn write_to(&self, bucket_start: u64, buf: &mut [u8; RESOLVED_ENTRY_SIZE]) {
         #[allow(clippy::cast_possible_truncation)]
         let local_slot_pos = (self.slot_pos - bucket_start) as u32;
-        buf[..4].copy_from_slice(&local_slot_pos.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.lat.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.lon.to_le_bytes());
+        buf[RE_OFF_LOCAL_SLOT_POS..][..RE_W_LOCAL_SLOT_POS]
+            .copy_from_slice(&local_slot_pos.to_le_bytes());
+        buf[RE_OFF_LAT..][..RE_W_LAT].copy_from_slice(&self.lat.to_le_bytes());
+        buf[RE_OFF_LON..][..RE_W_LON].copy_from_slice(&self.lon.to_le_bytes());
     }
 
     /// Bucket index for slot-pos partitioning.

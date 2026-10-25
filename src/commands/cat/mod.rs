@@ -107,25 +107,27 @@ pub(crate) fn cat_to(
         return Err(Error::invalid_argument("no input files specified"));
     }
 
-    // The indexdata requirement belongs to `cat_filtered`, not to `--type`.
-    //
-    // It used to be spelled `type_filter.is_some()`, which let `--clean` alone
-    // through: that combination also routes to `cat_filtered`, and
-    // `build_classify_schedules_split` replicates every *unindexed* blob into
-    // all three per-kind schedules, so each blob is read and decompressed three
-    // times. The output is correct, which is why nobody noticed - it is three
-    // times the work with no warning at all.
-    if type_filter.is_some() || clean.any() {
-        let reason = if type_filter.is_some() {
-            "input PBF has no blob-level indexdata. Without indexdata, the type \
-             filter is a no-op - all blobs are decompressed (significantly slower)."
-        } else {
-            "input PBF has no blob-level indexdata. Without indexdata, cleaning \
-             metadata decompresses every blob three times - once per element kind - \
-             because an unindexed blob has to be scheduled as all three."
-        };
+    // Selecting every kind while cleaning skips nothing, so it is the clean
+    // pass with no type filter: the same output, and no indexdata to want.
+    // Without `--clean` an all-kinds filter keeps its own route, where
+    // indexdata buys raw copies.
+    let type_filter = type_filter.filter(|tf| !(clean.any() && tf.count() == 3));
+
+    // The indexdata requirement belongs to the paths that use indexdata: a
+    // type filter skips a blob of an unselected kind on its indexdata alone,
+    // and the passthrough arm copies a selected one raw. The clean pass with
+    // every kind selected decodes every blob exactly once whatever its
+    // indexdata, so it has no slower fallback for `--force` to make explicit.
+    if type_filter.is_some() {
         for file in files {
-            require_indexdata(file, direct_io, force, reason, host)?;
+            require_indexdata(
+                file,
+                direct_io,
+                force,
+                "input PBF has no blob-level indexdata. Without indexdata, the type \
+                 filter is a no-op - all blobs are decompressed (significantly slower).",
+                host,
+            )?;
         }
     }
 
@@ -761,9 +763,10 @@ fn process_block(
     clean: &CleanAttrs,
     refs_buf: &mut Vec<i64>,
 ) -> crate::Result<u64> {
-    // Trust: the caller's per-kind phase scheduled this blob by its indexdata
-    // kind, so elements of an unclaimed kind are dropped silently (see
-    // reference/pipeline.md "Blob Filtering" and repack's worker_split_blob).
+    // Elements are kept by their actual kind against the selection, never by
+    // the blob's indexdata kind. What indexdata decides is upstream: whether
+    // the blob was scheduled at all (a blob labelled with an unselected kind
+    // is skipped whole, see reference/indexdata-trust.md).
     let (filter_node, filter_way, filter_relation) = (tf.nodes, tf.ways, tf.relations);
     let mut count: u64 = 0;
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
@@ -822,14 +825,28 @@ fn process_block(
 
 use super::clean_metadata;
 
-/// Type-filtered cat with full decode + re-encode (used for `--clean` and for
-/// type-filtered passes when raw passthrough doesn't apply).
+/// Cat with full decode + re-encode, the `--clean` path (with or without a
+/// type filter).
 ///
-/// Uses `parallel_classify_phase` per kind. Each worker pread's a blob from
-/// the shared file, decodes it inline (alloc on the worker thread), processes
-/// matching elements through a thread-local `BlockBuilder`, frames the output
-/// blobs, and returns the framed bytes back to the main thread for sequential
-/// writing in seq order.
+/// One pass per input: a header walk schedules every data blob, minus those
+/// whose indexdata claims an unselected kind, and
+/// `parallel_classify_phase_ordered` decodes each scheduled blob exactly
+/// once. The worker keeps the selected elements by their actual kind,
+/// rebuilds them through a worker-local `BlockBuilder` (a new block at each
+/// change of kind and at the element cap) and frames the output blobs; the
+/// ordered merge writes them in schedule order.
+///
+/// A blob without indexdata needs nothing else: it is scheduled and decoded
+/// like any other, so a partially indexed input gives the output its wholly
+/// indexed form would (`reference/indexdata-trust.md`, "Missing and partial
+/// indexdata"), and with every kind selected a wholly unindexed input costs
+/// what an indexed one does.
+///
+/// **Output order** is input order: the emitted elements are a subsequence of
+/// the decoded input sequence, so an honestly sorted input stays sorted, and an
+/// unsorted one is not regrouped by kind. (An earlier shape ran one phase per
+/// kind, which regrouped unsorted input by kind and had to decode every
+/// unindexed blob once per phase, since nothing said which kinds it held.)
 ///
 /// Replaces an earlier `into_blocks_pipelined` + `for_each_primitive_block_batch_budgeted`
 /// shape that hit the cross-thread `PrimitiveBlock` retention pattern of the
@@ -837,20 +854,11 @@ use super::clean_metadata;
 /// measured 2026-04-26 overnight): blocks were allocated on its decode pool
 /// and dropped on the consumer thread, so glibc kept the freed pages on the
 /// decode threads' arenas, and batching only narrowed that window without
-/// closing it. `parallel_classify_phase` confines each blob's allocation and
+/// closing it. The classify pool confines each blob's allocation and
 /// drop to a single worker thread. The pipelined reader has since moved its
 /// string-table entries inline into the pooled decompression buffer (see its
 /// "Memory: decoded-block working set" doc in `src/read/pipeline.rs`), so
 /// this history no longer describes a live hazard there.
-///
-/// **Output ordering note.** Both modes are type-sorted: nodes first, then
-/// ways, then relations. For inputs that are already type-sorted (the
-/// production case), this preserves the existing output structure. For
-/// unsorted inputs, the output is re-sorted into type order. For mixed-type
-/// blobs (rare in practice; PBFs conventionally have one kind per block),
-/// each kind is emitted in its own phase, splitting one input blob into up
-/// to three smaller output blobs.
-#[allow(clippy::too_many_lines)]
 fn cat_filtered(
     files: &[&Path],
     output: &crate::output::Output,
@@ -879,57 +887,34 @@ fn cat_filtered(
     let mut blobs_decoded: u64 = 0;
     let mut elements: u64 = 0;
 
-    for file in files {
-        // The fifth result sizes IdSets in check callers; filtered cat only
-        // needs the schedules.
-        let (node_schedule, way_schedule, rel_schedule, shared_file, _) =
-            crate::scan::classify::build_classify_schedules_split(file, host)?;
+    // Indexdata prunes only when a kind is unselected; with every kind
+    // selected there is nothing to filter and no note to give.
+    let kind_filter = (tf.count() < 3).then(|| BlobFilter::new(tf.nodes, tf.ways, tf.relations));
 
-        if tf.nodes {
-            crate::debug::emit_marker("CAT_NODES_START");
-            let (b, e) = run_kind_phase(
-                &shared_file,
-                &node_schedule,
-                crate::ElementKind::Node,
-                clean,
-                compression,
-                &mut writer,
+    for file in files {
+        // A blob without indexdata is scheduled whatever the selection and
+        // decoded like the rest, so a partially indexed file is accepted.
+        let (schedule, shared_file, _) =
+            crate::scan::classify::build_classify_schedule_blob_filtered(
+                file,
+                None,
+                kind_filter.as_ref(),
+                crate::scan::classify::PartialIndex::Accept,
                 host,
             )?;
-            blobs_decoded += b;
-            elements += e;
-            crate::debug::emit_marker("CAT_NODES_END");
-        }
-        if tf.ways {
-            crate::debug::emit_marker("CAT_WAYS_START");
-            let (b, e) = run_kind_phase(
-                &shared_file,
-                &way_schedule,
-                crate::ElementKind::Way,
-                clean,
-                compression,
-                &mut writer,
-                host,
-            )?;
-            blobs_decoded += b;
-            elements += e;
-            crate::debug::emit_marker("CAT_WAYS_END");
-        }
-        if tf.relations {
-            crate::debug::emit_marker("CAT_RELATIONS_START");
-            let (b, e) = run_kind_phase(
-                &shared_file,
-                &rel_schedule,
-                crate::ElementKind::Relation,
-                clean,
-                compression,
-                &mut writer,
-                host,
-            )?;
-            blobs_decoded += b;
-            elements += e;
-            crate::debug::emit_marker("CAT_RELATIONS_END");
-        }
+        crate::debug::emit_marker("CAT_FILTERED_START");
+        let (b, e) = run_filtered_pass(
+            &shared_file,
+            &schedule,
+            tf,
+            clean,
+            compression,
+            &mut writer,
+            host,
+        )?;
+        blobs_decoded += b;
+        elements += e;
+        crate::debug::emit_marker("CAT_FILTERED_END");
     }
 
     writer.flush()?;
@@ -941,42 +926,30 @@ fn cat_filtered(
     })
 }
 
-/// Run one per-kind phase: pread workers decode + clean + frame each blob
-/// of the given kind; main thread streams framed bytes to the writer in seq
-/// order via a `ReorderBuffer`.
+/// Decode, filter, clean and frame every scheduled blob of one input, and
+/// write the framed blobs in schedule order. Returns the number of input
+/// blobs decoded and of elements written.
 ///
-/// The reorder buffer is essential here. Worker output is large
-/// (~1.6 MB framed per planet node blob × 47K node blobs ≈ 75 GB if the
-/// whole phase's output were accumulated before writing). Streaming with
-/// `pop_ready` after every push caps the in-flight set to roughly the
-/// decode-thread count (~24 on a 24-thread host), bounding peak RSS to
-/// ~50 MB of framed bytes per phase regardless of input size.
-fn run_kind_phase(
+/// The ordered pool is what bounds memory here. Worker output is large
+/// (~1.6 MB framed per planet node blob, tens of thousands of node blobs), and
+/// ordering alone would not cap it: one slow blob at the head lets workers
+/// race ahead while their results wait for it. The pool's admission credit
+/// hands out schedule position `k` only once `k` is within the window of the
+/// earliest unmerged position, so at most a window of results is alive
+/// between decode and write, whatever the input size. Each result holds one
+/// input blob's rebuilt output; a block that switches kind often frames into
+/// several smaller blobs, still bounded by that one block.
+fn run_filtered_pass(
     input: &crate::read::input::InputFile,
     schedule: &[crate::scan::classify::ScheduledBlob],
-    kind: crate::ElementKind,
+    tf: TypeFilter,
     clean: &CleanAttrs,
     compression: Compression,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     host: &crate::host::Host,
 ) -> Result<(u64, u64)> {
-    use crate::ElementKind;
-    use crate::reorder_buffer::ReorderBuffer;
-
-    if schedule.is_empty() {
-        return Ok((0, 0));
-    }
-
-    let kind_filter = TypeFilter {
-        nodes: kind == ElementKind::Node,
-        ways: kind == ElementKind::Way,
-        relations: kind == ElementKind::Relation,
-    };
-
-    type PhaseResult = crate::Result<(Vec<Vec<u8>>, u64)>;
-    let mut reorder: ReorderBuffer<(Vec<Vec<u8>>, u64)> =
-        ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY_WIDE);
-    let mut total_blobs: u64 = 0;
+    type PassResult = crate::Result<(Vec<Vec<u8>>, u64)>;
+    let mut blobs_decoded: u64 = 0;
     let mut total_elements: u64 = 0;
     let mut write_error: Option<Error> = None;
 
@@ -985,23 +958,17 @@ fn run_kind_phase(
     // the closure is cheap (BlockBuilder::new is just a few empty Vec/HashMap
     // initialisers; no heap reservation until elements are added). A failed
     // blob ends the pool, located with its input and ordinal.
-    let pool_result = crate::scan::classify::parallel_classify_phase(
+    let pool_result = crate::scan::classify::parallel_classify_phase_ordered(
         input,
         schedule,
         None,
+        crate::tunables::POOL_REORDER_CAPACITY_WIDE,
         || (),
-        |block, _state| -> PhaseResult {
+        |block, _state| -> PassResult {
             let mut bb = BlockBuilder::new();
             let mut refs_buf: Vec<i64> = Vec::new();
             let mut output: Vec<OwnedBlock> = Vec::new();
-            let count = process_block(
-                block,
-                &mut bb,
-                &mut output,
-                &kind_filter,
-                clean,
-                &mut refs_buf,
-            )?;
+            let count = process_block(block, &mut bb, &mut output, &tf, clean, &mut refs_buf)?;
             flush_local(&mut bb, &mut output)?;
 
             let mut framed: Vec<Vec<u8>> = Vec::with_capacity(output.len());
@@ -1024,29 +991,22 @@ fn run_kind_phase(
             }
             Ok((framed, count))
         },
-        |seq, r| {
-            // Always queue the result so the next-seq invariant holds; we
-            // can't drop a slot mid-phase without breaking the reorder
-            // buffer's contiguous-prefix expectation.
-            reorder.push(seq, r);
-            // Drain everything ready from the front. Once we hit a hole
-            // (next seq not yet delivered), stop and wait for the next
-            // merge call. A write error is captured into a local slot and
-            // propagated after parallel_classify_phase returns; further
-            // ready items are still drained so the buffer doesn't grow.
-            while let Some((framed, count)) = reorder.pop_ready() {
-                if write_error.is_some() {
-                    continue;
-                }
-                for blob in framed {
-                    if let Err(e) = writer.write_raw_owned(blob) {
-                        write_error = Some(e);
-                        break;
-                    }
-                    total_blobs += 1;
-                }
-                total_elements += count;
+        |_position, (framed, count)| {
+            // Called in schedule order. The merge cannot fail, so a write
+            // error is captured, later results are dropped unwritten (the
+            // pool still runs to its end; its window bounds what is alive),
+            // and the error is returned once the pool is done.
+            if write_error.is_some() {
+                return;
             }
+            blobs_decoded += 1;
+            for blob in framed {
+                if let Err(e) = writer.write_raw_owned(blob) {
+                    write_error = Some(e);
+                    return;
+                }
+            }
+            total_elements += count;
         },
         host,
     );
@@ -1058,5 +1018,5 @@ fn run_kind_phase(
     }
     pool_result?;
 
-    Ok((total_blobs, total_elements))
+    Ok((blobs_decoded, total_elements))
 }

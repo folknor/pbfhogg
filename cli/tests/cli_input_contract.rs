@@ -378,6 +378,14 @@ fn cat_clean(c: &Ctx, input: &Path) -> Invocation {
     cat(c, input).words(&["--clean", "version"])
 }
 
+fn cat_type_way_clean(c: &Ctx, input: &Path) -> Invocation {
+    cat_type_way(c, input).words(&["--clean", "version"])
+}
+
+fn cat_type_all_clean(c: &Ctx, input: &Path) -> Invocation {
+    cat(c, input).words(&["--type", "node,way,relation", "--clean", "version"])
+}
+
 fn cat_dedupe(c: &Ctx, input: &Path) -> Invocation {
     cat(c, input).words(&["--dedupe"])
 }
@@ -1170,7 +1178,7 @@ const POLICY: &[PolicyRow] = &[
     refuses("extract --smart", extract_smart, FORCE_NOTED),
     refuses("cat --type node", cat_type, FORCE_NOTED),
     refuses("cat --type way", cat_type_way, FORCE_NOTED),
-    refuses("cat --clean", cat_clean, FORCE_NOTED),
+    refuses("cat --type way --clean", cat_type_way_clean, FORCE_NOTED),
     refuses("cat --dedupe", cat_dedupe, FORCE_NOTED),
     // degrade's decode path (a transformation that re-encodes elements).
     refuses("degrade --strip-locations", degrade, FORCE_NOTED),
@@ -1227,6 +1235,14 @@ const POLICY: &[PolicyRow] = &[
     ),
     falls_back("extract --simple", extract_simple, Says::Text(BLOBS_NOTE)),
     falls_back("cat", cat, Says::Nothing),
+    // The clean pass decodes every blob exactly once whatever its indexdata,
+    // so it has no slower path to gate; selecting every kind is that pass.
+    falls_back("cat --clean", cat_clean, Says::Nothing),
+    falls_back(
+        "cat --type node,way,relation --clean",
+        cat_type_all_clean,
+        Says::Nothing,
+    ),
     falls_back("degrade --strip-indexdata", degrade_strip, Says::Nothing),
     falls_back("time-filter", time_filter, Says::Nothing),
     falls_back("getparents", getparents, Says::Text(BLOBS_NOTE)),
@@ -1483,10 +1499,19 @@ const FIRST_BLOB_ONLY: &[MixedRow] = &[
     ("extract --simple", extract_simple, Mixed::RefusesPartial),
     ("extract --smart", extract_smart, Mixed::RefusesPartial),
     ("time-filter", time_filter, Mixed::RefusesPartial),
-    // These stream frames rather than walk headers for a schedule.
+    // cat accepts in every mode: --type decodes a blob without indexdata
+    // and filters its actual elements, --dedupe's first pass scans its IDs,
+    // and --clean schedules and decodes every blob whatever its indexdata.
     ("cat --type node", cat_type, Mixed::Accepts),
     ("cat --dedupe", cat_dedupe, Mixed::Accepts),
-    ("cat --clean", cat_clean, Mixed::RefusesPartial),
+    ("cat --clean", cat_clean, Mixed::Accepts),
+    // The unindexed tail is decoded although a kind is unselected, and the
+    // schedule walk says so.
+    (
+        "cat --type way --clean",
+        cat_type_way_clean,
+        Mixed::Reports(BLOBS_NOTE),
+    ),
     ("degrade --strip-locations", degrade, Mixed::RefusesPartial),
     ("inspect --nodes", inspect_nodes, Mixed::RefusesPartial),
     ("inspect tags", inspect_tags, Mixed::RefusesPartial),

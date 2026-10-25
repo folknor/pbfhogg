@@ -98,8 +98,9 @@ pub(crate) const POOL_RESULT_CHANNEL_DEPTH: usize = 32;
 /// common case).
 pub(crate) const POOL_REORDER_CAPACITY: usize = 32;
 
-/// Capacity of the wider reorder buffers (cat, time-filter and altw stage 1's
-/// per-way stream).
+/// Capacity of the wider reorder buffers (time-filter and altw stage 1's
+/// per-way stream), and the admission window of cat `--clean`'s ordered
+/// pool (at most this many decoded results alive between decode and write).
 pub(crate) const POOL_REORDER_CAPACITY_WIDE: usize = 64;
 
 /// How long a cooperative wait on an executor parks in `recv_timeout` once

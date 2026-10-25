@@ -1184,7 +1184,7 @@ enum Command {
     /// Concatenate PBF files with optional type filtering
     #[command(group(
         clap::ArgGroup::new("cat_indexed_paths")
-            .args(["type_filter", "clean", "dedupe"])
+            .args(["type_filter", "dedupe"])
             .multiple(true)
     ))]
     Cat {
@@ -1216,10 +1216,10 @@ enum Command {
         /// Only with --dedupe: plain cat has no io_uring writer
         #[arg(long, value_parser = io_uring_switch(), requires = "dedupe")]
         io_uring: bool,
-        /// Proceed on input without blob-level indexdata, which --type,
-        /// --clean and --dedupe would otherwise refuse, through the slower
-        /// fallback path. Plain cat adds the indexdata and never refuses, so
-        /// --force needs one of those three
+        /// Proceed on input without blob-level indexdata, which --type and
+        /// --dedupe would otherwise refuse, through the slower fallback path.
+        /// Plain cat adds the indexdata and --clean decodes every blob
+        /// anyway, so neither refuses, and --force needs --type or --dedupe
         #[arg(long, requires = "cat_indexed_paths")]
         force: bool,
         #[command(flatten)]

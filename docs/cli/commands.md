@@ -422,12 +422,12 @@ pbfhogg cat [OPTIONS] --output <OUTPUT> <FILES>...
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation) |
-| `--clean <ATTR>` | Strip metadata attribute (repeatable: version, timestamp, changeset, uid, user) |
+| `--clean <ATTR>` | Strip metadata attribute (repeatable: version, timestamp, changeset, uid, user). Decodes and re-encodes every selected blob once, keeping input order |
 | `--dedupe` | K-way sorted merge with dedup (all inputs must be sorted). Rejects `--type` and `--clean`: the dedupe path is blob-level passthrough and implements neither |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O (only with `--dedupe`) |
-| `--force` | Proceed on unindexed input with the slower fallback. Requires `--type`, `--clean` or `--dedupe`: plain `cat` never refuses |
+| `--force` | Proceed on unindexed input with the slower fallback. Requires `--type` or `--dedupe`: plain `cat` and `--clean` without `--type` never refuse |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 

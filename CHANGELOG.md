@@ -81,11 +81,25 @@
   missing-indexdata error, located at the first data blob without
   indexdata: sort, apply-changes, repack, degrade, tags-filter, tags-count,
   extract, add-locations-to-ways, build-geocode-index, time-filter,
-  `cat --clean`, `inspect --nodes`, `inspect tags`, `check --refs`,
+  `inspect --nodes`, `inspect tags`, `check --refs`,
   `check --ids` and digest. `--force` and `--allow-unindexed` do not lift
   this refusal; `pbfhogg cat` re-indexes such a file. A wholly unindexed
   input is handled as before. `ErrorKind::MissingIndexdata` gains a
   `partial` field that marks this case.
+
+- **`cat --clean` writes in input order, needs no indexdata, and takes
+  `--force` only with `--type`.** It used to run one pass per element kind,
+  so an unsorted input came out regrouped as nodes, ways, relations, and a
+  blob without indexdata was decompressed once per kind; an unindexed input
+  therefore needed `--force`, and a partially indexed one was refused. It
+  now decodes every blob once and writes the kept elements in the order it
+  read them (a sorted input stays sorted). Without `--type` it neither asks
+  for indexdata nor accepts `--force`; with all three kinds in `--type` it
+  does not ask either (`--force` is accepted there and does nothing); with a
+  narrower `--type` it still asks, since it skips blobs of other kinds on
+  their indexdata. A partially indexed input is accepted in every `cat`
+  mode. The summary's "Decoded N blobs" now counts input blobs decoded
+  rather than blobs written.
 
 - **Element caps are `NonZeroUsize`.** `repack::repack`'s
   `elements_per_blob`, `degrade::degrade`'s `block_cap`,

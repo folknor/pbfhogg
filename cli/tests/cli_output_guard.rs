@@ -202,7 +202,6 @@ fn framing_error_names_the_input_file() {
             bad.to_str().unwrap(),
             "--clean",
             "version",
-            "--force",
             "-o",
             dest.to_str().unwrap(),
         ])
@@ -244,7 +243,6 @@ fn cat_failure_leaves_preexisting_destination_intact() {
             bad.to_str().unwrap(),
             "--clean",
             "version",
-            "--force",
             "-o",
             dest.to_str().unwrap(),
             "--overwrite",

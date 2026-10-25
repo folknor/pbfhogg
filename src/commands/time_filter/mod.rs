@@ -324,7 +324,7 @@ fn time_filter_snapshot(
     // Send, so it can't ride the `S: Send` worker-state slot. Per-blob
     // alloc inside the closure is cheap (BlockBuilder::new is just a
     // few empty Vec/HashMap initialisers; no heap reservation until
-    // elements are added). Same pattern as cat --clean's run_kind_phase.
+    // elements are added). Same pattern as cat --clean's worker.
     let pool_result = parallel_classify_phase(
         &shared_file,
         &schedule,

@@ -55,14 +55,15 @@ Skips entire blobs before decompression using metadata embedded in `BlobHeader`:
 
 **Every filter here believes the claim it filters on**; what a false one
 costs per command is in [indexdata-trust.md](indexdata-trust.md). One
-mechanism detail belongs here: `repack`, `degrade` and `cat --clean` /
-`cat --type` (re-encode path) schedule an indexed blob into the one per-kind
-phase its indexdata names, and that phase re-encodes only elements of its
-kind. Checking the kind per blob is not possible in the worker, because the
-pool's classify closure receives only the decoded block and cannot tell an
-indexed blob from an unindexed one that the schedule builder replicated into
-all three kinds (a legitimate no-match); checking it per element is a cost on
-a measured path.
+mechanism detail belongs here: `repack` and `degrade` schedule an indexed
+blob into the one per-kind phase its indexdata names, and that phase
+re-encodes only elements of its kind. Checking the kind per blob is not
+possible in the worker, because the pool's classify closure receives only the
+decoded block and cannot tell an indexed blob from an unindexed one that the
+schedule builder replicated into all three kinds (a legitimate no-match);
+checking it per element is a cost on a measured path. `cat --clean` has no
+per-kind phases: it skips a blob whose indexdata names an unselected kind and
+keeps every decoded element of a selected kind, whatever its blob claims.
 
 Applied via `ElementReader::with_blob_filter()`. Used by `cat --type`, `tags-filter`, `extract`.
 Only the pipelined iteration methods honour it; the sequential `for_each` and
@@ -136,9 +137,22 @@ No `--type` filter: decompresses each blob to derive ID and tag metadata,
 then reframes the original compressed payload via `reframe_raw_with_index()`.
 The payload is not recompressed.
 
-### cat --type / --clean
+### cat --type
 
-Blob filter → pread-worker parallel decode + reframe, file order restored by a `ReorderBuffer` → element-level type check / clean → `BlockBuilder` re-encode → write. Migrated off the earlier `into_blocks_pipelined` + batch-budget path (see `src/commands/cat/mod.rs`).
+Sequential frame walk: an indexed blob of a selected kind is copied raw, one
+of another kind is skipped, and a blob without indexdata is decoded, filtered
+by element kind and re-encoded.
+
+### cat --clean
+
+One pass per input: a header walk schedules every data blob except those
+whose indexdata names an unselected kind; pread workers decode each scheduled
+blob once, keep the selected elements by actual kind, clean and re-encode them
+through `BlockBuilder` and frame the output; the ordered pool
+(`parallel_classify_phase_ordered`) merges in schedule order, so output order
+is input order, with at most its admission window of results alive. Migrated
+off the earlier `into_blocks_pipelined` + batch-budget path, then off one
+phase per kind (see `src/commands/cat/mod.rs`).
 
 ### cat --dedupe
 

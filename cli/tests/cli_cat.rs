@@ -24,8 +24,8 @@ use pbfhogg::MemberId;
 /// Invoke `pbfhogg cat <inputs...> -o <output> [--type T] [--clean A]...
 /// [--direct-io] [--force]` and assert success. Returns the captured
 /// `CliOutput` so callers can inspect stderr for stats and stdout if needed.
-/// `--force` is passed only with `--type` or `--clean`: plain cat never
-/// refuses unindexed input, so it refuses `--force`.
+/// `--force` is passed only with `--type`: plain cat and `--clean` without
+/// `--type` never refuse unindexed input, so they refuse `--force`.
 ///
 /// `clean_attrs` is the list of `--clean <name>` flags to pass; passing
 /// `&[]` is equivalent to `CleanAttrs::default()` (no fields cleaned).
@@ -50,7 +50,7 @@ fn run_cat(
     if direct_io {
         cli = cli.arg("--direct-io");
     }
-    if type_filter.is_some() || !clean_attrs.is_empty() {
+    if type_filter.is_some() {
         cli = cli.arg("--force");
     }
     cli.run()
@@ -899,15 +899,12 @@ fn cat_type_way_passthrough_across_multiple_blobs() {
     );
 }
 
-/// `--clean` on an unindexed input must refuse without `--force`.
-///
-/// `--clean` routes through `cat_filtered`, whose per-kind schedules cannot
-/// tell which kind an unindexed blob holds and therefore replicate it into all
-/// three - so every blob is read and decompressed three times. The output is
-/// correct, which is why this went unnoticed: the guard used to key on
-/// `--type` alone and let `--clean` past silently.
+/// `--clean` without `--type` needs no indexdata: it decodes every blob
+/// exactly once whether or not the blob is indexed, so an unindexed input runs
+/// without `--force` and gives what the indexed input gives. `--type` with
+/// `--clean` still asks for indexdata, since it skips unselected blobs on it.
 #[test]
-fn clean_on_an_unindexed_input_refuses_without_force() {
+fn clean_needs_no_indexdata_but_a_type_filter_does() {
     let dir = crate::common::test_scratch();
     let indexed = dir.path().join("indexed.osm.pbf");
     let unindexed = dir.path().join("unindexed.osm.pbf");
@@ -922,42 +919,217 @@ fn clean_on_an_unindexed_input_refuses_without_force() {
         .arg("--strip-indexdata")
         .assert_success();
 
+    let from_unindexed = dir.path().join("from-unindexed.osm.pbf");
+    let from_indexed = dir.path().join("from-indexed.osm.pbf");
+    for (input, dest) in [(&unindexed, &from_unindexed), (&indexed, &from_indexed)] {
+        CliInvoker::new()
+            .arg("cat")
+            .arg(input)
+            .arg("-o")
+            .arg(dest)
+            .arg("--clean")
+            .arg("version")
+            .assert_success();
+    }
+    assert_eq!(
+        ordered_elements(&from_unindexed),
+        ordered_elements(&from_indexed)
+    );
+
     let out = CliInvoker::new()
         .arg("cat")
         .arg(&unindexed)
         .arg("-o")
         .arg(&output)
-        .arg("--clean")
-        .arg("version")
+        .args(["--type", "way", "--clean", "version"])
         .run();
-    assert!(
-        !out.status.success(),
-        "--clean on an unindexed input costs three decode passes and must say \
-         so; stderr:\n{}",
-        out.stderr_str(),
-    );
-    out.assert_stderr_contains("three times");
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr_str());
+    out.assert_stderr_contains("no blob-level indexdata");
+}
 
-    // Two paired counterparts, so this is not satisfied by "cat now refuses
-    // everything": --force proceeds, and the same file with an index is fine.
-    CliInvoker::new()
+/// `--clean` writes in input order: an unsorted input is not regrouped by
+/// kind, and a block holding several kinds becomes consecutive single-kind
+/// blocks in its own element order. The summary counts input blobs decoded,
+/// not blocks written. An indexed blob labelled with an unselected kind is
+/// skipped undecoded (its payload is made undecodable to prove it); an
+/// unindexed one is decoded and filtered.
+#[test]
+fn clean_keeps_input_order() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("unsorted.osm.pbf");
+    let meta = pb::info(1, 8);
+    write_raw_block_pbf(
+        &input,
+        false,
+        &[],
+        &[
+            (
+                true,
+                pb::block(&[vec![(3, pb::way(31, &[9, 5], None, &meta))]]),
+            ),
+            (
+                true,
+                pb::block(&[vec![
+                    (1, pb::node(9, Some(&meta))),
+                    (1, pb::node(5, Some(&meta))),
+                ]]),
+            ),
+            (
+                false,
+                pb::block(&[
+                    vec![(3, pb::way(30, &[5, 9], None, &meta))],
+                    vec![(1, pb::node(1, Some(&meta)))],
+                    vec![(4, pb::relation(7, &[(30, 1, 7)], &meta))],
+                ]),
+            ),
+        ],
+    );
+
+    // The same file with the indexed node blob's payload overwritten: its
+    // header (and indexdata) intact, its Blob no longer decodable.
+    let poisoned = dir.path().join("poisoned.osm.pbf");
+    let mut bytes = std::fs::read(&input).expect("read fixture");
+    let frames = crate::common::adversarial::locate_blobs(&bytes);
+    let node_blob = &frames[2];
+    bytes[node_blob.blob_start..node_blob.blob_end].fill(0xff);
+    std::fs::write(&poisoned, &bytes).expect("write poisoned fixture");
+
+    let run = |source: &Path, name: &str, extra: &[&str], summary: &str| {
+        let output = dir.path().join(name);
+        let out = CliInvoker::new()
+            .arg("cat")
+            .arg(source)
+            .arg("-o")
+            .arg(&output)
+            .args(["--clean", "version"])
+            .args(extra.iter().copied())
+            .run();
+        assert!(out.status.success(), "{name}: {}", out.stderr_str());
+        out.assert_stderr_contains(summary);
+        block_layout(&output)
+    };
+    assert_eq!(
+        run(
+            &input,
+            "all.osm.pbf",
+            &[],
+            "Decoded 3 blobs, wrote 6 elements"
+        ),
+        [
+            ("way", 31, 31, 1),
+            ("node", 9, 5, 2),
+            ("way", 30, 30, 1),
+            ("node", 1, 1, 1),
+            ("relation", 7, 7, 1),
+        ]
+    );
+    assert_eq!(
+        run(
+            &poisoned,
+            "ways.osm.pbf",
+            &["--type", "way"],
+            "Decoded 2 blobs, wrote 2 elements"
+        ),
+        [("way", 31, 31, 1), ("way", 30, 30, 1)]
+    );
+    // The poisoned blob is what a node selection reads, so it fails there.
+    let out = CliInvoker::new()
         .arg("cat")
-        .arg(&unindexed)
+        .arg(&poisoned)
         .arg("-o")
-        .arg(&output)
-        .arg("--clean")
-        .arg("version")
-        .arg("--force")
-        .assert_success();
-    CliInvoker::new()
-        .arg("cat")
-        .arg(&indexed)
-        .arg("-o")
-        .arg(&output)
-        .arg("--overwrite")
-        .arg("--clean")
-        .arg("version")
-        .assert_success();
+        .arg(dir.path().join("nodes.osm.pbf"))
+        .args(["--clean", "version", "--type", "node"])
+        .run();
+    assert!(!out.status.success(), "{}", out.stderr_str());
+}
+
+/// The kinds and ids of a file every `cat` partial-index fixture holds, in
+/// order: nodes 1..=3, nodes 4..=5, ways 10 and 11, relation 20, one block
+/// each.
+fn partial_index_blocks() -> Vec<Vec<u8>> {
+    let meta = pb::info(1, 8);
+    vec![
+        pb::block(&[vec![
+            (1, pb::node(1, Some(&meta))),
+            (1, pb::node(2, Some(&meta))),
+            (1, pb::node(3, Some(&meta))),
+        ]]),
+        pb::block(&[vec![(2, pb::dense(&[(4, 1), (5, 1)], 8))]]),
+        pb::block(&[vec![
+            (3, pb::way(10, &[1, 2], None, &meta)),
+            (3, pb::way(11, &[4, 5], None, &meta)),
+        ]]),
+        pb::block(&[vec![(4, pb::relation(20, &[(10, 1, 7), (5, 0, 7)], &meta))]]),
+    ]
+}
+
+/// Every `cat` mode gives the wholly indexed file's elements on a file
+/// indexed on some blobs and not others, in either order: no mode skips or
+/// copies raw a blob on indexdata it lacks
+/// (`reference/indexdata-trust.md`, "Missing and partial indexdata").
+/// `--force` is passed where the first data blob is unindexed and the mode
+/// asks for indexdata at all.
+#[test]
+fn every_mode_gives_the_indexed_output_on_a_partially_indexed_input() {
+    let dir = crate::common::test_scratch();
+    let blocks = partial_index_blocks();
+    let shapes: [(&str, [bool; 4]); 3] = [
+        ("indexed", [true; 4]),
+        ("head-indexed", [true, false, false, false]),
+        ("head-unindexed", [false, true, true, true]),
+    ];
+    for (shape, indexed) in &shapes {
+        let blocks: Vec<(bool, Vec<u8>)> = indexed.iter().copied().zip(blocks.clone()).collect();
+        write_raw_block_pbf(
+            &dir.path().join(format!("{shape}.osm.pbf")),
+            true,
+            &[],
+            &blocks,
+        );
+    }
+
+    let modes: [(&str, &[&str], bool); 6] = [
+        ("plain", &[], false),
+        ("type-node", &["--type", "node"], true),
+        ("type-way", &["--type", "way"], true),
+        ("clean", &["--clean", "version"], false),
+        (
+            "type-way-clean",
+            &["--type", "way", "--clean", "version"],
+            true,
+        ),
+        ("dedupe", &["--dedupe"], true),
+    ];
+    for (mode, flags, gated) in modes {
+        let mut results = Vec::new();
+        for (shape, indexed) in &shapes {
+            let output = dir.path().join(format!("{mode}-{shape}.out.osm.pbf"));
+            let mut cli = CliInvoker::new()
+                .arg("cat")
+                .arg(dir.path().join(format!("{shape}.osm.pbf")))
+                .arg("-o")
+                .arg(&output)
+                .args(flags.iter().copied());
+            if gated && !indexed[0] {
+                cli = cli.arg("--force");
+            }
+            let out = cli.run();
+            assert!(
+                out.status.success(),
+                "{mode} on {shape}: {}",
+                out.stderr_str()
+            );
+            results.push((shape, ordered_elements(&output)));
+        }
+        let (_, expected) = &results[0];
+        assert!(
+            !expected.is_empty(),
+            "{mode}: the indexed run wrote nothing"
+        );
+        for (shape, got) in &results[1..] {
+            assert_eq!(got, expected, "{mode} on {shape}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1353,8 +1525,9 @@ fn every_cat_path_refuses_non_leading_header_frames() {
             ("dedupe", vec!["--dedupe"]),
         ] {
             let mut cli = CliInvoker::new().arg("cat").arg(&bad);
-            // Plain cat never refuses unindexed input, so it refuses --force.
-            let force = !flags.is_empty();
+            // Plain cat and --clean without --type never refuse unindexed
+            // input, so they refuse --force.
+            let force = mode == "filtered" || mode == "dedupe";
             for flag in flags {
                 cli = cli.arg(flag);
             }

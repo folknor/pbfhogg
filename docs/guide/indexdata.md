@@ -82,8 +82,8 @@ These commands will error if the input PBF lacks indexdata:
 - `extract` (complete-ways and smart strategies) - spatial blob filtering
 - `tags-filter` - skips blobs lacking required tag keys
 - `getid` - skips blobs whose ID range has no intersection with requested IDs
-- `cat --type` - skips non-matching blob types entirely
-- `cat --clean` and `cat --dedupe` - per-kind scheduling and merging
+- `cat --type` (with or without `--clean`) - skips non-matching blob types entirely (except `--type node,way,relation --clean`, which skips nothing and does not refuse)
+- `cat --dedupe` - blob-level overlap planning and merging
 - `repack` and `degrade` (except the metadata-only `--strip-indexdata` path) - per-kind blob schedules
 - `inspect tags --type` - type-filtered tag counting
 - `inspect --nodes` - node coordinate analysis
@@ -103,6 +103,9 @@ The escape, and whether a command refuses at all, is decided per command:
   is scanned more slowly.
 - `tags-filter` asks for indexdata only when it would use it: not with
   `--invert` or `--distrust-metadata`.
+- `cat --clean` without `--type` does not refuse: it decodes every blob
+  exactly once whether or not it is indexed, so indexdata would save it
+  nothing.
 
 Except for renumber's scan, the check reads only the first data blob's
 header. It is not a whole-file validation: a file whose first data blob is
@@ -112,7 +115,10 @@ that read all blob headers to plan their work (among them `sort`,
 `apply-changes`, `repack`, `tags-filter`, `extract`, `add-locations-to-ways`,
 `build-geocode-index`, `digest` and `diff`), at the first data blob without
 indexdata; `--force` does not lift that refusal. `pbfhogg cat` indexes every
-blob of such a file. Commands that do not read every header first run on it.
+blob of such a file, and every `cat` mode runs on it: `--type`, `--clean` and
+`--dedupe` decode or scan each blob that lacks indexdata, so their output is
+the same as from the file fully indexed. Commands that do not read every
+header first run on it.
 `getid` and `getparents` run on it by design, `getid` in every mode and both
 as a `-I` ID file: they decode each blob that lacks indexdata, so their
 output is the same as from the file fully indexed, only slower. One case

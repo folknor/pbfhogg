@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-8. HYG-155
 9. HYG-156
 10. HYG-157
 11. HYG-017
@@ -462,6 +461,29 @@ The judgement calls already known, to be checked first:
   full-scan arm's filter note reads the first data blob only, so it is
   silent on an indexed head with an unindexed tail where the walker notes
   it; left as is.
+- cat's `--clean` path (`cat_filtered`, with or without `--type`) was
+  rewritten from three per-kind phases (`build_classify_schedules_split`,
+  `parallel_classify_phase` plus a `ReorderBuffer` per phase) into one pass
+  per input: one header walk (`build_classify_schedule_blob_filtered`,
+  `PartialIndex::Accept`, a kind-only `BlobFilter` when a kind is
+  unselected) and one `parallel_classify_phase_ordered` run with an
+  admission window of `POOL_REORDER_CAPACITY_WIDE`, the merge writing
+  straight to the writer. A planet production command (5m34s planet in
+  `reference/performance.md`); not measured, per rule 8. On wholly indexed
+  sorted input the decoded set and output are argued the same as before,
+  minus two phase barriers; a reviewer should run a matched planet A/B of
+  `cat --clean version` against the parent commit, wall and peak anon, and
+  read whether the ordered pool's window (64, sized for reorder buffers,
+  not tuned here) leaves workers stalled behind a slow head blob. Behaviour
+  changes, all deliberate and sparred: output order is input order (an
+  unsorted input is no longer regrouped by kind); a partially indexed input
+  is accepted; `--clean` without `--type` (or with all three kinds) no
+  longer asks for indexdata and rejects `--force`, since it decodes every
+  blob once either way; an indexed blob whose kind claim is false loses no
+  selected element any more (elements are kept by actual kind); and the
+  summary's "Decoded N blobs" now counts input blobs decoded, where it
+  counted framed output blobs. The old per-phase reorder buffer was the
+  unbounded shape HYG-053 describes; the ordered pool bounds it.
 
 ---
 
@@ -530,10 +552,10 @@ slot) is built in:
   needs; a candidate to generalise rather than another copy.
 - `repack` and `degrade`: each defines `FRAME_BATCH`, `KindPayload`,
   `WorkerOutput`, `PhaseStats`, `run_kind_phase`, `frame_owned`,
-  `frame_and_write_batch`; `cat/mod.rs::run_kind_phase` is a third member.
-  The sort-preservation guards now agree; repack fires its guard only when
-  the worker produced full frames, degrade on every input blob (it mirrors
-  input blobs one to one).
+  `frame_and_write_batch`. (cat's `--clean` path left this family when it
+  became one ordered pass.) The sort-preservation guards now agree; repack
+  fires its guard only when the worker produced full frames, degrade on
+  every input blob (it mirrors input blobs one to one).
 - `extract/common.rs::pread_execute` (whose `ConsumerItem` match is written
   twice verbatim in the same function for the post-drain tail),
   `extract/simple.rs` (node and way classify), `extract/multi.rs` (node write,
@@ -1165,8 +1187,7 @@ Anger: 10 - a credit scheme inside the read engine and blob pools.
 The channel bounds queued messages, but consumers drain the channel into the
 `ReorderBuffer` whether or not the head seq has arrived, so one slow blob lets
 the buffer grow by however many blobs the other workers finish meanwhile.
-`cat::run_kind_phase`'s doc claims in-flight is capped "to roughly the
-decode-thread count"; the same holds for the three renumber loops,
+This holds for the three renumber loops,
 repack/degrade, and the read pipeline's decode window, which uses
 `decode_ahead` for both admission and the decoded channel depth (one number for
 two meanings). `ReorderBuffer::with_capacity(capacity)` sets
@@ -1180,8 +1201,11 @@ the explicit-ceiling variant were used, inputs with more than 32 passthrough
 blobs would break. Fix: a credit scheme (a worker may not claim seq > head + K)
 in the shared engine of HYG-011. A working precedent now exists:
 `scan::classify::parallel_classify_phase_ordered` (used by the geocode
-builder's Pass 2) hands out schedule positions only within a fixed window
-ahead of the merged head.
+builder's Pass 2 and cat's `--clean` pass) hands out schedule positions
+only within a fixed window ahead of the merged head. Its `merge` callback
+cannot fail, though, so a caller whose merge writes output (cat `--clean`)
+records a write error and lets the pool decode the rest of the input before
+returning it; an engine that lets the merge stop dispatch would fail fast.
 
 `ReorderBuffer::push` asserts on stale, duplicate and window-exceeded seqs,
 documented as programming errors because seqs come from `enumerate()`; that
@@ -1212,31 +1236,6 @@ docs sentence, since a sweep merge must hold whatever overlaps the current
 position and bounding it means an external merge.
 
 Reported by: re-encoding.
-
-## HYG-155 - `cat --type` and `cat --dedupe` trust the first blob's indexdata
-
-Anger: 8 - indexdata trust model, one command.
-
-Split out of the indexdata trust model entry, now resolved as
-`reference/indexdata-trust.md`. Both modes decide from the first data blob whether the
-whole file is indexed.
-
-Recommendation (2026-10-25): opt into the partial-index refusal only where a
-full header walk already happens; add no new walk. Where none happens,
-record on `reference/indexdata-trust.md` ("Missing and partial indexdata")
-that the command decides from the first blob. Move the contract table rows
-that change.
-
-Precedent from the getid and getparents entries, resolved against that
-recommendation: the trust page says refusing a partial file is owed only
-where a path cannot do without the missing indexdata, and getid and
-getparents accept on every path because each decodes a blob lacking
-indexdata. Classify builders take a `PartialIndex` policy per call site.
-Test this command's paths against the same rule before choosing either
-way.
-
-Reported by: change application, re-encoding, altw and scanning, geocode
-index (the indexdata trust model entry).
 
 ## HYG-156 - `tags-filter -R` trusts the first blob's indexdata
 
@@ -1380,6 +1379,23 @@ capability with a public format to design, not hygiene; if it comes back,
 normalising the summary-line shapes and keys is the first step.
 
 Reported by: split out of the diagnostic-wording item.
+
+## HYG-182 - `cat --dedupe` indexes an unindexed blob differently from plain `cat`
+
+Anger: 5 - a forced or partially indexed input to one cat mode.
+
+Plain `cat` indexes a blob without indexdata through `scan_block_ids_and_tags`
+and re-encodes one no single index describes (`reencode_unclassifiable`).
+`cat --dedupe`'s pass 1 (`index_input` in `src/commands/cat/dedupe.rs`) runs
+its own copy: `scan_block_ids` only, so a passthrough blob it reframes gets
+indexdata but no tagdata (it keeps the input's, usually none), and an empty
+or kind-mixed block fails the run with "failed to scan block IDs", which
+names neither the cause nor plain `cat` as the way out. One indexing rule
+for both, or at least the scan with tags and a refusal that says what the
+block is, would fit. Not a partial-index matter: a wholly unindexed input
+under `--force` meets the same.
+
+Reported by: the HYG-155 resolution (sparred with codex).
 
 ## HYG-181 - The parallel diff and derive shard decoders allocate a fresh buffer per block
 

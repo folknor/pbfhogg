@@ -228,7 +228,7 @@ no such line, and `build-geocode-index` names `--allow-unindexed` instead.
 
 | Command | Refuses unindexed input on | `--force` refused with |
 |---------|----------------------------|------------------------|
-| cat | `--type`, `--clean`, `--dedupe` | plain `cat`, which adds the indexdata |
+| cat | `--type` (with or without `--clean`), `--dedupe` | plain `cat`, which adds the indexdata, and `--clean` without `--type`, which decodes every blob exactly once either way. `--type node,way,relation --clean` is the clean pass and does not refuse; `--force` alongside it is accepted and does nothing |
 | sort, repack, getid (with or without `--invert`), inspect tags | every path | - |
 | degrade | the decode path (`--unsort`, `--unsort-intra`, `--strip-locations`, `--drop-ids`) | only header-only flags |
 | tags-filter | PBF input | `--invert-match`, `--distrust-metadata` (neither refuses), OSC input |
@@ -730,7 +730,7 @@ pbfhogg cat [OPTIONS] --output <OUTPUT> <FILES>...
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O. Only valid with `--dedupe` - the plain `cat` path has no io_uring writer, and passing it there is an error. |
-| `--force` | Proceed on unindexed input with the slower fallback. Requires `--type`, `--clean` or `--dedupe`: plain `cat` adds the indexdata and never refuses, so `--force` alone is an error. |
+| `--force` | Proceed on unindexed input with the slower fallback. Requires `--type` or `--dedupe`: plain `cat` adds the indexdata and `--clean` without `--type` decodes every blob once either way, so neither refuses and `--force` with only those is an error. `--type node,way,relation --clean` is the clean pass, which does not refuse; `--force` there is accepted and does nothing. |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 

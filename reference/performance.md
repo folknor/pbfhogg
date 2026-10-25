@@ -89,13 +89,15 @@ with indexdata+tagdata, preserves original compressed bytes. No re-compression.
 Passthrough is buffered-only; `--direct-io` adds alignment overhead without
 the concurrent read/write pattern that makes it faster for merge.
 
-The `--type` filtered path (full decode+re-encode) and the `--clean` path
-both use `parallel_classify_phase` per kind with framed-output streamed via
-`ReorderBuffer` (commits `6184602` + `b347c0a`, 2026-04-27). Planet
-`cat --clean version`: **5m34s wall, 750 MB peak anon** (UUID `f2315551`
-at `4fc8e35`, 2026-04-27 overnight; previously `7c4e03eb` 5m48s/835 MB at
-`b347c0a` re-bench - 14 s wall, 10 % anon improvement attributable to
-single-shot variance).
+The `--clean` path measured below ran `parallel_classify_phase` once per
+kind with framed output streamed via `ReorderBuffer` (commits `6184602` +
+`b347c0a`, 2026-04-27). Planet `cat --clean version`: **5m34s wall, 750 MB
+peak anon** (UUID `f2315551` at `4fc8e35`, 2026-04-27 overnight; previously
+`7c4e03eb` 5m48s/835 MB at `b347c0a` re-bench - 14 s wall, 10 % anon
+improvement attributable to single-shot variance). The path has since become
+one `parallel_classify_phase_ordered` pass per input (every scheduled blob
+decoded once, output in input order); that shape has not been measured yet,
+so these figures describe the per-kind one.
 
 ## Merge (apply-changes)
 

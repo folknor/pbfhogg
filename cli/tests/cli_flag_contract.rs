@@ -98,6 +98,12 @@ const REFUSALS: &[(&[&str], &str)] = &[
     (&["export", "IN", "-O"], "--output"),
     (&["diff", "IN", "IN2", "-O"], "--output"),
     (&["cat", "IN", "-o", "OUT", "--force"], "--type"),
+    // --clean without --type decodes every blob either way, so it has no
+    // slower fallback for --force to grant.
+    (
+        &["cat", "IN", "-o", "OUT", "--clean", "version", "--force"],
+        "--type",
+    ),
     // Without the linux-io-uring feature the switch is refused for that
     // instead; both refusals name it.
     (&["cat", "IN", "-o", "OUT", "--io-uring"], "--io-uring"),

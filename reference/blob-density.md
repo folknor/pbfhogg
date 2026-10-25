@@ -105,7 +105,9 @@ walk term even though their payload phase is shape-2. Callers of
 
 - `check --refs` (`src/commands/check/refs.rs`)
 - `check --ids` (`src/commands/check/verify_ids.rs`)
-- `cat --clean` (`src/commands/cat/mod.rs`)
+- `cat --clean` (`src/commands/cat/mod.rs`), which now walks through
+  `build_classify_schedule_blob_filtered` into one schedule, the same
+  serial walk
 - `repack` (`src/commands/repack/mod.rs`)
 - `degrade` (`src/commands/degrade/mod.rs`)
 - `extract --smart` shares the pattern

@@ -53,7 +53,7 @@ consequence 3).
 
 | Claim | Believed by, and what a lie costs | Checked in passing by | Verified by |
 |-------|-----------------------------------|-----------------------|-------------|
-| kind | Every per-kind schedule: a blob labelled with the wrong kind is invisible to the phase that needs its elements, and the phase that does read it drops elements of the unclaimed kind silently. That covers `repack`, `degrade`'s decode path, `cat --clean`, `tags-filter`, `tags-count`, `time-filter`, `getparents`, `inspect tags` / `--nodes` / `--show`, `check --ids` / `--refs`, the sorted `extract` schedules, `add-locations-to-ways` (node scan) and the geocode builder. `cat --type` copies a matching blob raw, so a mislabelled blob leaks off-kind elements or vanishes. `apply-changes` with `--locations-on-ways` extracts coordinates only from blobs claimed as nodes. | `renumber` (its wire rewrite refuses an element of another kind in a blob scheduled for one kind) | `check --index` |
+| kind | Every per-kind schedule: a blob labelled with the wrong kind is invisible to the phase that needs its elements, and the phase that does read it drops elements of the unclaimed kind silently. That covers `repack`, `degrade`'s decode path, `tags-filter`, `tags-count`, `time-filter`, `getparents`, `inspect tags` / `--nodes` / `--show`, `check --ids` / `--refs`, the sorted `extract` schedules, `add-locations-to-ways` (node scan) and the geocode builder. `cat --type` copies a matching blob raw, so a mislabelled blob leaks off-kind elements or vanishes. `cat --clean` keeps every decoded element of a selected kind whatever its blob claims, so with every kind selected the kind claim decides nothing; with `--type` a blob labelled with an unselected kind is skipped whole. `apply-changes` with `--locations-on-ways` extracts coordinates only from blobs claimed as nodes. | `renumber` (its wire rewrite refuses an element of another kind in a blob scheduled for one kind) | `check --index` |
 | `min_id` / `max_id` | `apply-changes` routes a blob whose range misses the diff to the splice fast path and copies it unchanged. `getid` skips a blob whose range holds no requested ID; `getid --invert` copies it raw. `diff`'s parallel path plans shards from ranges and decides a block's leftover tail from its claimed `max_id`. `sort` (declared-sorted fast path) and `cat --dedupe` analyse overlap from ranges and copy non-overlapping blobs raw. `add-locations-to-ways --index-type external` partitions node blobs by range. `inspect --show` skips on range. | `diff` refuses ranges that break canonical order; `add-locations-to-ways --index-type external` refuses reversed, negative-node and out-of-order ranges, including an overstated `max_id` overlapping the next blob; the geocode builder's Pass 2a refuses any decoded node above the largest claimed node `max_id` (a global bound, not each blob's range) | `check --index` |
 | `count` | `apply-changes` credits a spliced or passed-through blob's `count` to its `base_*` statistics, folded into the observed counts. `sort`, `getid --invert` and `cat --dedupe` report a passed-through blob's `count` separately, as claimed (`passthrough_claimed`). `inspect` reports counts from indexdata unless `--distrust-metadata`. `renumber` assigns ID blocks from it. | `renumber` (refuses a blob whose decoded count disagrees) | `check --index` |
 | bbox | `extract` and the public `BlobFilter::with_node_bbox` skip a blob claimed as nodes whose bbox misses the region, without decoding it; the bbox is consulted only when the claimed kind is node, so a mislabelled blob skipped this way loses everything in it, on the unsorted `extract --simple` path too. `extract` also nominates a node blob whose bbox lies inside the region for a raw copy. | `extract` decodes a nominated blob and copies it raw only when its payload is DenseNodes alone and every node lies in the region, counting the nodes it decoded. That is selection and structural verification, not verification of the copied header. | `check --index` (containment) |
@@ -183,8 +183,20 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   has no `--force` gate: its walker schedules a blob without indexdata
   whatever the query and its full-scan arm's blob filter passes one through
   to a decode, so both select parents from actual elements, and its output
-  is the wholly indexed file's. The other refusals on this page are
-  recorded as current behaviour, not justified by this rule.
+  is the wholly indexed file's. `cat` accepts in every mode by the same
+  rule, in either order. Its first-blob probes decide only whether `--type`
+  or `--dedupe` needs `--force` (first data blob unindexed) and, under a
+  declared way enrichment, which way declaration the output header makes;
+  no blob is skipped, copied raw or counted on indexdata it lacks. `--type`
+  decodes an unindexed blob and filters its actual elements; `--dedupe`'s
+  first pass scans the IDs of every unindexed blob, so its overlap plan and
+  way declaration rest on observed ranges; `--clean` schedules and decodes
+  every blob once whatever its indexdata. Two refusals remain, neither about
+  indexing: `--type` refuses an unindexed blob that yields ways when the
+  header already declared a way enrichment re-encoding would break (as
+  `getid --invert` does), and `--dedupe` cannot place an unindexed blob no
+  single index describes (empty, or kinds mixed). The other refusals on
+  this page are recorded as current behaviour, not justified by this rule.
 - **What a command does with a wholly unindexed file** - refuse and offer
   `--force`, refuse with no escape, fall back, or verify - is per command.
   The user-facing statement is the `--force` section of

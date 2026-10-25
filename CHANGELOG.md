@@ -1158,6 +1158,20 @@
 
 ### Fixed
 
+- **`getparents` reads one input file even if it is replaced mid-run.**
+  Every run opens the input two or three times (the indexdata check, the
+  scan-arm estimate on indexed input, then the header walk or the full
+  scan), and each open used to resolve the path again, so an input renamed
+  over during the run was read partly from each file, with no error. The
+  input is now pinned before any ID file is read: on Linux with `/proc` a
+  replaced or deleted input does not affect the run; on other Unix hosts
+  the run fails with `ErrorKind::InputReplaced` and publishes nothing. An
+  input that is a FIFO, socket or character device is now refused up
+  front, before a `-I` PBF is read. Library: `getparents::getparents` and
+  `getparents::getparents_with_min_blobs` take `impl Into<InputSource>` (a
+  path as before, or a `&PinnedInput` the caller took), and so does
+  `has_indexdata`, which probes through a pin it is given.
+
 - **`getid` reads one input file even if it is replaced mid-run.** Every
   mode opens the input two or three times (the indexdata check, the
   scan-arm estimate and the scan; `--add-referenced`'s two passes;
@@ -1169,8 +1183,8 @@
   and publishes nothing. An input that is a FIFO, socket or character
   device is now refused up front, before a `-I` PBF is read. The `-I` PBF
   of `getid` and `getparents` is pinned too, so a FIFO there is refused
-  rather than opened, which used to wait for a writer; `getparents` still
-  reopens its main input by path. Library: `getid::getid`,
+  rather than opened, which used to wait for a writer. Library:
+  `getid::getid`,
   `getid::removeid` and `getid::parse_ids_from_pbf` take
   `impl Into<InputSource>` (a path as before, or a `&PinnedInput` the
   caller took), and the new `InputSource::pin` pins a path or shares a

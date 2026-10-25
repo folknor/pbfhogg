@@ -1788,21 +1788,28 @@ fn getid_forced_unindexed_route_refuses_a_second_header() {
     assert!(!output.exists(), "published an output");
 }
 
-/// getid pins its input before it reads any ID file, so a FIFO input is
-/// refused ahead of an `-I` PBF that does not exist, in include and invert
-/// mode; and the `-I` PBF is pinned too, so a FIFO there is refused rather
+/// getid and getparents pin their input before they read any ID file, so a
+/// FIFO input is refused ahead of an `-I` PBF that does not exist, in every
+/// mode (getid's include and invert, getparents' walker and full-scan
+/// arms); and the `-I` PBF is pinned too, so a FIFO there is refused rather
 /// than opened (a blocking open would wait for a writer).
 #[cfg(unix)]
 #[test]
-fn getid_pins_its_input_and_its_id_pbf_before_reading_either() {
+fn id_commands_pin_their_input_and_id_pbf_before_reading_either() {
     let fx = Fx::new();
     let dir = crate::common::test_scratch();
     let fifo = crate::common::make_fifo(dir.path(), "in.fifo");
     let missing = dir.path().join("missing-ids.osm.pbf");
     let output = dir.path().join("out.osm.pbf");
-    for extra in [&[][..], &["--invert"][..]] {
+    let modes: [(&str, &[&str]); 4] = [
+        ("getid", &[]),
+        ("getid", &["--invert"]),
+        ("getparents", &[]),
+        ("getparents", &["--full-scan-min-blobs", "1"]),
+    ];
+    for (command, extra) in modes {
         let out = CliInvoker::new()
-            .arg("getid")
+            .arg(command)
             .arg(&fifo)
             .arg("-o")
             .arg(&output)
@@ -1811,28 +1818,33 @@ fn getid_pins_its_input_and_its_id_pbf_before_reading_either() {
             .args(extra)
             .run();
         let stderr = out.stderr_str();
-        assert!(!out.status.success(), "{extra:?}: stderr:\n{stderr}");
+        assert!(
+            !out.status.success(),
+            "{command} {extra:?}: stderr:\n{stderr}"
+        );
         assert!(
             stderr.contains(&format!("{} is not a regular file", fifo.display())),
-            "{extra:?}: the input's refusal must come first:\n{stderr}"
+            "{command} {extra:?}: the input's refusal must come first:\n{stderr}"
         );
-        assert!(!output.exists(), "{extra:?}: published an output");
+        assert!(!output.exists(), "{command} {extra:?}: published an output");
     }
-    let out = CliInvoker::new()
-        .arg("getid")
-        .arg(fx.path("good.osm.pbf"))
-        .arg("-o")
-        .arg(&output)
-        .arg("-I")
-        .arg(&fifo)
-        .run();
-    let stderr = out.stderr_str();
-    assert!(!out.status.success(), "stderr:\n{stderr}");
-    assert!(
-        stderr.contains(&format!("{} is not a regular file", fifo.display())),
-        "{stderr}"
-    );
-    assert!(!output.exists(), "published an output");
+    for command in ["getid", "getparents"] {
+        let out = CliInvoker::new()
+            .arg(command)
+            .arg(fx.path("good.osm.pbf"))
+            .arg("-o")
+            .arg(&output)
+            .arg("-I")
+            .arg(&fifo)
+            .run();
+        let stderr = out.stderr_str();
+        assert!(!out.status.success(), "{command}: stderr:\n{stderr}");
+        assert!(
+            stderr.contains(&format!("{} is not a regular file", fifo.display())),
+            "{command}: {stderr}"
+        );
+        assert!(!output.exists(), "{command}: published an output");
+    }
 }
 
 #[test]

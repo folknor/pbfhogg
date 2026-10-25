@@ -214,7 +214,7 @@ fn raw_copy_ways(
         return Ok(Ways::BlobsCopied);
     }
     for file in files {
-        if !super::has_indexdata(file, direct_io, &host.diagnostics)? {
+        if !super::has_indexdata(*file, direct_io, &host.diagnostics)? {
             return Ok(unindexed);
         }
     }

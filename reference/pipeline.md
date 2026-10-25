@@ -496,7 +496,9 @@ A library entry point may take its input as an `InputSource` and turn it
 into a pin with `InputSource::pin`: a path is pinned there, a caller's pin is
 shared as it is (keeping the host it was taken under). That lets a caller
 that does other work on the run's inputs first pin them all up front; the
-getid CLI pins its input, then its `-I` PBF, before reading any ID file.
+getid and getparents CLIs pin their input, then their `-I` PBF, before
+reading any ID file. `has_indexdata` opens once and does not pin: handed a
+pin, it probes through it.
 
 ## Read-path internals (both consumers)
 

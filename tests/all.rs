@@ -62,6 +62,8 @@ mod fault_geocode_pass3;
 #[cfg(feature = "test-hooks")]
 mod fault_getid_input;
 #[cfg(feature = "test-hooks")]
+mod fault_getparents_input;
+#[cfg(feature = "test-hooks")]
 mod fault_parallel_writer;
 #[cfg(feature = "test-hooks")]
 mod fault_read_pipeline;

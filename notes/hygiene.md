@@ -736,7 +736,7 @@ The judgement calls already known, to be checked first:
     path or shares a caller's pin, and the CLI pins the input after
     reserving the output and before `IdSources::resolve`, which pins the
     `-I` PBF before reading either ID file. `resolve` is shared, so
-    getparents' `-I` is pinned too; its main input is still HYG-174's.
+    getparents' `-I` is pinned too.
     The same path as input and `-I` is two pins, taken back to back:
     sharing one would need lexical path equality, which misses `./x`
     against `x`. `dispatch_scan_arm` and `estimate_blob_count` take
@@ -747,6 +747,25 @@ The judgement calls already known, to be checked first:
     way: `cli_input_contract.rs` claimed its forced-unindexed getid case
     reached the streaming arm; unindexed input always takes the walker,
     so the comment and test name now say so.
+  - getparents adopted it in getid's shape: the CLI pins the input after
+    reserving the output and before `IdSources::resolve`, and the public
+    `getparents` and `getparents_with_min_blobs` take
+    `impl Into<InputSource>`, pinned in `getparents_dispatched` before the
+    probe. Opens: the probe, the arm estimate (indexed input only), then
+    the walker (its descriptor still shared with the classify pool) or the
+    full scan's reader; every one became one derived open. The public
+    `has_indexdata` widened to `impl Into<InputSource>` and probes through
+    the pin (it never pins a path itself), rather than getparents reaching
+    for the private probe, since inspect's entry (HYG-187) needs the same;
+    cat's `&&Path` caller gained a deref. Both arms share an open count
+    (three on indexed input), so `tests/fault_getparents_input.rs` tells
+    them apart through the token's `reorder_filled_high_water`, which only
+    the full scan's fused read pipeline records: codex showed that a
+    wrapper dropping `min_blobs` would otherwise run the walker twice
+    unnoticed. Mutations checked: routing the walker or the full-scan
+    reader back to a path open fails every route, and forwarding the
+    default threshold from `getparents_with_min_blobs` fails the full-scan
+    route. getid's CLI FIFO test now covers getparents too.
 
 ---
 
@@ -1450,18 +1469,6 @@ and its full-decode fallback each read the whole report from one open, but
 the full decode takes its file size from a separate path `stat`, which
 HYG-187 covers.
 
-## HYG-174 - getparents reopens its input by path per pass
-
-Anger: 7 - one command.
-
-See "Adopting `PinnedInput`" above. Its `-I` PBF is already pinned (the
-shared `IdSources::resolve`, since getid's entry), so what is left is
-getid's shape: the CLI pins the main input before `resolve`, and
-`getparents` / `getparents_with_min_blobs` take an `InputSource`.
-Recommendation (2026-10-25): follow the brief.
-
-Reported by: the HYG-078 resolution.
-
 ## HYG-175 - renumber reopens its input by path
 
 Anger: 8 - planet-scale command.
@@ -1575,7 +1582,8 @@ takes the file size from a path `stat` beside its reader
 (`inspect/scan.rs`); and the CLI's inspect runs the scan, `has_indexdata`
 and node statistics as separate library calls on one path
 (`cli/src/lib.rs`), each opening it afresh. The public entry points need
-to accept a pin so the CLI pins once. Recommendation (2026-10-25): follow
+to accept a pin so the CLI pins once (`has_indexdata` already does, since
+getparents' entry). Recommendation (2026-10-25): follow
 the brief, with the CLI composition.
 
 Reported by: the HYG-151 resolution.

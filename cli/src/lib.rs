@@ -2797,9 +2797,17 @@ pub fn run() -> process::ExitCode {
                 };
                 let sources =
                     IdSources::parse("getparents", &ids, id_file, id_osm_file, default_type)?;
+                let output = output.open(&host)?;
+                // Pinned before any ID file is read, as getid's input: every
+                // input of the run is pinned before any is read (the -I PBF
+                // in `resolve`), and a FIFO or missing input is refused
+                // before a full -I pass. The same path given as the input
+                // and as -I is two inputs, each read from one file
+                // throughout.
+                let input = pbfhogg::read::input::PinnedInput::pin(&file, &host)?;
                 run_getparents(
-                    &file,
-                    output.open(&host)?,
+                    &input,
+                    output,
                     add_self,
                     sources,
                     &write,
@@ -4024,7 +4032,7 @@ fn run_getid(
 
 #[allow(clippy::too_many_arguments)]
 fn run_getparents(
-    file: &std::path::Path,
+    input: &pbfhogg::read::input::PinnedInput,
     output: pbfhogg::Output,
     add_self: bool,
     sources: IdSources,
@@ -4037,10 +4045,10 @@ fn run_getparents(
     let opts = pbfhogg::getparents::GetparentsOptions { add_self };
     let stats = if let Some(min_blobs) = full_scan_min_blobs {
         pbfhogg::getparents::getparents_with_min_blobs(
-            file, output, &id_set, &opts, write, overrides, min_blobs, host,
+            input, output, &id_set, &opts, write, overrides, min_blobs, host,
         )?
     } else {
-        pbfhogg::getparents::getparents(file, output, &id_set, &opts, write, overrides, host)?
+        pbfhogg::getparents::getparents(input, output, &id_set, &opts, write, overrides, host)?
     };
     stats.write_summary(&mut host.diagnostics.summary_writer("getparents.summary"))?;
     Ok(())

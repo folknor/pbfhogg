@@ -596,12 +596,16 @@ pub(crate) fn dispatch_scan_arm<'a>(
 /// partially-indexed PBF is not detected up front, and each consuming site
 /// decides what a later unindexed blob means (some decode it on a fallback
 /// path, some stop with an error mid-run).
-pub fn has_indexdata(
-    path: &Path,
+///
+/// One open of `input`: a path is opened as it is, a pin through the pin
+/// (it does not pin a path itself, so a caller that opens the input again
+/// pins it first and passes the pin).
+pub fn has_indexdata<'a>(
+    input: impl Into<crate::read::input::InputSource<'a>>,
     direct_io: bool,
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<bool> {
-    Ok(probe_first_data_blob(path, direct_io, diagnostics)?.0)
+    Ok(probe_first_data_blob(input, direct_io, diagnostics)?.0)
 }
 
 /// Check if the first OsmData blob in a PBF has tagdata (`BlobHeader`

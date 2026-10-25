@@ -9,8 +9,6 @@
 //! node IDs are in the query (nothing to ref), and relation blobs when the
 //! query is empty of node/way/relation IDs.
 
-use std::path::Path;
-
 use super::getid::ElementIds;
 use super::{
     HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
@@ -21,6 +19,7 @@ use crate::blob::{BlobKind, decode_blob_to_headerblock};
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
 use crate::read::header_walker::{HeaderWalker, ScanArm};
+use crate::read::input::{InputSource, PinnedInput};
 use crate::reorder_buffer::ReorderBuffer;
 use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
 use crate::write::WriteOptions;
@@ -55,8 +54,16 @@ impl GetparentsStats {
 }
 
 /// Find parent ways/relations referencing the given IDs.
-pub fn getparents(
-    input: &Path,
+///
+/// Every route opens the input more than once (the indexdata probe, the
+/// arm estimate on indexed input, then the header walker or the streaming
+/// reader), so the input must be a regular file or a block device
+/// (`InvalidArgument` otherwise) and is pinned for the run before any of
+/// them (see [`PinnedInput`] and [`InputSource::pin`]); a caller may pin it
+/// first and pass the pin. Where a later open cannot reach the pinned file,
+/// an input replaced mid-run fails with `InputReplaced`.
+pub fn getparents<'a>(
+    input: impl Into<InputSource<'a>>,
     output: crate::output::Output,
     ids: &ElementIds,
     opts: &GetparentsOptions,
@@ -72,8 +79,8 @@ pub fn getparents(
 
 /// [`getparents`] writing to a borrowed output it does not publish.
 #[hotpath::measure]
-pub(crate) fn getparents_to(
-    input: &Path,
+pub(crate) fn getparents_to<'a>(
+    input: impl Into<InputSource<'a>>,
     output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetparentsOptions,
@@ -94,10 +101,11 @@ pub(crate) fn getparents_to(
     Ok(stats)
 }
 
-/// Test instrument for exercising the FullScan arm on small fixtures.
+/// Test instrument for exercising the FullScan arm on small fixtures. The
+/// input is pinned as in [`getparents`].
 #[allow(clippy::too_many_arguments)]
-pub fn getparents_with_min_blobs(
-    input: &Path,
+pub fn getparents_with_min_blobs<'a>(
+    input: impl Into<InputSource<'a>>,
     output: crate::output::Output,
     ids: &ElementIds,
     opts: &GetparentsOptions,
@@ -116,8 +124,8 @@ pub fn getparents_with_min_blobs(
 /// [`getparents_with_min_blobs`] writing to a borrowed output it does not publish.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn getparents_with_min_blobs_to(
-    input: &Path,
+pub(crate) fn getparents_with_min_blobs_to<'a>(
+    input: impl Into<InputSource<'a>>,
     output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetparentsOptions,
@@ -130,12 +138,12 @@ pub(crate) fn getparents_with_min_blobs_to(
         .map(|(_, stats)| stats)
 }
 
-/// Dispatch on the blob-count estimate, then run the selected arm. Returns
-/// the arm alongside the stats so tests can inject `min_blobs` and assert
-/// which arm auto-dispatch actually executed.
+/// Pin the input, dispatch on the blob-count estimate, then run the
+/// selected arm. Returns the arm alongside the stats so tests can inject
+/// `min_blobs` and assert which arm auto-dispatch actually executed.
 #[allow(clippy::too_many_arguments)]
-fn getparents_dispatched(
-    input: &Path,
+fn getparents_dispatched<'a>(
+    input: impl Into<InputSource<'a>>,
     output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetparentsOptions,
@@ -144,6 +152,17 @@ fn getparents_dispatched(
     min_blobs: u64,
     host: &crate::host::Host,
 ) -> Result<(ScanArm, GetparentsStats)> {
+    // Every route opens the input more than once, each open its own open
+    // file description: the indexdata probe, the arm estimate (indexed
+    // input only), then the header walker (whose descriptor serves the
+    // classify pool) or the streaming reader. Each is derived from this one
+    // pin, so a file renamed over the input mid-run cannot be read partly
+    // from each: where `/proc/self/fd` reopens the pin every open reaches
+    // the pinned file, otherwise on Unix a replaced input fails the run
+    // (`PinnedInput` says what it does off Unix). Taken before any other
+    // open of the input; a caller's pin is used as it is.
+    let pin = input.into().pin(host)?;
+    let input = &pin;
     let arm = super::dispatch_scan_arm(
         input,
         super::has_indexdata(input, write.direct_reads, &host.diagnostics)?,
@@ -156,7 +175,7 @@ fn getparents_dispatched(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn getparents_with_arm(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetparentsOptions,
@@ -186,7 +205,7 @@ fn needed_blob_kinds(ids: &ElementIds, opts: &GetparentsOptions) -> (bool, bool,
 
 #[allow(clippy::too_many_lines)]
 fn getparents_walker(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetparentsOptions,
@@ -249,7 +268,7 @@ fn getparents_walker(
     let shared_file = walker.input();
     drop(walker);
 
-    let header = header_block.ok_or_else(|| crate::error::new_missing_header(input))?;
+    let header = header_block.ok_or_else(|| crate::error::new_missing_header(input.path()))?;
 
     crate::debug::emit_counter("getparents_schedule_blobs", schedule.len());
     crate::debug::emit_counter("getparents_blobs_skipped", blobs_skipped);
@@ -352,7 +371,7 @@ fn getparents_walker(
 }
 
 fn getparents_pipelined(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetparentsOptions,
@@ -512,6 +531,12 @@ mod tests {
     use crate::writer::{Compression, PbfWriter};
     use crate::{Element, ElementReader, HeaderOverrides, MemberId};
 
+    /// `path` pinned, for driving an arm directly.
+    fn pinned(path: &std::path::Path) -> crate::read::input::PinnedInput {
+        crate::read::input::PinnedInput::pin(path, &crate::host::Host::for_tests())
+            .expect("pin input")
+    }
+
     /// Write a node block, then optionally a way block, which can be written
     /// without indexdata to model a partially indexed input.
     fn write_blocks(
@@ -583,7 +608,7 @@ mod tests {
         )
         .expect("stage output");
         getparents_with_arm(
-            &input,
+            &pinned(&input),
             &staged,
             &query,
             &opts,
@@ -616,7 +641,7 @@ mod tests {
             )
             .expect("stage output");
             getparents_with_arm(
-                input,
+                &pinned(input),
                 &staged,
                 &query,
                 &opts,
@@ -794,7 +819,7 @@ mod tests {
         )
         .expect("stage output");
         let stats = getparents_with_arm(
-            input,
+            &pinned(input),
             &staged,
             &query,
             &GetparentsOptions { add_self },

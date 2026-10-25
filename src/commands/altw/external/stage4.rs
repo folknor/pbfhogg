@@ -17,10 +17,11 @@ use super::super::{
     HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
     flush_local, writer_from_header,
 };
+use crate::ElementKind;
 use crate::counters::record_max;
 use crate::error::Error;
 use crate::idset::IdSet;
-use crate::owned::{dense_node_metadata, element_metadata};
+use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
 
 use super::blob_meta::BlobMeta;
 
@@ -833,7 +834,7 @@ fn assemble_block(
                     || relation_member_node_ids.is_some_and(|ids| ids.get(dn.id()))
                 {
                     ensure_node_capacity_local(bb, output)?;
-                    let meta = dense_node_metadata(dn);
+                    let meta = dense_node_metadata(dn)?;
                     bb.add_node(
                         dn.id(),
                         dn.decimicro_lat(),
@@ -854,7 +855,7 @@ fn assemble_block(
                     || relation_member_node_ids.is_some_and(|ids| ids.get(n.id()))
                 {
                     ensure_node_capacity_local(bb, output)?;
-                    let meta = element_metadata(&n.info());
+                    let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
                     bb.add_node(
                         n.id(),
                         n.decimicro_lat(),
@@ -885,12 +886,8 @@ fn assemble_block(
             }
             Element::Relation(r) => {
                 ensure_relation_capacity_local(bb, output)?;
-                members_buf.clear();
-                members_buf.extend(r.members().map(|m| MemberData {
-                    id: m.id,
-                    role: m.role().unwrap_or(""),
-                }));
-                let meta = element_metadata(&r.info());
+                relation_members_into(r, &mut members_buf)?;
+                let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                 bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
                 stats.relations_written += 1;
             }

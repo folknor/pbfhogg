@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
-use crate::{Element, PrimitiveBlock};
+use crate::{Element, ElementKind, PrimitiveBlock};
 
 use super::super::{
     HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
@@ -21,7 +21,7 @@ use super::common::{
 };
 use super::{ExtractStats, Region};
 
-use crate::owned::{dense_node_metadata, element_metadata};
+use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
 
 /// Try single-pass multi-extract: read the PBF once, classify each element
 /// against all N regions, write to N output files. Returns `None` to fall
@@ -526,7 +526,7 @@ pub(super) fn try_extract_multi_single_pass(
                     // the overwhelmingly common no-region-matches node.
                     Element::DenseNode(dn) if bbox_node_ids.iter().any(|s| s.get(dn.id())) => {
                         let id = dn.id();
-                        let meta = dense_node_metadata(dn);
+                        let meta = dense_node_metadata(dn)?;
                         for i in 0..n {
                             if bbox_node_ids[i].get(id) {
                                 ensure_node_capacity_local(&mut bbs[i], &mut output[i])?;
@@ -543,7 +543,7 @@ pub(super) fn try_extract_multi_single_pass(
                     }
                     Element::Node(nd) if bbox_node_ids.iter().any(|s| s.get(nd.id())) => {
                         let id = nd.id();
-                        let meta = element_metadata(&nd.info());
+                        let meta = element_metadata(ElementKind::Node, id, &nd.info())?;
                         for i in 0..n {
                             if bbox_node_ids[i].get(id) {
                                 ensure_node_capacity_local(&mut bbs[i], &mut output[i])?;
@@ -639,7 +639,7 @@ pub(super) fn try_extract_multi_single_pass(
                     }
                     scratch.clear();
                     scratch.extend(w.refs());
-                    let meta = element_metadata(&w.info());
+                    let meta = element_metadata(ElementKind::Way, wid, &w.info())?;
                     for i in 0..n {
                         if matched_way_ids[i].get(wid) {
                             ensure_way_capacity_local(&mut bbs[i], &mut output[i])?;
@@ -701,12 +701,8 @@ pub(super) fn try_extract_multi_single_pass(
                     if !matched_relation_ids.iter().any(|s| s.get(rid)) {
                         continue;
                     }
-                    members_buf.clear();
-                    members_buf.extend(r.members().map(|m| MemberData {
-                        id: m.id,
-                        role: m.role().unwrap_or(""),
-                    }));
-                    let meta = element_metadata(&r.info());
+                    relation_members_into(r, &mut members_buf)?;
+                    let meta = element_metadata(ElementKind::Relation, rid, &r.info())?;
                     for i in 0..n {
                         if matched_relation_ids[i].get(rid) {
                             ensure_relation_capacity_local(&mut bbs[i], &mut output[i])?;

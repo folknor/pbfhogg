@@ -12,7 +12,7 @@ use super::{
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::error::Error;
 use crate::file_writer::FileWriter;
-use crate::owned::{dense_node_metadata, element_metadata};
+use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
 use crate::read::header_walker::ScanArm;
 use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
 use crate::write::WriteOptions;
@@ -1227,7 +1227,7 @@ fn process_block(
                 let strip = strip_tags
                     && dep_node_ids.is_some_and(|deps| deps.get(dn.id()))
                     && !ids.node_ids.get(dn.id());
-                let meta = dense_node_metadata(dn);
+                let meta = dense_node_metadata(dn)?;
                 if strip {
                     bb.add_node(
                         dn.id(),
@@ -1252,7 +1252,7 @@ fn process_block(
                 let strip = strip_tags
                     && dep_node_ids.is_some_and(|deps| deps.get(n.id()))
                     && !ids.node_ids.get(n.id());
-                let meta = element_metadata(&n.info());
+                let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
                 if strip {
                     bb.add_node(
                         n.id(),
@@ -1276,18 +1276,14 @@ fn process_block(
                 ensure_way_capacity_local(bb, output)?;
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
-                let meta = element_metadata(&w.info());
+                let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
                 bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
                 ways += 1;
             }
             Element::Relation(r) => {
                 ensure_relation_capacity_local(bb, output)?;
-                members_buf.clear();
-                members_buf.extend(r.members().map(|m| MemberData {
-                    id: m.id,
-                    role: m.role().unwrap_or(""),
-                }));
-                let meta = element_metadata(&r.info());
+                relation_members_into(r, &mut members_buf)?;
+                let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                 bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
                 relations += 1;
             }

@@ -11,7 +11,7 @@ use std::str::FromStr;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::tunables::{AUTO_ANON_HEADROOM_BYTES, AUTO_STORE_BUDGET_PCT};
 use crate::write::WriteOptions;
-use crate::{Element, ElementReader, MemberId, PrimitiveBlock};
+use crate::{Element, ElementKind, ElementReader, MemberId, PrimitiveBlock};
 
 use super::{
     HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
@@ -74,7 +74,6 @@ fn altw_output_facts(inject_prepass: bool) -> crate::commands::output_header::Ou
 /// Relations need no edits; nodes can bypass filtering only when all are kept.
 /// Unknown kinds must decode, and ways always need location splicing.
 fn blob_is_passthrough(kind: Option<crate::ElementKind>, keep_untagged_nodes: bool) -> bool {
-    use crate::ElementKind;
     matches!(kind, Some(ElementKind::Relation))
         || matches!(kind, Some(ElementKind::Node) if keep_untagged_nodes)
 }
@@ -1151,7 +1150,7 @@ fn write_output_decode_all(
 // ---------------------------------------------------------------------------
 
 use super::flush_local;
-use crate::owned::{dense_node_metadata, element_metadata};
+use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
 
 /// Process a single `PrimitiveBlock`, writing elements into the thread-local
 /// `BlockBuilder` and flushing complete blocks into `output`.
@@ -1190,7 +1189,7 @@ fn process_block(
                     || relation_member_node_ids.is_some_and(|ids| ids.get(dn.id()))
                 {
                     ensure_node_capacity_local(bb, output)?;
-                    let meta = dense_node_metadata(dn);
+                    let meta = dense_node_metadata(dn)?;
                     bb.add_node(
                         dn.id(),
                         dn.decimicro_lat(),
@@ -1211,7 +1210,7 @@ fn process_block(
                     || relation_member_node_ids.is_some_and(|ids| ids.get(n.id()))
                 {
                     ensure_node_capacity_local(bb, output)?;
-                    let meta = element_metadata(&n.info());
+                    let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
                     bb.add_node(
                         n.id(),
                         n.decimicro_lat(),
@@ -1238,18 +1237,14 @@ fn process_block(
                         }
                     }
                 }
-                let meta = element_metadata(&w.info());
+                let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
                 bb.add_way_with_locations(w.id(), w.tags(), refs_buf, locations_buf, meta.as_ref());
                 stats.ways_written += 1;
             }
             Element::Relation(r) => {
                 ensure_relation_capacity_local(bb, output)?;
-                members_buf.clear();
-                members_buf.extend(r.members().map(|m| MemberData {
-                    id: m.id,
-                    role: m.role().unwrap_or(""),
-                }));
-                let meta = element_metadata(&r.info());
+                relation_members_into(r, &mut members_buf)?;
+                let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                 bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
                 stats.relations_written += 1;
             }

@@ -314,10 +314,16 @@ impl<'a> DenseNodeInfo<'a> {
     }
 
     /// Returns the user name.
+    ///
+    /// A string index past the block's string table is
+    /// `StringtableIndexOutOfBounds`; a negative one is a wire-format error,
+    /// as for `RelMember::role`.
     #[allow(clippy::cast_sign_loss)]
     pub fn user(&self) -> Result<&'a str> {
         if self.user_sid < 0 {
-            return Err(crate::error::new_stringtable_index_out_of_bounds(0));
+            return Err(crate::error::new_wire_error(
+                "dense node info has negative user string index",
+            ));
         }
         str_from_stringtable(self.block, self.user_sid as usize)
     }

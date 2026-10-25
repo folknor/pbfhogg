@@ -89,7 +89,7 @@ use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::owned::{
     OwnedElement, OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata,
-    read_dense_node, read_node, read_relation, read_way,
+    read_dense_node, read_node, read_relation, read_way, relation_members_into,
 };
 use crate::read::raw_frame::{frame_location, read_raw_frame};
 use crate::write::WriteOptions;
@@ -1299,7 +1299,7 @@ fn worker_decode_kind(
             match (&element, kind) {
                 (Element::DenseNode(dn), ElementKind::Node) => {
                     ensure_node_capacity_local(&mut bb, &mut output)?;
-                    let meta = dense_node_metadata(dn);
+                    let meta = dense_node_metadata(dn)?;
                     bb.add_node(
                         dn.id(),
                         dn.decimicro_lat(),
@@ -1310,7 +1310,7 @@ fn worker_decode_kind(
                 }
                 (Element::Node(n), ElementKind::Node) => {
                     ensure_node_capacity_local(&mut bb, &mut output)?;
-                    let meta = element_metadata(&n.info());
+                    let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
                     bb.add_node(
                         n.id(),
                         n.decimicro_lat(),
@@ -1323,7 +1323,7 @@ fn worker_decode_kind(
                     ensure_way_capacity_local(&mut bb, &mut output)?;
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
-                    let meta = element_metadata(&w.info());
+                    let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
                     // add_way drops inline LOW coords - the documented
                     // behaviour for the decode path regardless of
                     // --strip-locations.
@@ -1331,12 +1331,8 @@ fn worker_decode_kind(
                 }
                 (Element::Relation(r), ElementKind::Relation) => {
                     ensure_relation_capacity_local(&mut bb, &mut output)?;
-                    members_buf.clear();
-                    members_buf.extend(r.members().map(|m| MemberData {
-                        id: m.id,
-                        role: m.role().unwrap_or(""),
-                    }));
-                    let meta = element_metadata(&r.info());
+                    relation_members_into(r, &mut members_buf)?;
+                    let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                     bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
                 }
                 _ => {}
@@ -1351,10 +1347,10 @@ fn worker_decode_kind(
             }
         } else {
             match (&element, &mut tail) {
-                (Element::DenseNode(dn), KindPayload::Nodes(v)) => v.push(read_dense_node(dn)),
-                (Element::Node(n), KindPayload::Nodes(v)) => v.push(read_node(n)),
-                (Element::Way(w), KindPayload::Ways(v)) => v.push(read_way(w)),
-                (Element::Relation(r), KindPayload::Relations(v)) => v.push(read_relation(r)),
+                (Element::DenseNode(dn), KindPayload::Nodes(v)) => v.push(read_dense_node(dn)?),
+                (Element::Node(n), KindPayload::Nodes(v)) => v.push(read_node(n)?),
+                (Element::Way(w), KindPayload::Ways(v)) => v.push(read_way(w)?),
+                (Element::Relation(r), KindPayload::Relations(v)) => v.push(read_relation(r)?),
                 _ => {}
             }
         }

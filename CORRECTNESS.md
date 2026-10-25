@@ -65,12 +65,14 @@ streaming path's owned conversion errors, and `digest` refuses the file. The
 one exception is diff's byte-equal blob fast path, which reports two
 byte-identical blobs as common without decoding either.
 
-Member roles are different at the API level - `RelMember::role` returns a
-`Result` - but most command consumers outside diff collapse the error with
-`role().unwrap_or("")`: the owned-element conversions and the re-encoding
-paths (`cat`, `repack`, `extract`, `tags-filter`, `getid`, `getparents`,
-`time-filter`, `altw`, `degrade`, the OSC writer). A bad role index is
-rewritten there as an empty role. `inspect` shows it as `<invalid>`.
+Member roles and user names are not covered by this gap. `RelMember::role`
+and the `user` accessors return a `Result`, and every path that writes them
+propagates it: the re-encoding commands (through `relation_members_into`,
+`element_metadata` and `dense_node_metadata` in `src/owned.rs`, which the
+owned-element conversions share) and the OSC writer refuse a bad role or user
+index with an error naming the element, rather than writing an empty string.
+`inspect` shows a bad role as `<invalid>`; `build-geocode-index` still reads a
+bad role as empty when classifying boundary members.
 
 `validate_groups_strict` (`src/read/block.rs`) does not close the gap: it is a
 structural pass that checks array framing and parallel-array lengths without
@@ -93,9 +95,14 @@ going through the infallible tag iterators or `role().unwrap_or("")`. Library
 users who need the same strictness should do likewise, and treat `tags()` as
 best-effort on untrusted input.
 
-**Fix approach for the remaining consumers (if ever needed):** move each
-re-encoding path to `tags_checked()` and a propagated role error; or resolve
-every index in `validate_groups_strict` behind an opt-in strictness flag.
+**Fix approach for the remaining consumers (if ever needed):** the re-encoding
+paths stream `tags()` straight into `BlockBuilder::add_*`, which takes an
+infallible iterator. A builder input that consumes `tags_checked()` once and
+propagates its error would refuse a bad tag without a second lookup or a
+validation pre-pass; the alternative is to resolve every index in
+`validate_groups_strict` behind an opt-in strictness flag. Either touches the
+hottest per-element path of every re-encoding command, so it is a measured
+change.
 
 ## Osmosis -1 sentinel for absent metadata
 

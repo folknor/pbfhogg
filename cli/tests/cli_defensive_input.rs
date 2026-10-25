@@ -530,3 +530,147 @@ fn bench_commands_report_unrecognised_indexdata() {
         );
     }
 }
+
+/// Which string reference of the fixture points past its block's string
+/// table.
+#[derive(Clone, Copy)]
+enum BadString {
+    /// Node 1's `Info.user_sid`.
+    User,
+    /// The role of relation 1's first member.
+    Role,
+}
+
+fn varint(mut value: u64, out: &mut Vec<u8>) {
+    while value >= 128 {
+        out.push(u8::try_from(value & 127).expect("seven bits") | 128);
+        value >>= 7;
+    }
+    out.push(u8::try_from(value).expect("seven bits"));
+}
+
+fn varint_field(field: u64, value: u64, out: &mut Vec<u8>) {
+    varint(field * 8, out);
+    varint(value, out);
+}
+
+fn bytes_field(field: u64, bytes: &[u8], out: &mut Vec<u8>) {
+    varint(field * 8 + 2, out);
+    varint(u64::try_from(bytes.len()).expect("length"), out);
+    out.extend_from_slice(bytes);
+}
+
+/// An element `Info`: version 1, timestamp 100 s (default granularity),
+/// changeset 1, uid 1 and user string index `user_sid`.
+fn info(user_sid: u64) -> Vec<u8> {
+    let mut info = Vec::new();
+    for (field, value) in [(1, 1), (2, 100), (3, 1), (4, 1), (5, user_sid)] {
+        varint_field(field, value, &mut info);
+    }
+    info
+}
+
+/// A sorted PBF with a plain node 1 and a relation 1 (member node 1), each
+/// in its own block whose string table holds only the empty string, so any
+/// string index but 0 is past it. `bad` picks the reference that is 9.
+fn write_bad_string_pbf(path: &Path, bad: BadString, historical: bool) {
+    let mut writer = PbfWriter::new(
+        std::fs::File::create(path).expect("create input"),
+        Compression::default(),
+    );
+    let mut header = block_builder::HeaderBuilder::new().sorted();
+    if historical {
+        header = header.historical();
+    }
+    writer
+        .write_header(&header.build().expect("header"))
+        .expect("write header");
+    let user_sid = if matches!(bad, BadString::User) { 9 } else { 0 };
+    let role_sid: u8 = if matches!(bad, BadString::Role) { 9 } else { 0 };
+
+    let mut node = Vec::new();
+    varint_field(1, 2, &mut node); // id 1, zigzag
+    bytes_field(4, &info(user_sid), &mut node);
+    varint_field(8, u64::try_from(LAT).expect("lat") * 2, &mut node);
+    varint_field(9, u64::try_from(LON).expect("lon") * 2, &mut node);
+    let mut group = Vec::new();
+    bytes_field(1, &node, &mut group);
+    let mut block = Vec::new();
+    bytes_field(1, &[10, 0], &mut block); // string table: just ""
+    bytes_field(2, &group, &mut block);
+    writer.write_primitive_block(&block).expect("node block");
+
+    let mut relation = Vec::new();
+    varint_field(1, 1, &mut relation); // id 1
+    bytes_field(4, &info(0), &mut relation);
+    bytes_field(8, &[role_sid], &mut relation); // roles_sid
+    bytes_field(9, &[2], &mut relation); // memids: node 1, zigzag delta
+    bytes_field(10, &[0], &mut relation); // types: node
+    let mut group = Vec::new();
+    bytes_field(4, &relation, &mut group);
+    let mut block = Vec::new();
+    bytes_field(1, &[10, 0], &mut block);
+    bytes_field(2, &group, &mut block);
+    writer
+        .write_primitive_block(&block)
+        .expect("relation block");
+    writer.flush().expect("flush");
+}
+
+fn assert_refused(out: &crate::invoker::CliOutput, needle: &str, context: &str) {
+    let stderr = out.stderr_str();
+    assert!(
+        !out.status.success(),
+        "{context}: a bad string index must be refused, not re-encoded as \"\"; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(needle),
+        "{context}: expected `{needle}`; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at"),
+        "{context}: stderr:\n{stderr}"
+    );
+}
+
+/// The re-encoding conversions refuse a user or role string index past the
+/// block's string table instead of writing an empty user or role: on the
+/// borrowed path (time-filter snapshot, cat --clean), the owned path
+/// (time-filter history) and even when the user is being cleaned away.
+#[test]
+fn bad_user_and_role_string_indices_are_refused_on_reencode() {
+    let dir = crate::common::test_scratch();
+    let user_needle = "node 1: user name string index 9";
+    let role_needle = "relation 1 member 0: role string index 9";
+    for (bad, needle) in [
+        (BadString::User, user_needle),
+        (BadString::Role, role_needle),
+    ] {
+        for historical in [false, true] {
+            let input = dir.path().join("bad-string.osm.pbf");
+            write_bad_string_pbf(&input, bad, historical);
+            let out = CliInvoker::new()
+                .arg("time-filter")
+                .arg(&input)
+                .arg("-o")
+                .arg(dir.path().join("time-filter.osm.pbf"))
+                .arg("250")
+                .run();
+            assert_refused(
+                &out,
+                needle,
+                &format!("time-filter historical={historical}"),
+            );
+        }
+        let input = dir.path().join("bad-string.osm.pbf");
+        write_bad_string_pbf(&input, bad, false);
+        let out = CliInvoker::new()
+            .arg("cat")
+            .arg(&input)
+            .arg("-o")
+            .arg(dir.path().join("cat.osm.pbf"))
+            .args(["--clean", "user"])
+            .run();
+        assert_refused(&out, needle, "cat --clean user");
+    }
+}

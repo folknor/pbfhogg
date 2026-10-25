@@ -585,7 +585,7 @@ pub(super) struct ExtractPass2IdSets<'a> {
 }
 
 use super::super::clean_metadata;
-use crate::owned::{dense_node_metadata, element_metadata};
+use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
 
 /// Process a single block for Pass 2 of complete-ways: write elements whose IDs
 /// were collected in Pass 1. Uses thread-local BlockBuilder and output buffer.
@@ -630,7 +630,7 @@ pub(super) fn extract_block_pass2(
                 let from_way = ids.all_way_node_ids.get(dn.id());
                 if in_bbox || from_way {
                     ensure_node_capacity_local(bb, output)?;
-                    let meta = clean_metadata(dense_node_metadata(dn), clean);
+                    let meta = clean_metadata(dense_node_metadata(dn)?, clean);
                     bb.add_node(
                         dn.id(),
                         dn.decimicro_lat(),
@@ -650,7 +650,10 @@ pub(super) fn extract_block_pass2(
                 let from_way = ids.all_way_node_ids.get(n.id());
                 if in_bbox || from_way {
                     ensure_node_capacity_local(bb, output)?;
-                    let meta = clean_metadata(element_metadata(&n.info()), clean);
+                    let meta = clean_metadata(
+                        element_metadata(crate::ElementKind::Node, n.id(), &n.info())?,
+                        clean,
+                    );
                     bb.add_node(
                         n.id(),
                         n.decimicro_lat(),
@@ -669,18 +672,20 @@ pub(super) fn extract_block_pass2(
                 ensure_way_capacity_local(bb, output)?;
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
-                let meta = clean_metadata(element_metadata(&w.info()), clean);
+                let meta = clean_metadata(
+                    element_metadata(crate::ElementKind::Way, w.id(), &w.info())?,
+                    clean,
+                );
                 bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
                 stats.ways_written += 1;
             }
             Element::Relation(r) if emit_rels && ids.matched_relation_ids.get(r.id()) => {
                 ensure_relation_capacity_local(bb, output)?;
-                members_buf.clear();
-                members_buf.extend(r.members().map(|m| MemberData {
-                    id: m.id,
-                    role: m.role().unwrap_or(""),
-                }));
-                let meta = clean_metadata(element_metadata(&r.info()), clean);
+                relation_members_into(r, &mut members_buf)?;
+                let meta = clean_metadata(
+                    element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?,
+                    clean,
+                );
                 bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
                 stats.relations_written += 1;
             }

@@ -264,6 +264,21 @@ impl Ord for OwnedRelation {
 // ---------------------------------------------------------------------------
 
 impl OwnedMetadata {
+    /// Own a borrowed [`Metadata`]: the one field mapping the owned
+    /// conversions share with [`element_metadata`] and
+    /// [`dense_node_metadata`], so an owned element and a borrowed re-encode
+    /// of the same input write the same metadata.
+    fn from_borrowed(meta: Metadata<'_>) -> Self {
+        Self {
+            version: meta.version,
+            timestamp: meta.timestamp,
+            changeset: meta.changeset,
+            uid: meta.uid,
+            user: meta.user.to_owned(),
+            visible: meta.visible,
+        }
+    }
+
     pub(crate) fn as_borrowed(&self) -> Metadata<'_> {
         Metadata {
             version: self.version,
@@ -314,37 +329,112 @@ fn map_sentinel(value: i64) -> i64 {
     if value == -1 { 0 } else { value }
 }
 
-/// Extract [`Metadata`] from an [`Info`](crate::Info) (Node/Way/Relation).
+/// Extract [`Metadata`] from the [`Info`](crate::Info) of the Node, Way or
+/// Relation `kind` `id`, for re-encoding.
 ///
-/// Returns `None` if the info block has no version. On `user()` error (string
-/// table corruption), defaults to empty string.
-pub(crate) fn element_metadata<'a>(info: &crate::Info<'a>) -> Option<Metadata<'a>> {
-    info.version().map(|v| Metadata {
-        version: v,
+/// Returns `None` if the info block has no version: the element is then
+/// re-encoded without metadata, whatever other fields its `Info` carries.
+/// Absent timestamp, changeset and uid become 0, the block builder's
+/// normalisation for a field it cannot leave out of a written `Info`.
+///
+/// A user name that is written is resolved, never substituted: a user string
+/// index past the block's string table, or negative, is an error naming the
+/// element and the index, not an empty user. Only the metadata this returns
+/// is resolved - a versionless `Info` is dropped whole, so its user is never
+/// looked up - and the refusal stands even where the caller later clears the
+/// user (`cat --clean user`), since the input is corrupt either way.
+pub(crate) fn element_metadata<'a>(
+    kind: crate::ElementKind,
+    id: i64,
+    info: &crate::Info<'a>,
+) -> Result<Option<Metadata<'a>>> {
+    let Some(version) = info.version() else {
+        return Ok(None);
+    };
+    let user = match info.user() {
+        None => "",
+        Some(user) => user.map_err(|e| bad_user(e, kind, id, info.raw_user_sid()))?,
+    };
+    Ok(Some(Metadata {
+        version,
         timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
         changeset: info.changeset().unwrap_or(0),
         uid: info.uid().unwrap_or(0),
-        user: info.user().and_then(std::result::Result::ok).unwrap_or(""),
+        user,
         visible: info.visible(),
-    })
+    }))
 }
 
-/// Extract [`Metadata`] from a [`DenseNode`](crate::DenseNode).
+/// Extract [`Metadata`] from a [`DenseNode`](crate::DenseNode), for
+/// re-encoding.
 ///
-/// Returns `None` if the node has no info block. On `user()` error (string
-/// table corruption), defaults to empty string - consistent with the
-/// Node/Way/Relation path.
-pub(crate) fn dense_node_metadata<'a>(dn: &'a crate::DenseNode<'a>) -> Option<Metadata<'a>> {
-    dn.info()
-        .filter(|info| info.version() != -1)
-        .map(|info| Metadata {
-            version: info.version(),
-            timestamp: info.milli_timestamp() / 1000,
-            changeset: map_sentinel(info.changeset()),
-            uid: info.uid(),
-            user: info.user().unwrap_or(""),
-            visible: info.visible(),
-        })
+/// Returns `None` if the node has no info block, or carries the Osmosis -1
+/// "absent" version. A version of 0 keeps its metadata. The user name is
+/// resolved as in [`element_metadata`]: a bad user string index is an error,
+/// not an empty user.
+pub(crate) fn dense_node_metadata<'a>(
+    dn: &'a crate::DenseNode<'a>,
+) -> Result<Option<Metadata<'a>>> {
+    let Some(info) = dn.info().filter(|info| info.version() != -1) else {
+        return Ok(None);
+    };
+    let user = info.user().map_err(|e| {
+        bad_user(
+            e,
+            crate::ElementKind::Node,
+            dn.id(),
+            Some(info.raw_user_sid()),
+        )
+    })?;
+    Ok(Some(Metadata {
+        version: info.version(),
+        timestamp: info.milli_timestamp() / 1000,
+        changeset: map_sentinel(info.changeset()),
+        uid: info.uid(),
+        user,
+        visible: info.visible(),
+    }))
+}
+
+/// Name the element and the string index on a failed user lookup.
+#[cold]
+#[inline(never)]
+fn bad_user(
+    err: crate::Error,
+    kind: crate::ElementKind,
+    id: i64,
+    sid: Option<i32>,
+) -> crate::Error {
+    let sid = sid.map_or_else(String::new, |sid| format!(" string index {sid}"));
+    err.context(format!("{} {id}: user name{sid}", kind.as_str()))
+}
+
+/// Resolve every member of `r` into `buf`, which is cleared first. A role
+/// string index past the block's string table, or negative, is an error
+/// naming the relation and the member's position, not an empty role. On an
+/// error `buf` holds the members before the bad one; the caller propagates.
+pub(crate) fn relation_members_into<'a>(
+    r: &crate::Relation<'a>,
+    buf: &mut Vec<MemberData<'a>>,
+) -> Result<()> {
+    buf.clear();
+    for (position, m) in r.members().enumerate() {
+        let role = m
+            .role()
+            .map_err(|e| bad_role(e, r.id(), position, m.role_sid))?;
+        buf.push(MemberData { id: m.id, role });
+    }
+    Ok(())
+}
+
+/// Name the relation, the member position and the string index on a failed
+/// role lookup.
+#[cold]
+#[inline(never)]
+fn bad_role(err: crate::Error, id: i64, position: usize, sid: i32) -> crate::Error {
+    err.context(format!(
+        "relation {id} member {position}: role string index {sid}"
+    ))
 }
 
 /// Extract [`RawMetadata`] from an [`Info`](crate::Info), preserving the raw
@@ -379,8 +469,14 @@ pub(crate) fn dense_node_raw_metadata(dn: &crate::DenseNode<'_>) -> Option<RawMe
 // Read functions - convert parsed elements to owned
 // ---------------------------------------------------------------------------
 
-pub(crate) fn read_dense_node(dn: &crate::DenseNode<'_>) -> OwnedNode {
-    OwnedNode {
+// The metadata of every owned conversion comes from `element_metadata` /
+// `dense_node_metadata`, so an owned re-encode and a borrowed one write the
+// same metadata and refuse the same bad user name. Tags still go through the
+// infallible tag iterators: see CORRECTNESS.md "Tag iterators end early on an
+// out-of-range string index".
+
+pub(crate) fn read_dense_node(dn: &crate::DenseNode<'_>) -> Result<OwnedNode> {
+    Ok(OwnedNode {
         id: dn.id(),
         decimicro_lat: dn.decimicro_lat(),
         decimicro_lon: dn.decimicro_lon(),
@@ -390,31 +486,15 @@ pub(crate) fn read_dense_node(dn: &crate::DenseNode<'_>) -> OwnedNode {
             .collect(),
         // Dense nodes use -1 as "no metadata" sentinel (Osmosis convention).
         // Non-dense elements normalize this at parse time in WireInfo::parse;
-        // dense nodes check it here to avoid adding branches to the hot
-        // DenseNodeIter path. See CORRECTNESS.md "Osmosis -1 sentinel".
-        metadata: dn.info().and_then(|info| {
-            if info.version() == -1 {
-                return None;
-            }
-            Some(OwnedMetadata {
-                version: info.version(),
-                timestamp: info.milli_timestamp() / 1000,
-                changeset: if info.changeset() == -1 {
-                    0
-                } else {
-                    info.changeset()
-                },
-                uid: info.uid(),
-                user: info.user().unwrap_or("").to_owned(),
-                visible: info.visible(),
-            })
-        }),
-    }
+        // dense nodes check it in `dense_node_metadata` to avoid adding
+        // branches to the hot DenseNodeIter path. See CORRECTNESS.md
+        // "Osmosis -1 sentinel".
+        metadata: dense_node_metadata(dn)?.map(OwnedMetadata::from_borrowed),
+    })
 }
 
-pub(crate) fn read_node(n: &crate::Node<'_>) -> OwnedNode {
-    let info = n.info();
-    OwnedNode {
+pub(crate) fn read_node(n: &crate::Node<'_>) -> Result<OwnedNode> {
+    Ok(OwnedNode {
         id: n.id(),
         decimicro_lat: n.decimicro_lat(),
         decimicro_lon: n.decimicro_lon(),
@@ -422,24 +502,13 @@ pub(crate) fn read_node(n: &crate::Node<'_>) -> OwnedNode {
             .tags()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect(),
-        metadata: info.version().map(|v| OwnedMetadata {
-            version: v,
-            timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-            changeset: info.changeset().unwrap_or(0),
-            uid: info.uid().unwrap_or(0),
-            user: info
-                .user()
-                .and_then(std::result::Result::ok)
-                .unwrap_or("")
-                .to_owned(),
-            visible: info.visible(),
-        }),
-    }
+        metadata: element_metadata(crate::ElementKind::Node, n.id(), &n.info())?
+            .map(OwnedMetadata::from_borrowed),
+    })
 }
 
-pub(crate) fn read_way(w: &crate::Way<'_>) -> OwnedWay {
-    let info = w.info();
-    OwnedWay {
+pub(crate) fn read_way(w: &crate::Way<'_>) -> Result<OwnedWay> {
+    Ok(OwnedWay {
         id: w.id(),
         tags: w
             .tags()
@@ -447,19 +516,9 @@ pub(crate) fn read_way(w: &crate::Way<'_>) -> OwnedWay {
             .collect(),
         refs: w.refs().collect(),
         locations: Vec::new(),
-        metadata: info.version().map(|v| OwnedMetadata {
-            version: v,
-            timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-            changeset: info.changeset().unwrap_or(0),
-            uid: info.uid().unwrap_or(0),
-            user: info
-                .user()
-                .and_then(std::result::Result::ok)
-                .unwrap_or("")
-                .to_owned(),
-            visible: info.visible(),
-        }),
-    }
+        metadata: element_metadata(crate::ElementKind::Way, w.id(), &w.info())?
+            .map(OwnedMetadata::from_borrowed),
+    })
 }
 
 /// Like [`read_way`] but also captures the way's inline node coordinates
@@ -468,43 +527,41 @@ pub(crate) fn read_way(w: &crate::Way<'_>) -> OwnedWay {
 /// round-trip coordinates. If the source way carries no inline coordinates
 /// (empty `node_locations()`), `locations` stays empty and the write path
 /// falls back to the plain `add_way` encoding for that way.
-pub(crate) fn read_way_with_locations(w: &crate::Way<'_>) -> OwnedWay {
-    let mut way = read_way(w);
+pub(crate) fn read_way_with_locations(w: &crate::Way<'_>) -> Result<OwnedWay> {
+    let mut way = read_way(w)?;
     way.locations = w
         .node_locations()
         .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
         .collect();
-    way
+    Ok(way)
 }
 
-pub(crate) fn read_relation(r: &crate::Relation<'_>) -> OwnedRelation {
-    let info = r.info();
-    OwnedRelation {
+/// A bad role string index is an error naming the relation and member, as in
+/// [`relation_members_into`].
+pub(crate) fn read_relation(r: &crate::Relation<'_>) -> Result<OwnedRelation> {
+    let members = r
+        .members()
+        .enumerate()
+        .map(|(position, m)| {
+            let role = m
+                .role()
+                .map_err(|e| bad_role(e, r.id(), position, m.role_sid))?;
+            Ok(OwnedMember {
+                id: m.id,
+                role: role.to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(OwnedRelation {
         id: r.id(),
         tags: r
             .tags()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect(),
-        members: r
-            .members()
-            .map(|m| OwnedMember {
-                id: m.id,
-                role: m.role().unwrap_or("").to_owned(),
-            })
-            .collect(),
-        metadata: info.version().map(|v| OwnedMetadata {
-            version: v,
-            timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-            changeset: info.changeset().unwrap_or(0),
-            uid: info.uid().unwrap_or(0),
-            user: info
-                .user()
-                .and_then(std::result::Result::ok)
-                .unwrap_or("")
-                .to_owned(),
-            visible: info.visible(),
-        }),
-    }
+        members,
+        metadata: element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?
+            .map(OwnedMetadata::from_borrowed),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -657,7 +714,7 @@ mod tests {
     use crate::{Element, PrimitiveBlock};
 
     #[test]
-    fn corrupt_dense_user_sid_preserves_other_metadata() {
+    fn corrupt_dense_user_sid_is_refused() {
         let mut builder = BlockBuilder::new();
         builder.add_node(
             1,
@@ -685,13 +742,20 @@ mod tests {
         };
         dense.set_test_user_sid(i32::MAX);
 
-        let owned = read_dense_node(&dense);
-        let metadata = owned.metadata.expect("metadata must survive bad user sid");
-        assert_eq!(metadata.version, 7);
-        assert_eq!(metadata.timestamp, 11_000);
-        assert_eq!(metadata.changeset, 13);
-        assert_eq!(metadata.uid, 17);
-        assert_eq!(metadata.user, "");
-        assert!(!metadata.visible);
+        let Err(err) = read_dense_node(&dense) else {
+            panic!("a user string index past the string table must be refused, not emptied");
+        };
+        let report = err.report();
+        assert!(
+            report.contains("node 1: user name string index 2147483647"),
+            "the refusal names the element and the index: {report}"
+        );
+        assert!(
+            matches!(
+                err.kind(),
+                crate::ErrorKind::StringtableIndexOutOfBounds { .. }
+            ),
+            "{report}"
+        );
     }
 }

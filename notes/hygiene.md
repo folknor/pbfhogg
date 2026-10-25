@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-19. HYG-165
 20. HYG-166
 21. HYG-167 (after HYG-164 to HYG-166: it adds the text rule)
 22. HYG-151 (confirms the per-command list below)
@@ -629,6 +628,30 @@ The judgement calls already known, to be checked first:
     whose doc says why its `.ok()` arms are unreachable.
   - `DenseNodeIter::new`, `new_skip_metadata` and `empty` narrowed to
     `pub(super)`.
+- The re-encoding metadata and role lookups refuse a bad string index
+  instead of writing `""`: `element_metadata` (now taking the element's kind
+  and id) and `dense_node_metadata` return `Result`, the owned `read_*`
+  conversions derive their metadata from them, and one
+  `relation_members_into` replaces the per-command role loops. Sparred with
+  codex. Judgement calls, none measured:
+  - Every re-encoding command picked up the refusal, not only the four the
+    finding named (altw both backends, extract, multi-extract, tags-filter,
+    getid, getparents, repack, cat `--clean` too). Per kept element on those
+    hot paths the lookup already ran; what is new is a `Result` return and
+    its branch, which codex cautioned is not guaranteed free.
+  - Roles were widened in on the same reasoning (the lookup already ran);
+    the role loop is now a plain `for` with an enumerate and a push where it
+    was an `extend` over a `map`. Tags stay the documented CORRECTNESS.md
+    gap.
+  - `cat --clean user` refuses a bad user although it would drop it: the rule
+    is "refuse a bad user the conversion resolves", not "refuse only what is
+    printed" (the OSC writers' rule). A versionless `Info` is still dropped
+    whole without resolving its user.
+  - `Info::user` and `DenseNodeInfo::user` (public) report a negative index
+    as a wire error, where they reported out-of-bounds index 0.
+  - The sort overlap and cat dedupe extract callbacks became fallible; sort
+    and dedupe locate the error at the run's frame, time-filter history
+    routes it through its existing `flush_error` channel.
 
 ---
 
@@ -879,26 +902,6 @@ as the only loop with an `on_idle()` hook; a source-scan test that only
 `pipeline.rs` calls `pop_ready()` under `src/write/`.
 
 Reported by: write path.
-
-## HYG-165 - The owned conversions turn a bad user string into an empty one
-
-Anger: 8 - sort, `cat --dedupe`, degrade and time-filter re-encode through it.
-
-`owned.rs` `element_metadata` / `dense_node_metadata`:
-a `user()` string-table error becomes `""` and missing timestamps,
-changesets and uids become `0`, re-encoded by sort, `cat --dedupe`, degrade
-and time-filter. Documented, but opposite to decision 0004's defensive-input
-stance, and invisible.
-
-Recommendation (2026-10-25): the user lookup uses the checked accessor and
-refuses, as the borrowed OSC writers already do since the unindexed-diff
-change; the four commands pick the refusal up through this one API (new
-refusal, CHANGELOG line; the existing fault test flips to assert the error).
-Absent fields becoming `0` stay: that is the block builder's documented
-normalisation (spelled out in `reencode_unclassifiable`'s doc in
-`src/commands/cat/mod.rs`), so it gets a comment, not a change.
-
-Reported by: read path, CLI and plumbing, change application.
 
 ## HYG-166 - The OSC writer swallows a bad user string
 

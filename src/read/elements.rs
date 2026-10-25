@@ -807,12 +807,18 @@ impl<'a> Info<'a> {
         self.info.user_sid
     }
 
-    /// Returns the user name.
+    /// Returns the user name, `None` when the element carries none.
+    ///
+    /// A string index past the block's string table is
+    /// `StringtableIndexOutOfBounds`; a negative one is a wire-format error,
+    /// as for [`RelMember::role`].
     #[allow(clippy::cast_sign_loss)]
     pub fn user(&self) -> Option<Result<&'a str>> {
         self.info.user_sid.map(|sid| {
             if sid < 0 {
-                return Err(crate::error::new_stringtable_index_out_of_bounds(0));
+                return Err(crate::error::new_wire_error(
+                    "element info has negative user string index",
+                ));
             }
             str_from_stringtable(self.block, sid as usize)
         })

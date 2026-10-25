@@ -12,10 +12,10 @@ use crate::blob::{BlobKind, decode_blob_to_headerblock, decompress_blob_data_int
 use crate::blob_meta::scan_block_ids_and_tags;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
-use crate::owned::{TypeFilter, dense_node_metadata, element_metadata};
+use crate::owned::{TypeFilter, dense_node_metadata, element_metadata, relation_members_into};
 use crate::write::WriteOptions;
 use crate::writer::{Compression, PbfWriter, reframe_raw_with_index};
-use crate::{BlobFilter, Element, PrimitiveBlock};
+use crate::{BlobFilter, Element, ElementKind, PrimitiveBlock};
 
 use super::output_header::{Declared, OutputFacts, OutputHeader, Ways};
 use super::{Result, flush_local};
@@ -495,12 +495,7 @@ fn reencode_unclassifiable(
         match &element {
             Element::DenseNode(dn) => {
                 check_tags(dn.tags_checked())?;
-                let meta = dense_node_metadata(dn);
-                if meta.is_some()
-                    && let Some(info) = dn.info()
-                {
-                    info.user()?;
-                }
+                let meta = dense_node_metadata(dn)?;
                 start_node(&mut bb, &mut output, &mut node_run_has_meta, meta.is_some())?;
                 bb.add_node(
                     dn.id(),
@@ -512,9 +507,7 @@ fn reencode_unclassifiable(
             }
             Element::Node(n) => {
                 check_tags(n.tags_checked())?;
-                let info = n.info();
-                let meta = element_metadata(&info);
-                check_user(meta.is_some(), &info)?;
+                let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
                 start_node(&mut bb, &mut output, &mut node_run_has_meta, meta.is_some())?;
                 bb.add_node(
                     n.id(),
@@ -539,9 +532,7 @@ fn reencode_unclassifiable(
                     )));
                 }
                 check_tags(w.tags_checked())?;
-                let info = w.info();
-                let meta = element_metadata(&info);
-                check_user(meta.is_some(), &info)?;
+                let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
                 ensure_way_capacity_local(&mut bb, &mut output)?;
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
@@ -564,17 +555,9 @@ fn reencode_unclassifiable(
             }
             Element::Relation(r) => {
                 check_tags(r.tags_checked())?;
-                let info = r.info();
-                let meta = element_metadata(&info);
-                check_user(meta.is_some(), &info)?;
+                let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                 ensure_relation_capacity_local(&mut bb, &mut output)?;
-                members_buf.clear();
-                for m in r.members() {
-                    members_buf.push(MemberData {
-                        id: m.id,
-                        role: m.role()?,
-                    });
-                }
+                relation_members_into(r, &mut members_buf)?;
                 bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
             }
         }
@@ -605,15 +588,6 @@ fn check_tags<'t>(
 ) -> crate::Result<()> {
     for tag in tags {
         tag?;
-    }
-    Ok(())
-}
-
-/// Resolve the user of metadata that is re-encoded (`kept`), failing on a
-/// bad string index instead of writing an empty user.
-fn check_user(kept: bool, info: &crate::Info<'_>) -> crate::Result<()> {
-    if kept && let Some(user) = info.user() {
-        user?;
     }
     Ok(())
 }
@@ -775,7 +749,7 @@ fn process_block(
         match &element {
             Element::DenseNode(dn) if filter_node => {
                 ensure_node_capacity_local(bb, output)?;
-                let meta = clean_metadata(dense_node_metadata(dn), clean);
+                let meta = clean_metadata(dense_node_metadata(dn)?, clean);
                 bb.add_node(
                     dn.id(),
                     dn.decimicro_lat(),
@@ -787,7 +761,10 @@ fn process_block(
             }
             Element::Node(n) if filter_node => {
                 ensure_node_capacity_local(bb, output)?;
-                let meta = clean_metadata(element_metadata(&n.info()), clean);
+                let meta = clean_metadata(
+                    element_metadata(ElementKind::Node, n.id(), &n.info())?,
+                    clean,
+                );
                 bb.add_node(
                     n.id(),
                     n.decimicro_lat(),
@@ -801,18 +778,20 @@ fn process_block(
                 ensure_way_capacity_local(bb, output)?;
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
-                let meta = clean_metadata(element_metadata(&w.info()), clean);
+                let meta = clean_metadata(
+                    element_metadata(ElementKind::Way, w.id(), &w.info())?,
+                    clean,
+                );
                 bb.add_way(w.id(), w.tags(), refs_buf, meta.as_ref());
                 count += 1;
             }
             Element::Relation(r) if filter_relation => {
                 ensure_relation_capacity_local(bb, output)?;
-                members_buf.clear();
-                members_buf.extend(r.members().map(|m| MemberData {
-                    id: m.id,
-                    role: m.role().unwrap_or(""),
-                }));
-                let meta = clean_metadata(element_metadata(&r.info()), clean);
+                relation_members_into(r, &mut members_buf)?;
+                let meta = clean_metadata(
+                    element_metadata(ElementKind::Relation, r.id(), &r.info())?,
+                    clean,
+                );
                 bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
                 count += 1;
             }

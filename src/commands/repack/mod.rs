@@ -49,8 +49,8 @@ use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::error::Error;
 use crate::owned::{
     OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata, read_dense_node,
-    read_node, read_relation, read_way, read_way_with_locations, write_single_node_local,
-    write_single_relation_local, write_single_way_local,
+    read_node, read_relation, read_way, read_way_with_locations, relation_members_into,
+    write_single_node_local, write_single_relation_local, write_single_way_local,
 };
 use crate::write::WriteOptions;
 use crate::writer::{Compression, PbfWriter, frame_blob_pipelined};
@@ -577,10 +577,10 @@ fn encode_way_full_block(
     refs_buf: &mut Vec<i64>,
     locations_buf: &mut Vec<(i32, i32)>,
     preserve_locations: bool,
-) {
+) -> crate::Result<()> {
     refs_buf.clear();
     refs_buf.extend(w.refs());
-    let meta = element_metadata(&w.info());
+    let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
     if preserve_locations {
         locations_buf.clear();
         locations_buf.extend(
@@ -593,6 +593,7 @@ fn encode_way_full_block(
     } else {
         bb.add_way(w.id(), w.tags(), refs_buf, meta.as_ref());
     }
+    Ok(())
 }
 
 /// One worker's body: count matching elements, frame the leading
@@ -668,7 +669,7 @@ fn worker_split_blob(
             match (&element, kind) {
                 (Element::DenseNode(dn), ElementKind::Node) => {
                     ensure_node_capacity_local(&mut bb, &mut output)?;
-                    let meta = dense_node_metadata(dn);
+                    let meta = dense_node_metadata(dn)?;
                     bb.add_node(
                         dn.id(),
                         dn.decimicro_lat(),
@@ -679,7 +680,7 @@ fn worker_split_blob(
                 }
                 (Element::Node(n), ElementKind::Node) => {
                     ensure_node_capacity_local(&mut bb, &mut output)?;
-                    let meta = element_metadata(&n.info());
+                    let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
                     bb.add_node(
                         n.id(),
                         n.decimicro_lat(),
@@ -696,16 +697,12 @@ fn worker_split_blob(
                         &mut refs_buf,
                         &mut locations_buf,
                         preserve_locations,
-                    );
+                    )?;
                 }
                 (Element::Relation(r), ElementKind::Relation) => {
                     ensure_relation_capacity_local(&mut bb, &mut output)?;
-                    members_buf.clear();
-                    members_buf.extend(r.members().map(|m| MemberData {
-                        id: m.id,
-                        role: m.role().unwrap_or(""),
-                    }));
-                    let meta = element_metadata(&r.info());
+                    relation_members_into(r, &mut members_buf)?;
+                    let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                     bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
                 }
                 _ => {}
@@ -716,14 +713,14 @@ fn worker_split_blob(
         } else {
             // Tail path: own and ship to the merge thread.
             match (&element, &mut tail) {
-                (Element::DenseNode(dn), KindPayload::Nodes(v)) => v.push(read_dense_node(dn)),
-                (Element::Node(n), KindPayload::Nodes(v)) => v.push(read_node(n)),
+                (Element::DenseNode(dn), KindPayload::Nodes(v)) => v.push(read_dense_node(dn)?),
+                (Element::Node(n), KindPayload::Nodes(v)) => v.push(read_node(n)?),
                 (Element::Way(w), KindPayload::Ways(v)) => v.push(if preserve_locations {
-                    read_way_with_locations(w)
+                    read_way_with_locations(w)?
                 } else {
-                    read_way(w)
+                    read_way(w)?
                 }),
-                (Element::Relation(r), KindPayload::Relations(v)) => v.push(read_relation(r)),
+                (Element::Relation(r), KindPayload::Relations(v)) => v.push(read_relation(r)?),
                 _ => {}
             }
         }

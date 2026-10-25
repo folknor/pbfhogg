@@ -19,7 +19,7 @@ use super::{
 use crate::ElementKind;
 use crate::blob::{BlobKind, decode_blob_to_headerblock};
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
-use crate::owned::{dense_node_metadata, element_metadata};
+use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
 use crate::read::header_walker::{HeaderWalker, ScanArm};
 use crate::reorder_buffer::ReorderBuffer;
 use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
@@ -439,7 +439,7 @@ fn process_block(
                 // Nodes are never parents. Include only if --add-self and ID matches.
                 if add_self && ids.node_ids.get(dn.id()) {
                     ensure_node_capacity_local(bb, output)?;
-                    let meta = dense_node_metadata(dn);
+                    let meta = dense_node_metadata(dn)?;
                     bb.add_node(
                         dn.id(),
                         dn.decimicro_lat(),
@@ -453,7 +453,7 @@ fn process_block(
             Element::Node(n) => {
                 if add_self && ids.node_ids.get(n.id()) {
                     ensure_node_capacity_local(bb, output)?;
-                    let meta = element_metadata(&n.info());
+                    let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
                     bb.add_node(
                         n.id(),
                         n.decimicro_lat(),
@@ -472,7 +472,7 @@ fn process_block(
                     ensure_way_capacity_local(bb, output)?;
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
-                    let meta = element_metadata(&w.info());
+                    let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
                     bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
                     ways += 1;
                 }
@@ -488,12 +488,8 @@ fn process_block(
                 let is_self = add_self && ids.relation_ids.get(r.id());
                 if is_parent || is_self {
                     ensure_relation_capacity_local(bb, output)?;
-                    members_buf.clear();
-                    members_buf.extend(r.members().map(|m| MemberData {
-                        id: m.id,
-                        role: m.role().unwrap_or(""),
-                    }));
-                    let meta = element_metadata(&r.info());
+                    relation_members_into(r, &mut members_buf)?;
+                    let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                     bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
                     relations += 1;
                 }

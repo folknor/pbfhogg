@@ -1144,6 +1144,20 @@
 
 ### Fixed
 
+- **A bad user name or member role index is refused on re-encode, not
+  written as an empty string.** A user string index or relation member role
+  index past its block's string table (or negative) used to be re-encoded as
+  an empty user or role by every command that rebuilds blocks: `sort`,
+  `cat --dedupe`, `cat --clean`, `degrade`, `repack`, `time-filter`,
+  `extract`, `multi-extract`, `tags-filter`, `getid`, `getparents` and
+  `add-locations-to-ways`. They now fail with an error naming the element
+  and the index (`node 1: user name string index 9`,
+  `relation 1 member 0: role string index 9`), as the OSC writers already
+  did; `cat --clean user` refuses too, since the input is corrupt whichever
+  fields are kept. Tag string indices are unchanged (see CORRECTNESS.md).
+  Library: `Info::user` and `DenseNodeInfo::user` report a negative index as
+  `ErrorKind::WireFormat` instead of `StringtableIndexOutOfBounds` for index 0.
+
 - **An element carrying two metadata messages is refused, not half-read.**
   A node, way or relation with its `Info` written twice, or a dense group
   with `DenseInfo` written twice, used to read as its last occurrence:

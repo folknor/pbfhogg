@@ -715,10 +715,13 @@ fn write_overlap_run(
                 files,
                 bb,
                 writer,
-                |e, heap| match e {
-                    Element::DenseNode(dn) => heap.push(Reverse(read_dense_node(dn))),
-                    Element::Node(n) => heap.push(Reverse(read_node(n))),
-                    _ => {}
+                |e, heap| {
+                    match e {
+                        Element::DenseNode(dn) => heap.push(Reverse(read_dense_node(dn)?)),
+                        Element::Node(n) => heap.push(Reverse(read_node(n)?)),
+                        _ => {}
+                    }
+                    Ok(())
                 },
                 write_single_node,
                 host,
@@ -734,8 +737,9 @@ fn write_overlap_run(
                 writer,
                 |e, heap| {
                     if let Element::Way(w) = e {
-                        heap.push(Reverse(read_way(w)));
+                        heap.push(Reverse(read_way(w)?));
                     }
+                    Ok(())
                 },
                 write_single_way,
                 host,
@@ -751,8 +755,9 @@ fn write_overlap_run(
                 writer,
                 |e, heap| {
                     if let Element::Relation(r) = e {
-                        heap.push(Reverse(read_relation(r)));
+                        heap.push(Reverse(read_relation(r)?));
                     }
+                    Ok(())
                 },
                 write_single_relation,
                 host,
@@ -778,7 +783,7 @@ fn sweep_merge_dedup<T: Ord + HasId>(
     files: &mut [Source<'_>],
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-    mut extract: impl FnMut(&Element<'_>, &mut BinaryHeap<Reverse<T>>),
+    mut extract: impl FnMut(&Element<'_>, &mut BinaryHeap<Reverse<T>>) -> Result<()>,
     mut write_elem: impl FnMut(&T, &mut BlockBuilder, &mut PbfWriter<FileWriter>) -> Result<()>,
     host: &crate::host::Host,
 ) -> Result<(u64, u64)> {
@@ -802,9 +807,10 @@ fn sweep_merge_dedup<T: Ord + HasId>(
             },
         )?;
 
-        let block = read_block(&mut files[entry.file_index], entry, &mut frame_buf)?;
+        let source = &mut files[entry.file_index];
+        let block = read_block(source, entry, &mut frame_buf)?;
         for element in block.elements() {
-            extract(&element, &mut heap);
+            extract(&element, &mut heap).map_err(|e| source.locate(entry, e))?;
         }
     }
 

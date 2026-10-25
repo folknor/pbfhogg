@@ -29,7 +29,7 @@ use super::{
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::owned::{
     OwnedElement, dense_node_metadata, element_metadata, owned_to_metadata, read_dense_node,
-    read_node, read_relation, read_way,
+    read_node, read_relation, read_way, relation_members_into,
 };
 use crate::reorder_buffer::ReorderBuffer;
 use crate::scan::classify::{PartialIndex, build_classify_schedule, parallel_classify_phase};
@@ -231,7 +231,10 @@ fn time_filter_history(
         if timestamp <= cutoff_timestamp {
             stats.versions_before_cutoff += 1;
             if let Some(group) = pending.as_mut() {
-                group.latest = Some(clone_owned_element(&element));
+                match clone_owned_element(&element) {
+                    Ok(owned) => group.latest = Some(owned),
+                    Err(e) => flush_error = Err(e),
+                }
             }
         }
     })?;
@@ -475,7 +478,7 @@ fn filter_block_snapshot(
                 ensure_node_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(dn.tags());
-                let meta = dense_node_metadata(dn);
+                let meta = dense_node_metadata(dn)?;
                 bb.add_node(
                     dn.id(),
                     dn.decimicro_lat(),
@@ -499,7 +502,7 @@ fn filter_block_snapshot(
                 ensure_node_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(n.tags());
-                let meta = element_metadata(&n.info());
+                let meta = element_metadata(ElementKind::Node, n.id(), &n.info())?;
                 bb.add_node(
                     n.id(),
                     n.decimicro_lat(),
@@ -525,7 +528,7 @@ fn filter_block_snapshot(
                 tags_buf.extend(w.tags());
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
-                let meta = element_metadata(&w.info());
+                let meta = element_metadata(ElementKind::Way, w.id(), &w.info())?;
                 bb.add_way(w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref());
                 stats.elements_written += 1;
             }
@@ -543,12 +546,8 @@ fn filter_block_snapshot(
                 ensure_relation_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(r.tags());
-                members_buf.clear();
-                members_buf.extend(r.members().map(|m| MemberData {
-                    id: m.id,
-                    role: m.role().unwrap_or(""),
-                }));
-                let meta = element_metadata(&r.info());
+                relation_members_into(r, &mut members_buf)?;
+                let meta = element_metadata(ElementKind::Relation, r.id(), &r.info())?;
                 bb.add_relation(
                     r.id(),
                     tags_buf.iter().copied(),
@@ -754,13 +753,13 @@ fn require_timestamp(ts: Option<i64>, kind: &str, id: i64) -> crate::Result<i64>
 }
 
 #[hotpath::measure]
-fn clone_owned_element(element: &Element<'_>) -> OwnedElement {
-    match element {
-        Element::DenseNode(dn) => OwnedElement::Node(read_dense_node(dn)),
-        Element::Node(n) => OwnedElement::Node(read_node(n)),
-        Element::Way(w) => OwnedElement::Way(read_way(w)),
-        Element::Relation(r) => OwnedElement::Relation(read_relation(r)),
-    }
+fn clone_owned_element(element: &Element<'_>) -> crate::Result<OwnedElement> {
+    Ok(match element {
+        Element::DenseNode(dn) => OwnedElement::Node(read_dense_node(dn)?),
+        Element::Node(n) => OwnedElement::Node(read_node(n)?),
+        Element::Way(w) => OwnedElement::Way(read_way(w)?),
+        Element::Relation(r) => OwnedElement::Relation(read_relation(r)?),
+    })
 }
 
 #[cfg(test)]

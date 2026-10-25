@@ -10,7 +10,7 @@ use super::{
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::idset::IdSet;
-use crate::owned::{dense_node_metadata, element_metadata};
+use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
 use crate::tag_expr::{Expression, StringMatcher, parse_expressions, tag_matches};
 use crate::write::WriteOptions;
 use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
@@ -386,7 +386,7 @@ fn filter_block_parallel(
                 tags_buf.extend(dn.tags());
                 if element_matches(expressions, &tags_buf, crate::ElementKind::Node) != invert {
                     ensure_node_capacity_local(bb, output)?;
-                    let meta = dense_node_metadata(dn);
+                    let meta = dense_node_metadata(dn)?;
                     bb.add_node(
                         dn.id(),
                         dn.decimicro_lat(),
@@ -402,7 +402,7 @@ fn filter_block_parallel(
                 tags_buf.extend(n.tags());
                 if element_matches(expressions, &tags_buf, crate::ElementKind::Node) != invert {
                     ensure_node_capacity_local(bb, output)?;
-                    let meta = element_metadata(&n.info());
+                    let meta = element_metadata(crate::ElementKind::Node, n.id(), &n.info())?;
                     bb.add_node(
                         n.id(),
                         n.decimicro_lat(),
@@ -420,7 +420,7 @@ fn filter_block_parallel(
                     ensure_way_capacity_local(bb, output)?;
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
-                    let meta = element_metadata(&w.info());
+                    let meta = element_metadata(crate::ElementKind::Way, w.id(), &w.info())?;
                     bb.add_way(w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref());
                     stats.ways_matched += 1;
                 }
@@ -430,12 +430,8 @@ fn filter_block_parallel(
                 tags_buf.extend(r.tags());
                 if element_matches(expressions, &tags_buf, crate::ElementKind::Relation) != invert {
                     ensure_relation_capacity_local(bb, output)?;
-                    members_buf.clear();
-                    members_buf.extend(r.members().map(|m| MemberData {
-                        id: m.id,
-                        role: m.role().unwrap_or(""),
-                    }));
-                    let meta = element_metadata(&r.info());
+                    relation_members_into(r, &mut members_buf)?;
+                    let meta = element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?;
                     bb.add_relation(
                         r.id(),
                         tags_buf.iter().copied(),
@@ -579,7 +575,7 @@ fn filter_block_pass2(
                     if !remove_tags || direct {
                         tags_buf.extend(dn.tags());
                     }
-                    let meta = dense_node_metadata(dn);
+                    let meta = dense_node_metadata(dn)?;
                     bb.add_node(
                         dn.id(),
                         dn.decimicro_lat(),
@@ -606,7 +602,7 @@ fn filter_block_pass2(
                     if !remove_tags || direct {
                         tags_buf.extend(n.tags());
                     }
-                    let meta = element_metadata(&n.info());
+                    let meta = element_metadata(crate::ElementKind::Node, n.id(), &n.info())?;
                     bb.add_node(
                         n.id(),
                         n.decimicro_lat(),
@@ -633,7 +629,7 @@ fn filter_block_pass2(
                     }
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
-                    let meta = element_metadata(&w.info());
+                    let meta = element_metadata(crate::ElementKind::Way, w.id(), &w.info())?;
                     bb.add_way(w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref());
                     if direct {
                         stats.ways_matched += 1;
@@ -650,12 +646,8 @@ fn filter_block_pass2(
                     if !remove_tags || direct {
                         tags_buf.extend(r.tags());
                     }
-                    members_buf.clear();
-                    members_buf.extend(r.members().map(|m| MemberData {
-                        id: m.id,
-                        role: m.role().unwrap_or(""),
-                    }));
-                    let meta = element_metadata(&r.info());
+                    relation_members_into(r, &mut members_buf)?;
+                    let meta = element_metadata(crate::ElementKind::Relation, r.id(), &r.info())?;
                     bb.add_relation(
                         r.id(),
                         tags_buf.iter().copied(),

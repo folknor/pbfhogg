@@ -873,10 +873,13 @@ fn compute_overlap_run_local(
                 &mut input_file,
                 &mut bb,
                 &mut output,
-                |e, heap| match e {
-                    Element::DenseNode(dn) => heap.push(Reverse(read_dense_node(dn))),
-                    Element::Node(n) => heap.push(Reverse(read_node(n))),
-                    _ => {}
+                |e, heap| {
+                    match e {
+                        Element::DenseNode(dn) => heap.push(Reverse(read_dense_node(dn)?)),
+                        Element::Node(n) => heap.push(Reverse(read_node(n)?)),
+                        _ => {}
+                    }
+                    Ok(())
                 },
                 write_single_node_local,
                 input_path,
@@ -891,8 +894,9 @@ fn compute_overlap_run_local(
                 &mut output,
                 |e, heap| {
                     if let Element::Way(w) = e {
-                        heap.push(Reverse(read_way(w)));
+                        heap.push(Reverse(read_way(w)?));
                     }
+                    Ok(())
                 },
                 write_single_way_local,
                 input_path,
@@ -907,8 +911,9 @@ fn compute_overlap_run_local(
                 &mut output,
                 |e, heap| {
                     if let Element::Relation(r) = e {
-                        heap.push(Reverse(read_relation(r)));
+                        heap.push(Reverse(read_relation(r)?));
                     }
+                    Ok(())
                 },
                 write_single_relation_local,
                 input_path,
@@ -929,7 +934,7 @@ fn sweep_merge_local<T: Ord + HasId>(
     input_file: &mut File,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-    mut extract: impl FnMut(&Element<'_>, &mut BinaryHeap<Reverse<T>>),
+    mut extract: impl FnMut(&Element<'_>, &mut BinaryHeap<Reverse<T>>) -> crate::Result<()>,
     mut write_elem: impl FnMut(&T, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> crate::Result<()>,
     input_path: &Path,
     cancel: &crate::host::Cancel,
@@ -960,7 +965,7 @@ fn sweep_merge_local<T: Ord + HasId>(
         let blob_bytes = extract_blob_bytes(&frame_buf).map_err(locate)?;
         let block = decode_blob_to_primitiveblock(blob_bytes).map_err(locate)?;
         for element in block.elements() {
-            extract(&element, &mut heap);
+            extract(&element, &mut heap).map_err(locate)?;
         }
     }
 

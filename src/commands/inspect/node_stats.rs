@@ -1,6 +1,5 @@
-use std::path::Path;
-
 use crate::elements::Element;
+use crate::read::input::InputSource;
 
 use crate::commands::require_indexdata;
 use crate::error::Result;
@@ -242,27 +241,41 @@ impl WorkerAccum {
 /// (`CoordStats` + two 128-entry block buffers + scalar mins/maxes /
 /// counters ≈ ~1 KB), so the `parallel_classify_accumulate` safety
 /// envelope applies comfortably.
+///
+/// The input is read twice (the indexdata probe, then the schedule walk),
+/// so it must be a regular file or a block device (`InvalidArgument`
+/// otherwise) and is pinned for the run (see
+/// [`PinnedInput`](crate::read::input::PinnedInput)); a caller's pin is used
+/// as it is. Where a later open cannot reach the pinned file, an input
+/// replaced mid-run fails with `InputReplaced`.
 #[hotpath::measure]
-pub fn node_stats(
-    path: &Path,
+pub fn node_stats<'a>(
+    input: impl Into<InputSource<'a>>,
     direct_io: bool,
     force: bool,
     parallelism: crate::host::Parallelism,
     host: &crate::host::Host,
 ) -> Result<NodeStatsReport> {
+    let input = input.into();
     host.cancel
-        .decided(|| node_stats_inner(path, direct_io, force, parallelism, host))
+        .decided(|| node_stats_inner(input, direct_io, force, parallelism, host))
 }
 
 fn node_stats_inner(
-    path: &Path,
+    input: InputSource<'_>,
     direct_io: bool,
     force: bool,
     parallelism: crate::host::Parallelism,
     host: &crate::host::Host,
 ) -> Result<NodeStatsReport> {
+    // Two opens, each its own open file description: the probe below, then
+    // the schedule walk whose descriptor the classify pool preads. Both are
+    // derived from this one pin, so a file renamed over the input between
+    // them cannot have its indexdata probed in one file and its nodes read
+    // from the other. Taken before either.
+    let pin = input.pin(host)?;
     require_indexdata(
-        path,
+        &pin,
         direct_io,
         force,
         "input PBF has no blob-level indexdata. Without indexdata, the node-only \
@@ -273,7 +286,7 @@ fn node_stats_inner(
     crate::debug::emit_marker("NODESTATS_START");
 
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
-        path,
+        &pin,
         Some(crate::ElementKind::Node),
         crate::scan::classify::PartialIndex::Refuse,
         host,

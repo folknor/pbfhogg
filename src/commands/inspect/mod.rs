@@ -12,6 +12,6 @@ mod show_element;
 mod types;
 
 pub use keys::{InspectGetKeyKind, InspectGetLookup, InspectGetNeed, inspect_get_lookup};
-pub use scan::{InspectOptions, inspect};
+pub use scan::{InspectHeader, InspectOptions, inspect, inspect_header};
 pub use show_element::show_element_to;
 pub use types::InspectReport;

@@ -4369,11 +4369,13 @@ fn run_inspect(
             return Ok(Outcome::Positive);
         }
         InspectMode::HeaderGet { key, known } => {
-            // The reader parses the header eagerly, and reports a file
-            // without one through the library's single missing-header error.
+            // One open: the header and the file size both come from it, so
+            // `file.size` is the size of the file the header was read from.
+            // A file without a header is the library's single missing-header
+            // error.
             host.cancel.check()?;
-            let reader = pbfhogg::ElementReader::open(path, direct_io)?;
-            let header = reader.header();
+            let read = pbfhogg::inspect::inspect_header(path, direct_io, host)?;
+            let header = &read.header;
             let val = match known {
                 Some(pbfhogg::inspect::InspectGetKeyKind::FileName) => Some(
                     path.file_name()
@@ -4381,7 +4383,7 @@ fn run_inspect(
                         .unwrap_or_else(|| path.display().to_string()),
                 ),
                 Some(pbfhogg::inspect::InspectGetKeyKind::FileSize) => {
-                    Some(std::fs::metadata(path)?.len().to_string())
+                    Some(read.file_size.to_string())
                 }
                 Some(pbfhogg::inspect::InspectGetKeyKind::FileFormat) => Some("PBF".to_string()),
                 Some(pbfhogg::inspect::InspectGetKeyKind::HeaderBbox) => header
@@ -4424,8 +4426,22 @@ fn run_inspect(
     } else {
         blocks
     };
+    // With `--indexed` or `--nodes` the run is several library calls on one
+    // input (the scan, the indexdata probe, the node statistics), each
+    // opening it afresh, so the input is pinned here, before any of them,
+    // and each reads through the pin: a file renamed over the input mid-run
+    // cannot answer one question from each file. Alone, the scan decides for
+    // itself (it pins when it may read twice), so a full-decode-only scan
+    // still reads a FIFO.
+    host.cancel.check()?;
+    let pin = if indexed || nodes {
+        Some(pbfhogg::read::input::PinnedInput::pin(path, host)?)
+    } else {
+        None
+    };
+    let input: pbfhogg::read::input::InputSource<'_> = pin.as_ref().map_or(path.into(), Into::into);
     let mut report = pbfhogg::inspect::inspect(
-        path,
+        input,
         &pbfhogg::inspect::InspectOptions {
             show_blocks,
             show_id_ranges: id_ranges,
@@ -4439,7 +4455,7 @@ fn run_inspect(
 
     // --indexed combined with other flags: check and report, set exit code
     let has_index = if indexed {
-        Some(pbfhogg::has_indexdata(path, direct_io, &host.diagnostics)?)
+        Some(pbfhogg::has_indexdata(input, direct_io, &host.diagnostics)?)
     } else {
         None
     };
@@ -4448,11 +4464,14 @@ fn run_inspect(
     // --nodes combined with other flags: run node stats, printed below
     let node_report = if nodes {
         Some(pbfhogg::inspect::node_stats::node_stats(
-            path, direct_io, force, jobs, host,
+            input, direct_io, force, jobs, host,
         )?)
     } else {
         None
     };
+    // The completion decision: the indexdata probe has no checkpoint of its
+    // own, so a cancellation during it must not still produce an answer.
+    host.cancel.check()?;
 
     // Everything is computed; only output remains. `--indexed` makes the
     // exit status an answer, and a reader that left early must not cost it.

@@ -946,6 +946,12 @@ impl ByteBudget {
 }
 
 impl ElementReader<FileReader> {
+    /// The metadata of the file this reader opened (an `fstat` of its own
+    /// descriptor, never a stat of the path).
+    pub(crate) fn file_metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.blob_iter.file_metadata()
+    }
+
     /// Tries to open the file at the given path and constructs an `ElementReader` from this.
     ///
     /// Reads and parses the PBF header from the first blob. Returns an error if the file

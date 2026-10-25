@@ -12,7 +12,15 @@ use crate::ElementKind;
 use crate::blob::{BlobKind, decode_blob_to_headerblock, decompress_blob_data_into};
 use crate::file_reader::FileReader;
 use crate::read::header_walker::HeaderWalker;
+use crate::read::input::{InputSource, PinnedInput};
 use crate::read::raw_frame::read_raw_frame;
+
+/// The name a report gives the input at `path`.
+fn file_name_of(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -43,17 +51,30 @@ pub struct InspectOptions {
     pub direct_io: bool,
 }
 
+/// Inspect `input` and return the report.
+///
+/// When the index-only scan may run (none of `show_locations`, `extended`,
+/// `distrust_metadata`), the input may be read twice - the header walk, then
+/// a full decode from the start if a data blob lacks indexdata - and whether
+/// it is is only learned from the file, so the input is pinned before the
+/// walk (see [`PinnedInput`](crate::read::input::PinnedInput)): it must be a
+/// regular file or a block device (`InvalidArgument` otherwise), and where a
+/// later open cannot reach the pinned file, an input replaced mid-run fails
+/// with `InputReplaced`. Otherwise the full decode is the one read, through
+/// one open of `input` as given, and takes no pin of its own. A caller's pin
+/// is used as it is on both routes.
 #[hotpath::measure]
-pub fn inspect(
-    path: &Path,
+pub fn inspect<'a>(
+    input: impl Into<InputSource<'a>>,
     opts: &InspectOptions,
     host: &crate::host::Host,
 ) -> Result<InspectReport> {
-    host.cancel.decided(|| inspect_inner(path, opts, host))
+    let input = input.into();
+    host.cancel.decided(|| inspect_inner(input, opts, host))
 }
 
 fn inspect_inner(
-    path: &Path,
+    input: InputSource<'_>,
     opts: &InspectOptions,
     host: &crate::host::Host,
 ) -> Result<InspectReport> {
@@ -61,22 +82,36 @@ fn inspect_inner(
     // empty report: each scan below refuses it itself, from its own read.
     // Index-only fast path: skip decompression when all blobs have indexdata.
     // --locations and --extended require per-element data, so they need full decode.
-    if !opts.show_locations
-        && !opts.extended
-        && !opts.distrust_metadata
-        && let Some(report) = try_index_only_scan(
-            path,
+    if !opts.show_locations && !opts.extended && !opts.distrust_metadata {
+        // The walk below and the full decode it may fall back to are two
+        // open file descriptions (the walk's `FADV_RANDOM` must not reach
+        // the decode's sequential or direct reads), both derived from this
+        // one pin, so a file renamed over the input between them cannot be
+        // reported partly from each file. Whether the fallback runs is only
+        // learned from the walk, so the pin is taken before it.
+        let pin = input.pin(host)?;
+        if let Some(report) = try_index_only_scan(
+            &pin,
             opts.show_blocks,
             opts.show_id_ranges,
             opts.direct_io,
             host,
-        )?
-    {
-        return Ok(report);
+        )? {
+            return Ok(report);
+        }
+        return full_decode_scan(
+            (&pin).into(),
+            opts.show_blocks,
+            opts.show_id_ranges,
+            opts.show_locations,
+            opts.extended,
+            opts.direct_io,
+            host,
+        );
     }
 
     full_decode_scan(
-        path,
+        input,
         opts.show_blocks,
         opts.show_id_ranges,
         opts.show_locations,
@@ -84,6 +119,46 @@ fn inspect_inner(
         opts.direct_io,
         host,
     )
+}
+
+/// The file's header block and its size, from one open: what `inspect --get`
+/// answers a header or file key from without scanning.
+#[derive(Clone, Debug)]
+pub struct InspectHeader {
+    /// The input's `HeaderBlock`.
+    pub header: crate::HeaderBlock,
+    /// The size of the file the header was read from (`st_size` of the
+    /// reader's own descriptor).
+    pub file_size: u64,
+}
+
+/// Read `input`'s header block and its size through one open, under
+/// `host`'s diagnostics, cancellation and page-cache policy.
+///
+/// The size is taken from the descriptor the header was read through, not
+/// by a second resolution of the path, so it describes the file the header
+/// came from; the route takes no pin and reads a FIFO (whose size is 0). A
+/// caller's pin is used as it is. A zero-byte or header-less file is the
+/// missing-header error, decided before the size is read.
+pub fn inspect_header<'a>(
+    input: impl Into<InputSource<'a>>,
+    direct_io: bool,
+    host: &crate::host::Host,
+) -> Result<InspectHeader> {
+    let input = input.into();
+    host.cancel.decided(|| {
+        let reader = crate::ElementReader::open_in(input, direct_io, host)?;
+        let file_size = reader
+            .file_metadata()
+            .map_err(|e| {
+                crate::Error::from(e).context(format!("failed to stat {}", input.path().display()))
+            })?
+            .len();
+        Ok(InspectHeader {
+            header: reader.header().clone(),
+            file_size,
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -105,18 +180,16 @@ fn inspect_inner(
 /// page-alignment requirements are incompatible with the tiny header
 /// reads. The full-decode fallback still honours `direct_io`.
 fn try_index_only_scan(
-    path: &Path,
+    input: &PinnedInput,
     show_blocks: bool,
     show_id_ranges: bool,
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<Option<InspectReport>> {
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
+    let path = input.path();
+    let file_name = file_name_of(path);
 
-    let mut walker = HeaderWalker::open(path, host)?;
+    let mut walker = HeaderWalker::open(input, host)?;
     let file_size = walker.file_size();
     let mut saw_header = false;
     let mut header_meta = HeaderMeta::default();
@@ -282,7 +355,7 @@ pub(super) fn extract_header_metadata(header: &crate::HeaderBlock) -> HeaderMeta
 // ---------------------------------------------------------------------------
 
 fn full_decode_scan(
-    path: &Path,
+    input: InputSource<'_>,
     show_blocks: bool,
     show_id_ranges: bool,
     show_locations: bool,
@@ -290,13 +363,16 @@ fn full_decode_scan(
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<InspectReport> {
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
+    let path = input.path();
+    let file_name = file_name_of(path);
 
-    let mut reader = FileReader::open(path, direct_io)?;
-    let meta = crate::read::input::metadata(path)?;
+    let mut reader = FileReader::open(input, direct_io)?;
+    // The size of the file this reader opened, not of whatever the path
+    // names by now: a stat of the path is a second resolution of it.
+    let file_size = reader
+        .metadata()
+        .map_err(|e| crate::Error::from(e).context(format!("failed to stat {}", path.display())))?
+        .len();
     let mut saw_header = false;
     let mut offset = 0u64;
     let mut decompress_buf = Vec::new();
@@ -378,7 +454,7 @@ fn full_decode_scan(
 
     Ok(InspectReport {
         file_name,
-        file_size: meta.len(),
+        file_size,
         header_meta,
         is_indexed,
         total_blocks: total_data_blobs,

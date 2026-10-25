@@ -1847,6 +1847,39 @@ fn id_commands_pin_their_input_and_id_pbf_before_reading_either() {
     }
 }
 
+/// inspect pins its input wherever a run reads it more than once: the scan
+/// that may fall back from the header walk to a full decode, node
+/// statistics, and any run composing the scan with `--indexed` or `--nodes`
+/// (the CLI pins those before the first call, even where the scan alone
+/// would read once). A FIFO is refused there rather than opened (a blocking
+/// open would wait for a writer, and none is attached).
+#[cfg(unix)]
+#[test]
+fn inspect_pins_its_input_wherever_it_reads_it_twice() {
+    let dir = crate::common::test_scratch();
+    let fifo = crate::common::make_fifo(dir.path(), "in.fifo");
+    let modes: [&[&str]; 5] = [
+        &[],
+        &["--nodes"],
+        &["--extended", "--indexed"],
+        &["--extended", "--nodes"],
+        &["--blocks", "--indexed"],
+    ];
+    for extra in modes {
+        let out = CliInvoker::new()
+            .arg("inspect")
+            .arg(&fifo)
+            .args(extra)
+            .run();
+        let stderr = out.stderr_str();
+        assert!(!out.status.success(), "{extra:?}: stderr:\n{stderr}");
+        assert!(
+            stderr.contains(&format!("{} is not a regular file", fifo.display())),
+            "{extra:?}: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn inspect_indexed_says_yes_for_a_header_only_file_and_fails_a_zero_byte_one() {
     let fx = Fx::new();

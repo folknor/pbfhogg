@@ -74,6 +74,8 @@ mod fault_getid_input;
 #[cfg(feature = "test-hooks")]
 mod fault_getparents_input;
 #[cfg(feature = "test-hooks")]
+mod fault_inspect_input;
+#[cfg(feature = "test-hooks")]
 mod fault_parallel_writer;
 #[cfg(feature = "test-hooks")]
 mod fault_read_pipeline;

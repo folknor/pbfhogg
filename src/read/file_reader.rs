@@ -135,6 +135,17 @@ impl FileReader {
 }
 
 impl FileReader {
+    /// The metadata of the file this reader opened (an `fstat` of its own
+    /// descriptor), so a size read here describes the bytes this reader
+    /// serves, whatever the input's path names by now.
+    pub(crate) fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        match self {
+            Self::Buffered(r) => r.get_ref().metadata(),
+            #[cfg(feature = "linux-direct-io")]
+            Self::Direct(r) => r.metadata(),
+        }
+    }
+
     /// Skip `n` bytes without materializing data into a destination buffer.
     ///
     /// For `BufReader`: skips `n-1` bytes via `seek_relative` (advances

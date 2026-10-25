@@ -134,6 +134,11 @@ impl DirectReader {
         self.file.as_raw_fd()
     }
 
+    /// The metadata of the opened file (an `fstat` of this reader's fd).
+    pub(crate) fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.file.metadata()
+    }
+
     /// Skip `n` bytes without materializing data.
     ///
     /// Discards any buffered bytes that overlap the skip range, then seeks

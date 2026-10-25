@@ -786,6 +786,12 @@ impl<R: Read + Send> BlobReader<R> {
 }
 
 impl BlobReader<FileReader> {
+    /// The metadata of the file this reader opened (an `fstat` of its own
+    /// descriptor, never a stat of the path).
+    pub(crate) fn file_metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.reader.metadata()
+    }
+
     /// Enable or disable page-cache eviction behind the read head.
     ///
     /// When enabled, a buffered reader advises `POSIX_FADV_DONTNEED` over the

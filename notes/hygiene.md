@@ -57,7 +57,7 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-23. HYG-187 to HYG-189, one per line, in ID order
+23. HYG-188 to HYG-189, one per line, in ID order
 24. HYG-047
 25. HYG-158
 26. HYG-159
@@ -824,6 +824,32 @@ The judgement calls already known, to be checked first:
     its planet memory ceiling); neither gives a correctness gain, only the
     FIFO. Mutation checked: routing either open back to a path open fails
     the tests.
+  - inspect adopted it per library entry, with the CLI pinning only where
+    it composes calls. `inspect::inspect` takes `impl Into<InputSource>`
+    and pins only when the index-only scan may run, since whether it falls
+    back to a full decode (a second open) is learned from the walk; a
+    decode-only run (`--extended`, `--locations`, `--distrust-metadata`)
+    opens once, takes no pin and still reads a FIFO. The full decode's
+    file size now comes from `fstat` of its own reader, not a path stat
+    (new `pub(crate)` `FileReader::metadata`). `node_stats` takes
+    `impl Into<InputSource>` and pins before its probe and walk. The
+    `--get` header route moved into a new public
+    `inspect::inspect_header`, one `ElementReader::open_in` whose
+    descriptor also gives `file.size`, replacing the CLI's
+    `ElementReader::open` plus a path stat; it now reads under the host's
+    page-cache policy, which codex flagged as an observable change under
+    `Evict` (an advisory `DONTNEED` over the header prefix), accepted as
+    that policy working as specified. The CLI's scanning report pins once
+    when `--indexed` or `--nodes` joins the scan and passes the pin to all
+    three calls, and gained cancellation checks before the pin and after
+    every computation, so a cancel during the indexdata probe, which has no
+    checkpoint, no longer yields an answer. Codex preferred moving the whole
+    composition into the library as one operation but found no case the
+    split pins wrongly; kept, since mode selection stays in the CLI either
+    way. `--indexed` alone and `--show` open once and are unchanged.
+    Mutation checked: a path stat for the decode's size, the fallback
+    decode or the node walk opened by path, and dropping the CLI's
+    composition pin each fail the tests.
 
 ---
 
@@ -1462,7 +1488,7 @@ Reported by: the HYG-150 implementation.
 
 ## Adopting `PinnedInput`, one command per entry
 
-Not a finding: the shared brief for HYG-187 to HYG-189. Each of those commands opens its input more than once per run (a
+Not a finding: the shared brief for HYG-188 to HYG-189. Each of those commands opens its input more than once per run (a
 precondition probe, a header reader, a schedule walk, worker and splice
 descriptors), each open resolving the path again, so a file renamed over
 the input mid-run is read partly from each file. The API that fixes it
@@ -1546,26 +1572,7 @@ path went. What each entry owes, settled in a codex spar on 2026-10-25:
   tags-filter's entry): hand it the pin and the probe reads through it.
 
 Commands confirmed to open their input once per run, not needing a pin:
-export, check refs, check index (one open each). inspect's index-only scan
-and its full-decode fallback each read the whole report from one open, but
-the full decode takes its file size from a separate path `stat`, which
-HYG-187 covers.
-
-## HYG-187 - inspect reads one input through several unpinned opens
-
-Anger: 7 - CLI behaviour.
-
-See "Adopting `PinnedInput`" above. `inspect --nodes` probes indexdata and
-then walks the schedule (`inspect/node_stats.rs`); the full-decode scan
-takes the file size from a path `stat` beside its reader
-(`inspect/scan.rs`); and the CLI's inspect runs the scan, `has_indexdata`
-and node statistics as separate library calls on one path
-(`cli/src/lib.rs`), each opening it afresh. The public entry points need
-to accept a pin so the CLI pins once (`has_indexdata` already does, since
-getparents' entry). Recommendation (2026-10-25): follow
-the brief, with the CLI composition.
-
-Reported by: the HYG-151 resolution.
+export, check refs, check index (one open each).
 
 ## HYG-188 - check ids reopens its input by path
 

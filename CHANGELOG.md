@@ -1158,6 +1158,28 @@
 
 ### Fixed
 
+- **`inspect` reads one input file even if it is replaced mid-run.** The
+  default report walks the blob headers and, on a blob without indexdata,
+  starts again with a full decode; `--nodes` probes for indexdata, then
+  walks the node blobs; `--indexed` or `--nodes` alongside the report each
+  read the input again; and the full decode and `--get file.size` took the
+  size from a separate stat of the path. Each of those resolved the path
+  again, so an input renamed over during the run could be reported partly
+  from each file, with no error. Every run that reads the input more than
+  once now pins it when it starts: on Linux with `/proc` a replaced or
+  deleted input does not affect the run; on other Unix hosts the run fails
+  with `ErrorKind::InputReplaced`. The file size now comes from the open
+  that read the file. On those routes (the default report, `--nodes`, and
+  any report with `--indexed` or `--nodes`) an input that is a FIFO,
+  socket or character device is now refused up front. `--extended`,
+  `--locations` and `--distrust-metadata` without `--indexed` or
+  `--nodes`, `--indexed` alone, a header `--get` key and `--show` read the
+  input once and take no pin; the report and a header `--get` key still
+  read a FIFO (its size reported as 0). Library: `inspect::inspect` and `inspect::node_stats::node_stats`
+  take `impl Into<InputSource>` (a path as before, or a `&PinnedInput` the
+  caller took, used as it is), and the new `inspect::inspect_header`
+  returns the header block and the file size from one open.
+
 - **`time-filter` reads one input file even if it is replaced mid-run.** On
   a snapshot input (no `HistoricalInformation`) every run opens the input
   twice (the header read, which picks the path, then the schedule walk the

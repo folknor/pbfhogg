@@ -80,7 +80,7 @@
   already reads every blob header to plan its work now refuses it with the
   missing-indexdata error, located at the first data blob without
   indexdata: sort, apply-changes, repack, degrade, tags-count,
-  extract, add-locations-to-ways, build-geocode-index, time-filter,
+  extract, add-locations-to-ways, build-geocode-index,
   `inspect --nodes`, `inspect tags`, `check --refs`,
   `check --ids` and digest. `--force` and `--allow-unindexed` do not lift
   this refusal; `pbfhogg cat` re-indexes such a file. A wholly unindexed

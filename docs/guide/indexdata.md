@@ -127,7 +127,9 @@ declares way enrichment (such as `LocationsOnWays`) and one of whose blobs
 without indexdata holds ways, since re-encoding those ways would break the
 declaration. `tags-filter` runs on it by the same design, with and without
 `-R`: it decodes each blob that lacks indexdata, so its output is the same
-as from the file fully indexed, only slower.
+as from the file fully indexed, only slower. `time-filter` reads no
+indexdata at all, so it runs on such a file, as on an unindexed one, with
+the same output.
 
 ## The --force flag
 

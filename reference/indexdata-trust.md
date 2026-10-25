@@ -53,7 +53,7 @@ consequence 3).
 
 | Claim | Believed by, and what a lie costs | Checked in passing by | Verified by |
 |-------|-----------------------------------|-----------------------|-------------|
-| kind | Every per-kind schedule: a blob labelled with the wrong kind is invisible to the phase that needs its elements, and the phase that does read it drops elements of the unclaimed kind silently. That covers `repack`, `degrade`'s decode path, `tags-filter`, `tags-count`, `time-filter`, `getparents`, `inspect tags` / `--nodes` / `--show`, `check --ids` / `--refs`, the sorted `extract` schedules, `add-locations-to-ways` (node scan) and the geocode builder. `cat --type` copies a matching blob raw, so a mislabelled blob leaks off-kind elements or vanishes. `cat --clean` keeps every decoded element of a selected kind whatever its blob claims, so with every kind selected the kind claim decides nothing; with `--type` a blob labelled with an unselected kind is skipped whole. `apply-changes` with `--locations-on-ways` extracts coordinates only from blobs claimed as nodes. | `renumber` (its wire rewrite refuses an element of another kind in a blob scheduled for one kind) | `check --index` |
+| kind | Every per-kind schedule: a blob labelled with the wrong kind is invisible to the phase that needs its elements, and the phase that does read it drops elements of the unclaimed kind silently. That covers `repack`, `degrade`'s decode path, `tags-filter`, `tags-count`, `getparents`, `inspect tags` / `--nodes` / `--show`, `check --ids` / `--refs`, the sorted `extract` schedules, `add-locations-to-ways` (node scan) and the geocode builder. `cat --type` copies a matching blob raw, so a mislabelled blob leaks off-kind elements or vanishes. `cat --clean` keeps every decoded element of a selected kind whatever its blob claims, so with every kind selected the kind claim decides nothing; with `--type` a blob labelled with an unselected kind is skipped whole. `apply-changes` with `--locations-on-ways` extracts coordinates only from blobs claimed as nodes. | `renumber` (its wire rewrite refuses an element of another kind in a blob scheduled for one kind) | `check --index` |
 | `min_id` / `max_id` | `apply-changes` routes a blob whose range misses the diff to the splice fast path and copies it unchanged. `getid` skips a blob whose range holds no requested ID; `getid --invert` copies it raw. `diff`'s parallel path plans shards from ranges and decides a block's leftover tail from its claimed `max_id`. `sort` (declared-sorted fast path) and `cat --dedupe` analyse overlap from ranges and copy non-overlapping blobs raw. `add-locations-to-ways --index-type external` partitions node blobs by range. `inspect --show` skips on range. | `diff` refuses ranges that break canonical order; `add-locations-to-ways --index-type external` refuses reversed, negative-node and out-of-order ranges, including an overstated `max_id` overlapping the next blob; the geocode builder's Pass 2a refuses any decoded node above the largest claimed node `max_id` (a global bound, not each blob's range) | `check --index` |
 | `count` | `apply-changes` credits a spliced or passed-through blob's `count` to its `base_*` statistics, folded into the observed counts. `sort`, `getid --invert` and `cat --dedupe` report a passed-through blob's `count` separately, as claimed (`passthrough_claimed`). `inspect` reports counts from indexdata unless `--distrust-metadata`. `renumber` assigns ID blocks from it. | `renumber` (refuses a blob whose decoded count disagrees) | `check --index` |
 | bbox | `extract` and the public `BlobFilter::with_node_bbox` skip a blob claimed as nodes whose bbox misses the region, without decoding it; the bbox is consulted only when the claimed kind is node, so a mislabelled blob skipped this way loses everything in it, on the unsorted `extract --simple` path too. `extract` also nominates a node blob whose bbox lies inside the region for a raw copy. | `extract` decodes a nominated blob and copies it raw only when its payload is DenseNodes alone and every node lies in the region, counting the nodes it decoded. That is selection and structural verification, not verification of the copied header. | `check --index` (containment) |
@@ -160,7 +160,8 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   `HeaderWalker::refusing_partial_index` refuses it with the typed
   missing-indexdata error, in either order (indexed then unindexed, or the
   reverse), located at the first unindexed data blob. Most schedule walks
-  opt in; `getid`'s, `getparents`' and `tags-filter`'s do not (below). `renumber`,
+  opt in; `getid`'s, `getparents`', `tags-filter`'s and `time-filter`'s do
+  not (below). `renumber`,
   `add-locations-to-ways --index-type external` and `diff`'s indexed
   block-pair paths refuse any unindexed blob (a wholly unindexed `diff`
   input takes the sequential fallback instead). Commands whose arm the first
@@ -203,6 +204,13 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   way-dependency scan each decode a blob lacking indexdata, unless its
   tagdata (a separate claim) excludes it, and match or write its elements
   by their actual kind and ID, so the output is the wholly indexed file's.
+  `time-filter` reads no indexdata at all, so it accepts on both paths, in
+  either order, and has no `--force`: the header's `HistoricalInformation`
+  picks the path, the history path's pipelined reader decodes every blob,
+  and the snapshot path schedules every blob with no kind filter; both
+  select from decoded elements by their actual kind and ID. For the same
+  reason it believes no sidecar claim, false ones included (it does believe
+  `Sort.Type_then_ID` and `HistoricalInformation`).
   The other refusals on this page are recorded as current behaviour, not
   justified by this rule.
 - **What a command does with a wholly unindexed file** - refuse and offer
@@ -224,11 +232,11 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
 
 Current behaviour recorded as such, not as a contract to preserve:
 
-- `check --refs`, `check --ids`, `inspect --nodes`, `inspect tags` and
-  non-history `time-filter` refuse a partially indexed file through their
-  classify walks, although `check` answers "is this file right?" and
-  `check --index` reports the same file as a violation (exit 1), and
-  `time-filter` and `extract --simple` accept a wholly unindexed file.
+- `check --refs`, `check --ids`, `inspect --nodes` and `inspect tags`
+  refuse a partially indexed file through their classify walks, although
+  `check` answers "is this file right?" and `check --index` reports the
+  same file as a violation (exit 1). `extract --simple` refuses it too,
+  although it accepts a wholly unindexed file.
 - The walks see headers only, so they cannot tell a blob no index can
   describe (empty, or mixed kinds), which carries no indexdata legitimately,
   from an unindexed one; such a blob among indexed ones is refused.

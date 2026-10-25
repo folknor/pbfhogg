@@ -176,6 +176,12 @@ impl Fx {
         // time-filter reads through its other path.
         write_history_header_only(&p.join("header-only-history.osm.pbf"));
         write_policy_fixtures(p);
+        // The first-blob-only file under the history header, for the same.
+        let mut history = std::fs::read(p.join("header-only-history.osm.pbf")).unwrap();
+        let partial = std::fs::read(p.join("first-blob-only.osm.pbf")).unwrap();
+        let blobs = crate::common::adversarial::locate_blobs(&partial);
+        history.extend_from_slice(&partial[blobs[1].frame_start..]);
+        std::fs::write(p.join("first-blob-only-history.osm.pbf"), history).unwrap();
         std::fs::write(p.join("a.osc"), OSC).unwrap();
         std::fs::write(p.join("b.osc"), OSC).unwrap();
         std::fs::write(p.join("good.osc"), OSC).unwrap();
@@ -611,16 +617,18 @@ fn time_filter(c: &Ctx, input: &Path) -> Invocation {
         .arg("2030-01-01T00:00:00Z")
 }
 
-/// The header-only input becomes the history header-only file, so the history
-/// path is the one that reads it; a file that is not a PBF stays as given.
+/// The header-only and first-blob-only inputs become their history-header
+/// twins, so the history path is the one that reads them; any other file
+/// stays as given.
 fn time_filter_history(c: &Ctx, input: &Path) -> Invocation {
-    let history = c.fx.path("header-only-history.osm.pbf");
-    let input = if input == c.fx.path("header-only.osm.pbf") {
-        history.as_path()
+    let twin = if input == c.fx.path("header-only.osm.pbf") {
+        Some(c.fx.path("header-only-history.osm.pbf"))
+    } else if input == c.fx.path("first-blob-only.osm.pbf") {
+        Some(c.fx.path("first-blob-only-history.osm.pbf"))
     } else {
-        input
+        None
     };
-    time_filter(c, input)
+    time_filter(c, twin.as_deref().unwrap_or(input))
 }
 
 fn apply_changes(c: &Ctx, input: &Path) -> Invocation {
@@ -1504,7 +1512,11 @@ const FIRST_BLOB_ONLY: &[MixedRow] = &[
     ),
     ("extract --simple", extract_simple, Mixed::RefusesPartial),
     ("extract --smart", extract_smart, Mixed::RefusesPartial),
-    ("time-filter", time_filter, Mixed::RefusesPartial),
+    // time-filter reads no indexdata on either path: the snapshot schedule
+    // takes every blob and the history path's reader decodes every blob, and
+    // both work on the decoded elements.
+    ("time-filter", time_filter, Mixed::Accepts),
+    ("time-filter (history)", time_filter_history, Mixed::Accepts),
     // cat accepts in every mode: --type decodes a blob without indexdata
     // and filters its actual elements, --dedupe's first pass scans its IDs,
     // and --clean schedules and decodes every blob whatever its indexdata.

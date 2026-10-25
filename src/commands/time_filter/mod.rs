@@ -11,6 +11,14 @@
 //!   out trivial per-block parallelism.
 //! - **Snapshot input**: parallel per-block filter. Each (kind, id) appears
 //!   in exactly one block, so blocks are independent.
+//!
+//! Neither path reads blob indexdata: every data blob is decoded and its
+//! elements are handled by their actual kind and ID, and the output's
+//! indexdata is built fresh. So time-filter has no `--force`, accepts a
+//! wholly or partially indexed input alike, and believes no sidecar claim.
+//! It does believe two header declarations: `Sort.Type_then_ID` (required;
+//! the history path's grouping needs each object's versions contiguous) and
+//! `HistoricalInformation` (which picks the path).
 
 use std::path::Path;
 
@@ -308,7 +316,12 @@ fn time_filter_snapshot(
     // comparisons; these samples are inert unless the CLI initialized the FIFO.
     crate::debug::emit_mallinfo2("timefilter_snapshot_start_mallinfo");
 
-    let (schedule, shared_file) = build_classify_schedule(input, None, PartialIndex::Refuse, host)?;
+    // No kind or blob filter: every OsmData blob is scheduled whatever its
+    // indexdata says or lacks, and `filter_block_snapshot` works on the
+    // decoded elements by their actual kind. A partially indexed file
+    // therefore gives the wholly indexed file's output, so it is accepted
+    // (reference/indexdata-trust.md, "Missing and partial indexdata").
+    let (schedule, shared_file) = build_classify_schedule(input, None, PartialIndex::Accept, host)?;
 
     if schedule.is_empty() {
         crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_END");
@@ -747,5 +760,222 @@ fn clone_owned_element(element: &Element<'_>) -> OwnedElement {
         Element::Node(n) => OwnedElement::Node(read_node(n)),
         Element::Way(w) => OwnedElement::Way(read_way(w)),
         Element::Relation(r) => OwnedElement::Relation(read_relation(r)),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::blob_meta::BlobIndex;
+    use crate::elements::MemberId;
+
+    const CUTOFF: i64 = 250;
+
+    /// What a fixture blob's header says about it.
+    #[derive(Clone, Copy, Debug)]
+    enum Claim {
+        /// Indexdata scanned from the payload.
+        Honest,
+        /// No indexdata.
+        Absent,
+        /// Parseable indexdata that is false on every field: another kind,
+        /// a range holding none of its IDs and a wrong count.
+        False,
+    }
+
+    /// One fixture element: kind, ID, version, timestamp, visible.
+    type Version = (char, i64, i32, i64, bool);
+
+    /// The history fixture's blobs. Node 2 and way 11 straddle a blob
+    /// boundary with versions on both sides of the cutoff; node 3 is deleted
+    /// at the cutoff, node 4 has no version at or before it, and way 10 and
+    /// relation 100 have a later version past it.
+    const HISTORY: &[&[Version]] = &[
+        &[
+            ('n', 1, 1, 100, true),
+            ('n', 2, 1, 100, true),
+            ('n', 2, 2, 200, true),
+        ],
+        &[
+            ('n', 2, 3, 300, true),
+            ('n', 3, 1, 100, true),
+            ('n', 3, 2, 150, false),
+            ('n', 4, 1, 400, true),
+        ],
+        &[
+            ('w', 10, 1, 100, true),
+            ('w', 10, 2, 300, true),
+            ('w', 11, 1, 200, true),
+        ],
+        &[('w', 11, 2, 240, true)],
+        &[('r', 100, 1, 100, true), ('r', 100, 2, 260, true)],
+    ];
+
+    /// The snapshot fixture's blobs: each object once. Node 2 and way 11 are
+    /// past the cutoff and node 3 is deleted.
+    const SNAPSHOT: &[&[Version]] = &[
+        &[('n', 1, 1, 100, true), ('n', 2, 1, 300, true)],
+        &[('n', 3, 2, 100, false), ('n', 4, 1, 200, true)],
+        &[('w', 10, 1, 100, true)],
+        &[('w', 11, 1, 300, true)],
+        &[('r', 100, 1, 100, true)],
+    ];
+
+    fn write_fixture(path: &Path, history: bool, claims: &[Claim]) {
+        let blobs = if history { HISTORY } else { SNAPSHOT };
+        assert_eq!(blobs.len(), claims.len());
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::default(),
+        );
+        let mut header = crate::block_builder::HeaderBuilder::new().sorted();
+        if history {
+            header = header.historical();
+        }
+        writer.write_header(&header.build().unwrap()).unwrap();
+        let mut bb = BlockBuilder::new();
+        for (blob, claim) in blobs.iter().zip(claims) {
+            for &(kind, id, version, timestamp, visible) in *blob {
+                let meta = crate::block_builder::Metadata {
+                    version,
+                    timestamp,
+                    changeset: 7,
+                    uid: 3,
+                    user: "u",
+                    visible,
+                };
+                let tags = [("name", "x")];
+                match kind {
+                    'n' => bb.add_node(id, 10, 10, tags, Some(&meta)),
+                    'w' => bb.add_way(id, tags, &[1, 2], Some(&meta)),
+                    _ => bb.add_relation(
+                        id,
+                        tags,
+                        &[MemberData {
+                            id: MemberId::Way(10),
+                            role: "outer",
+                        }],
+                        Some(&meta),
+                    ),
+                }
+            }
+            let bytes = bb.take().unwrap().unwrap();
+            match claim {
+                Claim::Honest => writer.write_primitive_block(bytes).unwrap(),
+                Claim::Absent => writer.write_primitive_block_no_indexdata(bytes).unwrap(),
+                Claim::False => {
+                    let kind = match blob[0].0 {
+                        'n' => ElementKind::Relation,
+                        'w' => ElementKind::Node,
+                        _ => ElementKind::Way,
+                    };
+                    let index = BlobIndex {
+                        kind,
+                        min_id: 1000,
+                        max_id: 2000,
+                        count: 99,
+                        bbox: None,
+                    };
+                    writer
+                        .write_primitive_block_owned(bytes.to_vec(), index, None, None)
+                        .unwrap();
+                }
+            }
+        }
+        writer.flush().unwrap();
+    }
+
+    /// An output element: kind, ID, version.
+    type Written = (char, i64, i32);
+
+    /// One run: output bytes, the written elements in file order, and stats.
+    fn run(input: &Path) -> (Vec<u8>, Vec<Written>, [u64; 5]) {
+        let dir = crate::path_guard::tests::scratch();
+        let output = dir.path().join("out.pbf");
+        let staged = crate::output::Output::new(
+            &output,
+            crate::output::Overwrite::Refuse,
+            &crate::host::Diagnostics::discard(),
+        )
+        .unwrap();
+        let host = crate::host::Host::for_tests();
+        let s = time_filter(
+            input,
+            staged,
+            CUTOFF,
+            &WriteOptions::default(),
+            &HeaderOverrides::default(),
+            &host,
+        )
+        .unwrap();
+        let mut elements = Vec::new();
+        ElementReader::open_in(&output, false, &host)
+            .unwrap()
+            .for_each(|element| {
+                elements.push(match element {
+                    Element::DenseNode(n) => ('n', n.id(), n.info().unwrap().version()),
+                    Element::Node(n) => ('n', n.id(), n.info().version().unwrap()),
+                    Element::Way(w) => ('w', w.id(), w.info().version().unwrap()),
+                    Element::Relation(r) => ('r', r.id(), r.info().version().unwrap()),
+                });
+            })
+            .unwrap();
+        let stats = [
+            s.versions_seen,
+            s.versions_before_cutoff,
+            s.elements_written,
+            s.dropped_deleted,
+            s.dropped_no_snapshot_version,
+        ];
+        (std::fs::read(&output).unwrap(), elements, stats)
+    }
+
+    /// Neither path reads indexdata, so a partially indexed input (in either
+    /// order) and one whose indexdata is false on every field give the
+    /// wholly indexed file's output byte for byte, with the same stats. On
+    /// the history path the claims change across versions of one object.
+    #[test]
+    fn indexdata_never_changes_the_output() {
+        use Claim::{Absent as A, False as F, Honest as H};
+        let dir = crate::path_guard::tests::scratch();
+        let history_expected: &[Written] = &[
+            ('n', 1, 1),
+            ('n', 2, 2),
+            ('w', 10, 1),
+            ('w', 11, 2),
+            ('r', 100, 1),
+        ];
+        let snapshot_expected: &[Written] =
+            &[('n', 1, 1), ('n', 4, 1), ('w', 10, 1), ('r', 100, 1)];
+        for (history, expected, expected_stats) in [
+            (true, history_expected, [13, 9, 5, 1, 1]),
+            (false, snapshot_expected, [7, 5, 4, 1, 2]),
+        ] {
+            let whole = dir.path().join(format!("whole-{history}.pbf"));
+            write_fixture(&whole, history, &[H; 5]);
+            let reference = run(&whole);
+            assert_eq!(reference.1, expected, "reference, history {history}");
+            assert_eq!(
+                reference.2, expected_stats,
+                "reference stats, history {history}"
+            );
+            for (name, claims) in [
+                ("indexed head", [H, A, A, A, A]),
+                ("unindexed head", [A, H, H, H, H]),
+                ("alternating", [H, A, H, A, H]),
+                ("all false", [F; 5]),
+                ("false and missing", [F, A, H, F, A]),
+            ] {
+                let what = format!("{name}, history {history}");
+                let input = dir.path().join(format!("{name}-{history}.pbf"));
+                write_fixture(&input, history, &claims);
+                let got = run(&input);
+                assert_eq!(got.1, expected, "{what}");
+                assert_eq!(got.2, reference.2, "stats: {what}");
+                assert!(got.0 == reference.0, "output bytes differ: {what}");
+            }
+        }
     }
 }

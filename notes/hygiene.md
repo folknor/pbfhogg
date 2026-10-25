@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-10. HYG-157
 11. HYG-017
 12. HYG-038
 13. HYG-032
@@ -498,6 +497,21 @@ The judgement calls already known, to be checked first:
   `build_classify_schedule_blob_filtered`; whether its workers count by
   actual kind was not checked, so a reviewer should judge it under the same
   rule.
+- time-filter accepts a partially indexed file on both paths (HYG-157).
+  The entry's premise was wrong: the history path reads no indexdata at
+  all (the pipelined reader parses none without a blob filter, and the
+  path is picked by `HistoricalInformation`), so there was no first-blob
+  decision to record. The snapshot path's classify walk, with no kind or
+  blob filter, now passes `PartialIndex::Accept`: the refusal protected
+  nothing, and it was the odd one out against the wholly unindexed file
+  the same path already accepted. The trust page's kind-claim row no
+  longer lists time-filter. Sparred with codex, which found no
+  counterexample and asked for false-claim and straddling-history
+  coverage: a unit test pins byte-identical output and stats for both
+  paths under partial (both orders), alternating and parseable-but-false
+  indexdata, with history versions straddling the blob boundaries; two
+  first-blob-only contract rows (snapshot and history). On a wholly
+  indexed planet run only a per-header guard branch goes; not measured.
 
 ---
 
@@ -1250,31 +1264,6 @@ docs sentence, since a sweep merge must hold whatever overlaps the current
 position and bounding it means an external merge.
 
 Reported by: re-encoding.
-
-## HYG-157 - time-filter's history path trusts the first blob's indexdata
-
-Anger: 8 - indexdata trust model, one command.
-
-Split out of the indexdata trust model entry, now resolved as
-`reference/indexdata-trust.md`. time-filter's history path decides from the first
-data blob, while its non-history classify walk refuses a partial file.
-
-Recommendation (2026-10-25): opt into the partial-index refusal only where a
-full header walk already happens; add no new walk. Where none happens,
-record on `reference/indexdata-trust.md` ("Missing and partial indexdata")
-that the command decides from the first blob. Move the contract table rows
-that change.
-
-Precedent from the getid and getparents entries, resolved against that
-recommendation: the trust page says refusing a partial file is owed only
-where a path cannot do without the missing indexdata, and getid and
-getparents accept on every path because each decodes a blob lacking
-indexdata. Classify builders take a `PartialIndex` policy per call site.
-Test this command's paths against the same rule before choosing either
-way.
-
-Reported by: change application, re-encoding, altw and scanning, geocode
-index (the indexdata trust model entry).
 
 ## HYG-077 - The enforcement levers most of these findings need are unused
 

@@ -14,8 +14,8 @@ use s2::latlng::LatLng;
 
 use super::format::{
     self, ADMIN_LEVEL_SLOTS, AddrEntry, AddrPoint, AdminCell, AdminEntry, AdminPolygon, GeoCell,
-    HEADER_SIZE, Header, InterpWay, InterpolationType, NodeCoord, Record, RunError, SegmentRef,
-    StreetWay, Table,
+    HEADER_SIZE, Header, InterpWay, InterpolationType, NodeCoord, Record, Records, RunError,
+    SegmentRef, StreetWay, Table,
 };
 use crate::geo;
 
@@ -215,41 +215,9 @@ pub struct Reader {
     strings: Mmap,
 }
 
-/// A mapped file of `T` records. The record type is fixed where the file is
-/// opened, so a file cannot be decoded as another file's record. (Files that
-/// share a record type - the three coordinate files, the street and
-/// interpolation entry files - are still bound to their roles only by the
-/// field they are opened into.)
-struct Records<T> {
-    map: Mmap,
-    record: PhantomData<fn() -> T>,
-}
-
-impl<T: Record> Records<T> {
-    fn map(path: &Path) -> Result<Self> {
-        Ok(Self {
-            map: format::mmap_or_empty(path)?,
-            record: PhantomData,
-        })
-    }
-
-    #[inline]
-    fn table(&self) -> Table<'_, T> {
-        Table::new(&self.map)
-    }
-
-    /// `count` records at byte `offset`: one way's or polygon's geometry.
-    #[inline]
-    fn span(&self, offset: u64, count: u64) -> std::result::Result<Table<'_, T>, RunError> {
-        Table::span(&self.map, offset, count)
-    }
-
-    fn byte_len(&self) -> usize {
-        self.map.len()
-    }
-}
-
-/// A mapped file of length-prefixed lists of `T`, one per cell.
+/// A mapped file of length-prefixed lists of `T`, one per cell. (Files that
+/// share a record type - the street and interpolation entry files - are bound
+/// to their roles only by the field they are opened into.)
 struct Lists<T> {
     map: Mmap,
     record: PhantomData<fn() -> T>,

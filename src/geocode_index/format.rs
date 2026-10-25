@@ -8,7 +8,9 @@
 //! format. It also owns how records are found: a whole record file, a
 //! fixed-count span of records at a byte offset, and the length-prefixed
 //! entry lists, all read through [`Table`], whose list framing is
-//! [`ListCount`] and [`list_byte_len`].
+//! [`ListCount`] and [`list_byte_len`]. The reader and the builder both reach
+//! mapped record files through the crate-internal `Records`, and the
+//! builder's pass 3 scratch record is defined here too, outside the index.
 
 use crate::coord_fmt::e7_to_deg;
 
@@ -186,6 +188,8 @@ impl Header {
 /// A fixed-size little-endian record of one of the index files.
 ///
 /// Every record type is defined below, and only there: the trait is sealed.
+/// That includes the builder's scratch record (`BucketRecord`), which is not
+/// part of the index.
 /// `SIZE` is nonzero, and `read` succeeds for every byte slice of exactly
 /// `SIZE` bytes - validating field *values* (an interpolation type, an
 /// offset into another file) is the reader's job, not the codec's.
@@ -239,13 +243,13 @@ wire_field!(u8, u16, u32, u64, i32, f32);
 macro_rules! record {
     (
         $(#[$meta:meta])*
-        pub struct $name:ident {
+        $vis:vis struct $name:ident {
             $( $(#[$field_meta:meta])* pub $field:ident : $ty:ty, )+
         }
         $( reserved = $reserved:literal; )?
     ) => {
         $(#[$meta])*
-        pub struct $name {
+        $vis struct $name {
             $( $(#[$field_meta])* pub $field: $ty, )+
         }
 
@@ -255,7 +259,7 @@ macro_rules! record {
 
             #[inline]
             #[allow(unused_assignments)]
-            pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+            pub fn to_bytes(self) -> [u8; Self::SIZE] {
                 let mut buf = [0u8; Self::SIZE];
                 let mut at = 0;
                 $(
@@ -472,6 +476,40 @@ impl Record for AdminEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Builder scratch records
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "commands")]
+record! {
+    /// One cell assignment in the builder's pass 3 bucket files, the external
+    /// partition between Stage A (cover) and Stage B (group and write). Not
+    /// part of the index: the files live in run scratch and are deleted once
+    /// read, so this layout can change without a `FORMAT_VERSION` bump.
+    ///
+    /// In memory the fields reorder to a 16-byte struct, one byte over the 15
+    /// on disk; Stage B holds a window of sorted buckets of these, which is
+    /// what `GEOCODE_STAGE_B_SORT_WINDOW` bounds.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct BucketRecord {
+        pub cell_id: u64,
+        /// Which entry list the record belongs to: one of the
+        /// `BUCKET_ENTRY_*` values.
+        pub entry_type: u8,
+        /// Street way, address point or interpolation way index.
+        pub index: u32,
+        /// Segment within the way; 0 for address points.
+        pub segment: u16,
+    }
+}
+
+#[cfg(feature = "commands")]
+pub(crate) const BUCKET_ENTRY_STREET: u8 = 0;
+#[cfg(feature = "commands")]
+pub(crate) const BUCKET_ENTRY_ADDR: u8 = 1;
+#[cfg(feature = "commands")]
+pub(crate) const BUCKET_ENTRY_INTERP: u8 = 2;
+
+// ---------------------------------------------------------------------------
 // Record runs: whole files, fixed-count spans and length-prefixed lists
 // ---------------------------------------------------------------------------
 
@@ -586,6 +624,14 @@ impl<'a, T: Record> Table<'a, T> {
             .get(items..end)
             .map(Self::new)
             .ok_or(RunError::PastEnd)
+    }
+
+    /// `count` records starting at byte `offset` of this run's bytes:
+    /// [`Table::span`] over the same bytes, so a byte offset that is not a
+    /// whole number of records in is legal, as the geometry offsets are.
+    #[inline]
+    pub fn span_at(&self, offset: u64, count: u64) -> Result<Self, RunError> {
+        Self::span(self.bytes, offset, count)
     }
 
     /// Whole records in the run.
@@ -751,6 +797,46 @@ pub(crate) fn mmap_or_empty(path: &std::path::Path) -> crate::Result<memmap2::Mm
             .map_err(|e| Error::from(e).context(format!("failed to mmap {}", path.display())))?
     };
     Ok(mapped)
+}
+
+/// A mapped file of `T` records, shared by the reader and the builder's
+/// passes over the files it has just written. The record type is fixed where
+/// the file is opened, so a file cannot be decoded as another file's record.
+/// (Files that share a record type - the three coordinate files - are still
+/// bound to their roles only by the field they are opened into.)
+///
+/// Mapping establishes the type, not validity: a partial trailing record is
+/// unreachable through [`Records::table`], and rejecting a file that has one
+/// is the caller's open-time check.
+#[cfg(feature = "geocode-reader")]
+pub(crate) struct Records<T> {
+    map: memmap2::Mmap,
+    record: std::marker::PhantomData<fn() -> T>,
+}
+
+#[cfg(feature = "geocode-reader")]
+impl<T: Record> Records<T> {
+    pub(crate) fn map(path: &std::path::Path) -> crate::Result<Self> {
+        Ok(Self {
+            map: mmap_or_empty(path)?,
+            record: std::marker::PhantomData,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn table(&self) -> Table<'_, T> {
+        Table::new(&self.map)
+    }
+
+    /// `count` records at byte `offset`: one way's or polygon's geometry.
+    #[inline]
+    pub(crate) fn span(&self, offset: u64, count: u64) -> Result<Table<'_, T>, RunError> {
+        self.table().span_at(offset, count)
+    }
+
+    pub(crate) fn byte_len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1350,6 +1436,29 @@ mod tests {
         );
     }
 
+    /// The scratch record's on-disk layout, and its in-memory size: Stage B
+    /// holds windows of decoded records at the build's peak, so growing the
+    /// struct past 16 bytes is a memory change, not a refactor.
+    #[cfg(feature = "commands")]
+    #[test]
+    fn bucket_record_layout() {
+        let record = BucketRecord {
+            cell_id: 0x0102_0304_0506_0708,
+            entry_type: BUCKET_ENTRY_INTERP,
+            index: 0x1112_1314,
+            segment: 0x2122,
+        };
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        expected.push(2);
+        expected.extend_from_slice(&0x1112_1314u32.to_le_bytes());
+        expected.extend_from_slice(&0x2122u16.to_le_bytes());
+        assert_eq!(BucketRecord::SIZE, 15);
+        assert_eq!(record.to_bytes().as_slice(), expected.as_slice());
+        assert_eq!(BucketRecord::from_bytes(&record.to_bytes()), record);
+        assert_eq!(std::mem::size_of::<BucketRecord>(), 16);
+    }
+
     #[test]
     fn admin_polygon_ignores_its_reserved_byte_on_read() {
         let poly = AdminPolygon {
@@ -1411,6 +1520,19 @@ mod tests {
         assert_eq!(table.get(usize::MAX), None);
         assert_eq!(table.iter().count(), 3);
         assert!(Table::<NodeCoord>::new(&[]).get(0).is_none());
+    }
+
+    #[test]
+    fn span_at_reads_the_tables_own_bytes() {
+        let mut bytes = vec![0u8; 3];
+        bytes.extend_from_slice(&coords(4));
+        // A partial tail stays reachable as span bytes, as over the raw file.
+        let table = Table::<NodeCoord>::new(&bytes);
+        assert_eq!(table.len(), 4, "3 + 32 bytes holds four whole records");
+        let span = table.span_at(3 + 16, 2).expect("in bounds");
+        assert_eq!(span.iter().collect::<Vec<_>>(), vec![nc(2, -2), nc(3, -3)]);
+        assert_eq!(table.span_at(3 + 16, 3).err(), Some(RunError::PastEnd));
+        assert!(table.span_at(u64::MAX, 0).expect("zero count").is_empty());
     }
 
     #[test]

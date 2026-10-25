@@ -23,7 +23,6 @@ use crate::tunables::{
 
 use super::Result;
 use super::admin::AssembledPolygon;
-use super::interp::{read_addr_point_mmap, read_node_at};
 use super::pass2::SlimInterpWay;
 use crate::error::Error;
 
@@ -252,6 +251,36 @@ fn cover_segment_fused(
     });
 }
 
+/// Fused cover of every segment of one way, whose nodes are `nodes` (a span
+/// of at most `u16::MAX` records, the width of `node_count`). Emits
+/// `(fine, coarse, segment_index)` as [`cover_segment_fused`] does.
+fn cover_way_segments(
+    nodes: Table<'_, NodeCoord>,
+    fine_level: u8,
+    coarse_level: u8,
+    mut emit: impl FnMut(u64, Option<u64>, u16),
+) {
+    let mut iter = nodes.iter();
+    let Some(mut prev) = iter.next() else {
+        return;
+    };
+    for (seg_idx, next) in iter.enumerate() {
+        // The span holds at most u16::MAX nodes, so each segment index fits.
+        #[allow(clippy::cast_possible_truncation)]
+        let segment = seg_idx as u16;
+        cover_segment_fused(
+            prev.lat_e7,
+            prev.lon_e7,
+            next.lat_e7,
+            next.lon_e7,
+            fine_level,
+            coarse_level,
+            |fine, coarse| emit(fine, coarse, segment),
+        );
+        prev = next;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // S2 cell assignment
 // ---------------------------------------------------------------------------
@@ -260,12 +289,7 @@ fn cover_segment_fused(
 // Bucketed cell assignment
 // ---------------------------------------------------------------------------
 
-/// Tagged bucket record: 15 bytes on disk.
-/// cell_id (8) + entry_type (1) + way_or_addr_index (4) + segment_index (2)
-const BUCKET_RECORD_SIZE: usize = 15;
-const ENTRY_TYPE_STREET: u8 = 0;
-const ENTRY_TYPE_ADDR: u8 = 1;
-const ENTRY_TYPE_INTERP: u8 = 2;
+// Bucket files hold `format::BucketRecord`s.
 
 fn bucket_for_cell(cell_id: u64) -> usize {
     (cell_id >> 56) as usize
@@ -297,73 +321,36 @@ fn bucket_write_error(e: std::io::Error, bucket_dir: &Path, bucket: usize) -> cr
     ))
 }
 
+/// Append `record` to the bucket file its cell id selects, creating that
+/// file on first use.
 fn write_bucket_record(
-    w: &mut BufWriter<std::fs::File>,
+    writers: &mut [Option<BufWriter<std::fs::File>>],
     bucket_dir: &Path,
-    bucket: usize,
-    cell_id: u64,
-    etype: u8,
-    index: u32,
-    segment: u16,
+    record: BucketRecord,
 ) -> Result<()> {
-    let mut buf = [0u8; BUCKET_RECORD_SIZE];
-    buf[0..8].copy_from_slice(&cell_id.to_le_bytes());
-    buf[8] = etype;
-    buf[9..13].copy_from_slice(&index.to_le_bytes());
-    buf[13..15].copy_from_slice(&segment.to_le_bytes());
-    w.write_all(&buf)
+    let bucket = bucket_for_cell(record.cell_id);
+    ensure_bucket_writer(writers, bucket, bucket_dir)?;
+    writers[bucket]
+        .as_mut()
+        .expect("ensured")
+        .write_all(&record.to_bytes())
         .map_err(|e| bucket_write_error(e, bucket_dir, bucket))
 }
 
-struct ParsedBucketEntry {
-    cell_id: u64,
-    etype: u8,
-    index: u32,
-    segment: u16,
-}
-
-fn parse_bucket_file(data: &[u8]) -> Result<Vec<ParsedBucketEntry>> {
+fn parse_bucket_file(data: &[u8]) -> Result<Vec<BucketRecord>> {
     // A partial trailing record means Stage A was interrupted mid-flush
-    // (ENOSPC, SIGKILL during write). Silently truncating would drop
-    // real assignments with no diagnostic; error loudly instead.
-    if !data.len().is_multiple_of(BUCKET_RECORD_SIZE) {
+    // (ENOSPC, SIGKILL during write). `Table` would silently skip it and
+    // drop real assignments with no diagnostic; error loudly instead.
+    if !data.len().is_multiple_of(BucketRecord::SIZE) {
         return Err(Error::internal(format!(
             "geocode bucket file has partial trailing record ({} bytes, \
-             not a multiple of {BUCKET_RECORD_SIZE}); Stage A write was \
+             not a multiple of {}); Stage A write was \
              likely interrupted (ENOSPC or crash)",
             data.len(),
+            BucketRecord::SIZE,
         )));
     }
-    let count = data.len() / BUCKET_RECORD_SIZE;
-    let mut entries = Vec::with_capacity(count);
-    for i in 0..count {
-        let off = i * BUCKET_RECORD_SIZE;
-        let cell_id = u64::from_le_bytes([
-            data[off],
-            data[off + 1],
-            data[off + 2],
-            data[off + 3],
-            data[off + 4],
-            data[off + 5],
-            data[off + 6],
-            data[off + 7],
-        ]);
-        let etype = data[off + 8];
-        let index = u32::from_le_bytes([
-            data[off + 9],
-            data[off + 10],
-            data[off + 11],
-            data[off + 12],
-        ]);
-        let segment = u16::from_le_bytes([data[off + 13], data[off + 14]]);
-        entries.push(ParsedBucketEntry {
-            cell_id,
-            etype,
-            index,
-            segment,
-        });
-    }
-    Ok(entries)
+    Ok(Table::<BucketRecord>::new(data).iter().collect())
 }
 
 /// Parameters for the fused fine + coarse bucketed cell assignment
@@ -378,13 +365,13 @@ pub(super) struct FusedCellAssignmentParams<'a> {
     pub(super) output_dir: &'a Path,
     /// The run's scratch directory, which holds the bucket trees.
     pub(super) scratch: &'a crate::scratch::RunScratch,
-    pub(super) street_ways_mmap: &'a [u8],
-    pub(super) street_nodes_mmap: &'a [u8],
+    pub(super) street_ways: Table<'a, StreetWay>,
+    pub(super) street_nodes: Table<'a, NodeCoord>,
     pub(super) street_way_count: u32,
-    pub(super) addr_points_mmap: &'a [u8],
+    pub(super) addr_points: Table<'a, AddrPoint>,
     pub(super) addr_point_count: u32,
     pub(super) interp_ways: &'a [SlimInterpWay],
-    pub(super) interp_nodes_mmap: &'a [u8],
+    pub(super) interp_nodes: Table<'a, NodeCoord>,
     pub(super) fine_level: u8,
     pub(super) coarse_level: u8,
     pub(super) fine_cells_file: &'a str,
@@ -426,13 +413,13 @@ pub(super) fn bucketed_cell_assignment_fused(
     let FusedCellAssignmentParams {
         output_dir,
         scratch,
-        street_ways_mmap,
-        street_nodes_mmap,
+        street_ways,
+        street_nodes,
         street_way_count,
-        addr_points_mmap,
+        addr_points,
         addr_point_count,
         interp_ways,
-        interp_nodes_mmap,
+        interp_nodes,
         fine_level,
         coarse_level,
         fine_cells_file,
@@ -446,6 +433,8 @@ pub(super) fn bucketed_cell_assignment_fused(
         executor,
         cancel,
     } = p;
+    let (street_ways, street_nodes, addr_points, interp_nodes) =
+        (*street_ways, *street_nodes, *addr_points, *interp_nodes);
     let street_way_count = *street_way_count;
     let addr_point_count = *addr_point_count;
     let fine_level = *fine_level;
@@ -520,11 +509,7 @@ pub(super) fn bucketed_cell_assignment_fused(
                     {
                         panic!("test-hooks: geocode pass3 stage A streets way {way_idx} panicking");
                     }
-                    let offset = way_idx as usize * StreetWay::SIZE;
-                    let rec = street_ways_mmap
-                        .get(offset..offset + StreetWay::SIZE)
-                        .and_then(|b| <&[u8; StreetWay::SIZE]>::try_from(b).ok())
-                        .map(StreetWay::from_bytes);
+                    let rec = street_ways.get(way_idx as usize);
                     let mut out = Vec::new();
                     // Pass 2 wrote these files moments ago, so a record or node
                     // out of bounds is a builder bug, not bad input: skipping it
@@ -536,36 +521,18 @@ pub(super) fn bucketed_cell_assignment_fused(
                         first_missing_street.fetch_min(way_idx, AtomicOrdering::Relaxed);
                         return out.into_iter();
                     };
-                    let nc = rec.node_count as usize;
-                    if nc >= 2 {
-                        out.reserve(nc * 2);
-                        for seg_idx in 0..nc - 1 {
-                            // node_count is u16, so each segment index fits.
-                            #[allow(clippy::cast_possible_truncation)]
-                            let segment_index = seg_idx as u16;
-                            let off1 = usize::try_from(rec.node_offset)
-                                .expect("builder requires 64-bit pointers")
-                                + seg_idx * NodeCoord::SIZE;
-                            let off2 = off1 + NodeCoord::SIZE;
-                            let (Some(n1), Some(n2)) = (
-                                read_node_at(street_nodes_mmap, off1 as u64),
-                                read_node_at(street_nodes_mmap, off2 as u64),
-                            ) else {
-                                first_missing_street.fetch_min(way_idx, AtomicOrdering::Relaxed);
-                                break;
-                            };
-                            cover_segment_fused(
-                                n1.0,
-                                n1.1,
-                                n2.0,
-                                n2.1,
-                                fine_level,
-                                coarse_level,
-                                |fine_cid, coarse_to_emit| {
-                                    out.push((fine_cid, coarse_to_emit, way_idx, segment_index));
-                                },
-                            );
-                        }
+                    // A way under two nodes has no segment and is never read.
+                    if rec.node_count >= 2 {
+                        let Ok(nodes) =
+                            street_nodes.span_at(rec.node_offset, u64::from(rec.node_count))
+                        else {
+                            first_missing_street.fetch_min(way_idx, AtomicOrdering::Relaxed);
+                            return out.into_iter();
+                        };
+                        out.reserve(nodes.len() * 2);
+                        cover_way_segments(nodes, fine_level, coarse_level, |fine, coarse, seg| {
+                            out.push((fine, coarse, way_idx, seg));
+                        });
                     }
                     out.into_iter()
                 })
@@ -579,29 +546,15 @@ pub(super) fn bucketed_cell_assignment_fused(
         }
 
         for &(fine_cid, coarse_opt, wi, si) in &entries {
-            let b = bucket_for_cell(fine_cid);
-            ensure_bucket_writer(&mut fine_writers, b, &fine_bucket_dir)?;
-            write_bucket_record(
-                fine_writers[b].as_mut().expect("ensured"),
-                &fine_bucket_dir,
-                b,
-                fine_cid,
-                ENTRY_TYPE_STREET,
-                wi,
-                si,
-            )?;
+            let record = |cell_id| BucketRecord {
+                cell_id,
+                entry_type: BUCKET_ENTRY_STREET,
+                index: wi,
+                segment: si,
+            };
+            write_bucket_record(&mut fine_writers, &fine_bucket_dir, record(fine_cid))?;
             if let Some(coarse_cid) = coarse_opt {
-                let b = bucket_for_cell(coarse_cid);
-                ensure_bucket_writer(&mut coarse_writers, b, &coarse_bucket_dir)?;
-                write_bucket_record(
-                    coarse_writers[b].as_mut().expect("ensured"),
-                    &coarse_bucket_dir,
-                    b,
-                    coarse_cid,
-                    ENTRY_TYPE_STREET,
-                    wi,
-                    si,
-                )?;
+                write_bucket_record(&mut coarse_writers, &coarse_bucket_dir, record(coarse_cid))?;
             }
         }
         chunk_start = chunk_end;
@@ -621,10 +574,7 @@ pub(super) fn bucketed_cell_assignment_fused(
                 .into_par_iter()
                 .filter_map(|idx| {
                     // Same producer-owned file rule as the streets above.
-                    let Some(pt) = read_addr_point_mmap(
-                        addr_points_mmap,
-                        u32::try_from(idx).expect("address index bounded by u32 count"),
-                    ) else {
+                    let Some(pt) = addr_points.get(idx) else {
                         first_missing_addr.fetch_min(idx, AtomicOrdering::Relaxed);
                         return None;
                     };
@@ -649,28 +599,14 @@ pub(super) fn bucketed_cell_assignment_fused(
             )));
         }
         for &(fine_cid, coarse_cid, idx) in &addr_entries {
-            let b = bucket_for_cell(fine_cid);
-            ensure_bucket_writer(&mut fine_writers, b, &fine_bucket_dir)?;
-            write_bucket_record(
-                fine_writers[b].as_mut().expect("ensured"),
-                &fine_bucket_dir,
-                b,
-                fine_cid,
-                ENTRY_TYPE_ADDR,
-                idx,
-                0,
-            )?;
-            let b = bucket_for_cell(coarse_cid);
-            ensure_bucket_writer(&mut coarse_writers, b, &coarse_bucket_dir)?;
-            write_bucket_record(
-                coarse_writers[b].as_mut().expect("ensured"),
-                &coarse_bucket_dir,
-                b,
-                coarse_cid,
-                ENTRY_TYPE_ADDR,
-                idx,
-                0,
-            )?;
+            let record = |cell_id| BucketRecord {
+                cell_id,
+                entry_type: BUCKET_ENTRY_ADDR,
+                index: idx,
+                segment: 0,
+            };
+            write_bucket_record(&mut fine_writers, &fine_bucket_dir, record(fine_cid))?;
+            write_bucket_record(&mut coarse_writers, &coarse_bucket_dir, record(coarse_cid))?;
         }
         chunk_start = chunk_end;
     }
@@ -688,45 +624,21 @@ pub(super) fn bucketed_cell_assignment_fused(
                 .into_par_iter()
                 .flat_map_iter(|way_idx| {
                     let iw = &interp_ways[way_idx];
-                    let nc = iw.node_count as usize;
                     let mut out = Vec::new();
-                    if nc >= 2 {
-                        out.reserve(nc * 2);
-                        for seg_idx in 0..nc - 1 {
-                            // node_count is u16, so each segment index fits.
-                            #[allow(clippy::cast_possible_truncation)]
-                            let segment_index = seg_idx as u16;
-                            let off1 = usize::try_from(iw.node_file_offset)
-                                .expect("builder requires 64-bit pointers")
-                                + seg_idx * NodeCoord::SIZE;
-                            let off2 = off1 + NodeCoord::SIZE;
-                            // Same producer-owned file rule as the streets above.
-                            let (Some(n1), Some(n2)) = (
-                                read_node_at(interp_nodes_mmap, off1 as u64),
-                                read_node_at(interp_nodes_mmap, off2 as u64),
-                            ) else {
-                                first_missing_interp.fetch_min(way_idx, AtomicOrdering::Relaxed);
-                                break;
-                            };
-                            cover_segment_fused(
-                                n1.0,
-                                n1.1,
-                                n2.0,
-                                n2.1,
-                                fine_level,
-                                coarse_level,
-                                |fine_cid, coarse_to_emit| {
-                                    out.push((
-                                        fine_cid,
-                                        coarse_to_emit,
-                                        u32::try_from(way_idx).expect(
-                                            "interpolation count checked before cell assignment",
-                                        ),
-                                        segment_index,
-                                    ));
-                                },
-                            );
-                        }
+                    if iw.node_count >= 2 {
+                        // Same producer-owned file rule as the streets above.
+                        let Ok(nodes) =
+                            interp_nodes.span_at(iw.node_file_offset, u64::from(iw.node_count))
+                        else {
+                            first_missing_interp.fetch_min(way_idx, AtomicOrdering::Relaxed);
+                            return out.into_iter();
+                        };
+                        let way_index = u32::try_from(way_idx)
+                            .expect("interpolation count checked before cell assignment");
+                        out.reserve(nodes.len() * 2);
+                        cover_way_segments(nodes, fine_level, coarse_level, |fine, coarse, seg| {
+                            out.push((fine, coarse, way_index, seg));
+                        });
                     }
                     out.into_iter()
                 })
@@ -739,29 +651,15 @@ pub(super) fn bucketed_cell_assignment_fused(
             )));
         }
         for &(fine_cid, coarse_opt, wi, si) in &interp_entries {
-            let b = bucket_for_cell(fine_cid);
-            ensure_bucket_writer(&mut fine_writers, b, &fine_bucket_dir)?;
-            write_bucket_record(
-                fine_writers[b].as_mut().expect("ensured"),
-                &fine_bucket_dir,
-                b,
-                fine_cid,
-                ENTRY_TYPE_INTERP,
-                wi,
-                si,
-            )?;
+            let record = |cell_id| BucketRecord {
+                cell_id,
+                entry_type: BUCKET_ENTRY_INTERP,
+                index: wi,
+                segment: si,
+            };
+            write_bucket_record(&mut fine_writers, &fine_bucket_dir, record(fine_cid))?;
             if let Some(coarse_cid) = coarse_opt {
-                let b = bucket_for_cell(coarse_cid);
-                ensure_bucket_writer(&mut coarse_writers, b, &coarse_bucket_dir)?;
-                write_bucket_record(
-                    coarse_writers[b].as_mut().expect("ensured"),
-                    &coarse_bucket_dir,
-                    b,
-                    coarse_cid,
-                    ENTRY_TYPE_INTERP,
-                    wi,
-                    si,
-                )?;
+                write_bucket_record(&mut coarse_writers, &coarse_bucket_dir, record(coarse_cid))?;
             }
         }
         interp_chunk_start = interp_chunk_end;
@@ -861,15 +759,15 @@ fn run_stage_b(
 
     // Bound the parse/sort lookahead. Keeping every sorted bucket alive here
     // defeats the external bucketing and costs more RAM than the 15-byte
-    // scratch records because ParsedBucketEntry is padded to 16 bytes.
+    // scratch records because a decoded BucketRecord is 16 bytes.
     for window_start in (0..GEOCODE_NUM_BUCKETS).step_by(GEOCODE_STAGE_B_SORT_WINDOW) {
         cancel.check()?;
         let window_end = (window_start + GEOCODE_STAGE_B_SORT_WINDOW).min(GEOCODE_NUM_BUCKETS);
-        let sorted_buckets: Vec<Vec<ParsedBucketEntry>> = executor.install(|| {
+        let sorted_buckets: Vec<Vec<BucketRecord>> = executor.install(|| {
             (window_start..window_end)
                 .into_par_iter()
-                .map(|bucket_idx| -> Result<Vec<ParsedBucketEntry>> {
-                    let bucket_path = bucket_dir.join(format!("{bucket_idx:03}"));
+                .map(|bucket_idx| -> Result<Vec<BucketRecord>> {
+                    let bucket_path = bucket_path(bucket_dir, bucket_idx);
                     if !bucket_path.exists() {
                         return Ok(Vec::new());
                     }
@@ -902,9 +800,9 @@ fn run_stage_b(
             }
 
             let mut i = 0;
-            let mut streets: Vec<&ParsedBucketEntry> = Vec::new();
-            let mut addrs: Vec<&ParsedBucketEntry> = Vec::new();
-            let mut interps: Vec<&ParsedBucketEntry> = Vec::new();
+            let mut streets: Vec<&BucketRecord> = Vec::new();
+            let mut addrs: Vec<&BucketRecord> = Vec::new();
+            let mut interps: Vec<&BucketRecord> = Vec::new();
             while i < entries.len() {
                 let cell_id = entries[i].cell_id;
                 let group_start = i;
@@ -918,10 +816,10 @@ fn run_stage_b(
                 addrs.clear();
                 interps.clear();
                 for e in group {
-                    match e.etype {
-                        ENTRY_TYPE_STREET => streets.push(e),
-                        ENTRY_TYPE_ADDR => addrs.push(e),
-                        ENTRY_TYPE_INTERP => interps.push(e),
+                    match e.entry_type {
+                        BUCKET_ENTRY_STREET => streets.push(e),
+                        BUCKET_ENTRY_ADDR => addrs.push(e),
+                        BUCKET_ENTRY_INTERP => interps.push(e),
                         other => {
                             return Err(Error::internal(format!(
                                 "geocode Stage B: unknown bucket entry type {other} in cell {cell_id}"
@@ -1186,6 +1084,49 @@ mod tests {
         assert!(window > 0);
         assert!(window <= 8);
         assert!(window < GEOCODE_NUM_BUCKETS);
+    }
+
+    #[test]
+    fn bucket_file_parses_whole_records_and_refuses_a_partial_tail() {
+        let records = [
+            BucketRecord {
+                cell_id: 7,
+                entry_type: BUCKET_ENTRY_STREET,
+                index: 1,
+                segment: 2,
+            },
+            BucketRecord {
+                cell_id: 3,
+                entry_type: BUCKET_ENTRY_ADDR,
+                index: 4,
+                segment: 0,
+            },
+        ];
+        let mut data: Vec<u8> = records
+            .into_iter()
+            .flat_map(BucketRecord::to_bytes)
+            .collect();
+        assert_eq!(parse_bucket_file(&data).expect("whole records"), records);
+        data.pop();
+        let err = parse_bucket_file(&data).expect_err("a partial tail must not be skipped");
+        assert!(err.to_string().contains("partial trailing record"), "{err}");
+    }
+
+    #[test]
+    fn cover_way_segments_numbers_each_segment() {
+        let nodes: Vec<u8> = [(0, 0), (1_000, 0), (2_000, 0)]
+            .into_iter()
+            .flat_map(|(lat_e7, lon_e7)| NodeCoord { lat_e7, lon_e7 }.to_bytes())
+            .collect();
+        let mut segments = Vec::new();
+        cover_way_segments(Table::new(&nodes), 17, 14, |_, _, seg| segments.push(seg));
+        segments.dedup();
+        assert_eq!(segments, vec![0, 1]);
+        let mut none = 0;
+        cover_way_segments(Table::new(&nodes[..NodeCoord::SIZE]), 17, 14, |_, _, _| {
+            none += 1;
+        });
+        assert_eq!(none, 0, "a single node has no segment");
     }
 
     #[test]

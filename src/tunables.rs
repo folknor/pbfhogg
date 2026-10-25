@@ -669,8 +669,8 @@ pub(crate) const GEOCODE_INTERP_CHUNK: usize = 100_000;
 
 /// Bound on the parse/sort lookahead of pass 3 stage B: the number of buckets
 /// sorted at once. Keeping every sorted bucket alive defeats the external
-/// bucketing and costs more RAM than the 15-byte scratch records because
-/// `ParsedBucketEntry` is padded to 16 bytes.
+/// bucketing and costs more RAM than the 15-byte scratch records because a
+/// decoded `BucketRecord` is 16 bytes.
 pub(crate) const GEOCODE_STAGE_B_SORT_WINDOW: usize = 8;
 
 /// Number of hole vertices sampled when deciding which outer ring owns the

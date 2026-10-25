@@ -481,10 +481,10 @@ fn build_generation(
         street_way_count,
         mut interp_ways,
         way_geom,
-        street_ways_mmap,
-        street_nodes_mmap,
-        addr_points_mmap,
-        interp_nodes_mmap,
+        street_ways,
+        street_nodes,
+        addr_points,
+        interp_nodes,
     } = pass2::run_pass2(
         output_dir,
         &node_schedule,
@@ -594,8 +594,8 @@ fn build_generation(
     checked_count(interp_ways.len(), "interpolation ways")?;
     let resolved = interp::resolve_interpolation_endpoints_mmap(
         &mut interp_ways,
-        &addr_points_mmap,
-        &interp_nodes_mmap,
+        addr_points.table(),
+        interp_nodes.table(),
         &strings,
         config.street_level,
         &host.executor,
@@ -700,13 +700,13 @@ fn build_generation(
         pass3::bucketed_cell_assignment_fused(&pass3::FusedCellAssignmentParams {
             output_dir,
             scratch,
-            street_ways_mmap: &street_ways_mmap,
-            street_nodes_mmap: &street_nodes_mmap,
+            street_ways: street_ways.table(),
+            street_nodes: street_nodes.table(),
             street_way_count,
-            addr_points_mmap: &addr_points_mmap,
+            addr_points: addr_points.table(),
             addr_point_count,
             interp_ways: &interp_ways,
-            interp_nodes_mmap: &interp_nodes_mmap,
+            interp_nodes: interp_nodes.table(),
             fine_level: sl,
             coarse_level: cl,
             fine_cells_file: FILE_GEO_CELLS,
@@ -760,15 +760,11 @@ fn build_generation(
     // part of the build wall time; skipping it would leave written output
     // unchecked by the reader path.
     let first_addr_point = if addr_point_count > 0 {
-        let bytes = addr_points_mmap.get(..AddrPoint::SIZE).ok_or_else(|| {
+        Some(addr_points.table().get(0).ok_or_else(|| {
             Error::internal(
                 "address point count is nonzero but addr_points.bin has no first record",
             )
-        })?;
-        let record: &[u8; AddrPoint::SIZE] = bytes
-            .try_into()
-            .map_err(|_| Error::internal("addr_points.bin first record has an invalid length"))?;
-        Some(AddrPoint::from_bytes(record))
+        })?)
     } else {
         None
     };

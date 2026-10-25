@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-14. HYG-161
 15. HYG-162
 16. HYG-163
 17. HYG-034
@@ -575,6 +574,24 @@ The judgement calls already known, to be checked first:
     in-bounds prefix, and a way or polygon whose span does not fit reads as
     no geometry rather than a partial one. Both are unreachable on an index
     that opens: open validates every list and span.
+- The geocode builder reads its own outputs through the same codec:
+  `Records<T>` moved to `format.rs`, pass 2 hands back typed mappings, and
+  pass 3 and interpolation resolve read through `Table` (`get`, and the new
+  `span_at` for byte-addressed geometry) instead of hand offset math. The
+  pass 3 bucket scratch record is a `record!` (`BucketRecord`, crate-private,
+  same 15-byte layout, still 16 bytes decoded). Index bytes unchanged.
+  Sparred with codex. Judgement calls on the planet-measured pass 3 and
+  interp-resolve paths, none measured:
+  - Stage A streets and interpolation ways validate a way's whole node span
+    once, then walk its consecutive node pairs (`cover_way_segments`), where
+    the old loop bounds-checked two nodes per segment. A missing node fails
+    the build as before, but no longer after partially covering the way
+    (the partial output was discarded anyway).
+  - Stage B decodes a bucket file with `Table::iter().collect()` (one
+    exact-size allocation) after the unchanged partial-tail refusal.
+  - The interp CSR build is driven by `(0..len).into_par_iter()` with a
+    checked `get` per point instead of `par_chunks_exact`; still an indexed
+    source, so `collect` still allocates once.
 
 ---
 
@@ -825,28 +842,6 @@ as the only loop with an `on_idle()` hook; a source-scan test that only
 `pipeline.rs` calls `pop_ready()` under `src/write/`.
 
 Reported by: write path.
-
-## HYG-161 - The geocode builder decodes its own records by hand
-
-Anger: 7 - geocode build.
-
-Split out of the geocode reader entry, which landed: `format.rs` now has a
-`record!` macro (field list derives `SIZE`, offsets and both codecs), a
-sealed `Record` trait and `Table` (whole file, `span`, `list`, `get`,
-`iter`, `find_by_key`), and the builder's list writers already use its
-`ListCount` / `list_byte_len` framing. Still by hand: `pass3.rs`'s
-`BUCKET_RECORD_SIZE = 15` with `write_bucket_record` / `parse_bucket_file`
-duplicates the pattern `format.rs` exists to own; `interp.rs`
-(`read_addr_point_mmap`, `read_node_at`) and `pass3.rs`'s street-way and
-node reads decode index records at `index * T::SIZE` with unchecked
-`offset + SIZE` where the reader goes through `Table`.
-
-Recommendation (2026-10-25): define the bucket record with `record!` and
-move `interp.rs` and pass 3's index reads onto `Table`, with checked
-offsets, so the builder-side reader stops being the unchecked one. Index
-bytes stay identical.
-
-Reported by: geocode index.
 
 ## HYG-162 - The OSC arena's metadata layout is a hand sum
 

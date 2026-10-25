@@ -57,11 +57,11 @@ impl CellAddrCsr {
 
 /// Build the endpoint lookup index without per-cell allocations or locks.
 fn build_cell_addr_csr(
-    addr_mmap: &[u8],
+    addr_points: Table<'_, AddrPoint>,
     street_level: u8,
     executor: &crate::host::Executor,
 ) -> CellAddrCsr {
-    // Drive the projection from an INDEXED source (`par_chunks_exact` is an
+    // Drive the projection from an INDEXED source (a `usize` range is an
     // IndexedParallelIterator, and `map` preserves that) so `collect` allocates
     // the final Vec once and each worker fills its own contiguous span. Do not
     // "simplify" this to `filter_map`: that is unindexed, so its `collect`
@@ -70,14 +70,12 @@ fn build_cell_addr_csr(
     // so no filter is needed. This also avoids the reverted fold/reduce hashmap
     // merge (commit 363c579) whose per-worker map union regressed the build.
     let mut pairs: Vec<(u64, u32)> = executor.install(|| {
-        addr_mmap
-            .par_chunks_exact(AddrPoint::SIZE)
-            .enumerate()
-            .map(|(index, record)| {
-                let record: &[u8; AddrPoint::SIZE] = record
-                    .try_into()
-                    .expect("par_chunks_exact always yields full AddrPoint records");
-                let point = AddrPoint::from_bytes(record);
+        (0..addr_points.len())
+            .into_par_iter()
+            .map(|index| {
+                let point = addr_points
+                    .get(index)
+                    .expect("an index below Table::len names a whole record");
                 let lat_lng = LatLng::from_degrees(
                     e7_to_deg(point.lat_e7 as f64),
                     e7_to_deg(point.lon_e7 as f64),
@@ -129,62 +127,30 @@ fn parse_house_number(s: &str) -> u32 {
     n
 }
 
-/// Read an AddrPoint from the mmap'd addr_points.bin by index.
-pub(super) fn read_addr_point_mmap(mmap: &[u8], index: u32) -> Option<AddrPoint> {
-    let offset = index as usize * AddrPoint::SIZE;
-    let end = offset + AddrPoint::SIZE;
-    if end > mmap.len() {
-        return None;
-    }
-    Some(AddrPoint::from_bytes(mmap[offset..end].try_into().ok()?))
-}
-
-/// Read a NodeCoord from a node mmap by byte offset.
-#[allow(clippy::cast_possible_truncation)] // u64→usize: Linux 64-bit only
-pub(super) fn read_node_at(mmap: &[u8], byte_offset: u64) -> Option<(i32, i32)> {
-    let off = byte_offset as usize;
-    let end = off + NodeCoord::SIZE;
-    if end > mmap.len() {
-        return None;
-    }
-    let nc = NodeCoord::from_bytes(mmap[off..end].try_into().ok()?);
-    Some((nc.lat_e7, nc.lon_e7))
-}
-
 /// Resolve start/end house numbers for interpolation ways by matching
 /// their endpoints against nearby address points with the same street name.
 /// Reads address points from mmap'd addr_points.bin.
 #[hotpath::measure]
 pub(super) fn resolve_interpolation_endpoints_mmap(
     interp_ways: &mut [SlimInterpWay],
-    addr_mmap: &[u8],
-    interp_nodes_mmap: &[u8],
+    addr_points: Table<'_, AddrPoint>,
+    interp_nodes: Table<'_, NodeCoord>,
     strings: &StringPool,
     street_level: u8,
     executor: &crate::host::Executor,
 ) -> u32 {
-    let addr_count = addr_mmap.len() / AddrPoint::SIZE;
-    if interp_ways.is_empty() || addr_count == 0 {
+    if interp_ways.is_empty() || addr_points.is_empty() {
         return 0;
     }
 
     crate::debug::emit_marker("GEOCODE_INTERP_RESOLVE_INDEX_START");
-    let csr = build_cell_addr_csr(addr_mmap, street_level, executor);
+    let csr = build_cell_addr_csr(addr_points, street_level, executor);
     crate::debug::emit_marker("GEOCODE_INTERP_RESOLVE_INDEX_END");
     crate::debug::emit_marker("GEOCODE_INTERP_RESOLVE_ENDPOINTS_START");
     let resolved = executor.install(|| {
         interp_ways
             .par_iter_mut()
-            .map(|way| {
-                resolve_one_way(
-                    way,
-                    interp_nodes_mmap,
-                    addr_mmap,
-                    strings,
-                    &csr,
-                    street_level,
-                )
-            })
+            .map(|way| resolve_one_way(way, interp_nodes, addr_points, strings, &csr, street_level))
             .sum()
     });
     crate::debug::emit_marker("GEOCODE_INTERP_RESOLVE_ENDPOINTS_END");
@@ -193,34 +159,36 @@ pub(super) fn resolve_interpolation_endpoints_mmap(
 
 fn resolve_one_way(
     way: &mut SlimInterpWay,
-    interp_nodes_mmap: &[u8],
-    addr_mmap: &[u8],
+    interp_nodes: Table<'_, NodeCoord>,
+    addr_points: Table<'_, AddrPoint>,
     strings: &StringPool,
     csr: &CellAddrCsr,
     street_level: u8,
 ) -> u32 {
+    // Not just a bounds guard: a one-node way would resolve both endpoints to
+    // the same point.
     if way.node_count < 2 {
         return 0;
     }
-    let Some(start_coord) = read_node_at(interp_nodes_mmap, way.node_file_offset) else {
+    let Ok(nodes) = interp_nodes.span_at(way.node_file_offset, u64::from(way.node_count)) else {
         return 0;
     };
-    let last_offset = way.node_file_offset + (way.node_count as u64 - 1) * NodeCoord::SIZE as u64;
-    let Some(end_coord) = read_node_at(interp_nodes_mmap, last_offset) else {
+    let (Some(start), Some(end)) = (nodes.get(0), nodes.get(usize::from(way.node_count) - 1))
+    else {
         return 0;
     };
     let start_hn = find_endpoint_house_number_mmap(
-        start_coord,
+        (start.lat_e7, start.lon_e7),
         way.street_offset,
-        addr_mmap,
+        addr_points,
         strings,
         csr,
         street_level,
     );
     let end_hn = find_endpoint_house_number_mmap(
-        end_coord,
+        (end.lat_e7, end.lon_e7),
         way.street_offset,
-        addr_mmap,
+        addr_points,
         strings,
         csr,
         street_level,
@@ -239,7 +207,7 @@ fn resolve_one_way(
 fn find_endpoint_house_number_mmap(
     endpoint: (i32, i32),
     street_offset: u32,
-    addr_mmap: &[u8],
+    addr_points: Table<'_, AddrPoint>,
     strings: &StringPool,
     csr: &CellAddrCsr,
     street_level: u8,
@@ -260,7 +228,7 @@ fn find_endpoint_house_number_mmap(
 
     let mut check_cell = |cell_id: u64| {
         for &idx in csr.get(cell_id) {
-            let Some(pt) = read_addr_point_mmap(addr_mmap, idx) else {
+            let Some(pt) = addr_points.get(idx as usize) else {
                 continue;
             };
             if pt.street_offset != street_offset {
@@ -294,7 +262,7 @@ fn find_endpoint_house_number_mmap(
     }
 
     let idx = best_idx?;
-    let pt = read_addr_point_mmap(addr_mmap, idx)?;
+    let pt = addr_points.get(idx as usize)?;
     let hn_str = read_string_from_pool(strings, pt.housenumber_offset);
     let hn = parse_house_number(hn_str);
     if hn > 0 { Some(hn) } else { None }
@@ -332,7 +300,11 @@ mod tests {
             );
         }
 
-        let csr = build_cell_addr_csr(&bytes, street_level, &crate::host::Executor::Ambient);
+        let csr = build_cell_addr_csr(
+            Table::new(&bytes),
+            street_level,
+            &crate::host::Executor::Ambient,
+        );
         assert_eq!(
             csr.get(cell_id(first_cell.0, first_cell.1, street_level)),
             &[0, 2, 4]
@@ -346,7 +318,7 @@ mod tests {
 
     #[test]
     fn csr_get_empty_input() {
-        let csr = build_cell_addr_csr(&[], 17, &crate::host::Executor::Ambient);
+        let csr = build_cell_addr_csr(Table::new(&[]), 17, &crate::host::Executor::Ambient);
         assert!(csr.cell_ids.is_empty());
         assert_eq!(csr.offsets, vec![0]);
         assert_eq!(csr.get(0), &[] as &[u32]);
@@ -395,12 +367,16 @@ mod tests {
             },
         );
 
-        let csr = build_cell_addr_csr(&bytes, street_level, &crate::host::Executor::Ambient);
+        let csr = build_cell_addr_csr(
+            Table::new(&bytes),
+            street_level,
+            &crate::host::Executor::Ambient,
+        );
         assert_eq!(
             find_endpoint_house_number_mmap(
                 endpoint,
                 street_offset,
-                &bytes,
+                Table::new(&bytes),
                 &strings,
                 &csr,
                 street_level,
@@ -431,12 +407,16 @@ mod tests {
             );
         }
 
-        let csr = build_cell_addr_csr(&bytes, street_level, &crate::host::Executor::Ambient);
+        let csr = build_cell_addr_csr(
+            Table::new(&bytes),
+            street_level,
+            &crate::host::Executor::Ambient,
+        );
         assert_eq!(
             find_endpoint_house_number_mmap(
                 endpoint,
                 street_offset,
-                &bytes,
+                Table::new(&bytes),
                 &strings,
                 &csr,
                 street_level,

@@ -411,10 +411,10 @@ pub(super) struct Pass2Output {
     pub(super) street_way_count: u32,
     pub(super) interp_ways: Vec<SlimInterpWay>,
     pub(super) way_geom: FxHashMap<i64, Vec<(i32, i32)>>,
-    pub(super) street_ways_mmap: memmap2::Mmap,
-    pub(super) street_nodes_mmap: memmap2::Mmap,
-    pub(super) addr_points_mmap: memmap2::Mmap,
-    pub(super) interp_nodes_mmap: memmap2::Mmap,
+    pub(super) street_ways: Records<StreetWay>,
+    pub(super) street_nodes: Records<NodeCoord>,
+    pub(super) addr_points: Records<AddrPoint>,
+    pub(super) interp_nodes: Records<NodeCoord>,
 }
 
 #[allow(
@@ -840,11 +840,10 @@ pub(super) fn run_pass2(
     drop(coord_mmap);
 
     // Mmap output files for coordinate access in cell assignment + interpolation
-    let mmap_file = |name: &str| mmap_or_empty(&output_dir.join(name));
-    let street_ways_mmap = mmap_file(FILE_STREET_WAYS)?;
-    let street_nodes_mmap = mmap_file(FILE_STREET_NODES)?;
-    let addr_points_mmap = mmap_file(FILE_ADDR_POINTS)?;
-    let interp_nodes_mmap = mmap_file(FILE_INTERP_NODES)?;
+    let street_ways = Records::map(&output_dir.join(FILE_STREET_WAYS))?;
+    let street_nodes = Records::map(&output_dir.join(FILE_STREET_NODES))?;
+    let addr_points = Records::map(&output_dir.join(FILE_ADDR_POINTS))?;
+    let interp_nodes = Records::map(&output_dir.join(FILE_INTERP_NODES))?;
     crate::debug::emit_marker("GEOCODE_PASS2_FLUSH_MMAP_END");
 
     Ok(Pass2Output {
@@ -852,10 +851,10 @@ pub(super) fn run_pass2(
         street_way_count,
         interp_ways,
         way_geom,
-        street_ways_mmap,
-        street_nodes_mmap,
-        addr_points_mmap,
-        interp_nodes_mmap,
+        street_ways,
+        street_nodes,
+        addr_points,
+        interp_nodes,
     })
 }
 

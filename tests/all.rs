@@ -87,6 +87,8 @@ mod fault_sort_input;
 mod fault_tags_count_input;
 #[cfg(feature = "test-hooks")]
 mod fault_tags_filter_input;
+#[cfg(feature = "test-hooks")]
+mod fault_time_filter_input;
 #[cfg(all(feature = "test-hooks", feature = "linux-io-uring"))]
 mod fault_uring_writer;
 mod fixture_helpers;

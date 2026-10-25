@@ -20,8 +20,6 @@
 //! the history path's grouping needs each object's versions contiguous) and
 //! `HistoricalInformation` (which picks the path).
 
-use std::path::Path;
-
 use super::{
     HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
     ensure_way_capacity_local, flush_local, require_sorted, writer_from_header,
@@ -31,6 +29,7 @@ use crate::owned::{
     OwnedElement, dense_node_metadata, element_metadata, owned_to_metadata, read_dense_node,
     read_node, read_relation, read_way, relation_members_into,
 };
+use crate::read::input::{InputSource, PinnedInput};
 use crate::reorder_buffer::ReorderBuffer;
 use crate::scan::classify::{PartialIndex, build_classify_schedule, parallel_classify_phase};
 use crate::write::WriteOptions;
@@ -72,8 +71,16 @@ struct PendingGroup {
 ///
 /// Requires sorted input (`Sort.Type_then_ID`) so each object's versions are
 /// contiguous and the snapshot can be computed in one streaming pass.
-pub fn time_filter(
-    input: &Path,
+///
+/// A snapshot input is read in two passes, and which path runs is only known
+/// once the header is read, so the input must be a regular file or a block
+/// device on either path (`InvalidArgument` otherwise), and is pinned for the
+/// run (see [`PinnedInput`](crate::read::input::PinnedInput)); a caller's pin
+/// is used as it is. Where a later open cannot reach the pinned file, an
+/// input replaced mid-run fails with `InputReplaced` and nothing is
+/// published.
+pub fn time_filter<'a>(
+    input: impl Into<InputSource<'a>>,
     output: crate::output::Output,
     cutoff_timestamp: i64,
     write: &WriteOptions,
@@ -81,7 +88,14 @@ pub fn time_filter(
     host: &crate::host::Host,
 ) -> Result<TimeFilterStats> {
     host.cancel.check()?;
-    let result = time_filter_to(input, &output, cutoff_timestamp, write, overrides, host)?;
+    let result = time_filter_to(
+        input.into(),
+        &output,
+        cutoff_timestamp,
+        write,
+        overrides,
+        host,
+    )?;
     output.publish(&host.cancel)?;
     Ok(result)
 }
@@ -89,7 +103,7 @@ pub fn time_filter(
 /// [`time_filter`] writing to a borrowed output it does not publish.
 #[hotpath::measure]
 pub(crate) fn time_filter_to(
-    input: &Path,
+    input: InputSource<'_>,
     output: &crate::output::Output,
     cutoff_timestamp: i64,
     write: &WriteOptions,
@@ -102,13 +116,26 @@ pub(crate) fn time_filter_to(
         direct_reads: direct_io,
         ..
     } = *write;
+    // The snapshot path opens the input twice, each through its own open
+    // file description: the header reader below, then the schedule walk
+    // whose descriptor the classify pool preads. The history path reads
+    // everything through the header reader. Both opens are derived from this
+    // one pin, so a file renamed over the input mid-run cannot have its
+    // header (which picks the path) read from one file and its blobs
+    // filtered from the other: where `/proc/self/fd` reopens the pin every
+    // open reaches the pinned file, otherwise on Unix a replaced input fails
+    // the run (`PinnedInput` says what it does off Unix). Taken before any
+    // other open of the input, so on the history path too: which path runs
+    // is learned from the header, so whether the input is reopened is not
+    // known until it has been read once, and a FIFO is refused up front.
+    let pin = input.pin(host)?;
     // History path: no arena-cap hook. Snapshot path: invokes the
     // host's `cross_thread_alloc_pool` hook - see the in-function
     // comment in time_filter_snapshot.
-    let reader = ElementReader::open_in(input, direct_io, host)?;
+    let reader = ElementReader::open_in(&pin, direct_io, host)?;
     require_sorted(
         reader.header().is_sorted(),
-        input,
+        pin.path(),
         "Input history PBF",
         "Time filtering requires sorted input to preserve type-then-ID ordering while selecting the snapshot.",
     )?;
@@ -135,7 +162,7 @@ pub(crate) fn time_filter_to(
         // build_classify_schedule, not ElementReader, so holding the
         // reader open here would just keep an extra fd around.
         drop(reader);
-        time_filter_snapshot(input, &mut writer, cutoff_timestamp, compression, host)?
+        time_filter_snapshot(&pin, &mut writer, cutoff_timestamp, compression, host)?
     };
 
     writer.flush()?;
@@ -290,7 +317,7 @@ fn time_filter_history(
 /// (`516129e`, 29.2 GB -> 504 MB) precedents.
 #[hotpath::measure]
 fn time_filter_snapshot(
-    input: &Path,
+    input: &PinnedInput,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     cutoff_timestamp: i64,
     compression: Compression,
@@ -765,6 +792,8 @@ fn clone_owned_element(element: &Element<'_>) -> crate::Result<OwnedElement> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::blob_meta::BlobIndex;
     use crate::elements::MemberId;

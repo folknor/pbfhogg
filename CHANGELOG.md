@@ -1158,6 +1158,22 @@
 
 ### Fixed
 
+- **`time-filter` reads one input file even if it is replaced mid-run.** On
+  a snapshot input (no `HistoricalInformation`) every run opens the input
+  twice (the header read, which picks the path, then the schedule walk the
+  filtering workers read through), and each open used to resolve the path
+  again, so an input renamed over during the run could have its header read
+  from one file and its blobs filtered from another, with no error. The
+  input is now pinned when the run starts: on Linux with `/proc` a replaced
+  or deleted input does not affect the run; on other Unix hosts the run
+  fails with `ErrorKind::InputReplaced` and publishes nothing. Because the
+  path is only known once the header is read, the input is pinned on the
+  history path too, which reads it once: an input that is a FIFO, socket or
+  character device is now refused up front on either path, including a
+  history file piped in through `/dev/stdin`. Library:
+  `time_filter::time_filter` takes `impl Into<InputSource>` (a path as
+  before, or a `&PinnedInput` the caller took, used as it is).
+
 - **`degrade` reads one input file even if it is replaced mid-run.** The
   decode path (`--unsort`, `--unsort-intra`, `--strip-locations`,
   `--drop-ids`) opens the input three times (the indexdata check, the header

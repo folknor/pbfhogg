@@ -333,7 +333,11 @@ Multi-stage parallel rewrite using rank-indexed `IdSet` bitsets (not hashmaps) f
 
 ### time-filter
 
-Single-pass grouped snapshot: maintains `PendingGroup` per object, emits latest version with `timestamp <= cutoff`, skips deleted (`visible=false`).
+Two paths, picked from the header's `HistoricalInformation` (`src/commands/time_filter/mod.rs`):
+- **History input**: single-pass grouped snapshot on the pipelined reader that read the header: maintains `PendingGroup` per object, emits latest version with `timestamp <= cutoff`, skips deleted (`visible=false`).
+- **Snapshot input**: each object appears once, so blocks are independent: a classify schedule walk feeds `parallel_classify_phase`, each worker filters and frames one blob, and a reorder buffer restores file order.
+
+The input is pinned before the header read (see "One input, one file, across passes").
 
 ### inspect
 
@@ -534,7 +538,11 @@ probe, the header reader, the schedule walk) from the pin, while the
 header-only passthrough reads the header and every data frame through one
 open and takes no pin of its own, so it reads a FIFO. A caller's pin is
 honoured on both routes. A command that learns from the input itself
-whether it will reopen has to pin before that read instead.
+whether it will reopen has to pin before that read instead: `time-filter`
+picks its path from the header's `HistoricalInformation`, and only the
+snapshot path opens the input again (its schedule walk), so it pins before
+the header read and refuses a FIFO on the history path too, which reads
+once.
 
 ## Read-path internals (both consumers)
 

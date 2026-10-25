@@ -57,7 +57,7 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-23. HYG-186 to HYG-189, one per line, in ID order
+23. HYG-187 to HYG-189, one per line, in ID order
 24. HYG-047
 25. HYG-158
 26. HYG-159
@@ -810,6 +810,20 @@ The judgement calls already known, to be checked first:
     metadata source: the bound changes capacity, not output bytes, so it
     rests on reading the code. Mutation checked: routing each of the three
     opens back to a path open fails the tests.
+  - time-filter adopted it in the same shape: the public `time_filter`
+    takes `impl Into<InputSource>`, `time_filter_to` pins first; the CLI
+    still passes the path. Its opens, the header `ElementReader` (which
+    picks the path from `HistoricalInformation`) and, on the snapshot path
+    only, the schedule walk whose descriptor the classify pool preads, each
+    became one derived open, descriptions unchanged. The history path reads
+    once but pins too, since the path is only known after the header read,
+    so it now refuses a FIFO. Codex agreed after being pressed on two
+    alternatives that would keep a history FIFO working: anchoring a pin on
+    the header reader's already open descriptor (a new constructor), or a
+    streaming snapshot path (undoing the classify-pool migration that fixed
+    its planet memory ceiling); neither gives a correctness gain, only the
+    FIFO. Mutation checked: routing either open back to a path open fails
+    the tests.
 
 ---
 
@@ -1448,7 +1462,7 @@ Reported by: the HYG-150 implementation.
 
 ## Adopting `PinnedInput`, one command per entry
 
-Not a finding: the shared brief for HYG-186 to HYG-189. Each of those commands opens its input more than once per run (a
+Not a finding: the shared brief for HYG-187 to HYG-189. Each of those commands opens its input more than once per run (a
 precondition probe, a header reader, a schedule walk, worker and splice
 descriptors), each open resolving the path again, so a file renamed over
 the input mid-run is read partly from each file. The API that fixes it
@@ -1536,19 +1550,6 @@ export, check refs, check index (one open each). inspect's index-only scan
 and its full-decode fallback each read the whole report from one open, but
 the full decode takes its file size from a separate path `stat`, which
 HYG-187 covers.
-
-## HYG-186 - time-filter reopens its input by path
-
-Anger: 7 - one command.
-
-See "Adopting `PinnedInput`" above. The header `ElementReader` decides
-history against snapshot; the snapshot arm drops it and walks the schedule
-through a fresh open (`time_filter/mod.rs`). The history arm reads once.
-Pinning at entry also refuses a FIFO on the history arm; that is the
-chosen contract (a command that may reopen pins up front), say so in the
-CHANGELOG line. Recommendation (2026-10-25): follow the brief.
-
-Reported by: the HYG-151 resolution.
 
 ## HYG-187 - inspect reads one input through several unpinned opens
 

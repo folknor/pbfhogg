@@ -1171,6 +1171,26 @@
   the repeated reads before either). Library: `build_geocode_index` still
   takes the path in `BuildConfig::input_path` and pins it itself.
 
+- **`diff` reads each input file from the file it started on, even if one
+  is replaced mid-run.** Every run opens each input two to four times (the
+  header and indexdata read, then the parallel header walk, the
+  sequential block reader or the streaming reader; a parallel run over
+  negative IDs adds the sequential reader, and `-t` excluding the later
+  kinds adds a header walk of the rest of the file), and each open used to
+  resolve the path again, so an input renamed over during the run was
+  compared partly from each file, with no error. Both inputs are now
+  pinned before either is read, a path given twice sharing one pin, so
+  `diff a a` compares one file with itself. On Linux where
+  `/proc/self/fd` can reopen the pin, a replaced or deleted input does not
+  affect the run; elsewhere on Unix a later open that finds another file
+  at the path fails the run with `ErrorKind::InputReplaced` (a deleted
+  input fails that open), and no `-o` output is published. An input that is a FIFO, socket or character device is now
+  refused up front, in either position, before the other is read.
+  Library: `diff::diff` and `diff::diff_stats` take each input as
+  `impl Into<InputSource>` (a path as before, or a `&PinnedInput` the
+  caller took, used as it is); a run refused mid-way may already have
+  written text to the caller's writer.
+
 - **`cat` reads each input file from the file it started on, even if one is
   replaced mid-run.** Every mode opens each input two to four times (the
   indexdata check under `--type`, the header read, an indexdata probe when

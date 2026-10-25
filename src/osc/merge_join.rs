@@ -51,13 +51,13 @@ impl StreamingBlocks {
     /// Create from a sequential BlobReader. Avoids PrimitiveBlock cross-thread
     /// alloc/free retention from the pipelined reader. Both sides of one
     /// merge take clones of the same `pool`.
-    pub(crate) fn new_sequential(
-        path: &std::path::Path,
+    pub(crate) fn new_sequential<'a>(
+        source: impl Into<crate::read::input::InputSource<'a>>,
         direct_io: bool,
         pool: MergeBuffers,
         host: &crate::host::Host,
     ) -> crate::error::Result<Self> {
-        let mut reader = crate::blob::BlobReader::open_in(path, direct_io, host)?;
+        let mut reader = crate::blob::BlobReader::open_in(source, direct_io, host)?;
         reader.set_parse_indexdata(true);
         reader.leading_header()?;
         let source = reader.source().cloned();
@@ -628,17 +628,24 @@ impl MergeSide {
     /// every data blob, canonical blob order - with a header-only walk from
     /// where this side's reader stands. A stashed frame was checked when it
     /// was read; the walk starts after it.
-    fn verify_rest(&mut self, host: &crate::host::Host) -> Result<()> {
+    ///
+    /// `source` is the input this side's reader was opened from (its pin,
+    /// for a command that pinned it): the walk is a new open of it, never of
+    /// the path the reader names, which a pinned run must not resolve again.
+    fn verify_rest(
+        &mut self,
+        source: crate::read::input::InputSource<'_>,
+        host: &crate::host::Host,
+    ) -> Result<()> {
         let internal = || {
             crate::Error::invalid_argument(
                 "block-pair merge: the reader's position is unknown, so the rest of the \
                  file cannot be walked",
             )
         };
-        let source = self.reader.source().cloned().ok_or_else(internal)?;
         let (offset, blob_index) = self.reader.position().ok_or_else(internal)?;
         let blob_index = blob_index.ok_or_else(internal)?;
-        let mut walker = crate::read::header_walker::HeaderWalker::open(&source, host)?
+        let mut walker = crate::read::header_walker::HeaderWalker::open(source, host)?
             .resume_at(offset.0, blob_index);
         while let Some(meta) = walker.next_header()? {
             if meta.blob_type != crate::blob::BlobKind::OsmData {
@@ -848,9 +855,17 @@ pub(crate) fn skip_phase(state: &mut BlockPairMergeState, kind: ElementKind) -> 
 /// without this `diff -t node` refused those files only at `-j` above one.
 /// The walk reads headers only (no body is read), so it costs a pread per
 /// remaining blob and nothing for a caller that runs the relation phase.
-pub(crate) fn verify_rest(state: &mut BlockPairMergeState, host: &crate::host::Host) -> Result<()> {
-    state.old.verify_rest(host)?;
-    state.new.verify_rest(host)
+///
+/// `old` and `new` are the inputs the two readers were opened from; each
+/// side's walk opens its own.
+pub(crate) fn verify_rest(
+    state: &mut BlockPairMergeState,
+    old: crate::read::input::InputSource<'_>,
+    new: crate::read::input::InputSource<'_>,
+    host: &crate::host::Host,
+) -> Result<()> {
+    state.old.verify_rest(old, host)?;
+    state.new.verify_rest(new, host)
 }
 
 /// Emit a decoded block as BlobOldOnly or BlobNewOnly, accounting for skip.

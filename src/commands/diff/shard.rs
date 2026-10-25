@@ -52,6 +52,7 @@ use crate::ElementKind;
 use crate::blob_meta::BlobIndex;
 use crate::error::Result;
 use crate::read::header_walker::HeaderWalker;
+use crate::read::input::InputSource;
 
 /// One OsmData blob's location + index metadata, enough to pread and
 /// classify without decompression.
@@ -83,16 +84,19 @@ pub(super) struct WalkedFile {
 /// then run the sequential block-pair merge for the whole comparison (see
 /// the module contract). Errors when an OsmData blob lacks indexdata or a
 /// file's blobs are not in canonical order.
-pub(super) fn walk_pair(
-    old_path: &Path,
-    new_path: &Path,
+///
+/// Each input is opened once, from its source (a pinned run passes its
+/// pins), and the walker's descriptor is the one the shard workers share.
+pub(super) fn walk_pair<'a, 'b>(
+    old_source: impl Into<InputSource<'a>>,
+    new_source: impl Into<InputSource<'b>>,
     host: &crate::host::Host,
 ) -> Result<Option<(WalkedFile, WalkedFile)>> {
     // Both files' negative-ID answers come before either file's order
     // check: the fallback covers the whole comparison, so an order-guard
     // error on one side must not preempt a negative ID on the other.
-    let old = walk_file(old_path, host)?;
-    let new = walk_file(new_path, host)?;
+    let old = walk_file(old_source.into(), host)?;
+    let new = walk_file(new_source.into(), host)?;
     if old.has_negative || new.has_negative {
         return Ok(None);
     }
@@ -107,8 +111,8 @@ struct RawWalk {
     file: Arc<std::fs::File>,
 }
 
-fn walk_file(path: &Path, host: &crate::host::Host) -> Result<RawWalk> {
-    let mut walker = HeaderWalker::open(path, host)?;
+fn walk_file(source: InputSource<'_>, host: &crate::host::Host) -> Result<RawWalk> {
+    let mut walker = HeaderWalker::open(source, host)?;
     let mut in_file_order: Vec<BlobDesc> = Vec::new();
     let mut has_negative = false;
     let mut first = true;

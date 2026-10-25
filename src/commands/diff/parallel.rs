@@ -25,6 +25,7 @@ use crate::PrimitiveBlock;
 use crate::blob_meta::BlobIndex;
 use crate::error::Result;
 use crate::owned::TypeFilter;
+use crate::read::input::PinnedInput;
 
 use super::shard::{BlobDesc, Shard, plan_shards, walk_pair};
 use super::{DiffOptions, DiffStats};
@@ -493,8 +494,8 @@ fn emit_modified(
 #[allow(clippy::too_many_lines)] // phase-orchestrator over 3 element kinds
 #[allow(clippy::too_many_arguments)]
 pub(super) fn diff_block_pair_parallel<W: Write>(
-    old_path: &Path,
-    new_path: &Path,
+    old_input: &PinnedInput,
+    new_input: &PinnedInput,
     mut text: Option<ShardText<'_, W>>,
     options: &DiffOptions,
     _direct_io: bool,
@@ -506,7 +507,7 @@ pub(super) fn diff_block_pair_parallel<W: Write>(
     // DIFF_SCAN_START/END and diff_common/created/modified/deleted counters
     // are emitted by the calling `diff()` function in `mod.rs`; do not
     // re-emit here.
-    let Some((old, new)) = walk_pair(old_path, new_path, host)? else {
+    let Some((old, new)) = walk_pair(old_input, new_input, host)? else {
         crate::host::diag!(
             host.diagnostics,
             Note,

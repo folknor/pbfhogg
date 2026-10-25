@@ -25,10 +25,10 @@ use crate::osc::merge_join::{
     stream_merge_phase, verify_rest,
 };
 use crate::owned::TypeFilter;
+use crate::read::input::{InputSource, PinnedInput};
 use crate::{Element, MemberType};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -151,10 +151,20 @@ impl DiffStats {
 /// no scratch and passes `None`; `None` with more than one shard is refused,
 /// before any input is read. A caller that wants only the counts calls
 /// [`diff_stats`], which shards without scratch.
+///
+/// Every route opens each input more than once, so both must be regular
+/// files or block devices (`InvalidArgument` otherwise) and are pinned for
+/// the run once the options are accepted, `old` first, before either is
+/// read (see [`PinnedInput`] and [`InputSource::pin`]). A path spelled
+/// exactly as the other shares its pin, so `diff a a` compares one file
+/// with itself; a caller may pin either input first and pass the pin, which
+/// is used as it is. Where a later open cannot reach the pinned file, an
+/// input replaced mid-run fails with `InputReplaced`; text already written
+/// to `output` by then stays written.
 #[hotpath::measure]
-pub fn diff(
-    old_path: &Path,
-    new_path: &Path,
+pub fn diff<'a, 'b>(
+    old: impl Into<InputSource<'a>>,
+    new: impl Into<InputSource<'b>>,
     output: &mut impl Write,
     options: &DiffOptions,
     direct_io: bool,
@@ -175,9 +185,10 @@ pub fn diff(
              without one it must run a single shard",
         ));
     }
+    let [old, new] = pin_pair(old.into(), new.into(), host)?;
     let result = compare(
-        old_path,
-        new_path,
+        &old,
+        &new,
         Report::Text {
             out: output,
             scratch: scratch.as_ref(),
@@ -206,10 +217,12 @@ pub fn diff(
 /// otherwise), the same input checks and refusals, and on success the same
 /// counts. Only the formatting is skipped, so no output or scratch I/O
 /// happens at all, and a sharded comparison needs no scratch directory.
+///
+/// The inputs are pinned as in [`diff`], with the same refusals.
 #[hotpath::measure]
-pub fn diff_stats(
-    old_path: &Path,
-    new_path: &Path,
+pub fn diff_stats<'a, 'b>(
+    old: impl Into<InputSource<'a>>,
+    new: impl Into<InputSource<'b>>,
     type_filter: Option<TypeFilter>,
     parallelism: crate::host::Parallelism,
     direct_io: bool,
@@ -223,9 +236,10 @@ pub fn diff_stats(
         parallelism,
     };
     let jobs = options.shards(host);
+    let [old, new] = pin_pair(old.into(), new.into(), host)?;
     let stats = compare(
-        old_path,
-        new_path,
+        &old,
+        &new,
         Report::<std::io::Sink>::Count,
         &options,
         jobs,
@@ -234,6 +248,19 @@ pub fn diff_stats(
     )?;
     host.cancel.check()?;
     Ok(stats)
+}
+
+/// Pin both inputs, `old` first, before either is read: a path spelled
+/// exactly as the other shares its pin, a caller's pin is used as it is
+/// (see `read::input::pin_sources`).
+fn pin_pair(
+    old: InputSource<'_>,
+    new: InputSource<'_>,
+    host: &crate::host::Host,
+) -> Result<[PinnedInput; 2]> {
+    let pins = crate::read::input::pin_sources(&[old, new], host)?;
+    <[PinnedInput; 2]>::try_from(pins)
+        .map_err(|_| crate::Error::internal("diff: two inputs must yield two pins"))
 }
 
 /// What a comparison produces besides its counts.
@@ -251,10 +278,11 @@ enum Report<'a, W> {
 
 /// The comparison shared by [`diff`] and [`diff_stats`]: input checks, path
 /// selection and the per-path drivers. The caller owns the entry and
-/// completion cancellation checks.
+/// completion cancellation checks, and has pinned both inputs: every open
+/// below is derived from a pin.
 fn compare<W: Write>(
-    old_path: &Path,
-    new_path: &Path,
+    old: &PinnedInput,
+    new: &PinnedInput,
     report: Report<'_, W>,
     options: &DiffOptions,
     jobs: usize,
@@ -262,10 +290,11 @@ fn compare<W: Write>(
     host: &crate::host::Host,
 ) -> Result<DiffStats> {
     let filter = TypeFilter::or_all(options.type_filter);
+    let (old_path, new_path) = (old.path(), new.path());
 
     // Sorted headers + indexdata from one front read of each input.
-    let (old_sorted, old_indexed) = sorted_and_indexed(old_path, direct_io, host)?;
-    let (new_sorted, new_indexed) = sorted_and_indexed(new_path, direct_io, host)?;
+    let (old_sorted, old_indexed) = sorted_and_indexed(old, direct_io, host)?;
+    let (new_sorted, new_indexed) = sorted_and_indexed(new, direct_io, host)?;
     super::require_sorted(
         old_sorted,
         old_path,
@@ -311,8 +340,8 @@ fn compare<W: Write>(
                     )
                 })?;
                 if let Some(stats) = parallel::diff_block_pair_parallel(
-                    old_path,
-                    new_path,
+                    old,
+                    new,
                     Some(parallel::ShardText {
                         out: &mut *out,
                         scratch,
@@ -332,7 +361,7 @@ fn compare<W: Write>(
             if both_indexed
                 && jobs > 1
                 && let Some(stats) = parallel::diff_block_pair_parallel::<W>(
-                    old_path, new_path, None, options, direct_io, &filter, jobs, host,
+                    old, new, None, options, direct_io, &filter, jobs, host,
                 )?
             {
                 return Ok(finish_scan(stats));
@@ -341,13 +370,9 @@ fn compare<W: Write>(
         }
     };
     let stats = if both_indexed {
-        diff_block_pair(
-            old_path, new_path, output, options, direct_io, &filter, host,
-        )?
+        diff_block_pair(old, new, output, options, direct_io, &filter, host)?
     } else {
-        diff_element_stream(
-            old_path, new_path, output, options, direct_io, &filter, host,
-        )?
+        diff_element_stream(old, new, output, options, direct_io, &filter, host)?
     };
     Ok(finish_scan(stats))
 }
@@ -371,17 +396,17 @@ fn finish_scan(stats: DiffStats) -> DiffStats {
 /// `suppress_common`, not the absence of text), only nothing is formatted.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn diff_block_pair<W: Write>(
-    old_path: &Path,
-    new_path: &Path,
+    old: &PinnedInput,
+    new: &PinnedInput,
     output: Option<&mut W>,
     options: &DiffOptions,
     direct_io: bool,
     filter: &TypeFilter,
     host: &crate::host::Host,
 ) -> Result<DiffStats> {
-    let mut old_reader = crate::blob::BlobReader::open_in(old_path, direct_io, host)?;
+    let mut old_reader = crate::blob::BlobReader::open_in(old, direct_io, host)?;
     old_reader.set_parse_indexdata(true);
-    let mut new_reader = crate::blob::BlobReader::open_in(new_path, direct_io, host)?;
+    let mut new_reader = crate::blob::BlobReader::open_in(new, direct_io, host)?;
     new_reader.set_parse_indexdata(true);
 
     let mut merge = BlockPairMergeState::new(old_reader, new_reader);
@@ -425,7 +450,7 @@ fn diff_block_pair<W: Write>(
     // The structure the parallel path's header walk checks over the whole
     // of both files, checked here for the part no phase read.
     if last_enabled.is_none_or(|last| last + 1 < phases.len()) {
-        verify_rest(&mut merge, host)?;
+        verify_rest(&mut merge, old.into(), new.into(), host)?;
     }
 
     emit_merge_stats_counters(&merge.stats);
@@ -542,8 +567,8 @@ fn emit_merge_stats_counters(s: &crate::osc::merge_join::BlockPairMergeStats) {
 /// same elements.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn diff_element_stream<W: Write>(
-    old_path: &Path,
-    new_path: &Path,
+    old: &PinnedInput,
+    new: &PinnedInput,
     output: Option<&mut W>,
     options: &DiffOptions,
     direct_io: bool,
@@ -552,8 +577,8 @@ fn diff_element_stream<W: Write>(
 ) -> Result<DiffStats> {
     let pool = crate::osc::merge_join::merge_buffers();
     let mut old_src =
-        StreamingBlocks::new_sequential(old_path, direct_io, std::sync::Arc::clone(&pool), host)?;
-    let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io, pool, host)?;
+        StreamingBlocks::new_sequential(old, direct_io, std::sync::Arc::clone(&pool), host)?;
+    let mut new_src = StreamingBlocks::new_sequential(new, direct_io, pool, host)?;
 
     let mut stats = DiffStats::default();
     let mut sink = DiffSink {

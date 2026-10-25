@@ -542,11 +542,35 @@ pub(crate) fn distinct_inputs(paths: &[&Path]) -> usize {
 /// # Errors
 /// As [`PinnedInput::pin`], for the first argument that fails.
 pub(crate) fn pin_inputs(paths: &[&Path], host: &crate::host::Host) -> Result<Vec<PinnedInput>> {
-    let mut pins: Vec<PinnedInput> = Vec::with_capacity(paths.len());
-    for (i, path) in paths.iter().enumerate() {
-        let pin = match paths[..i].iter().position(|earlier| repeats(earlier, path)) {
+    let sources: Vec<InputSource<'_>> = paths.iter().map(|&path| InputSource::Path(path)).collect();
+    pin_sources(&sources, host)
+}
+
+/// [`pin_inputs`] for a library entry point whose caller may hand some
+/// inputs over already pinned: a [`InputSource::Pinned`] source is used as
+/// it is (see [`InputSource::pin`]), and only [`InputSource::Path`] sources
+/// take part in the exact-spelling rule, sharing the pin of an earlier
+/// `Path` source spelled the same. A caller's pin never stands in for a
+/// path, nor a path for a caller's pin, whatever their spellings: two pins
+/// of one path may identify different files on purpose.
+///
+/// # Errors
+/// As [`PinnedInput::pin`], for the first path that fails.
+pub(crate) fn pin_sources(
+    sources: &[InputSource<'_>],
+    host: &crate::host::Host,
+) -> Result<Vec<PinnedInput>> {
+    let mut pins: Vec<PinnedInput> = Vec::with_capacity(sources.len());
+    for (i, source) in sources.iter().enumerate() {
+        let shared = match *source {
+            InputSource::Path(path) => sources[..i].iter().position(
+                |earlier| matches!(*earlier, InputSource::Path(earlier) if repeats(earlier, path)),
+            ),
+            InputSource::Pinned(_) => None,
+        };
+        let pin = match shared {
             Some(first) => pins[first].clone(),
-            None => PinnedInput::pin(path, host)?,
+            None => source.pin(host)?,
         };
         pins.push(pin);
     }
@@ -743,6 +767,31 @@ mod pin_tests {
         for (pin, path) in pins.iter().zip(paths) {
             assert_eq!(pin.path().as_os_str(), path.as_os_str());
         }
+    }
+
+    /// A caller's pin is used as it is and never shared with a path, nor two
+    /// caller pins of one path with each other; paths still share by exact
+    /// spelling among themselves.
+    #[test]
+    fn pin_sources_keeps_caller_pins_apart_from_paths() {
+        let dir = crate::path_guard::tests::scratch();
+        let (input, _) = fixture(dir.path());
+        let host = Host::for_tests();
+        let first = PinnedInput::pin(&input, &host).unwrap();
+        let second = PinnedInput::pin(&input, &host).unwrap();
+        let sources = [
+            InputSource::Pinned(&first),
+            InputSource::Path(&input),
+            InputSource::Pinned(&second),
+            InputSource::Path(&input),
+            InputSource::Pinned(&first),
+        ];
+        let pins = super::pin_sources(&sources, &host).unwrap();
+        let same = |i: usize, j: usize| std::sync::Arc::ptr_eq(&pins[i].0, &pins[j].0);
+        assert!(std::sync::Arc::ptr_eq(&pins[0].0, &first.0));
+        assert!(std::sync::Arc::ptr_eq(&pins[2].0, &second.0));
+        assert!(same(0, 4) && same(1, 3));
+        assert!(!same(0, 1) && !same(0, 2) && !same(1, 2));
     }
 
     /// A FIFO is refused at pin time, without blocking on a writer.

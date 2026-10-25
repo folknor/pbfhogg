@@ -43,12 +43,12 @@ fn header_location(path: &Path) -> crate::error::Location {
 /// hint (a file with no data blob counts as indexed). A file without a
 /// leading header is the missing-header error, ahead of either answer.
 /// Partially indexed files surface at the consuming site, not here.
-pub(crate) fn sorted_and_indexed(
-    path: &Path,
+pub(crate) fn sorted_and_indexed<'a>(
+    source: impl Into<crate::read::input::InputSource<'a>>,
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<(bool, bool)> {
-    let mut front = InputFront::open(path, direct_io, host)?;
+    let mut front = InputFront::open(source, direct_io, host)?;
     let sorted = front.is_sorted()?;
     let indexed = front.indexed()?;
     Ok((sorted, indexed))

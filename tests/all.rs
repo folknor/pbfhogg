@@ -54,6 +54,8 @@ mod fault_cat_input;
 #[cfg(feature = "test-hooks")]
 mod fault_derive_parallel;
 #[cfg(feature = "test-hooks")]
+mod fault_diff_input;
+#[cfg(feature = "test-hooks")]
 mod fault_diff_parallel;
 #[cfg(all(feature = "test-hooks", feature = "commands"))]
 mod fault_extract_grid;

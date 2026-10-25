@@ -513,6 +513,17 @@ argument, because its second pass holds a source per argument, opened from
 the pins, each pin dropped as its sources open. Both ask for a fixed
 allowance on top, for the writer and one transient open.
 
+`diff` pins its two inputs the same way, `old` first, once its options are
+accepted and before either is read, so `diff a a` compares one pinned file
+with itself. Its entry points take each input as an `InputSource`, and
+`read::input::pin_sources` keeps a caller's pin apart from the spelling
+rule: a pin is used as it is, only paths share a pin with an earlier path
+spelled the same, and a path is never folded into a caller's pin of the
+same path (the two may name different files on purpose). With a fixed two
+inputs, `diff` asks the host for no descriptors. A run refused at a later
+open (`InputReplaced`) may already have written text to the caller's
+writer; the CLI publishes a named output only after the run succeeds.
+
 ## Read-path internals (both consumers)
 
 All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.

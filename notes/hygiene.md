@@ -57,8 +57,7 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-13. HYG-032
-14. HYG-161 (after HYG-032)
+14. HYG-161
 15. HYG-162
 16. HYG-163
 17. HYG-034
@@ -556,6 +555,26 @@ The judgement calls already known, to be checked first:
   - altw stage 2's slot-bucket `sync_data` failure now fails the run
     ("failed to sync slot bucket") before the DONTNEED instead of being
     dropped. Success path unchanged.
+- The geocode index records are defined once in `geocode_index/format.rs`:
+  a `record!` field list derives each record's `SIZE`, offsets,
+  `to_bytes` and `from_bytes`; `AdminEntry` packs the interior hint behind a
+  checked constructor; `Table` owns whole-file, fixed-count span and
+  length-prefixed list access, with `ListCount` / `list_byte_len` the one
+  list framing (the builder's list writers use it). The reader holds typed
+  `Records<T>` / `Lists<T>` mappings and decodes only through `Table`.
+  Index bytes unchanged (wire-offset tests written out independently).
+  Sparred with codex. Judgement calls on the lookup path, none measured:
+  - Binary search is `Table::find_by_key` with a generic key closure, same
+    lo/hi/mid algorithm; relies on inlining for the per-probe decode to
+    load only `cell_id`, as the hand-written version did.
+  - Entry lists, polygon vertices and interpolation node runs iterate
+    `chunks_exact` over a slice cut once, instead of per-entry offset math;
+    a segment reads its two nodes from the owning way's span (re-derived
+    per query, a few checked adds).
+  - A list whose count overruns the file reads as empty rather than as its
+    in-bounds prefix, and a way or polygon whose span does not fit reads as
+    no geometry rather than a partial one. Both are unreachable on an index
+    that opens: open validates every list and span.
 
 ---
 
@@ -807,47 +826,25 @@ as the only loop with an `on_idle()` hook; a source-scan test that only
 
 Reported by: write path.
 
-## HYG-032 - Geocode index records are decoded by hand, differently per reader
-
-Anger: 8 - record codecs; `reader.rs` serves lookups.
-
-Split on 2026-10-25: this entry keeps the geocode format and reader; the
-builder side is HYG-161, the OSC arena HYG-162, altw external's records
-HYG-163.
-
-`reader.rs` (`decode_addr_point`, `record_at`, `read_record`,
-`two_node_distance`, `checked_add`) decodes records by hand at offsets that
-`format.rs` should own; `U32EntryIter`, `SegmentEntryIter`, `AdminEntryIter`
-have identical `new` bodies, `binary_search_cells` and
-`binary_search_admin_cells` are one function twice, and `validate_list` is a
-fourth implementation of the list framing, so a count-width bump is five
-edits.
-
-Recommendation (2026-10-25): a hand-written `Record` trait (`SIZE`,
-`write_to`, `read_from` over `[u8; SIZE]`) in `geocode_index/format.rs`,
-implemented by every record type; a generic `ListIter<T: Record>`, one
-`binary_search<T>`, and `validate_list` on the same framing; `reader.rs`
-decodes through it with checked offsets. On-disk bytes stay identical: an
-existing index reads the same and the format version does not move. No new
-dependency (`zerocopy` / `bytemuck` would be the maintainer's call and are
-not needed). Lookup decode paths change, so the change goes on "Review once
-drained" as unmeasured.
-
-Reported by: geocode index.
-
 ## HYG-161 - The geocode builder decodes its own records by hand
 
 Anger: 7 - geocode build.
 
-Split out of HYG-032; runs after it. `pass3.rs`'s `BUCKET_RECORD_SIZE = 15`
-with `write_bucket_record` / `parse_bucket_file` duplicates the pattern
-`format.rs` exists to own, and `interp.rs` (`read_addr_point_mmap`,
-`read_node_at`) decodes the same records as `reader.rs` differently, with
-unchecked `offset + SIZE` where `reader.rs` uses `checked_add`.
+Split out of the geocode reader entry, which landed: `format.rs` now has a
+`record!` macro (field list derives `SIZE`, offsets and both codecs), a
+sealed `Record` trait and `Table` (whole file, `span`, `list`, `get`,
+`iter`, `find_by_key`), and the builder's list writers already use its
+`ListCount` / `list_byte_len` framing. Still by hand: `pass3.rs`'s
+`BUCKET_RECORD_SIZE = 15` with `write_bucket_record` / `parse_bucket_file`
+duplicates the pattern `format.rs` exists to own; `interp.rs`
+(`read_addr_point_mmap`, `read_node_at`) and `pass3.rs`'s street-way and
+node reads decode index records at `index * T::SIZE` with unchecked
+`offset + SIZE` where the reader goes through `Table`.
 
-Recommendation (2026-10-25): move the bucket record and `interp.rs` onto
-HYG-032's `Record` trait, with checked offsets, so the builder-side reader
-stops being the unchecked one. Index bytes stay identical.
+Recommendation (2026-10-25): define the bucket record with `record!` and
+move `interp.rs` and pass 3's index reads onto `Table`, with checked
+offsets, so the builder-side reader stops being the unchecked one. Index
+bytes stay identical.
 
 Reported by: geocode index.
 
@@ -855,7 +852,7 @@ Reported by: geocode index.
 
 Anger: 8 - apply-changes, per OSC element.
 
-Split out of HYG-032. `compact.rs` writes metadata field by field in
+Split out of the geocode record-codec entry. `compact.rs` writes metadata field by field in
 `arena_append_meta` and `read_meta` reads back at hand-written offsets
 `+1, +5, +13, +21, +25`; `META_LEN = 29` is a hand sum; `NODE_META_OFF = 20`
 and `WAY_META_OFF = 16` repeat the record header layout.
@@ -872,7 +869,7 @@ Reported by: change application.
 
 Anger: 8 - altw external stage 3, per entry.
 
-Split out of HYG-032. `IdRecord::read_from` and `ResolvedEntry::write_to`
+Split out of the geocode record-codec entry. `IdRecord::read_from` and `ResolvedEntry::write_to`
 have no shared codec, and stage 3 decodes `ResolvedEntry` by slicing
 `chunk[0..4]`, `[4..8]`, `[8..12]`.
 

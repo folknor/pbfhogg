@@ -199,11 +199,10 @@ at the struct comment in `SlimInterpWay`.
 places:
 
 - Per-cell entry counts for street / addr / interp segments
-  (`street_entries.bin`, `addr_entries.bin`, `interp_entries.bin`,
-  read by `SegmentEntryIter` / `U32EntryIter` in
-  `src/geocode_index/reader.rs`).
-- Per-cell entry counts for admin polygons (`admin_entries.bin`, read
-  by `AdminEntryIter`).
+  (`street_entries.bin`, `addr_entries.bin`, `interp_entries.bin`) and
+  for admin polygons (`admin_entries.bin`). Every entry list shares one
+  framing, owned by `src/geocode_index/format.rs`: a `ListCount` (u16)
+  prefix read by `Table::list`, with list sizes from `list_byte_len`.
 - Per-way node counts in `StreetWay.node_count` and
   `InterpWay.node_count` (`src/geocode_index/format.rs`).
 

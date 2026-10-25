@@ -760,12 +760,12 @@ fn build_generation(
     // part of the build wall time; skipping it would leave written output
     // unchecked by the reader path.
     let first_addr_point = if addr_point_count > 0 {
-        let bytes = addr_points_mmap.get(..ADDR_POINT_SIZE).ok_or_else(|| {
+        let bytes = addr_points_mmap.get(..AddrPoint::SIZE).ok_or_else(|| {
             Error::internal(
                 "address point count is nonzero but addr_points.bin has no first record",
             )
         })?;
-        let record: &[u8; ADDR_POINT_SIZE] = bytes
+        let record: &[u8; AddrPoint::SIZE] = bytes
             .try_into()
             .map_err(|_| Error::internal("addr_points.bin first record has an invalid length"))?;
         Some(AddrPoint::from_bytes(record))

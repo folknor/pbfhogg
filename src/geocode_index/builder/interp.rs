@@ -71,10 +71,10 @@ fn build_cell_addr_csr(
     // merge (commit 363c579) whose per-worker map union regressed the build.
     let mut pairs: Vec<(u64, u32)> = executor.install(|| {
         addr_mmap
-            .par_chunks_exact(ADDR_POINT_SIZE)
+            .par_chunks_exact(AddrPoint::SIZE)
             .enumerate()
             .map(|(index, record)| {
-                let record: &[u8; ADDR_POINT_SIZE] = record
+                let record: &[u8; AddrPoint::SIZE] = record
                     .try_into()
                     .expect("par_chunks_exact always yields full AddrPoint records");
                 let point = AddrPoint::from_bytes(record);
@@ -131,8 +131,8 @@ fn parse_house_number(s: &str) -> u32 {
 
 /// Read an AddrPoint from the mmap'd addr_points.bin by index.
 pub(super) fn read_addr_point_mmap(mmap: &[u8], index: u32) -> Option<AddrPoint> {
-    let offset = index as usize * ADDR_POINT_SIZE;
-    let end = offset + ADDR_POINT_SIZE;
+    let offset = index as usize * AddrPoint::SIZE;
+    let end = offset + AddrPoint::SIZE;
     if end > mmap.len() {
         return None;
     }
@@ -143,7 +143,7 @@ pub(super) fn read_addr_point_mmap(mmap: &[u8], index: u32) -> Option<AddrPoint>
 #[allow(clippy::cast_possible_truncation)] // u64→usize: Linux 64-bit only
 pub(super) fn read_node_at(mmap: &[u8], byte_offset: u64) -> Option<(i32, i32)> {
     let off = byte_offset as usize;
-    let end = off + NODE_COORD_SIZE;
+    let end = off + NodeCoord::SIZE;
     if end > mmap.len() {
         return None;
     }
@@ -163,7 +163,7 @@ pub(super) fn resolve_interpolation_endpoints_mmap(
     street_level: u8,
     executor: &crate::host::Executor,
 ) -> u32 {
-    let addr_count = addr_mmap.len() / ADDR_POINT_SIZE;
+    let addr_count = addr_mmap.len() / AddrPoint::SIZE;
     if interp_ways.is_empty() || addr_count == 0 {
         return 0;
     }
@@ -205,7 +205,7 @@ fn resolve_one_way(
     let Some(start_coord) = read_node_at(interp_nodes_mmap, way.node_file_offset) else {
         return 0;
     };
-    let last_offset = way.node_file_offset + (way.node_count as u64 - 1) * NODE_COORD_SIZE as u64;
+    let last_offset = way.node_file_offset + (way.node_count as u64 - 1) * NodeCoord::SIZE as u64;
     let Some(end_coord) = read_node_at(interp_nodes_mmap, last_offset) else {
         return 0;
     };

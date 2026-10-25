@@ -5,7 +5,10 @@
 //!
 //! This module is the authoritative on-disk format definition: the record
 //! layouts below (magic bytes, header, and the per-file records) are the
-//! format.
+//! format. It also owns how records are found: a whole record file, a
+//! fixed-count span of records at a byte offset, and the length-prefixed
+//! entry lists, all read through [`Table`], whose list framing is
+//! [`ListCount`] and [`list_byte_len`].
 
 use crate::coord_fmt::e7_to_deg;
 
@@ -177,291 +180,230 @@ impl Header {
 }
 
 // ---------------------------------------------------------------------------
-// geo_cells.bin (32 bytes per record)
+// Fixed-size records
 // ---------------------------------------------------------------------------
 
-/// Merged street-level cell index entry.
-pub const GEO_CELL_SIZE: usize = 32;
+/// A fixed-size little-endian record of one of the index files.
+///
+/// Every record type is defined below, and only there: the trait is sealed.
+/// `SIZE` is nonzero, and `read` succeeds for every byte slice of exactly
+/// `SIZE` bytes - validating field *values* (an interpolation type, an
+/// offset into another file) is the reader's job, not the codec's.
+pub trait Record: Copy + sealed::Sealed {
+    /// Bytes per record on disk.
+    const SIZE: usize;
 
-#[derive(Debug, Clone, Copy)]
-pub struct GeoCell {
-    pub cell_id: u64,
-    /// Byte offset into street_entries.bin.
-    pub street_offset: u64,
-    /// Byte offset into addr_entries.bin.
-    pub addr_offset: u64,
-    /// Byte offset into interp_entries.bin.
-    pub interp_offset: u64,
+    /// Decode one record; `None` exactly when `bytes.len() != SIZE`.
+    fn read(bytes: &[u8]) -> Option<Self>;
 }
 
-impl GeoCell {
-    pub fn to_bytes(&self) -> [u8; GEO_CELL_SIZE] {
-        let mut buf = [0u8; GEO_CELL_SIZE];
-        buf[0..8].copy_from_slice(&self.cell_id.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.street_offset.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.addr_offset.to_le_bytes());
-        buf[24..32].copy_from_slice(&self.interp_offset.to_le_bytes());
-        buf
-    }
+mod sealed {
+    pub trait Sealed {}
+}
 
-    pub fn from_bytes(buf: &[u8; GEO_CELL_SIZE]) -> Self {
-        Self {
-            cell_id: u64::from_le_bytes([
-                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-            ]),
-            street_offset: u64::from_le_bytes([
-                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-            ]),
-            addr_offset: u64::from_le_bytes([
-                buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-            ]),
-            interp_offset: u64::from_le_bytes([
-                buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
-            ]),
+/// A little-endian primitive a record field is stored as. Its width is the
+/// whole of a field's layout: a record's field offsets and `SIZE` are sums of
+/// these widths, in field order.
+trait WireField: Copy {
+    const WIDTH: usize;
+    fn get(buf: &[u8], at: usize) -> Self;
+    fn put(self, buf: &mut [u8], at: usize);
+}
+
+macro_rules! wire_field {
+    ($($ty:ty),*) => {$(
+        impl WireField for $ty {
+            const WIDTH: usize = std::mem::size_of::<$ty>();
+
+            #[inline(always)]
+            fn get(buf: &[u8], at: usize) -> Self {
+                let mut bytes = [0u8; std::mem::size_of::<$ty>()];
+                bytes.copy_from_slice(&buf[at..at + Self::WIDTH]);
+                <$ty>::from_le_bytes(bytes)
+            }
+
+            #[inline(always)]
+            fn put(self, buf: &mut [u8], at: usize) {
+                buf[at..at + Self::WIDTH].copy_from_slice(&self.to_le_bytes());
+            }
         }
-    }
+    )*};
 }
 
-// ---------------------------------------------------------------------------
-// Segment ref (6 bytes, used in street_entries and interp_entries)
-// ---------------------------------------------------------------------------
+wire_field!(u8, u16, u32, u64, i32, f32);
 
-/// A reference to a specific segment within a way.
-pub const SEGMENT_REF_SIZE: usize = 6;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SegmentRef {
-    pub way_index: u32,
-    pub segment_index: u16,
-}
-
-impl SegmentRef {
-    pub fn to_bytes(&self) -> [u8; SEGMENT_REF_SIZE] {
-        let mut buf = [0u8; SEGMENT_REF_SIZE];
-        buf[0..4].copy_from_slice(&self.way_index.to_le_bytes());
-        buf[4..6].copy_from_slice(&self.segment_index.to_le_bytes());
-        buf
-    }
-
-    pub fn from_bytes(buf: &[u8; SEGMENT_REF_SIZE]) -> Self {
-        Self {
-            way_index: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
-            segment_index: u16::from_le_bytes([buf[4], buf[5]]),
+/// Define a record from its field list, which is its on-disk layout: fields
+/// are stored in the order listed, each at the width of its type, followed by
+/// `reserved` zero bytes that writers emit and readers ignore. `SIZE`, every
+/// field offset, `to_bytes` and `from_bytes` all derive from that one list.
+macro_rules! record {
+    (
+        $(#[$meta:meta])*
+        pub struct $name:ident {
+            $( $(#[$field_meta:meta])* pub $field:ident : $ty:ty, )+
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// street_ways.bin (14 bytes per record)
-// ---------------------------------------------------------------------------
-
-pub const STREET_WAY_SIZE: usize = 14;
-
-#[derive(Debug, Clone, Copy)]
-pub struct StreetWay {
-    /// Byte offset into street_nodes.bin (u64, file exceeds 4 GB at planet).
-    pub node_offset: u64,
-    /// String offset into strings.bin.
-    pub name_offset: u32,
-    pub node_count: u16,
-}
-
-impl StreetWay {
-    pub fn to_bytes(&self) -> [u8; STREET_WAY_SIZE] {
-        let mut buf = [0u8; STREET_WAY_SIZE];
-        buf[0..8].copy_from_slice(&self.node_offset.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.name_offset.to_le_bytes());
-        buf[12..14].copy_from_slice(&self.node_count.to_le_bytes());
-        buf
-    }
-
-    pub fn from_bytes(buf: &[u8; STREET_WAY_SIZE]) -> Self {
-        Self {
-            node_offset: u64::from_le_bytes([
-                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-            ]),
-            name_offset: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
-            node_count: u16::from_le_bytes([buf[12], buf[13]]),
+        $( reserved = $reserved:literal; )?
+    ) => {
+        $(#[$meta])*
+        pub struct $name {
+            $( $(#[$field_meta])* pub $field: $ty, )+
         }
-    }
-}
 
-// ---------------------------------------------------------------------------
-// addr_points.bin (20 bytes per record)
-// ---------------------------------------------------------------------------
+        impl $name {
+            /// Bytes per record on disk.
+            pub const SIZE: usize = 0 $( + <$ty as WireField>::WIDTH )+ $( + $reserved )?;
 
-pub const ADDR_POINT_SIZE: usize = 20;
+            #[inline]
+            #[allow(unused_assignments)]
+            pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+                let mut buf = [0u8; Self::SIZE];
+                let mut at = 0;
+                $(
+                    WireField::put(self.$field, &mut buf, at);
+                    at += <$ty as WireField>::WIDTH;
+                )+
+                buf
+            }
 
-#[derive(Debug, Clone, Copy)]
-pub struct AddrPoint {
-    pub lat_e7: i32,
-    pub lon_e7: i32,
-    pub housenumber_offset: u32,
-    pub street_offset: u32,
-    pub postcode_offset: u32,
-}
-
-impl AddrPoint {
-    pub fn to_bytes(&self) -> [u8; ADDR_POINT_SIZE] {
-        let mut buf = [0u8; ADDR_POINT_SIZE];
-        buf[0..4].copy_from_slice(&self.lat_e7.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.lon_e7.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.housenumber_offset.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.street_offset.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.postcode_offset.to_le_bytes());
-        buf
-    }
-
-    pub fn from_bytes(buf: &[u8; ADDR_POINT_SIZE]) -> Self {
-        Self {
-            lat_e7: i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
-            lon_e7: i32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
-            housenumber_offset: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
-            street_offset: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
-            postcode_offset: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
+            #[inline]
+            #[allow(unused_assignments)]
+            pub fn from_bytes(buf: &[u8; Self::SIZE]) -> Self {
+                let mut at = 0;
+                $(
+                    let $field = <$ty as WireField>::get(buf, at);
+                    at += <$ty as WireField>::WIDTH;
+                )+
+                Self { $( $field, )+ }
+            }
         }
-    }
-}
 
-// ---------------------------------------------------------------------------
-// interp_ways.bin (23 bytes per record)
-// ---------------------------------------------------------------------------
+        impl sealed::Sealed for $name {}
 
-pub const INTERP_WAY_SIZE: usize = 23;
+        impl Record for $name {
+            const SIZE: usize = $name::SIZE;
 
-#[derive(Debug, Clone, Copy)]
-pub struct InterpWay {
-    /// Byte offset into interp_nodes.bin (u64 for consistency).
-    pub node_offset: u64,
-    pub street_offset: u32,
-    pub start_number: u32,
-    pub end_number: u32,
-    pub node_count: u16,
-    /// Serialized InterpolationType; checked when opening the index.
-    pub interpolation_type: u8,
-}
-
-impl InterpWay {
-    pub fn to_bytes(&self) -> [u8; INTERP_WAY_SIZE] {
-        let mut buf = [0u8; INTERP_WAY_SIZE];
-        buf[0..8].copy_from_slice(&self.node_offset.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.street_offset.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.start_number.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.end_number.to_le_bytes());
-        buf[20..22].copy_from_slice(&self.node_count.to_le_bytes());
-        buf[22] = self.interpolation_type;
-        buf
-    }
-
-    pub fn from_bytes(buf: &[u8; INTERP_WAY_SIZE]) -> Self {
-        Self {
-            node_offset: u64::from_le_bytes([
-                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-            ]),
-            street_offset: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
-            start_number: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
-            end_number: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
-            node_count: u16::from_le_bytes([buf[20], buf[21]]),
-            interpolation_type: buf[22],
+            #[inline]
+            fn read(bytes: &[u8]) -> Option<Self> {
+                bytes.try_into().ok().map(Self::from_bytes)
+            }
         }
+    };
+}
+
+record! {
+    /// Merged street-level cell index entry (`geo_cells.bin`,
+    /// `coarse_geo_cells.bin`), sorted by `cell_id`.
+    #[derive(Debug, Clone, Copy)]
+    pub struct GeoCell {
+        pub cell_id: u64,
+        /// Byte offset of this cell's list in street_entries.bin.
+        pub street_offset: u64,
+        /// Byte offset of this cell's list in addr_entries.bin.
+        pub addr_offset: u64,
+        /// Byte offset of this cell's list in interp_entries.bin.
+        pub interp_offset: u64,
     }
 }
 
-// ---------------------------------------------------------------------------
-// admin_cells.bin (16 bytes per record)
-// ---------------------------------------------------------------------------
-
-pub const ADMIN_CELL_SIZE: usize = 16;
-
-#[derive(Debug, Clone, Copy)]
-pub struct AdminCell {
-    pub cell_id: u64,
-    pub entries_offset: u64,
-}
-
-impl AdminCell {
-    pub fn to_bytes(&self) -> [u8; ADMIN_CELL_SIZE] {
-        let mut buf = [0u8; ADMIN_CELL_SIZE];
-        buf[0..8].copy_from_slice(&self.cell_id.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.entries_offset.to_le_bytes());
-        buf
-    }
-
-    pub fn from_bytes(buf: &[u8; ADMIN_CELL_SIZE]) -> Self {
-        Self {
-            cell_id: u64::from_le_bytes([
-                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-            ]),
-            entries_offset: u64::from_le_bytes([
-                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-            ]),
-        }
+record! {
+    /// A reference to a specific segment within a way: the item of
+    /// street_entries.bin and interp_entries.bin lists.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SegmentRef {
+        pub way_index: u32,
+        pub segment_index: u16,
     }
 }
 
-// ---------------------------------------------------------------------------
-// admin_polygons.bin (26 bytes per record)
-// ---------------------------------------------------------------------------
-
-pub const ADMIN_POLYGON_SIZE: usize = 26;
-
-#[derive(Debug, Clone, Copy)]
-pub struct AdminPolygon {
-    /// Approximate area in square degrees (for smallest-polygon selection).
-    pub area: f32,
-    /// Byte offset into admin_vertices.bin.
-    /// Builder-produced exterior and hole rings repeat their first vertex at
-    /// the end; RING_SENTINEL separates rings. The closing edge is therefore
-    /// included in adjacent vertex pairs. Generic ring parsing also accepts
-    /// implicit closure, but does not certify this producer invariant.
-    pub vertex_offset: u64,
-    pub vertex_count: u32,
-    pub name_offset: u32,
-    /// String offset for ISO 3166-1 alpha2 country code (0 = none).
-    /// Only populated for admin_level=2 boundaries. The builder interns
-    /// the 2-char code (e.g., "DK") into the string pool.
-    pub country_code_offset: u32,
-    /// Administrative level 2-10, or POSTAL_BOUNDARY_LEVEL for postal boundaries.
-    pub admin_level: u8,
-}
-
-impl AdminPolygon {
-    pub fn to_bytes(&self) -> [u8; ADMIN_POLYGON_SIZE] {
-        let mut buf = [0u8; ADMIN_POLYGON_SIZE];
-        buf[0..4].copy_from_slice(&self.area.to_le_bytes());
-        buf[4..12].copy_from_slice(&self.vertex_offset.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.vertex_count.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.name_offset.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.country_code_offset.to_le_bytes());
-        buf[24] = self.admin_level;
-        // buf[25] reserved for future flags; writers emit zero and readers ignore it.
-        buf
-    }
-
-    pub fn from_bytes(buf: &[u8; ADMIN_POLYGON_SIZE]) -> Self {
-        Self {
-            area: f32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
-            vertex_offset: u64::from_le_bytes([
-                buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
-            ]),
-            vertex_count: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
-            name_offset: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
-            country_code_offset: u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]),
-            admin_level: buf[24],
-        }
+record! {
+    /// The item of addr_entries.bin lists: an index into addr_points.bin.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct AddrEntry {
+        pub addr_index: u32,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Node coordinate pair (8 bytes, used in street_nodes, interp_nodes, admin_vertices)
-// ---------------------------------------------------------------------------
+record! {
+    /// `street_ways.bin`.
+    #[derive(Debug, Clone, Copy)]
+    pub struct StreetWay {
+        /// Byte offset into street_nodes.bin (u64, file exceeds 4 GB at planet).
+        pub node_offset: u64,
+        /// String offset into strings.bin.
+        pub name_offset: u32,
+        pub node_count: u16,
+    }
+}
 
-pub const NODE_COORD_SIZE: usize = 8;
+record! {
+    /// `addr_points.bin`.
+    #[derive(Debug, Clone, Copy)]
+    pub struct AddrPoint {
+        pub lat_e7: i32,
+        pub lon_e7: i32,
+        pub housenumber_offset: u32,
+        pub street_offset: u32,
+        pub postcode_offset: u32,
+    }
+}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NodeCoord {
-    pub lat_e7: i32,
-    pub lon_e7: i32,
+record! {
+    /// `interp_ways.bin`.
+    #[derive(Debug, Clone, Copy)]
+    pub struct InterpWay {
+        /// Byte offset into interp_nodes.bin (u64 for consistency).
+        pub node_offset: u64,
+        pub street_offset: u32,
+        pub start_number: u32,
+        pub end_number: u32,
+        pub node_count: u16,
+        /// Serialized InterpolationType; checked when opening the index.
+        pub interpolation_type: u8,
+    }
+}
+
+record! {
+    /// `admin_cells.bin`, sorted by `cell_id`.
+    #[derive(Debug, Clone, Copy)]
+    pub struct AdminCell {
+        pub cell_id: u64,
+        /// Byte offset of this cell's list in admin_entries.bin.
+        pub entries_offset: u64,
+    }
+}
+
+record! {
+    /// `admin_polygons.bin`. The trailing reserved byte is for future flags.
+    #[derive(Debug, Clone, Copy)]
+    pub struct AdminPolygon {
+        /// Approximate area in square degrees (for smallest-polygon selection).
+        pub area: f32,
+        /// Byte offset into admin_vertices.bin.
+        /// Builder-produced exterior and hole rings repeat their first vertex at
+        /// the end; RING_SENTINEL separates rings. The closing edge is therefore
+        /// included in adjacent vertex pairs. Generic ring parsing also accepts
+        /// implicit closure, but does not certify this producer invariant.
+        pub vertex_offset: u64,
+        pub vertex_count: u32,
+        pub name_offset: u32,
+        /// String offset for ISO 3166-1 alpha2 country code (0 = none).
+        /// Only populated for admin_level=2 boundaries. The builder interns
+        /// the 2-char code (e.g., "DK") into the string pool.
+        pub country_code_offset: u32,
+        /// Administrative level 2-10, or POSTAL_BOUNDARY_LEVEL for postal boundaries.
+        pub admin_level: u8,
+    }
+    reserved = 1;
+}
+
+record! {
+    /// A coordinate pair: the record of street_nodes.bin, interp_nodes.bin
+    /// and admin_vertices.bin.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct NodeCoord {
+        pub lat_e7: i32,
+        pub lon_e7: i32,
+    }
 }
 
 /// Sentinel value for ring separator in admin_vertices.bin.
@@ -470,19 +412,224 @@ pub const RING_SENTINEL: NodeCoord = NodeCoord {
     lon_e7: i32::MIN,
 };
 
-impl NodeCoord {
-    pub fn to_bytes(&self) -> [u8; NODE_COORD_SIZE] {
-        let mut buf = [0u8; NODE_COORD_SIZE];
-        buf[0..4].copy_from_slice(&self.lat_e7.to_le_bytes());
-        buf[4..8].copy_from_slice(&self.lon_e7.to_le_bytes());
-        buf
+/// The item of admin_entries.bin lists: a polygon index with the interior
+/// hint packed into its high bit ([`INTERIOR_FLAG`]). Hand-written rather
+/// than a `record!` because its two values share one u32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdminEntry {
+    raw: u32,
+}
+
+impl AdminEntry {
+    /// Bytes per record on disk.
+    pub const SIZE: usize = <u32 as WireField>::WIDTH;
+
+    /// `None` when `polygon_index` reaches into the flag bit: masking it
+    /// would silently name a different polygon.
+    pub fn new(polygon_index: u32, interior_hint: bool) -> Option<Self> {
+        if polygon_index & INTERIOR_FLAG != 0 {
+            return None;
+        }
+        let flag = if interior_hint { INTERIOR_FLAG } else { 0 };
+        Some(Self {
+            raw: polygon_index | flag,
+        })
     }
 
-    pub fn from_bytes(buf: &[u8; NODE_COORD_SIZE]) -> Self {
+    #[inline]
+    pub fn polygon_index(self) -> u32 {
+        self.raw & INDEX_MASK
+    }
+
+    /// A hint only: the reader still runs the point-in-polygon test.
+    #[inline]
+    pub fn interior_hint(self) -> bool {
+        self.raw & INTERIOR_FLAG != 0
+    }
+
+    #[inline]
+    pub fn to_bytes(self) -> [u8; Self::SIZE] {
+        self.raw.to_le_bytes()
+    }
+
+    #[inline]
+    pub fn from_bytes(buf: &[u8; Self::SIZE]) -> Self {
         Self {
-            lat_e7: i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
-            lon_e7: i32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
+            raw: u32::from_le_bytes(*buf),
         }
+    }
+}
+
+impl sealed::Sealed for AdminEntry {}
+
+impl Record for AdminEntry {
+    const SIZE: usize = AdminEntry::SIZE;
+
+    #[inline]
+    fn read(bytes: &[u8]) -> Option<Self> {
+        bytes.try_into().ok().map(Self::from_bytes)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Record runs: whole files, fixed-count spans and length-prefixed lists
+// ---------------------------------------------------------------------------
+
+/// The count prefix of every entry list (the per-cell lists in the street,
+/// address, interpolation and admin entry files). A list is this count,
+/// little-endian, followed by that many records. Widening it is a format
+/// version bump.
+pub type ListCount = u16;
+
+/// Bytes of a list's count prefix.
+pub const LIST_COUNT_SIZE: usize = std::mem::size_of::<ListCount>();
+
+/// Bytes a list of `count` `T` records occupies, prefix included.
+pub fn list_byte_len<T: Record>(count: ListCount) -> u64 {
+    // At most u16::MAX * 32 + 2: no overflow is possible.
+    (LIST_COUNT_SIZE + usize::from(count) * T::SIZE) as u64
+}
+
+/// Why a span or list does not fit the file it points into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunError {
+    /// The byte offset does not fit this platform's `usize`.
+    OffsetUnaddressable,
+    /// A list's count prefix is not inside the file.
+    CountOutOfBounds,
+    /// The run's end offset overflows.
+    SizeOverflow,
+    /// The run extends past the end of the file.
+    PastEnd,
+}
+
+/// A run of `T` records over borrowed bytes: a whole record file, a
+/// fixed-count span, or a list's items. Records are read where they lie; no
+/// alignment is assumed.
+pub struct Table<'a, T> {
+    bytes: &'a [u8],
+    record: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> Clone for Table<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Table<'_, T> {}
+
+impl<T> Default for Table<'_, T> {
+    fn default() -> Self {
+        Self {
+            bytes: &[],
+            record: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, T: Record> Table<'a, T> {
+    const NONZERO_SIZE: () = assert!(T::SIZE > 0);
+
+    /// A whole record file. A trailing partial record is not reachable
+    /// through the table; the reader's open-time length check is what
+    /// rejects a file that has one.
+    #[inline]
+    pub fn new(bytes: &'a [u8]) -> Self {
+        let () = Self::NONZERO_SIZE;
+        Self {
+            bytes,
+            record: std::marker::PhantomData,
+        }
+    }
+
+    /// `count` records starting at byte `offset` of `bytes`. A zero count is
+    /// an empty run whatever the offset, as the format writes for empty
+    /// geometry.
+    #[inline]
+    pub fn span(bytes: &'a [u8], offset: u64, count: u64) -> Result<Self, RunError> {
+        if count == 0 {
+            return Ok(Self::default());
+        }
+        let start = usize::try_from(offset).map_err(|_| RunError::OffsetUnaddressable)?;
+        let end = usize::try_from(count)
+            .ok()
+            .and_then(|n| n.checked_mul(T::SIZE))
+            .and_then(|len| start.checked_add(len))
+            .ok_or(RunError::SizeOverflow)?;
+        bytes
+            .get(start..end)
+            .map(Self::new)
+            .ok_or(RunError::PastEnd)
+    }
+
+    /// The items of the list at byte `offset` of `bytes`.
+    /// [`NO_DATA_U64`] is an empty list.
+    #[inline]
+    pub fn list(bytes: &'a [u8], offset: u64) -> Result<Self, RunError> {
+        if offset == NO_DATA_U64 {
+            return Ok(Self::default());
+        }
+        let start = usize::try_from(offset).map_err(|_| RunError::OffsetUnaddressable)?;
+        let items = start
+            .checked_add(LIST_COUNT_SIZE)
+            .ok_or(RunError::SizeOverflow)?;
+        let prefix = bytes.get(start..items).ok_or(RunError::CountOutOfBounds)?;
+        let mut count = [0u8; LIST_COUNT_SIZE];
+        count.copy_from_slice(prefix);
+        let count = usize::from(ListCount::from_le_bytes(count));
+        let end = count
+            .checked_mul(T::SIZE)
+            .and_then(|len| items.checked_add(len))
+            .ok_or(RunError::SizeOverflow)?;
+        bytes
+            .get(items..end)
+            .map(Self::new)
+            .ok_or(RunError::PastEnd)
+    }
+
+    /// Whole records in the run.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.bytes.len() / T::SIZE
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Record `index`, or `None` past the end.
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<T> {
+        let start = index.checked_mul(T::SIZE)?;
+        let end = start.checked_add(T::SIZE)?;
+        T::read(self.bytes.get(start..end)?)
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = T> + 'a {
+        self.bytes
+            .chunks_exact(T::SIZE)
+            .map(|chunk| T::read(chunk).expect("chunks_exact yields exactly Record::SIZE bytes"))
+    }
+
+    /// Binary search a run sorted by `key_of`. With duplicate keys, which
+    /// one is found is unspecified (the index writes none).
+    #[inline]
+    pub fn find_by_key<F: Fn(&T) -> u64>(&self, key: u64, key_of: F) -> Option<T> {
+        let mut lo = 0usize;
+        let mut hi = self.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let record = self.get(mid)?;
+            match key_of(&record).cmp(&key) {
+                std::cmp::Ordering::Equal => return Some(record),
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+        None
     }
 }
 
@@ -953,7 +1100,8 @@ mod tests {
             admin_level: 2,
         };
         let bytes = poly.to_bytes();
-        assert_eq!(bytes.len(), ADMIN_POLYGON_SIZE);
+        assert_eq!(bytes.len(), 26);
+        assert_eq!(bytes[25], 0, "the reserved byte is written as zero");
         assert_eq!(
             u64::from_le_bytes(bytes[4..12].try_into().expect("8-byte vertex offset")),
             poly.vertex_offset,
@@ -1105,5 +1253,254 @@ mod tests {
         // Verify RING_SENTINEL uses i32::MIN, not (0, 0)
         assert_eq!(RING_SENTINEL.lat_e7, i32::MIN);
         assert_eq!(RING_SENTINEL.lon_e7, i32::MIN);
+    }
+
+    // -----------------------------------------------------------------------
+    // Wire layout, checked independently of the record codec
+    // -----------------------------------------------------------------------
+
+    /// The format's record sizes, written out rather than derived: `SIZE` is
+    /// computed from each field list, so a field added or retyped by mistake
+    /// changes it silently unless something states the expected value.
+    #[test]
+    fn record_sizes_are_the_format_sizes() {
+        assert_eq!(GeoCell::SIZE, 32);
+        assert_eq!(SegmentRef::SIZE, 6);
+        assert_eq!(AddrEntry::SIZE, 4);
+        assert_eq!(StreetWay::SIZE, 14);
+        assert_eq!(AddrPoint::SIZE, 20);
+        assert_eq!(InterpWay::SIZE, 23);
+        assert_eq!(AdminCell::SIZE, 16);
+        assert_eq!(AdminPolygon::SIZE, 26);
+        assert_eq!(NodeCoord::SIZE, 8);
+        assert_eq!(AdminEntry::SIZE, 4);
+        assert_eq!(LIST_COUNT_SIZE, 2);
+    }
+
+    /// Byte positions written out by hand. A round trip through the same
+    /// codec cannot catch a layout error both directions share.
+    #[test]
+    fn records_encode_fields_at_their_format_offsets() {
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        expected.extend_from_slice(&0x1112_1314u32.to_le_bytes());
+        expected.extend_from_slice(&0x2122u16.to_le_bytes());
+        let way = StreetWay {
+            node_offset: 0x0102_0304_0506_0708,
+            name_offset: 0x1112_1314,
+            node_count: 0x2122,
+        };
+        assert_eq!(way.to_bytes().as_slice(), expected.as_slice());
+
+        let iw = InterpWay {
+            node_offset: 7,
+            street_offset: 8,
+            start_number: 9,
+            end_number: 10,
+            node_count: 11,
+            interpolation_type: 2,
+        };
+        let bytes = iw.to_bytes();
+        assert_eq!(&bytes[0..8], &7u64.to_le_bytes());
+        assert_eq!(&bytes[8..12], &8u32.to_le_bytes());
+        assert_eq!(&bytes[12..16], &9u32.to_le_bytes());
+        assert_eq!(&bytes[16..20], &10u32.to_le_bytes());
+        assert_eq!(&bytes[20..22], &11u16.to_le_bytes());
+        assert_eq!(bytes[22], 2);
+
+        let pt = AddrPoint {
+            lat_e7: -1,
+            lon_e7: 2,
+            housenumber_offset: 3,
+            street_offset: 4,
+            postcode_offset: 5,
+        };
+        let bytes = pt.to_bytes();
+        assert_eq!(&bytes[0..4], &(-1i32).to_le_bytes());
+        assert_eq!(&bytes[4..8], &2i32.to_le_bytes());
+        assert_eq!(&bytes[16..20], &5u32.to_le_bytes());
+
+        let sr = SegmentRef {
+            way_index: 0xAABB_CCDD,
+            segment_index: 0xEEFF,
+        };
+        assert_eq!(sr.to_bytes(), [0xDD, 0xCC, 0xBB, 0xAA, 0xFF, 0xEE]);
+
+        let gc = GeoCell {
+            cell_id: 1,
+            street_offset: 2,
+            addr_offset: 3,
+            interp_offset: 4,
+        };
+        let bytes = gc.to_bytes();
+        assert_eq!(&bytes[16..24], &3u64.to_le_bytes(), "addr_offset");
+        assert_eq!(&bytes[24..32], &4u64.to_le_bytes(), "interp_offset");
+
+        let nc = NodeCoord {
+            lat_e7: 0x0102_0304,
+            lon_e7: -2,
+        };
+        assert_eq!(&nc.to_bytes()[0..4], &0x0102_0304i32.to_le_bytes());
+        assert_eq!(
+            AddrEntry {
+                addr_index: 0x0A0B_0C0D
+            }
+            .to_bytes(),
+            [0x0D, 0x0C, 0x0B, 0x0A]
+        );
+    }
+
+    #[test]
+    fn admin_polygon_ignores_its_reserved_byte_on_read() {
+        let poly = AdminPolygon {
+            area: f32::from_bits(0x7FC0_0001),
+            vertex_offset: 1,
+            vertex_count: 2,
+            name_offset: 3,
+            country_code_offset: 4,
+            admin_level: 5,
+        };
+        let mut bytes = poly.to_bytes();
+        bytes[25] = 0xFF;
+        let parsed = AdminPolygon::from_bytes(&bytes);
+        assert_eq!(parsed.admin_level, 5);
+        assert_eq!(
+            parsed.area.to_bits(),
+            0x7FC0_0001,
+            "float bits survive, NaN payload included"
+        );
+        assert_eq!(parsed.to_bytes()[25], 0);
+    }
+
+    #[test]
+    fn admin_entry_packs_the_interior_hint_into_the_high_bit() {
+        let plain = AdminEntry::new(7, false).expect("small index");
+        let interior = AdminEntry::new(7, true).expect("small index");
+        assert_eq!(plain.to_bytes(), 7u32.to_le_bytes());
+        assert_eq!(interior.to_bytes(), (7u32 | 0x8000_0000).to_le_bytes());
+        let parsed = AdminEntry::from_bytes(&interior.to_bytes());
+        assert_eq!(parsed.polygon_index(), 7);
+        assert!(parsed.interior_hint());
+        assert!(!plain.interior_hint());
+        assert_eq!(
+            AdminEntry::new(INDEX_MASK, false).map(AdminEntry::polygon_index),
+            Some(INDEX_MASK)
+        );
+        assert!(
+            AdminEntry::new(INDEX_MASK + 1, false).is_none(),
+            "an index reaching the flag bit must be refused, not masked"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Table, span and list framing
+    // -----------------------------------------------------------------------
+
+    fn coords(n: i32) -> Vec<u8> {
+        (0..n).flat_map(|i| nc(i, -i).to_bytes()).collect()
+    }
+
+    #[test]
+    fn table_reads_whole_records_only() {
+        let mut bytes = coords(3);
+        bytes.push(0xAA);
+        let table = Table::<NodeCoord>::new(&bytes);
+        assert_eq!(table.len(), 3);
+        assert_eq!(table.get(2), Some(nc(2, -2)));
+        assert_eq!(table.get(3), None, "the trailing partial record");
+        assert_eq!(table.get(usize::MAX), None);
+        assert_eq!(table.iter().count(), 3);
+        assert!(Table::<NodeCoord>::new(&[]).get(0).is_none());
+    }
+
+    #[test]
+    fn span_is_byte_addressed_and_bounded() {
+        let mut bytes = vec![0u8; 3];
+        bytes.extend_from_slice(&coords(4));
+        // An unaligned byte offset is legal: spans are not record-indexed.
+        let span = Table::<NodeCoord>::span(&bytes, 3 + 8, 2).expect("in bounds");
+        assert_eq!(span.iter().collect::<Vec<_>>(), vec![nc(1, -1), nc(2, -2)]);
+        assert_eq!(span.get(2), None, "a span ends at its count, not the file");
+        assert_eq!(
+            Table::<NodeCoord>::span(&bytes, 3 + 8, 4).err(),
+            Some(RunError::PastEnd)
+        );
+        assert_eq!(
+            Table::<NodeCoord>::span(&bytes, u64::MAX - 1, 1).err(),
+            Some(if usize::BITS >= 64 {
+                RunError::SizeOverflow
+            } else {
+                RunError::OffsetUnaddressable
+            })
+        );
+        assert_eq!(
+            Table::<NodeCoord>::span(&bytes, 0, u64::MAX).err(),
+            Some(RunError::SizeOverflow)
+        );
+        for offset in [0, 999, u64::MAX] {
+            let empty = Table::<NodeCoord>::span(&bytes, offset, 0)
+                .expect("a zero count is empty wherever it points");
+            assert!(empty.is_empty());
+        }
+    }
+
+    #[test]
+    fn list_reads_its_count_prefix() {
+        let mut bytes = vec![0xEEu8];
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&AddrEntry { addr_index: 5 }.to_bytes());
+        bytes.extend_from_slice(&AddrEntry { addr_index: 6 }.to_bytes());
+        let list = Table::<AddrEntry>::list(&bytes, 1).expect("well-formed list");
+        assert_eq!(
+            list.iter().map(|e| e.addr_index).collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+        assert_eq!(list_byte_len::<AddrEntry>(2), 10);
+        assert!(
+            Table::<AddrEntry>::list(&bytes, NO_DATA_U64)
+                .expect("the no-data sentinel")
+                .is_empty()
+        );
+        assert_eq!(
+            Table::<AddrEntry>::list(&bytes[..bytes.len() - 1], 1).err(),
+            Some(RunError::PastEnd),
+            "a count that overruns the file rejects the whole list"
+        );
+        assert_eq!(
+            Table::<AddrEntry>::list(&bytes, 10).err(),
+            Some(RunError::CountOutOfBounds)
+        );
+        assert_eq!(
+            Table::<AddrEntry>::list(&bytes, 0).err(),
+            Some(RunError::PastEnd),
+            "0xEE 0x02 reads as a count far past the end"
+        );
+    }
+
+    #[test]
+    fn find_by_key_finds_present_keys_only() {
+        let cells: Vec<u8> = [10u64, 20, 30]
+            .iter()
+            .flat_map(|&cell_id| {
+                AdminCell {
+                    cell_id,
+                    entries_offset: cell_id + 1,
+                }
+                .to_bytes()
+            })
+            .collect();
+        let table = Table::<AdminCell>::new(&cells);
+        for key in [10, 20, 30] {
+            let found = table.find_by_key(key, |c| c.cell_id).expect("present key");
+            assert_eq!(found.entries_offset, key + 1);
+        }
+        for key in [0, 15, 31, u64::MAX] {
+            assert!(table.find_by_key(key, |c| c.cell_id).is_none());
+        }
+        assert!(
+            Table::<AdminCell>::default()
+                .find_by_key(10, |c| c.cell_id)
+                .is_none()
+        );
     }
 }

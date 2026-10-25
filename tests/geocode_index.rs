@@ -1017,11 +1017,11 @@ fn street_way(refs: Vec<i64>) -> TestWay {
 
 /// Vertices written for all street ways of the index in `index_dir`.
 fn street_vertex_count(index_dir: &Path) -> u64 {
-    use pbfhogg::geocode_index::format::{FILE_STREET_NODES, NODE_COORD_SIZE};
+    use pbfhogg::geocode_index::format::{FILE_STREET_NODES, NodeCoord};
     let len = std::fs::metadata(index_dir.join(FILE_STREET_NODES))
         .expect("stat street nodes")
         .len();
-    len / u64::try_from(NODE_COORD_SIZE).expect("record size fits u64")
+    len / u64::try_from(NodeCoord::SIZE).expect("record size fits u64")
 }
 
 fn build_into(
@@ -2086,8 +2086,11 @@ fn admin_polygon_hole_excludes_queries_inside_the_hole() {
 /// cell interior-flagged" instead of "is some cell somewhere interior
 /// flagged" - the latter proves nothing about any particular query.
 fn admin_cell_interior_flags(index_dir: &Path) -> std::collections::HashMap<u64, bool> {
-    use pbfhogg::geocode_index::format::{ADMIN_CELL_SIZE, FILE_ADMIN_CELLS, FILE_ADMIN_ENTRIES};
+    use pbfhogg::geocode_index::format::{FILE_ADMIN_CELLS, FILE_ADMIN_ENTRIES};
 
+    // Written out rather than taken from the format module: this decoder is
+    // independent of the reader's codec on purpose.
+    const ADMIN_CELL_SIZE: usize = 16;
     const INTERIOR_FLAG: u32 = 0x8000_0000;
 
     let cells = std::fs::read(index_dir.join(FILE_ADMIN_CELLS)).expect("read admin_cells.bin");

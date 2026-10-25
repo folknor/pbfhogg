@@ -520,10 +520,10 @@ pub(super) fn bucketed_cell_assignment_fused(
                     {
                         panic!("test-hooks: geocode pass3 stage A streets way {way_idx} panicking");
                     }
-                    let offset = way_idx as usize * STREET_WAY_SIZE;
+                    let offset = way_idx as usize * StreetWay::SIZE;
                     let rec = street_ways_mmap
-                        .get(offset..offset + STREET_WAY_SIZE)
-                        .and_then(|b| <&[u8; STREET_WAY_SIZE]>::try_from(b).ok())
+                        .get(offset..offset + StreetWay::SIZE)
+                        .and_then(|b| <&[u8; StreetWay::SIZE]>::try_from(b).ok())
                         .map(StreetWay::from_bytes);
                     let mut out = Vec::new();
                     // Pass 2 wrote these files moments ago, so a record or node
@@ -545,8 +545,8 @@ pub(super) fn bucketed_cell_assignment_fused(
                             let segment_index = seg_idx as u16;
                             let off1 = usize::try_from(rec.node_offset)
                                 .expect("builder requires 64-bit pointers")
-                                + seg_idx * NODE_COORD_SIZE;
-                            let off2 = off1 + NODE_COORD_SIZE;
+                                + seg_idx * NodeCoord::SIZE;
+                            let off2 = off1 + NodeCoord::SIZE;
                             let (Some(n1), Some(n2)) = (
                                 read_node_at(street_nodes_mmap, off1 as u64),
                                 read_node_at(street_nodes_mmap, off2 as u64),
@@ -698,8 +698,8 @@ pub(super) fn bucketed_cell_assignment_fused(
                             let segment_index = seg_idx as u16;
                             let off1 = usize::try_from(iw.node_file_offset)
                                 .expect("builder requires 64-bit pointers")
-                                + seg_idx * NODE_COORD_SIZE;
-                            let off2 = off1 + NODE_COORD_SIZE;
+                                + seg_idx * NodeCoord::SIZE;
+                            let off2 = off1 + NodeCoord::SIZE;
                             // Same producer-owned file rule as the streets above.
                             let (Some(n1), Some(n2)) = (
                                 read_node_at(interp_nodes_mmap, off1 as u64),
@@ -931,15 +931,16 @@ fn run_stage_b(
                 }
 
                 // Write street entries.
-                // INVARIANT: the on-disk count field is u16 (see `format::SegmentEntryIter`
-                // and `U32EntryIter` reader-side decoders). Hard-error if any cell's
+                // INVARIANT: the on-disk list count is `ListCount` (u16), the
+                // framing `format::Table::list` reads. Hard-error if any cell's
                 // per-type entry count exceeds `u16::MAX`, rather than silently truncating.
                 // If this ever fires in practice, bump the on-disk count to u32 and
                 // increment `FORMAT_VERSION`. Do NOT restore a `.min(u16::MAX)` here -
                 // silent truncation made this a latent bug for a long time.
-                let has_streets = !streets.is_empty();
-                if has_streets {
-                    let count = u16::try_from(streets.len()).map_err(|_| {
+                let street_count = if streets.is_empty() {
+                    None
+                } else {
+                    let count = ListCount::try_from(streets.len()).map_err(|_| {
                     Error::invalid_data(format!(
                         "geocode Stage B: cell {cell_token} ({cell_id}) has {} street entries, exceeds u16::MAX. \
                      Bump on-disk count to u32 and increment FORMAT_VERSION.",
@@ -956,11 +957,13 @@ fn run_stage_b(
                             .to_bytes(),
                         )?;
                     }
-                }
+                    Some(count)
+                };
 
-                let has_addrs = !addrs.is_empty();
-                if has_addrs {
-                    let count = u16::try_from(addrs.len()).map_err(|_| {
+                let addr_count = if addrs.is_empty() {
+                    None
+                } else {
+                    let count = ListCount::try_from(addrs.len()).map_err(|_| {
                     Error::invalid_data(format!(
                         "geocode Stage B: cell {cell_token} ({cell_id}) has {} addr entries, exceeds u16::MAX. \
                      Bump on-disk count to u32 and increment FORMAT_VERSION.",
@@ -969,13 +972,20 @@ fn run_stage_b(
                 })?;
                     addr_out.write_all(&count.to_le_bytes())?;
                     for e in &addrs {
-                        addr_out.write_all(&e.index.to_le_bytes())?;
+                        addr_out.write_all(
+                            &AddrEntry {
+                                addr_index: e.index,
+                            }
+                            .to_bytes(),
+                        )?;
                     }
-                }
+                    Some(count)
+                };
 
-                let has_interps = !interps.is_empty();
-                if has_interps {
-                    let count = u16::try_from(interps.len()).map_err(|_| {
+                let interp_count = if interps.is_empty() {
+                    None
+                } else {
+                    let count = ListCount::try_from(interps.len()).map_err(|_| {
                     Error::invalid_data(format!(
                         "geocode Stage B: cell {cell_token} ({cell_id}) has {} interp entries, exceeds u16::MAX. \
                      Bump on-disk count to u32 and increment FORMAT_VERSION.",
@@ -992,25 +1002,14 @@ fn run_stage_b(
                             .to_bytes(),
                         )?;
                     }
-                }
+                    Some(count)
+                };
 
                 let gc = GeoCell {
                     cell_id,
-                    street_offset: if has_streets {
-                        street_byte_offset
-                    } else {
-                        NO_DATA_U64
-                    },
-                    addr_offset: if has_addrs {
-                        addr_byte_offset
-                    } else {
-                        NO_DATA_U64
-                    },
-                    interp_offset: if has_interps {
-                        interp_byte_offset
-                    } else {
-                        NO_DATA_U64
-                    },
+                    street_offset: street_count.map_or(NO_DATA_U64, |_| street_byte_offset),
+                    addr_offset: addr_count.map_or(NO_DATA_U64, |_| addr_byte_offset),
+                    interp_offset: interp_count.map_or(NO_DATA_U64, |_| interp_byte_offset),
                 };
                 cells_out.write_all(&gc.to_bytes())?;
                 debug_assert!(
@@ -1024,16 +1023,14 @@ fn run_stage_b(
                     Error::invalid_data("geocode cell count exceeds u32::MAX; bump FORMAT_VERSION")
                 })?;
 
-                // The per-type `u16::try_from` above guarantees `X.len() <= u16::MAX`
-                // so these `* SIZE as u64` casts won't overflow.
-                if has_streets {
-                    street_byte_offset += 2 + (streets.len() * SEGMENT_REF_SIZE) as u64;
+                if let Some(count) = street_count {
+                    street_byte_offset += list_byte_len::<SegmentRef>(count);
                 }
-                if has_addrs {
-                    addr_byte_offset += 2 + (addrs.len() * 4) as u64;
+                if let Some(count) = addr_count {
+                    addr_byte_offset += list_byte_len::<AddrEntry>(count);
                 }
-                if has_interps {
-                    interp_byte_offset += 2 + (interps.len() * SEGMENT_REF_SIZE) as u64;
+                if let Some(count) = interp_count {
+                    interp_byte_offset += list_byte_len::<SegmentRef>(count);
                 }
             }
         }

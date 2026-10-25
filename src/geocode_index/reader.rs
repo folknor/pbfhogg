@@ -3,6 +3,7 @@
 //! Opens an index directory, memory-maps all files, and provides two query
 //! levels: raw [`Candidates`] and ranked [`ReverseResult`].
 
+use std::marker::PhantomData;
 use std::path::Path;
 use std::{error::Error, fmt};
 
@@ -12,10 +13,9 @@ use s2::cellid::CellID;
 use s2::latlng::LatLng;
 
 use super::format::{
-    self, ADDR_POINT_SIZE, ADMIN_CELL_SIZE, ADMIN_LEVEL_SLOTS, ADMIN_POLYGON_SIZE, AddrPoint,
-    AdminCell, AdminPolygon, GEO_CELL_SIZE, GeoCell, HEADER_SIZE, Header, INDEX_MASK,
-    INTERIOR_FLAG, INTERP_WAY_SIZE, InterpWay, InterpolationType, NODE_COORD_SIZE, NodeCoord,
-    SEGMENT_REF_SIZE, STREET_WAY_SIZE, SegmentRef, StreetWay,
+    self, ADMIN_LEVEL_SLOTS, AddrEntry, AddrPoint, AdminCell, AdminEntry, AdminPolygon, GeoCell,
+    HEADER_SIZE, Header, InterpWay, InterpolationType, NodeCoord, Record, RunError, SegmentRef,
+    StreetWay, Table,
 };
 use crate::geo;
 
@@ -183,8 +183,8 @@ impl<'a> Candidates<'a> {
 
 /// A memory-mapped reverse geocoding index reader.
 ///
-/// `Send + Sync` - all fields are `Mmap` (which is `Send + Sync`), plain
-/// values, or (under `test-hooks`) an atomic counter.
+/// `Send + Sync` - all fields are `Mmap` (which is `Send + Sync`), typed
+/// wrappers of one, plain values, or (under `test-hooks`) an atomic counter.
 pub struct Reader {
     /// Admin point-in-polygon tests run by this reader since it was opened
     /// or last reset. Per reader, so a test observes only its own queries.
@@ -195,24 +195,86 @@ pub struct Reader {
     fine_max_dist_sq: f64,
     coarse_max_dist_sq: f64,
 
-    geo_cells: Mmap,
-    street_entries: Mmap,
-    addr_entries: Mmap,
-    interp_entries: Mmap,
-    coarse_geo_cells: Mmap,
-    coarse_street_entries: Mmap,
-    coarse_addr_entries: Mmap,
-    coarse_interp_entries: Mmap,
-    street_ways: Mmap,
-    street_nodes: Mmap,
-    addr_points: Mmap,
-    interp_ways: Mmap,
-    interp_nodes: Mmap,
-    admin_cells: Mmap,
-    admin_entries: Mmap,
-    admin_polygons: Mmap,
-    admin_vertices: Mmap,
+    geo_cells: Records<GeoCell>,
+    street_entries: Lists<SegmentRef>,
+    addr_entries: Lists<AddrEntry>,
+    interp_entries: Lists<SegmentRef>,
+    coarse_geo_cells: Records<GeoCell>,
+    coarse_street_entries: Lists<SegmentRef>,
+    coarse_addr_entries: Lists<AddrEntry>,
+    coarse_interp_entries: Lists<SegmentRef>,
+    street_ways: Records<StreetWay>,
+    street_nodes: Records<NodeCoord>,
+    addr_points: Records<AddrPoint>,
+    interp_ways: Records<InterpWay>,
+    interp_nodes: Records<NodeCoord>,
+    admin_cells: Records<AdminCell>,
+    admin_entries: Lists<AdminEntry>,
+    admin_polygons: Records<AdminPolygon>,
+    admin_vertices: Records<NodeCoord>,
     strings: Mmap,
+}
+
+/// A mapped file of `T` records. The record type is fixed where the file is
+/// opened, so a file cannot be decoded as another file's record. (Files that
+/// share a record type - the three coordinate files, the street and
+/// interpolation entry files - are still bound to their roles only by the
+/// field they are opened into.)
+struct Records<T> {
+    map: Mmap,
+    record: PhantomData<fn() -> T>,
+}
+
+impl<T: Record> Records<T> {
+    fn map(path: &Path) -> Result<Self> {
+        Ok(Self {
+            map: format::mmap_or_empty(path)?,
+            record: PhantomData,
+        })
+    }
+
+    #[inline]
+    fn table(&self) -> Table<'_, T> {
+        Table::new(&self.map)
+    }
+
+    /// `count` records at byte `offset`: one way's or polygon's geometry.
+    #[inline]
+    fn span(&self, offset: u64, count: u64) -> std::result::Result<Table<'_, T>, RunError> {
+        Table::span(&self.map, offset, count)
+    }
+
+    fn byte_len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+/// A mapped file of length-prefixed lists of `T`, one per cell.
+struct Lists<T> {
+    map: Mmap,
+    record: PhantomData<fn() -> T>,
+}
+
+impl<T: Record> Lists<T> {
+    fn map(path: &Path) -> Result<Self> {
+        Ok(Self {
+            map: format::mmap_or_empty(path)?,
+            record: PhantomData,
+        })
+    }
+
+    #[inline]
+    fn list(&self, offset: u64) -> std::result::Result<Table<'_, T>, RunError> {
+        Table::list(&self.map, offset)
+    }
+
+    /// The list at `offset` for a query. Open validated every list a cell
+    /// names, so a malformed one is unreachable here; it reads as empty
+    /// rather than failing the query.
+    #[inline]
+    fn entries(&self, offset: u64) -> Table<'_, T> {
+        self.list(offset).unwrap_or_default()
+    }
 }
 
 type Result<T> = crate::Result<T>;
@@ -271,7 +333,7 @@ impl Reader {
         )
         .map_err(|e| in_header(crate::Error::invalid_data_from(e)))?;
 
-        let mmap = |name: &str| format::mmap_or_empty(&dir.join(name));
+        let path = |name: &str| dir.join(name);
 
         let fine_radius_m = header.fine_search_radius_m as f64;
         let coarse_radius_m = header.coarse_search_radius_m as f64;
@@ -282,24 +344,24 @@ impl Reader {
             fine_max_dist_sq: geo::meters_to_radians_sq(fine_radius_m),
             coarse_max_dist_sq: geo::meters_to_radians_sq(coarse_radius_m),
             header,
-            geo_cells: mmap(format::FILE_GEO_CELLS)?,
-            street_entries: mmap(format::FILE_STREET_ENTRIES)?,
-            addr_entries: mmap(format::FILE_ADDR_ENTRIES)?,
-            interp_entries: mmap(format::FILE_INTERP_ENTRIES)?,
-            coarse_geo_cells: mmap(format::FILE_COARSE_GEO_CELLS)?,
-            coarse_street_entries: mmap(format::FILE_COARSE_STREET_ENTRIES)?,
-            coarse_addr_entries: mmap(format::FILE_COARSE_ADDR_ENTRIES)?,
-            coarse_interp_entries: mmap(format::FILE_COARSE_INTERP_ENTRIES)?,
-            street_ways: mmap(format::FILE_STREET_WAYS)?,
-            street_nodes: mmap(format::FILE_STREET_NODES)?,
-            addr_points: mmap(format::FILE_ADDR_POINTS)?,
-            interp_ways: mmap(format::FILE_INTERP_WAYS)?,
-            interp_nodes: mmap(format::FILE_INTERP_NODES)?,
-            admin_cells: mmap(format::FILE_ADMIN_CELLS)?,
-            admin_entries: mmap(format::FILE_ADMIN_ENTRIES)?,
-            admin_polygons: mmap(format::FILE_ADMIN_POLYGONS)?,
-            admin_vertices: mmap(format::FILE_ADMIN_VERTICES)?,
-            strings: mmap(format::FILE_STRINGS)?,
+            geo_cells: Records::map(&path(format::FILE_GEO_CELLS))?,
+            street_entries: Lists::map(&path(format::FILE_STREET_ENTRIES))?,
+            addr_entries: Lists::map(&path(format::FILE_ADDR_ENTRIES))?,
+            interp_entries: Lists::map(&path(format::FILE_INTERP_ENTRIES))?,
+            coarse_geo_cells: Records::map(&path(format::FILE_COARSE_GEO_CELLS))?,
+            coarse_street_entries: Lists::map(&path(format::FILE_COARSE_STREET_ENTRIES))?,
+            coarse_addr_entries: Lists::map(&path(format::FILE_COARSE_ADDR_ENTRIES))?,
+            coarse_interp_entries: Lists::map(&path(format::FILE_COARSE_INTERP_ENTRIES))?,
+            street_ways: Records::map(&path(format::FILE_STREET_WAYS))?,
+            street_nodes: Records::map(&path(format::FILE_STREET_NODES))?,
+            addr_points: Records::map(&path(format::FILE_ADDR_POINTS))?,
+            interp_ways: Records::map(&path(format::FILE_INTERP_WAYS))?,
+            interp_nodes: Records::map(&path(format::FILE_INTERP_NODES))?,
+            admin_cells: Records::map(&path(format::FILE_ADMIN_CELLS))?,
+            admin_entries: Lists::map(&path(format::FILE_ADMIN_ENTRIES))?,
+            admin_polygons: Records::map(&path(format::FILE_ADMIN_POLYGONS))?,
+            admin_vertices: Records::map(&path(format::FILE_ADMIN_VERTICES))?,
+            strings: format::mmap_or_empty(&path(format::FILE_STRINGS))?,
         };
         reader.validate_structure()?;
         Ok(reader)
@@ -336,55 +398,57 @@ impl Reader {
         }
         exact(
             format::FILE_GEO_CELLS,
-            self.geo_cells.len(),
+            self.geo_cells.byte_len(),
             self.header.geo_cell_count,
-            GEO_CELL_SIZE,
+            GeoCell::SIZE,
         )?;
         exact(
             format::FILE_COARSE_GEO_CELLS,
-            self.coarse_geo_cells.len(),
+            self.coarse_geo_cells.byte_len(),
             self.header.coarse_cell_count,
-            GEO_CELL_SIZE,
+            GeoCell::SIZE,
         )?;
         exact(
             format::FILE_ADMIN_CELLS,
-            self.admin_cells.len(),
+            self.admin_cells.byte_len(),
             self.header.admin_cell_count,
-            ADMIN_CELL_SIZE,
+            AdminCell::SIZE,
         )?;
         exact(
             format::FILE_STREET_WAYS,
-            self.street_ways.len(),
+            self.street_ways.byte_len(),
             self.header.street_way_count,
-            STREET_WAY_SIZE,
+            StreetWay::SIZE,
         )?;
         exact(
             format::FILE_ADDR_POINTS,
-            self.addr_points.len(),
+            self.addr_points.byte_len(),
             self.header.addr_point_count,
-            ADDR_POINT_SIZE,
+            AddrPoint::SIZE,
         )?;
         exact(
             format::FILE_INTERP_WAYS,
-            self.interp_ways.len(),
+            self.interp_ways.byte_len(),
             self.header.interp_way_count,
-            INTERP_WAY_SIZE,
+            InterpWay::SIZE,
         )?;
         exact(
             format::FILE_ADMIN_POLYGONS,
-            self.admin_polygons.len(),
+            self.admin_polygons.byte_len(),
             self.header.admin_polygon_count,
-            ADMIN_POLYGON_SIZE,
+            AdminPolygon::SIZE,
         )?;
 
-        self.validate_geo_tree(
+        // Every walk below runs after the exact-length checks above, so each
+        // record file's table holds exactly its header count of records.
+        Self::validate_geo_tree(
             format::FILE_GEO_CELLS,
             &self.geo_cells,
             &self.street_entries,
             &self.addr_entries,
             &self.interp_entries,
         )?;
-        self.validate_geo_tree(
+        Self::validate_geo_tree(
             format::FILE_COARSE_GEO_CELLS,
             &self.coarse_geo_cells,
             &self.coarse_street_entries,
@@ -400,19 +464,12 @@ impl Reader {
     /// point into the three geo entry files. Validating two of the three list
     /// kinds and leaving the third is how a truncated or hostile
     /// `admin_entries.bin` opens successfully and then silently returns
-    /// incomplete admin results: `AdminEntryIter` stops at the end of the
-    /// mmap and reports no error, so the caller cannot tell a short list from
-    /// a genuinely empty one.
+    /// incomplete admin results: a query reads a malformed list as empty, so
+    /// the caller cannot tell a broken list from a genuinely empty one.
     fn validate_admin_tree(&self) -> Result<()> {
-        for index in 0..self.admin_cells.len() / ADMIN_CELL_SIZE {
-            (|| -> Result<()> {
-                let rec =
-                    read_record::<ADMIN_CELL_SIZE>(&self.admin_cells, index * ADMIN_CELL_SIZE)
-                        .ok_or_else(|| corrupt("invalid admin cell record"))?;
-                let cell = AdminCell::from_bytes(rec);
-                validate_list(cell.entries_offset, &self.admin_entries, 4, "admin entry")
-            })()
-            .map_err(|e| in_record(e, format::FILE_ADMIN_CELLS, index))?;
+        for (index, cell) in self.admin_cells.table().iter().enumerate() {
+            validate_list(&self.admin_entries, cell.entries_offset, "admin entry")
+                .map_err(|e| in_record(e, format::FILE_ADMIN_CELLS, index))?;
         }
         Ok(())
     }
@@ -427,70 +484,53 @@ impl Reader {
     ///   `admin_vertices.bin`
     ///
     /// Each was previously unchecked at open time. The read paths that follow
-    /// them are individually bounds-safe - `record_at` and `read_record`
-    /// return `None` past the end - but "safe" is not "correct": a truncated
-    /// nodes file turns a street into a shorter street and a polygon into a
-    /// different polygon, silently, and the reader answers queries about it.
+    /// them are individually bounds-safe - a span that does not fit reads as
+    /// no geometry - but "safe" is not "correct": a truncated nodes file
+    /// turns a street into a missing street and a polygon into no polygon,
+    /// silently, and the reader answers queries without it.
     ///
     /// String-pool offsets (`name_offset`, `housenumber_offset`,
     /// `street_offset`, `postcode_offset`, `country_code_offset`) are validated
     /// here as well. `read_nul_string` independently returns `None` for an
     /// invalid offset, missing terminator, or invalid UTF-8.
     fn validate_way_geometry(&self) -> Result<()> {
-        for index in 0..self.street_ways.len() / STREET_WAY_SIZE {
+        for (index, way) in self.street_ways.table().iter().enumerate() {
             (|| -> Result<()> {
-                let rec =
-                    read_record::<STREET_WAY_SIZE>(&self.street_ways, index * STREET_WAY_SIZE)
-                        .ok_or_else(|| corrupt("invalid street way record"))?;
-                let way = StreetWay::from_bytes(rec);
                 validate_span(
+                    &self.street_nodes,
                     way.node_offset,
                     u64::from(way.node_count),
-                    NODE_COORD_SIZE,
-                    &self.street_nodes,
                     "street way node",
                 )?;
                 validate_string_offset(way.name_offset, &self.strings, "street way name")
             })()
             .map_err(|e| in_record(e, format::FILE_STREET_WAYS, index))?;
         }
-        for index in 0..self.interp_ways.len() / INTERP_WAY_SIZE {
+        for (index, way) in self.interp_ways.table().iter().enumerate() {
             (|| -> Result<()> {
-                let rec =
-                    read_record::<INTERP_WAY_SIZE>(&self.interp_ways, index * INTERP_WAY_SIZE)
-                        .ok_or_else(|| corrupt("invalid interpolation way record"))?;
-                let way = InterpWay::from_bytes(rec);
                 InterpolationType::try_from(way.interpolation_type)
                     .map_err(crate::Error::invalid_data_from)?;
                 validate_span(
+                    &self.interp_nodes,
                     way.node_offset,
                     u64::from(way.node_count),
-                    NODE_COORD_SIZE,
-                    &self.interp_nodes,
                     "interpolation way node",
                 )?;
                 validate_string_offset(way.street_offset, &self.strings, "interpolation way street")
             })()
             .map_err(|e| in_record(e, format::FILE_INTERP_WAYS, index))?;
         }
-        for index in 0..self.admin_polygons.len() / ADMIN_POLYGON_SIZE {
+        for (index, poly) in self.admin_polygons.table().iter().enumerate() {
             (|| -> Result<()> {
-                let rec = read_record::<ADMIN_POLYGON_SIZE>(
-                    &self.admin_polygons,
-                    index * ADMIN_POLYGON_SIZE,
-                )
-                .ok_or_else(|| corrupt("invalid admin polygon record"))?;
-                let poly = AdminPolygon::from_bytes(rec);
                 // Producer rings repeat their first vertex: assemble_rings
                 // keeps only closed rings and simplify_ring preserves both
                 // endpoints. Do not scan every vertex here solely to
                 // recertify closure; that would add coordinate-page reads to
                 // metadata validation at open.
                 validate_span(
+                    &self.admin_vertices,
                     poly.vertex_offset,
                     u64::from(poly.vertex_count),
-                    NODE_COORD_SIZE,
-                    &self.admin_vertices,
                     "admin polygon vertex",
                 )?;
                 validate_string_offset(poly.name_offset, &self.strings, "admin polygon name")?;
@@ -502,12 +542,8 @@ impl Reader {
             })()
             .map_err(|e| in_record(e, format::FILE_ADMIN_POLYGONS, index))?;
         }
-        for index in 0..self.addr_points.len() / ADDR_POINT_SIZE {
+        for (index, pt) in self.addr_points.table().iter().enumerate() {
             (|| -> Result<()> {
-                let rec =
-                    read_record::<ADDR_POINT_SIZE>(&self.addr_points, index * ADDR_POINT_SIZE)
-                        .ok_or_else(|| corrupt("invalid address point record"))?;
-                let pt = AddrPoint::from_bytes(rec);
                 validate_string_offset(
                     pt.housenumber_offset,
                     &self.strings,
@@ -521,34 +557,22 @@ impl Reader {
         Ok(())
     }
 
-    // These slices are roles, not filenames. Keep the pairing visible at
-    // the two call sites; a filename bundle cannot certify mmap provenance.
+    // Fine and coarse trees have the same shape and different files. Keep
+    // the pairing visible at the two call sites: the street and
+    // interpolation entry files share a type, so the types alone cannot
+    // certify which is which.
     fn validate_geo_tree(
-        &self,
         cells_file: &'static str,
-        cells: &[u8],
-        streets: &[u8],
-        addrs: &[u8],
-        interps: &[u8],
+        cells: &Records<GeoCell>,
+        streets: &Lists<SegmentRef>,
+        addrs: &Lists<AddrEntry>,
+        interps: &Lists<SegmentRef>,
     ) -> Result<()> {
-        for index in 0..cells.len() / GEO_CELL_SIZE {
+        for (index, cell) in cells.table().iter().enumerate() {
             (|| -> Result<()> {
-                let rec = read_record::<GEO_CELL_SIZE>(cells, index * GEO_CELL_SIZE)
-                    .ok_or_else(|| corrupt("invalid geo cell record"))?;
-                let cell = GeoCell::from_bytes(rec);
-                validate_list(cell.addr_offset, addrs, 4, "address entry")?;
-                validate_list(
-                    cell.street_offset,
-                    streets,
-                    SEGMENT_REF_SIZE,
-                    "street entry",
-                )?;
-                validate_list(
-                    cell.interp_offset,
-                    interps,
-                    SEGMENT_REF_SIZE,
-                    "interpolation entry",
-                )
+                validate_list(addrs, cell.addr_offset, "address entry")?;
+                validate_list(streets, cell.street_offset, "street entry")?;
+                validate_list(interps, cell.interp_offset, "interpolation entry")
             })()
             .map_err(|e| in_record(e, cells_file, index))?;
         }
@@ -713,7 +737,7 @@ impl Reader {
         if iw.start_number == 0 || iw.end_number == 0 {
             return None;
         }
-        let total_len = self.way_length_radians(&self.interp_nodes, iw.node_offset, iw.node_count);
+        let total_len = self.way_length_radians(&iw);
         (total_len >= crate::tunables::INTERP_MIN_TOTAL_LEN).then_some(total_len)
     }
 
@@ -753,13 +777,7 @@ impl Reader {
         {
             return None;
         }
-        let acc_len = self.accumulated_length_radians(
-            &self.interp_nodes,
-            iw.node_offset,
-            segment_index,
-            snap_lat_e7,
-            snap_lon_e7,
-        );
+        let acc_len = self.accumulated_length_radians(&iw, segment_index, snap_lat_e7, snap_lon_e7);
         let t = acc_len / total_len;
         let diff = iw.end_number as f64 - iw.start_number as f64;
         // Even and odd both preserve start_number parity. Endpoint numbers
@@ -1039,194 +1057,6 @@ impl<'a> CandidateCollector<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Zero-allocation entry iterators over mmap'd bytes
-// ---------------------------------------------------------------------------
-
-/// Iterator over u32 entries (addr_entries, interp_entries with u32 offset).
-struct U32EntryIter<'a> {
-    data: &'a [u8],
-    pos: usize,
-    remaining: u16,
-}
-
-impl<'a> U32EntryIter<'a> {
-    fn new(mmap: &'a [u8], offset: u64) -> Self {
-        let Ok(off) = usize::try_from(offset) else {
-            return Self {
-                data: mmap,
-                pos: 0,
-                remaining: 0,
-            };
-        };
-        let Some(end) = off.checked_add(2) else {
-            return Self {
-                data: mmap,
-                pos: 0,
-                remaining: 0,
-            };
-        };
-        if end > mmap.len() {
-            return Self {
-                data: mmap,
-                pos: 0,
-                remaining: 0,
-            };
-        }
-        let count = u16::from_le_bytes([mmap[off], mmap[off + 1]]);
-        Self {
-            data: mmap,
-            pos: end,
-            remaining: count,
-        }
-    }
-}
-
-impl Iterator for U32EntryIter<'_> {
-    type Item = u32;
-
-    fn next(&mut self) -> Option<u32> {
-        if self.remaining == 0 {
-            return None;
-        }
-        let end = self.pos.checked_add(4)?;
-        if end > self.data.len() {
-            self.remaining = 0;
-            return None;
-        }
-        let val = u32::from_le_bytes([
-            self.data[self.pos],
-            self.data[self.pos + 1],
-            self.data[self.pos + 2],
-            self.data[self.pos + 3],
-        ]);
-        self.pos = end;
-        self.remaining -= 1;
-        Some(val)
-    }
-}
-
-/// Iterator over segment ref entries (6 bytes each).
-struct SegmentEntryIter<'a> {
-    data: &'a [u8],
-    pos: usize,
-    remaining: u16,
-}
-
-impl<'a> SegmentEntryIter<'a> {
-    fn new(mmap: &'a [u8], offset: u64) -> Self {
-        let Ok(off) = usize::try_from(offset) else {
-            return Self {
-                data: mmap,
-                pos: 0,
-                remaining: 0,
-            };
-        };
-        let Some(end) = off.checked_add(2) else {
-            return Self {
-                data: mmap,
-                pos: 0,
-                remaining: 0,
-            };
-        };
-        if end > mmap.len() {
-            return Self {
-                data: mmap,
-                pos: 0,
-                remaining: 0,
-            };
-        }
-        let count = u16::from_le_bytes([mmap[off], mmap[off + 1]]);
-        Self {
-            data: mmap,
-            pos: end,
-            remaining: count,
-        }
-    }
-}
-
-impl Iterator for SegmentEntryIter<'_> {
-    type Item = SegmentRef;
-
-    fn next(&mut self) -> Option<SegmentRef> {
-        if self.remaining == 0 {
-            return None;
-        }
-        let end = self.pos.checked_add(SEGMENT_REF_SIZE)?;
-        if end > self.data.len() {
-            self.remaining = 0;
-            return None;
-        }
-        let rec: &[u8; SEGMENT_REF_SIZE] = self.data[self.pos..end].try_into().ok()?;
-        self.pos = end;
-        self.remaining -= 1;
-        Some(SegmentRef::from_bytes(rec))
-    }
-}
-
-/// Iterator over admin entries (u32 values with interior flag).
-struct AdminEntryIter<'a> {
-    data: &'a [u8],
-    pos: usize,
-    remaining: u16,
-}
-
-impl<'a> AdminEntryIter<'a> {
-    fn new(mmap: &'a [u8], offset: u64) -> Self {
-        let Ok(off) = usize::try_from(offset) else {
-            return Self {
-                data: mmap,
-                pos: 0,
-                remaining: 0,
-            };
-        };
-        let Some(end) = off.checked_add(2) else {
-            return Self {
-                data: mmap,
-                pos: 0,
-                remaining: 0,
-            };
-        };
-        if end > mmap.len() {
-            return Self {
-                data: mmap,
-                pos: 0,
-                remaining: 0,
-            };
-        }
-        let count = u16::from_le_bytes([mmap[off], mmap[off + 1]]);
-        Self {
-            data: mmap,
-            pos: end,
-            remaining: count,
-        }
-    }
-}
-
-impl Iterator for AdminEntryIter<'_> {
-    type Item = (u32, bool); // (polygon_index, is_interior_hint)
-
-    fn next(&mut self) -> Option<(u32, bool)> {
-        if self.remaining == 0 {
-            return None;
-        }
-        let end = self.pos.checked_add(4)?;
-        if end > self.data.len() {
-            self.remaining = 0;
-            return None;
-        }
-        let raw = u32::from_le_bytes([
-            self.data[self.pos],
-            self.data[self.pos + 1],
-            self.data[self.pos + 2],
-            self.data[self.pos + 3],
-        ]);
-        self.pos = end;
-        self.remaining -= 1;
-        Some((raw & INDEX_MASK, raw & INTERIOR_FLAG != 0))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // S2 cell helpers (fixed-size array, no allocation)
 // ---------------------------------------------------------------------------
 
@@ -1266,17 +1096,17 @@ impl Reader {
     fn search_level<'a, S: SearchSink<'a>>(
         &'a self,
         ctx: &QueryContext,
-        geo_cells_mmap: &Mmap,
-        street_entries_mmap: &Mmap,
-        addr_entries_mmap: &Mmap,
-        interp_entries_mmap: &Mmap,
+        geo_cells: &Records<GeoCell>,
+        street_entries: &Lists<SegmentRef>,
+        addr_entries: &Lists<AddrEntry>,
+        interp_entries: &Lists<SegmentRef>,
         level: u8,
         max_dist_sq: f64,
         kinds: SearchKinds,
         sink: &mut S,
     ) {
         let (cells, count) = cell_neighborhood(ctx.lat, ctx.lon, level);
-        let cell_count = geo_cells_mmap.len() / GEO_CELL_SIZE;
+        let geo_cells = geo_cells.table();
 
         // An entry naming a record that does not exist is skipped, not
         // reported: open certifies list spans but not entry contents (see
@@ -1284,13 +1114,14 @@ impl Reader {
         // index can carry one. The segment distance helpers return f64::MAX
         // for the same case, which never passes the radius test.
         for &cell_id in &cells[..count] {
-            let Some(gc) = binary_search_cells(geo_cells_mmap, cell_count, cell_id) else {
+            let Some(gc) = geo_cells.find_by_key(cell_id, |cell| cell.cell_id) else {
                 continue;
             };
 
             // Address points
-            if kinds.addr && gc.addr_offset != format::NO_DATA_U64 {
-                for idx in U32EntryIter::new(addr_entries_mmap, gc.addr_offset) {
+            if kinds.addr {
+                for entry in addr_entries.entries(gc.addr_offset).iter() {
+                    let idx = entry.addr_index;
                     let Some(pt) = self.read_addr_point(idx) else {
                         continue;
                     };
@@ -1308,8 +1139,8 @@ impl Reader {
             }
 
             // Street segments
-            if kinds.street && gc.street_offset != format::NO_DATA_U64 {
-                for seg_ref in SegmentEntryIter::new(street_entries_mmap, gc.street_offset) {
+            if kinds.street {
+                for seg_ref in street_entries.entries(gc.street_offset).iter() {
                     let (snap_lat, snap_lon, dist_sq) = self.street_segment_distance(ctx, &seg_ref);
                     if dist_sq < max_dist_sq {
                         sink.street(self, seg_ref, snap_lat, snap_lon, dist_sq);
@@ -1318,8 +1149,8 @@ impl Reader {
             }
 
             // Interpolation segments
-            if kinds.interp && gc.interp_offset != format::NO_DATA_U64 {
-                for seg_ref in SegmentEntryIter::new(interp_entries_mmap, gc.interp_offset) {
+            if kinds.interp {
+                for seg_ref in interp_entries.entries(gc.interp_offset).iter() {
                     let (snap_lat, snap_lon, dist_sq) = self.interp_segment_distance(ctx, &seg_ref);
                     if dist_sq < max_dist_sq {
                         sink.interpolation(self, seg_ref, snap_lat, snap_lon, dist_sq);
@@ -1336,17 +1167,16 @@ impl Reader {
     /// admin_polygon_contains (see the comment below).
     fn search_admin_ranked<'a>(&'a self, ctx: &QueryContext) -> Vec<AdminMatch<'a>> {
         let (cells, count) = cell_neighborhood(ctx.lat, ctx.lon, self.header.admin_cell_level);
-        let cell_count = self.admin_cells.len() / ADMIN_CELL_SIZE;
+        let admin_cells = self.admin_cells.table();
         let mut best_by_level: [(Option<u32>, f32); ADMIN_LEVEL_SLOTS] =
             [(None, f32::MAX); ADMIN_LEVEL_SLOTS];
 
         for &cell_id in &cells[..count] {
-            let Some(ac) = binary_search_admin_cells(&self.admin_cells, cell_count, cell_id) else {
+            let Some(ac) = admin_cells.find_by_key(cell_id, |cell| cell.cell_id) else {
                 continue;
             };
-            for (poly_idx, _is_interior) in
-                AdminEntryIter::new(&self.admin_entries, ac.entries_offset)
-            {
+            for entry in self.admin_entries.entries(ac.entries_offset).iter() {
+                let poly_idx = entry.polygon_index();
                 // Out-of-range entry: skipped, as in search_level.
                 let Some(poly) = self.read_admin_polygon(poly_idx) else {
                     continue;
@@ -1390,17 +1220,16 @@ impl Reader {
     /// All admin polygons containing the point (for candidates API).
     fn search_admin_all<'a>(&'a self, ctx: &QueryContext) -> Vec<AdminMatch<'a>> {
         let (cells, count) = cell_neighborhood(ctx.lat, ctx.lon, self.header.admin_cell_level);
-        let cell_count = self.admin_cells.len() / ADMIN_CELL_SIZE;
+        let admin_cells = self.admin_cells.table();
         let mut result = Vec::new();
         let mut seen: FxHashSet<u32> = FxHashSet::default();
 
         for &cell_id in &cells[..count] {
-            let Some(ac) = binary_search_admin_cells(&self.admin_cells, cell_count, cell_id) else {
+            let Some(ac) = admin_cells.find_by_key(cell_id, |cell| cell.cell_id) else {
                 continue;
             };
-            for (poly_idx, _is_interior) in
-                AdminEntryIter::new(&self.admin_entries, ac.entries_offset)
-            {
+            for entry in self.admin_entries.entries(ac.entries_offset).iter() {
+                let poly_idx = entry.polygon_index();
                 // Record every attempted polygon, not only successful PIP
                 // matches, so a non-containing polygon shared by neighboring
                 // cells is fetched and tested exactly once.
@@ -1432,21 +1261,19 @@ impl Reader {
         #[cfg(feature = "test-hooks")]
         self.admin_pip_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let Ok(start) = usize::try_from(poly.vertex_offset) else {
-            return false;
-        };
-        let count = poly.vertex_count as usize;
-        if count < 3 {
+        if poly.vertex_count < 3 {
             return false;
         }
+        // Open validated this span; re-deriving it here is the local bound.
+        let Ok(vertices) = self
+            .admin_vertices
+            .span(poly.vertex_offset, u64::from(poly.vertex_count))
+        else {
+            return false;
+        };
 
         // Parse vertices into rings separated by sentinel
-        let coords = (0..count).map_while(|i| {
-            let offset = i.checked_mul(NODE_COORD_SIZE)?.checked_add(start)?;
-            let rec = read_record::<NODE_COORD_SIZE>(&self.admin_vertices, offset)?;
-            Some(NodeCoord::from_bytes(rec))
-        });
-        let rings = format::parse_rings(coords);
+        let rings = format::parse_rings(vertices.iter());
         if rings.is_empty() {
             return false;
         }
@@ -1458,65 +1285,52 @@ impl Reader {
 
     // -- Segment distance ----------------------------------------------------
 
-    #[allow(clippy::cast_possible_truncation)]
     fn street_segment_distance(&self, ctx: &QueryContext, seg_ref: &SegmentRef) -> (i32, i32, f64) {
-        let way_offset = seg_ref.way_index as usize * STREET_WAY_SIZE;
-        let Some(rec) = read_record::<STREET_WAY_SIZE>(&self.street_ways, way_offset) else {
-            return (0, 0, f64::MAX);
+        let Some(way) = self.read_street_way(seg_ref.way_index) else {
+            return SEGMENT_MISS;
         };
-        let way = StreetWay::from_bytes(rec);
-        // A globally in-bounds node can belong to the next way. A segment
-        // needs two nodes within this way, including when node_count is zero.
-        if u32::from(seg_ref.segment_index) + 1 >= u32::from(way.node_count) {
-            return (0, 0, f64::MAX);
-        }
-        let Some(node_byte_offset) = usize::try_from(way.node_offset).ok().and_then(|base| {
-            usize::from(seg_ref.segment_index)
-                .checked_mul(NODE_COORD_SIZE)?
-                .checked_add(base)
-        }) else {
-            return (0, 0, f64::MAX);
-        };
-        two_node_distance(ctx, &self.street_nodes, node_byte_offset)
+        segment_distance(
+            ctx,
+            &self.street_nodes,
+            way.node_offset,
+            way.node_count,
+            seg_ref.segment_index,
+        )
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn interp_segment_distance(&self, ctx: &QueryContext, seg_ref: &SegmentRef) -> (i32, i32, f64) {
-        let way_offset = seg_ref.way_index as usize * INTERP_WAY_SIZE;
-        let Some(rec) = read_record::<INTERP_WAY_SIZE>(&self.interp_ways, way_offset) else {
-            return (0, 0, f64::MAX);
+        let Some(way) = self.read_interp_way(seg_ref.way_index) else {
+            return SEGMENT_MISS;
         };
-        let way = InterpWay::from_bytes(rec);
-        // Check the owning geometry before accessing the shared node file.
-        if u32::from(seg_ref.segment_index) + 1 >= u32::from(way.node_count) {
-            return (0, 0, f64::MAX);
-        }
-        let Some(node_byte_offset) = usize::try_from(way.node_offset).ok().and_then(|base| {
-            usize::from(seg_ref.segment_index)
-                .checked_mul(NODE_COORD_SIZE)?
-                .checked_add(base)
-        }) else {
-            return (0, 0, f64::MAX);
-        };
-        two_node_distance(ctx, &self.interp_nodes, node_byte_offset)
+        segment_distance(
+            ctx,
+            &self.interp_nodes,
+            way.node_offset,
+            way.node_count,
+            seg_ref.segment_index,
+        )
     }
 
     // -- Record readers ------------------------------------------------------
 
+    #[inline]
     fn read_addr_point(&self, index: u32) -> Option<AddrPoint> {
-        decode_addr_point(&self.addr_points, index)
+        self.addr_points.table().get(index as usize)
     }
 
+    #[inline]
     fn read_street_way(&self, index: u32) -> Option<StreetWay> {
-        decode_street_way(&self.street_ways, index)
+        self.street_ways.table().get(index as usize)
     }
 
+    #[inline]
     fn read_interp_way(&self, index: u32) -> Option<InterpWay> {
-        decode_interp_way(&self.interp_ways, index)
+        self.interp_ways.table().get(index as usize)
     }
 
+    #[inline]
     fn read_admin_polygon(&self, index: u32) -> Option<AdminPolygon> {
-        decode_admin_polygon(&self.admin_polygons, index)
+        self.admin_polygons.table().get(index as usize)
     }
 
     fn read_string(&self, offset: u32) -> &str {
@@ -1550,52 +1364,55 @@ impl Reader {
         })
     }
 
-    #[allow(clippy::cast_possible_truncation)]
-    fn way_length_radians(&self, nodes_mmap: &Mmap, node_offset: u64, node_count: u16) -> f64 {
-        let mut total = 0.0;
-        let Ok(base) = usize::try_from(node_offset) else {
+    /// The interpolation way's nodes. Open validated the span; a way whose
+    /// span does not fit reads as having no nodes.
+    #[inline]
+    fn interp_way_nodes(&self, iw: &InterpWay) -> Table<'_, NodeCoord> {
+        self.interp_nodes
+            .span(iw.node_offset, u64::from(iw.node_count))
+            .unwrap_or_default()
+    }
+
+    fn way_length_radians(&self, iw: &InterpWay) -> f64 {
+        let mut nodes = self.interp_way_nodes(iw).iter();
+        let Some(mut prev) = nodes.next() else {
             return 0.0;
         };
-        for i in 0..(node_count as usize).saturating_sub(1) {
-            let a = record_at(nodes_mmap, base, i).map(NodeCoord::from_bytes);
-            let b = record_at(nodes_mmap, base, i + 1).map(NodeCoord::from_bytes);
-            if let (Some(a), Some(b)) = (a, b) {
-                total += segment_length_radians(&a, &b);
-            }
+        let mut total = 0.0;
+        for node in nodes {
+            total += segment_length_radians(&prev, &node);
+            prev = node;
         }
         total
     }
 
-    #[allow(clippy::cast_possible_truncation)]
+    /// Length along the way from its first node to the snap point on
+    /// segment `seg_idx`. The caller has checked `seg_idx + 1 < node_count`.
     fn accumulated_length_radians(
         &self,
-        nodes_mmap: &Mmap,
-        node_offset: u64,
+        iw: &InterpWay,
         seg_idx: u16,
         snap_lat: i32,
         snap_lon: i32,
     ) -> f64 {
-        let mut acc = 0.0;
-        let Ok(base) = usize::try_from(node_offset) else {
+        let mut nodes = self
+            .interp_way_nodes(iw)
+            .iter()
+            .take(usize::from(seg_idx) + 1);
+        let Some(mut prev) = nodes.next() else {
             return 0.0;
         };
-        for i in 0..seg_idx as usize {
-            let a = record_at(nodes_mmap, base, i).map(NodeCoord::from_bytes);
-            let b = record_at(nodes_mmap, base, i + 1).map(NodeCoord::from_bytes);
-            if let (Some(a), Some(b)) = (a, b) {
-                acc += segment_length_radians(&a, &b);
-            }
+        let mut acc = 0.0;
+        for node in nodes {
+            acc += segment_length_radians(&prev, &node);
+            prev = node;
         }
-        // Partial segment to snap point
-        if let Some(rec) = record_at(nodes_mmap, base, usize::from(seg_idx)) {
-            let seg_start = NodeCoord::from_bytes(rec);
-            let snap = NodeCoord {
-                lat_e7: snap_lat,
-                lon_e7: snap_lon,
-            };
-            acc += segment_length_radians(&seg_start, &snap);
-        }
-        acc
+        // Partial segment from the segment's start node to the snap point
+        let snap = NodeCoord {
+            lat_e7: snap_lat,
+            lon_e7: snap_lon,
+        };
+        acc + segment_length_radians(&prev, &snap)
     }
 }
 
@@ -1603,12 +1420,31 @@ impl Reader {
 // Free functions
 // ---------------------------------------------------------------------------
 
-fn two_node_distance(ctx: &QueryContext, nodes_mmap: &Mmap, byte_offset: usize) -> (i32, i32, f64) {
-    let a = read_record::<NODE_COORD_SIZE>(nodes_mmap, byte_offset).map(NodeCoord::from_bytes);
-    let b = read_record::<NODE_COORD_SIZE>(nodes_mmap, byte_offset + NODE_COORD_SIZE)
-        .map(NodeCoord::from_bytes);
-    let (Some(a), Some(b)) = (a, b) else {
-        return (0, 0, f64::MAX);
+/// `(snap_lat, snap_lon, dist_sq)` for an entry that names no usable
+/// segment: the distance never passes a radius test.
+const SEGMENT_MISS: (i32, i32, f64) = (0, 0, f64::MAX);
+
+/// Distance from the query to segment `segment` of the way whose nodes are
+/// the `node_count` records at `node_offset` in `nodes`. Both nodes are read
+/// from the way's own span: a node that is in the file but past this way's
+/// count belongs to the next way.
+fn segment_distance(
+    ctx: &QueryContext,
+    nodes: &Records<NodeCoord>,
+    node_offset: u64,
+    node_count: u16,
+    segment: u16,
+) -> (i32, i32, f64) {
+    // Widened before the +1, and fails for node_count 0 and 1.
+    if u32::from(segment) + 1 >= u32::from(node_count) {
+        return SEGMENT_MISS;
+    }
+    let Ok(way_nodes) = nodes.span(node_offset, u64::from(node_count)) else {
+        return SEGMENT_MISS;
+    };
+    let first = usize::from(segment);
+    let (Some(a), Some(b)) = (way_nodes.get(first), way_nodes.get(first + 1)) else {
+        return SEGMENT_MISS;
     };
     let (t, dist_sq) = geo::point_to_segment_distance_sq(
         ctx.lon_rad,
@@ -1652,106 +1488,51 @@ fn segment_length_radians(a: &NodeCoord, b: &NodeCoord) -> f64 {
     .sqrt()
 }
 
-fn binary_search_cells(mmap: &[u8], count: usize, target: u64) -> Option<GeoCell> {
-    let mut lo = 0usize;
-    let mut hi = count;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let rec = read_record::<GEO_CELL_SIZE>(mmap, mid * GEO_CELL_SIZE)?;
-        let gc = GeoCell::from_bytes(rec);
-        match gc.cell_id.cmp(&target) {
-            std::cmp::Ordering::Equal => return Some(gc),
-            std::cmp::Ordering::Less => lo = mid + 1,
-            std::cmp::Ordering::Greater => hi = mid,
-        }
-    }
-    None
+/// Validate the list a cell names at `offset`. The framing is
+/// [`Table::list`]'s; this only words its refusal.
+fn validate_list<T: Record>(lists: &Lists<T>, offset: u64, kind: &str) -> Result<()> {
+    lists.list(offset).map(drop).map_err(|err| {
+        corrupt(match err {
+            RunError::OffsetUnaddressable => {
+                format!("invalid geocode index: {kind} offset {offset} does not fit this platform")
+            }
+            RunError::CountOutOfBounds => {
+                format!("invalid geocode index: {kind} offset {offset} is out of bounds")
+            }
+            RunError::SizeOverflow => {
+                format!("invalid geocode index: {kind} offset {offset}: list size overflows")
+            }
+            RunError::PastEnd => {
+                format!("invalid geocode index: {kind} list at {offset} extends past end of file")
+            }
+        })
+    })
 }
 
-fn binary_search_admin_cells(mmap: &[u8], count: usize, target: u64) -> Option<AdminCell> {
-    let mut lo = 0usize;
-    let mut hi = count;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let rec = read_record::<ADMIN_CELL_SIZE>(mmap, mid * ADMIN_CELL_SIZE)?;
-        let ac = AdminCell::from_bytes(rec);
-        match ac.cell_id.cmp(&target) {
-            std::cmp::Ordering::Equal => return Some(ac),
-            std::cmp::Ordering::Less => lo = mid + 1,
-            std::cmp::Ordering::Greater => hi = mid,
-        }
-    }
-    None
-}
-
-fn read_record<const N: usize>(mmap: &[u8], offset: usize) -> Option<&[u8; N]> {
-    mmap.get(offset..offset.checked_add(N)?)?.try_into().ok()
-}
-
-fn record_at(mmap: &[u8], base: usize, index: usize) -> Option<&[u8; NODE_COORD_SIZE]> {
-    let offset = index.checked_mul(NODE_COORD_SIZE)?.checked_add(base)?;
-    read_record::<NODE_COORD_SIZE>(mmap, offset)
-}
-
-fn validate_list(offset: u64, data: &[u8], item_size: usize, kind: &str) -> Result<()> {
-    if offset == format::NO_DATA_U64 {
-        return Ok(());
-    }
-    let off = usize::try_from(offset).map_err(|_| {
-        corrupt(format!(
-            "invalid geocode index: {kind} offset {offset} does not fit this platform"
-        ))
-    })?;
-    let count_end = off
-        .checked_add(2)
-        .ok_or_else(|| corrupt(format!("invalid geocode index: {kind} offset overflows")))?;
-    let count_bytes = data.get(off..count_end).ok_or_else(|| {
-        corrupt(format!(
-            "invalid geocode index: {kind} offset {offset} is out of bounds"
-        ))
-    })?;
-    let count = usize::from(u16::from_le_bytes([count_bytes[0], count_bytes[1]]));
-    let end = count
-        .checked_mul(item_size)
-        .and_then(|bytes| count_end.checked_add(bytes))
-        .ok_or_else(|| corrupt(format!("invalid geocode index: {kind} list size overflows")))?;
-    if end > data.len() {
-        return Err(corrupt(format!(
-            "invalid geocode index: {kind} list at {offset} extends past end of file"
-        )));
-    }
-    Ok(())
-}
-
-/// Validate a fixed-count run of records at `offset` in `data`. Unlike
+/// Validate a fixed-count run of records at `offset`. Unlike
 /// [`validate_list`] the count comes from the referring record rather than
 /// from a length prefix in the target file.
-fn validate_span(offset: u64, count: u64, item_size: usize, data: &[u8], kind: &str) -> Result<()> {
-    if count == 0 {
-        return Ok(());
-    }
-    let off = usize::try_from(offset).map_err(|_| {
-        corrupt(format!(
-            "invalid geocode index: {kind} offset {offset} does not fit this platform"
-        ))
-    })?;
-    let end = usize::try_from(count)
-        .ok()
-        .and_then(|n| n.checked_mul(item_size))
-        .and_then(|bytes| off.checked_add(bytes))
-        .ok_or_else(|| {
-            corrupt(format!(
-                "invalid geocode index: {kind} span at {offset} overflows"
-            ))
-        })?;
-    if end > data.len() {
-        return Err(corrupt(format!(
-            "invalid geocode index: {kind} span at {offset} covering {count} records extends \
-             past end of file ({} bytes)",
-            data.len()
-        )));
-    }
-    Ok(())
+fn validate_span<T: Record>(
+    records: &Records<T>,
+    offset: u64,
+    count: u64,
+    kind: &str,
+) -> Result<()> {
+    records.span(offset, count).map(drop).map_err(|err| {
+        corrupt(match err {
+            RunError::OffsetUnaddressable => {
+                format!("invalid geocode index: {kind} offset {offset} does not fit this platform")
+            }
+            RunError::SizeOverflow | RunError::CountOutOfBounds => {
+                format!("invalid geocode index: {kind} span at {offset} overflows")
+            }
+            RunError::PastEnd => format!(
+                "invalid geocode index: {kind} span at {offset} covering {count} records extends \
+                 past end of file ({} bytes)",
+                records.byte_len()
+            ),
+        })
+    })
 }
 
 /// Validate a string-pool offset. Offset 0 is the "no string" sentinel that
@@ -1779,26 +1560,6 @@ fn nonzero_string(reader: &Reader, offset: u32) -> Option<&str> {
     }
 }
 
-fn decode_addr_point(data: &[u8], index: u32) -> Option<AddrPoint> {
-    read_record::<ADDR_POINT_SIZE>(data, index as usize * ADDR_POINT_SIZE)
-        .map(AddrPoint::from_bytes)
-}
-
-fn decode_street_way(data: &[u8], index: u32) -> Option<StreetWay> {
-    read_record::<STREET_WAY_SIZE>(data, index as usize * STREET_WAY_SIZE)
-        .map(StreetWay::from_bytes)
-}
-
-fn decode_interp_way(data: &[u8], index: u32) -> Option<InterpWay> {
-    read_record::<INTERP_WAY_SIZE>(data, index as usize * INTERP_WAY_SIZE)
-        .map(InterpWay::from_bytes)
-}
-
-fn decode_admin_polygon(data: &[u8], index: u32) -> Option<AdminPolygon> {
-    read_record::<ADMIN_POLYGON_SIZE>(data, index as usize * ADMIN_POLYGON_SIZE)
-        .map(AdminPolygon::from_bytes)
-}
-
 fn first_admin_attempt(seen: &mut FxHashSet<u32>, polygon_index: u32) -> bool {
     seen.insert(polygon_index)
 }
@@ -1813,10 +1574,10 @@ mod tests {
         let _: fn(&Reader, u32) -> Option<StreetWay> = Reader::read_street_way;
         let _: fn(&Reader, u32) -> Option<InterpWay> = Reader::read_interp_way;
         let _: fn(&Reader, u32) -> Option<AdminPolygon> = Reader::read_admin_polygon;
-        assert!(decode_addr_point(&[], 0).is_none());
-        assert!(decode_street_way(&[], 0).is_none());
-        assert!(decode_interp_way(&[], 0).is_none());
-        assert!(decode_admin_polygon(&[], 0).is_none());
+        assert!(Table::<AddrPoint>::new(&[]).get(0).is_none());
+        assert!(Table::<StreetWay>::new(&[]).get(0).is_none());
+        assert!(Table::<InterpWay>::new(&[]).get(0).is_none());
+        assert!(Table::<AdminPolygon>::new(&[]).get(0).is_none());
     }
 
     #[test]

@@ -718,7 +718,7 @@ pub(super) fn run_pass2(
                             return;
                         }
                     }
-                    interp_node_offset += (pi.coords.len() * NODE_COORD_SIZE) as u64;
+                    interp_node_offset += (pi.coords.len() * NodeCoord::SIZE) as u64;
                 }
 
                 // Building-centroid addresses
@@ -780,7 +780,7 @@ pub(super) fn run_pass2(
                             return;
                         }
                     }
-                    street_node_offset += (ps.coords.len() * NODE_COORD_SIZE) as u64;
+                    street_node_offset += (ps.coords.len() * NodeCoord::SIZE) as u64;
                     let Some(next_count) = street_way_count.checked_add(1) else {
                         merge_err = Some(Error::invalid_data(
                             "street way count exceeds u32::MAX; bump FORMAT_VERSION",

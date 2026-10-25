@@ -71,7 +71,6 @@
 use super::output_header::{Bbox, Order, OutputFacts, Ways};
 use crate::read::wire_schema::BlobHeaderField;
 use std::collections::BinaryHeap;
-use std::path::Path;
 
 use rustc_hash::FxHashSet;
 
@@ -91,6 +90,7 @@ use crate::owned::{
     OwnedElement, OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata,
     read_dense_node, read_node, read_relation, read_way, relation_members_into,
 };
+use crate::read::input::InputSource;
 use crate::read::raw_frame::{frame_location, read_raw_frame};
 use crate::write::WriteOptions;
 use crate::writer::{Compression, PbfWriter, frame_blob_pipelined, strip_blob_header_fields};
@@ -390,8 +390,18 @@ impl DegradeStats {
 ///
 /// `force` skips the indexdata precondition required by the decode path's
 /// per-kind classify pipeline. Has no effect on the passthrough path.
-pub fn degrade(
-    input: &Path,
+///
+/// The route is chosen from `flags` alone, before the input is opened. The
+/// passthrough reads the input once, sequentially, so any readable input
+/// serves it, a FIFO included (with buffered reads). The decode path reads
+/// it in several passes, so there it must be a regular file or a block
+/// device (`InvalidArgument` otherwise) and is pinned for the run (see
+/// [`PinnedInput`](crate::read::input::PinnedInput)). A caller's pin is
+/// used as it is on either route; where a later open cannot reach the
+/// pinned file, an input replaced mid-run fails with `InputReplaced` and
+/// nothing is published.
+pub fn degrade<'a>(
+    input: impl Into<InputSource<'a>>,
     output: crate::output::Output,
     flags: DegradeFlags,
     block_cap: std::num::NonZeroUsize,
@@ -400,7 +410,15 @@ pub fn degrade(
     host: &crate::host::Host,
 ) -> Result<DegradeStats> {
     host.cancel.check()?;
-    let result = degrade_to(input, &output, flags, block_cap, write, overrides, host)?;
+    let result = degrade_to(
+        input.into(),
+        &output,
+        flags,
+        block_cap,
+        write,
+        overrides,
+        host,
+    )?;
     output.publish(&host.cancel)?;
     Ok(result)
 }
@@ -409,7 +427,7 @@ pub fn degrade(
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn degrade_to(
-    input: &Path,
+    input: InputSource<'_>,
     output: &crate::output::Output,
     flags: DegradeFlags,
     block_cap: std::num::NonZeroUsize,
@@ -542,17 +560,19 @@ pub(crate) fn degrade_to(
 /// fields survive byte for byte. `--strip-bbox` removes the bbox, and each
 /// `--generator` / `--output-header` override replaces only the field it
 /// names, so adding `--generator` no longer changes the declared features.
+///
+/// Reads the first frame from `reader`, advancing `file_offset` past it, so
+/// the caller goes on to the data frames through the same reader.
 fn passthrough_header_bytes(
-    input: &Path,
+    reader: &mut FileReader,
+    file_offset: &mut u64,
+    input: &std::path::Path,
     flags: DegradeFlags,
     overrides: &HeaderOverrides,
-    direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<Vec<u8>> {
     // The OSMHeader is always the first blob in a well-formed PBF.
-    let mut reader = FileReader::open(input, direct_io)?;
-    let mut file_offset: u64 = 0;
-    let frame = read_raw_frame(&mut reader, &mut file_offset, host, input)?
+    let frame = read_raw_frame(reader, file_offset, host, input)?
         .ok_or_else(|| crate::error::new_missing_header(input))?;
     let locate = |e: Error| e.locate(frame_location(input, frame.file_offset));
     if !matches!(frame.blob_type, BlobKind::OsmHeader) {
@@ -566,15 +586,23 @@ fn passthrough_header_bytes(
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn degrade_passthrough(
-    input: &Path,
+    source: InputSource<'_>,
     output: &crate::output::Output,
     flags: DegradeFlags,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<DegradeStats> {
-    let direct_io = write.direct_reads;
-    let header_bytes = passthrough_header_bytes(input, flags, overrides, direct_io, host)?;
+    // One open, one sequential traversal: the header frame and then every
+    // data frame come from this reader, so the run reads exactly one file
+    // whatever happens to the path after the open. That is why this route
+    // takes no pin of its own (a FIFO or stdin serves it, buffered) and the
+    // decode path does; a caller's pin is opened as the file it pinned.
+    let input = source.path();
+    let mut reader = FileReader::open(source, write.direct_reads)?;
+    let mut file_offset: u64 = 0;
+    let header_bytes =
+        passthrough_header_bytes(&mut reader, &mut file_offset, input, flags, overrides, host)?;
 
     let mut writer = writer_from_header_bytes(
         output,
@@ -584,8 +612,6 @@ fn degrade_passthrough(
         host,
     )?;
 
-    let mut reader = FileReader::open(input, direct_io)?;
-    let mut file_offset: u64 = 0;
     let mut blobs_written: u64 = 0;
 
     crate::debug::emit_marker("DEGRADE_PASSTHROUGH_START");
@@ -796,7 +822,7 @@ impl UnsortKindState {
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn degrade_decode_path(
-    input: &Path,
+    input: InputSource<'_>,
     output: &crate::output::Output,
     flags: DegradeFlags,
     block_cap: std::num::NonZeroUsize,
@@ -810,6 +836,19 @@ fn degrade_decode_path(
         direct_reads: direct_io,
         force,
     } = *write;
+
+    // The input is opened three times, each through its own open file
+    // description: the indexdata probe, the header reader, then the schedule
+    // walk whose descriptor the drop selection and every per-kind pool
+    // pread (its fstat is the pre-allocation bound below). All three are
+    // derived from this one pin, so a file renamed over the input mid-run
+    // cannot be probed, headed and re-encoded partly from each file: where
+    // `/proc/self/fd` reopens the pin every open reaches the pinned file,
+    // otherwise on Unix a replaced input fails the run (`PinnedInput` says
+    // what it does off Unix). Taken before any other open of the input.
+    let pin = input.pin(host)?;
+    let input = &pin;
+
     require_indexdata(
         input,
         direct_io,

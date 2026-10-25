@@ -1158,6 +1158,25 @@
 
 ### Fixed
 
+- **`degrade` reads one input file even if it is replaced mid-run.** The
+  decode path (`--unsort`, `--unsort-intra`, `--strip-locations`,
+  `--drop-ids`) opens the input three times (the indexdata check, the header
+  read and the schedule walk the re-encoding workers read through), and the
+  header-only passthrough opened it twice (the header, then every frame
+  again from the start); each open used to resolve the path again, so an
+  input renamed over during the run could be degraded under one file's
+  header from another file's blobs, with no error. The decode path now pins
+  the input when the run starts: on Linux with `/proc` a replaced or deleted
+  input does not affect the run; on other Unix hosts the run fails with
+  `ErrorKind::InputReplaced` and publishes nothing. On the decode path an
+  input that is a FIFO, socket or character device is now refused up front.
+  The passthrough now reads the header and every frame through a single
+  open, so it needs no pin and reads a FIFO or `/dev/stdin` (buffered
+  reads), which its second open could not, a FIFO serving no byte twice.
+  Library:
+  `degrade::degrade` takes `impl Into<InputSource>` (a path as before, or a
+  `&PinnedInput` the caller took, used as it is on either route).
+
 - **`repack` reads one input file even if it is replaced mid-run.** Every
   run opens the input three times (the indexdata check, the header read and
   the schedule walk the re-encoding workers read through) and reads its

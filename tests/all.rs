@@ -52,6 +52,8 @@ mod fault_apply_changes;
 #[cfg(feature = "test-hooks")]
 mod fault_cat_input;
 #[cfg(feature = "test-hooks")]
+mod fault_degrade_input;
+#[cfg(feature = "test-hooks")]
 mod fault_derive_input;
 #[cfg(feature = "test-hooks")]
 mod fault_derive_parallel;

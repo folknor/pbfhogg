@@ -527,6 +527,15 @@ writer; the CLI publishes a named output only after the run succeeds.
 rule, after its output-name refusal; it owns its `Output` and writes it
 only after every input open, so a refused run publishes nothing.
 
+A command whose route is known before it opens anything pins only the
+routes that reopen. `degrade` chooses its route from the flags alone: the
+decode path pins the input and derives its three opens (the indexdata
+probe, the header reader, the schedule walk) from the pin, while the
+header-only passthrough reads the header and every data frame through one
+open and takes no pin of its own, so it reads a FIFO. A caller's pin is
+honoured on both routes. A command that learns from the input itself
+whether it will reopen has to pin before that read instead.
+
 ## Read-path internals (both consumers)
 
 All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.

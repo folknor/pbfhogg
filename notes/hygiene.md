@@ -57,7 +57,7 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-23. HYG-185 to HYG-189, one per line, in ID order
+23. HYG-186 to HYG-189, one per line, in ID order
 24. HYG-047
 25. HYG-158
 26. HYG-159
@@ -1448,7 +1448,7 @@ Reported by: the HYG-150 implementation.
 
 ## Adopting `PinnedInput`, one command per entry
 
-Not a finding: the shared brief for HYG-185 to HYG-189. Each of those commands opens its input more than once per run (a
+Not a finding: the shared brief for HYG-186 to HYG-189. Each of those commands opens its input more than once per run (a
 precondition probe, a header reader, a schedule walk, worker and splice
 descriptors), each open resolving the path again, so a file renamed over
 the input mid-run is read partly from each file. The API that fixes it
@@ -1467,7 +1467,18 @@ path went. What each entry owes, settled in a codex spar on 2026-10-25:
 - Keep the description topology exactly: each existing independent open
   becomes one derived open, and a descriptor shared today (`walker.input()`
   handed to a classify pool, renumber's shared worker file) stays shared.
-  Never `try_clone` a pinned descriptor.
+  Never `try_clone` a pinned descriptor. The one exception is an open that
+  only re-reads what an earlier open of the same access pattern already
+  read: fold it into the earlier reader instead of guarding it. degrade's
+  passthrough did this (sparred 2026-10-25): it read the header through one
+  `FileReader` and every frame again from offset 0 through a second, and
+  now reads both through one.
+- A command that picks its route before opening anything (from flags, not
+  from the file) pins only the routes that reopen; a route left with one
+  open takes no pin and keeps reading FIFOs, and a caller's pin is still
+  used on it. degrade is the precedent (`reference/pipeline.md`). A
+  command that learns from the file whether it reopens (time-filter's
+  history versus snapshot) pins before that read.
 - Size and type reads of the input go through the pin
   (`InputSource::metadata` / `PinnedInput::metadata`), not
   `read::input::metadata(path)`.
@@ -1525,18 +1536,6 @@ export, check refs, check index (one open each). inspect's index-only scan
 and its full-decode fallback each read the whole report from one open, but
 the full decode takes its file size from a separate path `stat`, which
 HYG-187 covers.
-
-## HYG-185 - degrade reopens its input by path
-
-Anger: 7 - one command.
-
-See "Adopting `PinnedInput`" above. The decode path probes indexdata,
-reads the header and walks the schedules (`degrade/mod.rs`); the
-header-only passthrough reads the header and then the frames through two
-`FileReader` opens. Modes differ, so check each before pinning.
-Recommendation (2026-10-25): follow the brief.
-
-Reported by: the HYG-151 resolution.
 
 ## HYG-186 - time-filter reopens its input by path
 

@@ -3174,7 +3174,7 @@ pub fn run() -> process::ExitCode {
     // guard drops.
     pbfhogg::write::emit_writer_counters();
     pbfhogg::read::emit_read_counters();
-    pbfhogg::write::report_writer_index_loss(&host.diagnostics);
+    pbfhogg::write::report_writer_degradations(&host.diagnostics);
     #[cfg(feature = "test-hooks")]
     signals::test_hooks::write_count(&host.cancel);
 

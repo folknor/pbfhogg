@@ -15,7 +15,7 @@ use crate::error::{Error, Result, panic_error};
 use crate::output::Completion;
 use crate::write::Finish;
 #[cfg(feature = "linux-direct-io")]
-use crate::write::copy_range::copy_range;
+use crate::write::copy_range::{CopyOut, copy_range};
 use crate::write::file_writer::FileWriter;
 use crate::write::metrics::WRITER_METRICS;
 use std::fs::File;
@@ -1431,17 +1431,17 @@ impl PbfWriter<FileWriter> {
         } else {
             // This is reachable through FileWriter::buffered plus the public
             // generic PbfWriter::new constructor.
-            let out_fd = self
+            let out = self
                 .writer
                 .as_mut()
                 .ok_or_else(|| Error::invalid_argument(WRITER_CONSUMED))?
-                .flush_and_raw_fd()?
+                .flush_and_file()?
                 .ok_or_else(|| {
                     Error::invalid_argument("copy_file_range incompatible with O_DIRECT output")
                 })?;
             // `copy_range` decides on the original errno (whether the
             // userspace fallback takes over) before anything converts it.
-            let result = copy_range(in_file, out_fd, offset, len, &self.cancel);
+            let result = copy_range(in_file, CopyOut::Cursor(out), offset, len, &self.cancel);
             if result.is_ok() {
                 self.mark_pending();
             }

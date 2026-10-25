@@ -1,50 +1,107 @@
-//! Kernel-space byte copy helpers (`copy_file_range`) for passthrough writes,
-//! and the syscall rules every raw copy loop under `write/` shares.
+//! The crate's range copies: the one `copy_file_range` loop
+//! ([`copy_range`]) and the one positioned-read loop ([`read_range`]) that
+//! every passthrough write goes through.
 //!
 //! Lets the merge/passthrough write path hand raw blob bytes from an input fd
 //! straight into the output fd without a userspace round-trip. On filesystems
 //! with reflink support (btrfs, xfs), `copy_file_range` can be a metadata-only
 //! operation.
 //!
+//! Every backend that splices uses these two loops and nothing else:
+//!
+//! - the buffered sink and the unpipelined `PbfWriter::write_raw_copy` call
+//!   [`copy_range`] with [`CopyOut::Cursor`] (the output fd's position,
+//!   which the copy advances);
+//! - the `pwrite` pool calls it with [`CopyOut::At`] (an explicit offset; the
+//!   fd's position is never touched, so concurrent workers cannot race on
+//!   it);
+//! - the io_uring writer reads a range into its registered buffers through
+//!   [`read_range`] with itself as the [`ReadSink`], with no bounce buffer.
+//!
 //! When the kernel refuses the copy itself for this pair of files (see
 //! [`kernel_copy_refused`] for the errno set and why it is safe), the range
-//! falls back to `pread` + `write` in userspace. That fallback is a
-//! performance cliff at planet scale, so every range routed to it is counted
-//! (`writer_copy_range_fallback_ranges` / `_bytes`). Requires the
-//! `linux-direct-io` feature.
+//! falls back to [`read_range`] with a bounce buffer that writes the output
+//! the same way the kernel copy would have (`write_all` at the cursor, or
+//! `write_all_at` the explicit offset). That fallback is a performance cliff
+//! at planet scale, so every range routed to it is counted
+//! (`writer_copy_range_fallback_ranges` / `_bytes`), the first refusing errno
+//! is kept, and the CLI turns them into one note per run
+//! (`report_writer_degradations`). Requires the `linux-direct-io` feature.
 //!
-//! The shared rules, owned here so the loops cannot drift apart again:
+//! The shared rules, owned here so no second loop can drift from them:
 //!
 //! - **`EINTR` is retried, immediately, everywhere** ([`retry_eintr`]): a
 //!   signal that interrupted a call moved nothing, so the same call is made
 //!   again. No backoff. There is no cancellation check on the retry: library
 //!   cancellation is a token checked between calls, not a signal, and the CLI
 //!   blocks its signals in every thread, so nothing it does produces `EINTR`.
-//! - **A short read is progress, not an error.** Each loop advances by what
-//!   the call returned; only a read of zero bytes is end of file, which
-//!   inside an indexed range means the input is shorter than its index says.
+//! - **A short read or copy is progress, not an error.** Each loop advances
+//!   by what the call returned; only zero bytes is end of file, which inside
+//!   an indexed range means the input is shorter than its index says.
+//! - **Cancellation is checked before every call**: a coalesced passthrough
+//!   run can span the whole input (sort of an already-sorted planet is one
+//!   range), so this is where a cancelled run stops splicing.
 //! - **Lengths convert with [`len_to_usize`]**, saturating. The kernel and
-//!   every loop here cap the per-call size anyway, so a saturated request is
-//!   only ever a smaller first call.
+//!   every sink cap the per-call size anyway, so a saturated request is only
+//!   ever a smaller first call. The kernel copy asks for the whole remaining
+//!   range every call (the kernel caps it at about 2 GiB); it is never
+//!   chunked here.
+//!
+//! `clippy.toml` bans the raw byte-moving libc calls (`copy_file_range`,
+//! `pread`, `pwrite`, `read`, `write` and their kin) everywhere in the
+//! library; the one `copy_file_range` below is the only exemption. That
+//! enforces who makes the syscalls, not that no other byte loop can be
+//! written: std's `FileExt::read_at` stays allowed, because the read path
+//! uses it legitimately. A new passthrough copy belongs here.
 //!
 //! Errors name what they can: a failed `copy_file_range` names the input and
 //! the byte range (the syscall does not say which end failed; the writer adds
-//! the output's name outside it), a failed fallback read is located in the
-//! input at its offset, and a failed fallback write is left to the writer,
-//! which names the output.
+//! the output's name outside it), a failed read is located in the input at
+//! its offset, and a failed fallback write is left to the writer, which names
+//! the output.
 
-use std::io;
+use std::fs::File;
+use std::io::{self, Write as _};
+use std::os::unix::fs::FileExt as _;
 use std::os::unix::io::{AsRawFd as _, RawFd};
 
 use crate::error::{Error, Location, Result};
 use crate::read::input::InputFile;
 use crate::write::metrics::WRITER_METRICS;
 
+/// Where [`copy_range`] writes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CopyOut<'a> {
+    /// At the file's position, which the copy advances. The caller must own
+    /// that position for the whole copy: a buffered writer is flushed first
+    /// (`FileWriter::flush_and_file`), and nothing else writes through the
+    /// descriptor meanwhile.
+    Cursor(&'a File),
+    /// At this explicit offset. The file's position is never read or moved,
+    /// so concurrent copies into one file at disjoint offsets are safe.
+    At(&'a File, u64),
+}
+
+impl CopyOut<'_> {
+    fn file(&self) -> &File {
+        match self {
+            CopyOut::Cursor(file) | CopyOut::At(file, _) => file,
+        }
+    }
+
+    fn offset(&self) -> Option<u64> {
+        match self {
+            CopyOut::Cursor(_) => None,
+            CopyOut::At(_, offset) => Some(*offset),
+        }
+    }
+}
+
 /// A raw `ssize_t` syscall return as a result: the count, or the thread's
 /// `errno`. Read `errno` nowhere else - it must be taken before any other
 /// call can overwrite it.
 #[inline(always)]
-pub(crate) fn syscall_result(ret: isize) -> io::Result<usize> {
+fn syscall_result(ret: isize) -> io::Result<usize> {
     if ret < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -53,11 +110,10 @@ pub(crate) fn syscall_result(ret: isize) -> io::Result<usize> {
 }
 
 /// Run one syscall attempt until it is not interrupted. The shared `EINTR`
-/// rule for every raw read, write and copy loop under `write/`: retry at
-/// once, nothing else. Every other outcome, including a short count, goes
-/// back to the caller.
+/// rule: retry at once, nothing else. Every other outcome, including a short
+/// count, goes back to the caller.
 #[inline(always)]
-pub(crate) fn retry_eintr(mut call: impl FnMut() -> io::Result<usize>) -> io::Result<usize> {
+fn retry_eintr(mut call: impl FnMut() -> io::Result<usize>) -> io::Result<usize> {
     loop {
         match call() {
             Err(err) if err.raw_os_error() == Some(libc::EINTR) => {}
@@ -68,27 +124,10 @@ pub(crate) fn retry_eintr(mut call: impl FnMut() -> io::Result<usize>) -> io::Re
 
 /// A byte count as a per-call length, saturating where `usize` is narrower.
 /// Every caller clamps the result against its own per-call cap (the kernel's
-/// for `copy_file_range`, a buffer's for `pread`).
+/// for `copy_file_range`, a sink's for a read).
 #[inline(always)]
-pub(crate) fn len_to_usize(len: u64) -> usize {
+fn len_to_usize(len: u64) -> usize {
     usize::try_from(len).unwrap_or(usize::MAX)
-}
-
-/// `pread(2)` of up to `len` bytes into `dst` at `offset`, under the shared
-/// `EINTR` rule. May return fewer bytes than asked; zero is end of file.
-///
-/// # Safety
-/// `dst` must be valid for writes of `len` bytes and `fd` open for reading.
-#[allow(clippy::cast_possible_wrap)]
-#[inline]
-pub(crate) unsafe fn pread_retrying(
-    fd: RawFd,
-    dst: *mut u8,
-    len: usize,
-    offset: u64,
-) -> io::Result<usize> {
-    // An offset past `i64::MAX` wraps negative and the kernel answers EINVAL.
-    retry_eintr(|| syscall_result(unsafe { libc::pread(fd, dst.cast(), len, offset as i64) }))
 }
 
 /// Whether the kernel refused a `copy_file_range` of `len` bytes from
@@ -135,7 +174,7 @@ pub(crate) unsafe fn pread_retrying(
 ///
 /// `EBADF`, `EFBIG`, `EOVERFLOW`, `EIO` and everything else stay hard errors.
 #[cold]
-pub(crate) fn kernel_copy_refused(
+fn kernel_copy_refused(
     err: &io::Error,
     in_fd: RawFd,
     out_fd: RawFd,
@@ -182,15 +221,39 @@ fn file_id(fd: RawFd) -> Option<(libc::dev_t, libc::ino_t)> {
 
 /// Count one range routed to the userspace fallback and the `len` bytes it
 /// was asked to copy (counted at entry: a fallback that then fails partway
-/// has still been routed this many). Cold: the kernel path never gets here.
+/// has still been routed this many), and keep the first refusing errno for
+/// the run's note. Cold: the kernel path never gets here.
 #[cold]
-pub(crate) fn record_fallback(len: u64) {
+fn record_fallback(len: u64, err: &io::Error) {
+    use std::sync::atomic::Ordering::Relaxed;
     WRITER_METRICS
         .copy_range_fallback_ranges
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        .fetch_add(1, Relaxed);
     WRITER_METRICS
         .copy_range_fallback_bytes
-        .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+        .fetch_add(len, Relaxed);
+    if let Some(errno) = err.raw_os_error() {
+        // First refusal wins; a later one (another worker, another output)
+        // may have a different errno, which the note does not claim to cover.
+        // `Err` is "an earlier refusal is already kept", which is the rule.
+        WRITER_METRICS
+            .copy_range_fallback_errno
+            .compare_exchange(0, errno, Relaxed, Relaxed)
+            .ok();
+    }
+}
+
+/// The symbolic name of an errno [`kernel_copy_refused`] accepts, for the
+/// run's note; `None` for anything else.
+pub(crate) fn refusal_name(errno: i32) -> Option<&'static str> {
+    Some(match errno {
+        libc::EXDEV => "EXDEV",
+        libc::ENOSYS => "ENOSYS",
+        libc::EOPNOTSUPP => "EOPNOTSUPP",
+        libc::EPERM => "EPERM",
+        libc::EINVAL => "EINVAL",
+        _ => return None,
+    })
 }
 
 /// A failed `copy_file_range` of `start..end` from `input`.
@@ -202,60 +265,76 @@ fn copy_error(err: io::Error, input: &InputFile, start: u64, end: u64) -> Error 
     ))
 }
 
-/// Copy `len` bytes from `input` at `offset` to `out_fd` using
-/// `copy_file_range(2)`.
+/// Copy `len` bytes from `input` at `offset` to `out` using
+/// `copy_file_range(2)`, falling back to userspace where the kernel refuses
+/// (see the module docs).
 ///
 /// Uses an explicit input offset (does not change the input's file
 /// position), safe when the input is also read through a `BufReader` or
-/// `DirectReader`. Output uses the fd's current position (sequential write).
-///
-/// `cancel` is checked before every `copy_file_range` call: a coalesced
-/// passthrough run can span the whole input (sort of an already-sorted
-/// planet is one range), and the kernel copies at most about 2 GiB per call,
-/// so this is the point where a cancelled run stops splicing. The error is
-/// `ErrorKind::Cancelled`.
+/// `DirectReader`. The output is written as [`CopyOut`] says. A cancelled
+/// run stops between kernel calls with `ErrorKind::Cancelled`.
 pub(crate) fn copy_range(
     input: &InputFile,
-    out_fd: RawFd,
+    out: CopyOut<'_>,
     offset: u64,
     len: u64,
     cancel: &crate::host::Cancel,
 ) -> Result<()> {
     let in_fd = input.file().as_raw_fd();
-    copy_range_with(input, out_fd, offset, len, cancel, |off_in, chunk| {
-        // Safety: fds are valid and open. off_in is explicit (doesn't change
-        // in_fd position). off_out is NULL (uses out_fd's current position).
-        syscall_result(unsafe {
-            libc::copy_file_range(in_fd, off_in, out_fd, std::ptr::null_mut(), chunk, 0)
-        })
+    let out_fd = out.file().as_raw_fd();
+    copy_range_with(input, out, offset, len, cancel, |off_in, off_out, chunk| {
+        let off_out = off_out.map_or(std::ptr::null_mut(), std::ptr::from_mut);
+        // The crate's one `copy_file_range`: std has no wrapper for it.
+        #[allow(clippy::disallowed_methods)]
+        // Safety: both fds are open for the borrow of `input` and `out`.
+        // `off_in` is explicit, so the input's position never moves;
+        // `off_out` is explicit for `CopyOut::At` (the output's position
+        // never moves either) and NULL for `CopyOut::Cursor` (the kernel
+        // writes at, and advances, the output's position).
+        let ret = unsafe { libc::copy_file_range(in_fd, off_in, out_fd, off_out, chunk, 0) };
+        syscall_result(ret)
     })
 }
 
-/// The [`copy_range`] loop over one `copy_file_range` attempt, `cfr(off_in,
-/// len)`. Production passes the syscall; tests pass a fake that scripts the
+/// The [`copy_range`] loop over one `copy_file_range` attempt,
+/// `cfr(off_in, off_out, len)` (`off_out` is `None` for a cursor copy).
+/// Production passes the syscall; tests pass a fake that scripts the
 /// kernel's answers.
 #[allow(clippy::cast_possible_wrap)]
 #[inline(always)]
 fn copy_range_with(
     input: &InputFile,
-    out_fd: RawFd,
+    out: CopyOut<'_>,
     mut offset: u64,
     mut len: u64,
     cancel: &crate::host::Cancel,
-    mut cfr: impl FnMut(&mut i64, usize) -> io::Result<usize>,
+    mut cfr: impl FnMut(&mut i64, Option<&mut i64>, usize) -> io::Result<usize>,
 ) -> Result<()> {
     let (start, end) = (offset, offset.saturating_add(len));
+    let mut out_at = out.offset();
     while len > 0 {
         cancel.check()?;
         let mut off_in = offset as i64;
+        let mut off_out = out_at.map(|at| at as i64);
         let chunk = len_to_usize(len);
-        let n = match retry_eintr(|| cfr(&mut off_in, chunk)) {
+        let n = match retry_eintr(|| cfr(&mut off_in, off_out.as_mut(), chunk)) {
             Ok(n) => n,
             Err(err) => {
-                let in_fd = input.file().as_raw_fd();
-                if offset == start && kernel_copy_refused(&err, in_fd, out_fd, offset, None, len) {
-                    record_fallback(len);
-                    return copy_range_fallback(input, out_fd, offset, len, cancel);
+                // Decide on the original syscall error, before any
+                // conversion, and only while nothing of the range has moved
+                // (so `out` still names where the range starts).
+                if offset == start
+                    && kernel_copy_refused(
+                        &err,
+                        input.file().as_raw_fd(),
+                        out.file().as_raw_fd(),
+                        offset,
+                        out_at,
+                        len,
+                    )
+                {
+                    record_fallback(len, &err);
+                    return copy_range_fallback(input, out, offset, len, cancel);
                 }
                 return Err(copy_error(err, input, start, end));
             }
@@ -271,78 +350,139 @@ fn copy_range_with(
         let n = n as u64;
         offset += n;
         len -= n;
+        if let Some(at) = &mut out_at {
+            *at += n;
+        }
     }
     Ok(())
 }
 
-/// Userspace fallback when the kernel refuses the copy: pread from `input`
-/// at `offset`, write to `out_fd`.
+/// Where [`read_range`] puts the bytes it reads.
 ///
-/// **Single-threaded output only.** Uses position-based `write_all`, which
-/// advances `out_fd`'s file position. Parallel writers that call
-/// `pwrite`/`write_at` on the same `out_fd` concurrently with this helper
-/// would race on the implicit position and produce a torn output.
-/// `parallel_writer::copy_range_fallback_pwrite` is the pwrite-based
-/// sibling for parallel contexts; new parallel callers should use that
-/// primitive rather than reaching for this one.
-fn copy_range_fallback(
+/// The division of checks: [`read_range`] enforces the reservation protocol
+/// (it refuses an empty or oversized reservation before reading, and only
+/// ever reports a fill no larger than the reservation it just got); an
+/// implementation that hands out memory it does not own as a slice (the
+/// io_uring writer's registered buffers) still bounds-checks `filled`
+/// against its own capacity, so a protocol slip cannot corrupt state that
+/// later feeds pointer arithmetic.
+pub(crate) trait ReadSink {
+    /// Writable space for the next read: between 1 and `want` bytes
+    /// (`want` is never zero).
+    fn space(&mut self, want: usize) -> Result<&mut [u8]>;
+    /// The first `n` bytes of the space last returned now hold input bytes.
+    fn filled(&mut self, n: usize) -> Result<()>;
+}
+
+/// Read `len` bytes of `input` at `offset` into `sink`, one positioned read
+/// per reservation.
+///
+/// A short read is progress; a read of zero bytes inside the range is the
+/// input ending early, located in the input at that offset. The sink decides
+/// what happens to the bytes and when (the io_uring writer submits only full
+/// buffers; nothing here flushes a partial one).
+pub(crate) fn read_range(
     input: &InputFile,
-    out_fd: RawFd,
     mut offset: u64,
     mut len: u64,
     cancel: &crate::host::Cancel,
+    sink: &mut impl ReadSink,
 ) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::io::FromRawFd;
-
-    let in_fd = input.file().as_raw_fd();
-    let mut buf = vec![0u8; crate::write::IO_BUF_BYTES];
-    // Wrap in ManuallyDrop so we don't close the fd when done - caller owns it.
-    let mut out = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(out_fd) });
-    // Read from in_fd using pread (doesn't change file position). `write_all`
-    // retries `Interrupted` itself, which is the same rule.
+    let file = input.file();
     while len > 0 {
         cancel.check()?;
-        let chunk = buf.len().min(len_to_usize(len));
-        // Safety: `buf` is valid for `chunk <= buf.len()` bytes.
-        let n = unsafe { pread_retrying(in_fd, buf.as_mut_ptr(), chunk, offset) }
+        let want = len_to_usize(len);
+        let dst = sink.space(want)?;
+        if dst.is_empty() || dst.len() > want {
+            return Err(Error::internal(
+                "range read sink reserved an empty or oversized buffer",
+            ));
+        }
+        // std's `read_at` is one `pread`; the retry is the shared rule.
+        let n = retry_eintr(|| file.read_at(dst, offset))
             .map_err(|err| read_error(err, input, offset))?;
         if n == 0 {
             return Err(read_error(
                 io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "pread returned 0 during userspace copy fallback",
+                    "input ended inside the requested copy range",
                 ),
                 input,
                 offset,
             ));
         }
-        out.write_all(&buf[..n])?;
+        sink.filled(n)?;
         offset += n as u64;
         len -= n as u64;
     }
     Ok(())
 }
 
-/// A failed read of `input` at `offset` during a userspace copy.
+/// The userspace fallback's sink: a bounce buffer written to the output the
+/// way the kernel copy would have.
+struct Bounce<'a> {
+    buf: Vec<u8>,
+    out: CopyOut<'a>,
+}
+
+impl ReadSink for Bounce<'_> {
+    fn space(&mut self, want: usize) -> Result<&mut [u8]> {
+        let n = self.buf.len().min(want);
+        Ok(&mut self.buf[..n])
+    }
+
+    fn filled(&mut self, n: usize) -> Result<()> {
+        let bytes = self.buf.get(..n).ok_or_else(|| {
+            Error::internal("range read filled more than the bounce buffer holds")
+        })?;
+        // Both retry `Interrupted` themselves, which is the shared rule.
+        match &mut self.out {
+            CopyOut::Cursor(file) => file.write_all(bytes)?,
+            CopyOut::At(file, at) => {
+                file.write_all_at(bytes, *at)?;
+                *at += n as u64;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Userspace fallback when the kernel refuses the copy: [`read_range`] into
+/// a bounce buffer that writes `out` at its cursor or its explicit offset,
+/// as the kernel copy would have. An `At` fallback is as safe under
+/// concurrent pool workers as the kernel copy it replaces.
+fn copy_range_fallback(
+    input: &InputFile,
+    out: CopyOut<'_>,
+    offset: u64,
+    len: u64,
+    cancel: &crate::host::Cancel,
+) -> Result<()> {
+    let mut sink = Bounce {
+        buf: vec![0u8; crate::write::IO_BUF_BYTES],
+        out,
+    };
+    read_range(input, offset, len, cancel, &mut sink)
+}
+
+/// A failed read of `input` at `offset` during a range copy.
 #[cold]
-pub(crate) fn read_error(err: io::Error, input: &InputFile, offset: u64) -> Error {
+fn read_error(err: io::Error, input: &InputFile, offset: u64) -> Error {
     Error::from(err).locate(Location::at_offset(input.path(), offset))
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use crate::error::ErrorKind;
     use std::collections::VecDeque;
-    use std::os::unix::fs::FileExt as _;
     use std::path::Path;
     use std::sync::atomic::Ordering::Relaxed;
 
     /// One scripted answer from a fake `copy_file_range`.
     #[derive(Clone, Copy, Debug)]
-    pub(crate) enum Step {
+    enum Step {
         /// Copy up to this many bytes for real, like the kernel would.
         Copy(usize),
         /// Fail with this errno, copying nothing.
@@ -350,62 +490,84 @@ pub(crate) mod tests {
     }
 
     /// An input of `len` patterned bytes in `dir`.
-    pub(crate) fn patterned_input(dir: &Path, len: usize) -> (InputFile, Vec<u8>) {
+    fn patterned_input(dir: &Path, len: usize) -> (InputFile, Vec<u8>) {
         let bytes: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
         let path = dir.join("in.bin");
         std::fs::write(&path, &bytes).unwrap();
         (InputFile::open(&path).unwrap(), bytes)
     }
 
-    /// A fake copy with the kernel's effect: read `min(asked, cap)` bytes at
-    /// `off_in` and hand them to `write`, advancing `off_in`.
-    pub(crate) fn real_copy(
-        input: &InputFile,
-        off_in: &mut i64,
-        asked: usize,
-        cap: usize,
-        mut write: impl FnMut(&[u8]),
-    ) -> usize {
-        let mut buf = vec![0u8; asked.min(cap)];
-        let off = u64::try_from(*off_in).unwrap();
-        let n = input.file().read_at(&mut buf, off).unwrap();
-        write(&buf[..n]);
-        *off_in += i64::try_from(n).unwrap();
-        n
-    }
-
     /// Run the production [`copy_range`] loop against `script`, copying
-    /// `offset..offset + len` of a fresh input into a fresh output.
+    /// `offset..offset + len` of a fresh input into a fresh output that
+    /// already holds `out_at` bytes of 0xAA. `explicit` copies with
+    /// [`CopyOut::At`] at `out_at`; otherwise with [`CopyOut::Cursor`] after
+    /// seeking there. The fake has the kernel's effect on both offsets.
     fn run(
         script: &[Step],
         input_len: usize,
         offset: u64,
         len: u64,
+        out_at: u64,
+        explicit: bool,
     ) -> (Result<()>, Vec<u8>, Vec<u8>, usize) {
+        use std::io::{Seek as _, SeekFrom};
         let dir = crate::path_guard::tests::scratch();
         let (input, bytes) = patterned_input(dir.path(), input_len);
         let out_path = dir.path().join("out.bin");
-        let out = std::fs::File::create(&out_path).unwrap();
-        let out_fd = out.as_raw_fd();
+        std::fs::write(&out_path, vec![0xAA; usize::try_from(out_at).unwrap()]).unwrap();
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&out_path)
+            .unwrap();
+        if !explicit {
+            out.seek(SeekFrom::Start(out_at)).unwrap();
+        }
         let mut script: VecDeque<Step> = script.iter().copied().collect();
         let mut calls = 0;
+        let target = if explicit {
+            CopyOut::At(&out, out_at)
+        } else {
+            CopyOut::Cursor(&out)
+        };
         let result = copy_range_with(
             &input,
-            out_fd,
+            target,
             offset,
             len,
             &crate::host::Cancel::new(),
-            |off_in, asked| {
+            |off_in, off_out, asked| {
                 calls += 1;
                 match script.pop_front().unwrap_or(Step::Copy(usize::MAX)) {
                     Step::Errno(errno) => Err(io::Error::from_raw_os_error(errno)),
-                    // The implicit output position, as the kernel uses it.
-                    Step::Copy(cap) => Ok(real_copy(&input, off_in, asked, cap, |b| {
-                        std::io::Write::write_all(&mut &out, b).unwrap();
-                    })),
+                    Step::Copy(cap) => {
+                        let mut buf = vec![0u8; asked.min(cap)];
+                        let src = u64::try_from(*off_in).unwrap();
+                        let n = input.file().read_at(&mut buf, src).unwrap();
+                        *off_in += i64::try_from(n).unwrap();
+                        match off_out {
+                            Some(at) => {
+                                let pos = u64::try_from(*at).unwrap();
+                                out.write_all_at(&buf[..n], pos).unwrap();
+                                *at += i64::try_from(n).unwrap();
+                            }
+                            // The implicit output position, as the kernel
+                            // uses it.
+                            None => (&out).write_all(&buf[..n]).unwrap(),
+                        }
+                        Ok(n)
+                    }
                 }
             },
         );
+        if explicit {
+            // Neither the kernel copy nor the pwrite fallback may touch the
+            // cursor the pool's other workers share.
+            assert_eq!(
+                (&out).stream_position().unwrap(),
+                0,
+                "an explicit-offset copy moved the output cursor"
+            );
+        }
         drop(out);
         let written = std::fs::read(&out_path).unwrap();
         (result, written, bytes, calls)
@@ -427,53 +589,68 @@ pub(crate) mod tests {
             Step::Errno(libc::EINTR),
             Step::Copy(3),
         ];
-        let (result, written, bytes, calls) = run(&script, 10_000, 100, 9_000);
-        result.unwrap();
-        assert_eq!(written, bytes[100..9_100]);
-        assert_eq!(
-            calls, 6,
-            "four copies or retries, then the rest in one call"
-        );
-    }
-
-    #[test]
-    fn every_refusal_errno_falls_back_on_the_first_call() {
-        for errno in [
-            libc::EXDEV,
-            libc::ENOSYS,
-            libc::EOPNOTSUPP,
-            libc::EPERM,
-            libc::EINVAL,
-        ] {
-            let before = WRITER_METRICS.copy_range_fallback_ranges.load(Relaxed);
-            // EINTR first: the decision is on the first answer that is not an
-            // interruption. The range is larger than the fallback buffer.
-            let len = crate::write::IO_BUF_BYTES * 2 + 17;
-            let script = [Step::Errno(libc::EINTR), Step::Errno(errno)];
-            let (result, written, bytes, calls) = run(&script, len + 50, 50, len as u64);
-            result.unwrap_or_else(|e| panic!("errno {errno}: {e}"));
-            assert_eq!(written, bytes[50..], "errno {errno}");
-            assert_eq!(calls, 2, "errno {errno}: no kernel call after the fallback");
-            assert!(
-                WRITER_METRICS.copy_range_fallback_ranges.load(Relaxed) > before,
-                "errno {errno}: the fallback must be counted"
+        for explicit in [false, true] {
+            let (result, written, bytes, calls) = run(&script, 10_000, 100, 9_000, 7, explicit);
+            result.unwrap();
+            assert_eq!(&written[..7], &[0xAA; 7], "explicit {explicit}");
+            assert_eq!(&written[7..], &bytes[100..9_100], "explicit {explicit}");
+            assert_eq!(
+                calls, 6,
+                "four copies or retries, then the rest in one call"
             );
         }
     }
 
     #[test]
+    fn every_refusal_errno_falls_back_on_the_first_call() {
+        for explicit in [false, true] {
+            for errno in [
+                libc::EXDEV,
+                libc::ENOSYS,
+                libc::EOPNOTSUPP,
+                libc::EPERM,
+                libc::EINVAL,
+            ] {
+                let before = WRITER_METRICS.copy_range_fallback_ranges.load(Relaxed);
+                // EINTR first: the decision is on the first answer that is
+                // not an interruption. The range is larger than the fallback
+                // buffer, and lands after 5 bytes already in the output.
+                let len = crate::write::IO_BUF_BYTES * 2 + 17;
+                let script = [Step::Errno(libc::EINTR), Step::Errno(errno)];
+                let (result, written, bytes, calls) =
+                    run(&script, len + 50, 50, len as u64, 5, explicit);
+                result.unwrap_or_else(|e| panic!("errno {errno}: {e}"));
+                assert_eq!(&written[..5], &[0xAA; 5], "errno {errno}");
+                assert_eq!(&written[5..], &bytes[50..], "errno {errno}");
+                assert_eq!(calls, 2, "errno {errno}: no kernel call after the fallback");
+                assert!(
+                    WRITER_METRICS.copy_range_fallback_ranges.load(Relaxed) > before,
+                    "errno {errno}: the fallback must be counted"
+                );
+                assert_ne!(
+                    WRITER_METRICS.copy_range_fallback_errno.load(Relaxed),
+                    0,
+                    "errno {errno}: a refusing errno must be kept"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_refusal_after_progress_is_a_hard_error() {
-        let script = [Step::Copy(10), Step::Errno(libc::EXDEV)];
-        let (result, written, _, _) = run(&script, 1_000, 0, 1_000);
-        let err = result.unwrap_err();
-        assert_eq!(errno_of(&err), Some(libc::EXDEV), "{err}");
-        assert_eq!(written.len(), 10);
+        for explicit in [false, true] {
+            let script = [Step::Copy(10), Step::Errno(libc::EXDEV)];
+            let (result, written, _, _) = run(&script, 1_000, 0, 1_000, 0, explicit);
+            let err = result.unwrap_err();
+            assert_eq!(errno_of(&err), Some(libc::EXDEV), "{err}");
+            assert_eq!(written.len(), 10);
+        }
     }
 
     #[test]
     fn other_errnos_are_hard_errors() {
         for errno in [libc::EBADF, libc::EIO, libc::EFBIG, libc::EOVERFLOW] {
-            let (result, written, _, _) = run(&[Step::Errno(errno)], 1_000, 0, 1_000);
+            let (result, written, _, _) = run(&[Step::Errno(errno)], 1_000, 0, 1_000, 0, false);
             let err = result.unwrap_err();
             assert_eq!(errno_of(&err), Some(errno), "{err}");
             assert!(written.is_empty());
@@ -482,7 +659,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_zero_copy_is_end_of_file() {
-        let (result, _, _, _) = run(&[Step::Copy(0)], 1_000, 0, 1_000);
+        let (result, _, _, _) = run(&[Step::Copy(0)], 1_000, 0, 1_000, 0, true);
         let err = result.unwrap_err();
         assert!(
             matches!(err.kind(), ErrorKind::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof),
@@ -494,13 +671,67 @@ pub(crate) mod tests {
     fn a_fallback_past_the_end_of_input_is_end_of_file() {
         // The index claims more bytes than the input has: the fallback reads
         // what there is, then reports the truncation.
-        let (result, written, bytes, _) = run(&[Step::Errno(libc::EXDEV)], 1_000, 0, 5_000);
+        let (result, written, bytes, _) =
+            run(&[Step::Errno(libc::EXDEV)], 1_000, 0, 5_000, 0, false);
         let err = result.unwrap_err();
         assert!(
             matches!(err.kind(), ErrorKind::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof),
             "{err}"
         );
         assert_eq!(written, bytes);
+    }
+
+    /// A sink that reserves a scripted number of bytes per read and records
+    /// what it was given.
+    struct Scripted {
+        sizes: VecDeque<usize>,
+        buf: Vec<u8>,
+        got: Vec<u8>,
+    }
+
+    impl ReadSink for Scripted {
+        fn space(&mut self, want: usize) -> Result<&mut [u8]> {
+            let n = self.sizes.pop_front().unwrap_or(want);
+            self.buf.resize(n, 0);
+            Ok(&mut self.buf[..n])
+        }
+        fn filled(&mut self, n: usize) -> Result<()> {
+            self.got.extend_from_slice(&self.buf[..n]);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn read_range_fills_small_reservations_in_order() {
+        let dir = crate::path_guard::tests::scratch();
+        let (input, bytes) = patterned_input(dir.path(), 1_000);
+        let mut sink = Scripted {
+            sizes: VecDeque::from([1, 7, 300]),
+            buf: Vec::new(),
+            got: Vec::new(),
+        };
+        read_range(&input, 10, 900, &crate::host::Cancel::new(), &mut sink).unwrap();
+        assert_eq!(sink.got, bytes[10..910]);
+    }
+
+    #[test]
+    fn read_range_refuses_an_empty_or_oversized_reservation() {
+        let dir = crate::path_guard::tests::scratch();
+        let (input, _) = patterned_input(dir.path(), 100);
+        for size in [0, 51] {
+            let mut sink = Scripted {
+                sizes: VecDeque::from([size]),
+                buf: Vec::new(),
+                got: Vec::new(),
+            };
+            let err =
+                read_range(&input, 0, 50, &crate::host::Cancel::new(), &mut sink).unwrap_err();
+            assert!(
+                matches!(err.kind(), ErrorKind::Internal { .. }),
+                "size {size}: {err}"
+            );
+            assert!(sink.got.is_empty(), "size {size}: nothing may be read");
+        }
     }
 
     #[test]

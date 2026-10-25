@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering::Relaxed};
 
 use crate::counters::Stopwatch;
 
@@ -33,9 +33,10 @@ crate::counters::counter_set! {
         pub payload_copy_range_bytes => "writer_payload_copy_range_bytes",
         /// Passthrough ranges the kernel refused to `copy_file_range` (cross
         /// filesystem, unsupported filesystem or kernel, seccomp, non-regular
-        /// output; see `copy_range::kernel_copy_refused`) and that were copied
-        /// through userspace instead. Non-zero on a planet run is a performance
-        /// cliff worth knowing about, not a failure.
+        /// output; see `copy_range::kernel_copy_refused`) and that were routed
+        /// to the userspace copy instead. Non-zero on a planet run is a
+        /// performance cliff worth knowing about, not a failure; the CLI
+        /// reports it as a note (`report_writer_degradations`).
         pub copy_range_fallback_ranges => "writer_copy_range_fallback_ranges",
         /// Bytes those ranges routed to the userspace fallback, counted when the
         /// range is routed (a fallback that then fails is still counted).
@@ -86,6 +87,14 @@ crate::counters::counter_set! {
         /// Latch for [`WriterMetrics::emit_once`], so a process emits the
         /// counter set exactly once no matter how many writers it flushes.
         emitted: AtomicBool = AtomicBool::new(false),
+        /// The errno of the first `copy_file_range` refusal that routed a
+        /// range to the userspace fallback (0 = none yet). Kept for the
+        /// run's note (`report_writer_degradations`), not emitted as a
+        /// counter: a later refusal may carry a different errno, and only
+        /// the first is claimed. Only the splice path (`linux-direct-io`)
+        /// records or reads it.
+        #[cfg_attr(not(feature = "linux-direct-io"), allow(dead_code))]
+        pub copy_range_fallback_errno: AtomicI32 = AtomicI32::new(0),
     }
 }
 

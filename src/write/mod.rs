@@ -47,17 +47,25 @@ pub fn emit_writer_counters() {
     metrics::WRITER_METRICS.emit_once();
 }
 
-/// Report, once, that output blobs lost their optional tag skip-index
-/// (`tagdata`) because their headers exceeded the size limit.
+/// Report, once each, the ways the writers' output or speed fell short of
+/// the normal path, for users who never read sidecar counters:
 ///
-/// Call after dispatch, beside [`emit_writer_counters`]: the count is the
-/// same process total behind the `writer_tagdata_dropped_oversize` counter,
-/// surfaced here for users who never read sidecar counters. Output stays
-/// valid; later tag filtering of that file decodes more blobs.
-pub fn report_writer_index_loss(diagnostics: &crate::host::Diagnostics) {
-    let dropped = metrics::WRITER_METRICS
-        .tagdata_dropped_oversize
-        .load(std::sync::atomic::Ordering::Relaxed);
+/// - a warning when output blobs lost their optional tag skip-index
+///   (`tagdata`) because their headers exceeded the size limit. Output stays
+///   valid; later tag filtering of that file decodes more blobs.
+/// - a note when the kernel refused `copy_file_range` for passthrough ranges
+///   and they were routed to the userspace copy, naming the first refusal.
+///   The note says only that the userspace copy was selected, not that it
+///   finished: the count is taken when a range is routed, and this runs on
+///   failure too.
+///
+/// Call after dispatch, beside [`emit_writer_counters`]: the counts are the
+/// same process totals behind the `writer_tagdata_dropped_oversize` and
+/// `writer_copy_range_fallback_*` counters.
+pub fn report_writer_degradations(diagnostics: &crate::host::Diagnostics) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let m = &metrics::WRITER_METRICS;
+    let dropped = m.tagdata_dropped_oversize.load(Relaxed);
     if dropped != 0 {
         crate::host::diag_once!(
             diagnostics,
@@ -65,6 +73,23 @@ pub fn report_writer_index_loss(diagnostics: &crate::host::Diagnostics) {
             "writer.tagdata_dropped_oversize",
             "{dropped} output blobs lost their tag skip-index because their headers exceeded the size limit; tag filtering may decode more blobs"
         );
+    }
+    // Only the splice path (feature `linux-direct-io`) moves these counters.
+    #[cfg(feature = "linux-direct-io")]
+    {
+        let ranges = m.copy_range_fallback_ranges.load(Relaxed);
+        if ranges != 0 {
+            let bytes = m.copy_range_fallback_bytes.load(Relaxed);
+            let errno = m.copy_range_fallback_errno.load(Relaxed);
+            let name = copy_range::refusal_name(errno).unwrap_or("errno");
+            let first = std::io::Error::from_raw_os_error(errno);
+            crate::host::diag_once!(
+                diagnostics,
+                Note,
+                "writer.copy_range_fallback",
+                "the kernel refused copy_file_range for {ranges} passthrough ranges ({bytes} bytes requested), so they were routed to the userspace copy, which moves every byte through this process; first refusal: {name}, {first}"
+            );
+        }
     }
 }
 pub mod options;

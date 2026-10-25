@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-11. HYG-017
 12. HYG-038
 13. HYG-032
 14. HYG-161 (after HYG-032)
@@ -512,6 +511,31 @@ The judgement calls already known, to be checked first:
   indexdata, with history versions straddling the blob boundaries; two
   first-blob-only contract rows (snapshot and history). On a wholly
   indexed planet run only a per-header guard branch goes; not measured.
+- The five passthrough copy loops are two, both in `write/copy_range.rs`
+  (HYG-017): `copy_range` (the one `copy_file_range`, `CopyOut::Cursor` for
+  the buffered sink and unpipelined `write_raw_copy`, `CopyOut::At` for the
+  pwrite pool) and `read_range` over a `ReadSink` (the userspace fallback's
+  bounce buffer, and the io_uring writer, which reads straight into its
+  registered buffers as before). clippy.toml bans `libc::copy_file_range`,
+  `pread*`, `pwrite*`, `read`, `write`, `sendfile*` and `splice` library-wide;
+  the copy module's one `copy_file_range` is the only allow (verified: the
+  lint fires on it with the allow removed). Sparred with codex. Judgement
+  calls on measured paths, none measured:
+  - The kernel copy still asks for the whole remaining range per call; the
+    pool's copy gained an `Option` branch per call (one call per 2 GiB).
+  - The io_uring sink is a trait impl with checked `space` / `filled`
+    instead of the inline loop. Same pread sizes, no bounce, full-buffer
+    submits only; it could not be run end to end here (memlock, ADR-0014).
+  - `DirectWriter::flush_buf` and `DirectReader`'s fill now use std `File`
+    `write_all` / `read` (the same single syscall each); `DirectReader`'s
+    buffer is now allocated zeroed (once per reader) so it can be a slice.
+  - The pool's fallback is now the shared bounce sink (`write_all_at`), and
+    the copy errors and EOF messages are one wording across backends.
+  - New once-per-run Note (`writer.copy_range_fallback`) from the fallback
+    counters plus a first-refusal errno kept in `WriterMetrics`; the public
+    `report_writer_index_loss` is renamed `report_writer_degradations` and
+    emits it. The Note says the userspace copy was selected, never that it
+    finished.
 
 ---
 
@@ -760,30 +784,6 @@ uring, summed across 16 pool threads for parallel; and parallel counts
 `writer_bytes_written` at dispatch, others after the write. Fix: `writer_thread<S: OutputSink>`
 as the only loop with an `on_idle()` hook; a source-scan test that only
 `pipeline.rs` calls `pop_ready()` under `src/write/`.
-
-Reported by: write path.
-
-## HYG-017 - `copy_file_range` and pread loops are written five times
-
-Anger: 8 - I/O fallbacks, gating, alignment.
-
-The rules are now shared from `write/copy_range.rs` (`retry_eintr`,
-`pread_retrying`, `len_to_usize`, the one fallback decision
-`kernel_copy_refused`, the `writer_copy_range_fallback_*` counters), but the
-five loops are still five: `copy_range` (implicit out offset),
-`parallel_writer::copy_range_to_fd` (explicit), the fallbacks
-`copy_range_fallback` and `copy_range_fallback_pwrite`, and
-`uring_writer::handle_copy_range_uring`'s pread loop. Nothing stops a new raw
-loop bypassing the helpers. A fallback to userspace is counted only in
-sidecar counters, so outside brokkr it is silent; proposed, not decided: a
-once-per-run `Note` from the fallback counters, called beside
-`report_writer_index_loss` after dispatch (the same pattern), naming the
-range and byte counts (the errno would need one more cold-path counter). Fix: one module owning the loops too;
-`disallowed-methods` for `libc::pread`, `libc::copy_file_range`, `libc::write`
-elsewhere.
-
-Maintainer (2026-10-25): queued; no recommendation is recorded for this
-entry.
 
 Reported by: write path.
 

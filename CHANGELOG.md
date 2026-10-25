@@ -923,6 +923,15 @@
 
 ### Added
 
+- **A run says when passthrough copies left the kernel fast path.** When
+  the kernel refuses `copy_file_range` (cross-filesystem output, FUSE or
+  NFS, seccomp, a non-regular output) and passthrough ranges are copied
+  through userspace instead, a `Note:` line now gives the number of ranges,
+  the bytes requested and the first refusing errno. It used to show only in
+  sidecar counters. Library: `write::report_writer_index_loss` is renamed
+  `write::report_writer_degradations` and emits this note as well as the
+  tag skip-index warning; rename the call.
+
 - **Plain `cat` says when it rebuilt or omitted a block.** An unindexed
   blob whose block no single index can describe (no elements, a group with
   more than one element field, kinds changing across groups) is rebuilt

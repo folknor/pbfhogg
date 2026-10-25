@@ -133,18 +133,20 @@ fn sync_unsupported(
 
 #[cfg(feature = "linux-direct-io")]
 impl FileWriter {
-    /// Flush internal buffers and return the raw output fd, if available.
+    /// Flush internal buffers and return the output file for a cursor copy
+    /// (`copy_range::CopyOut::Cursor`), if available.
     ///
     /// Returns `None` for O_DIRECT writers (`copy_file_range` is incompatible
-    /// with `DirectWriter`'s page-aligned buffering). Returns `Some(fd)` for
-    /// buffered writers after flushing the `BufWriter` so the fd position
-    /// matches the logical write position.
-    pub(crate) fn flush_and_raw_fd(&mut self) -> io::Result<Option<std::os::unix::io::RawFd>> {
-        use std::os::unix::io::AsRawFd;
+    /// with `DirectWriter`'s page-aligned buffering). Returns the file for
+    /// buffered writers after flushing the `BufWriter`, so the file position
+    /// matches the logical write position; the empty `BufWriter` resumes at
+    /// wherever the copy leaves it. The returned borrow keeps this writer
+    /// from being written meanwhile.
+    pub(crate) fn flush_and_file(&mut self) -> io::Result<Option<&std::fs::File>> {
         match self {
             FileWriter::Buffered(w) => {
                 w.flush()?;
-                Ok(Some(w.get_ref().as_raw_fd()))
+                Ok(Some(w.get_ref()))
             }
             FileWriter::Direct(_) => Ok(None),
         }

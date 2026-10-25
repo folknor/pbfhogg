@@ -1,7 +1,7 @@
 //! O_DIRECT file writer with aligned buffering.
 //!
 //! [`DirectWriter`] maintains an aligned internal buffer and flushes in
-//! aligned chunks via `libc::write`, at the alignment `crate::direct_io`
+//! aligned chunks via `write(2)`, at the alignment `crate::direct_io`
 //! discovered for the file. On final flush, writes the padded
 //! tail and calls `ftruncate` to trim to the actual byte count. This bypasses
 //! the kernel page cache entirely, preventing cache pollution during
@@ -10,12 +10,10 @@
 use std::alloc::{self, Layout};
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::NonNull;
 
 use super::IO_BUF_BYTES;
-use super::copy_range::{retry_eintr, syscall_result};
 use crate::direct_io::{alloc_aligned_zeroed, round_up};
 
 // ---------------------------------------------------------------------------
@@ -52,8 +50,11 @@ impl AlignedBuffer {
         self.capacity() - self.len
     }
 
-    fn as_ptr(&self) -> *const u8 {
-        self.ptr.as_ptr()
+    /// The `len` bytes held.
+    fn as_slice(&self) -> &[u8] {
+        // Safety: `len <= capacity`, and the allocation is zeroed, so every
+        // byte is initialised.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 
     /// Append `data` to the buffer. Caller must ensure `data.len() <= remaining()`.
@@ -137,35 +138,19 @@ impl DirectWriter {
     }
 
     /// Write the full aligned buffer to the fd, handling partial writes.
+    ///
+    /// std's `write_all` is the loop: each call is one `write(2)` straight
+    /// from the aligned buffer (no copy), `Interrupted` is retried, and a
+    /// write that takes nothing is `WriteZero`. The first write is aligned
+    /// (buffer address, fd offset and length are multiples of `align`, the
+    /// last ensured by callers). A short write that stopped off an aligned
+    /// boundary makes the retry of the remainder misaligned. It is still
+    /// issued, on purpose: a filesystem with a buffered fallback for
+    /// misaligned direct writes (btrfs) completes it correctly, and a strict
+    /// one refuses it with `EINVAL`, which surfaces as this flush's error.
+    /// Refusing here instead would fail the first case for nothing.
     fn flush_buf(&mut self) -> io::Result<()> {
-        let mut written = 0;
-        let total = self.buf.len;
-        let fd = self.file.as_raw_fd();
-        while written < total {
-            // A signal delivered mid-write is not a write failure: the shared
-            // `EINTR` rule in `copy_range` retries it.
-            let n = retry_eintr(|| {
-                // Safety: the range lies inside the buffer and the fd is open
-                // for writing. The first write is aligned (buffer address,
-                // fd offset and `total` are multiples of `align`, the last
-                // ensured by callers).
-                syscall_result(unsafe {
-                    libc::write(fd, self.buf.as_ptr().add(written).cast(), total - written)
-                })
-            })?;
-            if n == 0 {
-                // `write_all`'s rule: a write that takes nothing would loop
-                // here forever.
-                return Err(io::Error::from(io::ErrorKind::WriteZero));
-            }
-            written += n;
-            // A short write that stopped off an aligned boundary makes the
-            // retry of the remainder misaligned. It is still issued, on
-            // purpose: a filesystem with a buffered fallback for misaligned
-            // direct writes (btrfs) completes it correctly, and a strict one
-            // refuses it with `EINVAL`, which surfaces as this flush's error.
-            // Refusing here instead would fail the first case for nothing.
-        }
+        (&self.file).write_all(self.buf.as_slice())?;
         self.buf.clear();
         Ok(())
     }
@@ -265,7 +250,7 @@ mod tests {
         assert_eq!(buf.len, 0);
         assert_eq!(buf.capacity(), ALIGN * 4);
         assert_eq!(buf.remaining(), ALIGN * 4);
-        assert_eq!(buf.as_ptr() as usize % ALIGN, 0);
+        assert_eq!(buf.as_slice().as_ptr() as usize % ALIGN, 0);
 
         buf.extend(&[1, 2, 3, 4, 5]);
         assert_eq!(buf.len, 5);

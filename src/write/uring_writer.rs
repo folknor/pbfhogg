@@ -455,8 +455,8 @@ impl Drop for UringState {
 // CopyRange handling
 // ---------------------------------------------------------------------------
 
-/// Handle a `CopyRange` payload by `pread`ing input bytes directly into the
-/// current registered buffer, letting the normal accumulator submit full
+/// A `CopyRange` payload is read by `copy_range::read_range` straight into
+/// the current registered buffer, and the normal accumulator submits full
 /// buffers via `submit_current` (always aligned, always safe).
 ///
 /// The previous design used linked `ReadFixed` → `WriteFixed` SQE chains to
@@ -469,79 +469,69 @@ impl Drop for UringState {
 /// not at the end). Readers saw `OSMHeader` followed by nulls where the next
 /// `OSMData` blob header should have been.
 ///
-/// The buffered path below preserves the writer's core invariant: mid-stream
-/// `WriteFixed` SQEs are always `IO_BUF_BYTES` (a multiple of the alignment) because
-/// `submit_current` only fires when `current_len == IO_BUF_BYTES`; only the
-/// final flush_final SQE is partial, and its trailing zero-padding is then
-/// truncated by `set_len`.
+/// This sink preserves the writer's core invariant: mid-stream `WriteFixed`
+/// SQEs are always `IO_BUF_BYTES` (a multiple of the alignment) because
+/// `filled` submits only when `current_len == IO_BUF_BYTES`; a partial
+/// buffer carries over to the next item, and only the final flush_final SQE
+/// is partial, its trailing zero-padding then truncated by `set_len`.
 ///
-/// The `pread` writes directly into the registered buffer at `current_len`,
-/// so there is no user-space bounce buffer and no extra copy beyond what
-/// the kernel's read path already performs.
+/// The read lands directly in the registered buffer at `current_len`, so
+/// there is no user-space bounce buffer and no extra copy beyond what the
+/// kernel's read path already performs. A short read is progress: the input
+/// fd is an ordinary buffered one (no O_DIRECT alignment on the destination,
+/// length or offset), and the alignment the O_DIRECT output needs is kept by
+/// submitting full buffers only.
+///
+/// `read_range` enforces the reservation protocol; `space` and `filled`
+/// still bounds-check against the buffer with checked arithmetic, because
+/// `current_len` feeds the pointer arithmetic below.
 #[cfg(feature = "linux-direct-io")]
-fn handle_copy_range_uring(
-    state: &mut UringState,
-    input: &crate::read::input::InputFile,
-    mut src_offset: u64,
-    mut remaining: u64,
-    cancel: &crate::host::Cancel,
-) -> Result<()> {
-    use std::os::unix::io::AsRawFd as _;
-    let in_fd = input.file().as_raw_fd();
-    while remaining > 0 {
-        // Once per registered buffer filled (each a `pread` syscall): a
-        // coalesced splice can span the whole input, and this is where a
-        // cancelled run stops it.
-        cancel.check()?;
-        if state.current_buf.is_none() {
-            let idx = state.acquire_buffer()?;
-            state.current_buf = Some(idx);
-            state.current_len = 0;
-        }
-        let buf_idx = match state.current_buf {
+impl super::copy_range::ReadSink for UringState {
+    fn space(&mut self, want: usize) -> Result<&mut [u8]> {
+        let buf_idx = match self.current_buf {
             Some(idx) => idx,
-            None => return Err(Error::internal("no current buffer")),
+            None => {
+                let idx = self.acquire_buffer()?;
+                self.current_buf = Some(idx);
+                self.current_len = 0;
+                idx
+            }
         };
+        let free = self
+            .pool
+            .buf_size
+            .checked_sub(self.current_len)
+            .ok_or_else(|| Error::internal("io_uring buffer filled past its size"))?;
+        let len = free.min(want);
+        // Safety: `buf_idx` was acquired from the pool and is not in flight
+        // (only submitted buffers are, and `current_buf` is taken on submit).
+        // The slice covers `current_len..current_len + len` of that one
+        // buffer, inside its allocation since `len <= buf_size - current_len`,
+        // and never another buffer an in-flight `WriteFixed` may be reading.
+        // The pool is allocated zeroed, so the bytes are initialised. The
+        // borrow of `self` ends before `filled` can submit the buffer.
+        Ok(unsafe {
+            std::slice::from_raw_parts_mut(self.pool.buf_ptr(buf_idx).add(self.current_len), len)
+        })
+    }
 
-        let space = state.pool.buf_size - state.current_len;
-        let chunk = space.min(super::copy_range::len_to_usize(remaining));
-        // Safety: buf_idx is valid (acquired from pool), current_len is
-        // within IO_BUF_BYTES, chunk <= remaining space, so dst is within the
-        // buffer allocation.
-        let dst = unsafe { state.pool.buf_ptr(buf_idx).add(state.current_len) };
-
-        // A short read is progress, as in every copy loop (the shared rules
-        // in `copy_range`): it fills the registered buffer at any byte count,
-        // because the input fd is an ordinary buffered one (no O_DIRECT
-        // alignment on `dst`, length or offset) and the alignment the
-        // O_DIRECT output needs is kept by `submit_current`, which fires only
-        // on a full buffer. A truncated input still fails: the next read
-        // returns 0.
-        // Safety: dst points into a valid registered buffer of size IO_BUF_BYTES,
-        // chunk <= remaining space in that buffer, and in_fd is a valid
-        // readable file descriptor passed in from the caller.
-        let n = unsafe { super::copy_range::pread_retrying(in_fd, dst, chunk, src_offset) }
-            .map_err(|err| super::copy_range::read_error(err, input, src_offset))?;
-        if n == 0 {
-            return Err(super::copy_range::read_error(
-                io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "io_uring CopyRange pread returned 0 inside the range",
-                ),
-                input,
-                src_offset,
+    fn filled(&mut self, n: usize) -> Result<()> {
+        let free = self
+            .pool
+            .buf_size
+            .checked_sub(self.current_len)
+            .ok_or_else(|| Error::internal("io_uring buffer filled past its size"))?;
+        if self.current_buf.is_none() || n > free {
+            return Err(Error::internal(
+                "io_uring CopyRange read reported more than its buffer space",
             ));
         }
-
-        state.accept_buffered(n);
-        src_offset += n as u64;
-        remaining -= n as u64;
-
-        if state.current_len == state.pool.buf_size {
-            state.submit_current()?;
+        self.accept_buffered(n);
+        if self.current_len == self.pool.buf_size {
+            self.submit_current()?;
         }
+        Ok(())
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -797,8 +787,8 @@ fn uring_main_loop(
                     len,
                 } => {
                     let t_write = crate::counters::Stopwatch::start();
-                    handle_copy_range_uring(state, &in_file, offset, len, cancel)?;
-                    // The Arc keeps the input open across the pread loop.
+                    super::copy_range::read_range(&in_file, offset, len, cancel, state)?;
+                    // The Arc keeps the input open across the read loop.
                     drop(in_file);
                     t_write.record_ns(&WRITER_METRICS.write_ns);
                     WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);

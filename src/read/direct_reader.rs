@@ -1,7 +1,7 @@
 //! O_DIRECT file reader with aligned buffering.
 //!
 //! [`DirectReader`] maintains an aligned internal buffer and reads in
-//! aligned chunks via `libc::read`, at the alignment `crate::direct_io`
+//! aligned chunks via `read(2)`, at the alignment `crate::direct_io`
 //! discovered for the file. This bypasses the kernel page cache entirely,
 //! preventing cache pollution during planet-scale (80 GB+) PBF reads.
 
@@ -12,7 +12,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::NonNull;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::write::IO_BUF_BYTES;
 
 // ---------------------------------------------------------------------------
@@ -23,7 +23,7 @@ use crate::write::IO_BUF_BYTES;
 struct AlignedReadBuffer {
     ptr: NonNull<u8>,
     layout: Layout,
-    /// Number of valid bytes in the buffer (from the last `libc::read`).
+    /// Number of valid bytes in the buffer (from the last read).
     len: usize,
     /// Current read position within the buffer.
     pos: usize,
@@ -35,13 +35,11 @@ unsafe impl Send for AlignedReadBuffer {}
 
 impl AlignedReadBuffer {
     /// Allocate a new buffer of `capacity` bytes aligned to `align`.
+    ///
+    /// Zeroed, like the write-side buffers, so the whole capacity can be
+    /// handed to `read` as an initialised slice. Paid once per reader.
     fn new(capacity: usize, align: usize) -> Result<Self> {
-        let layout = Layout::from_size_align(capacity, align)
-            .map_err(|e| Error::internal_with("invalid aligned read buffer layout", e))?;
-        // Safety: layout has non-zero size (IO_BUF_BYTES > 0).
-        let ptr = unsafe { alloc::alloc(layout) };
-        let ptr = NonNull::new(ptr)
-            .ok_or_else(|| Error::io_kind(io::ErrorKind::OutOfMemory, "aligned alloc failed"))?;
+        let (ptr, layout) = crate::direct_io::alloc_aligned_zeroed(capacity, align)?;
         Ok(Self {
             ptr,
             layout,
@@ -71,20 +69,21 @@ impl AlignedReadBuffer {
         self.pos += n;
     }
 
-    /// Fill the buffer from a file descriptor via `libc::read`.
-    /// Returns the number of bytes read (0 on EOF).
-    fn fill_from(&mut self, fd: i32) -> io::Result<usize> {
+    /// Fill the buffer with one `read(2)` of its whole capacity (std's
+    /// `File::read`, which is that one call). Returns the number of bytes
+    /// read (0 on EOF); an interrupted read is returned as `Interrupted`.
+    ///
+    /// The read is aligned: the buffer address is aligned to the file's
+    /// alignment, the capacity is a multiple of it, and the fd offset is
+    /// aligned too (`DirectReader::fill` never reads past a regular file's
+    /// final short read, and `skip` seeks to aligned offsets only).
+    fn fill_from(&mut self, mut file: &File) -> io::Result<usize> {
         self.pos = 0;
         self.len = 0;
-        // Safety: ptr is aligned to the file's alignment, capacity is a
-        // multiple of it, and fd is open with O_DIRECT. The fd offset is
-        // aligned too: `DirectReader::fill` never reads past a regular
-        // file's final short read, and `skip` seeks to aligned offsets only.
-        let n = unsafe { libc::read(fd, self.ptr.as_ptr().cast(), self.capacity()) };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        self.len = n.cast_unsigned();
+        // Safety: the allocation is `capacity` zeroed (so initialised) bytes,
+        // exclusively owned through `&mut self`.
+        let dst = unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.capacity()) };
+        self.len = file.read(dst)?;
         Ok(self.len)
     }
 }
@@ -105,7 +104,7 @@ impl Drop for AlignedReadBuffer {
 /// All reads from the underlying file descriptor use an aligned buffer,
 /// aligned sizes and aligned offsets, at the file's direct I/O alignment.
 /// Data is served from the internal buffer, which is refilled via
-/// `libc::read` when exhausted.
+/// `read(2)` when exhausted.
 pub struct DirectReader {
     file: File,
     buf: AlignedReadBuffer,
@@ -206,7 +205,7 @@ impl DirectReader {
             self.buf.len = 0;
             return Ok(0);
         }
-        let filled = self.buf.fill_from(self.file.as_raw_fd())?;
+        let filled = self.buf.fill_from(&self.file)?;
         self.fd_pos += filled as u64;
         Ok(filled)
     }

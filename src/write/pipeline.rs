@@ -163,10 +163,16 @@ impl OutputSink for FileOutputSink {
                 len,
             } => {
                 let t_write = crate::counters::Stopwatch::start();
-                let out_fd = self.writer.flush_and_raw_fd()?.ok_or_else(|| {
+                let out = self.writer.flush_and_file()?.ok_or_else(|| {
                     Error::invalid_argument("copy_file_range incompatible with O_DIRECT output")
                 })?;
-                super::copy_range::copy_range(&in_file, out_fd, offset, len, &self.cancel)?;
+                super::copy_range::copy_range(
+                    &in_file,
+                    super::copy_range::CopyOut::Cursor(out),
+                    offset,
+                    len,
+                    &self.cancel,
+                )?;
                 // Hold the input open until the splice has actually happened.
                 drop(in_file);
                 t_write.record_ns(&WRITER_METRICS.write_ns);

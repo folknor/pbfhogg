@@ -467,7 +467,8 @@ an ext4-CFR characteristic, not pbfhogg code.
 
 Planet hotpath (`e42b0c8c`) + alloc (2026-04-27 at `4fc8e35`, UUIDs
 `d64932d2` / `26fb329e`): 115.4 s wall, **94% in the pool worker's
-`copy_range_to_fd`** (unannotated) inside `writer.flush()`; main thread
+`copy_range_to_fd`** (unannotated; the pool's copy loop, since folded
+into `write::copy_range::copy_range`) inside `writer.flush()`; main thread
 Blocked 20% avg CPU waiting on the writer drain. No allocation pressure
 (459 MB exclusive, all `blob_wire::parse`; net diff 78.6 MB). Nothing to
 chase in software on this storage stack.

@@ -43,8 +43,6 @@
 //! so at its own definition, with a reason.
 
 use std::fs::File;
-#[cfg(feature = "linux-direct-io")]
-use std::io;
 use std::os::unix::fs::FileExt;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
@@ -469,7 +467,17 @@ fn worker_loop(
                 src_offset,
                 len,
             } => {
-                let r = copy_range_to_fd(file, &in_file, src_offset, out_offset, len, cancel);
+                // Explicit output offset: the fd's position is never touched,
+                // so the pool's concurrent copies and writes cannot race on
+                // it, and a refused copy falls back to `pwrite`s at the same
+                // offset.
+                let r = super::copy_range::copy_range(
+                    &in_file,
+                    super::copy_range::CopyOut::At(file, out_offset),
+                    src_offset,
+                    len,
+                    cancel,
+                );
                 // The Arc is held across the splice, so the input cannot be
                 // closed out from under the kernel copy.
                 drop(in_file);
@@ -482,154 +490,6 @@ fn worker_loop(
             return;
         }
     }
-}
-
-/// `copy_file_range` with explicit out offset. Loops until `len` bytes
-/// are copied, handling short returns per kernel semantics. The `EINTR`,
-/// short-count, length and fallback rules are the shared ones in
-/// `copy_range`.
-#[cfg(feature = "linux-direct-io")]
-fn copy_range_to_fd(
-    out: &File,
-    input: &crate::read::input::InputFile,
-    src_offset: u64,
-    out_offset: u64,
-    remaining: u64,
-    cancel: &crate::host::Cancel,
-) -> Result<()> {
-    use super::copy_range::syscall_result;
-    use std::os::unix::io::AsRawFd;
-    let out_fd = out.as_raw_fd();
-    let in_fd = input.file().as_raw_fd();
-    copy_range_to_fd_with(
-        out,
-        input,
-        src_offset,
-        out_offset,
-        remaining,
-        cancel,
-        |src_off, out_off, chunk| {
-            // Safety: both fds are open; both offsets are explicit, so
-            // neither fd's file position moves and concurrent pool workers
-            // cannot race on it.
-            syscall_result(unsafe {
-                libc::copy_file_range(in_fd, src_off, out_fd, out_off, chunk, 0)
-            })
-        },
-    )
-}
-
-/// The [`copy_range_to_fd`] loop over one `copy_file_range` attempt,
-/// `cfr(src_off, out_off, len)`. Production passes the syscall; tests pass
-/// a fake that scripts the kernel's answers.
-#[cfg(feature = "linux-direct-io")]
-#[allow(clippy::cast_possible_wrap)]
-#[inline(always)]
-fn copy_range_to_fd_with(
-    out: &File,
-    input: &crate::read::input::InputFile,
-    mut src_offset: u64,
-    mut out_offset: u64,
-    mut remaining: u64,
-    cancel: &crate::host::Cancel,
-    mut cfr: impl FnMut(&mut i64, &mut i64, usize) -> io::Result<usize>,
-) -> Result<()> {
-    use super::copy_range::{kernel_copy_refused, len_to_usize, record_fallback, retry_eintr};
-    use std::os::unix::io::AsRawFd;
-    let (start, end) = (src_offset, src_offset.saturating_add(remaining));
-    // The syscall does not say which end failed: name the input and the
-    // range here, and the writer names the output outside it.
-    let copy_error = |err: Error| {
-        err.context(format!(
-            "failed to copy bytes {start}..{end} of {}",
-            input.path().display()
-        ))
-    };
-    while remaining > 0 {
-        // Between kernel calls (each at most about 2 GiB): a cancelled run
-        // stops a long splice here; see `copy_range::copy_range`.
-        cancel.check()?;
-        let mut src_off_i64 = src_offset as i64;
-        let mut out_off_i64 = out_offset as i64;
-        let chunk_len = len_to_usize(remaining);
-        let ret = match retry_eintr(|| cfr(&mut src_off_i64, &mut out_off_i64, chunk_len)) {
-            Ok(n) => n,
-            Err(err) => {
-                // Decide on the original syscall error, before any
-                // conversion, and only while nothing of the range has moved.
-                // The fallback is pread -> pwrite with explicit offsets, so
-                // parallel workers don't race on the output fd's position.
-                if src_offset == start
-                    && kernel_copy_refused(
-                        &err,
-                        input.file().as_raw_fd(),
-                        out.as_raw_fd(),
-                        src_offset,
-                        Some(out_offset),
-                        remaining,
-                    )
-                {
-                    record_fallback(remaining);
-                    return copy_range_fallback_pwrite(
-                        out, input, src_offset, out_offset, remaining, cancel,
-                    );
-                }
-                return Err(copy_error(err.into()));
-            }
-        };
-        if ret == 0 {
-            return Err(copy_error(Error::io_kind(
-                io::ErrorKind::UnexpectedEof,
-                "copy_file_range returned 0 before completing",
-            )));
-        }
-        let advanced = ret as u64;
-        src_offset += advanced;
-        out_offset += advanced;
-        remaining -= advanced;
-    }
-    Ok(())
-}
-
-/// Userspace fallback when the kernel refuses the copy, using `pread` +
-/// `pwrite` with explicit offsets. Safe to call concurrently from pool
-/// workers because `pwrite` doesn't touch the fd's file position.
-/// `write_all_at` retries `Interrupted` itself, which is the shared rule.
-#[cfg(feature = "linux-direct-io")]
-fn copy_range_fallback_pwrite(
-    out: &File,
-    input: &crate::read::input::InputFile,
-    mut src_offset: u64,
-    mut out_offset: u64,
-    mut remaining: u64,
-    cancel: &crate::host::Cancel,
-) -> Result<()> {
-    use super::copy_range::{len_to_usize, pread_retrying, read_error};
-    use std::os::unix::io::AsRawFd;
-    let in_fd = input.file().as_raw_fd();
-    let mut buf = vec![0u8; crate::write::IO_BUF_BYTES];
-    while remaining > 0 {
-        cancel.check()?;
-        let chunk = buf.len().min(len_to_usize(remaining));
-        // Safety: `buf` is valid for `chunk <= buf.len()` bytes.
-        let n_u = unsafe { pread_retrying(in_fd, buf.as_mut_ptr(), chunk, src_offset) }
-            .map_err(|err| read_error(err, input, src_offset))?;
-        if n_u == 0 {
-            return Err(read_error(
-                io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "pread returned 0 during userspace copy fallback",
-                ),
-                input,
-                src_offset,
-            ));
-        }
-        out.write_all_at(&buf[..n_u], out_offset)?;
-        src_offset += n_u as u64;
-        out_offset += n_u as u64;
-        remaining -= n_u as u64;
-    }
-    Ok(())
 }
 
 /// Regression test to keep the module compiling under consumer
@@ -790,95 +650,5 @@ mod tests {
         dispatch_loop(&rx, &worker_txs, &failure, 0, &seq_total)
             .expect("a complete one-item stream is not a truncation");
         drop(worker_rx);
-    }
-}
-
-/// The explicit-offset copy loop under scripted kernel answers. The shared
-/// rules themselves are tested in `copy_range`; these check that this loop
-/// applies them with its own offsets.
-#[cfg(all(test, feature = "linux-direct-io"))]
-#[allow(clippy::unwrap_used)]
-mod copy_tests {
-    use super::copy_range_to_fd_with;
-    use crate::error::{ErrorKind, Result};
-    use crate::write::copy_range::tests::{Step, patterned_input, real_copy};
-    use std::collections::VecDeque;
-    use std::io;
-    use std::os::unix::fs::FileExt as _;
-
-    /// Copy `src..src + len` of a fresh input to `out_at` in a fresh output
-    /// that already holds `out_at` bytes of 0xAA, under `script`.
-    fn run(
-        script: &[Step],
-        input_len: usize,
-        src: u64,
-        out_at: u64,
-        len: u64,
-    ) -> (Result<()>, Vec<u8>, Vec<u8>) {
-        let dir = crate::path_guard::tests::scratch();
-        let (input, bytes) = patterned_input(dir.path(), input_len);
-        let out_path = dir.path().join("out.bin");
-        std::fs::write(&out_path, vec![0xAA; usize::try_from(out_at).unwrap()]).unwrap();
-        let out = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&out_path)
-            .unwrap();
-        let mut script: VecDeque<Step> = script.iter().copied().collect();
-        let result = copy_range_to_fd_with(
-            &out,
-            &input,
-            src,
-            out_at,
-            len,
-            &crate::host::Cancel::new(),
-            |src_off, out_off, asked| match script.pop_front().unwrap_or(Step::Copy(usize::MAX)) {
-                Step::Errno(errno) => Err(io::Error::from_raw_os_error(errno)),
-                Step::Copy(cap) => {
-                    let at = u64::try_from(*out_off).unwrap();
-                    let n = real_copy(&input, src_off, asked, cap, |b| {
-                        out.write_all_at(b, at).unwrap();
-                    });
-                    *out_off += i64::try_from(n).unwrap();
-                    Ok(n)
-                }
-            },
-        );
-        drop(out);
-        (result, std::fs::read(&out_path).unwrap(), bytes)
-    }
-
-    #[test]
-    fn eintr_and_short_copies_keep_both_offsets_in_step() {
-        let script = [
-            Step::Errno(libc::EINTR),
-            Step::Copy(10),
-            Step::Errno(libc::EINTR),
-            Step::Copy(1),
-        ];
-        let (result, written, bytes) = run(&script, 1_000, 40, 7, 500);
-        result.unwrap();
-        assert_eq!(&written[..7], &[0xAA; 7]);
-        assert_eq!(&written[7..], &bytes[40..540]);
-    }
-
-    #[test]
-    fn a_first_call_refusal_falls_back_at_the_explicit_offset() {
-        let len = crate::write::IO_BUF_BYTES + 3;
-        let script = [Step::Errno(libc::EINTR), Step::Errno(libc::EOPNOTSUPP)];
-        let (result, written, bytes) = run(&script, len + 9, 9, 5, len as u64);
-        result.unwrap();
-        assert_eq!(&written[..5], &[0xAA; 5]);
-        assert_eq!(&written[5..], &bytes[9..]);
-    }
-
-    #[test]
-    fn a_refusal_after_progress_is_a_hard_error() {
-        let script = [Step::Copy(4), Step::Errno(libc::EINVAL)];
-        let (result, _, _) = run(&script, 100, 0, 0, 100);
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err.kind(), ErrorKind::Io(e) if e.raw_os_error() == Some(libc::EINVAL)),
-            "{err}"
-        );
     }
 }

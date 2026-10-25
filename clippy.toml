@@ -1,4 +1,5 @@
-# Methods that write, or open for reading, a file by path. The lint is off workspace-wide
+# Methods that write, or open for reading, a file by path, and the raw libc
+# byte-moving syscalls (see their group below). The lint is off workspace-wide
 # (`disallowed_methods = "allow"` in Cargo.toml) and denied by crate attribute in
 # the shipped code: the whole library (`src/lib.rs`, outside `cfg(test)`) and the
 # CLI (`cli/src/lib.rs`, `cli/src/main.rs`). Examples, benches and integration
@@ -39,6 +40,25 @@ disallowed-methods = [
     { path = "std::fs::File::open", reason = "inputs open through crate::read::input, which names the path" },
     { path = "std::fs::read", reason = "inputs are read through crate::read::input, which names the path" },
     { path = "std::fs::read_to_string", reason = "inputs are read through crate::read::input, which names the path" },
+    # Raw byte-moving syscalls. Passthrough range copies and their positioned
+    # reads have one owner, `crate::write::copy_range` (`copy_range`,
+    # `read_range`), which holds the crate's only `copy_file_range` and the
+    # shared EINTR / short-count / fallback / cancellation rules. Plain reads
+    # and writes go through std's `File`, which makes the same single syscall.
+    # This governs who calls libc, not every conceivable byte loop: std's
+    # `FileExt::read_at` stays allowed for the read path.
+    { path = "libc::copy_file_range", reason = "range copies go through crate::write::copy_range" },
+    { path = "libc::sendfile", reason = "range copies go through crate::write::copy_range" },
+    { path = "libc::sendfile64", reason = "range copies go through crate::write::copy_range" },
+    { path = "libc::splice", reason = "range copies go through crate::write::copy_range" },
+    { path = "libc::pread", reason = "range reads go through crate::write::copy_range::read_range, others through std FileExt" },
+    { path = "libc::pread64", reason = "range reads go through crate::write::copy_range::read_range, others through std FileExt" },
+    { path = "libc::preadv", reason = "range reads go through crate::write::copy_range::read_range, others through std FileExt" },
+    { path = "libc::pwrite", reason = "positioned writes go through std FileExt::write_all_at" },
+    { path = "libc::pwrite64", reason = "positioned writes go through std FileExt::write_all_at" },
+    { path = "libc::pwritev", reason = "positioned writes go through std FileExt::write_all_at" },
+    { path = "libc::read", reason = "use std::fs::File's Read, which issues the same read(2)" },
+    { path = "libc::write", reason = "use std::fs::File's Write, which issues the same write(2)" },
     { path = "std::process::id", reason = "scratch is named by its run directory, not by pid" },
     { path = "std::env::temp_dir", reason = "scratch goes where the caller put the run directory" },
 ]

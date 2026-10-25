@@ -500,6 +500,34 @@ fn getid_invert(c: &Ctx, input: &Path) -> Invocation {
     getid(c, input).words(&["--invert"])
 }
 
+fn getid_add_referenced_way(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["getid"])
+        .arg(input)
+        .arg("-o")
+        .arg(out_pbf(c))
+        .words(&["w1", "--add-referenced"])
+}
+
+/// `input` as the `-I` ID source of a getid run over the good file.
+fn getid_id_osm_file(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["getid"])
+        .arg(c.fx.path("good.osm.pbf"))
+        .arg("-o")
+        .arg(out_pbf(c))
+        .arg("-I")
+        .arg(input)
+}
+
+/// `input` as the `-I` ID source of a getparents run over the good file.
+fn getparents_id_osm_file(c: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["getparents"])
+        .arg(c.fx.path("good.osm.pbf"))
+        .arg("-o")
+        .arg(out_pbf(c))
+        .arg("-I")
+        .arg(input)
+}
+
 fn getparents(c: &Ctx, input: &Path) -> Invocation {
     Invocation::new(&["getparents"])
         .arg(input)
@@ -1408,10 +1436,25 @@ const FIRST_BLOB_ONLY: &[MixedRow] = &[
     ("sort", sort, Mixed::RefusesPartial),
     ("repack", repack, Mixed::RefusesPartial),
     ("tags-filter", tags_filter, Mixed::RefusesPartial),
-    // getid's walker and full-scan arms are chosen by input size, so neither
-    // refuses: the verdict must not depend on how big the file is.
+    // getid accepts on every path: each one decodes a blob without indexdata
+    // and filters its actual elements, so the output is the wholly indexed
+    // file's. The way-ID row runs `--add-referenced`'s classify walk, and the
+    // `-I` rows read this file as the ID source (getparents shares that
+    // reader).
     ("getid", getid, Mixed::Accepts),
     ("getid --invert", getid_invert, Mixed::Accepts),
+    (
+        "getid --add-referenced",
+        getid_add_referenced,
+        Mixed::Accepts,
+    ),
+    (
+        "getid --add-referenced w1",
+        getid_add_referenced_way,
+        Mixed::Accepts,
+    ),
+    ("getid -I", getid_id_osm_file, Mixed::Accepts),
+    ("getparents -I", getparents_id_osm_file, Mixed::Accepts),
     ("apply-changes", apply_changes, Mixed::RefusesPartial),
     (
         "extract (complete)",

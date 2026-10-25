@@ -24,7 +24,7 @@ use crate::owned::{
     read_node, read_relation, read_way,
 };
 use crate::reorder_buffer::ReorderBuffer;
-use crate::scan::classify::{build_classify_schedule, parallel_classify_phase};
+use crate::scan::classify::{PartialIndex, build_classify_schedule, parallel_classify_phase};
 use crate::write::WriteOptions;
 use crate::writer::{Compression, PbfWriter};
 use crate::{DenseNode, Element, ElementKind, ElementReader, Node, PrimitiveBlock, Relation, Way};
@@ -308,7 +308,7 @@ fn time_filter_snapshot(
     // comparisons; these samples are inert unless the CLI initialized the FIFO.
     crate::debug::emit_mallinfo2("timefilter_snapshot_start_mallinfo");
 
-    let (schedule, shared_file) = build_classify_schedule(input, None, host)?;
+    let (schedule, shared_file) = build_classify_schedule(input, None, PartialIndex::Refuse, host)?;
 
     if schedule.is_empty() {
         crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_END");

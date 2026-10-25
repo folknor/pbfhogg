@@ -1232,6 +1232,7 @@ fn collect_relation_member_closure(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         kind_schedule_filter(crate::ElementKind::Relation, distrust_metadata),
+        crate::scan::classify::PartialIndex::Refuse,
         host,
     )?;
 
@@ -1354,6 +1355,7 @@ fn collect_way_node_dependencies(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         kind_schedule_filter(crate::ElementKind::Way, distrust_metadata),
+        crate::scan::classify::PartialIndex::Refuse,
         host,
     )?;
 

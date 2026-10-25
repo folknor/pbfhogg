@@ -284,9 +284,12 @@ impl HeaderWalker {
     /// so a file indexed on its first blob and not on a later one would
     /// otherwise pass as indexed and run on an index it does not have.
     /// Walks that do not build a schedule (inspect's description, the blob
-    /// count probe) or that sit on one arm of a size-dispatched command
-    /// (getid, getparents) do not opt in, so the verdict never depends on
-    /// input size.
+    /// count probe) do not opt in. Nor do getid's: every getid path decodes
+    /// a blob without indexdata and filters its actual elements, so a
+    /// partially indexed file is correct input for it and is accepted
+    /// (`scan::classify::PartialIndex::Accept` on its classify walks).
+    /// getparents' walker and full-scan arms do not opt in either; being
+    /// chosen by input size, they must not refuse on one arm only.
     #[must_use]
     pub(crate) fn refusing_partial_index(mut self) -> Self {
         self.partial_index = Some(PartialIndexGuard::default());

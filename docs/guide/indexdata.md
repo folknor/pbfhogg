@@ -113,7 +113,13 @@ that read all blob headers to plan their work (among them `sort`,
 `build-geocode-index`, `digest` and `diff`), at the first data blob without
 indexdata; `--force` does not lift that refusal. `pbfhogg cat` indexes every
 blob of such a file. Commands that do not read every header first run on it,
-and so, today, do `getid` and `getparents`.
+and so, today, does `getparents`. `getid` runs on it by design, in every mode
+and as a `-I` ID file (for `getparents` too): it decodes each blob that lacks
+indexdata, so its output is the same as from the file fully indexed, only
+slower. One case still fails: `getid --invert` on a file whose header
+declares way enrichment (such as `LocationsOnWays`) and one of whose blobs
+without indexdata holds ways, since re-encoding those ways would break the
+declaration.
 
 ## The --force flag
 

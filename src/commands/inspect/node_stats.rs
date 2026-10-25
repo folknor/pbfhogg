@@ -272,8 +272,12 @@ fn node_stats_inner(
 
     crate::debug::emit_marker("NODESTATS_START");
 
-    let (schedule, shared_file) =
-        crate::scan::classify::build_classify_schedule(path, Some(crate::ElementKind::Node), host)?;
+    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
+        path,
+        Some(crate::ElementKind::Node),
+        crate::scan::classify::PartialIndex::Refuse,
+        host,
+    )?;
 
     // `None` keeps the classify pool's own host-derived sizing.
     let thread_override = parallelism.fixed();

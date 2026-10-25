@@ -140,6 +140,7 @@ fn tags_count_inner(
             path,
             kind_filter,
             blob_filter.as_ref(),
+            crate::scan::classify::PartialIndex::Refuse,
             host,
         )?;
     if blobs_skipped_by_tag > 0 {

@@ -165,6 +165,22 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   block-pair paths refuse any unindexed blob (a wholly unindexed `diff`
   input takes the sequential fallback instead). Commands whose arm the first
   blob alone decides, and walks that do not opt in, run on such a file.
+- **Refusing a partially indexed file is owed only where a path cannot do
+  without the missing indexdata.** A path that decodes a blob lacking
+  indexdata and works from its actual elements produces the same output as
+  on the wholly indexed file, so for it the refusal removes a capability and
+  protects nothing. Each classify-schedule caller states its policy
+  (`scan::classify::PartialIndex`). `getid` accepts on every path by this
+  rule: the first-blob probe only decides whether the primary input needs
+  `--force` (its first data blob unindexed) and picks the scan arm, and no
+  path skips, copies raw or counts a blob on
+  indexdata it lacks - both include arms, the `--invert` walker,
+  `--add-referenced`'s classify walk and second pass, and the `-I` ID file
+  reader (shared with `getparents`) all decode such a blob. The one refusal
+  left is `getid --invert`'s, for an unindexed blob holding ways under a
+  carried way-enrichment declaration, which re-encoding would break. The
+  other refusals on this page are recorded as current behaviour, not
+  justified by this rule.
 - **What a command does with a wholly unindexed file** - refuse and offer
   `--force`, refuse with no escape, fall back, or verify - is per command.
   The user-facing statement is the `--force` section of

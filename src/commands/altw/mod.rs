@@ -864,8 +864,12 @@ fn collect_way_referenced_node_ids(
     inject_prepass: bool,
     host: &crate::host::Host,
 ) -> Result<(IdSet, Option<IdSet>)> {
-    let (schedule, shared_file) =
-        crate::scan::classify::build_classify_schedule(input, Some(crate::ElementKind::Way), host)?;
+    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
+        input,
+        Some(crate::ElementKind::Way),
+        crate::scan::classify::PartialIndex::Refuse,
+        host,
+    )?;
     let mut referenced = IdSet::new();
     // Prepass needs two independent facts: whether an ID has been seen at
     // all, and whether it was referenced again (a closed ring's repeated last
@@ -973,6 +977,7 @@ pub(crate) fn collect_relation_member_ids(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         Some(crate::ElementKind::Relation),
+        crate::scan::classify::PartialIndex::Refuse,
         host,
     )?;
     let mut member_node_ids = want_nodes.then(IdSet::new);

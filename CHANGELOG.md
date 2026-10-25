@@ -1121,6 +1121,17 @@
 
 ### Fixed
 
+- **`getid` accepts a partially indexed input in every mode.** A file whose
+  first data blob carries indexdata and a later one does not was refused by
+  `getid --add-referenced` when way IDs were requested, and as a
+  `-I`/`--id-osm-file` ID file by `getid` and `getparents`, while every
+  other `getid` mode ran on it. Every `getid` path decodes a blob that
+  lacks indexdata, so the output is the same as from the file fully
+  indexed; these now run too. A primary input whose first data blob lacks
+  indexdata still needs `--force` (an `-I` file never did), and
+  `getid --invert` still refuses an unindexed blob holding ways under a
+  header that declares way enrichment.
+
 - **`apply-changes --force` writes a wholly indexed output.** On an
   unindexed base, the blobs the diff rewrote got indexdata and the ones it
   left alone were copied without it, so the output was partially indexed and

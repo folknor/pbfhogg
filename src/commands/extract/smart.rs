@@ -529,6 +529,7 @@ pub(super) fn extract_smart(
             crate::scan::classify::build_classify_schedule(
                 input,
                 Some(crate::ElementKind::Way),
+                crate::scan::classify::PartialIndex::Refuse,
                 host,
             )?
         } else {

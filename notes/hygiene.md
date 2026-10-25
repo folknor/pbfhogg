@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-6. HYG-153
 7. HYG-154
 8. HYG-155
 9. HYG-156
@@ -444,6 +443,17 @@ The judgement calls already known, to be checked first:
     kind's modifications and put its creates out of type order. A new
     `DrainItem::Omitted` drops a blob with no element instead of copying it
     unindexed (it also used to fake a type transition to Node).
+- getid accepts a partially indexed file on every path, a contract choice
+  against the uniform refusal the schedule walks introduced: the finding
+  asked for refusals where a full walk already happens, and the drain
+  decided instead that refusal is owed only where a path cannot do without
+  the missing indexdata (`reference/indexdata-trust.md`). Classify builders
+  take a `PartialIndex` policy; getid's `--add-referenced` pass 1 and the
+  `-I` reader (`parse_ids_from_pbf`, shared with getparents) accept, every
+  other caller refuses as before. A reviewer should confirm no getid path
+  decides from indexdata a blob lacks, and judge whether the other
+  refusals should follow the same rule. The builder change adds one branch
+  at walker open; not measured.
 
 ---
 
@@ -1195,36 +1205,29 @@ position and bounding it means an external merge.
 
 Reported by: re-encoding.
 
-## HYG-153 - getid trusts the first blob's indexdata for the whole file
-
-Anger: 8 - indexdata trust model, one command.
-
-Split out of the indexdata trust model entry, now resolved as
-`reference/indexdata-trust.md`. getid's walker and full-scan arms are chosen by input
-size, and neither walk opts into `HeaderWalker::refusing_partial_index`, so
-a file indexed on its first blob only passes. `getid --add-referenced` is
-covered only when way IDs are asked for, since its classify walk runs only
-then.
-
-Recommendation (2026-10-25): opt into the partial-index refusal only where a
-full header walk already happens; add no new walk. Where none happens,
-record on `reference/indexdata-trust.md` ("Missing and partial indexdata",
-which today says only that commands whose arm the first blob alone decides
-run on a partial file) that getid decides from the first blob. Move the
-contract table rows that change.
-
-Reported by: change application, re-encoding, altw and scanning, geocode
-index (the indexdata trust model entry).
-
 ## HYG-154 - getparents trusts the first blob's indexdata for the whole file
 
 Anger: 8 - indexdata trust model, one command.
 
 Split out of the indexdata trust model entry, now resolved as
-`reference/indexdata-trust.md`. As HYG-153: the walker and full-scan arms are chosen
-by input size and neither opts into the partial-index refusal.
+`reference/indexdata-trust.md`. getparents' walker and full-scan arms are
+chosen by input size and neither opts into
+`HeaderWalker::refusing_partial_index`, so a file indexed on its first blob
+only passes.
 
-Recommendation (2026-10-25): as HYG-153.
+Recommendation (2026-10-25): opt into the partial-index refusal only where a
+full header walk already happens; add no new walk. Where none happens,
+record on `reference/indexdata-trust.md` ("Missing and partial indexdata")
+that the command decides from the first blob. Move the contract table rows
+that change.
+
+Precedent from the getid entry, resolved against that recommendation: the
+trust page now says refusing a partial file is owed only where a path cannot
+do without the missing indexdata, and getid accepts on every path because
+each decodes a blob lacking indexdata. Classify builders take a
+`PartialIndex` policy per call site. The `-I` reader getparents shares with
+getid already accepts. Test this command's paths against the same rule
+before choosing either way.
 
 Reported by: change application, re-encoding, altw and scanning, geocode
 index (the indexdata trust model entry).
@@ -1237,7 +1240,7 @@ Split out of the indexdata trust model entry, now resolved as
 `reference/indexdata-trust.md`. Both modes decide from the first data blob whether the
 whole file is indexed.
 
-Recommendation (2026-10-25): as HYG-153.
+Recommendation (2026-10-25): as HYG-154, precedent included.
 
 Reported by: change application, re-encoding, altw and scanning, geocode
 index (the indexdata trust model entry).
@@ -1250,7 +1253,7 @@ Split out of the indexdata trust model entry, now resolved as
 `reference/indexdata-trust.md`. `tags-filter -R` decides from the first data blob,
 while tags-filter's other schedule walks already refuse a partial file.
 
-Recommendation (2026-10-25): as HYG-153.
+Recommendation (2026-10-25): as HYG-154, precedent included.
 
 Reported by: change application, re-encoding, altw and scanning, geocode
 index (the indexdata trust model entry).
@@ -1263,7 +1266,7 @@ Split out of the indexdata trust model entry, now resolved as
 `reference/indexdata-trust.md`. time-filter's history path decides from the first
 data blob, while its non-history classify walk refuses a partial file.
 
-Recommendation (2026-10-25): as HYG-153.
+Recommendation (2026-10-25): as HYG-154, precedent included.
 
 Reported by: change application, re-encoding, altw and scanning, geocode
 index (the indexdata trust model entry).

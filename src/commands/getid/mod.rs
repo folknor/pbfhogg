@@ -251,6 +251,10 @@ fn id_file_token(raw: &str) -> Option<&str> {
 /// Reads every node, way, and relation in the file and adds its ID to the
 /// returned `ElementIds`. No member or reference IDs are collected - only
 /// top-level element IDs (matching osmium's `--id-osm-file` behavior).
+///
+/// Every data blob is decoded and its IDs read from the elements, so
+/// indexdata decides nothing here and a partially indexed file gives the
+/// same set as a wholly indexed one: the walk accepts it.
 pub fn parse_ids_from_pbf(
     path: &Path,
     _direct_io: bool,
@@ -258,7 +262,12 @@ pub fn parse_ids_from_pbf(
 ) -> Result<ElementIds> {
     let mut set = ElementIds::empty();
 
-    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(path, None, host)?;
+    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
+        path,
+        None,
+        crate::scan::classify::PartialIndex::Accept,
+        host,
+    )?;
 
     struct IdBatch {
         node_ids: Vec<i64>,
@@ -458,6 +467,18 @@ fn getid_dispatched(
     // The indexdata result selects an arm only for the no-references path.
     // add_referenced still shares the refusal above: --force explicitly opts
     // into its slower unindexed scans even though it does not dispatch an arm.
+    //
+    // This first-blob probe is the only indexing decision getid makes. A
+    // partially indexed file (indexed first data blob, a later one without
+    // indexdata) is accepted on every path, deliberately and without a
+    // refusing walk: no getid path skips, copies or counts a blob on the
+    // strength of indexdata it lacks. Both include arms, the invert walker,
+    // `--add-referenced`'s two passes and `-I`'s walk decompress such a blob
+    // and filter its actual elements, so the output equals the one from the
+    // same file wholly indexed; only the decode costs more. The one refusal
+    // that can follow is the invert walker's, for an unindexed way blob under
+    // a carried way-enrichment declaration, which re-encoding would break.
+    // reference/indexdata-trust.md, "Missing and partial indexdata".
     let (arm, result) = if opts.add_referenced {
         let stats = getid_with_refs(input, output, ids, opts, write, overrides, host)?;
         (None, stats)
@@ -996,10 +1017,14 @@ fn getid_with_refs(
 
     if ids.way_ids.has_any() {
         // Parallel classification: pread workers scan way blobs for matching
-        // way IDs and collect their node refs.
+        // way IDs and collect their node refs. A blob without indexdata is
+        // scheduled and decoded, and the worker looks only at the ways it
+        // actually holds, so a partially indexed file is accepted here as on
+        // every other getid path (see `getid_dispatched`).
         let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
             input,
             Some(crate::ElementKind::Way),
+            crate::scan::classify::PartialIndex::Accept,
             host,
         )?;
 
@@ -1566,6 +1591,51 @@ mod tests {
             read_ids(&output, &crate::host::Host::for_tests()),
             vec![1, 2, 10]
         );
+    }
+
+    /// A file indexed on its node blob and not on its way blob is accepted by
+    /// `--add-referenced`'s classify walk and by the `-I` reader, and both
+    /// read the unindexed blob's actual elements: the way and the nodes it
+    /// references come out, and every ID is collected.
+    #[test]
+    fn partially_indexed_input_is_read_in_full_by_the_classify_walks() {
+        let dir = crate::path_guard::tests::scratch();
+        let input = dir.path().join("partial.pbf");
+        write_blocks(&input, &[1, 2, 3], Some((10, &[1, 2])), false);
+        let host = crate::host::Host::for_tests();
+        let ids = parse_ids(&["w10".to_owned()]).unwrap();
+        let opts = GetidOptions {
+            add_referenced: true,
+            remove_tags: false,
+            report_found: false,
+        };
+        let output = dir.path().join("output.pbf");
+        let staged = crate::output::Output::new(
+            &output,
+            crate::output::Overwrite::Refuse,
+            &crate::host::Diagnostics::discard(),
+        )
+        .unwrap();
+        let (arm, stats) = getid_dispatched(
+            &input,
+            &staged,
+            &ids,
+            &opts,
+            &WriteOptions::default(),
+            &HeaderOverrides::default(),
+            FULL_SCAN_ARM_MIN_BLOBS,
+            &host,
+        )
+        .unwrap();
+        staged.publish(&crate::host::Cancel::new()).unwrap();
+        assert_eq!(arm, None);
+        assert_eq!((stats.nodes_written, stats.ways_written), (2, 1));
+        assert_eq!(read_ids(&output, &host), vec![1, 2, 10]);
+
+        let collected = parse_ids_from_pbf(&input, false, &host).unwrap();
+        assert!((1..=3).all(|id| collected.node_ids.get(id)));
+        assert!(collected.way_ids.get(10));
+        assert!(!collected.relation_ids.has_any());
     }
 
     /// Run the same include-mode query under both arms, assert they emit

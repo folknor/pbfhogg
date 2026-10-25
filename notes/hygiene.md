@@ -70,14 +70,16 @@ goes on "Review once drained" as a bisect candidate, named by commit.
 
 Launch order, one agent per line, run serially:
 
-28. HYG-180
-29. BUG-183
 30. BUG-190
-31. HYG-077 (last: it annotates files across the crate)
+31. HYG-010
+32. HYG-012
+33. HYG-013
+34. HYG-014
+35. HYG-077 (last: it annotates files across the crate)
 
-Discussed and skipped for now: HYG-036, HYG-037, HYG-058, HYG-109, HYG-181,
-HYG-182. Not discussed: HYG-002, HYG-010, HYG-011, HYG-012, HYG-013,
-HYG-014, HYG-015, HYG-016, HYG-053, HYG-081, BUG-009.
+Discussed and skipped for now: HYG-011, HYG-036, HYG-037, HYG-058, HYG-109,
+HYG-181, HYG-182. Not discussed yet: HYG-002, HYG-015, HYG-016, HYG-053,
+HYG-081, BUG-009, BUG-191.
 
 ---
 
@@ -892,6 +894,30 @@ The judgement calls already known, to be checked first:
   adds on a poisoned builder are deliberately not checked, so they still
   mutate its buffers; `can_add_*` answers kind and capacity only. The
   zero-cap panic the finding also named was already gone (`NonZeroUsize`).
+- The raw node scanner's dense loop (`scan/node.rs::scan_dense_coords`,
+  the per-node hot loop of altw sparse pass 1, altw external stage 2,
+  extract simple and apply-changes' node coords) now reads `id`, `lat` and
+  `lon` with three `protohoggr::Cursor::read_varint` calls in lockstep and
+  propagates their errors, then requires the `lat` and `lon` cursors empty,
+  instead of zipping three `PackedSint64Iter`s that stopped silently at the
+  shortest array or first bad varint. Same decoder, no extra pass, errors
+  built out of line; argued cost-neutral, not measured. Codex accepted the
+  mechanism but not "identical performance follows from identical
+  branches": codegen of three sequential fallible reads versus the old
+  tuple evaluation is the open question. Measure at planet on both altw
+  index types. The per-ref loops of the raw way scanner
+  (`scan/way.rs::accumulate_refs`: altw, extract simple, geocode passes
+  1.5 and 2) and altw's way rewriter (`altw/reframe.rs`) got the same
+  change, for the same silent stop on a bad refs varint; same argument,
+  not measured.
+- The block validator's `packed_varint_count` (every packed sint64 and
+  int32 array on every `PrimitiveBlock` construction) and
+  `packed_uint32_count` (`keys` / `vals`) now track the byte position within
+  each varint and refuse a tenth byte above `1`, matching
+  `Cursor::read_varint`, which previously made a ten-byte overflowing varint
+  count as one value and decode as none. Still one byte scan, but the
+  former's loop body grew from one compare to a position counter; a
+  construction-time cost on every read path, not measured.
 
 ---
 
@@ -1006,6 +1032,10 @@ router payloads), which also merges the two `reframe_way_blob_with_locations`
 (same name, different signatures). Enforce by dependency rule:
 `std::thread::scope`, `sync_channel` and `Arc::new(Mutex::new(` allowed only in
 the pipeline module.
+
+Maintainer (2026-10-25): skipped for now. A unified pool has been considered
+twice before and judged not worth doing once every implementation was
+catalogued; if it is done at all, it is done last.
 
 Reported by: altw and scanning, re-encoding, filtering and spatial, read path,
 geocode index.

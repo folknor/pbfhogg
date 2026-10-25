@@ -668,29 +668,58 @@ impl PrimitiveBlock {
     }
 }
 
-/// Count the values in a packed varint array, rejecting one that ends
-/// mid-varint.
+/// Count the values in a packed varint array, rejecting exactly the arrays
+/// that the packed iterators would stop decoding early.
 ///
-/// A varint's last byte has the continuation bit clear, so the value count is
-/// the number of such bytes and a trailing continuation byte means the array
-/// was truncated. This is a byte scan, not a decode - no value is
-/// reconstructed.
+/// Every packed iterator reads through `protohoggr::Cursor::read_varint` and
+/// turns its error into an end of iteration, so the parallel-array checks
+/// built on this count are only worth anything if this accepts precisely what
+/// repeated `read_varint` consumes in full. That decoder refuses three shapes:
+/// an array that ends mid-varint, a tenth byte with any bit set above the
+/// lowest (payload past 64 bits, or a continuation bit), and so anything
+/// longer than ten bytes. A plain count of terminal bytes, which this used to
+/// be, catches only the first: a ten-byte varint ending in `0x02` counted as
+/// one value here and decoded as none, so a "validated" dense group yielded
+/// one node fewer than its id count, and the independently decoded columnar
+/// arrays could pair an id with another node's coordinates.
+///
+/// Byte `i` of a varint (zero-based) is accepted as-is for `i < 9` and must be
+/// at most `1` at `i == 9`. Overlong encodings that stay within ten bytes are
+/// accepted, as the decoder accepts them, and so are sign-extended ten-byte
+/// negative `int32` values. This is a byte scan, not a decode - no value is
+/// reconstructed. `packed_varint_count_matches_read_varint` pins the
+/// equivalence against the decoder itself.
 #[inline]
 fn packed_varint_count(data: &[u8]) -> Result<usize> {
     let mut count = 0usize;
-    let mut open = false;
+    // Index of the current byte within its varint.
+    let mut pos = 0u8;
     for &b in data {
-        if b & 0x80 == 0 {
+        if pos == 9 {
+            if b > 1 {
+                return Err(overlong_varint_err());
+            }
             count += 1;
-            open = false;
+            pos = 0;
+        } else if b & 0x80 == 0 {
+            count += 1;
+            pos = 0;
         } else {
-            open = true;
+            pos += 1;
         }
     }
-    if open {
+    if pos != 0 {
         return Err(new_wire_error("packed varint array ends mid-varint"));
     }
     Ok(count)
+}
+
+/// A varint that runs past ten bytes or carries payload past bit 63 - one the
+/// decoder refuses, which the packed iterators would turn into a silent end.
+#[cold]
+#[inline(never)]
+fn overlong_varint_err() -> crate::error::Error {
+    new_wire_error("packed varint array holds a varint wider than 64 bits")
 }
 
 /// [`packed_varint_count`] for a `uint32` string-index array (`keys` / `vals`
@@ -710,11 +739,14 @@ fn packed_varint_count(data: &[u8]) -> Result<usize> {
 /// iff byte 4 carries nothing above bit 31 (payload at most `0x0f`) and every
 /// later byte carries nothing at all. An overlong encoding of a small value
 /// (zero payload bytes past the fifth) therefore fits, as it does for a
-/// decoding reader.
+/// decoding reader - up to the decoder's own ten-byte limit, past which it
+/// refuses the varint (see [`packed_varint_count`]), so a continuation bit on
+/// the tenth byte is refused here too.
 #[inline]
 fn packed_uint32_count(data: &[u8]) -> Result<usize> {
     let mut count = 0usize;
-    // Index of the current byte within its varint, saturating past 5.
+    // Index of the current byte within its varint; never past 9, because the
+    // tenth byte either terminates the varint or is refused.
     let mut pos = 0u8;
     for &b in data {
         let payload = b & 0x7f;
@@ -729,8 +761,10 @@ fn packed_uint32_count(data: &[u8]) -> Result<usize> {
         if b & 0x80 == 0 {
             count += 1;
             pos = 0;
+        } else if pos == 9 {
+            return Err(overlong_varint_err());
         } else {
-            pos = pos.saturating_add(1).min(5);
+            pos += 1;
         }
     }
     if pos != 0 {
@@ -1610,6 +1644,134 @@ mod strict_validation_tests {
         good.extend_from_slice(&len_field(9, &[0x02, 0x02]));
         PrimitiveBlock::from_vec(block_with_groups(&[len_field(2, &good)]))
             .expect("the untruncated fixture must parse");
+    }
+
+    /// A ten-byte varint whose last byte carries payload past bit 63 counts as
+    /// one terminal byte but decodes as nothing, so a count-only check accepted
+    /// it and the dense iterator then yielded one node fewer than the id count.
+    /// Every count here is 1, so only the width check can reject it.
+    #[test]
+    fn dense_packed_array_with_overlong_varint_is_rejected() {
+        let mut overflow = vec![0x80u8; 9];
+        overflow.push(0x02);
+        let mut dense = len_field(1, &overflow);
+        dense.extend_from_slice(&len_field(8, &[0x00]));
+        dense.extend_from_slice(&len_field(9, &[0x00]));
+        let err = PrimitiveBlock::from_vec(block_with_groups(&[len_field(2, &dense)]))
+            .expect_err("a varint wider than 64 bits must be rejected");
+        assert!(
+            format!("{err}").contains("wider than 64 bits"),
+            "expected the varint width check, got: {err}"
+        );
+
+        // The widest legal ten-byte varint is the passing counterpart.
+        let mut widest = vec![0xffu8; 9];
+        widest.push(0x01);
+        let mut good = len_field(1, &widest);
+        good.extend_from_slice(&len_field(8, &[0x00]));
+        good.extend_from_slice(&len_field(9, &[0x00]));
+        let block = PrimitiveBlock::from_vec(block_with_groups(&[len_field(2, &good)]))
+            .expect("a legal ten-byte varint must parse");
+        assert_eq!(block.elements().count(), 1);
+    }
+
+    /// The packed-array validators accept exactly the arrays the decoder
+    /// consumes in full. Every packed iterator turns a `read_varint` error into
+    /// an end of iteration, so any input the validator accepts and the decoder
+    /// does not is a silently short array behind a passed parallel-length
+    /// check. The oracle is the decoder itself, stopping at its first error;
+    /// for the `uint32` validator it also requires every value to fit `u32`.
+    #[test]
+    fn packed_varint_count_matches_read_varint() {
+        use crate::read::wire::Cursor;
+
+        fn oracle(data: &[u8], max: u64) -> Option<usize> {
+            let mut cursor = Cursor::new(data);
+            let mut count = 0;
+            while !cursor.is_empty() {
+                let value = cursor.read_varint().ok()?;
+                if value > max {
+                    return None;
+                }
+                count += 1;
+            }
+            Some(count)
+        }
+
+        fn check(data: &[u8]) {
+            assert_eq!(
+                super::packed_varint_count(data).ok(),
+                oracle(data, u64::MAX),
+                "packed_varint_count disagrees with read_varint on {data:02x?}"
+            );
+            assert_eq!(
+                super::packed_uint32_count(data).ok(),
+                oracle(data, u64::from(u32::MAX)),
+                "packed_uint32_count disagrees with read_varint on {data:02x?}"
+            );
+        }
+
+        // Exhaustive short strings over bytes that sit on every boundary the
+        // validators care about: terminal versus continuation, payload above
+        // the u32 limit in byte 4, and the tenth-byte limit of 1.
+        let alphabet = [0x00u8, 0x01, 0x02, 0x0f, 0x10, 0x7f, 0x80, 0x81, 0x8f, 0xff];
+        let mut buf = Vec::new();
+        for len in 0..=5u32 {
+            for mut index in 0..alphabet.len().pow(len) {
+                buf.clear();
+                for _ in 0..len {
+                    buf.push(alphabet[index % alphabet.len()]);
+                    index /= alphabet.len();
+                }
+                check(&buf);
+            }
+        }
+
+        // Random strings almost never reach a tenth byte, so build that case
+        // directly: every continuation run up to eleven bytes, then every
+        // possible next byte, with and without a valid value before it and
+        // with a terminal, a continuation, or nothing after it.
+        for fill in [0x80u8, 0x8f, 0xff] {
+            for run in 0..=11 {
+                for last in 0..=255u8 {
+                    for prefix in [&[][..], &[0x02]] {
+                        for suffix in [&[][..], &[0x02], &[0x80]] {
+                            buf.clear();
+                            buf.extend_from_slice(prefix);
+                            buf.extend(std::iter::repeat_n(fill, run));
+                            buf.push(last);
+                            buf.extend_from_slice(suffix);
+                            check(&buf);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Longer pseudo-random strings, biased toward continuation bytes so
+        // multi-byte and overlong varints are common.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..20_000 {
+            buf.clear();
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            #[allow(clippy::cast_possible_truncation)]
+            let len = (state % 40) as usize;
+            for _ in 0..len {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                #[allow(clippy::cast_possible_truncation)]
+                let byte = state as u8;
+                buf.push(if state & 0x300 == 0 {
+                    byte & 0x7f
+                } else {
+                    byte | 0x80
+                });
+            }
+            check(&buf);
+        }
     }
 
     /// A malformed element sub-message is a hard error, not a skipped element.

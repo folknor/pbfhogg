@@ -1161,6 +1161,21 @@
 
 ### Fixed
 
+- **A corrupt dense node group is refused instead of silently losing
+  nodes.** `add-locations-to-ways` (both index types), `extract --strategy
+  simple` and `apply-changes --locations-on-ways` read node coordinates
+  with a scanner of their own that stopped at the shortest of a dense
+  group's `id`, `lat` and `lon` arrays and at the first malformed varint,
+  so a group whose arrays disagreed in length or ended mid-value yielded
+  fewer nodes and exited 0, leaving ways that reference the lost nodes
+  without locations. It now fails with a wire error. The block reader
+  refused those shapes already, but accepted a packed array holding a
+  ten-byte varint wider than 64 bits and then decoded it as nothing; it now
+  refuses that too, as do the way-ref scanner used by
+  `add-locations-to-ways`, `extract` and `build-geocode-index`, and
+  `add-locations-to-ways`' way rewriter, which used to copy such a refs
+  array through with locations for only part of the way.
+
 - **`BlockBuilder` refuses an element its block cannot take instead of
   panicking.** Library: an `add_*` call on a block that is at its element
   cap or holds another element kind (the case `can_add_node`, `can_add_way`

@@ -238,7 +238,8 @@ group, in order:
 2. every `Node` / `Way` / `Relation` sub-message parses,
 3. every element's optional `Info` sub-message parses,
 4. every packed array on those elements holds only complete,
-   bounded varints, and the parallel-array invariants the zipping
+   bounded varints (see "Which varints count as complete" below),
+   and the parallel-array invariants the zipping
    iterators depend on hold: `keys` against `vals` on all three
    kinds, `lat` against `lon` against `refs` on ways, and
    `roles_sid` against `memids` against `types` on relations,
@@ -290,6 +291,31 @@ Two encodings stay legal and are not truncation: an absent
 `keys_vals`, meaning no node in the group has tags; and a final
 tag run that ends at the end of the array without its `0`
 terminator, which some writers emit.
+
+### Which varints count as complete
+
+Every packed iterator decodes with `protohoggr`'s
+`Cursor::read_varint` and turns its error into an end of
+iteration, so a length check is only as good as the count it
+compares. The count therefore accepts exactly the arrays repeated
+`read_varint` consumes in full: no array may end mid-varint, and
+the tenth byte of a varint must be `0` or `1` (anything more is
+payload past bit 63 or an eleventh byte, which the decoder
+refuses). Overlong encodings within ten bytes, and the ten-byte
+sign-extended negatives of `int32` fields, stay legal because the
+decoder accepts them. The count used to look only at terminal
+bytes, so a ten-byte varint ending in `0x02` counted as one value
+and decoded as none: a validated dense group then yielded one node
+fewer than its id count, and the columnar decoder, which decodes
+the three arrays independently, could pair an id with another
+node's coordinates. A unit test checks the count against the
+decoder itself.
+
+This is a decodability guarantee, not a value-range one. Apart
+from the `uint32` string-index arrays, which are bounded to `u32`,
+a value that decodes but does not fit the type its iterator
+narrows it to (an `int32` above `i32::MAX`, a `sint32` whose raw
+varint exceeds `u32`) is not refused at construction.
 
 ## Which wire forms of a packed field count as present
 
@@ -349,7 +375,9 @@ parser of its own, so the policy cannot drift again:
 - `src/scan/way.rs` parses each Way via `WireWay::parse`. It had
   matched `WIRE_LEN` only on `refs`, `keys` and `vals`; an unpacked
   `refs` invoked no callback at all and the caller concluded the way
-  referenced no nodes - a silently short node index.
+  referenced no nodes - a silently short node index. It decodes
+  `refs` with the fallible `read_varint` and propagates its error,
+  since no block construction validated the array first.
 - `src/blob_meta/scan.rs` parses every element message (`Node`,
   `DenseNodes`, `Way`, `Relation`) via the `wire.rs` parsers. Its
   predecessor read an unpacked `id` array as empty, so the blob
@@ -357,6 +385,15 @@ parser of its own, so the policy cannot drift again:
 - `src/scan/node.rs` already routed through `WireDenseNodes::parse`
   and never had the defect; its own top-level matcher touches only
   submessages and scalar fields, neither of which can be packed.
+  Because it never constructs a `PrimitiveBlock`, it makes the
+  block layer's dense coordinate checks itself, during the decode
+  it already performs: `id`, `lat` and `lon` are read in lockstep
+  with the fallible `read_varint`, and the group is refused unless
+  all three arrays end together. It used to zip three infallible
+  packed iterators, which stopped at the shortest array or the
+  first bad varint, so a malformed group scanned to fewer nodes and
+  the altw node index silently missed them. It does not validate
+  `keys_vals` or `denseinfo`, which it never reads.
 
 **Handled locally, because routing is impossible:**
 
@@ -377,7 +414,10 @@ parser of its own, so the policy cannot drift again:
   coordinates were appended, and the way came out of
   `add-locations-to-ways` with no locations at all. It also strips
   both forms of the stale `lat` / `lon` / pins fields, so an unpacked
-  stale coordinate can no longer survive next to the fresh one. The
+  stale coordinate can no longer survive next to the fresh one. It
+  decodes `refs` with the fallible `read_varint` too: an array that
+  ends mid-varint or holds a varint wider than 64 bits used to be
+  copied through verbatim with locations for only its prefix. The
   normalization is byte-exact for every packed input, including an
   empty packed segment: `add-locations-to-ways` output is compared
   byte-wise against osmium in `brokkr verify`, so re-emitting the

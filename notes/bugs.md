@@ -63,30 +63,27 @@ CHANGELOG) say so. The walker does not learn device sizes.
 
 Reported by: the HYG-186 resolution.
 
-## BUG-183 - The raw node scanner truncates a dense group whose arrays disagree
+## BUG-191 - Narrow packed values that do not fit their type alias silently
 
-Anger: 8 - altw sparse pass 1 and external stage 2 run on it.
+Anger: 9 - the fix is construction-time validation on every read path.
 
-`scan/node.rs::extract_node_coords` bypasses `PrimitiveBlock` construction,
-so none of `validate_groups_strict`'s dense checks run on its input. Its
-dense loop is `while let (Some(did), Some(dlat), Some(dlon)) = ...`, which
-stops at the shortest of the `id`, `lat` and `lon` arrays: a group whose
-arrays disagree in length, or whose packed array ends mid-varint (assuming
-`protohoggr`'s packed iterators end there, as the block layer's docs say
-they do), yields fewer nodes with no error, and the node index it feeds
-misses them. The block decoder refuses both shapes ("dense group has
-mismatched id/lat/lon array lengths", `packed_varint_count`). Found while
-checking the `WireMessageIter` callers for the element `Info` change; not
-verified with a test. A check after the loop is not enough: the tuple
-pattern calls all three `next()`s before matching, so it consumes the
-unmatched tail, and a clean end cannot be told from a truncated varint if
-both read as `None`. The fix needs fallible counting (the block layer's
-`packed_varint_count`) or per-iterator handling of each result.
+Block construction now guarantees that every packed array decodes in full
+with `Cursor::read_varint` and that the parallel arrays agree in length,
+but not that each value fits the type the iterator narrows it to.
+`protohoggr`'s typed wrappers narrow after decoding: `PackedInt32Iter`
+casts the `u64` to `i32`, `PackedSint32Iter` truncates to `u32` before the
+zigzag step, and `PackedBoolIter` maps any nonzero value to `true`. So a
+`DenseInfo.version` of `2^32` reads as version 0, a `DenseInfo.uid` or
+`user_sid` delta of zigzag `2^32` reads as delta 0, a relation member type
+of `2^32` reads as a node member, and a `roles_sid` of `2^32 + n` aliases
+string `n`. The `uint32` tag-index arrays are already bounded in
+`packed_uint32_count`; the fix for the others is the same single-scan
+width check, for `int32` keeping sign-extended ten-byte negatives legal
+and for `sint32` bounding the raw varint to `u32`. Raised by codex in the
+dense-scanner spar; the narrowing casts were read in protohoggr 0.4.0, not
+verified with a test.
 
-Maintainer (2026-10-25): fail loudly and early, without impacting
-performance.
-
-Reported by: the element metadata accessor change.
+Reported by: the BUG-183 resolution.
 
 ## BUG-009 - `apply-changes --locations-on-ways` does not update untouched base ways
 

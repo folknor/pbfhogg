@@ -13,6 +13,11 @@
 //! retain their single group walk; a second walk is needed only when a group
 //! contains plain nodes, to preserve the element iterator's dense-first order.
 //!
+//! Skipping construction also skips `validate_groups_strict`, so the dense
+//! coordinate checks it makes (equal-length, well-formed `id`/`lat`/`lon`
+//! arrays) are made here instead, during the decode itself; see
+//! `scan_dense_coords`.
+//!
 //! # Known limitations
 //!
 //! - **Sorted PBF assumption.** The indexdata-based blob skip (`ElementKind::Node` check)
@@ -59,6 +64,112 @@ fn decimicro(offset: i64, granularity: i64, raw: i64) -> Result<i32> {
     })
 }
 
+/// Error for a dense `id` array that ends mid-varint or holds a varint wider
+/// than 64 bits. Out of line: only a corrupt block reaches it.
+#[cold]
+#[inline(never)]
+fn dense_id_err() -> crate::error::Error {
+    crate::error::new_wire_error("dense group id array holds a truncated or overlong varint")
+}
+
+/// Error for a dense `lat` or `lon` array that is shorter than the `id`
+/// array or holds a truncated or overlong varint. A failed read cannot tell
+/// those apart cheaply (a truncated final varint also leaves the cursor
+/// empty), and both mean the same thing here: the group's coordinate
+/// arrays do not describe its ids.
+#[cold]
+#[inline(never)]
+fn dense_coord_err() -> crate::error::Error {
+    crate::error::new_wire_error(
+        "dense group lat/lon array is shorter than its id array or holds a \
+         truncated or overlong varint",
+    )
+}
+
+/// Error for a dense `lat` or `lon` array with values left over after the
+/// last id.
+#[cold]
+#[inline(never)]
+fn dense_mismatch_err() -> crate::error::Error {
+    crate::error::new_wire_error("dense group has mismatched id/lat/lon array lengths")
+}
+
+/// Decode one dense group's `id`, `lat` and `lon` arrays in lockstep into
+/// `sink`, refusing any group whose arrays are not three complete varint
+/// streams of equal length.
+///
+/// This scanner bypasses `PrimitiveBlock` construction, so the checks
+/// `validate_groups_strict` makes on these three arrays have to happen here.
+/// They cost no extra pass: each value is read with `Cursor::read_varint`,
+/// the same decoder `PackedSint64Iter` wraps, but its error is propagated
+/// instead of being turned into an end of iteration. A successful read
+/// consumes exactly one complete varint, so `n` successful lockstep reads
+/// followed by three empty cursors is exactly "three well-formed arrays of
+/// `n` values each":
+///
+/// - an array that ends mid-varint, or holds a varint past 64 bits, fails
+///   its read;
+/// - a `lat` or `lon` array shorter than `id` fails a read on an empty
+///   cursor;
+/// - a `lat` or `lon` array longer than `id` is left non-empty.
+///
+/// The previous `while let (Some(..), Some(..), Some(..))` over three
+/// `PackedSint64Iter`s stopped at the shortest array and at the first
+/// malformed varint, so such a group scanned to fewer nodes with no error
+/// and the node index built from it silently missed them.
+///
+/// Failure is streaming, not atomic: nodes before the malformed value have
+/// already reached `sink` when the error returns. Every caller propagates
+/// the error and abandons the operation, so that partial output is never
+/// used.
+///
+/// Only the coordinate streams are validated. `keys_vals` and `denseinfo`
+/// are never read by this scanner, so their contents cannot change its
+/// output, and they are not checked here.
+#[inline]
+fn scan_dense_coords(
+    dense: &crate::read::wire::WireDenseNodes<'_>,
+    granularity: i64,
+    lat_offset: i64,
+    lon_offset: i64,
+    sink: &mut impl FnMut(i64, i32, i32),
+) -> Result<()> {
+    use crate::read::wire::Cursor;
+    use protohoggr::zigzag_decode_64;
+
+    let mut ids = Cursor::new(dense.id_data);
+    let mut lats = Cursor::new(dense.lat_data);
+    let mut lons = Cursor::new(dense.lon_data);
+    let mut cum_id: i64 = 0;
+    let mut cum_lat: i64 = 0;
+    let mut cum_lon: i64 = 0;
+
+    // Deltas sum modulo 2^64, as the decoder and the writer do, so a
+    // block whose IDs wrap (the writer encodes `i64::MIN` then
+    // `i64::MAX` as deltas `MIN`, `-1`) scans to the IDs every reader
+    // yields. A wrapped coordinate cannot slip through: a sum that wraps
+    // lands at least 2^63 away from the previous, accepted coordinate,
+    // far outside the window `decimicro` accepts for any granularity and
+    // offset, so it is refused exactly where a checked sum was.
+    while !ids.is_empty() {
+        let did = zigzag_decode_64(ids.read_varint().map_err(|_| dense_id_err())?);
+        let dlat = zigzag_decode_64(lats.read_varint().map_err(|_| dense_coord_err())?);
+        let dlon = zigzag_decode_64(lons.read_varint().map_err(|_| dense_coord_err())?);
+        cum_id = cum_id.wrapping_add(did);
+        cum_lat = cum_lat.wrapping_add(dlat);
+        cum_lon = cum_lon.wrapping_add(dlon);
+        sink(
+            cum_id,
+            decimicro(lat_offset, granularity, cum_lat)?,
+            decimicro(lon_offset, granularity, cum_lon)?,
+        );
+    }
+    if !lats.is_empty() || !lons.is_empty() {
+        return Err(dense_mismatch_err());
+    }
+    Ok(())
+}
+
 /// Extract (id, lat, lon) tuples from decompressed PrimitiveBlock bytes.
 ///
 /// Zero heap allocations per block - reads wire format inline, appends to caller's Vec.
@@ -82,9 +193,7 @@ pub(crate) fn extract_node_coords(
     group_starts: &mut Vec<(usize, usize)>,
     mut sink: impl FnMut(i64, i32, i32),
 ) -> Result<()> {
-    use crate::read::wire::{
-        Cursor, PackedSint64Iter, WIRE_LEN, WIRE_VARINT, WireDenseNodes, WireGroup, WireNode,
-    };
+    use crate::read::wire::{Cursor, WIRE_LEN, WIRE_VARINT, WireDenseNodes, WireGroup, WireNode};
 
     let buffer = decompressed;
     let mut cursor = Cursor::new(buffer);
@@ -173,31 +282,7 @@ pub(crate) fn extract_node_coords(
 
         if let Some(dd) = dense_data {
             let dense = WireDenseNodes::parse(dd)?;
-
-            let mut ids = PackedSint64Iter::new(dense.id_data);
-            let mut lats = PackedSint64Iter::new(dense.lat_data);
-            let mut lons = PackedSint64Iter::new(dense.lon_data);
-            let mut cum_id: i64 = 0;
-            let mut cum_lat: i64 = 0;
-            let mut cum_lon: i64 = 0;
-
-            // Deltas sum modulo 2^64, as the decoder and the writer do, so a
-            // block whose IDs wrap (the writer encodes `i64::MIN` then
-            // `i64::MAX` as deltas `MIN`, `-1`) scans to the IDs every reader
-            // yields. A wrapped coordinate cannot slip through: a sum that wraps
-            // lands at least 2^63 away from the previous, accepted coordinate,
-            // far outside the window `decimicro` accepts for any granularity and
-            // offset, so it is refused exactly where a checked sum was.
-            while let (Some(did), Some(dlat), Some(dlon)) = (ids.next(), lats.next(), lons.next()) {
-                cum_id = cum_id.wrapping_add(did);
-                cum_lat = cum_lat.wrapping_add(dlat);
-                cum_lon = cum_lon.wrapping_add(dlon);
-                sink(
-                    cum_id,
-                    decimicro(lat_offset, granularity, cum_lat)?,
-                    decimicro(lon_offset, granularity, cum_lon)?,
-                );
-            }
+            scan_dense_coords(&dense, granularity, lat_offset, lon_offset, &mut sink)?;
         }
         if has_plain {
             for data in WireGroup::new(group_data).nodes() {
@@ -277,6 +362,21 @@ mod tests {
         for &(field, value) in scalars {
             scalar(field, value, &mut block);
         }
+        block
+    }
+
+    /// A PrimitiveBlock with one DenseNodes group whose `id` (1), `lat` (8)
+    /// and `lon` (9) packed payloads are given as raw bytes, so a test can
+    /// write a truncated or overlong varint.
+    fn dense_block_raw(ids: &[u8], lats: &[u8], lons: &[u8]) -> Vec<u8> {
+        let mut dense = Vec::new();
+        len_delimited(1, ids, &mut dense);
+        len_delimited(8, lats, &mut dense);
+        len_delimited(9, lons, &mut dense);
+        let mut group = Vec::new();
+        len_delimited(2, &dense, &mut group);
+        let mut block = Vec::new();
+        len_delimited(2, &group, &mut block);
         block
     }
 
@@ -388,6 +488,108 @@ mod tests {
             err.to_string().contains("overflow"),
             "expected an overflow guard. Got: {err}"
         );
+    }
+
+    /// BUG-183: the dense loop used to zip three infallible packed iterators
+    /// and stop at the shortest, so every shape below scanned to fewer nodes
+    /// with `Ok`. Each malformed group now fails, and each refusal names the
+    /// array at fault. Zigzag `0x02` is delta 1.
+    #[test]
+    fn malformed_dense_coordinate_arrays_are_refused_not_truncated() {
+        let ten_byte_overflow: Vec<u8> = [0x80; 9].iter().copied().chain([0x02]).collect();
+        let mut overflow_tail = vec![0x02];
+        overflow_tail.extend_from_slice(&ten_byte_overflow);
+        // (what, id bytes, lat bytes, lon bytes, expected error substring)
+        type Case<'a> = (&'a str, &'a [u8], &'a [u8], &'a [u8], &'a str);
+        let cases: [Case<'_>; 10] = [
+            (
+                "lat tenth byte overflows",
+                &[2],
+                &ten_byte_overflow,
+                &[0],
+                "lat/lon array",
+            ),
+            (
+                "lon tenth byte overflows",
+                &[2],
+                &[0],
+                &ten_byte_overflow,
+                "lat/lon array",
+            ),
+            (
+                "lat shorter than id",
+                &[2, 2],
+                &[2],
+                &[2, 2],
+                "lat/lon array is shorter",
+            ),
+            (
+                "lon shorter than id",
+                &[2, 2],
+                &[2, 2],
+                &[2],
+                "lat/lon array is shorter",
+            ),
+            (
+                "lat longer than id",
+                &[2],
+                &[2, 2],
+                &[2],
+                "mismatched id/lat/lon",
+            ),
+            ("lat without ids", &[], &[2], &[], "mismatched id/lat/lon"),
+            // Equal terminal-byte counts, so only the truncation is wrong.
+            (
+                "id ends mid-varint",
+                &[2, 0x80],
+                &[2],
+                &[2],
+                "id array holds a truncated",
+            ),
+            (
+                "lon ends mid-varint",
+                &[2, 2],
+                &[2, 2],
+                &[2, 0x80],
+                "lat/lon array is shorter",
+            ),
+            (
+                "id tenth byte overflows",
+                &ten_byte_overflow,
+                &[0],
+                &[0],
+                "id array",
+            ),
+            // All three arrays end in the same overflowing varint: no length
+            // disagreement is left to notice, only the decode failure.
+            (
+                "every array overflows last",
+                &overflow_tail,
+                &overflow_tail,
+                &overflow_tail,
+                "id array",
+            ),
+        ];
+        for (what, ids, lats, lons, want) in cases {
+            let err = scan(&dense_block_raw(ids, lats, lons))
+                .expect_err(&format!("{what}: a malformed dense group must be refused"));
+            assert!(
+                err.to_string().contains(want),
+                "{what}: expected {want:?}. Got: {err}"
+            );
+        }
+
+        // Well-formed counterparts: the checks are bounds, not bans. A legal
+        // ten-byte varint (u64::MAX, zigzag delta i64::MIN) decodes, and
+        // three empty arrays are a group of zero nodes.
+        let ten_byte_max: Vec<u8> = [0xff; 9].iter().copied().chain([0x01]).collect();
+        let tuples = scan(&dense_block_raw(&ten_byte_max, &[0], &[0])).unwrap();
+        assert_eq!(tuples.len(), 1);
+        assert_eq!(tuples[0].id, i64::MIN);
+        assert!(scan(&dense_block_raw(&[], &[], &[])).unwrap().is_empty());
+        let tuples = scan(&dense_block_raw(&[2, 2], &[2, 2], &[2, 2])).unwrap();
+        let ids: Vec<i64> = tuples.iter().map(|t| t.id).collect();
+        assert_eq!(ids, [1, 2]);
     }
 
     /// A coordinate that does not fit an i32 decimicrodegree used to be

@@ -150,14 +150,32 @@ pub(crate) fn scan_way_refs(
 /// Signed deltas reconstruct modulo 2^64, matching WayRefIter and the writer.
 /// For example, absolute refs MIN then MAX encode as MIN then -1; rejecting
 /// the second addition would refuse output our own writer can produce.
-fn accumulate_refs(refs_data: &[u8], refs_buf: &mut Vec<i64>) {
-    use crate::read::wire::PackedSint64Iter;
+///
+/// This scanner bypasses `PrimitiveBlock` construction, so the array is
+/// validated here, during the decode: each delta is read with the fallible
+/// `Cursor::read_varint` and its error propagated. `PackedSint64Iter`, which
+/// this used to iterate, wraps the same decoder but turns its error into an
+/// end of iteration, so an array ending mid-varint or holding a varint wider
+/// than 64 bits gave the way a silently short ref list.
+fn accumulate_refs(refs_data: &[u8], refs_buf: &mut Vec<i64>) -> Result<()> {
+    use crate::read::wire::Cursor;
 
+    let mut cursor = Cursor::new(refs_data);
     let mut cum: i64 = 0;
-    for delta in PackedSint64Iter::new(refs_data) {
-        cum = cum.wrapping_add(delta);
+    while !cursor.is_empty() {
+        let raw = cursor.read_varint().map_err(|_| refs_err())?;
+        cum = cum.wrapping_add(protohoggr::zigzag_decode_64(raw));
         refs_buf.push(cum);
     }
+    Ok(())
+}
+
+/// Error for a `Way.refs` array that ends mid-varint or holds a varint wider
+/// than 64 bits. Out of line: only a corrupt block reaches it.
+#[cold]
+#[inline(never)]
+fn refs_err() -> crate::error::Error {
+    crate::error::new_wire_error("way refs array holds a truncated or overlong varint")
 }
 
 /// Parse a single Way message and extract id + refs.
@@ -182,7 +200,7 @@ fn parse_way_refs(
     // Emit every Way, including zero-ref ways: the external location join
     // records one refcount per callback and consumes one per Way at assembly.
     refs_buf.clear();
-    accumulate_refs(way.refs_data, refs_buf);
+    accumulate_refs(way.refs_data, refs_buf)?;
     callback(way.id, refs_buf);
 
     Ok(())
@@ -427,7 +445,7 @@ fn parse_way_tagged_refs(
     // 2000-ref convention.
     refs_buf.clear();
     if let Some(rd) = refs_data {
-        accumulate_refs(rd, refs_buf);
+        accumulate_refs(rd, refs_buf)?;
     }
 
     callback(way_id, flags, refs_buf);
@@ -502,8 +520,27 @@ mod tests {
     fn scanned_refs_wrap_like_the_writer_and_element_iterator() {
         let deltas = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 1];
         let mut refs = Vec::new();
-        accumulate_refs(&deltas, &mut refs);
+        accumulate_refs(&deltas, &mut refs).unwrap();
         assert_eq!(refs, [i64::MIN, i64::MAX]);
+    }
+
+    /// A refs array the decoder cannot consume in full is refused, not cut
+    /// short: one ending mid-varint, and one whose tenth byte carries payload
+    /// past bit 63. Each follows a valid ref, which the old iterator kept
+    /// while dropping the rest with no error.
+    #[test]
+    fn malformed_refs_are_refused_not_truncated() {
+        let mut overlong = vec![0x02u8];
+        overlong.extend_from_slice(&[0x80; 9]);
+        overlong.push(0x02);
+        for refs_data in [&[0x02u8, 0x80][..], &overlong] {
+            let err = accumulate_refs(refs_data, &mut Vec::new())
+                .expect_err("a malformed refs array must be refused");
+            assert!(
+                err.to_string().contains("way refs array"),
+                "expected the refs guard. Got: {err}"
+            );
+        }
     }
 
     /// PrimitiveBlock holding one PrimitiveGroup holding one Way. `refs` is

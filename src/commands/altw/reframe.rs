@@ -15,8 +15,8 @@
 //! own the coordinates from `NodeIndex`, the input's are stale at best.
 
 use protohoggr::{
-    Cursor, PackedSint64Iter, WIRE_LEN, WIRE_VARINT, encode_bytes_field, encode_int64_field,
-    encode_tag, encode_varint, zigzag_encode_64,
+    Cursor, WIRE_LEN, WIRE_VARINT, encode_bytes_field, encode_int64_field, encode_tag,
+    encode_varint, zigzag_decode_64, zigzag_encode_64,
 };
 
 use super::NodeIndex;
@@ -327,9 +327,18 @@ fn splice_way_locations(
                         ));
                     }
                     have_refs = true;
+                    // Decoded with the fallible `read_varint`, not
+                    // `PackedSint64Iter`, which wraps the same decoder but ends
+                    // iteration on its error: a refs array ending mid-varint or
+                    // holding a varint wider than 64 bits would then copy
+                    // through verbatim with locations for only its prefix.
+                    let mut refs_cursor = Cursor::new(refs_data);
                     let mut cum: i64 = 0;
-                    for delta in PackedSint64Iter::new(refs_data) {
-                        cum = cum.wrapping_add(delta);
+                    while !refs_cursor.is_empty() {
+                        let raw = refs_cursor
+                            .read_varint()
+                            .map_err(|e| crate::Error::from(e).context("reframe wrefs decode"))?;
+                        cum = cum.wrapping_add(zigzag_decode_64(raw));
                         scratch.refs.push(cum);
                     }
                     encode_tag(&mut scratch.reframed_way, 8, WIRE_LEN);

@@ -1,5 +1,6 @@
-//! Fault injection into `diff::parallel::run_shard`, through the fault plan
-//! on the run's token (`diff_shard_panic`, see `pbfhogg::test_hooks`).
+//! Fault injection into a text diff shard worker of the sharded block-pair
+//! merge, through the fault plan on the run's token (`diff_shard_panic`,
+//! see `pbfhogg::test_hooks`).
 
 #![allow(clippy::unwrap_used)]
 
@@ -9,7 +10,7 @@ use pbfhogg::diff::{DiffOptions, diff};
 
 use crate::common::{TestNode, generate_nodes, snapshot_dir, write_multi_block_test_pbf};
 
-/// A shard panic inside `diff::parallel::run_shard` must surface
+/// A panic in a text diff shard worker must surface
 /// as an `Err` (scope-join captures the panic, cleanup sweeps
 /// every per-shard scratch file) and leave the scratch dir in
 /// the same state we found it.

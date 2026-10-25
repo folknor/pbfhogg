@@ -70,7 +70,6 @@ goes on "Review once drained" as a bisect candidate, named by commit.
 
 Launch order, one agent per line, run serially:
 
-33. HYG-013
 34. HYG-014
 35. HYG-015
 36. HYG-192
@@ -415,9 +414,10 @@ The judgement calls already known, to be checked first:
     4 MiB-per-buffer and 64-buffer limits. Buffers over 4 MiB are dropped
     and now show in the diff and derive runs' `DECOMPRESS_POOL_METRICS`
     oversize-drop counters, which these paths never fed before.
-  - The parallel shard decoders (`diff/parallel.rs` and
-    `diff/derive_parallel.rs` `pread_decode`), the measured default path,
-    still allocate per block; left alone (HYG-181).
+  - The parallel shard decoders, the measured default path, still
+    allocate per block; left alone (HYG-181). Since the one-engine merge
+    (below) the indexed block-pair merge no longer uses `MergeBuffers` at
+    all, at any `-j`; only the unindexed element stream still pools.
 - The indexdata trust model (`reference/indexdata-trust.md`) was written by
   folding the trust paragraphs of CORRECTNESS.md, pipeline.md and
   cli-reference.md into one page and correcting what had gone false
@@ -974,6 +974,47 @@ The judgement calls already known, to be checked first:
   one per overlap run to three; a zero-byte `copy_file_range` is now
   located in the input (path and offset), which dedupe's between-pass
   truncation test needs now that its passthrough splices.
+- Diff and derive over indexed inputs are one block-pair engine at every
+  `-j` (the HYG-013 drain, sparred with codex): the BlobReader-based
+  sequential merge (`MergeSide`, `skip_phase`, `verify_rest`) and the two
+  per-command shard copies (`diff/parallel.rs`, `diff/derive_parallel.rs`)
+  are gone; `-j 1` is the header walk plus one shard run on the calling
+  thread, negative IDs force one unbounded shard, and each shard runs the
+  former sequential control flow (byte-equal fast path on fresh pairs,
+  observed-tail residuals with the claimed-max refusal) over pread sides,
+  clipping only blobs whose claim crosses the shard window. One sink per
+  command (`DiffSink`, `ChangeSink`) at every shard count; verbose now
+  shards. Judgement calls on the measured default path, none measured:
+  - Per shard step the merge now reads both fresh blobs raw before
+    deciding, and holds one undecoded when only the other is emitted; the
+    old shard loop decoded eagerly. Same decode count, one held body per
+    side at most.
+  - The byte-equal probe runs on the default path for `--format osc` (and
+    `-c`): an index-field compare per fresh overlapping pair, plus an
+    envelope parse and memcmp only when min, max and count all match. On
+    independent snapshots (planet diff-snapshots) such pairs are expected
+    to be rare; on an apply-changes output against its base the sharded
+    path now skips decoding unchanged blobs, which it never did.
+  - `ElementEqual` carries the element, so derive no longer computes a
+    version for every common element (the old sequential engine did; the
+    shard copies did not), and the per-element sink call is generic, not
+    `dyn`.
+  - The merge loop computes each head's ID once per step (the old copies
+    twice) and uses `osm_id_cmp` for the in-range test where the shard
+    copies used a raw compare.
+  - The shard driver opens every shard's sink on the calling thread before
+    spawning, where the copies created their files in the workers.
+  - Shadow `mergejoin_shadow_*` counters are now emitted on sharded runs
+    too, and derive's `derivepar_*` plan counters on `-j 1` runs.
+  - `-j 1` on indexed inputs changed I/O shape: a whole-file header walk
+    first (as every sharded run did), then pread per blob from the walker's
+    descriptor re-advised `SEQUENTIAL` (it was a streaming `BlobReader`);
+    it lost the CLI host's page-cache eviction, `--direct-io`, and
+    `MergeBuffers` recycling. The text output still goes straight to the
+    caller's writer, derive's straight to its final fragments.
+  - Single-shard phases of a multi-shard run (a kind with one old blob)
+    run inline on the calling thread and write the final destination
+    directly instead of a scratch file plus copy.
 
 ---
 
@@ -1091,40 +1132,6 @@ catalogued; if it is done at all, it is done last.
 
 Reported by: altw and scanning, re-encoding, filtering and spatial, read path,
 geocode index.
-
-## HYG-013 - Diff and derive-changes share a parallel core in two copies
-
-Anger: 9 - diff core on a hot path.
-
-Shard planning (`BlobDesc`, `WalkedFile`, `walk_file`, `Shard`,
-`plan_shards`, `build_shard`) lives once in `diff/shard.rs`, and the delete
-and merge-stats helpers have one owner each. `diff/parallel.rs` and
-`diff/derive_parallel.rs` still each carry `pread_decode`, `Side`,
-`element_merge`, `append_and_cleanup` and the driver loop, and
-`parallel.rs`'s `emit_element` / `emit_modified` copy `mod.rs`'s
-`write_compact_line` / `write_modified_line` (identical formatting, per
-element). The equality predicate is shared (`crate::content::content_equal`).
-Because the CLI defaults `-j 0` to all cores, the parallel path is the default
-for indexed inputs and the sequential paths run only under `--verbose` or
-`-j 1`. `cli_diff`'s `diff_sequential_and_sharded_output_byte_identical` and
-`derive_sequential_and_sharded_output_byte_identical` pin `-j1` against `-j8`
-(8 shards per kind) and fail on a shard-boundary drift. One known divergence
-they cannot see: the sequential merge (`osc/merge_join.rs`) decides a blob's
-leftover tail from what its iterator saw, the parallel copies from indexdata
-`max_id`, so an understated `max_id` could drop a tail on the parallel path
-only (within `shard.rs`'s "index claims are trusted" contract). A second:
-the parallel copies have no byte-equal fast path, so they decode every
-selected blob where the sequential merge skips a byte-identical pair under
-`-c` and `--format osc`. That is a refusal difference (a corrupt body inside
-an identical pair passes `-j 1` and fails `-j N`; `diff`'s input-checks
-paragraph in both CLI references states it) and a likely cost on the
-default path for inputs that share blobs, such as an `apply-changes` output
-against its base. Fix: one shared shard core. The two parallel files also
-carry about twenty sound `.expect("checked")` / `.expect("checked peek")`
-calls (a peek, then a next) that the 2026-10-25 triage left here: they go when the
-copies merge, or become `match (peek, peek)` with `next_if`.
-
-Reported by: re-encoding.
 
 ## HYG-014 - Three frame decoders for one frame format
 
@@ -1325,9 +1332,11 @@ The parameter is taken and discarded in altw `stage1_way_pass(_direct_io)`,
 `collect_relation_member_ids` (every pread path, so the flag does nothing to
 reads in passes 0 and 1, stage 1 or stage 2), `sort::build_blob_index`
 (kept "for signature stability" in a private pre-1.0 function),
-`diff::parallel::diff_block_pair_parallel` and the parallel derive path
-(both pread through `HeaderWalker`, so `diff --direct-io` on indexed inputs
-with `-j` above 1 reads buffered; derive never receives the flag),
+`diff`'s and derive's block-pair paths (`diff_block_pair`,
+`derive_changes_block_pair`, `_direct_io`: both pread through
+`HeaderWalker`, so `diff --direct-io` on indexed inputs reads buffered at
+every `-j`, `-j 1` included since the one-engine merge replaced the
+streaming `-j 1` reader that honoured it),
 `getid::parse_ids_from_pbf(_direct_io)` (the CLI threads `write.direct_io`
 into it), and `check_refs` (`let _ = direct_io;`). Extract's pread passes open
 buffered regardless (a comment explains alignment), `multi.rs` writes through
@@ -1540,13 +1549,13 @@ Reported by: the HYG-155 resolution (sparred with codex).
 
 Anger: 9 - the measured default path of diff and derive.
 
-`pread_decode` in `src/commands/diff/parallel.rs` and
-`src/commands/diff/derive_parallel.rs` decompresses every blob into a fresh
+`BlockPairSide::decode` in `src/osc/merge_join.rs` (the one block-pair
+engine, every shard at every `-j`) decompresses every blob into a fresh
 `Vec` and hands it to `PrimitiveBlock::from_vec_with_scratch`, so each shard
 worker allocates a new, often megabyte-sized, buffer per block. The
-sequential merges now recycle theirs through one `DecompressPool` per merge
-(`MergeBuffers` in `osc/merge_join.rs`); the classify workers keep one pool
-per worker. The same change fits here, one pool per shard worker, but this
+unindexed streaming merge recycles its buffers through one `DecompressPool`
+per merge (`MergeBuffers` in `osc/merge_join.rs`); the classify workers keep
+one pool per worker. The same change fits here, one pool per shard worker, but this
 is the headline planet path (`diff-snapshots -j 16` in
 `reference/performance.md`), and the sequential change itself is unmeasured
 ("Review once drained"). Whether glibc already recycles these frees well

@@ -612,9 +612,9 @@ fn extreme_negative_ids_are_distinct_objects() {
     assert_ne!(digest_ok(&a)[0], digest_ok(&b)[0]);
 }
 
-/// Indexed inputs with negative IDs take the sequential block-pair merge
-/// even at the default `-j`: the parallel planner's raw-i64 thresholds do
-/// not order negative IDs the way the merge does.
+/// Indexed inputs with negative IDs run as one shard even at the default
+/// `-j`: the shard planner's raw-i64 thresholds do not order negative IDs
+/// the way the merge does.
 #[test]
 fn negative_ids_diff_correctly_at_default_jobs() {
     let dir = crate::common::test_scratch();

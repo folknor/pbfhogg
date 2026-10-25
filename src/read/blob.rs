@@ -15,14 +15,14 @@ use std::sync::Arc;
 use super::decompress::decompress_parsed_blob_into;
 pub(crate) use super::decompress::{
     DecompressPool, decompress_blob, decompress_blob_data_into, decompress_blob_raw,
-    decompress_wire_blob_into, pool_get, pool_wrap,
+    decompress_wire_blob_into, pool_get, pool_wrap, raw_blob_payload,
 };
 
 // Blob-level wire-format parsers live in the sibling `blob_wire` module.
 // Re-exported at pub(crate) so existing paths like `crate::blob::WireBlob`
 // and `crate::blob::parse_blob_header_with_index` keep resolving.
 pub(crate) use super::blob_wire::{
-    BlobData, BlobKind, BlobSite, WireBlob, WireBlobHeader, parse_blob_header_with_index,
+    BlobKind, BlobSite, WireBlob, WireBlobHeader, parse_blob_header_with_index,
     warn_unrecognised_indexdata,
 };
 pub use super::blob_wire::{MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE, MAX_BLOB_MESSAGE_SIZE};
@@ -240,24 +240,10 @@ impl Blob {
             .and_then(|d| crate::blob_meta::BlobIndex::deserialize(d))
     }
 
-    /// Returns the compression kind and payload bytes for blob equality comparison.
-    ///
-    /// Two blobs with the same compression kind and identical payload bytes are
-    /// guaranteed to contain identical elements. Returns `None` if the blob has
-    /// no data payload.
-    pub(crate) fn compressed_data(&self) -> Option<(u8, &[u8])> {
-        match &self.blob.data {
-            Some(BlobData::Raw(b)) => Some((0, b)),
-            Some(BlobData::Zlib(b)) => Some((1, b)),
-            Some(BlobData::Zstd(b)) => Some((2, b)),
-            None => None,
-        }
-    }
-
     /// Total bytes retained by this blob's payload allocation.
     ///
-    /// [`compressed_data`](Self::compressed_data) returns only the selected
-    /// compression field, but that `Bytes` slice shares the single parent
+    /// The payload is only the selected compression field, but that `Bytes`
+    /// slice shares the single parent
     /// buffer holding the entire Blob message body (`BlobReader::next` fills a
     /// `datasize`-byte `Vec` and every `BlobData` variant is a zero-copy slice
     /// into it). Slicing never shrinks that buffer, so the whole
@@ -964,14 +950,8 @@ impl BlobReader<FileReader> {
 }
 
 /// One frame read in full - length prefix, `BlobHeader` and body bytes - with
-/// the body's `Blob` envelope not yet parsed.
-///
-/// For a consumer that classifies a blob by its header and has no use for
-/// some blobs' bodies: it reads past them without interpreting a byte of
-/// them, which is what lets the sequential block-pair merge treat an
-/// excluded kind's blobs exactly as the header walk of the parallel path
-/// does. [`RawFrame::into_blob`] parses the envelope with the failure
-/// located where [`BlobReader`]'s iterator would have located it.
+/// the body's `Blob` envelope not yet parsed. [`RawFrame::into_blob`]
+/// parses the envelope, with a failure located at the body.
 pub(crate) struct RawFrame {
     header: WireBlobHeader,
     body: Bytes,
@@ -983,25 +963,6 @@ pub(crate) struct RawFrame {
 }
 
 impl RawFrame {
-    pub(crate) fn is_osm_data(&self) -> bool {
-        matches!(self.header.blob_type, BlobKind::OsmData)
-    }
-
-    /// The header's indexdata, as [`Blob::index`] reads it.
-    pub(crate) fn index(&self) -> Option<crate::blob_meta::BlobIndex> {
-        self.header
-            .indexdata
-            .as_ref()
-            .and_then(|d| crate::blob_meta::BlobIndex::deserialize(d))
-    }
-
-    /// Attach this frame's provenance to an error, as [`Blob::locate_error`]
-    /// does for a parsed blob.
-    #[cold]
-    pub(crate) fn locate_error(&self, source: Option<&Arc<Path>>, err: Error) -> Error {
-        err.locate(Location::new(source, self.blob_index, self.offset))
-    }
-
     /// Parse the body's `Blob` envelope. `source` names the input the frame
     /// came from, as for [`Blob::locate_error`].
     pub(crate) fn into_blob(self, source: Option<&Arc<Path>>) -> Result<Blob> {
@@ -1015,13 +976,6 @@ impl RawFrame {
 }
 
 impl<R: Read + Send> BlobReader<R> {
-    /// Where the next frame starts and its 0-based ordinal, when this reader
-    /// knows them; `None` once a failure has cleared the position. For a
-    /// caller that hands the rest of the file to a header walk.
-    pub(crate) fn position(&self) -> Option<(ByteOffset, Option<u64>)> {
-        self.offset.map(|offset| (offset, self.blob_index))
-    }
-
     /// Read the next frame without parsing its body's envelope. The framing
     /// checks, cancellation, offset and ordinal bookkeeping and page-cache
     /// eviction are the iterator's, which is this plus
@@ -1539,6 +1493,7 @@ pub(crate) fn decode_headerblock(
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
+    use crate::read::blob_wire::BlobData;
 
     /// Truncate `tests/test.osm.pbf` inside the payload of its last blob and
     /// return the file, its path kept alive by the returned tempdir.
@@ -2063,7 +2018,6 @@ mod tests {
         };
         let blob = Blob::new(header, wire, None);
         assert_eq!(blob.retained_len(), 1_000_000);
-        assert_eq!(blob.compressed_data().map(|(_, d)| d.len()), Some(1));
     }
 
     #[test]

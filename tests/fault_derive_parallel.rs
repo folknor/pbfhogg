@@ -1,6 +1,6 @@
-//! Fault injection into `diff::derive_parallel::run_shard`, through the
-//! fault plan on the run's token (`derive_shard_panic`, see
-//! `pbfhogg::test_hooks`).
+//! Fault injection into a derive shard worker of the sharded block-pair
+//! merge, through the fault plan on the run's token (`derive_shard_panic`,
+//! see `pbfhogg::test_hooks`).
 
 #![allow(clippy::unwrap_used)]
 
@@ -10,7 +10,7 @@ use pbfhogg::diff::derive::derive_changes;
 
 use crate::common::{TestNode, generate_nodes, snapshot_dir, write_multi_block_test_pbf};
 
-/// A shard panic inside `diff::derive_parallel::run_shard` must
+/// A panic in a derive shard worker must
 /// surface as an `Err` and leave the scratch dir clean of
 /// per-shard XML scratch files (creates / modifies / deletes -
 /// three patterns per shard).
@@ -88,8 +88,9 @@ fn fault_injection_derive_parallel_shard_panic_surfaces_and_sweeps_scratch() {
     );
     assert!(!faulted_osc.exists(), "a failed derive published an output");
 
-    // Scratch cleanup: the driver must sweep every `derive-par-*`
-    // (creates / modifies / deletes) after any shard errors.
+    // Scratch cleanup: every `derive-*` fragment (creates / modifies /
+    // deletes, the run's and each shard's) must be swept after any shard
+    // errors.
     let after = snapshot_dir(dir.path());
     assert!(
         snapshot_dir(&scratch).is_empty(),
@@ -97,7 +98,7 @@ fn fault_injection_derive_parallel_shard_panic_surfaces_and_sweeps_scratch() {
     );
     let leaked: Vec<_> = after
         .difference(&before)
-        .filter(|p| p.to_string_lossy().contains("derive-par-"))
+        .filter(|p| p.to_string_lossy().contains("derive-"))
         .collect();
     assert!(
         leaked.is_empty(),

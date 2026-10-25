@@ -13,11 +13,9 @@
 //! one.
 //!
 //! The opens of one input, in order (see `Route::opens`): the front read of
-//! the header and the first blob's indexdata; then the parallel route's
-//! header walk, the sequential block-pair reader, or the streaming reader
-//! of a route with an unindexed side. A parallel route whose inputs hold a
-//! negative ID walks both and then runs the sequential block-pair merge,
-//! adding its reader.
+//! the header and the first blob's indexdata; then the block-pair merge's
+//! header walk (at any shard count, negative IDs included), or the
+//! streaming reader of a route with an unindexed side.
 //!
 //! The output is written only after every input open, and published only
 //! when the run succeeds: a refused run leaves an absent destination absent
@@ -64,16 +62,11 @@ impl Route {
         ..Self::SEQUENTIAL
     };
 
-    fn both_indexed(self) -> bool {
-        !self.unindexed.contains(&true)
-    }
-
-    /// Opens of either input through its pin.
+    /// Opens of either input through its pin: the front read, then the
+    /// header walk (both inputs indexed, at any shard count) or the
+    /// streaming reader (an unindexed side).
     fn opens(self) -> u64 {
-        // The front read, then the walker or the reader.
-        let parallel = self.jobs > 1 && self.both_indexed();
-        // The negative-ID fallback runs the block-pair merge after the walk.
-        if parallel && self.negative { 3 } else { 2 }
+        2
     }
 
     fn output_name(self, stem: &str) -> String {
@@ -412,7 +405,7 @@ fn sequential_derive_reads_only_the_pinned_inputs() {
             2,
         );
     }
-    // The sequential block-pair merge takes negative IDs as they are.
+    // One shard takes negative IDs as they are.
     check_route(
         Route {
             negative: true,
@@ -435,8 +428,7 @@ fn parallel_derive_reads_only_the_pinned_inputs() {
     }
 }
 
-/// Negative IDs send a parallel run to the sequential block-pair merge
-/// after both walks.
+/// Negative IDs make a sharded run one unbounded shard, over the same walk.
 #[test]
 fn the_negative_id_fallback_reads_only_the_pinned_inputs() {
     check_route(
@@ -444,7 +436,7 @@ fn the_negative_id_fallback_reads_only_the_pinned_inputs() {
             negative: true,
             ..Route::PARALLEL
         },
-        3,
+        2,
     );
 }
 
@@ -463,8 +455,8 @@ fn the_streaming_derive_reads_only_the_pinned_inputs() {
     }
 }
 
-/// The front reads and the sequential readers open `O_DIRECT` when asked
-/// to, through the pin's own direct open (the parallel walk stays
+/// The front reads and the streaming readers open `O_DIRECT` when asked
+/// to, through the pin's own direct open (the block-pair walk stays
 /// buffered).
 #[cfg(feature = "linux-direct-io")]
 #[test]
@@ -477,7 +469,7 @@ fn direct_reads_follow_the_pinned_inputs() {
                 negative: true,
                 ..Route::PARALLEL
             },
-            3,
+            2,
         ),
         (
             Route {

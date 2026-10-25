@@ -1,7 +1,10 @@
 //! Compare two PBF files and output human-readable differences. Equivalent to `osmium diff`.
 //!
-//! Streams through both files in constant memory using [`StreamingBlocks`] cursors.
-//! Requires both inputs to declare `Sort.Type_then_ID`.
+//! Requires both inputs to declare `Sort.Type_then_ID`. Indexed inputs are
+//! compared by the block-pair merge over ID-range shards (`shard`,
+//! `sharded`, one shard at `-j 1`); inputs without indexdata by the
+//! element-level merge over [`StreamingBlocks`] cursors. Memory is bounded
+//! by the decoded blocks in flight either way.
 //!
 //! # Design: content equality, not version ordering
 //!
@@ -12,18 +15,14 @@
 //! of whether metadata (version, timestamp, changeset, uid) is present, partial, or absent.
 
 pub mod derive;
-pub(crate) mod derive_parallel;
-pub(crate) mod parallel;
 mod shard;
+mod sharded;
 
 use super::Result;
 use super::input_front::sorted_and_indexed;
 use crate::ElementKind;
 use crate::coord_fmt::{format_coord, from_decimicro};
-use crate::osc::merge_join::{
-    BlockMergeAction, BlockPairMergeState, StreamingBlocks, block_pair_merge_phase, skip_phase,
-    stream_merge_phase, verify_rest,
-};
+use crate::osc::merge_join::{BlockMergeAction, MergeSink, StreamingBlocks, stream_merge_phase};
 use crate::owned::TypeFilter;
 use crate::read::input::{InputSource, PinnedInput};
 use crate::{Element, MemberType};
@@ -48,28 +47,24 @@ pub struct DiffOptions {
     pub verbose: bool,
     /// Restrict the comparison to these element types. `None` = all.
     pub type_filter: Option<TypeFilter>,
-    /// Number of parallel shards (and worker threads) for the block-pair
-    /// merge. `Fixed(1)` runs the sequential path; `Fixed(n)` dispatches `n`
+    /// Number of ID-range shards (and worker threads) for the block-pair
+    /// merge of indexed inputs. `Fixed(1)` runs one shard on the calling
+    /// thread, writing the output directly; `Fixed(n)` dispatches up to `n`
     /// shards across worker threads; `Auto` uses one shard per core the host
-    /// reports (one when it reports none). `verbose` is sequential-only, so
-    /// a fixed count above one is refused alongside it, and `Auto` with
-    /// `verbose` runs sequentially.
+    /// reports (one when it reports none). The answer is the same at any
+    /// count.
     pub parallelism: crate::host::Parallelism,
 }
 
 impl DiffOptions {
     /// The shard count this run uses: the fixed count, else one per core.
     fn shards(&self, host: &crate::host::Host) -> usize {
-        if self.verbose {
-            return 1;
-        }
         resolve_shards(self.parallelism, host)
     }
 }
 
-/// The derive (`--format osc`) shard count: the fixed count, else one per
-/// core the host reports (one when it reports none). The same rule as
-/// [`DiffOptions`] without the verbose case.
+/// The shard count of a diff or derive (`--format osc`) run: the fixed
+/// count, else one per core the host reports (one when it reports none).
 pub(crate) fn resolve_shards(
     parallelism: crate::host::Parallelism,
     host: &crate::host::Host,
@@ -141,15 +136,14 @@ impl DiffStats {
 
 /// Compare two sorted PBF files and write human-readable differences.
 ///
-/// Streams through both files in constant memory (~3 MB overhead per cursor)
-/// using pipelined block iterators. Requires both inputs to declare
+/// Holds a bounded number of decoded blocks at a time, whatever the input
+/// size. Requires both inputs to declare
 /// `Sort.Type_then_ID` - returns an actionable error if either is unsorted.
 ///
-/// `scratch` is the run's scratch directory, used by the parallel path for
+/// `scratch` is the run's scratch directory, used by a multi-shard run for
 /// its shard files and removed when the call returns. A caller whose options
-/// run one shard (`Fixed(1)`, or `verbose`, which is sequential-only) writes
-/// no scratch and passes `None`; `None` with more than one shard is refused,
-/// before any input is read. A caller that wants only the counts calls
+/// run one shard (`Fixed(1)`) writes no scratch and passes `None`; `None`
+/// with more than one shard is refused, before any input is read. A caller that wants only the counts calls
 /// [`diff_stats`], which shards without scratch.
 ///
 /// Every route opens each input more than once, so both must be regular
@@ -172,12 +166,6 @@ pub fn diff<'a, 'b>(
     scratch: Option<crate::scratch::RunScratch>,
 ) -> Result<DiffStats> {
     host.cancel.check()?;
-    if options.verbose && options.parallelism.fixed().is_some_and(|n| n > 1) {
-        return Err(crate::Error::invalid_argument(
-            "diff: a fixed shard count above one has no effect with verbose, whose \
-             per-field detail lines are produced by the sequential path only",
-        ));
-    }
     let jobs = options.shards(host);
     if jobs > 1 && scratch.is_none() {
         return Err(crate::Error::invalid_argument(
@@ -265,7 +253,7 @@ pub(super) fn pin_pair(
 
 /// What a comparison produces besides its counts.
 enum Report<'a, W> {
-    /// Diff text written to `out`. `scratch` holds the parallel path's shard
+    /// Diff text written to `out`. `scratch` holds a multi-shard run's shard
     /// files; `None` only when the run is single-shard, which [`diff`]
     /// enforces.
     Text {
@@ -320,57 +308,16 @@ fn compare<W: Write>(
 
     crate::debug::emit_marker("DIFF_SCAN_START");
 
-    // Verbose always takes the sequential path: the parallel shard
-    // workers emit summary lines only (per-field modification details
-    // are not implemented there), and silently losing detail lines
-    // would be worse than the wall-time cost of a sequential verbose
-    // diff. Verbose is a human-inspection mode; the parallel default
-    // serves the common non-verbose case.
-    //
     // Path selection depends on the inputs and the shard count only, never on
     // whether text is wanted: a count-only run shards exactly as a text run.
-    let output = match report {
-        Report::Text { out, scratch } => {
-            if both_indexed && jobs > 1 {
-                // `diff` refuses a multi-shard run without scratch before
-                // any input is read.
-                let scratch = scratch.ok_or_else(|| {
-                    crate::Error::invalid_argument(
-                        "diff: a run that may use more than one shard needs a scratch directory",
-                    )
-                })?;
-                if let Some(stats) = parallel::diff_block_pair_parallel(
-                    old,
-                    new,
-                    Some(parallel::ShardText {
-                        out: &mut *out,
-                        scratch,
-                    }),
-                    options,
-                    direct_io,
-                    &filter,
-                    jobs,
-                    host,
-                )? {
-                    return Ok(finish_scan(stats));
-                }
-            }
-            Some(out)
-        }
-        Report::Count => {
-            if both_indexed
-                && jobs > 1
-                && let Some(stats) = parallel::diff_block_pair_parallel::<W>(
-                    old, new, None, options, direct_io, &filter, jobs, host,
-                )?
-            {
-                return Ok(finish_scan(stats));
-            }
-            None
-        }
+    let (output, scratch) = match report {
+        Report::Text { out, scratch } => (Some(out), scratch),
+        Report::Count => (None, None),
     };
     let stats = if both_indexed {
-        diff_block_pair(old, new, output, options, direct_io, &filter, host)?
+        diff_block_pair(
+            old, new, output, scratch, options, &filter, jobs, direct_io, host,
+        )?
     } else {
         diff_element_stream(old, new, output, options, direct_io, &filter, host)?
     };
@@ -387,130 +334,160 @@ fn finish_scan(stats: DiffStats) -> DiffStats {
     stats
 }
 
-/// Optimized diff path using block-pair merge with borrowed elements.
-/// Requires both inputs to have indexdata. Zero String allocation for
-/// unchanged elements (98.8%+ of typical daily diffs).
+/// The diff of two indexed inputs: the header walk, then the block-pair
+/// merge over up to `jobs` ID-range shards per kind (see `shard` and
+/// `sharded`). Zero String allocation for unchanged elements.
 ///
-/// `output` is `None` for a count-only run: every block is still read,
-/// decoded and merged exactly as for text (the byte-equal fast path follows
-/// `suppress_common`, not the absence of text), only nothing is formatted.
+/// `output` is `None` for a count-only run: every selected block is still
+/// read, decoded and merged exactly as for text (the byte-equal fast path
+/// follows `suppress_common`, not the absence of text), only nothing is
+/// formatted and no scratch is written. A text run of more than one shard
+/// writes each shard's text to `scratch` and streams it to `output` in
+/// shard order; a phase of one shard writes `output` directly.
+#[allow(clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn diff_block_pair<W: Write>(
     old: &PinnedInput,
     new: &PinnedInput,
     output: Option<&mut W>,
+    scratch: Option<&crate::scratch::RunScratch>,
     options: &DiffOptions,
-    direct_io: bool,
     filter: &TypeFilter,
+    jobs: usize,
+    // Not honoured yet: the walk and the shard reads pread through the
+    // walker's buffered descriptor at every shard count. Kept as the place
+    // the flag reaches once those reads honour it.
+    _direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<DiffStats> {
-    let mut old_reader = crate::blob::BlobReader::open_in(old, direct_io, host)?;
-    old_reader.set_parse_indexdata(true);
-    let mut new_reader = crate::blob::BlobReader::open_in(new, direct_io, host)?;
-    new_reader.set_parse_indexdata(true);
+    // DIFF_SCAN_START/END and the diff_* result counters are the caller's.
+    let walked = shard::walk_pair(old, new, host)?;
+    if walked.has_negative && jobs > 1 {
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "diff.negative_id_fallback",
+            "Using a single shard: negative IDs cannot use ID-range shards"
+        );
+        crate::debug::emit_counter("diff_negative_id_fallback", 1);
+    }
 
-    let mut merge = BlockPairMergeState::new(old_reader, new_reader);
+    // Scratch shard files live in the run's scratch directory, which the
+    // caller placed (the CLI's --tmp-dir, else beside the output).
+    // No input-size-based free-space refusal: compressed PBF sizes and index
+    // counts do not bound changed text bytes (identical inputs emit none).
+    // Exact sizing would repeat the measured comparison/serialization pass.
+    // Shards coexist until their kind is drained, then are removed one by
+    // one; the caller's arbitrary Write destination may share this
+    // filesystem or consume no disk at all, so twice the input size is not a
+    // space budget. Keep write errors authoritative rather than rejecting on
+    // that guess.
+    let phases: Vec<sharded::Phase> = [
+        (
+            ElementKind::Node,
+            filter.nodes,
+            "DIFF_PHASE_NODE_START",
+            "DIFF_PHASE_NODE_END",
+        ),
+        (
+            ElementKind::Way,
+            filter.ways,
+            "DIFF_PHASE_WAY_START",
+            "DIFF_PHASE_WAY_END",
+        ),
+        (
+            ElementKind::Relation,
+            filter.relations,
+            "DIFF_PHASE_REL_START",
+            "DIFF_PHASE_REL_END",
+        ),
+    ]
+    .into_iter()
+    .filter(|&(_, enabled, _, _)| enabled)
+    .map(|(kind, _, start_marker, end_marker)| sharded::Phase {
+        kind,
+        start_marker,
+        end_marker,
+    })
+    .collect();
 
-    let mut stats = DiffStats::default();
-    let mut sink = DiffSink {
-        output,
-        options,
-        stats: &mut stats,
+    let mut report = TextReport {
+        sink: DiffSink::new(output, options),
+        scratch,
     };
-
-    let phases: [(ElementKind, bool, &str); 3] = [
-        (ElementKind::Node, filter.nodes, "NODE"),
-        (ElementKind::Way, filter.ways, "WAY"),
-        (ElementKind::Relation, filter.relations, "REL"),
-    ];
-
-    // An excluded kind ahead of an enabled one is skipped undecoded, so the
-    // later phase starts at its own first blob; see `skip_phase`. Excluded
-    // kinds after the last enabled one get a header-only walk, `verify_rest`,
-    // after the loop.
-    let last_enabled = phases.iter().rposition(|&(_, enabled, _)| enabled);
-    for (i, (kind, enabled, tag)) in phases.into_iter().enumerate() {
-        if !enabled {
-            if last_enabled.is_some_and(|last| i < last) {
-                skip_phase(&mut merge, kind)?;
-            }
-            continue;
-        }
-
-        let start_marker = format!("DIFF_PHASE_{tag}_START");
-        let end_marker = format!("DIFF_PHASE_{tag}_END");
-        crate::debug::emit_marker(&start_marker);
-
-        block_pair_merge_phase(&mut merge, kind, options.suppress_common, &mut |action| {
-            sink.record(kind, &action)
-        })?;
-        crate::debug::emit_marker(&end_marker);
-    }
-
-    // The structure the parallel path's header walk checks over the whole
-    // of both files, checked here for the part no phase read.
-    if last_enabled.is_none_or(|last| last + 1 < phases.len()) {
-        verify_rest(&mut merge, old.into(), new.into(), host)?;
-    }
-
-    emit_merge_stats_counters(&merge.stats);
-    Ok(stats)
+    let merge_stats = sharded::run(
+        &walked,
+        &phases,
+        jobs,
+        options.suppress_common,
+        &mut report,
+        host,
+    )?;
+    emit_merge_stats_counters(&merge_stats);
+    Ok(report.sink.stats)
 }
 
-/// Where a sequential diff's merge actions go: the counts, and the text when
-/// there is an output. Shared by both sequential paths, so a difference
-/// prints the same line (and, under `verbose`, the same details) whether or
-/// not the inputs carried indexdata.
-struct DiffSink<'a, W: Write> {
+/// Where a diff's merge actions go: the counts, and the text when there is
+/// an output. One sink for every path - each shard of the block-pair merge
+/// and the unindexed element stream - so a difference prints the same line
+/// (and, under `verbose`, the same details) at any shard count and whether
+/// or not the inputs carried indexdata.
+struct DiffSink<'a, O: Write> {
     /// `None` for a count-only run.
-    output: Option<&'a mut W>,
+    output: Option<O>,
     options: &'a DiffOptions,
-    stats: &'a mut DiffStats,
+    stats: DiffStats,
 }
 
-impl<W: Write> DiffSink<'_, W> {
+impl<'a, O: Write> DiffSink<'a, O> {
+    fn new(output: Option<O>, options: &'a DiffOptions) -> Self {
+        Self {
+            output,
+            options,
+            stats: DiffStats::default(),
+        }
+    }
+}
+
+impl<O: Write> MergeSink for DiffSink<'_, O> {
     fn record(&mut self, kind: ElementKind, action: &BlockMergeAction<'_>) -> Result<()> {
         use crate::osc::merge_join::{element_id, element_version};
         let type_char = kind.type_char();
-        match *action {
+        match action {
             BlockMergeAction::BlobEqual(count) => {
                 self.stats.common += count;
             }
-            // A single-sided block's count is the claim the merge already
-            // decoded against; count-only runs skip the element walk
+            // A single-sided run's count is the merge's (claimed or, for a
+            // clipped block, counted); count-only runs skip the element walk
             // that exists only to format each line.
-            BlockMergeAction::BlobOldOnly { block, count, skip } => {
-                if let Some(out) = self.output.as_deref_mut() {
-                    for elem in block.elements().skip(skip) {
+            BlockMergeAction::BlobOldOnly(run) => {
+                if let Some(out) = self.output.as_mut() {
+                    for elem in run.elements() {
                         let ver = element_version(&elem);
                         write_compact_line(out, '-', type_char, element_id(&elem), ver)?;
                     }
                 }
-                self.stats.deleted += count;
+                self.stats.deleted += run.count;
             }
-            BlockMergeAction::BlobNewOnly { block, count, skip } => {
-                if let Some(out) = self.output.as_deref_mut() {
-                    for elem in block.elements().skip(skip) {
+            BlockMergeAction::BlobNewOnly(run) => {
+                if let Some(out) = self.output.as_mut() {
+                    for elem in run.elements() {
                         let ver = element_version(&elem);
                         write_compact_line(out, '+', type_char, element_id(&elem), ver)?;
                     }
                 }
-                self.stats.created += count;
+                self.stats.created += run.count;
             }
-            BlockMergeAction::ElementEqual {
-                id,
-                version,
-                type_char,
-            } => {
+            BlockMergeAction::ElementEqual(e) => {
                 if !self.options.suppress_common
-                    && let Some(out) = self.output.as_deref_mut()
+                    && let Some(out) = self.output.as_mut()
                 {
-                    write_compact_line(out, ' ', type_char, id, version)?;
+                    write_compact_line(out, ' ', type_char, element_id(e), element_version(e))?;
                 }
                 self.stats.common += 1;
             }
             BlockMergeAction::ElementModified { old, new } => {
-                if let Some(out) = self.output.as_deref_mut() {
+                if let Some(out) = self.output.as_mut() {
                     let old_ver = element_version(old);
                     let new_ver = element_version(new);
                     write_modified_line(out, type_char, element_id(old), old_ver, new_ver)?;
@@ -521,13 +498,13 @@ impl<W: Write> DiffSink<'_, W> {
                 self.stats.modified += 1;
             }
             BlockMergeAction::ElementOldOnly(o) => {
-                if let Some(out) = self.output.as_deref_mut() {
+                if let Some(out) = self.output.as_mut() {
                     write_compact_line(out, '-', type_char, element_id(o), element_version(o))?;
                 }
                 self.stats.deleted += 1;
             }
             BlockMergeAction::ElementNewOnly(n) => {
-                if let Some(out) = self.output.as_deref_mut() {
+                if let Some(out) = self.output.as_mut() {
                     write_compact_line(out, '+', type_char, element_id(n), element_version(n))?;
                 }
                 self.stats.created += 1;
@@ -537,10 +514,161 @@ impl<W: Write> DiffSink<'_, W> {
     }
 }
 
-/// Emit `mergejoin_shadow_*` counters accumulated across all phases.
-/// Shadow-only - no code-path change. Shared by the text diff and the
-/// derive (`--format osc`) sequential block-pair paths, which both drive
-/// `BlockPairMergeState` and report the same shadow view.
+/// The text diff's side of a sharded comparison: the caller's writer (or
+/// nothing, counting only) as the final sink, and one scratch text file per
+/// shard of a multi-shard phase.
+struct TextReport<'a, W: Write> {
+    sink: DiffSink<'a, &'a mut W>,
+    /// `None` for a count-only run, and for a text run that may use only
+    /// one shard (which `diff` enforces).
+    scratch: Option<&'a crate::scratch::RunScratch>,
+}
+
+/// One shard of a multi-shard text phase: its sink and its scratch file
+/// (`None` for a count-only run, which formats nothing).
+struct TextShard<'a> {
+    sink: DiffSink<'a, std::io::BufWriter<std::fs::File>>,
+    path: Option<crate::scratch::ScratchPath>,
+}
+
+impl MergeSink for TextShard<'_> {
+    fn record(&mut self, kind: ElementKind, action: &BlockMergeAction<'_>) -> Result<()> {
+        self.sink.record(kind, action)
+    }
+}
+
+impl<'a, W: Write> sharded::ShardedReport for TextReport<'a, W> {
+    type Shard = TextShard<'a>;
+    type Done = (Option<crate::scratch::ScratchPath>, DiffStats);
+
+    const WORKER: &'static str = "shard worker";
+
+    fn inline(&mut self) -> &mut impl MergeSink {
+        &mut self.sink
+    }
+
+    fn open_shard(&mut self, kind: ElementKind, idx: usize) -> Result<Self::Shard> {
+        let options = self.sink.options;
+        if self.sink.output.is_none() {
+            return Ok(TextShard {
+                sink: DiffSink::new(None, options),
+                path: None,
+            });
+        }
+        let scratch = self.scratch.ok_or_else(|| {
+            crate::Error::invalid_argument(
+                "diff: a run that may use more than one shard needs a scratch directory",
+            )
+        })?;
+        let path = scratch.file(&format!("diff-par-{}-{idx}.txt.tmp", kind.type_char()))?;
+        let file = crate::scratch::create_file(&path)?;
+        Ok(TextShard {
+            sink: DiffSink::new(Some(std::io::BufWriter::new(file)), options),
+            path: Some(path),
+        })
+    }
+
+    fn finish_shard(shard: Self::Shard) -> Result<Self::Done> {
+        // BufWriter::into_inner propagates any deferred flush error; dropping
+        // the unwrapped File closes it and the main thread reopens the path.
+        if let Some(out) = shard.sink.output {
+            drop(
+                out.into_inner()
+                    .map_err(|e| crate::Error::from(e.into_error()))?,
+            );
+        }
+        Ok((shard.path, shard.sink.stats))
+    }
+
+    fn absorb(&mut self, done: Vec<Self::Done>, cancel: &crate::host::Cancel) -> Result<()> {
+        match (self.sink.output.as_mut(), self.scratch) {
+            (Some(out), Some(scratch)) => {
+                emit_shard_outputs(&mut **out, done, &mut self.sink.stats, scratch, cancel)
+            }
+            _ => {
+                for (_, stats) in done {
+                    self.sink.stats.add(&stats);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn panic_hook(faults: &crate::test_hooks::FaultPlan) -> &std::sync::atomic::AtomicUsize {
+        &faults.diff_shard_panic
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn panic_message(idx: usize) -> String {
+        format!("test-hooks: diff/parallel shard {idx} panicking")
+    }
+}
+
+/// Stream every shard's temp file to `output` in shard order, folding each
+/// shard's counts into `total`.
+///
+/// A failed write to `output` - the reader of a stdout pipe going away is
+/// the ordinary case (`diff a b | head`) - stops the emission, but every
+/// remaining shard's temp file is still removed before the error returns.
+/// Returning on the first error left them all in the scratch directory
+/// beside the old input, one per shard per run.
+fn emit_shard_outputs(
+    output: &mut impl Write,
+    outputs: Vec<(Option<crate::scratch::ScratchPath>, DiffStats)>,
+    total: &mut DiffStats,
+    scratch: &crate::scratch::RunScratch,
+    cancel: &crate::host::Cancel,
+) -> Result<()> {
+    let mut first_err = None;
+    for (text_path, stats) in outputs {
+        let Some(text_path) = text_path else {
+            return Err(crate::Error::internal(
+                "diff: a shard of a text run wrote no text file",
+            ));
+        };
+        if first_err.is_some() {
+            scratch.remove(&text_path);
+            continue;
+        }
+        if let Err(e) = append_and_cleanup(output, &text_path, scratch, cancel) {
+            first_err = Some(e);
+            continue;
+        }
+        total.add(&stats);
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
+/// Copy a shard's scratch temp file to the caller's output writer and then
+/// remove it - also when the copy fails, so a failed write does not leave
+/// the temp file behind.
+fn append_and_cleanup(
+    out: &mut impl Write,
+    src: &crate::scratch::ScratchPath,
+    scratch: &crate::scratch::RunScratch,
+    cancel: &crate::host::Cancel,
+) -> Result<()> {
+    // The copy checks the token at every read of the shard file (a shard
+    // can hold gigabytes of text, and stdout is not cancellation-aware).
+    let copied = crate::scratch::open(src)
+        .and_then(|f| std::io::copy(&mut crate::host::CancellableRead::new(f, cancel), out));
+    scratch.remove(src);
+    match copied {
+        Ok(_) => Ok(()),
+        // A cancellation is not a failure of this file: left as it is.
+        Err(e) if crate::error::io_carries_cancellation(&e) => Err(e.into()),
+        Err(e) => {
+            Err(crate::Error::from(e)
+                .context(format!("failed to copy scratch file {}", src.display())))
+        }
+    }
+}
+
+/// Emit `mergejoin_shadow_*` counters accumulated across all shards and
+/// phases. Shadow-only - no code-path change. Shared by the text diff and
+/// derive (`--format osc`), which both drive the block-pair merge and
+/// report the same shadow view.
 fn emit_merge_stats_counters(s: &crate::osc::merge_join::BlockPairMergeStats) {
     crate::debug::emit_counter("mergejoin_shadow_pairs_byte_equal", s.pairs_byte_equal);
     crate::debug::emit_counter(
@@ -580,12 +708,7 @@ fn diff_element_stream<W: Write>(
         StreamingBlocks::new_sequential(old, direct_io, std::sync::Arc::clone(&pool), host)?;
     let mut new_src = StreamingBlocks::new_sequential(new, direct_io, pool, host)?;
 
-    let mut stats = DiffStats::default();
-    let mut sink = DiffSink {
-        output,
-        options,
-        stats: &mut stats,
-    };
+    let mut sink = DiffSink::new(output, options);
 
     let phases = [
         (
@@ -610,16 +733,14 @@ fn diff_element_stream<W: Write>(
     for (kind, enabled, start, end) in phases {
         if enabled {
             crate::debug::emit_marker(start);
-            stream_merge_phase(&mut old_src, &mut new_src, kind, &mut |action| {
-                sink.record(kind, &action)
-            })?;
+            stream_merge_phase(&mut old_src, &mut new_src, kind, &mut sink)?;
             crate::debug::emit_marker(end);
         } else {
             skip_kind(&mut old_src, &mut new_src, kind)?;
         }
     }
 
-    Ok(stats)
+    Ok(sink.stats)
 }
 
 /// Advance both cursors past a kind the type filter excludes, wherever it

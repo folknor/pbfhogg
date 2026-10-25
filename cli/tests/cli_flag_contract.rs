@@ -111,14 +111,6 @@ const REFUSALS: &[(&[&str], &str)] = &[
         &["cat", "IN", "-o", "OUT", "--dedupe", "--type", "node"],
         "cannot be used with",
     ),
-    (
-        &["diff", "IN", "IN2", "-v", "--tmp-dir", "DIR"],
-        "cannot be used with",
-    ),
-    (
-        &["diff", "IN", "IN2", "-v", "-j", "2"],
-        "cannot be used with",
-    ),
     (&["diff", "IN", "IN2", "-q", "-s"], "cannot be used with"),
     (&["diff", "IN", "IN2", "-q", "-c"], "cannot be used with"),
     (&["diff", "IN", "IN2", "-q", "-v"], "cannot be used with"),
@@ -551,9 +543,9 @@ const JOBS: &[JobsRow] = &[
         accepts: [true, true, true],
     },
     JobsRow {
-        label: "diff -v (sequential only)",
+        label: "diff -v",
         words: &["diff", "IN", "IN2", "-v", "-j", "J"],
-        accepts: [false, false, false],
+        accepts: [true, true, true],
     },
     JobsRow {
         label: "apply-changes (one worker is not validated)",

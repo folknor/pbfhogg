@@ -1,8 +1,9 @@
 //! Generate an OSC diff from two PBF snapshots. Equivalent to `osmium derive-changes`.
 //!
-//! Streams through both files writing changes directly to temp files,
-//! then assembles the final `.osc.gz` in a single pass. Memory is bounded
-//! by one element at a time, not total change count.
+//! Merges both files writing changes directly to temp files (one set per
+//! shard of a multi-shard phase, concatenated in shard order), then
+//! assembles the final `.osc.gz` in a single pass. Memory is bounded by the
+//! decoded blocks in flight, not total change count.
 //! Requires both inputs to declare `Sort.Type_then_ID`.
 
 use std::fs::File;
@@ -15,10 +16,7 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use crate::ElementKind;
 use crate::commands::input_front::sorted_and_indexed;
 use crate::error::{Error, Result};
-use crate::osc::merge_join::{
-    BlockMergeAction, BlockPairMergeState, StreamingBlocks, block_pair_merge_phase,
-    stream_merge_phase,
-};
+use crate::osc::merge_join::{BlockMergeAction, MergeSink, StreamingBlocks, stream_merge_phase};
 use crate::osc::write::{OwnedMetadata, write_element_xml};
 use crate::read::input::{InputSource, PinnedInput};
 
@@ -53,8 +51,9 @@ impl DeriveChangesStats {
 
 /// Generate an OSC diff from two sorted PBF snapshots.
 ///
-/// Streams through both files using pipelined block iterators and performs
-/// a merge-join by (type, id). Changes are buffered by action type and
+/// Performs a merge-join by (type, id), over ID-range shards for indexed
+/// inputs (`parallelism`; the answer is the same at any shard count).
+/// Changes are buffered by action type and
 /// written as OsmChange XML, gzipped when the output name ends `.osc.gz` and
 /// plain when it ends `.osc` (any other name is refused before any work). Memory is bounded by the number of
 /// changed elements, not total input size.
@@ -160,39 +159,11 @@ pub(crate) fn derive_changes_to(
 
     crate::debug::emit_marker("DERIVECHANGES_SCAN_START");
 
-    // Derivation has no verbose-detail mode: only indexdata and worker count
-    // gate this attempt, unlike the text diff driver.
-    // Parallel shard-based path. Only valid when both inputs are indexed
-    // (same constraint as derive_changes_block_pair) and hold no negative
-    // IDs (the driver declines with `None`). Falls through to the
-    // sequential sink path otherwise.
-    let parallel_stats = if both_indexed && jobs > 1 {
-        super::derive_parallel::derive_changes_parallel(
-            &old,
-            &new,
-            output,
-            scratch,
-            jobs,
-            increment_version,
-            timestamp,
-            host,
-        )?
-    } else {
-        None
-    };
-    if let Some(stats) = parallel_stats {
-        crate::debug::emit_marker("DERIVECHANGES_SCAN_END");
-        crate::debug::emit_counter("derivechanges_creates", stats.creates);
-        crate::debug::emit_counter("derivechanges_modifies", stats.modifies);
-        crate::debug::emit_counter("derivechanges_deletes", stats.deletes);
-        return Ok(stats);
-    }
-
-    let mut sink = ChangeSink::new(scratch, increment_version, timestamp)?;
+    let mut sink = ChangeSink::new(scratch, "", increment_version, timestamp)?;
 
     let result = (|| -> Result<DeriveChangesStats> {
         if both_indexed {
-            derive_changes_block_pair(&old, &new, direct_io, &mut sink, host)?;
+            derive_changes_block_pair(&old, &new, jobs, direct_io, &mut sink, scratch, host)?;
         } else {
             derive_changes_element_stream(&old, &new, direct_io, &mut sink, host)?;
         }
@@ -238,14 +209,19 @@ struct ChangeSink {
 }
 
 impl ChangeSink {
+    /// A sink on three fresh scratch files, `derive-<action><suffix>.xml.tmp`:
+    /// the run's final fragments with an empty suffix, a shard's own with
+    /// one naming its kind and index. Creating a file truncates any of the
+    /// same name, so no two live sinks may share a suffix.
     fn new(
         scratch: &crate::scratch::RunScratch,
+        suffix: &str,
         increment_version: bool,
         timestamp: Option<u64>,
     ) -> Result<Self> {
-        let cp = scratch.file("derive-creates.xml.tmp")?;
-        let mp = scratch.file("derive-modifies.xml.tmp")?;
-        let dp = scratch.file("derive-deletes.xml.tmp")?;
+        let cp = scratch.file(&format!("derive-creates{suffix}.xml.tmp"))?;
+        let mp = scratch.file(&format!("derive-modifies{suffix}.xml.tmp"))?;
+        let dp = scratch.file(&format!("derive-deletes{suffix}.xml.tmp"))?;
         let creates = Writer::new(io::BufWriter::new(crate::scratch::create_file(&cp)?));
         let modifies = Writer::new(io::BufWriter::new(crate::scratch::create_file(&mp)?));
         let deletes = Writer::new(io::BufWriter::new(crate::scratch::create_file(&dp)?));
@@ -292,29 +268,6 @@ impl ChangeSink {
         Ok(())
     }
 
-    /// Record one merge action, from either sequential path. The one place
-    /// a sequential derive turns an action into OSC, so the output does not
-    /// depend on whether the inputs carried indexdata.
-    fn record(&mut self, kind: ElementKind, action: &BlockMergeAction<'_>) -> Result<()> {
-        match *action {
-            BlockMergeAction::BlobEqual(_) | BlockMergeAction::ElementEqual { .. } => {}
-            BlockMergeAction::BlobOldOnly { block, skip, .. } => {
-                for elem in block.elements().skip(skip) {
-                    self.write_delete(&elem, kind)?;
-                }
-            }
-            BlockMergeAction::BlobNewOnly { block, skip, .. } => {
-                for elem in block.elements().skip(skip) {
-                    self.write_create(&elem)?;
-                }
-            }
-            BlockMergeAction::ElementModified { new, .. } => self.write_modify(new)?,
-            BlockMergeAction::ElementOldOnly(o) => self.write_delete(o, kind)?,
-            BlockMergeAction::ElementNewOnly(n) => self.write_create(n)?,
-        }
-        Ok(())
-    }
-
     fn flush(&mut self) -> Result<()> {
         self.creates.get_mut().flush()?;
         self.modifies.get_mut().flush()?;
@@ -331,12 +284,194 @@ impl ChangeSink {
     }
 }
 
+impl MergeSink for ChangeSink {
+    /// Record one merge action, from any path - each shard of the block-pair
+    /// merge and the unindexed element stream. The one place derive turns an
+    /// action into OSC, so the output depends neither on the shard count nor
+    /// on whether the inputs carried indexdata.
+    fn record(&mut self, kind: ElementKind, action: &BlockMergeAction<'_>) -> Result<()> {
+        match action {
+            BlockMergeAction::BlobEqual(_) | BlockMergeAction::ElementEqual(_) => {}
+            BlockMergeAction::BlobOldOnly(run) => {
+                for elem in run.elements() {
+                    self.write_delete(&elem, kind)?;
+                }
+            }
+            BlockMergeAction::BlobNewOnly(run) => {
+                for elem in run.elements() {
+                    self.write_create(&elem)?;
+                }
+            }
+            BlockMergeAction::ElementModified { new, .. } => self.write_modify(new)?,
+            BlockMergeAction::ElementOldOnly(o) => self.write_delete(o, kind)?,
+            BlockMergeAction::ElementNewOnly(n) => self.write_create(n)?,
+        }
+        Ok(())
+    }
+}
+
+/// Derive's side of a sharded comparison: the run's [`ChangeSink`] as the
+/// final sink, and one `ChangeSink` per shard of a multi-shard phase whose
+/// three fragments are appended, action by action and in shard order, to
+/// the final sink's three.
+struct OscReport<'a> {
+    sink: &'a mut ChangeSink,
+    scratch: &'a crate::scratch::RunScratch,
+}
+
+/// A finished shard: its three flushed fragments and their counts.
+struct OscShardDone {
+    creates: crate::scratch::ScratchPath,
+    modifies: crate::scratch::ScratchPath,
+    deletes: crate::scratch::ScratchPath,
+    stats: DeriveChangesStats,
+}
+
+impl super::sharded::ShardedReport for OscReport<'_> {
+    type Shard = ChangeSink;
+    type Done = OscShardDone;
+
+    const WORKER: &'static str = "derive shard worker";
+
+    fn inline(&mut self) -> &mut impl MergeSink {
+        &mut *self.sink
+    }
+
+    fn open_shard(&mut self, kind: ElementKind, idx: usize) -> Result<Self::Shard> {
+        ChangeSink::new(
+            self.scratch,
+            &format!("-{}-{idx}", kind.type_char()),
+            self.sink.increment_version,
+            self.sink.timestamp,
+        )
+    }
+
+    fn finish_shard(mut shard: Self::Shard) -> Result<Self::Done> {
+        shard.flush()?;
+        let stats = shard.stats();
+        // The writers drop here, closing the files before the append opens
+        // them again.
+        let ChangeSink {
+            creates_path,
+            modifies_path,
+            deletes_path,
+            ..
+        } = shard;
+        Ok(OscShardDone {
+            creates: creates_path,
+            modifies: modifies_path,
+            deletes: deletes_path,
+            stats,
+        })
+    }
+
+    /// Append through the final sink's own `BufWriter`s, never another
+    /// descriptor, so bytes an inline phase left buffered stay ahead of the
+    /// appended ones, and fold the counts into the final sink's, which the
+    /// OSC assembly frames from.
+    fn absorb(&mut self, done: Vec<Self::Done>, cancel: &crate::host::Cancel) -> Result<()> {
+        let mut first_err = None;
+        for shard in done {
+            // Once per shard, between appends (the appends themselves are
+            // kernel copies with no checkpoint): after a cancellation the
+            // remaining shard files are removed below, as after a failed
+            // append.
+            if first_err.is_none()
+                && let Err(e) = cancel.check()
+            {
+                first_err = Some(e);
+            }
+            if first_err.is_some() {
+                self.scratch.remove(&shard.creates);
+                self.scratch.remove(&shard.modifies);
+                self.scratch.remove(&shard.deletes);
+                continue;
+            }
+            // `and` takes its argument eagerly, so all three calls run and
+            // each removes its own source file even when an earlier copy
+            // failed; the first error is the one kept.
+            let appended =
+                append_and_cleanup(self.sink.creates.get_mut(), &shard.creates, self.scratch)
+                    .and(append_and_cleanup(
+                        self.sink.modifies.get_mut(),
+                        &shard.modifies,
+                        self.scratch,
+                    ))
+                    .and(append_and_cleanup(
+                        self.sink.deletes.get_mut(),
+                        &shard.deletes,
+                        self.scratch,
+                    ));
+            if let Err(e) = appended {
+                first_err = Some(e);
+                continue;
+            }
+            self.sink.create_count += shard.stats.creates;
+            self.sink.modify_count += shard.stats.modifies;
+            self.sink.delete_count += shard.stats.deletes;
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+
+    fn on_plan(&mut self, kind: ElementKind, shards: &[super::shard::Shard]) {
+        let [shards_name, max_name, min_name] = match kind {
+            ElementKind::Node => [
+                "derivepar_node_shards",
+                "derivepar_node_shard_max_blobs",
+                "derivepar_node_shard_min_blobs",
+            ],
+            ElementKind::Way => [
+                "derivepar_way_shards",
+                "derivepar_way_shard_max_blobs",
+                "derivepar_way_shard_min_blobs",
+            ],
+            ElementKind::Relation => [
+                "derivepar_rel_shards",
+                "derivepar_rel_shard_max_blobs",
+                "derivepar_rel_shard_min_blobs",
+            ],
+        };
+        crate::debug::emit_counter(shards_name, shards.len());
+        let blobs = shards.iter().map(super::shard::Shard::blobs);
+        crate::debug::emit_counter(max_name, blobs.clone().max().unwrap_or(0));
+        crate::debug::emit_counter(min_name, blobs.min().unwrap_or(0));
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn panic_hook(faults: &crate::test_hooks::FaultPlan) -> &std::sync::atomic::AtomicUsize {
+        &faults.derive_shard_panic
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn panic_message(idx: usize) -> String {
+        format!("test-hooks: derive_parallel shard {idx} panicking")
+    }
+}
+
+/// Copy a shard's scratch file onto `out` and then remove it - also when the
+/// copy fails, so a failed write does not leave the temp file behind.
+fn append_and_cleanup(
+    out: &mut io::BufWriter<File>,
+    src: &crate::scratch::ScratchPath,
+    scratch: &crate::scratch::RunScratch,
+) -> Result<()> {
+    // Named: a bare "Permission denied" for a scratch file the user never
+    // chose says nothing about where to look.
+    let copied = crate::scratch::open(src)
+        .and_then(|mut f| io::copy(&mut f, out))
+        .map_err(|e| {
+            crate::Error::from(e).context(format!("failed to copy scratch file {}", src.display()))
+        });
+    scratch.remove(src);
+    copied.map(drop)
+}
+
 /// Extract just id + metadata from a borrowed element for delete output.
 /// Avoids full owned conversion (no tag/ref cloning - deletes only need id + version).
-/// Shared by the sequential sink and the parallel shard workers, so both
-/// paths emit the same delete for the same element. The version is passed
-/// raw; `write_delete_element` decides whether it is a claim.
-pub(super) fn extract_delete_info(
+/// The version is passed raw; `write_delete_element` decides whether it is
+/// a claim. An element of another kind than the phase's yields `None` and
+/// is neither written nor counted.
+fn extract_delete_info(
     elem: &crate::Element<'_>,
     kind: ElementKind,
 ) -> Option<(&'static str, i64, Option<OwnedMetadata>)> {
@@ -375,48 +510,60 @@ pub(super) fn extract_delete_info(
 // Optimized block-pair path (borrowed elements, zero-alloc for Equal)
 // ---------------------------------------------------------------------------
 
-/// Stream changes using block-pair merge with borrowed elements.
-/// Only changed elements (~1.2% of typical daily diff) are materialized as owned,
-/// written to temp files immediately, then dropped.
+/// Stream changes using the block-pair merge with borrowed elements, over
+/// up to `jobs` ID-range shards per kind (see `shard` and `sharded`). Only
+/// changed elements are serialized, written to temp files immediately.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn derive_changes_block_pair(
     old: &PinnedInput,
     new: &PinnedInput,
-    direct_io: bool,
+    jobs: usize,
+    // Not honoured yet: the walk and the shard reads pread through the
+    // walker's buffered descriptor at every shard count. Kept as the place
+    // the flag reaches once those reads honour it.
+    _direct_io: bool,
     sink: &mut ChangeSink,
+    scratch: &crate::scratch::RunScratch,
     host: &crate::host::Host,
 ) -> Result<()> {
-    let mut old_reader = crate::blob::BlobReader::open_in(old, direct_io, host)?;
-    old_reader.set_parse_indexdata(true);
-    let mut new_reader = crate::blob::BlobReader::open_in(new, direct_io, host)?;
-    new_reader.set_parse_indexdata(true);
-
-    let mut merge = BlockPairMergeState::new(old_reader, new_reader);
-
-    crate::debug::emit_marker("DERIVECHANGES_PHASE_NODE_START");
-    collect_phase_block_pair(&mut merge, ElementKind::Node, sink)?;
-    crate::debug::emit_marker("DERIVECHANGES_PHASE_NODE_END");
-
-    crate::debug::emit_marker("DERIVECHANGES_PHASE_WAY_START");
-    collect_phase_block_pair(&mut merge, ElementKind::Way, sink)?;
-    crate::debug::emit_marker("DERIVECHANGES_PHASE_WAY_END");
-
-    crate::debug::emit_marker("DERIVECHANGES_PHASE_REL_START");
-    collect_phase_block_pair(&mut merge, ElementKind::Relation, sink)?;
-    crate::debug::emit_marker("DERIVECHANGES_PHASE_REL_END");
-
-    super::emit_merge_stats_counters(&merge.stats);
+    let walked = super::shard::walk_pair(old, new, host)?;
+    if walked.has_negative && jobs > 1 {
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "derive_changes.negative_id_fallback",
+            "Using a single shard: negative IDs cannot use ID-range shards"
+        );
+        crate::debug::emit_counter("derive_changes_negative_id_fallback", 1);
+    }
+    // Scratch peaks include the final action fragments plus the current
+    // kind's shard fragments. Appending temporarily duplicates the source
+    // shard, then removes it; gzip later keeps all three final fragments
+    // alive. Header ranges/counts cannot predict changed XML bytes, so an
+    // input-size free-space refusal here would be a guess, not a
+    // lifetime-aware budget; retain bounded-memory streaming and propagate
+    // actual write failures.
+    let phases = [
+        super::sharded::Phase {
+            kind: ElementKind::Node,
+            start_marker: "DERIVECHANGES_PHASE_NODE_START",
+            end_marker: "DERIVECHANGES_PHASE_NODE_END",
+        },
+        super::sharded::Phase {
+            kind: ElementKind::Way,
+            start_marker: "DERIVECHANGES_PHASE_WAY_START",
+            end_marker: "DERIVECHANGES_PHASE_WAY_END",
+        },
+        super::sharded::Phase {
+            kind: ElementKind::Relation,
+            start_marker: "DERIVECHANGES_PHASE_REL_START",
+            end_marker: "DERIVECHANGES_PHASE_REL_END",
+        },
+    ];
+    let mut report = OscReport { sink, scratch };
+    let merge_stats = super::sharded::run(&walked, &phases, jobs, true, &mut report, host)?;
+    super::emit_merge_stats_counters(&merge_stats);
     Ok(())
-}
-
-/// Run one type phase of block-pair merge, streaming changed elements to temp files.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn collect_phase_block_pair(
-    merge: &mut BlockPairMergeState,
-    kind: ElementKind,
-    sink: &mut ChangeSink,
-) -> Result<()> {
-    block_pair_merge_phase(merge, kind, true, &mut |action| sink.record(kind, &action))
 }
 
 /// Fallback path for inputs without indexdata: the element-level streaming
@@ -454,9 +601,7 @@ fn derive_changes_element_stream(
     ];
     for (kind, start, end) in phases {
         crate::debug::emit_marker(start);
-        stream_merge_phase(&mut old_src, &mut new_src, kind, &mut |action| {
-            sink.record(kind, &action)
-        })?;
+        stream_merge_phase(&mut old_src, &mut new_src, kind, &mut *sink)?;
         crate::debug::emit_marker(end);
     }
 
@@ -488,12 +633,10 @@ fn assemble_osc(
     )
 }
 
-/// Assemble the final `.osc.gz` from three external temp file fragments.
-/// Same logic as `assemble_osc` but takes the paths + counts directly,
-/// so non-`ChangeSink` callers (e.g. the parallel derive path) can
-/// produce fragments however they like and feed them in.
+/// Assemble the final `.osc.gz` from three temp file fragments and their
+/// element counts; [`assemble_osc`] passes the run's sink's.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn assemble_osc_from_paths(
+fn assemble_osc_from_paths(
     output: &crate::output::Output,
     creates_path: &Path,
     modifies_path: &Path,
@@ -616,9 +759,8 @@ fn copy_section<W: Write>(
 }
 
 /// Write one `<node|way|relation id=".." [version=".."] [timestamp=".."]/>`
-/// delete entry. Shared by the sequential sink (both sequential paths) and
-/// the parallel shard workers.
-pub(super) fn write_delete_element<W: Write>(
+/// delete entry, for [`ChangeSink`].
+fn write_delete_element<W: Write>(
     writer: &mut Writer<W>,
     tag_name: &str,
     id: i64,
@@ -697,7 +839,7 @@ mod scratch_tests {
         let scratch =
             RunScratch::create(dir.path(), &crate::host::Host::for_tests()).expect("scratch");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _sink = ChangeSink::new(&scratch, false, None).expect("sink");
+            let _sink = ChangeSink::new(&scratch, "", false, None).expect("sink");
             panic!("simulate a failed derive run");
         }));
         assert!(result.is_err());

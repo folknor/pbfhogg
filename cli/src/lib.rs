@@ -677,12 +677,12 @@ fn validate_diff(command: &Command, quiet: bool) -> Result<(), Box<dyn std::erro
                     return refuse(&format!("{flag} is only valid with --format osc"));
                 }
             }
-            // `-j 1` selects the sequential text path, which writes no
-            // scratch. (`--format osc` keeps its scratch on the sequential
-            // path too, so it keeps --tmp-dir.)
+            // `-j 1` runs one shard, whose text goes straight to the output:
+            // no scratch. (`--format osc` keeps its scratch at one shard
+            // too, so it keeps --tmp-dir.)
             if tmp.tmp_dir.is_some() && jobs.fixed() == Some(1) {
                 return refuse(
-                    "--tmp-dir has no effect with -j 1: the sequential text diff writes no \
+                    "--tmp-dir has no effect with -j 1: a one-shard text diff writes no \
                      scratch files",
                 );
             }
@@ -1526,9 +1526,8 @@ enum Command {
         /// Hide unchanged elements (show only created/modified/deleted)
         #[arg(short = 'c', long = "suppress-common")]
         suppress_common: bool,
-        /// Show detailed changes for modified elements. Sequential-only, so not
-        /// with -j or --tmp-dir, which only the parallel path uses
-        #[arg(short = 'v', long, conflicts_with_all = ["jobs", "tmp_dir"])]
+        /// Show detailed changes for modified elements
+        #[arg(short = 'v', long)]
         verbose: bool,
         /// Print osmium-style summary (left/right/same/different
         /// counts) to stderr instead of the default pbfhogg-format
@@ -1547,11 +1546,11 @@ enum Command {
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type", value_parser = parse_type_filter)]
         type_filter: Option<TypeFilter>,
-        // Diff's N is a shard count as well as a thread cap: the parallel
-        // path partitions the ID space into N shards, writes their text to
+        // Diff's N is a shard count as well as a thread cap: the block-pair
+        // merge partitions the ID space into N shards, writes their text to
         // scratch and stitches it in order. Sharding needs both inputs
-        // indexed and no negative IDs; otherwise the run takes the
-        // sequential path with a note, whatever -j says.
+        // indexed and no negative IDs; otherwise the run uses one shard (or,
+        // unindexed, the element stream) with a note, whatever -j says.
         #[arg(
             short = 'j',
             long = "jobs",

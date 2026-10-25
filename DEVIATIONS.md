@@ -310,10 +310,9 @@ positive-only, and several code paths rely on that invariant.
 
 `diff` and `diff --format osc` are not among the sites below: they
 accept negative IDs and order them by the canonical `id_order`. Their
-parallel shard planners compare thresholds as raw `i64`, which agrees
-with `id_order` only for non-negative IDs, so an indexed input holding
-any negative ID takes the sequential block-pair merge for the whole
-comparison instead (`src/commands/diff/shard.rs`).
+shard planner compares thresholds as raw `i64`, which agrees with
+`id_order` only for non-negative IDs, so an indexed comparison holding
+any negative ID runs as one shard instead (`src/commands/diff/shard.rs`).
 
 **Sites enforcing the invariant:**
 

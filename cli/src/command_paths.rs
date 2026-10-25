@@ -78,21 +78,15 @@ impl ScratchSite {
     }
 }
 
-/// Whether a `diff` run writes scratch. `--format osc` always does, on the
-/// sequential path too. A text diff does unless it runs one shard (`-j 1`,
-/// or `--verbose`, which is sequential-only) or is quiet: a quiet text diff
-/// only counts (`diff_stats`), which shards without scratch. `validate_diff`
-/// refuses `--tmp-dir` on the runs this answers `false` for, each refusal
-/// with its own reason.
-fn diff_writes_scratch(
-    format: DiffFormat,
-    quiet: bool,
-    verbose: bool,
-    jobs: pbfhogg::Parallelism,
-) -> bool {
+/// Whether a `diff` run writes scratch. `--format osc` always does, at one
+/// shard too. A text diff does unless it runs one shard (`-j 1`) or is
+/// quiet: a quiet text diff only counts (`diff_stats`), which shards without
+/// scratch. `validate_diff` refuses `--tmp-dir` on the runs this answers
+/// `false` for, each refusal with its own reason.
+fn diff_writes_scratch(format: DiffFormat, quiet: bool, jobs: pbfhogg::Parallelism) -> bool {
     match format {
         DiffFormat::Osc => true,
-        DiffFormat::Text => !(quiet || verbose || jobs.fixed() == Some(1)),
+        DiffFormat::Text => !(quiet || jobs.fixed() == Some(1)),
     }
 }
 
@@ -211,7 +205,6 @@ impl CommandPaths {
             Command::Diff {
                 old,
                 new,
-                verbose,
                 output,
                 jobs,
                 format,
@@ -220,14 +213,14 @@ impl CommandPaths {
             } => {
                 paths.inputs.extend([old.clone(), new.clone()]);
                 paths.outputs.extend(output.as_ref().map(file));
-                if diff_writes_scratch(*format, quiet, *verbose, *jobs) {
+                if diff_writes_scratch(*format, quiet, *jobs) {
                     paths.scratch = Some(ScratchSite::new(tmp, output.as_deref()));
                 }
                 // Older versions wrote `diff-par-*` shards beside the old
                 // input.
                 paths.also_scan.push(parent_of(old));
                 // Where a stdout diff that makes scratch puts it; a run that
-                // makes none (`-j 1`, `-v`, a quiet text diff, which takes
+                // makes none (text `-j 1`, a quiet text diff, which takes
                 // no -o) still scans it for an earlier run's leftover.
                 if output.is_none() && tmp.tmp_dir.is_none() {
                     paths.also_scan.push(PathBuf::from("."));

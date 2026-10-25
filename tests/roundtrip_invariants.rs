@@ -596,9 +596,9 @@ fn diff_blob_layout_independence() {
     }
 }
 
-/// `diff_stats` is `diff` without the text: on every path (parallel shards,
-/// the sequential block-pair merge, the unindexed element stream, the
-/// negative-ID fallback) and every type filter, it either returns the same
+/// `diff_stats` is `diff` without the text: on every path (one shard or
+/// several, the unindexed element stream, the negative-ID single shard) and
+/// every type filter, it either returns the same
 /// four counts as an unsuppressed text diff of the same inputs, or fails
 /// with the same error. An identical pair of corrupt files must fail both
 /// ways, which a byte-equal shortcut in the count would not.
@@ -683,6 +683,78 @@ fn diff_stats_matches_text_diff_on_every_path() {
     assert!(ok_runs > 30, "only {ok_runs} runs succeeded");
 }
 
+/// A comparison that may skip equal blobs (`-c`, and derive) does not decode
+/// a fresh blob pair with identical claims and compressed bytes, at every
+/// shard count: two identical files whose one corrupt blob sits mid-way
+/// through a multi-shard kind compare clean there, and are refused by a diff
+/// that must print every common element, which decodes the pair. Only `-j 1`
+/// used to skip the pair; the sharded merge decoded every blob.
+#[test]
+fn an_identical_corrupt_pair_is_skipped_wherever_equal_blobs_may_be() {
+    let dir = crate::common::test_scratch();
+    let clean = dir.path().join("clean.osm.pbf");
+    let corrupt = dir.path().join("corrupt.osm.pbf");
+    // Eight node blobs, so `-j 4` plans four node shards.
+    write_multi_block_test_pbf(&clean, &generate_nodes(40, 1), &[], &[], 5);
+    let bytes = std::fs::read(&clean).expect("read");
+    // Blob 0 is the header; blob 4 is the fourth node blob.
+    let mangled = crate::common::adversarial::mutate_blob_payload(&bytes, 4, |payload| {
+        *payload = vec![0xff; 16];
+    });
+    std::fs::write(&corrupt, mangled).expect("write corrupt");
+
+    for jobs in [1, 2, 4] {
+        let parallelism = pbfhogg::Parallelism::from_jobs(jobs);
+        let run_diff = |suppress_common: bool| {
+            let options = pbfhogg::diff::DiffOptions {
+                suppress_common,
+                verbose: false,
+                type_filter: None,
+                parallelism,
+            };
+            pbfhogg::diff::diff(
+                &corrupt,
+                &corrupt,
+                &mut Vec::new(),
+                &options,
+                false,
+                &crate::common::test_host(),
+                Some(crate::common::scratch_in(dir.path())),
+            )
+        };
+        let stats = run_diff(true)
+            .unwrap_or_else(|e| panic!("-j {jobs} -c: the identical pair must be skipped: {e}"));
+        assert_eq!(
+            (stats.common, stats.created, stats.modified, stats.deleted),
+            (40, 0, 0, 0),
+            "-j {jobs} -c"
+        );
+        assert!(
+            run_diff(false).is_err(),
+            "-j {jobs}: printing every common element decodes the corrupt pair"
+        );
+
+        let osc = dir.path().join(format!("j{jobs}.osc.gz"));
+        let derived = pbfhogg::diff::derive::derive_changes(
+            &corrupt,
+            &corrupt,
+            crate::common::out(&osc),
+            false,
+            false,
+            None,
+            parallelism,
+            &crate::common::test_host(),
+            crate::common::scratch_in(dir.path()),
+        )
+        .unwrap_or_else(|e| panic!("-j {jobs} derive: the identical pair must be skipped: {e}"));
+        assert_eq!(
+            (derived.creates, derived.modifies, derived.deletes),
+            (0, 0, 0),
+            "-j {jobs} derive"
+        );
+    }
+}
+
 /// The inputs of [`diff_stats_matches_text_diff_on_every_path`]: an indexed
 /// pair with creates, deletes and modifies in every kind, the same content
 /// unindexed, a mixed-sign indexed pair, and the old file with its last
@@ -736,12 +808,11 @@ fn write_diff_stats_fixtures(dir: &Path) {
 }
 
 /// A type filter that excludes a kind ahead of an enabled one answers the
-/// same on every path: the sequential block-pair merge (`-j 1`, verbose,
-/// and every negative-ID run) skips the excluded kind's blobs, the parallel
-/// path never reads them, and the unindexed stream decodes them to classify
-/// them and drops them unconverted.
-/// The sequential merge used to start the later phase on the excluded
-/// kind's first blob and refuse every such run as unsorted. The answer is
+/// same on every path: the block-pair merge never reads the excluded kind's
+/// blobs at any shard count, and the unindexed stream decodes them to
+/// classify them and drops them unconverted.
+/// The streaming merge `-j 1` once ran used to start the later phase on the
+/// excluded kind's first blob and refuse every such run as unsorted. The answer is
 /// also pinned to the single-kind runs, which skip nothing.
 #[test]
 fn diff_type_filter_excluding_an_earlier_kind_agrees_on_every_path() {

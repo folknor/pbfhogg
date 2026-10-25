@@ -2547,6 +2547,30 @@
 
 ### Changed
 
+- **`diff` and `diff --format osc` give the same answer at every `-j`, and
+  `diff -v` runs at any `-j`.** Indexed inputs used to go through two
+  engines: a streaming one at `-j 1` (and for `-v` and negative IDs) and a
+  sharded one, the default, which differed at the edges. Both now run one
+  engine; `-j 1` is that engine with one shard. What moved for users:
+  - The default (sharded) path no longer decodes a byte-identical blob pair
+    under `-c` and `--format osc`, as `-j 1` already did: diffing an
+    `apply-changes` output against its base skips its unchanged blobs, and
+    an identical pair of files corrupt only inside such a pair now compares
+    clean at every `-j` instead of only at `-j 1`.
+  - A blob whose indexdata understates its last ID is refused at every `-j`
+    where the merge meets the extra elements; the sharded path used to drop
+    them and report them as deleted or created.
+  - A sharded derive no longer counts a delete it did not write (an
+    element of another kind than its blob claims).
+  - `-v/--verbose` is no longer refused with `-j` or `--tmp-dir`, and the
+    library no longer refuses `verbose` with a fixed shard count above one;
+    a verbose diff shards like any other and needs scratch when it does.
+  - Inputs with negative IDs run as one shard of the same engine; the
+    `Note:` now says so.
+  - `--direct-io` no longer affects how an indexed `diff -j 1` reads its
+    inputs: every `-j` reads them through the buffered header-walk
+    descriptor, as the default path always did.
+
 - **`cat --dedupe` runs on `sort`'s engine, and `sort` no longer buffers
   its overlap output.** The two were one blob-level merge in two copies;
   they now share one. For `cat --dedupe` that means pass 1 walks blob

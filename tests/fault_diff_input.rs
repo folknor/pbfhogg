@@ -11,13 +11,9 @@
 //! pread the walker's descriptor), one at a time, so the counts are exact.
 //!
 //! The opens of one input, in order (see `Route::opens`): the front read of
-//! the header and the first blob's indexdata; then the parallel route's
-//! header walk, the sequential block-pair reader, or the streaming reader
-//! of a route with an unindexed side. A parallel route whose inputs hold a
-//! negative ID walks both and then runs the sequential block-pair merge,
-//! adding its reader; a block-pair merge whose type filter excludes the
-//! kinds after its last phase walks the rest of each file's headers,
-//! adding that walk.
+//! the header and the first blob's indexdata; then the block-pair merge's
+//! header walk (at any shard count, negative IDs and type filters
+//! included), or the streaming reader of a route with an unindexed side.
 //!
 //! `diff` writes to a caller's `Write`, so a run refused at a later open
 //! may already have written text; what it owes is the typed refusal.
@@ -36,8 +32,8 @@ use crate::common::{
 
 #[derive(Clone, Copy, Debug)]
 struct Route {
-    /// Fixed shard count: 1 runs the sequential paths, 3 the parallel one
-    /// when both inputs carry indexdata.
+    /// Fixed shard count: 1 runs one shard on the calling thread, 3 the
+    /// sharded merge when both inputs carry indexdata.
     jobs: usize,
     /// `diff_stats` instead of `diff`.
     count: bool,
@@ -64,24 +60,11 @@ impl Route {
         ..Self::SEQUENTIAL
     };
 
-    fn both_indexed(self) -> bool {
-        !self.unindexed.contains(&true)
-    }
-
-    /// Opens of either input through its pin.
+    /// Opens of either input through its pin: the front read, then the
+    /// header walk (both inputs indexed, at any shard count and filter) or
+    /// the streaming reader (an unindexed side).
     fn opens(self) -> u64 {
-        // The front read, then the walker or the reader.
-        let mut opens = 2;
-        let parallel = self.jobs > 1 && self.both_indexed();
-        // The negative-ID fallback runs the block-pair merge after the walk.
-        if parallel && self.negative {
-            opens += 1;
-        }
-        let block_pair = self.both_indexed() && (!parallel || self.negative);
-        if block_pair && self.nodes_only {
-            opens += 1;
-        }
-        opens
+        2
     }
 
     fn type_filter(self) -> Option<TypeFilter> {
@@ -364,14 +347,14 @@ fn sequential_diff_reads_only_the_pinned_inputs() {
             },
             2,
         );
-        // The block-pair merge walks the headers of the excluded tail.
+        // The excluded tail is covered by the one header walk.
         check_route(
             Route {
                 count,
                 nodes_only: true,
                 ..Route::SEQUENTIAL
             },
-            3,
+            2,
         );
     }
 }
@@ -398,8 +381,7 @@ fn parallel_diff_reads_only_the_pinned_inputs() {
     }
 }
 
-/// Negative IDs send a parallel run to the sequential block-pair merge
-/// after both walks.
+/// Negative IDs make a sharded run one unbounded shard, over the same walk.
 #[test]
 fn the_negative_id_fallback_reads_only_the_pinned_inputs() {
     for count in [false, true] {
@@ -408,13 +390,13 @@ fn the_negative_id_fallback_reads_only_the_pinned_inputs() {
             negative: true,
             ..Route::PARALLEL
         };
-        check_route(negative, 3);
+        check_route(negative, 2);
         check_route(
             Route {
                 nodes_only: true,
                 ..negative
             },
-            4,
+            2,
         );
     }
 }
@@ -443,8 +425,8 @@ fn the_streaming_diff_reads_only_the_pinned_inputs() {
     );
 }
 
-/// The front reads and the sequential readers open `O_DIRECT` when asked
-/// to, through the pin's own direct open (the parallel walk stays
+/// The front reads and the streaming readers open `O_DIRECT` when asked
+/// to, through the pin's own direct open (the block-pair walk stays
 /// buffered).
 #[cfg(feature = "linux-direct-io")]
 #[test]
@@ -455,7 +437,7 @@ fn direct_reads_follow_the_pinned_inputs() {
                 nodes_only: true,
                 ..Route::SEQUENTIAL
             },
-            3,
+            2,
         ),
         (Route::PARALLEL, 2),
         (
@@ -690,31 +672,32 @@ fn an_invalid_option_is_refused_before_the_inputs_are_touched() {
     inputs.push(crate::common::make_fifo(dir.path(), "in.fifo"));
     let host = crate::common::test_host();
     for input in &inputs {
-        let verbose = DiffOptions {
+        let unsharded = DiffOptions {
             suppress_common: false,
-            verbose: true,
+            verbose: false,
             type_filter: None,
             parallelism: pbfhogg::Parallelism::from_jobs(3),
         };
-        let unsharded = DiffOptions {
-            verbose: false,
-            ..verbose
-        };
-        for (options, needle) in [(&verbose, "verbose"), (&unsharded, "scratch")] {
-            let err =
-                pbfhogg::diff::diff(input, input, &mut Vec::new(), options, false, &host, None)
-                    .err()
-                    .unwrap_or_else(|| panic!("{}: must be refused", input.display()));
-            assert!(
-                matches!(err.kind(), pbfhogg::ErrorKind::InvalidArgument { .. }),
-                "{}: {err:?}",
-                input.display()
-            );
-            assert!(
-                err.to_string().contains(needle),
-                "{}: {err}",
-                input.display()
-            );
-        }
+        let err = pbfhogg::diff::diff(
+            input,
+            input,
+            &mut Vec::new(),
+            &unsharded,
+            false,
+            &host,
+            None,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{}: must be refused", input.display()));
+        assert!(
+            matches!(err.kind(), pbfhogg::ErrorKind::InvalidArgument { .. }),
+            "{}: {err:?}",
+            input.display()
+        );
+        assert!(
+            err.to_string().contains("scratch"),
+            "{}: {err}",
+            input.display()
+        );
     }
 }

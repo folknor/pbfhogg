@@ -162,9 +162,9 @@ should stay that way:
   and writer-side reframe paths
 - `extract` (simple / complete / smart / multi) - pread workers
 - `sort` - direct pread per blob
-- `diff`, `derive_changes` (aka `diff --format osc`) - `StreamingBlocks`
-  for the sequential path; shard-based pread for the parallel path
-  (`DiffOptions::num_shards >= 2`)
+- `diff`, `derive_changes` (aka `diff --format osc`) - shard-based pread
+  for indexed inputs at every `-j` (one shard at `-j 1`); `StreamingBlocks`
+  for unindexed inputs
 - `apply-changes` - descriptor-first scanner + worker pool, pread
   per blob (`src/commands/apply_changes/`)
 - `renumber` - external-join style stages (`pass1.rs`, `stage2.rs`,

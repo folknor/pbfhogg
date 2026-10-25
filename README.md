@@ -70,7 +70,7 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 | `tags-filter -R highway=primary` | 52s | 688 MB |
 | `time-filter` (snapshot, cutoff 2024-01-01) | 4m24s | 812 MB |
 
-Three commands write temp files to the output's parent directory: `add-locations-to-ways --index-type external` (~246 GB), `diff` (parallel by default; ~30 GB text shards at planet), `diff --format osc` (~45 GB XML shards). The others are scratch-free. `diff -j 1` restores the scratch-free sequential path if temp disk is scarce.
+Three commands write temp files to the output's parent directory: `add-locations-to-ways --index-type external` (~246 GB), `diff` (parallel by default; ~30 GB text shards at planet), `diff --format osc` (~45 GB XML shards). The others are scratch-free. A text `diff -j 1` runs one shard and writes no scratch, if temp disk is scarce.
 
 History-shaped input (per-element version history and visibility, consumed by `time-filter` on multi-version files) is functional but deliberately outside this validation surface: no history dataset is configured or benchmarked, and the table above says nothing about it.
 

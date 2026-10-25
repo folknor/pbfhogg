@@ -280,20 +280,6 @@ impl HeaderWalker {
         })
     }
 
-    /// Start the walk at the frame beginning at byte `frame_start`, the
-    /// `blob_index`-th frame of the file, instead of at the file's start.
-    /// For a caller that read the file this far through another reader and
-    /// hands the rest to a header-only walk; both values must be that
-    /// reader's logical position (a frame boundary), not where an underlying
-    /// descriptor has read ahead to. Errors keep naming the true ordinal and
-    /// offset, and a leading-header blob found here is refused as misplaced.
-    #[must_use]
-    pub(crate) fn resume_at(mut self, frame_start: u64, blob_index: u64) -> Self {
-        self.offset = frame_start;
-        self.blob_index = blob_index;
-        self
-    }
-
     /// Make this walk refuse a partially indexed file: once the data blobs
     /// seen so far include one with readable indexdata and one without,
     /// [`Self::next_header`] returns the typed missing-indexdata error

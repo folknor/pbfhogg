@@ -1660,47 +1660,27 @@ fn diff_block_pair_parallel_matches_sequential_on_multi_blob() {
     );
 }
 
-/// `-v/--verbose` always runs the sequential path, so an explicit
-/// `-j/--jobs` alongside it was accepted and thrown away. `tags-filter`
-/// already made the equivalent `-R` + `-j` a hard error; the two agree
-/// now. The default `-j 0` must keep working with `-v` - only an
-/// explicit value is a conflict.
+/// `-v/--verbose` details come from the one diff sink every shard writes
+/// through, so a sharded verbose diff prints exactly the one-shard text,
+/// detail lines included, each under its modification line.
 #[test]
-fn diff_rejects_explicit_jobs_with_verbose() {
+fn diff_verbose_sharded_matches_one_shard() {
     let dir = crate::common::test_scratch();
-    let old = dir.path().join("old.osm.pbf");
-    let new = dir.path().join("new.osm.pbf");
-    let nodes = generate_nodes(4, 1);
-    write_test_pbf_sorted(&old, &nodes, &[], &[]);
-    write_test_pbf_sorted(&new, &nodes, &[], &[]);
+    let (old, new) = write_shard_pair(dir.path());
 
-    let out = CliInvoker::new()
-        .arg("diff")
-        .arg(&old)
-        .arg(&new)
-        .arg("-v")
-        .arg("-j")
-        .arg("4")
-        .run();
+    let opts = |jobs| DiffOpts {
+        verbose: true,
+        jobs: Some(jobs),
+        ..DiffOpts::default()
+    };
+    let (text_one, stats_one) = run_diff(&old, &new, opts(1));
+    let (text_par, stats_par) = run_diff(&old, &new, opts(8));
     assert!(
-        !out.status.success(),
-        "-v with an explicit -j must be rejected, not silently ignored; stderr:\n{}",
-        out.stderr_str(),
+        text_one.lines().any(|line| line.starts_with("  ")),
+        "the fixture must produce verbose detail lines; text:\n{text_one}"
     );
-
-    // Verbose on its own is unaffected: `jobs` defaults to 0 and a
-    // default value must not trip the conflict.
-    let out = CliInvoker::new()
-        .arg("diff")
-        .arg(&old)
-        .arg(&new)
-        .arg("-v")
-        .run();
-    assert!(
-        out.status.success(),
-        "-v alone must still run on identical inputs; stderr:\n{}",
-        out.stderr_str(),
-    );
+    assert_eq!(stats_one, stats_par, "verbose stats drift");
+    assert_eq!(text_one, text_par, "-j 8 verbose text diverges from -j 1");
 }
 
 /// `-j 1` is the scratch-free path: it must run, to stdout, from a current
@@ -1743,9 +1723,9 @@ fn diff_single_job_needs_no_writable_current_directory() {
 // Sequential vs parallel sharded equivalence
 // ---------------------------------------------------------------------------
 //
-// `-j 1` runs the sequential block-pair merge; `-j 8` runs the sharded
-// drivers, which reimplement that merge per ID-range shard. The two must
-// produce the same bytes. The fixture is laid out blob by blob so the
+// `-j 1` runs the block-pair merge as one shard; `-j 8` runs it per
+// ID-range shard, clipping blobs that straddle a shard's window and
+// concatenating the shards' output. The two must produce the same bytes. The fixture is laid out blob by blob so the
 // shard planner really splits every kind and the interesting cases sit on
 // shard boundaries.
 //

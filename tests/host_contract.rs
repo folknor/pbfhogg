@@ -598,9 +598,12 @@ fn diff_without_scratch_needs_a_single_shard() {
         )
     };
     assert!(run(false, 1).is_ok());
-    assert!(run(true, 0).is_ok());
-    let err = run(false, 2).expect_err("two shards need scratch");
-    assert!(err.to_string().contains("scratch directory"), "{err}");
+    assert!(run(true, 1).is_ok());
+    // Verbose shards like any other diff.
+    for verbose in [false, true] {
+        let err = run(verbose, 2).expect_err("two shards need scratch");
+        assert!(err.to_string().contains("scratch directory"), "{err}");
+    }
     // Counting takes no scratch at any shard count and writes nothing.
     let before = crate::common::snapshot_dir(dir.path());
     for jobs in [0, 2, 4] {

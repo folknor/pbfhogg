@@ -358,8 +358,59 @@ fn decompress_parsed_blob_body(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()>
 /// to stay thread-local.
 #[hotpath::measure]
 pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<()> {
-    use super::wire::Cursor;
     buf.clear();
+    let (payload, raw_size) = parse_raw_envelope(raw_blob)?;
+    let Some((field, slice)) = payload else {
+        return Err(new_blob_error(BlobError::Empty));
+    };
+    if field == blob_fields::RAW {
+        let size = slice.len() as u64;
+        if size > MAX_BLOB_MESSAGE_SIZE {
+            return Err(new_blob_error(BlobError::MessageTooBig { size }));
+        }
+        buf.extend_from_slice(slice);
+    } else {
+        if let Some(rs) = raw_size
+            && rs > 0
+        {
+            #[allow(clippy::cast_sign_loss)]
+            // `buf` was cleared at function entry; reserve the full clamped
+            // hint because `reserve` counts additional bytes from its length.
+            buf.reserve(clamp_capacity_hint(rs as usize));
+        }
+        if field == blob_fields::ZLIB_DATA {
+            zlib_decompress_into(slice, buf)?;
+        } else {
+            zstd_decompress_into(slice, buf)?;
+        }
+    }
+    crate::read::blob_wire::check_raw_size(raw_size, buf.len())
+}
+
+/// The payload of raw blob bytes (from pread), undecompressed, for a blob
+/// equality test: the compression kind (0 raw, 1 zlib, 2 zstd) and the
+/// payload bytes, or `None` when the envelope carries no payload. Two blobs
+/// with the same kind and identical payload bytes hold identical elements.
+/// Parsed by the same rules as
+/// [`decompress_blob_raw`], so an envelope one refuses the other refuses, and
+/// borrowed, so a failed comparison costs no copy.
+pub(crate) fn raw_blob_payload(raw_blob: &[u8]) -> Result<Option<(u8, &[u8])>> {
+    let (payload, _) = parse_raw_envelope(raw_blob)?;
+    Ok(payload.map(|(field, slice)| {
+        let kind = match field {
+            blob_fields::RAW => 0,
+            blob_fields::ZLIB_DATA => 1,
+            _ => 2,
+        };
+        (kind, slice)
+    }))
+}
+
+/// Parse a `Blob` envelope from raw bytes: the payload field and its bytes,
+/// and the declared `raw_size`.
+#[allow(clippy::type_complexity)]
+fn parse_raw_envelope(raw_blob: &[u8]) -> Result<(Option<(u32, &[u8])>, Option<i32>)> {
+    use super::wire::Cursor;
 
     let mut cursor = Cursor::new(raw_blob);
     let mut raw_size: Option<i32> = None;
@@ -391,32 +442,7 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
             _ => cursor.skip_field(wire_type)?,
         }
     }
-
-    let Some((field, slice)) = payload else {
-        return Err(new_blob_error(BlobError::Empty));
-    };
-    if field == blob_fields::RAW {
-        let size = slice.len() as u64;
-        if size > MAX_BLOB_MESSAGE_SIZE {
-            return Err(new_blob_error(BlobError::MessageTooBig { size }));
-        }
-        buf.extend_from_slice(slice);
-    } else {
-        if let Some(rs) = raw_size
-            && rs > 0
-        {
-            #[allow(clippy::cast_sign_loss)]
-            // `buf` was cleared at function entry; reserve the full clamped
-            // hint because `reserve` counts additional bytes from its length.
-            buf.reserve(clamp_capacity_hint(rs as usize));
-        }
-        if field == blob_fields::ZLIB_DATA {
-            zlib_decompress_into(slice, buf)?;
-        } else {
-            zstd_decompress_into(slice, buf)?;
-        }
-    }
-    crate::read::blob_wire::check_raw_size(raw_size, buf.len())
+    Ok((payload, raw_size))
 }
 
 /// Decompress a parsed WireBlob into an owned `Bytes`.

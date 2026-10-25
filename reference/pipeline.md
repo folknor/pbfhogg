@@ -211,8 +211,8 @@ Optional `--locations-on-ways` (`node_locations.rs`): preserves/updates inline w
 
 Two-pointer merge-join over two sorted PBFs. Three phases per element type (nodes, ways, relations). Each element compared by content equality (coordinates, tags, refs, members).
 
-- Sequential path (`diff/mod.rs`, `derive.rs`): `StreamingBlocks` merge-join on the calling thread.
-- Sharded parallel path (`diff/parallel.rs`, `derive_parallel.rs`): `DiffOptions::num_shards >= 2` partitions the ID space across shards and dispatches per-shard merge-joins in parallel.
+- Indexed inputs (`diff/shard.rs`, `diff/sharded.rs`, `osc/merge_join.rs`): a header walk of both files, then the block-pair merge over ID-range shards, one per job (one at `-j 1`, run on the calling thread; one for inputs holding negative IDs). Multi-shard phases run each shard on its own thread and concatenate the shards' scratch output in order. One engine and one sink per command (`DiffSink`, `ChangeSink`) at every shard count.
+- Unindexed inputs (`diff/mod.rs`, `derive.rs`): `StreamingBlocks` element-level merge-join on the calling thread, through the same sinks.
 - `diff` → text or summary output
 - `diff --format osc` (derive-changes) → OSC XML output
 

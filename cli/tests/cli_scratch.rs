@@ -246,7 +246,7 @@ fn a_scratch_free_diff_needs_no_writable_directory() {
     for args in [
         vec!["-j", "1"],
         vec!["-j", "1", "-q"],
-        vec!["-v"],
+        vec!["-v", "-j", "1"],
         vec!["-q"],
         vec!["-q", "-j", "2"],
     ] {

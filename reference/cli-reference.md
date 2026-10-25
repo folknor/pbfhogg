@@ -173,8 +173,9 @@ never silently means something new:
   writes no scratch, `-j` on a path with no worker pool, a PBF-only flag on
   OSC input, and so on. The refusal names the flags involved.
 - **A fallback the host or the input selects at run time is not grounds for
-  refusal**: an unindexed input or one with negative IDs taking diff's
-  sequential path, `-j 0` resolving to one worker on a one-core host. The same
+  refusal**: an unindexed input taking diff's sequential path, or one with
+  negative IDs its single-shard one, `-j 0` resolving to one worker on a
+  one-core host. The same
   command line must not be valid on one machine or file and invalid on
   another. Such a fallback prints a `Note:`.
 - **Every flag is parsed and checked before any input is opened**: malformed
@@ -201,12 +202,12 @@ its scanner, drain or writer threads, a minimum, a fallback when the host
 cannot say how many cores it has); `-j 0` and an omitted `-j` are the same.
 An explicit `-j` (any value, `0` included) is refused where it can have no
 effect: `tags-filter -R` and OSC-mode tags-filter, `inspect` outside
-`--nodes`, `diff -v`. Two exceptions to the rule:
+`--nodes`. Two exceptions to the rule:
 
-- **diff**: `N` is also the number of ID-range shards the parallel path
-  partitions the inputs into. The parallel path needs both inputs indexed and
-  free of negative IDs; otherwise the run takes the sequential path with a
-  `Note:`.
+- **diff**: `N` is also the number of ID-range shards the block-pair merge
+  partitions the inputs into. Sharding needs both inputs indexed and free of
+  negative IDs; otherwise the run is one shard (negative IDs) or the
+  sequential element stream (no indexdata), with a `Note:`.
 - **apply-changes**: `-j 1` is refused. Single-worker operation through the
   node-to-way barrier and its failure shutdown has not been validated.
 
@@ -240,8 +241,8 @@ no such line, and `build-geocode-index` names `--allow-unindexed` instead.
 `renumber` has no `--force`: its schedule needs indexdata on every blob and
 has no fallback, so an unindexed blob is a hard error. `getparents`,
 `time-filter`, `diff`, `digest`, `check` and `export` never refuse unindexed
-input, so they have no `--force` either (`diff` prints a `Note:` when it falls
-back to its sequential path).
+input, so they have no `--force` either (`diff` prints a `Note:` when an
+unindexed input sends it to its sequential path).
 
 `build-geocode-index` is the exception: its indexdata switch is
 `--allow-unindexed`, and its `--force` is a legacy shorthand for both
@@ -1020,22 +1021,22 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 |------|-------------|
 | `--format <FORMAT>` | Output format: `text` (default) or `osc` |
 | `-c, --suppress-common` | Hide unchanged elements (text only) |
-| `-v, --verbose` | Show detailed changes for modified elements (text only). Sequential-only, so not with `-j` or `--tmp-dir` |
+| `-v, --verbose` | Show detailed changes for modified elements (text only), at any `-j` |
 | `-s, --osmium-summary` | Print osmium-style summary (`Summary: left=N right=N same=N different=N`) on stderr instead of the default pbfhogg-format summary. Both formats fire on stderr unless `-q` (text only; refused with `-q`) |
 | `-o, --output <FILE>` | Write output to file (required for `--format osc`; refused with `-q` on a text diff) |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way. Requires `-o`: stdout is never replaced |
 | `-t, --type <TYPE>` | Filter by element type (text only) |
-| `-j, --jobs <N>` | Worker threads, and the number of ID-range shards (see [`-j/--jobs`](#-j--jobs)). `0` (default) uses one shard per core; `1` takes the sequential path, which for text writes no scratch. Applies to both text and `--format osc`; parallel sharding requires both inputs to be indexed. **Refused with `-v/--verbose`**, which is sequential-only. The parallel path writes its shard files to the run's scratch directory (planet scale: ~30 GB text, ~45 GB osc XML), removed on completion; a quiet text diff, which only counts, writes none. |
+| `-j, --jobs <N>` | Worker threads, and the number of ID-range shards (see [`-j/--jobs`](#-j--jobs)). `0` (default) uses one shard per core; `1` runs one shard on the main thread, which for text writes no scratch. The answer is the same at any `-j`. Applies to both text and `--format osc`; sharding requires both inputs to be indexed. A multi-shard run writes its shard files to the run's scratch directory (planet scale: ~30 GB text, ~45 GB osc XML), removed on completion; a quiet text diff, which only counts, writes none. |
 | `--increment-version` | Bump version of deleted elements by 1 (osc only) |
 | `--update-timestamp` | Set delete timestamp to current time (osc only) |
-| `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read. Default: the output's directory, or the current directory without `-o`. Refused with text `-j 1` and with `-v`, whose sequential path writes no scratch, and with `-q` on a text diff, which only counts (`--format osc` writes scratch on every path) |
+| `--tmp-dir <DIR>` | Directory for this run's scratch files (see [Scratch files](#scratch-files)). Must exist and be writable; checked before any input is read. Default: the output's directory, or the current directory without `-o`. Refused with text `-j 1`, whose one shard writes no scratch, and with `-q` on a text diff, which only counts (`--format osc` writes scratch on every path) |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 
 With `--format osc`, roundtrips content - applying the derived OSC to the old PBF gives a file `diff` finds identical to the new PBF; metadata, which `diff` ignores, is outside that check (see [DEVIATIONS](../DEVIATIONS.md#derive-changes-lossless-delete-roundtrip)).
 
-Inputs holding any negative ID always take the sequential block-pair path, whatever `-j` says: the parallel planner's shard boundaries are raw numeric comparisons, which do not order negative IDs the way the merge does.
+Inputs holding any negative ID always run as one shard, whatever `-j` says: shard boundaries are raw numeric comparisons, which do not order negative IDs the way the merge does.
 
-**Input checks.** Both inputs must claim `Sort.Type_then_ID`. With both inputs indexed, every path - sequential or parallel, at any `-j` and `-t` - refuses the same structurally malformed files: a truncated or malformed frame anywhere in either file, a data blob without indexdata, and blobs out of canonical order as far as their indexdata ID ranges prove it (order inside a blob, and inside a range spanning negative and positive IDs, is trusted). The body of a blob of a kind `-t` excludes is never interpreted. Blob bodies of the selected kinds are decoded where the comparison needs them, and there the paths differ: the sequential path does not decode a byte-identical blob pair when it may skip equal blobs (`-c`, `--format osc`), and the parallel path trusts each blob's claimed last ID when it decides whether a block has elements left, where the sequential path checks the claim against the block. Without indexdata the comparison is sequential at every `-j` and decodes every block of both files to learn its kind: a block of an earlier kind after a later one, and elements going backwards within a selected kind, are refused as unsorted, while blocks of excluded kinds are classified and dropped without converting their elements, so faults only a conversion sees (a tag whose string index is out of range) are not refused there.
+**Input checks.** Both inputs must claim `Sort.Type_then_ID`. With both inputs indexed, the comparison is one engine at every `-j` and `-t`: a walk of every blob header of both files first refuses a truncated or malformed frame anywhere in either file, a data blob without indexdata, and blobs out of canonical order as far as their indexdata ID ranges prove it (order inside a blob, and inside a range spanning negative and positive IDs, is trusted). The body of a blob of a kind `-t` excludes is never read. Blob bodies of the selected kinds are decoded where the comparison needs them: a byte-identical blob pair (same claimed range and count, same compression and compressed bytes) is not decoded when the comparison may skip equal blobs (`-c`, `--format osc`), so a corrupt body inside such a pair passes there and is refused by a diff that prints common elements. Where a block holds elements past its claimed last ID, the merge refuses the claim when it meets them (a shard boundary hides elements past it from the shard below, which a later shard reads). Without indexdata the comparison is sequential at every `-j` and decodes every block of both files to learn its kind: a block of an earlier kind after a later one, and elements going backwards within a selected kind, are refused as unsorted, while blocks of excluded kinds are classified and dropped without converting their elements, so faults only a conversion sees (a tag whose string index is out of range) are not refused there.
 
 ### digest
 

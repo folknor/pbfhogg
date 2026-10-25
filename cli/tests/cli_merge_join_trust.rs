@@ -1,29 +1,30 @@
 //! The block-pair merge-join must not lose elements when a file's header
 //! claims `Sort.Type_then_ID` and its blobs disagree.
 //!
-//! `block_pair_merge_phase` walks each element kind in one pass, stashing the
-//! first blob of a later kind for the next phase. A blob of an EARLIER kind
-//! turning up after that kind's phase had already ended used to be
-//! `continue`d - discarded, along with every element in it, with no error, no
-//! warning, and no anomaly in the reported counts. A header can lie about
+//! The streaming block-pair merge that `-j 1` once ran walked each element
+//! kind in one pass, stashing the first blob of a later kind for the next
+//! phase. A blob of an EARLIER kind turning up after that kind's phase had
+//! already ended used to be `continue`d - discarded, along with every element
+//! in it, with no error, no warning, and no anomaly in the reported counts.
+//! A header can lie about
 //! sortedness (`pbfhogg degrade --unsort` exists to produce such files), so
 //! the merge cannot take the stamp as proof.
 //!
-//! The two `diff` paths reach the same conclusion by different routes. The
-//! SEQUENTIAL path (`-j 1`) runs `BlobOrderGuard` on each blob as it reads
-//! it, and walks the headers of a tail its phases never read. The PARALLEL
-//! path buckets blobs by kind in `walk_file`, so file order never reaches its
-//! planner; it runs the same guard at the walk, before bucketing. The
-//! unindexed element stream, which has no blob ranges, classifies every
-//! block by its elements and checks element order as it converts.
+//! Indexed inputs are compared by one block-pair engine at every `-j`: a
+//! header walk of both whole files runs `BlobOrderGuard` in file order
+//! before bucketing blobs by kind, and `-j` only changes how many ID-range
+//! shards the merge runs. The unindexed element stream, which has no blob
+//! ranges, classifies every block by its elements and checks element order
+//! as it converts.
 //!
-//! Every rejection test here therefore runs at BOTH `-j 1` and the default
-//! `-j`. That is load-bearing, not thoroughness: this divergence is how the
-//! bug hid. Before the guard, `pbfhogg diff` returned exit 2 with "not in
-//! canonical order" at `-j 1` and exit 0 with "Files are identical" at the
-//! default `-j`, on the same pair of files - and the suite's one
-//! seq-vs-parallel parity test used an honestly-sorted fixture, so it had no
-//! power against the only case where the two paths disagreed.
+//! Every rejection test here still runs at BOTH `-j 1` and a sharded `-j`.
+//! That is history, not thoroughness: `-j 1` used to run a separate
+//! streaming engine, and that divergence is how this bug hid. Before the
+//! guard, `pbfhogg diff` returned exit 2 with "not in canonical order" at
+//! `-j 1` and exit 0 with "Files are identical" at the default `-j`, on the
+//! same pair of files - and the suite's one seq-vs-parallel parity test used
+//! an honestly-sorted fixture, so it had no power against the only case
+//! where the two paths disagreed.
 //!
 //! The fixtures here are written with `BlockBuilder` + `PbfWriter::to_path`
 //! directly rather than through `tests/common`, because the point is to lay
@@ -135,9 +136,9 @@ fn run_diff_args(old: &Path, new: &Path, jobs: &str, args: &[&str]) -> (Option<i
     (out.status.code(), out.stderr_str())
 }
 
-/// Assert `diff` with `args` exits `code` at `-j 1` and `-j 4`, the
-/// sequential and the parallel path (an unindexed or negative-ID input runs
-/// the sequential path at both), with `needle` in stderr when given.
+/// Assert `diff` with `args` exits `code` at `-j 1` and `-j 4`, one shard
+/// and up to four (an unindexed input runs the element stream at both, a
+/// negative-ID one a single shard), with `needle` in stderr when given.
 fn assert_both_paths(old: &Path, new: &Path, args: &[&str], code: i32, needle: Option<&str>) {
     for jobs in ["1", "4"] {
         let (got, stderr) = run_diff_args(old, new, jobs, args);
@@ -155,16 +156,13 @@ fn assert_both_paths(old: &Path, new: &Path, args: &[&str], code: i32, needle: O
     }
 }
 
-/// Sequential path only, for the assertions that name a
-/// sequential-specific phrase.
+/// One shard only, for the assertions that check a message in detail.
 fn run_diff(old: &Path, new: &Path) -> (Option<i32>, String) {
     run_diff_jobs(old, new, "1")
 }
 
-/// Assert both `diff` paths refuse `old` vs `new` with an ordering
-/// complaint. The two produce different wording because they detect the
-/// disorder at different points; the contract is the verdict, not the
-/// sentence.
+/// Assert `diff` refuses `old` vs `new` with an ordering complaint at
+/// `-j 1` and `-j 4`. The contract is the verdict, not the sentence.
 fn assert_both_paths_refuse(old: &Path, new: &Path) {
     for jobs in ["1", "4"] {
         let (code, stderr) = run_diff_jobs(old, new, jobs);
@@ -212,19 +210,18 @@ fn node_blob_after_way_blobs_is_rejected_not_dropped() {
         "error should name the ordering problem; got:\n{stderr}"
     );
     assert!(
-        stderr.contains("node blob during the way phase"),
-        "error should name which kind turned up in which phase; got:\n{stderr}"
+        stderr.contains("a node blob holding id 3 follows way output"),
+        "error should name which kind turned up after which; got:\n{stderr}"
     );
 
-    // And the same verdict from the parallel planner, which reaches it by a
-    // different route. Before `BlobOrderGuard` this arm returned exit 0 and
-    // "Files are identical" on exactly this input.
+    // And the same verdict at the default shard count. Before
+    // `BlobOrderGuard` the parallel arm returned exit 0 and "Files are
+    // identical" on exactly this input.
     assert_both_paths_refuse(&honest, &liar);
 }
 
 /// The same shape on the other side of the comparison, so the guard is not
-/// accidentally one-sided (the two readers are separate `BlobReader`s with
-/// separate stashes).
+/// accidentally one-sided (each input is walked and guarded on its own).
 #[test]
 fn out_of_order_blob_on_the_old_side_is_rejected_too() {
     let dir = crate::common::test_scratch();
@@ -302,12 +299,52 @@ fn understated_max_id_is_rejected_not_silently_truncated() {
     );
 }
 
+/// The same refusal inside a sharded run: the understated blob sits in the
+/// middle of a multi-shard kind, with its claim inside its shard's window,
+/// so the shard sees what the block holds past the claim. The sharded merge
+/// used to decide a block's tail from the claim alone and silently report
+/// node 6 as deleted here.
+#[test]
+fn understated_max_id_is_rejected_at_every_shard_count() {
+    let dir = crate::common::test_scratch();
+    let old = dir.path().join("old.osm.pbf");
+    let honest_new = dir.path().join("new.osm.pbf");
+    let lying_new = dir.path().join("lying.osm.pbf");
+
+    let layout = [
+        Blob::Nodes(&[1, 2, 3]),
+        Blob::Nodes(&[4, 5, 6]),
+        Blob::Nodes(&[7, 8, 9]),
+        Blob::Nodes(&[10, 11, 12]),
+    ];
+    write_blobs(&old, &layout);
+    write_blobs(&honest_new, &layout);
+    assert_both_paths(&old, &honest_new, &[], 0, None);
+
+    // Blob 2 is the second node blob, `[4, 5, 6]`: claim its last node is 5.
+    let bytes = std::fs::read(&honest_new).expect("read fixture");
+    let forged = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, 2, |ix| {
+        assert_eq!(ix.len(), 42, "fixture blob must carry a v3 index");
+        ix[10..18].copy_from_slice(&5i64.to_le_bytes());
+    });
+    std::fs::write(&lying_new, forged).expect("write forged");
+
+    assert_both_paths(
+        &old,
+        &lying_new,
+        &[],
+        2,
+        Some("does not match the blob's contents"),
+    );
+}
+
 /// A same-kind ID regression, which is the layout `degrade --unsort`
 /// actually produces: two adjacent node blobs whose ID spans go backwards.
 /// The sequential merge used to see only kind transitions and answered
 /// wrongly here - against a correctly ordered file with the same elements it
 /// reported the backwards blob's elements as created and deleted - while the
-/// parallel planner refused the file. Both run the blob order guard now.
+/// parallel planner refused the file. The one header walk every `-j` runs
+/// applies the blob order guard now.
 #[test]
 fn backwards_id_spans_within_one_kind_are_rejected() {
     let dir = crate::common::test_scratch();
@@ -322,9 +359,8 @@ fn backwards_id_spans_within_one_kind_are_rejected() {
     assert_both_paths_refuse(&liar, &honest);
 }
 
-/// The same regression inside a kind the type filter excludes: the
-/// sequential merge skips the excluded blobs by header, and still checks
-/// their order, as the parallel walk does.
+/// The same regression inside a kind the type filter excludes: the header
+/// walk checks every blob's order, whatever the filter selects.
 #[test]
 fn backwards_id_spans_in_an_excluded_kind_are_rejected() {
     let dir = crate::common::test_scratch();
@@ -415,11 +451,10 @@ fn with_garbage_body(bytes: &[u8], idx: usize) -> Vec<u8> {
     out
 }
 
-/// The structure of the tail after the last selected kind is checked on
-/// both paths: the parallel path walks every header up front, and the
-/// sequential merge, whose phases stop at the first blob after the last
-/// selected kind, walks the rest of the headers. `diff -t node` used to
-/// refuse these files only at `-j` above one.
+/// The structure of the tail after the last selected kind is checked at
+/// every `-j`: the header walk reads every header up front. `diff -t node`
+/// used to refuse these files only at `-j` above one, when `-j 1` ran a
+/// streaming merge whose phases stopped at the last selected kind.
 #[test]
 fn tail_after_the_last_selected_kind_is_checked_on_both_paths() {
     let dir = crate::common::test_scratch();
@@ -473,11 +508,10 @@ fn tail_after_the_last_selected_kind_is_checked_on_both_paths() {
     );
 }
 
-/// No path interprets the body of an excluded kind's blob: the parallel path
-/// never reads it, and the sequential merge reads past it without parsing
-/// its envelope - including the first blob after the last selected kind,
-/// which the sequential merge reads to find where that kind ends and used to
-/// parse, so `-j 1` refused a malformed envelope there that `-j 4` never saw.
+/// No `-j` interprets the body of an excluded kind's blob: the header walk
+/// never reads it. The streaming merge `-j 1` once ran read the first blob
+/// after the last selected kind to find where that kind ended and parsed
+/// it, so `-j 1` refused a malformed envelope there that `-j 4` never saw.
 #[test]
 fn excluded_kind_bodies_are_never_interpreted() {
     let dir = crate::common::test_scratch();

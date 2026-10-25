@@ -9,6 +9,10 @@ Amended: 2026-10-22 - the diff and derive-changes shard planners are
 no longer an enforcement site: an indexed input holding any negative
 ID takes the sequential block-pair merge, which orders by `osm_id_cmp`,
 instead of relying on a `debug_assert` and mis-sharding in release.
+Amended: 2026-10-25 - the sequential block-pair merge is gone; every
+indexed comparison runs one engine over ID-range shards, and an input
+holding a negative ID is planned as one unbounded shard of that engine,
+which still orders by `osm_id_cmp`.
 Status: Accepted
 
 ## Decision
@@ -27,11 +31,10 @@ invariant. Enforcement is layered by site:
   than diverging from it.
 - **Routing, not enforcement**, for the shard planners in `diff` and
   `derive-changes` (amended 2026-10-22). Their threshold compares are
-  raw `i64`, which order negative IDs wrongly, so the blob walk
-  (`src/commands/diff/shard.rs`) sends any indexed input holding a
-  negative ID to the sequential block-pair merge instead. This
-  replaced a `debug_assert!` that left release builds to mis-shard
-  silently.
+  raw `i64`, which order negative IDs wrongly, so the shard planner
+  (`src/commands/diff/shard.rs`) plans any indexed comparison holding
+  a negative ID as one shard with no window. This replaced a
+  `debug_assert!` that left release builds to mis-shard silently.
 - **Silent inheritance** through `IdSet::set`'s no-op-on-negative
   semantics for `tags-filter` (silently drops negative-id ways) and
   `add-locations-to-ways --index-type external` (silently omits

@@ -90,6 +90,9 @@ pub(super) fn pass1_parallel_scan(
                 } else {
                     let bytes = std::mem::take(&mut w.reframe_buf);
                     w.reframe_buf.reserve(bytes.len());
+                    // The bbox is the input's indexdata claim, carried over
+                    // unchecked (renumber does not move nodes); a false one
+                    // survives into the output (reference/indexdata-trust.md).
                     let index =
                         blob_index(crate::ElementKind::Node, base, outcome.count, task.bbox)?;
                     Some((bytes, index))

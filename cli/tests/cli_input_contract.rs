@@ -1027,10 +1027,11 @@ fn alias_extract_config_polygon(fx: &Fx, dir: &Path) -> (Vec<OsString>, PathBuf)
 // What a command does with unindexed input
 // ---------------------------------------------------------------------------
 //
-// The decision is made per command, and nowhere else is it stated in one
-// place. Each row is one command line and the outcome today: refused (and what
-// lifts the refusal), fallen back from (silently or with a note), or verified.
-// A change to any of them is a decision, and fails here until the row says so.
+// The rules are stated in reference/indexdata-trust.md; the outcome is per
+// command, and these tables pin it. Each row is one command line and the
+// outcome today: refused (and what lifts the refusal), fallen back from
+// (silently or with a note), or verified. A change to any of them is a
+// decision, and fails here until the row says so.
 
 /// Present in every refusal of a missing index (a few say `base PBF`).
 const NO_INDEXDATA: &str = "no blob-level indexdata";
@@ -1771,8 +1772,9 @@ fn every_secondary_input_flag_has_an_alias_case() {
 }
 
 /// What each command does with a file that has no indexdata on any data blob:
-/// refuse (and what lifts it), fall back (and what it says), or verify. One
-/// table is the only place this is stated; the rows follow the code.
+/// refuse (and what lifts it), fall back (and what it says), or verify. The
+/// table is the per-command pin of reference/indexdata-trust.md; the rows
+/// follow the code.
 #[test]
 fn what_each_command_does_with_unindexed_input_is_pinned() {
     let fx = Fx::new();

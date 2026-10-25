@@ -408,6 +408,14 @@ where
         // Both use the reorder buffer keyed by global sequence number.
         // Passthrough blobs: consumer reads raw frame directly, writes via write_raw_owned.
         // Worker blobs: consumer receives OwnedBlocks, writes via write_primitive_block_owned.
+        //
+        // A raw frame keeps the input's BlobHeader, indexdata and tagdata
+        // included. Verification (see `Passthrough`) proved the payload
+        // belongs in the region, not that its header is true, so a false
+        // `count` or ID range carries into the output, where the next run
+        // believes it again. Deliberate: re-indexing would cost the scan the
+        // raw copy exists to skip, and claims are believed, not verified
+        // (reference/indexdata-trust.md).
 
         enum ConsumerItem {
             Decoded(crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>),

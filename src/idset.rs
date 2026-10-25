@@ -609,8 +609,8 @@ impl IdSet {
     ///
     /// A claim of `i64::MAX` from a 4 KB file would otherwise ask
     /// `pre_allocate` for an exabyte before a single blob is read
-    /// (CORRECTNESS.md, the indexdata trust boundary). At one bit per ID the
-    /// bitmap stays within `ids_per_byte / 8` times the input's own size,
+    /// (reference/indexdata-trust.md, "Allocation from claims"). At one bit
+    /// per ID the bitmap stays within `ids_per_byte / 8` times the input's own size,
     /// plus one chunk of rounding.
     ///
     /// `ids_per_byte` is the caller's, because what happens to an ID above

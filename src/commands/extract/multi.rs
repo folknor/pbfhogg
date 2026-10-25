@@ -210,6 +210,12 @@ pub(super) fn try_extract_multi_single_pass(
         }
         walker.observe_filter_index(meta.index.as_ref());
         let entry = ScheduledBlob::from_meta(&meta)?;
+        // Both decisions below are taken on indexdata claims, never decoded
+        // to check: a blob claimed as nodes whose bbox misses every region
+        // is skipped unread, and each blob joins the one per-kind schedule
+        // its kind names, so a mislabelled blob's elements are missed or
+        // dropped. Deliberate: claims are believed, not verified
+        // (reference/indexdata-trust.md); `check --index` is the verifier.
         if let Some(idx) = meta.index.as_ref() {
             if !spatial_filter.wants_index(idx) {
                 continue;
@@ -829,6 +835,11 @@ where
         );
     }
 
+    // A raw frame keeps the input's BlobHeader, sidecars included: verified
+    // passthrough proved region membership, not that the header is true, so
+    // a false `count` or ID range carries into every region's output (see
+    // the matching note in `common::pread_execute`).
+    //
     // If everything is passthrough, skip the thread scope entirely.
     if decode_items.is_empty() {
         let mut frame_buf: Vec<u8> = Vec::new();

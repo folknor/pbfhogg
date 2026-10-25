@@ -41,11 +41,10 @@ Three consequences follow, and are binding on new code:
    `renumber` bounds its initial node bitmap by the file size and inserts
    decoded IDs beyond that allocation after the parallel pass, preserving
    legitimately sparse IDs without trusting the sizing claim. The geocode-index
-   builder still calls `IdSet::pre_allocate` straight from the schedule's
-   indexdata `max_id`, so an overstated claim can request an arbitrarily large
-   eager bitset. It cannot adopt `check`'s clamp as-is: an ID beyond the clamp
-   is a reportable property for a verifier but a functional requirement for
-   the builder. Closing that gap remains tracked in TODO.md.
+   builder caps its node-set pre-allocation by the same file-size bound; it
+   also treats the largest claimed node `max_id` as a functional bound (refs
+   above it are dropped as dangling), so it checks every decoded node against
+   it and refuses the file when one exceeds it, rather than tracking it.
 
 3. **A verifier must not inherit a reader's safe collapse.** Every read path in
    this crate turns metadata it cannot parse into "no metadata, decode the
@@ -58,8 +57,11 @@ Three consequences follow, and are binding on new code:
    *presence* of a field separately from its parsed value, and must treat
    "present but unusable" as a finding rather than as absence.
 
-The trust boundary itself is documented in `CORRECTNESS.md`, alongside the
-sortedness boundary it is distinct from.
+The trust model this decision sets - which claims are believed, what checks
+them in passing, what verifies them and with which gaps, and what a false one
+costs per command - is stated in `reference/indexdata-trust.md`, which also
+covers the header's `Sort.Type_then_ID` claim (believed the same way, and
+verified by `check --ids` rather than `check --index`).
 
 ## Why
 
@@ -93,8 +95,9 @@ two commands and comparing their output.
 - **Make `--distrust-metadata` a global flag on every command.** Rejected for
   now, and partially self-defeating: the flag is only meaningful where a command
   makes a *decision* from the metadata, and for a verifier it is meaningless by
-  construction (point 1 above). The two commands that have it are the two where
-  the metadata changes the answer rather than the speed. Extending it further is
+  construction (point 1 above). The metadata changes the answer, not just the
+  speed, in many commands (the consumers above among them); the two that have
+  the flag are the two where it was asked for. Extending it further is
   a per-command judgement, not a blanket one - and every new indexdata-consulting
   path must be checked against the flag deliberately, which is how round 2's
   version of it shipped true on one path and false on the reference-expansion
@@ -109,7 +112,10 @@ two commands and comparing their output.
 
 - **Stop writing the fields on inputs we did not produce** (e.g. have `cat`
   decline to index third-party blobs). Rejected: indexdata is valid for any
-  blob, the values are re-derived from the payload at write time regardless of
-  provenance, and refusing would punish every downstream consumer to protect
+  single-kind, non-empty blob (`cat` re-encodes a block no single index can
+  describe into ones that can be indexed), the values `cat` writes are derived
+  from the payload regardless of provenance (a blob that already carries
+  indexdata is passed through as it is, so `cat` does not repair a false
+  one), and refusing would punish every downstream consumer to protect
   against a file that lies about itself - which the verifier now catches
   directly.

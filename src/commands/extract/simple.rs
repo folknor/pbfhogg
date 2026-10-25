@@ -186,6 +186,9 @@ fn extract_simple_two_pass(
             if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
                 continue;
             }
+            // Even here, where elements are classified after decoding, a
+            // blob claimed as nodes is skipped on its indexdata bbox
+            // without a decode (reference/indexdata-trust.md).
             if let Some(idx) = blob.index()
                 && !spatial_filter.wants_index(&idx)
             {
@@ -316,6 +319,12 @@ fn extract_simple_single_pass(
     };
     let full_schedule =
         build_blob_schedule_with_passthrough(input, passthrough_bbox.as_ref(), host)?;
+    // The three schedules split on the indexdata kind, and node blobs are
+    // dropped on the indexdata bbox, both claims never decoded to check: a
+    // mislabelled blob's elements are missed by the phase that needs them,
+    // and a blob whose bbox understates its nodes is skipped unread.
+    // Deliberate: claims are believed, not verified
+    // (reference/indexdata-trust.md); `check --index` is the verifier.
     let node_schedule: Vec<&BlobDesc> = full_schedule
         .iter()
         .filter(|d| {

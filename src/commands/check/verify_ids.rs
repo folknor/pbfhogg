@@ -694,11 +694,10 @@ fn verify_ids_full_parallel(
     // indexdata is missing (there's no cheap way to know a blob's
     // element kind from headers alone), so the offset comparisons
     // above span the same offset set three times and produce spurious
-    // violations on correctly-ordered files. The sequential
-    // (non-full) path's element-level `check_type_order` still runs
-    // when users need actual type-ordering verification on
-    // non-indexed input; `--full` under `--force` just loses the
-    // offset-based pre-check.
+    // violations on correctly-ordered files. The streaming arm skips it
+    // the same way, so neither arm checks type order on unindexed input:
+    // that is a coverage gap of `check --ids`, recorded in
+    // reference/indexdata-trust.md.
     if indexed {
         check_type_order(
             &node_schedule,
@@ -926,8 +925,10 @@ fn check_type_order(
     total_violations: &mut u64,
     max_errors: Option<usize>,
 ) {
-    let record = |after: &'static str,
-                  found: &'static str,
+    // `found` is the kind whose blob sits out of place, `after` the kind it
+    // was found after: a node blob past a way blob is "node after way".
+    let record = |found: &'static str,
+                  after: &'static str,
                   violations: &mut Vec<IdViolation>,
                   total_violations: &mut u64| {
         *total_violations += 1;
@@ -936,10 +937,13 @@ fn check_type_order(
         }
     };
 
-    // Canonical order is nodes < ways < relations (by file offset). The two
-    // pairwise checks below are sufficient: node<way and way<rel give
-    // node<rel transitively. A third (max_rel vs min_node) would fire on
-    // every correctly-ordered file.
+    // Canonical order is nodes < ways < relations (by file offset). The
+    // node-relation pair is checked directly: node<way and way<rel imply it
+    // only when ways exist, and a file with no ways (a relation blob, then a
+    // node blob) would otherwise pass. On a correctly ordered file
+    // max_node < min_rel, so the direct check never fires there; on a
+    // disordered one it may fire beside the other two, which is the bound
+    // the doc above states.
     let offset = crate::scan::classify::ScheduledBlob::frame_start;
     let max_node = node_sched.iter().map(offset).max();
     let min_way = way_sched.iter().map(offset).min();
@@ -951,9 +955,74 @@ fn check_type_order(
     {
         record("node", "way", violations, total_violations);
     }
+    if let (Some(mn), Some(mr)) = (max_node, min_rel)
+        && mn > mr
+    {
+        record("node", "relation", violations, total_violations);
+    }
     if let (Some(mw), Some(mr)) = (max_way, min_rel)
         && mw > mr
     {
         record("way", "relation", violations, total_violations);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IdViolation, check_type_order};
+    use crate::scan::classify::ScheduledBlob;
+
+    /// One schedule entry per frame start, each a small frame.
+    fn blobs(frames: &[u64]) -> Vec<ScheduledBlob> {
+        frames
+            .iter()
+            .map(|&f| ScheduledBlob::at_frame(f, f + 10, 1).expect("valid test frame"))
+            .collect()
+    }
+
+    fn type_order(nodes: &[u64], ways: &[u64], rels: &[u64]) -> Vec<(&'static str, &'static str)> {
+        let mut violations = Vec::new();
+        let mut total = 0u64;
+        check_type_order(
+            &blobs(nodes),
+            &blobs(ways),
+            &blobs(rels),
+            &mut violations,
+            &mut total,
+            None,
+        );
+        assert_eq!(usize::try_from(total).ok(), Some(violations.len()));
+        violations
+            .into_iter()
+            .map(|v| match v {
+                IdViolation::TypeOrder { found, after } => (found, after),
+                _ => panic!("check_type_order reported a non-type-order violation"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_node_blob_after_a_relation_blob_is_reported_without_ways() {
+        assert_eq!(type_order(&[200], &[], &[100]), [("node", "relation")]);
+    }
+
+    #[test]
+    fn a_correctly_ordered_file_reports_nothing_with_any_kind_absent() {
+        assert!(type_order(&[100, 200], &[300], &[400]).is_empty());
+        assert!(type_order(&[100], &[], &[400]).is_empty());
+        assert!(type_order(&[], &[300], &[400]).is_empty());
+        assert!(type_order(&[100], &[300], &[]).is_empty());
+        assert!(type_order(&[], &[], &[400]).is_empty());
+        assert!(type_order(&[100], &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn each_inverted_pair_is_reported_once() {
+        assert_eq!(type_order(&[300], &[200], &[400]), [("node", "way")]);
+        assert_eq!(type_order(&[100], &[400], &[300]), [("way", "relation")]);
+        assert_eq!(
+            type_order(&[500], &[300], &[400]),
+            [("node", "way"), ("node", "relation")]
+        );
     }
 }

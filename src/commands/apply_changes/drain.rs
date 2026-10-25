@@ -688,6 +688,12 @@ fn dispatch_variant(
             // (plus the 4-byte prefix), so this sample fits u32.
             #[allow(clippy::cast_possible_truncation)]
             stats.blob_sizes.push(frame_len as u32);
+            // A spliced blob is never decoded, so its element count is the
+            // indexdata `count` claim, folded into the observed `base_*`
+            // totals: a false claim moves the headline with nothing to show
+            // it. Deliberate: claims are believed, not verified, and
+            // counting here would cost the decode the splice exists to skip
+            // (reference/indexdata-trust.md). `check --index` verifies.
             match kind {
                 ElementKind::Node => stats.base_nodes += index.count,
                 ElementKind::Way => stats.base_ways += index.count,
@@ -719,7 +725,8 @@ fn dispatch_variant(
             // false-positive on `Route::Owned`) reported
             // `base_nodes=base_ways=base_relations=0` for the
             // passthrough portion even though the output contained the
-            // elements correctly.
+            // elements correctly. For an indexed blob `count` is the
+            // indexdata claim, believed as in the CopyRange arm.
             match kind {
                 ElementKind::Node => stats.base_nodes += count,
                 ElementKind::Way => stats.base_ways += count,

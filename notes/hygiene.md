@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-4. HYG-061
 5. HYG-152
 6. HYG-153
 7. HYG-154
@@ -413,6 +412,23 @@ The judgement calls already known, to be checked first:
   - The parallel shard decoders (`diff/parallel.rs` and
     `diff/derive_parallel.rs` `pread_decode`), the measured default path,
     still allocate per block; left alone (HYG-181).
+- The indexdata trust model (`reference/indexdata-trust.md`) was written by
+  folding the trust paragraphs of CORRECTNESS.md, pipeline.md and
+  cli-reference.md into one page and correcting what had gone false
+  (ADR-0013's geocode allocation account, CORRECTNESS.md's "costs neither
+  memory nor a refusal" for the geocode builder). Judgement calls:
+  - The ruling extends ADR-0013's belief to the header's
+    `Sort.Type_then_ID` claim and names `check --index --ids` as the
+    admission test, with the gaps listed on the page; whole-file indexing
+    is recorded as an inference, not a claim.
+  - altw external's intra-blob order check (a per-blob monotonicity pass
+    over the tuples stage 2 already extracts, `degrade --unsort-intra` as
+    the fixture) was documented as believed, not added. Candidate to add if
+    a measurement shows it free.
+  - `check --ids`' type-order check gained the direct node/relation
+    comparison (a file with no ways, a relation blob before a node blob,
+    used to pass). One comparison over offsets already computed; not
+    measured.
 
 ---
 
@@ -1164,126 +1180,12 @@ position and bounding it means an external merge.
 
 Reported by: re-encoding.
 
-## HYG-061 - The indexdata trust model is decided per command
-
-Anger: 9 - indexdata trust model.
-
-Sort trusts indexdata only under a sorted header and otherwise decodes; dedupe
-trusts it whenever present; renumber trusts `count` but cross-checks per blob,
-and trusts `max_id` for preallocation but checks per ID; repack and degrade
-trust `parallel_classify_phase`'s schedule; apply-changes trusts `count` for
-stats and `id_range` for routing, using `infer_kind_and_range` only when
-indexdata is absent, so a forged or stale `min/max` routes a blob as "no
-overlap" and splices it unchanged past a delete (silent data loss); altw scan
-filtering relies on indexdata `kind` being honest; altw external's metadata
-scan refuses ranges that break the sorted order, but element order inside one
-blob is unchecked, so a node blob holding `[2, 1]` with honest indexdata
-`[1, 2]` makes stage 2 drop present nodes (its `debug_assert` sees only the
-tuples the inner loop steps over; a per-blob monotonicity pass over the
-extracted tuples would catch it, `degrade --unsort-intra` is the fixture);
-the geocode builder trusts indexdata kind to schedule node blobs, so a node
-in a blob labelled way or relation is never seen by Pass 2a. `CORRECTNESS.md`
-partly states this for sort. `has_indexdata` decides whether a whole file is
-indexed from its first data blob alone, so a file with indexdata on the first
-blob and not on a later one passes every gate; the output-header policy had to
-add its own check for that case on the raw-copy paths, and the schedule walks
-now refuse it (below).
-
-The second half of the model is what a command does when indexdata is absent,
-and that is decided per command too. It is now pinned, as observed, by two
-tables in `cli/tests/cli_input_contract.rs`
-(`what_each_command_does_with_unindexed_input_is_pinned` and
-`..._with_input_indexed_on_its_first_blob_only_is_pinned`); the tables are
-the current statement of who refuses, who escapes with which flag, who falls
-back with which note, and who verifies. Pinned oddities worth a ruling:
-
-- renumber has no `--force`; altw `--index-type external` refuses `--force`
-  at parse time.
-- A partially indexed file is refused, with the typed missing-indexdata
-  error at its first unindexed data blob, by every command whose schedule
-  comes from a walk over every header (`HeaderWalker::refusing_partial_index`):
-  sort, apply-changes, digest, the classify-based schedule builders and the
-  bespoke schedule walks of tags-filter, extract, altw and the geocode
-  builder. diff, renumber and altw external refuse any unindexed blob. What
-  is left:
-  - Still trusting the first blob: getid and getparents (their walker and
-    full-scan arms are chosen by input size, so neither walk opts in),
-    `cat --type`, `cat --dedupe`, `tags-filter -R`, time-filter's history
-    path, and `getid --add-referenced` unless way IDs are asked for (its
-    classify walk runs only then). `inspect --indexed` says yes while plain
-    `inspect` says no.
-  - `apply-changes --force` on an unindexed base writes a partially indexed
-    output: a blob the diff does not touch is copied without indexdata, a
-    rewritten one gets it. Every walk above then refuses that output.
-  - check, inspect and time-filter now refuse a partial file through their
-    classify walks (`check --refs`, `check --ids`, `inspect --nodes`,
-    `inspect tags`, non-history time-filter), though check answers "is this
-    file right?" and `check --index` reports the same file as a violation
-    (exit 1). time-filter and `extract --simple` never needed indexdata.
-  - The walks see headers only, so they cannot tell an unindexable blob
-    (empty, or mixed kinds) without indexdata from an unindexed one, where
-    `check --index` exempts the former; such a blob among indexed ones is
-    refused. Since `cat` indexes those blobs, only a hand-made file has one.
-  - The geocode builder refuses at its Pass 1.5 schedule walk, after Pass 1
-    has decoded the whole file once.
-- Only tags-filter and plain inspect have `--distrust-metadata`; getid, cat
-  `--type`, apply-changes and altw trust the metadata with no way to turn
-  that off.
-
-The sortedness the same commands require is read from the header flag alone
-(renumber and digest additionally check order while reading), and a
-header-only input counts as indexed (no blob lacks indexdata). No sentence
-anywhere says which of refuse, fall back or verify a command is meant to be.
-
-Decided (the first ruling, a uniform forced-run Note, is implemented in
-`require_indexdata`, keyed `reader.filter_without_indexdata` so the reader's
-own filter notes fold into it):
-
-- No action: renumber's missing `--force` and altw external's parse-time
-  `--force` refusal are guards; `--distrust-metadata` stays where it is.
-
-Fix: state the trust model once in `reference/` (indexdata is a hint; these
-properties are verified, these are believed, this is the consequence, and this
-is what a missing index does), have each command cite it, and move the
-contract tables' rows when a ruling changes one.
-
-Recommendation (2026-10-25), agreed with the maintainer. Split: this entry
-keeps the trust model page and the BUG-005 / BUG-081 comments; the forced
-apply-changes output is HYG-152; the first-blob trusters are HYG-153 to
-HYG-157, one per command.
-
-- Proposed ruling: indexdata and the `Sort.Type_then_ID` flag are believed,
-  not verified. pbfhogg's writer and `cat` produce them; a file whose claims
-  lie is outside the contract; `check --index` is the verifier for a file of
-  unknown provenance. Verifying everywhere costs a per-blob decode, which
-  the splice and passthrough fast paths exist to avoid, so the cheap checks
-  that exist stay (renumber's per-ID check, the order watermark, the
-  schedule walks' partial-index refusal) and nothing more expensive is
-  added.
-- This entry writes that model once in `reference/`: which properties are
-  verified and which believed; what a lie costs per command, stating the
-  worst ones plainly (apply-changes splicing a forged-range blob past a
-  delete, altw external dropping present nodes when a blob's elements are
-  out of order under a sorted header, the geocode builder never seeing a
-  node in a blob labelled way or relation); and what each command does
-  without indexdata, which the contract tables already pin. Each command's
-  docs cite the page. BUG-005 and BUG-081 then close under rule 3, with
-  comments at their sites pointing to the page.
-- altw external's intra-blob order check (a per-blob monotonicity pass over
-  the tuples stage 2 already extracts, `degrade --unsort-intra` as the
-  fixture) is recommended as documented-as-believed, not added; it goes on
-  "Review once drained" as a candidate if a measurement shows it free.
-- The pinned oddities above under "check, inspect and time-filter", "The
-  walks see headers only" and "The geocode builder refuses at its Pass 1.5"
-  are recorded on the page as current behaviour, not changed.
-
-Reported by: change application, re-encoding, altw and scanning, geocode index.
-
 ## HYG-152 - `apply-changes --force` on an unindexed base writes a partially indexed output
 
 Anger: 8 - apply-changes internals.
 
-Split out of HYG-061. A blob the diff does not touch is copied without
+Split out of the indexdata trust model entry, now resolved as
+`reference/indexdata-trust.md`. A blob the diff does not touch is copied without
 indexdata and a rewritten one gets fresh indexdata
 (`frame_blob_pipelined(..., Some(&indexdata), ...)` in `streaming.rs`), so the
 output is partially indexed and every walk that refuses partial indexdata
@@ -1303,62 +1205,74 @@ Reported by: the 2026-10-25 triage, while closing brokkr#25.
 
 Anger: 8 - indexdata trust model, one command.
 
-Split out of HYG-061. getid's walker and full-scan arms are chosen by input
+Split out of the indexdata trust model entry, now resolved as
+`reference/indexdata-trust.md`. getid's walker and full-scan arms are chosen by input
 size, and neither walk opts into `HeaderWalker::refusing_partial_index`, so
 a file indexed on its first blob only passes. `getid --add-referenced` is
 covered only when way IDs are asked for, since its classify walk runs only
 then.
 
 Recommendation (2026-10-25): opt into the partial-index refusal only where a
-full header walk already happens; add no new walk. Where none happens, the
-trust model page (HYG-061) records that getid decides from the first blob.
-Move the contract table rows that change.
+full header walk already happens; add no new walk. Where none happens,
+record on `reference/indexdata-trust.md` ("Missing and partial indexdata",
+which today says only that commands whose arm the first blob alone decides
+run on a partial file) that getid decides from the first blob. Move the
+contract table rows that change.
 
-Reported by: as HYG-061.
+Reported by: change application, re-encoding, altw and scanning, geocode
+index (the indexdata trust model entry).
 
 ## HYG-154 - getparents trusts the first blob's indexdata for the whole file
 
 Anger: 8 - indexdata trust model, one command.
 
-Split out of HYG-061. As HYG-153: the walker and full-scan arms are chosen
+Split out of the indexdata trust model entry, now resolved as
+`reference/indexdata-trust.md`. As HYG-153: the walker and full-scan arms are chosen
 by input size and neither opts into the partial-index refusal.
 
 Recommendation (2026-10-25): as HYG-153.
 
-Reported by: as HYG-061.
+Reported by: change application, re-encoding, altw and scanning, geocode
+index (the indexdata trust model entry).
 
 ## HYG-155 - `cat --type` and `cat --dedupe` trust the first blob's indexdata
 
 Anger: 8 - indexdata trust model, one command.
 
-Split out of HYG-061. Both modes decide from the first data blob whether the
+Split out of the indexdata trust model entry, now resolved as
+`reference/indexdata-trust.md`. Both modes decide from the first data blob whether the
 whole file is indexed.
 
 Recommendation (2026-10-25): as HYG-153.
 
-Reported by: as HYG-061.
+Reported by: change application, re-encoding, altw and scanning, geocode
+index (the indexdata trust model entry).
 
 ## HYG-156 - `tags-filter -R` trusts the first blob's indexdata
 
 Anger: 8 - indexdata trust model, one command.
 
-Split out of HYG-061. `tags-filter -R` decides from the first data blob,
+Split out of the indexdata trust model entry, now resolved as
+`reference/indexdata-trust.md`. `tags-filter -R` decides from the first data blob,
 while tags-filter's other schedule walks already refuse a partial file.
 
 Recommendation (2026-10-25): as HYG-153.
 
-Reported by: as HYG-061.
+Reported by: change application, re-encoding, altw and scanning, geocode
+index (the indexdata trust model entry).
 
 ## HYG-157 - time-filter's history path trusts the first blob's indexdata
 
 Anger: 8 - indexdata trust model, one command.
 
-Split out of HYG-061. time-filter's history path decides from the first
+Split out of the indexdata trust model entry, now resolved as
+`reference/indexdata-trust.md`. time-filter's history path decides from the first
 data blob, while its non-history classify walk refuses a partial file.
 
 Recommendation (2026-10-25): as HYG-153.
 
-Reported by: as HYG-061.
+Reported by: change application, re-encoding, altw and scanning, geocode
+index (the indexdata trust model entry).
 
 ## HYG-077 - The enforcement levers most of these findings need are unused
 

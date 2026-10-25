@@ -39,24 +39,6 @@ behaviour; below that the work is progressively more contained.
 
 ---
 
-## BUG-005 - Indexdata claims are folded into observed element counts
-
-Anger: 9 - verifying indexdata costs a per-blob decode.
-
-`sort`, `getid` and `cat --dedupe` keep a separate `passthrough_claimed`
-count, and extract verifies a passthrough blob by decoding it before
-copying it raw, so its counts are observed. Apply-changes still trusts
-indexdata `count` for its stats on passthrough blobs, so a lying indexdata
-moves its headline number with no way to tell (see HYG-061 for the trust
-model).
-
-Recommendation (2026-10-25), agreed with the maintainer: no code change.
-Under the trust model HYG-061 writes (indexdata believed, not verified;
-`check --index` verifies), close under rule 3 with a comment at the stats
-site pointing to that page. Done by the HYG-061 agent.
-
-Reported by: re-encoding, filtering and spatial, change application.
-
 ## BUG-009 - `apply-changes --locations-on-ways` does not update untouched base ways
 
 Anger: 10 - apply-changes -l loses its splice fast path.
@@ -84,22 +66,3 @@ an opt-in flag is the fallback. Enforce with a cross-validation test against
 untouched way, and on one that deletes such a node.
 
 Reported by: change application.
-
-## BUG-081 - Extract still trusts indexdata on the paths verification does not cover
-
-Anger: 9 - verifying indexdata costs a per-blob decode.
-
-Extract now decodes a passthrough candidate before copying it raw, but: a
-verified raw copy keeps the input's BlobHeader, so a false `count` or ID range
-in it carries into the output; a blob whose indexdata bbox claims it lies
-outside the region is skipped without decoding; and every extract schedule
-trusts the indexdata element kind. Verification also checks only what
-building a `PrimitiveBlock` validates, not metadata arithmetic done later
-during decode.
-
-Recommendation (2026-10-25), agreed with the maintainer: as BUG-005 - no
-code change; close under rule 3 with comments at the three trust points
-(header copy, bbox skip, kind scheduling) pointing to HYG-061's trust model
-page. Done by the HYG-061 agent.
-
-Reported by: the extract passthrough fix.

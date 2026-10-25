@@ -248,6 +248,10 @@ back to its sequential path).
 `--overwrite` and `--allow-unindexed`. It keeps working, and warns every time
 that it also grants overwrite, naming the two flags to spell instead.
 
+This section is about absent indexdata. What commands believe when it is
+present, and what a partially indexed file meets, is in
+[indexdata-trust.md](indexdata-trust.md).
+
 ## Output header
 
 Every PBF-writing command derives its `OSMHeader` from one rule
@@ -634,14 +638,16 @@ canonical one is the definition.
 #### `--index`: the metadata trust boundary
 
 `BlobHeader.indexdata` (element kind, ID range, element count, spatial bbox) and
-`BlobHeader.tagdata` (the blob's tag key set) are hints every fast path in this
-crate believes without opening the blob. `cat --type` passes a blob through raw
-on the strength of the declared kind, `renumber` assigns IDs from the declared
-count, `tags-filter` skips whole blobs on the strength of the tag index, and the
-spatial filter skips node blobs on the strength of the bbox. Nothing in the
+`BlobHeader.tagdata` (the blob's tag key set) are claims every fast path in this
+crate believes without opening the blob; who believes which, and what a false
+one costs, is in [indexdata-trust.md](indexdata-trust.md). Nothing in the
 format signs any of it, and `degrade --corrupt-indexdata` /
 `--corrupt-indexdata-kind` / `--corrupt-tagdata` exist precisely to manufacture
 files whose hints are well-formed and false.
+
+`check --index` does not verify order: a file whose header claims
+`Sort.Type_then_ID` with a blob internally out of order passes it. Combine it
+with `--ids`, which checks ID and type order.
 
 `check --index` is the other side of that boundary. It decompresses every
 OSMData blob, re-derives the metadata from the payload with `scan_block_ids`
@@ -703,6 +709,12 @@ situation as an `id_out_of_range` violation.
 Concatenate PBF files with optional type filtering. Embeds blob-level indexdata and tagdata automatically.
 
 With `--dedupe`, merges multiple sorted PBF files with blob-level passthrough and exact-duplicate deduplication.
+
+A blob that already carries indexdata is passed through with it, unchecked,
+so plain `cat` cannot repair false indexdata. `--type` copies a blob raw on
+its indexdata kind and `--dedupe` passes blobs through on their kind and
+range, both believed without a decode. See
+[indexdata-trust.md](indexdata-trust.md).
 
 ```
 pbfhogg cat [OPTIONS] --output <OUTPUT> <FILES>...
@@ -862,6 +874,12 @@ pbfhogg renumber [OPTIONS] --output <OUTPUT> <FILE>
 Extract elements within a geographic region (bounding box or polygon).
 
 Three strategies: `--simple` (single pass, fast, may have dangling refs), complete-ways (default, two passes, all way nodes included), `--smart` (three passes, completes multipolygon/boundary relations).
+
+Node blobs whose indexdata bbox misses the region are skipped unread, and the
+sorted-input schedules split blobs on their indexdata kind; both claims are
+believed. A node blob copied raw is first decoded to prove every node lies in
+the region, but keeps its input `BlobHeader`. See
+[indexdata-trust.md](indexdata-trust.md).
 
 Supports multi-extract via `--config` with a JSON config file specifying multiple regions.
 Relative `directory` and `polygon_file` values resolve from the config file's
@@ -1131,6 +1149,12 @@ Embed node coordinates in ways. Two index strategies:
 
 By default, untagged nodes not referenced by a relation are dropped from output.
 
+Node blobs are found by their indexdata kind. `--index-type external` also
+believes each node blob's elements are in order under the sorted header (a
+blob out of order loses present locations), and drops a node blob whole on
+its tagdata and ID range when removing untagged nodes. See
+[indexdata-trust.md](indexdata-trust.md).
+
 ```
 pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 ```
@@ -1180,6 +1204,12 @@ state, which the snapshot no longer is (see [Output header](#output-header)).
 
 Apply an OSC diff to a sorted PBF file. Uses blob passthrough -- unmodified blobs are copied as raw bytes without decompression.
 
+Which blobs are unmodified is decided from each blob's indexdata ID range,
+and a passed-through blob's element count in the statistics is its indexdata
+claim; neither is checked, so a base whose indexdata understates a blob's
+range gets that blob copied past a change aimed at it. See
+[indexdata-trust.md](indexdata-trust.md).
+
 The output header declares no bbox (the OSC can place a node outside the
 base's). Of the base's replication state it keeps the base URL and drops the
 timestamp and sequence number, since the output is past them; set the new
@@ -1225,6 +1255,10 @@ pbfhogg merge-changes [OPTIONS] --output <OUTPUT> <CHANGES>...
 Build a reverse geocoding index from a PBF file. Produces a set of binary files (S2 cell index, address points, street segments, admin boundaries, string pool) that can be memory-mapped for sub-millisecond reverse geocoding queries.
 
 Requires an indexed PBF (generated by `pbfhogg cat`) unless `--allow-unindexed` is set. An existing output directory is refused before any work unless `--overwrite` is set, and even then it must hold a geocode index or be empty; any other existing path is refused because publication replaces the whole directory. The output path itself cannot be a symlink. On Linux, an existing mount-point output directory is refused before the build.
+
+The node phase schedules blobs on their indexdata kind, so a node in a blob
+labelled way or relation is never indexed; a node above the largest claimed
+node `max_id` is refused. See [indexdata-trust.md](indexdata-trust.md).
 
 ```
 pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>

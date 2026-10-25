@@ -37,6 +37,17 @@ full contract, including the few phases that finish before the run stops,
 is in the
 [CLI reference](https://github.com/folknor/pbfhogg/blob/main/reference/cli-reference.md#interruption).
 
+## Indexdata is believed
+
+Commands that act on blob-level indexdata or tagdata, or on the header's
+`Sort.Type_then_ID` flag, believe them; a few checks happen in passing where
+a command decodes anyway, but none is a guarantee. A file whose claims are
+false can get a wrong answer that reports success. `check --index --ids`
+verifies a file of unknown provenance, except for element-kind order on a
+file without indexdata and the header's feature flags. Which command believes which claim,
+and what a false one costs, is in the
+[indexdata trust model](https://github.com/folknor/pbfhogg/blob/main/reference/indexdata-trust.md).
+
 ## Common flags
 
 These flags appear on most commands that produce PBF output:
@@ -354,7 +365,10 @@ kind, `tags-filter` skips whole blobs on the strength of the tag index, and the
 spatial filter skips node blobs on the strength of the bbox. Nothing in the
 format signs those claims. `check --index` decompresses every blob, re-derives
 the metadata from the payload, and reports each disagreement with its blob
-ordinal and byte offset.
+ordinal and byte offset. It does not check order: combine it with `--ids` to
+check that IDs ascend within and across blobs and that kinds come in order.
+Which commands believe which claim, and what a false one costs, is in the
+[indexdata trust model](https://github.com/folknor/pbfhogg/blob/main/reference/indexdata-trust.md).
 
 It never routes on the metadata it is checking - no blob filter, no
 `require_indexdata`, every OSMData blob decompressed - so there is no

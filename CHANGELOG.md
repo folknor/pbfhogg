@@ -1121,6 +1121,19 @@
 
 ### Fixed
 
+- **`check --ids` reports a node blob after a relation blob when the file has
+  no ways.** Type order was checked only as node before way and way before
+  relation, so a file with no ways and its relations ahead of its nodes
+  passed. The node/relation pair is now checked directly. Every type-order
+  violation also named its two kinds the wrong way round: a node blob past a
+  way blob printed `type order: way after node` and, under `--json`,
+  `"found": "way", "after": "node"`. It now reads `node after way`, with
+  `found` the misplaced kind. The indexdata
+  trust model (what every command believes about indexdata, tagdata and the
+  sorted flag, what a false claim costs, and that `check --index --ids` is
+  the admission test for a file from elsewhere) is now stated in one place,
+  `reference/indexdata-trust.md`.
+
 - **`add-locations-to-ways --index-type auto` judges indexdata the way the
   backends do.** It used to look at the frame right after the header, of any
   type, while the indexdata check that follows looks at the first data blob,

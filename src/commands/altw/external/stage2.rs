@@ -474,6 +474,18 @@ pub(super) fn stage2_node_join(
                             // any slot_pos not covered by a
                             // ResolvedEntry, matching the existing
                             // missing-ref behaviour.
+                            //
+                            // Order inside the blob is believed, from the
+                            // header's sorted claim: nothing checks it in
+                            // release builds (the debug_assert below sees
+                            // only the tuples the walk steps over). A blob
+                            // whose elements are out of order makes the
+                            // walk pass present nodes, which then go out as
+                            // missing locations. A per-blob monotonicity
+                            // pass over `node_tuples` would catch it; it is
+                            // not added, since claims are believed, not
+                            // verified (reference/indexdata-trust.md), and
+                            // `check --ids` verifies order.
                             let t_walk = crate::counters::Stopwatch::start();
                             let blob_actual_upper: Option<u64> = node_tuples
                                 .last()

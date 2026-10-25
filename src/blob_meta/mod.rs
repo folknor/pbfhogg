@@ -374,6 +374,12 @@ impl BlobFilter {
     ///
     /// Only effective on files with v2 indexdata. Blobs without spatial
     /// indexdata always pass through (conservative).
+    ///
+    /// The kind and bbox are the blob's own indexdata claims and are not
+    /// checked: a blob whose bbox understates its nodes, or that is
+    /// mislabelled as nodes, is skipped with everything in it. See
+    /// `reference/indexdata-trust.md` in the repository; `check --index`
+    /// verifies a file's claims.
     pub fn with_node_bbox(mut self, bbox: BlobBbox) -> Self {
         self.node_bbox = Some(bbox);
         self

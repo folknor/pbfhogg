@@ -379,6 +379,10 @@ pub(super) fn build_pass2_schedules(
             unindexed.push(entry);
             continue;
         };
+        // Scheduled on the indexdata kind, believed without a decode: a
+        // node in a blob labelled way or relation is never seen by Phase 2a,
+        // so its coordinates are missing from the index and the bound check
+        // there cannot see it either (reference/indexdata-trust.md).
         match idx.kind {
             crate::ElementKind::Node => {
                 if idx.max_id > max_node_id {

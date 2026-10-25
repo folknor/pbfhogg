@@ -385,8 +385,10 @@ fn worker_loop(
                 // splice-capable passthroughs straight to the drain).
                 // Scanner only emits Passthrough for indexed blobs
                 // (`scanner.rs::is_fastpath` requires `has_indexdata`),
-                // so `desc.index.count` is authoritative and
-                // desc.kind/id_range are authoritative (no override).
+                // so `desc.index.count`, `desc.kind` and `desc.id_range`
+                // are present and are used as given: they are indexdata
+                // claims, believed and never checked against this
+                // undecoded blob (reference/indexdata-trust.md).
                 let count = desc.index.as_ref().map_or(0, |i| i.count);
                 handle_owned_passthrough(
                     file,
@@ -530,8 +532,9 @@ fn handle_candidate(
             .blobs_false_positive
             .fetch_add(1, Ordering::Relaxed);
         // The drain needs an element count for per-kind `base_*` stats
-        // (gap #7). Indexed blobs carry it in `desc.index.count`; for
-        // non-indexed blobs (-force path) we walk the already-parsed
+        // (gap #7). Indexed blobs carry it in `desc.index.count`, a claim
+        // believed like every other here (reference/indexdata-trust.md);
+        // for non-indexed blobs (-force path) we walk the already-parsed
         // block. Counting is cheap next to the decompress + parse we
         // just did.
         let blob_count = desc

@@ -53,20 +53,16 @@ Skips entire blobs before decompression using metadata embedded in `BlobHeader`:
 | Tag key/prefix | Tagdata (BlobHeader field 4) | Skip blobs without required tag keys |
 | Spatial bbox | Coordinate bounds in indexdata | Skip blobs outside bounding box (nodes only) |
 
-**The kind claim is trusted by the per-kind schedules.** `repack`, `degrade`
-and `cat --clean` / `cat --type` (re-encode path) schedule an indexed blob into
-the one per-kind phase its indexdata names, and that phase re-encodes only
-elements of its kind. A blob whose indexdata kind is wrong (or a valid
-multi-kind block indexed by another writer's rule) silently loses the elements
-of the unclaimed kinds, and the run reports success. Verifying the kind per
-element is a cost on a measured path; verifying it per blob is not possible in
-the worker, because the pool's classify closure receives only the decoded
-block and cannot tell an indexed blob from an unindexed one that the schedule
-builder replicated into all three kinds (a legitimate no-match). Indexdata
-written by pbfhogg (one kind per block) is right. For inputs indexed
-elsewhere, an element-count drop between input and output is the symptom;
-plain `cat` cannot repair it, since it copies a blob that already carries
-indexdata verbatim.
+**Every filter here believes the claim it filters on**; what a false one
+costs per command is in [indexdata-trust.md](indexdata-trust.md). One
+mechanism detail belongs here: `repack`, `degrade` and `cat --clean` /
+`cat --type` (re-encode path) schedule an indexed blob into the one per-kind
+phase its indexdata names, and that phase re-encodes only elements of its
+kind. Checking the kind per blob is not possible in the worker, because the
+pool's classify closure receives only the decoded block and cannot tell an
+indexed blob from an unindexed one that the schedule builder replicated into
+all three kinds (a legitimate no-match); checking it per element is a cost on
+a measured path.
 
 Applied via `ElementReader::with_blob_filter()`. Used by `cat --type`, `tags-filter`, `extract`.
 Only the pipelined iteration methods honour it; the sequential `for_each` and

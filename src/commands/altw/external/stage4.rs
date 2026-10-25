@@ -202,6 +202,9 @@ pub(super) fn stage4_assembly(
         }
 
         // P1b: skip node blobs with only untagged non-member nodes.
+        // Both tests read claims, believed without a decode: a tagdata key
+        // set falsely empty drops tagged nodes, and an understated ID range
+        // hides relation members (reference/indexdata-trust.md).
         if !keep_untagged_nodes && matches!(meta.kind, crate::ElementKind::Node) {
             if !meta.has_tagindex {
                 s4_node_blobs_no_tagindex += 1;

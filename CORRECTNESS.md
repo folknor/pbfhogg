@@ -349,111 +349,14 @@ consumers to protect an inference sort no longer makes.
 
 ## Blob sidecar metadata: `indexdata` and `tagdata` are a trust boundary
 
-**Status:** Documented and verifiable. Consumers still trust these fields by
-default, by design; `check --index` verifies them on demand, and
-`--distrust-metadata` declines them per-run on `tags-filter` and `inspect`.
+**Status:** Documented and verifiable. Consumers believe these fields by
+default, by design; `check --index` verifies them on demand.
 
-**Context:** pbfhogg writes two non-standard `BlobHeader` fields that standard
-readers skip: `indexdata` (field 2 - element kind, `min_id`, `max_id`, `count`,
-and for node blobs a spatial bbox) and `tagdata` (field 4 - the blob's set of
-unique tag keys). They exist so a command can classify or reject a blob without
-decompressing it, which is where essentially all of this crate's performance on
-large files comes from.
-
-Nothing in the format signs, checksums or validates either field, and nothing
-requires them to have been written by pbfhogg. They are claims a file makes
-about itself. The sortedness boundary above is documented carefully because
-`sort` used to *infer* sortedness from indexdata's presence; the kind / count /
-range boundary is the separate question of whether the values themselves are
-true, and it has consumers that act on it destructively:
-
-- `cat --type <kind>` copies a blob through **raw**, without decoding, when the
-  declared kind matches - so a mislabelled blob leaks off-kind elements into the
-  output, or vanishes from it entirely.
-- `renumber` assigns ID blocks from the declared `count`, then checks each
-  blob's decoded count against it, and checks that IDs strictly increase
-  rather than trusting the header's `Sort.Type_then_ID`.
-- `apply-changes` routes an indexed blob whose declared ID range does not
-  overlap the diff to the splice fast path, copying it unchanged, so an
-  understated range carries the blob past a modify or delete aimed at it.
-- `cat --dedupe` passes blobs through on their declared kind and range, so a
-  false one can put unsorted output under the sorted stamp.
-- `diff` plans its parallel shards from the declared ranges, so a file whose
-  indexdata lies about its ID range can diff identical against one copy of
-  the same elements and different against another.
-- `getid --invert`, `sort` and `cat --dedupe` take a passthrough blob's
-  element count from `count`, reported apart from the counts they observe
-  (`passthrough_claimed`); `extract` decodes a blob before copying it raw.
-- `tags-filter` and `tags-count` skip whole blobs whose tag index lacks every
-  required key - so an index omitting a key its elements carry silently drops
-  matches. This is a wrong answer, not a slow one.
-- The spatial filter skips node blobs whose declared bbox misses the query
-  region.
-
-**Why trust is the default:** decoding every blob to check would delete the
-optimization the fields exist to provide. A blob's metadata is checked when a
-caller asks, not on every read.
-
-**What exists on the other side of the boundary:**
-
-- `pbfhogg check --index` decompresses every blob, re-derives the metadata from
-  the payload with `scan_block_ids` / `scan_block_tags`, and reports each
-  disagreement. Those are the same two scanners the writer's *passthrough* path
-  uses, so on a re-framed blob the check cannot catch a bug inside the scanner
-  itself - only metadata that has since diverged from its payload. The
-  scanners parse every element through the decoder's own `wire.rs` parsers
-  and never return a partial index: a block they cannot fully parse yields
-  an error or no index, never a shorter one. Against the
-  ordinary write path it is independent: `BlockBuilder` derives its index
-  incrementally as elements are added and never rescans what it emitted. It
-  never routes on the metadata it is checking - no blob filter,
-  no `require_indexdata`, every blob decompressed - so it has no
-  `--distrust-metadata` flag: distrust is its only mode. Exit 1 means mismatches
-  were found; exit 2 means it could not run.
-- `--distrust-metadata` on `tags-filter` and `inspect` declines the hints for
-  one run, so the answer depends only on element data.
-- `degrade --corrupt-indexdata`, `--corrupt-indexdata-kind` and
-  `--corrupt-tagdata` generate the adversarial corpus both of the above are
-  tested against. All three write **well-formed** hints through the same
-  encoders the honest path uses, so a test built on them exercises a consumer's
-  belief rather than the reader's rejection of malformed bytes.
-
-**What `check --index` deliberately does not report:** absence. A blob with no
-`indexdata` (every third-party PBF) or no `tagdata` makes no claim; a v1
-(26-byte) index has no bbox field at all.
-
-Absence is not the same as unreadability, and the difference is load-bearing.
-`BlobIndex::deserialize` returns `None` for an index of an unrecognised length,
-version or element kind, for a field whose length disagrees with the size its
-version byte declares (26 bytes for v1, 42 for v2 and v3), for an inverted ID
-range, and when a blob header carries the field more than once. Every *reader*
-is right to treat that as "no index, decode the blob" - but a verifier that inherits the collapse passes the single
-most obviously broken input it can be handed. The verifier therefore carries the
-raw field's *presence* separately from its parsed value, and reports unreadable
-`indexdata`, unreadable `tagdata`, and a well-formed `tagdata` attached to a
-blob whose group mixes element kinds (where the scanner sees only the first
-element field, so no key set can be complete while `tags-filter` skips the blob
-on the strength of it).
-
-Two checks are containment rather than
-equality for the same reason - a stored bbox must *contain* the blob's
-coordinates (the scan rounds outward through `granularity` / `lat_offset` /
-`lon_offset`, so a wider stored box is sound), and a stored tag key set must
-*contain* every key the blob carries (a key listed but absent only costs a
-decode, and is reported as a distinct, separate violation). Kind, count and ID
-range are exact, because every consumer above treats them as exact.
-
-**Residual:** an allocation sized from unverified metadata must still cope with
-being wrong. `check`'s `id_alloc_bound` bounds the ID bitset by the input file's
-own size rather than by the claimed `max_id`, and both `verify_ids` and
-`check_refs` report an out-of-range ID as an input property instead of panicking.
-`repack` bounds its `BlockBuilder` pre-allocation the same way. `renumber`
-and the geocode builder's node pass pre-allocate their node sets to the
-smaller of the claimed `max_id` and a bound from the file size, and insert
-any ID above that afterwards, so a false claim costs neither memory nor a
-refusal. All three ID-bitset callers take the bound from
-`IdSet::file_bounded_max_id`, each with its own IDs-per-byte factor. New
-code that sizes anything from `indexdata` must do likewise.
+The trust model - which claims are believed, what checks them in passing,
+what verifies them, what a false one costs per command, and what a missing
+or partial index does - is stated once, in
+[reference/indexdata-trust.md](reference/indexdata-trust.md). The decision is
+ADR-0013.
 
 ## OSC compatibility and emission contracts
 

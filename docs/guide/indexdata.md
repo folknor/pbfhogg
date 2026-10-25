@@ -35,9 +35,21 @@ This enables `tags-filter`, `tags-count` and filtered reads to skip decompressio
 ## Verifying indexdata
 
 Neither field is signed or checked by the format, and every fast path above
-believes them. `pbfhogg check --index` decompresses every blob and diffs what it
-finds against what the header claims, exiting `1` when they disagree. See
-[check](/cli/commands#check).
+believes them, as do the commands that require sorted input of the header's
+`Sort.Type_then_ID` flag. A file whose claims are false is outside what
+pbfhogg promises to handle: commands may produce wrong output from it and
+report success. pbfhogg's own writer produces honest metadata, and `cat`
+derives it from the payload for every blob it indexes (a blob that already
+carries indexdata is passed through as it is). For a file from elsewhere,
+`pbfhogg check --index --ids` is the admission test: `--index` decompresses
+every blob and diffs what it finds against what the header claims, and
+`--ids` checks ID and type order; either exits `1` on a disagreement. It has
+gaps: element-kind order is not checked on a file without indexdata, and the
+header's feature flags (`LocationsOnWays` and the like) are not checked at
+all. See [check](/cli/commands#check), and the
+[indexdata trust model](https://github.com/folknor/pbfhogg/blob/main/reference/indexdata-trust.md)
+for which command believes which claim, what a false one costs, and what no
+check covers.
 
 ## Generating indexed PBFs
 
@@ -58,7 +70,7 @@ Indexdata generation timings:
 
 Buffered I/O wins for this workload - sequential single-file passthrough benefits from page cache prefetch. `--direct-io` adds alignment overhead without the concurrent read/write pattern that makes it faster for merge.
 
-When `cat` is invoked with a `--type` flag (e.g., `cat -t way`), it also embeds indexdata but does full decode and re-encode of every block.
+When `cat` is invoked with a `--type` flag (e.g., `cat -t way`), an indexed blob of the selected kind is copied raw on the strength of its indexdata, one of another kind is skipped, and a blob without indexdata (under `--force`) is decoded and re-encoded with fresh indexdata.
 
 ## Which commands require indexdata?
 
@@ -95,12 +107,13 @@ The escape, and whether a command refuses at all, is decided per command:
 Except for renumber's scan, the check reads only the first data blob's
 header. It is not a whole-file validation: a file whose first data blob is
 indexed passes it even if later blobs are not. Such a partially indexed file
-is refused, with the same missing-indexdata error and advice, by every command
-that reads all blob headers to plan its work (among them `sort`,
+is refused, with the same missing-indexdata error and advice, by most commands
+that read all blob headers to plan their work (among them `sort`,
 `apply-changes`, `repack`, `tags-filter`, `extract`, `add-locations-to-ways`,
 `build-geocode-index`, `digest` and `diff`), at the first data blob without
 indexdata; `--force` does not lift that refusal. `pbfhogg cat` indexes every
-blob of such a file. Commands that do not read every header first run on it.
+blob of such a file. Commands that do not read every header first run on it,
+and so, today, do `getid` and `getparents`.
 
 ## The --force flag
 

@@ -42,8 +42,8 @@
 //!   element in range is left to consume: the old block always ends at or
 //!   before the boundary.
 //! - **Index claims are trusted.** Ranges and counts come from indexdata, as
-//!   everywhere in the block-pair engine (see CORRECTNESS.md, "Blob sidecar
-//!   metadata"). A lying claim can change the answer.
+//!   everywhere in the block-pair engine (see reference/indexdata-trust.md).
+//!   A lying claim can change the answer.
 
 use std::path::Path;
 use std::sync::Arc;

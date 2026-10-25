@@ -282,6 +282,10 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
             bbox,
             passthrough: Passthrough::No,
         });
+        // Kind and bbox are indexdata claims, believed without a decode: a
+        // mislabelled blob lands in the wrong per-kind schedule and a node
+        // blob whose bbox understates its nodes is skipped by
+        // `filter.wants_index` (reference/indexdata-trust.md).
         if let Some(idx) = idx {
             // Build full_way_schedule unconditionally for way blobs.
             if matches!(idx.kind, crate::ElementKind::Way) {

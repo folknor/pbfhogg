@@ -191,6 +191,13 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         // Keep that a deliberate indexdata trust-policy change: the measured
         // descriptor-first path avoids reading/decompressing those bodies,
         // and kind verification alone would still trust forged ID ranges.
+        //
+        // The range is believed the same way: an indexed blob whose claimed
+        // range misses the diff is spliced unchanged, so an understated
+        // range carries the blob past a modify or delete aimed at one of its
+        // elements. Claims are believed, not verified, and a file whose
+        // claims lie is outside the contract (reference/indexdata-trust.md);
+        // `check --index` is the verifier.
         let low_node_must_decompress = locations_on_ways && matches!(kind, ElementKind::Node);
         let item = if let Some(drain_tx) = splice_tx
             && has_indexdata

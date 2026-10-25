@@ -10,7 +10,7 @@ use super::super::Result;
 use super::pool::{Rewritten, run_rewrite_stage};
 use super::schedule::BlobTask;
 use super::wire_rewrite::{Scratch, reframe_dense_with_new_ids};
-use super::{BlobBuffers, StageCounters, blob_index, positional_bases};
+use super::{BlobBuffers, Phase, StageCounters, blob_index, positional_bases};
 use crate::idset::IdSet;
 use crate::tunables::RENUMBER_PASS1_WORKERS;
 
@@ -53,7 +53,7 @@ pub(super) fn pass1_parallel_scan(
 
     let totals = run_rewrite_stage(
         "node",
-        "pass1",
+        Phase::Pass1,
         source,
         schedule.len(),
         &mut workers,

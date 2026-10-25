@@ -473,30 +473,28 @@ pub(crate) fn degrade_to(
         ));
     }
 
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("degrade_unsort", i64::from(flags.unsort));
-        crate::debug::emit_counter("degrade_unsort_intra", i64::from(flags.unsort_intra));
-        crate::debug::emit_counter("degrade_strip_locations", i64::from(flags.strip_locations));
-        crate::debug::emit_counter("degrade_strip_indexdata", i64::from(flags.strip_indexdata));
-        crate::debug::emit_counter("degrade_strip_tagdata", i64::from(flags.strip_tagdata));
-        crate::debug::emit_counter("degrade_corrupt_tagdata", i64::from(flags.corrupt_tagdata));
-        crate::debug::emit_counter(
-            "degrade_corrupt_indexdata",
-            i64::from(flags.corrupt_indexdata),
-        );
-        crate::debug::emit_counter(
-            "degrade_corrupt_indexdata_kind",
-            i64::from(flags.corrupt_indexdata_kind),
-        );
-        crate::debug::emit_counter("degrade_strip_bbox", i64::from(flags.strip_bbox));
-        crate::debug::emit_counter("degrade_drop_ids", i64::from(flags.drop_ids.is_some()));
-        if let Some(spec) = flags.drop_ids {
-            crate::debug::emit_counter("degrade_drop_n", spec.n as i64);
-            crate::debug::emit_counter("degrade_drop_seed", spec.seed as i64);
-        }
-        crate::debug::emit_counter("degrade_block_cap", block_cap.get() as i64);
+    crate::debug::emit_counter("degrade_unsort", flags.unsort);
+    crate::debug::emit_counter("degrade_unsort_intra", flags.unsort_intra);
+    crate::debug::emit_counter("degrade_strip_locations", flags.strip_locations);
+    crate::debug::emit_counter("degrade_strip_indexdata", flags.strip_indexdata);
+    crate::debug::emit_counter("degrade_strip_tagdata", flags.strip_tagdata);
+    crate::debug::emit_counter("degrade_corrupt_tagdata", flags.corrupt_tagdata);
+    crate::debug::emit_counter("degrade_corrupt_indexdata", flags.corrupt_indexdata);
+    crate::debug::emit_counter(
+        "degrade_corrupt_indexdata_kind",
+        flags.corrupt_indexdata_kind,
+    );
+    crate::debug::emit_counter("degrade_strip_bbox", flags.strip_bbox);
+    crate::debug::emit_counter("degrade_drop_ids", flags.drop_ids.is_some());
+    if let Some(spec) = flags.drop_ids {
+        // Both are user-supplied u64s and have always been emitted as their
+        // bit pattern reinterpreted as i64 (a value from 2^63 up arrives
+        // negative), so they keep that rather than the saturation
+        // `emit_counter` applies to an unsigned count.
+        crate::debug::emit_counter("degrade_drop_n", spec.n.cast_signed());
+        crate::debug::emit_counter("degrade_drop_seed", spec.seed.cast_signed());
     }
+    crate::debug::emit_counter("degrade_block_cap", block_cap.get());
 
     let stats = if flags.needs_decode() {
         degrade_decode_path(input, output, flags, block_cap, write, overrides, host)?
@@ -504,12 +502,9 @@ pub(crate) fn degrade_to(
         degrade_passthrough(input, output, flags, write, overrides, host)?
     };
 
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("degrade_blobs_written", stats.blobs_written as i64);
-        crate::debug::emit_counter("degrade_elements_written", stats.elements_written as i64);
-        crate::debug::emit_counter("degrade_dropped_elements", stats.dropped as i64);
-    }
+    crate::debug::emit_counter("degrade_blobs_written", stats.blobs_written);
+    crate::debug::emit_counter("degrade_elements_written", stats.elements_written);
+    crate::debug::emit_counter("degrade_dropped_elements", stats.dropped);
 
     Ok(stats)
 }

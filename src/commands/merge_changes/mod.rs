@@ -190,17 +190,14 @@ pub(crate) fn merge_changes_to(
     });
 
     crate::debug::emit_marker("MERGECHANGES_START");
-    #[allow(clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("merge_changes_files", inputs.len() as i64);
-    #[allow(clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("merge_changes_worker_count", worker_count as i64);
+    crate::debug::emit_counter("merge_changes_files", inputs.len());
+    crate::debug::emit_counter("merge_changes_worker_count", worker_count);
     let total_bytes_in: u64 = inputs
         .iter()
         .filter_map(|p| std::fs::metadata(p).ok())
         .map(|m| m.len())
         .sum();
-    #[allow(clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("merge_changes_total_bytes_in", total_bytes_in as i64);
+    crate::debug::emit_counter("merge_changes_total_bytes_in", total_bytes_in);
 
     // Build a scoped rayon pool when the caller fixed the parallelism.
     // Pool controls par_iter and par_chunks thread count for both the
@@ -244,11 +241,9 @@ pub(crate) fn merge_changes_to(
         }
     })?;
 
-    #[allow(clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("merge_changes_changes_out", changes_out as i64);
+    crate::debug::emit_counter("merge_changes_changes_out", changes_out);
     if let Ok(meta) = std::fs::metadata(output.path()) {
-        #[allow(clippy::cast_possible_wrap)]
-        crate::debug::emit_counter("merge_changes_total_bytes_out", meta.len() as i64);
+        crate::debug::emit_counter("merge_changes_total_bytes_out", meta.len());
     }
     crate::debug::emit_marker("MERGECHANGES_END");
 
@@ -280,8 +275,7 @@ fn build_simplify_stream(
 
     for path in inputs {
         if let Ok(meta) = std::fs::metadata(path) {
-            #[allow(clippy::cast_possible_wrap)]
-            crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
+            crate::debug::emit_counter("merge_changes_input_bytes", meta.len());
         }
     }
 
@@ -303,10 +297,9 @@ fn build_simplify_stream(
     for s in streams {
         let len_before = combined.changes.len();
         combined.changes.extend(s.changes);
-        #[allow(clippy::cast_possible_wrap)]
         crate::debug::emit_counter(
             "merge_changes_changes_per_osc",
-            (combined.changes.len() - len_before) as i64,
+            combined.changes.len() - len_before,
         );
     }
     Ok(combined)
@@ -322,17 +315,15 @@ fn parse_one_into_stream(
     cancel: &crate::host::Cancel,
 ) -> Result<()> {
     if let Ok(meta) = std::fs::metadata(path) {
-        #[allow(clippy::cast_possible_wrap)]
-        crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
+        crate::debug::emit_counter("merge_changes_input_bytes", meta.len());
     }
     let len_before = stream.changes.len();
     crate::debug::emit_marker("MERGECHANGES_PARSE_START");
     let result = parse_osc_into(path, stream, cancel);
     crate::debug::emit_marker("MERGECHANGES_PARSE_END");
-    #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter(
         "merge_changes_changes_per_osc",
-        (stream.changes.len() - len_before) as i64,
+        stream.changes.len() - len_before,
     );
     result
 }
@@ -605,18 +596,13 @@ fn write_streaming(
         let mut count = 0u64;
         for path in inputs {
             if let Ok(meta) = std::fs::metadata(path) {
-                #[allow(clippy::cast_possible_wrap)]
-                crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
+                crate::debug::emit_counter("merge_changes_input_bytes", meta.len());
             }
             let count_before = count;
             crate::debug::emit_marker("MERGECHANGES_PARSE_START");
             parse_osc_streaming(path, &mut writer, &mut open_action, &mut count, cancel)?;
             crate::debug::emit_marker("MERGECHANGES_PARSE_END");
-            #[allow(clippy::cast_possible_wrap)]
-            crate::debug::emit_counter(
-                "merge_changes_changes_per_osc",
-                (count - count_before) as i64,
-            );
+            crate::debug::emit_counter("merge_changes_changes_per_osc", count - count_before);
         }
 
         if let Some(prev) = open_action {
@@ -645,8 +631,7 @@ fn write_streaming(
     // that 223 s across the same N rayon workers already doing parse.
     for path in inputs {
         if let Ok(meta) = std::fs::metadata(path) {
-            #[allow(clippy::cast_possible_wrap)]
-            crate::debug::emit_counter("merge_changes_input_bytes", meta.len() as i64);
+            crate::debug::emit_counter("merge_changes_input_bytes", meta.len());
         }
     }
 
@@ -668,8 +653,7 @@ fn write_streaming(
     emit_members_ordered(executor, inputs, is_gz, window, cancel, |bytes, n| {
         out.write_all(&bytes)?;
         count += n;
-        #[allow(clippy::cast_possible_wrap)]
-        crate::debug::emit_counter("merge_changes_changes_per_osc", n as i64);
+        crate::debug::emit_counter("merge_changes_changes_per_osc", n);
         Ok(())
     })?;
     crate::debug::emit_marker("MERGECHANGES_PARALLEL_EMIT_END");
@@ -917,8 +901,7 @@ fn write_simplified(
 ) -> Result<usize> {
     cancel.check()?;
     crate::debug::emit_marker("MERGECHANGES_SIMPLIFY_START");
-    #[allow(clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("merge_changes_changes_in", stream.changes.len() as i64);
+    crate::debug::emit_counter("merge_changes_changes_in", stream.changes.len());
     // Each object's last change, beside the highest version ever claimed
     // for it. The floor is only maintained while the gate is on; with
     // `--allow-version-regression` the dedupe is purely positional.

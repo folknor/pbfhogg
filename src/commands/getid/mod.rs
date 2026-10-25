@@ -477,12 +477,9 @@ fn getid_dispatched(
         )?;
         (Some(arm), stats)
     };
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("getid_nodes_written", result.nodes_written as i64);
-        crate::debug::emit_counter("getid_ways_written", result.ways_written as i64);
-        crate::debug::emit_counter("getid_relations_written", result.relations_written as i64);
-    }
+    crate::debug::emit_counter("getid_nodes_written", result.nodes_written);
+    crate::debug::emit_counter("getid_ways_written", result.ways_written);
+    crate::debug::emit_counter("getid_relations_written", result.relations_written);
     Ok((arm, result))
 }
 
@@ -782,10 +779,7 @@ fn filter_by_id_walker(
     }
 
     let mut writer = writer.ok_or_else(|| crate::error::new_missing_header(input))?;
-    crate::debug::emit_counter(
-        "walk_actual_osmdata_blobs",
-        i64::try_from(osmdata_blobs).unwrap_or(i64::MAX),
-    );
+    crate::debug::emit_counter("walk_actual_osmdata_blobs", osmdata_blobs);
     if blobs_skipped > 0 {
         crate::host::diag!(
             host.diagnostics,
@@ -958,10 +952,7 @@ fn filter_by_id_streaming(
     }
 
     let mut writer = writer.ok_or_else(|| crate::error::new_missing_header(input))?;
-    crate::debug::emit_counter(
-        "walk_actual_osmdata_blobs",
-        i64::try_from(osmdata_blobs).unwrap_or(i64::MAX),
-    );
+    crate::debug::emit_counter("walk_actual_osmdata_blobs", osmdata_blobs);
     if blobs_skipped > 0 {
         crate::host::diag!(
             host.diagnostics,
@@ -1046,10 +1037,7 @@ fn getid_with_refs(
     // starts so the counter survives a SIGKILL during pass 2.
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter(
-            "getid_dep_node_ids",
-            i64::try_from(dep_node_ids.iter().count()).unwrap_or(i64::MAX),
-        );
+        crate::debug::emit_counter("getid_dep_node_ids", dep_node_ids.iter().count());
     }
 
     // Pass 2: Write matching elements + dependent nodes (transform fused into

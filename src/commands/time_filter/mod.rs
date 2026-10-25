@@ -131,21 +131,18 @@ pub(crate) fn time_filter_to(
     };
 
     writer.flush()?;
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("timefilter_versions_seen", stats.versions_seen as i64);
-        crate::debug::emit_counter(
-            "timefilter_versions_before_cutoff",
-            stats.versions_before_cutoff as i64,
-        );
-        crate::debug::emit_counter("timefilter_elements_written", stats.elements_written as i64);
-        crate::debug::emit_counter("timefilter_dropped_deleted", stats.dropped_deleted as i64);
-        crate::debug::emit_counter(
-            "timefilter_dropped_no_snapshot_version",
-            stats.dropped_no_snapshot_version as i64,
-        );
-        crate::debug::emit_counter("timefilter_is_history_path", i64::from(is_history));
-    }
+    crate::debug::emit_counter("timefilter_versions_seen", stats.versions_seen);
+    crate::debug::emit_counter(
+        "timefilter_versions_before_cutoff",
+        stats.versions_before_cutoff,
+    );
+    crate::debug::emit_counter("timefilter_elements_written", stats.elements_written);
+    crate::debug::emit_counter("timefilter_dropped_deleted", stats.dropped_deleted);
+    crate::debug::emit_counter(
+        "timefilter_dropped_no_snapshot_version",
+        stats.dropped_no_snapshot_version,
+    );
+    crate::debug::emit_counter("timefilter_is_history_path", is_history);
     Ok(stats)
 }
 

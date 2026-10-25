@@ -1,7 +1,10 @@
 //! Sidecar counter machinery.
 //!
-//! Three shared pieces; new counter code uses them rather than hand-rolling
-//! its own (some older command modules still do):
+//! Three shared pieces; counter code uses them rather than hand-rolling its
+//! own. Plain values (stats fields, schedule lengths, local tallies) need none
+//! of them: `crate::debug::emit_counter` takes unsigned integers directly and
+//! saturates, so they are passed without an `as i64` cast (a source check in
+//! `scripts/check_source_invariants.py` refuses one inside its arguments).
 //!
 //! - [`counter_set!`] declares a set of `AtomicU64` counters from one list
 //!   that pairs every field with the exact name it is emitted under, so a
@@ -23,6 +26,8 @@ use std::time::Instant;
 ///         pread_ms => "s9_pread_ms",
 ///         // Accumulated in nanoseconds, emitted in milliseconds.
 ///         write_ns => "s9_write_ms" / 1_000_000,
+///         // No name: counted and read in place, never emitted by the set.
+///         scanned,
 ///     }
 ///     // Optional non-counter fields, with their (const) initialisers.
 ///     extra {
@@ -41,6 +46,11 @@ use std::time::Instant;
 /// the macro and its children, so a set whose emission is restricted to one
 /// route (the process-exit hooks) keeps that route as its only public way out.
 ///
+/// A counter written without `=> name` is declared in place (so it keeps its
+/// position among its neighbours) but neither visited nor emitted: its
+/// owner reads it directly. The `extra` block is for fields that are not
+/// `AtomicU64` counters at all.
+///
 /// Attributes on a counter are copied to its field declaration only; do not
 /// put `#[cfg]` on a counter (the initialiser and the visit would not see
 /// it). A counter that only some builds bump stays declared and reads zero.
@@ -50,7 +60,7 @@ macro_rules! counter_set {
         $vis:vis struct $name:ident {
             $(
                 $(#[$fattr:meta])*
-                $fvis:vis $field:ident => $emit:literal $(/ $div:literal)?
+                $fvis:vis $field:ident $(=> $emit:literal $(/ $div:literal)?)?
             ),* $(,)?
         }
         $(extra {
@@ -81,15 +91,16 @@ macro_rules! counter_set {
                 }
             }
 
-            /// Visit every counter in declaration order: its emitted name
-            /// and its current value, divided by its divisor if it has one.
+            /// Visit every named counter in declaration order: its emitted
+            /// name and its current value, divided by its divisor if it has
+            /// one. Unnamed counters are skipped.
             fn for_each(&self, mut visit: impl FnMut(&'static str, u64)) {
-                $(
+                $($(
                     visit(
                         $emit,
                         self.$field.load(::std::sync::atomic::Ordering::Relaxed) $(/ $div)?,
                     );
-                )*
+                )?)*
             }
 
             /// Emit every counter, in declaration order.
@@ -191,6 +202,7 @@ mod tests {
     super::counter_set! {
         struct Probe {
             plain => "probe_plain",
+            unnamed,
             scaled_ns => "probe_scaled_ms" / 1_000_000,
         }
         extra {
@@ -202,10 +214,12 @@ mod tests {
     fn counter_set_visits_in_order_with_divisor() {
         let probe = Probe::new();
         probe.plain.fetch_add(7, Relaxed);
+        probe.unnamed.fetch_add(5, Relaxed);
         probe.scaled_ns.fetch_add(3_999_999, Relaxed);
         let mut seen = Vec::new();
         probe.for_each(|name, value| seen.push((name, value)));
         assert_eq!(seen, [("probe_plain", 7), ("probe_scaled_ms", 3)]);
+        assert_eq!(probe.unnamed.load(Relaxed), 5);
         assert!(!probe.latch.load(Relaxed));
     }
 

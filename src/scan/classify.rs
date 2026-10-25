@@ -454,10 +454,8 @@ pub(crate) fn build_classify_schedule_blob_filtered(
     drop(walker);
     crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_END");
 
-    #[allow(clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("schedule_blobs", schedule.len() as i64);
-    #[allow(clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("schedule_tagidx_skipped_blobs", blobs_skipped_by_tag as i64);
+    crate::debug::emit_counter("schedule_blobs", schedule.len());
+    crate::debug::emit_counter("schedule_tagidx_skipped_blobs", blobs_skipped_by_tag);
     Ok((schedule, shared_file, blobs_skipped_by_tag))
 }
 
@@ -539,12 +537,9 @@ pub(crate) fn build_classify_schedules_split(
     drop(walker);
     crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_END");
 
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("schedule_node_blobs", nodes.len() as i64);
-        crate::debug::emit_counter("schedule_way_blobs", ways.len() as i64);
-        crate::debug::emit_counter("schedule_relation_blobs", rels.len() as i64);
-    }
+    crate::debug::emit_counter("schedule_node_blobs", nodes.len());
+    crate::debug::emit_counter("schedule_way_blobs", ways.len());
+    crate::debug::emit_counter("schedule_relation_blobs", rels.len());
     Ok((nodes, ways, rels, shared_file, max_ids))
 }
 

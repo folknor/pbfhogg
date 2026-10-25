@@ -324,19 +324,16 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
     }
 
     crate::debug::emit_marker("MERGE_SCANNER_END");
-    crate::debug::emit_counter(
-        "merge_scanner_blobs_emitted",
-        i64::try_from(seq).unwrap_or(i64::MAX),
-    );
+    crate::debug::emit_counter("merge_scanner_blobs_emitted", seq);
     // Deliberately retain the historical counter names and emission semantics.
     // Renaming these estimates breaks brokkr comparisons with measured runs.
     crate::debug::emit_counter(
         "merge_scanner_to_drain_bytes_high_water",
-        i64::try_from(max_item_bytes_fastpath).unwrap_or(i64::MAX),
+        max_item_bytes_fastpath,
     );
     crate::debug::emit_counter(
         "merge_scanner_to_workers_bytes_high_water",
-        i64::try_from(max_item_bytes_slowpath).unwrap_or(i64::MAX),
+        max_item_bytes_slowpath,
     );
 
     Ok(seq)

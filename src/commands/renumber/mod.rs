@@ -48,7 +48,8 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::time::Instant;
+
+use crate::counters::Stopwatch;
 
 use super::{HeaderOverrides, Result, require_sorted, writer_from_header};
 use crate::error::Error;
@@ -132,55 +133,115 @@ use crate::tunables::{RENUMBER_PREALLOC_IDS_PER_BYTE, RENUMBER_STAGE2D_WORKERS};
 // Shared instrumentation counters
 // ---------------------------------------------------------------------------
 
-/// Per-stage timing counters, summed across workers and emitted once the
-/// stage ends. Timed in nanoseconds (`Stopwatch::record_ns`), not
-/// milliseconds: these counters sum one span per blob, and a planet node
-/// blob's pread is well under a millisecond, so per-blob `as_millis()` summed
-/// truncated zeros. The two `*_wait_ns` fields follow brokkr's stall convention
-/// (`brokkr sidecar <uuid> --stalls`): `window_wait` is workers parked
-/// because the writer side is a full window behind, `consumer_recv_wait` is
-/// the writer side idle for want of a finished blob.
-struct StageCounters {
-    pread_ns: AtomicU64,
-    decompress_ns: AtomicU64,
-    reframe_ns: AtomicU64,
-    consumer_write_ns: AtomicU64,
-    window_wait_ns: AtomicU64,
-    consumer_recv_wait_ns: AtomicU64,
-    blobs: AtomicU64,
+/// The renumber phase a [`StageCounters`] set is emitted for. It selects the
+/// emitted names only; it is not stored in the counters, so the set every
+/// worker writes holds the seven atomics and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Pass1,
+    Stage2d,
+    R1,
+    R2d,
+}
+
+/// Declares [`StageCounters`]: each counter once, with its emitted name for
+/// every stage on the same line (columns: pass1, stage2d, r1, r2d), so every
+/// sidecar name is greppable verbatim and a name cannot drift from its field.
+/// `crate::counters::counter_set!` takes one name per counter, which would
+/// need a type per stage; this is the same idea with a stage column.
+macro_rules! stage_counters {
+    (
+        $(#[$sattr:meta])*
+        struct $name:ident {
+            $(
+                $(#[$fattr:meta])*
+                $field:ident => [$pass1:literal, $stage2d:literal, $r1:literal, $r2d:literal]
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$sattr])*
+        struct $name {
+            $(
+                $(#[$fattr])*
+                $field: AtomicU64,
+            )*
+        }
+
+        impl $name {
+            const fn new() -> Self {
+                Self {
+                    $($field: AtomicU64::new(0),)*
+                }
+            }
+
+            /// Visit every counter in declaration order with its name for
+            /// `stage` and its current value.
+            fn for_each(&self, stage: Phase, mut visit: impl FnMut(&'static str, u64)) {
+                $(
+                    visit(
+                        match stage {
+                            Phase::Pass1 => $pass1,
+                            Phase::Stage2d => $stage2d,
+                            Phase::R1 => $r1,
+                            Phase::R2d => $r2d,
+                        },
+                        self.$field.load(Relaxed),
+                    );
+                )*
+            }
+
+            /// Emit every counter under its name for `stage`, in declaration
+            /// order.
+            fn emit(&self, stage: Phase) {
+                self.for_each(stage, |name, value| crate::debug::emit_counter(name, value));
+            }
+        }
+    };
+}
+
+stage_counters! {
+    /// Per-stage timing counters, summed across workers and emitted once the
+    /// stage ends. Timed in nanoseconds (`Stopwatch::record_ns`), not
+    /// milliseconds: these counters sum one span per blob, and a planet node
+    /// blob's pread is well under a millisecond, so per-blob `as_millis()`
+    /// summed truncated zeros. The two `*_wait_ns` fields follow brokkr's stall
+    /// convention (`brokkr sidecar <uuid> --stalls`): `window_wait` is workers
+    /// parked because the writer side is a full window behind,
+    /// `consumer_recv_wait` is the writer side idle for want of a finished blob.
+    struct StageCounters {
+        pread_ns => ["pass1_pread_ns", "stage2d_pread_ns", "r1_pread_ns", "r2d_pread_ns"],
+        decompress_ns => [
+            "pass1_decompress_ns",
+            "stage2d_decompress_ns",
+            "r1_decompress_ns",
+            "r2d_decompress_ns"
+        ],
+        reframe_ns => ["pass1_reframe_ns", "stage2d_reframe_ns", "r1_reframe_ns", "r2d_reframe_ns"],
+        consumer_write_ns => [
+            "pass1_consumer_write_ns",
+            "stage2d_consumer_write_ns",
+            "r1_consumer_write_ns",
+            "r2d_consumer_write_ns"
+        ],
+        window_wait_ns => [
+            "pass1_window_wait_ns",
+            "stage2d_window_wait_ns",
+            "r1_window_wait_ns",
+            "r2d_window_wait_ns"
+        ],
+        consumer_recv_wait_ns => [
+            "pass1_consumer_recv_wait_ns",
+            "stage2d_consumer_recv_wait_ns",
+            "r1_consumer_recv_wait_ns",
+            "r2d_consumer_recv_wait_ns"
+        ],
+        blobs => ["pass1_blobs", "stage2d_blobs", "r1_blobs", "r2d_blobs"],
+    }
 }
 
 impl StageCounters {
-    fn new() -> Self {
-        Self {
-            pread_ns: AtomicU64::new(0),
-            decompress_ns: AtomicU64::new(0),
-            reframe_ns: AtomicU64::new(0),
-            consumer_write_ns: AtomicU64::new(0),
-            window_wait_ns: AtomicU64::new(0),
-            consumer_recv_wait_ns: AtomicU64::new(0),
-            blobs: AtomicU64::new(0),
-        }
-    }
-
     fn bump_blobs(&self) {
         self.blobs.fetch_add(1, Relaxed);
-    }
-
-    fn emit(&self, prefix: &str) {
-        let fields: [(&str, &AtomicU64); 7] = [
-            ("pread_ns", &self.pread_ns),
-            ("decompress_ns", &self.decompress_ns),
-            ("reframe_ns", &self.reframe_ns),
-            ("consumer_write_ns", &self.consumer_write_ns),
-            ("window_wait_ns", &self.window_wait_ns),
-            ("consumer_recv_wait_ns", &self.consumer_recv_wait_ns),
-            ("blobs", &self.blobs),
-        ];
-        for (name, value) in fields {
-            let v = i64::try_from(value.load(Relaxed)).unwrap_or(i64::MAX);
-            crate::debug::emit_counter(&format!("{prefix}_{name}"), v);
-        }
     }
 }
 
@@ -401,9 +462,9 @@ pub(crate) fn renumber_external_to(
     crate::debug::emit_marker("RENUMBER_EXT_START");
 
     // ---- Blob schedule scan ----
-    let t_sched = Instant::now();
+    let t_sched = Stopwatch::start();
     let (pass1_schedule, way_schedule, relation_schedule) = build_all_blob_schedules(input, host)?;
-    emit_elapsed_ms("renumber_ext_schedule_ms", t_sched);
+    crate::debug::emit_counter("renumber_ext_schedule_ms", t_sched.elapsed_ms());
 
     // ---- Pass 1: parallel node rewrite ----
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_START");
@@ -451,20 +512,17 @@ pub(crate) fn renumber_external_to(
             node_id_set.set(id);
         }
     }
-    crate::debug::emit_counter(
-        "renumber_ext_node_overflow_ids",
-        i64::try_from(overflow_ids).unwrap_or(i64::MAX),
-    );
+    crate::debug::emit_counter("renumber_ext_node_overflow_ids", overflow_ids);
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_END");
 
     // ---- Build rank index ----
     // Stage boundaries are checkpoints: the rank builds between the parallel
     // stages have none of their own.
     host.cancel.check()?;
-    let t_rank = Instant::now();
+    let t_rank = Stopwatch::start();
     let node_id_set = node_id_set.into_ranked();
-    emit_elapsed_ms("renumber_ext_node_rank_ms", t_rank);
-    emit_count("renumber_ext_node_map_entries", node_id_set.total_count());
+    crate::debug::emit_counter("renumber_ext_node_rank_ms", t_rank.elapsed_ms());
+    crate::debug::emit_counter("renumber_ext_node_map_entries", node_id_set.total_count());
     set_matches_written("node", node_id_set.total_count(), pass1.nodes_written)?;
     let nodes = IdSpace::new("node", &node_id_set, opts.start_node_id);
 
@@ -487,15 +545,15 @@ pub(crate) fn renumber_external_to(
 
     // ---- R1: collect relation IDs into IdSet ----
     crate::debug::emit_marker("RENUMBER_EXT_R1_START");
-    let t_way_merge = Instant::now();
+    let t_way_merge = Stopwatch::start();
     let mut way_id_set = crate::idset::IdSet::new();
     for other in way_id_sets {
         way_id_set.merge(other);
     }
     host.cancel.check()?;
     let way_id_set = way_id_set.into_ranked();
-    emit_elapsed_ms("renumber_ext_way_merge_rank_ms", t_way_merge);
-    emit_count("renumber_ext_way_map_entries", way_id_set.total_count());
+    crate::debug::emit_counter("renumber_ext_way_merge_rank_ms", t_way_merge.elapsed_ms());
+    crate::debug::emit_counter("renumber_ext_way_map_entries", way_id_set.total_count());
     set_matches_written("way", way_id_set.total_count(), stage2d.ways_written)?;
 
     let mut relation_id_set = crate::idset::IdSet::new();
@@ -506,11 +564,11 @@ pub(crate) fn renumber_external_to(
         &mut relation_id_set,
         &host.cancel,
     )?;
-    let t_rel_rank = Instant::now();
+    let t_rel_rank = Stopwatch::start();
     let relation_id_set = relation_id_set.into_ranked();
-    emit_elapsed_ms("renumber_ext_rel_rank_ms", t_rel_rank);
+    crate::debug::emit_counter("renumber_ext_rel_rank_ms", t_rel_rank.elapsed_ms());
     let relation_count = relation_id_set.total_count();
-    emit_count("renumber_ext_relation_map_entries", relation_count);
+    crate::debug::emit_counter("renumber_ext_relation_map_entries", relation_count);
     // Relation IDs are `start + rank`; the largest rank is count - 1.
     if relation_count > 0 {
         positional_last_fits(opts.start_relation_id, relation_count, "relation")?;
@@ -581,20 +639,44 @@ fn set_matches_written(kind: &str, in_set: u64, written: u64) -> Result<()> {
     }
 }
 
-fn emit_elapsed_ms(name: &str, since: Instant) {
-    crate::debug::emit_counter(
-        name,
-        i64::try_from(since.elapsed().as_millis()).unwrap_or(i64::MAX),
-    );
-}
-
-fn emit_count(name: &str, count: u64) {
-    crate::debug::emit_counter(name, i64::try_from(count).unwrap_or(i64::MAX));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The literal per-stage names equal the `{prefix}_{field}` names the
+    /// counters were emitted under before they were spelled out, each paired
+    /// with its own field's value.
+    #[test]
+    fn stage_counter_names_and_values_pair_up() {
+        let counters = StageCounters::new();
+        let fields: [(&str, &AtomicU64); 7] = [
+            ("pread_ns", &counters.pread_ns),
+            ("decompress_ns", &counters.decompress_ns),
+            ("reframe_ns", &counters.reframe_ns),
+            ("consumer_write_ns", &counters.consumer_write_ns),
+            ("window_wait_ns", &counters.window_wait_ns),
+            ("consumer_recv_wait_ns", &counters.consumer_recv_wait_ns),
+            ("blobs", &counters.blobs),
+        ];
+        for (value, (_, field)) in (11_u64..).zip(fields) {
+            field.store(value, Relaxed);
+        }
+        let stages = [
+            (Phase::Pass1, "pass1"),
+            (Phase::Stage2d, "stage2d"),
+            (Phase::R1, "r1"),
+            (Phase::R2d, "r2d"),
+        ];
+        for (stage, prefix) in stages {
+            let mut seen = Vec::new();
+            counters.for_each(stage, |name, value| seen.push((name.to_owned(), value)));
+            let expected: Vec<(String, u64)> = (11_u64..)
+                .zip(fields)
+                .map(|(value, (field, _))| (format!("{prefix}_{field}"), value))
+                .collect();
+            assert_eq!(seen, expected, "{stage:?}");
+        }
+    }
 
     fn task(count: u64) -> BlobTask {
         BlobTask {

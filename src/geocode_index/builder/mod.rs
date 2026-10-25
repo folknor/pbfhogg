@@ -47,10 +47,6 @@ pub(super) fn sample_id(sample: &mut Vec<i64>, id: i64) {
     sample.sort_unstable();
 }
 
-pub(super) fn counter_value(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
-
 // ---------------------------------------------------------------------------
 // Build configuration
 // ---------------------------------------------------------------------------
@@ -396,7 +392,7 @@ fn build_generation(
         "Pass 1: Relations..."
     );
     #[cfg(feature = "hotpath")]
-    let pass1_start = std::time::Instant::now();
+    let pass1_start = crate::counters::Stopwatch::start();
 
     let (admin_relations, needed_admin_ways) =
         pass1::run_pass1(&config.input_path, config.direct_io, &mut strings, host)?;
@@ -409,7 +405,7 @@ fn build_generation(
     );
 
     #[cfg(feature = "hotpath")]
-    let pass1_ms = pass1_start.elapsed().as_millis();
+    let pass1_ms = pass1_start.elapsed_ms();
 
     // -----------------------------------------------------------------------
     // Pass 1.5: Referenced node collection (planet-scale memory optimization)
@@ -472,7 +468,7 @@ fn build_generation(
         "Pass 2: Nodes + Ways..."
     );
     #[cfg(feature = "hotpath")]
-    let pass2_start = std::time::Instant::now();
+    let pass2_start = crate::counters::Stopwatch::start();
 
     // `way_geom`, `admin_polygons`, `interp_ways`, and `admin_cell_entries`
     // remain input-sized in-memory intermediates. Their measured planet
@@ -521,13 +517,10 @@ fn build_generation(
         admin::assemble_admin_polygons(&admin_relations, &way_geom, config, &host.executor);
     let missing_admin_geometry = admin::missing_admin_way_geometry(&admin_relations, &way_geom);
     let dropped_admin_relations = dropped_admin.total;
-    crate::debug::emit_counter(
-        "geocode_admin_relation_drops",
-        i64::try_from(dropped_admin_relations).unwrap_or(i64::MAX),
-    );
+    crate::debug::emit_counter("geocode_admin_relation_drops", dropped_admin_relations);
     crate::debug::emit_counter(
         "geocode_admin_way_member_refs_without_geometry",
-        counter_value(missing_admin_geometry.member_refs),
+        missing_admin_geometry.member_refs,
     );
     if missing_admin_geometry.member_refs > 0 {
         crate::host::diag!(
@@ -591,7 +584,7 @@ fn build_generation(
     }
 
     #[cfg(feature = "hotpath")]
-    let pass2_ms = pass2_start.elapsed().as_millis();
+    let pass2_ms = pass2_start.elapsed_ms();
 
     // -----------------------------------------------------------------------
     // Interpolation endpoint resolution (reads from mmap'd addr_points.bin)
@@ -617,7 +610,7 @@ fn build_generation(
     }
     crate::debug::emit_counter(
         "geocode_unresolved_interpolation_ways",
-        counter_value(unresolved_interpolation_count),
+        unresolved_interpolation_count,
     );
     if unresolved_interpolation_count > 0 {
         crate::host::diag!(
@@ -684,7 +677,7 @@ fn build_generation(
         "Pass 3: S2 cells + write (bucketed)..."
     );
     #[cfg(feature = "hotpath")]
-    let pass4_start = std::time::Instant::now();
+    let pass4_start = crate::counters::Stopwatch::start();
 
     let sl = config.street_level;
     let cl = config.coarse_level;
@@ -818,11 +811,11 @@ fn build_generation(
     };
     crate::debug::emit_counter(
         "geocode_smoke_test_no_match",
-        i64::from(matches!(smoke_test, SmokeOutcome::NoMatch { .. })),
+        matches!(smoke_test, SmokeOutcome::NoMatch { .. }),
     );
 
     #[cfg(feature = "hotpath")]
-    let pass4_ms = pass4_start.elapsed().as_millis();
+    let pass4_ms = pass4_start.elapsed_ms();
 
     let stats = BuildStats {
         addr_points: u64::from(header.addr_point_count),

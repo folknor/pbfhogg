@@ -14,7 +14,7 @@ use super::schedule::BlobTask;
 use super::wire_rewrite::{
     RelationIdSpaces, Scratch, order_error, reframe_relations_with_new_ids, relation_id,
 };
-use super::{BlobBuffers, StageCounters};
+use super::{BlobBuffers, Phase, StageCounters};
 use crate::idset::IdSet;
 
 /// Reject negative ids at the entry of the external path.
@@ -112,7 +112,7 @@ pub(super) fn relation_r1_collect_ids(
         .map_err(|e| task.locate(source, e))?;
     }
 
-    counters.emit("r1");
+    counters.emit(Phase::R1);
     Ok(())
 }
 
@@ -160,7 +160,7 @@ pub(super) fn relation_r2d_assembly(
 
     let totals = run_rewrite_stage(
         "relation",
-        "r2d",
+        Phase::R2d,
         source,
         relation_schedule.len(),
         &mut workers,

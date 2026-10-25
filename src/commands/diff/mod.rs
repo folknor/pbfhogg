@@ -355,13 +355,10 @@ fn compare<W: Write>(
 /// Close the scan: the end marker and the result counters, on every path.
 fn finish_scan(stats: DiffStats) -> DiffStats {
     crate::debug::emit_marker("DIFF_SCAN_END");
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("diff_common", stats.common as i64);
-        crate::debug::emit_counter("diff_created", stats.created as i64);
-        crate::debug::emit_counter("diff_modified", stats.modified as i64);
-        crate::debug::emit_counter("diff_deleted", stats.deleted as i64);
-    }
+    crate::debug::emit_counter("diff_common", stats.common);
+    crate::debug::emit_counter("diff_created", stats.created);
+    crate::debug::emit_counter("diff_modified", stats.modified);
+    crate::debug::emit_counter("diff_deleted", stats.deleted);
     stats
 }
 
@@ -519,34 +516,24 @@ impl<W: Write> DiffSink<'_, W> {
 /// Shadow-only - no code-path change. Shared by the text diff and the
 /// derive (`--format osc`) sequential block-pair paths, which both drive
 /// `BlockPairMergeState` and report the same shadow view.
-#[allow(clippy::cast_possible_wrap)]
 fn emit_merge_stats_counters(s: &crate::osc::merge_join::BlockPairMergeStats) {
-    crate::debug::emit_counter(
-        "mergejoin_shadow_pairs_byte_equal",
-        s.pairs_byte_equal as i64,
-    );
+    crate::debug::emit_counter("mergejoin_shadow_pairs_byte_equal", s.pairs_byte_equal);
     crate::debug::emit_counter(
         "mergejoin_shadow_elements_byte_equal",
-        s.elements_byte_equal as i64,
+        s.elements_byte_equal,
     );
     crate::debug::emit_counter(
         "mergejoin_shadow_pairs_overlapping_decoded",
-        s.pairs_overlapping_decoded as i64,
+        s.pairs_overlapping_decoded,
     );
     crate::debug::emit_counter(
         "mergejoin_shadow_elements_overlapping_decoded",
-        s.elements_overlapping_decoded as i64,
+        s.elements_overlapping_decoded,
     );
-    crate::debug::emit_counter("mergejoin_shadow_blobs_old_only", s.blobs_old_only as i64);
-    crate::debug::emit_counter(
-        "mergejoin_shadow_elements_old_only",
-        s.elements_old_only as i64,
-    );
-    crate::debug::emit_counter("mergejoin_shadow_blobs_new_only", s.blobs_new_only as i64);
-    crate::debug::emit_counter(
-        "mergejoin_shadow_elements_new_only",
-        s.elements_new_only as i64,
-    );
+    crate::debug::emit_counter("mergejoin_shadow_blobs_old_only", s.blobs_old_only);
+    crate::debug::emit_counter("mergejoin_shadow_elements_old_only", s.elements_old_only);
+    crate::debug::emit_counter("mergejoin_shadow_blobs_new_only", s.blobs_new_only);
+    crate::debug::emit_counter("mergejoin_shadow_elements_new_only", s.elements_new_only);
 }
 
 /// Fallback diff path for inputs without indexdata: the element-level

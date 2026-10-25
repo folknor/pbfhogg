@@ -41,7 +41,7 @@
 //! verbatim: emit any remaining upserts of the current and later kinds.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock, mpsc};
 
 use rustc_hash::FxHashMap;
@@ -140,73 +140,27 @@ pub(super) struct DrainChannels {
     pub last_node_seq_rx: Option<mpsc::Receiver<u64>>,
 }
 
-/// Atomic counters surfaced as sidecar counters at end of `merge()`.
-pub(super) struct DrainCounters {
-    pub items_processed: AtomicU64,
-    pub copy_range_calls: AtomicU64,
-    pub copy_range_coalesced_items: AtomicU64,
-    pub passthrough_chunks_flushed: AtomicU64,
-    pub rewrite_blocks_written: AtomicU64,
-    pub gap_creates_emitted: AtomicU64,
-    pub trailing_creates_emitted: AtomicU64,
-    pub reorder_buffer_high_water_count: AtomicU64,
-    pub reorder_buffer_high_water_bytes: AtomicU64,
-    pub barrier_loc_map_size: AtomicU64,
-    /// Cumulative wall-clock time the drain spent waiting for the
-    /// next-in-seq item (i.e., reorder gap stalls).
-    pub reorder_gap_wait_ns: AtomicU64,
-}
-
-impl DrainCounters {
-    pub(super) fn new() -> Self {
-        Self {
-            items_processed: AtomicU64::new(0),
-            copy_range_calls: AtomicU64::new(0),
-            copy_range_coalesced_items: AtomicU64::new(0),
-            passthrough_chunks_flushed: AtomicU64::new(0),
-            rewrite_blocks_written: AtomicU64::new(0),
-            gap_creates_emitted: AtomicU64::new(0),
-            trailing_creates_emitted: AtomicU64::new(0),
-            reorder_buffer_high_water_count: AtomicU64::new(0),
-            reorder_buffer_high_water_bytes: AtomicU64::new(0),
-            barrier_loc_map_size: AtomicU64::new(0),
-            reorder_gap_wait_ns: AtomicU64::new(0),
-        }
-    }
-
-    pub(super) fn emit(&self) {
-        macro_rules! emit {
-            ($name:literal, $field:ident) => {
-                let v = self.$field.load(Ordering::Relaxed);
-                crate::debug::emit_counter($name, i64::try_from(v).unwrap_or(i64::MAX));
-            };
-        }
-        emit!("merge_drain_items_processed", items_processed);
-        emit!("merge_drain_copy_range_calls", copy_range_calls);
-        emit!(
-            "merge_drain_copy_range_coalesced_items",
-            copy_range_coalesced_items
-        );
-        emit!(
-            "merge_drain_passthrough_chunks_flushed",
-            passthrough_chunks_flushed
-        );
-        emit!("merge_drain_rewrite_blocks_written", rewrite_blocks_written);
-        emit!("merge_drain_gap_creates_emitted", gap_creates_emitted);
-        emit!(
-            "merge_drain_trailing_creates_emitted",
-            trailing_creates_emitted
-        );
-        emit!(
-            "merge_drain_reorder_buffer_high_water_count",
-            reorder_buffer_high_water_count
-        );
-        emit!(
-            "merge_drain_reorder_buffer_high_water_bytes",
-            reorder_buffer_high_water_bytes
-        );
-        emit!("merge_drain_barrier_loc_map_size", barrier_loc_map_size);
-        emit!("merge_drain_reorder_gap_wait_ns", reorder_gap_wait_ns);
+crate::counters::counter_set! {
+    /// Drain-thread counters, surfaced as sidecar counters when the drain
+    /// finishes. The drain is their only writer: the two high-water marks
+    /// are raised with a plain load and store, not `record_max`, because no
+    /// other thread can race the raise and a compare-exchange would add a
+    /// locked operation for nothing. A separate set (and allocation) from
+    /// the worker pool's `WorkerCounters`.
+    pub(super) struct DrainCounters {
+        pub items_processed => "merge_drain_items_processed",
+        pub copy_range_calls => "merge_drain_copy_range_calls",
+        pub copy_range_coalesced_items => "merge_drain_copy_range_coalesced_items",
+        pub passthrough_chunks_flushed => "merge_drain_passthrough_chunks_flushed",
+        pub rewrite_blocks_written => "merge_drain_rewrite_blocks_written",
+        pub gap_creates_emitted => "merge_drain_gap_creates_emitted",
+        pub trailing_creates_emitted => "merge_drain_trailing_creates_emitted",
+        pub reorder_buffer_high_water_count => "merge_drain_reorder_buffer_high_water_count",
+        pub reorder_buffer_high_water_bytes => "merge_drain_reorder_buffer_high_water_bytes",
+        pub barrier_loc_map_size => "merge_drain_barrier_loc_map_size",
+        /// Cumulative wall-clock time the drain spent waiting for the
+        /// next-in-seq item (i.e., reorder gap stalls).
+        pub reorder_gap_wait_ns => "merge_drain_reorder_gap_wait_ns",
     }
 }
 
@@ -458,7 +412,7 @@ pub(super) fn run_drain(
     writer.flush()?;
 
     crate::debug::emit_marker("MERGE_DRAIN_END");
-    counters.emit();
+    counters.emit_all();
 
     Ok(stats)
 }

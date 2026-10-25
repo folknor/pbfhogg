@@ -163,11 +163,8 @@ fn single_dense_info(dense: &[u8]) -> crate::error::Result<bool> {
 /// containment its own payload contradicts, or the payload has a shape no
 /// raw copy can be proved safe for (see [`dense_only_payload`]).
 pub(super) fn warn_passthrough_demotions(verified: u64, demoted: u64, host: &crate::host::Host) {
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("extract_passthrough_verified_blobs", verified as i64);
-        crate::debug::emit_counter("extract_passthrough_demoted_blobs", demoted as i64);
-    }
+    crate::debug::emit_counter("extract_passthrough_verified_blobs", verified);
+    crate::debug::emit_counter("extract_passthrough_demoted_blobs", demoted);
     if demoted > 0 {
         crate::host::diag!(
             host.diagnostics,
@@ -243,14 +240,11 @@ pub(super) fn build_blob_schedule_with_passthrough(
     }
     crate::debug::emit_marker("EXTRACT_SCHEDULE_SCAN_END");
 
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("extract_schedule_blobs", schedule.len() as i64);
-        crate::debug::emit_counter(
-            "extract_passthrough_candidate_blobs",
-            passthrough_candidates as i64,
-        );
-    }
+    crate::debug::emit_counter("extract_schedule_blobs", schedule.len());
+    crate::debug::emit_counter(
+        "extract_passthrough_candidate_blobs",
+        passthrough_candidates,
+    );
     Ok(schedule)
 }
 

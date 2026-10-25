@@ -241,9 +241,9 @@ fn getparents_walker(
 
     crate::debug::emit_counter(
         "walk_actual_osmdata_blobs",
-        i64::try_from(schedule.len())
-            .unwrap_or(i64::MAX)
-            .saturating_add(i64::try_from(blobs_skipped).unwrap_or(i64::MAX)),
+        u64::try_from(schedule.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(blobs_skipped),
     );
 
     let shared_file = walker.input();
@@ -251,11 +251,8 @@ fn getparents_walker(
 
     let header = header_block.ok_or_else(|| crate::error::new_missing_header(input))?;
 
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("getparents_schedule_blobs", schedule.len() as i64);
-        crate::debug::emit_counter("getparents_blobs_skipped", blobs_skipped as i64);
-    }
+    crate::debug::emit_counter("getparents_schedule_blobs", schedule.len());
+    crate::debug::emit_counter("getparents_blobs_skipped", blobs_skipped);
     crate::debug::emit_marker("GETPARENTS_SCHEDULE_END");
 
     let header_bytes = super::output_header::build_one(

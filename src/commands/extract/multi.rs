@@ -731,22 +731,16 @@ pub(super) fn try_extract_multi_single_pass(
     // `extract()` wrapper at the bottom of `pub fn extract` - the single-pass
     // path bypasses that wrapper, so without this block `brokkr sidecar
     // --counters` is empty for multi-extract runs.
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("multi_extract_region_count", n as i64);
-        crate::debug::emit_counter("multi_extract_node_blobs", node_schedule.len() as i64);
-        crate::debug::emit_counter("multi_extract_way_blobs", way_schedule.len() as i64);
-        crate::debug::emit_counter(
-            "multi_extract_relation_blobs",
-            relation_schedule.len() as i64,
-        );
-        let total_nodes: u64 = stats.iter().map(|s| s.nodes_in_bbox).sum();
-        let total_ways: u64 = stats.iter().map(|s| s.ways_written).sum();
-        let total_relations: u64 = stats.iter().map(|s| s.relations_written).sum();
-        crate::debug::emit_counter("multi_extract_nodes_written", total_nodes as i64);
-        crate::debug::emit_counter("multi_extract_ways_written", total_ways as i64);
-        crate::debug::emit_counter("multi_extract_relations_written", total_relations as i64);
-    }
+    crate::debug::emit_counter("multi_extract_region_count", n);
+    crate::debug::emit_counter("multi_extract_node_blobs", node_schedule.len());
+    crate::debug::emit_counter("multi_extract_way_blobs", way_schedule.len());
+    crate::debug::emit_counter("multi_extract_relation_blobs", relation_schedule.len());
+    let total_nodes: u64 = stats.iter().map(|s| s.nodes_in_bbox).sum();
+    let total_ways: u64 = stats.iter().map(|s| s.ways_written).sum();
+    let total_relations: u64 = stats.iter().map(|s| s.relations_written).sum();
+    crate::debug::emit_counter("multi_extract_nodes_written", total_nodes);
+    crate::debug::emit_counter("multi_extract_ways_written", total_ways);
+    crate::debug::emit_counter("multi_extract_relations_written", total_relations);
     crate::debug::emit_marker("MULTI_EXTRACT_END");
 
     Ok(Some(stats))

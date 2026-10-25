@@ -1,7 +1,7 @@
 //! Validate referential integrity in a PBF file. Equivalent to `osmium check-refs`.
 
+use crate::counters::Stopwatch;
 use std::path::Path;
-use std::time::Instant;
 
 use crate::{Element, MemberId};
 
@@ -516,7 +516,7 @@ fn check_refs_inner(
     let missing_node_members_occurrences = missing_node_members_vec.len() as u64;
 
     // Dedup the per-kind missing-ref vecs to get the unique-missing counts.
-    let t_dedup = Instant::now();
+    let t_dedup = Stopwatch::start();
     let unique_len = |v: &mut Vec<i64>| -> u64 {
         v.sort_unstable();
         v.dedup();
@@ -525,11 +525,11 @@ fn check_refs_inner(
     result.missing_node_refs = unique_len(&mut missing_node_refs_vec);
     result.missing_way_refs = unique_len(&mut missing_way_refs_vec);
     result.missing_node_members = unique_len(&mut missing_node_members_vec);
-    let missing_dedup_ns = t_dedup.elapsed().as_nanos();
+    let missing_dedup_ms = t_dedup.elapsed_ms();
 
     // Resolve deferred relation refs against the complete relation_ids set.
     crate::debug::emit_marker("CHECKREFS_DEFERRED_RESOLVE_START");
-    let t_deferred = Instant::now();
+    let t_deferred = Stopwatch::start();
     if check_relations {
         let mut missing_relation_members_vec: Vec<i64> = Vec::new();
         let mut occurrences: u64 = 0;
@@ -552,7 +552,7 @@ fn check_refs_inner(
         result.missing_relation_members = unique_len(&mut missing_relation_members_vec);
         result.missing_relation_member_occurrences = occurrences;
     }
-    let deferred_resolve_ns = t_deferred.elapsed().as_nanos();
+    let deferred_resolve_ms = t_deferred.elapsed_ms();
     crate::debug::emit_marker("CHECKREFS_DEFERRED_RESOLVE_END");
 
     result.missing_refs = missing_refs;
@@ -561,75 +561,56 @@ fn check_refs_inner(
     // Brokkr stores named counters generically and reports changes in sidecar
     // comparisons; this sample is inert unless the CLI initialized the FIFO.
     crate::debug::emit_mallinfo2("checkrefs_final");
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    {
-        crate::debug::emit_counter("checkrefs_node_count", result.node_count as i64);
-        crate::debug::emit_counter("checkrefs_way_count", result.way_count as i64);
-        crate::debug::emit_counter("checkrefs_relation_count", result.relation_count as i64);
-        crate::debug::emit_counter(
-            "checkrefs_missing_node_refs",
-            result.missing_node_refs as i64,
-        );
-        crate::debug::emit_counter("checkrefs_missing_way_refs", result.missing_way_refs as i64);
-        crate::debug::emit_counter(
-            "checkrefs_missing_node_members",
-            result.missing_node_members as i64,
-        );
-        crate::debug::emit_counter(
-            "checkrefs_missing_relation_members",
-            result.missing_relation_members as i64,
-        );
-        crate::debug::emit_counter(
-            "checkrefs_untrackable_node_ids",
-            result.untrackable_ids[0] as i64,
-        );
-        crate::debug::emit_counter(
-            "checkrefs_untrackable_way_ids",
-            result.untrackable_ids[1] as i64,
-        );
-        crate::debug::emit_counter(
-            "checkrefs_untrackable_relation_ids",
-            result.untrackable_ids[2] as i64,
-        );
+    crate::debug::emit_counter("checkrefs_node_count", result.node_count);
+    crate::debug::emit_counter("checkrefs_way_count", result.way_count);
+    crate::debug::emit_counter("checkrefs_relation_count", result.relation_count);
+    crate::debug::emit_counter("checkrefs_missing_node_refs", result.missing_node_refs);
+    crate::debug::emit_counter("checkrefs_missing_way_refs", result.missing_way_refs);
+    crate::debug::emit_counter(
+        "checkrefs_missing_node_members",
+        result.missing_node_members,
+    );
+    crate::debug::emit_counter(
+        "checkrefs_missing_relation_members",
+        result.missing_relation_members,
+    );
+    crate::debug::emit_counter("checkrefs_untrackable_node_ids", result.untrackable_ids[0]);
+    crate::debug::emit_counter("checkrefs_untrackable_way_ids", result.untrackable_ids[1]);
+    crate::debug::emit_counter(
+        "checkrefs_untrackable_relation_ids",
+        result.untrackable_ids[2],
+    );
 
-        // One-shot post-pass timers.
-        let ns_to_ms = |ns: u128| (ns / 1_000_000) as i64;
-        crate::debug::emit_counter("checkrefs_missing_dedup_ms", ns_to_ms(missing_dedup_ns));
-        crate::debug::emit_counter(
-            "checkrefs_deferred_resolve_ms",
-            ns_to_ms(deferred_resolve_ns),
-        );
+    // One-shot post-pass timers, sampled where each step ended.
+    crate::debug::emit_counter("checkrefs_missing_dedup_ms", missing_dedup_ms);
+    crate::debug::emit_counter("checkrefs_deferred_resolve_ms", deferred_resolve_ms);
 
-        // Structural counters.
-        crate::debug::emit_counter("checkrefs_node_blobs", node_blobs as i64);
-        crate::debug::emit_counter("checkrefs_way_blobs", way_blobs as i64);
-        crate::debug::emit_counter("checkrefs_relation_blobs", relation_blobs as i64);
-        crate::debug::emit_counter("checkrefs_way_refs_checked", way_refs_checked as i64);
-        crate::debug::emit_counter(
-            "checkrefs_rel_node_members_checked",
-            rel_node_members_checked as i64,
-        );
-        crate::debug::emit_counter(
-            "checkrefs_rel_way_members_checked",
-            rel_way_members_checked as i64,
-        );
-        crate::debug::emit_counter(
-            "checkrefs_rel_rel_members_deferred",
-            rel_rel_members_deferred as i64,
-        );
-        crate::debug::emit_counter(
-            "checkrefs_missing_node_refs_occurrences",
-            missing_node_refs_occurrences as i64,
-        );
-        crate::debug::emit_counter(
-            "checkrefs_missing_way_refs_occurrences",
-            missing_way_refs_occurrences as i64,
-        );
-        crate::debug::emit_counter(
-            "checkrefs_missing_node_members_occurrences",
-            missing_node_members_occurrences as i64,
-        );
-    }
+    // Structural counters.
+    crate::debug::emit_counter("checkrefs_node_blobs", node_blobs);
+    crate::debug::emit_counter("checkrefs_way_blobs", way_blobs);
+    crate::debug::emit_counter("checkrefs_relation_blobs", relation_blobs);
+    crate::debug::emit_counter("checkrefs_way_refs_checked", way_refs_checked);
+    crate::debug::emit_counter(
+        "checkrefs_rel_node_members_checked",
+        rel_node_members_checked,
+    );
+    crate::debug::emit_counter("checkrefs_rel_way_members_checked", rel_way_members_checked);
+    crate::debug::emit_counter(
+        "checkrefs_rel_rel_members_deferred",
+        rel_rel_members_deferred,
+    );
+    crate::debug::emit_counter(
+        "checkrefs_missing_node_refs_occurrences",
+        missing_node_refs_occurrences,
+    );
+    crate::debug::emit_counter(
+        "checkrefs_missing_way_refs_occurrences",
+        missing_way_refs_occurrences,
+    );
+    crate::debug::emit_counter(
+        "checkrefs_missing_node_members_occurrences",
+        missing_node_members_occurrences,
+    );
 
     Ok(result)
 }

@@ -564,31 +564,28 @@ pub(crate) fn derive_changes_parallel(
         crate::debug::emit_marker(&start_marker);
 
         let shards = plan_shards(phase.old, phase.new, shard_count);
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            crate::debug::emit_counter(
-                &format!("derivepar_{}_shards", tag.to_lowercase()),
-                shards.len() as i64,
-            );
-            let max_blobs = shards
-                .iter()
-                .map(|s| (s.old_end - s.old_start) + (s.new_end - s.new_start))
-                .max()
-                .unwrap_or(0) as i64;
-            let min_blobs = shards
-                .iter()
-                .map(|s| (s.old_end - s.old_start) + (s.new_end - s.new_start))
-                .min()
-                .unwrap_or(0) as i64;
-            crate::debug::emit_counter(
-                &format!("derivepar_{}_shard_max_blobs", tag.to_lowercase()),
-                max_blobs,
-            );
-            crate::debug::emit_counter(
-                &format!("derivepar_{}_shard_min_blobs", tag.to_lowercase()),
-                min_blobs,
-            );
-        }
+        crate::debug::emit_counter(
+            &format!("derivepar_{}_shards", tag.to_lowercase()),
+            shards.len(),
+        );
+        let max_blobs = shards
+            .iter()
+            .map(|s| (s.old_end - s.old_start) + (s.new_end - s.new_start))
+            .max()
+            .unwrap_or(0);
+        let min_blobs = shards
+            .iter()
+            .map(|s| (s.old_end - s.old_start) + (s.new_end - s.new_start))
+            .min()
+            .unwrap_or(0);
+        crate::debug::emit_counter(
+            &format!("derivepar_{}_shard_max_blobs", tag.to_lowercase()),
+            max_blobs,
+        );
+        crate::debug::emit_counter(
+            &format!("derivepar_{}_shard_min_blobs", tag.to_lowercase()),
+            min_blobs,
+        );
         let mut shard_outputs: Vec<Option<Result<ShardOutput>>> =
             (0..shards.len()).map(|_| None).collect();
 

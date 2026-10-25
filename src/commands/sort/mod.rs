@@ -166,9 +166,8 @@ pub(crate) fn sort_to(
         crate::debug::emit_counter("sort_unindexed_fallback", 1);
     }
 
-    #[allow(clippy::cast_possible_wrap)]
     if let Ok(meta) = std::fs::metadata(input) {
-        crate::debug::emit_counter("sort_total_bytes_in", meta.len() as i64);
+        crate::debug::emit_counter("sort_total_bytes_in", meta.len());
     }
 
     // Pass 1: Build blob index
@@ -189,8 +188,7 @@ pub(crate) fn sort_to(
         "  {} OSMData blobs indexed",
         entries.len()
     );
-    #[allow(clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("sort_blobs_total", entries.len() as i64);
+    crate::debug::emit_counter("sort_blobs_total", entries.len());
 
     // Sort by (type_order, min_id)
     crate::debug::emit_marker("SORT_OVERLAP_DETECT_START");
@@ -221,10 +219,8 @@ pub(crate) fn sort_to(
     // the header's Sort.Type_then_ID claim - see CORRECTNESS.md.)
     let intra_unsorted_blobs = mark_intra_unsorted_for_rewrite(&entries, &mut overlaps);
     crate::debug::emit_marker("SORT_OVERLAP_DETECT_END");
-    #[allow(clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("sort_blobs_overlap", overlap_count as i64);
-    #[allow(clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("sort_blobs_intra_unsorted", intra_unsorted_blobs as i64);
+    crate::debug::emit_counter("sort_blobs_overlap", overlap_count);
+    crate::debug::emit_counter("sort_blobs_intra_unsorted", intra_unsorted_blobs);
     if overlap_count > 0 {
         crate::host::diag!(
             host.diagnostics,
@@ -317,8 +313,7 @@ pub(crate) fn sort_to(
     // entries to a kind-gated sweep would silently drop off-kind
     // elements.
     let overlap_runs: Vec<(usize, usize, ElementKind)> = collect_overlap_runs(&entries, &overlaps);
-    #[allow(clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("sort_overlap_runs", overlap_runs.len() as i64);
+    crate::debug::emit_counter("sort_overlap_runs", overlap_runs.len());
 
     // Parallel overlap rewrite: each rayon worker decodes its run, runs the
     // sweep-merge, and emits owned blocks into a local `Vec<OwnedBlock>`.
@@ -434,13 +429,10 @@ pub(crate) fn sort_to(
 
     crate::debug::emit_marker("SORT_WRITE_LOOP_END");
 
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("sort_blobs_passthrough", stats.blobs_passthrough as i64);
-        crate::debug::emit_counter("sort_blobs_rewritten", stats.blobs_rewritten as i64);
-        crate::debug::emit_counter("sort_copy_range_calls", copy_run_calls as i64);
-        crate::debug::emit_counter("sort_copy_range_coalesced", copy_run_coalesced as i64);
-    }
+    crate::debug::emit_counter("sort_blobs_passthrough", stats.blobs_passthrough);
+    crate::debug::emit_counter("sort_blobs_rewritten", stats.blobs_rewritten);
+    crate::debug::emit_counter("sort_copy_range_calls", copy_run_calls);
+    crate::debug::emit_counter("sort_copy_range_coalesced", copy_run_coalesced);
 
     crate::debug::emit_marker("SORT_FLUSH_START");
     // WAIT_WRITER spans the main thread's wait on the writer worker
@@ -452,9 +444,8 @@ pub(crate) fn sort_to(
     writer.flush()?;
     crate::debug::emit_marker("WAIT_WRITER_END");
     crate::debug::emit_marker("SORT_FLUSH_END");
-    #[allow(clippy::cast_possible_wrap)]
     if let Ok(meta) = std::fs::metadata(output.path()) {
-        crate::debug::emit_counter("sort_total_bytes_out", meta.len() as i64);
+        crate::debug::emit_counter("sort_total_bytes_out", meta.len());
     }
     crate::debug::emit_marker("SORT_PASS2_END");
     Ok(stats)

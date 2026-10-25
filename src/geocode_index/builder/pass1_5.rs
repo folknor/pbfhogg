@@ -146,10 +146,7 @@ fn publish_negative_node_refs(
 /// the bounded ID sample.
 fn report_negative_node_refs(count: &AtomicU64, sample: Mutex<Vec<i64>>, host: &crate::host::Host) {
     let negative_count = count.load(Ordering::Relaxed);
-    crate::debug::emit_counter(
-        "geocode_negative_node_refs",
-        super::counter_value(negative_count),
-    );
+    crate::debug::emit_counter("geocode_negative_node_refs", negative_count);
     if negative_count > 0 {
         let sample = sample
             .into_inner()
@@ -455,12 +452,9 @@ pub(super) fn build_pass2_schedules(
     into_file_order(&mut node_schedule);
     into_file_order(&mut way_schedule);
 
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("pass2_node_blobs", node_schedule.len() as i64);
-        crate::debug::emit_counter("pass2_way_blobs", way_schedule.len() as i64);
-        crate::debug::emit_counter("pass2_max_node_id", max_node_id);
-    }
+    crate::debug::emit_counter("pass2_node_blobs", node_schedule.len());
+    crate::debug::emit_counter("pass2_way_blobs", way_schedule.len());
+    crate::debug::emit_counter("pass2_max_node_id", max_node_id);
 
     Ok((node_schedule, way_schedule, max_node_id, shared_file))
 }

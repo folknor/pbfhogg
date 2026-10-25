@@ -9,7 +9,7 @@ use super::super::Result;
 use super::pool::{Rewritten, run_rewrite_stage};
 use super::schedule::BlobTask;
 use super::wire_rewrite::{IdSpace, Scratch, reframe_ways_with_new_ids};
-use super::{BlobBuffers, StageCounters, blob_index, positional_bases};
+use super::{BlobBuffers, Phase, StageCounters, blob_index, positional_bases};
 use crate::idset::IdSet;
 
 struct Stage2dWorker<'a> {
@@ -49,7 +49,7 @@ pub(super) fn stage2d_parallel_way_assembly(
 
     let totals = run_rewrite_stage(
         "way",
-        "stage2d",
+        Phase::Stage2d,
         source,
         way_schedule.len(),
         &mut workers,

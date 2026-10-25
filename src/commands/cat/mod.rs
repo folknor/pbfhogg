@@ -147,12 +147,9 @@ pub(crate) fn cat_to(
         (Some(filter), true) => cat_filtered(files, output, filter, clean, write, overrides, host),
     }?;
     crate::debug::emit_marker("CAT_SCAN_END");
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("cat_blobs_passthrough", result.blobs_passthrough as i64);
-        crate::debug::emit_counter("cat_blobs_decoded", result.blobs_decoded as i64);
-        crate::debug::emit_counter("cat_elements_written", result.elements_written as i64);
-    }
+    crate::debug::emit_counter("cat_blobs_passthrough", result.blobs_passthrough);
+    crate::debug::emit_counter("cat_blobs_decoded", result.blobs_decoded);
+    crate::debug::emit_counter("cat_elements_written", result.elements_written);
     Ok(result)
 }
 

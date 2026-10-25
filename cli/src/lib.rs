@@ -4538,6 +4538,10 @@ fn run_bench_read(
     mode: BenchReadMode,
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // A plain Instant, not the library's crate-private counter Stopwatch: the
+    // elapsed_ms printed below is bench-read output the benchmark harness
+    // parses, not a sidecar counter, and its whole-millisecond value must not
+    // change.
     use std::time::Instant;
 
     let (elapsed_ms, nodes, ways, rels): (u128, u64, u64, u64) = match mode {

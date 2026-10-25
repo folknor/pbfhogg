@@ -166,12 +166,9 @@ pub(crate) fn derive_changes_to(
     };
     if let Some(stats) = parallel_stats {
         crate::debug::emit_marker("DERIVECHANGES_SCAN_END");
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            crate::debug::emit_counter("derivechanges_creates", stats.creates as i64);
-            crate::debug::emit_counter("derivechanges_modifies", stats.modifies as i64);
-            crate::debug::emit_counter("derivechanges_deletes", stats.deletes as i64);
-        }
+        crate::debug::emit_counter("derivechanges_creates", stats.creates);
+        crate::debug::emit_counter("derivechanges_modifies", stats.modifies);
+        crate::debug::emit_counter("derivechanges_deletes", stats.deletes);
         return Ok(stats);
     }
 
@@ -198,12 +195,9 @@ pub(crate) fn derive_changes_to(
     drop(sink);
     let stats = result?;
 
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("derivechanges_creates", stats.creates as i64);
-        crate::debug::emit_counter("derivechanges_modifies", stats.modifies as i64);
-        crate::debug::emit_counter("derivechanges_deletes", stats.deletes as i64);
-    }
+    crate::debug::emit_counter("derivechanges_creates", stats.creates);
+    crate::debug::emit_counter("derivechanges_modifies", stats.modifies);
+    crate::debug::emit_counter("derivechanges_deletes", stats.deletes);
 
     Ok(stats)
 }

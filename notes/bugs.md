@@ -50,6 +50,11 @@ indexdata `count` for its stats on passthrough blobs, so a lying indexdata
 moves its headline number with no way to tell (see HYG-061 for the trust
 model).
 
+Recommendation (2026-10-25), agreed with the maintainer: no code change.
+Under the trust model HYG-061 writes (indexdata believed, not verified;
+`check --index` verifies), close under rule 3 with a comment at the stats
+site pointing to that page. Done by the HYG-061 agent.
+
 Reported by: re-encoding, filtering and spatial, change application.
 
 ## BUG-009 - `apply-changes --locations-on-ways` does not update untouched base ways
@@ -92,6 +97,11 @@ trusts the indexdata element kind. Verification also checks only what
 building a `PrimitiveBlock` validates, not metadata arithmetic done later
 during decode.
 
+Recommendation (2026-10-25), agreed with the maintainer: as BUG-005 - no
+code change; close under rule 3 with comments at the three trust points
+(header copy, bbox skip, kind scheduling) pointing to HYG-061's trust model
+page. Done by the HYG-061 agent.
+
 Reported by: the extract passthrough fix.
 
 ## BUG-152 - `bench-read --mode blobreader` reads a header-less file as data
@@ -108,5 +118,14 @@ default mode only, so nothing catches it. Fix: take
 does. Bench-read starts its timer after opening the reader, so taking the
 header there moves one header decode out of the timed region (bench-write
 times it).
+
+Recommendation (2026-10-25), agreed with the maintainer: the fix as stated,
+taking the header before `start = Instant::now()`. Correction to the timing
+note: the other three modes already decode the header before their timer
+(`ElementReader` does it at open), and today's blobreader loop decodes the
+header blob inside the timer as its first `blob.decode()`, so moving it out
+matches its siblings; one header decode is microseconds against
+multi-second runs. Add a `--mode blobreader` row to the input contract
+table. No CHANGELOG line (synthetic benchmark command).
 
 Reported by: the HYG-078 resolution.

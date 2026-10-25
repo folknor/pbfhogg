@@ -311,14 +311,11 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
     }
     crate::debug::emit_marker("SMART_PASS1_SCHEDULE_SCAN_END");
 
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("smart_pass1_node_blobs", node_schedule.len() as i64);
-        crate::debug::emit_counter("smart_pass1_way_blobs", way_schedule.len() as i64);
-        crate::debug::emit_counter("smart_pass1_relation_blobs", relation_schedule.len() as i64);
-        crate::debug::emit_counter("smart_pass1_full_way_blobs", full_way_schedule.len() as i64);
-        crate::debug::emit_counter("smart_pass1_pass3_blobs", pass3_blob_schedule.len() as i64);
-    }
+    crate::debug::emit_counter("smart_pass1_node_blobs", node_schedule.len());
+    crate::debug::emit_counter("smart_pass1_way_blobs", way_schedule.len());
+    crate::debug::emit_counter("smart_pass1_relation_blobs", relation_schedule.len());
+    crate::debug::emit_counter("smart_pass1_full_way_blobs", full_way_schedule.len());
+    crate::debug::emit_counter("smart_pass1_pass3_blobs", pass3_blob_schedule.len());
 
     let shared_file = walker.input();
     drop(walker);

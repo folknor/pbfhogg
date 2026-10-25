@@ -866,21 +866,12 @@ pub(crate) fn extract_to(
             input, output, region, set_bounds, clean, write, overrides, host,
         ),
     }?;
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("extract_nodes_in_bbox", result.nodes_in_bbox as i64);
-        crate::debug::emit_counter("extract_nodes_from_ways", result.nodes_from_ways as i64);
-        crate::debug::emit_counter(
-            "extract_nodes_from_relations",
-            result.nodes_from_relations as i64,
-        );
-        crate::debug::emit_counter("extract_ways_written", result.ways_written as i64);
-        crate::debug::emit_counter(
-            "extract_ways_from_relations",
-            result.ways_from_relations as i64,
-        );
-        crate::debug::emit_counter("extract_relations_written", result.relations_written as i64);
-    }
+    crate::debug::emit_counter("extract_nodes_in_bbox", result.nodes_in_bbox);
+    crate::debug::emit_counter("extract_nodes_from_ways", result.nodes_from_ways);
+    crate::debug::emit_counter("extract_nodes_from_relations", result.nodes_from_relations);
+    crate::debug::emit_counter("extract_ways_written", result.ways_written);
+    crate::debug::emit_counter("extract_ways_from_relations", result.ways_from_relations);
+    crate::debug::emit_counter("extract_relations_written", result.relations_written);
     Ok(result)
 }
 

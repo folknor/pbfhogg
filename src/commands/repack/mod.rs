@@ -183,16 +183,13 @@ pub(crate) fn repack_to(
     let (node_schedule, way_schedule, rel_schedule, shared_file, _) =
         crate::scan::classify::build_classify_schedules_split(input, host)?;
 
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("repack_input_blobs_nodes", node_schedule.len() as i64);
-        crate::debug::emit_counter("repack_input_blobs_ways", way_schedule.len() as i64);
-        crate::debug::emit_counter("repack_input_blobs_relations", rel_schedule.len() as i64);
-        crate::debug::emit_counter(
-            "repack_input_blobs_total",
-            (node_schedule.len() + way_schedule.len() + rel_schedule.len()) as i64,
-        );
-    }
+    crate::debug::emit_counter("repack_input_blobs_nodes", node_schedule.len());
+    crate::debug::emit_counter("repack_input_blobs_ways", way_schedule.len());
+    crate::debug::emit_counter("repack_input_blobs_relations", rel_schedule.len());
+    crate::debug::emit_counter(
+        "repack_input_blobs_total",
+        node_schedule.len() + way_schedule.len() + rel_schedule.len(),
+    );
 
     // Pre-allocation ceiling for every BlockBuilder in this run, derived from
     // the input rather than fixed: a file cannot deliver more elements than it
@@ -278,16 +275,13 @@ pub(crate) fn repack_to(
     writer.flush()?;
     crate::debug::emit_marker("REPACK_FLUSH_END");
 
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("repack_blobs_written", blobs_written as i64);
-        crate::debug::emit_counter("repack_elements_written", elements_written as i64);
-        crate::debug::emit_counter("repack_input_blobs_coalesced", total_coalesces as i64);
-        crate::debug::emit_counter("repack_worker_full_blobs", total_worker_full_blobs as i64);
-        crate::debug::emit_counter("repack_central_blobs", total_central_blobs as i64);
-        crate::debug::emit_counter("repack_cap_fired", i64::from(any_cap_fired));
-        crate::debug::emit_counter("repack_elements_per_blob", elements_per_blob as i64);
-    }
+    crate::debug::emit_counter("repack_blobs_written", blobs_written);
+    crate::debug::emit_counter("repack_elements_written", elements_written);
+    crate::debug::emit_counter("repack_input_blobs_coalesced", total_coalesces);
+    crate::debug::emit_counter("repack_worker_full_blobs", total_worker_full_blobs);
+    crate::debug::emit_counter("repack_central_blobs", total_central_blobs);
+    crate::debug::emit_counter("repack_cap_fired", any_cap_fired);
+    crate::debug::emit_counter("repack_elements_per_blob", elements_per_blob);
 
     // Detect the silent-identity surprise: cap exceeds every kind's total
     // element count, so no kind has ever flushed (in workers or in the
@@ -332,21 +326,15 @@ struct PhaseStats {
 
 /// Emit per-kind sidecar counters for one `run_kind_phase` result.
 fn emit_phase_counters(kind: &str, s: &PhaseStats) {
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter(&format!("repack_{kind}_blobs"), s.blobs as i64);
-        crate::debug::emit_counter(&format!("repack_{kind}_elements"), s.elements as i64);
-        crate::debug::emit_counter(&format!("repack_{kind}_coalesces"), s.coalesces as i64);
-        crate::debug::emit_counter(
-            &format!("repack_{kind}_worker_full_blobs"),
-            s.worker_full_blobs as i64,
-        );
-        crate::debug::emit_counter(
-            &format!("repack_{kind}_central_blobs"),
-            s.central_blobs as i64,
-        );
-        crate::debug::emit_counter(&format!("repack_{kind}_cap_fired"), i64::from(s.cap_fired));
-    }
+    crate::debug::emit_counter(&format!("repack_{kind}_blobs"), s.blobs);
+    crate::debug::emit_counter(&format!("repack_{kind}_elements"), s.elements);
+    crate::debug::emit_counter(&format!("repack_{kind}_coalesces"), s.coalesces);
+    crate::debug::emit_counter(
+        &format!("repack_{kind}_worker_full_blobs"),
+        s.worker_full_blobs,
+    );
+    crate::debug::emit_counter(&format!("repack_{kind}_central_blobs"), s.central_blobs);
+    crate::debug::emit_counter(&format!("repack_{kind}_cap_fired"), s.cap_fired);
 }
 
 /// Run one per-kind phase: pread workers decode + split (full blocks

@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 use super::super::Result;
-use super::StageCounters;
+use super::{Phase, StageCounters};
 use crate::blob_meta::BlobIndex;
 use crate::error::Error;
 
@@ -291,11 +291,12 @@ impl StrictOrder {
 
 /// Run one parallel rewrite stage: `work` rewrites blob `idx` on a worker,
 /// and the calling thread checks cross-blob order and writes the results in
-/// schedule order. Counters are emitted under `prefix` once the stage ends.
+/// schedule order. Counters are emitted under `stage`'s names once the stage
+/// ends.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_rewrite_stage<S, W>(
     kind: &'static str,
-    prefix: &str,
+    stage: Phase,
     source: &std::sync::Arc<std::path::Path>,
     n_tasks: usize,
     states: &mut [S],
@@ -342,7 +343,7 @@ where
             Ok(())
         },
     )?;
-    counters.emit(prefix);
+    counters.emit(stage);
     Ok(totals)
 }
 

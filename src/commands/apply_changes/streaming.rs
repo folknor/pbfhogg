@@ -39,7 +39,7 @@
 
 use std::os::unix::fs::FileExt as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -132,83 +132,41 @@ pub(super) struct StreamingChannels {
     pub drain_tx: mpsc::SyncSender<DrainItem>,
 }
 
-/// Atomic counters surfaced as sidecar counters at end of `merge()`.
-pub(super) struct WorkerCounters {
-    pub blobs_processed: AtomicU64,
-    pub blobs_rewritten: AtomicU64,
-    pub blobs_false_positive: AtomicU64,
-    /// Candidates whose base elements the diff does not touch but whose ID
-    /// span holds inline upserts (pure creates), so they are rewritten
-    /// rather than passed through to keep the output sorted. A subset of
-    /// `blobs_rewritten`.
-    pub blobs_forced_rewrite: AtomicU64,
-    pub blobs_owned_passthrough: AtomicU64,
-    /// Decompress wall summed across all workers (cumulative ns).
-    pub decompress_ns: AtomicU64,
-    /// Parse wall summed across all workers.
-    pub parse_ns: AtomicU64,
-    /// Precise-check wall summed across all workers.
-    pub precise_ns: AtomicU64,
-    /// Rewrite wall summed across all workers.
-    pub rewrite_ns: AtomicU64,
-    /// Coord-extraction wall summed across all workers (LOW only).
-    pub coord_extract_ns: AtomicU64,
-    /// Node coord pairs extracted across all workers (LOW only).
-    pub coord_pairs_extracted: AtomicU64,
-    /// Node blobs decompressed for coordinate extraction (LOW only).
-    /// Bumped once per blob on the extraction branch, unlike
-    /// `blobs_processed`, which counts every candidate and owned
-    /// passthrough of every kind.
-    pub loc_node_blobs_scanned: AtomicU64,
-    /// In-line framing wall summed across all workers (P1.5: avoids
-    /// the writer's rayon-spawn-per-block dispatch).
-    pub frame_ns: AtomicU64,
-}
-
-impl WorkerCounters {
-    pub(super) fn new() -> Self {
-        Self {
-            blobs_processed: AtomicU64::new(0),
-            blobs_rewritten: AtomicU64::new(0),
-            blobs_false_positive: AtomicU64::new(0),
-            blobs_forced_rewrite: AtomicU64::new(0),
-            blobs_owned_passthrough: AtomicU64::new(0),
-            decompress_ns: AtomicU64::new(0),
-            parse_ns: AtomicU64::new(0),
-            precise_ns: AtomicU64::new(0),
-            rewrite_ns: AtomicU64::new(0),
-            coord_extract_ns: AtomicU64::new(0),
-            coord_pairs_extracted: AtomicU64::new(0),
-            loc_node_blobs_scanned: AtomicU64::new(0),
-            frame_ns: AtomicU64::new(0),
-        }
-    }
-
-    pub(super) fn emit(&self) {
-        macro_rules! emit {
-            ($name:literal, $field:ident) => {
-                let v = self.$field.load(Ordering::Relaxed);
-                crate::debug::emit_counter($name, i64::try_from(v).unwrap_or(i64::MAX));
-            };
-        }
-        emit!("merge_streaming_blobs_processed", blobs_processed);
-        emit!("merge_streaming_blobs_rewritten", blobs_rewritten);
-        emit!("merge_streaming_blobs_false_positive", blobs_false_positive);
-        emit!("merge_streaming_blobs_forced_rewrite", blobs_forced_rewrite);
-        emit!(
-            "merge_streaming_blobs_owned_passthrough",
-            blobs_owned_passthrough
-        );
-        emit!("merge_streaming_decompress_ns", decompress_ns);
-        emit!("merge_streaming_parse_ns", parse_ns);
-        emit!("merge_streaming_precise_ns", precise_ns);
-        emit!("merge_streaming_rewrite_ns", rewrite_ns);
-        emit!("merge_streaming_coord_extract_ns", coord_extract_ns);
-        emit!(
-            "merge_streaming_coord_pairs_extracted",
-            coord_pairs_extracted
-        );
-        emit!("merge_streaming_frame_ns", frame_ns);
+crate::counters::counter_set! {
+    /// Worker-pool counters, summed across workers and surfaced as sidecar
+    /// counters when the pool finishes. A separate set (and allocation) from
+    /// the drain thread's `DrainCounters`.
+    pub(super) struct WorkerCounters {
+        pub blobs_processed => "merge_streaming_blobs_processed",
+        pub blobs_rewritten => "merge_streaming_blobs_rewritten",
+        pub blobs_false_positive => "merge_streaming_blobs_false_positive",
+        /// Candidates whose base elements the diff does not touch but whose ID
+        /// span holds inline upserts (pure creates), so they are rewritten
+        /// rather than passed through to keep the output sorted. A subset of
+        /// `blobs_rewritten`.
+        pub blobs_forced_rewrite => "merge_streaming_blobs_forced_rewrite",
+        pub blobs_owned_passthrough => "merge_streaming_blobs_owned_passthrough",
+        /// Decompress wall summed across all workers (cumulative ns).
+        pub decompress_ns => "merge_streaming_decompress_ns",
+        /// Parse wall summed across all workers.
+        pub parse_ns => "merge_streaming_parse_ns",
+        /// Precise-check wall summed across all workers.
+        pub precise_ns => "merge_streaming_precise_ns",
+        /// Rewrite wall summed across all workers.
+        pub rewrite_ns => "merge_streaming_rewrite_ns",
+        /// Coord-extraction wall summed across all workers (LOW only).
+        pub coord_extract_ns => "merge_streaming_coord_extract_ns",
+        /// Node coord pairs extracted across all workers (LOW only).
+        pub coord_pairs_extracted => "merge_streaming_coord_pairs_extracted",
+        /// Node blobs decompressed for coordinate extraction (LOW only).
+        /// Bumped once per blob on the extraction branch, unlike
+        /// `blobs_processed`, which counts every candidate and owned
+        /// passthrough of every kind. Not emitted by this set: `merge`
+        /// reads it into the stats it emits as `merge_loc_node_blobs_scanned`.
+        pub loc_node_blobs_scanned,
+        /// In-line framing wall summed across all workers (P1.5: avoids
+        /// the writer's rayon-spawn-per-block dispatch).
+        pub frame_ns => "merge_streaming_frame_ns",
     }
 }
 
@@ -336,7 +294,7 @@ pub(super) fn run_workers(
     drop(drain_tx);
 
     crate::debug::emit_marker("MERGE_STREAMING_END");
-    counters.emit();
+    counters.emit_all();
 }
 
 /// Per-worker hot loop. Pulls candidates until the channel closes; for

@@ -294,8 +294,7 @@ pub(crate) fn tags_filter_to(
     }
 
     if let Some(n) = opts.parallelism.fixed() {
-        #[allow(clippy::cast_possible_wrap)]
-        crate::debug::emit_counter("tagsfilter_worker_count", n as i64);
+        crate::debug::emit_counter("tagsfilter_worker_count", n);
     }
 
     if opts.omit_referenced {
@@ -309,15 +308,9 @@ pub(crate) fn tags_filter_to(
             overrides,
             host,
         )?;
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            crate::debug::emit_counter("tagsfilter_matched_nodes", result.nodes_matched as i64);
-            crate::debug::emit_counter("tagsfilter_matched_ways", result.ways_matched as i64);
-            crate::debug::emit_counter(
-                "tagsfilter_matched_relations",
-                result.relations_matched as i64,
-            );
-        }
+        crate::debug::emit_counter("tagsfilter_matched_nodes", result.nodes_matched);
+        crate::debug::emit_counter("tagsfilter_matched_ways", result.ways_matched);
+        crate::debug::emit_counter("tagsfilter_matched_relations", result.relations_matched);
         Ok(result)
     } else {
         let result = tags_filter_two_pass(
@@ -332,28 +325,19 @@ pub(crate) fn tags_filter_to(
             overrides,
             host,
         )?;
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            crate::debug::emit_counter("tagsfilter_matched_nodes", result.nodes_matched as i64);
-            crate::debug::emit_counter("tagsfilter_matched_ways", result.ways_matched as i64);
-            crate::debug::emit_counter(
-                "tagsfilter_matched_relations",
-                result.relations_matched as i64,
-            );
-            crate::debug::emit_counter("tagsfilter_nodes_from_ways", result.nodes_from_ways as i64);
-            crate::debug::emit_counter(
-                "tagsfilter_nodes_from_relations",
-                result.nodes_from_relations as i64,
-            );
-            crate::debug::emit_counter(
-                "tagsfilter_ways_from_relations",
-                result.ways_from_relations as i64,
-            );
-            crate::debug::emit_counter(
-                "tagsfilter_relations_from_relations",
-                result.relations_from_relations as i64,
-            );
-        }
+        crate::debug::emit_counter("tagsfilter_matched_nodes", result.nodes_matched);
+        crate::debug::emit_counter("tagsfilter_matched_ways", result.ways_matched);
+        crate::debug::emit_counter("tagsfilter_matched_relations", result.relations_matched);
+        crate::debug::emit_counter("tagsfilter_nodes_from_ways", result.nodes_from_ways);
+        crate::debug::emit_counter(
+            "tagsfilter_nodes_from_relations",
+            result.nodes_from_relations,
+        );
+        crate::debug::emit_counter("tagsfilter_ways_from_relations", result.ways_from_relations);
+        crate::debug::emit_counter(
+            "tagsfilter_relations_from_relations",
+            result.relations_from_relations,
+        );
         Ok(result)
     }
 }
@@ -790,17 +774,11 @@ fn tags_filter_two_pass(
         }
         crate::debug::emit_marker("TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_END");
 
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            crate::debug::emit_counter(
-                "tagsfilter_single_pass_schedule_blobs",
-                schedule.len() as i64,
-            );
-            crate::debug::emit_counter(
-                "tagsfilter_single_pass_tagidx_skipped_blobs",
-                blobs_skipped_by_tag as i64,
-            );
-        }
+        crate::debug::emit_counter("tagsfilter_single_pass_schedule_blobs", schedule.len());
+        crate::debug::emit_counter(
+            "tagsfilter_single_pass_tagidx_skipped_blobs",
+            blobs_skipped_by_tag,
+        );
 
         let shared_file = walker.input();
         drop(walker);
@@ -1006,11 +984,8 @@ fn tags_filter_two_pass(
     drop(walker);
     crate::debug::emit_marker("TAGSFILTER_PASS2_SCHEDULE_SCAN_END");
 
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("tagsfilter_pass2_schedule_blobs", schedule.len() as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_skipped_blobs", blobs_skipped as i64);
-    }
+    crate::debug::emit_counter("tagsfilter_pass2_schedule_blobs", schedule.len());
+    crate::debug::emit_counter("tagsfilter_pass2_skipped_blobs", blobs_skipped);
 
     if blobs_skipped > 0 {
         crate::host::diag!(

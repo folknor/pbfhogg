@@ -19,7 +19,6 @@ use std::cell::Cell;
 use std::io::{self, BufReader, Read, Seek};
 use std::path::Path;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
 
 use flate2::read::MultiGzDecoder;
 use quick_xml::Reader;
@@ -301,16 +300,21 @@ where
 /// reader), never per XML event.
 struct TimedRead<R: io::Read> {
     inner: R,
-    total: Rc<Cell<Duration>>,
+    /// Nanoseconds spent in `read()`, summed. Saturates rather than wraps:
+    /// the sum would need centuries of cumulative read time to reach
+    /// `i64::MAX` (where the emitted counter used to wrap negative) or
+    /// `u64::MAX`.
+    total: Rc<Cell<u64>>,
     cancel: crate::host::Cancel,
 }
 
 impl<R: io::Read> io::Read for TimedRead<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.cancel.check().map_err(io::Error::from)?;
-        let start = Instant::now();
+        let start = crate::counters::Stopwatch::start();
         let result = self.inner.read(buf);
-        self.total.set(self.total.get() + start.elapsed());
+        self.total
+            .set(self.total.get().saturating_add(start.elapsed_ns()));
         result
     }
 }
@@ -331,7 +335,7 @@ pub(crate) type OscReader = Reader<BufReader<Box<dyn io::Read>>>;
 pub(crate) fn open_osc_reader(
     path: &Path,
     cancel: &crate::host::Cancel,
-) -> ParseResult<(OscReader, Rc<Cell<Duration>>)> {
+) -> ParseResult<(OscReader, Rc<Cell<u64>>)> {
     let mut file = crate::read::input::open(path)?;
     // A file shorter than two bytes cannot be gzip and cannot be XML
     // either; read what is there and let the XML parser produce the
@@ -351,7 +355,7 @@ pub(crate) fn open_osc_reader(
     }
     file.seek(io::SeekFrom::Start(0)).map_err(read_error)?;
 
-    let total = Rc::new(Cell::new(Duration::ZERO));
+    let total = Rc::new(Cell::new(0_u64));
     let inner: Box<dyn io::Read> = if got == 2 && magic == [0x1f, 0x8b] {
         Box::new(TimedRead {
             inner: MultiGzDecoder::new(file),
@@ -573,11 +577,7 @@ pub(crate) fn parse_osc_path<S: OscSink>(
     let result = drive_osc(&mut reader, sink, path);
     // Deliberately emit this historical name once per file, without accumulation,
     // from every sink. Changing attribution or totals breaks brokkr run comparisons.
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    crate::debug::emit_counter(
-        "merge_changes_decompress_ns",
-        decompress_total.get().as_nanos() as i64,
-    );
+    crate::debug::emit_counter("merge_changes_decompress_ns", decompress_total.get());
     result
 }
 

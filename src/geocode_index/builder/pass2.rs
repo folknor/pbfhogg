@@ -802,7 +802,7 @@ pub(super) fn run_pass2(
 
     crate::debug::emit_counter(
         "geocode_way_refs_without_coordinates",
-        super::counter_value(missing_node_ref_count),
+        missing_node_ref_count,
     );
     if missing_node_ref_count > 0 {
         crate::host::diag!(

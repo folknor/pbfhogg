@@ -224,7 +224,7 @@ pub(crate) fn merge_to(
     // precede a header decode failure. `merge_header_read_ms` therefore
     // times the whole front read: the open, the header frame, the probe to
     // the first data blob's header and the decode, not the header alone.
-    let header_start = std::time::Instant::now();
+    let header_start = crate::counters::Stopwatch::start();
     let mut front = InputFront::open(base_pbf, direct_io, host)?;
     front.require_indexdata(
         force,
@@ -240,13 +240,9 @@ pub(crate) fn merge_to(
     let header_bytes = build_header_bytes(front.header()?, locations_on_ways, overrides, host)
         .map_err(|e| e.locate(crate::error::Location::in_file(base_pbf)))?;
     drop(front);
-    let header_read_ms = header_start
-        .elapsed()
-        .as_millis()
-        .try_into()
-        .unwrap_or(i64::MAX);
+    let header_read_ms = header_start.elapsed_ms();
 
-    let osc_start = std::time::Instant::now();
+    let osc_start = crate::counters::Stopwatch::start();
     crate::host::diag!(
         host.diagnostics,
         Progress,
@@ -277,19 +273,11 @@ pub(crate) fn merge_to(
         diff.deleted_ids(crate::ElementKind::Relation).len(),
     );
     let diff_heap_bytes = diff.heap_size_estimate() as u64;
-    let osc_parse_ms = osc_start
-        .elapsed()
-        .as_millis()
-        .try_into()
-        .unwrap_or(i64::MAX);
+    let osc_parse_ms = osc_start.elapsed_ms();
 
-    let diffranges_start = std::time::Instant::now();
+    let diffranges_start = crate::counters::Stopwatch::start();
     let ranges = Arc::new(DiffRanges::from_diff(&diff));
-    let diffranges_ms = diffranges_start
-        .elapsed()
-        .as_millis()
-        .try_into()
-        .unwrap_or(i64::MAX);
+    let diffranges_ms = diffranges_start.elapsed_ms();
     crate::host::diag!(
         host.diagnostics,
         Progress,
@@ -328,17 +316,13 @@ pub(crate) fn merge_to(
         (None, None, (0, 0, 0))
     };
 
-    let writer_setup_start = std::time::Instant::now();
+    let writer_setup_start = crate::counters::Stopwatch::start();
     // Apply-changes' output pass is writer-bound at default compression, so
     // an unspecified (buffered) backend becomes the parallel writer.
     let backend = backend.parallel_by_default();
     let mut writer =
         writer_from_header_bytes(output_pbf, compression, &header_bytes, backend, host)?;
-    let writer_setup_ms = writer_setup_start
-        .elapsed()
-        .as_millis()
-        .try_into()
-        .unwrap_or(i64::MAX);
+    let writer_setup_ms = writer_setup_start.elapsed_ms();
 
     // copy_file_range input setup. Mirrors the legacy path so direct-io and
     // io_uring routing remain correct. The handle is shared rather than
@@ -388,8 +372,7 @@ pub(crate) fn merge_to(
             APPLY_CHANGES_WORKERS_FALLBACK,
         )
     });
-    #[allow(clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("merge_worker_count", worker_count as i64);
+    crate::debug::emit_counter("merge_worker_count", worker_count);
 
     // Channels.
     let (drain_tx, drain_rx) = mpsc::sync_channel::<DrainItem>(DRAIN_CHANNEL_CAPACITY);
@@ -492,7 +475,7 @@ pub(crate) fn merge_to(
     };
 
     crate::debug::emit_marker("MERGE_LOOP_START");
-    let pipeline_start = std::time::Instant::now();
+    let pipeline_start = crate::counters::Stopwatch::start();
 
     // Drain runs in this (the merge() caller's) thread because it owns
     // `&mut writer`. Scanner and worker pool run in scoped threads.
@@ -542,11 +525,7 @@ pub(crate) fn merge_to(
         Ok(stats)
     })?;
 
-    let pipeline_ms = pipeline_start
-        .elapsed()
-        .as_millis()
-        .try_into()
-        .unwrap_or(i64::MAX);
+    let pipeline_ms = pipeline_start.elapsed_ms();
     crate::debug::emit_marker("MERGE_LOOP_END");
 
     let mut final_stats = stats;
@@ -587,41 +566,26 @@ pub(crate) fn merge_to(
     crate::debug::emit_counter("merge_writer_setup_ms", writer_setup_ms);
     crate::debug::emit_counter("merge_pipeline_ms", pipeline_ms);
 
-    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-    {
+    crate::debug::emit_counter("merge_blobs_passthrough", final_stats.blobs_passthrough);
+    crate::debug::emit_counter("merge_blobs_rewritten", final_stats.blobs_rewritten);
+    crate::debug::emit_counter("merge_blobs_index_hit", final_stats.blobs_index_hit);
+    crate::debug::emit_counter("merge_total_elements", final_stats.total_elements());
+    crate::debug::emit_counter("merge_deleted", final_stats.deleted);
+    crate::debug::emit_counter("merge_diff_nodes", final_stats.diff_nodes);
+    crate::debug::emit_counter("merge_diff_ways", final_stats.diff_ways);
+    crate::debug::emit_counter("merge_diff_relations", final_stats.diff_relations);
+    crate::debug::emit_counter("merge_bytes_passthrough", final_stats.bytes_passthrough);
+    crate::debug::emit_counter("merge_bytes_rewritten", final_stats.bytes_rewritten);
+    crate::debug::emit_counter("merge_diff_heap_bytes", final_stats.diff_heap_bytes);
+    if locations_on_ways {
+        crate::debug::emit_counter("merge_loc_needed", final_stats.loc_nodes_needed);
+        crate::debug::emit_counter("merge_loc_from_diff", final_stats.loc_nodes_from_diff);
+        crate::debug::emit_counter("merge_loc_from_base", final_stats.loc_nodes_from_base);
+        crate::debug::emit_counter("merge_loc_missing", final_stats.loc_missing);
         crate::debug::emit_counter(
-            "merge_blobs_passthrough",
-            final_stats.blobs_passthrough as i64,
+            "merge_loc_node_blobs_scanned",
+            final_stats.loc_node_blobs_scanned,
         );
-        crate::debug::emit_counter("merge_blobs_rewritten", final_stats.blobs_rewritten as i64);
-        crate::debug::emit_counter("merge_blobs_index_hit", final_stats.blobs_index_hit as i64);
-        crate::debug::emit_counter("merge_total_elements", final_stats.total_elements() as i64);
-        crate::debug::emit_counter("merge_deleted", final_stats.deleted as i64);
-        crate::debug::emit_counter("merge_diff_nodes", final_stats.diff_nodes as i64);
-        crate::debug::emit_counter("merge_diff_ways", final_stats.diff_ways as i64);
-        crate::debug::emit_counter("merge_diff_relations", final_stats.diff_relations as i64);
-        crate::debug::emit_counter(
-            "merge_bytes_passthrough",
-            final_stats.bytes_passthrough as i64,
-        );
-        crate::debug::emit_counter("merge_bytes_rewritten", final_stats.bytes_rewritten as i64);
-        crate::debug::emit_counter("merge_diff_heap_bytes", final_stats.diff_heap_bytes as i64);
-        if locations_on_ways {
-            crate::debug::emit_counter("merge_loc_needed", final_stats.loc_nodes_needed as i64);
-            crate::debug::emit_counter(
-                "merge_loc_from_diff",
-                final_stats.loc_nodes_from_diff as i64,
-            );
-            crate::debug::emit_counter(
-                "merge_loc_from_base",
-                final_stats.loc_nodes_from_base as i64,
-            );
-            crate::debug::emit_counter("merge_loc_missing", final_stats.loc_missing as i64);
-            crate::debug::emit_counter(
-                "merge_loc_node_blobs_scanned",
-                final_stats.loc_node_blobs_scanned as i64,
-            );
-        }
     }
 
     Ok(final_stats)

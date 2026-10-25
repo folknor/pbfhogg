@@ -1413,8 +1413,9 @@ must_scan = [
 ]
 message = "emit_read_counters is the once-per-process exit hook; only the CLI exit path calls it"
 
-# Presence of the CLI exit-path hook calls and the function-scoped probe_lock
-# open flags: neither fits a one-line forbid rule.
+# Presence of the CLI exit-path hook calls, the function-scoped probe_lock
+# open flags, and no `as i64` cast inside an emit_counter call's arguments
+# (which rustfmt wraps across lines): none fits a one-line forbid rule.
 [[script_check]]
 name = "source-invariants"
 command = "python3 scripts/check_source_invariants.py"

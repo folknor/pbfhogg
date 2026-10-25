@@ -38,8 +38,6 @@
 //! "never fired" warning fires only when the cap exceeds every kind's
 //! total element count (every kind collapses to a single output blob).
 
-use std::path::Path;
-
 use super::{
     HeaderOverrides, Result, ensure_node_capacity_local, ensure_relation_capacity_local,
     ensure_way_capacity_local, flush_local, require_indexdata, writer_from_header,
@@ -52,6 +50,7 @@ use crate::owned::{
     read_node, read_relation, read_way, read_way_with_locations, relation_members_into,
     write_single_node_local, write_single_relation_local, write_single_way_local,
 };
+use crate::read::input::InputSource;
 use crate::write::WriteOptions;
 use crate::writer::{Compression, PbfWriter, frame_blob_pipelined};
 use crate::{Element, ElementReader};
@@ -108,8 +107,14 @@ struct WorkerOutput {
 /// round-trips with its tags, refs, members, metadata, and DenseNodes
 /// encoding. Output is type-sorted (nodes, then ways, then relations);
 /// the `Sort.Type_then_ID` flag is propagated when the input has it.
-pub fn repack(
-    input: &Path,
+///
+/// The input is read in several passes, so it must be a regular file or a
+/// block device (`InvalidArgument` otherwise), and is pinned for the run
+/// (see [`PinnedInput`](crate::read::input::PinnedInput)); a caller's pin is
+/// used as it is. Where a later open cannot reach the pinned file, an input
+/// replaced mid-run fails with `InputReplaced` and nothing is published.
+pub fn repack<'a>(
+    input: impl Into<InputSource<'a>>,
     output: crate::output::Output,
     elements_per_blob: std::num::NonZeroUsize,
     write: &WriteOptions,
@@ -117,7 +122,14 @@ pub fn repack(
     host: &crate::host::Host,
 ) -> Result<RepackStats> {
     host.cancel.check()?;
-    let result = repack_to(input, &output, elements_per_blob, write, overrides, host)?;
+    let result = repack_to(
+        input.into(),
+        &output,
+        elements_per_blob,
+        write,
+        overrides,
+        host,
+    )?;
     output.publish(&host.cancel)?;
     Ok(result)
 }
@@ -126,7 +138,7 @@ pub fn repack(
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn repack_to(
-    input: &Path,
+    input: InputSource<'_>,
     output: &crate::output::Output,
     cap: std::num::NonZeroUsize,
     write: &WriteOptions,
@@ -140,6 +152,18 @@ pub(crate) fn repack_to(
         force,
     } = *write;
     let elements_per_blob = cap.get();
+
+    // The input is opened three times, each through its own open file
+    // description: the indexdata probe, the header reader, then the schedule
+    // walk whose descriptor every per-kind pool preads. All three are derived
+    // from this one pin, and the size bound below is read from it, so a
+    // file renamed over the input mid-run cannot be probed, headed and
+    // re-encoded partly from each file: where `/proc/self/fd` reopens the pin
+    // every open reaches the pinned file, otherwise on Unix a replaced input
+    // fails the run (`PinnedInput` says what it does off Unix). Taken before
+    // any other open of the input.
+    let pin = input.pin(host)?;
+    let input = &pin;
 
     require_indexdata(
         input,
@@ -193,13 +217,10 @@ pub(crate) fn repack_to(
 
     // Pre-allocation ceiling for every BlockBuilder in this run, derived from
     // the input rather than fixed: a file cannot deliver more elements than it
-    // has bytes. See `BlockBuilder::with_element_cap_prealloc`.
-    let prealloc_bound = usize::try_from(
-        std::fs::metadata(input)
-            .map(|m| m.len())
-            .unwrap_or(u64::MAX),
-    )
-    .unwrap_or(usize::MAX);
+    // has bytes. See `BlockBuilder::with_element_cap_prealloc`. The size is
+    // the pinned file's, and a failed stat of it fails the run: falling back
+    // to an unbounded ceiling would drop the bound exactly when it is unknown.
+    let prealloc_bound = usize::try_from(input.metadata()?.len()).unwrap_or(usize::MAX);
 
     let mut blobs_written: u64 = 0;
     let mut elements_written: u64 = 0;

@@ -78,6 +78,8 @@ mod fault_read_pipeline;
 #[cfg(feature = "test-hooks")]
 mod fault_renumber_input;
 #[cfg(feature = "test-hooks")]
+mod fault_repack_input;
+#[cfg(feature = "test-hooks")]
 mod fault_sort_input;
 #[cfg(feature = "test-hooks")]
 mod fault_tags_count_input;

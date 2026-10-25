@@ -57,7 +57,7 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-23. HYG-184 to HYG-189, one per line, in ID order
+23. HYG-185 to HYG-189, one per line, in ID order
 24. HYG-047
 25. HYG-158
 26. HYG-159
@@ -798,6 +798,18 @@ The judgement calls already known, to be checked first:
     unindexed, direct). Codex confirmed the inventory, including that
     `WillneedPrefetch` and `decided` neither reopen nor stat. Mutation
     checked: routing the walk back to a path open fails every route.
+  - repack adopted it in the same shape: the public `repack` takes
+    `impl Into<InputSource>`, `repack_to` pins first; the CLI still passes
+    the path. Its three opens (the `require_indexdata` probe, the header
+    `ElementReader`, the schedule walk whose descriptor every per-kind pool
+    preads) each became one derived open, on every route (indexed, forced
+    unindexed, LocationsOnWays, an empty relation schedule, direct). The
+    `BlockBuilder` pre-allocation bound now reads the pin's metadata, and a
+    failed stat now fails the run where it used to fall back to an
+    unbounded `u64::MAX` ceiling (codex agreed). No test observes that
+    metadata source: the bound changes capacity, not output bytes, so it
+    rests on reading the code. Mutation checked: routing each of the three
+    opens back to a path open fails the tests.
 
 ---
 
@@ -1436,7 +1448,7 @@ Reported by: the HYG-150 implementation.
 
 ## Adopting `PinnedInput`, one command per entry
 
-Not a finding: the shared brief for HYG-184 to HYG-189. Each of those commands opens its input more than once per run (a
+Not a finding: the shared brief for HYG-185 to HYG-189. Each of those commands opens its input more than once per run (a
 precondition probe, a header reader, a schedule walk, worker and splice
 descriptors), each open resolving the path again, so a file renamed over
 the input mid-run is read partly from each file. The API that fixes it
@@ -1513,16 +1525,6 @@ export, check refs, check index (one open each). inspect's index-only scan
 and its full-decode fallback each read the whole report from one open, but
 the full decode takes its file size from a separate path `stat`, which
 HYG-187 covers.
-
-## HYG-184 - repack reopens its input by path
-
-Anger: 7 - one command.
-
-See "Adopting `PinnedInput`" above. The indexdata probe, the header
-`ElementReader` and `build_classify_schedules_split` each open the input
-(`repack/mod.rs`). Recommendation (2026-10-25): follow the brief.
-
-Reported by: the HYG-151 resolution.
 
 ## HYG-185 - degrade reopens its input by path
 

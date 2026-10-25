@@ -1158,6 +1158,19 @@
 
 ### Fixed
 
+- **`repack` reads one input file even if it is replaced mid-run.** Every
+  run opens the input three times (the indexdata check, the header read and
+  the schedule walk the re-encoding workers read through) and reads its
+  size, and each of these used to resolve the path again, so an input
+  renamed over during the run could be re-encoded under one file's header
+  from another file's blobs, with no error. The input is now pinned when
+  the run starts: on Linux with `/proc` a replaced or deleted input does
+  not affect the run; on other Unix hosts the run fails with
+  `ErrorKind::InputReplaced` and publishes nothing. An input that is a
+  FIFO, socket or character device is now refused up front. Library:
+  `repack::repack` takes `impl Into<InputSource>` (a path as before, or a
+  `&PinnedInput` the caller took, used as it is).
+
 - **`inspect --tags` (tags-count) reads one input file even if it is
   replaced mid-run.** Every run opens the input twice (the indexdata check,
   then the schedule walk the counting workers read through), and each open

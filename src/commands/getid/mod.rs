@@ -14,6 +14,7 @@ use crate::error::Error;
 use crate::file_writer::FileWriter;
 use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
 use crate::read::header_walker::ScanArm;
+use crate::read::input::{InputSource, PinnedInput};
 use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
 use crate::write::WriteOptions;
 use crate::writer::PbfWriter;
@@ -255,15 +256,19 @@ fn id_file_token(raw: &str) -> Option<&str> {
 /// Every data blob is decoded and its IDs read from the elements, so
 /// indexdata decides nothing here and a partially indexed file gives the
 /// same set as a wholly indexed one: the walk accepts it.
-pub fn parse_ids_from_pbf(
-    path: &Path,
+///
+/// The input is opened once, and that one description serves the whole
+/// read, so a path reads one file without a pin. A caller that pins it
+/// anyway (the CLI pins every input before reading any) passes the pin.
+pub fn parse_ids_from_pbf<'a>(
+    input: impl Into<InputSource<'a>>,
     _direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<ElementIds> {
     let mut set = ElementIds::empty();
 
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
-        path,
+        input,
         None,
         crate::scan::classify::PartialIndex::Accept,
         host,
@@ -392,8 +397,15 @@ impl GetidStats {
 ///
 /// If `opts.add_referenced` is true, referenced nodes of matching ways are also
 /// included (two-pass). Otherwise, only exact ID matches are output.
-pub fn getid(
-    input: &Path,
+///
+/// Every route opens the input more than once, so the input must be a
+/// regular file or a block device (`InvalidArgument` otherwise) and is
+/// pinned for the run once the options are accepted (see [`PinnedInput`]
+/// and [`InputSource::pin`]); a caller may pin it first and pass the pin.
+/// Where a later open cannot reach the pinned file, an input replaced
+/// mid-run fails with `InputReplaced`.
+pub fn getid<'a>(
+    input: impl Into<InputSource<'a>>,
     output: crate::output::Output,
     ids: &ElementIds,
     opts: &GetidOptions,
@@ -409,8 +421,8 @@ pub fn getid(
 
 /// [`getid`] writing to a borrowed output it does not publish.
 #[hotpath::measure]
-pub(crate) fn getid_to(
-    input: &Path,
+pub(crate) fn getid_to<'a>(
+    input: impl Into<InputSource<'a>>,
     output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetidOptions,
@@ -436,8 +448,8 @@ pub(crate) fn getid_to(
 /// which is not dispatched) alongside the stats so tests can inject
 /// `min_blobs` and assert which arm auto-dispatch actually executed.
 #[allow(clippy::too_many_arguments)]
-fn getid_dispatched(
-    input: &Path,
+fn getid_dispatched<'a>(
+    input: impl Into<InputSource<'a>>,
     output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetidOptions,
@@ -454,6 +466,18 @@ fn getid_dispatched(
              emits the referenced objects it strips",
         ));
     }
+    // Every route opens the input more than once, each open its own open
+    // file description (the indexdata probe, the arm estimate, the walker or
+    // the streaming reader; `add_referenced`'s pass-1 schedule walk, whose
+    // descriptor serves the classify pool, and pass 2's reader), and each is
+    // derived from this one pin, so a file renamed over the input mid-run
+    // cannot be read partly from each: where `/proc/self/fd` reopens the pin
+    // every open reaches the pinned file, otherwise on Unix a replaced input
+    // fails the run (`PinnedInput` says what it does off Unix). Taken after
+    // the option refusal above and before any other open of the input; a
+    // caller's pin is used as it is.
+    let pin = input.into().pin(host)?;
+    let input = &pin;
     let has_indexdata = require_indexdata(
         input,
         write.direct_reads,
@@ -510,8 +534,11 @@ fn getid_dispatched(
 /// path at `filter_by_id` can skip re-encoding non-matching blobs. On a
 /// non-indexed PBF the fast path is unreachable and every blob would
 /// decode-and-re-encode silently; `--force` overrides.
-pub fn removeid(
-    input: &Path,
+///
+/// The input is opened twice (the indexdata probe, then the walk), so it
+/// is pinned as in [`getid`], with the same refusals.
+pub fn removeid<'a>(
+    input: impl Into<InputSource<'a>>,
     output: crate::output::Output,
     ids: &ElementIds,
     write: &WriteOptions,
@@ -526,14 +553,17 @@ pub fn removeid(
 
 /// [`removeid`] writing to a borrowed output it does not publish.
 #[hotpath::measure]
-pub(crate) fn removeid_to(
-    input: &Path,
+pub(crate) fn removeid_to<'a>(
+    input: impl Into<InputSource<'a>>,
     output: &crate::output::Output,
     ids: &ElementIds,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<GetidStats> {
+    // The probe and the walk each open the input; see `getid_dispatched`.
+    let pin = input.into().pin(host)?;
+    let input = &pin;
     let indexed = require_indexdata(
         input,
         write.direct_reads,
@@ -580,7 +610,7 @@ pub(crate) fn removeid_to(
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn filter_by_id(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     ids: &ElementIds,
     include: bool,
@@ -617,7 +647,7 @@ fn filter_by_id(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 fn filter_by_id_walker(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     ids: &ElementIds,
     include: bool,
@@ -694,7 +724,7 @@ fn filter_by_id_walker(
                 osmdata_blobs += 1;
                 let w = writer
                     .as_mut()
-                    .ok_or_else(|| crate::error::new_missing_header(input))?;
+                    .ok_or_else(|| crate::error::new_missing_header(input.path()))?;
 
                 if let Some(ref idx) = meta.index {
                     let has_match = match idx.kind {
@@ -799,7 +829,7 @@ fn filter_by_id_walker(
         }
     }
 
-    let mut writer = writer.ok_or_else(|| crate::error::new_missing_header(input))?;
+    let mut writer = writer.ok_or_else(|| crate::error::new_missing_header(input.path()))?;
     crate::debug::emit_counter("walk_actual_osmdata_blobs", osmdata_blobs);
     if blobs_skipped > 0 {
         crate::host::diag!(
@@ -835,7 +865,7 @@ fn filter_by_id_walker(
 /// small blobs loses to a plain sequential read loop.
 #[allow(clippy::too_many_lines)]
 fn filter_by_id_streaming(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     ids: &ElementIds,
     write: &WriteOptions,
@@ -873,9 +903,9 @@ fn filter_by_id_streaming(
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, host, input)? {
+    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, host, input.path())? {
         // The frame loop owns the provenance of failures on this frame.
-        let locate = |e: Error| e.locate(frame_location(input, frame.file_offset));
+        let locate = |e: Error| e.locate(frame_location(input.path(), frame.file_offset));
         match frame.blob_type {
             // `read_raw_frame` refuses a second OSMHeader, so this is the
             // only one.
@@ -902,7 +932,7 @@ fn filter_by_id_streaming(
                 osmdata_blobs += 1;
                 let w = writer
                     .as_mut()
-                    .ok_or_else(|| crate::error::new_missing_header(input))?;
+                    .ok_or_else(|| crate::error::new_missing_header(input.path()))?;
                 if let Some(ref idx) = frame.index {
                     let has_match = match idx.kind {
                         crate::ElementKind::Node => {
@@ -972,7 +1002,7 @@ fn filter_by_id_streaming(
         }
     }
 
-    let mut writer = writer.ok_or_else(|| crate::error::new_missing_header(input))?;
+    let mut writer = writer.ok_or_else(|| crate::error::new_missing_header(input.path()))?;
     crate::debug::emit_counter("walk_actual_osmdata_blobs", osmdata_blobs);
     if blobs_skipped > 0 {
         crate::host::diag!(
@@ -993,7 +1023,7 @@ fn filter_by_id_streaming(
 
 #[allow(clippy::too_many_lines)]
 fn getid_with_refs(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     ids: &ElementIds,
     opts: &GetidOptions,
@@ -1573,7 +1603,7 @@ mod tests {
         )
         .unwrap();
         getid_with_refs(
-            &input,
+            &PinnedInput::pin(&input, &crate::host::Host::for_tests()).unwrap(),
             &staged,
             &ids,
             &opts,
@@ -1650,7 +1680,7 @@ mod tests {
             )
             .unwrap();
             filter_by_id(
-                input,
+                &PinnedInput::pin(input, host).unwrap(),
                 &staged,
                 &query,
                 true,
@@ -1708,6 +1738,132 @@ mod tests {
             ids_from_both_arms(&input, &["n1", "w10"], &crate::host::Host::for_tests()),
             vec![1, 10]
         );
+    }
+
+    /// The streaming full-scan arm reads only the pinned input. It needs an
+    /// estimate past `FULL_SCAN_ARM_MIN_BLOBS` to dispatch, which no fixture
+    /// reaches through the public `getid`, so this drives `getid_dispatched`
+    /// with the threshold at one; `tests/fault_getid_input.rs` covers every
+    /// other route. Three opens: the probe, the estimate walk and the
+    /// streaming reader. The replacement is armed after each in turn, in
+    /// both reopen modes, buffered and `O_DIRECT`.
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn full_scan_arm_reads_only_the_pinned_input() {
+        use std::sync::atomic::Ordering;
+        const OPENS: u64 = 3;
+        let dir = crate::path_guard::tests::scratch();
+        let input = dir.path().join("in.pbf");
+        let replacement = dir.path().join("replacement.pbf");
+        let query = parse_ids(&["n1".to_owned(), "w10".to_owned()]).unwrap();
+        let opts = GetidOptions {
+            add_referenced: false,
+            remove_tags: false,
+            report_found: false,
+        };
+        let run = |output: &Path, host: &crate::host::Host, direct: bool| {
+            let staged = crate::output::Output::new(
+                output,
+                crate::output::Overwrite::Replace,
+                &crate::host::Diagnostics::discard(),
+            )
+            .unwrap();
+            let write = WriteOptions {
+                direct_reads: direct,
+                ..WriteOptions::default()
+            };
+            let result = getid_dispatched(
+                &input,
+                &staged,
+                &query,
+                &opts,
+                &write,
+                &HeaderOverrides::default(),
+                1,
+                host,
+            );
+            if result.is_ok() {
+                staged.publish(&host.cancel).unwrap();
+            }
+            result
+        };
+        let mut directs = vec![false];
+        if cfg!(feature = "linux-direct-io") {
+            directs.push(true);
+        }
+        for direct in directs {
+            write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
+            let reference = dir.path().join("reference.pbf");
+            let host = crate::host::Host::for_tests();
+            host.cancel
+                .faults()
+                .arm_input_replacement(&input, &replacement, OPENS + 1);
+            match run(&reference, &host, direct) {
+                Ok((arm, _)) => assert_eq!(arm, Some(ScanArm::FullScan)),
+                Err(e)
+                    if direct
+                        && matches!(e.kind(), crate::ErrorKind::PlatformUnsupported { .. }) =>
+                {
+                    continue;
+                }
+                Err(e) => panic!("direct {direct}: unreplaced run: {e}"),
+            }
+            let counted = host.cancel.faults().input_replacement().unwrap();
+            assert_eq!(
+                (counted.attempts, counted.verified, counted.fired),
+                (OPENS, OPENS, false),
+                "direct {direct}: {counted:?}"
+            );
+            let expected = std::fs::read(&reference).unwrap();
+            assert_eq!(read_ids(&reference, &host), vec![1, 10]);
+
+            for after in 1..=OPENS {
+                for force_path in [true, false] {
+                    write_blocks(&input, &[1, 2], Some((10, &[1, 2])), true);
+                    // Other IDs entirely: a run that read any of it would
+                    // write different bytes.
+                    write_blocks(&replacement, &[1_001, 1_002], Some((1_010, &[1_001])), true);
+                    let host = crate::host::Host::for_tests();
+                    host.cancel
+                        .faults()
+                        .force_pin_path_reopen
+                        .store(force_path, Ordering::Relaxed);
+                    let procfs = PinnedInput::pin(&input, &host)
+                        .unwrap()
+                        .reopens_through_procfs();
+                    host.cancel
+                        .faults()
+                        .arm_input_replacement(&input, &replacement, after);
+                    let output = dir.path().join("out.pbf");
+                    let result = run(&output, &host, direct);
+                    let cell = format!("direct {direct}, after open {after}, procfs {procfs}");
+                    let report = host.cancel.faults().input_replacement().unwrap();
+                    assert!(report.fired, "{cell}: {report:?}");
+                    if procfs || after == OPENS {
+                        result.unwrap_or_else(|e| panic!("{cell}: {e}"));
+                        assert_eq!(report.attempts, OPENS, "{cell}: {report:?}");
+                        assert_eq!(report.refused, 0, "{cell}: {report:?}");
+                        assert_eq!(std::fs::read(&output).unwrap(), expected, "{cell}");
+                        std::fs::remove_file(&output).unwrap();
+                    } else if cfg!(unix) {
+                        let err = result
+                            .err()
+                            .unwrap_or_else(|| panic!("{cell}: must refuse"));
+                        assert!(
+                            matches!(err.kind(), crate::ErrorKind::InputReplaced),
+                            "{cell}: {err:?}"
+                        );
+                        assert_eq!(
+                            (report.attempts, report.refused),
+                            (after + 1, 1),
+                            "{cell}: {report:?}"
+                        );
+                        assert!(!output.exists(), "{cell}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

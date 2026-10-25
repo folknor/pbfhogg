@@ -157,9 +157,8 @@ impl Fx {
         let last = blobs.last().unwrap();
         let cut = last.blob_start + (last.blob_end - last.blob_start) / 2;
         std::fs::write(p.join("payload-past-eof.osm.pbf"), &bytes[..cut]).unwrap();
-        // The same two-header shape without indexdata on any data blob: the
-        // only input getid's streaming full-scan arm reaches from the CLI
-        // (with --force).
+        // The same two-header shape without indexdata on any data blob, for
+        // getid's walker on the forced unindexed route.
         crate::common::write_test_pbf_non_indexed(
             &p.join("unindexed.osm.pbf"),
             &crate::common::generate_nodes(5, 1),
@@ -1765,11 +1764,13 @@ fn a_payload_running_past_eof_is_refused_with_its_location_by_every_command() {
     run_property(Prop::PayloadPastEof, payload_past_eof_is_located);
 }
 
-/// getid's streaming full-scan arm reads frames through its own loop and is
-/// reached from the CLI only by unindexed input with `--force`; it refuses a
-/// second OSMHeader like the arms above.
+/// getid on unindexed input with `--force` skips the arm estimate and walks
+/// the headers (an unindexed input always takes the walker); it refuses a
+/// second OSMHeader like the indexed route above. The streaming full-scan
+/// arm, which no CLI fixture reaches, takes its refusal from
+/// `read_raw_frame`, which the frame conformance tests cover.
 #[test]
-fn getid_streaming_arm_refuses_a_second_header() {
+fn getid_forced_unindexed_route_refuses_a_second_header() {
     let fx = Fx::new();
     let dir = crate::common::test_scratch();
     let output = dir.path().join("out.osm.pbf");
@@ -1784,6 +1785,53 @@ fn getid_streaming_arm_refuses_a_second_header() {
     let stderr = out.stderr_str();
     assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
     assert!(stderr.contains("a second OSMHeader blob"), "{stderr}");
+    assert!(!output.exists(), "published an output");
+}
+
+/// getid pins its input before it reads any ID file, so a FIFO input is
+/// refused ahead of an `-I` PBF that does not exist, in include and invert
+/// mode; and the `-I` PBF is pinned too, so a FIFO there is refused rather
+/// than opened (a blocking open would wait for a writer).
+#[cfg(unix)]
+#[test]
+fn getid_pins_its_input_and_its_id_pbf_before_reading_either() {
+    let fx = Fx::new();
+    let dir = crate::common::test_scratch();
+    let fifo = crate::common::make_fifo(dir.path(), "in.fifo");
+    let missing = dir.path().join("missing-ids.osm.pbf");
+    let output = dir.path().join("out.osm.pbf");
+    for extra in [&[][..], &["--invert"][..]] {
+        let out = CliInvoker::new()
+            .arg("getid")
+            .arg(&fifo)
+            .arg("-o")
+            .arg(&output)
+            .arg("-I")
+            .arg(&missing)
+            .args(extra)
+            .run();
+        let stderr = out.stderr_str();
+        assert!(!out.status.success(), "{extra:?}: stderr:\n{stderr}");
+        assert!(
+            stderr.contains(&format!("{} is not a regular file", fifo.display())),
+            "{extra:?}: the input's refusal must come first:\n{stderr}"
+        );
+        assert!(!output.exists(), "{extra:?}: published an output");
+    }
+    let out = CliInvoker::new()
+        .arg("getid")
+        .arg(fx.path("good.osm.pbf"))
+        .arg("-o")
+        .arg(&output)
+        .arg("-I")
+        .arg(&fifo)
+        .run();
+    let stderr = out.stderr_str();
+    assert!(!out.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains(&format!("{} is not a regular file", fifo.display())),
+        "{stderr}"
+    );
     assert!(!output.exists(), "published an output");
 }
 

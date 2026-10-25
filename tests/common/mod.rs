@@ -72,6 +72,16 @@ pub fn out_replace(path: impl AsRef<Path>) -> pbfhogg::Output {
     .unwrap_or_else(|e| panic!("stage output {}: {}", path.as_ref().display(), e.report()))
 }
 
+/// A FIFO named `name` in `dir`, for the input-pinning refusals.
+#[cfg(unix)]
+pub fn make_fifo(dir: &Path, name: &str) -> std::path::PathBuf {
+    let fifo = dir.join(name);
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo path");
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+    fifo
+}
+
 /// Report a test that cannot run on this host and returns early.
 pub fn skip(reason: impl std::fmt::Display) {
     eprintln!("Skipping: {reason}");

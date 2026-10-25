@@ -56,11 +56,13 @@ pub(crate) enum ScanArm {
 ///
 /// The first header frame and unknown frames are intentionally excluded from
 /// the frame-size mean: only OSMData frame bytes predict OSMData count.
-pub(crate) fn estimate_blob_count(
-    path: &Path,
+pub(crate) fn estimate_blob_count<'a>(
+    input: impl Into<crate::read::input::InputSource<'a>>,
     host: &crate::host::Host,
 ) -> Result<BlobCountEstimate> {
-    let mut walker = HeaderWalker::open(path, host)?;
+    let source = input.into();
+    let path = source.path();
+    let mut walker = HeaderWalker::open(source, host)?;
     let file_size = walker.file_size();
     if file_size == 0 {
         return Err(crate::error::new_missing_header(path));

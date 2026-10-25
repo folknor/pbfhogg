@@ -492,6 +492,12 @@ where `std` reports no device and inode, a pin holds only the path and
 nothing is verified. One-shot opens
 (`InputSource::Path`), and scratch files, resolve the path as before.
 
+A library entry point may take its input as an `InputSource` and turn it
+into a pin with `InputSource::pin`: a path is pinned there, a caller's pin is
+shared as it is (keeping the host it was taken under). That lets a caller
+that does other work on the run's inputs first pin them all up front; the
+getid CLI pins its input, then its `-I` PBF, before reading any ID file.
+
 ## Read-path internals (both consumers)
 
 All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.

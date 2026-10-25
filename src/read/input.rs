@@ -159,6 +159,26 @@ impl<'a> InputSource<'a> {
             Self::Pinned(pin) => pin.metadata(),
         }
     }
+
+    /// The input as a pin for a run under `host`: a path is pinned now (see
+    /// [`PinnedInput::pin`]), a pinned input is shared as it is. A library
+    /// entry point that opens its input more than once takes an
+    /// `InputSource` and calls this, so a caller that composes several
+    /// steps on one input (a CLI reading other inputs first) can pin it
+    /// once, ahead of them, and hand the pin down.
+    ///
+    /// A shared pin is not taken again: it keeps the identity it was taken
+    /// with and the host it was taken under (its fault plan, under
+    /// `test-hooks`), whatever `host` says.
+    ///
+    /// # Errors
+    /// As [`PinnedInput::pin`], for a path.
+    pub fn pin(self, host: &crate::host::Host) -> Result<PinnedInput> {
+        match self {
+            Self::Path(path) => PinnedInput::pin(path, host),
+            Self::Pinned(pin) => Ok(pin.clone()),
+        }
+    }
 }
 
 /// One input of one run, pinned, so that every open of it during the run

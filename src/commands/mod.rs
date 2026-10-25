@@ -570,8 +570,8 @@ pub(crate) fn require_sorted(
 /// only, so a file with an indexed head and an unindexed tail can still
 /// dispatch to the pipelined arm; its filter passes unindexed blobs through
 /// to a full decode, which keeps that choice correct, merely unpriced.
-pub(crate) fn dispatch_scan_arm(
-    input: &Path,
+pub(crate) fn dispatch_scan_arm<'a>(
+    input: impl Into<crate::read::input::InputSource<'a>>,
     has_indexdata: bool,
     min_blobs: u64,
     host: &crate::host::Host,

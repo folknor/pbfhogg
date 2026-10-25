@@ -2756,30 +2756,23 @@ pub fn run() -> process::ExitCode {
                 // ID files are read after, so an existing output is refused
                 // before a full pass over an -I PBF.
                 let sources = IdSources::parse("getid", &ids, id_file, id_osm_file, default_type)?;
+                let output = output.open(&host)?;
+                // getid opens its input more than once, so it is pinned, and
+                // before any ID file is read: every input of the run is
+                // pinned before any is read (the -I PBF in `resolve`), and a
+                // FIFO or missing input is refused before a full -I pass. The
+                // same path given as the input and as -I is two inputs, each
+                // read from one file throughout.
+                let input = pbfhogg::read::input::PinnedInput::pin(&file, &host)?;
                 if invert {
-                    run_removeid(
-                        &file,
-                        output.open(&host)?,
-                        sources,
-                        &write,
-                        &overrides,
-                        &host,
-                    )
+                    run_removeid(&input, output, sources, &write, &overrides, &host)
                 } else {
                     let flags = GetidFlags {
                         add_referenced,
                         remove_tags,
                         verbose_ids,
                     };
-                    run_getid(
-                        &file,
-                        output.open(&host)?,
-                        flags,
-                        sources,
-                        &write,
-                        &overrides,
-                        &host,
-                    )
+                    run_getid(&input, output, flags, sources, &write, &overrides, &host)
                 }
             }
             Command::Getparents {
@@ -3788,19 +3781,28 @@ impl IdSources {
     /// Read the ID files and merge everything. clap already refused a
     /// command line naming no ID source; this catches sources that hold no
     /// ID.
+    ///
+    /// The -I PBF is pinned before either ID file is read, so it is refused
+    /// up front when it is not a regular file or block device (a FIFO would
+    /// block its open), and its one read goes through the pin.
     fn resolve(
         self,
         direct_io: bool,
         host: &pbfhogg::host::Host,
     ) -> Result<pbfhogg::getid::ElementIds, Box<dyn std::error::Error>> {
+        let id_osm_pin = self
+            .id_osm_file
+            .as_deref()
+            .map(|path| pbfhogg::read::input::PinnedInput::pin(path, host))
+            .transpose()?;
         let mut id_set = self.positional;
         if let Some(path) = self.id_file.as_deref() {
             let file_ids =
                 pbfhogg::getid::parse_ids_from_file_with_default_type(path, self.default_type)?;
             pbfhogg::getid::merge_id_sets(&mut id_set, &file_ids);
         }
-        if let Some(path) = self.id_osm_file.as_deref() {
-            let pbf_ids = pbfhogg::getid::parse_ids_from_pbf(path, direct_io, host)?;
+        if let Some(pin) = id_osm_pin.as_ref() {
+            let pbf_ids = pbfhogg::getid::parse_ids_from_pbf(pin, direct_io, host)?;
             pbfhogg::getid::merge_id_sets(&mut id_set, &pbf_ids);
         }
         if id_set.is_empty() {
@@ -3985,7 +3987,7 @@ fn run_derive_changes(
 }
 
 fn run_getid(
-    file: &std::path::Path,
+    input: &pbfhogg::read::input::PinnedInput,
     output: pbfhogg::Output,
     flags: GetidFlags,
     sources: IdSources,
@@ -4009,7 +4011,7 @@ fn run_getid(
         remove_tags,
         report_found: verbose_ids,
     };
-    let stats = pbfhogg::getid::getid(file, output, &id_set, &opts, write, overrides, host)?;
+    let stats = pbfhogg::getid::getid(input, output, &id_set, &opts, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("getid.summary"))?;
     host::note_unverified_claims(stats.passthrough_claimed);
 
@@ -4045,7 +4047,7 @@ fn run_getparents(
 }
 
 fn run_removeid(
-    file: &std::path::Path,
+    input: &pbfhogg::read::input::PinnedInput,
     output: pbfhogg::Output,
     sources: IdSources,
     write: &WriteOptions,
@@ -4053,7 +4055,7 @@ fn run_removeid(
     host: &pbfhogg::host::Host,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let id_set = sources.resolve(write.direct_reads, host)?;
-    let stats = pbfhogg::getid::removeid(file, output, &id_set, write, overrides, host)?;
+    let stats = pbfhogg::getid::removeid(input, output, &id_set, write, overrides, host)?;
     stats.write_summary(&mut host.diagnostics.summary_writer("getid.summary"))?;
     host::note_unverified_claims(stats.passthrough_claimed);
     Ok(())

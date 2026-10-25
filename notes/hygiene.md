@@ -727,6 +727,26 @@ The judgement calls already known, to be checked first:
     and pass-2 schedules each walk the headers again where pass 1's walk
     could feed them all - repeated work on a measured planet path, not an
     identity hole, so it was left for a measured change of its own.
+  - getid adopted it with the CLI pinning, not the library: the first
+    design pinned inside `getid` and left the `-I` PBF read whole before
+    the main input was pinned, which codex held breaks "pin each before
+    probing any", and a FIFO `-I` blocks in its open (no ESPIPE first).
+    So the public `getid`, `removeid` and `parse_ids_from_pbf` take
+    `impl Into<InputSource>`, the new public `InputSource::pin` pins a
+    path or shares a caller's pin, and the CLI pins the input after
+    reserving the output and before `IdSources::resolve`, which pins the
+    `-I` PBF before reading either ID file. `resolve` is shared, so
+    getparents' `-I` is pinned too; its main input is still HYG-174's.
+    The same path as input and `-I` is two pins, taken back to back:
+    sharing one would need lexical path equality, which misses `./x`
+    against `x`. `dispatch_scan_arm` and `estimate_blob_count` take
+    `impl Into<InputSource>`. Every open became one derived open,
+    descriptions unchanged. The streaming full-scan arm is unreachable
+    from a fixture through the public entry, so a test-hooks unit test
+    drives `getid_dispatched` with the threshold at one. Found on the
+    way: `cli_input_contract.rs` claimed its forced-unindexed getid case
+    reached the streaming arm; unindexed input always takes the walker,
+    so the comment and test name now say so.
 
 ---
 
@@ -1393,9 +1413,12 @@ path went. What each entry owes, settled in a codex spar on 2026-10-25:
   its scan, `has_indexdata`, then node statistics), the public entry points
   have to accept a pin (an `impl Into<InputSource>` or a `&PinnedInput`
   variant), so one run is one pin; independent pins per call do not help.
-- With several inputs, pin each before probing any. The same path given
+- With several inputs, pin each before probing any, secondary ones read in
+  a single open included (a FIFO blocks in that open). The same path given
   twice (`cat a a`, `diff a a`) needs a decision in that command's entry:
-  one pin or two.
+  one pin or two. Where the CLI reads one input before the library call
+  that reads another (getid's `-I`), the CLI pins and the entry point takes
+  an `InputSource` and calls `InputSource::pin`.
 - Test from the fault point: arm `FaultPlan::arm_input_replacement` after
   an open in the middle of the run, then assert the replacement fired, that
   opens followed it (`attempts_after_fired`), and the outcome in both modes:
@@ -1427,21 +1450,15 @@ and its full-decode fallback each read the whole report from one open, but
 the full decode takes its file size from a separate path `stat`, which
 HYG-187 covers.
 
-## HYG-173 - getid reopens its input by path per pass
-
-Anger: 7 - one command.
-
-See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): follow
-the brief.
-
-Reported by: the HYG-078 resolution.
-
 ## HYG-174 - getparents reopens its input by path per pass
 
 Anger: 7 - one command.
 
-See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): follow
-the brief.
+See "Adopting `PinnedInput`" above. Its `-I` PBF is already pinned (the
+shared `IdSources::resolve`, since getid's entry), so what is left is
+getid's shape: the CLI pins the main input before `resolve`, and
+`getparents` / `getparents_with_min_blobs` take an `InputSource`.
+Recommendation (2026-10-25): follow the brief.
 
 Reported by: the HYG-078 resolution.
 

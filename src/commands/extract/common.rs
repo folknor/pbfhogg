@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::cat::CleanAttrs;
+use crate::read::input::PinnedInput;
 use crate::read::wire::{Cursor, WIRE_LEN};
 use crate::writer::PbfWriter;
 use crate::{BlobFilter, Element, MemberId, PrimitiveBlock};
@@ -180,7 +181,10 @@ pub(super) fn warn_passthrough_demotions(verified: u64, demoted: u64, host: &cra
 
 /// Build a blob schedule from a header-only scan.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(super) fn build_blob_schedule(input: &Path, host: &crate::host::Host) -> Result<Vec<BlobDesc>> {
+pub(super) fn build_blob_schedule(
+    input: &PinnedInput,
+    host: &crate::host::Host,
+) -> Result<Vec<BlobDesc>> {
     build_blob_schedule_with_passthrough(input, None, host)
 }
 
@@ -192,7 +196,7 @@ pub(super) fn build_blob_schedule(input: &Path, host: &crate::host::Host) -> Res
 /// a fresh fd and reads only the blobs it actually needs.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn build_blob_schedule_with_passthrough(
-    input: &Path,
+    input: &PinnedInput,
     extract_bbox: Option<&crate::BlobBbox>,
     host: &crate::host::Host,
 ) -> Result<Vec<BlobDesc>> {
@@ -201,7 +205,7 @@ pub(super) fn build_blob_schedule_with_passthrough(
         crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
     let _ = walker
         .next_header()?
-        .ok_or_else(|| crate::error::new_missing_header(input))?;
+        .ok_or_else(|| crate::error::new_missing_header(input.path()))?;
 
     let mut schedule = Vec::new();
     let mut passthrough_candidates: u64 = 0;
@@ -266,7 +270,7 @@ pub(super) fn merge_extract_stats(target: &mut ExtractStats, source: &ExtractSta
 #[allow(clippy::too_many_lines)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn pread_execute<F>(
-    input: &Path,
+    input: &PinnedInput,
     schedule: &[BlobDesc],
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
@@ -289,14 +293,15 @@ where
     // are plain Vec<u8> without alignment guarantees.
     //
     // wontfix(fd-per-call): simple extract calls `pread_execute` three times
-    // (nodes, ways, relations) and each call opens a fresh fd. The cost is
-    // 1-5 us per open, 3-15 us total per run - invisible against the ~tens of
-    // seconds of pread+decode work. Hoisting to the caller is possible but
-    // buys nothing measurable; the local-scope Arc keeps the API simple.
-    let shared_file = std::sync::Arc::new(crate::read::input::open(input)?);
+    // (nodes, ways, relations) and each call opens a fresh fd, derived from
+    // the run's pin. The cost is a few us per open (with the pin's fstat
+    // check) - invisible against the ~tens of seconds of pread+decode work.
+    // Hoisting to the caller is possible but buys nothing measurable; the
+    // local-scope Arc keeps the API simple.
+    let shared_file = std::sync::Arc::new(input.open()?);
     // The input's identity, captured once; each worker borrows it to locate a
     // failure with the frame offset the schedule handed it.
-    let source: std::sync::Arc<Path> = std::sync::Arc::from(input);
+    let source: std::sync::Arc<Path> = std::sync::Arc::from(input.path());
     let source = &source;
 
     let decode_threads = crate::host::sized_workers(
@@ -518,7 +523,7 @@ where
 /// that will be reused for subsequent phases).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn pread_write_pass<F>(
-    input: &Path,
+    input: &PinnedInput,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
     block_fn: F,
@@ -548,7 +553,7 @@ where
 /// cascade (commits `d4ea760`, `0b085b1`, 2026-04-10/11).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn pread_write_pass_with_schedule<F>(
-    input: &Path,
+    input: &PinnedInput,
     schedule: &[BlobDesc],
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,

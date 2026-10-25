@@ -1158,6 +1158,20 @@
 
 ### Fixed
 
+- **`extract` and `multi-extract` read one input file even if it is
+  replaced mid-run.** Every strategy opens the input several times per run
+  (the sortedness and indexdata checks, the schedule walks, the header
+  read, the classify and write passes, and on a multi-extract that falls
+  back to one extract per region, every region's passes), and each open
+  used to resolve the path again, so an input renamed over during the run
+  was read partly from each file, with no error. The input is now pinned
+  once when the run starts, for every region of a multi-extract: on Linux
+  with `/proc` a replaced or deleted input does not affect the run; on
+  other Unix hosts the run fails with `ErrorKind::InputReplaced` and
+  publishes nothing. An input that is a FIFO, socket or character device
+  is now refused up front (it could not serve the repeated reads before
+  either).
+
 - **`sort` reads one input file even if it is replaced mid-run.** The
   input is opened several times per run (the indexdata check, pass 1's
   header walk, pass 2's passthrough source, and one reader per overlap run

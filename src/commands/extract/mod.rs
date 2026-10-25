@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use crate::cat::CleanAttrs;
 use crate::coord_fmt::e7_to_deg;
 use crate::error::Error;
+use crate::read::input::PinnedInput;
 use crate::write::WriteOptions;
 
-use super::{HeaderOverrides, Result, require_indexdata};
+use super::{HeaderOverrides, Result};
 
 mod common;
 mod complete;
@@ -624,6 +625,12 @@ fn parse_extract_geometry(
 /// `outputs` is checked in full when it is built, so a refusal for any
 /// region costs no extraction work, and a failure in any region publishes
 /// nothing.
+///
+/// The input is read in several passes, so it must be a regular file or a
+/// block device (`InvalidArgument` otherwise), and is pinned once for the
+/// whole run, every region included (see [`PinnedInput`]): where a later
+/// open cannot reach the pinned file, an input replaced mid-run fails with
+/// `InputReplaced`.
 #[allow(clippy::too_many_arguments)]
 pub fn extract_multi(
     input: &Path,
@@ -644,8 +651,11 @@ pub fn extract_multi(
             regions.len()
         )));
     }
+    // One pin for the run: the single-pass attempt and, when it declines or
+    // is not tried, every region's extract open the input again through it.
+    let pin = PinnedInput::pin(input, host)?;
     let stats = extract_multi_to(
-        input, regions, &outputs, strategy, set_bounds, clean, write, overrides, host,
+        &pin, regions, &outputs, strategy, set_bounds, clean, write, overrides, host,
     )?;
     outputs.publish(&host.cancel)?;
     Ok(stats)
@@ -653,7 +663,7 @@ pub fn extract_multi(
 
 #[allow(clippy::too_many_arguments)]
 fn extract_multi_to(
-    input: &Path,
+    input: &PinnedInput,
     regions: &[Region],
     outputs: &crate::output::OutputSet,
     strategy: ExtractStrategy,
@@ -811,6 +821,11 @@ fn output_facts(set_bounds: bool, bbox: &Bbox) -> crate::commands::output_header
 // ---------------------------------------------------------------------------
 
 /// Extract elements within `region` from `input` and write to `output`.
+///
+/// The input is read in several passes, so it must be a regular file or a
+/// block device (`InvalidArgument` otherwise), and is pinned for the run
+/// (see [`PinnedInput`]): where a later open cannot reach the pinned file,
+/// an input replaced mid-run fails with `InputReplaced`.
 #[allow(clippy::too_many_arguments)]
 pub fn extract(
     input: &Path,
@@ -824,8 +839,17 @@ pub fn extract(
     host: &crate::host::Host,
 ) -> Result<ExtractStats> {
     host.cancel.check()?;
+    // Every pass opens the input again, each through its own open file
+    // description (the probes, the schedule walks, the header read, the
+    // classify descriptors and the write passes), and each is derived from
+    // this one pin, so a file renamed over the input mid-run cannot be read
+    // partly from each: where `/proc/self/fd` reopens the pin every open
+    // reaches the pinned file, otherwise on Unix a replaced input fails the
+    // run (`PinnedInput` says what it does off Unix). Taken before any
+    // other open of it.
+    let pin = PinnedInput::pin(input, host)?;
     let result = extract_to(
-        input, &output, region, strategy, set_bounds, clean, write, overrides, host,
+        &pin, &output, region, strategy, set_bounds, clean, write, overrides, host,
     )?;
     output.publish(&host.cancel)?;
     Ok(result)
@@ -835,7 +859,7 @@ pub fn extract(
 #[allow(clippy::too_many_arguments)]
 #[hotpath::measure]
 pub(crate) fn extract_to(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     region: &Region,
     strategy: ExtractStrategy,
@@ -846,9 +870,9 @@ pub(crate) fn extract_to(
     host: &crate::host::Host,
 ) -> Result<ExtractStats> {
     if !matches!(strategy, ExtractStrategy::Simple) {
-        require_indexdata(
-            input,
-            write.direct_reads,
+        // A front read of its own, dropped at once: the passes below read
+        // the header again on their own descriptions.
+        super::input_front::InputFront::open(input, write.direct_reads, host)?.require_indexdata(
             write.force,
             "input PBF has no blob-level indexdata. Without indexdata, the spatial bbox \
              filter is a no-op - all blobs are decompressed (significantly slower).",

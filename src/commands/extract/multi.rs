@@ -1,7 +1,5 @@
 //! Multi-extract: single-pass multi-region extraction for sorted inputs (simple strategy).
 
-use std::path::Path;
-
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
 use crate::{Element, ElementKind, PrimitiveBlock};
@@ -11,7 +9,7 @@ use super::super::{
     ensure_way_capacity_local, flush_local,
 };
 use crate::idset::IdSet;
-use crate::read::input::InputFile;
+use crate::read::input::{InputFile, PinnedInput};
 use crate::read::region_grid::RegionGrid;
 use crate::scan::classify::ScheduledBlob;
 
@@ -36,7 +34,7 @@ use crate::owned::{dense_node_metadata, element_metadata, relation_members_into}
 )]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn try_extract_multi_single_pass(
-    input: &Path,
+    input: &PinnedInput,
     regions: &[Region],
     outputs: &crate::output::OutputSet,
     set_bounds: bool,
@@ -197,7 +195,7 @@ pub(super) fn try_extract_multi_single_pass(
         crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
     let _ = walker
         .next_header()?
-        .ok_or_else(|| crate::error::new_missing_header(input))?;
+        .ok_or_else(|| crate::error::new_missing_header(input.path()))?;
 
     let mut node_schedule: Vec<ScheduledBlob> = Vec::new();
     let mut way_schedule: Vec<ScheduledBlob> = Vec::new();

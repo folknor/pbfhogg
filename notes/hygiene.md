@@ -1411,15 +1411,6 @@ and its full-decode fallback each read the whole report from one open, but
 the full decode takes its file size from a separate path `stat`, which
 HYG-187 covers.
 
-## HYG-171 - extract reopens its input by path per pass
-
-Anger: 8 - planet-scale command.
-
-See "Adopting `PinnedInput`" above. multi-extract included if it is the
-same command. Recommendation (2026-10-25): follow the brief.
-
-Reported by: the HYG-078 resolution.
-
 ## HYG-172 - tags-filter reopens its input by path per pass
 
 Anger: 8 - planet-scale command.

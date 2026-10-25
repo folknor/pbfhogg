@@ -6,6 +6,7 @@ use rayon::prelude::*;
 
 use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::cat::CleanAttrs;
+use crate::read::input::PinnedInput;
 use crate::write::WriteOptions;
 use crate::writer::PbfWriter;
 use crate::{BlockType, Element, PrimitiveBlock};
@@ -98,7 +99,7 @@ fn classify_block_simple(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn extract_simple(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     region: &Region,
     set_bounds: bool,
@@ -129,7 +130,7 @@ pub(super) fn extract_simple(
 // Unsorted fallback: two passes (collect IDs, then write).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn extract_simple_two_pass(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     region: &Region,
     set_bounds: bool,
@@ -275,7 +276,7 @@ fn extract_simple_two_pass(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn extract_simple_single_pass(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     region: &Region,
     set_bounds: bool,
@@ -392,9 +393,9 @@ fn extract_simple_single_pass(
 
         // node_schedule already filtered to node blobs.
 
-        let classify_file = std::sync::Arc::new(crate::read::input::open(input)?);
+        let classify_file = std::sync::Arc::new(input.open()?);
         // The input's identity, captured once; each worker borrows it.
-        let source: std::sync::Arc<Path> = std::sync::Arc::from(input);
+        let source: std::sync::Arc<Path> = std::sync::Arc::from(input.path());
         let source = &source;
 
         let decode_threads = crate::host::sized_workers(
@@ -555,9 +556,9 @@ fn extract_simple_single_pass(
     {
         use std::os::unix::fs::FileExt as _;
 
-        let classify_file = std::sync::Arc::new(crate::read::input::open(input)?);
+        let classify_file = std::sync::Arc::new(input.open()?);
         // The input's identity, captured once; each worker borrows it.
-        let source: std::sync::Arc<Path> = std::sync::Arc::from(input);
+        let source: std::sync::Arc<Path> = std::sync::Arc::from(input.path());
         let source = &source;
         let decode_threads = crate::host::sized_workers(
             &*host.resources,

@@ -1,9 +1,8 @@
 //! Smart extraction strategy (three passes) + shared Pass 1 ID collection used by complete-ways.
 
-use std::path::Path;
-
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::cat::CleanAttrs;
+use crate::read::input::PinnedInput;
 use crate::write::WriteOptions;
 use crate::{Element, MemberId, PrimitiveBlock};
 
@@ -131,7 +130,7 @@ enum UnsortedPhase {
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 #[hotpath::measure]
 pub(super) fn collect_pass1_generic<H: RelationHandler>(
-    input: &Path,
+    input: &PinnedInput,
     region: &Region,
     bbox_int: &BboxInt,
     direct_io: bool,
@@ -243,7 +242,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
         crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
     let _ = walker
         .next_header()?
-        .ok_or_else(|| crate::error::new_missing_header(input))?;
+        .ok_or_else(|| crate::error::new_missing_header(input.path()))?;
 
     use crate::scan::classify::ScheduledBlob;
     let mut node_schedule: Vec<ScheduledBlob> = Vec::new();
@@ -476,7 +475,7 @@ pub(super) fn collect_pass1_generic<H: RelationHandler>(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn extract_smart(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     region: &Region,
     set_bounds: bool,

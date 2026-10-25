@@ -1,8 +1,7 @@
 //! Complete-ways extraction strategy (two passes).
 
-use std::path::Path;
-
 use crate::cat::CleanAttrs;
+use crate::read::input::PinnedInput;
 use crate::write::WriteOptions;
 
 use super::super::{HeaderOverrides, Result, writer_from_header};
@@ -17,7 +16,7 @@ use super::{ExtractStats, Region};
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn extract_complete_ways(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     region: &Region,
     set_bounds: bool,

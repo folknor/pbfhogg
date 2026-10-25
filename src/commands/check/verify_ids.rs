@@ -559,7 +559,11 @@ fn verify_single_kind_streaming(
     let mut total_violations: u64 = 0;
     let mut prev_last: Option<i64> = None;
     for slot in per_blob {
-        let r = slot.expect("parallel_classify_phase must deliver every blob");
+        let Some(r) = slot else {
+            return Err(crate::error::Error::internal(
+                "id check: classify phase left a blob slot unfilled",
+            ));
+        };
         count += r.count;
         for v in r.within_violations {
             total_violations += 1;
@@ -880,7 +884,11 @@ fn verify_single_kind_parallel(
     let mut total_violations: u64 = 0;
     let mut prev_last: Option<i64> = None;
     for slot in per_blob {
-        let r = slot.expect("parallel_classify_phase must deliver every blob");
+        let Some(r) = slot else {
+            return Err(crate::error::Error::internal(
+                "id check: classify phase left a blob slot unfilled",
+            ));
+        };
         count += r.count;
         for v in r.within_violations {
             total_violations += 1;

@@ -55,9 +55,21 @@ themselves, the entry says "Maintainer:".
 Entries were split so that each shared API and each command gets its own
 entry; the split-off entries took fresh IDs.
 
+On a measured path, a change argued as a win because it removes an
+allocation, a copy, a pass or a reread is unproven, not obvious: at planet
+scale memory moves rather than vanishing, and each stage's throughput shifts
+with it in ways the code does not show. altw's history has two such "obvious"
+wins that measured badly and were reverted (fusing stage 1's passes lost to
+re-decompression; a pipelined stage 4 reader was faster but held 27 GB
+against 1.5 GB). Before such a change, search `git log`,
+`reference/performance-history.md` and deleted `notes/` and `plans/` files
+for an earlier attempt at the same idea and its measured outcome; if one was
+reverted, say why the new attempt differs. Prefer changes that leave the data
+flow and each stage's memory shape untouched. Anything that changes them
+goes on "Review once drained" as a bisect candidate, named by commit.
+
 Launch order, one agent per line, run serially:
 
-26. HYG-159
 27. HYG-160
 28. HYG-180
 29. BUG-183
@@ -1224,19 +1236,6 @@ reports zero alignment.
 
 Reported by: altw and scanning, re-encoding, filtering and spatial, CLI and
 plumbing.
-
-## HYG-159 - `check --ids` expects every classify slot filled
-
-Anger: 5 - the hostile-input path.
-
-Split out of an entry on aborts where a refusal was owed (2026-10-25). `check/verify_ids.rs`:
-`slot.expect("parallel_classify_phase must deliver every blob")` twice, on
-the path whose job is to survive hostile files.
-
-Recommendation (2026-10-25): let-else returning an internal error.
-
-Reported by: write path, read path, CLI and plumbing, filtering and spatial,
-re-encoding, altw and scanning.
 
 ## HYG-160 - getid's `unreachable!()`s rest on a char prefix
 

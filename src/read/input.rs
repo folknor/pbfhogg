@@ -13,9 +13,26 @@
 //! failure is located with the file, the blob ordinal and the byte offset.
 //!
 //! Locating is cold: nothing here runs per blob on success.
+//!
+//! # One input, one file, however many opens
+//!
+//! A command that reads its input in several passes opens it several times,
+//! and on purpose: `posix_fadvise` advice and readahead state belong to an
+//! open file description, so the header walker's `FADV_RANDOM`, a buffered
+//! pass's `FADV_SEQUENTIAL` and a worker pool's plain body preads each keep
+//! their own. Opening the path each time, though, resolves it each time, so
+//! a file renamed over the input mid-run (an atomic replace by a downloader)
+//! would be read partly from each file, with no error. A [`PinnedInput`]
+//! closes that gap without merging any descriptions: it is taken once, at
+//! the command's start, and every later open of that input is an
+//! [`InputSource::Pinned`] open derived from it - a fresh description of the
+//! pinned file, verified against it before use. See [`PinnedInput`] for what
+//! it does and does not catch. A one-shot [`InputSource::Path`] open is what
+//! a single-pass reader, a library entry point handed a bare path, and every
+//! scratch file use.
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::error::{Error, Location, Result};
@@ -61,6 +78,400 @@ pub(crate) fn metadata(path: &Path) -> Result<std::fs::Metadata> {
     std::fs::metadata(path).map_err(|e| named("stat", path, e))
 }
 
+/// Where an input is opened from: its path, resolved again by every open, or
+/// a [`PinnedInput`] every open is derived from and verified against.
+///
+/// Deliberately not `AsRef<Path>`: a helper that took the path back out of a
+/// pinned source and opened that would drop the pin without a trace.
+/// [`Self::path`] is for naming the input, never for opening it.
+#[derive(Clone, Copy, Debug)]
+pub enum InputSource<'a> {
+    /// The path, resolved again by every open: a single-pass reader, a
+    /// library entry point handed a bare path.
+    Path(&'a Path),
+    /// A pinned input; see [`PinnedInput`].
+    Pinned(&'a PinnedInput),
+}
+
+impl<'a> From<&'a Path> for InputSource<'a> {
+    fn from(path: &'a Path) -> Self {
+        Self::Path(path)
+    }
+}
+
+impl<'a> From<&'a PathBuf> for InputSource<'a> {
+    fn from(path: &'a PathBuf) -> Self {
+        Self::Path(path.as_path())
+    }
+}
+
+impl<'a> From<&'a Arc<Path>> for InputSource<'a> {
+    fn from(path: &'a Arc<Path>) -> Self {
+        Self::Path(path)
+    }
+}
+
+impl<'a> From<&'a PinnedInput> for InputSource<'a> {
+    fn from(pin: &'a PinnedInput) -> Self {
+        Self::Pinned(pin)
+    }
+}
+
+impl<'a> InputSource<'a> {
+    /// The input's path, for naming it in diagnostics and errors.
+    #[must_use]
+    pub fn path(&self) -> &'a Path {
+        match *self {
+            Self::Path(path) => path,
+            Self::Pinned(pin) => pin.path(),
+        }
+    }
+
+    /// A new open file description of the input, for reading, with no
+    /// advice applied. The error names the input.
+    pub(crate) fn open(&self) -> Result<File> {
+        match *self {
+            Self::Path(path) => open(path),
+            Self::Pinned(pin) => pin.open(),
+        }
+    }
+
+    /// A new `O_DIRECT` open file description of the input and the
+    /// alignment its reads must keep, as `crate::direct_io::open_for_read`
+    /// returns them: a platform refusal names the input, an ordinary open
+    /// failure is left for the caller to name.
+    #[cfg(feature = "linux-direct-io")]
+    pub(crate) fn open_direct(&self) -> Result<(File, usize)> {
+        match *self {
+            Self::Path(path) => crate::direct_io::open_for_read(path),
+            Self::Pinned(pin) => pin.open_direct(),
+        }
+    }
+
+    /// The input's metadata: of the pinned file for a pinned input, so a
+    /// size or type read here describes the file the passes read.
+    ///
+    /// # Errors
+    /// The `stat` failed; the error names the input.
+    pub fn metadata(&self) -> Result<std::fs::Metadata> {
+        match *self {
+            Self::Path(path) => metadata(path),
+            Self::Pinned(pin) => pin.metadata(),
+        }
+    }
+}
+
+/// One input of one run, pinned, so that every open of it during the run
+/// reads the same file.
+///
+/// Taken once, at the start of a command that opens its input more than
+/// once, before any other open of it; every later open goes through
+/// [`InputSource::Pinned`] and yields a new open file description (its own
+/// offset, flags, `posix_fadvise` advice and readahead state, exactly as an
+/// open of the path would), of the pinned file. The pin itself holds one
+/// descriptor for the run, which nothing reads or advises. Clones share it,
+/// and it lives as long as the last clone.
+///
+/// How a later open reaches the pinned file:
+///
+/// - On Linux, when `/proc/self/fd` reopens the pin (checked once, with a
+///   real open, when the pin is taken), every open goes through the pin's
+///   `/proc/self/fd` entry, which names the pinned file itself whatever its
+///   path names now. A file renamed over the input, or the input unlinked,
+///   mid-run does not affect the run: it reads the file it started on.
+/// - Otherwise (no usable procfs, another Unix) every open goes through the
+///   path again, and an open that finds a different file there is refused
+///   with [`ErrorKind::InputReplaced`](crate::ErrorKind::InputReplaced), so
+///   the run stops rather than read some passes from each file. These opens
+///   are non-blocking, so a FIFO put in the input's place cannot hang the
+///   run, but the open itself still happens: a device put in its place
+///   sees the open before it is refused.
+///
+/// Either way every descriptor is checked against the pin (`fstat`, device
+/// and inode) before it is returned, and its `O_NONBLOCK` is cleared again.
+///
+/// What a pin does not catch: changes to the contents behind the same file
+/// (an in-place rewrite, truncation, a block device reconfigured or its
+/// media changed), and a replacement before the pin was taken. A pin
+/// identifies a file; it is not a snapshot of one. Where `std` reports no
+/// device and inode (not Unix) nothing is verified: every open is a plain
+/// open of the path.
+///
+/// Only a regular file or a block device can be pinned: a command that
+/// pins reads its input more than once, and a FIFO, socket or character
+/// device does not serve the same bytes twice. On Linux the pin is an
+/// `O_PATH` descriptor, so the pin itself runs no device open and needs no
+/// read permission (the one-off procfs probe is a real read-only open of the
+/// pinned file); an unreadable input fails at its first real open, naming
+/// the path.
+///
+/// Off Unix a pin holds no descriptor, only the path: its opens and its
+/// metadata go through the path, unverified.
+#[derive(Clone, Debug)]
+pub struct PinnedInput(Arc<Pin>);
+
+#[derive(Debug)]
+struct Pin {
+    path: Arc<Path>,
+    #[cfg(unix)]
+    anchor: File,
+    #[cfg(unix)]
+    identity: Identity,
+    #[cfg(unix)]
+    reopen: Reopen,
+    /// Where the fault plan lives (see `crate::test_hooks`).
+    #[cfg(feature = "test-hooks")]
+    cancel: crate::host::Cancel,
+}
+
+/// `(st_dev, st_ino)`.
+#[cfg(unix)]
+type Identity = (u64, u64);
+
+#[cfg(unix)]
+fn identity_of(meta: &std::fs::Metadata) -> Identity {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
+/// How a pinned input's later opens reach the pinned file.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reopen {
+    /// Through `/proc/self/fd/<pin>`: the pinned file itself.
+    Procfs,
+    /// Through the path, verified.
+    Path,
+}
+
+/// A read-only, non-blocking open of `path` with `extra` flags; the caller
+/// names the input in a failure.
+#[cfg(unix)]
+fn open_nonblocking(path: &Path, extra: i32) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // A read-only open: `crate::read::input` is the one owner of these, and
+    // every caller names the input in the error.
+    #[allow(clippy::disallowed_methods)]
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | extra)
+        .open(path)
+}
+
+/// Clear `O_NONBLOCK` on `file`'s description again, keeping every other
+/// status flag (`O_DIRECT` among them) as the open set it.
+#[cfg(unix)]
+fn clear_nonblock(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    // SAFETY: `fd` stays open for the call (borrowed from `file`); F_GETFL
+    // takes no argument.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(named(
+            "read the status flags of",
+            path,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: as above; F_SETFL takes the new status flags as an int.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+        return Err(named(
+            "set the status flags of",
+            path,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+impl PinnedInput {
+    /// Pin `path` for a run under `host`.
+    ///
+    /// # Errors
+    /// The path cannot be opened or `stat`ed, or names something other than
+    /// a regular file or a block device; the error names it.
+    pub fn pin(path: &Path, host: &crate::host::Host) -> Result<Self> {
+        #[cfg(feature = "test-hooks")]
+        let force_path = host.cancel.faults().forces_pin_path_reopen();
+        #[cfg(not(feature = "test-hooks"))]
+        let force_path = false;
+        Self::pin_with(path, host, force_path)
+    }
+
+    #[cfg(unix)]
+    fn pin_with(path: &Path, host: &crate::host::Host, force_path: bool) -> Result<Self> {
+        use std::os::unix::fs::FileTypeExt;
+        #[cfg(not(feature = "test-hooks"))]
+        let _ = host;
+        #[cfg(target_os = "linux")]
+        let flags = libc::O_PATH;
+        #[cfg(not(target_os = "linux"))]
+        let flags = 0;
+        let anchor = open_nonblocking(path, flags).map_err(|e| named("open", path, e))?;
+        let meta = anchor.metadata().map_err(|e| named("stat", path, e))?;
+        let kind = meta.file_type();
+        if !kind.is_file() && !kind.is_block_device() {
+            return Err(Error::invalid_argument(format!(
+                "{} is not a regular file or a block device: this command reads its input \
+                 more than once, which needs one that serves the same bytes to every open",
+                path.display()
+            )));
+        }
+        let identity = identity_of(&meta);
+        let reopen = if !force_path && procfs_reopens(&anchor, identity) {
+            Reopen::Procfs
+        } else {
+            Reopen::Path
+        };
+        Ok(Self(Arc::new(Pin {
+            path: Arc::from(path),
+            anchor,
+            identity,
+            reopen,
+            #[cfg(feature = "test-hooks")]
+            cancel: host.cancel.clone(),
+        })))
+    }
+
+    #[cfg(not(unix))]
+    fn pin_with(path: &Path, host: &crate::host::Host, _force_path: bool) -> Result<Self> {
+        #[cfg(not(feature = "test-hooks"))]
+        let _ = host;
+        let meta = metadata(path)?;
+        if !meta.is_file() {
+            return Err(Error::invalid_argument(format!(
+                "{} is not a regular file: this command reads its input more than once, \
+                 which needs one that serves the same bytes to every open",
+                path.display()
+            )));
+        }
+        Ok(Self(Arc::new(Pin {
+            path: Arc::from(path),
+            #[cfg(feature = "test-hooks")]
+            cancel: host.cancel.clone(),
+        })))
+    }
+
+    /// The pinned input's path, as given.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.0.path
+    }
+
+    /// The pinned file's metadata (on Unix a live `fstat` of the pin; off
+    /// Unix a `stat` of the path).
+    ///
+    /// # Errors
+    /// The `stat` failed; the error names the input.
+    pub fn metadata(&self) -> Result<std::fs::Metadata> {
+        #[cfg(unix)]
+        {
+            self.0
+                .anchor
+                .metadata()
+                .map_err(|e| named("stat", &self.0.path, e))
+        }
+        #[cfg(not(unix))]
+        {
+            metadata(&self.0.path)
+        }
+    }
+
+    /// See [`InputSource::open`].
+    pub(crate) fn open(&self) -> Result<File> {
+        self.hooked(|| self.open_verified())
+    }
+
+    /// See [`InputSource::open_direct`].
+    #[cfg(feature = "linux-direct-io")]
+    pub(crate) fn open_direct(&self) -> Result<(File, usize)> {
+        self.hooked(|| {
+            crate::direct_io::open_for_read_verified(
+                &self.open_path(),
+                &self.0.path,
+                libc::O_NONBLOCK,
+                |file| self.verify(file),
+            )
+        })
+    }
+
+    #[cfg(unix)]
+    fn open_verified(&self) -> Result<File> {
+        let file =
+            open_nonblocking(&self.open_path(), 0).map_err(|e| named("open", &self.0.path, e))?;
+        self.verify(&file)?;
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    fn open_verified(&self) -> Result<File> {
+        open(&self.0.path)
+    }
+
+    /// What a later open opens: the pin's `/proc/self/fd` entry, or the path.
+    #[cfg(unix)]
+    fn open_path(&self) -> std::borrow::Cow<'_, Path> {
+        match self.0.reopen {
+            Reopen::Procfs => std::borrow::Cow::Owned(procfs_entry(&self.0.anchor)),
+            Reopen::Path => std::borrow::Cow::Borrowed(&self.0.path),
+        }
+    }
+
+    /// Refuse `file` unless it is the pinned file, then clear the
+    /// `O_NONBLOCK` the open added.
+    #[cfg(unix)]
+    fn verify(&self, file: &File) -> Result<()> {
+        let meta = file
+            .metadata()
+            .map_err(|e| named("stat", &self.0.path, e))?;
+        if identity_of(&meta) != self.0.identity {
+            return Err(crate::error::new_input_replaced(&self.0.path));
+        }
+        clear_nonblock(file, &self.0.path)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn hooked<T>(&self, open: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.0.cancel.faults().pinned_open(&self.0.path, open)
+    }
+
+    #[cfg(not(feature = "test-hooks"))]
+    #[allow(clippy::unused_self)]
+    fn hooked<T>(&self, open: impl FnOnce() -> Result<T>) -> Result<T> {
+        open()
+    }
+
+    /// Which way this pin's later opens go, for tests.
+    #[cfg(all(test, unix))]
+    fn reopens_through_procfs(&self) -> bool {
+        self.0.reopen == Reopen::Procfs
+    }
+}
+
+/// `/proc/self/fd/<fd>` of `file`.
+#[cfg(unix)]
+fn procfs_entry(file: &File) -> PathBuf {
+    use std::os::unix::io::AsRawFd;
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// Whether a real read-only open of the pin's `/proc/self/fd` entry yields
+/// the pinned file. Any failure, or any other file, means later opens go
+/// through the path instead, which verifies every open just the same: the
+/// fallback gives up tolerating a replaced input, never consistency.
+#[cfg(target_os = "linux")]
+fn procfs_reopens(anchor: &File, identity: Identity) -> bool {
+    open_nonblocking(&procfs_entry(anchor), 0)
+        .and_then(|probe| probe.metadata())
+        .is_ok_and(|meta| identity_of(&meta) == identity)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn procfs_reopens(_anchor: &File, _identity: Identity) -> bool {
+    false
+}
+
 /// An open input and the path it was opened from, so a failure reading it
 /// can name the file. Cloning shares both.
 #[derive(Clone, Debug)]
@@ -70,14 +481,16 @@ pub struct InputFile {
 }
 
 impl InputFile {
-    /// Open `path` for positional reads, naming it in a failure.
+    /// Open `source` for positional reads, naming it in a failure.
     ///
     /// # Errors
-    /// The open failed; the error names `path`.
-    pub fn open(path: &Path) -> Result<Self> {
+    /// The open failed, or a pinned input's path now names another file;
+    /// the error names the input.
+    pub fn open<'a>(source: impl Into<InputSource<'a>>) -> Result<Self> {
+        let source = source.into();
         Ok(Self {
-            file: Arc::new(open(path)?),
-            path: Arc::from(path),
+            file: Arc::new(source.open()?),
+            path: Arc::from(source.path()),
         })
     }
 
@@ -119,6 +532,166 @@ impl InputFile {
             None,
             Some(crate::ByteOffset(offset)),
         ))
+    }
+}
+
+/// A pinned input against a path renamed over, unlinked, or naming a stream.
+#[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used, clippy::disallowed_methods)]
+mod pin_tests {
+    use std::io::Read as _;
+    use std::os::unix::fs::FileExt as _;
+    use std::path::Path;
+
+    use super::{InputSource, PinnedInput};
+    use crate::ErrorKind;
+    use crate::host::Host;
+
+    fn read_all(mut file: std::fs::File) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// `original` at `input`, `replacement` beside it.
+    fn fixture(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let input = dir.join("in.osm.pbf");
+        let replacement = dir.join("replacement.osm.pbf");
+        std::fs::write(&input, b"original").unwrap();
+        std::fs::write(&replacement, b"the replacement").unwrap();
+        (input, replacement)
+    }
+
+    /// On Linux the pin reopens through procfs: a file renamed over the
+    /// input, or the input unlinked, leaves every later open on the pinned
+    /// file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn procfs_reopen_reads_the_pinned_file_after_a_replace_and_an_unlink() {
+        let dir = crate::path_guard::tests::scratch();
+        let (input, replacement) = fixture(dir.path());
+        let pin = PinnedInput::pin_with(&input, &Host::for_tests(), false).unwrap();
+        if !pin.reopens_through_procfs() {
+            // No usable procfs here: the path mode is covered by its own test.
+            return;
+        }
+        assert_eq!(read_all(pin.open().unwrap()), b"original");
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&input)
+            .unwrap();
+
+        std::fs::rename(&replacement, &input).unwrap();
+        assert_eq!(read_all(pin.open().unwrap()), b"original");
+        assert_eq!(pin.metadata().unwrap().len(), 8);
+        // The pin's metadata is a live fstat of the pinned file.
+        std::io::Write::write_all(&mut writer, b"!").unwrap();
+        assert_eq!(pin.metadata().unwrap().len(), 9);
+        // The path itself now names the replacement.
+        assert_eq!(read_all(super::open(&input).unwrap()), b"the replacement");
+
+        std::fs::remove_file(&input).unwrap();
+        assert_eq!(
+            read_all(InputSource::from(&pin).open().unwrap()),
+            b"original!"
+        );
+    }
+
+    /// Reopening through the path refuses a file renamed over the input,
+    /// with the typed error naming it, and keeps working while the path
+    /// names the pinned file.
+    #[test]
+    fn path_reopen_refuses_a_replaced_input() {
+        let dir = crate::path_guard::tests::scratch();
+        let (input, replacement) = fixture(dir.path());
+        let pin = PinnedInput::pin_with(&input, &Host::for_tests(), true).unwrap();
+        assert!(!pin.reopens_through_procfs());
+        assert_eq!(read_all(pin.open().unwrap()), b"original");
+
+        std::fs::rename(&replacement, &input).unwrap();
+        let err = pin.open().unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::InputReplaced), "{err:?}");
+        assert_eq!(err.source_path(), Some(input.as_path()));
+        let err = crate::file_reader::FileReader::open(&pin, false)
+            .err()
+            .unwrap();
+        assert!(matches!(err.kind(), ErrorKind::InputReplaced), "{err:?}");
+    }
+
+    /// Every later open is a description of its own (own offset), and none
+    /// is left non-blocking.
+    #[test]
+    fn derived_opens_are_separate_blocking_descriptions() {
+        use std::os::unix::io::AsRawFd as _;
+        let dir = crate::path_guard::tests::scratch();
+        let (input, _) = fixture(dir.path());
+        for force_path in [false, true] {
+            let pin = PinnedInput::pin_with(&input, &Host::for_tests(), force_path).unwrap();
+            let mut first = pin.open().unwrap();
+            let mut second = pin.open().unwrap();
+            let mut byte = [0u8; 1];
+            first.read_exact(&mut byte).unwrap();
+            first.read_exact(&mut byte).unwrap();
+            second.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, *b"o", "the second description has its own offset");
+            let mut at = [0u8; 2];
+            second.read_exact_at(&mut at, 6).unwrap();
+            assert_eq!(at, *b"al");
+            // SAFETY: the descriptor is open for the call.
+            let flags = unsafe { libc::fcntl(first.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_eq!(flags & libc::O_NONBLOCK, 0);
+        }
+    }
+
+    /// A FIFO is refused at pin time, without blocking on a writer.
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = crate::path_guard::tests::scratch();
+        let fifo = dir.path().join("fifo");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let err = PinnedInput::pin(&fifo, &Host::for_tests()).unwrap_err();
+        assert!(
+            matches!(err.kind(), ErrorKind::InvalidArgument { .. }),
+            "{err:?}"
+        );
+        assert!(err.report().contains(&fifo.display().to_string()));
+    }
+
+    /// The test-hooks replacement fires after the armed open and the later
+    /// opens see it: refused through the path, unaffected through procfs.
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn armed_replacement_fires_between_opens() {
+        let dir = crate::path_guard::tests::scratch();
+        for force_path in [true, false] {
+            let (input, replacement) = fixture(dir.path());
+            let host = Host::for_tests();
+            host.cancel
+                .faults()
+                .force_pin_path_reopen
+                .store(force_path, std::sync::atomic::Ordering::Relaxed);
+            host.cancel
+                .faults()
+                .arm_input_replacement(&input, &replacement, 1);
+            let pin = PinnedInput::pin(&input, &host).unwrap();
+            assert_eq!(read_all(pin.open().unwrap()), b"original");
+            let later = pin.open();
+            let report = host.cancel.faults().input_replacement().unwrap();
+            assert!(report.fired);
+            assert_eq!(report.attempts, 2);
+            assert_eq!(report.attempts_after_fired, 1);
+            if force_path || !pin.reopens_through_procfs() {
+                let err = later.unwrap_err();
+                assert!(matches!(err.kind(), ErrorKind::InputReplaced), "{err:?}");
+                assert_eq!(report.refused, 1);
+            } else {
+                assert_eq!(read_all(later.unwrap()), b"original");
+                assert_eq!(report.verified, 2);
+            }
+        }
     }
 }
 

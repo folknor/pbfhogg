@@ -118,6 +118,13 @@ pub(crate) fn new_indexdata_mismatch(reason: impl Into<Cow<'static, str>>) -> Er
     })
 }
 
+/// A later open of a pinned input found a different file at its path; see
+/// [`ErrorKind::InputReplaced`].
+#[cold]
+pub(crate) fn new_input_replaced(path: &Path) -> Error {
+    new_error(ErrorKind::InputReplaced).locate(Location::in_file(path))
+}
+
 #[cold]
 pub(crate) fn new_missing_node_locations(count: u64) -> Error {
     new_error(ErrorKind::MissingNodeLocations { count })
@@ -462,6 +469,7 @@ impl Error {
             | ErrorKind::Unsorted { .. }
             | ErrorKind::IndexdataMismatch { .. }
             | ErrorKind::MissingNodeLocations { .. }
+            | ErrorKind::InputReplaced
             | ErrorKind::BlobTooLarge { .. }
             | ErrorKind::VersionRegression { .. }
             | ErrorKind::Cancelled => None,
@@ -621,6 +629,15 @@ pub enum ErrorKind {
     /// and writing a `(0, 0)` placeholder for them was not allowed. Nothing
     /// was published.
     MissingNodeLocations { count: u64 },
+    /// A command opens its input more than once, and a later open found a
+    /// different file at the input's path than the one the run pinned at its
+    /// start (the path was renamed over or replaced). The run stops rather
+    /// than read some of its passes from each file. The error's location
+    /// names the input. Where the pinned file is reopened directly (Linux
+    /// with `/proc`, see `pbfhogg::read::input::PinnedInput`) a replacement
+    /// does not affect the run, and this is raised only if a reopen yields
+    /// some other file regardless.
+    InputReplaced,
     /// A blob being written exceeds a PBF format limit: `part` is `size`
     /// bytes against a `limit` it must stay under.
     BlobTooLarge {
@@ -974,6 +991,7 @@ impl From<Error> for io::Error {
             | ErrorKind::Unsorted { .. }
             | ErrorKind::IndexdataMismatch { .. }
             | ErrorKind::MissingNodeLocations { .. }
+            | ErrorKind::InputReplaced
             | ErrorKind::VersionRegression { .. } => io::ErrorKind::InvalidData,
             ErrorKind::InvalidArgument { .. } | ErrorKind::BlobTooLarge { .. } => {
                 io::ErrorKind::InvalidInput
@@ -1072,6 +1090,12 @@ impl fmt::Display for Message<'_> {
                  off the coast of Ghana and cannot be told apart from genuine data by any \
                  reader, so no output was written. Supply a complete input, or allow the \
                  placeholder coordinates"
+            ),
+            ErrorKind::InputReplaced => write!(
+                f,
+                "the input was replaced while the run was reading it: a later open found a \
+                 different file at its path than the one the run started on, so the run \
+                 stopped rather than read some of its passes from each"
             ),
             ErrorKind::BlobTooLarge { part, size, limit } => part.describe(f, size, limit),
             ErrorKind::VersionRegression {

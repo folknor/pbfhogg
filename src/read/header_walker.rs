@@ -208,7 +208,9 @@ impl PartialIndexGuard {
 }
 
 impl HeaderWalker {
-    /// Open `path` and hint `posix_fadvise(RANDOM)` to the kernel.
+    /// Open `source` (a new open file description of it, so the advice
+    /// below stays this walker's) and hint `posix_fadvise(RANDOM)` to the
+    /// kernel.
     /// Errors if the file cannot be opened or metadata read.
     ///
     /// Intentionally opens a plain buffered fd regardless of whether
@@ -219,8 +221,13 @@ impl HeaderWalker {
     /// body reads open their own worker fds alongside the walker's
     /// `shared_file()`, rather than flowing `--direct-io` through
     /// this helper.
-    pub(crate) fn open(path: &Path, host: &crate::host::Host) -> Result<Self> {
-        let file = crate::read::input::open(path)?;
+    pub(crate) fn open<'a>(
+        source: impl Into<crate::read::input::InputSource<'a>>,
+        host: &crate::host::Host,
+    ) -> Result<Self> {
+        let source = source.into();
+        let path = source.path();
+        let file = source.open()?;
         let file_size = file
             .metadata()
             .map_err(|e| {

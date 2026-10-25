@@ -461,6 +461,37 @@ Both consumers use default features. In practice:
 - Zlib backend: **zlib-rs** (hardcoded, pure Rust, via flate2)
 - Zstd: available but **unused** - nidhogg hardcodes `Compression::Zlib(6)`
 
+## One input, one file, across passes
+
+A command that reads its input in several passes opens it once per pass or
+access pattern, and keeps those opens separate: `posix_fadvise` advice and
+readahead state belong to an open file description, so the header walker's
+`FADV_RANDOM` and a buffered pass's `FADV_SEQUENTIAL` stay on their own
+descriptions (a description shared today, such as the classify schedule's
+walker descriptor handed to its worker pool, stays shared). Opening the path
+each time would resolve it each time, so a file renamed over the input
+mid-run would be read partly from each file.
+
+`read::input::PinnedInput` is the guard. A command pins each input once, at
+its start, and every later open of it is an `InputSource::Pinned` open:
+
+- On Linux, when `/proc/self/fd` can reopen the pin (checked with a real
+  open when the pin is taken), each open is a new description of the pinned
+  file itself. A replaced or unlinked input does not affect the run.
+- Otherwise each open goes through the path, non-blocking, and an open that
+  finds a different file there (device and inode) fails the run with
+  `ErrorKind::InputReplaced` instead of mixing files. A device put in the
+  input's place still sees that open before it is refused.
+
+What a pin does not catch: a change behind the same file (an in-place
+rewrite or truncation, a block device reconfigured or its media changed),
+and a replacement before the pin is taken. Only a regular file or a block
+device can be pinned; a FIFO, socket or character device is refused when the
+pin is taken. On Unix each pin holds one descriptor for the run. Off Unix,
+where `std` reports no device and inode, a pin holds only the path and
+nothing is verified. One-shot opens
+(`InputSource::Path`), and scratch files, resolve the path as before.
+
 ## Read-path internals (both consumers)
 
 All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.

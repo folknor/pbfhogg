@@ -11,6 +11,7 @@ use std::io::{self, BufReader, Read};
 use std::path::Path;
 
 use crate::error::{Error, Result};
+use crate::read::input::InputSource;
 
 #[cfg(feature = "linux-direct-io")]
 use super::direct_reader::DirectReader;
@@ -68,7 +69,11 @@ impl FileReader {
     /// `posix_fadvise(POSIX_FADV_SEQUENTIAL)`, as osmium does, in every
     /// build: the hint is not tied to the `O_DIRECT` or `io_uring` features.
     pub fn buffered(path: &Path) -> Result<Self> {
-        let f = crate::read::input::open(path)?;
+        Self::buffered_from(InputSource::Path(path))
+    }
+
+    fn buffered_from(source: InputSource<'_>) -> Result<Self> {
+        let f = source.open()?;
         crate::fadvise::advise(&f, 0, 0, crate::fadvise::Advice::Sequential);
         Ok(Self::Buffered(BufReader::with_capacity(
             crate::write::IO_BUF_BYTES,
@@ -79,10 +84,23 @@ impl FileReader {
     /// Open a file for O_DIRECT reading with page-aligned buffers.
     #[cfg(feature = "linux-direct-io")]
     pub fn direct(path: &Path) -> Result<Self> {
+        Self::direct_from(InputSource::Path(path))
+    }
+
+    #[cfg(feature = "linux-direct-io")]
+    fn direct_from(source: InputSource<'_>) -> Result<Self> {
+        let path = source.path();
         // A platform refusal already names the path inside its source, so
-        // it stays the outermost text; any other failure gets the context.
-        Ok(Self::Direct(DirectReader::open(path).map_err(|e| {
-            if matches!(e.kind(), crate::ErrorKind::PlatformUnsupported { .. }) {
+        // it stays the outermost text, and a replaced pinned input is its
+        // own refusal; any other failure gets the context.
+        let opened = source
+            .open_direct()
+            .and_then(|(file, align)| DirectReader::from_opened(file, align, path));
+        Ok(Self::Direct(opened.map_err(|e| {
+            if matches!(
+                e.kind(),
+                crate::ErrorKind::PlatformUnsupported { .. } | crate::ErrorKind::InputReplaced
+            ) {
                 e
             } else {
                 open_error(path, e)
@@ -90,15 +108,19 @@ impl FileReader {
         })?))
     }
 
-    /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
+    /// Open an input, selecting buffered or O_DIRECT based on the `direct`
+    /// flag. A path (`&Path`, `&PathBuf`) is opened as given; a
+    /// [`PinnedInput`](crate::read::input::PinnedInput) is opened as the
+    /// file it pinned.
     ///
     /// Returns an error if `direct` is true but the `linux-direct-io` feature
     /// is not enabled.
-    pub fn open(path: &Path, direct: bool) -> Result<Self> {
+    pub fn open<'a>(source: impl Into<InputSource<'a>>, direct: bool) -> Result<Self> {
+        let source = source.into();
         if direct {
             #[cfg(feature = "linux-direct-io")]
             {
-                return Self::direct(path);
+                return Self::direct_from(source);
             }
             #[cfg(not(feature = "linux-direct-io"))]
             {
@@ -108,7 +130,7 @@ impl FileReader {
                 ));
             }
         }
-        Self::buffered(path)
+        Self::buffered_from(source)
     }
 }
 

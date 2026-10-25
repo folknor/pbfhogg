@@ -913,27 +913,34 @@ impl BlobReader<FileReader> {
 
     /// Open a file for a command run under `host`: buffered or O_DIRECT per
     /// `direct`, with the host's diagnostics and page-cache policy.
-    pub(crate) fn open_in<P: AsRef<Path>>(
-        path: P,
+    pub(crate) fn open_in<'a>(
+        source: impl Into<crate::read::input::InputSource<'a>>,
         direct: bool,
         host: &crate::host::Host,
     ) -> Result<Self> {
-        Self::open(path, direct).map(|r| {
-            r.diagnostics(host.diagnostics.clone())
+        let source = source.into();
+        Ok(
+            Self::from_reader(FileReader::open(source, direct)?, source.path())
+                .diagnostics(host.diagnostics.clone())
                 .cancel(host.cancel.clone())
-                .evict_page_cache(host.page_cache == crate::host::PageCachePolicy::Evict)
-        })
+                .evict_page_cache(host.page_cache == crate::host::PageCachePolicy::Evict),
+        )
     }
 
     /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
     /// The page cache is left alone; see [`BlobReader::evict_page_cache`].
     pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
         let reader = FileReader::open(path.as_ref(), direct)?;
-        Ok(BlobReader {
+        Ok(Self::from_reader(reader, path.as_ref()))
+    }
+
+    /// A reader over `reader`, opened from `path`.
+    fn from_reader(reader: FileReader, path: &Path) -> Self {
+        BlobReader {
             reader,
             offset: Some(ByteOffset(0)),
             stream_start: 0,
-            source: Some(std::sync::Arc::from(path.as_ref())),
+            source: Some(std::sync::Arc::from(path)),
             blob_index: Some(0),
             last_blob_ok: true,
             header_buf: Vec::new(),
@@ -946,7 +953,7 @@ impl BlobReader<FileReader> {
             evict_prefix: None,
             #[cfg(target_os = "linux")]
             evict_calls: 0,
-        })
+        }
     }
 }
 

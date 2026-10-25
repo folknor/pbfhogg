@@ -43,6 +43,7 @@
 
 pub use crate::output::PublishFault;
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -161,6 +162,36 @@ pub struct FaultPlan {
     // --- geocode builder pass 3 ---
     /// Street way index at which the Stage A streets worker panics.
     pub geocode_streets_panic_at_way: AtomicU32,
+
+    // --- pinned inputs (`read::input::PinnedInput`) ---
+    /// Pin every input taken under this token as on a host whose
+    /// `/proc/self/fd` cannot reopen it: later opens go through the path and
+    /// refuse a replaced file. Read once, when the pin is taken.
+    pub force_pin_path_reopen: AtomicBool,
+    input_replacement: Mutex<Option<InputReplacement>>,
+}
+
+/// An armed input replacement and what it observed; see
+/// [`FaultPlan::arm_input_replacement`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputReplacement {
+    /// The pinned input's path, as the command was given it.
+    pub target: PathBuf,
+    /// The file renamed over `target`.
+    pub replacement: PathBuf,
+    /// The verified open after which the replacement happens (1-based).
+    pub after: u64,
+    /// Opens of `target` attempted through its pin.
+    pub attempts: u64,
+    /// Opens of `target` that returned a descriptor verified against the
+    /// pin.
+    pub verified: u64,
+    /// Opens of `target` refused because its path named another file.
+    pub refused: u64,
+    /// Whether the rename happened.
+    pub fired: bool,
+    /// Attempts made after the rename.
+    pub attempts_after_fired: u64,
 }
 
 /// The message of the source error behind an injected backend refusal, so a
@@ -217,7 +248,94 @@ impl FaultPlan {
             apply_changes_panic_at_blob_seq: AtomicU64::new(u64::MAX),
             altw_stage3_panic_at_bucket: AtomicUsize::new(usize::MAX),
             geocode_streets_panic_at_way: AtomicU32::new(u32::MAX),
+            force_pin_path_reopen: AtomicBool::new(false),
+            input_replacement: Mutex::new(None),
         }
+    }
+
+    // ---- pinned inputs ----------------------------------------------------
+
+    fn replacement(&self) -> MutexGuard<'_, Option<InputReplacement>> {
+        self.input_replacement
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Rename `replacement` over `target` right after the `after`-th open of
+    /// the pinned input `target` (matched by the path the pin was taken
+    /// with) returns a verified descriptor, and count every open of it.
+    /// While armed, each open of `target` - open, verification, counting and
+    /// the rename - runs under one lock, so concurrent opens fall clearly
+    /// before or after the replacement. A failed rename fails that open.
+    ///
+    /// # Panics
+    /// `after` is zero: the replacement follows an open, and a replacement
+    /// before the pin is taken is not a case a pin addresses.
+    pub fn arm_input_replacement(&self, target: &Path, replacement: &Path, after: u64) {
+        assert!(
+            after >= 1,
+            "arm_input_replacement: `after` counts opens from 1"
+        );
+        *self.replacement() = Some(InputReplacement {
+            target: target.to_path_buf(),
+            replacement: replacement.to_path_buf(),
+            after,
+            attempts: 0,
+            verified: 0,
+            refused: 0,
+            fired: false,
+            attempts_after_fired: 0,
+        });
+    }
+
+    /// The armed replacement and its counts, if one was armed.
+    pub fn input_replacement(&self) -> Option<InputReplacement> {
+        self.replacement().clone()
+    }
+
+    /// Whether pins taken under this token must reopen through the path.
+    pub(crate) fn forces_pin_path_reopen(&self) -> bool {
+        self.force_pin_path_reopen.load(Ordering::Relaxed)
+    }
+
+    /// Called by a pinned input for every later open of `target`; `open`
+    /// opens and verifies.
+    pub(crate) fn pinned_open<T>(
+        &self,
+        target: &Path,
+        open: impl FnOnce() -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        let mut guard = self.replacement();
+        let Some(armed) = guard.as_mut().filter(|armed| armed.target == target) else {
+            drop(guard);
+            return open();
+        };
+        armed.attempts += 1;
+        if armed.fired {
+            armed.attempts_after_fired += 1;
+        }
+        let result = open();
+        match &result {
+            Ok(_) => {
+                armed.verified += 1;
+                if !armed.fired && armed.verified == armed.after {
+                    // The fault itself: a file renamed over the input
+                    // mid-run, as an atomic replace by a downloader does.
+                    #[allow(clippy::disallowed_methods)]
+                    std::fs::rename(&armed.replacement, &armed.target).map_err(|e| {
+                        crate::Error::from(e).context(format!(
+                            "test-hooks: renaming {} over the input {}",
+                            armed.replacement.display(),
+                            armed.target.display()
+                        ))
+                    })?;
+                    armed.fired = true;
+                }
+            }
+            Err(e) if matches!(e.kind(), crate::ErrorKind::InputReplaced) => armed.refused += 1,
+            Err(_) => {}
+        }
+        result
     }
 
     // ---- read pipeline decode gate -------------------------------------

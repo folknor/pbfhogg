@@ -923,6 +923,20 @@
 
 ### Added
 
+- **Library: `read::input::PinnedInput` keeps a multi-pass read on one
+  file.** A command that reads its input in several passes opens it several
+  times, and each open used to resolve the path again, so a file renamed
+  over the input mid-run was read partly from each. A `PinnedInput`, taken
+  once per input, makes every later open a fresh descriptor of the pinned
+  file: on Linux with `/proc` a replaced or unlinked input does not affect
+  the run; on other Unix hosts an open that finds another file at the path
+  fails with the new `ErrorKind::InputReplaced` (off Unix nothing is
+  verified). Only regular files and block devices
+  can be pinned. `FileReader::open` and `InputFile::open` now take an
+  `impl Into<InputSource>` (a `&Path`, `&PathBuf`, `&Arc<Path>` or
+  `&PinnedInput`); a caller passing `&&Path` dereferences it. The commands
+  adopt it one by one; until a command does, it still reopens by path.
+
 - **A run says when passthrough copies left the kernel fast path.** When
   the kernel refuses `copy_file_range` (cross-filesystem output, FUSE or
   NFS, seccomp, a non-regular output) and passthrough ranges are copied

@@ -10,11 +10,15 @@
 //! hint is read only when asked for.
 //!
 //! It is a precondition read, not a data path. The passes that follow open
-//! their own descriptors on purpose: `posix_fadvise` advice and readahead
-//! state belong to an open file description, so the header walker's
-//! `FADV_RANDOM`, a buffered pass's `FADV_SEQUENTIAL` and a worker pool's
-//! plain body preads must not share one. Handing this reader's file down to
-//! them would merge that state.
+//! their own descriptors: `posix_fadvise` advice and readahead state belong
+//! to an open file description, so the header walker's `FADV_RANDOM` and a
+//! buffered pass's `FADV_SEQUENTIAL` stay off the descriptions the other
+//! passes read through. Handing this reader's file down to them would merge
+//! that state. (Whether a merge would cost anything is unmeasured: the
+//! classify schedules hand the walker's own descriptor to their worker
+//! pools.) A command that pins its input opens this front, and every pass
+//! after it, from the [`PinnedInput`](crate::read::input::PinnedInput), so
+//! the separate descriptions are all of one file.
 
 use std::io::Read as _;
 use std::path::Path;
@@ -71,8 +75,14 @@ impl<'a> InputFront<'a> {
     /// frame is not an OsmHeader, is the missing-header error, decided before
     /// any payload is read. The header payload is read here but decoded only
     /// by [`Self::header`].
-    pub(crate) fn open(path: &'a Path, direct_io: bool, host: &crate::host::Host) -> Result<Self> {
-        let mut reader = FileReader::open(path, direct_io)?;
+    pub(crate) fn open(
+        source: impl Into<crate::read::input::InputSource<'a>>,
+        direct_io: bool,
+        host: &crate::host::Host,
+    ) -> Result<Self> {
+        let source = source.into();
+        let path = source.path();
+        let mut reader = FileReader::open(source, direct_io)?;
         let mut offset = 0u64;
         let size = super::leading_header_frame(&mut reader, &mut offset, &host.diagnostics, path)?;
         let mut header_payload = vec![0u8; size];

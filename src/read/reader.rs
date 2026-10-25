@@ -1045,12 +1045,12 @@ impl ElementReader<FileReader> {
     /// Open a file for a command run under `host`: buffered or O_DIRECT per
     /// `direct`, with the host's diagnostics, resources and page-cache policy,
     /// the latter applied before the header blob is read.
-    pub(crate) fn open_in<P: AsRef<Path>>(
-        path: P,
+    pub(crate) fn open_in<'a>(
+        source: impl Into<crate::read::input::InputSource<'a>>,
         direct: bool,
         host: &crate::host::Host,
     ) -> Result<Self> {
-        let mut blob_iter = BlobReader::open_in(path, direct, host)?;
+        let mut blob_iter = BlobReader::open_in(source, direct, host)?;
         let header = read_header_blob(&mut blob_iter)?;
         Ok(Self {
             blob_iter,

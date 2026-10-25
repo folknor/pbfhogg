@@ -219,6 +219,12 @@ impl DirectReader {
         // Ordinary failures name the path in the caller (`FileReader::direct`),
         // as the input helpers do; a platform refusal already names it.
         let (file, align) = crate::direct_io::open_for_read(path)?;
+        Self::from_opened(file, align, path)
+    }
+
+    /// A reader over `file`, already opened `O_DIRECT` by `crate::direct_io`
+    /// with the alignment `align` it reported; `path` names it in a failure.
+    pub(crate) fn from_opened(file: File, align: usize, path: &Path) -> Result<Self> {
         let metadata = file.metadata().map_err(|e| {
             crate::Error::from(e).context(format!("failed to stat {}", path.display()))
         })?;

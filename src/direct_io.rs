@@ -100,13 +100,31 @@ mod imp {
     /// failure is an ordinary I/O error the caller names.
     #[cfg(feature = "linux-direct-io")]
     pub(crate) fn open_for_read(path: &Path) -> Result<(File, usize)> {
+        open_for_read_verified(path, path, 0, |_| Ok(()))
+    }
+
+    /// [`open_for_read`] of `open_path` with `extra_flags` added to
+    /// `O_DIRECT`, for an input known to the user as `display`: `verify`
+    /// runs on the opened file before its alignment is queried, so a file
+    /// that is not the one expected is refused as that, never as the
+    /// alignment refusal a different file could earn. Failures name
+    /// `display`, never `open_path` (a pinned input reopens through
+    /// `/proc/self/fd`).
+    #[cfg(feature = "linux-direct-io")]
+    pub(crate) fn open_for_read_verified(
+        open_path: &Path,
+        display: &Path,
+        extra_flags: i32,
+        verify: impl FnOnce(&File) -> Result<()>,
+    ) -> Result<(File, usize)> {
         #[allow(clippy::disallowed_methods)]
         let opened = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(path);
-        let file = opened.map_err(|e| crate::error::direct_io_open_error_at(path, e))?;
-        let align = resolve(query(&file, Access::Read)).map_err(|r| refusal(Some(path), r))?;
+            .custom_flags(libc::O_DIRECT | extra_flags)
+            .open(open_path);
+        let file = opened.map_err(|e| crate::error::direct_io_open_error_at(display, e))?;
+        verify(&file)?;
+        let align = resolve(query(&file, Access::Read)).map_err(|r| refusal(Some(display), r))?;
         Ok((file, align))
     }
 

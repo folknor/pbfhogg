@@ -273,7 +273,7 @@ fn cat_passthrough(
     let mut decompress_buf: Vec<u8> = Vec::new();
 
     for file in files {
-        let mut reader = FileReader::open(file, direct_io)?;
+        let mut reader = FileReader::open(*file, direct_io)?;
         let mut file_offset: u64 = 0;
 
         while let Some(mut frame) = read_raw_frame(&mut reader, &mut file_offset, host, file)? {
@@ -641,7 +641,7 @@ fn cat_type_passthrough(
     let mut refs_buf: Vec<i64> = Vec::new();
 
     for file in files {
-        let mut reader = FileReader::open(file, direct_io)?;
+        let mut reader = FileReader::open(*file, direct_io)?;
         let mut file_offset: u64 = 0;
 
         while let Some(mut frame) = read_raw_frame(&mut reader, &mut file_offset, host, file)? {

@@ -57,8 +57,8 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-22. HYG-151 (confirms the per-command list below)
-23. HYG-168 to HYG-179, one per line, in ID order
+23. HYG-168 to HYG-179, then HYG-183 to HYG-189, one per line, in ID
+    order
 24. HYG-047
 25. HYG-158
 26. HYG-159
@@ -669,6 +669,23 @@ The judgement calls already known, to be checked first:
     panic in place of the `""`.
   - Chose the panic over the triage's `debug_assert!`, as `validated` in
     `block.rs` did: a release fallback is the silent wrong answer.
+- Input pinning (`read::input::PinnedInput`, `InputSource`): went past the
+  triage's identity-anchor recommendation after a codex spar. The pin is a
+  held `O_PATH` descriptor on Linux, and later opens reopen
+  `/proc/self/fd/<pin>` (a fresh description of the pinned file, so a
+  replaced input is harmless); only where that probe fails do opens go
+  through the path and refuse a different inode (`InputReplaced`). Every
+  derived descriptor is `fstat`-verified and opened `O_NONBLOCK`, then
+  cleared with `F_SETFL`. Judgement calls, none measured:
+  - Pinning commands refuse FIFOs, sockets and character devices up front
+    (block devices pass), including arms that would have read once (the
+    time-filter history arm).
+  - Per later open: one `open` through procfs, one `fstat`, two `fcntl`;
+    per pin, one `O_PATH` open held for the run and one probe open. A
+    handful per run, never per blob.
+  - `FileReader::open` (public) and `InputFile::open` widened from `&Path`
+    to `impl Into<InputSource>`; `&&Path` callers lost deref coercion.
+  - No command pins yet; each adopts it in its own entry below.
 
 ---
 
@@ -1305,99 +1322,76 @@ change.
 
 Reported by: the HYG-150 implementation.
 
-## HYG-151 - Every pass reopens its input by path, so a replaced input gives mixed reads
+## Adopting `PinnedInput`, one command per entry
 
-Anger: 8 - an input-handle contract across every multi-pass command.
+Not a finding: the shared brief for HYG-168 to HYG-179 and HYG-183 to
+HYG-189. Each of those commands opens its input more than once per run (a
+precondition probe, a header reader, a schedule walk, worker and splice
+descriptors), each open resolving the path again, so a file renamed over
+the input mid-run is read partly from each file. The API that fixes it
+exists: `read::input::PinnedInput` and `InputSource` (`src/read/input.rs`;
+contract in `reference/pipeline.md`, "One input, one file, across passes").
+`HeaderWalker::open`, `FileReader::open`, `InputFile::open`,
+`InputFront::open` and `BlobReader` / `ElementReader::open_in` already take
+`impl Into<InputSource>`, so adopting it is mostly passing the pin where the
+path went. What each entry owes, settled in a codex spar on 2026-10-25:
 
-Every multi-pass command takes `&Path` and opens the input once per pass or
-per access pattern: apply-changes four times (front read, scanner walker,
-worker pool, splice source), altw once per pass and stage, and likewise
-sort, extract, tags-filter, getid, getparents, renumber, cat and geocode.
-Each open resolves the path again, so a file renamed over the input mid-run
-(an atomic replace by a downloader, say) is read partly from each inode:
-the header and schedule from one, blob bodies or `copy_file_range` splices
-from the other, with no error. Sharing one descriptor is not the fix:
-`posix_fadvise` advice and readahead state belong to the open file
-description, and the separations are deliberate (the header walker's
-`FADV_RANDOM` must not reach worker body preads; see the comments at
-apply-changes' opens). The fix that keeps them is an identity anchor: the
-first open records `(st_dev, st_ino)`, and every later open of the same
-input is verified against it with `fstat` after opening (a check of the path
-before opening races), refusing a different inode with a typed error. That
-needs a per-run input handle passed down in place of `&Path`; the `Host` is
-the wrong owner, since a library caller may reuse one across runs between
-which replacing the file is legitimate. An identity check does not catch an
-in-place rewrite of the same inode (truncate and write), which nothing short
-of a snapshot does; the entry is about replacement consistency only.
+- Pin every input once, at the command's start, before any other open of
+  it (`PinnedInput::pin(path, host)`), and pass the pin down through every
+  later input open, including dispatch and fallback arms (auto-select, a
+  parallel attempt falling back to streaming, multi-extract's engines).
+  Scratch opens stay plain `read::input::open`.
+- Keep the description topology exactly: each existing independent open
+  becomes one derived open, and a descriptor shared today (`walker.input()`
+  handed to a classify pool, renumber's shared worker file) stays shared.
+  Never `try_clone` a pinned descriptor.
+- Size and type reads of the input go through the pin
+  (`InputSource::metadata` / `PinnedInput::metadata`), not
+  `read::input::metadata(path)`.
+- Where the CLI composes several library calls on one input (inspect runs
+  its scan, `has_indexdata`, then node statistics), the public entry points
+  have to accept a pin (an `impl Into<InputSource>` or a `&PinnedInput`
+  variant), so one run is one pin; independent pins per call do not help.
+- With several inputs, pin each before probing any. The same path given
+  twice (`cat a a`, `diff a a`) needs a decision in that command's entry:
+  one pin or two.
+- Test from the fault point: arm `FaultPlan::arm_input_replacement` after
+  an open in the middle of the run, then assert the replacement fired, that
+  opens followed it (`attempts_after_fired`), and the outcome in both modes:
+  with `force_pin_path_reopen` the run fails `InputReplaced` and publishes
+  nothing; without it (procfs) the output equals the unreplaced run's. A
+  test that never reaches a later open proves nothing.
+- Pinning refuses FIFOs, sockets and character devices up front; say so in
+  the command's CHANGELOG line, which every adopting entry owes (a
+  replacement mid-run is now harmless on Linux, refused elsewhere).
 
-Research done 2026-10-25 (a history search of altw external, prompted by the
-maintainer recalling two reverted attempts at something like this):
-
-- No attempt to share or hand down the input descriptor in altw was ever
-  committed or reverted. "Open once and hand the File down" was only a plan
-  (HYG-078), dropped before implementation in commit `a3f1a1bc` on an
-  argument ("would regress: fadvise and readahead state belong to each
-  open"), not a measurement.
-- What was tried twice and reverted twice in altw external were pass-fusion
-  experiments: fusing stage 1's pass A and pass B by spooling node IDs to
-  scratch (`44913a5a` reverted by `ba62fb1d`; v1 and v2 reverted together
-  by `568a3bc5`: Europe stage 1 42.6 s became 48.6 s and 49.8 s, because
-  zlib-rs at about 1 GB/s beats re-reading 23 GB of scratch on a 25 GB-RAM
-  host), and epoch-spill fused stages 2 and 3 (`3ae10521`, then `b160c414`:
-  planet 741 s against 661 s, 25 GB RSS). Both were lost on measured time or
-  memory; neither applies to an identity check that changes no pass
-  structure or data flow.
-- The "sharing a descriptor would regress" premise in this entry is
-  overstated: renumber shares one fd across all phases (`db49c929`, never
-  reverted), and about eight commands hand the walker's `FADV_RANDOM` fd to
-  their pread workers through `walker.input()`. Only altw external,
-  apply-changes and `InputFront` keep separate descriptors. See "Review once
-  drained". The entry's conclusion (anchor, not shared fd) stands on its
-  own: a held-open anchor descriptor would also cost fds against altw's
-  fd budget (`ca15f441`, `5c36fed5`).
-- The plumbing as first proposed does not work as written:
-  `crate::read::input::open` also opens scratch files (altw stage 3's
-  buckets, stage 4's ref-count sidecar, `coord_payloads.rs`), so the check
-  cannot live inside it; and a public `InputFile { file, path }` already
-  exists in `src/read/input.rs`, used for scratch worker files too through
-  `from_parts`, so a new type of that name would clash.
-
-Recommendation (2026-10-25), split one entry per command: this entry keeps
-the API - a small `(st_dev, st_ino)` anchor value recorded at
-`InputFront::open` (the first open; its descriptor is dropped afterwards, so
-the value travels next to the header, as stage 4's header handoff already
-does), a separate anchored-open entry point beside `input::open` (scratch
-keeps the plain one), the typed refusal, a `test-hooks` fault point that
-replaces the input between passes, and the `reference/` sentence on what a
-replaced input does and does not catch (in-place rewrites, replacement
-before the first open). Public library signatures keep `&Path`. This entry
-also confirms the list of multi-pass commands below; entries for commands
-that turn out to open their input once are removed under rule 3. HYG-168
-to HYG-179 then thread the anchor through one command each, with a test
-from the fault point. New refusal: CHANGELOG line.
-
-Reported by: the HYG-078 resolution.
+Commands confirmed to open their input once per run, not needing a pin:
+export, check refs, check index (one open each). inspect's index-only scan
+and its full-decode fallback each read the whole report from one open, but
+the full decode takes its file size from a separate path `stat`, which
+HYG-187 covers.
 
 ## HYG-168 - apply-changes reopens its input by path per access pattern
 
 Anger: 8 - apply-changes internals.
 
-Split out of HYG-151; runs after it. apply-changes opens its base four
+See "Adopting `PinnedInput`" above. apply-changes opens its base four
 times: the front read, the scanner walker, the worker pool and the splice
 source. The comments at those opens state that separate descriptors are
-required; per HYG-151's research that is an unmeasured argument
-(renumber and the `walker.input()` sites share). Recommendation
+required; that is an unmeasured argument (the `walker.input()` sites
+share, and `a3f1a1bc`, which added the comments, argued rather than
+measured it). Recommendation
 (2026-10-25): thread the anchor through all four opens, and reword the
 comments to "separate descriptors are kept here; whether sharing would cost
 anything is unmeasured".
 
-Reported by: as HYG-151.
+Reported by: the HYG-078 resolution.
 
 ## HYG-169 - altw reopens its input by path per pass and stage
 
 Anger: 8 - altw internals.
 
-Split out of HYG-151; runs after it. Sparse and external together, one
+See "Adopting `PinnedInput`" above. Sparse and external together, one
 command. Input opens found on 2026-10-25: `InputFront::open` in
 `external/mod.rs` and `altw/mod.rs` (auto-select), `HeaderWalker::open` in
 `external/blob_meta.rs`, stage 1's shared `Arc<File>`, `relation_scan.rs`,
@@ -1408,92 +1402,99 @@ so the extra `fstat`s are a handful per run. Signatures such as
 ...)` change. Recommendation (2026-10-25): thread the anchor through every
 input open; scratch opens stay plain.
 
-Reported by: as HYG-151.
+Reported by: the HYG-078 resolution.
 
 ## HYG-170 - sort reopens its input by path per pass
 
 Anger: 8 - planet-scale command.
 
-Split out of HYG-151; runs after it. Recommendation (2026-10-25): thread the
+See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): thread the
 anchor through every input open.
 
-Reported by: as HYG-151.
+Reported by: the HYG-078 resolution.
 
 ## HYG-171 - extract reopens its input by path per pass
 
 Anger: 8 - planet-scale command.
 
-Split out of HYG-151; runs after it. multi-extract included if it is the
+See "Adopting `PinnedInput`" above. multi-extract included if it is the
 same command. Recommendation (2026-10-25): as HYG-170.
 
-Reported by: as HYG-151.
+Reported by: the HYG-078 resolution.
 
 ## HYG-172 - tags-filter reopens its input by path per pass
 
 Anger: 8 - planet-scale command.
 
-Split out of HYG-151; runs after it. Recommendation (2026-10-25): as
+See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): as
 HYG-170.
 
-Reported by: as HYG-151.
+Reported by: the HYG-078 resolution.
 
 ## HYG-173 - getid reopens its input by path per pass
 
 Anger: 7 - one command.
 
-Split out of HYG-151; runs after it. Recommendation (2026-10-25): as
+See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): as
 HYG-170.
 
-Reported by: as HYG-151.
+Reported by: the HYG-078 resolution.
 
 ## HYG-174 - getparents reopens its input by path per pass
 
 Anger: 7 - one command.
 
-Split out of HYG-151; runs after it. Recommendation (2026-10-25): as
+See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): as
 HYG-170.
 
-Reported by: as HYG-151.
+Reported by: the HYG-078 resolution.
 
 ## HYG-175 - renumber reopens its input by path
 
 Anger: 8 - planet-scale command.
 
-Split out of HYG-151; runs after it. Renumber already shares one fd across
-its phases (`src/commands/renumber/mod.rs`, from `db49c929`;
-`reference/performance.md` says so too), while commit `a3f1a1bc`'s message
-and the comment it added describe renumber's schedule walk as a separate
-description, and HYG-151 lists renumber among the per-pass openers: which
-is true needs checking first. Recommendation (2026-10-25): anchor whatever
-opens remain beyond the first.
+See "Adopting `PinnedInput`" above. Checked 2026-10-25: both are true.
+Renumber opens three descriptions - the header reader
+(`ElementReader::open_in` in `renumber/mod.rs`), the schedule walker
+(`renumber/schedule.rs`) and the one worker file every data phase shares
+(`db49c929`). "One fd across all phases" describes the worker phases only.
+Recommendation (2026-10-25): pin, and pass the pin to all three; the
+worker file stays one shared description.
 
-Reported by: as HYG-151.
+Reported by: the HYG-078 resolution.
 
 ## HYG-176 - cat reopens its input by path per pass
 
 Anger: 7 - one command.
 
-Split out of HYG-151; runs after it. Recommendation (2026-10-25): as
-HYG-170.
+See "Adopting `PinnedInput`" above. Every mode is in scope: even plain cat
+reads each input's header (`read_headers`) before its body reader, and the
+indexdata probe opens it once more; `cat --dedupe` (`cat/dedupe.rs`)
+probes, indexes (`index_input`) and opens its sources again
+(`open_sources`). Many inputs mean one held pin descriptor per input for
+the whole run, where cat used to hold one at a time. Recommendation
+(2026-10-25): as HYG-170.
 
-Reported by: as HYG-151.
+Reported by: the HYG-078 resolution.
 
 ## HYG-177 - build-geocode-index reopens its input by path per pass
 
 Anger: 7 - geocode build.
 
-Split out of HYG-151; runs after it. Recommendation (2026-10-25): as
+See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): as
 HYG-170.
 
-Reported by: as HYG-151.
+Reported by: the HYG-078 resolution.
 
 ## HYG-178 - diff reopens its inputs by path
 
 Anger: 8 - diff on a hot path.
 
-Split out of HYG-151; runs after it. Not in HYG-151's original list: the
-parallel walk and the shard workers open each input separately (unverified
-in detail). Recommendation (2026-10-25): as HYG-170, for both inputs.
+See "Adopting `PinnedInput`" above. Checked 2026-10-25: the shard workers
+do not reopen (they keep the walker's shared file, `diff/shard.rs`), but
+each input is opened by the `sorted_and_indexed` front read and again by
+the parallel walk or the sequential readers. Recommendation (2026-10-25):
+as HYG-170, for both inputs.
 
 Reported by: the 2026-10-25 triage.
 
@@ -1501,7 +1502,90 @@ Reported by: the 2026-10-25 triage.
 
 Anger: 8 - derive on a hot path.
 
-Split out of HYG-151; runs after it. As HYG-178. Recommendation
+See "Adopting `PinnedInput`" above. As HYG-178. Recommendation
 (2026-10-25): as HYG-170, for both inputs.
 
 Reported by: the 2026-10-25 triage.
+
+## HYG-183 - tags-count reopens its input by path
+
+Anger: 7 - one command.
+
+See "Adopting `PinnedInput`" above. `require_indexdata` probes the input,
+then `build_classify_schedule_blob_filtered` walks it again
+(`tags_count/mod.rs`). Recommendation (2026-10-25): as HYG-170.
+
+Reported by: the HYG-151 resolution.
+
+## HYG-184 - repack reopens its input by path
+
+Anger: 7 - one command.
+
+See "Adopting `PinnedInput`" above. The indexdata probe, the header
+`ElementReader` and `build_classify_schedules_split` each open the input
+(`repack/mod.rs`). Recommendation (2026-10-25): as HYG-170.
+
+Reported by: the HYG-151 resolution.
+
+## HYG-185 - degrade reopens its input by path
+
+Anger: 7 - one command.
+
+See "Adopting `PinnedInput`" above. The decode path probes indexdata,
+reads the header and walks the schedules (`degrade/mod.rs`); the
+header-only passthrough reads the header and then the frames through two
+`FileReader` opens. Modes differ, so check each before pinning.
+Recommendation (2026-10-25): as HYG-170.
+
+Reported by: the HYG-151 resolution.
+
+## HYG-186 - time-filter reopens its input by path
+
+Anger: 7 - one command.
+
+See "Adopting `PinnedInput`" above. The header `ElementReader` decides
+history against snapshot; the snapshot arm drops it and walks the schedule
+through a fresh open (`time_filter/mod.rs`). The history arm reads once.
+Pinning at entry also refuses a FIFO on the history arm; that is the
+chosen contract (a command that may reopen pins up front), say so in the
+CHANGELOG line. Recommendation (2026-10-25): as HYG-170.
+
+Reported by: the HYG-151 resolution.
+
+## HYG-187 - inspect reads one input through several unpinned opens
+
+Anger: 7 - CLI behaviour.
+
+See "Adopting `PinnedInput`" above. `inspect --nodes` probes indexdata and
+then walks the schedule (`inspect/node_stats.rs`); the full-decode scan
+takes the file size from a path `stat` beside its reader
+(`inspect/scan.rs`); and the CLI's inspect runs the scan, `has_indexdata`
+and node statistics as separate library calls on one path
+(`cli/src/lib.rs`), each opening it afresh. The public entry points need
+to accept a pin so the CLI pins once. Recommendation (2026-10-25): as
+HYG-170, with the CLI composition.
+
+Reported by: the HYG-151 resolution.
+
+## HYG-188 - check ids reopens its input by path
+
+Anger: 7 - CLI behaviour.
+
+See "Adopting `PinnedInput`" above. Both engines read `sorted_and_indexed`
+and then build the split schedules from a second open, and the parallel
+engine stats the path for its length (`check/verify_ids.rs`).
+Recommendation (2026-10-25): as HYG-170.
+
+Reported by: the HYG-151 resolution.
+
+## HYG-189 - digest reopens its input by path
+
+Anger: 7 - one command.
+
+See "Adopting `PinnedInput`" above. The envelope walk (`HeaderWalker`)
+collects each blob's index, then an `ElementReader` decodes the blocks
+those indexes are matched against (`commands/digest.rs`): a replacement
+between the two digests one file's blocks against the other's indexes.
+Recommendation (2026-10-25): as HYG-170.
+
+Reported by: the HYG-151 resolution.

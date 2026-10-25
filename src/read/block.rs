@@ -621,16 +621,15 @@ impl PrimitiveBlock {
     /// for classification passes that only need ID + coordinates.
     /// A malformed dense group cannot reach here: [`PrimitiveBlock::finish`]
     /// rejects a block whose dense `id`/`lat`/`lon` arrays disagree in length
-    /// or fail to parse, so the `Ok` guards below are structure, not recovery.
+    /// or fail to parse, so a re-parse failure is a broken invariant and
+    /// panics (see `validated`) rather than dropping the group's nodes.
     pub(crate) fn decode_dense_columns(
         &self,
         columns: &mut super::columnar::DenseNodeColumns,
     ) -> usize {
         columns.clear();
         for group in self.groups() {
-            if let Ok(Some(dense_data)) = group.group.dense()
-                && let Ok(dense) = super::wire::WireDenseNodes::parse(dense_data)
-            {
+            if let Some(dense) = validated_dense(&group.group) {
                 columns.decode_append(
                     &dense,
                     self.block.granularity,
@@ -756,7 +755,13 @@ fn packed_uint32_count(data: &[u8]) -> Result<usize> {
 ///
 /// Validating once at construction fixes all of them at a single fallible site
 /// and leaves the iterators' signatures alone: after this passes, none of those
-/// `Err` arms is reachable, so the skips are dead code rather than silent loss.
+/// re-parses can fail. The iterators no longer skip or end on one; they treat
+/// a failure as a broken construction invariant and panic through
+/// [`validated`], because any fallback would be the silent loss this pass
+/// exists to prevent. `WireMessageIter` is the exception: it is shared framing
+/// plumbing (this pass drives it too, as does the raw node scanner), its every
+/// caller walks the framing first, and its doc says why its error arms are
+/// unreachable.
 ///
 /// # What is checked
 ///
@@ -1113,6 +1118,72 @@ fn validate_info(info_data: Option<&[u8]>) -> Result<()> {
     }
 }
 
+/// Unwrap a re-parse of bytes that block construction already validated.
+///
+/// The block iterators (`PrimitiveGroup`, `BlockElementsIter`, the group
+/// element iterators, `DenseNodeIter`) and the element `info()` accessors
+/// re-parse slices of a block's bytes - a group's `DenseNodes`, `DenseInfo`
+/// and `keys_vals` varints, each `Node` / `Way` / `Relation`, each element
+/// `Info` - because the block stores no parsed layout. Every one of those re-parses
+/// runs a parser that [`validate_groups_strict`] already ran, successfully,
+/// on the same immutable bytes: `PrimitiveBlock::finish` is the only
+/// constructor and validates before handing out a block, and the iterators
+/// derive their slices from that block themselves. A failure here is
+/// therefore a pbfhogg bug (a slice that never went through validation, or a
+/// validator that drifted from the parser the iterator runs), not a property
+/// of the input, and it panics naming `what` failed.
+///
+/// It must not fall back instead. Every available fallback is a silent wrong
+/// answer: a dense group that reads as no nodes, a dense group whose metadata
+/// reads as absent, a dense node whose tags end early, an element skipped, an
+/// `Info` that reads as version 0 / timestamp 0. Corrupt input is refused at construction, where an error can
+/// be returned; this is the consumption side of that contract.
+///
+/// The success path is a match; the failure path is a cold, never-inlined
+/// call.
+///
+/// Provenance - that a slice handed to an iterator constructor came from the
+/// validated block it is paired with - is enforced by encapsulation rather
+/// than by a type: the constructors that pair a slice with its block are
+/// private to `src/read`, and each derives the slice from that block. A
+/// validated-block wrapper type alone would not prove more, because these
+/// constructors take sub-slices alongside the block. Provenance-carrying
+/// views (a private pairing type assembled only where the slice is derived)
+/// are possible without runtime cost, but would restate the boundary this
+/// module already keeps, not replace the invariant or this check.
+#[inline]
+#[track_caller]
+pub(super) fn validated<T, E: std::fmt::Display>(
+    result: std::result::Result<T, E>,
+    what: &'static str,
+) -> T {
+    match result {
+        Ok(value) => value,
+        Err(err) => construction_invariant_broken(what, &err),
+    }
+}
+
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn construction_invariant_broken(what: &'static str, err: &dyn std::fmt::Display) -> ! {
+    panic!(
+        "{what} failed to parse after PrimitiveBlock construction validated it \
+         (validate_groups_strict in block.rs): construction invariant broken: {err}"
+    )
+}
+
+/// The dense group of a group in a validated block, if it has one.
+///
+/// Both [`WireGroup::dense`] and [`WireDenseNodes::parse`] ran successfully on
+/// these bytes in [`validate_groups_strict`]; see [`validated`].
+#[inline]
+#[track_caller]
+fn validated_dense<'a>(group: &WireGroup<'a>) -> Option<WireDenseNodes<'a>> {
+    validated(group.dense(), "PrimitiveGroup.dense")
+        .map(|data| validated(WireDenseNodes::parse(data), "DenseNodes"))
+}
+
 /// A `PrimitiveGroup` contains a sequence of elements of one type.
 pub struct PrimitiveGroup<'a> {
     block: &'a WireBlock<'static>,
@@ -1136,13 +1207,17 @@ impl<'a> PrimitiveGroup<'a> {
     }
 
     /// Returns an iterator over the dense nodes in this group.
+    ///
+    /// # Panics
+    ///
+    /// Only on a broken internal invariant: a dense group or its `DenseInfo`
+    /// that fails to parse although block construction validated it. That is
+    /// a pbfhogg bug, not a property of the input; corrupt input is refused
+    /// when the block is constructed.
     pub fn dense_nodes(&self) -> DenseNodeIter<'a> {
-        match self.group.dense() {
-            Ok(Some(data)) => match WireDenseNodes::parse(data) {
-                Ok(dense) => DenseNodeIter::new(self.block, dense),
-                Err(_) => DenseNodeIter::empty(self.block),
-            },
-            _ => DenseNodeIter::empty(self.block),
+        match validated_dense(&self.group) {
+            Some(dense) => DenseNodeIter::new(self.block, dense),
+            None => DenseNodeIter::empty(self.block),
         }
     }
 
@@ -1228,18 +1303,12 @@ impl<'a> BlockElementsIter<'a> {
                 self.group_index += 1;
                 self.state = ElementsIterState::DenseNode;
                 let group = WireGroup::new(group_data);
-                self.dense_nodes = match group.dense() {
-                    Ok(Some(data)) => match WireDenseNodes::parse(data) {
-                        Ok(dense) => {
-                            if self.skip_metadata {
-                                DenseNodeIter::new_skip_metadata(self.block, dense)
-                            } else {
-                                DenseNodeIter::new(self.block, dense)
-                            }
-                        }
-                        Err(_) => DenseNodeIter::empty(self.block),
-                    },
-                    _ => DenseNodeIter::empty(self.block),
+                self.dense_nodes = match validated_dense(&group) {
+                    Some(dense) if self.skip_metadata => {
+                        DenseNodeIter::new_skip_metadata(self.block, dense)
+                    }
+                    Some(dense) => DenseNodeIter::new(self.block, dense),
+                    None => DenseNodeIter::empty(self.block),
                 };
                 self.nodes = group.nodes();
                 self.ways = group.ways();
@@ -1253,33 +1322,36 @@ impl<'a> BlockElementsIter<'a> {
                     None
                 }
             },
-            ElementsIterState::Node => {
-                for data in self.nodes.by_ref() {
-                    if let Ok(wire_node) = WireNode::parse(data) {
-                        return Some(Some(Element::Node(Node::new(self.block, wire_node))));
-                    }
+            ElementsIterState::Node => match self.nodes.next() {
+                Some(data) => {
+                    let wire_node = validated(WireNode::parse(data), "Node");
+                    Some(Some(Element::Node(Node::new(self.block, wire_node))))
                 }
-                self.state = ElementsIterState::Way;
-                None
-            }
-            ElementsIterState::Way => {
-                for data in self.ways.by_ref() {
-                    if let Ok(wire_way) = WireWay::parse(data) {
-                        return Some(Some(Element::Way(Way::new(self.block, wire_way))));
-                    }
+                None => {
+                    self.state = ElementsIterState::Way;
+                    None
                 }
-                self.state = ElementsIterState::Relation;
-                None
-            }
-            ElementsIterState::Relation => {
-                for data in self.relations.by_ref() {
-                    if let Ok(wire_rel) = WireRelation::parse(data) {
-                        return Some(Some(Element::Relation(Relation::new(self.block, wire_rel))));
-                    }
+            },
+            ElementsIterState::Way => match self.ways.next() {
+                Some(data) => {
+                    let wire_way = validated(WireWay::parse(data), "Way");
+                    Some(Some(Element::Way(Way::new(self.block, wire_way))))
                 }
-                self.state = ElementsIterState::Group;
-                None
-            }
+                None => {
+                    self.state = ElementsIterState::Relation;
+                    None
+                }
+            },
+            ElementsIterState::Relation => match self.relations.next() {
+                Some(data) => {
+                    let wire_rel = validated(WireRelation::parse(data), "Relation");
+                    Some(Some(Element::Relation(Relation::new(self.block, wire_rel))))
+                }
+                None => {
+                    self.state = ElementsIterState::Group;
+                    None
+                }
+            },
         }
     }
 }
@@ -1343,14 +1415,15 @@ pub struct GroupNodeIter<'a> {
 impl<'a> Iterator for GroupNodeIter<'a> {
     type Item = Node<'a>;
 
+    /// # Panics
+    ///
+    /// Only on a broken internal invariant; see [`PrimitiveGroup::dense_nodes`].
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let data = self.iter.next()?;
-            if let Ok(wire_node) = WireNode::parse(data) {
-                return Some(Node::new(self.block, wire_node));
-            }
-            // Skip malformed nodes
-        }
+        let data = self.iter.next()?;
+        Some(Node::new(
+            self.block,
+            validated(WireNode::parse(data), "Node"),
+        ))
     }
 }
 
@@ -1363,13 +1436,12 @@ pub struct GroupWayIter<'a> {
 impl<'a> Iterator for GroupWayIter<'a> {
     type Item = Way<'a>;
 
+    /// # Panics
+    ///
+    /// Only on a broken internal invariant; see [`PrimitiveGroup::dense_nodes`].
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let data = self.iter.next()?;
-            if let Ok(wire_way) = WireWay::parse(data) {
-                return Some(Way::new(self.block, wire_way));
-            }
-        }
+        let data = self.iter.next()?;
+        Some(Way::new(self.block, validated(WireWay::parse(data), "Way")))
     }
 }
 
@@ -1382,13 +1454,15 @@ pub struct GroupRelationIter<'a> {
 impl<'a> Iterator for GroupRelationIter<'a> {
     type Item = Relation<'a>;
 
+    /// # Panics
+    ///
+    /// Only on a broken internal invariant; see [`PrimitiveGroup::dense_nodes`].
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let data = self.iter.next()?;
-            if let Ok(wire_rel) = WireRelation::parse(data) {
-                return Some(Relation::new(self.block, wire_rel));
-            }
-        }
+        let data = self.iter.next()?;
+        Some(Relation::new(
+            self.block,
+            validated(WireRelation::parse(data), "Relation"),
+        ))
     }
 }
 
@@ -1562,6 +1636,173 @@ mod strict_validation_tests {
                 PrimitiveBlock::from_vec(block_with_groups(&[group])).is_err(),
                 "field {field}: a malformed element sub-message must be rejected"
             );
+        }
+    }
+
+    /// A block view over `buffer` that skipped `validate_groups_strict` - what
+    /// `PrimitiveBlock::finish` builds, minus the validation. No production
+    /// path can produce one; it exists so the tests below can reach the
+    /// consumption side of the construction contract.
+    fn unvalidated_block(mut buffer: Vec<u8>) -> PrimitiveBlock {
+        let meta = super::WireBlock::parse_and_inline(&mut buffer).unwrap();
+        let bytes = bytes::Bytes::from(buffer);
+        let block = super::WireBlock::from_inline(&bytes, &meta);
+        // SAFETY: as in `PrimitiveBlock::finish`: `bytes` owns the heap data
+        // `block` borrows and moves into the same `PrimitiveBlock`, which
+        // never hands out mutable access to it.
+        #[allow(clippy::transmute_undefined_repr)]
+        let block = unsafe {
+            std::mem::transmute::<super::WireBlock<'_>, super::WireBlock<'static>>(block)
+        };
+        PrimitiveBlock {
+            _buffer: bytes,
+            block,
+        }
+    }
+
+    /// Run `consume` and return its panic message, failing if it does not
+    /// panic.
+    fn panic_message(consume: impl FnOnce()) -> String {
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(consume))
+            .expect_err("consumption must panic");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default()
+    }
+
+    /// Bytes that block construction refuses are refused there, and a
+    /// consumer handed them anyway (a block view that bypassed
+    /// `validate_groups_strict`) panics naming the broken invariant instead
+    /// of reading a corrupt dense group as no nodes, dropping dense metadata,
+    /// or skipping an element.
+    ///
+    /// Each case is checked on both sides: `from_vec` returns `Err` (the
+    /// public contract), and every consumer that re-parses those bytes
+    /// panics with a message naming what failed (the internal invariant).
+    /// The three dense failures are distinct parsers: `WireGroup::dense`
+    /// (a repeated `dense` field), `WireDenseNodes::parse` (a truncated
+    /// field inside `DenseNodes`) and `WireDenseInfo::parse` (a truncated
+    /// field inside `denseinfo`).
+    #[test]
+    fn consumers_panic_on_bytes_construction_would_refuse() {
+        // A length-delimited field 1 declaring 5 bytes and supplying 1.
+        let truncated_field = [0x0au8, 0x05, 0x02];
+
+        let mut repeated_dense = len_field(2, &[]);
+        repeated_dense.extend_from_slice(&len_field(2, &[]));
+        let bad_dense_nodes = len_field(2, &truncated_field);
+        let bad_dense_info = dense_group_with(1, &[], Some(&truncated_field));
+
+        let dense_cases = [
+            (repeated_dense, "PrimitiveGroup.dense"),
+            (bad_dense_nodes, "DenseNodes"),
+            (bad_dense_info.clone(), "DenseInfo"),
+        ];
+        for (group, what) in dense_cases {
+            let buffer = block_with_groups(&[group]);
+            PrimitiveBlock::from_vec(buffer.clone())
+                .expect_err("construction must refuse the fixture");
+            let expected = format!("{what} failed to parse after PrimitiveBlock construction");
+
+            let block = unvalidated_block(buffer.clone());
+            let msg = panic_message(|| {
+                block.groups().for_each(|g| g.dense_nodes().for_each(drop));
+            });
+            assert!(msg.contains(&expected), "dense_nodes, {what}: {msg}");
+
+            let block = unvalidated_block(buffer.clone());
+            let msg = panic_message(|| block.elements().for_each(drop));
+            assert!(msg.contains(&expected), "elements, {what}: {msg}");
+
+            let block = unvalidated_block(buffer.clone());
+            let msg = panic_message(|| block.for_each_element(|_| {}));
+            assert!(msg.contains(&expected), "for_each_element, {what}: {msg}");
+
+            if what != "DenseInfo" {
+                // The metadata-skipping iterator and the columnar decode never
+                // parse `denseinfo`, so only the group-level failures reach
+                // them.
+                let block = unvalidated_block(buffer.clone());
+                let msg = panic_message(|| block.elements_skip_metadata().for_each(drop));
+                assert!(
+                    msg.contains(&expected),
+                    "elements_skip_metadata, {what}: {msg}"
+                );
+
+                let block = unvalidated_block(buffer);
+                let msg = panic_message(|| {
+                    let mut columns = crate::read::columnar::DenseNodeColumns::new();
+                    block.decode_dense_columns(&mut columns);
+                });
+                assert!(
+                    msg.contains(&expected),
+                    "decode_dense_columns, {what}: {msg}"
+                );
+            }
+        }
+
+        // The metadata-skipping iterator still reads the nodes of a group
+        // whose only defect is its denseinfo: it never looks at it.
+        let block = unvalidated_block(block_with_groups(&[bad_dense_info]));
+        assert_eq!(block.elements_skip_metadata().count(), 1);
+
+        // `keys_vals` that `validate_dense_keys_vals` refuses: a key varint
+        // cut short, a value varint cut short, and a final key with no value.
+        // `DenseNodeIter` walks the same varints per node; it used to end the
+        // node's tags early.
+        let keys_vals_cases: [(&[u8], usize, &str); 3] = [
+            (&[0x81], 1, "DenseNodes keys_vals key"),
+            (&[0x01, 0x81], 1, "DenseNodes keys_vals value"),
+            (&[0x01, 0x01, 0x00, 0x02], 2, "DenseNodes keys_vals value"),
+        ];
+        for (keys_vals, nodes, what) in keys_vals_cases {
+            let buffer = block_with_groups(&[dense_group_with(nodes, keys_vals, None)]);
+            PrimitiveBlock::from_vec(buffer.clone())
+                .expect_err("construction must refuse the fixture");
+            let expected = format!("{what} failed to parse after PrimitiveBlock construction");
+            for skip_metadata in [false, true] {
+                let block = unvalidated_block(buffer.clone());
+                let msg = panic_message(|| {
+                    if skip_metadata {
+                        block.elements_skip_metadata().for_each(drop);
+                    } else {
+                        block.elements().for_each(drop);
+                    }
+                });
+                assert!(
+                    msg.contains(&expected),
+                    "{what}, skip {skip_metadata}: {msg}"
+                );
+            }
+        }
+
+        // A valid element followed by one whose `keys` field declares more
+        // bytes than it holds, on each element kind: used to be skipped.
+        let truncated_element = [0x12u8, 0x05];
+        for (field, what) in [(1u8, "Node"), (3, "Way"), (4, "Relation")] {
+            let mut group = len_field(field, &[0x08, 0x01]);
+            group.extend_from_slice(&len_field(field, &truncated_element));
+            let buffer = block_with_groups(&[group]);
+            PrimitiveBlock::from_vec(buffer.clone())
+                .expect_err("construction must refuse the fixture");
+            let expected = format!("{what} failed to parse after PrimitiveBlock construction");
+
+            let block = unvalidated_block(buffer.clone());
+            let msg = panic_message(|| block.elements().for_each(drop));
+            assert!(msg.contains(&expected), "elements, {what}: {msg}");
+
+            let block = unvalidated_block(buffer.clone());
+            let msg = panic_message(|| block.elements_skip_metadata().for_each(drop));
+            assert!(
+                msg.contains(&expected),
+                "elements_skip_metadata, {what}: {msg}"
+            );
+
+            let block = unvalidated_block(buffer);
+            let msg = panic_message(|| block.for_each_element(|_| {}));
+            assert!(msg.contains(&expected), "group iterator, {what}: {msg}");
         }
     }
 

@@ -1156,7 +1156,11 @@
   produces either shape; an empty extra occurrence is still accepted.
   `Node::info`, `Way::info` and `Relation::info` no longer fall back to
   default metadata on a parse failure: block construction rules it out, and
-  reaching it would be a pbfhogg bug, so they panic.
+  reaching it would be a pbfhogg bug, so they panic. The block and group
+  iterators (`elements`, `elements_skip_metadata`, `dense_nodes`, `nodes`,
+  `ways`, `relations`) and dense node tags follow the same rule: where they
+  once read such a failure as no dense nodes, absent dense metadata, a
+  skipped element or a shortened tag list, they now panic.
 
 - **`getid` accepts a partially indexed input in every mode.** A file whose
   first data blob carries indexdata and a later one does not was refused by

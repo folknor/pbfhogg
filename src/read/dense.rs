@@ -1,6 +1,6 @@
 //! Iterate over the dense nodes in a `PrimitiveGroup`
 
-use super::block::{get_stringtable_key_value, str_from_stringtable};
+use super::block::{get_stringtable_key_value, str_from_stringtable, validated};
 use super::wire::{
     Cursor, PackedBoolIter, PackedInt32Iter, PackedSint32Iter, PackedSint64Iter, WireBlock,
     WireDenseInfo, WireDenseNodes,
@@ -108,13 +108,18 @@ pub struct DenseNodeIter<'a> {
 }
 
 impl<'a> DenseNodeIter<'a> {
-    pub(crate) fn new(
+    /// `dense` must come from a group of `block`, which block construction
+    /// validated (`validate_groups_strict` ran `WireDenseInfo::parse` on this
+    /// `denseinfo`). A `DenseInfo` parse failure is therefore a broken
+    /// invariant and panics through `validated` rather than reading every
+    /// node's metadata as absent.
+    pub(super) fn new(
         block: &'a WireBlock<'static>,
         dense: WireDenseNodes<'a>,
     ) -> DenseNodeIter<'a> {
         let info_iter = dense
             .info_data
-            .and_then(|data| WireDenseInfo::parse(data).ok())
+            .map(|data| validated(WireDenseInfo::parse(data), "DenseInfo"))
             .map(|info| DenseNodeInfoIter::new(block, info));
         DenseNodeIter {
             block,
@@ -133,7 +138,7 @@ impl<'a> DenseNodeIter<'a> {
         }
     }
 
-    pub(crate) fn new_skip_metadata(
+    pub(super) fn new_skip_metadata(
         block: &'a WireBlock<'static>,
         dense: WireDenseNodes<'a>,
     ) -> DenseNodeIter<'a> {
@@ -154,7 +159,7 @@ impl<'a> DenseNodeIter<'a> {
         }
     }
 
-    pub(crate) fn empty(block: &'a WireBlock<'static>) -> DenseNodeIter<'a> {
+    pub(super) fn empty(block: &'a WireBlock<'static>) -> DenseNodeIter<'a> {
         DenseNodeIter {
             block,
             dids: PackedSint64Iter::empty(),
@@ -202,8 +207,8 @@ impl<'a> Iterator for DenseNodeIter<'a> {
                 //   terminated by a single 0 varint delimiter.
                 let tag_start = self.kv_pos;
                 // `tag_end` trails `kv_pos`: it advances only over complete
-                // (key, val) pairs, so it never includes the 0 delimiter and
-                // never includes a partial trailing varint. Deriving it by
+                // (key, val) pairs, so it never includes the 0 delimiter.
+                // Deriving it by
                 // subtracting one byte from `kv_pos` instead - on the
                 // assumption that the run always ended at a delimiter - chopped
                 // the last byte of the final value varint whenever `keys_vals`
@@ -212,31 +217,24 @@ impl<'a> Iterator for DenseNodeIter<'a> {
                 let mut cursor = Cursor::new(&self.kv_data[self.kv_pos..]);
 
                 // Scan forward, decoding varints until we hit a 0 key.
+                // `validate_dense_keys_vals` walked these same varints at block
+                // construction and refused a malformed one and a key with no
+                // value, so neither read can fail here; a failure is a broken
+                // invariant and panics (see `validated`) rather than ending
+                // the node's tags early.
                 while !cursor.is_empty() {
                     let before = cursor.remaining();
-                    match cursor.read_varint() {
-                        Ok(0) => {
-                            // 0 delimiter found. Step kv_pos past the
-                            // delimiter; tag_end stays before it.
-                            self.kv_pos += before - cursor.remaining();
-                            break;
-                        }
-                        Ok(_key) => {
-                            // Skip the corresponding value varint. A key with
-                            // no value is malformed input; leave both cursors
-                            // at the last complete pair and stop.
-                            if cursor.read_varint().is_err() {
-                                self.kv_pos = self.kv_data.len();
-                                break;
-                            }
-                            self.kv_pos += before - cursor.remaining();
-                            tag_end = self.kv_pos;
-                        }
-                        Err(_) => {
-                            self.kv_pos = self.kv_data.len();
-                            break;
-                        }
+                    let key = validated(cursor.read_varint(), "DenseNodes keys_vals key");
+                    if key == 0 {
+                        // 0 delimiter found. Step kv_pos past the delimiter;
+                        // tag_end stays before it.
+                        self.kv_pos += before - cursor.remaining();
+                        break;
                     }
+                    // Skip the corresponding value varint.
+                    validated(cursor.read_varint(), "DenseNodes keys_vals value");
+                    self.kv_pos += before - cursor.remaining();
+                    tag_end = self.kv_pos;
                 }
 
                 let tag_bytes = &self.kv_data[tag_start..tag_end];
@@ -516,10 +514,17 @@ impl<'a> Iterator for DenseTagIter<'a> {
         if self.cursor.is_empty() {
             return None;
         }
-        // wontfix(type-result-fallible): Iterator trait constrains return type;
-        // .ok() stops iteration on corrupt data rather than propagating errors.
-        let key = self.cursor.read_varint().ok()? as usize;
-        let val = self.cursor.read_varint().ok()? as usize;
+        // The cursor covers only the complete (key, val) pairs `DenseNodeIter`
+        // found in `keys_vals`, which block construction validated
+        // (`validate_dense_keys_vals`), so neither read can fail; a failure is
+        // a broken invariant and panics (see `validated`).
+        // wontfix(type-result-fallible): an out-of-range string index is
+        // different - construction does not resolve indices - and still ends
+        // iteration, because Iterator constrains the return type. See
+        // CORRECTNESS.md "Tag iterators end early on an out-of-range string
+        // index".
+        let key = validated(self.cursor.read_varint(), "DenseNodes keys_vals key") as usize;
+        let val = validated(self.cursor.read_varint(), "DenseNodes keys_vals value") as usize;
         get_stringtable_key_value(self.block, Some(key), Some(val))
     }
 }
@@ -570,11 +575,13 @@ impl Iterator for DenseRawTagIter<'_> {
         if self.cursor.is_empty() {
             return None;
         }
-        // wontfix(type-result-fallible): same as DenseTagIter - Iterator constrains return type
+        // Neither read can fail, for the reason given in `DenseTagIter::next`;
+        // the narrowing is lossless because construction refused any index
+        // above `i32::MAX`.
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let key = self.cursor.read_varint().ok()? as i32;
+        let key = validated(self.cursor.read_varint(), "DenseNodes keys_vals key") as i32;
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let val = self.cursor.read_varint().ok()? as i32;
+        let val = validated(self.cursor.read_varint(), "DenseNodes keys_vals value") as i32;
         Some((key, val))
     }
 }

@@ -82,15 +82,14 @@ macro_rules! impl_coordinate_conversions {
 /// rather than fall back to default metadata: the default is indistinguishable
 /// from absent metadata, so a silent fallback would hand version 0 /
 /// timestamp 0 to `time-filter`, the owned conversions and the OSC writers
-/// with no signal. The cost is the branch the old `unwrap_or_default` paid.
+/// with no signal. The policy and its panic live in `validated` in `block.rs`,
+/// shared with the block iterators.
 #[inline]
+#[track_caller]
 fn validated_info(info_data: Option<&[u8]>) -> WireInfo {
     match info_data {
         None => WireInfo::default(),
-        Some(data) => WireInfo::parse(data).expect(
-            "element Info failed to parse after PrimitiveBlock construction validated it \
-             (validate_groups_strict / validate_info in block.rs): construction invariant broken",
-        ),
+        Some(data) => super::block::validated(WireInfo::parse(data), "element Info"),
     }
 }
 

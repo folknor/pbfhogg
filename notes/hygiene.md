@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-18. HYG-164
 19. HYG-165
 20. HYG-166
 21. HYG-167 (after HYG-164 to HYG-166: it adds the text rule)
@@ -608,6 +607,28 @@ The judgement calls already known, to be checked first:
     `catch_unwind` it surfaces as an internal error, elsewhere it unwinds
     or aborts per the caller.
   - `Node::new`, `Way::new` and `Relation::new` narrowed to `pub(super)`.
+- The same rule now covers every re-parse a validated block's consumers
+  run: one helper (`validated` in `block.rs`, which `validated_info` now
+  calls) panics with a cold, never-inlined call naming what failed. Sites:
+  `PrimitiveGroup::dense_nodes`, `BlockElementsIter::step` (dense group and
+  the per-element `Node` / `Way` / `Relation` arms), the three group element
+  iterators, `decode_dense_columns`, `DenseNodeIter::new` (`DenseInfo`), the
+  per-node `keys_vals` walk in `DenseNodeIter::next`, and the varint reads in
+  `DenseTagIter` / `DenseRawTagIter`. Each used to read corruption as fewer
+  nodes, absent metadata, shorter tags or a skipped element. Sparred with
+  codex, which agreed the arms are unreachable and that a validated-block
+  wrapper type would restate the existing private construction boundary
+  rather than add a proof. Judgement calls on the read hot path, none
+  measured:
+  - Per element and per dense tag varint, an `Err` branch to a cold panic
+    call replaces an `Err` branch to a skip, an early end or a loop
+    back-edge. Argued cost-neutral; codex cautioned that equal branch counts
+    do not guarantee equal codegen (inlining of the generic helper, layout).
+  - `WireMessageIter::next` is deliberately unchanged: shared framing
+    plumbing, driven by the validation pass and the raw node scanner too,
+    whose doc says why its `.ok()` arms are unreachable.
+  - `DenseNodeIter::new`, `new_skip_metadata` and `empty` narrowed to
+    `pub(super)`.
 
 ---
 
@@ -859,38 +880,6 @@ as the only loop with an `on_idle()` hook; a source-scan test that only
 
 Reported by: write path.
 
-## HYG-164 - A corrupt dense group reads as no nodes
-
-Anger: 9 - read hot path.
-
-`block.rs::PrimitiveGroup::dense_nodes` and its twin in
-`BlockElementsIter::step` (plus the `skip_metadata` variant near the top of
-the iterator code): a `WireDenseNodes` parse error yields an empty iterator,
-so a corrupt dense group reads as "no nodes". `dense.rs::DenseNodeIter::new`
-drops all dense metadata on a `WireDenseInfo` parse error.
-
-Already settled, for whoever takes this: `PrimitiveBlock::finish` is the only
-constructor (all three `from_vec*` funnel through it; there is no lazy or
-unvalidated path), and it runs `validate_groups_strict` before handing out a
-block. That pass parses the dense group (`WireGroup::dense`,
-`WireDenseNodes::parse`) and its `denseinfo` (`validate_dense_info_arrays`,
-which runs `WireDenseInfo::parse`) on the same immutable bytes the iterators
-read, and the parsers now refuse a second data-bearing `denseinfo`, so these
-swallows are unreachable. The element metadata accessors were resolved the
-same way: `validated_info` in `elements.rs` panics with a message naming the
-validator rather than `debug_assert!` plus a default, because a release
-default is the silent wrong metadata the finding is about and the panic costs
-the same branch (sparred with codex). Same family, same invariant: the
-`if let Ok(...)` element skips in `BlockElementsIter::step` and the
-`GroupNodeIter` / `GroupWayIter` / `GroupRelationIter` loops, already
-described as dead in `validate_groups_strict`'s doc.
-
-Not to be re-reported: tag iterators ending early on an out-of-range string
-index, and roles collapsed to `""` by `role().unwrap_or("")`, are accepted in
-CORRECTNESS.md "Tag iterators end early on an out-of-range string index".
-
-Reported by: read path, CLI and plumbing, change application.
-
 ## HYG-165 - The owned conversions turn a bad user string into an empty one
 
 Anger: 8 - sort, `cat --dedupe`, degrade and time-filter re-encode through it.
@@ -940,6 +929,14 @@ marker comment with the reason (`disallowed-methods` cannot be scoped to
 modules, and `Result::ok` is legitimate elsewhere). `WireMessageIter::next`
 in `wire.rs` is one such legitimate site: its doc explains why its `.ok()`
 is unreachable.
+
+Since then the block-read consumers were resolved with a panic rather than
+a `debug_assert!`: `validated` in `block.rs` is the one helper, used by the
+block iterators, `DenseNodeIter`, the dense tag iterators and the element
+`info()` accessors, so `src/read/dense.rs` and `src/read/block.rs` carry no
+`.ok()` swallow any more. Its doc gives the reasoning (a release fallback
+is the silent wrong answer itself; the panic is a cold call); whoever takes
+this entry may weigh the same argument for the arena.
 
 Reported by: read path, CLI and plumbing, change application.
 

@@ -155,7 +155,7 @@ if let Some(bytes) = bb.take()? {
 # Ok::<(), std::io::Error>(())
 ```
 
-`BlockBuilder` automatically flushes when it hits the 8000-entity limit or when the element type changes (e.g., switching from nodes to ways). Always call `take()` after adding all elements to flush the final partial block.
+`BlockBuilder` does not flush by itself. Before each add, check `can_add_node()` / `can_add_way()` / `can_add_relation()`: they return `false` when the block is at its element cap or holds another element type (e.g. switching from nodes to ways), and then you `take()` the block and write it before adding. An add the block cannot take is refused, not encoded: the element is lost, and every later `take()` returns an error, so no output can be completed after the mistake. The same refusal applies to a way whose refs and locations differ in length and a relation member of an unknown type. Always call `take()` after adding all elements to flush the final partial block, and propagate its error.
 
 ### Metadata
 
@@ -407,22 +407,37 @@ let mut writer = PbfWriter::to_path(
 )?;
 
 let mut bb = BlockBuilder::new();
+// The closure cannot return an error, so keep the first one and stop writing.
+let mut failed = None;
 
 reader.for_each(|element| {
+    if failed.is_some() {
+        return;
+    }
     if let Element::Way(way) = element {
-        let dominated_by_highway = way.tags().any(|(k, _)| k == "highway");
-        if dominated_by_highway {
+        let is_highway = way.tags().any(|(k, _)| k == "highway");
+        if is_highway {
+            // Flush a full block before adding to it
+            if !bb.can_add_way() {
+                let flushed = match bb.take() {
+                    Ok(Some(bytes)) => writer.write_primitive_block(bytes),
+                    Ok(None) => Ok(()),
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = flushed {
+                    failed = Some(e);
+                    return;
+                }
+            }
             let tags: Vec<(&str, &str)> = way.tags().collect();
             let refs: Vec<i64> = way.refs().collect();
             bb.add_way(way.id(), tags, &refs, None);
-
-            // Flush full blocks
-            if let Ok(Some(bytes)) = bb.take() {
-                let _ = writer.write_primitive_block(bytes);
-            }
         }
     }
 })?;
+if let Some(e) = failed {
+    return Err(e.into());
+}
 
 // Flush the final partial block
 if let Some(bytes) = bb.take()? {

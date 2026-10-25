@@ -201,11 +201,15 @@ pub struct BlockBuilder {
     // Sticky poison. Set by an `add_*` method that was handed input it cannot
     // encode without corrupting the output (a way whose ref and location
     // counts disagree, a relation member whose type has no protobuf enum
-    // value). The offending element is not encoded, and `encode_block` refuses
-    // to produce a block from that point on, so no such element can reach a
-    // file. Deliberately NOT cleared by `reset()`: once a caller has fed the
-    // builder something unencodable, every later block from the same builder
-    // is suspect, and a writer that keeps going has already lost the element.
+    // value), or called when `can_add_*` says no (the block holds another
+    // kind, or is at its cap). The offending element is not encoded, and
+    // `encode_block` refuses to produce a block from that point on, so no
+    // such element can reach a file. Deliberately NOT cleared by `reset()`:
+    // once a caller has fed the builder something unencodable, every later
+    // block from the same builder is suspect, and a writer that keeps going
+    // has already lost the element. Later `add_*` calls are not checked
+    // against it (that would cost every element a load and a branch): they
+    // may still mutate the doomed block's buffers, but nothing is emitted.
     poison: Option<String>,
 }
 
@@ -322,6 +326,48 @@ impl BlockBuilder {
         }
     }
 
+    /// Refuse an element the current block cannot take, because the block
+    /// holds another kind or is at its cap.
+    ///
+    /// The `add_*` methods used to `assert!` here. Every caller is required
+    /// to check `can_add_*` first and every caller in this crate does, so
+    /// this is a caller bug rather than a data condition - but a library
+    /// caller's bug should be an error, not a panic. It poisons rather than
+    /// returning a `Result` from `add_*`: the poison is the builder's one
+    /// failure model, finalization (`take` / `take_owned`) is its error
+    /// boundary, and no block can be emitted after a refusal. Kept out of
+    /// line and cold so the per-element guard costs what the assert did.
+    #[cold]
+    #[inline(never)]
+    fn refuse(&mut self, attempted: BlockType, id: i64) {
+        let what = match attempted {
+            BlockType::DenseNodes => "node",
+            BlockType::Ways => "way",
+            BlockType::Relations => "relation",
+        };
+        // A block of another kind is reported as that, whether or not it is
+        // also full: its fullness is not why this element was refused.
+        let reason = match self.block_type {
+            Some(held) if held != attempted => {
+                let held = match held {
+                    BlockType::DenseNodes => "nodes",
+                    BlockType::Ways => "ways",
+                    BlockType::Relations => "relations",
+                };
+                format!(
+                    "{what} {id} added to a block holding {held}; a block holds one \
+                     element kind, so take the block before adding another kind"
+                )
+            }
+            _ => format!(
+                "{what} {id} added to a full block ({} element cap); take the \
+                 block when can_add returns false",
+                self.cap
+            ),
+        };
+        self.poison(reason);
+    }
+
     /// Track an element ID for BlobIndex min/max range.
     #[inline]
     fn track_id(&mut self, id: i64) {
@@ -369,6 +415,15 @@ impl BlockBuilder {
     }
 
     /// Returns `true` if a node can be added to the current block.
+    ///
+    /// The `can_add_*` methods answer kind and capacity only, not whether the
+    /// builder has been poisoned. When one returns `false`, call
+    /// [`take`](Self::take) (or flush however the caller flushes) before
+    /// adding: an `add_*` the block cannot take is refused rather than
+    /// encoded, and the builder is poisoned - the element is lost and every
+    /// later `take` / `take_owned` returns an error, so no block is emitted
+    /// after the refusal. Subsequent additions may still modify the
+    /// builder's internal buffers.
     pub fn can_add_node(&self) -> bool {
         match self.block_type {
             None => true,
@@ -408,10 +463,10 @@ impl BlockBuilder {
         tags: impl IntoIterator<Item = (&'t str, &'t str)>,
         metadata: Option<&Metadata<'_>>,
     ) {
-        assert!(
-            self.can_add_node(),
-            "cannot add node: block full or wrong type"
-        );
+        if !self.can_add_node() {
+            self.refuse(BlockType::DenseNodes, id);
+            return;
+        }
         self.block_type = Some(BlockType::DenseNodes);
 
         let lat = i64::from(decimicro_lat);
@@ -546,10 +601,10 @@ impl BlockBuilder {
         refs: &[i64],
         metadata: Option<&Metadata<'_>>,
     ) {
-        assert!(
-            self.can_add_way(),
-            "cannot add way: block full or wrong type"
-        );
+        if !self.can_add_way() {
+            self.refuse(BlockType::Ways, id);
+            return;
+        }
         self.block_type = Some(BlockType::Ways);
         encode_way(
             &mut self.string_table,
@@ -595,10 +650,10 @@ impl BlockBuilder {
             ));
             return;
         }
-        assert!(
-            self.can_add_way(),
-            "cannot add way: block full or wrong type"
-        );
+        if !self.can_add_way() {
+            self.refuse(BlockType::Ways, id);
+            return;
+        }
         self.block_type = Some(BlockType::Ways);
         encode_way_with_locations(
             &mut self.string_table,
@@ -649,10 +704,10 @@ impl BlockBuilder {
             ));
             return;
         }
-        assert!(
-            self.can_add_relation(),
-            "cannot add relation: block full or wrong type"
-        );
+        if !self.can_add_relation() {
+            self.refuse(BlockType::Relations, id);
+            return;
+        }
         self.block_type = Some(BlockType::Relations);
         encode_relation(
             &mut self.string_table,
@@ -701,10 +756,10 @@ impl BlockBuilder {
         raw_tags: impl Iterator<Item = (i32, i32)>,
         metadata: Option<&RawMetadata>,
     ) {
-        assert!(
-            self.can_add_node(),
-            "cannot add node: block full or wrong type"
-        );
+        if !self.can_add_node() {
+            self.refuse(BlockType::DenseNodes, id);
+            return;
+        }
         self.block_type = Some(BlockType::DenseNodes);
 
         let lat = i64::from(decimicro_lat);
@@ -762,10 +817,10 @@ impl BlockBuilder {
         refs_data: &[u8],
         info_data: Option<&[u8]>,
     ) {
-        assert!(
-            self.can_add_way(),
-            "cannot add way: block full or wrong type"
-        );
+        if !self.can_add_way() {
+            self.refuse(BlockType::Ways, id);
+            return;
+        }
         #[cfg(debug_assertions)]
         self.debug_assert_raw_strings(keys_data, vals_data, &[], info_data);
         self.block_type = Some(BlockType::Ways);
@@ -799,10 +854,10 @@ impl BlockBuilder {
         lon_data: &[u8],
         info_data: Option<&[u8]>,
     ) {
-        assert!(
-            self.can_add_way(),
-            "cannot add way: block full or wrong type"
-        );
+        if !self.can_add_way() {
+            self.refuse(BlockType::Ways, id);
+            return;
+        }
         #[cfg(debug_assertions)]
         self.debug_assert_raw_strings(keys_data, vals_data, &[], info_data);
         self.block_type = Some(BlockType::Ways);
@@ -838,10 +893,10 @@ impl BlockBuilder {
         types_data: &[u8],
         info_data: Option<&[u8]>,
     ) {
-        assert!(
-            self.can_add_relation(),
-            "cannot add relation: block full or wrong type"
-        );
+        if !self.can_add_relation() {
+            self.refuse(BlockType::Relations, id);
+            return;
+        }
         #[cfg(debug_assertions)]
         self.debug_assert_raw_strings(keys_data, vals_data, roles_sid_data, info_data);
         self.block_type = Some(BlockType::Relations);
@@ -1264,6 +1319,79 @@ mod tests {
             };
             assert_eq!(tags, [("key", "tail"), ("key", "")]);
         }
+    }
+
+    /// Every `add_*` path refuses an element the block cannot take.
+    ///
+    /// These used to `assert!`, so a caller that skipped `can_add_*` panicked
+    /// the thread. Each path is driven separately - eight copies of the guard
+    /// exist, and one left as an assert would leave the other seven green -
+    /// on a block of another kind, and the refusal must reach both emit
+    /// paths. The paired success is the first add on each fresh builder,
+    /// which the refusal must not have disturbed: the message names the
+    /// second element, not the first.
+    #[test]
+    fn every_add_path_refuses_a_block_of_another_kind() {
+        let empty = std::iter::empty::<(&str, &str)>;
+        let members = [MemberData {
+            id: MemberId::Node(1),
+            role: "",
+        }];
+        for path in 0..8 {
+            let mut bb = BlockBuilder::new();
+            // Seed a block of a kind the path under test does not add. The
+            // raw paths need no pre-seeded table: the guard runs first.
+            let held = if [2, 3, 4, 6].contains(&path) {
+                bb.add_node(1, 0, 0, empty(), None);
+                "nodes"
+            } else {
+                bb.add_way(1, empty(), &[1, 2], None);
+                "ways"
+            };
+            match path {
+                0 => bb.add_node(7, 0, 0, empty(), None),
+                1 => bb.add_node_raw(7, 0, 0, std::iter::empty(), None),
+                2 => bb.add_way(7, empty(), &[1, 2], None),
+                3 => bb.add_way_with_locations(7, empty(), &[1], &[(0, 0)], None),
+                4 => bb.add_way_raw_bytes(7, &[], &[], &[2], None),
+                5 => bb.add_relation(7, empty(), &members, None),
+                6 => bb.add_way_raw_bytes_with_locations(7, &[], &[], &[2], &[0], &[0], None),
+                _ => bb.add_relation_raw_bytes(7, &[], &[], &[0], &[2], &[0], None),
+            }
+            let msg = match bb.take_owned() {
+                Ok(_) => panic!("path {path}: a refused element must stop the block"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                msg.contains(&format!(" 7 added to a block holding {held}")),
+                "path {path}: the error must name the element and the held kind, got: {msg}"
+            );
+            assert!(bb.take().is_err(), "path {path}: take must refuse it too");
+        }
+    }
+
+    /// A full block refuses one more element of its own kind, and the
+    /// refusal is sticky across a later legal block.
+    #[test]
+    fn a_full_block_refuses_the_next_element_and_stays_refused() {
+        let cap = std::num::NonZeroUsize::new(2).expect("non-zero");
+        let mut bb = BlockBuilder::with_element_cap_prealloc(cap, 2);
+        bb.add_node(1, 0, 0, [("k", "v")], None);
+        bb.add_node(2, 0, 0, [("k", "v")], None);
+        assert!(!bb.can_add_node(), "fixture: the block is at its cap");
+        bb.add_node(3, 0, 0, [("k", "v")], None);
+        let msg = match bb.take() {
+            Ok(_) => panic!("an over-cap block must not encode"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("node 3 added to a full block (2 element cap)"),
+            "the error must name the element and the cap, got: {msg}"
+        );
+        // Sticky: the block is gone, and a fresh legal add cannot flush past
+        // the refusal into a file with node 3 missing.
+        bb.add_way(10, [("k", "v")], &[1, 2], None);
+        assert!(bb.take_owned().is_err(), "the refusal must survive");
     }
 
     #[test]

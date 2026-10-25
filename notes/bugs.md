@@ -57,6 +57,10 @@ the device size (`BLKGETSIZE64`, or seeking to the end), or the pin refuses
 block devices and the docs say so. Raised by codex in the time-filter pin
 spar; not verified with a test.
 
+Maintainer (2026-10-25): the pin refuses block devices, and the docs that
+promise them (`reference/pipeline.md`, the adopting commands' docs, the
+CHANGELOG) say so. The walker does not learn device sizes.
+
 Reported by: the HYG-186 resolution.
 
 ## BUG-183 - The raw node scanner truncates a dense group whose arrays disagree
@@ -78,6 +82,9 @@ pattern calls all three `next()`s before matching, so it consumes the
 unmatched tail, and a clean end cannot be told from a truncated varint if
 both read as `None`. The fix needs fallible counting (the block layer's
 `packed_varint_count`) or per-iterator handling of each result.
+
+Maintainer (2026-10-25): fail loudly and early, without impacting
+performance.
 
 Reported by: the element metadata accessor change.
 

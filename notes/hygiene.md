@@ -57,15 +57,17 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-24. HYG-047
 25. HYG-158
 26. HYG-159
 27. HYG-160
-28. HYG-077 (last: it annotates files across the crate)
+28. HYG-180
+29. BUG-183
+30. BUG-190
+31. HYG-077 (last: it annotates files across the crate)
 
-Discussed and skipped for now: HYG-036, HYG-037, HYG-058, HYG-109. Not
-discussed: HYG-002, HYG-010, HYG-011, HYG-012, HYG-013, HYG-014, HYG-015,
-HYG-016, HYG-053, HYG-081, BUG-009.
+Discussed and skipped for now: HYG-036, HYG-037, HYG-058, HYG-109, HYG-181,
+HYG-182. Not discussed: HYG-002, HYG-010, HYG-011, HYG-012, HYG-013,
+HYG-014, HYG-015, HYG-016, HYG-053, HYG-081, BUG-009.
 
 ---
 
@@ -866,6 +868,20 @@ The judgement calls already known, to be checked first:
     over its location and is shared by the header walker and digest's
     consumer. A multi-fault file can now report a different refusal first,
     since partial indexdata is no longer refused before any decode.
+- `BlockBuilder`'s eight `add_*` paths (four public, four raw) no longer
+  `assert!(can_add_*)`: a wrong kind or full block poisons the builder
+  through a `#[cold] #[inline(never)]` `refuse`, the element is dropped and
+  the next `take` / `take_owned` errors. Per-element write hot path on every
+  re-encoding command; argued cost-neutral (the same predicted branch, the
+  cold body out of line where the assert's panic path was), not measured.
+  Sparred with codex: `add_*` returning `Result` plus poison was its first
+  preference and was withdrawn once finalization was accepted as the
+  builder's error boundary; it confirmed no production caller can emit a
+  block or exit zero after a refusal (a kind or cap refusal leaves the
+  builder non-empty, so `is_empty`-gated flushes cannot skip it). Later
+  adds on a poisoned builder are deliberately not checked, so they still
+  mutate its buffers; `can_add_*` answers kind and capacity only. The
+  zero-cap panic the finding also named was already gone (`NonZeroUsize`).
 
 ---
 
@@ -1033,7 +1049,7 @@ paragraph in both CLI references states it) and a likely cost on the
 default path for inputs that share blobs, such as an `apply-changes` output
 against its base. Fix: one shared shard core. The two parallel files also
 carry about twenty sound `.expect("checked")` / `.expect("checked peek")`
-calls (a peek, then a next) that HYG-047's triage left here: they go when the
+calls (a peek, then a next) that the 2026-10-25 triage left here: they go when the
 copies merge, or become `match (peek, peek)` with `next_if`.
 
 Reported by: re-encoding.
@@ -1210,98 +1226,45 @@ reports zero alignment.
 Reported by: altw and scanning, re-encoding, filtering and spatial, CLI and
 plumbing.
 
-## HYG-047 - Code aborts on caller-controlled input where a refusal was owed
-
-Anger: 9 - decode failures and aborts become errors: new refusals, Results on builder hot paths.
-
-- `BlockBuilder::add_node`, `add_way`, `add_relation`,
-  `add_way_with_locations` and the `_raw` variants `assert!(self.can_add_*())`,
-  aborting on a wrong element kind or full block, while the builder already has
-  a non-panicking `poison` mechanism for other bad input.
-  `BlockBuilder::with_element_cap_prealloc(0, _)` panics.
-- `PbfWriter::into_inner` panics on a pipelined writer, while `writer_mut` was
-  changed to return an error for the same state.
-- `ReorderBuffer::push` asserts on stale, duplicate and window-exceeded seqs,
-  documented as programming errors because seqs come from `enumerate()`. That
-  holds for the read pipeline, not structurally: about fifteen callers feed it,
-  some from worker-computed seqs, and a panicking consumer inside
-  `thread::scope` re-raises at join.
-- `check/verify_ids.rs`: `slot.expect("parallel_classify_phase must deliver
-  every blob")` twice, on the path whose job is to survive hostile files.
-- `geo::assemble_rings` `.expect("nonempty ring")` and `.expect("search is
-  nonempty")`, true by construction today.
-- `getid::parse_id_spec` `unreachable!()` twice and `parse_element_spec`
-  `unreachable!()`, held only by a `char`-typed prefix (HYG-007).
-- About 20 `.expect("checked")` / `.expect("checked peek")` in
-  `diff/parallel.rs` and `derive_parallel.rs`, three in degrade, removable by
-  `match (peek, peek)` with `next_if`.
-- `SparseArrayIndex::get` and `SharedSparseWriter::insert` assert on a rank
-  outside the store; a real internal invariant, but the messages are
-  paragraph-length.
-- `new_permit_pool` uses `.expect` soundly; nothing distinguishes sound uses
-  from the others.
-
-`unwrap_used` is denied workspace-wide but `expect_used` is not, so every one
-of these slips through. Fix: `add_*` returning `Result` or poisoning; a
-typestate `PbfWriter<Sync>` / `PbfWriter<Pipelined>`; `ReorderBuffer::push`
-returning `Err`; `let Some(..) else`. Enforce with
-`clippy::expect_used = "deny"` and `allow-expect-in-tests` in a `clippy.toml`.
-The input-driven panics are in `notes/bugs.md` (IdSet, BucketLayout, renumber
-deltas).
-
-Split on 2026-10-25, one entry per API: this entry keeps `BlockBuilder`;
-`PbfWriter::into_inner` is HYG-158, `check --ids` HYG-159, getid HYG-160, and
-the `expect_used` lever moved to HYG-077, which runs last. Left with the
-work that owns them: `ReorderBuffer::push` (HYG-053), the diff and derive
-parallel peeks (HYG-013), and the sound invariants (`assemble_rings`,
-`SparseArrayIndex` / `SharedSparseWriter`, `new_permit_pool`), which get
-`#[expect]` reasons under HYG-077 and shorter assert messages.
-
-Recommendation (2026-10-25) for `BlockBuilder`: the `add_*` and `_raw`
-asserts become the builder's existing poison, surfacing when the block is
-built (same branch cost per element, signature unchanged; a panic becomes an
-error for library users, CHANGELOG line), and `with_element_cap_prealloc(0,
-_)` refuses a zero cap with an error.
-
-Reported by: write path, read path, CLI and plumbing, filtering and spatial,
-re-encoding, altw and scanning.
-
 ## HYG-158 - `PbfWriter::into_inner` panics on a pipelined writer
 
 Anger: 6 - public API.
 
-Split out of HYG-047. `into_inner` panics on a pipelined writer, while
+Split out of an entry on aborts where a refusal was owed (2026-10-25). `into_inner` panics on a pipelined writer, while
 `writer_mut` returns an error for the same state.
 
 Recommendation (2026-10-25): return a `Result`, as `writer_mut` does; a
-breaking API change before 1.0, CHANGELOG line. HYG-047's typestate
+breaking API change before 1.0, CHANGELOG line. The original entry's typestate
 alternative (`PbfWriter<Sync>` / `PbfWriter<Pipelined>`) is not needed for
 this.
 
-Reported by: as HYG-047.
+Reported by: write path, read path, CLI and plumbing, filtering and spatial,
+re-encoding, altw and scanning.
 
 ## HYG-159 - `check --ids` expects every classify slot filled
 
 Anger: 5 - the hostile-input path.
 
-Split out of HYG-047. `check/verify_ids.rs`:
+Split out of an entry on aborts where a refusal was owed (2026-10-25). `check/verify_ids.rs`:
 `slot.expect("parallel_classify_phase must deliver every blob")` twice, on
 the path whose job is to survive hostile files.
 
 Recommendation (2026-10-25): let-else returning an internal error.
 
-Reported by: as HYG-047.
+Reported by: write path, read path, CLI and plumbing, filtering and spatial,
+re-encoding, altw and scanning.
 
 ## HYG-160 - getid's `unreachable!()`s rest on a char prefix
 
 Anger: 4 - contained.
 
-Split out of HYG-047. `getid::parse_id_spec` has two `unreachable!()` and
+Split out of an entry on aborts where a refusal was owed (2026-10-25). `getid::parse_id_spec` has two `unreachable!()` and
 `parse_element_spec` one, held only by a `char`-typed prefix.
 
 Recommendation (2026-10-25): let-else returning an error.
 
-Reported by: as HYG-047.
+Reported by: write path, read path, CLI and plumbing, filtering and spatial,
+re-encoding, altw and scanning.
 
 ## HYG-053 - Reorder buffers are bounded only statistically
 
@@ -1334,7 +1297,7 @@ returning it; an engine that lets the merge stop dispatch would fail fast.
 documented as programming errors because seqs come from `enumerate()`; that
 holds for the read pipeline, not structurally, since about fifteen callers
 feed it, some from worker-computed seqs, and a panicking consumer inside
-`thread::scope` re-raises at join. HYG-047's triage left this here: with a
+`thread::scope` re-raises at join. The 2026-10-25 triage left this here: with a
 credit scheme in one engine, `push` can return `Err` instead.
 
 Reported by: re-encoding, read path, filtering and spatial, altw and scanning.
@@ -1367,11 +1330,15 @@ Anger: 8 - clippy.toml with expect_used denied means hundreds of edits.
 Recommendation (2026-10-25), agreed with the maintainer; runs last of the
 queue, since it annotates files across the crate. Record the
 levers-per-entry ruling below as a comment in `clippy.toml`, and bring
-HYG-047's lever: deny `clippy::expect_used` workspace-wide with
-`allow-expect-in-tests = true` in `clippy.toml`; every remaining production
-`expect` gets `#[expect(clippy::expect_used, reason = "...")]` saying why it
-is sound (the sound invariants HYG-047 lists included, with their assert
-messages shortened). Most of the roughly 700 `.expect(` hits are in test
+the panics-where-a-refusal-was-owed lever: deny `clippy::expect_used`
+workspace-wide with `allow-expect-in-tests = true` in `clippy.toml`; every
+remaining production `expect` gets `#[expect(clippy::expect_used, reason =
+"...")]` saying why it is sound. That includes the sound invariants the
+2026-10-25 triage named: `geo::assemble_rings`' `.expect("nonempty ring")`
+and `.expect("search is nonempty")`, true by construction; `new_permit_pool`'s
+`.expect`; and `SparseArrayIndex::get` / `SharedSparseWriter::insert`, which
+assert on a rank outside the store (a real internal invariant) with
+paragraph-length messages to shorten. Most of the roughly 700 `.expect(` hits are in test
 modules, which the setting exempts. `panic`, `unreachable` and
 `arithmetic_side_effects` stay off. The entry is then resolved: the other
 levers arrive with their own entries.
@@ -1468,6 +1435,9 @@ for both, or at least the scan with tags and a refusal that says what the
 block is, would fit. Not a partial-index matter: a wholly unindexed input
 under `--force` meets the same.
 
+Maintainer (2026-10-25): skipped for now; dedupe's indexing is not to be
+touched in this drain.
+
 Reported by: the HYG-155 resolution (sparred with codex).
 
 ## HYG-181 - The parallel diff and derive shard decoders allocate a fresh buffer per block
@@ -1486,6 +1456,10 @@ is the headline planet path (`diff-snapshots -j 16` in
 ("Review once drained"). Whether glibc already recycles these frees well
 enough is unknown (rule 8).
 
+Maintainer (2026-10-25): skipped, no action. The current per-block
+allocation on this path is believed deliberate - the code has been
+performance-squeezed, and pooling here is not to be assumed a win.
+
 Reported by: the HYG-149 fix.
 
 ## HYG-180 - Two counter families still build their names with `format!`
@@ -1499,5 +1473,7 @@ names per phase (a local `stage_counters!` macro, a `Phase` value picking
 the name column at emission, a unit test pinning every name against the old
 spelling). The same treatment fits both; no emitted name or value may
 change.
+
+Maintainer (2026-10-25): queued as described.
 
 Reported by: the HYG-150 implementation.

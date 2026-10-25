@@ -957,14 +957,22 @@ fn roundtrip_zstd() {
     }
 }
 
-/// Verify that adding a way after a node without take() panics.
-/// BlockBuilder enforces one element type per block.
+/// Adding a way to a node block without take() is refused, not encoded:
+/// BlockBuilder holds one element type per block, and a caller that skipped
+/// `can_add_way` gets an error from the next take() instead of a panic.
 #[test]
-#[should_panic(expected = "cannot add way: block full or wrong type")]
-fn block_builder_mixed_type_panics() {
+fn block_builder_mixed_type_is_an_error_at_take() {
     let mut bb = BlockBuilder::new();
     bb.add_node(1, 0, 0, std::iter::empty::<(&str, &str)>(), None);
-    bb.add_way(10, std::iter::empty::<(&str, &str)>(), &[1, 2], None); // should panic
+    bb.add_way(10, std::iter::empty::<(&str, &str)>(), &[1, 2], None);
+    let msg = match bb.take() {
+        Ok(_) => panic!("a node block with a way added must not encode"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("way 10") && msg.contains("holding nodes"),
+        "the error must name the way and the kind the block holds, got: {msg}"
+    );
 }
 
 /// Mixed metadata: some nodes have metadata, others don't (like merge OSC replacements).

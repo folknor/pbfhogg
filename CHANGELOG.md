@@ -1158,6 +1158,16 @@
 
 ### Fixed
 
+- **`BlockBuilder` refuses an element its block cannot take instead of
+  panicking.** Library: an `add_*` call on a block that is at its element
+  cap or holds another element kind (the case `can_add_node`, `can_add_way`
+  and `can_add_relation` report) used to panic. The element is now refused
+  as a way with mismatched refs and locations already was: the builder is
+  poisoned and every later `take` returns an error naming the element and
+  the reason, so no block is written after it. The writing guide wrongly
+  said the builder flushes on its own; it does not, and the guide's
+  complete example now checks `can_add_way` and propagates errors.
+
 - **`digest` reads its input once, and accepts a stream.** It used to open
   the input twice (a walk of every blob header, then the decoding pass), so
   an input renamed over between the two could have one file's blocks

@@ -282,6 +282,17 @@ pub(crate) fn tags_filter_to(
     // Blob-level filtering can't help in invert mode (we want non-matching
     // blobs), and `--distrust-metadata` declines to use it at all - demanding
     // indexdata the run will not consult would be a pointless refusal.
+    //
+    // This first-blob probe is the only indexing decision tags-filter makes.
+    // A partially indexed file (some data blobs with indexdata, some without,
+    // in either order) is accepted on every path, deliberately and without a
+    // refusing walk: no path skips a blob on indexdata it lacks. `-R`'s
+    // pipelined reader, pass 1, the relation closure, the way-dependency scan
+    // and pass 2 each decode such a blob (unless its tagdata, a separate
+    // claim, excludes it) and select from its actual elements by kind and ID,
+    // so the output equals the one from the same file wholly indexed; only
+    // the decode costs more. reference/indexdata-trust.md, "Missing and
+    // partial indexdata".
     if !opts.invert && !opts.distrust_metadata {
         require_indexdata(
             input,
@@ -730,10 +741,11 @@ fn tags_filter_two_pass(
 
         // Build schedule from header-only scan via the pread-only HeaderWalker.
         // Avoids pulling blob bodies into the page cache for blobs we'll decide
-        // to skip on the tag-index filter anyway.
+        // to skip on the tag-index filter anyway. A partially indexed file is
+        // accepted (see `tags_filter_to`): a blob without indexdata is
+        // scheduled and its elements matched by their actual kind.
         crate::debug::emit_marker("TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_START");
-        let mut walker =
-            crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
+        let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
         let _ = walker
             .next_header()?
             .ok_or_else(|| crate::error::new_missing_header(input))?;
@@ -906,9 +918,8 @@ fn tags_filter_two_pass(
     crate::debug::emit_marker("TAGSFILTER_WAYDEPS_END");
 
     // --- Pass 2: Write matching elements via pread-from-workers ---
-    // Way/relation blobs where ALL elements are included pass through as raw
-    // frames (zero decompression + re-encoding). Remaining blobs are decoded
-    // and filtered by parallel workers.
+    // Every scheduled blob is decoded and its included elements re-encoded by
+    // parallel workers; there is no raw passthrough (see the pin below).
     crate::debug::emit_marker("TAGSFILTER_PASS2_START");
 
     let mut header_reader = crate::blob::BlobReader::open_in(input, direct_io, host)?;
@@ -942,8 +953,7 @@ fn tags_filter_two_pass(
     };
 
     crate::debug::emit_marker("TAGSFILTER_PASS2_SCHEDULE_SCAN_START");
-    let mut walker =
-        crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input))?;
@@ -959,14 +969,13 @@ fn tags_filter_two_pass(
         // in pass 2 - elements can be included via relation closure without
         // having the matching tag key).
         //
-        // The `if let Some(idx) = meta.index.as_ref()` gate means non-indexed
-        // blobs fall through unskipped and decode fully in pass 2. This is
-        // only reachable when the upstream `require_indexdata` at :177 was
-        // waived by `opts.force` or `opts.invert` - both explicit slow-path
-        // opt-ins where the user accepts full decode. If that upstream gate
-        // is ever relaxed, this site needs tightening: either bail out
-        // earlier for non-indexed blobs, or decode-to-check the blob's kind
-        // before admitting it to the schedule.
+        // The `if let Some(idx) = meta.index.as_ref()` gate means a blob
+        // without indexdata falls through unskipped and decodes fully in
+        // pass 2, whether the whole file lacks indexdata (`--force`) or only
+        // some blobs do (a partially indexed file, accepted). That costs a
+        // decode and nothing else: `filter_block_pass2` writes an element
+        // only when its ID is in the set for its actual kind, so a blob of a
+        // kind the filter would have skipped contributes nothing.
         if blob_filter.as_ref().is_some_and(BlobFilter::uses_index) {
             walker.observe_filter_index(meta.index.as_ref());
         }
@@ -1232,7 +1241,9 @@ fn collect_relation_member_closure(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         kind_schedule_filter(crate::ElementKind::Relation, distrust_metadata),
-        crate::scan::classify::PartialIndex::Refuse,
+        // A blob without indexdata is scheduled and only its decoded
+        // relations are read, so a partially indexed file is accepted.
+        crate::scan::classify::PartialIndex::Accept,
         host,
     )?;
 
@@ -1355,7 +1366,9 @@ fn collect_way_node_dependencies(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         kind_schedule_filter(crate::ElementKind::Way, distrust_metadata),
-        crate::scan::classify::PartialIndex::Refuse,
+        // A blob without indexdata is scheduled and only its decoded ways
+        // are read, so a partially indexed file is accepted.
+        crate::scan::classify::PartialIndex::Accept,
         host,
     )?;
 
@@ -1541,6 +1554,187 @@ mod tests {
             })
             .unwrap();
         assert_eq!(ids, vec![1]);
+    }
+
+    /// Three blobs, one per kind, each carrying indexdata only where `indexed`
+    /// says so, to model a partially indexed input:
+    ///   node blob:     nodes 1..=4, node 1 tagged `amenity=cafe`
+    ///   way blob:      way 10 `highway=primary` refs [1, 2];
+    ///                  way 11 `building=yes` refs [3, 4]
+    ///   relation blob: rel 100 `type=route` -> [rel 101];
+    ///                  rel 101 untagged -> [way 11, node 4]
+    /// Reaching way 11 and nodes 3 and 4 from rel 100 takes a second closure
+    /// iteration and then the way-dependency scan.
+    fn write_partial_fixture(path: &Path, indexed: [bool; 3]) {
+        fn write(writer: &mut PbfWriter<std::io::BufWriter<std::fs::File>>, b: &[u8], idx: bool) {
+            if idx {
+                writer.write_primitive_block(b).unwrap();
+            } else {
+                writer.write_primitive_block_no_indexdata(b).unwrap();
+            }
+        }
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::default(),
+        );
+        writer
+            .write_header(
+                &crate::block_builder::HeaderBuilder::new()
+                    .sorted()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        let meta = crate::block_builder::Metadata {
+            version: 2,
+            timestamp: 1_600_000_000,
+            changeset: 7,
+            uid: 3,
+            user: "u",
+            visible: true,
+        };
+        let meta = Some(&meta);
+        let none = std::iter::empty::<(&str, &str)>;
+        let mut block = BlockBuilder::new();
+        block.add_node(1, 10, 10, [("amenity", "cafe")], meta);
+        for id in 2..=4_i64 {
+            block.add_node(id, 10, 10, none(), meta);
+        }
+        write(&mut writer, block.take().unwrap().unwrap(), indexed[0]);
+        block.add_way(10, [("highway", "primary")], &[1, 2], meta);
+        block.add_way(11, [("building", "yes")], &[3, 4], meta);
+        write(&mut writer, block.take().unwrap().unwrap(), indexed[1]);
+        let rel100 = [MemberData {
+            id: MemberId::Relation(101),
+            role: "",
+        }];
+        block.add_relation(100, [("type", "route")], &rel100, meta);
+        let rel101 = [
+            MemberData {
+                id: MemberId::Way(11),
+                role: "outer",
+            },
+            MemberData {
+                id: MemberId::Node(4),
+                role: "label",
+            },
+        ];
+        block.add_relation(101, none(), &rel101, meta);
+        write(&mut writer, block.take().unwrap().unwrap(), indexed[2]);
+        writer.flush().unwrap();
+    }
+
+    /// One run: output bytes, (kind, id) in file order, and the stats.
+    fn run_filter(
+        input: &Path,
+        expression: &str,
+        mode: &str,
+        force: bool,
+    ) -> (Vec<u8>, Vec<(char, i64)>, [u64; 7]) {
+        let dir = crate::path_guard::tests::scratch();
+        let expression_strs = [expression.to_owned()];
+        let opts = TagsFilterOptions {
+            expression_strs: &expression_strs,
+            omit_referenced: mode == "omit-referenced",
+            invert: mode == "invert",
+            remove_tags: mode == "remove-tags",
+            write: WriteOptions {
+                force,
+                ..WriteOptions::default()
+            },
+            parallelism: crate::host::Parallelism::Auto,
+            distrust_metadata: mode == "distrust-metadata",
+        };
+        let output = dir.path().join("out.pbf");
+        let staged = crate::output::Output::new(
+            &output,
+            crate::output::Overwrite::Refuse,
+            &crate::host::Diagnostics::discard(),
+        )
+        .unwrap();
+        let host = crate::host::Host::for_tests();
+        let s = tags_filter(input, staged, &opts, &HeaderOverrides::default(), &host).unwrap();
+        let mut elements = Vec::new();
+        ElementReader::open_in(&output, false, &host)
+            .unwrap()
+            .for_each(|element| match element {
+                Element::DenseNode(n) => elements.push(('n', n.id())),
+                Element::Node(n) => elements.push(('n', n.id())),
+                Element::Way(w) => elements.push(('w', w.id())),
+                Element::Relation(r) => elements.push(('r', r.id())),
+            })
+            .unwrap();
+        let stats = [
+            s.nodes_matched,
+            s.nodes_from_ways,
+            s.nodes_from_relations,
+            s.ways_matched,
+            s.ways_from_relations,
+            s.relations_matched,
+            s.relations_from_relations,
+        ];
+        (std::fs::read(&output).unwrap(), elements, stats)
+    }
+
+    /// A partially indexed input, in either order, is accepted on every path
+    /// and gives the wholly indexed file's output byte for byte, with the
+    /// same stats: each path decodes a blob without indexdata and selects
+    /// from its actual elements, so the missing index costs a decode, never
+    /// a result. The unindexed blobs cover every kind, and the relation
+    /// query needs both dependency walks, the closure over two iterations.
+    #[test]
+    fn partial_index_in_either_order_matches_the_wholly_indexed_output() {
+        let dir = crate::path_guard::tests::scratch();
+        let whole = dir.path().join("whole.pbf");
+        write_partial_fixture(&whole, [true; 3]);
+        let route: &[(char, i64)] = &[('n', 3), ('n', 4), ('w', 11), ('r', 100), ('r', 101)];
+        /// An expression, a mode, and the expected output.
+        type Case<'a> = (&'a str, &'a str, &'a [(char, i64)]);
+        let cases: [Case<'_>; 7] = [
+            ("r/type=route", "two-pass", route),
+            ("r/type=route", "remove-tags", route),
+            ("r/type=route", "distrust-metadata", route),
+            (
+                "w/highway=primary",
+                "two-pass",
+                &[('n', 1), ('n', 2), ('w', 10)],
+            ),
+            (
+                "r/type=route",
+                "invert",
+                &[
+                    ('n', 1),
+                    ('n', 2),
+                    ('n', 3),
+                    ('n', 4),
+                    ('w', 10),
+                    ('w', 11),
+                    ('r', 101),
+                ],
+            ),
+            ("r/type=route", "omit-referenced", &[('r', 100)]),
+            ("amenity", "omit-referenced", &[('n', 1)]),
+        ];
+        for (name, mask) in [
+            ("indexed head", [true, false, false]),
+            ("unindexed head", [false, true, true]),
+        ] {
+            let partial = dir.path().join(format!("{name}.pbf"));
+            write_partial_fixture(&partial, mask);
+            // The first-blob probe asks for `--force` only when the first
+            // data blob lacks indexdata.
+            let force = !mask[0];
+            for (expression, mode, expected) in cases {
+                let what = format!("{name}, {expression}, {mode}");
+                let reference = run_filter(&whole, expression, mode, false);
+                let got = run_filter(&partial, expression, mode, force);
+                assert_eq!(reference.1, expected, "reference: {what}");
+                assert_eq!(got.1, expected, "{what}");
+                assert_eq!(got.2, reference.2, "stats: {what}");
+                assert!(got.0 == reference.0, "output bytes differ: {what}");
+            }
+        }
     }
 
     #[test]

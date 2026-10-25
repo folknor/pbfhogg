@@ -1457,7 +1457,13 @@ type MixedRow = (&'static str, fn(&Ctx, &Path) -> Invocation, Mixed);
 const FIRST_BLOB_ONLY: &[MixedRow] = &[
     ("sort", sort, Mixed::RefusesPartial),
     ("repack", repack, Mixed::RefusesPartial),
-    ("tags-filter", tags_filter, Mixed::RefusesPartial),
+    // tags-filter accepts on every path: -R's reader, both two-pass schedule
+    // walks and the dependency walks decode a blob without indexdata and
+    // select from its actual elements. The way-dependency walk's kind filter
+    // notes the unindexed tail it cannot skip; -R's tag-key-only filter
+    // prunes through tagdata, so it has no such note.
+    ("tags-filter", tags_filter, Mixed::Reports(BLOBS_NOTE)),
+    ("tags-filter -R", tags_filter_omit, Mixed::Accepts),
     // getid accepts on every path: each one decodes a blob without indexdata
     // and filters its actual elements, so the output is the wholly indexed
     // file's. The way-ID row runs `--add-referenced`'s classify walk, and the

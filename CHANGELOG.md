@@ -79,7 +79,7 @@
   does not used to pass the first-blob indexdata check. Every command that
   already reads every blob header to plan its work now refuses it with the
   missing-indexdata error, located at the first data blob without
-  indexdata: sort, apply-changes, repack, degrade, tags-filter, tags-count,
+  indexdata: sort, apply-changes, repack, degrade, tags-count,
   extract, add-locations-to-ways, build-geocode-index, time-filter,
   `inspect --nodes`, `inspect tags`, `check --refs`,
   `check --ids` and digest. `--force` and `--allow-unindexed` do not lift

@@ -291,7 +291,9 @@ impl HeaderWalker {
     /// getparents' walker does not opt in for the same reason: it schedules
     /// a blob without indexdata whatever the query, and its full-scan arm's
     /// blob filter passes one through to a decode, so both arms select from
-    /// actual elements.
+    /// actual elements. tags-filter's pass 1 and pass 2 walks do not opt in
+    /// either: each schedules a blob without indexdata and matches or writes
+    /// its decoded elements by their actual kind and ID.
     #[must_use]
     pub(crate) fn refusing_partial_index(mut self) -> Self {
         self.partial_index = Some(PartialIndexGuard::default());

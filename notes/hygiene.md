@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-9. HYG-156
 10. HYG-157
 11. HYG-017
 12. HYG-038
@@ -484,6 +483,21 @@ The judgement calls already known, to be checked first:
   summary's "Decoded N blobs" now counts input blobs decoded, where it
   counted framed output blobs. The old per-phase reorder buffer was the
   unbounded shape HYG-053 describes; the ordered pool bounds it.
+- tags-filter accepts a partially indexed file on every path, by the same
+  rule, reversing the refusal its two-pass walks had: pass 1 and pass 2
+  walkers no longer opt into `refusing_partial_index`, and the relation
+  closure and way-dependency walks pass `PartialIndex::Accept`. `-R` already
+  ran on such a file. Sparred with codex, which found no path deciding from
+  indexdata a blob lacks; the cost is the extra decode of unindexed blobs in
+  every closure iteration. On a wholly indexed planet run only a per-header
+  guard branch goes; not measured. Pinned by a unit test (both orders,
+  every kind unindexed, -R, two-pass, closure over two iterations, invert,
+  remove-tags, distrust; bytes and stats equal to the wholly indexed run)
+  and two first-blob-only contract rows. Lateral: tags-count shares the
+  tag-key skip and still refuses through
+  `build_classify_schedule_blob_filtered`; whether its workers count by
+  actual kind was not checked, so a reviewer should judge it under the same
+  rule.
 
 ---
 
@@ -1236,31 +1250,6 @@ docs sentence, since a sweep merge must hold whatever overlaps the current
 position and bounding it means an external merge.
 
 Reported by: re-encoding.
-
-## HYG-156 - `tags-filter -R` trusts the first blob's indexdata
-
-Anger: 8 - indexdata trust model, one command.
-
-Split out of the indexdata trust model entry, now resolved as
-`reference/indexdata-trust.md`. `tags-filter -R` decides from the first data blob,
-while tags-filter's other schedule walks already refuse a partial file.
-
-Recommendation (2026-10-25): opt into the partial-index refusal only where a
-full header walk already happens; add no new walk. Where none happens,
-record on `reference/indexdata-trust.md` ("Missing and partial indexdata")
-that the command decides from the first blob. Move the contract table rows
-that change.
-
-Precedent from the getid and getparents entries, resolved against that
-recommendation: the trust page says refusing a partial file is owed only
-where a path cannot do without the missing indexdata, and getid and
-getparents accept on every path because each decodes a blob lacking
-indexdata. Classify builders take a `PartialIndex` policy per call site.
-Test this command's paths against the same rule before choosing either
-way.
-
-Reported by: change application, re-encoding, altw and scanning, geocode
-index (the indexdata trust model entry).
 
 ## HYG-157 - time-filter's history path trusts the first blob's indexdata
 

@@ -160,7 +160,7 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   `HeaderWalker::refusing_partial_index` refuses it with the typed
   missing-indexdata error, in either order (indexed then unindexed, or the
   reverse), located at the first unindexed data blob. Most schedule walks
-  opt in; `getid`'s and `getparents`' do not (below). `renumber`,
+  opt in; `getid`'s, `getparents`' and `tags-filter`'s do not (below). `renumber`,
   `add-locations-to-ways --index-type external` and `diff`'s indexed
   block-pair paths refuse any unindexed blob (a wholly unindexed `diff`
   input takes the sequential fallback instead). Commands whose arm the first
@@ -195,8 +195,16 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   indexing: `--type` refuses an unindexed blob that yields ways when the
   header already declared a way enrichment re-encoding would break (as
   `getid --invert` does), and `--dedupe` cannot place an unindexed blob no
-  single index describes (empty, or kinds mixed). The other refusals on
-  this page are recorded as current behaviour, not justified by this rule.
+  single index describes (empty, or kinds mixed). `tags-filter` accepts on
+  every path by the same rule, in either order. Its first-blob probe decides
+  only whether `--force` is needed (first data blob unindexed; never under
+  `--invert-match` or `--distrust-metadata`). `-R`'s pipelined reader, the
+  two-pass schedule walks for pass 1 and pass 2, the relation closure and the
+  way-dependency scan each decode a blob lacking indexdata, unless its
+  tagdata (a separate claim) excludes it, and match or write its elements
+  by their actual kind and ID, so the output is the wholly indexed file's.
+  The other refusals on this page are recorded as current behaviour, not
+  justified by this rule.
 - **What a command does with a wholly unindexed file** - refuse and offer
   `--force`, refuse with no escape, fall back, or verify - is per command.
   The user-facing statement is the `--force` section of

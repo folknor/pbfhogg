@@ -112,7 +112,7 @@ header. It is not a whole-file validation: a file whose first data blob is
 indexed passes it even if later blobs are not. Such a partially indexed file
 is refused, with the same missing-indexdata error and advice, by most commands
 that read all blob headers to plan their work (among them `sort`,
-`apply-changes`, `repack`, `tags-filter`, `extract`, `add-locations-to-ways`,
+`apply-changes`, `repack`, `extract`, `add-locations-to-ways`,
 `build-geocode-index`, `digest` and `diff`), at the first data blob without
 indexdata; `--force` does not lift that refusal. `pbfhogg cat` indexes every
 blob of such a file, and every `cat` mode runs on it: `--type`, `--clean` and
@@ -125,7 +125,9 @@ output is the same as from the file fully indexed, only slower. One case
 still fails: `getid --invert` on a file whose header
 declares way enrichment (such as `LocationsOnWays`) and one of whose blobs
 without indexdata holds ways, since re-encoding those ways would break the
-declaration.
+declaration. `tags-filter` runs on it by the same design, with and without
+`-R`: it decodes each blob that lacks indexdata, so its output is the same
+as from the file fully indexed, only slower.
 
 ## The --force flag
 

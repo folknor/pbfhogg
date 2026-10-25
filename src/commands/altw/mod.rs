@@ -19,6 +19,7 @@ use super::{
 };
 use crate::commands::input_front::InputFront;
 use crate::idset::IdSet;
+use crate::read::input::PinnedInput;
 
 use super::Result;
 use crate::error::Error;
@@ -354,6 +355,12 @@ impl Stats {
 ///
 /// If `keep_untagged_nodes` is false, nodes with zero tags are omitted from
 /// the output (their coordinates are still used for ways).
+///
+/// The input is read in several passes, so it must be a regular file or a
+/// block device (`InvalidArgument` otherwise), and is pinned for the run
+/// (see [`PinnedInput`](crate::read::input::PinnedInput)): where a later
+/// open cannot reach the pinned file, an input replaced mid-run fails with
+/// `InputReplaced`.
 pub fn add_locations_to_ways(
     input: &Path,
     output: crate::output::Output,
@@ -381,6 +388,16 @@ pub(crate) fn add_locations_to_ways_to(
     scratch: &crate::scratch::RunScratch,
 ) -> Result<Stats> {
     options.validate()?;
+    // Every pass below opens the input again, each through its own open
+    // file description (the front read, the header walks, the worker
+    // pools, external's stage readers), and each is derived from this one
+    // pin, so a file renamed over the input mid-run cannot be read partly
+    // from each: where `/proc/self/fd` reopens the pin every open reaches
+    // the pinned file, otherwise on Unix a replaced input fails the run
+    // (`PinnedInput` says what it does off Unix). Taken before any other
+    // open of it.
+    let pin = PinnedInput::pin(input, host)?;
+    let input = &pin;
     // Every precondition that depends on the input (sorted, indexed, the
     // header) is answered by this one front read, whichever backend runs.
     // The header walks that follow are separate and deliberate (see
@@ -557,7 +574,7 @@ fn enforce_missing_locations_policy(stats: &Stats, ignore_missing_nodes: bool) -
 // header claims, not blob payloads: a malformed data blob is the business
 // of whichever pass reads it.
 fn auto_select_backend(
-    input: &Path,
+    input: &PinnedInput,
     front: &mut InputFront<'_>,
     host: &crate::host::Host,
 ) -> Result<ResolvedBackend> {
@@ -652,7 +669,10 @@ fn route_sorted_indexed(store_bytes: Option<u64>, budget_bytes: Option<u64>) -> 
 /// `None` when the first OsmData blob lacks indexdata, since the sum would
 /// silently undercount; an input that is indexed on its first OsmData blob
 /// and not on a later one is refused by the walk.
-fn estimate_sparse_store_bytes(input: &Path, host: &crate::host::Host) -> Result<Option<u64>> {
+fn estimate_sparse_store_bytes(
+    input: &PinnedInput,
+    host: &crate::host::Host,
+) -> Result<Option<u64>> {
     let mut walker =
         crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
     let mut node_count: u64 = 0;
@@ -858,7 +878,7 @@ fn emit_stats_counters(stats: &Stats) {
 /// incompatible with `O_DIRECT`'s alignment requirements.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn collect_way_referenced_node_ids(
-    input: &Path,
+    input: &PinnedInput,
     _direct_io: bool,
     inject_prepass: bool,
     host: &crate::host::Host,
@@ -967,7 +987,7 @@ fn collect_way_referenced_node_ids(
 /// with `O_DIRECT` alignment requirements.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn collect_relation_member_ids(
-    input: &Path,
+    input: &PinnedInput,
     _direct_io: bool,
     want_nodes: bool,
     want_ways: bool,
@@ -1013,7 +1033,7 @@ pub(crate) fn collect_relation_member_ids(
 
 #[allow(clippy::too_many_arguments)]
 fn write_output_checked(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     index: &NodeIndex,
     keep_untagged_nodes: bool,
@@ -1036,7 +1056,7 @@ fn write_output_checked(
             "add-locations-to-ways with inject_prepass requires blob-level indexdata, even \
              when forced: the decode-all fallback cannot attach per-blob WayMembers metadata",
         )
-        .locate(crate::error::Location::in_file(input)));
+        .locate(crate::error::Location::in_file(input.path())));
     }
     if indexdata_present {
         write_output_passthrough(
@@ -1074,7 +1094,7 @@ fn write_output_checked(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 fn write_output_decode_all(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     index: &NodeIndex,
     keep_untagged_nodes: bool,

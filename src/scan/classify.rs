@@ -31,7 +31,7 @@
 //! [`build_classify_schedules_split`].
 
 use crate::error::{Error, Result};
-use crate::read::input::InputFile;
+use crate::read::input::{InputFile, InputSource};
 
 /// One blob of a pread schedule: where its frame starts, which blob of the
 /// file it is, and how to reach its payload. Carries the same location the
@@ -361,9 +361,10 @@ pub(crate) enum PartialIndex {
 /// so blob bodies are not dragged into the page cache during the scan. The
 /// [`InputFile`] handed back for `pread`-based body reads is the walker's own
 /// file handle (opened with `posix_fadvise(RANDOM)`) and path, reused to
-/// avoid a second `open` at scan end.
-pub(crate) fn build_classify_schedule(
-    input: &std::path::Path,
+/// avoid a second `open` at scan end. A pinned `input` is opened from its
+/// pin, so the walk and the workers read the file the run pinned.
+pub(crate) fn build_classify_schedule<'a>(
+    input: impl Into<InputSource<'a>>,
     kind_filter: Option<crate::ElementKind>,
     partial: PartialIndex,
     host: &crate::host::Host,
@@ -398,15 +399,17 @@ fn consume_leading_header(
 /// the whole key set when any expression's key matcher cannot be expressed as
 /// key-set membership, because the filter is a union.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(crate) fn build_classify_schedule_blob_filtered(
-    input: &std::path::Path,
+pub(crate) fn build_classify_schedule_blob_filtered<'a>(
+    input: impl Into<InputSource<'a>>,
     kind_filter: Option<crate::ElementKind>,
     blob_filter: Option<&crate::blob_meta::BlobFilter>,
     partial: PartialIndex,
     host: &crate::host::Host,
 ) -> Result<(Vec<ScheduledBlob>, InputFile, u64)> {
+    let source = input.into();
+    let input = source.path();
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
-    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
+    let mut walker = crate::read::header_walker::HeaderWalker::open(source, host)?;
     if partial == PartialIndex::Refuse {
         walker = walker.refusing_partial_index();
     }
@@ -488,8 +491,8 @@ pub(crate) fn build_classify_schedule_blob_filtered(
 /// ceiling that the passage of time invalidates.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::type_complexity)]
-pub(crate) fn build_classify_schedules_split(
-    input: &std::path::Path,
+pub(crate) fn build_classify_schedules_split<'a>(
+    input: impl Into<InputSource<'a>>,
     host: &crate::host::Host,
 ) -> Result<(
     Vec<ScheduledBlob>,
@@ -498,9 +501,11 @@ pub(crate) fn build_classify_schedules_split(
     InputFile,
     [i64; 3],
 )> {
+    let source = input.into();
+    let input = source.path();
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
     let mut walker =
-        crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
+        crate::read::header_walker::HeaderWalker::open(source, host)?.refusing_partial_index();
     consume_leading_header(&mut walker, input)?;
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 

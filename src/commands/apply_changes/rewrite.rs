@@ -236,9 +236,10 @@ pub(crate) fn merge_to(
     // The base is read through several open file descriptions (the front
     // read here, the splice source, the scanner's header walker and the
     // worker pool's), and each is derived from this one pin, so a file
-    // renamed over the base mid-run cannot be read partly from each: on
-    // Linux every open reaches the pinned file, elsewhere a replaced base
-    // fails the run (`PinnedInput`). Taken before any other open of it.
+    // renamed over the base mid-run cannot be read partly from each: where
+    // `/proc/self/fd` reopens the pin every open reaches the pinned file,
+    // otherwise on Unix a replaced base fails the run (`PinnedInput` says
+    // what it does off Unix). Taken before any other open of it.
     let base = PinnedInput::pin(base_pbf, host)?;
 
     // One open answers both the indexdata question and the header, in that

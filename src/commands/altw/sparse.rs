@@ -225,7 +225,7 @@ impl<'a> SharedSparseWriter<'a> {
     clippy::too_many_lines
 )]
 pub(super) fn build_node_index_sparse(
-    input: &Path,
+    input: &crate::read::input::PinnedInput,
     _direct_io: bool,
     scratch: &crate::scratch::RunScratch,
     referenced: IdSet,

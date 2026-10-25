@@ -33,6 +33,7 @@ use crate::blob_meta::BlobIndex;
 use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::idset::IdSet;
 use crate::read::header_walker::HeaderWalker;
+use crate::read::input::PinnedInput;
 use crate::reorder_buffer::ReorderBuffer;
 use crate::write::WriteOptions;
 use crate::writer::PbfWriter;
@@ -114,7 +115,7 @@ crate::counters::counter_set! {
 /// pass 1's eviction (+3.8 %). See reference/blob-density.md.
 #[hotpath::measure]
 fn build_schedule(
-    input: &Path,
+    input: &PinnedInput,
     overrides: &HeaderOverrides,
     keep_untagged_nodes: bool,
     inject_prepass: bool,
@@ -170,7 +171,8 @@ fn build_schedule(
         }
     }
 
-    let header_bytes = header_bytes.ok_or_else(|| crate::error::new_missing_header(input))?;
+    let header_bytes =
+        header_bytes.ok_or_else(|| crate::error::new_missing_header(input.path()))?;
     let shared_file = std::sync::Arc::clone(walker.shared_file());
     crate::debug::emit_marker("ALTW_PASS2_SCHEDULE_WALK_END");
     Ok((schedule, header_bytes, shared_file))
@@ -341,7 +343,7 @@ fn decode_one(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn write_output_passthrough(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     node_index: &NodeIndex,
     keep_untagged_nodes: bool,
@@ -408,7 +410,7 @@ pub(super) fn write_output_passthrough(
     let p2_counters_ref = &p2_counters;
     let p2_send_stall_ref = &p2_send_stall;
     // The input's identity, captured once; each worker borrows it.
-    let source: std::sync::Arc<Path> = std::sync::Arc::from(input);
+    let source: std::sync::Arc<Path> = std::sync::Arc::from(input.path());
     let source = &source;
 
     // Consumer-side counters (single thread; plain locals).

@@ -57,7 +57,7 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-23. HYG-169 to HYG-179, then HYG-183 to HYG-189, one per line, in ID
+23. HYG-170 to HYG-179, then HYG-183 to HYG-189, one per line, in ID
     order
 24. HYG-047
 25. HYG-158
@@ -692,6 +692,16 @@ The judgement calls already known, to be checked first:
     dropped unused under a `--direct-io` output. `PinnedInput::
     reopens_through_procfs` became public under `test-hooks` so
     replacement tests can tell which outcome the host owes.
+  - add-locations-to-ways adopted it on every route (sparse, decode-all,
+    external, auto's estimate walk), pinning in `add_locations_to_ways_to`
+    and separately in the public `external_join`; both public signatures
+    stay `&Path`, since the CLI calls one of them once. Every open became
+    one derived open, descriptions unchanged (external stage 1 and the
+    relation scan still open separately, concurrently). The external
+    path holds one more descriptor for the run, which stage 1's fd
+    allowance counts as already open. The classify schedule builders
+    (`build_classify_schedule`, `_blob_filtered`, `_split`) now take
+    `impl Into<InputSource>`, ready for the other commands' entries.
 
 ---
 
@@ -1330,7 +1340,7 @@ Reported by: the HYG-150 implementation.
 
 ## Adopting `PinnedInput`, one command per entry
 
-Not a finding: the shared brief for HYG-169 to HYG-179 and HYG-183 to
+Not a finding: the shared brief for HYG-170 to HYG-179 and HYG-183 to
 HYG-189. Each of those commands opens its input more than once per run (a
 precondition probe, a header reader, a schedule walk, worker and splice
 descriptors), each open resolving the path again, so a file renamed over
@@ -1372,33 +1382,24 @@ path went. What each entry owes, settled in a codex spar on 2026-10-25:
   every racing failure path runs. A probe `PinnedInput::pin` under the same
   host answers `reopens_through_procfs()` (public under `test-hooks`), so
   the non-forced mode asserts the outcome the host owes instead of
-  skipping. `tests/fault_apply_changes.rs` is the worked example.
+  skipping. `tests/fault_apply_changes.rs` is the worked example for one
+  arming point; `tests/fault_altw_input.rs` arms after each open of each
+  route but the last in turn, which is cheap on small fixtures and runs
+  the refusal path of every open after the first. Where a command has a public library entry besides the
+  one the CLI calls, test that entry's pin too.
 - Pinning refuses FIFOs, sockets and character devices up front; say so in
   the command's CHANGELOG line, which every adopting entry owes (a
-  replacement mid-run is now harmless on Linux, refused elsewhere).
+  replacement mid-run is now harmless on Linux with procfs, refused on
+  other Unix hosts; off Unix a pin verifies nothing, so do not claim
+  "elsewhere").
+- The classify schedule builders already take `impl Into<InputSource>`;
+  a `&&Path` caller needs a deref.
 
 Commands confirmed to open their input once per run, not needing a pin:
 export, check refs, check index (one open each). inspect's index-only scan
 and its full-decode fallback each read the whole report from one open, but
 the full decode takes its file size from a separate path `stat`, which
 HYG-187 covers.
-
-## HYG-169 - altw reopens its input by path per pass and stage
-
-Anger: 8 - altw internals.
-
-See "Adopting `PinnedInput`" above. Sparse and external together, one
-command. Input opens found on 2026-10-25: `InputFront::open` in
-`external/mod.rs` and `altw/mod.rs` (auto-select), `HeaderWalker::open` in
-`external/blob_meta.rs`, stage 1's shared `Arc<File>`, `relation_scan.rs`,
-`InputFile::open` for stage 2, stage 4's shared file, and on the sparse path
-`altw/mod.rs` and `passthrough.rs`. Workers clone an already-opened `Arc`,
-so the extra `fstat`s are a handful per run. Signatures such as
-`stage4_assembly(input: &Path, ...)` and `scan_blob_metadata(input: &Path,
-...)` change. Recommendation (2026-10-25): thread the anchor through every
-input open; scratch opens stay plain.
-
-Reported by: the HYG-078 resolution.
 
 ## HYG-170 - sort reopens its input by path per pass
 

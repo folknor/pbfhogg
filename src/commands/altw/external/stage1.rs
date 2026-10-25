@@ -14,7 +14,6 @@
 //!     blobs intersecting each id bucket.
 
 use std::io::{BufWriter, Write as _};
-use std::path::Path;
 
 use super::super::Result;
 use super::blob_meta::BlobMeta;
@@ -151,7 +150,7 @@ pub(super) fn build_way_schedule(blob_meta: &[BlobMeta]) -> Vec<WayBlobTask> {
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn stage1_pass_a(
-    input: &Path,
+    input: &crate::read::input::PinnedInput,
     schedule: &[WayBlobTask],
     num_workers: usize,
     scratch: &RunScratch,
@@ -163,7 +162,8 @@ pub(super) fn stage1_pass_a(
 ) -> Result<(u64, Vec<u64>)> {
     use std::os::unix::fs::FileExt as _;
 
-    let shared_file = std::sync::Arc::new(crate::read::input::open(input)?);
+    let shared_file = std::sync::Arc::new(crate::read::input::InputSource::from(input).open()?);
+    let input = input.path();
 
     crate::debug::emit_marker("EXTJOIN_S1_PASS_A_START");
 
@@ -507,7 +507,7 @@ pub(super) fn build_node_blob_mapping(blob_meta: &[BlobMeta]) -> Vec<NodeBlobInf
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn stage1_way_pass(
     blob_meta: &[BlobMeta],
-    input: &Path,
+    input: &crate::read::input::PinnedInput,
     _direct_io: bool,
     scratch: &RunScratch,
     layout: &BucketLayout,

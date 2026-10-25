@@ -45,6 +45,8 @@ mod inspect;
 mod corrupt_input;
 mod edge_cases;
 #[cfg(feature = "test-hooks")]
+mod fault_altw_input;
+#[cfg(feature = "test-hooks")]
 mod fault_altw_stage3;
 mod fault_apply_changes;
 #[cfg(feature = "test-hooks")]

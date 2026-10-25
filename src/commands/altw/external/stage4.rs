@@ -150,7 +150,7 @@ fn load_ref_count_sidecar_in(path: &Path, total_slots: u64) -> Result<Vec<u64>> 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn stage4_assembly(
-    input: &Path,
+    input: &crate::read::input::PinnedInput,
     output: &crate::output::Output,
     // The input's header, from the run's one front read; stage 4 does not
     // reopen the input for it.
@@ -273,8 +273,9 @@ pub(super) fn stage4_assembly(
     }
     crate::debug::emit_marker("EXTJOIN_S4_SCHEDULE_END");
 
-    // Open shared file for worker pread.
-    let shared_file = std::sync::Arc::new(crate::read::input::open(input)?);
+    // Open shared file for worker pread, a description of the pinned input.
+    let shared_file = std::sync::Arc::new(crate::read::input::InputSource::from(input).open()?);
+    let input = input.path();
 
     let mut writer = writer_from_header(
         output,

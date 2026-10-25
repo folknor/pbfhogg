@@ -1158,6 +1158,19 @@
 
 ### Fixed
 
+- **`add-locations-to-ways` reads one input file even if it is replaced
+  mid-run.** Both index types open the input several times per run (the
+  header and indexdata read, the header walks, the worker pools, and on
+  the external index each stage's reader), and each open used to resolve
+  the path again, so an input renamed over during the run was read partly
+  from each file, with no error. The input is now pinned when the run
+  starts, in `add_locations_to_ways` and in `altw::external::external_join`
+  alike: on Linux with `/proc` a replaced or deleted input does not affect
+  the run; on other Unix hosts the run fails with
+  `ErrorKind::InputReplaced` instead. An input that is a FIFO, socket or
+  character device is now refused up front (it could not serve the
+  repeated reads before either).
+
 - **`apply-changes` reads one base file even if it is replaced mid-run.**
   The base PBF is opened several times per run (the header and indexdata
   read, the header walk, the worker pool, the passthrough copy source), and

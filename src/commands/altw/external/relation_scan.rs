@@ -22,15 +22,15 @@ pub(super) struct RelationScanOutput {
 
 #[hotpath::measure]
 pub(super) fn collect_relation_member_ids_indexed(
-    input: &Path,
+    input: &crate::read::input::PinnedInput,
     blob_meta: &[BlobMeta],
     want_nodes: bool,
     want_ways: bool,
     cancel: &crate::host::Cancel,
 ) -> Result<RelationScanOutput> {
-    let file = Arc::new(crate::read::input::open(input)?);
+    let file = Arc::new(crate::read::input::InputSource::from(input).open()?);
     // Errors are located against the input once, not per blob.
-    let source: Arc<Path> = Arc::from(input);
+    let source: Arc<Path> = Arc::from(input.path());
 
     let mut node_ids = want_nodes.then(IdSet::new);
     let mut way_ids = want_ways.then(IdSet::new);

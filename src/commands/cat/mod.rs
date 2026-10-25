@@ -875,7 +875,7 @@ fn cat_filtered(
         // decoded like the rest, so a partially indexed file is accepted.
         let (schedule, shared_file, _) =
             crate::scan::classify::build_classify_schedule_blob_filtered(
-                file,
+                *file,
                 None,
                 kind_filter.as_ref(),
                 crate::scan::classify::PartialIndex::Accept,

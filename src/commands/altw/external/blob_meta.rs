@@ -3,7 +3,7 @@
 //! Replaces repeated header-only scans in stage 1 and stage 4 with one
 //! reusable pass over blob headers.
 
-use std::path::Path;
+use crate::read::input::PinnedInput;
 
 use crate::ElementKind;
 
@@ -53,7 +53,7 @@ pub(super) struct BlobMeta {
 /// here.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn scan_blob_metadata(
-    input: &Path,
+    input: &PinnedInput,
     parse_tagdata: bool,
     host: &crate::host::Host,
 ) -> Result<Vec<BlobMeta>> {
@@ -61,7 +61,7 @@ pub(super) fn scan_blob_metadata(
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let _ = walker
         .next_header()?
-        .ok_or_else(|| crate::error::new_missing_header(input))?;
+        .ok_or_else(|| crate::error::new_missing_header(input.path()))?;
 
     let mut metas = Vec::new();
     let mut order = crate::osm_id::OrderWatermark::default();

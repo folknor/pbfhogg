@@ -27,6 +27,7 @@ use super::Stats;
 use crate::commands::HeaderOverrides;
 use crate::commands::input_front::InputFront;
 use crate::error::Result;
+use crate::read::input::PinnedInput;
 
 mod blob_bucket_index;
 mod blob_meta;
@@ -656,6 +657,12 @@ pub(super) fn slot_bucket_bounds(
 /// Bounded working memory and sequential I/O. Temporary-disk demand depends
 /// on the input; see `reference/performance.md` for measured resource use and
 /// the module docs for the algorithm.
+///
+/// The input is read in several passes, so it must be a regular file or a
+/// block device (`InvalidArgument` otherwise), and is pinned for the run
+/// (see [`PinnedInput`](crate::read::input::PinnedInput)): where a later
+/// open cannot reach the pinned file, an input replaced mid-run fails with
+/// `InputReplaced`.
 #[allow(clippy::too_many_arguments)]
 pub fn external_join(
     input: &Path,
@@ -668,9 +675,12 @@ pub fn external_join(
     scratch: crate::scratch::RunScratch,
 ) -> Result<Stats> {
     host.cancel.check()?;
-    let front = InputFront::open(input, write.direct_reads, host)?;
+    // Every stage's open of the input derives from this pin; see
+    // `add_locations_to_ways_to`, which pins the same way.
+    let pin = PinnedInput::pin(input, host)?;
+    let front = InputFront::open(&pin, write.direct_reads, host)?;
     let result = external_join_in(
-        input,
+        &pin,
         front,
         &output,
         keep_untagged_nodes,
@@ -734,7 +744,7 @@ mod slot_layout_tests {
 #[hotpath::measure]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(crate) fn external_join_in(
-    input: &Path,
+    input: &PinnedInput,
     mut front: InputFront<'_>,
     output: &crate::output::Output,
     keep_untagged_nodes: bool,
@@ -769,13 +779,13 @@ pub(crate) fn external_join_in(
              even when forced: its ID bucket ranges come from per-blob indexdata. \
              The sparse index decodes every blob and runs without it.",
         )
-        .locate(crate::error::Location::in_file(input)));
+        .locate(crate::error::Location::in_file(input.path())));
     }
 
     let header = front.into_header()?;
     crate::commands::require_sorted(
         header.is_sorted(),
-        input,
+        input.path(),
         "Input PBF",
         "The external join's single-pass node merge depends on ascending node ID order.",
     )?;
@@ -806,12 +816,13 @@ pub(crate) fn external_join_in(
     // #9 layer 2: relation member-id scan runs concurrently with stage 1.
     // The scan reads relation blobs only (via blob_meta) and shares no
     // state with stage 1 - both read from the same input PBF via pread
-    // (`File: Sync` on Unix) with no locking. Running it here avoids the
-    // former serial gap between stage 2 and stage 4.
+    // (`File: Sync` on Unix) with no locking, each through its own open
+    // derived from the pin. Running it here avoids the former serial gap
+    // between stage 2 and stage 4.
     crate::debug::emit_marker("EXTJOIN_STAGE1_START");
     let s1_faults_before = crate::debug::read_page_faults();
 
-    let input_ref_parallel: &Path = input;
+    let input_ref_parallel: &PinnedInput = input;
     let blob_meta_ref_parallel = &blob_meta;
     let bucket_layout_ref = &bucket_layout;
     let (stage1_out, relation_member_node_ids) = std::thread::scope(

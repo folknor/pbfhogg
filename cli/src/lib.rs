@@ -3814,7 +3814,7 @@ impl IdSources {
     /// ID.
     ///
     /// The -I PBF is pinned before either ID file is read, so it is refused
-    /// up front when it is not a regular file or block device (a FIFO would
+    /// up front when it is not a regular file (a FIFO would
     /// block its open), and its one read goes through the pin.
     fn resolve(
         self,

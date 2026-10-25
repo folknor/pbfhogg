@@ -70,16 +70,21 @@ goes on "Review once drained" as a bisect candidate, named by commit.
 
 Launch order, one agent per line, run serially:
 
-30. BUG-190
 31. HYG-010
 32. HYG-012
 33. HYG-013
 34. HYG-014
-35. HYG-077 (last: it annotates files across the crate)
+35. HYG-015
+36. HYG-192
+37. HYG-193
+38. HYG-194
+39. HYG-016
+40. HYG-195
+41. HYG-077 (last: it annotates files across the crate)
 
-Discussed and skipped for now: HYG-011, HYG-036, HYG-037, HYG-058, HYG-109,
-HYG-181, HYG-182. Not discussed yet: HYG-002, HYG-015, HYG-016, HYG-053,
-HYG-081, BUG-009, BUG-191.
+Discussed and skipped for now: HYG-002, HYG-011, HYG-036, HYG-037, HYG-053,
+HYG-058, HYG-081, HYG-109, HYG-181, HYG-182. Not discussed yet: BUG-009 (the
+maintainer's own project), BUG-191.
 
 ---
 
@@ -1150,6 +1155,42 @@ Fix: one `dispatch_framed(FrameRequest)`
 with `IndexSource::{Scan, Precomputed, None}`; one `WritePipeline::spawn`.
 Structural.
 
+Maintainer (2026-10-25): split into three entries, one commit each, since the
+three parts share no code path and differ in risk. This entry keeps the
+per-block part: the three `write_primitive_block*` variants become one
+dispatch with `IndexSource::{Scan, Precomputed, None}`. It is the only part on
+the per-block hot path, so it is the bisect point a planet regression would
+point at. `WritePipeline::spawn` is HYG-192; the two framing decisions are
+HYG-193.
+
+Reported by: write path.
+
+## HYG-192 - The writer's four constructors build the same pipeline by hand
+
+Anger: 5 - once-per-run setup.
+
+Split out of HYG-015. `to_path_uring` and `to_path_parallel` carry the same
+spawn plus `init_rx` match (messages differ by one word), all four
+constructors build the same `WritePipeline` literal, and a test helper builds
+a fifth. Fix: one `WritePipeline::spawn`. `to_path_uring`'s unbounded
+`init_rx.recv()` is documented and left. Setup code that runs once per run;
+no throughput effect.
+
+Reported by: write path.
+
+## HYG-193 - Two framing questions nobody decided
+
+Anger: 7 - refusals and error messages on the write path.
+
+Split out of HYG-015. These are behaviour decisions, not refactors, and may
+change what a user sees:
+
+- `reframe_raw_with_index_scratch` is a second framing assembly that skips
+  the `MAX_BLOB_DATASIZE` check. Arguably right for passthrough (the bytes
+  are copied, not built), but nobody decided; decide, and state it.
+- `encode_blob_header_into`'s WayMembers culprit heuristic (`len > 1024`)
+  guesses which field overflowed instead of computing sizes.
+
 Reported by: write path.
 
 ## HYG-016 - Writer loops are copied per backend and their metrics mean different things
@@ -1170,6 +1211,39 @@ uring, summed across 16 pool threads for parallel; and parallel counts
 `writer_bytes_written` at dispatch, others after the write. Fix: `writer_thread<S: OutputSink>`
 as the only loop with an `on_idle()` hook; a source-scan test that only
 `pipeline.rs` calls `pop_ready()` under `src/write/`.
+
+Maintainer (2026-10-25): split into three entries, one commit each. This
+entry keeps the PBF writer-loop unification (`writer_thread<S: OutputSink>`,
+io_uring as a sink). ADR-0014 is binding: argue explicitly why the loop is
+not backend logic, or update the ADR. The metric meanings are HYG-194, which
+runs first so cross-backend comparisons mean the same thing; the
+`parallel_gzip` reorder map is HYG-195, which runs after this one.
+
+Reported by: write path.
+
+## HYG-194 - Writer metrics mean different things per backend
+
+Anger: 6 - sidecar meaning; brokkr history reads these names.
+
+Split out of HYG-016. `writer_write_ns` is wall time on the writer thread
+for buffered and uring, but summed across 16 pool threads for parallel; and
+parallel counts `writer_bytes_written` at dispatch, the others after the
+write. Comparing writer metrics across backends compares different
+quantities. Make each name mean one thing on every backend, or give the
+diverging ones their own names. brokkr's stored history reads these names, so
+a meaning change needs saying where brokkr users will see it.
+
+Reported by: write path.
+
+## HYG-195 - `parallel_gzip` has its own reorder map
+
+Anger: 8 - the gzip output writer's memory behaviour.
+
+Split out of HYG-016; runs after it. `parallel_gzip::writer_loop` has its own
+completeness check with a `BTreeMap` reorder buffer instead of
+`ReorderBuffer`, and no announced total. It is a separate writer (OSC gzip
+output) with its own loop and memory shape. HYG-053 (skipped) holds the
+bounding question for reorder buffers; read it before changing this one.
 
 Reported by: write path.
 

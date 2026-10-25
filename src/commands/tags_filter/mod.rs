@@ -254,7 +254,7 @@ impl TagsFilterOptions<'_> {
 /// are output (single pass, faster). Otherwise, referenced nodes of matching
 /// ways are also included (two-pass).
 ///
-/// The input must be a regular file or a block device (`InvalidArgument`
+/// The input must be a regular file (`InvalidArgument`
 /// otherwise), in every mode, and is pinned for the run once the options
 /// and expressions are accepted (see [`PinnedInput`]): where a later open
 /// cannot reach the pinned file, an input replaced mid-run fails with

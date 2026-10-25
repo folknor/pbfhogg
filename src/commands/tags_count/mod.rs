@@ -75,8 +75,7 @@ pub struct TagCountOptions<'a> {
 /// restrictions to reduce cardinality, rather than treating thresholds as a
 /// memory budget. See reference/cli-reference.md, "inspect tags".
 ///
-/// The input must be a regular file or a block device (`InvalidArgument`
-/// otherwise), and is pinned for the run once the expressions are accepted
+/// The input must be a regular file (`InvalidArgument` otherwise), and is pinned for the run once the expressions are accepted
 /// (see [`PinnedInput`](crate::read::input::PinnedInput)); a caller's pin is
 /// used as it is. Where a later open cannot reach the pinned file, an input
 /// replaced mid-run fails with `InputReplaced`.

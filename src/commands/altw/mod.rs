@@ -356,8 +356,8 @@ impl Stats {
 /// If `keep_untagged_nodes` is false, nodes with zero tags are omitted from
 /// the output (their coordinates are still used for ways).
 ///
-/// The input is read in several passes, so it must be a regular file or a
-/// block device (`InvalidArgument` otherwise), and is pinned for the run
+/// The input is read in several passes, so it must be a regular file
+/// (`InvalidArgument` otherwise), and is pinned for the run
 /// (see [`PinnedInput`](crate::read::input::PinnedInput)): where a later
 /// open cannot reach the pinned file, an input replaced mid-run fails with
 /// `InputReplaced`.

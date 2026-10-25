@@ -211,15 +211,15 @@ impl<'a> InputSource<'a> {
 /// and inode) before it is returned, and its `O_NONBLOCK` is cleared again.
 ///
 /// What a pin does not catch: changes to the contents behind the same file
-/// (an in-place rewrite, truncation, a block device reconfigured or its
-/// media changed), and a replacement before the pin was taken. A pin
+/// (an in-place rewrite or truncation), and a replacement before the pin was taken. A pin
 /// identifies a file; it is not a snapshot of one. Where `std` reports no
 /// device and inode (not Unix) nothing is verified: every open is a plain
 /// open of the path.
 ///
-/// Only a regular file or a block device can be pinned: a command that
-/// pins reads its input more than once, and a FIFO, socket or character
-/// device does not serve the same bytes twice. On Linux the pin is an
+/// Only a regular file can be pinned: a command that pins reads its input
+/// more than once, and a FIFO, socket or character device does not serve
+/// the same bytes twice. A block device is refused as well: its `st_size`
+/// is zero, which the header walker would read as an empty file. On Linux the pin is an
 /// `O_PATH` descriptor, so the pin itself runs no device open and needs no
 /// read permission (the one-off procfs probe is a real read-only open of the
 /// pinned file); an unreadable input fails at its first real open, naming
@@ -310,7 +310,7 @@ impl PinnedInput {
     ///
     /// # Errors
     /// The path cannot be opened or `stat`ed, or names something other than
-    /// a regular file or a block device; the error names it.
+    /// a regular file; the error names it.
     pub fn pin(path: &Path, host: &crate::host::Host) -> Result<Self> {
         #[cfg(feature = "test-hooks")]
         let force_path = host.cancel.faults().forces_pin_path_reopen();
@@ -321,7 +321,6 @@ impl PinnedInput {
 
     #[cfg(unix)]
     fn pin_with(path: &Path, host: &crate::host::Host, force_path: bool) -> Result<Self> {
-        use std::os::unix::fs::FileTypeExt;
         #[cfg(not(feature = "test-hooks"))]
         let _ = host;
         #[cfg(target_os = "linux")]
@@ -331,10 +330,11 @@ impl PinnedInput {
         let anchor = open_nonblocking(path, flags).map_err(|e| named("open", path, e))?;
         let meta = anchor.metadata().map_err(|e| named("stat", path, e))?;
         let kind = meta.file_type();
-        if !kind.is_file() && !kind.is_block_device() {
+        if !kind.is_file() {
             return Err(Error::invalid_argument(format!(
-                "{} is not a regular file or a block device: this command reads its input \
-                 more than once, which needs one that serves the same bytes to every open",
+                "{} is not a regular file: this command reads its input more than once, \
+                 which needs one that serves the same bytes to every open (a block device \
+                 is refused too, its size is not known to the header walker)",
                 path.display()
             )));
         }

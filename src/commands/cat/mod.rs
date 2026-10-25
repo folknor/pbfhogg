@@ -86,7 +86,7 @@ impl CatStats {
 ///
 /// # Errors
 /// Besides read, decode and write failures: an input that is not a regular
-/// file or a block device, or a host that allows fewer descriptors than
+/// file, or a host that allows fewer descriptors than
 /// the run holds, is refused before any input is read.
 pub fn cat(
     files: &[&Path],

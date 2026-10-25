@@ -492,10 +492,10 @@ its start, and every later open of it is an `InputSource::Pinned` open:
   input's place still sees that open before it is refused.
 
 What a pin does not catch: a change behind the same file (an in-place
-rewrite or truncation, a block device reconfigured or its media changed),
-and a replacement before the pin is taken. Only a regular file or a block
-device can be pinned; a FIFO, socket or character device is refused when the
-pin is taken. On Unix each pin holds one descriptor for the run. Off Unix,
+rewrite or truncation), and a replacement before the pin is taken. Only a
+regular file can be pinned; a block device (its `st_size` is zero, which the
+header walker would read as empty), FIFO, socket or character device is
+refused when the pin is taken. On Unix each pin holds one descriptor for the run. Off Unix,
 where `std` reports no device and inode, a pin holds only the path and
 nothing is verified. One-shot opens
 (`InputSource::Path`), and scratch files, resolve the path as before.

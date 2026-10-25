@@ -243,7 +243,7 @@ impl WorkerAccum {
 /// envelope applies comfortably.
 ///
 /// The input is read twice (the indexdata probe, then the schedule walk),
-/// so it must be a regular file or a block device (`InvalidArgument`
+/// so it must be a regular file (`InvalidArgument`
 /// otherwise) and is pinned for the run (see
 /// [`PinnedInput`](crate::read::input::PinnedInput)); a caller's pin is used
 /// as it is. Where a later open cannot reach the pinned file, an input

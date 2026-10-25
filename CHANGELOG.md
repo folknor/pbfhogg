@@ -934,8 +934,9 @@
   file: on Linux with `/proc` a replaced or unlinked input does not affect
   the run; on other Unix hosts an open that finds another file at the path
   fails with the new `ErrorKind::InputReplaced` (off Unix nothing is
-  verified). Only regular files and block devices
-  can be pinned. `FileReader::open` and `InputFile::open` now take an
+  verified). Only regular files
+  can be pinned; a block device is refused (its size reads as zero, so the
+  header walker would take it for an empty file). `FileReader::open` and `InputFile::open` now take an
   `impl Into<InputSource>` (a `&Path`, `&PathBuf`, `&Arc<Path>` or
   `&PinnedInput`); a caller passing `&&Path` dereferences it. The commands
   adopt it one by one; until a command does, it still reopens by path.

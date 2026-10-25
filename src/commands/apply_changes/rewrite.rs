@@ -163,8 +163,7 @@ fn build_header_bytes(
 /// Returns an error if the base PBF or OSC file cannot be read, the
 /// output path aliases the base PBF, the output file cannot be written, or
 /// any PBF parsing/encoding fails. The base is read in several passes, so
-/// it must be a regular file or a block device (`InvalidArgument`
-/// otherwise), and is pinned for the run (see
+/// it must be a regular file (`InvalidArgument` otherwise), and is pinned for the run (see
 /// [`PinnedInput`](crate::read::input::PinnedInput)): where a later open
 /// cannot reach the pinned file, a base replaced mid-run fails with
 /// `InputReplaced`.

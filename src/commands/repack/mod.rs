@@ -108,8 +108,8 @@ struct WorkerOutput {
 /// encoding. Output is type-sorted (nodes, then ways, then relations);
 /// the `Sort.Type_then_ID` flag is propagated when the input has it.
 ///
-/// The input is read in several passes, so it must be a regular file or a
-/// block device (`InvalidArgument` otherwise), and is pinned for the run
+/// The input is read in several passes, so it must be a regular file
+/// (`InvalidArgument` otherwise), and is pinned for the run
 /// (see [`PinnedInput`](crate::read::input::PinnedInput)); a caller's pin is
 /// used as it is. Where a later open cannot reach the pinned file, an input
 /// replaced mid-run fails with `InputReplaced` and nothing is published.

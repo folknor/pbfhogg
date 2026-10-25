@@ -626,8 +626,8 @@ fn parse_extract_geometry(
 /// region costs no extraction work, and a failure in any region publishes
 /// nothing.
 ///
-/// The input is read in several passes, so it must be a regular file or a
-/// block device (`InvalidArgument` otherwise), and is pinned once for the
+/// The input is read in several passes, so it must be a regular file
+/// (`InvalidArgument` otherwise), and is pinned once for the
 /// whole run, every region included (see [`PinnedInput`]): where a later
 /// open cannot reach the pinned file, an input replaced mid-run fails with
 /// `InputReplaced`.
@@ -822,8 +822,8 @@ fn output_facts(set_bounds: bool, bbox: &Bbox) -> crate::commands::output_header
 
 /// Extract elements within `region` from `input` and write to `output`.
 ///
-/// The input is read in several passes, so it must be a regular file or a
-/// block device (`InvalidArgument` otherwise), and is pinned for the run
+/// The input is read in several passes, so it must be a regular file
+/// (`InvalidArgument` otherwise), and is pinned for the run
 /// (see [`PinnedInput`]): where a later open cannot reach the pinned file,
 /// an input replaced mid-run fails with `InputReplaced`.
 #[allow(clippy::too_many_arguments)]

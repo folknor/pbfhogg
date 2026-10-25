@@ -57,7 +57,7 @@ impl GetparentsStats {
 ///
 /// Every route opens the input more than once (the indexdata probe, the
 /// arm estimate on indexed input, then the header walker or the streaming
-/// reader), so the input must be a regular file or a block device
+/// reader), so the input must be a regular file
 /// (`InvalidArgument` otherwise) and is pinned for the run before any of
 /// them (see [`PinnedInput`] and [`InputSource::pin`]); a caller may pin it
 /// first and pass the pin. Where a later open cannot reach the pinned file,

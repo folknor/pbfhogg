@@ -153,7 +153,7 @@ impl DiffStats {
 /// [`diff_stats`], which shards without scratch.
 ///
 /// Every route opens each input more than once, so both must be regular
-/// files or block devices (`InvalidArgument` otherwise) and are pinned for
+/// files (`InvalidArgument` otherwise) and are pinned for
 /// the run once the options are accepted, `old` first, before either is
 /// read (see [`PinnedInput`] and [`InputSource::pin`]). A path spelled
 /// exactly as the other shares its pin, so `diff a a` compares one file

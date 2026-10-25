@@ -39,30 +39,6 @@ behaviour; below that the work is progressively more contained.
 
 ---
 
-## BUG-190 - The header walker sizes a block-device input as empty
-
-Anger: 6 - pinned inputs accept block devices, but no command was ever
-shown to read one.
-
-`HeaderWalker::open` (`read/header_walker.rs`) takes `file_size` from the
-opened descriptor's `metadata().len()`, which is `st_size`: 0 for a Linux
-block device. `PinnedInput` deliberately accepts block devices ("a regular
-file or a block device"), as do the contract in `reference/pipeline.md` and
-every adopting command's docs, so a block-device input passes the pin and
-then meets a walker that believes the file is empty - presumably a
-missing-header refusal on every command that walks headers (the classify
-schedule builders, sort, getid, getparents, time-filter's snapshot path,
-and the rest). Either the walker (and any other `st_size` reader) learns
-the device size (`BLKGETSIZE64`, or seeking to the end), or the pin refuses
-block devices and the docs say so. Raised by codex in the time-filter pin
-spar; not verified with a test.
-
-Maintainer (2026-10-25): the pin refuses block devices, and the docs that
-promise them (`reference/pipeline.md`, the adopting commands' docs, the
-CHANGELOG) say so. The walker does not learn device sizes.
-
-Reported by: the HYG-186 resolution.
-
 ## BUG-191 - Narrow packed values that do not fit their type alias silently
 
 Anger: 9 - the fix is construction-time validation on every read path.

@@ -58,7 +58,7 @@ pub struct InspectOptions {
 /// a full decode from the start if a data blob lacks indexdata - and whether
 /// it is is only learned from the file, so the input is pinned before the
 /// walk (see [`PinnedInput`](crate::read::input::PinnedInput)): it must be a
-/// regular file or a block device (`InvalidArgument` otherwise), and where a
+/// regular file (`InvalidArgument` otherwise), and where a
 /// later open cannot reach the pinned file, an input replaced mid-run fails
 /// with `InputReplaced`. Otherwise the full decode is the one read, through
 /// one open of `input` as given, and takes no pin of its own. A caller's pin

@@ -312,8 +312,7 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
 ///
 /// # Input
 ///
-/// The input must be a regular file or a block device (`InvalidArgument`
-/// otherwise), and is pinned for the run (see [`PinnedInput`]); a caller's
+/// The input must be a regular file (`InvalidArgument` otherwise), and is pinned for the run (see [`PinnedInput`]); a caller's
 /// pin is used as it is. Where a later open cannot reach the pinned file, an
 /// input replaced mid-run fails with `InputReplaced`.
 #[hotpath::measure]

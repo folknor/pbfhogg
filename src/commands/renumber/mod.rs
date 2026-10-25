@@ -377,8 +377,8 @@ fn validate_start_ids(opts: &RenumberOptions) -> Result<()> {
 /// Refuses input whose node, way or relation IDs do not strictly increase
 /// in file order (see the module docs), and start IDs below 1.
 ///
-/// The input is read in several passes, so it must be a regular file or a
-/// block device (`InvalidArgument` otherwise), and is pinned for the run
+/// The input is read in several passes, so it must be a regular file
+/// (`InvalidArgument` otherwise), and is pinned for the run
 /// (see [`InputSource::pin`](crate::read::input::InputSource::pin)): a path
 /// is pinned here, a caller's [`PinnedInput`] is used as it is. Where a
 /// later open cannot reach the pinned file, an input replaced mid-run fails

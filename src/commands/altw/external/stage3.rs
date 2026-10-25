@@ -2,7 +2,6 @@
 //! pipeline (the flat coord_slots intermediate was retired 2026-04).
 
 use super::super::Result;
-#[cfg(feature = "linux-direct-io")]
 use super::radix::advise_dontneed_file;
 use crate::error::Error;
 
@@ -43,9 +42,9 @@ crate::counters::counter_set! {
         bytes_read => "s3_bytes_read",
         scatter_stores => "s3_scatter_stores",
         max_worker_buf_bytes => "s3_max_worker_buf_bytes",
-        /// Bumped only in `linux-direct-io` builds; zero otherwise.
+        /// Slot buckets advised out of the page cache; zero off Linux.
         fadvise_calls => "s3_fadvise_calls",
-        /// Bumped only in `linux-direct-io` builds; zero otherwise.
+        /// Bytes of those buckets; zero off Linux.
         fadvise_bytes => "s3_fadvise_bytes",
         encode_ms => "s3_encode_ms",
         straddler_copy_ms => "s3_straddler_copy_ms",
@@ -255,11 +254,9 @@ pub(super) fn stage3_slot_reorder(
                                 ))
                             },
                         )?;
-                        #[cfg(feature = "linux-direct-io")]
-                        {
+                        if advise_dontneed_file(&bucket_file) {
                             c.fadvise_calls.fetch_add(1, Relaxed);
                             c.fadvise_bytes.fetch_add(data_buf.len() as u64, Relaxed);
-                            advise_dontneed_file(&bucket_file);
                         }
                         t_read.record_ms(&c.read_ms);
                         c.bytes_read.fetch_add(data_buf.len() as u64, Relaxed);

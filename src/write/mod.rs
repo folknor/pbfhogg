@@ -18,7 +18,6 @@
 
 pub mod block_builder;
 pub mod compression;
-#[cfg(feature = "linux-direct-io")]
 mod copy_range;
 #[cfg(feature = "linux-direct-io")]
 pub mod direct_writer;
@@ -74,22 +73,19 @@ pub fn report_writer_degradations(diagnostics: &crate::host::Diagnostics) {
             "{dropped} output blobs lost their tag skip-index because their headers exceeded the size limit; tag filtering may decode more blobs"
         );
     }
-    // Only the splice path (feature `linux-direct-io`) moves these counters.
-    #[cfg(feature = "linux-direct-io")]
-    {
-        let ranges = m.copy_range_fallback_ranges.load(Relaxed);
-        if ranges != 0 {
-            let bytes = m.copy_range_fallback_bytes.load(Relaxed);
-            let errno = m.copy_range_fallback_errno.load(Relaxed);
-            let name = copy_range::refusal_name(errno).unwrap_or("errno");
-            let first = std::io::Error::from_raw_os_error(errno);
-            crate::host::diag_once!(
-                diagnostics,
-                Note,
-                "writer.copy_range_fallback",
-                "the kernel refused copy_file_range for {ranges} passthrough ranges ({bytes} bytes requested), so they were routed to the userspace copy, which moves every byte through this process; first refusal: {name}, {first}"
-            );
-        }
+    // Only a kernel refusal on Linux moves these counters.
+    let ranges = m.copy_range_fallback_ranges.load(Relaxed);
+    if ranges != 0 {
+        let bytes = m.copy_range_fallback_bytes.load(Relaxed);
+        let errno = m.copy_range_fallback_errno.load(Relaxed);
+        let name = copy_range::refusal_name(errno).unwrap_or("errno");
+        let first = std::io::Error::from_raw_os_error(errno);
+        crate::host::diag_once!(
+            diagnostics,
+            Note,
+            "writer.copy_range_fallback",
+            "the kernel refused copy_file_range for {ranges} passthrough ranges ({bytes} bytes requested), so they were routed to the userspace copy, which moves every byte through this process; first refusal: {name}, {first}"
+        );
     }
 }
 pub mod options;

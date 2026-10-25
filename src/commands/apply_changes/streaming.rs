@@ -107,8 +107,7 @@ pub(super) struct StreamingConfig {
     /// `rayon::spawn`-per-block dispatch (P1.5).
     pub compression: Compression,
     /// `Splice` when the output backend supports `copy_file_range` (so the
-    /// drain accepts `DrainItem::CopyRange`). On `Owned` (consumer
-    /// build without the `linux-direct-io` feature, or when
+    /// drain accepts `DrainItem::CopyRange`). On `Owned` (when
     /// `--direct-io` is selected), false-positive candidates must be
     /// routed through the owned-passthrough path instead - the drain
     /// rejects `CopyRange` items up front.
@@ -608,8 +607,7 @@ fn handle_candidate(
             })?;
             return send_drain(drain_tx, item);
         }
-        // Consumer build (no `linux-direct-io` feature) or `--direct-io`
-        // output: the drain rejects `DrainItem::CopyRange` up front, so
+        // `--direct-io` output: the drain rejects `DrainItem::CopyRange` up front, so
         // route the false-positive through the owned-passthrough path
         // (pread the full frame, ship the bytes via
         // `DrainItem::OwnedBytes`). `handle_owned_passthrough` does

@@ -249,27 +249,10 @@ impl WillneedPrefetch {
                 self.next_offset = end;
             }
 
-            #[cfg(target_os = "linux")]
-            {
-                use std::os::unix::io::AsRawFd as _;
-
-                let (Ok(offset), Ok(size)) = (offset.try_into(), size.try_into()) else {
-                    continue;
-                };
-                // Safety: the File owns a valid descriptor for this call. As
-                // with HeaderWalker's RANDOM hint, fadvise failures are advisory.
-                unsafe {
-                    libc::posix_fadvise(
-                        shared_file.as_ref().as_raw_fd(),
-                        offset,
-                        size,
-                        libc::POSIX_FADV_WILLNEED,
-                    );
-                }
-            }
-
-            #[cfg(not(target_os = "linux"))]
-            let _ = shared_file;
+            // `size` is never zero here (zero-sized bodies are not coalesced
+            // and the window end lies past `offset`), so this is never the
+            // through-EOF form.
+            crate::fadvise::advise(shared_file, offset, size, crate::fadvise::Advice::WillNeed);
         }
     }
 }

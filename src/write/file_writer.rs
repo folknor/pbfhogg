@@ -131,7 +131,6 @@ fn sync_unsupported(
     false
 }
 
-#[cfg(feature = "linux-direct-io")]
 impl FileWriter {
     /// Flush internal buffers and return the output file for a cursor copy
     /// (`copy_range::CopyOut::Cursor`), if available.
@@ -148,6 +147,7 @@ impl FileWriter {
                 w.flush()?;
                 Ok(Some(w.get_ref()))
             }
+            #[cfg(feature = "linux-direct-io")]
             FileWriter::Direct(_) => Ok(None),
         }
     }

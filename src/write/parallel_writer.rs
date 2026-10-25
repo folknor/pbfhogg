@@ -70,7 +70,6 @@ enum WriteOp {
     /// descriptor cannot be closed - or recycled onto an unrelated file - by
     /// the producer while this op sits in a pool worker's queue, and with
     /// its path, so a failed read or splice names the file.
-    #[cfg(feature = "linux-direct-io")]
     CopyRange {
         out_offset: u64,
         in_file: crate::read::input::InputFile,
@@ -354,7 +353,6 @@ fn dispatch_chunk(
                     .fetch_add(len, Ordering::Relaxed);
             }
         }
-        #[cfg(feature = "linux-direct-io")]
         OutputChunk::CopyRange {
             in_file,
             offset: src_offset,
@@ -440,8 +438,6 @@ fn worker_loop(
 ) {
     #[cfg(not(feature = "test-hooks"))]
     let _ = index;
-    #[cfg(not(any(feature = "linux-direct-io", feature = "test-hooks")))]
-    let _ = cancel;
     while let Ok(op) = rx.recv() {
         // One Acquire load per op - next to two Relaxed RMWs on the shared
         // `WRITER_METRICS` and a multi-hundred-KB pwrite.
@@ -460,7 +456,6 @@ fn worker_loop(
             WriteOp::Write { offset, bytes } => {
                 file.write_all_at(&bytes, offset).map_err(Error::from)
             }
-            #[cfg(feature = "linux-direct-io")]
             WriteOp::CopyRange {
                 out_offset,
                 in_file,
@@ -492,9 +487,7 @@ fn worker_loop(
     }
 }
 
-/// Regression test to keep the module compiling under consumer
-/// profiles where `linux-direct-io` is off. Exercises only the
-/// always-present `Write` branch.
+/// The pool's `Write` path, end to end, in every feature configuration.
 #[cfg(test)]
 mod tests {
     use super::*;

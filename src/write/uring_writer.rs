@@ -485,7 +485,6 @@ impl Drop for UringState {
 /// `read_range` enforces the reservation protocol; `space` and `filled`
 /// still bounds-check against the buffer with checked arithmetic, because
 /// `current_len` feeds the pointer arithmetic below.
-#[cfg(feature = "linux-direct-io")]
 impl super::copy_range::ReadSink for UringState {
     fn space(&mut self, want: usize) -> Result<&mut [u8]> {
         let buf_idx = match self.current_buf {
@@ -727,8 +726,6 @@ fn uring_main_loop(
     expected: &SeqTotal,
     cancel: &crate::host::Cancel,
 ) -> Result<()> {
-    #[cfg(not(any(feature = "linux-direct-io", feature = "test-hooks")))]
-    let _ = cancel;
     let mut pending: ReorderBuffer<Result<OutputChunk>> = ReorderBuffer::with_capacity(WRITE_AHEAD);
 
     loop {
@@ -780,7 +777,6 @@ fn uring_main_loop(
                     t_write.record_ns(&WRITER_METRICS.write_ns);
                     WRITER_METRICS.bytes_written.fetch_add(total_bytes, Relaxed);
                 }
-                #[cfg(feature = "linux-direct-io")]
                 OutputChunk::CopyRange {
                     in_file,
                     offset,

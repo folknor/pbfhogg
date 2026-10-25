@@ -43,7 +43,6 @@ pub(crate) enum OutputChunk {
     ///
     /// The input travels with its path ([`InputFile`](crate::read::input::InputFile)),
     /// so a failed read or splice names the file and the byte range.
-    #[cfg(feature = "linux-direct-io")]
     CopyRange {
         in_file: crate::read::input::InputFile,
         offset: u64,
@@ -156,7 +155,6 @@ impl OutputSink for FileOutputSink {
                 WRITER_METRICS.bytes_written.fetch_add(total_bytes, Relaxed);
                 Ok(())
             }
-            #[cfg(feature = "linux-direct-io")]
             OutputChunk::CopyRange {
                 in_file,
                 offset,

@@ -32,8 +32,8 @@ pub(super) enum Route<T> {
     /// to the drain, and the drain coalesces adjacent ranges into
     /// `write_raw_copy` calls.
     Splice(T),
-    /// Owned bytes: backends that cannot splice (`--direct-io`, or a build
-    /// without `linux-direct-io`). Passthroughs go through the worker pool,
+    /// Owned bytes: the backend that cannot splice (`--direct-io`).
+    /// Passthroughs go through the worker pool,
     /// which preads the full frame and emits `DrainItem::OwnedBytes`.
     Owned,
 }

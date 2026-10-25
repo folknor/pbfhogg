@@ -2177,6 +2177,20 @@
 
 ### Changed
 
+- **Default Linux builds now do the I/O the published numbers were
+  measured with.** Passthrough splicing (`copy_file_range`, used by `sort`
+  and `apply-changes` for untouched blobs), the sequential-readahead hint on
+  buffered reads, and `add-locations-to-ways --index-type external`'s
+  scratch eviction used to compile only with the `linux-direct-io` or
+  `linux-io-uring` feature, so `cargo install pbfhogg-cli` and every
+  default library build ran without them. They now run in every Linux
+  build, and the two features mean only `O_DIRECT` and `io_uring`. Library:
+  `PbfWriter::write_raw_copy` and `OutputBackend::supports_copy_range` no
+  longer depend on `linux-direct-io`; off Linux, `write_raw_copy` copies in
+  userspace and refuses a same-file or append-mode pair. A failed writeback
+  of an external-join slot bucket now fails the run (`failed to sync slot
+  bucket ...`) instead of being ignored.
+
 - **`--force` on unindexed input says the same thing on every command.** A
   forced run, or `build-geocode-index --allow-unindexed`, prints one note
   that the run proceeds without indexdata and is slower. getid,

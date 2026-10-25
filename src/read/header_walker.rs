@@ -233,15 +233,7 @@ impl HeaderWalker {
         // (workers may address disjoint shards). Sequential readahead
         // would pull blob bodies adjacent to each header into the page
         // cache and never be reused.
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::io::AsRawFd;
-            // Safety: posix_fadvise on a valid fd is safe to call; any
-            // error is a hint that can be ignored (see posix_fadvise(2)).
-            unsafe {
-                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
-            }
-        }
+        crate::fadvise::advise(&file, 0, 0, crate::fadvise::Advice::Random);
         Ok(Self {
             diagnostics: host.diagnostics.clone(),
             cancel: host.cancel.clone(),

@@ -91,9 +91,7 @@ crate::counters::counter_set! {
         /// range to the userspace fallback (0 = none yet). Kept for the
         /// run's note (`report_writer_degradations`), not emitted as a
         /// counter: a later refusal may carry a different errno, and only
-        /// the first is claimed. Only the splice path (`linux-direct-io`)
-        /// records or reads it.
-        #[cfg_attr(not(feature = "linux-direct-io"), allow(dead_code))]
+        /// the first is claimed. Only a kernel refusal on Linux records it.
         pub copy_range_fallback_errno: AtomicI32 = AtomicI32::new(0),
     }
 }

@@ -26,7 +26,18 @@
 //! at planet scale, so every range routed to it is counted
 //! (`writer_copy_range_fallback_ranges` / `_bytes`), the first refusing errno
 //! is kept, and the CLI turns them into one note per run
-//! (`report_writer_degradations`). Requires the `linux-direct-io` feature.
+//! (`report_writer_degradations`).
+//!
+//! The module compiles in every build, and every backend that can splice
+//! does so in every build: splicing used to need the `linux-direct-io`
+//! feature, a leftover from when `libc` was optional, though it has nothing
+//! to do with `O_DIRECT`. The one platform split is inside [`copy_range`]:
+//! Linux asks the kernel first; elsewhere there is no `copy_file_range` to
+//! ask, so the range goes straight to the userspace copy. That is the
+//! platform's copy, not a refusal, so it is not counted or noted - but it is
+//! only taken when [`bounce_safe`] holds, and otherwise refused, since there
+//! is no kernel to have checked the pair first. Off Linux is not built or
+//! tested by any sweep here.
 //!
 //! The shared rules, owned here so no second loop can drift from them:
 //!
@@ -100,6 +111,7 @@ impl CopyOut<'_> {
 /// A raw `ssize_t` syscall return as a result: the count, or the thread's
 /// `errno`. Read `errno` nowhere else - it must be taken before any other
 /// call can overwrite it.
+#[cfg(target_os = "linux")]
 #[inline(always)]
 fn syscall_result(ret: isize) -> io::Result<usize> {
     if ret < 0 {
@@ -161,18 +173,11 @@ fn len_to_usize(len: u64) -> usize {
 ///
 /// The guards apply to every errno in the set, not just `EINVAL`: a kernel
 /// that answers `ENOSYS` or a seccomp `EPERM` checked nothing about the
-/// arguments. Each refuses the fallback (the caller reports the original
-/// error), and each fails closed when it cannot tell:
-///
-/// - the range must end at or below `i64::MAX` on both sides that carry an
-///   explicit offset (computed with `checked_add`);
-/// - the two fds must be different files (`fstat` `st_dev`/`st_ino`): a
-///   forward chunked copy within one file corrupts overlapping ranges;
-/// - `out_fd` must not be `O_APPEND`, where `pwrite` ignores its offset on
-///   Linux. No writer here opens one, and a caller that flips the flag on a
-///   descriptor it handed over mid-copy is outside what any check can see.
+/// arguments. They are [`bounce_safe`]'s; each refuses the fallback (the
+/// caller reports the original error).
 ///
 /// `EBADF`, `EFBIG`, `EOVERFLOW`, `EIO` and everything else stay hard errors.
+#[cfg(target_os = "linux")]
 #[cold]
 fn kernel_copy_refused(
     err: &io::Error,
@@ -182,12 +187,33 @@ fn kernel_copy_refused(
     out_offset: Option<u64>,
     len: u64,
 ) -> bool {
-    if !matches!(
+    matches!(
         err.raw_os_error(),
         Some(libc::EXDEV | libc::ENOSYS | libc::EOPNOTSUPP | libc::EPERM | libc::EINVAL)
-    ) {
-        return false;
-    }
+    ) && bounce_safe(in_fd, out_fd, src_offset, out_offset, len)
+}
+
+/// Whether the userspace copy may move `len` bytes from `in_fd` at
+/// `src_offset` to `out_fd` (at `out_offset`, or at its file position when
+/// `None`). Each guard fails closed when it cannot tell:
+///
+/// - the range must end at or below `i64::MAX` on both sides that carry an
+///   explicit offset (computed with `checked_add`);
+/// - the two fds must be different files (`fstat` `st_dev`/`st_ino`): a
+///   forward chunked copy within one file corrupts overlapping ranges;
+/// - `out_fd` must not be `O_APPEND`, where `pwrite` ignores its offset on
+///   Linux. No writer here opens one, and a caller that flips the flag on a
+///   descriptor it handed over mid-copy is outside what any check can see.
+///
+/// Stricter than the kernel, which accepts disjoint ranges of one file; the
+/// fallback has no such check of its own, so it takes none of them.
+fn bounce_safe(
+    in_fd: RawFd,
+    out_fd: RawFd,
+    src_offset: u64,
+    out_offset: Option<u64>,
+    len: u64,
+) -> bool {
     let representable = |start: u64| {
         start
             .checked_add(len)
@@ -223,6 +249,7 @@ fn file_id(fd: RawFd) -> Option<(libc::dev_t, libc::ino_t)> {
 /// was asked to copy (counted at entry: a fallback that then fails partway
 /// has still been routed this many), and keep the first refusing errno for
 /// the run's note. Cold: the kernel path never gets here.
+#[cfg(target_os = "linux")]
 #[cold]
 fn record_fallback(len: u64, err: &io::Error) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -273,6 +300,10 @@ fn copy_error(err: io::Error, input: &InputFile, start: u64, end: u64) -> Error 
 /// position), safe when the input is also read through a `BufReader` or
 /// `DirectReader`. The output is written as [`CopyOut`] says. A cancelled
 /// run stops between kernel calls with `ErrorKind::Cancelled`.
+///
+/// Off Linux there is no kernel copy: the range is copied in userspace when
+/// [`bounce_safe`] holds and refused otherwise (see the module docs).
+#[cfg(target_os = "linux")]
 pub(crate) fn copy_range(
     input: &InputFile,
     out: CopyOut<'_>,
@@ -296,10 +327,36 @@ pub(crate) fn copy_range(
     })
 }
 
+/// [`copy_range`] off Linux: the userspace copy, when it is safe.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn copy_range(
+    input: &InputFile,
+    out: CopyOut<'_>,
+    offset: u64,
+    len: u64,
+    cancel: &crate::host::Cancel,
+) -> Result<()> {
+    let in_fd = input.file().as_raw_fd();
+    let out_fd = out.file().as_raw_fd();
+    if !bounce_safe(in_fd, out_fd, offset, out.offset(), len) {
+        return Err(copy_error(
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot establish that a userspace range copy is safe for this pair of files",
+            ),
+            input,
+            offset,
+            offset.saturating_add(len),
+        ));
+    }
+    copy_range_fallback(input, out, offset, len, cancel)
+}
+
 /// The [`copy_range`] loop over one `copy_file_range` attempt,
 /// `cfr(off_in, off_out, len)` (`off_out` is `None` for a cursor copy).
 /// Production passes the syscall; tests pass a fake that scripts the
 /// kernel's answers.
+#[cfg(target_os = "linux")]
 #[allow(clippy::cast_possible_wrap)]
 #[inline(always)]
 fn copy_range_with(
@@ -478,9 +535,15 @@ mod tests {
     use crate::error::ErrorKind;
     use std::collections::VecDeque;
     use std::path::Path;
+    #[cfg(target_os = "linux")]
     use std::sync::atomic::Ordering::Relaxed;
 
+    // The fake-kernel tests below drive `copy_range_with`, the Linux loop;
+    // the read loop, the bounce guards and `retry_eintr` are tested on every
+    // platform.
+
     /// One scripted answer from a fake `copy_file_range`.
+    #[cfg(target_os = "linux")]
     #[derive(Clone, Copy, Debug)]
     enum Step {
         /// Copy up to this many bytes for real, like the kernel would.
@@ -502,6 +565,7 @@ mod tests {
     /// already holds `out_at` bytes of 0xAA. `explicit` copies with
     /// [`CopyOut::At`] at `out_at`; otherwise with [`CopyOut::Cursor`] after
     /// seeking there. The fake has the kernel's effect on both offsets.
+    #[cfg(target_os = "linux")]
     fn run(
         script: &[Step],
         input_len: usize,
@@ -573,6 +637,7 @@ mod tests {
         (result, written, bytes, calls)
     }
 
+    #[cfg(target_os = "linux")]
     fn errno_of(err: &Error) -> Option<i32> {
         match err.kind() {
             ErrorKind::Io(e) => e.raw_os_error(),
@@ -580,6 +645,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn eintr_is_retried_and_short_copies_advance() {
         let script = [
@@ -601,6 +667,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn every_refusal_errno_falls_back_on_the_first_call() {
         for explicit in [false, true] {
@@ -636,6 +703,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_refusal_after_progress_is_a_hard_error() {
         for explicit in [false, true] {
@@ -647,6 +715,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn other_errnos_are_hard_errors() {
         for errno in [libc::EBADF, libc::EIO, libc::EFBIG, libc::EOVERFLOW] {
@@ -657,6 +726,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_zero_copy_is_end_of_file() {
         let (result, _, _, _) = run(&[Step::Copy(0)], 1_000, 0, 1_000, 0, true);
@@ -667,6 +737,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_fallback_past_the_end_of_input_is_end_of_file() {
         // The index claims more bytes than the input has: the fallback reads
@@ -741,12 +812,43 @@ mod tests {
         let in_fd = input.file().as_raw_fd();
         let out = std::fs::File::create(dir.path().join("out.bin")).unwrap();
         let out_fd = out.as_raw_fd();
+
+        assert!(bounce_safe(in_fd, out_fd, 0, None, 64));
+        assert!(bounce_safe(in_fd, out_fd, 0, Some(8), 64));
+        // The same file on both ends.
+        let again = std::fs::File::open(input.path()).unwrap();
+        assert!(!bounce_safe(in_fd, again.as_raw_fd(), 0, None, 64));
+        // Ranges the syscall cannot represent.
+        let max = i64::MAX.cast_unsigned();
+        assert!(!bounce_safe(in_fd, out_fd, max, None, 1));
+        assert!(!bounce_safe(in_fd, out_fd, u64::MAX, None, 1));
+        assert!(!bounce_safe(in_fd, out_fd, 0, Some(max), 1));
+        assert!(bounce_safe(in_fd, out_fd, max - 1, None, 1));
+        // An appending output.
+        let appending = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("out.bin"))
+            .unwrap();
+        assert!(!bounce_safe(in_fd, appending.as_raw_fd(), 0, None, 64));
+        // A closed descriptor fails closed.
+        assert!(!bounce_safe(in_fd, -1, 0, None, 64));
+    }
+
+    /// The kernel refusal is the errno set and the bounce guards together.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_kernel_refusal_needs_both_the_errno_and_the_guards() {
+        let dir = crate::path_guard::tests::scratch();
+        let (input, _) = patterned_input(dir.path(), 64);
+        let in_fd = input.file().as_raw_fd();
+        let out = std::fs::File::create(dir.path().join("out.bin")).unwrap();
+        let out_fd = out.as_raw_fd();
         let einval = io::Error::from_raw_os_error(libc::EINVAL);
         let enosys = io::Error::from_raw_os_error(libc::ENOSYS);
 
         assert!(kernel_copy_refused(&einval, in_fd, out_fd, 0, None, 64));
-        assert!(kernel_copy_refused(&einval, in_fd, out_fd, 0, Some(8), 64));
-        // The same file on both ends, whatever the errno.
+        assert!(kernel_copy_refused(&enosys, in_fd, out_fd, 0, Some(8), 64));
+        // The guards hold whatever the errno.
         let again = std::fs::File::open(input.path()).unwrap();
         assert!(!kernel_copy_refused(
             &enosys,
@@ -756,48 +858,6 @@ mod tests {
             None,
             64
         ));
-        // Ranges the syscall cannot represent.
-        let max = i64::MAX.cast_unsigned();
-        assert!(!kernel_copy_refused(&einval, in_fd, out_fd, max, None, 1));
-        assert!(!kernel_copy_refused(
-            &einval,
-            in_fd,
-            out_fd,
-            u64::MAX,
-            None,
-            1
-        ));
-        assert!(!kernel_copy_refused(
-            &einval,
-            in_fd,
-            out_fd,
-            0,
-            Some(max),
-            1
-        ));
-        assert!(kernel_copy_refused(
-            &einval,
-            in_fd,
-            out_fd,
-            max - 1,
-            None,
-            1
-        ));
-        // An appending output.
-        let appending = std::fs::OpenOptions::new()
-            .append(true)
-            .open(dir.path().join("out.bin"))
-            .unwrap();
-        assert!(!kernel_copy_refused(
-            &enosys,
-            in_fd,
-            appending.as_raw_fd(),
-            0,
-            None,
-            64
-        ));
-        // A closed descriptor fails closed.
-        assert!(!kernel_copy_refused(&enosys, in_fd, -1, 0, None, 64));
         // Errnos outside the set.
         let ebadf = io::Error::from_raw_os_error(libc::EBADF);
         assert!(!kernel_copy_refused(&ebadf, in_fd, out_fd, 0, None, 64));

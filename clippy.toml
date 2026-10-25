@@ -59,6 +59,8 @@ disallowed-methods = [
     { path = "libc::pwritev", reason = "positioned writes go through std FileExt::write_all_at" },
     { path = "libc::read", reason = "use std::fs::File's Read, which issues the same read(2)" },
     { path = "libc::write", reason = "use std::fs::File's Write, which issues the same write(2)" },
-    { path = "std::process::id", reason = "scratch is named by its run directory, not by pid" },
+    # Page-cache advice has one owner, `crate::fadvise::advise`, which handles
+    # the off_t range, the platform gate and the failure counter once.
+    { path = "libc::posix_fadvise", reason = "page-cache advice goes through crate::fadvise::advise" },    { path = "std::process::id", reason = "scratch is named by its run directory, not by pid" },
     { path = "std::env::temp_dir", reason = "scratch goes where the caller put the run directory" },
 ]

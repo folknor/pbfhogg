@@ -43,9 +43,13 @@ pub(crate) fn payload_path(scratch: &RunScratch, index: usize) -> Result<Scratch
 // File-level page-cache eviction helper
 // ---------------------------------------------------------------------------
 
-/// Advise the kernel to evict a single file's pages from page cache.
-#[cfg(feature = "linux-direct-io")]
-pub(crate) fn advise_dontneed_file(file: &std::fs::File) {
-    use std::os::unix::io::AsRawFd;
-    unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+/// Advise the kernel to drop a scratch file's clean pages from the page
+/// cache, once its bytes have been read into memory (or, for a file this run
+/// wrote, synced). Scratch is the library's own, so this is library scratch
+/// management, not the caller's page-cache policy (ADR-0016), and it runs in
+/// every Linux build: it used to compile only with the `linux-direct-io`
+/// feature, which has nothing to do with it. Returns whether the advice was
+/// given (false off Linux), for the stage counters.
+pub(crate) fn advise_dontneed_file(file: &std::fs::File) -> bool {
+    crate::fadvise::advise(file, 0, 0, crate::fadvise::Advice::DontNeed)
 }

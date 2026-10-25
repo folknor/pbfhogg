@@ -716,19 +716,18 @@ fn write_passthrough_blob(
 }
 
 /// Outcome of offering a blob to the `copy_file_range` coalescer.
-#[allow(dead_code)] // `Extended`/`Started` only constructed under `linux-direct-io`.
 enum CopyRunStep {
     /// Blob extended an in-flight run (contiguous with the current tail).
     Extended,
     /// Blob started a new run; any prior run was flushed.
     Started,
-    /// Blob can't go through the copy path - missing indexdata or
-    /// `copy_file_range` unavailable. Caller flushes + uses the fallback.
+    /// Blob can't go through the copy path - missing indexdata, or an
+    /// output backend that cannot splice (`--direct-io`). Caller flushes +
+    /// uses the fallback.
     Fallback,
 }
 
 /// Try to fold `entry` into an in-flight `copy_file_range` run.
-#[allow(unused_variables)]
 fn try_extend_copy_run(
     run: &mut Option<(u64, u64)>,
     entry: &BlobEntry,
@@ -740,27 +739,21 @@ fn try_extend_copy_run(
     if !(entry.has_indexdata && use_copy_range) {
         return Ok(CopyRunStep::Fallback);
     }
-    #[cfg(feature = "linux-direct-io")]
-    {
-        match *run {
-            Some((start, end)) if end == entry.file_offset => {
-                *run = Some((start, end + entry.frame_len));
-                Ok(CopyRunStep::Extended)
-            }
-            _ => {
-                flush_copy_run(run, writer, input, calls)?;
-                *run = Some((entry.file_offset, entry.file_offset + entry.frame_len));
-                Ok(CopyRunStep::Started)
-            }
+    match *run {
+        Some((start, end)) if end == entry.file_offset => {
+            *run = Some((start, end + entry.frame_len));
+            Ok(CopyRunStep::Extended)
+        }
+        _ => {
+            flush_copy_run(run, writer, input, calls)?;
+            *run = Some((entry.file_offset, entry.file_offset + entry.frame_len));
+            Ok(CopyRunStep::Started)
         }
     }
-    #[cfg(not(feature = "linux-direct-io"))]
-    Ok(CopyRunStep::Fallback)
 }
 
 /// Emit any in-flight `copy_file_range` run as a single `write_raw_copy`
 /// call and clear the run state. No-op when no run is in flight.
-#[cfg(feature = "linux-direct-io")]
 fn flush_copy_run(
     run: &mut Option<(u64, u64)>,
     writer: &mut PbfWriter<FileWriter>,
@@ -771,23 +764,6 @@ fn flush_copy_run(
         writer.write_raw_copy(input, start, end - start)?;
         *calls += 1;
     }
-    Ok(())
-}
-
-/// No-op stub: without `linux-direct-io`, `try_extend_copy_run` never
-/// populates `run`, so this only ever sees `None`.
-#[cfg(not(feature = "linux-direct-io"))]
-fn flush_copy_run(
-    run: &mut Option<(u64, u64)>,
-    _writer: &mut PbfWriter<FileWriter>,
-    _input: &crate::read::input::InputFile,
-    _calls: &mut u64,
-) -> Result<()> {
-    debug_assert!(
-        run.is_none(),
-        "copy_file_range run set without linux-direct-io feature"
-    );
-    run.take();
     Ok(())
 }
 

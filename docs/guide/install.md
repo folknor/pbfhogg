@@ -35,6 +35,8 @@ pbfhogg = { version = "0.5", default-features = false }
 | `linux-direct-io` | no | O_DIRECT read/write paths - bypasses page cache for planet-scale I/O (Linux only) |
 | `linux-io-uring` | no | io_uring writer with registered buffers - faster writes above ~4 GB (Linux only, requires kernel 5.1+) |
 
+The two Linux features gate only `O_DIRECT` and `io_uring`. Every Linux build, with or without them, copies passthrough blobs with `copy_file_range`, hints sequential readahead on buffered reads, and drops `add-locations-to-ways --index-type external` scratch from the page cache once it is read.
+
 For reverse geocoding queries without the full `commands` feature:
 
 ```toml

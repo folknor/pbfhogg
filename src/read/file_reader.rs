@@ -45,19 +45,17 @@ impl FileReader {
     /// The fd is borrowed only for this call, never cached by the caller.
     #[cfg(target_os = "linux")]
     pub(crate) fn evict_consumed_prefix(&self, offset: u64) -> bool {
-        use std::os::unix::io::AsRawFd;
         match self {
+            // An empty prefix is not advised: length zero would mean the
+            // whole file.
             Self::Buffered(reader) => {
-                // SAFETY: the borrow keeps the owning File alive for the call.
-                unsafe {
-                    libc::posix_fadvise(
-                        reader.get_ref().as_raw_fd(),
+                offset != 0
+                    && crate::fadvise::advise(
+                        reader.get_ref(),
                         0,
-                        offset.try_into().unwrap_or(i64::MAX),
-                        libc::POSIX_FADV_DONTNEED,
+                        offset,
+                        crate::fadvise::Advice::DontNeed,
                     )
-                };
-                true
             }
             #[cfg(feature = "linux-direct-io")]
             Self::Direct(_) => false,
@@ -67,19 +65,11 @@ impl FileReader {
     /// Open a file for buffered reading (256 KB `BufReader`).
     ///
     /// On Linux, advises the kernel for sequential readahead via
-    /// `posix_fadvise(POSIX_FADV_SEQUENTIAL)`.
+    /// `posix_fadvise(POSIX_FADV_SEQUENTIAL)`, as osmium does, in every
+    /// build: the hint is not tied to the `O_DIRECT` or `io_uring` features.
     pub fn buffered(path: &Path) -> Result<Self> {
         let f = crate::read::input::open(path)?;
-        #[cfg(all(
-            target_os = "linux",
-            any(feature = "linux-direct-io", feature = "linux-io-uring")
-        ))]
-        {
-            use std::os::unix::io::AsRawFd;
-            // Advisory hint for sequential readahead - matches osmium's approach.
-            // SAFETY: valid fd, advisory-only, no-op on failure.
-            unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
-        }
+        crate::fadvise::advise(&f, 0, 0, crate::fadvise::Advice::Sequential);
         Ok(Self::Buffered(BufReader::with_capacity(
             crate::write::IO_BUF_BYTES,
             f,
@@ -181,5 +171,29 @@ impl Read for FileReader {
             #[cfg(feature = "linux-direct-io")]
             Self::Direct(r) => r.read(buf),
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use crate::fadvise::{Advice, tests::attempts};
+
+    /// Every Linux build hints sequential readahead on a buffered open. The
+    /// hint used to compile only with the `O_DIRECT` or `io_uring` feature,
+    /// so a default build read without it while every published number was
+    /// measured with it; this runs in the no-feature build too.
+    #[test]
+    fn a_buffered_open_advises_sequential_readahead() {
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("in.bin");
+        std::fs::write(&path, b"bytes").unwrap();
+        let before = attempts(Advice::Sequential);
+        let _reader = super::FileReader::buffered(&path).unwrap();
+        assert_eq!(
+            attempts(Advice::Sequential),
+            before + 1,
+            "FileReader::buffered must advise POSIX_FADV_SEQUENTIAL exactly once"
+        );
     }
 }

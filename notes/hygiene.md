@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-12. HYG-038
 13. HYG-032
 14. HYG-161 (after HYG-032)
 15. HYG-162
@@ -536,6 +535,27 @@ The judgement calls already known, to be checked first:
     `report_writer_index_loss` is renamed `report_writer_degradations` and
     emits it. The Note says the userspace copy was selected, never that it
     finished.
+- Passthrough splicing, the `FileReader::buffered` SEQUENTIAL hint and altw
+  external's scratch eviction were un-gated from `linux-direct-io` /
+  `linux-io-uring` (history: the gates were proxies for a once-optional
+  `libc`). The measured binary built with both features, so its behaviour
+  is meant to be unchanged; default builds now get all three. Sparred with
+  codex. Judgement calls, none measured:
+  - The splice path compiles in every build; off Linux `copy_range` goes
+    straight to the userspace bounce copy (uncounted, no Note) and refuses
+    a pair `bounce_safe` rejects, so a non-Linux default build now uses
+    coalesced copy runs where it used the per-blob owned route. A whole
+    coalesced run lands on one parallel-writer worker there. No sweep
+    builds a non-Linux target.
+  - Every `posix_fadvise` goes through `crate::fadvise::advise` (clippy
+    bans the raw call): failures are counted under a cold-path Mutex and
+    emitted as `fadvise_failures`; one extra match and range check per call
+    on the per-blob eviction path. An empty consumed prefix is no longer
+    advised (length zero would have meant the whole file; not reachable,
+    eviction runs after a frame).
+  - altw stage 2's slot-bucket `sync_data` failure now fails the run
+    ("failed to sync slot bucket") before the DONTNEED instead of being
+    dropped. Success path unchanged.
 
 ---
 
@@ -1055,65 +1075,6 @@ reports zero alignment.
 
 Reported by: altw and scanning, re-encoding, filtering and spatial, CLI and
 plumbing.
-
-## HYG-038 - Linux behaviours are gated on features that have nothing to do with them
-
-Anger: 8 - I/O fallbacks, gating, alignment.
-
-- `copy_file_range`, `OutputChunk::CopyRange`, `write_raw_copy` and the
-  parallel backend's `WriteOp::CopyRange` compile only with `linux-direct-io`,
-  though kernel-space splicing has nothing to do with O_DIRECT; a default build
-  silently loses passthrough splicing. `sort` notices via `cfg!`,
-  `apply_changes/rewrite.rs` does not (HYG-018). `linux-direct-io = []` does not
-  gate `libc`, which is unconditional.
-- `FileReader::buffered` issues `POSIX_FADV_SEQUENTIAL` only under
-  `any(feature = "linux-direct-io", feature = "linux-io-uring")`, while
-  `blob.rs` issues `DONTNEED` (when eviction is on: the CLI's
-  `PageCachePolicy::Evict` or an explicit opt-in) under plain
-  `target_os = "linux"`; so the default library build reads without the
-  readahead hint and the CLI with it, and any benchmark comparing a library
-  consumer to the CLI compares different I/O.
-- Altw stage 2 and 3 `posix_fadvise(DONTNEED)` on slot buckets and id shards,
-  and stage 2's dropped `sync_data`, run whenever the `linux-direct-io` feature
-  is compiled, whether or not `--direct-io` was passed; the `consumer` sweep
-  and the release build behave differently with no flag in sight, and the
-  `s2_fadvise_*` counters read zero on other builds with no "not compiled"
-  marker.
-- `posix_fadvise` return codes are discarded at three read-path sites with
-  their own comments; correct for hints, but three statements of it.
-
-Fix: gate on `target_os = "linux"` (or a `linux-copy-range` feature), decide
-scratch eviction at run time or always; one `advise(fd, off, len, advice)` that
-counts failures. Enforce the SEQUENTIAL hint with a test in the `minimal` sweep
-using the `evict_calls` call-count trick.
-
-Checked 2026-10-25: still current. `write_raw_copy` (`write/writer.rs`) is
-under `#[cfg(feature = "linux-direct-io")]`, sort's and apply-changes'
-drain copy-run flushes have `#[cfg(not(...))]` fallback twins, the
-SEQUENTIAL hint in `FileReader::buffered` is under
-`all(target_os = "linux", any(linux-direct-io, linux-io-uring))`, and altw
-stages 2 and 3 gate their scratch `DONTNEED` on the feature. Why it matters
-more than it looks: `pbfhogg-cli`'s default features are empty, while
-`brokkr.toml` builds the benchmarked binary with both Linux features, so a
-plain `cargo install pbfhogg-cli` (and every default library consumer) runs
-without the splicing, readahead hint and scratch eviction that every
-published number assumes. The `Host` work (ADR-0016) does not cover this:
-it moved process-wide state (`mallopt`, `malloc_trim`) behind the CLI's
-process toolbox and input-page eviction behind `PageCachePolicy`, whose doc
-excludes the library's own scratch files; the three behaviours here touch
-only the library's own descriptors and files.
-
-Recommendation (2026-10-25): gate all three on `target_os = "linux"`, so the
-features mean only O_DIRECT and io_uring; the measured binary is unchanged
-and default builds gain what is measured (CHANGELOG: default Linux builds
-now splice passthrough blobs). altw's scratch eviction becomes always-on
-under Linux, today's measured behaviour, rather than a new run-time choice.
-One `advise` helper with one comment and a failure counter; the
-minimal-sweep test as above. Each new comment cites ADR-0016 for why the
-library may do this.
-
-Reported by: write path, read path, altw and scanning, re-encoding, change
-application.
 
 ## HYG-047 - Code aborts on caller-controlled input where a refusal was owed
 

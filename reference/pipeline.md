@@ -455,6 +455,9 @@ Both consumers use default features. In practice:
 - `geocode-reader` feature: **implied by `commands`**. nidhogg can alternatively depend on just `geocode-reader` for the reverse geocoding reader without pulling in `roaring`/`serde_json`.
 - `linux-direct-io`: **disabled** (nidhogg passes `false`)
 - `linux-io-uring`: **disabled** (nidhogg passes `false`)
+- Neither feature gates passthrough splicing (`copy_file_range`), the
+  sequential-readahead hint or altw scratch eviction: those run in every
+  Linux build, so the consumers get them with default features.
 - Zlib backend: **zlib-rs** (hardcoded, pure Rust, via flate2)
 - Zstd: available but **unused** - nidhogg hardcodes `Compression::Zlib(6)`
 

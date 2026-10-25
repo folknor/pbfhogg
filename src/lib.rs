@@ -184,6 +184,9 @@ pub mod debug;
 pub(crate) mod direct_io;
 mod element_kind;
 mod error;
+// The one owner of `posix_fadvise`: page-cache advice on the library's own
+// descriptors.
+pub(crate) mod fadvise;
 pub mod geo;
 pub mod geocode_index; // format is always available; reader requires geocode-reader feature
 pub(crate) mod idset;

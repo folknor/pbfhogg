@@ -718,7 +718,7 @@ fn dispatch_variant(
             // Credit per-kind base_* stats the same way the CopyRange arm
             // above does. Before this line `OwnedBytes` dropped per-kind
             // counts entirely, so any merge that routed passthroughs
-            // through this arm (consumer build, `--direct-io`, or a
+            // through this arm (`--direct-io`, or a
             // false-positive on `Route::Owned`) reported
             // `base_nodes=base_ways=base_relations=0` for the
             // passthrough portion even though the output contained the
@@ -779,9 +779,8 @@ fn dispatch_variant(
 
 /// Flush the in-flight contiguous `copy_file_range` run as a single
 /// `write_raw_copy(&input_file, start, len)` call. A run only exists on the
-/// `Route::Splice` route, which `merge()` selects only when the
-/// `linux-direct-io` feature is compiled.
-#[cfg(feature = "linux-direct-io")]
+/// `Route::Splice` route, which `merge()` selects when the output backend can
+/// splice.
 fn flush_copy_range(
     state: &mut DrainState,
     cfg: &DrainConfig<'_>,
@@ -799,26 +798,6 @@ fn flush_copy_range(
     let len = end - start;
     writer.write_raw_copy(input_file, start, len)?;
     counters.copy_range_calls.fetch_add(1, Ordering::Relaxed);
-    Ok(())
-}
-
-/// No-op variant under non-Linux / no-`linux-direct-io` builds. The
-/// CopyRange branch in `dispatch_variant` only fires on
-/// `Route::Splice`, which `merge()` only ever selects when the feature is
-/// enabled - so this body is unreachable at runtime, but the symbol must
-/// compile so the call sites do.
-#[cfg(not(feature = "linux-direct-io"))]
-fn flush_copy_range(
-    state: &mut DrainState,
-    _cfg: &DrainConfig<'_>,
-    _writer: &mut PbfWriter<FileWriter>,
-    _counters: &DrainCounters,
-) -> Result<()> {
-    if state.copy_range_run.take().is_some() {
-        return Err(Error::internal(
-            "drain: copy_file_range path requires linux-direct-io feature",
-        ));
-    }
     Ok(())
 }
 

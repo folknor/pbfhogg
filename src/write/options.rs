@@ -77,15 +77,14 @@ impl OutputBackend {
     /// Whether `PbfWriter::write_raw_copy` (a kernel-space `copy_file_range`
     /// splice of an input byte range into the output) is available.
     ///
-    /// True iff the `linux-direct-io` feature is compiled (the splice path
-    /// lives behind it, although it has nothing to do with `O_DIRECT`) and
-    /// the backend writes through a regular file descriptor: `Buffered`,
-    /// `Parallel` or `Uring`. `Direct` is excluded because splicing would
-    /// bypass its page-aligned buffering.
+    /// True iff the backend writes through a regular file descriptor:
+    /// `Buffered`, `Parallel` or `Uring`, in every build (the splice used to
+    /// need the `linux-direct-io` feature, though it has nothing to do with
+    /// `O_DIRECT`). `Direct` is excluded because splicing would bypass its
+    /// page-aligned buffering.
     #[must_use]
     pub const fn supports_copy_range(self) -> bool {
-        cfg!(feature = "linux-direct-io")
-            && matches!(self, Self::Buffered | Self::Parallel | Self::Uring)
+        matches!(self, Self::Buffered | Self::Parallel | Self::Uring)
     }
 }
 

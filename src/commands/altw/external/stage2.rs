@@ -27,7 +27,6 @@ use std::io::Write as _;
 use std::sync::Arc;
 
 use super::super::Result;
-#[cfg(feature = "linux-direct-io")]
 use super::radix::advise_dontneed_file;
 use super::{
     BucketLayout, CLOSURE_FLAG, ID_RECORD_SIZE, IdRecord, LOCAL_ID_MASK, NodeBlobInfo,
@@ -130,10 +129,8 @@ fn prepare_bucket(
     loader.records.clear();
     let mut open_calls: u64 = 0;
     let mut stat_calls: u64 = 0;
-    // fadvise_* only mutated under feature = "linux-direct-io".
-    #[allow(unused_mut)]
+    // Zero off Linux, where there is no advice to give.
     let mut fadvise_calls: u64 = 0;
-    #[allow(unused_mut)]
     let mut fadvise_bytes: u64 = 0;
 
     for worker_id in 0..num_shard_workers {
@@ -158,11 +155,9 @@ fn prepare_bucket(
         loader.data_buf.resize(start + len, 0);
         std::io::Read::read_exact(&mut &file, &mut loader.data_buf[start..])
             .map_err(|e| named("read", e))?;
-        #[cfg(feature = "linux-direct-io")]
-        {
+        if advise_dontneed_file(&file) {
             fadvise_calls += 1;
             fadvise_bytes += len as u64;
-            advise_dontneed_file(&file);
         }
     }
 
@@ -259,21 +254,42 @@ impl SharedSlotBuckets {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             w.flush().map_err(|e| self.write_error(bucket, e))?;
-            #[cfg(feature = "linux-direct-io")]
+            // Stage 3 reads each bucket back once, so its pages are dropped
+            // now rather than left to crowd out the stage-3 working set.
+            // DONTNEED leaves dirty pages alone, so the bucket is written back
+            // first. Linux only, where the advice exists; in every Linux
+            // build, since this is library scratch (ADR-0016), not the
+            // `linux-direct-io` feature it used to be compiled under.
+            #[cfg(target_os = "linux")]
             {
-                use std::os::unix::io::AsRawFd;
+                // A failed writeback means the bucket on disk is not what was
+                // written, and once its pages leave the cache (by the advice
+                // below or by ordinary reclaim) stage 3 would read that back.
+                // The run fails here instead. This covers the slot buckets
+                // only; it is not a scratch-wide integrity check.
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "scratch pages are written back so the fadvise below can drop them; \
                               this is not an output sync"
                 )]
-                drop(w.get_ref().sync_data());
-                unsafe {
-                    libc::posix_fadvise(w.get_ref().as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED)
-                };
+                w.get_ref()
+                    .sync_data()
+                    .map_err(|e| self.sync_error(bucket, e))?;
+                advise_dontneed_file(w.get_ref());
             }
         }
         Ok(())
+    }
+
+    /// A failed writeback of bucket `bucket`, naming its file.
+    #[cfg(target_os = "linux")]
+    #[cold]
+    fn sync_error(&self, bucket: usize, err: std::io::Error) -> Error {
+        let path = self
+            .paths
+            .get(bucket)
+            .map_or_else(|| format!("{bucket}"), |p| p.display().to_string());
+        Error::from(err).context(format!("failed to sync slot bucket {path}"))
     }
 }
 

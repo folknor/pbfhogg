@@ -235,9 +235,9 @@ fn a_failed_pbf_write_names_the_output() {
 }
 
 /// The passthrough path: apply-changes with an empty change set copies
-/// every base blob into the output, with `copy_file_range` when built with
-/// `linux-direct-io`. That failure cannot say which end failed, so it names
-/// the input and the byte range and the writer names the output.
+/// every base blob into the output with `copy_file_range`, in every Linux
+/// build. That failure cannot say which end failed, so it names the input
+/// and the byte range and the writer names the output.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_failed_splice_names_the_output_and_the_input_range() {
@@ -259,9 +259,6 @@ fn a_failed_splice_names_the_output_and_the_input_range() {
         .file_size_limit(WRITE_CAP)
         .run();
     assert_write_failure_named(&out, &output, "apply-changes");
-    // Without the feature the passthrough is a userspace copy, whose write
-    // failure is the output's alone.
-    #[cfg(feature = "linux-direct-io")]
     assert!(
         error_text(&out).contains(&format!("of {}", base.display())),
         "the splice failure must name the input it copied from; stderr:\n{}",

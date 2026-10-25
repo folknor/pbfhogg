@@ -14,7 +14,6 @@ use crate::blob_meta;
 use crate::error::{Error, Result, panic_error};
 use crate::output::Completion;
 use crate::write::Finish;
-#[cfg(feature = "linux-direct-io")]
 use crate::write::copy_range::{CopyOut, copy_range};
 use crate::write::file_writer::FileWriter;
 use crate::write::metrics::WRITER_METRICS;
@@ -1360,13 +1359,20 @@ impl<W: Write> Drop for PbfWriter<W> {
     }
 }
 
-#[cfg(feature = "linux-direct-io")]
 impl PbfWriter<FileWriter> {
     /// Write a passthrough blob via kernel-space copy (`copy_file_range`).
     ///
     /// Instead of copying blob bytes through userspace, this tells the kernel
     /// to copy directly between file descriptors. On filesystems with reflink
     /// support (btrfs, xfs), this is a metadata-only operation.
+    ///
+    /// Available in every build; it used to need the `linux-direct-io`
+    /// feature. Where the kernel refuses the copy, and on every platform but
+    /// Linux, the range is copied in userspace instead. Off Linux that copy
+    /// is refused for the input and output being the same file, an
+    /// append-mode output, or a range past `i64::MAX`, which Linux would
+    /// first offer to the kernel (and accept for disjoint ranges of one
+    /// file).
     ///
     /// `in_file` is the open input PBF and its path, shared rather than
     /// borrowed: the pipelined path queues this request into the writer
@@ -1662,7 +1668,6 @@ mod tests {
     /// hands out the lowest free descriptor, so if dropping the handle really
     /// closed the input, the decoy takes its number and the splice copies the
     /// decoy's bytes.
-    #[cfg(feature = "linux-direct-io")]
     #[test]
     fn a_queued_copy_range_outlives_the_callers_handle() {
         use std::sync::Arc;

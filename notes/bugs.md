@@ -39,6 +39,28 @@ behaviour; below that the work is progressively more contained.
 
 ---
 
+## BUG-183 - The raw node scanner truncates a dense group whose arrays disagree
+
+Anger: 8 - altw sparse pass 1 and external stage 2 run on it.
+
+`scan/node.rs::extract_node_coords` bypasses `PrimitiveBlock` construction,
+so none of `validate_groups_strict`'s dense checks run on its input. Its
+dense loop is `while let (Some(did), Some(dlat), Some(dlon)) = ...`, which
+stops at the shortest of the `id`, `lat` and `lon` arrays: a group whose
+arrays disagree in length, or whose packed array ends mid-varint (assuming
+`protohoggr`'s packed iterators end there, as the block layer's docs say
+they do), yields fewer nodes with no error, and the node index it feeds
+misses them. The block decoder refuses both shapes ("dense group has
+mismatched id/lat/lon array lengths", `packed_varint_count`). Found while
+checking the `WireMessageIter` callers for the element `Info` change; not
+verified with a test. A check after the loop is not enough: the tuple
+pattern calls all three `next()`s before matching, so it consumes the
+unmatched tail, and a clean end cannot be told from a truncated varint if
+both read as `None`. The fix needs fallible counting (the block layer's
+`packed_varint_count`) or per-iterator handling of each result.
+
+Reported by: the element metadata accessor change.
+
 ## BUG-009 - `apply-changes --locations-on-ways` does not update untouched base ways
 
 Anger: 10 - apply-changes -l loses its splice fast path.

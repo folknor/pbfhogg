@@ -78,6 +78,47 @@ fn take_packed<'a>(
     Ok(())
 }
 
+/// Take one occurrence of a singular embedded message field (an element's
+/// `Info`, a dense group's `DenseInfo`) into `slot`.
+///
+/// Protobuf merges repeated occurrences of a singular message field: within
+/// the merged message a scalar set in a later occurrence overrides, one set
+/// only in an earlier occurrence survives, and a repeated field (every
+/// `DenseInfo` array) concatenates across occurrences. One borrowed slice
+/// cannot express that merge, and keeping the last
+/// occurrence (what these parsers used to do) silently drops whatever only the
+/// earlier one carried - and let a malformed earlier `Info` slip past
+/// `validate_info` in `block.rs`, which only ever saw the retained slice. So a
+/// second non-empty occurrence is a hard error naming the field: a legal
+/// protobuf encoding this decoder does not support, which no known writer
+/// produces. An empty occurrence merges to nothing, so it is ignored in either
+/// position, as `take_packed` ignores an empty segment; a lone empty occurrence
+/// is kept as present-but-empty, which reads exactly like absent.
+///
+/// The effect is that the slice left in `slot` is the only metadata the
+/// message carries, so validating it validates the element's metadata.
+#[inline]
+fn take_message<'a>(
+    cursor: &mut Cursor<'a>,
+    slot: &mut Option<&'a [u8]>,
+    dup_msg: &'static str,
+) -> Result<()> {
+    let bytes = cursor.read_len_delimited()?;
+    match slot {
+        Some(existing) if !existing.is_empty() => {
+            if bytes.is_empty() {
+                Ok(())
+            } else {
+                Err(new_wire_error(dup_msg))
+            }
+        }
+        _ => {
+            *slot = Some(bytes);
+            Ok(())
+        }
+    }
+}
+
 /// Refusal of a `PrimitiveGroup` carrying more than one `DenseNodes` message.
 /// Shared by the decoder (`WireGroup::dense`) and the raw scanners that walk
 /// groups themselves (`blob_meta::scan`, `scan::node`), so all of them refuse
@@ -112,6 +153,11 @@ const DUP_DENSE_LON: &str =
     "DenseNodes.lon appears twice with data; packed field split across segments";
 const DUP_DENSE_KV: &str =
     "DenseNodes.keys_vals appears twice with data; packed field split across segments";
+const DUP_NODE_INFO: &str = "Node.info appears twice with data; message merge is unsupported";
+const DUP_WAY_INFO: &str = "Way.info appears twice with data; message merge is unsupported";
+const DUP_REL_INFO: &str = "Relation.info appears twice with data; message merge is unsupported";
+const DUP_DENSE_INFO: &str =
+    "DenseNodes.denseinfo appears twice with data; message merge is unsupported";
 const DUP_DI_VERSION: &str =
     "DenseInfo.version appears twice with data; packed field split across segments";
 const DUP_DI_TIMESTAMP: &str =
@@ -494,6 +540,12 @@ impl<'a> WireMessageIter<'a> {
 impl<'a> Iterator for WireMessageIter<'a> {
     type Item = &'a [u8];
 
+    /// Ends the stream on a wire error, because `Iterator::next` cannot
+    /// return one. Every caller walks the same group bytes' framing to the
+    /// end with `?` first, so the error arms are unreachable rather than
+    /// silent truncation: `validate_groups_strict` in `block.rs` (for every
+    /// block iterator) and the group walk in `scan::node::extract_node_coords`.
+    /// A new caller owes the same framing walk.
     #[inline]
     fn next(&mut self) -> Option<&'a [u8]> {
         loop {
@@ -541,7 +593,7 @@ impl<'a> WireNode<'a> {
                 (3, WIRE_LEN | WIRE_VARINT) => {
                     take_packed(&mut cursor, wire_type, &mut vals_data, DUP_NODE_VALS)?;
                 }
-                (4, WIRE_LEN) => info_data = Some(cursor.read_len_delimited()?),
+                (4, WIRE_LEN) => take_message(&mut cursor, &mut info_data, DUP_NODE_INFO)?,
                 (8, WIRE_VARINT) => lat = cursor.read_sint64()?,
                 (9, WIRE_VARINT) => lon = cursor.read_sint64()?,
                 _ => cursor.skip_field(wire_type)?,
@@ -592,7 +644,7 @@ impl<'a> WireWay<'a> {
                 (3, WIRE_LEN | WIRE_VARINT) => {
                     take_packed(&mut cursor, wire_type, &mut vals_data, DUP_WAY_VALS)?;
                 }
-                (4, WIRE_LEN) => info_data = Some(cursor.read_len_delimited()?),
+                (4, WIRE_LEN) => take_message(&mut cursor, &mut info_data, DUP_WAY_INFO)?,
                 (8, WIRE_LEN | WIRE_VARINT) => {
                     take_packed(&mut cursor, wire_type, &mut refs_data, DUP_WAY_REFS)?;
                 }
@@ -651,7 +703,7 @@ impl<'a> WireRelation<'a> {
                 (3, WIRE_LEN | WIRE_VARINT) => {
                     take_packed(&mut cursor, wire_type, &mut vals_data, DUP_REL_VALS)?;
                 }
-                (4, WIRE_LEN) => info_data = Some(cursor.read_len_delimited()?),
+                (4, WIRE_LEN) => take_message(&mut cursor, &mut info_data, DUP_REL_INFO)?,
                 (8, WIRE_LEN | WIRE_VARINT) => {
                     take_packed(&mut cursor, wire_type, &mut roles_sid_data, DUP_REL_ROLES)?;
                 }
@@ -700,7 +752,7 @@ impl<'a> WireDenseNodes<'a> {
                 (1, WIRE_LEN | WIRE_VARINT) => {
                     take_packed(&mut cursor, wire_type, &mut id_data, DUP_DENSE_ID)?;
                 }
-                (5, WIRE_LEN) => info_data = Some(cursor.read_len_delimited()?),
+                (5, WIRE_LEN) => take_message(&mut cursor, &mut info_data, DUP_DENSE_INFO)?,
                 (8, WIRE_LEN | WIRE_VARINT) => {
                     take_packed(&mut cursor, wire_type, &mut lat_data, DUP_DENSE_LAT)?;
                 }
@@ -1156,5 +1208,80 @@ mod tests {
         let mut it = PackedInt32Iter::new(dn.keys_vals_data);
         assert_eq!(it.next(), Some(300));
         assert_eq!(it.next(), None);
+    }
+
+    /// A second data-bearing `Info` is refused on every element kind, naming
+    /// the field; keeping the last would drop what only the first carried and
+    /// hide a malformed first occurrence from block validation.
+    #[test]
+    fn repeated_info_with_data_is_a_named_error_on_every_element_kind() {
+        // Info { version = 1 } then Info { version = 2 }.
+        let two_infos = [
+            tag(4, WIRE_LEN),
+            0x02,
+            0x08,
+            0x01,
+            tag(4, WIRE_LEN),
+            0x02,
+            0x08,
+            0x02,
+        ];
+        let node = [&[0x08, 0x02][..], &two_infos].concat();
+        let err = WireNode::parse(&node).unwrap_err();
+        assert!(
+            err.to_string().contains("Node.info appears twice"),
+            "got: {err}"
+        );
+        let way = [&[0x08, 0x01][..], &two_infos].concat();
+        let err = WireWay::parse(&way).unwrap_err();
+        assert!(
+            err.to_string().contains("Way.info appears twice"),
+            "got: {err}"
+        );
+        let err = WireRelation::parse(&way).unwrap_err();
+        assert!(
+            err.to_string().contains("Relation.info appears twice"),
+            "got: {err}"
+        );
+
+        let two_dense_infos = [tag(5, WIRE_LEN), 0x01, 0x07, tag(5, WIRE_LEN), 0x01, 0x07];
+        let err = WireDenseNodes::parse(&two_dense_infos).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("DenseNodes.denseinfo appears twice"),
+            "got: {err}"
+        );
+    }
+
+    /// An empty `Info` merges to nothing, so it neither shadows nor is
+    /// refused beside a data-bearing one, in either order.
+    #[test]
+    fn an_empty_info_does_not_shadow_a_data_bearing_one() {
+        let info = [0x08u8, 0x05]; // version = 5
+        let empty_first = [
+            tag(4, WIRE_LEN),
+            0x00,
+            tag(4, WIRE_LEN),
+            0x02,
+            info[0],
+            info[1],
+        ];
+        let empty_last = [
+            tag(4, WIRE_LEN),
+            0x02,
+            info[0],
+            info[1],
+            tag(4, WIRE_LEN),
+            0x00,
+        ];
+        for bytes in [empty_first, empty_last] {
+            let node = WireNode::parse(&bytes).unwrap();
+            assert_eq!(node.info_data, Some(info.as_slice()));
+        }
+        let lone_empty = [tag(4, WIRE_LEN), 0x00];
+        assert_eq!(
+            WireWay::parse(&lone_empty).unwrap().info_data,
+            Some(&[][..])
+        );
     }
 }

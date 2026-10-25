@@ -1144,6 +1144,20 @@
 
 ### Fixed
 
+- **An element carrying two metadata messages is refused, not half-read.**
+  A node, way or relation with its `Info` written twice, or a dense group
+  with `DenseInfo` written twice, used to read as its last occurrence:
+  fields only the first one set were dropped, and a corrupt first `Info` was
+  never checked and could read as version 0 / timestamp 0. The shared element
+  parsers (every decode, and the node, way and indexdata scanners) now refuse
+  a second occurrence that carries data, naming the field, as they already
+  refused a packed array split across occurrences; renumber's byte-level
+  rewriter and raw blob passthrough still copy such an element unchanged. No known writer
+  produces either shape; an empty extra occurrence is still accepted.
+  `Node::info`, `Way::info` and `Relation::info` no longer fall back to
+  default metadata on a parse failure: block construction rules it out, and
+  reaching it would be a pbfhogg bug, so they panic.
+
 - **`getid` accepts a partially indexed input in every mode.** A file whose
   first data blob carries indexdata and a later one does not was refused by
   `getid --add-referenced` when way IDs were requested, and as a

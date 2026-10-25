@@ -22,8 +22,19 @@ second non-empty occurrence is a hard error naming the field. Empty packed
 segments are ignored in either position. A field written as several
 unpacked values therefore errors rather than silently dropping values.
 
+The singular embedded metadata messages follow the same rule
+(`take_message` in `src/read/wire.rs`): an element's `Info` and a dense
+group's `DenseInfo` may appear once with data, plus any number of empty
+occurrences. Protobuf merges repeated occurrences of a singular message, which
+one borrowed slice cannot express; keeping the last occurrence, as the parsers
+once did, dropped fields only the earlier one set and let a malformed earlier
+`Info` pass block validation unseen. A second data-bearing occurrence is
+therefore a hard error naming the field. The `PrimitiveGroup.dense` message
+itself is stricter and refuses any repeat (`WireGroup::dense`).
+
 **Remaining compatibility limit:** Legal protobuf messages that split an
-array across data-bearing occurrences are refused. Supporting them would
+array across data-bearing occurrences, or a metadata message across
+data-bearing occurrences, are refused. Supporting them would
 require a different representation or an allocated fallback. The frame and
 block error contracts, including the byte-level rewriters' handling of
 these forms, are described in

@@ -57,11 +57,10 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-17. HYG-034
 18. HYG-164
 19. HYG-165
 20. HYG-166
-21. HYG-167 (after the other HYG-034 pieces: it adds the text rule)
+21. HYG-167 (after HYG-164 to HYG-166: it adds the text rule)
 22. HYG-151 (confirms the per-command list below)
 23. HYG-168 to HYG-179, one per line, in ID order
 24. HYG-047
@@ -590,6 +589,25 @@ The judgement calls already known, to be checked first:
   - The interp CSR build is driven by `(0..len).into_par_iter()` with a
     checked `get` per point instead of `par_chunks_exact`; still an indexed
     source, so `collect` still allocates once.
+- The element metadata accessors (`Node::info`, `Way::info`,
+  `Relation::info`) no longer fall back to default metadata on an `Info`
+  parse failure: one helper (`validated_info` in `elements.rs`) panics, the
+  failure being unreachable after `validate_groups_strict`. To make that true
+  for the element's only metadata, the element parsers (`WireNode`,
+  `WireWay`, `WireRelation`, and `WireDenseNodes` for `denseinfo`) refuse a
+  second data-bearing occurrence through a new `take_message`, where they
+  used to keep the last. Sparred with codex. Judgement calls on the read hot
+  path, per element, none measured:
+  - Field 4 / 5 parsing goes through `take_message` (an `Option` match)
+    instead of a plain assignment, in every element parse on every read path
+    and in the raw scanners (`scan/node.rs`, `scan/way.rs`,
+    `blob_meta/scan.rs`), which now refuse the repeat too. Renumber's
+    byte-level rewriter does not use these parsers and still copies a
+    repeated `Info` verbatim.
+  - The release-mode panic replaces a silent default; inside the pipeline's
+    `catch_unwind` it surfaces as an internal error, elsewhere it unwinds
+    or aborts per the caller.
+  - `Node::new`, `Way::new` and `Relation::new` narrowed to `pub(super)`.
 
 ---
 
@@ -841,63 +859,43 @@ as the only loop with an `on_idle()` hook; a source-scan test that only
 
 Reported by: write path.
 
-## HYG-034 - Element metadata accessors turn a decode failure into defaults
-
-Anger: 9 - read hot path, per element.
-
-Split on 2026-10-25, one entry per API: this entry keeps the element
-metadata accessors; dense nodes are HYG-164, the owned conversions HYG-165,
-the OSC writer HYG-166, the OSC arena and the enforcement rule HYG-167.
-
-`elements.rs` (three sites): `WireInfo::parse(data).ok().unwrap_or_default()`,
-so corrupt metadata becomes version 0 / timestamp 0, indistinguishable from
-absent; `time-filter` and history handling can treat a corrupt element as
-timestamp 0. `block.rs::validate_info`'s doc says so. (`wire.rs`'s
-`read_tag().ok()??` ending on the first bad tag is the same pattern; the
-`blob_meta` scanners no longer do it and their callers propagate.)
-
-Already adjudicated, not to be re-reported: tag iterators ending early on an
-out-of-range string index, and roles collapsed to `""` by
-`role().unwrap_or("")` (the OSC writer, `bench_write_loop` and the owned
-conversions included), are accepted in CORRECTNESS.md "Tag iterators end
-early on an out-of-range string index". A tag array ending mid-varint is
-rejected up front by `validate_groups_strict`.
-
-The crux for this entry and HYG-164: whether a swallow can fire at all
-depends on whether `PrimitiveBlock::from_vec*` validated the same bytes.
-`block.rs` has a validation pass, so some sites may be "cannot happen after
-construction", but that invariant is held by a different function in a
-different file, and nobody has confirmed it runs on every construction path
-(strict and lazy).
-
-Recommendation (2026-10-25), per site, never as a blanket accessor change:
-where construction provably validates the bytes on every path, the swallow
-becomes a `debug_assert!` plus a comment naming the validator (same cost per
-element, invariant written where it is relied on); where it does not, the
-error must reach the caller without turning public accessors into `Result`
-(an API break and a per-element cost) - the internal re-encoding callers use
-checked lookups, as HYG-165 and HYG-166 do. Even a same-cost change here goes
-on "Review once drained".
-
-Reported by: read path, CLI and plumbing, change application.
-
 ## HYG-164 - A corrupt dense group reads as no nodes
 
 Anger: 9 - read hot path.
 
-Split out of HYG-034 (see its crux paragraph and recommendation, which
-apply here unchanged). `block.rs::PrimitiveGroup::dense_nodes` and its twin:
-a `WireDenseNodes` parse error yields an empty iterator, so a corrupt dense
-group reads as "no nodes". `dense.rs::DenseNodeIter::new` drops all dense
-metadata on corruption.
+`block.rs::PrimitiveGroup::dense_nodes` and its twin in
+`BlockElementsIter::step` (plus the `skip_metadata` variant near the top of
+the iterator code): a `WireDenseNodes` parse error yields an empty iterator,
+so a corrupt dense group reads as "no nodes". `dense.rs::DenseNodeIter::new`
+drops all dense metadata on a `WireDenseInfo` parse error.
 
-Reported by: as HYG-034.
+Already settled, for whoever takes this: `PrimitiveBlock::finish` is the only
+constructor (all three `from_vec*` funnel through it; there is no lazy or
+unvalidated path), and it runs `validate_groups_strict` before handing out a
+block. That pass parses the dense group (`WireGroup::dense`,
+`WireDenseNodes::parse`) and its `denseinfo` (`validate_dense_info_arrays`,
+which runs `WireDenseInfo::parse`) on the same immutable bytes the iterators
+read, and the parsers now refuse a second data-bearing `denseinfo`, so these
+swallows are unreachable. The element metadata accessors were resolved the
+same way: `validated_info` in `elements.rs` panics with a message naming the
+validator rather than `debug_assert!` plus a default, because a release
+default is the silent wrong metadata the finding is about and the panic costs
+the same branch (sparred with codex). Same family, same invariant: the
+`if let Ok(...)` element skips in `BlockElementsIter::step` and the
+`GroupNodeIter` / `GroupWayIter` / `GroupRelationIter` loops, already
+described as dead in `validate_groups_strict`'s doc.
+
+Not to be re-reported: tag iterators ending early on an out-of-range string
+index, and roles collapsed to `""` by `role().unwrap_or("")`, are accepted in
+CORRECTNESS.md "Tag iterators end early on an out-of-range string index".
+
+Reported by: read path, CLI and plumbing, change application.
 
 ## HYG-165 - The owned conversions turn a bad user string into an empty one
 
 Anger: 8 - sort, `cat --dedupe`, degrade and time-filter re-encode through it.
 
-Split out of HYG-034. `owned.rs` `element_metadata` / `dense_node_metadata`:
+`owned.rs` `element_metadata` / `dense_node_metadata`:
 a `user()` string-table error becomes `""` and missing timestamps,
 changesets and uids become `0`, re-encoded by sort, `cat --dedupe`, degrade
 and time-filter. Documented, but opposite to decision 0004's defensive-input
@@ -911,36 +909,39 @@ Absent fields becoming `0` stay: that is the block builder's documented
 normalisation (spelled out in `reencode_unclassifiable`'s doc in
 `src/commands/cat/mod.rs`), so it gets a comment, not a change.
 
-Reported by: as HYG-034.
+Reported by: read path, CLI and plumbing, change application.
 
 ## HYG-166 - The OSC writer swallows a bad user string
 
 Anger: 7 - OSC output.
 
-Split out of HYG-034. `osc/write.rs`: `info.user().ok()`.
+`osc/write.rs`: `info.user().ok()`.
 
 Recommendation (2026-10-25): the checked lookup and a refusal, matching the
 borrowed OSC writers.
 
-Reported by: as HYG-034.
+Reported by: read path, CLI and plumbing, change application.
 
 ## HYG-167 - The OSC arena resolves a bad id to an empty string
 
 Anger: 6 - crate-written arenas.
 
-Split out of HYG-034; runs after HYG-034, HYG-164, HYG-165 and HYG-166.
+Runs after HYG-164, HYG-165 and HYG-166.
 `StringInterner::resolve` and `CompactTagIter` return `""` on an
 out-of-range id or invalid UTF-8 ("keeps a read-side accessor from
 panicking"), turning arena corruption into silent empty tags.
 
 Recommendation (2026-10-25): corruption here is a pbfhogg bug, not hostile
 input, so a `debug_assert!` at each site. This entry also brings the
-enforcement for the whole HYG-034 family: a `brokkr.toml` text rule banning
+enforcement for the whole family (this entry, HYG-164 to HYG-166, and the
+element `info()` accessors already fixed): a `brokkr.toml` text rule banning
 `.ok()` in `src/read/` and `src/blob_meta/` except on lines carrying a
 marker comment with the reason (`disallowed-methods` cannot be scoped to
-modules, and `Result::ok` is legitimate elsewhere).
+modules, and `Result::ok` is legitimate elsewhere). `WireMessageIter::next`
+in `wire.rs` is one such legitimate site: its doc explains why its `.ok()`
+is unreachable.
 
-Reported by: as HYG-034.
+Reported by: read path, CLI and plumbing, change application.
 
 ## HYG-036 - `too_many_arguments` is denied and then allowed locally all over
 

@@ -141,8 +141,9 @@ fn dense_only_group(group: &[u8]) -> crate::error::Result<bool> {
 }
 
 /// A DenseNodes message carries at most one DenseInfo (field 5).
-/// `WireDenseNodes::parse` keeps only the last occurrence, while a raw copy
-/// carries all of them and a merging protobuf reader would combine them.
+/// `WireDenseNodes::parse` refuses two data-bearing occurrences, while a raw
+/// copy would carry all of them past this decoder to a merging protobuf
+/// reader downstream, so a blob holding any repeat is not copied raw.
 fn single_dense_info(dense: &[u8]) -> crate::error::Result<bool> {
     let mut cursor = Cursor::new(dense);
     let mut info_seen = false;

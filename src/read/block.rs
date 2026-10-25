@@ -1099,9 +1099,12 @@ fn validate_relation_member_arrays(relation: &WireRelation<'_>) -> Result<()> {
 
 /// Validate an element's optional `Info` sub-message.
 ///
-/// `elements.rs` reads info as `WireInfo::parse(d).ok().unwrap_or_default()`,
-/// which turns corrupt metadata into default metadata (version 0, timestamp 0)
-/// that is indistinguishable from genuinely absent metadata.
+/// `Node::info`, `Way::info` and `Relation::info` (`validated_info` in
+/// `elements.rs`) re-parse this same slice per call and treat a parse failure
+/// as a broken invariant, panicking: this check is what makes that failure
+/// unreachable. It covers the element's only metadata, because the element
+/// parsers refuse a second data-bearing `Info` (`take_message` in `wire.rs`).
+/// It is a parse check only; the user string index is not resolved.
 #[inline]
 fn validate_info(info_data: Option<&[u8]>) -> Result<()> {
     match info_data {
@@ -1443,6 +1446,7 @@ pub(crate) fn get_stringtable_key_value<'a>(
 #[allow(clippy::unwrap_used)]
 mod strict_validation_tests {
     use super::PrimitiveBlock;
+    use crate::read::elements::Element;
 
     /// Wrap `body` as protobuf field `field`, wire type 2 (length-delimited).
     /// Every fixture here is small enough for a single-byte length varint,
@@ -1708,6 +1712,42 @@ mod strict_validation_tests {
         good.extend_from_slice(&len_field(4, &[0x08, 0x01]));
         PrimitiveBlock::from_vec(block_with_groups(&[len_field(1, &good)]))
             .expect("a well-formed Info sub-message must parse");
+
+        // A malformed Info followed by a valid one: the element parser used to
+        // keep only the last, so validation saw the valid one and the
+        // malformed one went unchecked. Two data-bearing Infos are refused.
+        let mut shadowed = vec![0x08u8, 0x01];
+        shadowed.extend_from_slice(&bad_info);
+        shadowed.extend_from_slice(&len_field(4, &[0x08, 0x01]));
+        PrimitiveBlock::from_vec(block_with_groups(&[len_field(1, &shadowed)]))
+            .expect_err("a malformed Info shadowed by a later valid one must be rejected");
+    }
+
+    /// `info()` reads present metadata through the validated slice and
+    /// absent metadata as `None` (checked on `version`), on all three element
+    /// kinds.
+    #[test]
+    fn element_info_reads_present_and_absent_metadata() {
+        let mut with_info = vec![0x08u8, 0x01];
+        with_info.extend_from_slice(&len_field(4, &[0x08, 0x07])); // version = 7
+        let without_info = vec![0x08u8, 0x02];
+        for group_field in [1, 3, 4] {
+            let block = PrimitiveBlock::from_vec(block_with_groups(&[
+                len_field(group_field, &with_info),
+                len_field(group_field, &without_info),
+            ]))
+            .expect("valid elements");
+            let versions: Vec<Option<i32>> = block
+                .elements()
+                .map(|element| match element {
+                    Element::Node(n) => n.info().version(),
+                    Element::Way(w) => w.info().version(),
+                    Element::Relation(r) => r.info().version(),
+                    other => panic!("unexpected element {other:?}"),
+                })
+                .collect();
+            assert_eq!(versions, vec![Some(7), None], "group field {group_field}");
+        }
     }
 
     /// A dense group with `n` one-byte ids/lats/lons plus a raw `keys_vals`

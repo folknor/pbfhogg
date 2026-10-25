@@ -63,6 +63,37 @@ macro_rules! impl_coordinate_conversions {
     };
 }
 
+/// Decode an element's `Info` sub-message for the `info()` accessors.
+///
+/// Absent metadata reads as all-`None` ([`WireInfo::default`]). Present
+/// metadata cannot fail to parse here, and this relies on that rather than
+/// guessing: `Node`, `Way` and `Relation` are built only by the block
+/// iterators in `block.rs`, from element bytes of a block that
+/// `PrimitiveBlock::finish` constructed, and `finish` runs
+/// `validate_groups_strict` first. That pass parses every element with the
+/// same `WireNode` / `WireWay` / `WireRelation::parse` the iterators use, on
+/// the same immutable bytes, and runs `validate_info` - exactly
+/// `WireInfo::parse` - on the slice that parse retains. The element parsers
+/// refuse a second data-bearing `Info` (`take_message` in `wire.rs`), so that
+/// slice is the element's only metadata.
+///
+/// A parse failure here is therefore a pbfhogg bug (an element built from
+/// bytes the validation pass never saw), not hostile input, and it panics
+/// rather than fall back to default metadata: the default is indistinguishable
+/// from absent metadata, so a silent fallback would hand version 0 /
+/// timestamp 0 to `time-filter`, the owned conversions and the OSC writers
+/// with no signal. The cost is the branch the old `unwrap_or_default` paid.
+#[inline]
+fn validated_info(info_data: Option<&[u8]>) -> WireInfo {
+    match info_data {
+        None => WireInfo::default(),
+        Some(data) => WireInfo::parse(data).expect(
+            "element Info failed to parse after PrimitiveBlock construction validated it \
+             (validate_groups_strict / validate_info in block.rs): construction invariant broken",
+        ),
+    }
+}
+
 /// An enum with the OSM core elements: nodes, ways and relations.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -93,7 +124,7 @@ pub struct Node<'a> {
 }
 
 impl<'a> Node<'a> {
-    pub(crate) fn new(block: &'a WireBlock<'static>, node: WireNode<'a>) -> Node<'a> {
+    pub(super) fn new(block: &'a WireBlock<'static>, node: WireNode<'a>) -> Node<'a> {
         Node {
             block,
             node,
@@ -125,13 +156,18 @@ impl<'a> Node<'a> {
     }
 
     /// Returns additional metadata for this element.
+    ///
+    /// Metadata the element does not carry reads as `None` fields. The bytes
+    /// were validated when the block was constructed, so a corrupt `Info`
+    /// never reaches this accessor.
+    ///
+    /// # Panics
+    ///
+    /// Only on a broken internal invariant: an `Info` that fails to parse
+    /// although block construction validated it. That is a pbfhogg bug, not a
+    /// property of the input.
     pub fn info(&self) -> Info<'a> {
-        let wire_info = self
-            .node
-            .info_data
-            .and_then(|data| WireInfo::parse(data).ok())
-            .unwrap_or_default();
-        Info::new(self.block, wire_info)
+        Info::new(self.block, validated_info(self.node.info_data))
     }
 
     /// Returns the latitude coordinate in nanodegrees (10^-9).
@@ -177,7 +213,7 @@ pub struct Way<'a> {
 }
 
 impl<'a> Way<'a> {
-    pub(crate) fn new(block: &'a WireBlock<'static>, way: WireWay<'a>) -> Way<'a> {
+    pub(super) fn new(block: &'a WireBlock<'static>, way: WireWay<'a>) -> Way<'a> {
         Way {
             block,
             way,
@@ -209,13 +245,18 @@ impl<'a> Way<'a> {
     }
 
     /// Returns additional metadata for this element.
+    ///
+    /// Metadata the element does not carry reads as `None` fields. The bytes
+    /// were validated when the block was constructed, so a corrupt `Info`
+    /// never reaches this accessor.
+    ///
+    /// # Panics
+    ///
+    /// Only on a broken internal invariant: an `Info` that fails to parse
+    /// although block construction validated it. That is a pbfhogg bug, not a
+    /// property of the input.
     pub fn info(&self) -> Info<'a> {
-        let wire_info = self
-            .way
-            .info_data
-            .and_then(|data| WireInfo::parse(data).ok())
-            .unwrap_or_default();
-        Info::new(self.block, wire_info)
+        Info::new(self.block, validated_info(self.way.info_data))
     }
 
     /// Returns an iterator over the references of this way. Each reference should correspond to a
@@ -296,7 +337,7 @@ pub struct Relation<'a> {
 }
 
 impl<'a> Relation<'a> {
-    pub(crate) fn new(block: &'a WireBlock<'static>, rel: WireRelation<'a>) -> Relation<'a> {
+    pub(super) fn new(block: &'a WireBlock<'static>, rel: WireRelation<'a>) -> Relation<'a> {
         Relation { block, rel }
     }
 
@@ -322,13 +363,18 @@ impl<'a> Relation<'a> {
     }
 
     /// Returns additional metadata for this element.
+    ///
+    /// Metadata the element does not carry reads as `None` fields. The bytes
+    /// were validated when the block was constructed, so a corrupt `Info`
+    /// never reaches this accessor.
+    ///
+    /// # Panics
+    ///
+    /// Only on a broken internal invariant: an `Info` that fails to parse
+    /// although block construction validated it. That is a pbfhogg bug, not a
+    /// property of the input.
     pub fn info(&self) -> Info<'a> {
-        let wire_info = self
-            .rel
-            .info_data
-            .and_then(|data| WireInfo::parse(data).ok())
-            .unwrap_or_default();
-        Info::new(self.block, wire_info)
+        Info::new(self.block, validated_info(self.rel.info_data))
     }
 
     /// Returns an iterator over the members of this relation.

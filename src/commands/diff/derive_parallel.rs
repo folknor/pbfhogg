@@ -532,6 +532,8 @@ pub(crate) fn derive_changes_parallel(
     struct PhaseSlot<'a> {
         kind: ElementKind,
         tag: &'static str,
+        /// Sidecar counter names: shards, shard_max_blobs, shard_min_blobs.
+        counters: [&'static str; 3],
         old: &'a [BlobDesc],
         new: &'a [BlobDesc],
     }
@@ -539,18 +541,33 @@ pub(crate) fn derive_changes_parallel(
         PhaseSlot {
             kind: ElementKind::Node,
             tag: "NODE",
+            counters: [
+                "derivepar_node_shards",
+                "derivepar_node_shard_max_blobs",
+                "derivepar_node_shard_min_blobs",
+            ],
             old: &old.nodes,
             new: &new.nodes,
         },
         PhaseSlot {
             kind: ElementKind::Way,
             tag: "WAY",
+            counters: [
+                "derivepar_way_shards",
+                "derivepar_way_shard_max_blobs",
+                "derivepar_way_shard_min_blobs",
+            ],
             old: &old.ways,
             new: &new.ways,
         },
         PhaseSlot {
             kind: ElementKind::Relation,
             tag: "REL",
+            counters: [
+                "derivepar_rel_shards",
+                "derivepar_rel_shard_max_blobs",
+                "derivepar_rel_shard_min_blobs",
+            ],
             old: &old.relations,
             new: &new.relations,
         },
@@ -567,10 +584,8 @@ pub(crate) fn derive_changes_parallel(
         crate::debug::emit_marker(&start_marker);
 
         let shards = plan_shards(phase.old, phase.new, shard_count);
-        crate::debug::emit_counter(
-            &format!("derivepar_{}_shards", tag.to_lowercase()),
-            shards.len(),
-        );
+        let [shards_name, max_name, min_name] = phase.counters;
+        crate::debug::emit_counter(shards_name, shards.len());
         let max_blobs = shards
             .iter()
             .map(|s| (s.old_end - s.old_start) + (s.new_end - s.new_start))
@@ -581,14 +596,8 @@ pub(crate) fn derive_changes_parallel(
             .map(|s| (s.old_end - s.old_start) + (s.new_end - s.new_start))
             .min()
             .unwrap_or(0);
-        crate::debug::emit_counter(
-            &format!("derivepar_{}_shard_max_blobs", tag.to_lowercase()),
-            max_blobs,
-        );
-        crate::debug::emit_counter(
-            &format!("derivepar_{}_shard_min_blobs", tag.to_lowercase()),
-            min_blobs,
-        );
+        crate::debug::emit_counter(max_name, max_blobs);
+        crate::debug::emit_counter(min_name, min_blobs);
         let mut shard_outputs: Vec<Option<Result<ShardOutput>>> =
             (0..shards.len()).map(|_| None).collect();
 

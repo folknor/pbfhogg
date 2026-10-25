@@ -70,7 +70,6 @@ goes on "Review once drained" as a bisect candidate, named by commit.
 
 Launch order, one agent per line, run serially:
 
-27. HYG-160
 28. HYG-180
 29. BUG-183
 30. BUG-190
@@ -1237,18 +1236,6 @@ reports zero alignment.
 Reported by: altw and scanning, re-encoding, filtering and spatial, CLI and
 plumbing.
 
-## HYG-160 - getid's `unreachable!()`s rest on a char prefix
-
-Anger: 4 - contained.
-
-Split out of an entry on aborts where a refusal was owed (2026-10-25). `getid::parse_id_spec` has two `unreachable!()` and
-`parse_element_spec` one, held only by a `char`-typed prefix.
-
-Recommendation (2026-10-25): let-else returning an error.
-
-Reported by: write path, read path, CLI and plumbing, filtering and spatial,
-re-encoding, altw and scanning.
-
 ## HYG-053 - Reorder buffers are bounded only statistically
 
 Anger: 10 - a credit scheme inside the read engine and blob pools.
@@ -1444,19 +1431,3 @@ allocation on this path is believed deliberate - the code has been
 performance-squeezed, and pooling here is not to be assumed a win.
 
 Reported by: the HYG-149 fix.
-
-## HYG-180 - Two counter families still build their names with `format!`
-
-Anger: 6 - sidecar counter plumbing on per-blob command paths.
-
-Repack's `repack_{kind}_*` and derive-parallel's `derivepar_{tag}_*` counter
-names are built with `format!` from a prefix, so they cannot be grepped
-verbatim - the problem renumber had until commit `13dd02aa` gave it literal
-names per phase (a local `stage_counters!` macro, a `Phase` value picking
-the name column at emission, a unit test pinning every name against the old
-spelling). The same treatment fits both; no emitted name or value may
-change.
-
-Maintainer (2026-10-25): queued as described.
-
-Reported by: the HYG-150 implementation.

@@ -242,7 +242,7 @@ pub(crate) fn repack_to(
         host,
     )?;
     crate::debug::emit_marker("REPACK_NODES_END");
-    emit_phase_counters("nodes", &node_stats);
+    emit_phase_counters(ElementKind::Node, &node_stats);
     blobs_written += node_stats.blobs;
     elements_written += node_stats.elements;
     total_coalesces += node_stats.coalesces;
@@ -263,7 +263,7 @@ pub(crate) fn repack_to(
         host,
     )?;
     crate::debug::emit_marker("REPACK_WAYS_END");
-    emit_phase_counters("ways", &way_stats);
+    emit_phase_counters(ElementKind::Way, &way_stats);
     blobs_written += way_stats.blobs;
     elements_written += way_stats.elements;
     total_coalesces += way_stats.coalesces;
@@ -284,7 +284,7 @@ pub(crate) fn repack_to(
         host,
     )?;
     crate::debug::emit_marker("REPACK_RELATIONS_END");
-    emit_phase_counters("relations", &rel_stats);
+    emit_phase_counters(ElementKind::Relation, &rel_stats);
     blobs_written += rel_stats.blobs;
     elements_written += rel_stats.elements;
     total_coalesces += rel_stats.coalesces;
@@ -345,17 +345,47 @@ struct PhaseStats {
     cap_fired: bool,
 }
 
+/// Sidecar counter names for one kind's phase, in emission order: blobs,
+/// elements, coalesces, worker_full_blobs, central_blobs, cap_fired. Spelled
+/// out literally so each name can be grepped verbatim.
+fn phase_counter_names(kind: ElementKind) -> [&'static str; 6] {
+    match kind {
+        ElementKind::Node => [
+            "repack_nodes_blobs",
+            "repack_nodes_elements",
+            "repack_nodes_coalesces",
+            "repack_nodes_worker_full_blobs",
+            "repack_nodes_central_blobs",
+            "repack_nodes_cap_fired",
+        ],
+        ElementKind::Way => [
+            "repack_ways_blobs",
+            "repack_ways_elements",
+            "repack_ways_coalesces",
+            "repack_ways_worker_full_blobs",
+            "repack_ways_central_blobs",
+            "repack_ways_cap_fired",
+        ],
+        ElementKind::Relation => [
+            "repack_relations_blobs",
+            "repack_relations_elements",
+            "repack_relations_coalesces",
+            "repack_relations_worker_full_blobs",
+            "repack_relations_central_blobs",
+            "repack_relations_cap_fired",
+        ],
+    }
+}
+
 /// Emit per-kind sidecar counters for one `run_kind_phase` result.
-fn emit_phase_counters(kind: &str, s: &PhaseStats) {
-    crate::debug::emit_counter(&format!("repack_{kind}_blobs"), s.blobs);
-    crate::debug::emit_counter(&format!("repack_{kind}_elements"), s.elements);
-    crate::debug::emit_counter(&format!("repack_{kind}_coalesces"), s.coalesces);
-    crate::debug::emit_counter(
-        &format!("repack_{kind}_worker_full_blobs"),
-        s.worker_full_blobs,
-    );
-    crate::debug::emit_counter(&format!("repack_{kind}_central_blobs"), s.central_blobs);
-    crate::debug::emit_counter(&format!("repack_{kind}_cap_fired"), s.cap_fired);
+fn emit_phase_counters(kind: ElementKind, s: &PhaseStats) {
+    let [blobs, elements, coalesces, worker_full, central, cap_fired] = phase_counter_names(kind);
+    crate::debug::emit_counter(blobs, s.blobs);
+    crate::debug::emit_counter(elements, s.elements);
+    crate::debug::emit_counter(coalesces, s.coalesces);
+    crate::debug::emit_counter(worker_full, s.worker_full_blobs);
+    crate::debug::emit_counter(central, s.central_blobs);
+    crate::debug::emit_counter(cap_fired, s.cap_fired);
 }
 
 /// Run one per-kind phase: pread workers decode + split (full blocks
@@ -824,4 +854,29 @@ fn frame_and_write_batch(
         written += 1;
     }
     Ok(written)
+}
+
+#[cfg(test)]
+mod counter_name_tests {
+    use super::*;
+
+    #[test]
+    fn phase_counter_names_match_the_old_format_spelling() {
+        for (kind, word) in [
+            (ElementKind::Node, "nodes"),
+            (ElementKind::Way, "ways"),
+            (ElementKind::Relation, "relations"),
+        ] {
+            let want = [
+                "blobs",
+                "elements",
+                "coalesces",
+                "worker_full_blobs",
+                "central_blobs",
+                "cap_fired",
+            ]
+            .map(|c| format!("repack_{word}_{c}"));
+            assert_eq!(phase_counter_names(kind).map(String::from), want);
+        }
+    }
 }

@@ -348,9 +348,18 @@ fn build_generation(
     // `output_dir` is the output's staging directory, which `OutputDir`
     // created when it was staged; it is not created again here.
 
+    // The input is opened four times: the indexdata probe, the replication
+    // header read, pass 1's relation scan and the schedule walk, whose one
+    // description the unindexed classify, pass 1.5 and pass 2 then share.
+    // Every open is derived from this pin, taken before any of them, so an
+    // input renamed over mid-build is never read partly from each file.
+    // Pinned here rather than by the caller: nothing else reads the input
+    // before the build, and a failure to pin is named with the index.
+    let input = crate::read::input::PinnedInput::pin(&config.input_path, host)?;
+
     // Validate input
     crate::commands::require_indexdata(
-        &config.input_path,
+        &input,
         config.direct_io,
         config.allow_unindexed,
         "input PBF has no blob-level indexdata. Without indexdata, \
@@ -359,7 +368,7 @@ fn build_generation(
     )?;
 
     // Read PBF header
-    let reader = ElementReader::open_in(&config.input_path, config.direct_io, host)?;
+    let reader = ElementReader::open_in(&input, config.direct_io, host)?;
     let pbf_header = reader.header();
     // The geocode header stores replication sequence in a u32. Missing
     // metadata is represented by zero, but wrapping a present larger value
@@ -395,7 +404,7 @@ fn build_generation(
     let pass1_start = crate::counters::Stopwatch::start();
 
     let (admin_relations, needed_admin_ways) =
-        pass1::run_pass1(&config.input_path, config.direct_io, &mut strings, host)?;
+        pass1::run_pass1(&input, config.direct_io, &mut strings, host)?;
     crate::host::diag!(
         host.diagnostics,
         Progress,
@@ -432,7 +441,7 @@ fn build_generation(
     // -----------------------------------------------------------------------
     crate::debug::emit_marker("GEOCODE_SCHEDULES_START");
     let (node_schedule, way_schedule, max_node_id, shared_file) =
-        pass1_5::build_pass2_schedules(&config.input_path, host)?;
+        pass1_5::build_pass2_schedules(&input, host)?;
     crate::debug::emit_marker("GEOCODE_SCHEDULES_END");
 
     crate::debug::emit_marker("GEOCODE_PASS1_5_START");
@@ -499,6 +508,8 @@ fn build_generation(
     drop(node_schedule);
     drop(way_schedule);
     drop(shared_file);
+    // Pass 2 was the input's last reader.
+    drop(input);
     crate::debug::emit_marker("GEOCODE_PASS2_SCAN_END");
     host.cancel.check()?;
 

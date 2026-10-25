@@ -1158,6 +1158,19 @@
 
 ### Fixed
 
+- **`build-geocode-index` reads one input file even if it is replaced
+  mid-run.** Every build opens the input four times (the indexdata check,
+  the replication header read, the relation pass and the schedule walk the
+  later passes share), and each open used to resolve the path again, so an
+  input renamed over during the build was indexed partly from each file,
+  with no error. The input is now pinned when the build starts: on Linux
+  with `/proc` a replaced or deleted input does not affect the build; on
+  other Unix hosts the build fails with `ErrorKind::InputReplaced` and the
+  existing index, if any, is left as it was. An input that is a FIFO,
+  socket or character device is now refused up front (it could not serve
+  the repeated reads before either). Library: `build_geocode_index` still
+  takes the path in `BuildConfig::input_path` and pins it itself.
+
 - **`cat` reads each input file from the file it started on, even if one is
   replaced mid-run.** Every mode opens each input two to four times (the
   indexdata check under `--type`, the header read, an indexdata probe when

@@ -7,13 +7,12 @@
 //! referenced). Same pattern as ALTW pass 0.
 
 use std::os::unix::fs::FileExt as _;
-use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::Result;
 use crate::error::Error;
-use crate::read::input::InputFile;
+use crate::read::input::{InputFile, PinnedInput};
 use crate::scan::classify::ScheduledBlob;
 
 use crate::tunables::{NODE_PREALLOC_IDS_PER_BYTE, OVERFLOW_COMPACT_MIN};
@@ -348,7 +347,7 @@ pub(super) fn run_pass1_5(
 /// dense `IdSet` pre-allocation by input file size.
 #[allow(clippy::type_complexity)]
 pub(super) fn build_pass2_schedules(
-    input_path: &Path,
+    input: &PinnedInput,
     host: &crate::host::Host,
 ) -> Result<(
     Vec<ScheduledBlob>, // node_schedule
@@ -357,10 +356,10 @@ pub(super) fn build_pass2_schedules(
     InputFile,
 )> {
     let mut walker =
-        crate::read::header_walker::HeaderWalker::open(input_path, host)?.refusing_partial_index();
+        crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
     let _ = walker
         .next_header()?
-        .ok_or_else(|| crate::error::new_missing_header(input_path))?;
+        .ok_or_else(|| crate::error::new_missing_header(input.path()))?;
 
     // Each schedule is put into file order once both are complete (see
     // `into_file_order` below).

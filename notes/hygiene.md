@@ -57,7 +57,7 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-23. HYG-177 to HYG-179, then HYG-183 to HYG-189, one per line, in ID
+23. HYG-178 and HYG-179, then HYG-183 to HYG-189, one per line, in ID
     order
 24. HYG-047
 25. HYG-158
@@ -1427,7 +1427,7 @@ Reported by: the HYG-150 implementation.
 
 ## Adopting `PinnedInput`, one command per entry
 
-Not a finding: the shared brief for HYG-177 to HYG-179 and HYG-183 to
+Not a finding: the shared brief for HYG-178, HYG-179 and HYG-183 to
 HYG-189. Each of those commands opens its input more than once per run (a
 precondition probe, a header reader, a schedule walk, worker and splice
 descriptors), each open resolving the path again, so a file renamed over
@@ -1497,15 +1497,6 @@ export, check refs, check index (one open each). inspect's index-only scan
 and its full-decode fallback each read the whole report from one open, but
 the full decode takes its file size from a separate path `stat`, which
 HYG-187 covers.
-
-## HYG-177 - build-geocode-index reopens its input by path per pass
-
-Anger: 7 - geocode build.
-
-See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): follow
-the brief.
-
-Reported by: the HYG-078 resolution.
 
 ## HYG-178 - diff reopens its inputs by path
 

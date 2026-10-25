@@ -60,6 +60,8 @@ mod fault_extract_grid;
 #[cfg(all(feature = "test-hooks", feature = "commands"))]
 mod fault_extract_input;
 #[cfg(all(feature = "test-hooks", feature = "commands"))]
+mod fault_geocode_input;
+#[cfg(all(feature = "test-hooks", feature = "commands"))]
 mod fault_geocode_pass3;
 #[cfg(feature = "test-hooks")]
 mod fault_getid_input;

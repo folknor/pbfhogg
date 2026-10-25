@@ -2,8 +2,7 @@
 //!
 //! Collects admin boundary metadata and the way IDs they reference.
 
-use std::path::Path;
-
+use crate::read::input::PinnedInput;
 use crate::{BlobFilter, Element, ElementReader, MemberId};
 
 use super::Result;
@@ -41,14 +40,14 @@ fn boundary_role(role: &str) -> BoundaryRole {
 /// - the set of way IDs those relations reference (outer + inner members).
 #[hotpath::measure]
 pub(super) fn run_pass1(
-    input_path: &Path,
+    input: &PinnedInput,
     direct_io: bool,
     strings: &mut StringPool,
     host: &crate::host::Host,
 ) -> Result<(Vec<RawAdminRelation>, crate::idset::IdSet)> {
     let mut admin_relations: Vec<RawAdminRelation> = Vec::new();
     {
-        let reader = ElementReader::open_in(input_path, direct_io, host)?;
+        let reader = ElementReader::open_in(input, direct_io, host)?;
         reader
             .with_blob_filter(BlobFilter::only_relations())
             .for_each_block_pipelined(|block| {

@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-5. HYG-152
 6. HYG-153
 7. HYG-154
 8. HYG-155
@@ -429,6 +428,22 @@ The judgement calls already known, to be checked first:
     comparison (a file with no ways, a relation blob before a node blob,
     used to pass). One comparison over offsets already computed; not
     measured.
+- `apply-changes --force` now writes a wholly indexed output, restoring what
+  the pre-descriptor-first pipeline did (`coalesce_passthrough` reframed
+  unindexed passthroughs; commit `719f306a` lost it). Judgement calls:
+  - An untouched unindexed blob is reframed in the worker
+    (`reframe_raw_with_index`, `DrainItem::OwnedBytes`) on both routes, so
+    the splice route gives up `copy_file_range` for those blobs. Forced path
+    only; not measured.
+  - The indexed hot path changes only in shape: `take_drain_item`'s
+    placeholder-index fallback became `take_copy_range` (indexed only), and
+    `handle_owned_passthrough` lost its kind/range override. Argued
+    neutral, not measured.
+  - A forced blob whose elements span two kinds is now refused; it used to
+    be copied or rewritten under its first kind, which duplicated the second
+    kind's modifications and put its creates out of type order. A new
+    `DrainItem::Omitted` drops a blob with no element instead of copying it
+    unindexed (it also used to fake a type transition to Node).
 
 ---
 
@@ -1179,27 +1194,6 @@ docs sentence, since a sweep merge must hold whatever overlaps the current
 position and bounding it means an external merge.
 
 Reported by: re-encoding.
-
-## HYG-152 - `apply-changes --force` on an unindexed base writes a partially indexed output
-
-Anger: 8 - apply-changes internals.
-
-Split out of the indexdata trust model entry, now resolved as
-`reference/indexdata-trust.md`. A blob the diff does not touch is copied without
-indexdata and a rewritten one gets fresh indexdata
-(`frame_blob_pipelined(..., Some(&indexdata), ...)` in `streaming.rs`), so the
-output is partially indexed and every walk that refuses partial indexdata
-(diff, sort, the schedule walks) refuses pbfhogg's own output; the contract
-table in `cli/tests/cli_input_contract.rs` pins it. Under `--force` the
-scanner routes every unindexed blob to the workers (`scanner.rs`: no
-indexdata, no fast path), which already decompress and scan it.
-
-Recommendation (2026-10-25): index every blob the forced path writes, so the
-output is wholly indexed: for an untouched blob that is a header reframe on
-a cold path, not new decode work (unverified: how the worker emits an
-untouched unindexed blob today). Move the contract table row.
-
-Reported by: the 2026-10-25 triage, while closing brokkr#25.
 
 ## HYG-153 - getid trusts the first blob's indexdata for the whole file
 

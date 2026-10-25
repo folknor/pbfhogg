@@ -1121,6 +1121,18 @@
 
 ### Fixed
 
+- **`apply-changes --force` writes a wholly indexed output.** On an
+  unindexed base, the blobs the diff rewrote got indexdata and the ones it
+  left alone were copied without it, so the output was partially indexed and
+  `sort`, `diff`, `tags-filter`, `extract` and `apply-changes` itself refused
+  it. Untouched blobs now keep their compressed payload under a header
+  carrying indexdata and tagdata derived from it, as plain `cat` does. A blob
+  no single index describes is re-encoded, and one with no elements is
+  dropped. A blob whose elements span more than one kind is now refused
+  (exit 2, nothing published) instead of being written with creates and
+  modifications of its second kind out of type order or duplicated; re-encode
+  such a base with plain `cat` first.
+
 - **`check --ids` reports a node blob after a relation blob when the file has
   no ways.** Type order was checked only as node before way and way before
   relation, so a file with no ways and its relations ahead of its nodes

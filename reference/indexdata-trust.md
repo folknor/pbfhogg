@@ -30,7 +30,8 @@ on it; verification is the job of the explicit verifiers (`check --index`,
 `check --ids`). A file whose claims are false is outside the contract: a
 command given one may produce wrong output and report success. pbfhogg's
 writer derives every sidecar it computes from the payload (`cat` included,
-for the blobs it indexes); a raw copy keeps the input's own, and `renumber`
+for the blobs it indexes, and `apply-changes --force`, for the unindexed
+blobs it would otherwise copy); a raw copy keeps the input's own, and `renumber`
 carries each node blob's bbox into the index it rebuilds (below). pbfhogg's
 sorted producers produce honestly sorted output. For a file of unknown
 provenance, the verifiers are the admission test, within the coverage gaps
@@ -173,6 +174,13 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   either outcome moves a row there. `renumber` has no `--force` and
   `add-locations-to-ways --index-type external` refuses it at parse time:
   both are deliberate, since neither has an unindexed fallback.
+- **Plain `cat` and `apply-changes --force` write no partially indexed
+  file**, which pbfhogg's own schedule walks would refuse. Both index every
+  blob they write from an unindexed input: an untouched blob keeps its compressed payload under a header
+  carrying indexdata scanned from it, a blob no single index describes is
+  re-encoded into single-kind blocks, and one holding no element is
+  dropped. `apply-changes` refuses a blob whose elements span more than one
+  kind, which it cannot place in type order, where `cat` splits it.
 
 Current behaviour recorded as such, not as a contract to preserve:
 

@@ -437,6 +437,12 @@ fn parse_datasize(header: &[u8]) -> Option<u32> {
     None
 }
 
+/// True for an `OSMData` blob header with no indexdata field (field 2).
+pub fn is_unindexed_data_blob(header: &[u8]) -> bool {
+    read_bytes_field(header, 1).as_deref() == Some(b"OSMData".as_slice())
+        && locate_indexdata(header).is_none()
+}
+
 fn locate_indexdata(header: &[u8]) -> Option<(usize, usize)> {
     let mut pos = 0;
     while pos < header.len() {

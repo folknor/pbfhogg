@@ -890,6 +890,27 @@ pub fn assert_non_indexed(path: &Path) {
     );
 }
 
+/// Assert every OsmData blob in the PBF carries indexdata, walking every
+/// frame. [`assert_indexed`] reads the first data blob only, so it passes a
+/// partially indexed file, which every schedule walk refuses.
+pub fn assert_every_data_blob_indexed(path: &Path) {
+    let bytes = std::fs::read(path).expect("read pbf");
+    let blobs = adversarial::locate_blobs(&bytes);
+    let unindexed: Vec<usize> = blobs
+        .iter()
+        .enumerate()
+        .filter(|(_, blob)| {
+            adversarial::is_unindexed_data_blob(&bytes[blob.header_start..blob.header_end])
+        })
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        unindexed.is_empty(),
+        "expected every data blob of {} to carry indexdata; blobs {unindexed:?} do not",
+        path.display()
+    );
+}
+
 /// Assert the PBF's first OsmData blob carries tagdata (`BlobHeader`
 /// field 4). Tagdata sibling of [`assert_indexed`]; used to prove a fixture
 /// really has a per-blob tag key index before a `--strip-tagdata` run so the

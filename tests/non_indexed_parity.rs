@@ -365,8 +365,14 @@ fn getid_include_non_indexed_parity() {
 // drain's per-kind upsert cursor never advanced past any id. At
 // end-of-stream the trailing-creates loop re-emitted every modify the
 // worker had already handled inline. Fixed 2026-04-23 by recovering
-// the true `(kind, min_id, max_id)` from the parsed block before
-// routing it into the drain (`streaming.rs::infer_kind_and_range`).
+// the true `(kind, min_id, max_id)` from the payload before routing it
+// into the drain.
+//
+// The forced output is also wholly indexed: the blobs the diff leaves
+// alone (here the way and relation blobs) are reframed with indexdata
+// scanned from their payload, not copied unindexed beside the indexed
+// rewrites, which made a partially indexed file every schedule walk
+// refuses.
 
 fn write_osc_gz(path: &Path, xml: &str) {
     let file = File::create(path).expect("create osc.gz");
@@ -430,6 +436,7 @@ fn apply_changes_non_indexed_parity() {
     .expect("merge non-indexed");
 
     assert_elements_equivalent(&out_idx, &out_non);
+    crate::common::assert_every_data_blob_indexed(&out_non);
 }
 
 // ---------------------------------------------------------------------------

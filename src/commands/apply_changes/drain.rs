@@ -607,8 +607,11 @@ fn process_item(
 ) -> Result<()> {
     counters.items_processed.fetch_add(1, Ordering::Relaxed);
 
-    let item_kind = item.kind();
-    let (min_id, max_id) = item.id_range();
+    // An omitted blob writes nothing and has no kind, so it must not look
+    // like a type transition or move the gap-create and order state.
+    let Some((item_kind, (min_id, max_id))) = item.placement() else {
+        return Ok(());
+    };
 
     if let Some(prev) = state.last_type
         && prev != item_kind
@@ -617,19 +620,13 @@ fn process_item(
     }
     state.last_type = Some(item_kind);
 
-    // Skip gap-creates for the reversed-range sentinel `(i64::MAX, i64::MIN)`
-    // that `infer_kind_and_range` (the --force non-indexed path in
-    // `streaming.rs`) emits for an empty block, and for a block whose
-    // `block_type()` names a kind none of its elements has: its min/max
-    // accumulators never move off their starting values, so the range
-    // stays reversed. Without this guard, `blob_osm_first_id` would
+    // A reversed range names no real ID span. None is expected (an
+    // unindexed blob with no element arrives as `DrainItem::Omitted`, and
+    // `BlobIndex::deserialize` refuses an inverted range), but if one arrived, `blob_osm_first_id` would
     // return `i64::MAX` and `has_gap_creates` would emit every remaining
-    // upsert of `item_kind` as a gap-create. The dispatch below still writes
-    // the rewritten blob; trailing-creates picks up any legitimate upserts.
+    // upsert of `item_kind` as a gap-create. Neither gap creates nor the
+    // sortedness guard run on it; the dispatch below still writes the blob.
     if min_id <= max_id {
-        // Sortedness guard runs on the same non-sentinel condition as
-        // gap-creates: the reversed sentinel `(i64::MAX, i64::MIN)` names
-        // no real ID span, so it carries no ordering claim.
         check_output_order(state, item_kind, min_id, max_id)?;
         let osm_first = crate::osm_id::blob_osm_first_id(min_id, max_id);
         handle_gap_creates(item_kind, osm_first, cfg, state, writer, stats, counters)?;
@@ -773,6 +770,8 @@ fn dispatch_variant(
                 *cursor += 1;
             }
         }
+        // `process_item` returns before dispatch for this variant.
+        DrainItem::Omitted { .. } => {}
     }
 
     Ok(())

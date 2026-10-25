@@ -18,7 +18,11 @@
 //!   [`PrimitiveBlock::from_vec_with_scratch`], precise-check via
 //!   [`block_overlaps_diff`]. False positives emit a `DrainItem::CopyRange`
 //!   carrying the original descriptor so the drain can `copy_file_range`
-//!   the raw frame. True overlaps compute
+//!   the raw frame. An unindexed blob (`--force`) is scanned for the
+//!   sidecars the writer would give it, and a false positive among those
+//!   is reframed with them (`DrainItem::OwnedBytes`), so the output is
+//!   wholly indexed; one no index can describe is re-encoded, omitted when
+//!   it holds no element, or refused when it mixes kinds. True overlaps compute
 //!   the inline-upsert range from the descriptor's `id_range` against the
 //!   diff's sorted upsert vector and call [`rewrite_block_parallel`] on the
 //!   worker's persistent `BlockBuilder`, emitting
@@ -48,7 +52,7 @@ use crate::ElementKind;
 use crate::blob::decompress_blob_raw;
 use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::error::{Error, Result};
-use crate::writer::{Compression, frame_blob_pipelined};
+use crate::writer::{Compression, frame_blob_pipelined, reframe_raw_with_index};
 
 use super::classify::block_overlaps_diff;
 use super::descriptor::{BlobDescriptor, DrainItem, Route, ScannedBlob};
@@ -142,8 +146,9 @@ crate::counters::counter_set! {
         pub blobs_false_positive => "merge_streaming_blobs_false_positive",
         /// Candidates whose base elements the diff does not touch but whose ID
         /// span holds inline upserts (pure creates), so they are rewritten
-        /// rather than passed through to keep the output sorted. A subset of
-        /// `blobs_rewritten`.
+        /// rather than passed through to keep the output sorted, plus
+        /// unindexed blobs no single index describes, re-encoded so the
+        /// output is indexed. A subset of `blobs_rewritten`.
         pub blobs_forced_rewrite => "merge_streaming_blobs_forced_rewrite",
         pub blobs_owned_passthrough => "merge_streaming_blobs_owned_passthrough",
         /// Decompress wall summed across all workers (cumulative ns).
@@ -390,16 +395,8 @@ fn worker_loop(
                 // claims, believed and never checked against this
                 // undecoded blob (reference/indexdata-trust.md).
                 let count = desc.index.as_ref().map_or(0, |i| i.count);
-                handle_owned_passthrough(
-                    file,
-                    &desc,
-                    drain_tx,
-                    counters,
-                    &mut read_buf,
-                    count,
-                    None,
-                )
-                .map_err(|e| blob_err(&desc, source, e))?;
+                handle_owned_passthrough(file, &desc, drain_tx, counters, &mut read_buf, count)
+                    .map_err(|e| blob_err(&desc, source, e))?;
             }
         }
     }
@@ -455,6 +452,21 @@ fn handle_candidate(
     decompress_blob_raw(read_buf, decompress_buf)?;
     t_decompress.record_ns(&counters.decompress_ns);
 
+    // An unindexed blob (`--force`; the scanner sends every one here) gets
+    // the sidecars the writer would give it, derived from the payload by the
+    // same scan plain `cat` uses. They replace the scanner's placeholder
+    // kind and range below, and a blob the diff leaves alone is reframed
+    // with them rather than copied: a raw copy would leave it unindexed
+    // beside the indexed blobs the rewrites produce, a partially indexed
+    // output that every schedule walk (diff, sort, apply-changes itself)
+    // refuses. Indexed blobs skip this; their claims are believed
+    // (reference/indexdata-trust.md).
+    let scanned = if desc.index.is_none() {
+        Some(crate::blob_meta::scan_block_ids_and_tags(decompress_buf)?)
+    } else {
+        None
+    };
+
     if locations_on_ways && desc.kind == ElementKind::Node {
         let t_extract = crate::counters::Stopwatch::start();
         let mut hits = 0u64;
@@ -484,6 +496,26 @@ fn handle_candidate(
     let block = crate::PrimitiveBlock::from_vec_with_scratch(raw, st_scratch, gr_scratch)?;
     t_parse.record_ns(&counters.parse_ns);
 
+    // What an unindexed blob's payload makes of it, decided before either
+    // output branch below so an overlapping blob cannot bypass it.
+    let derived = match scanned {
+        None => None,
+        Some((Some(index), tags)) => Some(Derived::Indexed {
+            index,
+            tagdata: tags
+                .as_ref()
+                .and_then(crate::blob_meta::TagIndex::serialize),
+        }),
+        Some((None, _)) => match single_kind_range(&block)? {
+            Some((kind, min_id, max_id)) => Some(Derived::Reencode {
+                kind,
+                min_id,
+                max_id,
+            }),
+            None => return send_drain(drain_tx, DrainItem::Omitted { seq: desc.seq }),
+        },
+    };
+
     let t_precise = crate::counters::Stopwatch::start();
     let overlaps = block_overlaps_diff(&block, ranges);
     t_precise.record_ns(&counters.precise_ns);
@@ -502,18 +534,35 @@ fn handle_candidate(
 
     // On the --force path the scanner fills `desc` with a placeholder
     // `kind=Node` and `id_range=None` because it can't distinguish blob
-    // kinds without decompressing. Recover both from the parsed block so
-    // the drain credits `base_*` on the real kind, the rewrite slice
+    // kinds without decompressing. The payload's own values replace them
+    // so the drain credits `base_*` on the real kind, the rewrite slice
     // lookup and create dispatch see correct values, and type-transition
     // logic doesn't fire spurious Way->Node/Relation->Node flushes that
     // would drain remaining upserts as trailing creates. Indexed
-    // descriptors carry authoritative values already (the scanner sets
-    // `id_range` exactly when `index` is present).
-    let (effective_kind, effective_min_id, effective_max_id) = match desc.id_range {
-        Some((min, max)) => (desc.kind, min, max),
-        None => infer_kind_and_range(&block),
+    // descriptors carry their claimed values (the scanner sets `id_range`
+    // exactly when `index` is present).
+    let (effective_kind, effective_min_id, effective_max_id) = match (&derived, desc.id_range) {
+        (Some(Derived::Indexed { index, .. }), _) => (index.kind, index.min_id, index.max_id),
+        (
+            Some(Derived::Reencode {
+                kind,
+                min_id,
+                max_id,
+            }),
+            _,
+        ) => (*kind, *min_id, *max_id),
+        (None, Some((min, max))) => (desc.kind, min, max),
+        (None, None) => {
+            return Err(Error::internal(
+                "streaming: indexed descriptor without an id range",
+            ));
+        }
     };
     let inline_upserts = upsert_slice(ranges, effective_kind, effective_min_id, effective_max_id);
+    // A blob no single index describes cannot be copied with one, so it is
+    // re-encoded even when the diff leaves it alone: `BlockBuilder` writes
+    // indexed single-kind blocks.
+    let must_reencode = matches!(derived, Some(Derived::Reencode { .. }));
 
     // Passthrough is only sound when the blob needs no edit AND no create
     // lands inside its ID span. `block_overlaps_diff` answers the first
@@ -527,25 +576,37 @@ fn handle_candidate(
     // Forcing the rewrite lets `rewrite_block_parallel` interleave the
     // create at its sorted position and lets the drain advance the upsert
     // cursor past this blob's range.
-    if !overlaps && inline_upserts.is_empty() {
+    if !overlaps && inline_upserts.is_empty() && !must_reencode {
         counters
             .blobs_false_positive
             .fetch_add(1, Ordering::Relaxed);
-        // The drain needs an element count for per-kind `base_*` stats
-        // (gap #7). Indexed blobs carry it in `desc.index.count`, a claim
-        // believed like every other here (reference/indexdata-trust.md);
-        // for non-indexed blobs (-force path) we walk the already-parsed
-        // block. Counting is cheap next to the decompress + parse we
-        // just did.
-        let blob_count = desc
-            .index
-            .as_ref()
-            .map_or_else(|| count_block_elements(&block), |i| i.count);
-        let effective_id_range = (effective_min_id, effective_max_id);
+        if let Some(Derived::Indexed { index, tagdata }) = &derived {
+            // The original compressed body under a rebuilt header carrying
+            // the scanned sidecars: no recompression, on either route. Any
+            // prepass sidecar the input header carried is dropped, which
+            // the output header allows: it declares no way enrichment
+            // (`Ways::Reencoded` in `build_header_bytes`).
+            let frame_bytes =
+                reframe_raw_with_index(read_buf, &index.serialize(), tagdata.as_deref())?;
+            return send_drain(
+                drain_tx,
+                DrainItem::OwnedBytes {
+                    seq: desc.seq,
+                    frame_bytes,
+                    kind: effective_kind,
+                    id_range: (effective_min_id, effective_max_id),
+                    count: index.count,
+                },
+            );
+        }
+        // An indexed blob: the drain needs an element count for per-kind
+        // `base_*` stats (gap #7), and takes the `desc.index.count` claim,
+        // believed like every other here (reference/indexdata-trust.md).
         if route.is_splice() {
-            desc.kind = effective_kind;
-            desc.id_range = Some(effective_id_range);
-            return send_drain(drain_tx, desc.take_drain_item(blob_count));
+            let item = desc.take_copy_range().ok_or_else(|| {
+                Error::internal("streaming: false positive without indexdata reached the splice")
+            })?;
+            return send_drain(drain_tx, item);
         }
         // Consumer build (no `linux-direct-io` feature) or `--direct-io`
         // output: the drain rejects `DrainItem::CopyRange` up front, so
@@ -553,15 +614,8 @@ fn handle_candidate(
         // (pread the full frame, ship the bytes via
         // `DrainItem::OwnedBytes`). `handle_owned_passthrough` does
         // exactly that for the scanner-side passthrough case.
-        return handle_owned_passthrough(
-            file,
-            desc,
-            drain_tx,
-            counters,
-            read_buf,
-            blob_count,
-            Some((effective_kind, effective_id_range)),
-        );
+        let count = desc.index.as_ref().map_or(0, |i| i.count);
+        return handle_owned_passthrough(file, desc, drain_tx, counters, read_buf, count);
     }
     if !overlaps {
         counters
@@ -624,92 +678,71 @@ fn handle_candidate(
     )
 }
 
-/// Count the elements in an already-parsed block. Used on the
-/// non-indexed false-positive path to supply a `base_<kind>` count to
-/// the drain when `desc.index.count` is unavailable (gap #7 parity).
-fn count_block_elements(block: &crate::PrimitiveBlock) -> u64 {
-    u64::try_from(block.elements_skip_metadata().count()).unwrap_or(u64::MAX)
+/// What an unindexed blob's payload says about it, for the sidecars the
+/// output needs.
+enum Derived {
+    /// One index describes the blob: the scan's index and tag key set.
+    Indexed {
+        index: crate::blob_meta::BlobIndex,
+        tagdata: Option<Vec<u8>>,
+    },
+    /// No index describes the blob, but its elements are all one kind (one
+    /// group carries more than one element field), so a re-encode through
+    /// `BlockBuilder` turns it into indexed single-kind blocks. The kind and
+    /// numeric ID range come from its decoded elements.
+    Reencode {
+        kind: ElementKind,
+        min_id: i64,
+        max_id: i64,
+    },
 }
 
-/// Recover a non-indexed blob's dominant element kind and (min, max)
-/// id range by walking the already-parsed block. Used on the --force
-/// path where the scanner has to emit a placeholder `kind=Node` and
-/// `id_range=None` because it runs off the blob header alone; the
-/// values it returns are authoritative for drain cursor advancement.
+/// The kind and numeric `(min, max)` ID range of a block no single index
+/// describes, walked from its decoded elements; `None` when it yields none.
 ///
-/// For homogeneous blobs (the usual shape for writers that emit one
-/// kind per block - our own `PbfWriter` included) `block.block_type()`
-/// is the dominant kind and the walk returns tight (min, max) id
-/// bounds for that kind. For mixed blocks this picks the first-seen
-/// element's kind and its own min/max - other-kind elements are
-/// ignored by the range, leaving their upserts to the drain's
-/// trailing-creates path. Empty blocks return a degenerate sentinel
-/// range that the upsert cursor computation treats as "no range".
-fn infer_kind_and_range(block: &crate::PrimitiveBlock) -> (ElementKind, i64, i64) {
-    use crate::{BlockType, Element};
+/// The kind comes from the first decoded element, never `block_type()`:
+/// that reads only each group's first field, so a group holding an empty
+/// `DenseNodes` and then a way would pass for nodes.
+///
+/// Elements of more than one kind are refused. The drain places each blob
+/// by one kind (type transitions, gap creates, the upsert cursor and the
+/// order watermark), so another kind's modifications would be written
+/// twice and its creates out of type order under the sorted stamp. Such a
+/// blob reaches this only on `--force`: on indexed input it carries no
+/// indexdata, and the scanner's walk refuses the partially indexed base.
+fn single_kind_range(block: &crate::PrimitiveBlock) -> Result<Option<(ElementKind, i64, i64)>> {
+    use crate::Element;
 
-    let primary = match block.block_type() {
-        BlockType::DenseNodes | BlockType::Nodes => Some(ElementKind::Node),
-        BlockType::Ways => Some(ElementKind::Way),
-        BlockType::Relations => Some(ElementKind::Relation),
-        BlockType::Mixed | BlockType::Empty => None,
-    };
-
-    let mut kind: Option<ElementKind> = primary;
-    let mut min_id = i64::MAX;
-    let mut max_id = i64::MIN;
-
+    let mut found: Option<(ElementKind, i64, i64)> = None;
     for element in block.elements_skip_metadata() {
-        let (elem_kind, id) = match &element {
+        let (kind, id) = match &element {
             Element::DenseNode(dn) => (ElementKind::Node, dn.id()),
             Element::Node(n) => (ElementKind::Node, n.id()),
             Element::Way(w) => (ElementKind::Way, w.id()),
             Element::Relation(r) => (ElementKind::Relation, r.id()),
         };
-        match kind {
-            Some(k) if k == elem_kind => {
-                min_id = min_id.min(id);
-                max_id = max_id.max(id);
+        found = match found {
+            None => Some((kind, id, id)),
+            Some((k, min_id, max_id)) if k == kind => Some((k, min_id.min(id), max_id.max(id))),
+            Some((k, _, _)) => {
+                return Err(Error::invalid_data(format!(
+                    "the blob mixes {} and {} elements, which apply-changes cannot \
+                     place in type order. Re-encode the base so that each blob holds \
+                     one kind of element (a plain cat splits such blobs), and rerun",
+                    k.as_str(),
+                    kind.as_str()
+                )));
             }
-            Some(_) => {
-                // Different kind in a block whose block_type() said
-                // homogeneous - ignore for the range (trailing-creates
-                // handle other-kind upserts).
-            }
-            None => {
-                kind = Some(elem_kind);
-                min_id = id;
-                max_id = id;
-            }
-        }
+        };
     }
-
-    match kind {
-        Some(k) => (k, min_id, max_id),
-        // Empty block (or homogeneous-classified block whose elements are
-        // all a different kind): return the reversed sentinel range
-        // `(i64::MAX, i64::MIN)`. `upsert_slice` keys on
-        // `blob_osm_first_key`/`blob_osm_last_key` and yields an empty
-        // slice. The drain-side `process_item` detects `min > max` and
-        // skips `handle_gap_creates`; without that guard,
-        // `blob_osm_first_id` would return `i64::MAX` and gap-creates
-        // would fire for every remaining upsert of `kind`. Any upserts
-        // of any kind get trailing-created.
-        None => (ElementKind::Node, i64::MAX, i64::MIN),
-    }
+    Ok(found)
 }
 
-/// `--direct-io` (or consumer-build false-positive) passthrough: pread
-/// the **full framed bytes** so the drain can `write_raw_owned` without
-/// re-framing. `count` is the blob's element count; the drain uses it
-/// to credit `base_<kind>` stats and must not be zero on the indexed
-/// path or per-kind merge totals drift (gap #7).
-///
-/// `override_kind_range`: scanner-side passthrough (indexed blob) leaves
-/// this `None` and lets desc's authoritative kind + range flow through.
-/// Worker-side false-positive on a non-indexed blob supplies the kind +
-/// range walked from the parsed block, overriding desc's placeholder
-/// `kind=Node` and `id_range=None` so the drain routes on the real kind.
+/// `--direct-io` (or consumer-build false-positive) passthrough of an
+/// indexed blob: pread the **full framed bytes** so the drain can
+/// `write_raw_owned` without re-framing. `count` is the blob's element
+/// count; the drain uses it to credit `base_<kind>` stats and must not be
+/// zero or per-kind merge totals drift (gap #7).
 fn handle_owned_passthrough(
     file: &std::fs::File,
     desc: &BlobDescriptor,
@@ -717,7 +750,6 @@ fn handle_owned_passthrough(
     counters: &WorkerCounters,
     read_buf: &mut Vec<u8>,
     count: u64,
-    override_kind_range: Option<(ElementKind, (i64, i64))>,
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
     counters
@@ -729,16 +761,14 @@ fn handle_owned_passthrough(
     // Move the bytes into the DrainItem; reset read_buf for the next
     // pread without keeping the per-blob allocation alive.
     let frame_bytes = std::mem::take(read_buf);
-    let (kind, id_range) =
-        override_kind_range.unwrap_or_else(|| (desc.kind, desc.id_range.unwrap_or((0, 0))));
 
     send_drain(
         drain_tx,
         DrainItem::OwnedBytes {
             seq: desc.seq,
             frame_bytes,
-            kind,
-            id_range,
+            kind: desc.kind,
+            id_range: desc.id_range.unwrap_or((0, 0)),
             count,
         },
     )

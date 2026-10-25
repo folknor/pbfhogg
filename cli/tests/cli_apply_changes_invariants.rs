@@ -398,6 +398,244 @@ fn sorted_multi_blob_base_still_succeeds() {
 }
 
 // ---------------------------------------------------------------------------
+// Forced runs over an unindexed base write a wholly indexed file. A blob the
+// diff leaves alone used to be copied without indexdata beside the indexed
+// rewrites, a partially indexed output every schedule walk refuses. Blocks no
+// single index describes are hand-encoded here, since `BlockBuilder` never
+// writes them.
+// ---------------------------------------------------------------------------
+
+fn put_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push(u8::try_from(value & 0x7F).unwrap() | 0x80);
+        value >>= 7;
+    }
+    out.push(u8::try_from(value).unwrap());
+}
+
+fn zigzag(value: i64) -> u64 {
+    ((value << 1) ^ (value >> 63)).cast_unsigned()
+}
+
+fn put_len(out: &mut Vec<u8>, field: u64, body: &[u8]) {
+    put_varint(out, field << 3 | 2);
+    put_varint(out, u64::try_from(body.len()).unwrap());
+    out.extend_from_slice(body);
+}
+
+fn put_uint(out: &mut Vec<u8>, field: u64, value: u64) {
+    put_varint(out, field << 3);
+    put_varint(out, value);
+}
+
+/// Packed sint64, delta-coded as `DenseNodes` and way refs are.
+fn packed_deltas(values: &[i64]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut prev = 0;
+    for &v in values {
+        put_varint(&mut out, zigzag(v - prev));
+        prev = v;
+    }
+    out
+}
+
+/// `PrimitiveGroup` field numbers.
+const G_NODE: u64 = 1;
+const G_DENSE: u64 = 2;
+const G_WAY: u64 = 3;
+
+fn dense(ids: &[i64]) -> (u64, Vec<u8>) {
+    let coords: Vec<i64> = ids.iter().map(|id| id * 1_000).collect();
+    let mut body = Vec::new();
+    if !ids.is_empty() {
+        put_len(&mut body, 1, &packed_deltas(ids));
+        put_len(&mut body, 8, &packed_deltas(&coords));
+        put_len(&mut body, 9, &packed_deltas(&coords));
+    }
+    (G_DENSE, body)
+}
+
+fn plain_node(id: i64) -> (u64, Vec<u8>) {
+    let mut body = Vec::new();
+    put_uint(&mut body, 1, zigzag(id));
+    put_uint(&mut body, 8, zigzag(id * 1_000));
+    put_uint(&mut body, 9, zigzag(id * 1_000));
+    (G_NODE, body)
+}
+
+fn way(id: i64, refs: &[i64]) -> (u64, Vec<u8>) {
+    let mut body = Vec::new();
+    put_uint(&mut body, 1, id.cast_unsigned());
+    put_len(&mut body, 8, &packed_deltas(refs));
+    (G_WAY, body)
+}
+
+/// One `PrimitiveGroup` holding these element fields, in this order.
+fn group(fields: &[(u64, Vec<u8>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (field, body) in fields {
+        put_len(&mut out, *field, body);
+    }
+    out
+}
+
+/// A `PrimitiveBlock` with a one-entry string table and these groups.
+fn block(groups: &[Vec<u8>]) -> Vec<u8> {
+    let mut table = Vec::new();
+    put_len(&mut table, 1, b"");
+    let mut out = Vec::new();
+    put_len(&mut out, 1, &table);
+    for g in groups {
+        put_len(&mut out, 2, g);
+    }
+    out
+}
+
+/// A sorted PBF whose data blobs are `blocks`, none carrying indexdata.
+fn write_unindexed_blocks(path: &Path, blocks: &[Vec<u8>]) {
+    use pbfhogg::writer::{Compression, PbfWriter};
+    let file = File::create(path).unwrap();
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    let header = pbfhogg::block_builder::HeaderBuilder::new()
+        .sorted()
+        .build()
+        .unwrap();
+    writer.write_header(&header).unwrap();
+    for b in blocks {
+        writer.write_primitive_block_no_indexdata(b).unwrap();
+    }
+    writer.flush().unwrap();
+}
+
+/// Every shape a forced run meets: an indexable block the diff rewrites, one
+/// it leaves alone (reframed), a node block whose one group carries both
+/// `DenseNodes` and a plain node (one kind, no single index: re-encoded, with
+/// a create interleaved), an empty block (omitted), and a way block whose
+/// group opens with an empty `DenseNodes` (a way blob that `block_type()`
+/// would call nodes).
+#[test]
+fn forced_run_over_an_unindexed_base_writes_a_wholly_indexed_file() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_unindexed_blocks(
+        &base,
+        &[
+            block(&[group(&[dense(&[1, 2, 3, 4])])]),
+            block(&[group(&[dense(&[5, 7]), plain_node(9)])]),
+            block(&[]),
+            block(&[group(&[way(100, &[1, 2])])]),
+            block(&[group(&[dense(&[]), way(101, &[3, 4])])]),
+            block(&[group(&[way(102, &[5, 7])])]),
+        ],
+    );
+    crate::common::assert_non_indexed(&base);
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="2" lat="2.0" lon="2.0" version="2"/>
+    <way id="102" version="2"><nd ref="7"/><nd ref="9"/></way>
+  </modify>
+  <create>
+    <node id="8" lat="8.0" lon="8.0" version="1"/>
+    <node id="10" lat="10.0" lon="10.0" version="1"/>
+    <way id="103" version="1"><nd ref="1"/><nd ref="9"/></way>
+  </create>
+</osmChange>"#,
+    );
+
+    run_apply_simple(&base, &osc, &output);
+
+    crate::common::assert_every_data_blob_indexed(&output);
+    let check = CliInvoker::new()
+        .arg("check")
+        .arg(&output)
+        .arg("--index")
+        .run();
+    assert_eq!(
+        check.status.code(),
+        Some(0),
+        "check --index must accept the forced output; stdout:\n{}\nstderr:\n{}",
+        check.stdout_str(),
+        check.stderr_str()
+    );
+    crate::common::assert_sorted_file(&output);
+
+    let c = read_all_elements(&output);
+    assert_eq!(
+        c.nodes.iter().map(|n| n.0).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5, 7, 8, 9, 10]
+    );
+    assert_eq!(
+        c.ways.iter().map(|w| w.0).collect::<Vec<_>>(),
+        vec![100, 101, 102, 103]
+    );
+}
+
+/// A blob whose elements span two kinds cannot be placed in type order by a
+/// drain that places each blob by one kind, so a forced run refuses it,
+/// even after earlier blobs have been written, and publishes nothing.
+#[test]
+fn forced_run_refuses_a_blob_that_mixes_kinds_and_publishes_nothing() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_unindexed_blocks(
+        &base,
+        &[
+            block(&[group(&[dense(&[1, 2])])]),
+            block(&[group(&[dense(&[3])]), group(&[way(100, &[1, 2])])]),
+            block(&[group(&[way(101, &[2, 3])])]),
+        ],
+    );
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="99" lat="9.0" lon="9.0" version="1"/>
+  </create>
+</osmChange>"#,
+    );
+
+    let refused = |extra: &[&str]| {
+        let out = CliInvoker::new()
+            .arg("apply-changes")
+            .arg(&base)
+            .arg(&osc)
+            .arg("-o")
+            .arg(&output)
+            .arg("--force")
+            .args(extra.iter().copied())
+            .run();
+        let stderr = out.stderr_str();
+        assert_eq!(out.status.code(), Some(2), "stderr:\n{stderr}");
+        assert!(
+            stderr.contains("mixes node and way elements"),
+            "stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("each blob holds one kind of element"),
+            "stderr:\n{stderr}"
+        );
+    };
+
+    refused(&[]);
+    assert!(!output.exists(), "a refused run published an output");
+
+    std::fs::write(&output, b"keep").unwrap();
+    refused(&["--overwrite"]);
+    assert_eq!(std::fs::read(&output).unwrap(), b"keep");
+}
+
+// ---------------------------------------------------------------------------
 // jobs parity: output is independent of worker count.
 // ---------------------------------------------------------------------------
 

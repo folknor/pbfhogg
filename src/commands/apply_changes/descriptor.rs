@@ -73,14 +73,16 @@ pub(super) struct BlobDescriptor {
     pub blob_offset: usize,
     /// Size of the Blob protobuf payload in bytes.
     pub data_size: usize,
-    /// Element kind from indexdata (or inferred post-decompress under
-    /// `--force`).
+    /// Element kind from indexdata. A placeholder `Node` on an unindexed
+    /// blob (`--force`), which the worker replaces from the decompressed
+    /// payload.
     pub kind: ElementKind,
-    /// Inclusive `(min_id, max_id)` from indexdata. `None` under
-    /// `--force` / unindexed inputs; workers fill it in after scan.
+    /// Inclusive `(min_id, max_id)` from indexdata. `None` on an unindexed
+    /// blob until the worker derives it from the payload.
     pub id_range: Option<(i64, i64)>,
-    /// Parsed indexdata, if the blob carried any. `None` under
-    /// `--force` / unindexed inputs.
+    /// The indexdata the input blob carries, if any. `None` on an unindexed
+    /// blob (`--force`); only a descriptor with one may become a
+    /// [`DrainItem::CopyRange`], since that copies the input header as-is.
     pub index: Option<BlobIndex>,
     /// Raw tagdata bytes from BlobHeader field 4, if present.
     /// Forwarded byte-for-byte to the output writer on passthrough.
@@ -156,13 +158,35 @@ pub(super) enum DrainItem {
         id_range: (i64, i64),
         stats: super::stats::MergeStats,
     },
+    /// An unindexed input blob (`--force`) whose payload holds no element.
+    /// No index can describe it, so it is left out of the output rather
+    /// than copied unindexed, as plain `cat` does. It still holds its seq
+    /// so the reorder buffer advances, but it has no kind: it must not
+    /// move the drain's type transitions, gap creates or order watermark.
+    Omitted { seq: u64 },
 }
 
 impl BlobDescriptor {
     /// Convert this descriptor into a [`DrainItem::CopyRange`] for the
     /// scanner's fast-path. Returns `None` when the descriptor lacks
     /// indexdata (only indexed blobs can take the splice fast-path).
-    pub(super) fn into_drain_copy_range(self) -> Option<DrainItem> {
+    pub(super) fn into_drain_copy_range(mut self) -> Option<DrainItem> {
+        self.take_copy_range()
+    }
+
+    /// Convert an indexed descriptor into a [`DrainItem::CopyRange`]: the
+    /// drain splices the raw frame via `copy_file_range`, header included,
+    /// and credits the index's `count` to the run's statistics.
+    ///
+    /// `None` when the descriptor carries no indexdata. Copying such a frame
+    /// would put an unindexed blob in the output beside the indexed ones the
+    /// rewrites produce, a partially indexed file every schedule walk
+    /// refuses; the worker reframes it with an index derived from the
+    /// payload instead.
+    ///
+    /// Moves the tagdata into the item, retaining the descriptor for error
+    /// diagnostics without cloning its allocation.
+    pub(super) fn take_copy_range(&mut self) -> Option<DrainItem> {
         let index = self.index?;
         let id_range = self.id_range.unwrap_or((index.min_id, index.max_id));
         Some(DrainItem::CopyRange {
@@ -172,42 +196,8 @@ impl BlobDescriptor {
             kind: self.kind,
             id_range,
             index,
-            tagdata: self.tagdata,
-        })
-    }
-
-    /// Convert a false-positive descriptor into a [`DrainItem::CopyRange`]
-    /// for the unified drain stream. The drain splices the raw frame
-    /// via `copy_file_range`; the descriptor's index/tagdata carry the
-    /// frame boundaries forward.
-    ///
-    /// `fallback_count` is used only when the descriptor has no
-    /// indexdata (non-indexed blob under `--force`) - the worker
-    /// supplies the element count walked from the already-parsed
-    /// block so the drain can credit `base_<kind>` correctly (merge
-    /// stats parity). For indexed blobs this value is ignored in
-    /// favour of `index.count`.
-    ///
-    /// Moves the tagdata into the item, retaining the descriptor for error
-    /// diagnostics without cloning its allocation.
-    pub(super) fn take_drain_item(&mut self, fallback_count: u64) -> DrainItem {
-        let id_range = self.id_range.unwrap_or((0, 0));
-        let index = self.index.unwrap_or(BlobIndex {
-            kind: self.kind,
-            min_id: id_range.0,
-            max_id: id_range.1,
-            count: fallback_count,
-            bbox: None,
-        });
-        DrainItem::CopyRange {
-            seq: self.seq,
-            frame_start: self.frame_start,
-            frame_len: self.frame_len,
-            kind: self.kind,
-            id_range,
-            index,
             tagdata: self.tagdata.take(),
-        }
+        })
     }
 }
 
@@ -217,28 +207,21 @@ impl DrainItem {
         match self {
             DrainItem::CopyRange { seq, .. }
             | DrainItem::OwnedBytes { seq, .. }
-            | DrainItem::Rewritten { seq, .. } => *seq,
+            | DrainItem::Rewritten { seq, .. }
+            | DrainItem::Omitted { seq } => *seq,
         }
     }
 
-    /// The element kind of this blob - drain uses this for type-transition
-    /// detection (Node → Way → Relation boundaries drive flushes of
-    /// pending upserts).
-    pub(super) fn kind(&self) -> ElementKind {
+    /// Where this blob sits in the output's type and ID order: its element
+    /// kind (Node → Way → Relation boundaries drive flushes of pending
+    /// upserts) and its OSM ID range (gap creates before it, the order
+    /// watermark). `None` for [`DrainItem::Omitted`], which writes nothing.
+    pub(super) fn placement(&self) -> Option<(ElementKind, (i64, i64))> {
         match self {
-            DrainItem::CopyRange { kind, .. }
-            | DrainItem::OwnedBytes { kind, .. }
-            | DrainItem::Rewritten { kind, .. } => *kind,
-        }
-    }
-
-    /// The blob's OSM ID range - drain uses this for gap-create decisions
-    /// (emit upserts with `id < min_id` before this blob).
-    pub(super) fn id_range(&self) -> (i64, i64) {
-        match self {
-            DrainItem::CopyRange { id_range, .. }
-            | DrainItem::OwnedBytes { id_range, .. }
-            | DrainItem::Rewritten { id_range, .. } => *id_range,
+            DrainItem::CopyRange { kind, id_range, .. }
+            | DrainItem::OwnedBytes { kind, id_range, .. }
+            | DrainItem::Rewritten { kind, id_range, .. } => Some((*kind, *id_range)),
+            DrainItem::Omitted { .. } => None,
         }
     }
 
@@ -257,6 +240,7 @@ impl DrainItem {
             DrainItem::Rewritten { framed_chunks, .. } => {
                 DESCRIPTOR_OVERHEAD + framed_chunks.iter().map(Vec::len).sum::<usize>()
             }
+            DrainItem::Omitted { .. } => DESCRIPTOR_OVERHEAD,
         }
     }
 }

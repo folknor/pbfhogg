@@ -68,8 +68,10 @@ impl UnindexedFilterNote {
     }
 }
 
-type DecodedPayload = Option<crate::error::Result<PrimitiveBlock>>;
-type DecodedItem = (usize, DecodedPayload, Option<Permit>);
+/// One decode slot's result as it crosses to the consumer: `None` delivers
+/// nothing (a skipped or non-data blob), and the permit rides with it until
+/// the consumer has handled it.
+type DecodedItem<T> = (usize, Option<Result<T>>, Option<Permit>);
 
 /// Returns `true` if the blob should be skipped based on the filter.
 ///
@@ -178,21 +180,104 @@ impl Default for PipelineConfig {
     }
 }
 
-fn send_direct_error(tx: &SyncSender<DecodedItem>, seq: usize, e: crate::error::Error) -> bool {
+/// What the engine runs on a decode worker for each blob.
+///
+/// [`apply`](Self::apply) is called for every blob the reader yields after
+/// the leading header, concurrently and in unspecified order (the consumer
+/// still sees the results in file order), except a data blob the blob filter
+/// skips, which never reaches it. It runs inside the engine's
+/// `catch_unwind`, and an error it returns is located at the blob by the
+/// engine.
+///
+/// The plain pipelined surfaces run [`Blocks`], which hands the decoded
+/// block itself to the consumer; full-scan commands run their per-block
+/// work here instead, so only the compact result crosses to the ordered
+/// consumer (ADR-0009).
+pub(crate) trait DecodeTransform: Sync {
+    type Out: Send;
+
+    /// Whether the reader parses each blob header's indexdata, so
+    /// [`crate::blob::Blob::index`] answers in `apply`. With no blob filter
+    /// set, the engine skips parsing it otherwise.
+    const PARSE_INDEXDATA: bool;
+
+    /// The slot's result: `None` delivers nothing for this blob. `decode`
+    /// decodes the blob as a data block (on the worker's reused scratch) and
+    /// may be called only for an `OsmData` blob.
+    fn apply<D>(&self, blob: &crate::blob::Blob, decode: D) -> Option<Result<Self::Out>>
+    where
+        D: FnOnce() -> Result<PrimitiveBlock>;
+}
+
+/// The identity transform: data blobs decode and the block itself is
+/// delivered, every other blob is skipped. What the plain pipelined surfaces
+/// (`for_each_block_pipelined`, `into_blocks_pipelined`) run.
+pub(crate) struct Blocks;
+
+impl DecodeTransform for Blocks {
+    type Out = PrimitiveBlock;
+    const PARSE_INDEXDATA: bool = false;
+
+    #[inline]
+    fn apply<D>(&self, blob: &crate::blob::Blob, decode: D) -> Option<Result<PrimitiveBlock>>
+    where
+        D: FnOnce() -> Result<PrimitiveBlock>,
+    {
+        if blob.get_type() != BlobType::OsmData {
+            return None;
+        }
+        Some(decode())
+    }
+}
+
+/// The block-only command transform: data blobs decode and go through the
+/// closure, every other blob is skipped. What
+/// `ElementReader::for_each_fused_block` runs.
+pub(crate) struct BlockOnly<X>(pub(crate) X);
+
+impl<T, X> DecodeTransform for BlockOnly<X>
+where
+    T: Send,
+    X: Fn(PrimitiveBlock) -> Result<T> + Sync,
+{
+    type Out = T;
+    const PARSE_INDEXDATA: bool = false;
+
+    #[inline]
+    fn apply<D>(&self, blob: &crate::blob::Blob, decode: D) -> Option<Result<T>>
+    where
+        D: FnOnce() -> Result<PrimitiveBlock>,
+    {
+        if blob.get_type() != BlobType::OsmData {
+            return None;
+        }
+        Some(decode().and_then(&self.0))
+    }
+}
+
+/// Forwards a reader error as a sequenced item. The wait is recorded whether
+/// or not the send succeeds, like every other timed send in the engine.
+fn send_direct_error<T>(
+    tx: &SyncSender<DecodedItem<T>>,
+    seq: usize,
+    e: crate::error::Error,
+) -> bool {
     let t_send = crate::counters::Stopwatch::start();
     let sent = tx.send((seq, Some(Err(e)), None)).is_ok();
     t_send.record_ns(&PIPELINE_METRICS.decoded_send_wait_ns);
     sent
 }
 
-struct DecodeTask<'scope> {
+struct DecodeTask<'scope, X: DecodeTransform> {
     seq: usize,
     blob: crate::blob::Blob,
-    tx: SyncSender<DecodedItem>,
+    tx: SyncSender<DecodedItem<X::Out>>,
     buffer_pool: Arc<DecompressPool>,
     blob_filter: Option<Arc<BlobFilter>>,
     permit: Permit,
     shutdown: Arc<AtomicBool>,
+    /// The run's transform, borrowed from the caller for the whole scope.
+    transform: &'scope X,
     /// The path of the reader the blob came from, borrowed from the
     /// dispatcher (captured once per pipeline, no per-blob refcounting) so a
     /// decode failure can be located with the blob's true provenance.
@@ -202,7 +287,10 @@ struct DecodeTask<'scope> {
     faults: &'scope crate::test_hooks::FaultPlan,
 }
 
-fn spawn_decode_task<'scope>(scope: &rayon::Scope<'scope>, task: DecodeTask<'scope>) {
+fn spawn_decode_task<'scope, X: DecodeTransform>(
+    scope: &rayon::Scope<'scope>,
+    task: DecodeTask<'scope, X>,
+) {
     let DecodeTask {
         seq,
         blob,
@@ -211,13 +299,14 @@ fn spawn_decode_task<'scope>(scope: &rayon::Scope<'scope>, task: DecodeTask<'sco
         blob_filter,
         permit,
         shutdown,
+        transform,
         source,
         #[cfg(feature = "test-hooks")]
         faults,
     } = task;
     scope.spawn(move |_| {
-        // Thread-local scratch buffers for parse_and_inline. Avoids allocating
-        // fresh Vec<(u32, u32)> per blob.
+        // Thread-local scratch buffers for parse_and_inline. Rayon keeps them
+        // with its worker, avoiding a fresh pair of Vec<(u32, u32)> per blob.
         thread_local! {
             static ST_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
             static GR_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
@@ -228,33 +317,32 @@ fn spawn_decode_task<'scope>(scope: &rayon::Scope<'scope>, task: DecodeTask<'sco
             // spawn, which has no panic handler and would abort the process.
             #[cfg(feature = "test-hooks")]
             faults.maybe_block_decode(seq);
-            match blob.get_type() {
-                BlobType::OsmData => {
-                    if let Some(ref filter) = blob_filter
-                        && should_skip_blob(filter, &blob)
-                    {
-                        PIPELINE_METRICS
-                            .blobs_skipped_by_filter
-                            .fetch_add(1, Relaxed);
-                        return None;
-                    }
-                    ST_SCRATCH.with_borrow_mut(|st| {
-                        GR_SCRATCH.with_borrow_mut(|gr| {
-                            let result =
-                                blob.to_primitiveblock_inline_with_scratch(&buffer_pool, st, gr);
-                            // Per-thread scratch retention is the iter-5 residual
-                            // alloc bucket. Record current capacity in (u32, u32)
-                            // pairs * 8 bytes for the global peak.
-                            PIPELINE_METRICS.record_scratch_capacity(
-                                st.capacity().saturating_mul(8),
-                                gr.capacity().saturating_mul(8),
-                            );
-                            Some(result)
-                        })
-                    })
-                }
-                _ => None,
+            if blob.get_type() == BlobType::OsmData
+                && let Some(filter) = blob_filter.as_ref()
+                && should_skip_blob(filter, &blob)
+            {
+                PIPELINE_METRICS
+                    .blobs_skipped_by_filter
+                    .fetch_add(1, Relaxed);
+                return None;
             }
+            let decode = || {
+                ST_SCRATCH.with_borrow_mut(|st| {
+                    GR_SCRATCH.with_borrow_mut(|gr| {
+                        let block =
+                            blob.to_primitiveblock_inline_with_scratch(&buffer_pool, st, gr);
+                        // Per-thread scratch retention is the iter-5 residual
+                        // alloc bucket. Record current capacity in (u32, u32)
+                        // pairs * 8 bytes for the global peak.
+                        PIPELINE_METRICS.record_scratch_capacity(
+                            st.capacity().saturating_mul(8),
+                            gr.capacity().saturating_mul(8),
+                        );
+                        block
+                    })
+                })
+            };
+            transform.apply(&blob, decode)
         }));
         let item = match item {
             Ok(item) => item,
@@ -276,19 +364,19 @@ fn spawn_decode_task<'scope>(scope: &rayon::Scope<'scope>, task: DecodeTask<'sco
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn drain_decoded<F>(
-    decoded_rx: Receiver<DecodedItem>,
+fn drain_decoded<T, F>(
+    decoded_rx: Receiver<DecodedItem<T>>,
     decode_ahead: usize,
     cancel: &crate::host::Cancel,
-    block_fn: &mut F,
+    consume: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(PrimitiveBlock) -> Result<()>,
+    F: FnMut(T) -> Result<()>,
 {
     // Cancellation is checked here, on the consumer, before each wait and on
     // each arrival (a gap in the reorder buffer can hold back every pop, so a
     // pop-only check could starve), and returns through the same early exit
-    // as a `block_fn` error. Stage 1's reader also stops on the token and
+    // as a `consume` error. Stage 1's reader also stops on the token and
     // delivers `Cancelled` as a sequenced error item; this check only makes
     // the stop independent of how many decoded items are queued ahead of it.
     // Normal completion: the dispatcher drops its sender after raw EOF, task
@@ -297,7 +385,7 @@ where
     // Early exit: returning from this helper drops `decoded_rx` before scoped
     // threads join. Blocked senders then fail, set shutdown, release permits,
     // wake the dispatcher, and let stage 1 stop at the raw channel.
-    let mut pending: ReorderBuffer<(DecodedPayload, Option<Permit>)> =
+    let mut pending: ReorderBuffer<(Option<Result<T>>, Option<Permit>)> =
         ReorderBuffer::with_capacity(decode_ahead);
 
     loop {
@@ -317,8 +405,8 @@ where
 
         while let Some((item, permit)) = pending.pop_ready() {
             match item {
-                Some(Ok(block)) => {
-                    let result = block_fn(block);
+                Some(Ok(item)) => {
+                    let result = consume(item);
                     drop(permit);
                     result?;
                 }
@@ -333,11 +421,16 @@ where
 /// Runs a three-stage pipeline over a PBF file:
 ///
 /// 1. **Reader thread**: sequential I/O, reads raw `Blob`s from the file.
-/// 2. **Rayon pool**: parallel decompression (zlib) + protobuf parse.
-/// 3. **Main thread**: reorder buffer delivers `PrimitiveBlock`s in file order to `block_fn`.
+/// 2. **Rayon pool**: parallel decompression (zlib) + protobuf parse, then
+///    the [`DecodeTransform`] on the same worker.
+/// 3. **Main thread**: reorder buffer delivers the transform's results in
+///    file order to `consume`.
 ///
-/// The closure runs on the calling thread and may hold mutable state.
-/// PBF ordering (nodes → ways → relations) is preserved.
+/// This is the one ordered read engine: the plain pipelined surfaces run it
+/// with [`Blocks`] (the decoded block itself is the result), full-scan
+/// commands with their own transform. `consume` runs on the calling thread
+/// and may hold mutable state. PBF ordering (nodes → ways → relations) is
+/// preserved.
 ///
 /// # Memory: decoded-block working set
 ///
@@ -356,31 +449,42 @@ where
 /// decode tasks are admitted but not yet delivered from the reorder buffer.
 /// The permit rides with decoded items through the channel and any reorder
 /// slot, so completion skew cannot grow decoded-block memory with file size.
-/// Backpressure from a slow consumer propagates through the decoded channel
-/// to the admission gate, then to the raw channel and stage 1.
-#[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::too_many_lines)]
+/// The bound counts items, not bytes: a transform whose output is larger
+/// than its input block (add-locations-to-ways' decode-all fallback) holds
+/// up to `decode_ahead` of its outputs, which the admission window does not
+/// size. Backpressure from a slow consumer propagates through the decoded
+/// channel to the admission gate, then to the raw channel and stage 1.
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
 #[hotpath::measure]
-pub(crate) fn run_pipeline<R, F>(
+pub(crate) fn run_pipeline<R, X, F>(
     mut blob_reader: BlobReader<R>,
     decode_thread_count: Option<usize>,
     pipeline_config: PipelineConfig,
     blob_filter: Option<BlobFilter>,
     resources: Option<crate::host::ResourcesHandle>,
     diagnostics: crate::host::Diagnostics,
-    mut block_fn: F,
+    transform: X,
+    mut consume: F,
 ) -> Result<()>
 where
     R: Read + Send,
-    F: FnMut(PrimitiveBlock) -> Result<()>,
+    X: DecodeTransform,
+    F: FnMut(X::Out) -> Result<()>,
 {
+    // Borrowed by every decode task for the whole scope.
+    let transform = &transform;
     // Enable tagdata parsing only when the filter needs tag key matching.
-    // Enable indexdata parsing only when any filter is active (should_skip_blob
-    // checks blob.index() for type + spatial filtering).
+    // Enable indexdata parsing when any filter is active (should_skip_blob
+    // checks blob.index() for type + spatial filtering) or the transform
+    // reads it.
     let mut unindexed = UnindexedFilterNote::new(blob_filter.as_ref());
     let has_tag_filter = blob_filter.as_ref().is_some_and(BlobFilter::has_tag_filter);
     blob_reader.set_parse_tagdata(has_tag_filter);
-    blob_reader.set_parse_indexdata(blob_filter.is_some());
+    blob_reader.set_parse_indexdata(blob_filter.is_some() || X::PARSE_INDEXDATA);
     let blob_filter = blob_filter.map(Arc::new);
     let source = blob_reader.source().cloned();
     let cancel = blob_reader.cancel_token().clone();
@@ -389,7 +493,8 @@ where
     #[cfg(feature = "test-hooks")]
     let faults = cancel.faults();
     let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead.get());
-    let (decoded_tx, decoded_rx) = sync_channel::<DecodedItem>(pipeline_config.decode_ahead.get());
+    let (decoded_tx, decoded_rx) =
+        sync_channel::<DecodedItem<X::Out>>(pipeline_config.decode_ahead.get());
 
     let result = std::thread::scope(|scope| {
         // Stage 1: Sequential I/O reader thread
@@ -413,7 +518,7 @@ where
         //
         // Thread count rationale:
         //   The pipeline occupies 2 threads beyond this pool: the Stage 1 I/O reader
-        //   thread and the Stage 3 main/consumer thread (which runs `block_fn`).
+        //   thread and the Stage 3 main/consumer thread (which runs `consume`).
         //   We subtract those 2 from the available hardware parallelism so the total
         //   thread count stays close to the physical core count, avoiding excessive
         //   context switching. The minimum is clamped to 1 to handle tiny VMs / CI.
@@ -493,6 +598,7 @@ where
                                     blob_filter: blob_filter.clone(),
                                     permit,
                                     shutdown: Arc::clone(&shutdown),
+                                    transform,
                                     source,
                                     #[cfg(feature = "test-hooks")]
                                     faults,
@@ -517,7 +623,7 @@ where
             decoded_rx,
             pipeline_config.decode_ahead.get(),
             &cancel,
-            &mut block_fn,
+            &mut consume,
         )
     });
     // After the scope has joined every stage, on every returning path (a
@@ -529,273 +635,6 @@ where
     // after dispatch.
     PIPELINE_METRICS.emit();
     result
-}
-
-// ---------------------------------------------------------------------------
-// Fusion section: ordered decode-worker transforms for full-scan commands.
-// ---------------------------------------------------------------------------
-
-/// What the fused engine runs on a decode worker for each blob.
-///
-/// [`apply`](Self::apply) is called for every blob the reader yields after
-/// the leading header, concurrently and in unspecified order (the consumer
-/// still sees the results in file order), except a data blob the blob filter skips,
-/// which never reaches it. It runs inside the engine's `catch_unwind`, and an
-/// error it returns is located at the blob by the engine.
-pub(crate) trait FusedTransform: Sync {
-    type Out: Send;
-
-    /// Whether the reader parses each blob header's indexdata, so
-    /// [`crate::blob::Blob::index`] answers in `apply`. With no blob filter
-    /// set, the engine skips parsing it otherwise.
-    const PARSE_INDEXDATA: bool;
-
-    /// The slot's result: `None` delivers nothing for this blob. `decode`
-    /// decodes the blob as a data block (on the worker's reused scratch) and
-    /// may be called only for an `OsmData` blob.
-    fn apply<D>(&self, blob: &crate::blob::Blob, decode: D) -> Option<Result<Self::Out>>
-    where
-        D: FnOnce() -> Result<PrimitiveBlock>;
-}
-
-/// The block-only transform: data blobs decode and go through the closure,
-/// every other blob is skipped. What `ElementReader::for_each_fused_block`
-/// runs.
-pub(crate) struct BlockOnly<X>(pub(crate) X);
-
-impl<T, X> FusedTransform for BlockOnly<X>
-where
-    T: Send,
-    X: Fn(PrimitiveBlock) -> Result<T> + Sync,
-{
-    type Out = T;
-    const PARSE_INDEXDATA: bool = false;
-
-    #[inline]
-    fn apply<D>(&self, blob: &crate::blob::Blob, decode: D) -> Option<Result<T>>
-    where
-        D: FnOnce() -> Result<PrimitiveBlock>,
-    {
-        if blob.get_type() != BlobType::OsmData {
-            return None;
-        }
-        Some(decode().and_then(&self.0))
-    }
-}
-
-/// Fused sibling of `run_pipeline`. Keep this additive: the plain engine
-/// continues to serve non-transform consumers with a different read shape.
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::too_many_lines,
-    clippy::too_many_arguments
-)]
-#[hotpath::measure]
-pub(crate) fn run_pipeline_fused<R, X, F>(
-    mut blob_reader: BlobReader<R>,
-    decode_thread_count: Option<usize>,
-    pipeline_config: PipelineConfig,
-    blob_filter: Option<BlobFilter>,
-    resources: Option<crate::host::ResourcesHandle>,
-    diagnostics: crate::host::Diagnostics,
-    transform: X,
-    mut consume: F,
-) -> Result<()>
-where
-    R: Read + Send,
-    X: FusedTransform,
-    F: FnMut(X::Out) -> Result<()>,
-{
-    // Borrowed by every decode task.
-    let transform = &transform;
-    let mut unindexed = UnindexedFilterNote::new(blob_filter.as_ref());
-    let has_tag_filter = blob_filter.as_ref().is_some_and(BlobFilter::has_tag_filter);
-    blob_reader.set_parse_tagdata(has_tag_filter);
-    blob_reader.set_parse_indexdata(blob_filter.is_some() || X::PARSE_INDEXDATA);
-    let blob_filter = blob_filter.map(Arc::new);
-    let source = blob_reader.source().cloned();
-    let cancel = blob_reader.cancel_token().clone();
-    let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead.get());
-    type FusedPayload<T> = Option<crate::error::Result<T>>;
-    let (decoded_tx, decoded_rx) = sync_channel::<(usize, FusedPayload<X::Out>, Option<Permit>)>(
-        pipeline_config.decode_ahead.get(),
-    );
-
-    let result = std::thread::scope(|scope| {
-        scope.spawn(move || {
-            for (seq, blob_result) in blob_reader.enumerate() {
-                unindexed.observe(&blob_result, &diagnostics);
-                let start = crate::counters::Stopwatch::start();
-                let send_result = raw_tx.send((seq, blob_result));
-                start.record_ns(&PIPELINE_METRICS.raw_send_wait_ns);
-                if send_result.is_err() {
-                    break;
-                }
-            }
-        });
-
-        let dispatch_tx = decoded_tx.clone();
-        scope.spawn(move || {
-            let threads = decode_thread_count.unwrap_or_else(|| {
-                crate::host::sized_workers(resources.as_ref().map_or(&crate::host::MachineProbe as &dyn crate::host::Resources, |r| &*r.0), DECODE_WORKERS_RESERVED, DECODE_WORKERS_MIN, DECODE_WORKERS_FALLBACK)
-            });
-            let pool = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
-                Ok(pool) => pool,
-                Err(e) => {
-                    let error = crate::error::Error::pool_build("decode pool", e);
-                    // Seq 0 is correct here for the same reason as in the
-                    // block-oriented variant above: the pool is built before
-                    // the loop over `raw_rx`, so no item has been dispatched
-                    // and 0 is the reorder buffer's first legitimate push.
-                    drop(dispatch_tx.send((0, Some(Err(error)), None)));
-                    return;
-                }
-            };
-            let buffer_pool = DecompressPool::new();
-            let gate = Arc::new(AdmissionGate::new(pipeline_config.decode_ahead));
-            let shutdown = Arc::new(AtomicBool::new(false));
-            // Tasks borrow the reader's path from this scope: one capture per
-            // pipeline, no refcounting per blob.
-            let source = source.as_ref();
-            pool.in_place_scope(|task_scope| {
-                for (seq, blob_result) in raw_rx {
-                    if shutdown.load(Relaxed) {
-                        break;
-                    }
-                    match blob_result {
-                        Ok(blob) => {
-                            let start = crate::counters::Stopwatch::start();
-                            let blocked = gate.acquire();
-                            start.record_ns(&PIPELINE_METRICS.decode_admit_wait_ns);
-                            if blocked {
-                                PIPELINE_METRICS.decode_admit_blocked.fetch_add(1, Relaxed);
-                            }
-                            let permit = Permit(Arc::clone(&gate));
-                            let tx = dispatch_tx.clone();
-                            let pool = Arc::clone(&buffer_pool);
-                            let filter = blob_filter.clone();
-                            let shutdown = Arc::clone(&shutdown);
-                            PIPELINE_METRICS.decode_tasks.fetch_add(1, Relaxed);
-                            task_scope.spawn(move |_| {
-                                // Rayon keeps these thread-local buffers with its worker,
-                                // avoiding a fresh pair of Vec allocations per blob task.
-                                thread_local! {
-                                    static ST_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
-                                    static GR_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
-                                }
-                                let item =
-                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        if blob.get_type() == BlobType::OsmData
-                                            && let Some(filter) = filter.as_ref()
-                                            && should_skip_blob(filter, &blob)
-                                        {
-                                            PIPELINE_METRICS
-                                                .blobs_skipped_by_filter
-                                                .fetch_add(1, Relaxed);
-                                            return None;
-                                        }
-                                        let decode = || {
-                                            ST_SCRATCH.with_borrow_mut(|st| {
-                                                GR_SCRATCH.with_borrow_mut(|gr| {
-                                                    let block = blob
-                                                        .to_primitiveblock_inline_with_scratch(
-                                                            &pool, st, gr,
-                                                        );
-                                                    PIPELINE_METRICS.record_scratch_capacity(
-                                                        st.capacity().saturating_mul(8),
-                                                        gr.capacity().saturating_mul(8),
-                                                    );
-                                                    block
-                                                })
-                                            })
-                                        };
-                                        transform.apply(&blob, decode)
-                                    }));
-                                let item = match item {
-                                    Ok(item) => item,
-                                    Err(payload) => Some(Err(crate::error::panic_error(
-                                        "decode task",
-                                        payload.as_ref(),
-                                    ))),
-                                };
-                                // Cold: only a failure pays for the location.
-                                // `seq` is a pipeline ordering key, never a
-                                // location.
-                                let item =
-                                    item.map(|r| r.map_err(|e| blob.locate_error(source, e)));
-                                let start = crate::counters::Stopwatch::start();
-                                if tx.send((seq, item, Some(permit))).is_err() {
-                                    shutdown.store(true, Relaxed);
-                                }
-                                start.record_ns(&PIPELINE_METRICS.decoded_send_wait_ns);
-                            });
-                        }
-                        Err(error) => {
-                            let start = crate::counters::Stopwatch::start();
-                            if dispatch_tx
-                                .send((seq, Some(Err(error)), None))
-                                .is_err()
-                            {
-                                break;
-                            }
-                            start.record_ns(&PIPELINE_METRICS.decoded_send_wait_ns);
-                        }
-                    }
-                }
-            });
-        });
-        drop(decoded_tx);
-        drain_fused(
-            decoded_rx,
-            pipeline_config.decode_ahead.get(),
-            &cancel,
-            &mut consume,
-        )
-    });
-    // After the join, as in `run_pipeline`.
-    PIPELINE_METRICS.emit();
-    result
-}
-
-#[allow(clippy::needless_pass_by_value, clippy::type_complexity)]
-fn drain_fused<T, F>(
-    decoded_rx: Receiver<(usize, Option<crate::error::Result<T>>, Option<Permit>)>,
-    decode_ahead: usize,
-    cancel: &crate::host::Cancel,
-    consume: &mut F,
-) -> Result<()>
-where
-    F: FnMut(T) -> Result<()>,
-{
-    // Cancellation checks as in `drain_decoded`.
-    let mut pending = ReorderBuffer::with_capacity(decode_ahead);
-    loop {
-        cancel.check()?;
-        let start = crate::counters::Stopwatch::start();
-        let next = decoded_rx.recv();
-        start.record_ns(&PIPELINE_METRICS.decoded_recv_wait_ns);
-        let (seq, item, permit) = match next {
-            Ok(item) => item,
-            Err(_) => break,
-        };
-        cancel.check()?;
-        pending.push(seq, (item, permit));
-        PIPELINE_METRICS.record_reorder_levels(pending.filled_len(), pending.pending_len());
-        #[cfg(feature = "test-hooks")]
-        cancel.faults().record_reorder_filled(pending.filled_len());
-        while let Some((item, permit)) = pending.pop_ready() {
-            match item {
-                Some(Ok(item)) => {
-                    let result = consume(item);
-                    drop(permit);
-                    result?;
-                }
-                Some(Err(error)) => return Err(error),
-                None => drop(permit),
-            }
-        }
-    }
-    cancel.check()
 }
 
 #[cfg(test)]

@@ -1,11 +1,14 @@
 # Pipelined reader paths
 
 Reference for every current caller of the ordered pipelined reader
-surfaces on `ElementReader` (`src/read/pipeline.rs`): the plain
+surfaces on `ElementReader`: the plain
 `into_blocks_pipelined` / `for_each_block_pipelined` / `for_each_pipelined`
-(engine `run_pipeline`) and the fused `for_each_fused_block`
-(engine `run_pipeline_fused`). Workload profile, decode shape, and the
-rule for adding or converting callers.
+and the fused `for_each_fused_block` / `for_each_fused_blob`. Both are
+one engine, `run_pipeline` in `src/read/pipeline.rs`, generic over the
+`DecodeTransform` that runs on the decode worker: the plain surfaces
+pass the identity transform `Blocks`, the fused ones a command's
+transform. Workload profile, decode shape, and the rule for adding or
+converting callers.
 
 ## Background
 

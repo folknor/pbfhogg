@@ -70,7 +70,6 @@ goes on "Review once drained" as a bisect candidate, named by commit.
 
 Launch order, one agent per line, run serially:
 
-31. HYG-010
 32. HYG-012
 33. HYG-013
 34. HYG-014
@@ -923,6 +922,19 @@ The judgement calls already known, to be checked first:
   count as one value and decode as none. Still one byte scan, but the
   former's loop body grew from one compare to a position counter; a
   construction-time cost on every read path, not measured.
+- The ordered read engine is one `run_pipeline` generic over a
+  `DecodeTransform`; `run_pipeline_fused` and `drain_fused` are gone, and
+  the plain surfaces (`for_each_block_pipelined`, `into_blocks_pipelined`,
+  and through them the `read` bench, time-filter history and geocode pass 1)
+  pass the identity transform `Blocks`. Same channels, depths, threads,
+  admission and drop order; argued codegen-equivalent under
+  monomorphization, not measured. Behaviour that did move: a reader-error
+  item's `decoded_send_wait_ns` is now recorded on failed sends in the
+  command-transform runs too, the test-hooks decode gate now parks command
+  transforms as well (it matches `seq`, not a pass), and hotpath attributes
+  the command runs to `run_pipeline` instead of `run_pipeline_fused`.
+  Sparred with codex, which confirmed the equivalence point by point but
+  held "identical codegen" as plausible, not established.
 
 ---
 
@@ -950,25 +962,6 @@ defaulted from `src/tunables.rs`, passed in rather than read as constants,
 documented in `reference/`.
 
 Reported by: all nine scopes.
-
-## HYG-010 - The read engine's ordered pipeline exists twice and has drifted
-
-Anger: 10 - unifies the read engine and the blob pools; the batched-pipeline rebuild was already measured and reverted.
-
-`read/pipeline.rs` has `run_pipeline` (admission gate, permit riding with the
-item, shutdown flag, panic capture, reorder buffer, metrics) and
-`run_pipeline_fused`, a near-verbatim copy the comment says to "keep
-additive". Drift: the error-forwarding branch records `decoded_send_wait_ns` in
-`send_direct_error` even on failure, the fused copy only on success; the plain
-engine spawns with `ThreadPool::spawn`, the fused one with `in_place_scope`
-(different lifetime and drain semantics); the `raw_rx` drop-ordering comment
-exists in one copy. The plain engine is the fused one with `transform = Ok`.
-The fused transform signature `Fn(PrimitiveBlock) -> Result<T, String>` also
-blocks typed errors (HYG-021). Fix: one engine generic over the transform,
-frame source and work item, so the command-level pools of HYG-011 can use it
-too; afterwards make `ReorderBuffer` private to the engine module.
-
-Reported by: read path.
 
 ## HYG-011 - The pread-decompress-dispatch-reorder pool is hand-built about fifteen times
 
@@ -1037,6 +1030,16 @@ router payloads), which also merges the two `reframe_way_blob_with_locations`
 (same name, different signatures). Enforce by dependency rule:
 `std::thread::scope`, `sync_channel` and `Arc::new(Mutex::new(` allowed only in
 the pipeline module.
+
+The ordered read engine (`read/pipeline.rs::run_pipeline`) is already one
+engine generic over its decode-worker transform; what it is not generic over
+is the frame source (it takes a sequential `BlobReader`, these pools pread a
+schedule) and the work item (one blob, where altw stages 2 and 3 dispatch
+buckets). Making it so is this entry's work, not a read-engine change, and
+so is making `ReorderBuffer` private to the pipeline module: the three
+writer paths (`write/pipeline.rs`, `parallel_writer.rs`, `uring_writer.rs`)
+use it as well as these pools, so the writer side would need its own answer
+first.
 
 Maintainer (2026-10-25): skipped for now. A unified pool has been considered
 twice before and judged not worth doing once every implementation was

@@ -294,6 +294,7 @@ impl<R: Read + Send> ElementReader<R> {
             self.blob_filter,
             self.resources,
             self.diagnostics,
+            super::pipeline::Blocks,
             f,
         )
     }
@@ -314,13 +315,13 @@ impl<R: Read + Send> ElementReader<R> {
     /// after the leading header, not only the decoded data blocks: its kind,
     /// indexdata and provenance, for a consumer that checks the envelope in
     /// the same pass that decodes it. See
-    /// [`FusedTransform`](super::pipeline::FusedTransform).
+    /// [`DecodeTransform`](super::pipeline::DecodeTransform).
     pub(crate) fn for_each_fused_blob<X, F>(self, transform: X, consume: F) -> Result<()>
     where
-        X: super::pipeline::FusedTransform,
+        X: super::pipeline::DecodeTransform,
         F: FnMut(X::Out) -> Result<()>,
     {
-        super::pipeline::run_pipeline_fused(
+        super::pipeline::run_pipeline(
             self.blob_iter,
             self.decode_threads,
             self.pipeline_config,
@@ -378,6 +379,7 @@ impl<R: Read + Send> ElementReader<R> {
                 blob_filter,
                 resources,
                 diagnostics,
+                super::pipeline::Blocks,
                 deliver,
             );
             if let Err(e) = result {

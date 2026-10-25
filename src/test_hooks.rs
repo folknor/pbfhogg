@@ -58,11 +58,11 @@ const HOOK_WAIT: Duration = Duration::from_secs(10);
 /// Fields are public atomics: a test stores to arm and loads to observe.
 /// Each group names the code it reaches.
 pub struct FaultPlan {
-    // --- read pipeline (`read::pipeline`, block engine) ---
+    // --- read pipeline (`read::pipeline::run_pipeline`) ---
     decode_gate: Mutex<DecodeGate>,
     decode_gate_cv: Condvar,
     /// Highest number of filled reorder slots any pipelined read under this
-    /// token has held (both the block and the fused engine record it).
+    /// token has held (plain block reads and command transforms alike).
     pub reorder_filled_high_water: AtomicUsize,
 
     // --- multi-extract (`commands::extract::multi`) ---
@@ -346,9 +346,16 @@ impl FaultPlan {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Park the block engine's decode task for `seq` until
+    /// Park the pipelined read's decode task for `seq` until
     /// [`release_blocked_decode`](Self::release_blocked_decode). Arm before
     /// the read starts; once released, the gate stays open.
+    ///
+    /// The gate matches `seq` alone, not a pass: every pipelined read under
+    /// this token parks at that `seq` until release, whether it delivers
+    /// plain blocks or runs a command transform (digest, getid, getparents,
+    /// tags-filter, the add-locations-to-ways fallback). In a command that
+    /// reads more than once, the first pipelined pass that dispatches the
+    /// armed `seq` parks, whichever pass the test meant to target.
     pub fn arm_block_decode(&self, seq: usize) {
         let mut g = self.gate();
         g.armed_seq = Some(seq);

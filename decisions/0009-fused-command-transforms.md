@@ -27,6 +27,9 @@ tags-filter by 6.97%; getid primary's pass-2 peak RSS fell from 1.18 GB to
 - Retain command-side 64-block batches with a byte budget: the materialization
   and second dispatch are the removed cost; `PBFHOGG_CMD_BATCH_BYTES` regressed
   getid-8k by 3.49% and has no remaining consumer.
-- Move all read users onto one generic fused engine: plain pipelined consumers
-  have different needs, so that broader unification remains separate from the
-  command-transform policy.
+- Move all read users onto one generic fused engine: kept out of this
+  decision, which is about where command transforms run. Later done as an
+  internal refactor: plain pipelined consumers turned out to need nothing the
+  transform engine lacks (an identity transform delivers the decoded block),
+  so `run_pipeline` is now the one ordered engine and the plain and fused
+  surfaces' calls into it differ only in the transform they pass.

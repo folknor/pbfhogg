@@ -1,5 +1,4 @@
-//! Sidecar counters for the 3-stage pipelined PBF reader (`run_pipeline`
-//! and `run_pipeline_fused`).
+//! Sidecar counters for the 3-stage pipelined PBF reader (`run_pipeline`).
 //!
 //! # Process totals, re-emitted at the end of every pipelined read
 //!
@@ -111,7 +110,7 @@ impl PipelineMetrics {
     }
 
     /// Emit the process totals so far (see the module docs), after every
-    /// `run_pipeline` / `run_pipeline_fused` has joined its stages.
+    /// `run_pipeline` has joined its stages.
     pub fn emit(&self) {
         self.emit_all();
     }

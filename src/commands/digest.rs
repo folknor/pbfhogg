@@ -71,7 +71,7 @@ use crate::content::write_record;
 use crate::error::{Error, Location};
 use crate::read::header_walker::{PartialIndexGuard, partial_index_error};
 use crate::read::input::InputSource;
-use crate::read::pipeline::FusedTransform;
+use crate::read::pipeline::DecodeTransform;
 use crate::{BlockType, ByteOffset, Element, ElementKind, ElementReader, PrimitiveBlock};
 
 use super::Result;
@@ -167,7 +167,7 @@ fn digest_inner(
 /// provenance, which the ordered consumer checks.
 struct DigestTransform;
 
-impl FusedTransform for DigestTransform {
+impl DecodeTransform for DigestTransform {
     type Out = BlockSummary;
     const PARSE_INDEXDATA: bool = true;
 

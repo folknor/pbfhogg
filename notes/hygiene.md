@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-15. HYG-162
 16. HYG-163
 17. HYG-034
 18. HYG-164
@@ -843,23 +842,6 @@ as the only loop with an `on_idle()` hook; a source-scan test that only
 
 Reported by: write path.
 
-## HYG-162 - The OSC arena's metadata layout is a hand sum
-
-Anger: 8 - apply-changes, per OSC element.
-
-Split out of the geocode record-codec entry. `compact.rs` writes metadata field by field in
-`arena_append_meta` and `read_meta` reads back at hand-written offsets
-`+1, +5, +13, +21, +25`; `META_LEN = 29` is a hand sum; `NODE_META_OFF = 20`
-and `WAY_META_OFF = 16` repeat the record header layout.
-
-Recommendation (2026-10-25): constants only. Derive `META_LEN` and the
-offsets from per-field width constants, with `const` asserts, so a layout
-change is one edit and a mismatch fails to compile. Encode and decode logic
-stay as written: zero runtime change on a measured path. Moving onto a
-record trait can wait until rule 8 lifts.
-
-Reported by: change application.
-
 ## HYG-163 - altw external's records have no shared codec
 
 Anger: 8 - altw external stage 3, per entry.
@@ -868,7 +850,7 @@ Split out of the geocode record-codec entry. `IdRecord::read_from` and `Resolved
 have no shared codec, and stage 3 decodes `ResolvedEntry` by slicing
 `chunk[0..4]`, `[4..8]`, `[8..12]`.
 
-Recommendation (2026-10-25): constants only, as HYG-162: record sizes and
+Recommendation (2026-10-25): constants only, as done for the OSC arena metadata layout in `osc/compact.rs` (per-field width constants, derived offsets, `const` asserts): record sizes and
 field offsets derived from width constants with `const` asserts, logic
 unchanged.
 

@@ -105,8 +105,24 @@ impl ArenaMeta {
     }
 }
 
+/// Width in bytes of each field of the metadata block, in write order.
+const W_FLAGS: usize = 1;
+const W_VERSION: usize = size_of::<i32>();
+const W_TIMESTAMP: usize = size_of::<i64>();
+const W_CHANGESET: usize = size_of::<i64>();
+const W_UID: usize = size_of::<i32>();
+const W_USER_ID: usize = size_of::<u32>();
+
+/// Field offsets inside the metadata block, derived from the widths above.
+const M_VERSION: usize = W_FLAGS;
+const M_TIMESTAMP: usize = M_VERSION + W_VERSION;
+const M_CHANGESET: usize = M_TIMESTAMP + W_TIMESTAMP;
+const M_UID: usize = M_CHANGESET + W_CHANGESET;
+const M_USER_ID: usize = M_UID + W_UID;
+
 /// Metadata block size in bytes.
-pub(super) const META_LEN: usize = 29;
+pub(super) const META_LEN: usize = M_USER_ID + W_USER_ID;
+const _: () = assert!(META_LEN == 29);
 /// Set when the source element carried at least one metadata attribute.
 pub(super) const META_FLAG_PRESENT: u8 = 1;
 /// Set when the source element carried `visible="false"`.
@@ -122,11 +138,14 @@ pub(super) const META_FLAG_HAS_USER: u8 = 4;
 pub(super) const META_FLAG_HAS_VERSION: u8 = 8;
 
 /// Byte offset of the metadata block inside a node record.
-pub(super) const NODE_META_OFF: usize = 20;
+/// Header: `id:i64, lat:i32, lon:i32, tag_count:u32`.
+pub(super) const NODE_META_OFF: usize = 8 + 4 + 4 + 4;
 /// Byte offset of the metadata block inside a way record.
-pub(super) const WAY_META_OFF: usize = 16;
+/// Header: `id:i64, ref_count:u32, tag_count:u32`.
+pub(super) const WAY_META_OFF: usize = 8 + 4 + 4;
 /// Byte offset of the metadata block inside a relation record.
-pub(super) const RELATION_META_OFF: usize = 16;
+/// Header: `id:i64, member_count:u32, tag_count:u32`.
+pub(super) const RELATION_META_OFF: usize = 8 + 4 + 4;
 
 /// Read the version an arena record claims, or `None` when the source
 /// element carried no `version` attribute.
@@ -135,7 +154,7 @@ pub(super) fn version_at(data: &[u8], record_offset: usize, meta_off: usize) -> 
     if flags & META_FLAG_HAS_VERSION == 0 {
         return None;
     }
-    Some(read_i32_le(data, record_offset + meta_off + 1))
+    Some(read_i32_le(data, record_offset + meta_off + M_VERSION))
 }
 
 fn arena_append_meta(arena: &mut Vec<u8>, meta: &ArenaMeta) {
@@ -159,12 +178,12 @@ fn read_meta<'a>(
         return None;
     }
     Some(crate::write::block_builder::Metadata {
-        version: read_i32_le(data, offset + 1),
-        timestamp: read_i64_le(data, offset + 5),
-        changeset: read_i64_le(data, offset + 13),
-        uid: read_i32_le(data, offset + 21),
+        version: read_i32_le(data, offset + M_VERSION),
+        timestamp: read_i64_le(data, offset + M_TIMESTAMP),
+        changeset: read_i64_le(data, offset + M_CHANGESET),
+        uid: read_i32_le(data, offset + M_UID),
         user: if flags & META_FLAG_HAS_USER != 0 {
-            interner.resolve(read_u32_le(data, offset + 25))
+            interner.resolve(read_u32_le(data, offset + M_USER_ID))
         } else {
             ""
         },

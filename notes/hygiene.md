@@ -57,8 +57,7 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-23. HYG-179, then HYG-183 to HYG-189, one per line, in ID
-    order
+23. HYG-183 to HYG-189, one per line, in ID order
 24. HYG-047
 25. HYG-158
 26. HYG-159
@@ -1427,8 +1426,7 @@ Reported by: the HYG-150 implementation.
 
 ## Adopting `PinnedInput`, one command per entry
 
-Not a finding: the shared brief for HYG-179 and HYG-183 to
-HYG-189. Each of those commands opens its input more than once per run (a
+Not a finding: the shared brief for HYG-183 to HYG-189. Each of those commands opens its input more than once per run (a
 precondition probe, a header reader, a schedule walk, worker and splice
 descriptors), each open resolving the path again, so a file renamed over
 the input mid-run is read partly from each file. The API that fixes it
@@ -1463,10 +1461,10 @@ path went. What each entry owes, settled in a codex spar on 2026-10-25:
   has the rule), which a multi-input command can reuse; diff settled on one
   pin too, through `read::input::pin_sources`, the same rule for entry
   points that take `InputSource`s (a caller's pin is used as it is, never
-  shared with a path). `walk_pair`, `StreamingBlocks::new_sequential` and
-  `sorted_and_indexed`, which derive shares with diff, already take
-  `impl Into<InputSource>`, so derive's entry can hand them its pins (its
-  sequential block-pair `BlobReader::open_in` calls too). cat also asks the
+  shared with a path); derive-changes reuses diff's `pin_pair`, and
+  `tests/fault_derive_input.rs` shows the owned-output variant of the
+  refusal (nothing published, an existing destination left as it was).
+  cat also asks the
   host for the descriptors its pins hold (`admit_descriptors` in
   `commands/cat/mod.rs`), since its input count is unbounded; a command
   with a fixed small number of inputs has no such need. Where the CLI
@@ -1505,20 +1503,6 @@ export, check refs, check index (one open each). inspect's index-only scan
 and its full-decode fallback each read the whole report from one open, but
 the full decode takes its file size from a separate path `stat`, which
 HYG-187 covers.
-
-## HYG-179 - derive-changes reopens its inputs by path
-
-Anger: 8 - derive on a hot path.
-
-See "Adopting `PinnedInput`" above. Checked 2026-10-25: as in diff, the
-shard workers do not reopen (they keep the walker's shared file,
-`diff/shard.rs`), but each input is opened by the `sorted_and_indexed`
-front read (`diff/derive.rs`) and again by the parallel walk or the
-sequential readers. diff's adoption (`diff/mod.rs`, `pin_pair`) and
-`tests/fault_diff_input.rs` are the closest precedent. Recommendation
-(2026-10-25): follow the brief, for both inputs.
-
-Reported by: the 2026-10-25 triage.
 
 ## HYG-183 - tags-count reopens its input by path
 

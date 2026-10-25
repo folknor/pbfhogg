@@ -252,8 +252,8 @@ pub fn diff_stats<'a, 'b>(
 
 /// Pin both inputs, `old` first, before either is read: a path spelled
 /// exactly as the other shares its pin, a caller's pin is used as it is
-/// (see `read::input::pin_sources`).
-fn pin_pair(
+/// (see `read::input::pin_sources`). Shared by the text diff and derive.
+pub(super) fn pin_pair(
     old: InputSource<'_>,
     new: InputSource<'_>,
     host: &crate::host::Host,

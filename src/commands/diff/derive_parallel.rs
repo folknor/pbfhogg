@@ -479,10 +479,13 @@ fn emit_delete<W: Write>(
 /// Returns `Ok(None)`, having written nothing, when either input holds a
 /// negative ID: the caller must run the sequential path instead (see
 /// `shard`'s correctness contract).
+///
+/// Each input is opened once here, from its pin, by the header walk; the
+/// walker's descriptor is the one the shard workers pread.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn derive_changes_parallel(
-    old_path: &Path,
-    new_path: &Path,
+    old_input: &crate::read::input::PinnedInput,
+    new_input: &crate::read::input::PinnedInput,
     output: &crate::output::Output,
     scratch: &crate::scratch::RunScratch,
     shard_count: usize,
@@ -490,7 +493,7 @@ pub(crate) fn derive_changes_parallel(
     timestamp: Option<u64>,
     host: &crate::host::Host,
 ) -> Result<Option<DeriveChangesStats>> {
-    let Some((old, new)) = walk_pair(old_path, new_path, host)? else {
+    let Some((old, new)) = walk_pair(old_input, new_input, host)? else {
         crate::host::diag!(
             host.diagnostics,
             Note,

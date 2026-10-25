@@ -523,6 +523,9 @@ same path (the two may name different files on purpose). With a fixed two
 inputs, `diff` asks the host for no descriptors. A run refused at a later
 open (`InputReplaced`) may already have written text to the caller's
 writer; the CLI publishes a named output only after the run succeeds.
+`derive_changes` (`diff --format osc`) pins its pair through the same
+rule, after its output-name refusal; it owns its `Output` and writes it
+only after every input open, so a refused run publishes nothing.
 
 ## Read-path internals (both consumers)
 

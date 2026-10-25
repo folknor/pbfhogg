@@ -20,6 +20,7 @@ use crate::osc::merge_join::{
     stream_merge_phase,
 };
 use crate::osc::write::{OwnedMetadata, write_element_xml};
+use crate::read::input::{InputSource, PinnedInput};
 
 // ---------------------------------------------------------------------------
 // Stats
@@ -63,10 +64,20 @@ impl DeriveChangesStats {
 ///
 /// Requires both inputs to declare `Sort.Type_then_ID` - returns an
 /// actionable error if either is unsorted.
+///
+/// Every route opens each input more than once, so both must be regular
+/// files or block devices (`InvalidArgument` otherwise) and are pinned for
+/// the run once the output name is accepted, `old` first, before either is
+/// read (see [`PinnedInput`] and [`InputSource::pin`]). A path spelled
+/// exactly as the other shares its pin, so deriving a file against itself
+/// yields no changes; a caller may pin either input first and pass the pin,
+/// which is used as it is. Where a later open cannot reach the pinned file,
+/// an input replaced mid-run fails with `InputReplaced` and nothing is
+/// published.
 #[allow(clippy::too_many_arguments)]
-pub fn derive_changes(
-    old_path: &Path,
-    new_path: &Path,
+pub fn derive_changes<'a, 'b>(
+    old: impl Into<InputSource<'a>>,
+    new: impl Into<InputSource<'b>>,
     output: crate::output::Output,
     direct_io: bool,
     increment_version: bool,
@@ -77,8 +88,8 @@ pub fn derive_changes(
 ) -> Result<DeriveChangesStats> {
     host.cancel.check()?;
     let result = derive_changes_to(
-        old_path,
-        new_path,
+        old.into(),
+        new.into(),
         &output,
         direct_io,
         increment_version,
@@ -92,12 +103,14 @@ pub fn derive_changes(
     Ok(result)
 }
 
-/// [`derive_changes`] writing to a borrowed output it does not publish.
+/// [`derive_changes`] writing to a borrowed output it does not publish. The
+/// inputs are pinned here, after the output-name refusal and before either
+/// is read; every open below is derived from a pin.
 #[allow(clippy::too_many_arguments)]
 #[hotpath::measure]
 pub(crate) fn derive_changes_to(
-    old_path: &Path,
-    new_path: &Path,
+    old: InputSource<'_>,
+    new: InputSource<'_>,
     output: &crate::output::Output,
     direct_io: bool,
     increment_version: bool,
@@ -106,12 +119,15 @@ pub(crate) fn derive_changes_to(
     host: &crate::host::Host,
     scratch: &crate::scratch::RunScratch,
 ) -> Result<DeriveChangesStats> {
+    host.cancel.check()?;
     // The name rule every OSC producer shares, applied before any work.
     crate::osc::output_is_gzip(output.destination())?;
     let jobs = super::resolve_shards(parallelism, host);
+    let [old, new] = super::pin_pair(old, new, host)?;
+    let (old_path, new_path) = (old.path(), new.path());
     // Sorted headers + indexdata from one front read of each input.
-    let (old_sorted, old_indexed) = sorted_and_indexed(old_path, direct_io, host)?;
-    let (new_sorted, new_indexed) = sorted_and_indexed(new_path, direct_io, host)?;
+    let (old_sorted, old_indexed) = sorted_and_indexed(&old, direct_io, host)?;
+    let (new_sorted, new_indexed) = sorted_and_indexed(&new, direct_io, host)?;
     crate::commands::require_sorted(
         old_sorted,
         old_path,
@@ -152,8 +168,8 @@ pub(crate) fn derive_changes_to(
     // sequential sink path otherwise.
     let parallel_stats = if both_indexed && jobs > 1 {
         super::derive_parallel::derive_changes_parallel(
-            old_path,
-            new_path,
+            &old,
+            &new,
             output,
             scratch,
             jobs,
@@ -176,9 +192,9 @@ pub(crate) fn derive_changes_to(
 
     let result = (|| -> Result<DeriveChangesStats> {
         if both_indexed {
-            derive_changes_block_pair(old_path, new_path, direct_io, &mut sink, host)?;
+            derive_changes_block_pair(&old, &new, direct_io, &mut sink, host)?;
         } else {
-            derive_changes_element_stream(old_path, new_path, direct_io, &mut sink, host)?;
+            derive_changes_element_stream(&old, &new, direct_io, &mut sink, host)?;
         }
         sink.flush()?;
 
@@ -364,15 +380,15 @@ pub(super) fn extract_delete_info(
 /// written to temp files immediately, then dropped.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn derive_changes_block_pair(
-    old_path: &Path,
-    new_path: &Path,
+    old: &PinnedInput,
+    new: &PinnedInput,
     direct_io: bool,
     sink: &mut ChangeSink,
     host: &crate::host::Host,
 ) -> Result<()> {
-    let mut old_reader = crate::blob::BlobReader::open_in(old_path, direct_io, host)?;
+    let mut old_reader = crate::blob::BlobReader::open_in(old, direct_io, host)?;
     old_reader.set_parse_indexdata(true);
-    let mut new_reader = crate::blob::BlobReader::open_in(new_path, direct_io, host)?;
+    let mut new_reader = crate::blob::BlobReader::open_in(new, direct_io, host)?;
     new_reader.set_parse_indexdata(true);
 
     let mut merge = BlockPairMergeState::new(old_reader, new_reader);
@@ -408,16 +424,16 @@ fn collect_phase_block_pair(
 /// through the same [`ChangeSink::record`] as the block-pair path.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn derive_changes_element_stream(
-    old_path: &Path,
-    new_path: &Path,
+    old: &PinnedInput,
+    new: &PinnedInput,
     direct_io: bool,
     sink: &mut ChangeSink,
     host: &crate::host::Host,
 ) -> Result<()> {
     let pool = crate::osc::merge_join::merge_buffers();
     let mut old_src =
-        StreamingBlocks::new_sequential(old_path, direct_io, std::sync::Arc::clone(&pool), host)?;
-    let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io, pool, host)?;
+        StreamingBlocks::new_sequential(old, direct_io, std::sync::Arc::clone(&pool), host)?;
+    let mut new_src = StreamingBlocks::new_sequential(new, direct_io, pool, host)?;
 
     let phases = [
         (

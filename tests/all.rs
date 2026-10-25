@@ -50,6 +50,8 @@ mod fault_altw_input;
 mod fault_altw_stage3;
 mod fault_apply_changes;
 #[cfg(feature = "test-hooks")]
+mod fault_cat_input;
+#[cfg(feature = "test-hooks")]
 mod fault_derive_parallel;
 #[cfg(feature = "test-hooks")]
 mod fault_diff_parallel;

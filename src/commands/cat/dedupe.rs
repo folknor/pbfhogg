@@ -18,6 +18,7 @@ use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::Element;
 use crate::ElementKind;
@@ -40,6 +41,7 @@ use crate::owned::{
     OwnedNode, OwnedRelation, OwnedWay, read_dense_node, read_node, read_relation, read_way,
     write_single_node, write_single_relation, write_single_way,
 };
+use crate::read::input::{InputSource, PinnedInput};
 use crate::read::raw_frame::frame_location;
 
 /// Statistics from a multi-PBF merge operation.
@@ -151,6 +153,12 @@ impl HasId for OwnedRelation {
 /// non-overlapping blobs; overlapping blobs are decoded, merged, and deduped
 /// via a streaming sweep. A blob that overlaps no other is never decoded, so
 /// duplicates inside it survive.
+///
+/// Every input is pinned before any is read, as in [`cat`](super::cat), so
+/// each is read from the file the run started on. Pass 2 holds one source
+/// per argument, so the run asks the host for one descriptor per argument
+/// (`ProcessActions::fd_allowance`) and is refused up front when allowed
+/// fewer.
 pub fn merge_pbf(
     inputs: &[&Path],
     output: crate::output::Output,
@@ -181,7 +189,9 @@ pub(crate) fn merge_pbf_to(
 /// travel with the entries, so an entry's `file_index` can only ever be
 /// resolved against the list it was indexed from.
 struct MergePlan {
-    inputs: Vec<std::path::PathBuf>,
+    /// One pin per argument, in argument order (a repeated argument shares
+    /// its pin), consumed by pass 2's [`open_sources`].
+    inputs: Vec<PinnedInput>,
     headers: Vec<crate::HeaderBlock>,
     /// Every OSMData blob of every input, in (type, first ID) order.
     entries: Vec<BlobEntry>,
@@ -201,10 +211,23 @@ fn plan_merge(
         return Err(Error::invalid_argument("no input files specified"));
     }
 
+    // Every input is opened three times (the indexdata probe, pass 1's
+    // index walk, pass 2's source), so every input is pinned up front. The
+    // pins are held until pass 2 has opened its sources, one per argument
+    // and held for the whole of pass 2, so the run asks for one descriptor
+    // per argument.
+    super::admit_descriptors(
+        inputs.len(),
+        inputs.len(),
+        crate::read::input::distinct_inputs(inputs),
+        host,
+    )?;
+    let pins = crate::read::input::pin_inputs(inputs, host)?;
+
     // Validate inputs have indexdata
-    for input in inputs {
+    for input in &pins {
         require_indexdata(
-            *input,
+            input,
             opts.direct_reads,
             opts.force,
             "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
@@ -221,7 +244,7 @@ fn plan_merge(
         "cat.dedupe.pass1",
         "Pass 1: indexing blobs..."
     );
-    let (headers, mut entries) = build_blob_index(inputs, opts.direct_reads, host)?;
+    let (headers, mut entries) = build_blob_index(&pins, opts.direct_reads, host)?;
     crate::host::diag!(
         host.diagnostics,
         Progress,
@@ -252,7 +275,7 @@ fn plan_merge(
     }
 
     Ok(MergePlan {
-        inputs: inputs.iter().map(|p| p.to_path_buf()).collect(),
+        inputs: pins,
         headers,
         entries,
         overlaps,
@@ -308,7 +331,7 @@ fn write_merge(
     let mut writer =
         writer_from_header_bytes(output, opts.compression, &header.bytes, opts.backend, host)?;
 
-    let mut files = open_sources(&inputs)?;
+    let mut files = open_sources(inputs)?;
 
     let mut stats = MergePbfStats {
         nodes: 0,
@@ -388,7 +411,7 @@ fn write_merge(
 /// whatever it declares (history, a bbox, enrichment) would otherwise be
 /// silently left out of the reconciled output header.
 fn build_blob_index(
-    inputs: &[&Path],
+    inputs: &[PinnedInput],
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<(Vec<crate::HeaderBlock>, Vec<BlobEntry>)> {
@@ -422,7 +445,7 @@ struct IndexScratch {
 /// its header. See [`build_blob_index`] for the header rules.
 fn index_input(
     file_idx: usize,
-    input: &Path,
+    pin: &PinnedInput,
     direct_io: bool,
     host: &crate::host::Host,
     scratch: &mut IndexScratch,
@@ -433,7 +456,8 @@ fn index_input(
         header_buf,
         blob_buf,
     } = scratch;
-    let mut reader = FileReader::open(input, direct_io)?;
+    let input = pin.path();
+    let mut reader = FileReader::open(pin, direct_io)?;
     let mut file_offset: u64 = 0;
     let mut header: Option<crate::HeaderBlock> = None;
 
@@ -588,32 +612,38 @@ fn detect_overlaps(entries: &[BlobEntry]) -> Vec<bool> {
 // ---------------------------------------------------------------------------
 
 /// One input of the second pass: its open file and the path it came from.
-struct Source<'a> {
+struct Source {
     file: File,
-    path: &'a Path,
+    path: Arc<Path>,
 }
 
-/// Open every input for pass 2's random access, each with its path so a
-/// failed read or decode in this pass names the file.
-fn open_sources(inputs: &[std::path::PathBuf]) -> Result<Vec<Source<'_>>> {
-    inputs
-        .iter()
-        .map(|path| {
-            Ok(Source {
-                file: crate::read::input::open(path)?,
-                path: path.as_path(),
-            })
-        })
-        .collect()
+/// Open every input for pass 2's random access, one source per argument
+/// from its pin, each with its path so a failed read or decode in this pass
+/// names the file.
+///
+/// Consumes the pins and drops each as soon as its source is open (a
+/// repeated argument's shared pin goes with its last argument): nothing
+/// opens an input after this, and an open, verified source reads its file
+/// whatever its path names later. So the run holds about one input
+/// descriptor per argument here, not two.
+fn open_sources(inputs: Vec<PinnedInput>) -> Result<Vec<Source>> {
+    let mut sources = Vec::with_capacity(inputs.len());
+    for pin in inputs {
+        sources.push(Source {
+            file: InputSource::from(&pin).open()?,
+            path: pin.shared_path(),
+        });
+    }
+    Ok(sources)
 }
 
-impl Source<'_> {
+impl Source {
     /// Locate a failure on `entry`'s frame in this input. Cold: built only
     /// on the error path.
     #[cold]
     fn locate(&self, entry: &BlobEntry, err: Error) -> Error {
         err.locate_blob(crate::error::Location::at_offset(
-            self.path,
+            &self.path,
             entry.file_offset,
         ))
     }
@@ -621,7 +651,7 @@ impl Source<'_> {
 
 fn write_passthrough_blob(
     entry: &BlobEntry,
-    source: &mut Source<'_>,
+    source: &mut Source,
     writer: &mut PbfWriter<FileWriter>,
     frame_buf: &mut Vec<u8>,
 ) -> Result<()> {
@@ -641,7 +671,7 @@ fn write_passthrough_blob(
     Ok(())
 }
 
-fn read_frame_into(source: &mut Source<'_>, entry: &BlobEntry, buf: &mut Vec<u8>) -> Result<()> {
+fn read_frame_into(source: &mut Source, entry: &BlobEntry, buf: &mut Vec<u8>) -> Result<()> {
     #[allow(clippy::cast_possible_truncation)]
     let len = entry.frame_len as usize;
     buf.clear();
@@ -656,7 +686,7 @@ fn read_frame_into(source: &mut Source<'_>, entry: &BlobEntry, buf: &mut Vec<u8>
 /// Re-read and decode the frame of an overlap-run `entry`, locating a read
 /// or decode failure at its input and frame offset.
 fn read_block(
-    source: &mut Source<'_>,
+    source: &mut Source,
     entry: &BlobEntry,
     buf: &mut Vec<u8>,
 ) -> Result<crate::PrimitiveBlock> {
@@ -701,7 +731,7 @@ fn count_entry(entry: &BlobEntry, stats: &mut MergePbfStats) {
 
 fn write_overlap_run(
     entries: &[BlobEntry],
-    files: &mut [Source<'_>],
+    files: &mut [Source],
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergePbfStats,
@@ -780,7 +810,7 @@ fn write_overlap_run(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn sweep_merge_dedup<T: Ord + HasId>(
     entries: &[BlobEntry],
-    files: &mut [Source<'_>],
+    files: &mut [Source],
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     mut extract: impl FnMut(&Element<'_>, &mut BinaryHeap<Reverse<T>>) -> Result<()>,
@@ -1082,7 +1112,7 @@ mod tests {
         bytes[payload..end].fill(0xff);
         std::fs::write(&b, &bytes).expect("corrupt B");
 
-        let mut sources = open_sources(&plan.inputs).expect("open inputs");
+        let mut sources = open_sources(plan.inputs.clone()).expect("open inputs");
         let err = match read_block(&mut sources[entry.file_index], entry, &mut Vec::new()) {
             Ok(_) => panic!("a corrupt blob must fail pass 2"),
             Err(err) => err,
@@ -1116,7 +1146,7 @@ mod tests {
             .expect("truncate B at the relation frame");
         drop(file);
 
-        let mut sources = open_sources(&plan.inputs).expect("open inputs");
+        let mut sources = open_sources(plan.inputs.clone()).expect("open inputs");
         let err = match read_frame_into(&mut sources[entry.file_index], entry, &mut Vec::new()) {
             Ok(()) => panic!("a missing frame must fail pass 2"),
             Err(err) => err,

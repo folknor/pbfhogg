@@ -20,6 +20,7 @@ use crate::{BlobFilter, Element, ElementKind, PrimitiveBlock};
 use super::output_header::{Declared, OutputFacts, OutputHeader, Ways};
 use super::{Result, flush_local};
 use crate::error::Error;
+use crate::read::input::PinnedInput;
 use crate::read::raw_frame::{frame_location, read_raw_frame};
 use crate::writer::frame_blob_pipelined;
 
@@ -76,6 +77,17 @@ impl CatStats {
 /// raw bytes (zero decode); an unindexed blob is scanned and reframed with
 /// indexdata, and one whose block no single index can describe is
 /// re-encoded into single-kind blocks (see `reencode_unclassifiable`).
+///
+/// Every input is pinned before any is read
+/// ([`PinnedInput`](crate::read::input::PinnedInput)), a path given twice
+/// sharing one pin, so each is read from the file the run started on. The
+/// pins are held for the whole run, one descriptor per distinct input, which
+/// the run first asks the host for (`ProcessActions::fd_allowance`).
+///
+/// # Errors
+/// Besides read, decode and write failures: an input that is not a regular
+/// file or a block device, or a host that allows fewer descriptors than
+/// the run holds, is refused before any input is read.
 pub fn cat(
     files: &[&Path],
     output: crate::output::Output,
@@ -107,6 +119,15 @@ pub(crate) fn cat_to(
         return Err(Error::invalid_argument("no input files specified"));
     }
 
+    // Every input is read at least twice (its header, then its blobs, and
+    // between them an indexdata probe on some routes), with every header
+    // read before any blob, so every input is pinned up front and holds its
+    // pin for the run: one descriptor per distinct input.
+    let distinct = crate::read::input::distinct_inputs(files);
+    admit_descriptors(distinct, files.len(), distinct, host)?;
+    let pins = crate::read::input::pin_inputs(files, host)?;
+    let files = pins.as_slice();
+
     // Selecting every kind while cleaning skips nothing, so it is the clean
     // pass with no type filter: the same output, and no indexdata to want.
     // Without `--clean` an all-kinds filter keeps its own route, where
@@ -121,7 +142,7 @@ pub(crate) fn cat_to(
     if type_filter.is_some() {
         for file in files {
             require_indexdata(
-                *file,
+                file,
                 direct_io,
                 force,
                 "input PBF has no blob-level indexdata. Without indexdata, the type \
@@ -155,6 +176,44 @@ pub(crate) fn cat_to(
     Ok(result)
 }
 
+/// Ask the host for the descriptors a cat run holds: `inputs` (its pins, or
+/// dedupe's pass-2 sources) plus [`CAT_EXTRA_FDS`], and refuse the run up
+/// front when the host allows fewer. `arguments` and `distinct` only name
+/// the demand in the refusal. An admission check, not a reservation: the
+/// built-in providers answer from a snapshot of the open descriptors.
+///
+/// [`CAT_EXTRA_FDS`]: crate::tunables::CAT_EXTRA_FDS
+pub(super) fn admit_descriptors(
+    inputs: usize,
+    arguments: usize,
+    distinct: usize,
+    host: &crate::host::Host,
+) -> Result<()> {
+    let wanted = u64::try_from(inputs)
+        .ok()
+        .and_then(|n| n.checked_add(crate::tunables::CAT_EXTRA_FDS))
+        .ok_or_else(|| {
+            Error::invalid_argument(format!(
+                "{arguments} input files are more than cat can hold"
+            ))
+        })?;
+    let allowance = host.process.fd_allowance(wanted);
+    if allowance.descriptors < wanted {
+        let remedy = if allowance.probe.is_some() {
+            "; raise the open-file limit (ulimit -n), or cat fewer files at a time"
+        } else {
+            "; cat fewer files at a time"
+        };
+        return Err(Error::invalid_argument(format!(
+            "cat holds a file descriptor per input for the whole run: {arguments} input \
+             files ({distinct} distinct) need {wanted} descriptors, but only {} are \
+             allowed ({allowance}){remedy}",
+            allowance.descriptors
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Output header
 // ---------------------------------------------------------------------------
@@ -163,11 +222,12 @@ pub(crate) fn cat_to(
 /// that starts with anything else has none (a later one is refused by the
 /// frame decoder).
 fn read_header(
-    file: &Path,
+    input: &PinnedInput,
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<crate::HeaderBlock> {
-    let mut reader = FileReader::open(file, direct_io)?;
+    let file = input.path();
+    let mut reader = FileReader::open(input, direct_io)?;
     let mut file_offset: u64 = 0;
     match read_raw_frame(&mut reader, &mut file_offset, host, file)? {
         Some(frame) if frame.blob_type == BlobKind::OsmHeader => {
@@ -179,8 +239,8 @@ fn read_header(
 }
 
 /// Read every input's `OSMHeader`, one per input, in input order.
-pub(super) fn read_headers(
-    files: &[&Path],
+fn read_headers(
+    files: &[PinnedInput],
     direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<Vec<crate::HeaderBlock>> {
@@ -199,7 +259,7 @@ pub(super) fn read_headers(
 ///
 /// [`Declared::broken_by_unindexed_way_blob`]: super::output_header::Declared::broken_by_unindexed_way_blob
 fn raw_copy_ways(
-    files: &[&Path],
+    files: &[PinnedInput],
     headers: &[crate::HeaderBlock],
     direct_io: bool,
     unindexed: Ways,
@@ -214,7 +274,7 @@ fn raw_copy_ways(
         return Ok(Ways::BlobsCopied);
     }
     for file in files {
-        if !super::has_indexdata(*file, direct_io, &host.diagnostics)? {
+        if !super::has_indexdata(file, direct_io, &host.diagnostics)? {
             return Ok(unindexed);
         }
     }
@@ -239,7 +299,7 @@ fn cat_output_header(
 // ---------------------------------------------------------------------------
 
 fn cat_passthrough(
-    files: &[&Path],
+    files: &[PinnedInput],
     output: &crate::output::Output,
     write: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -272,8 +332,9 @@ fn cat_passthrough(
     let mut elements_reencoded: u64 = 0;
     let mut decompress_buf: Vec<u8> = Vec::new();
 
-    for file in files {
-        let mut reader = FileReader::open(*file, direct_io)?;
+    for input in files {
+        let file = input.path();
+        let mut reader = FileReader::open(input, direct_io)?;
         let mut file_offset: u64 = 0;
 
         while let Some(mut frame) = read_raw_frame(&mut reader, &mut file_offset, host, file)? {
@@ -602,7 +663,7 @@ fn check_tags<'t>(
 /// decode + re-encode.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn cat_type_passthrough(
-    files: &[&Path],
+    files: &[PinnedInput],
     output: &crate::output::Output,
     tf: TypeFilter,
     write: &WriteOptions,
@@ -640,8 +701,9 @@ fn cat_type_passthrough(
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
     let mut refs_buf: Vec<i64> = Vec::new();
 
-    for file in files {
-        let mut reader = FileReader::open(*file, direct_io)?;
+    for input in files {
+        let file = input.path();
+        let mut reader = FileReader::open(input, direct_io)?;
         let mut file_offset: u64 = 0;
 
         while let Some(mut frame) = read_raw_frame(&mut reader, &mut file_offset, host, file)? {
@@ -839,7 +901,7 @@ use super::clean_metadata;
 /// "Memory: decoded-block working set" doc in `src/read/pipeline.rs`), so
 /// this history no longer describes a live hazard there.
 fn cat_filtered(
-    files: &[&Path],
+    files: &[PinnedInput],
     output: &crate::output::Output,
     tf: TypeFilter,
     clean: &CleanAttrs,
@@ -875,7 +937,7 @@ fn cat_filtered(
         // decoded like the rest, so a partially indexed file is accepted.
         let (schedule, shared_file, _) =
             crate::scan::classify::build_classify_schedule_blob_filtered(
-                *file,
+                file,
                 None,
                 kind_filter.as_ref(),
                 crate::scan::classify::PartialIndex::Accept,

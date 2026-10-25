@@ -48,11 +48,13 @@ fn process_actions_fire_once_at_each_hook_site() {
         &host,
     )
     .expect("cat clean");
+    // cat asks for one descriptor per pinned input before pinning them.
     assert_eq!(
         (actions.alloc.load(Relaxed), actions.fd.load(Relaxed)),
-        (1, 0)
+        (1, 1)
     );
     actions.alloc.store(0, Relaxed);
+    actions.fd.store(0, Relaxed);
     pbfhogg::altw::external::external_join(
         &base,
         crate::common::out(dir.path().join("external.pbf")),
@@ -81,7 +83,7 @@ fn process_actions_fire_once_at_each_hook_site() {
     .expect("cat");
     assert_eq!(
         (actions.alloc.load(Relaxed), actions.fd.load(Relaxed)),
-        (0, 0)
+        (0, 1)
     );
 }
 struct CountingResources(AtomicUsize);

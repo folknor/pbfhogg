@@ -57,7 +57,7 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-23. HYG-176 to HYG-179, then HYG-183 to HYG-189, one per line, in ID
+23. HYG-177 to HYG-179, then HYG-183 to HYG-189, one per line, in ID
     order
 24. HYG-047
 25. HYG-158
@@ -115,6 +115,13 @@ The judgement calls already known, to be checked first:
 - Two public APIs were added (`BlobReader::new_named`, a now-public
   `Blob::locate_error`), and `blob_from_offset` reads after an earlier failed
   read instead of reporting no blob.
+- cat and `cat --dedupe` now call `ProcessActions::fd_allowance` before
+  pinning their inputs and refuse the run when the host allows fewer than
+  the inputs plus a fixed `CAT_EXTRA_FDS` (the CLI raises its soft limit
+  there, as for altw external). A new refusal and a new process-policy
+  call on a measured command, from the pin adoption; unmeasured, though it
+  is one `getrlimit`, one `setrlimit` and one `/proc/self/fd` listing per
+  run.
 - `CliInvoker::child_limits` was deleted with the other unused builders, and
   the docs that cited it reworded.
 - Degrade's sort-preservation guard now also checks `pending`, which was
@@ -1420,7 +1427,7 @@ Reported by: the HYG-150 implementation.
 
 ## Adopting `PinnedInput`, one command per entry
 
-Not a finding: the shared brief for HYG-176 to HYG-179 and HYG-183 to
+Not a finding: the shared brief for HYG-177 to HYG-179 and HYG-183 to
 HYG-189. Each of those commands opens its input more than once per run (a
 precondition probe, a header reader, a schedule walk, worker and splice
 descriptors), each open resolving the path again, so a file renamed over
@@ -1450,8 +1457,14 @@ path went. What each entry owes, settled in a codex spar on 2026-10-25:
   variant), so one run is one pin; independent pins per call do not help.
 - With several inputs, pin each before probing any, secondary ones read in
   a single open included (a FIFO blocks in that open). The same path given
-  twice (`cat a a`, `diff a a`) needs a decision in that command's entry:
-  one pin or two. Where the CLI reads one input before the library call
+  twice (`diff a a`) needs a decision in that command's entry: one pin or
+  two. cat settled it as one pin per exact spelling, through
+  `read::input::pin_inputs` (sparred 2026-10-25; `reference/pipeline.md`
+  has the rule), which a multi-input command can reuse. cat also asks the
+  host for the descriptors its pins hold (`admit_descriptors` in
+  `commands/cat/mod.rs`), since its input count is unbounded; a command
+  with a fixed small number of inputs has no such need. Where the CLI
+  reads one input before the library call
   that reads another (getid's `-I`), the CLI pins and the entry point takes
   an `InputSource` and calls `InputSource::pin`.
 - Test from the fault point: arm `FaultPlan::arm_input_replacement` after
@@ -1484,20 +1497,6 @@ export, check refs, check index (one open each). inspect's index-only scan
 and its full-decode fallback each read the whole report from one open, but
 the full decode takes its file size from a separate path `stat`, which
 HYG-187 covers.
-
-## HYG-176 - cat reopens its input by path per pass
-
-Anger: 7 - one command.
-
-See "Adopting `PinnedInput`" above. Every mode is in scope: even plain cat
-reads each input's header (`read_headers`) before its body reader, and the
-indexdata probe opens it once more; `cat --dedupe` (`cat/dedupe.rs`)
-probes, indexes (`index_input`) and opens its sources again
-(`open_sources`). Many inputs mean one held pin descriptor per input for
-the whole run, where cat used to hold one at a time. Recommendation
-(2026-10-25): follow the brief.
-
-Reported by: the HYG-078 resolution.
 
 ## HYG-177 - build-geocode-index reopens its input by path per pass
 

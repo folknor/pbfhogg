@@ -500,6 +500,19 @@ getid and getparents CLIs pin their input, then their `-I` PBF, before
 reading any ID file. `has_indexdata` opens once and does not pin: handed a
 pin, it probes through it.
 
+`cat`, which takes any number of inputs, pins them all, in argument order,
+before it opens any (`read::input::pin_inputs`). An argument spelled exactly
+as an earlier one shares that argument's pin, so `cat a a` reads one file
+twice rather than two files if `a` is replaced while the pins are taken;
+other spellings of one file are pinned separately. Each argument's opens
+stay its own. Since its input count is unbounded, `cat` first asks the host
+for the descriptors it will hold (`ProcessActions::fd_allowance`) and
+refuses the run up front when allowed fewer: plain `cat` holds its pins,
+one per distinct input, for the whole run; `cat --dedupe` asks for one per
+argument, because its second pass holds a source per argument, opened from
+the pins, each pin dropped as its sources open. Both ask for a fixed
+allowance on top, for the writer and one transient open.
+
 ## Read-path internals (both consumers)
 
 All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.

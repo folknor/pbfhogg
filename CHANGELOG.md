@@ -1158,6 +1158,27 @@
 
 ### Fixed
 
+- **`cat` reads each input file from the file it started on, even if one is
+  replaced mid-run.** Every mode opens each input two to four times (the
+  indexdata check under `--type`, the header read, an indexdata probe when
+  an input declares a way enrichment, then the blob reader or the
+  `--clean` schedule walk; `--dedupe`'s check, index pass and second
+  pass), and each open used to resolve the path again, so an input renamed
+  over during the run was read partly from each file, with no error. Every
+  input is now pinned before any is read, a path given twice sharing one
+  pin: on Linux where `/proc/self/fd` can reopen the pin, a replaced or
+  deleted input does not affect the run; elsewhere on Unix the run fails
+  with `ErrorKind::InputReplaced` and publishes nothing. An input that is
+  a FIFO, socket or character device is now refused up front, before any
+  other input is read. Plain `cat` holds its pins for the run, one
+  descriptor per distinct input (it used to hold one input open at a
+  time), and `--dedupe` one per argument as before, so `cat` now asks its
+  host for them first: the CLI raises its soft
+  open-file limit to the hard limit, and a run the limit cannot hold is
+  refused before it reads anything, naming the counts. Library hosts are
+  asked through `ProcessActions::fd_allowance`, which `cat::cat` and
+  `cat::dedupe::merge_pbf` now call.
+
 - **`renumber` reads one input file even if it is replaced mid-run.**
   Every run opens the input three times (the header read, the one reader
   every rewrite phase shares, and the schedule walk), and each open used

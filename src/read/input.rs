@@ -379,6 +379,12 @@ impl PinnedInput {
         &self.0.path
     }
 
+    /// The pinned input's path, shared, for naming the input after the pin
+    /// itself is gone.
+    pub(crate) fn shared_path(&self) -> Arc<Path> {
+        Arc::clone(&self.0.path)
+    }
+
     /// The pinned file's metadata (on Unix a live `fstat` of the pin; off
     /// Unix a `stat` of the path).
     ///
@@ -501,6 +507,50 @@ fn procfs_reopens(anchor: &File, identity: Identity) -> bool {
 #[cfg(all(unix, not(target_os = "linux")))]
 fn procfs_reopens(_anchor: &File, _identity: Identity) -> bool {
     false
+}
+
+/// Whether a command-line argument repeats an earlier one, for pinning:
+/// the exact spelling, not `Path` equality (which folds separators and `.`
+/// components) and not the file (no canonicalisation, which would resolve
+/// the filesystem again). Two spellings of one file get a pin each.
+fn repeats(earlier: &Path, path: &Path) -> bool {
+    earlier.as_os_str() == path.as_os_str()
+}
+
+/// How many pins [`pin_inputs`] takes for `paths`: one per distinct
+/// spelling.
+pub(crate) fn distinct_inputs(paths: &[&Path]) -> usize {
+    paths
+        .iter()
+        .enumerate()
+        .filter(|&(i, path)| !paths[..i].iter().any(|earlier| repeats(earlier, path)))
+        .count()
+}
+
+/// Pin every input of a command that takes several, in argument order,
+/// before any of them is opened otherwise: one [`PinnedInput`] per argument
+/// position, an argument spelled exactly as an earlier one sharing that
+/// argument's pin. `cat a a` names one file twice, so it reads one file
+/// twice; two pins of one path taken one after the other would pin two
+/// files if the path were replaced between them. Every other open of each
+/// argument stays its own, derived from its pin.
+///
+/// Holds one descriptor per distinct input until the pins are dropped; a
+/// caller that may be handed many inputs asks the host for them first
+/// (`ProcessActions::fd_allowance`).
+///
+/// # Errors
+/// As [`PinnedInput::pin`], for the first argument that fails.
+pub(crate) fn pin_inputs(paths: &[&Path], host: &crate::host::Host) -> Result<Vec<PinnedInput>> {
+    let mut pins: Vec<PinnedInput> = Vec::with_capacity(paths.len());
+    for (i, path) in paths.iter().enumerate() {
+        let pin = match paths[..i].iter().position(|earlier| repeats(earlier, path)) {
+            Some(first) => pins[first].clone(),
+            None => PinnedInput::pin(path, host)?,
+        };
+        pins.push(pin);
+    }
+    Ok(pins)
 }
 
 /// An open input and the path it was opened from, so a failure reading it
@@ -672,6 +722,26 @@ mod pin_tests {
             let flags = unsafe { libc::fcntl(first.as_raw_fd(), libc::F_GETFL) };
             assert!(flags >= 0);
             assert_eq!(flags & libc::O_NONBLOCK, 0);
+        }
+    }
+
+    /// An argument spelled exactly as an earlier one shares its pin; any
+    /// other spelling, even of the same file, gets its own, and the count
+    /// of pins taken agrees with `distinct_inputs`.
+    #[test]
+    fn pin_inputs_shares_a_pin_per_exact_spelling() {
+        let dir = crate::path_guard::tests::scratch();
+        let (input, other) = fixture(dir.path());
+        let dotted = dir.path().join(".").join("in.osm.pbf");
+        assert_eq!(input, dotted, "Path equality folds the `.`");
+        let paths: [&Path; 5] = [&input, &other, &input, &dotted, &other];
+        let pins = super::pin_inputs(&paths, &Host::for_tests()).unwrap();
+        let same = |i: usize, j: usize| std::sync::Arc::ptr_eq(&pins[i].0, &pins[j].0);
+        assert!(same(0, 2) && same(1, 4));
+        assert!(!same(0, 1) && !same(0, 3) && !same(1, 3));
+        assert_eq!(super::distinct_inputs(&paths), 3);
+        for (pin, path) in pins.iter().zip(paths) {
+            assert_eq!(pin.path().as_os_str(), path.as_os_str());
         }
     }
 

@@ -22,11 +22,12 @@ use crate::block_builder::BlockBuilder;
 use crate::error::Error;
 use crate::file_writer::FileWriter;
 use crate::read::header_walker::HeaderWalker;
+use crate::read::input::PinnedInput;
 use crate::read::raw_frame::frame_location;
 use crate::write::WriteOptions;
 use crate::writer::{PbfWriter, reframe_raw_with_index};
 
-use super::{HeaderOverrides, Result, require_indexdata, writer_from_header_bytes};
+use super::{HeaderOverrides, Result, writer_from_header_bytes};
 use crate::block_builder::OwnedBlock;
 use crate::owned::{
     OwnedNode, OwnedRelation, OwnedWay, read_dense_node, read_node, read_relation, read_way,
@@ -119,6 +120,12 @@ struct BlobEntry {
 /// Uses blob-level permutation sort: O(num_blobs) memory. Non-overlapping
 /// blobs are passed through as raw bytes; overlapping blobs are decoded,
 /// sorted, and re-encoded.
+///
+/// The input is read in several passes, so it must be a regular file or a
+/// block device (`InvalidArgument` otherwise), and is pinned for the run
+/// (see [`PinnedInput`](crate::read::input::PinnedInput)): where a later
+/// open cannot reach the pinned file, an input replaced mid-run fails with
+/// `InputReplaced`.
 pub fn sort(
     input: &Path,
     output: crate::output::Output,
@@ -148,14 +155,26 @@ pub(crate) fn sort_to(
         direct_reads: direct_io,
         force,
     } = *opts;
-    let indexed = require_indexdata(
-        input,
-        direct_io,
-        force,
-        "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
-         decompressed to scan element IDs (significantly slower).",
-        host,
-    )?;
+    // Every pass below opens the input again, each through its own open
+    // file description (the front read, pass 1's header walker, pass 2's
+    // source and every overlap-run worker), and each is derived from this
+    // one pin, so a file renamed over the input mid-run cannot be read
+    // partly from each: where `/proc/self/fd` reopens the pin every open
+    // reaches the pinned file, otherwise on Unix a replaced input fails the
+    // run (`PinnedInput` says what it does off Unix). Taken before any
+    // other open of it.
+    let pin = PinnedInput::pin(input, host)?;
+    let input = &pin;
+    // The indexdata precondition is answered by a front read of its own,
+    // dropped at once: pass 1's walker reads the header again on its own
+    // `FADV_RANDOM` description.
+    let indexed = crate::commands::input_front::InputFront::open(input, direct_io, host)?
+        .require_indexdata(
+            force,
+            "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
+             decompressed to scan element IDs (significantly slower).",
+            host,
+        )?;
     if !indexed {
         crate::host::diag!(
             host.diagnostics,
@@ -166,7 +185,7 @@ pub(crate) fn sort_to(
         crate::debug::emit_counter("sort_unindexed_fallback", 1);
     }
 
-    if let Ok(meta) = std::fs::metadata(input) {
+    if let Ok(meta) = input.metadata() {
         crate::debug::emit_counter("sort_total_bytes_in", meta.len());
     }
 
@@ -274,16 +293,17 @@ pub(crate) fn sort_to(
     crate::debug::emit_marker("SORT_WRITER_SETUP_END");
 
     // Open input for random-access reads
-    let mut input_file = crate::read::input::open(input)?;
+    let mut input_file = input.open()?;
 
     // copy_file_range / CopyRange setup. The writer thread splices from this
     // handle asynchronously, so it gets its own `dup`ed descriptor owned by an
     // `Arc` that outlives every queued CopyRange - see
     // `PbfWriter::write_raw_copy`. `input_file` stays untouched for the
-    // random-access reads below.
+    // random-access reads below. The `dup` shares `input_file`'s open file
+    // description, already derived from the pin and verified against it.
     let input_shared = crate::read::input::InputFile::from_parts(
         std::sync::Arc::new(input_file.try_clone()?),
-        std::sync::Arc::from(input),
+        std::sync::Arc::from(input.path()),
     );
     // Buffered output splices with copy_file_range; the io_uring writer
     // services a CopyRange with a pread into a registered buffer followed by
@@ -404,7 +424,7 @@ pub(crate) fn sort_to(
                     )?;
                     write_passthrough_blob(
                         entry,
-                        input,
+                        input.path(),
                         &mut input_file,
                         &mut writer,
                         &mut frame_buf,
@@ -477,7 +497,7 @@ pub(crate) fn sort_to(
 /// the page cache entirely).
 #[hotpath::measure]
 fn build_blob_index(
-    input: &Path,
+    input: &PinnedInput,
     _direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<(crate::HeaderBlock, Vec<BlobEntry>)> {
@@ -558,7 +578,7 @@ fn build_blob_index(
         }
     }
 
-    let header = header.ok_or_else(|| crate::error::new_missing_header(input))?;
+    let header = header.ok_or_else(|| crate::error::new_missing_header(input.path()))?;
 
     Ok((header, entries))
 }
@@ -853,16 +873,17 @@ fn collect_overlap_runs(
 }
 
 /// Decode one overlap run on a rayon worker and emit owned blocks into a
-/// local `Vec<OwnedBlock>`. Each worker opens its own input fd so there
-/// is no shared reader state; results are collected by the main thread
-/// and drained in input order.
+/// local `Vec<OwnedBlock>`. Each worker opens its own input fd, derived
+/// from the run's pin, so there is no shared reader state; results are
+/// collected by the main thread and drained in input order.
 fn compute_overlap_run_local(
     entries: &[BlobEntry],
     kind: ElementKind,
-    input_path: &Path,
+    input: &PinnedInput,
     cancel: &crate::host::Cancel,
 ) -> crate::Result<(Vec<OwnedBlock>, OverlapCounts)> {
-    let mut input_file = crate::read::input::open(input_path)?;
+    let mut input_file = input.open()?;
+    let input_path = input.path();
     let mut bb = BlockBuilder::new();
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut counts = OverlapCounts::default();

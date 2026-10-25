@@ -57,7 +57,7 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-23. HYG-170 to HYG-179, then HYG-183 to HYG-189, one per line, in ID
+23. HYG-171 to HYG-179, then HYG-183 to HYG-189, one per line, in ID
     order
 24. HYG-047
 25. HYG-158
@@ -702,6 +702,16 @@ The judgement calls already known, to be checked first:
     allowance counts as already open. The classify schedule builders
     (`build_classify_schedule`, `_blob_filtered`, `_split`) now take
     `impl Into<InputSource>`, ready for the other commands' entries.
+  - sort adopted it in `sort_to`; the public `sort` stays `&Path`. Its
+    indexdata precondition moved from `require_indexdata` (a `FileReader`
+    probe that skipped the OSMHeader payload) to an `InputFront`, which
+    reads that payload (a few hundred bytes) without decoding it, so a
+    payload read failure now surfaces at the front rather than at pass 1's
+    walker. Every other open became one derived open: pass 1's walker, pass
+    2's source (still `dup`ed into the writer's copy source, one shared
+    description as before) and one per overlap-run worker. The
+    `sort_total_bytes_in` counter now reads the pin's `fstat`; no test
+    observes that conversion.
 
 ---
 
@@ -1340,7 +1350,7 @@ Reported by: the HYG-150 implementation.
 
 ## Adopting `PinnedInput`, one command per entry
 
-Not a finding: the shared brief for HYG-170 to HYG-179 and HYG-183 to
+Not a finding: the shared brief for HYG-171 to HYG-179 and HYG-183 to
 HYG-189. Each of those commands opens its input more than once per run (a
 precondition probe, a header reader, a schedule walk, worker and splice
 descriptors), each open resolving the path again, so a file renamed over
@@ -1401,21 +1411,12 @@ and its full-decode fallback each read the whole report from one open, but
 the full decode takes its file size from a separate path `stat`, which
 HYG-187 covers.
 
-## HYG-170 - sort reopens its input by path per pass
-
-Anger: 8 - planet-scale command.
-
-See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): thread the
-anchor through every input open.
-
-Reported by: the HYG-078 resolution.
-
 ## HYG-171 - extract reopens its input by path per pass
 
 Anger: 8 - planet-scale command.
 
 See "Adopting `PinnedInput`" above. multi-extract included if it is the
-same command. Recommendation (2026-10-25): as HYG-170.
+same command. Recommendation (2026-10-25): follow the brief.
 
 Reported by: the HYG-078 resolution.
 
@@ -1423,8 +1424,8 @@ Reported by: the HYG-078 resolution.
 
 Anger: 8 - planet-scale command.
 
-See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): as
-HYG-170.
+See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): follow
+the brief.
 
 Reported by: the HYG-078 resolution.
 
@@ -1432,8 +1433,8 @@ Reported by: the HYG-078 resolution.
 
 Anger: 7 - one command.
 
-See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): as
-HYG-170.
+See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): follow
+the brief.
 
 Reported by: the HYG-078 resolution.
 
@@ -1441,8 +1442,8 @@ Reported by: the HYG-078 resolution.
 
 Anger: 7 - one command.
 
-See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): as
-HYG-170.
+See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): follow
+the brief.
 
 Reported by: the HYG-078 resolution.
 
@@ -1470,7 +1471,7 @@ indexdata probe opens it once more; `cat --dedupe` (`cat/dedupe.rs`)
 probes, indexes (`index_input`) and opens its sources again
 (`open_sources`). Many inputs mean one held pin descriptor per input for
 the whole run, where cat used to hold one at a time. Recommendation
-(2026-10-25): as HYG-170.
+(2026-10-25): follow the brief.
 
 Reported by: the HYG-078 resolution.
 
@@ -1478,8 +1479,8 @@ Reported by: the HYG-078 resolution.
 
 Anger: 7 - geocode build.
 
-See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): as
-HYG-170.
+See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): follow
+the brief.
 
 Reported by: the HYG-078 resolution.
 
@@ -1491,7 +1492,7 @@ See "Adopting `PinnedInput`" above. Checked 2026-10-25: the shard workers
 do not reopen (they keep the walker's shared file, `diff/shard.rs`), but
 each input is opened by the `sorted_and_indexed` front read and again by
 the parallel walk or the sequential readers. Recommendation (2026-10-25):
-as HYG-170, for both inputs.
+follow the brief, for both inputs.
 
 Reported by: the 2026-10-25 triage.
 
@@ -1500,7 +1501,7 @@ Reported by: the 2026-10-25 triage.
 Anger: 8 - derive on a hot path.
 
 See "Adopting `PinnedInput`" above. As HYG-178. Recommendation
-(2026-10-25): as HYG-170, for both inputs.
+(2026-10-25): follow the brief, for both inputs.
 
 Reported by: the 2026-10-25 triage.
 
@@ -1510,7 +1511,7 @@ Anger: 7 - one command.
 
 See "Adopting `PinnedInput`" above. `require_indexdata` probes the input,
 then `build_classify_schedule_blob_filtered` walks it again
-(`tags_count/mod.rs`). Recommendation (2026-10-25): as HYG-170.
+(`tags_count/mod.rs`). Recommendation (2026-10-25): follow the brief.
 
 Reported by: the HYG-151 resolution.
 
@@ -1520,7 +1521,7 @@ Anger: 7 - one command.
 
 See "Adopting `PinnedInput`" above. The indexdata probe, the header
 `ElementReader` and `build_classify_schedules_split` each open the input
-(`repack/mod.rs`). Recommendation (2026-10-25): as HYG-170.
+(`repack/mod.rs`). Recommendation (2026-10-25): follow the brief.
 
 Reported by: the HYG-151 resolution.
 
@@ -1532,7 +1533,7 @@ See "Adopting `PinnedInput`" above. The decode path probes indexdata,
 reads the header and walks the schedules (`degrade/mod.rs`); the
 header-only passthrough reads the header and then the frames through two
 `FileReader` opens. Modes differ, so check each before pinning.
-Recommendation (2026-10-25): as HYG-170.
+Recommendation (2026-10-25): follow the brief.
 
 Reported by: the HYG-151 resolution.
 
@@ -1545,7 +1546,7 @@ history against snapshot; the snapshot arm drops it and walks the schedule
 through a fresh open (`time_filter/mod.rs`). The history arm reads once.
 Pinning at entry also refuses a FIFO on the history arm; that is the
 chosen contract (a command that may reopen pins up front), say so in the
-CHANGELOG line. Recommendation (2026-10-25): as HYG-170.
+CHANGELOG line. Recommendation (2026-10-25): follow the brief.
 
 Reported by: the HYG-151 resolution.
 
@@ -1559,8 +1560,8 @@ takes the file size from a path `stat` beside its reader
 (`inspect/scan.rs`); and the CLI's inspect runs the scan, `has_indexdata`
 and node statistics as separate library calls on one path
 (`cli/src/lib.rs`), each opening it afresh. The public entry points need
-to accept a pin so the CLI pins once. Recommendation (2026-10-25): as
-HYG-170, with the CLI composition.
+to accept a pin so the CLI pins once. Recommendation (2026-10-25): follow
+the brief, with the CLI composition.
 
 Reported by: the HYG-151 resolution.
 
@@ -1571,7 +1572,7 @@ Anger: 7 - CLI behaviour.
 See "Adopting `PinnedInput`" above. Both engines read `sorted_and_indexed`
 and then build the split schedules from a second open, and the parallel
 engine stats the path for its length (`check/verify_ids.rs`).
-Recommendation (2026-10-25): as HYG-170.
+Recommendation (2026-10-25): follow the brief.
 
 Reported by: the HYG-151 resolution.
 
@@ -1583,6 +1584,6 @@ See "Adopting `PinnedInput`" above. The envelope walk (`HeaderWalker`)
 collects each blob's index, then an `ElementReader` decodes the blocks
 those indexes are matched against (`commands/digest.rs`): a replacement
 between the two digests one file's blocks against the other's indexes.
-Recommendation (2026-10-25): as HYG-170.
+Recommendation (2026-10-25): follow the brief.
 
 Reported by: the HYG-151 resolution.

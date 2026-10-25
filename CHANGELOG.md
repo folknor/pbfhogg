@@ -1158,6 +1158,17 @@
 
 ### Fixed
 
+- **`sort` reads one input file even if it is replaced mid-run.** The
+  input is opened several times per run (the indexdata check, pass 1's
+  header walk, pass 2's passthrough source, and one reader per overlap run
+  being re-sorted), and each open used to resolve the path again, so an
+  input renamed over during the run was read partly from each file, with
+  no error. The input is now pinned when the run starts: on Linux with
+  `/proc` a replaced or deleted input does not affect the run; on other
+  Unix hosts the run fails with `ErrorKind::InputReplaced` instead. An
+  input that is a FIFO, socket or character device is now refused up
+  front (it could not serve the repeated reads before either).
+
 - **`add-locations-to-ways` reads one input file even if it is replaced
   mid-run.** Both index types open the input several times per run (the
   header and indexdata read, the header walks, the worker pools, and on

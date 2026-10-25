@@ -1,11 +1,10 @@
 //! Count tag frequencies in a PBF file. Equivalent to `osmium tags-count`.
 
-use std::path::Path;
-
 use rustc_hash::FxHashMap;
 
 use super::require_indexdata;
 use crate::owned::TypeFilter;
+use crate::read::input::InputSource;
 use crate::tag_expr::{Expression, parse_expressions, tag_matches};
 use crate::{Element, ElementKind, PrimitiveBlock};
 
@@ -75,17 +74,24 @@ pub struct TagCountOptions<'a> {
 /// and a sketch would change the exact-count contract. Use type/expression
 /// restrictions to reduce cardinality, rather than treating thresholds as a
 /// memory budget. See reference/cli-reference.md, "inspect tags".
+///
+/// The input must be a regular file or a block device (`InvalidArgument`
+/// otherwise), and is pinned for the run once the expressions are accepted
+/// (see [`PinnedInput`](crate::read::input::PinnedInput)); a caller's pin is
+/// used as it is. Where a later open cannot reach the pinned file, an input
+/// replaced mid-run fails with `InputReplaced`.
 #[hotpath::measure]
-pub fn tags_count(
-    path: &Path,
+pub fn tags_count<'a>(
+    input: impl Into<InputSource<'a>>,
     opts: &TagCountOptions<'_>,
     host: &crate::host::Host,
 ) -> Result<Vec<TagCount>> {
-    host.cancel.decided(|| tags_count_inner(path, opts, host))
+    let input = input.into();
+    host.cancel.decided(|| tags_count_inner(input, opts, host))
 }
 
 fn tags_count_inner(
-    path: &Path,
+    input: InputSource<'_>,
     opts: &TagCountOptions<'_>,
     host: &crate::host::Host,
 ) -> Result<Vec<TagCount>> {
@@ -100,11 +106,21 @@ fn tags_count_inner(
         Some(parse_expressions(opts.expressions)?)
     };
 
+    // The input is opened twice, each through its own open file description:
+    // the indexdata probe, then the schedule walk whose descriptor the
+    // classify pool preads. Both are derived from this one pin, so a file
+    // renamed over the input between them cannot be probed as one file and
+    // counted as the other: where `/proc/self/fd` reopens the pin both opens
+    // reach the pinned file, otherwise on Unix a replaced input fails the run
+    // (`PinnedInput` says what it does off Unix). Taken before any other open
+    // of the input.
+    let pin = input.pin(host)?;
+
     // Need indexdata either for the type-filter schedule or (when there
     // is no type filter) simply for the all-kinds schedule the parallel
     // path uses. `require_indexdata` gracefully accepts `force`.
     require_indexdata(
-        path,
+        &pin,
         opts.direct_io,
         opts.force,
         "input PBF has no blob-level indexdata. Without indexdata, the type filter \
@@ -137,7 +153,7 @@ fn tags_count_inner(
         .and_then(crate::commands::tags_filter::blob_filter_from_expressions);
     let (schedule, shared_file, blobs_skipped_by_tag) =
         crate::scan::classify::build_classify_schedule_blob_filtered(
-            path,
+            &pin,
             kind_filter,
             blob_filter.as_ref(),
             crate::scan::classify::PartialIndex::Refuse,

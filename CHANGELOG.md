@@ -1158,6 +1158,18 @@
 
 ### Fixed
 
+- **`inspect --tags` (tags-count) reads one input file even if it is
+  replaced mid-run.** Every run opens the input twice (the indexdata check,
+  then the schedule walk the counting workers read through), and each open
+  used to resolve the path again, so an input renamed over between them was
+  checked as one file and counted as the other, with no error. The input is
+  now pinned when the run starts, after the expressions are accepted: on
+  Linux with `/proc` a replaced or deleted input does not affect the run;
+  on other Unix hosts the run fails with `ErrorKind::InputReplaced`. An
+  input that is a FIFO, socket or character device is now refused up
+  front. Library: `tags_count::tags_count` takes `impl Into<InputSource>`
+  (a path as before, or a `&PinnedInput` the caller took, used as it is).
+
 - **`build-geocode-index` reads one input file even if it is replaced
   mid-run.** Every build opens the input four times (the indexdata check,
   the replication header read, the relation pass and the schedule walk the

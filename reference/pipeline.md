@@ -554,6 +554,14 @@ and hands the pin to each (the `inspect` CLI does, when `--indexed` or
 `--nodes` joins the scan; the `check` CLI does, when more than one check
 runs).
 
+A pass whose reads a later pass repeats can be folded into that pass
+instead of pinned. `digest` checks the blob envelope (unknown blob types,
+each blob's indexdata claims, the partial-index refusal) in its one
+decoding pass rather than in a header walk ahead of it, through
+`ElementReader::for_each_fused_blob`, whose transform sees each blob's
+kind, indexdata and provenance as well as its block. It takes no pin of
+its own, reads a FIFO, and opens a caller's pin as it is.
+
 ## Read-path internals (both consumers)
 
 All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.

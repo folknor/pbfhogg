@@ -61,14 +61,18 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 use xxhash_rust::xxh3::Xxh3;
 
+use crate::blob::{Blob, BlobType};
 use crate::blob_meta::BlobIndex;
 use crate::content::write_record;
-use crate::error::Error;
-use crate::read::header_walker::HeaderWalker;
-use crate::{BlockType, Element, ElementKind, ElementReader, PrimitiveBlock};
+use crate::error::{Error, Location};
+use crate::read::header_walker::{PartialIndexGuard, partial_index_error};
+use crate::read::input::InputSource;
+use crate::read::pipeline::FusedTransform;
+use crate::{BlockType, ByteOffset, Element, ElementKind, ElementReader, PrimitiveBlock};
 
 use super::Result;
 
@@ -111,71 +115,102 @@ impl ContentDigest {
     }
 }
 
-/// Compute the element-content digest of `path`, or refuse it.
+/// Compute the element-content digest of `input`, or refuse it.
 ///
 /// Returns an error, and no digest, for unreadable input and for any input
 /// outside the domain described in the module documentation.
+///
+/// The input is read in one sequential pass through one open, which checks
+/// the envelope and the indexdata claims as it decodes, so a stream (a FIFO,
+/// `/dev/stdin`) is digested like a file, and a file renamed over the input
+/// mid-run cannot mix two files into one digest. A caller's
+/// [`PinnedInput`](crate::read::input::PinnedInput) is opened through as it
+/// is; none is taken here.
 #[hotpath::measure]
-pub fn digest(path: &Path, direct_io: bool, host: &crate::host::Host) -> Result<ContentDigest> {
-    host.cancel.decided(|| digest_inner(path, direct_io, host))
+pub fn digest<'a>(
+    input: impl Into<InputSource<'a>>,
+    direct_io: bool,
+    host: &crate::host::Host,
+) -> Result<ContentDigest> {
+    let input = input.into();
+    host.cancel.decided(|| digest_inner(input, direct_io, host))
 }
 
-fn digest_inner(path: &Path, direct_io: bool, host: &crate::host::Host) -> Result<ContentDigest> {
-    crate::debug::emit_marker("DIGEST_ENVELOPE_START");
-    let indexes = walk_envelope(path, host)?;
-    crate::debug::emit_marker("DIGEST_ENVELOPE_END");
-
-    let reader = ElementReader::open_in(path, direct_io, host)?;
+fn digest_inner(
+    input: InputSource<'_>,
+    direct_io: bool,
+    host: &crate::host::Host,
+) -> Result<ContentDigest> {
+    let path = input.path();
+    // The one open of the input. The leading-header rule (domain rule 1) is
+    // the reader's: it refuses a file whose first blob is not an OsmHeader,
+    // and any later OsmHeader blob.
+    let reader = ElementReader::open_in(input, direct_io, host)?;
     if !reader.header().is_sorted() {
         return Err(crate::error::new_unsorted(
             "the header does not claim Sort.Type_then_ID; digest covers sorted input only, \
              as diff does.",
         )
-        .locate(crate::error::Location::in_file(path)));
+        .locate(Location::in_file(path)));
     }
 
     crate::debug::emit_marker("DIGEST_SCAN_START");
-    let mut state = DigestState::new(indexes);
-    reader.for_each_fused_block(summarize_block, |summary| state.absorb(summary))?;
-    let digest = state.finish()?;
+    let mut state = DigestState::new(Arc::from(path));
+    reader.for_each_fused_blob(DigestTransform, |summary| state.absorb(summary))?;
+    let digest = state.finish();
     crate::debug::emit_marker("DIGEST_SCAN_END");
     Ok(digest)
 }
 
-/// Check the blob envelope (domain rule 1, minus the sorted claim, which the
-/// reader's decoded header answers) and collect each data blob's parsed
-/// index in file order. A partially indexed file is refused here, before any
-/// decode, with the missing-indexdata error located at its first unindexed
-/// data blob; a wholly unindexed one is digested.
-fn walk_envelope(path: &Path, host: &crate::host::Host) -> Result<Vec<Option<BlobIndex>>> {
-    use crate::blob::BlobKind;
+/// The decode-worker side of the pass: refuses a blob of unknown type
+/// (domain rule 1) and summarizes each data blob with its indexdata and
+/// provenance, which the ordered consumer checks.
+struct DigestTransform;
 
-    let mut walker = HeaderWalker::open(path, host)?.refusing_partial_index();
-    let mut indexes = Vec::new();
-    let mut seen_header = false;
-    while let Some(meta) = walker.next_header()? {
-        match meta.blob_type {
-            // HeaderWalker enforces the shared leading-header policy.
-            BlobKind::OsmHeader => seen_header = true,
-            BlobKind::OsmData if seen_header => indexes.push(meta.index),
-            BlobKind::OsmData => {
-                return Err(crate::error::new_missing_header(path));
-            }
-            BlobKind::Unknown(name) => {
-                return Err(Error::invalid_data(format!(
-                    "blob of unknown type {name:?}; digest refuses it"
+impl FusedTransform for DigestTransform {
+    type Out = BlockSummary;
+    const PARSE_INDEXDATA: bool = true;
+
+    fn apply<D>(&self, blob: &Blob, decode: D) -> Option<crate::Result<BlockSummary>>
+    where
+        D: FnOnce() -> crate::Result<PrimitiveBlock>,
+    {
+        match blob.get_type() {
+            BlobType::OsmData => {}
+            // The reader refuses a misplaced header before it gets here;
+            // refused again rather than skipped, so the domain does not
+            // hang on that.
+            BlobType::OsmHeader => {
+                return Some(Err(Error::invalid_data(
+                    "a second OsmHeader blob; digest refuses it",
                 )));
             }
+            BlobType::Unknown(name) => {
+                return Some(Err(Error::invalid_data(format!(
+                    "blob of unknown type {name:?}; digest refuses it"
+                ))));
+            }
         }
+        Some(decode().and_then(|block| {
+            Ok(BlockSummary {
+                index: blob.index(),
+                blob: blob.blob_index(),
+                offset: blob.offset(),
+                content: summarize_block(block)?,
+            })
+        }))
     }
-    if !seen_header {
-        return Err(crate::error::new_missing_header(path));
-    }
-    Ok(indexes)
 }
 
-/// What one decoded data block contributes, computed on a decode worker.
+/// What one data blob contributes, computed on a decode worker.
 struct BlockSummary {
+    /// The blob's indexdata, `None` where absent or unreadable (presence as
+    /// diff's own readers see it).
+    index: Option<BlobIndex>,
+    /// The blob's ordinal and frame start, as far as the reader knew them,
+    /// to locate a refusal the consumer raises.
+    blob: Option<u64>,
+    offset: Option<ByteOffset>,
     /// `None` for a block with no elements.
     content: Option<BlockContent>,
 }
@@ -218,7 +253,7 @@ fn block_kind(block_type: BlockType) -> crate::Result<Option<ElementKind>> {
 /// Runs on the decode workers. Takes the block by value because the fused
 /// pipeline hands ownership to its transform.
 #[allow(clippy::needless_pass_by_value)]
-fn summarize_block(block: PrimitiveBlock) -> crate::Result<BlockSummary> {
+fn summarize_block(block: PrimitiveBlock) -> crate::Result<Option<BlockContent>> {
     let classified = block_kind(block.block_type())?;
     let mut content: Option<BlockContent> = None;
     for element in block.elements() {
@@ -257,7 +292,7 @@ fn summarize_block(block: PrimitiveBlock) -> crate::Result<BlockSummary> {
         c.max_id = c.max_id.max(id);
         c.count += 1;
     }
-    Ok(BlockSummary { content })
+    Ok(content)
 }
 
 /// Resolve the element's metadata user name, if it has one (domain rule 4).
@@ -285,7 +320,14 @@ fn check_user(element: &Element<'_>) -> crate::error::Result<()> {
 /// streaming hash states. Nothing leaves it until [`Self::finish`], so a
 /// refusal anywhere in the file prints no digest at all.
 struct DigestState {
-    indexes: std::vec::IntoIter<Option<BlobIndex>>,
+    /// The input, to locate the refusals raised here.
+    path: Arc<Path>,
+    /// Domain rule 3's either-or, over the data blobs in file order. A
+    /// partially indexed file is refused with the missing-indexdata error
+    /// located at its first unindexed data blob (as the header walks of
+    /// the commands that plan from indexdata refuse it), at the first data
+    /// blob that shows the mixture; a wholly unindexed one is digested.
+    partial: PartialIndexGuard<(Option<u64>, Option<ByteOffset>)>,
     /// Kind and ID of the last element seen.
     last: Option<(ElementKind, i64)>,
     all: Xxh3,
@@ -293,22 +335,38 @@ struct DigestState {
 }
 
 impl DigestState {
-    fn new(indexes: Vec<Option<BlobIndex>>) -> Self {
+    fn new(path: Arc<Path>) -> Self {
         Self {
-            indexes: indexes.into_iter(),
+            path,
+            partial: PartialIndexGuard::default(),
             last: None,
             all: Xxh3::new(),
             kinds: [(0, Xxh3::new()), (0, Xxh3::new()), (0, Xxh3::new())],
         }
     }
 
+    /// Absorb one data blob's summary, in file order. A refusal is located
+    /// at the blob that raised it.
     fn absorb(&mut self, summary: BlockSummary) -> crate::Result<()> {
-        // The pipeline and the envelope walk both visit data blobs in file
-        // order, so the n-th summary belongs to the n-th walked blob.
-        let index = self.indexes.next().ok_or_else(|| {
-            Error::internal("the file has more data blobs than its envelope walk found")
-        })?;
-        Self::check_index(index, summary.content.as_ref())?;
+        let (blob, offset) = (summary.blob, summary.offset);
+        if let Some((blob, offset)) = self
+            .partial
+            .observe(summary.index.is_some(), (blob, offset))
+        {
+            return Err(partial_index_error().locate(Location::new(
+                Some(&self.path),
+                blob,
+                offset,
+            )));
+        }
+        self.absorb_checked(summary)
+            .map_err(|e| e.locate_blob(Location::new(Some(&self.path), blob, offset)))
+    }
+
+    fn absorb_checked(&mut self, summary: BlockSummary) -> crate::Result<()> {
+        // Each summary carries its own blob's index, so no alignment
+        // between two readers of the file is needed.
+        Self::check_index(summary.index, summary.content.as_ref())?;
         let Some(content) = summary.content else {
             return Ok(());
         };
@@ -340,7 +398,7 @@ impl DigestState {
     }
 
     /// Check one blob's indexdata against its decoded block. Whether the
-    /// file is indexed throughout was settled by the envelope walk.
+    /// file is indexed throughout is the partial-index guard's question.
     fn check_index(index: Option<BlobIndex>, content: Option<&BlockContent>) -> crate::Result<()> {
         let Some(index) = index else {
             return Ok(());
@@ -369,22 +427,17 @@ impl DigestState {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<ContentDigest> {
-        if self.indexes.next().is_some() {
-            return Err(Error::internal(
-                "the envelope walk found more data blobs than were decoded",
-            ));
-        }
+    fn finish(self) -> ContentDigest {
         let [nodes, ways, relations] = self.kinds;
         let kind = |(count, hasher): (u64, Xxh3)| KindDigest {
             count,
             hash: hasher.digest128(),
         };
-        Ok(ContentDigest {
+        ContentDigest {
             all: self.all.digest128(),
             nodes: kind(nodes),
             ways: kind(ways),
             relations: kind(relations),
-        })
+        }
     }
 }

@@ -1070,6 +1070,8 @@ The command refuses, exiting non-zero and printing no digest line, any input on 
 
 A refusal is the safe answer for a cache keyed on the digest: fall back to the real comparison. The promise is "refuses input failing these checks", not "refuses every corrupt file": a file cut off exactly at a blob boundary is a valid shorter file.
 
+The input is read front to back through one open, with every check made while it decodes, so `<FILE>` may be a stream (a FIFO, `/dev/stdin`) as well as a file. A refusal partway through a stream can wait for the stream's writer to write again or close it before the command exits.
+
 ### getid
 
 Extract or remove elements by ID. By default, keeps only the listed IDs. With `--invert`, removes the listed IDs and keeps everything else.

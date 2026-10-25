@@ -113,12 +113,13 @@ indexed passes it even if later blobs are not. Such a partially indexed file
 is refused, with the same missing-indexdata error and advice, by most commands
 that read all blob headers to plan their work (among them `sort`,
 `apply-changes`, `repack`, `extract`, `add-locations-to-ways`,
-`build-geocode-index`, `digest` and `diff`), at the first data blob without
-indexdata; `--force` does not lift that refusal. `pbfhogg cat` indexes every
-blob of such a file, and every `cat` mode runs on it: `--type`, `--clean` and
-`--dedupe` decode or scan each blob that lacks indexdata, so their output is
-the same as from the file fully indexed. Commands that do not read every
-header first run on it.
+`build-geocode-index` and `diff`), at the first data blob without
+indexdata; `--force` does not lift that refusal. `digest` refuses it the
+same way, located at the same blob, while it reads the file. `pbfhogg cat`
+indexes every blob of such a file, and every `cat` mode runs on it: `--type`,
+`--clean` and `--dedupe` decode or scan each blob that lacks indexdata, so
+their output is the same as from the file fully indexed. Other commands that
+do not read every header first, `digest` aside, run on it.
 `getid` and `getparents` run on it by design, `getid` in every mode and both
 as a `-I` ID file: they decode each blob that lacks indexdata, so their
 output is the same as from the file fully indexed, only slower. One case

@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-23. HYG-189
 24. HYG-047
 25. HYG-158
 26. HYG-159
@@ -850,6 +849,23 @@ The judgement calls already known, to be checked first:
     Mutation checked: a path stat for the decode's size, the fallback
     decode or the node walk opened by path, and dropping the CLI's
     composition pin each fail the tests.
+  - digest did not adopt it: its envelope walk was folded into its
+    decoding pass instead, so it opens once, takes no pin and now reads a
+    FIFO (sparred with codex, which agreed after checking that the
+    sequential `BlobReader` enforces everything the walk did - header
+    length, truncation, payload extent, leading header - and parses the
+    same index with the same presence semantics). This touched the shared
+    fused read engine, a measured path (ADR-0009): `run_pipeline_fused`
+    now takes a `FusedTransform` whose `apply` sees every blob after the
+    leading header plus a deferred decode, and `for_each_fused_block`
+    wraps its closure in a `BlockOnly` adapter that skips non-data blobs
+    as before, monomorphized. Judgement calls, none measured: the scratch
+    borrows now end before the getid, getparents, tags-filter and altw
+    transforms run instead of spanning them, and `apply` is called (and
+    returns `None`) for non-data blobs. `PartialIndexGuard` became generic
+    over its location and is shared by the header walker and digest's
+    consumer. A multi-fault file can now report a different refusal first,
+    since partial indexdata is no longer refused before any decode.
 
 ---
 
@@ -1485,106 +1501,3 @@ spelling). The same treatment fits both; no emitted name or value may
 change.
 
 Reported by: the HYG-150 implementation.
-
-## Adopting `PinnedInput`, one command per entry
-
-Not a finding: the shared brief for HYG-189. That command opens its input more than once per run (a
-precondition probe, a header reader, a schedule walk, worker and splice
-descriptors), each open resolving the path again, so a file renamed over
-the input mid-run is read partly from each file. The API that fixes it
-exists: `read::input::PinnedInput` and `InputSource` (`src/read/input.rs`;
-contract in `reference/pipeline.md`, "One input, one file, across passes").
-`HeaderWalker::open`, `FileReader::open`, `InputFile::open`,
-`InputFront::open` and `BlobReader` / `ElementReader::open_in` already take
-`impl Into<InputSource>`, so adopting it is mostly passing the pin where the
-path went. What each entry owes, settled in a codex spar on 2026-10-25:
-
-- Pin every input once, at the command's start, before any other open of
-  it (`PinnedInput::pin(path, host)`), and pass the pin down through every
-  later input open, including dispatch and fallback arms (auto-select, a
-  parallel attempt falling back to streaming, multi-extract's engines).
-  Scratch opens stay plain `read::input::open`.
-- Keep the description topology exactly: each existing independent open
-  becomes one derived open, and a descriptor shared today (`walker.input()`
-  handed to a classify pool, renumber's shared worker file) stays shared.
-  Never `try_clone` a pinned descriptor. The one exception is an open that
-  only re-reads what an earlier open of the same access pattern already
-  read: fold it into the earlier reader instead of guarding it. degrade's
-  passthrough did this (sparred 2026-10-25): it read the header through one
-  `FileReader` and every frame again from offset 0 through a second, and
-  now reads both through one.
-- A command that picks its route before opening anything (from flags, not
-  from the file) pins only the routes that reopen; a route left with one
-  open takes no pin and keeps reading FIFOs, and a caller's pin is still
-  used on it. degrade is the precedent (`reference/pipeline.md`). A
-  command that learns from the file whether it reopens (time-filter's
-  history versus snapshot) pins before that read.
-- Size and type reads of the input go through the pin
-  (`InputSource::metadata` / `PinnedInput::metadata`), not
-  `read::input::metadata(path)`.
-- Where the CLI composes several library calls on one input (inspect runs
-  its scan, `has_indexdata`, then node statistics), the public entry points
-  have to accept a pin (an `impl Into<InputSource>` or a `&PinnedInput`
-  variant), so one run is one pin; independent pins per call do not help.
-- With several inputs, pin each before probing any, secondary ones read in
-  a single open included (a FIFO blocks in that open). The same path given
-  twice (`diff a a`) needs a decision in that command's entry: one pin or
-  two. cat settled it as one pin per exact spelling, through
-  `read::input::pin_inputs` (sparred 2026-10-25; `reference/pipeline.md`
-  has the rule), which a multi-input command can reuse; diff settled on one
-  pin too, through `read::input::pin_sources`, the same rule for entry
-  points that take `InputSource`s (a caller's pin is used as it is, never
-  shared with a path); derive-changes reuses diff's `pin_pair`, and
-  `tests/fault_derive_input.rs` shows the owned-output variant of the
-  refusal (nothing published, an existing destination left as it was).
-  cat also asks the
-  host for the descriptors its pins hold (`admit_descriptors` in
-  `commands/cat/mod.rs`), since its input count is unbounded; a command
-  with a fixed small number of inputs has no such need. Where the CLI
-  reads one input before the library call
-  that reads another (getid's `-I`), the CLI pins and the entry point takes
-  an `InputSource` and calls `InputSource::pin`.
-- Test from the fault point: arm `FaultPlan::arm_input_replacement` after
-  an open in the middle of the run, then assert the replacement fired, that
-  opens followed it (`attempts_after_fired`), and the outcome in both modes:
-  with `force_pin_path_reopen` the run fails `InputReplaced` and publishes
-  nothing (an entry that writes to a caller's `Write`, like diff's, owes
-  only the refusal: text written before the refused open stays written);
-  without it (procfs) the output equals the unreplaced run's. A
-  test that never reaches a later open proves nothing. Where opens race
-  across threads, arming after the last open before they start makes every
-  racing open follow the replacement, so the counts stay deterministic and
-  every racing failure path runs. A probe `PinnedInput::pin` under the same
-  host answers `reopens_through_procfs()` (public under `test-hooks`), so
-  the non-forced mode asserts the outcome the host owes instead of
-  skipping. `tests/fault_apply_changes.rs` is the worked example for one
-  arming point; `tests/fault_altw_input.rs` arms after each open of each
-  route but the last in turn, which is cheap on small fixtures and runs
-  the refusal path of every open after the first. Where a command has a public library entry besides the
-  one the CLI calls, test that entry's pin too.
-- Pinning refuses FIFOs, sockets and character devices up front; say so in
-  the command's CHANGELOG line, which every adopting entry owes (a
-  replacement mid-run is now harmless on Linux with procfs, refused on
-  other Unix hosts; off Unix a pin verifies nothing, so do not claim
-  "elsewhere").
-- The classify schedule builders already take `impl Into<InputSource>`;
-  a `&&Path` caller needs a deref. So does `require_indexdata` (since
-  tags-filter's entry): hand it the pin and the probe reads through it.
-
-Commands confirmed to open their input once per run, not needing a pin:
-export, check refs, check index (one open each; the check CLI pins when it
-runs more than one check and hands them the pin, and a CLI composition can
-be fault-tested through the CLI's `PBFHOGG_TEST_REPLACE_*` hooks, see
-`cli/tests/cli_input_contract.rs`).
-
-## HYG-189 - digest reopens its input by path
-
-Anger: 7 - one command.
-
-See "Adopting `PinnedInput`" above. The envelope walk (`HeaderWalker`)
-collects each blob's index, then an `ElementReader` decodes the blocks
-those indexes are matched against (`commands/digest.rs`): a replacement
-between the two digests one file's blocks against the other's indexes.
-Recommendation (2026-10-25): follow the brief.
-
-Reported by: the HYG-151 resolution.

@@ -43,6 +43,7 @@ mod geocode_index;
 mod inspect;
 
 mod corrupt_input;
+mod digest_input;
 mod edge_cases;
 #[cfg(feature = "test-hooks")]
 mod fault_altw_input;
@@ -63,6 +64,8 @@ mod fault_derive_parallel;
 mod fault_diff_input;
 #[cfg(feature = "test-hooks")]
 mod fault_diff_parallel;
+#[cfg(feature = "test-hooks")]
+mod fault_digest_input;
 #[cfg(all(feature = "test-hooks", feature = "commands"))]
 mod fault_extract_grid;
 #[cfg(all(feature = "test-hooks", feature = "commands"))]

@@ -1158,6 +1158,21 @@
 
 ### Fixed
 
+- **`digest` reads its input once, and accepts a stream.** It used to open
+  the input twice (a walk of every blob header, then the decoding pass), so
+  an input renamed over between the two could have one file's blocks
+  checked against the other file's indexdata, and a FIFO could not be
+  digested at all. It now makes every check in its one decoding pass,
+  through one open: a replaced input cannot mix two files into one digest,
+  and `<FILE>` may be a FIFO or `/dev/stdin`. A partially indexed file is
+  refused as before, located at the same blob, and a blob of unknown type
+  is refused as before, now located at that blob; on a file with several
+  faults, which one is reported can differ, since
+  a partially indexed file is no longer refused before any block is
+  decoded. Library: `digest::digest` takes `impl Into<InputSource>` (a
+  path as before, or a `&PinnedInput` the caller took, opened through as
+  it is; digest takes no pin of its own).
+
 - **`check` reads one input file even if it is replaced mid-run.**
   `--ids` opens the input twice (the header and indexdata check, then the
   schedule walk its workers read through), and `--ids --full` took its

@@ -535,6 +535,54 @@ where
 // Fusion section: ordered decode-worker transforms for full-scan commands.
 // ---------------------------------------------------------------------------
 
+/// What the fused engine runs on a decode worker for each blob.
+///
+/// [`apply`](Self::apply) is called for every blob the reader yields after
+/// the leading header, concurrently and in unspecified order (the consumer
+/// still sees the results in file order), except a data blob the blob filter skips,
+/// which never reaches it. It runs inside the engine's `catch_unwind`, and an
+/// error it returns is located at the blob by the engine.
+pub(crate) trait FusedTransform: Sync {
+    type Out: Send;
+
+    /// Whether the reader parses each blob header's indexdata, so
+    /// [`crate::blob::Blob::index`] answers in `apply`. With no blob filter
+    /// set, the engine skips parsing it otherwise.
+    const PARSE_INDEXDATA: bool;
+
+    /// The slot's result: `None` delivers nothing for this blob. `decode`
+    /// decodes the blob as a data block (on the worker's reused scratch) and
+    /// may be called only for an `OsmData` blob.
+    fn apply<D>(&self, blob: &crate::blob::Blob, decode: D) -> Option<Result<Self::Out>>
+    where
+        D: FnOnce() -> Result<PrimitiveBlock>;
+}
+
+/// The block-only transform: data blobs decode and go through the closure,
+/// every other blob is skipped. What `ElementReader::for_each_fused_block`
+/// runs.
+pub(crate) struct BlockOnly<X>(pub(crate) X);
+
+impl<T, X> FusedTransform for BlockOnly<X>
+where
+    T: Send,
+    X: Fn(PrimitiveBlock) -> Result<T> + Sync,
+{
+    type Out = T;
+    const PARSE_INDEXDATA: bool = false;
+
+    #[inline]
+    fn apply<D>(&self, blob: &crate::blob::Blob, decode: D) -> Option<Result<T>>
+    where
+        D: FnOnce() -> Result<PrimitiveBlock>,
+    {
+        if blob.get_type() != BlobType::OsmData {
+            return None;
+        }
+        Some(decode().and_then(&self.0))
+    }
+}
+
 /// Fused sibling of `run_pipeline`. Keep this additive: the plain engine
 /// continues to serve non-transform consumers with a different read shape.
 #[allow(
@@ -543,32 +591,33 @@ where
     clippy::too_many_arguments
 )]
 #[hotpath::measure]
-pub(crate) fn run_pipeline_fused<R, T, X, F>(
+pub(crate) fn run_pipeline_fused<R, X, F>(
     mut blob_reader: BlobReader<R>,
     decode_thread_count: Option<usize>,
     pipeline_config: PipelineConfig,
     blob_filter: Option<BlobFilter>,
     resources: Option<crate::host::ResourcesHandle>,
     diagnostics: crate::host::Diagnostics,
-    transform: &X,
+    transform: X,
     mut consume: F,
 ) -> Result<()>
 where
     R: Read + Send,
-    T: Send,
-    X: Fn(PrimitiveBlock) -> Result<T> + Sync,
-    F: FnMut(T) -> Result<()>,
+    X: FusedTransform,
+    F: FnMut(X::Out) -> Result<()>,
 {
+    // Borrowed by every decode task.
+    let transform = &transform;
     let mut unindexed = UnindexedFilterNote::new(blob_filter.as_ref());
     let has_tag_filter = blob_filter.as_ref().is_some_and(BlobFilter::has_tag_filter);
     blob_reader.set_parse_tagdata(has_tag_filter);
-    blob_reader.set_parse_indexdata(blob_filter.is_some());
+    blob_reader.set_parse_indexdata(blob_filter.is_some() || X::PARSE_INDEXDATA);
     let blob_filter = blob_filter.map(Arc::new);
     let source = blob_reader.source().cloned();
     let cancel = blob_reader.cancel_token().clone();
     let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead.get());
     type FusedPayload<T> = Option<crate::error::Result<T>>;
-    let (decoded_tx, decoded_rx) = sync_channel::<(usize, FusedPayload<T>, Option<Permit>)>(
+    let (decoded_tx, decoded_rx) = sync_channel::<(usize, FusedPayload<X::Out>, Option<Permit>)>(
         pipeline_config.decode_ahead.get(),
     );
 
@@ -636,10 +685,8 @@ where
                                 }
                                 let item =
                                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        if blob.get_type() != BlobType::OsmData {
-                                            return None;
-                                        }
-                                        if let Some(filter) = filter.as_ref()
+                                        if blob.get_type() == BlobType::OsmData
+                                            && let Some(filter) = filter.as_ref()
                                             && should_skip_blob(filter, &blob)
                                         {
                                             PIPELINE_METRICS
@@ -647,18 +694,22 @@ where
                                                 .fetch_add(1, Relaxed);
                                             return None;
                                         }
-                                        ST_SCRATCH.with_borrow_mut(|st| {
-                                            GR_SCRATCH.with_borrow_mut(|gr| {
-                                                let result = blob
-                                                    .to_primitiveblock_inline_with_scratch(&pool, st, gr)
-                                                    .and_then(transform);
-                                                PIPELINE_METRICS.record_scratch_capacity(
-                                                    st.capacity().saturating_mul(8),
-                                                    gr.capacity().saturating_mul(8),
-                                                );
-                                                Some(result)
+                                        let decode = || {
+                                            ST_SCRATCH.with_borrow_mut(|st| {
+                                                GR_SCRATCH.with_borrow_mut(|gr| {
+                                                    let block = blob
+                                                        .to_primitiveblock_inline_with_scratch(
+                                                            &pool, st, gr,
+                                                        );
+                                                    PIPELINE_METRICS.record_scratch_capacity(
+                                                        st.capacity().saturating_mul(8),
+                                                        gr.capacity().saturating_mul(8),
+                                                    );
+                                                    block
+                                                })
                                             })
-                                        })
+                                        };
+                                        transform.apply(&blob, decode)
                                     }));
                                 let item = match item {
                                     Ok(item) => item,

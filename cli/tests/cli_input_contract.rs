@@ -1535,6 +1535,8 @@ const FIRST_BLOB_ONLY: &[MixedRow] = &[
     ("altw", altw, Mixed::RefusesPartial),
     // Refused at the Pass 1.5 schedule walk, after Pass 1 has run.
     ("build-geocode-index", geocode, Mixed::RefusesPartial),
+    // Refused in its one decoding pass rather than at a header walk, at the
+    // same blob.
     ("digest", digest, Mixed::RefusesPartial),
     // These refuse any unindexed data blob at their own walk, with their own
     // reason.

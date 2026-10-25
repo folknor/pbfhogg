@@ -174,29 +174,43 @@ pub(crate) struct HeaderWalker {
     blob_index: u64,
     /// Present when this walk refuses a partially indexed file; see
     /// [`Self::refusing_partial_index`].
-    partial_index: Option<PartialIndexGuard>,
+    partial_index: Option<PartialIndexGuard<(u64, u64)>>,
 }
 
-/// The state behind [`HeaderWalker::refusing_partial_index`]: what the first
-/// data blob said about indexdata, and where the first data blob without it
-/// sits.
-#[derive(Default)]
-struct PartialIndexGuard {
+/// The partially-indexed rule, one owner for every reader that enforces it
+/// (the state behind [`HeaderWalker::refusing_partial_index`], and `digest`,
+/// which checks it in its decoding pass): what the first data blob said
+/// about indexdata, and where the first data blob without it sits. `L` is
+/// that location, in whatever form the reader knows it. Fed every data
+/// blob in file order; a file is partial once it has shown both kinds, and
+/// the refusal names the first unindexed data blob, whether it came before
+/// or after the first indexed one.
+pub(crate) struct PartialIndexGuard<L> {
     /// Whether the first data blob carried readable indexdata; `None` until
     /// the walk has seen one.
     first_indexed: Option<bool>,
-    /// `(blob ordinal, frame start)` of the first data blob without readable
-    /// indexdata.
-    first_unindexed: Option<(u64, u64)>,
+    /// Where the first data blob without readable indexdata sits; `None`
+    /// until one has been seen (an unknown location is an `L` the caller
+    /// chose, never a missing entry).
+    first_unindexed: Option<L>,
 }
 
-impl PartialIndexGuard {
-    /// Record one data blob. Returns the location of the first unindexed
-    /// data blob once the file has shown both kinds.
-    fn observe(&mut self, meta: &BlobHeaderMeta) -> Option<(u64, u64)> {
-        let indexed = meta.index.is_some();
+impl<L> Default for PartialIndexGuard<L> {
+    fn default() -> Self {
+        Self {
+            first_indexed: None,
+            first_unindexed: None,
+        }
+    }
+}
+
+impl<L: Copy> PartialIndexGuard<L> {
+    /// Record one data blob, `indexed` when it carries readable indexdata.
+    /// Returns the location of the first unindexed data blob once the file
+    /// has shown both kinds.
+    pub(crate) fn observe(&mut self, indexed: bool, at: L) -> Option<L> {
         if !indexed && self.first_unindexed.is_none() {
-            self.first_unindexed = Some((meta.blob_index, meta.frame_start));
+            self.first_unindexed = Some(at);
         }
         match self.first_indexed {
             None => {
@@ -207,6 +221,15 @@ impl PartialIndexGuard {
             Some(_) => None,
         }
     }
+}
+
+/// The refusal [`PartialIndexGuard`] raises, unlocated: the caller locates
+/// it at the blob the guard returned.
+pub(crate) fn partial_index_error() -> crate::error::Error {
+    crate::error::new_partial_indexdata(
+        "the file is partially indexed: indexdata on some data blobs and not \
+         others, and this is the first data blob without indexdata",
+    )
 }
 
 impl HeaderWalker {
@@ -399,13 +422,10 @@ impl HeaderWalker {
                 self.blob_index += 1;
                 if meta.blob_type == BlobKind::OsmData
                     && let Some(guard) = self.partial_index.as_mut()
-                    && let Some((blob, frame_start)) = guard.observe(&meta)
+                    && let Some((blob, frame_start)) =
+                        guard.observe(meta.index.is_some(), (meta.blob_index, meta.frame_start))
                 {
-                    return Err(crate::error::new_partial_indexdata(
-                        "the file is partially indexed: indexdata on some data blobs and not \
-                         others, and this is the first data blob without indexdata",
-                    )
-                    .locate(crate::error::Location::new(
+                    return Err(partial_index_error().locate(crate::error::Location::new(
                         Some(&self.path),
                         Some(blob),
                         Some(crate::ByteOffset(frame_start)),

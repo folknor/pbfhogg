@@ -307,6 +307,19 @@ impl<R: Read + Send> ElementReader<R> {
         X: Fn(PrimitiveBlock) -> Result<T> + Sync,
         F: FnMut(T) -> Result<()>,
     {
+        self.for_each_fused_blob(super::pipeline::BlockOnly(transform), consume)
+    }
+
+    /// [`Self::for_each_fused_block`] with a transform that sees every blob
+    /// after the leading header, not only the decoded data blocks: its kind,
+    /// indexdata and provenance, for a consumer that checks the envelope in
+    /// the same pass that decodes it. See
+    /// [`FusedTransform`](super::pipeline::FusedTransform).
+    pub(crate) fn for_each_fused_blob<X, F>(self, transform: X, consume: F) -> Result<()>
+    where
+        X: super::pipeline::FusedTransform,
+        F: FnMut(X::Out) -> Result<()>,
+    {
         super::pipeline::run_pipeline_fused(
             self.blob_iter,
             self.decode_threads,
@@ -314,7 +327,7 @@ impl<R: Read + Send> ElementReader<R> {
             self.blob_filter,
             self.resources,
             self.diagnostics,
-            &transform,
+            transform,
             consume,
         )
     }

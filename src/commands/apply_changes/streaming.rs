@@ -78,7 +78,8 @@ pub(super) type CoordSlots = Vec<CoordSlot>;
 /// Streaming pool configuration. Channels are passed separately so this
 /// struct can be `Clone` cheaply across worker startup.
 pub(super) struct StreamingConfig {
-    pub base_pbf: Box<Path>,
+    /// The run's pinned base; the pool opens one description of it.
+    pub base: crate::read::input::PinnedInput,
     pub ranges: Arc<DiffRanges>,
     pub diff: Arc<CompactDiffOverlay>,
     /// Number of worker threads. Should be `nproc - 2` (one each for the
@@ -193,7 +194,7 @@ pub(super) fn run_workers(
     counters: &WorkerCounters,
 ) {
     let StreamingConfig {
-        base_pbf,
+        base,
         ranges,
         diff,
         worker_count,
@@ -226,11 +227,12 @@ pub(super) fn run_workers(
 
     crate::debug::emit_marker("MERGE_STREAMING_START");
 
-    // One plain description for the whole pool, separate from the scanner
-    // walker's FADV_RANDOM one and the drain's splice source: advice and
-    // readahead state are per description (see the copy-input comment in
-    // `rewrite::merge_to`).
-    let shared_file = match crate::read::input::open(&base_pbf) {
+    // One plain description of the pinned base for the whole pool, kept
+    // separate from the scanner walker's FADV_RANDOM one and the drain's
+    // splice source (advice and readahead state are per description; see
+    // the copy-input comment in `rewrite::merge_to`, which also says what
+    // is unmeasured about it).
+    let shared_file = match crate::read::input::InputSource::from(&base).open() {
         Ok(file) => file,
         Err(e) => {
             failure.publish(e);
@@ -245,7 +247,7 @@ pub(super) fn run_workers(
     let candidate_rx = Mutex::new(candidate_rx);
     // Worker errors are located against the base PBF; captured once, not per
     // blob.
-    let source: Arc<Path> = Arc::from(&*base_pbf);
+    let source: Arc<Path> = Arc::from(base.path());
 
     std::thread::scope(|scope| {
         for worker_id in 0..worker_count {

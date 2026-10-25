@@ -57,7 +57,7 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-23. HYG-168 to HYG-179, then HYG-183 to HYG-189, one per line, in ID
+23. HYG-169 to HYG-179, then HYG-183 to HYG-189, one per line, in ID
     order
 24. HYG-047
 25. HYG-158
@@ -685,7 +685,13 @@ The judgement calls already known, to be checked first:
     handful per run, never per blob.
   - `FileReader::open` (public) and `InputFile::open` widened from `&Path`
     to `impl Into<InputSource>`; `&&Path` callers lost deref coercion.
-  - No command pins yet; each adopts it in its own entry below.
+  - Each command adopts it in its own entry below.
+  - apply-changes adopted it keeping its four separate descriptions (front
+    read, splice source, header walker, worker pool), and now opens the
+    splice source only on the splice route: it used to be opened and
+    dropped unused under a `--direct-io` output. `PinnedInput::
+    reopens_through_procfs` became public under `test-hooks` so
+    replacement tests can tell which outcome the host owes.
 
 ---
 
@@ -1324,7 +1330,7 @@ Reported by: the HYG-150 implementation.
 
 ## Adopting `PinnedInput`, one command per entry
 
-Not a finding: the shared brief for HYG-168 to HYG-179 and HYG-183 to
+Not a finding: the shared brief for HYG-169 to HYG-179 and HYG-183 to
 HYG-189. Each of those commands opens its input more than once per run (a
 precondition probe, a header reader, a schedule walk, worker and splice
 descriptors), each open resolving the path again, so a file renamed over
@@ -1360,7 +1366,13 @@ path went. What each entry owes, settled in a codex spar on 2026-10-25:
   opens followed it (`attempts_after_fired`), and the outcome in both modes:
   with `force_pin_path_reopen` the run fails `InputReplaced` and publishes
   nothing; without it (procfs) the output equals the unreplaced run's. A
-  test that never reaches a later open proves nothing.
+  test that never reaches a later open proves nothing. Where opens race
+  across threads, arming after the last open before they start makes every
+  racing open follow the replacement, so the counts stay deterministic and
+  every racing failure path runs. A probe `PinnedInput::pin` under the same
+  host answers `reopens_through_procfs()` (public under `test-hooks`), so
+  the non-forced mode asserts the outcome the host owes instead of
+  skipping. `tests/fault_apply_changes.rs` is the worked example.
 - Pinning refuses FIFOs, sockets and character devices up front; say so in
   the command's CHANGELOG line, which every adopting entry owes (a
   replacement mid-run is now harmless on Linux, refused elsewhere).
@@ -1370,22 +1382,6 @@ export, check refs, check index (one open each). inspect's index-only scan
 and its full-decode fallback each read the whole report from one open, but
 the full decode takes its file size from a separate path `stat`, which
 HYG-187 covers.
-
-## HYG-168 - apply-changes reopens its input by path per access pattern
-
-Anger: 8 - apply-changes internals.
-
-See "Adopting `PinnedInput`" above. apply-changes opens its base four
-times: the front read, the scanner walker, the worker pool and the splice
-source. The comments at those opens state that separate descriptors are
-required; that is an unmeasured argument (the `walker.input()` sites
-share, and `a3f1a1bc`, which added the comments, argued rather than
-measured it). Recommendation
-(2026-10-25): thread the anchor through all four opens, and reword the
-comments to "separate descriptors are kept here; whether sharing would cost
-anything is unmeasured".
-
-Reported by: the HYG-078 resolution.
 
 ## HYG-169 - altw reopens its input by path per pass and stage
 

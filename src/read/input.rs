@@ -442,10 +442,21 @@ impl PinnedInput {
         open()
     }
 
-    /// Which way this pin's later opens go, for tests.
-    #[cfg(all(test, unix))]
-    fn reopens_through_procfs(&self) -> bool {
-        self.0.reopen == Reopen::Procfs
+    /// Whether this pin's later opens go through `/proc/self/fd` (a replaced
+    /// input does not affect the run) rather than the path (a replaced input
+    /// fails the run with `InputReplaced`), so a replacement test can tell
+    /// which outcome this host owes.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn reopens_through_procfs(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.0.reopen == Reopen::Procfs
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
     }
 }
 

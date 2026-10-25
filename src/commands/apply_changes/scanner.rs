@@ -1,7 +1,7 @@
 //! Descriptor-first scanner: `HeaderWalker`-driven blob metadata emission.
 //!
-//! The scanner opens the base PBF via `HeaderWalker`, walks blob headers
-//! in file order, and emits one [`BlobDescriptor`] per OsmData blob to
+//! The scanner opens the run's pinned base PBF via `HeaderWalker`, walks
+//! blob headers in file order, and emits one [`BlobDescriptor`] per OsmData blob to
 //! one of two channels based on the overlap check:
 //!
 //! - **No overlap + indexed**: fast-path. Routed as
@@ -23,13 +23,13 @@
 //! that no way worker can start classify concurrent with a still-in-flight
 //! node worker.
 
-use std::path::Path;
 use std::sync::mpsc;
 
 use crate::ElementKind;
 use crate::blob::BlobKind;
 use crate::error::Result;
 use crate::read::header_walker::HeaderWalker;
+use crate::read::input::PinnedInput;
 
 use super::descriptor::{BlobDescriptor, DrainItem, Route, ScannedBlob};
 use super::diff_ranges::DiffRanges;
@@ -52,7 +52,8 @@ pub(super) struct ScannerChannels {
 
 /// Scanner configuration + I/O channels.
 pub(super) struct ScannerConfig<'a> {
-    pub base_pbf: &'a Path,
+    /// The run's pinned base; the walker opens its own description of it.
+    pub base: &'a PinnedInput,
     pub ranges: &'a DiffRanges,
     /// True when `--locations-on-ways` is active. Enables the node→way
     /// barrier: scanner buffers way/relation descriptors after the first
@@ -86,7 +87,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
     // which matters: the SyncSenders dropping at scanner exit is what
     // signals end-of-input to the worker pool and drain.
     let ScannerConfig {
-        base_pbf,
+        base,
         ranges,
         locations_on_ways,
         channels,
@@ -106,7 +107,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
     // A partially indexed base is refused at the blob that shows it: the walk
     // reads every header anyway. Descriptors already dispatched are discarded
     // with the run, whose output is never published.
-    let mut walker = HeaderWalker::open(base_pbf, host)?.refusing_partial_index();
+    let mut walker = HeaderWalker::open(base, host)?.refusing_partial_index();
     let mut seq: u64 = 0;
     // Intentionally unbounded under --locations-on-ways: the non-node
     // branch below appends and continues without polling barrier_rx. On a

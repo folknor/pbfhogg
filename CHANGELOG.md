@@ -1158,6 +1158,17 @@
 
 ### Fixed
 
+- **`apply-changes` reads one base file even if it is replaced mid-run.**
+  The base PBF is opened several times per run (the header and indexdata
+  read, the header walk, the worker pool, the passthrough copy source), and
+  each open used to resolve the path again, so a base renamed over during
+  the run (an atomic replace by a downloader) was read partly from each
+  file, with no error. The base is now pinned when the run starts: on Linux
+  with `/proc` a replaced or deleted base does not affect the run; on other
+  Unix hosts the run fails with `ErrorKind::InputReplaced` instead. A base
+  that is a FIFO, socket or character device is now refused up front (it
+  could not serve the repeated reads before either).
+
 - **A bad user name or member role index is refused on re-encode, not
   written as an empty string.** A user string index or relation member role
   index past its block's string table (or negative) used to be re-encoded as

@@ -11,6 +11,7 @@ use crate::write::WriteOptions;
 use crate::commands::input_front::InputFront;
 use crate::commands::output_header::{Bbox, OutputFacts, Replication, Ways};
 use crate::commands::{HeaderOverrides, writer_from_header_bytes};
+use crate::read::input::PinnedInput;
 
 use super::descriptor::{DrainItem, Route};
 use super::diff_ranges::DiffRanges;
@@ -161,7 +162,12 @@ fn build_header_bytes(
 ///
 /// Returns an error if the base PBF or OSC file cannot be read, the
 /// output path aliases the base PBF, the output file cannot be written, or
-/// any PBF parsing/encoding fails.
+/// any PBF parsing/encoding fails. The base is read in several passes, so
+/// it must be a regular file or a block device (`InvalidArgument`
+/// otherwise), and is pinned for the run (see
+/// [`PinnedInput`](crate::read::input::PinnedInput)): where a later open
+/// cannot reach the pinned file, a base replaced mid-run fails with
+/// `InputReplaced`.
 pub fn merge(
     base_pbf: &Path,
     osc_file: &Path,
@@ -227,13 +233,21 @@ pub(crate) fn merge_to(
     // barrier that gates the worker pool until the node-coord loc_map is
     // published. So with `-l` an unindexed base is always refused here.
     //
+    // The base is read through several open file descriptions (the front
+    // read here, the splice source, the scanner's header walker and the
+    // worker pool's), and each is derived from this one pin, so a file
+    // renamed over the base mid-run cannot be read partly from each: on
+    // Linux every open reaches the pinned file, elsewhere a replaced base
+    // fails the run (`PinnedInput`). Taken before any other open of it.
+    let base = PinnedInput::pin(base_pbf, host)?;
+
     // One open answers both the indexdata question and the header, in that
     // order, so a forced run's Note and the missing-indexdata refusal still
     // precede a header decode failure. `merge_header_read_ms` therefore
     // times the whole front read: the open, the header frame, the probe to
     // the first data blob's header and the decode, not the header alone.
     let header_start = crate::counters::Stopwatch::start();
-    let mut front = InputFront::open(base_pbf, direct_io, host)?;
+    let mut front = InputFront::open(&base, direct_io, host)?;
     front.require_indexdata(
         force,
         "base PBF has no blob-level indexdata. Without indexdata, every blob must be \
@@ -332,24 +346,26 @@ pub(crate) fn merge_to(
         writer_from_header_bytes(output_pbf, compression, &header_bytes, backend, host)?;
     let writer_setup_ms = writer_setup_start.elapsed_ms();
 
-    // copy_file_range input setup. Mirrors the legacy path so direct-io and
-    // io_uring routing remain correct. The handle is shared rather than
-    // borrowed: `write_raw_copy` queues the splice into the writer thread, so
-    // the input has to stay open past the point this function returns from the
-    // call. This used to be a bare `RawFd` kept alive by a `_copy_fd_file`
-    // binding whose only job was to not be dropped.
+    // copy_file_range input setup, opened only on the splice route (the
+    // drain is its one reader; a `--direct-io` output takes no CopyRange).
+    // The handle is shared rather than borrowed: `write_raw_copy` queues the
+    // splice into the writer thread, so the input has to stay open past the
+    // point this function returns from the call.
     //
     // The base is opened again by the scanner's header walker
     // (`FADV_RANDOM`) and once for the whole worker pool (plain preads of
-    // candidate bodies), besides this plain splice source. Those are
-    // separate open file descriptions on purpose: fadvise advice and
-    // readahead state live on the description, so sharing one would put
-    // the walker's RANDOM advice on the workers' body reads. Each open
-    // resolves the path again, so a base replaced on disk between them is
-    // not detected; keeping the descriptions separate while closing that
-    // gap needs an identity check on each later open, not one shared file.
-    let input_file = crate::read::input::InputFile::open(base_pbf)?;
+    // candidate bodies), besides this plain splice source. Separate open
+    // file descriptions are kept here, so the walker's RANDOM advice and
+    // each reader's readahead state stay off the others' reads; whether
+    // sharing one would cost anything is unmeasured (the classify schedules
+    // hand their walker's descriptor to their worker pools). All of them
+    // derive from `base`, so they are descriptions of one file.
     let splice = backend.supports_copy_range();
+    let splice_source = if splice {
+        Some(crate::read::input::InputFile::open(&base)?)
+    } else {
+        None
+    };
 
     // Worker count: a fixed parallelism if supplied, else the default
     // `nproc - 2` heuristic (leaves two cores for the scanner and drain
@@ -393,14 +409,13 @@ pub(crate) fn merge_to(
     // clone keeps `drain_rx` alive past worker exit and the drain thread
     // deadlocks waiting for a sender that will never drop until merge()
     // returns - which only happens after the drain joins.
-    let (scanner_route, worker_route, drain_route) = if splice {
-        (
+    let (scanner_route, worker_route, drain_route) = match splice_source {
+        Some(input_file) => (
             Route::Splice(drain_tx.clone()),
             Route::Splice(()),
             Route::Splice(input_file),
-        )
-    } else {
-        (Route::Owned, Route::Owned, Route::Owned)
+        ),
+        None => (Route::Owned, Route::Owned, Route::Owned),
     };
 
     // --locations-on-ways barrier wiring.
@@ -433,7 +448,7 @@ pub(crate) fn merge_to(
     let failure = Arc::new(FailureSlot::new());
 
     let scanner_cfg = ScannerConfig {
-        base_pbf,
+        base: &base,
         ranges: &ranges,
         locations_on_ways,
         channels: ScannerChannels {
@@ -445,7 +460,7 @@ pub(crate) fn merge_to(
     };
 
     let streaming_cfg = StreamingConfig {
-        base_pbf: Box::from(base_pbf),
+        base: base.clone(),
         ranges: Arc::clone(&ranges),
         diff: Arc::clone(&diff),
         worker_count,

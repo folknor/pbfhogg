@@ -57,8 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-20. HYG-166
-21. HYG-167 (after HYG-164 to HYG-166: it adds the text rule)
 22. HYG-151 (confirms the per-command list below)
 23. HYG-168 to HYG-179, one per line, in ID order
 24. HYG-047
@@ -652,6 +650,25 @@ The judgement calls already known, to be checked first:
   - The sort overlap and cat dedupe extract callbacks became fallible; sort
     and dedupe locate the error at the run's frame, time-filter history
     routes it through its existing `flush_error` channel.
+- The OSC overlay's arena reads panic on a broken invariant instead of
+  answering `""`: `StringInterner::resolve` (tag keys, member roles, user
+  names) on an id it never handed out, `CompactTagIter` on a tag value
+  that does not decode, and `byte_to_member_type` on a type byte other
+  than 0/1/2 (it used to decode as `MemberType::Unknown`, which the block
+  builder then refused as bad input). One cold helper,
+  `arena_invariant_broken` in `osc/interner.rs`. Two `brokkr.toml`
+  text rules now cover the family (`.ok()` and `.unwrap_or("")` over
+  `src/read`, `src/blob_meta`, `src/osc` and `src/owned.rs`, a deliberate
+  `.ok()` carrying `// ok-deliberate: <reason>`); the indexdata decoders'
+  infallible slice-to-array `.ok()?` became `le_at` (`first_chunk`).
+  Sparred with codex. Judgement calls on apply-changes' per-OSC-element
+  write path, none measured:
+  - The interner's buffer is a `String` and `resolve` slices it with
+    `str::get` instead of running `from_utf8` on every key, role and user;
+    argued cheaper. Tag values keep the `from_utf8` check, with a cold
+    panic in place of the `""`.
+  - Chose the panic over the triage's `debug_assert!`, as `validated` in
+    `block.rs` did: a release fallback is the silent wrong answer.
 
 ---
 
@@ -902,46 +919,6 @@ as the only loop with an `on_idle()` hook; a source-scan test that only
 `pipeline.rs` calls `pop_ready()` under `src/write/`.
 
 Reported by: write path.
-
-## HYG-166 - The OSC writer swallows a bad user string
-
-Anger: 7 - OSC output.
-
-`osc/write.rs`: `info.user().ok()`.
-
-Recommendation (2026-10-25): the checked lookup and a refusal, matching the
-borrowed OSC writers.
-
-Reported by: read path, CLI and plumbing, change application.
-
-## HYG-167 - The OSC arena resolves a bad id to an empty string
-
-Anger: 6 - crate-written arenas.
-
-Runs after HYG-164, HYG-165 and HYG-166.
-`StringInterner::resolve` and `CompactTagIter` return `""` on an
-out-of-range id or invalid UTF-8 ("keeps a read-side accessor from
-panicking"), turning arena corruption into silent empty tags.
-
-Recommendation (2026-10-25): corruption here is a pbfhogg bug, not hostile
-input, so a `debug_assert!` at each site. This entry also brings the
-enforcement for the whole family (this entry, HYG-164 to HYG-166, and the
-element `info()` accessors already fixed): a `brokkr.toml` text rule banning
-`.ok()` in `src/read/` and `src/blob_meta/` except on lines carrying a
-marker comment with the reason (`disallowed-methods` cannot be scoped to
-modules, and `Result::ok` is legitimate elsewhere). `WireMessageIter::next`
-in `wire.rs` is one such legitimate site: its doc explains why its `.ok()`
-is unreachable.
-
-Since then the block-read consumers were resolved with a panic rather than
-a `debug_assert!`: `validated` in `block.rs` is the one helper, used by the
-block iterators, `DenseNodeIter`, the dense tag iterators and the element
-`info()` accessors, so `src/read/dense.rs` and `src/read/block.rs` carry no
-`.ok()` swallow any more. Its doc gives the reasoning (a release fallback
-is the silent wrong answer itself; the panic is a cold call); whoever takes
-this entry may weigh the same argument for the arena.
-
-Reported by: read path, CLI and plumbing, change application.
 
 ## HYG-036 - `too_many_arguments` is denied and then allowed locally all over
 

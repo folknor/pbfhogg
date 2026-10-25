@@ -498,8 +498,8 @@ fn transform_range(lo: i64, hi: i64, offset: i64, granularity: i32) -> Option<(i
     let b = offset.checked_add(gran.checked_mul(hi)?)?;
     let (min_nano, max_nano) = if a <= b { (a, b) } else { (b, a) };
     Some((
-        i32::try_from(floor_div(min_nano, 100)).ok()?,
-        i32::try_from(ceil_div(max_nano, 100)).ok()?,
+        i32::try_from(floor_div(min_nano, 100)).ok()?, // ok-deliberate: no bbox, see doc
+        i32::try_from(ceil_div(max_nano, 100)).ok()?,  // ok-deliberate: no bbox, see doc
     ))
 }
 

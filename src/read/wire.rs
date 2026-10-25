@@ -549,9 +549,9 @@ impl<'a> Iterator for WireMessageIter<'a> {
     #[inline]
     fn next(&mut self) -> Option<&'a [u8]> {
         loop {
-            let (field, wire_type) = self.cursor.read_tag().ok()??;
+            let (field, wire_type) = self.cursor.read_tag().ok()??; // ok-deliberate: see doc
             if field == self.target_field && wire_type == WIRE_LEN {
-                return self.cursor.read_len_delimited().ok();
+                return self.cursor.read_len_delimited().ok(); // ok-deliberate: see doc
             }
             if self.cursor.skip_field(wire_type).is_err() {
                 return None;

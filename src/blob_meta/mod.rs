@@ -28,6 +28,14 @@ pub(crate) use scan::{
 };
 pub(crate) use tag_index::{TagIndex, encode_tag_index};
 
+/// The `N` bytes of `data` at `at`, or `None` when they run past its end.
+/// The fixed-width field read for the indexdata decoders: no slice-to-array
+/// conversion whose impossible failure has to be swallowed.
+#[inline]
+fn le_at<const N: usize>(data: &[u8], at: usize) -> Option<[u8; N]> {
+    data.get(at..)?.first_chunk::<N>().copied()
+}
+
 /// Scan a decompressed PrimitiveBlock for its [`BlobIndex`], or `None`.
 ///
 /// `None` covers both "this blob cannot be described by one index" and "the
@@ -43,7 +51,7 @@ pub(crate) fn scan_block_ids(raw: &[u8]) -> Option<BlobIndex> {
 /// file will carry should use [`try_scan_block_ids_checked`] and treat its
 /// `Err` as an error.
 pub(crate) fn scan_block_ids_checked(raw: &[u8]) -> Option<(BlobIndex, bool)> {
-    try_scan_block_ids_checked(raw).ok().flatten()
+    try_scan_block_ids_checked(raw).ok().flatten() // ok-deliberate: advisory, see doc
 }
 
 /// Scan a decompressed PrimitiveBlock for its tag key set, or `None`.
@@ -51,7 +59,7 @@ pub(crate) fn scan_block_ids_checked(raw: &[u8]) -> Option<(BlobIndex, bool)> {
 /// Same collapse as [`scan_block_ids_checked`]; [`try_scan_block_tags`] keeps
 /// malformed bytes as an `Err`. Never a truncated key set.
 pub(crate) fn scan_block_tags(raw: &[u8]) -> Option<TagIndex> {
-    try_scan_block_tags(raw).ok().flatten()
+    try_scan_block_tags(raw).ok().flatten() // ok-deliberate: advisory, see doc
 }
 
 /// Scan IDs and tags in one walk, preserving malformed-block errors for
@@ -258,9 +266,9 @@ impl BlobIndex {
             return None;
         }
         let kind = ElementKind::from_ordinal(data[1])?;
-        let min_id = i64::from_le_bytes(data[2..10].try_into().ok()?);
-        let max_id = i64::from_le_bytes(data[10..18].try_into().ok()?);
-        let count = u64::from_le_bytes(data[18..26].try_into().ok()?);
+        let min_id = i64::from_le_bytes(le_at(data, 2)?);
+        let max_id = i64::from_le_bytes(le_at(data, 10)?);
+        let count = u64::from_le_bytes(le_at(data, 18)?);
         if min_id > max_id {
             return None;
         }
@@ -269,10 +277,10 @@ impl BlobIndex {
         // size, never on the slice length: a carrier holding a v1 index is 42
         // bytes long and its last 16 are padding.
         let bbox = if declared == INDEX_SIZE && kind == ElementKind::Node {
-            let min_lat = i32::from_le_bytes(data[26..30].try_into().ok()?);
-            let max_lat = i32::from_le_bytes(data[30..34].try_into().ok()?);
-            let min_lon = i32::from_le_bytes(data[34..38].try_into().ok()?);
-            let max_lon = i32::from_le_bytes(data[38..42].try_into().ok()?);
+            let min_lat = i32::from_le_bytes(le_at(data, 26)?);
+            let max_lat = i32::from_le_bytes(le_at(data, 30)?);
+            let min_lon = i32::from_le_bytes(le_at(data, 34)?);
+            let max_lon = i32::from_le_bytes(le_at(data, 38)?);
             let words = [min_lat, max_lat, min_lon, max_lon];
             // v3 spells absence as the inverted box; v2 spelled it with zeros,
             // so v2 files keep that reading - and keep the ambiguity their

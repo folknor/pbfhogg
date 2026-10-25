@@ -164,7 +164,7 @@ pub(crate) fn parse_str_attr_optional(
         if attr.key.as_ref() == name {
             return attr
                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                .ok()
+                .ok() // ok-deliberate: malformed optional attr reads as absent, see above
                 .map(std::borrow::Cow::into_owned);
         }
     }

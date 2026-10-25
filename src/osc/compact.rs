@@ -7,7 +7,7 @@ use crate::ElementKind;
 use crate::read::elements::MemberType;
 
 use super::ParseResult;
-use super::interner::StringInterner;
+use super::interner::{StringInterner, arena_invariant_broken};
 
 // ---------------------------------------------------------------------------
 // LE byte-reading helpers
@@ -58,12 +58,17 @@ pub(super) fn member_type_to_byte(mt: MemberType) -> ParseResult<u8> {
     }
 }
 
+/// Decode the arena's member type byte. Panics on any byte other than the
+/// three [`member_type_to_byte`] writes: it refuses everything else, so
+/// another value means the arena was misread (a pbfhogg bug), and decoding
+/// it as `MemberType::Unknown` would push the failure downstream as an
+/// error blaming the input.
 fn byte_to_member_type(b: u8) -> MemberType {
     match b {
         0 => MemberType::Node,
         1 => MemberType::Way,
         2 => MemberType::Relation,
-        other => MemberType::Unknown(i32::from(other)),
+        _ => arena_invariant_broken("member type byte is not one member_type_to_byte writes"),
     }
 }
 
@@ -333,7 +338,12 @@ impl<'a> Iterator for CompactTagIter<'a> {
         let value_bytes = &self.data[self.offset..self.offset + value_len];
         self.offset += value_len;
         let key = self.interner.resolve(key_id);
-        let value = std::str::from_utf8(value_bytes).unwrap_or("");
+        // The value bytes were copied from a `&str` by `append_tags`, so
+        // they decode unless this walk misread the record. Still checked,
+        // not `from_utf8_unchecked`: a misread is then a panic, not UB.
+        let Ok(value) = std::str::from_utf8(value_bytes) else {
+            arena_invariant_broken("tag value bytes are not the UTF-8 append_tags wrote")
+        };
         Some((key, value))
     }
 

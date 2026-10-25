@@ -56,7 +56,7 @@ impl DecompressPool {
     pub fn get(&self) -> Vec<u8> {
         self.buffers
             .lock()
-            .ok()
+            .ok() // ok-deliberate: a poisoned pool hands out a fresh buffer
             .and_then(|mut v| v.pop())
             .unwrap_or_default()
     }

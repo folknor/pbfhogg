@@ -228,6 +228,48 @@ except = [
 region = "string"
 message = "Use the Feature constants from read/block.rs for PBF header feature names"
 
+# Read-side data the crate has already validated (a constructed block, the
+# OSC overlay's arena) is consumed with a panic on a broken invariant, never
+# a fallback: an empty tag, a default Info or a dropped element is the silent
+# wrong answer validation exists to prevent (`validated` in read/block.rs,
+# `arena_invariant_broken` in osc/interner.rs). Input that can genuinely be
+# bad is refused with an error. A Result-to-Option `.ok()` in these paths is
+# therefore either a swallow or a deliberate "absent" answer, and the second
+# carries `// ok-deliberate: <reason>` on the same line; the except regex
+# insists on a non-empty reason. Text checks, not proof: the swallow
+# spellings `if let Ok`, `.is_err()` then `return None`, `.flatten()` and
+# `unwrap_or_default` are common in legitimate optional-field handling and
+# are left to review, as is an `.unwrap_or(` whose `""` rustfmt leaves on
+# the next line.
+[[textlint]]
+name = "read-side-ok-is-deliberate"
+pattern = '\.ok\(\)'
+paths = ["src/read/**/*.rs", "src/blob_meta/**/*.rs", "src/osc/**/*.rs", "src/owned.rs"]
+except = ['//\s*ok-deliberate:\s*\S']
+region = "code"
+test_code = "skip"
+must_scan = [
+    "src/read/block.rs",
+    "src/read/dense.rs",
+    "src/read/elements.rs",
+    "src/osc/compact.rs",
+    "src/osc/interner.rs",
+    "src/osc/write.rs",
+    "src/owned.rs",
+]
+message = "A .ok() on validated read-side data swallows a broken invariant; panic through the module's invariant helper, return the error, or mark a deliberate absent answer with // ok-deliberate: <reason>"
+
+# The exact spelling the OSC arena used to turn a bad intern id or bad UTF-8
+# into an empty tag key, role, value or user name. Matched on the raw line
+# (`region = "code"` would blank the literal), so comment lines are exempt.
+[[textlint]]
+name = "read-side-no-empty-string-fallback"
+pattern = '\.unwrap_or\(""\)'
+paths = ["src/read/**/*.rs", "src/blob_meta/**/*.rs", "src/osc/**/*.rs", "src/owned.rs"]
+except = ['^\s*//', '//\s*ok-deliberate:\s*\S']
+test_code = "skip"
+message = "An empty-string fallback on read-side data writes a silent wrong tag, role or user; panic on the broken invariant or return the error"
+
 [bin]
 default = "pbfhogg"
 install = ["pbfhogg-cli"]

@@ -12,12 +12,26 @@ use rustc_hash::FxHashMap;
 ///
 /// Intern ID 0 is reserved for the empty string.
 pub(super) struct StringInterner {
-    /// Flat buffer holding all interned string bytes, concatenated.
-    data: Vec<u8>,
+    /// Flat buffer holding all interned strings, concatenated. A `String`
+    /// rather than bytes: every `(offset, len)` in `table` spans one whole
+    /// appended `&str`, so [`Self::resolve`] slices it with `str::get` (a
+    /// bounds and char-boundary check) instead of re-validating UTF-8 on
+    /// every tag key, member role and user name it hands out.
+    data: String,
     /// Maps intern_id -> (offset, len) into `data`.
     table: Vec<(u32, u32)>,
     /// Maps string content -> intern_id for dedup lookup.
     lookup: FxHashMap<String, u32>,
+}
+
+/// The OSC overlay's arena and interner are written only by the overlay
+/// itself, so a read that finds them inconsistent is a pbfhogg bug. Cold
+/// and never inlined, so the read accessors pay one branch for the check.
+#[cold]
+#[inline(never)]
+#[track_caller]
+pub(super) fn arena_invariant_broken(what: &'static str) -> ! {
+    panic!("OSC overlay arena invariant broken: {what}")
 }
 
 fn interner_overflow(what: &str) -> crate::Error {
@@ -31,7 +45,7 @@ fn interner_overflow(what: &str) -> crate::Error {
 impl StringInterner {
     pub(super) fn new() -> Self {
         let mut interner = Self {
-            data: Vec::new(),
+            data: String::new(),
             table: Vec::new(),
             lookup: FxHashMap::default(),
         };
@@ -65,7 +79,7 @@ impl StringInterner {
             .ok_or_else(|| interner_overflow("string bytes"))?;
         let id =
             u32::try_from(self.table.len()).map_err(|_| interner_overflow("distinct strings"))?;
-        self.data.extend_from_slice(s.as_bytes());
+        self.data.push_str(s);
         self.table.push((offset, len));
         self.lookup.insert(s.to_string(), id);
         Ok(id)
@@ -73,20 +87,24 @@ impl StringInterner {
 
     /// Resolve an intern ID back to the original string.
     ///
-    /// Returns `""` for an id this interner never handed out. Every id
-    /// reaching here was produced by [`Self::intern`] on this same
-    /// interner, so an out-of-range id means the arena bytes were
-    /// misinterpreted; answering with the empty string keeps a read-side
-    /// accessor from panicking mid-iteration.
+    /// Panics on an id this interner never handed out, or a table entry
+    /// that does not span whole strings of `data`. Every id reaching here
+    /// was read from an arena record that the overlay wrote with an id
+    /// [`Self::intern`] returned on this same interner, and the arena views
+    /// can only be built by the overlay, so either failure is a pbfhogg bug
+    /// (arena bytes misread, or ids crossed between interners), not a
+    /// property of the input. Any fallback string would be the silent wrong
+    /// answer: an empty tag key, member role or user name written to the
+    /// output as if the diff had said so.
+    #[inline]
     pub(super) fn resolve(&self, id: u32) -> &str {
         let Some(&(offset, len)) = self.table.get(id as usize) else {
-            return "";
+            arena_invariant_broken("intern id was never handed out by this interner")
         };
         let start = offset as usize;
-        let end = start + len as usize;
-        match self.data.get(start..end) {
-            Some(bytes) => std::str::from_utf8(bytes).unwrap_or(""),
-            None => "",
+        match self.data.get(start..start + len as usize) {
+            Some(s) => s,
+            None => arena_invariant_broken("interner table entry does not span a whole string"),
         }
     }
 

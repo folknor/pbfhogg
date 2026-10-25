@@ -96,14 +96,14 @@ impl TagIndex {
         if data[0] != TAG_INDEX_VERSION {
             return None;
         }
-        let key_count = u16::from_le_bytes(data[1..3].try_into().ok()?) as usize;
+        let key_count = u16::from_le_bytes(super::le_at(data, 1)?) as usize;
         let mut pos = 3;
         let mut keys = Vec::with_capacity(key_count);
         for _ in 0..key_count {
             if pos + 2 > data.len() {
                 return None;
             }
-            let key_len = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?) as usize;
+            let key_len = u16::from_le_bytes(super::le_at(data, pos)?) as usize;
             pos += 2;
             if pos + key_len > data.len() {
                 return None;

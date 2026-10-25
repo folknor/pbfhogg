@@ -192,7 +192,7 @@ impl Blob {
         }
         let end = end?;
         let bitmap = data.get(end..)?;
-        let expected = usize::try_from(u64::from(value).div_ceil(8)).ok()?;
+        let expected = usize::try_from(u64::from(value).div_ceil(8)).ok()?; // ok-deliberate: unrepresentable is no bitmap
         (bitmap.len() == expected).then_some((value, bitmap))
     }
 

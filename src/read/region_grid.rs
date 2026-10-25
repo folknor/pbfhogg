@@ -93,10 +93,10 @@ impl RegionGrid {
         // <= u32::MAX), so it fits usize on any supported target; try_from makes
         // that explicit and cannot fail for an in-budget grid (the ? is dead for
         // valid input, matching the checked_add / try_from(region) fallbacks).
-        let mut region_indices = vec![0_u32; usize::try_from(total_pairs).ok()?];
+        let mut region_indices = vec![0_u32; usize::try_from(total_pairs).ok()?]; // ok-deliberate: in budget, dead
         let mut cursor = cell_starts.clone();
         for (region, &(min_lat, max_lat, min_lon, max_lon)) in region_bboxes.iter().enumerate() {
-            let region = u32::try_from(region).ok()?;
+            let region = u32::try_from(region).ok()?; // ok-deliberate: in budget, dead
             for row in cell_lat(min_lat)..=cell_lat(max_lat) {
                 let row_start = row * LON_CELLS;
                 for col in cell_lon(min_lon)..=cell_lon(max_lon) {

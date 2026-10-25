@@ -579,7 +579,7 @@ pub fn parse_osc_file(path: &Path) -> ParseResult<CompactDiffOverlay> {
 fn parse_sequence_number(filename: &str) -> Option<u64> {
     let stem = filename.strip_suffix(".gz").unwrap_or(filename);
     let num_str = stem.strip_suffix(".osc")?;
-    num_str.parse::<u64>().ok()
+    num_str.parse::<u64>().ok() // ok-deliberate: not a sequence-named diff
 }
 
 /// Load numeric-sequence `.osc` and `.osc.gz` diffs from a directory, sorted
@@ -675,7 +675,7 @@ pub fn load_all_diffs(
 #[cfg(test)]
 mod tests {
     use super::super::compact::{
-        arena_append_node, arena_append_relation, arena_append_way, member_type_to_byte,
+        META_LEN, arena_append_node, arena_append_relation, arena_append_way, member_type_to_byte,
     };
     use super::*;
     use crate::read::elements::MemberType;
@@ -1623,16 +1623,59 @@ mod tests {
         Ok(())
     }
 
-    /// `resolve` answers an id it never handed out with the empty string
-    /// rather than panicking out of a read-side accessor mid-iteration.
+    /// An id the interner never handed out is a broken arena invariant,
+    /// not an empty string.
     #[test]
-    fn test_interner_resolve_unknown_id() -> ParseResult<()> {
+    #[should_panic(expected = "intern id was never handed out by this interner")]
+    fn test_interner_resolve_unknown_id_panics() {
         let mut interner = StringInterner::new();
-        let known = interner.intern("highway")?;
+        let known = interner.intern("highway").expect("intern");
         assert_eq!(interner.resolve(known), "highway");
-        assert_eq!(interner.resolve(known + 1), "");
-        assert_eq!(interner.resolve(u32::MAX), "");
-        Ok(())
+        let _ = interner.resolve(known + 1);
+    }
+
+    /// A tag value whose arena bytes do not decode is a broken arena
+    /// invariant, not an empty value.
+    #[test]
+    #[should_panic(expected = "tag value bytes are not the UTF-8 append_tags wrote")]
+    fn test_corrupt_tag_value_panics() {
+        let mut interner = StringInterner::new();
+        let key = interner.intern("name").expect("intern");
+        let mut arena = Vec::new();
+        let offset = arena_append_node(&mut arena, 1, 0, 0, &[(key, "x")], &ArenaMeta::default())
+            .expect("append");
+        // Header (49 bytes), then the tag's key id and value length.
+        arena[offset + NODE_META_OFF + META_LEN + 8] = 0xFF;
+        let node = CompactNodeRef {
+            data: &arena[offset..],
+            interner: &interner,
+        };
+        let _ = node.tags().count();
+    }
+
+    /// A member type byte other than the three the writer emits is a
+    /// broken arena invariant, not `MemberType::Unknown`.
+    #[test]
+    #[should_panic(expected = "member type byte is not one member_type_to_byte writes")]
+    fn test_corrupt_member_type_byte_panics() {
+        let mut interner = StringInterner::new();
+        let role = interner.intern("outer").expect("intern");
+        let mut arena = Vec::new();
+        let offset = arena_append_relation(
+            &mut arena,
+            1,
+            &[(10, member_type_to_byte(MemberType::Way).expect("way"), role)],
+            &[],
+            &ArenaMeta::default(),
+        )
+        .expect("append");
+        // Header (45 bytes), then the member's ref id.
+        arena[offset + RELATION_META_OFF + META_LEN + 8] = 7;
+        let rel = CompactRelationRef {
+            data: &arena[offset..],
+            interner: &interner,
+        };
+        let _ = rel.members().count();
     }
 
     #[test]

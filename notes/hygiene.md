@@ -57,7 +57,7 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-23. HYG-171 to HYG-179, then HYG-183 to HYG-189, one per line, in ID
+23. HYG-176 to HYG-179, then HYG-183 to HYG-189, one per line, in ID
     order
 24. HYG-047
 25. HYG-158
@@ -766,6 +766,22 @@ The judgement calls already known, to be checked first:
     reader back to a path open fails every route, and forwarding the
     default threshold from `getparents_with_min_blobs` fails the full-scan
     route. getid's CLI FIFO test now covers getparents too.
+  - renumber adopted it in `renumber_external_to`, after the start-ID
+    check (which touches no file). Unlike sort, the public
+    `renumber_external` takes `impl Into<InputSource>` and pins through
+    `InputSource::pin`, as that method's doc asks of an entry that opens
+    its input more than once; the CLI still passes the path, since
+    nothing on the output side (reservation stats only the destination)
+    reads the input first. Its three opens each became one derived open,
+    all on the calling thread before any worker: the header reader
+    (`O_DIRECT` under direct reads), the one description every data phase
+    preads, and the schedule walk's own `FADV_RANDOM` description. The
+    file length now comes from the pin's `fstat`. The replacement fixture
+    differs in coordinates, tags and counts, since a replacement that
+    differed only in IDs would renumber to the same bytes, and the
+    unreplaced output is checked by content before it serves as the byte
+    reference (codex). Mutation checked: routing the shared data open back
+    to a path open fails every route.
 
 ---
 
@@ -1404,7 +1420,7 @@ Reported by: the HYG-150 implementation.
 
 ## Adopting `PinnedInput`, one command per entry
 
-Not a finding: the shared brief for HYG-171 to HYG-179 and HYG-183 to
+Not a finding: the shared brief for HYG-176 to HYG-179 and HYG-183 to
 HYG-189. Each of those commands opens its input more than once per run (a
 precondition probe, a header reader, a schedule walk, worker and splice
 descriptors), each open resolving the path again, so a file renamed over
@@ -1468,20 +1484,6 @@ export, check refs, check index (one open each). inspect's index-only scan
 and its full-decode fallback each read the whole report from one open, but
 the full decode takes its file size from a separate path `stat`, which
 HYG-187 covers.
-
-## HYG-175 - renumber reopens its input by path
-
-Anger: 8 - planet-scale command.
-
-See "Adopting `PinnedInput`" above. Checked 2026-10-25: both are true.
-Renumber opens three descriptions - the header reader
-(`ElementReader::open_in` in `renumber/mod.rs`), the schedule walker
-(`renumber/schedule.rs`) and the one worker file every data phase shares
-(`db49c929`). "One fd across all phases" describes the worker phases only.
-Recommendation (2026-10-25): pin, and pass the pin to all three; the
-worker file stays one shared description.
-
-Reported by: the HYG-078 resolution.
 
 ## HYG-176 - cat reopens its input by path per pass
 

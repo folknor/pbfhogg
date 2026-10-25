@@ -1158,6 +1158,18 @@
 
 ### Fixed
 
+- **`renumber` reads one input file even if it is replaced mid-run.**
+  Every run opens the input three times (the header read, the one reader
+  every rewrite phase shares, and the schedule walk), and each open used
+  to resolve the path again, so an input renamed over during the run was
+  read partly from each file, with no error. The input is now pinned when
+  the run starts: on Linux with `/proc` a replaced or deleted input does
+  not affect the run; on other Unix hosts the run fails with
+  `ErrorKind::InputReplaced` and publishes nothing. An input that is a
+  FIFO, socket or character device is now refused up front. Library:
+  `renumber::renumber_external` takes `impl Into<InputSource>` (a path as
+  before, or a `&PinnedInput` the caller took).
+
 - **`getparents` reads one input file even if it is replaced mid-run.**
   Every run opens the input two or three times (the indexdata check, the
   scan-arm estimate on indexed input, then the header walk or the full

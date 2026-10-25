@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use super::super::Result;
+use crate::read::input::PinnedInput;
 
 /// Per-blob task for the parallel pass pool; a task's index in its per-kind
 /// schedule is its sequence number for the ordered writer. `data_offset` /
@@ -55,18 +56,18 @@ impl BlobTask {
 ///
 /// Walks via the pread-only `HeaderWalker` + `posix_fadvise(RANDOM)` so
 /// blob bodies stay out of the page cache during this scan - renumber's
-/// downstream pread workers open separate fds and touch only the blobs
-/// they rewrite.
+/// downstream pread workers share one other description of the input and
+/// touch only the blobs they rewrite.
 #[hotpath::measure]
 pub(super) fn build_all_blob_schedules(
-    input: &Path,
+    input: &PinnedInput,
     host: &crate::host::Host,
 ) -> Result<(Vec<BlobTask>, Vec<BlobTask>, Vec<BlobTask>)> {
-    // Its own open, on purpose: this walk's descriptor carries FADV_RANDOM,
-    // which must not reach the workers' shared body descriptor, and the
-    // caller's header reader (which established that the file opens with an
-    // OsmHeader and is sorted) is a sequential read, O_DIRECT under direct
-    // I/O, already closed. The walk
+    // Its own open, derived from the run's pin, on purpose: this walk's
+    // descriptor carries FADV_RANDOM, which must not reach the workers'
+    // shared body descriptor, and the caller's header reader (which
+    // established that the file opens with an OsmHeader and is sorted) is a
+    // sequential read, O_DIRECT under direct I/O, already closed. The walk
     // starts at the beginning and consumes the leading frame itself; the
     // walker would accept a data blob there, so the leading-header contract
     // is the caller's earlier read, not this check.
@@ -74,7 +75,7 @@ pub(super) fn build_all_blob_schedules(
     drop(
         walker
             .next_header()?
-            .ok_or_else(|| crate::error::new_missing_header(input))?,
+            .ok_or_else(|| crate::error::new_missing_header(input.path()))?,
     );
     let mut nodes: Vec<BlobTask> = Vec::new();
     let mut ways: Vec<BlobTask> = Vec::new();

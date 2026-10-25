@@ -53,6 +53,7 @@ use crate::counters::Stopwatch;
 
 use super::{HeaderOverrides, Result, require_sorted, writer_from_header};
 use crate::error::Error;
+use crate::read::input::{InputSource, PinnedInput};
 use crate::write::WriteOptions;
 use crate::writer::Compression;
 
@@ -375,8 +376,15 @@ fn validate_start_ids(opts: &RenumberOptions) -> Result<()> {
 ///
 /// Refuses input whose node, way or relation IDs do not strictly increase
 /// in file order (see the module docs), and start IDs below 1.
-pub fn renumber_external(
-    input: &Path,
+///
+/// The input is read in several passes, so it must be a regular file or a
+/// block device (`InvalidArgument` otherwise), and is pinned for the run
+/// (see [`InputSource::pin`](crate::read::input::InputSource::pin)): a path
+/// is pinned here, a caller's [`PinnedInput`] is used as it is. Where a
+/// later open cannot reach the pinned file, an input replaced mid-run fails
+/// with `InputReplaced`.
+pub fn renumber_external<'a>(
+    input: impl Into<InputSource<'a>>,
     output: crate::output::Output,
     opts: &RenumberOptions,
     write: &WriteOptions,
@@ -392,8 +400,8 @@ pub fn renumber_external(
 /// [`renumber_external`] writing to a borrowed output it does not publish.
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
-pub(crate) fn renumber_external_to(
-    input: &Path,
+pub(crate) fn renumber_external_to<'a>(
+    input: impl Into<InputSource<'a>>,
     output: &crate::output::Output,
     opts: &RenumberOptions,
     write: &WriteOptions,
@@ -408,6 +416,17 @@ pub(crate) fn renumber_external_to(
     } = *write;
     validate_start_ids(opts)?;
 
+    // The input is opened three times, each a new open file description
+    // derived from this one pin, so a file renamed over the input mid-run
+    // cannot be read partly from each: the header read below, the one
+    // description every data phase preads, and the schedule walk's own
+    // `FADV_RANDOM` description. Where `/proc/self/fd` reopens the pin every
+    // open reaches the pinned file, otherwise on Unix a replaced input fails
+    // the run (`PinnedInput` says what it does off Unix). Taken before any
+    // other open of it.
+    let pin: PinnedInput = input.into().pin(host)?;
+    let input = pin.path();
+
     // OwnedBlock Vec<u8>s are allocated on pass1/stage2d worker threads
     // and freed on rayon compression threads. Uncapped, the arenas grow
     // to ~26 GB anon RSS on planet; with 2 the peak stays under 1 GB.
@@ -416,7 +435,7 @@ pub(crate) fn renumber_external_to(
     // ---- Header validation + output writer setup ----
     // The reader reports a file without a leading OsmHeader through the one
     // missing-header error, ahead of the sortedness check.
-    let header = crate::ElementReader::open_in(input, direct_io, host)?
+    let header = crate::ElementReader::open_in(&pin, direct_io, host)?
         .header()
         .clone();
     require_sorted(
@@ -457,19 +476,16 @@ pub(crate) fn renumber_external_to(
     )?;
 
     // Single shared input fd for all phases - pread is concurrent-safe.
-    let shared_file = crate::read::input::open(input)?;
+    let shared_file = pin.open()?;
     // The path every worker locates its errors against, captured once.
     let source: std::sync::Arc<Path> = std::sync::Arc::from(input);
-    let file_len = shared_file
-        .metadata()
-        .map_err(|e| Error::from(e).context(format!("failed to stat {}", input.display())))?
-        .len();
+    let file_len = pin.metadata()?.len();
 
     crate::debug::emit_marker("RENUMBER_EXT_START");
 
     // ---- Blob schedule scan ----
     let t_sched = Stopwatch::start();
-    let (pass1_schedule, way_schedule, relation_schedule) = build_all_blob_schedules(input, host)?;
+    let (pass1_schedule, way_schedule, relation_schedule) = build_all_blob_schedules(&pin, host)?;
     crate::debug::emit_counter("renumber_ext_schedule_ms", t_sched.elapsed_ms());
 
     // ---- Pass 1: parallel node rewrite ----

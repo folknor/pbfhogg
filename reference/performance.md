@@ -946,7 +946,8 @@ R2d: parallel with inline rank() dispatch (relation_map replaced by
 `relation_id_set.rank()`). All member-ref lookups via
 `node_id_set.rank()` + `way_id_set.rank()` inline - no flat temp
 files. Zero scratch disk usage. Single shared input fd across all
-phases. Atomic index dispatch (no `Arc<Mutex<Receiver>>`). Output
+data phases (the header read and the schedule walk have their own).
+Atomic index dispatch (no `Arc<Mutex<Receiver>>`). Output
 defaults to zlib:1. The arena cap requested at the start of `renumber_external()` through
 the caller's process actions (the CLI applies it) prevents glibc cross-thread arena
 fragmentation.

@@ -68,6 +68,8 @@ mod fault_parallel_writer;
 #[cfg(feature = "test-hooks")]
 mod fault_read_pipeline;
 #[cfg(feature = "test-hooks")]
+mod fault_renumber_input;
+#[cfg(feature = "test-hooks")]
 mod fault_sort_input;
 #[cfg(feature = "test-hooks")]
 mod fault_tags_filter_input;

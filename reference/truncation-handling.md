@@ -117,8 +117,8 @@ there is no per-command relaxation. The contract sites are:
 - `read::frame` (`src/read/frame.rs`) - the shared frame helper. It
   owns the length prefix, the shape-1 EOF policy and both size
   guards (zero-length and `MAX_BLOB_HEADER_SIZE`) for the decoders
-  that call it end to end: `read_raw_frame`, `read_blob_header_only`
-  and the `cat --dedupe` pass-1 loop. It does not own the EOF policy
+  that call it end to end: `read_raw_frame` and `read_blob_header_only`.
+  It does not own the EOF policy
   for the other two. `BlobReader::read_length_prefix` and
   `HeaderWalker::next_header` each implement shape 1 themselves
   (`BlobReader` reads the first prefix byte alone, then the other
@@ -135,9 +135,10 @@ there is no per-command relaxation. The contract sites are:
   shape 4 against the file size captured at `open()`
 - `FileReader::skip` (`src/read/file_reader.rs`) - the
   caller-side payload-skip that follows `read_blob_header_only`.
-  Its callers are the indexdata probe in `src/commands/mod.rs`
+  Its caller is the indexdata probe in `src/commands/mod.rs`
   (which returns at the first OSMData header, so it skips only
-  non-data blobs) and the `cat --dedupe` frame loop.
+  non-data blobs). `cat --dedupe`'s pass 1 walks with
+  `HeaderWalker`, as `sort`'s does.
 
 Shape 4 is the one shape `read::frame` could not unify, because
 each site has only the mechanism its I/O shape offers: a streaming
@@ -578,15 +579,17 @@ contract.
   EOF policy at their boundaries: a 0-3 byte tail is `Ok(None)`, a
   complete prefix never is, and a prefix of `0xFFFFFFFF` is
   refused by the size guard rather than by the allocator. This
-  covers the three decoders that share the helper's I/O; the other
+  covers the decoders that share the helper's I/O; the other
   two spell the same policy themselves and are pinned at their own
   call sites, by the two `trailing_partial_length_prefix_*` tests
   above for `BlobReader` and by
   `src/read/header_walker.rs::tests::the_walk_tolerates_a_short_tail_but_not_a_complete_prefix`
   for the pread walk.
 - `tests/merge_pbf.rs::merge_rejects_a_corrupt_frame_prefix_without_allocating` -
-  the `cat --dedupe` frame loop specifically, which had no
-  coverage of either guard while it had neither guard. Each arm
+  both guards end to end through `cat --dedupe`, whose pass 1 once
+  had its own frame loop with neither guard and no test of either
+  (it now walks with `HeaderWalker`, which calls the shared
+  `check_header_len`). Each arm
   asserts its own guard's message, not a shared substring: with a
   bare "header" check the zero-length arm passed with the
   zero-length guard disabled, because an empty `BlobHeader` is then

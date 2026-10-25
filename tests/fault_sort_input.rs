@@ -10,9 +10,11 @@
 //! after the first runs.
 //!
 //! The opens, in order: the front read (the indexdata precondition), pass
-//! 1's header walker, pass 2's source (the passthrough read and the
-//! writer's copy source share it), then one per overlap run, opened by the
-//! rayon workers that decode the runs.
+//! 1's header walker and pass 2's source. The passthrough read, the writer's
+//! copy source and the overlap-run workers all read that one source by
+//! position, so a run with overlaps opens the input no more often than one
+//! without; the overlap layouts check that the workers' reads follow the pin
+//! too.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -32,15 +34,6 @@ enum Overlaps {
     Both,
 }
 
-impl Overlaps {
-    fn runs(self) -> u64 {
-        match self {
-            Self::Nodes | Self::Ways => 1,
-            Self::Both => 2,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 enum Route {
     /// An indexed input whose header claims `Sort.Type_then_ID`: pass 1
@@ -48,15 +41,15 @@ enum Route {
     DeclaredSorted,
     /// An input without a sorted claim, with overlap runs and passthrough
     /// blobs. Indexed, its passthrough blobs take the writer's copy path;
-    /// unindexed (forced), they take the seek-and-read fallback.
+    /// unindexed (forced), they take the read-and-reframe fallback.
     Unsorted { overlaps: Overlaps, indexed: bool },
 }
 
 impl Route {
+    /// Every route opens the input three times (see the module doc).
     fn opens(self) -> u64 {
         match self {
-            Self::DeclaredSorted => 3,
-            Self::Unsorted { overlaps, .. } => 3 + overlaps.runs(),
+            Self::DeclaredSorted | Self::Unsorted { .. } => 3,
         }
     }
 }
@@ -164,14 +157,6 @@ fn run(
 /// last in turn, in both reopen modes.
 fn check_route(route: Route) {
     let opens = route.opens();
-    // After pass 2's open the overlap-run opens race on rayon workers, and
-    // the collect stops at the first error, so where there are two runs
-    // either one or both are refused. That arming point therefore does not
-    // prove both refusal paths ran; the one-run layouts do, each alone.
-    let racing = match route {
-        Route::Unsorted { overlaps, .. } if overlaps.runs() > 1 => Some(3),
-        _ => None,
-    };
     let dir = crate::common::test_scratch();
     let input = dir.path().join("in.osm.pbf");
     let replacement = dir.path().join("replacement.osm.pbf");
@@ -239,11 +224,7 @@ fn check_route(route: Route) {
                     matches!(err.kind(), pbfhogg::ErrorKind::InputReplaced),
                     "{cell}: {err:?}"
                 );
-                if racing == Some(after) {
-                    assert!((1..=2).contains(&report.refused), "{cell}: {report:?}");
-                } else {
-                    assert_eq!(report.refused, 1, "{cell}: {report:?}");
-                }
+                assert_eq!(report.refused, 1, "{cell}: {report:?}");
                 assert_eq!(
                     report.attempts,
                     after + report.refused,

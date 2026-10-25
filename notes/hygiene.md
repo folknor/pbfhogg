@@ -70,7 +70,6 @@ goes on "Review once drained" as a bisect candidate, named by commit.
 
 Launch order, one agent per line, run serially:
 
-32. HYG-012
 33. HYG-013
 34. HYG-014
 35. HYG-015
@@ -79,10 +78,11 @@ Launch order, one agent per line, run serially:
 38. HYG-194
 39. HYG-016
 40. HYG-195
-41. HYG-077 (last: it annotates files across the crate)
+41. HYG-196
+42. HYG-077 (last: it annotates files across the crate)
 
 Discussed and skipped for now: HYG-002, HYG-011, HYG-036, HYG-037, HYG-053,
-HYG-058, HYG-081, HYG-109, HYG-181, HYG-182. Not discussed yet: BUG-009 (the
+HYG-081, HYG-109, HYG-181, HYG-182. Not discussed yet: BUG-009 (the
 maintainer's own project), BUG-191.
 
 ---
@@ -935,6 +935,45 @@ The judgement calls already known, to be checked first:
   the command runs to `run_pipeline` instead of `run_pipeline_fused`.
   Sparred with codex, which confirmed the equivalence point by point but
   held "identical codegen" as plausible, not established.
+- `sort` and `cat --dedupe` are one engine, `src/commands/blob_merge.rs`
+  (sparred with codex to consensus on the mechanism). Bisect candidate on
+  three axes, none measured:
+  - `cat --dedupe` pass 1 moved from a sequential `FileReader` walk
+    (`fadvise(SEQUENTIAL)`, payload skipped by seek) to `HeaderWalker`
+    preads, sort's trade: a planet win and a dense-europe pass-1
+    regression when sort made it (performance-history "Sort", #4).
+  - `cat --dedupe` passthrough went from read plus `write_raw` per frame
+    to sort's coalesced `copy_file_range`, and the overlap runs of both
+    commands from (sort) a `par_iter` collect of every run's output before
+    the write loop and (dedupe) one serial sweep writing straight to the
+    writer, to dedicated worker threads streaming each run's blocks
+    through a bounded channel, admitted two runs per worker ahead of the
+    write head. Dedupe's memory shape changes most: up to
+    `min(window, workers)` sweep heaps at once where it had one, plus
+    `window x 4` re-encoded blocks. The planet bench (planet merged with
+    itself, every blob in a two-blob run, 133 min single-threaded) is the
+    cell to re-run. A run is now one overlap component (or one lone
+    unsorted blob); it used to be a maximal stretch of adjacent rewrite
+    blobs of one kind, which on a self-merge is the whole kind, so the old
+    sort `par_iter` had at most three runs there and a first cut of this
+    engine swept the denmark self-merge serially (one unstored smoke run,
+    30.0 s against the 29.8 s `214361bb` row). The split adds a builder
+    flush at every component end, so the output's block boundaries change
+    and adjacent components stop sharing `BlockBuilder`'s backfill of
+    default node metadata when one carries metadata and the other does
+    not; element sequence and duplicate survivors are unchanged (the old
+    sweep emptied its heap at each component boundary anyway).
+  - Sort on already-sorted input should be untouched (no runs, no threads,
+    the same single coalesced copy), but its pass 2 now reads through one
+    shared positional source and the per-entry loop is the shared one.
+  Behaviour that moved: dedupe now repairs an unindexed internally
+  unsorted blob under its sorted claim (and drops exact duplicates inside
+  it) instead of copying it through; an input whose first frame is not
+  the OSMHeader is refused at that frame instead of after sort's full
+  pass-1 scan; the sort fault test's open count dropped from three plus
+  one per overlap run to three; a zero-byte `copy_file_range` is now
+  located in the input (path and offset), which dedupe's between-pass
+  truncation test needs now that its passthrough splices.
 
 ---
 
@@ -993,6 +1032,11 @@ slot) is built in:
   `extract/simple.rs` (node and way classify), `extract/multi.rs` (node write,
   way/relation write), `tags_filter/mod.rs` pass 2.
 - `geocode_index/builder/pass1_5.rs`.
+- `commands/blob_merge.rs::write_plan` (sort and `cat --dedupe`): its work
+  items are multi-blob overlap runs that stream blocks back through one
+  bounded channel per run, so it is a variant rather than a copy; it
+  reuses classify's admission credit (`OrderedCredit`, `wait_for_credit`,
+  `CloseOnDrop`, `recv_checked`) instead of carrying its own.
 
 `getparents` and `getid --id-osm-file` use the shared helper; the rest do not.
 Divergence across copies is already fact:
@@ -1047,26 +1091,6 @@ catalogued; if it is done at all, it is done last.
 
 Reported by: altw and scanning, re-encoding, filtering and spatial, read path,
 geocode index.
-
-## HYG-012 - Sort and `cat --dedupe` are one algorithm in two copies
-
-Anger: 10 - merging sort and dedupe could undo sort's deliberate pread-walker trade-off.
-
-`sort/mod.rs` and `cat/dedupe.rs` each define `BlobEntry`, `HasId`,
-`build_blob_index`, `type_order`, `detect_overlaps`, `write_passthrough_blob`,
-`read_frame_into`, `extract_blob_bytes`, `count_entry`, a sweep merge and
-`flush_heap_below`. Divergence: sort reads headers through `HeaderWalker`
-(pread plus `fadvise(RANDOM)`, justified by a planet measurement), dedupe
-through `FileReader` plus `read_frame_header`; sort has `intra_unsorted`
-detection, the counted-vs-claimed split, parallel overlap rewrite and the
-`copy_file_range` coalescer, and dedupe has only gained the counted-vs-claimed
-split; the kind-boundary run-splitting fix exists in both as a comment citing
-the other. The header reconciliation and claimed-count split were each fixed
-in one copy and later ported to the other by hand. `HasId::version` maps absent to 0 in dedupe while `derive.rs`
-says "absent is not zero". Fix: one module parameterised on input set and
-merge policy.
-
-Reported by: re-encoding.
 
 ## HYG-013 - Diff and derive-changes share a parallel core in two copies
 
@@ -1238,6 +1262,21 @@ a meaning change needs saying where brokkr users will see it.
 
 Reported by: write path.
 
+## HYG-196 - `reference/pipelined-reader-paths.md` has gone stale
+
+Anger: 2 - a reference doc, no code.
+
+`reference/` must be true, and three claims in this page no longer are
+(found by the HYG-010 resolution, commit `dd312160`): its Callers list omits
+digest, which now uses the fused path; its Background section says the
+decode pool uses `available_parallelism() - 2` threads, where the code now
+uses `sized_workers`; and "Admission is bounded" talks about gating
+`rayon::spawn`, where tasks are now spawned inside a scope. Check the whole
+page against the code, not only these three, and reword drifting specifics
+rather than hard-coding today's values.
+
+Reported by: the HYG-010 resolution.
+
 ## HYG-195 - `parallel_gzip` has its own reorder map
 
 Anger: 8 - the gzip output writer's memory behaviour.
@@ -1379,27 +1418,6 @@ credit scheme in one engine, `push` can return `Err` instead.
 
 Reported by: re-encoding, read path, filtering and spatial, altw and scanning.
 
-## HYG-058 - Sort and dedupe memory on adversarial input
-
-Anger: 8 - memory bounds change algorithms and output.
-
-Sort holds every overlap run's re-encoded output (`overlap_outputs`) before the
-write loop; the comment says for pathologically unsorted input it can approach
-the input size, which is planet-sized RSS on exactly the input sort exists for.
-Process runs in a sliding window of K in-flight runs written in order. Dedupe's
-sweep heap is bounded by overlap-run width, which one blob spanning the whole ID
-range makes the whole kind.
-
-Maintainer (2026-10-25): skipped for now. The session's suggestion for
-whoever picks it up: sort gets the sliding window (K a tunable around twice
-the worker count, output byte-identical, realistic inputs have fewer runs
-than K so nothing changes for them; the pattern is
-`parallel_classify_phase_ordered`'s); dedupe gets a rule-3 comment and a
-docs sentence, since a sweep merge must hold whatever overlaps the current
-position and bounding it means an external merge.
-
-Reported by: re-encoding.
-
 ## HYG-077 - The enforcement levers most of these findings need are unused
 
 Anger: 8 - clippy.toml with expect_used denied means hundreds of edits.
@@ -1503,8 +1521,9 @@ Anger: 5 - a forced or partially indexed input to one cat mode.
 
 Plain `cat` indexes a blob without indexdata through `scan_block_ids_and_tags`
 and re-encodes one no single index describes (`reencode_unclassifiable`).
-`cat --dedupe`'s pass 1 (`index_input` in `src/commands/cat/dedupe.rs`) runs
-its own copy: `scan_block_ids` only, so a passthrough blob it reframes gets
+`cat --dedupe`'s pass 1 (`Walk::scan_payload` in
+`src/commands/blob_merge.rs`, shared with `sort` since the two merged) runs
+its own copy: `scan_block_ids_checked` only, so a passthrough blob it reframes gets
 indexdata but no tagdata (it keeps the input's, usually none), and an empty
 or kind-mixed block fails the run with "failed to scan block IDs", which
 names neither the cause nor plain `cat` as the way out. One indexing rule

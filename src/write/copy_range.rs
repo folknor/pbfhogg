@@ -67,9 +67,10 @@
 //!
 //! Errors name what they can: a failed `copy_file_range` names the input and
 //! the byte range (the syscall does not say which end failed; the writer adds
-//! the output's name outside it), a failed read is located in the input at
-//! its offset, and a failed fallback write is left to the writer, which names
-//! the output.
+//! the output's name outside it), a zero-byte copy inside the range and a
+//! failed or short-ended read are located in the input at the offset where
+//! they stopped, and a failed fallback write is left to the writer, which
+//! names the output.
 
 use std::fs::File;
 use std::io::{self, Write as _};
@@ -397,12 +398,18 @@ fn copy_range_with(
             }
         };
         if n == 0 {
+            // Zero bytes inside the range is the input ending early - the
+            // one kernel answer that does say which end failed - so it is
+            // located in the input at the first byte not copied, as
+            // `read_range` locates a zero-byte read. Other syscall errors
+            // stay unlocated: they do not establish which file failed.
             return Err(copy_error(
                 io::Error::new(io::ErrorKind::UnexpectedEof, "copy_file_range returned 0"),
                 input,
                 start,
                 end,
-            ));
+            )
+            .locate(Location::at_offset(input.path(), offset)));
         }
         let n = n as u64;
         offset += n;

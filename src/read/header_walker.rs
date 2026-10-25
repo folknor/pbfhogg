@@ -714,7 +714,7 @@ mod tests {
     ///
     /// `read::frame` owns one policy - a 0-3 byte tail at a frame boundary is
     /// clean EOF, a complete 4-byte prefix is a committed frame - but only the
-    /// three streaming decoders share its I/O. `HeaderWalker` preads, so it
+    /// streaming decoders that call it share its I/O. `HeaderWalker` preads, so it
     /// spells the same rule as `probe_len < 4` and a unit test of the helper
     /// cannot reach it; `BlobReader`'s third spelling is pinned by
     /// `tests/read_paths.rs::trailing_partial_length_prefix_*`. Without this

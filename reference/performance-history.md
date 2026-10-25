@@ -443,6 +443,20 @@ the cargo `target/` dir, not the sort scratch path).
   runs) and no unsorted dataset is configured. Memory: buffered overlap
   output is uncapped; pathological unsorted input could approach input size
   (fix if it bites: bounded rayon pipeline + reorder buffer).
+  **Superseded 2026-10-25, unmeasured:** sort and `cat --dedupe` became one
+  engine (`src/commands/blob_merge.rs`), whose overlap runs are swept on
+  dedicated worker threads and stream their blocks to the write loop in run
+  order (a bounded channel per run, an admission window of two runs per
+  worker), so buffered overlap output is bounded and the write loop overlaps
+  the sweeps. The `SORT_OVERLAP_PARALLEL_START`/`_END` markers went with
+  the collect-then-write phase; `SORT_WRITE_LOOP` now spans the sweeps.
+  A run is now one overlap component; it was a maximal stretch of adjacent
+  rewrite blobs of one kind, so input whose every blob overlaps a
+  neighbour (a file merged with itself) had at most one run per kind and
+  the old `par_iter` was serial there.
+  Workers read the pass-2 source by position instead of opening the input
+  once per run. On already-sorted input (no runs) nothing starts and the
+  pass is the coalesced copy as before.
 
 ### Planet writer-side floor (storage-stack bound, not software)
 

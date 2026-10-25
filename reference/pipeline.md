@@ -156,12 +156,14 @@ phase per kind (see `src/commands/cat/mod.rs`).
 
 ### cat --dedupe
 
-K-way sorted merge of multiple PBFs. Blob-level passthrough for non-overlapping ranges, decode + dedup for overlaps. All inputs must be sorted.
+K-way sorted merge of multiple PBFs. Blob-level passthrough for non-overlapping ranges, decode + dedup for overlaps. All inputs must be sorted. The same engine as `sort` (below, `src/commands/blob_merge.rs`), over several inputs, dropping an element equal in (type, id, version) to the one just emitted; an absent version is 0.
 
 ### sort
 
-Two-pass blob-level permutation sort.
-1. Scan all blobs, build index of (element_type, min_id, max_id). For
+Two-pass blob-level permutation sort, through the engine `cat --dedupe`
+shares (`src/commands/blob_merge.rs`).
+1. Walk all blob headers (`HeaderWalker`, pread only), build index of
+   (element_type, min_id, max_id). For
    inputs whose header does not declare `Sort.Type_then_ID` (including
    indexed inputs - blob indexdata alone does not prove intra-blob
    order), pass 1 decodes every blob payload and checks intra-blob ID
@@ -170,8 +172,19 @@ Two-pass blob-level permutation sort.
    neighbours. Declared-sorted inputs keep the header-only fast path
    (index built from indexdata, no payload decode) and trust the
    header's claim.
-2. Non-overlapping, intra-sorted blobs: raw passthrough. Overlapping or
-   intra-unsorted blobs: decode → binary heap merge → re-encode.
+2. Non-overlapping, intra-sorted blobs: raw passthrough, coalesced into
+   one `copy_file_range` per contiguous stretch of an input where the
+   output can splice. Overlapping or intra-unsorted blobs: decode → binary
+   heap merge → re-encode, one sweep per run: an overlap component (a
+   kind-bounded group of blobs whose ranges chain together), or one
+   internally unsorted blob that overlaps nothing. Runs are
+   swept on worker threads and stream their blocks to the write loop in
+   run order through a bounded channel per run, with an admission window
+   of `OVERLAP_RUN_WINDOW_PER_WORKER` runs per worker, so the re-encoded
+   output buffered is bounded whatever the input. A sweep's heap is not:
+   it holds whatever overlaps the current position, which one blob
+   spanning a kind's whole ID range makes the whole kind; bounding that
+   would take an external merge.
 
 ### export
 

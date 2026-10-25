@@ -519,6 +519,26 @@ pub(crate) const FRAME_BATCH: usize = 32;
 pub(crate) const CORRUPT_INDEXDATA_INFLATION: i64 = 1_000_000;
 
 // ---------------------------------------------------------------------------
+// Blob-level merge (sort, cat --dedupe)
+// ---------------------------------------------------------------------------
+
+/// Overlap runs admitted ahead of the write loop per sweep worker: run `k`
+/// is handed to a worker only while `k < drained + window`, with the window
+/// this times the worker count. Two keeps every worker fed while the run at
+/// the head drains. With [`OVERLAP_RUN_CHANNEL_DEPTH`] it bounds the
+/// re-encoded output buffered between the sweeps and the writer at
+/// `window x depth` blocks, where the earlier collect-every-run shape held
+/// all of it, which on `cat --dedupe` of a file with itself is the whole
+/// output.
+pub(crate) const OVERLAP_RUN_WINDOW_PER_WORKER: usize = 2;
+
+/// Blocks one overlap run's sweep may have encoded ahead of the write loop
+/// before its worker parks. A run of a single giant overlap component (two
+/// regional extracts whose ID ranges interleave) therefore streams through
+/// the writer instead of being held whole.
+pub(crate) const OVERLAP_RUN_CHANNEL_DEPTH: usize = 4;
+
+// ---------------------------------------------------------------------------
 // Cat
 // ---------------------------------------------------------------------------
 

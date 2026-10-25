@@ -379,12 +379,6 @@ impl PinnedInput {
         &self.0.path
     }
 
-    /// The pinned input's path, shared, for naming the input after the pin
-    /// itself is gone.
-    pub(crate) fn shared_path(&self) -> Arc<Path> {
-        Arc::clone(&self.0.path)
-    }
-
     /// The pinned file's metadata (on Unix a live `fstat` of the pin; off
     /// Unix a `stat` of the path).
     ///

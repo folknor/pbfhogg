@@ -2547,6 +2547,28 @@
 
 ### Changed
 
+- **`cat --dedupe` runs on `sort`'s engine, and `sort` no longer buffers
+  its overlap output.** The two were one blob-level merge in two copies;
+  they now share one. For `cat --dedupe` that means pass 1 walks blob
+  headers by `pread` instead of reading every input sequentially, blobs
+  that overlap nothing are copied with `copy_file_range` (coalesced per
+  contiguous stretch of an input) instead of being read and rewritten, and
+  overlapping blobs are merged on worker threads instead of one. A blob
+  without indexdata whose elements are out of ID order is now repaired
+  (re-encoded in order, dropping exact duplicates inside it) instead of
+  being copied through under the sorted stamp. For `sort` on unsorted
+  input, the re-encoded output of every overlap run used to be held in
+  memory before any of it was written, up to the size of the input; it is
+  now streamed through a bounded window. Each group of mutually
+  overlapping blobs is now merged on its own (it used to share an output
+  block with an adjacent group), so both commands can write more, smaller
+  blocks where such groups meet, and a node group without metadata next to
+  one with metadata is no longer given default metadata to match; the
+  elements written and which of two duplicates survives are unchanged.
+  `sort` on an already-sorted input is unchanged. A `copy_file_range` that finds its input shorter than the
+  index said now reports the input path and offset as a structured
+  location, as the userspace and `io_uring` copies already did.
+
 - **Default Linux builds now do the I/O the published numbers were
   measured with.** Passthrough splicing (`copy_file_range`, used by `sort`
   and `apply-changes` for untouched blobs), the sequential-readahead hint on

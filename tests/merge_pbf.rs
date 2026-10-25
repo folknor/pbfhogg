@@ -920,3 +920,145 @@ fn a_frame_truncated_between_passes_is_located() {
         err.report()
     );
 }
+
+// ---------------------------------------------------------------------------
+// The overlap-run pipeline shared with sort
+// ---------------------------------------------------------------------------
+
+/// Overlap runs in the fixture below.
+const RUNS: i64 = 8;
+/// Blobs per run, their IDs interleaved so every blob of a run overlaps.
+const BLOBS_PER_RUN: i64 = 6;
+/// Nodes per blob: a run re-encodes into more blocks than one run's channel
+/// holds, so a worker running ahead parks on it.
+const NODES_PER_BLOB: i64 = 6_000;
+
+/// A file claiming `Sort.Type_then_ID` whose node blobs nevertheless
+/// overlap: `RUNS` runs of `BLOBS_PER_RUN` interleaved blobs. Indexed, so
+/// pass 1 reads headers only and every payload is first decoded by an
+/// overlap worker in pass 2. Every node sits at latitude `lat`. Returns its
+/// frames.
+fn write_interleaved_runs(path: &std::path::Path, lat: i32) -> Vec<(u64, u64)> {
+    use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
+    use pbfhogg::writer::{Compression, PbfWriter};
+    let file = std::fs::File::create(path).expect("create fixture");
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    writer
+        .write_header(&HeaderBuilder::new().sorted().build().expect("header"))
+        .expect("write header");
+    let mut bb = BlockBuilder::new();
+    for run in 0..RUNS {
+        let base = 1 + run * BLOBS_PER_RUN * NODES_PER_BLOB;
+        for blob in 0..BLOBS_PER_RUN {
+            for i in 0..NODES_PER_BLOB {
+                let id = base + blob + i * BLOBS_PER_RUN;
+                bb.add_node(id, lat, 0, std::iter::empty::<(&str, &str)>(), None);
+            }
+            let bytes = bb.take().expect("encode").expect("non-empty block");
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+    }
+    writer.flush().expect("flush fixture");
+    frames(path)
+}
+
+fn host_with_cores(cores: usize) -> pbfhogg::host::Host {
+    let mut host = crate::common::test_host();
+    host.resources = std::sync::Arc::new(pbfhogg::host::Fixed {
+        parallelism: std::num::NonZeroUsize::new(cores),
+        memory_available: Some(8 << 30),
+    });
+    host
+}
+
+/// The sweeps run on worker threads but the output is written in run order:
+/// one worker and many write the same bytes, each run being one overlap
+/// component, with more blocks per run than its channel holds and (on one
+/// worker) more runs than the admission window. The two inputs hold the same
+/// IDs and versions at different coordinates, so which of each duplicate
+/// pair survives shows in the bytes: the heap gives no input-order
+/// guarantee, but the worker count must not change its choice.
+#[test]
+fn overlap_runs_write_the_same_bytes_on_one_worker_and_many() {
+    let dir = crate::common::test_scratch();
+    let a = dir.path().join("a.osm.pbf");
+    let b = dir.path().join("b.osm.pbf");
+    write_interleaved_runs(&a, 0);
+    write_interleaved_runs(&b, 1_000);
+    let total = RUNS * BLOBS_PER_RUN * NODES_PER_BLOB;
+    let mut outputs = Vec::new();
+    // Three cores is one sweep worker; ten is eight, one per run.
+    for cores in [3, 10] {
+        let output = dir.path().join(format!("out-{cores}.osm.pbf"));
+        let stats = merge_pbf(
+            &[a.as_path(), b.as_path()],
+            crate::common::out(&output),
+            &default_opts(),
+            &pbfhogg::HeaderOverrides::default(),
+            &host_with_cores(cores),
+        )
+        .unwrap_or_else(|e| panic!("{cores} cores: {e}"));
+        let total_u64 = u64::try_from(total).expect("count");
+        assert_eq!(stats.nodes, total_u64, "{cores} cores");
+        assert_eq!(stats.duplicates_removed, total_u64, "{cores} cores");
+        assert_eq!(
+            stats.blobs_rewritten,
+            u64::try_from(2 * RUNS * BLOBS_PER_RUN).expect("count"),
+            "{cores} cores"
+        );
+        let ids = node_ids(&read_all_elements(&output));
+        assert!(
+            ids.iter().copied().eq(1..=total),
+            "{cores} cores: merged node IDs are not 1..=N"
+        );
+        outputs.push(std::fs::read(&output).expect("read output"));
+    }
+    assert!(
+        outputs[0] == outputs[1],
+        "the worker count changed the output bytes"
+    );
+}
+
+/// A run that fails while later runs are in flight ends the merge with that
+/// run's error, located at its input and frame, instead of hanging or
+/// reporting a consequence of the shutdown. The admission window (four runs
+/// on two workers) is smaller than the run count, so the dispatcher can be
+/// waiting on credit when the error lands; the test does not force that
+/// schedule, only allows it.
+#[test]
+fn a_failed_overlap_run_ends_the_pipeline_with_its_own_error() {
+    let dir = crate::common::test_scratch();
+    let a = dir.path().join("a.osm.pbf");
+    let frames = write_interleaved_runs(&a, 0);
+    // Frame 0 is the header, then the blobs in order: corrupt the payload of
+    // run 0's fourth blob, keeping every length and its BlobHeader.
+    let (frame, payload_len) = frames[4];
+    let end = frames[5].0;
+    let mut bytes = std::fs::read(&a).expect("read A");
+    let start = usize::try_from(end - payload_len).expect("payload start");
+    bytes[start..usize::try_from(end).expect("frame end")].fill(0xff);
+    std::fs::write(&a, bytes).expect("corrupt A");
+
+    // Four cores is two workers and a window of four runs, for eight runs.
+    let err = merge_pbf(
+        &[a.as_path()],
+        crate::common::out(dir.path().join("out.osm.pbf")),
+        &default_opts(),
+        &pbfhogg::HeaderOverrides::default(),
+        &host_with_cores(4),
+    )
+    .err()
+    .unwrap_or_else(|| panic!("a corrupt overlap blob must fail the merge"));
+    assert!(
+        matches!(err.kind(), pbfhogg::ErrorKind::WireFormat { .. }),
+        "expected the Blob decode failure, got {}",
+        err.report()
+    );
+    assert_eq!(err.source_path(), Some(a.as_path()), "{}", err.report());
+    assert_eq!(
+        err.byte_offset(),
+        Some(pbfhogg::ByteOffset(frame)),
+        "{}",
+        err.report()
+    );
+}

@@ -15,9 +15,7 @@
 //!
 //! Scope is the frame layer. Shape 5 (decompression failure) is invisible to
 //! every source here, which none of them decompress; the separate test below
-//! shows the damage is real and is caught at decode. The `cat --dedupe`
-//! frame loop shares `read_frame_header` but owns its payload handling and
-//! error locations, and is not covered here.
+//! shows the damage is real and is caught at decode.
 //!
 //! The cells are what the code does, not what it should do. Where the
 //! sources disagree, each is pinned as it is and the disagreement is named

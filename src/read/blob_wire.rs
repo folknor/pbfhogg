@@ -484,8 +484,8 @@ pub(crate) fn parse_blob_header_with_index(
     // Reject an oversized declared datasize before any downstream site
     // preallocates or preads the compressed body. This is the shared funnel
     // for `HeaderWalker::next_header` and for `read::frame::read_frame_header`
-    // (hence `read_raw_frame`, `read_blob_header_only` and the `cat --dedupe`
-    // frame loop); enforcing here bounds the `data_size`
+    // (hence `read_raw_frame` and `read_blob_header_only`); enforcing here
+    // bounds the `data_size`
     // every one of those returns, so none can drive an outsized allocation
     // ahead of the 32 MiB post-decompression `MAX_BLOB_MESSAGE_SIZE` guard.
     // `BlobReader::read_blob_header` bypasses this funnel and carries the
@@ -702,8 +702,8 @@ mod tests {
     /// parse to `BlobKind::Unknown("")`, which every consumer skips as an
     /// unrecognised blob type - so a garbage frame read as clean success with
     /// no output. Rejecting inside `WireBlobHeader::parse` covers
-    /// `BlobReader`, `read_raw_frame`, `read_blob_header_only`,
-    /// `HeaderWalker::next_header` and the `cat --dedupe` frame loop at once,
+    /// `BlobReader`, `read_raw_frame`, `read_blob_header_only` and
+    /// `HeaderWalker::next_header` at once,
     /// which is why the check lives here rather than at each decoder.
     ///
     /// An unknown but non-empty type stays acceptable: forward compatibility

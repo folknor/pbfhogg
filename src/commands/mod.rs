@@ -4,6 +4,7 @@
 
 pub mod altw;
 pub mod apply_changes;
+pub(crate) mod blob_merge;
 pub mod cat;
 #[cfg(feature = "commands")]
 pub mod check;

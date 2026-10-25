@@ -1,10 +1,9 @@
 //! PBF-oriented owned element types for decode → re-encode round-trips.
 //!
-//! Used by sort, merge_pbf, and time_filter for overlap-run and sweep-merge operations.
+//! Used by the blob-level merge (sort, cat --dedupe) and time_filter for
+//! overlap-run and sweep-merge operations.
 
 use crate::block_builder::{BlockBuilder, MemberData, Metadata, OwnedBlock, RawMetadata};
-use crate::file_writer::FileWriter;
-use crate::writer::PbfWriter;
 
 use crate::error::Result;
 pub(crate) use crate::osc::write::OwnedMember;
@@ -565,80 +564,10 @@ pub(crate) fn read_relation(r: &crate::Relation<'_>) -> Result<OwnedRelation> {
 }
 
 // ---------------------------------------------------------------------------
-// Write functions - write owned elements to BlockBuilder + PbfWriter
+// Write functions - write owned elements into a BlockBuilder whose filled
+// blocks go to a local `Vec<OwnedBlock>` (`ensure_*_capacity_local` /
+// `flush_local`), so a worker thread never touches the writer.
 // ---------------------------------------------------------------------------
-
-pub(crate) fn write_single_node(
-    node: &OwnedNode,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    crate::commands::ensure_node_capacity(bb, writer)?;
-    let meta = owned_to_metadata(node.metadata.as_ref());
-    bb.add_node(
-        node.id,
-        node.decimicro_lat,
-        node.decimicro_lon,
-        node.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-        meta.as_ref(),
-    );
-    Ok(())
-}
-
-pub(crate) fn write_single_way(
-    way: &OwnedWay,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    crate::commands::ensure_way_capacity(bb, writer)?;
-    let meta = owned_to_metadata(way.metadata.as_ref());
-    if way.locations.len() == way.refs.len() && !way.locations.is_empty() {
-        bb.add_way_with_locations(
-            way.id,
-            way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-            &way.refs,
-            &way.locations,
-            meta.as_ref(),
-        );
-    } else {
-        bb.add_way(
-            way.id,
-            way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-            &way.refs,
-            meta.as_ref(),
-        );
-    }
-    Ok(())
-}
-
-pub(crate) fn write_single_relation(
-    rel: &OwnedRelation,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    crate::commands::ensure_relation_capacity(bb, writer)?;
-    let members: Vec<MemberData<'_>> = rel
-        .members
-        .iter()
-        .map(|m| MemberData {
-            id: m.id,
-            role: &m.role,
-        })
-        .collect();
-    let meta = owned_to_metadata(rel.metadata.as_ref());
-    bb.add_relation(
-        rel.id,
-        rel.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-        &members,
-        meta.as_ref(),
-    );
-    Ok(())
-}
-
-// Local-output variants (emit into `Vec<OwnedBlock>`) for rayon worker
-// threads. Mirror the `write_single_*` functions above but call the
-// `ensure_*_capacity_local` / `flush_local` helpers so no writer thread
-// is touched from the worker.
 
 pub(crate) fn write_single_node_local(
     node: &OwnedNode,

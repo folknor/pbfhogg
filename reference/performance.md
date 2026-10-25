@@ -589,13 +589,18 @@ suite; the rest still carry their older commit in the Notes column.
 > any further planet streaming work has to aim.
 
 > **`cat --dedupe` planet 133-minute wall.** Single `MERGEPBF` phase,
-> peak anon RSS only 1.4 GB, avg cores 1.3 - the path is essentially
+> peak anon RSS only 1.4 GB, avg cores 1.3 - the path was essentially
 > single-threaded for the full 87 GB input. `cat --type way`
 > passthrough is 45.3 s on the same input, so the dedupe overhead is
-> ~175× the passthrough wall. Workload is the BTreeMap-backed
-> "newest-version-per-id" pass; not a regression but a clear `O(N)`
-> parallelisation opportunity if `cat --dedupe` becomes a recurring
-> planet workload.
+> ~175× the passthrough wall. The bench merges the planet with itself
+> (brokkr passes the same path twice), so every blob sits in a two-blob
+> overlap group and the whole file is decoded, heap-merged and
+> re-encoded on one thread; it never was a `BTreeMap` pass, as this
+> callout used to say. Since that run, `cat --dedupe` shares `sort`'s
+> engine (`src/commands/blob_merge.rs`): pass 1 is the `HeaderWalker`
+> walk, passthrough is coalesced `copy_file_range`, and each overlap
+> group is swept on a worker thread with bounded streaming. **Unmeasured** -
+> the 133-minute row predates all three and needs a fresh cell.
 
 > **Renumber `+10 s` - CLOSED 2026-07-14, no regression.** The matched
 > `--bench 3` pair the flag asked for has run: HEAD **191.1 s**

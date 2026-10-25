@@ -58,7 +58,7 @@ consequence 3).
 | `count` | `apply-changes` credits a spliced or passed-through blob's `count` to its `base_*` statistics, folded into the observed counts. `sort`, `getid --invert` and `cat --dedupe` report a passed-through blob's `count` separately, as claimed (`passthrough_claimed`). `inspect` reports counts from indexdata unless `--distrust-metadata`. `renumber` assigns ID blocks from it. | `renumber` (refuses a blob whose decoded count disagrees) | `check --index` |
 | bbox | `extract` and the public `BlobFilter::with_node_bbox` skip a blob claimed as nodes whose bbox misses the region, without decoding it; the bbox is consulted only when the claimed kind is node, so a mislabelled blob skipped this way loses everything in it, on the unsorted `extract --simple` path too. `extract` also nominates a node blob whose bbox lies inside the region for a raw copy. | `extract` decodes a nominated blob and copies it raw only when its payload is DenseNodes alone and every node lies in the region, counting the nodes it decoded. That is selection and structural verification, not verification of the copied header. | `check --index` (containment) |
 | tagdata | `tags-filter` and `tags-count` skip a blob whose key set lacks every required key: a key set omitting a key its elements carry drops matches. `add-locations-to-ways --index-type external`, removing untagged nodes, drops a whole node blob whose key set is empty and whose claimed range holds no retained relation member, so a false empty key set deletes tagged nodes and a false range hides members. | - | `check --index` (missing and surplus keys, and tagdata on a blob no index can describe) |
-| `Sort.Type_then_ID` | Every command that requires sorted input reads the flag alone. `sort` takes its header-only fast path exactly when the header claims sorted and the blob has readable indexdata, and copies non-overlapping blobs raw, so an internally unsorted blob under the claim passes through under the sorted stamp ([CORRECTNESS.md](../CORRECTNESS.md), "`sort`: intra-blob disorder"). `add-locations-to-ways --index-type external` merge-walks each node blob's decoded tuples against ID-sorted records, so a node blob whose elements are out of order (honest range, payload `[2, 1]`) turns present nodes into missing locations. `diff` trusts order inside a blob and inside a range spanning negative and positive IDs. | `renumber` and `digest` check order while reading; `sort` checks intra-blob order on every blob outside its fast path | `check --ids`, partly (below) |
+| `Sort.Type_then_ID` | Every command that requires sorted input reads the flag alone. `sort` takes its header-only fast path exactly when the header claims sorted and the blob has readable indexdata, and copies non-overlapping blobs raw, so an internally unsorted blob under the claim passes through under the sorted stamp ([CORRECTNESS.md](../CORRECTNESS.md), "`sort`: intra-blob disorder"). `add-locations-to-ways --index-type external` merge-walks each node blob's decoded tuples against ID-sorted records, so a node blob whose elements are out of order (honest range, payload `[2, 1]`) turns present nodes into missing locations. `diff` trusts order inside a blob and inside a range spanning negative and positive IDs. | `renumber` and `digest` check order while reading; `sort` and `cat --dedupe` (one shared pass 1) check intra-blob order on every blob outside the header-only fast path | `check --ids`, partly (below) |
 
 The worst of these, stated plainly:
 
@@ -118,7 +118,7 @@ take the bound from `IdSet::file_bounded_max_id`.
 
 How `check --index` is built, so its verdict means what it says:
 
-- It re-derives the sidecars with `scan_block_ids` / `scan_block_tags`, the
+- It re-derives the sidecars with `try_scan_block_ids_checked` / `scan_block_tags`, the
   scanners the writer's passthrough path uses. On a re-framed blob it
   therefore cannot catch a bug inside those scanners, only a sidecar that has
   diverged from its payload; against `BlockBuilder`, which derives its index
@@ -190,8 +190,9 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   declared way enrichment, which way declaration the output header makes;
   no blob is skipped, copied raw or counted on indexdata it lacks. `--type`
   decodes an unindexed blob and filters its actual elements; `--dedupe`'s
-  first pass scans the IDs of every unindexed blob, so its overlap plan and
-  way declaration rest on observed ranges; `--clean` schedules and decodes
+  first pass scans the IDs of every unindexed blob (checking their order, as
+  `sort`'s shared pass 1 does), so its overlap plan and way declaration rest
+  on observed ranges; `--clean` schedules and decodes
   every blob once whatever its indexdata. Two refusals remain, neither about
   indexing: `--type` refuses an unindexed blob that yields ways when the
   header already declared a way enrichment re-encoding would break (as

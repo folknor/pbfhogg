@@ -650,7 +650,7 @@ files whose hints are well-formed and false.
 with `--ids`, which checks ID and type order.
 
 `check --index` is the other side of that boundary. It decompresses every
-OSMData blob, re-derives the metadata from the payload with `scan_block_ids`
+OSMData blob, re-derives the metadata from the payload with `try_scan_block_ids_checked`
 and `scan_block_tags`, and reports each disagreement with the blob's ordinal and
 byte offset.
 

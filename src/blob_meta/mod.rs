@@ -42,11 +42,13 @@ fn le_at<const N: usize>(data: &[u8], at: usize) -> Option<[u8; N]> {
 /// block bytes are malformed" - see [`try_scan_block_ids_checked`], which keeps
 /// the two apart. Never a partial index: a parse failure anywhere in the block
 /// yields `None`, not an index built from the part that parsed.
+#[cfg(test)]
 pub(crate) fn scan_block_ids(raw: &[u8]) -> Option<BlobIndex> {
     scan_block_ids_checked(raw).map(|(index, _sorted)| index)
 }
 
-/// [`scan_block_ids`] plus the intra-blob sortedness flag. `None` collapses
+/// A decompressed PrimitiveBlock's [`BlobIndex`] and whether its elements
+/// are in canonical ID order, or `None`. `None` collapses
 /// malformed bytes into "no index"; callers that build an index the output
 /// file will carry should use [`try_scan_block_ids_checked`] and treat its
 /// `Err` as an error.
@@ -114,7 +116,7 @@ impl BlobBbox {
 
 /// Blob-level index: element type, ID range, element count, and optional spatial bbox.
 ///
-/// Produced by [`scan_block_ids`] from decompressed PrimitiveBlock bytes,
+/// Produced by [`scan_block_ids_checked`] from decompressed PrimitiveBlock bytes,
 /// or deserialized from BlobHeader `indexdata`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BlobIndex {

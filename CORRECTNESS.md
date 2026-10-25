@@ -349,6 +349,13 @@ on:
   sorted claim, so their output - indexed or not - is detected and repaired,
   not passed through.
 
+**`cat --dedupe` shares this pass 1** (`src/commands/blob_merge.rs`). Every
+dedupe input must claim `Sort.Type_then_ID`, so only its blobs without
+indexdata take the checked scan, and one found internally out of order is
+rewritten through the sweep like an overlapping blob - which also drops any
+exact duplicates inside it - rather than copied through under the sorted
+stamp.
+
 **Residual - precondition on the header claim:** A file whose header claims
 `Sort.Type_then_ID` while its blobs are internally unsorted is passed
 through undetected. That file already violates its own declared contract;

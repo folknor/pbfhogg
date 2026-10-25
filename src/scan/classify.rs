@@ -614,7 +614,7 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
 /// once the last worker has gone. Workers and dispatchers of the ordered
 /// pools never check, so no admitted sequence position is abandoned while
 /// the consumer still waits for it.
-fn recv_checked<T>(
+pub(crate) fn recv_checked<T>(
     rx: &std::sync::mpsc::Receiver<T>,
     cancel: &crate::host::Cancel,
 ) -> Result<Option<T>> {
@@ -748,9 +748,15 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
     Ok(())
 }
 
-/// Admission state of [`parallel_classify_phase_ordered`]: how many results
-/// the consumer has merged, and whether the scan is shutting down.
-type OrderedCredit = (std::sync::Mutex<(usize, bool)>, std::sync::Condvar);
+/// Admission state of [`parallel_classify_phase_ordered`] (and of the
+/// overlap-run pipeline in `commands::blob_merge`): how many results the
+/// consumer has merged, and whether the scan is shutting down.
+pub(crate) type OrderedCredit = (std::sync::Mutex<(usize, bool)>, std::sync::Condvar);
+
+/// A fresh, open admission credit with nothing merged yet.
+pub(crate) fn ordered_credit() -> OrderedCredit {
+    (std::sync::Mutex::new((0, false)), std::sync::Condvar::new())
+}
 
 /// Marks the ordered scan closed on drop, waking a dispatcher parked on
 /// admission credit. The consumer holds one for its whole loop (an early
@@ -758,14 +764,24 @@ type OrderedCredit = (std::sync::Mutex<(usize, bool)>, std::sync::Condvar);
 /// or the scope never joins); each worker holds one that fires only when the
 /// worker panics, because the result it was producing will never arrive and
 /// the window could otherwise never advance past it.
-struct CloseOnDrop<'a> {
+pub(crate) struct CloseOnDrop<'a> {
     credit: &'a OrderedCredit,
     only_if_panicking: bool,
 }
 
+impl<'a> CloseOnDrop<'a> {
+    /// The consumer's guard: closes the credit whenever it drops.
+    pub(crate) fn consumer(credit: &'a OrderedCredit) -> Self {
+        Self {
+            credit,
+            only_if_panicking: false,
+        }
+    }
+}
+
 /// Park until schedule position `position` is admitted (`position < merged +
 /// window`). Returns `false` when the scan closed instead.
-fn wait_for_credit(credit: &OrderedCredit, position: usize, window: usize) -> bool {
+pub(crate) fn wait_for_credit(credit: &OrderedCredit, position: usize, window: usize) -> bool {
     let (lock, cvar) = credit;
     let mut state = lock
         .lock()
@@ -779,7 +795,7 @@ fn wait_for_credit(credit: &OrderedCredit, position: usize, window: usize) -> bo
 }
 
 /// Publish the consumer's merged count and wake the dispatcher.
-fn publish_merged(credit: &OrderedCredit, merged: usize) {
+pub(crate) fn publish_merged(credit: &OrderedCredit, merged: usize) {
     let (lock, cvar) = credit;
     lock.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -842,7 +858,7 @@ pub(crate) fn parallel_classify_phase_ordered<S: Send, R: Send>(
     let window = window.max(1);
     let decode_threads = resolve_thread_count(threads, &*host.resources);
 
-    let credit: OrderedCredit = (std::sync::Mutex::new((0, false)), std::sync::Condvar::new());
+    let credit = ordered_credit();
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<usize>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(
@@ -917,10 +933,7 @@ pub(crate) fn parallel_classify_phase_ordered<S: Send, R: Send>(
         drop(desc_rx);
         drop(result_tx);
 
-        let _close = CloseOnDrop {
-            credit: credit_ref,
-            only_if_panicking: false,
-        };
+        let _close = CloseOnDrop::consumer(credit_ref);
         // Position `k` is admitted only while `k < next + window`, so the
         // live positions are distinct modulo the ring length.
         let ring = window.min(schedule.len());

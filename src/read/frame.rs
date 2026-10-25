@@ -9,7 +9,8 @@
 //! the `header_len == 0` rejection had to be added to four of them
 //! independently and was never added to the fifth, and the fifth also went
 //! without a `MAX_BLOB_HEADER_SIZE` guard, so four bytes of corrupt input drove
-//! an unbounded `resize`.
+//! an unbounded `resize`. (That loop is gone: `cat --dedupe` now walks its
+//! inputs with `HeaderWalker`, as `sort` does.)
 //!
 //! This module owns the policy so a future framing guard is a one-line change
 //! here rather than a five-line change spread across the crate:
@@ -223,7 +224,7 @@ mod tests {
     /// 0-3 trailing bytes at a frame boundary are clean EOF; a validated
     /// prefix is returned otherwise.
     ///
-    /// This pins the policy for the three decoders that share this helper's
+    /// This pins the policy for the decoders that share this helper's
     /// I/O. The other two spell it themselves and are pinned at their own call
     /// sites, because a unit test here cannot reach them:
     /// `tests/read_paths.rs::trailing_partial_length_prefix_returns_ok_none`

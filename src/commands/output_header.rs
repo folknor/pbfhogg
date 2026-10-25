@@ -18,20 +18,22 @@
 //!   holds for this file.
 //! - bbox only when it contains the output's coordinates (or the user asked
 //!   for an extract's region envelope with `--set-bounds`).
-//! - replication state only when the output is at that state.
+//! - replication position (timestamp, sequence number) only when the output's
+//!   content is drawn from that position, and the feed (base URL) only while
+//!   the content stays in that feed's ID space; see [`Replication`].
 //! - optional features the crate does not know are never carried: nothing can
 //!   vouch for them after a rewrite. Only [`verbatim`] (degrade's header-only
 //!   passthrough) forwards a header field for field.
 //!
 //! `--generator` / `--output-header` are applied last, and replace only the
-//! field they name.
+//! field they name; an empty `--output-header` value omits that field.
 
 use crate::HeaderBlock;
 use crate::block_builder::HeaderBuilder;
 use crate::read::block::Feature;
 use crate::read::wire_schema::HeaderBlockField;
 
-use super::{HeaderOverrides, Result};
+use super::{FieldOverride, HeaderOverrides, Result};
 use crate::error::Error;
 
 /// How the output's element order relates to `Sort.Type_then_ID`.
@@ -119,15 +121,32 @@ pub(crate) enum Bbox {
 }
 
 /// The output's replication state.
+///
+/// The replication fields name the feed (base URL) and the position in it
+/// (timestamp, sequence number) the output's content was drawn from: every
+/// object is in that feed's ID space, and a snapshot's objects are at their
+/// version as of that position. They do not promise that applying the feed's
+/// later diffs maintains a selection: an extract or a filter grows under them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Replication {
-    /// The output is at the inputs' replication state: kept when every input
-    /// carries the same timestamp, sequence number and base URL.
+    /// The output's content is drawn from the inputs' replication state (all
+    /// of it, a subset, or a re-encoding): kept when every input carries the
+    /// same timestamp, sequence number and base URL.
     Carry,
     /// time-filter: the output holds the data as of `cutoff` (UNIX seconds).
     /// The timestamp becomes `min(input, cutoff)`; the sequence number is kept
     /// only when the input's timestamp is known and not after the cutoff.
     AsOf(i64),
+    /// apply-changes: the output has moved past the input's position to one
+    /// the command cannot name (an OSC carries no sequence number, nor proof
+    /// that it continues the input's feed without a gap). The timestamp and
+    /// sequence number are dropped; the base URL, which names the feed
+    /// rather than a position in it, is kept as provenance. A caller that
+    /// knows the new state stamps it with `--output-header`.
+    FeedOnly,
+    /// renumber: the content left the feed's ID space, so the feed's diffs
+    /// address other objects than the ones in the file. Nothing is kept.
+    Drop,
 }
 
 /// The facts a command states about its output.
@@ -269,9 +288,10 @@ pub(crate) fn build(
         Bbox::Drop => {}
     }
 
-    let (mut ts, mut seq, url) = agreed_replication(inputs);
-    if let Replication::AsOf(cutoff) = facts.replication {
-        match ts {
+    let (mut ts, mut seq, mut url) = agreed_replication(inputs);
+    match facts.replication {
+        Replication::Carry => {}
+        Replication::AsOf(cutoff) => match ts {
             Some(t) if t <= cutoff => {}
             Some(_) => {
                 ts = Some(cutoff);
@@ -280,7 +300,9 @@ pub(crate) fn build(
             // Without a timestamp nothing proves the filter left the input's
             // replication state intact, so its sequence number cannot stay.
             None => seq = None,
-        }
+        },
+        Replication::FeedOnly => (ts, seq) = (None, None),
+        Replication::Drop => (ts, seq, url) = (None, None, None),
     }
     if let Some(ts) = ts {
         hb = hb.replication_timestamp(ts);
@@ -329,7 +351,8 @@ pub(crate) fn build_one(
 /// for field, so the writing program, `source`, every optional feature
 /// (custom ones included) and unknown fields survive. `--strip-bbox` removes
 /// the bbox; each override replaces exactly the field it names, every
-/// occurrence of it, and leaves the rest alone.
+/// occurrence of it, and leaves the rest alone. A cleared field is stripped
+/// and nothing is written in its place.
 pub(crate) fn verbatim(
     header_block: &[u8],
     strip_bbox: bool,
@@ -345,13 +368,13 @@ pub(crate) fn verbatim(
     if overrides.generator.is_some() {
         strip.push(HeaderBlockField::WritingProgram);
     }
-    if overrides.replication_timestamp.is_some() {
+    if overrides.replication_timestamp != FieldOverride::Unchanged {
         strip.push(HeaderBlockField::ReplicationTimestamp);
     }
-    if overrides.replication_sequence_number.is_some() {
+    if overrides.replication_sequence_number != FieldOverride::Unchanged {
         strip.push(HeaderBlockField::ReplicationSequenceNumber);
     }
-    if overrides.replication_base_url.is_some() {
+    if overrides.replication_base_url != FieldOverride::Unchanged {
         strip.push(HeaderBlockField::ReplicationBaseUrl);
     }
     if strip.is_empty() {
@@ -362,13 +385,13 @@ pub(crate) fn verbatim(
     if let Some(program) = &overrides.generator {
         encode_bytes_field_always(&mut out, field::WRITING_PROGRAM, program.as_bytes());
     }
-    if let Some(ts) = overrides.replication_timestamp {
+    if let FieldOverride::Set(ts) = overrides.replication_timestamp {
         encode_int64_field_always(&mut out, field::REPLICATION_TIMESTAMP, ts);
     }
-    if let Some(seq) = overrides.replication_sequence_number {
+    if let FieldOverride::Set(seq) = overrides.replication_sequence_number {
         encode_int64_field_always(&mut out, field::REPLICATION_SEQUENCE_NUMBER, seq);
     }
-    if let Some(url) = &overrides.replication_base_url {
+    if let FieldOverride::Set(url) = &overrides.replication_base_url {
         encode_bytes_field_always(&mut out, field::REPLICATION_BASE_URL, url.as_bytes());
     }
     Ok(out)
@@ -636,6 +659,84 @@ mod tests {
         assert_eq!(h.osmosis_replication_sequence_number(), None);
     }
 
+    /// FeedOnly keeps the feed and drops the position; Drop keeps neither.
+    /// An override still applies last.
+    #[test]
+    fn feed_only_and_drop_shed_the_position() {
+        let input = header(
+            HeaderBuilder::new()
+                .replication_timestamp(1000)
+                .replication_sequence_number(7)
+                .replication_base_url("https://feed.invalid/"),
+        );
+        let with = |replication| OutputFacts {
+            replication,
+            ..OutputFacts::carry(Ways::Reencoded)
+        };
+        let state = |h: HeaderBlock| {
+            (
+                h.osmosis_replication_timestamp(),
+                h.osmosis_replication_sequence_number(),
+                h.osmosis_replication_base_url().map(str::to_owned),
+            )
+        };
+        let feed_only = built(std::slice::from_ref(&input), &with(Replication::FeedOnly));
+        assert_eq!(
+            state(feed_only),
+            (None, None, Some("https://feed.invalid/".to_owned()))
+        );
+        let dropped = built(std::slice::from_ref(&input), &with(Replication::Drop));
+        assert_eq!(state(dropped), (None, None, None));
+
+        let host = crate::host::Host::for_tests();
+        let stamped = HeaderOverrides {
+            replication_sequence_number: FieldOverride::Set(8),
+            ..Default::default()
+        };
+        let out = build(
+            std::slice::from_ref(&input),
+            &with(Replication::FeedOnly),
+            &stamped,
+            &host,
+        )
+        .unwrap();
+        let h = HeaderBlock::parse_from_bytes(&out.bytes).unwrap();
+        assert_eq!(h.osmosis_replication_sequence_number(), Some(8));
+    }
+
+    /// A cleared override removes the field the policy would have written,
+    /// and leaves the other fields alone.
+    #[test]
+    fn a_cleared_override_omits_its_field() {
+        let input = header(
+            HeaderBuilder::new()
+                .replication_timestamp(0)
+                .replication_sequence_number(0)
+                .replication_base_url(""),
+        );
+        let host = crate::host::Host::for_tests();
+        let cleared = HeaderOverrides::parse(
+            None,
+            &[
+                "osmosis_replication_sequence_number=5".to_owned(),
+                "osmosis_replication_sequence_number=".to_owned(),
+                "osmosis_replication_base_url=".to_owned(),
+            ],
+        )
+        .unwrap();
+        let out = build(
+            std::slice::from_ref(&input),
+            &OutputFacts::carry(Ways::Reencoded),
+            &cleared,
+            &host,
+        )
+        .unwrap();
+        let h = HeaderBlock::parse_from_bytes(&out.bytes).unwrap();
+        assert_eq!(h.osmosis_replication_timestamp(), Some(0));
+        assert_eq!(h.osmosis_replication_sequence_number(), None);
+        assert_eq!(h.osmosis_replication_base_url(), None);
+    }
+
     #[test]
     fn source_survives_only_when_every_input_agrees() {
         let with = |s: Option<&str>| {
@@ -740,5 +841,15 @@ mod tests {
             verbatim(&input, false, &HeaderOverrides::default()).unwrap(),
             input
         );
+
+        // A clear strips the field and writes nothing in its place.
+        let cleared = HeaderOverrides {
+            replication_timestamp: FieldOverride::Clear,
+            ..Default::default()
+        };
+        let h = HeaderBlock::parse_from_bytes(&verbatim(&input, false, &cleared).unwrap()).unwrap();
+        assert_eq!(h.osmosis_replication_timestamp(), None);
+        assert_eq!(h.osmosis_replication_sequence_number(), Some(7));
+        assert_eq!(h.writing_program(), Some("osmium/1.16"));
     }
 }

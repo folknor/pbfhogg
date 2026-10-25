@@ -4,6 +4,31 @@
 
 ### Breaking
 
+- **apply-changes no longer claims the base's replication position.** Its
+  output used to carry the base's `osmosis_replication_timestamp` and
+  sequence number although it holds a later state. It now drops both (as
+  osmium does) and keeps the base URL; an updater that knows the state of
+  the diff it applied must stamp it with `--output-header` (library:
+  `HeaderOverrides`). A tool that bootstraps from the header, such as
+  `osm2pgsql-replication init --osm-file`, refuses an unstamped output
+  instead of resuming from a stale position. `bench-merge` follows suit.
+
+- **renumber writes no replication state.** Its new IDs are not the feed's,
+  so a header naming the feed and position invited updaters to apply diffs
+  that address other objects. osmium renumber writes none either.
+
+- **An empty `--output-header` value omits the field.**
+  `--output-header osmosis_replication_base_url=` used to write a present,
+  empty base URL, and an empty timestamp or sequence number was refused; any
+  of the three keys with an empty value now removes that field from the
+  output, whatever the command would have written, as in osmium. It works
+  on degrade's header-only passthrough too. `--generator ""` still writes an
+  empty writing program. Library: `HeaderOverrides`' replication fields are
+  now `FieldOverride` (`Unchanged`, `Set`, `Clear`) instead of `Option`, the
+  `OutputHeaderEntry` variants carry an `Option` (`None` clears), and
+  `HeaderBuilder` gains `without_replication_timestamp`,
+  `without_replication_sequence_number` and `without_replication_base_url`.
+
 - **`DiffOptions::summary` is removed.** The library never read it: the
   caller chooses between `DiffStats::write_summary` and
   `DiffStats::write_osmium_summary` itself. Delete the field from any

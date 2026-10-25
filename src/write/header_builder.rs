@@ -157,6 +157,27 @@ impl<'a> HeaderBuilder<'a> {
         self
     }
 
+    /// Clear any replication timestamp set so far.
+    #[must_use]
+    pub fn without_replication_timestamp(mut self) -> Self {
+        self.replication_timestamp = None;
+        self
+    }
+
+    /// Clear any replication sequence number set so far.
+    #[must_use]
+    pub fn without_replication_sequence_number(mut self) -> Self {
+        self.replication_sequence_number = None;
+        self
+    }
+
+    /// Clear any replication base URL set so far.
+    #[must_use]
+    pub fn without_replication_base_url(mut self) -> Self {
+        self.replication_base_url = None;
+        self
+    }
+
     /// Declare `Sort.Type_then_ID` - elements are sorted by type then by ID.
     #[must_use]
     pub fn sorted(mut self) -> Self {
@@ -439,6 +460,20 @@ mod tests {
             .build()
             .unwrap();
         assert!(field_bytes(&stripped, 17).is_none());
+
+        // The replication opt-outs remove a value already set, zero included.
+        let cleared = HeaderBuilder::new()
+            .replication_timestamp(0)
+            .replication_sequence_number(0)
+            .replication_base_url("")
+            .without_replication_timestamp()
+            .without_replication_sequence_number()
+            .without_replication_base_url()
+            .build()
+            .unwrap();
+        for field in [32, 33, 34] {
+            assert!(field_bytes(&cleared, field).is_none(), "field {field}");
+        }
     }
 
     /// The default writing program names the release that wrote the file.

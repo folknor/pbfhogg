@@ -202,13 +202,28 @@ pub(crate) fn ensure_relation_capacity_local(
 // Header overrides (--generator, --output-header)
 // ---------------------------------------------------------------------------
 
+/// What an override does to one output header field.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum FieldOverride<T> {
+    /// No override: the command's output-header policy decides the field.
+    #[default]
+    Unchanged,
+    /// Write this value, whatever the policy would have written.
+    Set(T),
+    /// Do not write the field, whatever the policy would have written
+    /// (`--output-header KEY=` with an empty value).
+    Clear,
+}
+
 /// Header field overrides from `--generator` and `--output-header` CLI flags.
 #[derive(Default)]
 pub struct HeaderOverrides {
+    /// The writing program. An empty string is written as a present, empty
+    /// field (osmium writes the writing program unconditionally too).
     pub generator: Option<String>,
-    pub replication_timestamp: Option<i64>,
-    pub replication_sequence_number: Option<i64>,
-    pub replication_base_url: Option<String>,
+    pub replication_timestamp: FieldOverride<i64>,
+    pub replication_sequence_number: FieldOverride<i64>,
+    pub replication_base_url: FieldOverride<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -259,11 +274,15 @@ impl HeaderOverrideKey {
 /// value at its argument boundary, before any input is opened; the overrides
 /// are then assembled from already-typed entries by
 /// [`HeaderOverrides::from_entries`], which cannot fail.
+///
+/// `None` is an entry with an empty value (`KEY=`): the field is not written.
+/// osmium means the same by an empty value (libosmium's PBF writer skips an
+/// empty replication field).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutputHeaderEntry {
-    ReplicationTimestamp(i64),
-    ReplicationSequenceNumber(i64),
-    ReplicationBaseUrl(String),
+    ReplicationTimestamp(Option<i64>),
+    ReplicationSequenceNumber(Option<i64>),
+    ReplicationBaseUrl(Option<String>),
 }
 
 impl std::str::FromStr for OutputHeaderEntry {
@@ -281,27 +300,38 @@ impl std::str::FromStr for OutputHeaderEntry {
                 HeaderOverrideKey::help_list()
             ))
         })?;
+        if value.is_empty() {
+            return Ok(match key.kind {
+                HeaderOverrideKind::Timestamp => Self::ReplicationTimestamp(None),
+                HeaderOverrideKind::SequenceNumber => Self::ReplicationSequenceNumber(None),
+                HeaderOverrideKind::BaseUrl => Self::ReplicationBaseUrl(None),
+            });
+        }
         Ok(match key.kind {
             // Integer seconds or RFC 3339, the same two spellings
             // time-filter's cutoff takes.
             HeaderOverrideKind::Timestamp => {
-                Self::ReplicationTimestamp(match value.parse::<i64>() {
+                Self::ReplicationTimestamp(Some(match value.parse::<i64>() {
                     Ok(seconds) => seconds,
                     Err(_) => parse_rfc3339_utc(value).map_err(|_| {
                         Error::invalid_argument(format!(
                             "invalid {}: '{value}' (expected UNIX seconds or \
-                             YYYY-MM-DDTHH:MM:SSZ)",
+                             YYYY-MM-DDTHH:MM:SSZ, or nothing to omit the field)",
                             key.name
                         ))
                     })?,
-                })
+                }))
             }
             HeaderOverrideKind::SequenceNumber => {
-                Self::ReplicationSequenceNumber(value.parse::<i64>().map_err(|_| {
-                    Error::invalid_argument(format!("invalid {}: '{value}'", key.name))
-                })?)
+                Self::ReplicationSequenceNumber(Some(value.parse::<i64>().map_err(|_| {
+                    Error::invalid_argument(format!(
+                        "invalid {}: '{value}' (expected an integer, or nothing to \
+                         omit the field)",
+                        key.name
+                    ))
+                })?))
             }
-            HeaderOverrideKind::BaseUrl => Self::ReplicationBaseUrl(value.to_string()),
+            HeaderOverrideKind::BaseUrl => Self::ReplicationBaseUrl(Some(value.to_string())),
         })
     }
 }
@@ -319,24 +349,27 @@ impl HeaderOverrides {
     }
 
     /// Assemble overrides from already-parsed entries. A later entry for the
-    /// same field replaces an earlier one.
+    /// same field replaces an earlier one, a clear included.
     #[must_use]
     pub fn from_entries(
         generator: Option<String>,
         entries: impl IntoIterator<Item = OutputHeaderEntry>,
     ) -> Self {
+        fn field<T>(value: Option<T>) -> FieldOverride<T> {
+            value.map_or(FieldOverride::Clear, FieldOverride::Set)
+        }
         let mut ov = HeaderOverrides {
             generator,
             ..Default::default()
         };
         for entry in entries {
             match entry {
-                OutputHeaderEntry::ReplicationTimestamp(ts) => ov.replication_timestamp = Some(ts),
+                OutputHeaderEntry::ReplicationTimestamp(ts) => ov.replication_timestamp = field(ts),
                 OutputHeaderEntry::ReplicationSequenceNumber(seq) => {
-                    ov.replication_sequence_number = Some(seq);
+                    ov.replication_sequence_number = field(seq);
                 }
                 OutputHeaderEntry::ReplicationBaseUrl(url) => {
-                    ov.replication_base_url = Some(url);
+                    ov.replication_base_url = field(url);
                 }
             }
         }
@@ -350,7 +383,7 @@ impl HeaderOverrides {
         format!(
             "Set output header fields (repeatable, format: key=value). Supported keys: {}. \
              The timestamp takes UNIX seconds or YYYY-MM-DDTHH:MM:SSZ. Each key replaces \
-             only its own field.",
+             only its own field; an empty value (key=) omits the field.",
             HeaderOverrideKey::help_list()
         )
     }
@@ -361,16 +394,21 @@ impl HeaderOverrides {
         if let Some(program) = &self.generator {
             hb = hb.writing_program(program);
         }
-        if let Some(ts) = self.replication_timestamp {
-            hb = hb.replication_timestamp(ts);
+        hb = match self.replication_timestamp {
+            FieldOverride::Unchanged => hb,
+            FieldOverride::Set(ts) => hb.replication_timestamp(ts),
+            FieldOverride::Clear => hb.without_replication_timestamp(),
+        };
+        hb = match self.replication_sequence_number {
+            FieldOverride::Unchanged => hb,
+            FieldOverride::Set(seq) => hb.replication_sequence_number(seq),
+            FieldOverride::Clear => hb.without_replication_sequence_number(),
+        };
+        match &self.replication_base_url {
+            FieldOverride::Unchanged => hb,
+            FieldOverride::Set(url) => hb.replication_base_url(url),
+            FieldOverride::Clear => hb.without_replication_base_url(),
         }
-        if let Some(seq) = self.replication_sequence_number {
-            hb = hb.replication_sequence_number(seq);
-        }
-        if let Some(url) = &self.replication_base_url {
-            hb = hb.replication_base_url(url);
-        }
-        hb
     }
 }
 

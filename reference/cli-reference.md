@@ -118,7 +118,7 @@ These flags appear on most commands that produce PBF output:
 | `--direct-io` | Use O_DIRECT to bypass page cache (requires `linux-direct-io` feature) |
 | `--force` | On a command that would refuse unindexed input: proceed with the slower fallback (see [`--force`](#--force)) |
 | `--generator <GENERATOR>` | Override the writing program name in the output header |
-| `--output-header <KEY=VALUE>` | Set output header fields (repeatable). Keys: `osmosis_replication_timestamp` (UNIX seconds or `YYYY-MM-DDTHH:MM:SSZ`), `osmosis_replication_sequence_number`, `osmosis_replication_base_url` |
+| `--output-header <KEY=VALUE>` | Set output header fields (repeatable). Keys: `osmosis_replication_timestamp` (UNIX seconds or `YYYY-MM-DDTHH:MM:SSZ`), `osmosis_replication_sequence_number`, `osmosis_replication_base_url`. An empty value (`KEY=`) omits the field |
 
 ## Short flags
 
@@ -287,21 +287,35 @@ header follows from them.
   declares the region's envelope instead, which complete_ways and smart
   exceed by design with the out-of-region nodes of selected ways (osmium
   does the same).
-- **Replication state**: the base URL is kept when every input names the same
-  one; the timestamp and sequence number only when every input carries the
-  same timestamp, sequence number and base URL. time-filter writes
-  `min(input timestamp, cutoff)` and keeps the sequence number only when the
-  input's timestamp is known and not after the cutoff.
+- **Replication state**: the base URL names the feed, and the timestamp and
+  sequence number the position in it, that the output's content was drawn
+  from: every object is in that feed's ID space, and a snapshot's objects are
+  at their version as of that position. They do not promise that applying the
+  feed's later diffs maintains a selection (an extract or a filter grows under
+  them), and they are only as true as the input headers they come from. The
+  base URL is kept when every input names the same one; the timestamp and
+  sequence number only when every input carries the same timestamp, sequence
+  number and base URL. time-filter writes `min(input timestamp, cutoff)` and
+  keeps the sequence number only when the input's timestamp is known and not
+  after the cutoff. apply-changes keeps the base URL only: its output is past
+  the base's position, at one it cannot name (an OSC has no sequence number,
+  nor proof that it follows the base without a gap); a caller that knows the
+  new position sets it with `--output-header`. renumber keeps none of the
+  three: its new IDs are not the feed's, so the feed's diffs would address
+  other objects.
 - **`source`** is kept when every input agrees; **`HistoricalInformation`**
   when any input declares it.
 - **Writing program**: `pbfhogg/<version>`, the library's package version.
 - Optional features pbfhogg does not know are not carried: nothing can vouch
   for them after a rewrite.
 - **`--generator` / `--output-header`** apply last, and each replaces only
-  the field it names. An empty value is a value: `--generator ""` writes an
-  empty writing program and `--output-header osmosis_replication_base_url=`
-  an empty base URL, both as present, empty fields. Neither removes the
-  field; no flag removes a field the policy would write.
+  the field it names; a later `--output-header` for the same key replaces an
+  earlier one. An empty `--output-header` value omits the field, whatever the
+  policy would have written (`--output-header osmosis_replication_base_url=`
+  writes no base URL), as in osmium. `--generator ""` writes a present, empty
+  writing program (osmium writes the writing program unconditionally too).
+  An empty `source` or base URL carried from an input header stays a
+  present, empty field.
 
 The exception is degrade's header-only passthrough (`--strip-indexdata`,
 `--strip-tagdata`, `--strip-bbox`, `--corrupt-*`), which copies every blob
@@ -825,6 +839,10 @@ FullScan arm unconditionally.
 
 Renumber all element IDs sequentially, remapping cross-references (way node refs, relation member refs).
 
+The output header carries no replication state: the new IDs are not the
+feed's, so its diffs would address other objects (see
+[Output header](#output-header)).
+
 ```
 pbfhogg renumber [OPTIONS] --output <OUTPUT> <FILE>
 ```
@@ -1163,8 +1181,9 @@ state, which the snapshot no longer is (see [Output header](#output-header)).
 Apply an OSC diff to a sorted PBF file. Uses blob passthrough -- unmodified blobs are copied as raw bytes without decompression.
 
 The output header declares no bbox (the OSC can place a node outside the
-base's) and carries the base's replication state unchanged; set the new state
-with `--output-header` (see [Output header](#output-header)).
+base's). Of the base's replication state it keeps the base URL and drops the
+timestamp and sequence number, since the output is past them; set the new
+state with `--output-header` (see [Output header](#output-header)).
 
 ```
 pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>

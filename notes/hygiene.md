@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-3. HYG-121, HYG-128
 4. HYG-061
 5. HYG-152
 6. HYG-153
@@ -1453,111 +1452,6 @@ capability with a public format to design, not hygiene; if it comes back,
 normalising the summary-line shapes and keys is the first step.
 
 Reported by: split out of the diagnostic-wording item.
-
-## HYG-121 - apply-changes carries the base's replication state onto a newer output
-
-Anger: 8 - apply-changes output contract; nidhogg reads replication state
-from PBF headers.
-
-Output headers now come from one policy (`src/commands/output_header.rs`,
-`reference/cli-reference.md` "Output header"). What remains: apply-changes
-states `Replication::Carry`, so its output declares the base's
-`osmosis_replication_timestamp` and sequence number although it holds the base
-plus the OSC, a later state. osmium apply-changes writes a fresh header with
-no replication fields. Claiming the older state is the safe direction for an
-updater (it re-applies a diff, which is idempotent at equal versions), but it
-is not what the output contains. The OSC carries no sequence number, so the
-honest options are to drop the timestamp and sequence number (osmium) or keep
-them and document them as the base's; which one depends on how nidhogg's
-`update.rs` reads them, which the maintainer has to check. bench-merge shares
-the path.
-
-What nidhogg does today (nidhogg may be changed freely): only `update::init`
-reads the header, to bootstrap its state file; afterwards the state file is
-authoritative. With no replication fields, `init` falls back to Geofabrik's
-current state, which silently skips diffs if the PBF is not current - so
-today's carry is the safe direction for it (a re-init replays, which is
-idempotent). `merge.rs` passes a `HeaderOverrides` with every replication
-field `None`. Proposed, not decided: pbfhogg drops the fields unless the
-caller supplies them, nidhogg's merge stamps the sequence and timestamp of
-the last diff it applied, and `init`'s fallback stops being silent.
-
-Needs research before a ruling:
-
-- What osmium `apply-changes` writes, exactly, and whether osmium or
-  osmosis ever advance replication fields across a merge (and from what).
-- What other consumers of pbfhogg output read these fields (osm2pgsql's
-  replication init, pyosmium's `pyosmium-up-to-date`, Overpass, imposm),
-  and what each does with a stale value versus a missing one.
-- Whether an OSC's companion `state.txt`, or the OSC's own content (newest
-  element timestamp), is a sound source pbfhogg could derive the true state
-  from.
-- Which other pbfhogg commands carry replication state (`Replication::Carry`
-  in `output_header.rs`) onto outputs whose content no longer matches it,
-  so one rule covers them all.
-
-HYG-128 (no flag clears a header field) waits on this outcome.
-
-Research done 2026-10-25, from `research/`:
-
-- osmium apply-changes writes a fresh header:
-  `with_osm_output::setup_header` (`research/osmium-tool/src/io.cpp`) sets
-  `generator` and the user's `--output-header` options only, so the
-  replication fields are dropped. osmium's `--output-header KEY!` copies a
-  field from the input header.
-- libosmium's PBF writer (`pbf_output_format.hpp`) skips a replication
-  field whose value is empty: in osmium an empty value means absent.
-- Every pbfhogg command but time-filter states `Replication::Carry`
-  (`src/commands/output_header.rs`). For all of them except apply-changes
-  and bench-merge the output is a subset or re-encoding of the input at the
-  input's state, so carrying is true there. One rule covers it: carry when
-  the content is at the input's state, not when it moves past it.
-- Deriving a timestamp from the OSC's newest element was ruled out: the OSC
-  has no sequence number, so the header would pair a new timestamp with a
-  stale sequence number.
-- Not verified (not vendored; from memory): `pyosmium-up-to-date` and
-  `osm2pgsql-replication init` fall back to the newest object timestamp in
-  the file when the header has no replication fields, a conservative
-  fallback that should not skip diffs. Worth checking their sources before
-  landing.
-
-Recommendation (2026-10-25), agreed with the maintainer: apply-changes and
-bench-merge drop the replication timestamp and sequence number unless the
-caller supplies them (osmium parity; whether the base URL, which names the
-source rather than the state, keeps carrying is open), with a CHANGELOG
-entry; and a nidhogg bz ticket for nidhogg's merge to stamp the sequence
-and timestamp of the last diff it applied through `HeaderOverrides`, and
-for `init`'s Geofabrik fallback to stop being silent. The ticket needs to
-land before or with the pbfhogg release nidhogg next picks up.
-
-Reported by: the output-header policy work.
-
-## HYG-128 - No flag clears a header field
-
-Anger: 3 - CLI behaviour, small.
-
-`--generator` and `--output-header` can only set a value; an empty value
-writes a present, empty field. Nothing removes `source`, the replication base
-URL or the writing program from an output header (`degrade --strip-bbox` is
-the only removal, and only of the bbox). Whether removal is wanted, and with
-what spelling, is the maintainer's call; no syntax is reserved today.
-
-Needs research, together with HYG-121: the one concrete use seen so far is
-stripping stale replication state, which HYG-121 is deciding the default
-for. If its outcome drops the fields from apply-changes output unless the
-caller supplies them, the main reason for a removal flag goes away. Options
-on the table for whatever remains: an empty value meaning absent (changes
-today's present-but-empty behaviour), or an explicit repeatable
-`--clear-header KEY` with a conflict rule against `--output-header KEY=...`.
-
-Recommendation (2026-10-25), agreed with the maintainer; lands with or
-after HYG-121: follow osmium (see HYG-121's research) - an explicit empty
-`--output-header KEY=` means the field is not written. Values carried from
-an input header keep commit `7b584b2f`'s present-but-empty behaviour, which
-was about carrying input headers faithfully, not about flags. No
-`--clear-header`.
-
-Reported by: the scratch-lifecycle review fixes.
 
 ## HYG-181 - The parallel diff and derive shard decoders allocate a fresh buffer per block
 

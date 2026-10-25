@@ -440,11 +440,17 @@ pub(crate) fn renumber_external_to(
     };
     // The writer fills the output's staging file; `renumber_external`
     // publishes it only after this function has succeeded.
+    // Renumbered content has left the feed's ID space: the feed's diffs
+    // address other objects than the ones in this file, so no replication
+    // field is carried (osmium renumber writes a fresh header too).
     let mut writer = writer_from_header(
         output,
         effective_compression,
         &header,
-        &super::output_header::OutputFacts::sorted(super::output_header::Ways::Reencoded),
+        &super::output_header::OutputFacts {
+            replication: super::output_header::Replication::Drop,
+            ..super::output_header::OutputFacts::sorted(super::output_header::Ways::Reencoded)
+        },
         overrides,
         backend,
         host,

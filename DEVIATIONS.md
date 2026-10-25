@@ -487,6 +487,22 @@ which was worse than either: the cat paths built the output header from the
 first input alone, so the output advertised one input's bounding box over
 data drawn from all of them.
 
+## apply-changes: the base URL survives, the position does not
+
+`osmium apply-changes` (`command_apply_changes.cpp`) writes a fresh header:
+the writing program and the user's `--output-header` values, no replication
+field at all.
+
+`pbfhogg apply-changes` drops the replication timestamp and sequence number
+as osmium does - the output is past them, and an OSC carries no sequence
+number to name the new position - but keeps the base URL. The URL names the
+feed, not a position in it, and stays the output's provenance. It matters to
+updaters that fall back to the newest object timestamp when the header has
+no position: `pyosmium-up-to-date` and `osm2pgsql-replication init` (from
+its import properties) then stay on the base's feed instead of switching a
+regional extract to their planet-feed default. An explicit
+`--output-header osmosis_replication_base_url=` drops it as osmium would.
+
 ## time-filter: the sequence number does not outlive the replication state
 
 `osmium time-filter` (`command_time_filter.cpp`) lowers the output's

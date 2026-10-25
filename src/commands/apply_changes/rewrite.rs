@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 use crate::write::WriteOptions;
 
 use crate::commands::input_front::InputFront;
-use crate::commands::output_header::{Bbox, OutputFacts, Ways};
+use crate::commands::output_header::{Bbox, OutputFacts, Replication, Ways};
 use crate::commands::{HeaderOverrides, writer_from_header_bytes};
 
 use super::descriptor::{DrainItem, Route};
@@ -121,9 +121,17 @@ fn build_header_bytes(
     // coordinates; the prepass fields of spliced blobs are stale against the
     // changed relations and ways, so they are not declared. Without -l a
     // rewritten way blob loses its coordinates. An OSC can create or move a
-    // node outside the base's bbox, so no bbox is declared.
+    // node outside the base's bbox, so no bbox is declared. The output is
+    // past the base's replication position, at one the OSC cannot name (it
+    // has no sequence number, nor proof it follows the base without a gap),
+    // so only the feed's base URL is kept; the caller stamps the new
+    // position with `HeaderOverrides` when it knows it. osmium apply-changes
+    // drops all three fields; keeping the URL keeps pyosmium-up-to-date and
+    // osm2pgsql-replication on the base's feed instead of their planet
+    // default when they fall back to the newest object timestamp.
     let facts = OutputFacts {
         bbox: Bbox::Drop,
+        replication: Replication::FeedOnly,
         ..OutputFacts::sorted(if locations_on_ways {
             Ways::ReencodedWithLocations
         } else {

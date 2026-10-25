@@ -49,7 +49,7 @@ These flags appear on most commands that produce PBF output:
 | `--direct-io` | Use O_DIRECT to bypass page cache (requires `linux-direct-io` feature) |
 | `--force` | On a command that would refuse unindexed input: proceed with the slower fallback. Only those commands have it |
 | `--generator <GENERATOR>` | Override the writing program name in the output header |
-| `--output-header <KEY=VALUE>` | Set output header fields (repeatable). Keys: `osmosis_replication_timestamp` (UNIX seconds or `YYYY-MM-DDTHH:MM:SSZ`), `osmosis_replication_sequence_number`, `osmosis_replication_base_url`. Each key replaces only its own field |
+| `--output-header <KEY=VALUE>` | Set output header fields (repeatable). Keys: `osmosis_replication_timestamp` (UNIX seconds or `YYYY-MM-DDTHH:MM:SSZ`), `osmosis_replication_sequence_number`, `osmosis_replication_base_url`. Each key replaces only its own field; an empty value (`KEY=`) omits it |
 
 ## Flag rules
 
@@ -102,12 +102,17 @@ A command's output header never claims more than its output contains:
 - The input's bbox (the union when every input declares one), except
   `apply-changes`, which declares none, and `extract --set-bounds`, which
   declares the region.
-- The input's replication state; `time-filter` lowers the timestamp to its
-  cutoff when the cutoff is earlier, and then drops the sequence number.
+- The input's replication state, naming the feed and the position the
+  content was drawn from; `time-filter` lowers the timestamp to its cutoff
+  when the cutoff is earlier, and then drops the sequence number.
+  `apply-changes` keeps only the base URL (its output is past the base's
+  position, at one it cannot name; set it with `--output-header`), and
+  `renumber` keeps none (its new IDs are not the feed's).
 - Writing program `pbfhogg/<version>` (the release that wrote the file),
-  unless `--generator` says otherwise.
-- An empty `--generator ""` or `--output-header osmosis_replication_base_url=`
-  value is written as a present, empty field. No flag removes a field.
+  unless `--generator` says otherwise; `--generator ""` writes a present,
+  empty writing program.
+- An empty `--output-header` value (`osmosis_replication_base_url=`) omits
+  that field, as in osmium.
 
 `degrade`'s header-only flags forward the input header field for field
 instead. The full rule is in `reference/cli-reference.md` "Output header".
@@ -507,6 +512,9 @@ pbfhogg degrade [OPTIONS] --output <OUTPUT> <FILE>
 
 Renumber all element IDs sequentially, remapping cross-references (way node refs, relation member refs).
 
+The output header carries no replication state: the new IDs are not the
+feed's, so its diffs would address other objects.
+
 ```
 pbfhogg renumber [OPTIONS] --output <OUTPUT> <FILE>
 ```
@@ -830,8 +838,10 @@ known and not after the cutoff.
 Apply an OSC diff to a sorted PBF file. Uses blob passthrough -- unmodified blobs are copied as raw bytes without decompression.
 
 The output header declares no bbox (the OSC can place a node outside the
-base's) and carries the base's replication state unchanged; set the new state
-with `--output-header`.
+base's). Of the base's replication state it keeps the base URL and drops the
+timestamp and sequence number, since the output is past them; set the new
+state with `--output-header`, for example
+`--output-header osmosis_replication_sequence_number=4707 --output-header osmosis_replication_timestamp=2026-04-10T00:00:00Z`.
 
 ```
 pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>

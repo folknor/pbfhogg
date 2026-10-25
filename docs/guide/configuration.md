@@ -47,7 +47,9 @@ pbfhogg apply-changes base.osm.pbf changes.osc.gz -o updated.osm.pbf \
   --output-header osmosis_replication_base_url=https://download.geofabrik.de/europe/denmark-updates
 ```
 
-Supported keys: `osmosis_replication_timestamp`, `osmosis_replication_sequence_number`, `osmosis_replication_base_url`.
+Supported keys: `osmosis_replication_timestamp`, `osmosis_replication_sequence_number`, `osmosis_replication_base_url`. An empty value (`--output-header osmosis_replication_base_url=`) omits the field.
+
+`apply-changes` drops the base's replication timestamp and sequence number (the output is past them, and an OSC does not say where to) and keeps its base URL, so an updater should stamp the state of the last diff it applied, as above.
 
 ## I/O mode flags
 

@@ -242,7 +242,7 @@ pub use read::reader::{ElementReader, PipelinedBlocks};
 // Module re-exports: short internal paths (`crate::blob`, `crate::block_builder`, etc.)
 // Required by imports and doc links in commands/, read/, and write/ modules.
 #[doc(hidden)]
-pub use commands::{HeaderOverrides, OutputHeaderEntry};
+pub use commands::{FieldOverride, HeaderOverrides, OutputHeaderEntry};
 #[doc(hidden)]
 pub use commands::{
     altw, apply_changes, cat, degrade, diff, digest, getid, getparents, inspect, merge_changes,

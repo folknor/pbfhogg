@@ -278,8 +278,12 @@ struct Exp {
     /// `None`: the input's writing program forwarded (degrade's verbatim
     /// header); otherwise the program written.
     program: Option<&'static str>,
+    /// The replication timestamp written.
+    ts: Option<i64>,
     /// The replication sequence number written.
     seq: Option<i64>,
+    /// The replication base URL written.
+    url: Option<&'static str>,
 }
 
 impl Exp {
@@ -292,7 +296,21 @@ impl Exp {
             prepass: false,
             bbox: BboxExp::Input,
             program: Some(OWN_PROGRAM),
+            ts: Some(REPLICATION_TS),
             seq: Some(REPLICATION_SEQ),
+            url: Some(REPLICATION_URL),
+        }
+    }
+
+    /// apply-changes: past the input's replication position, at one it
+    /// cannot name, so only the feed's base URL is kept.
+    fn merged(f: Fixture) -> Self {
+        Self {
+            sorted: true,
+            bbox: BboxExp::None,
+            ts: None,
+            seq: None,
+            ..Self::reencoded(f)
         }
     }
 
@@ -513,7 +531,18 @@ const ROWS: &[Row] = &[
         command: "renumber",
         label: "renumber",
         build: |fx, f| simple(fx, "renumber", &[fx.path(f)], &[]),
-        expect: |f| sorted_only(f, Exp::reencoded(f)),
+        // New IDs leave the feed's ID space: no replication field survives.
+        expect: |f| {
+            sorted_only(
+                f,
+                Exp {
+                    ts: None,
+                    seq: None,
+                    url: None,
+                    ..Exp::reencoded(f)
+                },
+            )
+        },
     },
     Row {
         command: "tags-filter",
@@ -688,16 +717,7 @@ const ROWS: &[Row] = &[
         label: "apply-changes",
         build: |fx, f| simple(fx, "apply-changes", &[fx.path(f), fx.osc()], &[]),
         // The OSC creates a node outside the base's box.
-        expect: |f| {
-            sorted_only(
-                f,
-                Exp {
-                    sorted: true,
-                    bbox: BboxExp::None,
-                    ..Exp::reencoded(f)
-                },
-            )
-        },
+        expect: |f| sorted_only(f, Exp::merged(f)),
     },
     Row {
         command: "apply-changes",
@@ -713,10 +733,8 @@ const ROWS: &[Row] = &[
         expect: |f| {
             if f.low() {
                 Outcome::Writes(Exp {
-                    sorted: true,
                     low: true,
-                    bbox: BboxExp::None,
-                    ..Exp::reencoded(f)
+                    ..Exp::merged(f)
                 })
             } else {
                 Outcome::Refused
@@ -727,16 +745,7 @@ const ROWS: &[Row] = &[
         command: "bench-merge",
         label: "bench-merge",
         build: |fx, f| simple(fx, "bench-merge", &[fx.path(f), fx.osc()], &[]),
-        expect: |f| {
-            sorted_only(
-                f,
-                Exp {
-                    sorted: true,
-                    bbox: BboxExp::None,
-                    ..Exp::reencoded(f)
-                },
-            )
-        },
+        expect: |f| sorted_only(f, Exp::merged(f)),
     },
 ];
 
@@ -1075,16 +1084,13 @@ fn check_output(
         "writing program {:?}, expected {program:?}",
         h.writing_program()
     );
-    ensure!(
-        h.osmosis_replication_timestamp() == Some(REPLICATION_TS)
-            && h.osmosis_replication_sequence_number() == exp.seq
-            && h.osmosis_replication_base_url() == Some(REPLICATION_URL),
-        "replication state ({:?}, {:?}, {:?}), expected ({REPLICATION_TS}, {:?}, {REPLICATION_URL})",
+    let got = (
         h.osmosis_replication_timestamp(),
         h.osmosis_replication_sequence_number(),
         h.osmosis_replication_base_url(),
-        exp.seq
     );
+    let want = (exp.ts, exp.seq, exp.url);
+    ensure!(got == want, "replication state {got:?}, expected {want:?}");
     Ok(())
 }
 
@@ -1355,6 +1361,62 @@ fn the_replication_timestamp_override_accepts_rfc3339() {
         Some(2000),
         "the fixture's own timestamp is {REPLICATION_TS}; the override must replace it"
     );
+}
+
+/// apply-changes drops the base's replication position, and a caller that
+/// knows the new one stamps it.
+#[test]
+fn apply_changes_takes_the_new_replication_position_from_the_caller() {
+    let fx = Fx::new(&[Fixture::Plain]);
+    let (args, outputs) = simple(
+        &fx,
+        "apply-changes",
+        &[fx.path(Fixture::Plain), fx.osc()],
+        &[
+            "--output-header",
+            "osmosis_replication_sequence_number=8",
+            "--output-header",
+            "osmosis_replication_timestamp=2000",
+        ],
+    );
+    CliInvoker::new().args(&args).assert_success();
+    let h = read_header(&outputs[0]);
+    assert_eq!(h.osmosis_replication_timestamp(), Some(2000));
+    assert_eq!(h.osmosis_replication_sequence_number(), Some(8));
+    assert_eq!(h.osmosis_replication_base_url(), Some(REPLICATION_URL));
+}
+
+/// An empty `--output-header` value omits the field, on the policy path and
+/// on degrade's verbatim passthrough alike, and leaves the others alone.
+#[test]
+fn an_empty_output_header_value_omits_the_field() {
+    let fx = Fx::new(&[Fixture::Plain]);
+    let clear = [
+        "--output-header",
+        "osmosis_replication_base_url=",
+        "--output-header",
+        "osmosis_replication_sequence_number=",
+    ];
+    let runs = [
+        simple(&fx, "cat", &[fx.path(Fixture::Plain)], &clear),
+        simple(
+            &fx,
+            "degrade",
+            &[fx.path(Fixture::Plain)],
+            &[&["--strip-tagdata"][..], &clear[..]].concat(),
+        ),
+    ];
+    for (args, outputs) in runs {
+        CliInvoker::new().args(&args).assert_success();
+        let h = read_header(&outputs[0]);
+        assert_eq!(h.osmosis_replication_base_url(), None, "{args:?}");
+        assert_eq!(h.osmosis_replication_sequence_number(), None, "{args:?}");
+        assert_eq!(
+            h.osmosis_replication_timestamp(),
+            Some(REPLICATION_TS),
+            "{args:?}"
+        );
+    }
 }
 
 /// OSC output has no PBF header, so the header flags are refused rather than

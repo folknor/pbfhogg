@@ -77,13 +77,12 @@
 //! The kind, count and ID-range checks are exact. Every consumer of those
 //! treats them as exact, so anything but equality is a lie with a consumer.
 
-use std::path::Path;
-
 use crate::blob::BlobKind;
 use crate::blob_meta::{BlobBbox, BlobIndex, scan_block_tags};
 use crate::error::Result;
 use crate::file_reader::FileReader;
 use crate::read::decompress::decompress_blob_data_into;
+use crate::read::input::InputSource;
 use crate::read::raw_frame::read_raw_frame;
 
 /// Compatibility name for the options shared by all check modes.
@@ -460,20 +459,26 @@ fn diff_tagdata(stored_bytes: Option<&[u8]>, block: &[u8], out: &mut Vec<IndexVi
 
 /// Decompress every OSMData blob and diff its payload against the metadata its
 /// `BlobHeader` claims.
-pub fn check_index(
-    path: &Path,
+///
+/// Reads the input front to back through one open, so it takes no pin of its
+/// own and reads a FIFO; a caller that composes it with other checks on the
+/// same input pins once and hands the pin here.
+pub fn check_index<'a>(
+    input: impl Into<InputSource<'a>>,
     opts: &CheckIndexOptions,
     host: &crate::host::Host,
 ) -> Result<IndexReport> {
-    host.cancel.decided(|| check_index_inner(path, opts, host))
+    let input = input.into();
+    host.cancel.decided(|| check_index_inner(input, opts, host))
 }
 
 fn check_index_inner(
-    path: &Path,
+    input: InputSource<'_>,
     opts: &CheckIndexOptions,
     host: &crate::host::Host,
 ) -> Result<IndexReport> {
-    let mut reader = FileReader::open(path, opts.direct_io)?;
+    let path = input.path();
+    let mut reader = FileReader::open(input, opts.direct_io)?;
     let mut file_offset: u64 = 0;
     let mut block = Vec::new();
     let mut report = IndexReport::default();

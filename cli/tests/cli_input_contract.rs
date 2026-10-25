@@ -1880,6 +1880,197 @@ fn inspect_pins_its_input_wherever_it_reads_it_twice() {
     }
 }
 
+/// The `check` selector sets that compose more than one library call on the
+/// input, with the pinned opens each run takes: `--ids` opens twice (its
+/// probe and its schedule walk), `--index` and `--refs` once each.
+const CHECK_COMPOSITIONS: [(&[&str], u64); 5] = [
+    (&[], 3),
+    (&["--ids", "--refs"], 3),
+    (&["--ids", "--index"], 3),
+    (&["--index", "--refs"], 2),
+    (&["--ids", "--index", "--refs"], 4),
+];
+
+/// A check run composing several checks pins its input once, before the
+/// first, so a FIFO is refused there rather than opened (a blocking open
+/// would wait for a writer, and none is attached). `--ids` alone pins in the
+/// library.
+#[cfg(unix)]
+#[test]
+fn check_pins_its_input_when_it_composes_checks() {
+    let dir = crate::common::test_scratch();
+    let fifo = crate::common::make_fifo(dir.path(), "in.fifo");
+    let ids_alone: &[&str] = &["--ids"];
+    for extra in CHECK_COMPOSITIONS
+        .iter()
+        .map(|&(extra, _)| extra)
+        .chain([ids_alone])
+    {
+        let out = CliInvoker::new().arg("check").arg(&fifo).args(extra).run();
+        let stderr = out.stderr_str();
+        assert!(!out.status.success(), "{extra:?}: stderr:\n{stderr}");
+        assert!(
+            stderr.contains(&format!("{} is not a regular file", fifo.display())),
+            "{extra:?}: {stderr}"
+        );
+    }
+}
+
+/// A check run composing several checks reads every check from the one
+/// pinned file, through the CLI's input replacement hook (`signals`
+/// `test_hooks`): a file renamed over the input after each pinned open in
+/// turn, between the checks as well as inside `--ids`, leaves the report
+/// unchanged where opens reach the pinned file (procfs, or after the last
+/// open), and otherwise refuses the next open with nothing printed. A CLI
+/// that pinned or opened the path per check would report the replacement
+/// for the checks after it. One test per selector set, each a few dozen
+/// runs of the binary, so each stays inside the per-test watchdog.
+#[cfg(all(unix, feature = "test-hooks"))]
+mod check_composition {
+    use super::{CHECK_COMPOSITIONS, CliInvoker, Path};
+
+    #[test]
+    fn bare() {
+        reads_every_check_from_the_pinned_input(0);
+    }
+
+    #[test]
+    fn ids_refs() {
+        reads_every_check_from_the_pinned_input(1);
+    }
+
+    #[test]
+    fn ids_index() {
+        reads_every_check_from_the_pinned_input(2);
+    }
+
+    #[test]
+    fn index_refs() {
+        reads_every_check_from_the_pinned_input(3);
+    }
+
+    #[test]
+    fn ids_index_refs() {
+        reads_every_check_from_the_pinned_input(4);
+    }
+
+    /// Unique, ordered IDs; the replacement has more nodes, ways and blobs,
+    /// so every check's report changes if it reads it.
+    fn write(path: &Path, nodes: usize, ways: i64) {
+        use crate::common::{TestWay, generate_nodes, write_multi_block_test_pbf};
+        let nodes = generate_nodes(nodes, 1);
+        let ways: Vec<TestWay> = (0..ways)
+            .map(|k| TestWay {
+                id: 1_000 + k,
+                refs: vec![k + 1, k + 2, k + 3],
+                tags: vec![("highway", "primary")],
+                meta: None,
+            })
+            .collect();
+        write_multi_block_test_pbf(path, &nodes, &ways, &[], 25);
+    }
+
+    /// `fired attempts verified refused attempts_after_fired`, as the CLI's
+    /// replacement hook writes them; a missing report fails.
+    fn report(path: &Path) -> [u64; 5] {
+        let text = std::fs::read_to_string(path).expect("the run writes its replacement report");
+        let fields: Vec<u64> = text
+            .split_whitespace()
+            .map(|f| f.parse().expect("numeric field"))
+            .collect();
+        fields.try_into().expect("five fields")
+    }
+
+    fn reads_every_check_from_the_pinned_input(composition: usize) {
+        let dir = crate::common::test_scratch();
+        let input = dir.path().join("in.osm.pbf");
+        let replacement = dir.path().join("replacement.osm.pbf");
+        let control = crate::common::test_scratch();
+        let run = |extra: &[&str], after: u64, force_path: bool| {
+            let report_file = control.path().join("report");
+            drop(std::fs::remove_file(&report_file));
+            let out = CliInvoker::new()
+                .arg("check")
+                .arg(&input)
+                .args(extra)
+                .arg("--json")
+                .env("PBFHOGG_TEST_REPLACE_INPUT", &input)
+                .env("PBFHOGG_TEST_REPLACE_WITH", &replacement)
+                .env("PBFHOGG_TEST_REPLACE_AFTER", after.to_string())
+                .env(
+                    "PBFHOGG_TEST_FORCE_PIN_PATH_REOPEN",
+                    if force_path { "1" } else { "0" },
+                )
+                .env("PBFHOGG_TEST_REPLACE_REPORT", &report_file)
+                .run();
+            (out, report(&report_file))
+        };
+
+        let (extra, opens) = CHECK_COMPOSITIONS[composition];
+        write(&input, 100, 5);
+        write(&replacement, 130, 9);
+        // Armed past the last open: the replacement never fires, and the run
+        // is the reference.
+        let (reference, counted) = run(extra, opens + 1, false);
+        assert!(
+            reference.status.success(),
+            "{extra:?}: {}",
+            reference.stderr_str()
+        );
+        assert_eq!(counted, [0, opens, opens, 0, 0], "{extra:?}");
+        let expected = reference.stdout_str();
+        assert!(
+            expected.contains("\"nodes\": 100") || expected.contains("\"node_count\": 100"),
+            "{extra:?}: the reference must report the pinned file:\n{expected}"
+        );
+
+        for after in 1..=opens {
+            for force_path in [true, false] {
+                write(&input, 100, 5);
+                write(&replacement, 130, 9);
+                let host = crate::common::test_host();
+                host.cancel
+                    .faults()
+                    .force_pin_path_reopen
+                    .store(force_path, std::sync::atomic::Ordering::Relaxed);
+                let procfs = pbfhogg::read::input::PinnedInput::pin(&input, &host)
+                    .expect("probe pin")
+                    .reopens_through_procfs();
+                let (out, [fired, attempts, verified, refused, after_fired]) =
+                    run(extra, after, force_path);
+                let cell = format!("{extra:?}, replaced after open {after}, procfs {procfs}");
+                assert_eq!(fired, 1, "{cell}: the replacement must fire");
+                if procfs || after == opens {
+                    assert!(out.status.success(), "{cell}: {}", out.stderr_str());
+                    assert_eq!(
+                        [attempts, verified, refused, after_fired],
+                        [opens, opens, 0, opens - after],
+                        "{cell}"
+                    );
+                    assert_eq!(
+                        out.stdout_str(),
+                        expected,
+                        "{cell}: every check must read the pinned file"
+                    );
+                } else {
+                    assert!(!out.status.success(), "{cell}: must refuse");
+                    assert!(
+                        out.stderr_str().contains("the input was replaced"),
+                        "{cell}: {}",
+                        out.stderr_str()
+                    );
+                    assert!(out.stdout_str().is_empty(), "{cell}: nothing printed");
+                    assert_eq!(
+                        [attempts, verified, refused, after_fired],
+                        [after + 1, after, 1, 1],
+                        "{cell}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn inspect_indexed_says_yes_for_a_header_only_file_and_fails_a_zero_byte_one() {
     let fx = Fx::new();

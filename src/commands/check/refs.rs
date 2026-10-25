@@ -1,12 +1,12 @@
 //! Validate referential integrity in a PBF file. Equivalent to `osmium check-refs`.
 
 use crate::counters::Stopwatch;
-use std::path::Path;
 
 use crate::{Element, MemberId};
 
 use crate::error::Result;
 use crate::idset::IdSet;
+use crate::read::input::InputSource;
 use crate::scan::classify::{build_classify_schedules_split, parallel_classify_phase};
 use crate::tunables::{NODE_ID_FLOOR, RELATION_ID_FLOOR, WAY_ID_FLOOR};
 
@@ -191,18 +191,27 @@ fn append_capped_missing_refs(
 /// decompression throughput (zstd input format, io_uring, direct I/O),
 /// not selective parse. Revisit step #3 only if a future change makes
 /// parse a meaningful share of wall again.
+///
+/// # Input
+///
+/// Opened once (the schedule walk, whose descriptor the worker pools
+/// preread), so this takes no pin of its own; a caller that composes it with
+/// other checks on the same input pins once and hands the pin here, and the
+/// walk opens through it. That walk reads by position, so the input has to be
+/// seekable: a FIFO is not checked.
 #[hotpath::measure]
-pub fn check_refs(
-    path: &Path,
+pub fn check_refs<'a>(
+    input: impl Into<InputSource<'a>>,
     opts: &CheckRefsOptions,
     host: &crate::host::Host,
 ) -> Result<RefCheckResult> {
-    host.cancel.decided(|| check_refs_inner(path, opts, host))
+    let input = input.into();
+    host.cancel.decided(|| check_refs_inner(input, opts, host))
 }
 
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 fn check_refs_inner(
-    path: &Path,
+    input: InputSource<'_>,
     opts: &CheckRefsOptions,
     host: &crate::host::Host,
 ) -> Result<RefCheckResult> {
@@ -252,12 +261,21 @@ fn check_refs_inner(
     // once. At Europe scale the header walk is ~15 s; three separate
     // `build_classify_schedule` calls would triple that cost.
     let (node_schedule, way_schedule, rel_schedule, shared_file, max_ids) =
-        build_classify_schedules_split(path, host)?;
+        build_classify_schedules_split(input, host)?;
 
     // Bound indexdata-driven allocation, then insert observed positive IDs
     // above that allocation after each parallel phase joins. A regional
     // extract retains global IDs; its file size is not a validity ceiling.
-    let file_len = std::fs::metadata(path).map_or(0, |m| m.len());
+    // The size is an fstat of the walk's own descriptor, the one every phase
+    // reads, so it describes that file even when `input` is a bare path a
+    // stat would resolve again.
+    let file_len = shared_file
+        .file()
+        .metadata()
+        .map_err(|e| {
+            crate::Error::from(e).context(format!("failed to stat {}", input.path().display()))
+        })?
+        .len();
     let mut node_ids = IdSet::new();
     node_ids.pre_allocate(super::id_alloc_bound(max_ids[0], NODE_ID_FLOOR, file_len));
     let mut way_ids = IdSet::new();

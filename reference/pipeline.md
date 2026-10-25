@@ -350,6 +350,8 @@ Pinning (see "One input, one file, across passes") is decided per library entry:
 - `--ids`: sequential scan checking ID uniqueness and ordering. Optional `--full` bitmap for duplicate detection.
 - `--refs`: referential integrity via `IdSet` (custom chunked bitset, `src/idset.rs`). Optional `--check-relations`.
 
+Pinning (see "One input, one file, across passes"): `verify_ids` pins (header and indexdata probe, then schedule walk) and takes its `--full` allocation size from the pin. `check_index` reads front to back through one open and `check_refs` opens once (its schedule walk, sizing its allocation from an fstat of that descriptor), so neither pins of its own; `check_index` alone still reads a FIFO, while `check_refs` reads by position and cannot. All three take an `InputSource`. The CLI pins once itself when two or more checks run (a bare `check` is `--ids` then `--refs`), and hands the pin to every check.
+
 ### build-geocode-index
 
 4-pass build pipeline:
@@ -549,7 +551,8 @@ back to a full decode is learned from the walk, so it pins before the walk,
 while a scan the options make decode-only reads once and takes no pin.
 Where a front end composes several entry points on one input, it pins once
 and hands the pin to each (the `inspect` CLI does, when `--indexed` or
-`--nodes` joins the scan).
+`--nodes` joins the scan; the `check` CLI does, when more than one check
+runs).
 
 ## Read-path internals (both consumers)
 

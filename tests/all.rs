@@ -51,6 +51,8 @@ mod fault_altw_stage3;
 mod fault_apply_changes;
 #[cfg(feature = "test-hooks")]
 mod fault_cat_input;
+#[cfg(all(feature = "test-hooks", feature = "commands"))]
+mod fault_check_ids_input;
 #[cfg(feature = "test-hooks")]
 mod fault_degrade_input;
 #[cfg(feature = "test-hooks")]

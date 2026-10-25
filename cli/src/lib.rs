@@ -2361,6 +2361,8 @@ pub fn run() -> process::ExitCode {
     }
     #[cfg(feature = "test-hooks")]
     signals::test_hooks::arm(&cancel);
+    #[cfg(feature = "test-hooks")]
+    signals::test_hooks::arm_input_replacement(&cancel);
     host::init_marker_fifo();
     let host = host::cli_host(cancel);
     let _guard = hotpath::HotpathGuardBuilder::new("pbfhogg::main")
@@ -3178,6 +3180,8 @@ pub fn run() -> process::ExitCode {
     pbfhogg::write::report_writer_degradations(&host.diagnostics);
     #[cfg(feature = "test-hooks")]
     signals::test_hooks::write_count(&host.cancel);
+    #[cfg(feature = "test-hooks")]
+    signals::test_hooks::write_replacement_report(&host.cancel);
 
     // From here on the outcome is decided; a "stopping" notice the signal
     // thread has not printed yet would be stale.
@@ -3325,6 +3329,25 @@ fn run_check(
         direct_io,
     };
 
+    // With two or more checks selected (a bare `check` is ids then refs) the
+    // run is several library calls on one input, each opening it afresh, so
+    // the input is pinned here, before any of them, and each reads through
+    // the pin: a file renamed over the input between two checks cannot have
+    // one checked as one file and the next as the other. Alone, each check
+    // decides for itself: `--ids` pins (it opens twice), `--index` and
+    // `--refs` open once, so `--index` alone still reads a FIFO.
+    let pin = if [run_ids, run_index, run_refs]
+        .into_iter()
+        .filter(|&run| run)
+        .count()
+        > 1
+    {
+        Some(pbfhogg::read::input::PinnedInput::pin(path, host)?)
+    } else {
+        None
+    };
+    let input: pbfhogg::read::input::InputSource<'_> = pin.as_ref().map_or(path.into(), Into::into);
+
     // Run checks and collect results
     let ids_report = if run_ids {
         use pbfhogg::check::verify_ids::VerifyIdsOptions;
@@ -3333,7 +3356,7 @@ fn run_check(
             full,
             type_filter,
         };
-        let report = pbfhogg::check::verify_ids::verify_ids(path, &opts, host)?;
+        let report = pbfhogg::check::verify_ids::verify_ids(input, &opts, host)?;
         if !report.passed {
             failed = true;
         }
@@ -3343,7 +3366,7 @@ fn run_check(
     };
 
     let index_report = if run_index {
-        let report = pbfhogg::check::index::check_index(path, &check_options, host)?;
+        let report = pbfhogg::check::index::check_index(input, &check_options, host)?;
         if !report.passed() {
             failed = true;
         }
@@ -3358,7 +3381,7 @@ fn run_check(
             check_relations,
             show_ids,
         };
-        let result = pbfhogg::check::refs::check_refs(path, &opts, host)?;
+        let result = pbfhogg::check::refs::check_refs(input, &opts, host)?;
         if !result.is_valid() {
             failed = true;
         }

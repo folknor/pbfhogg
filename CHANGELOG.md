@@ -1158,6 +1158,24 @@
 
 ### Fixed
 
+- **`check` reads one input file even if it is replaced mid-run.**
+  `--ids` opens the input twice (the header and indexdata check, then the
+  schedule walk its workers read through), and `--ids --full` took its
+  allocation size from a separate stat of the path; a bare `check` runs
+  `--ids` and then `--refs`, and `--index` alongside another check reads
+  the input once more. Each of those resolved the path again, so an input
+  renamed over during the run could be checked partly from each file, with
+  no error. `--ids`, and any run of more than one check, now pins the input
+  when it starts: on Linux with `/proc` a replaced or deleted input does
+  not affect the run; on other Unix hosts the run fails with
+  `ErrorKind::InputReplaced`. On those runs an input that is a FIFO, socket
+  or character device is now refused up front; `--index` alone still reads
+  a FIFO. `--refs` takes its allocation size from the open it reads.
+  Library: `check::verify_ids::verify_ids`, `check::refs::check_refs` and
+  `check::index::check_index` take `impl Into<InputSource>` (a path as
+  before, or a `&PinnedInput` the caller took, used as it is);
+  `verify_ids` pins a path itself, the other two open once and do not.
+
 - **`inspect` reads one input file even if it is replaced mid-run.** The
   default report walks the blob headers and, on a blob without indexdata,
   starts again with a full decode; `--nodes` probes for indexdata, then

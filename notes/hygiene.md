@@ -57,7 +57,7 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-23. HYG-188 to HYG-189, one per line, in ID order
+23. HYG-189
 24. HYG-047
 25. HYG-158
 26. HYG-159
@@ -1488,7 +1488,7 @@ Reported by: the HYG-150 implementation.
 
 ## Adopting `PinnedInput`, one command per entry
 
-Not a finding: the shared brief for HYG-188 to HYG-189. Each of those commands opens its input more than once per run (a
+Not a finding: the shared brief for HYG-189. That command opens its input more than once per run (a
 precondition probe, a header reader, a schedule walk, worker and splice
 descriptors), each open resolving the path again, so a file renamed over
 the input mid-run is read partly from each file. The API that fixes it
@@ -1572,18 +1572,10 @@ path went. What each entry owes, settled in a codex spar on 2026-10-25:
   tags-filter's entry): hand it the pin and the probe reads through it.
 
 Commands confirmed to open their input once per run, not needing a pin:
-export, check refs, check index (one open each).
-
-## HYG-188 - check ids reopens its input by path
-
-Anger: 7 - CLI behaviour.
-
-See "Adopting `PinnedInput`" above. Both engines read `sorted_and_indexed`
-and then build the split schedules from a second open, and the parallel
-engine stats the path for its length (`check/verify_ids.rs`).
-Recommendation (2026-10-25): follow the brief.
-
-Reported by: the HYG-151 resolution.
+export, check refs, check index (one open each; the check CLI pins when it
+runs more than one check and hands them the pin, and a CLI composition can
+be fault-tested through the CLI's `PBFHOGG_TEST_REPLACE_*` hooks, see
+`cli/tests/cli_input_contract.rs`).
 
 ## HYG-189 - digest reopens its input by path
 

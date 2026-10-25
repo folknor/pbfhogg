@@ -213,6 +213,68 @@ pub(crate) mod test_hooks {
         });
     }
 
+    /// Arm the library's input replacement fault on the run's token, so a
+    /// test can rename a file over a pinned input between two opens of a CLI
+    /// run that composes several library calls (see
+    /// `pbfhogg::test_hooks::FaultPlan::arm_input_replacement`):
+    /// `PBFHOGG_TEST_REPLACE_INPUT=<input as given>`,
+    /// `PBFHOGG_TEST_REPLACE_WITH=<replacement>` and
+    /// `PBFHOGG_TEST_REPLACE_AFTER=<n>` rename the replacement over the input
+    /// after the `n`-th verified pinned open of it.
+    /// `PBFHOGG_TEST_FORCE_PIN_PATH_REOPEN=1` makes every pin taken in the
+    /// run reopen through the path. [`write_replacement_report`] writes what
+    /// the replacement observed.
+    pub(crate) fn arm_input_replacement(cancel: &Cancel) {
+        let faults = cancel.faults();
+        if std::env::var_os("PBFHOGG_TEST_FORCE_PIN_PATH_REOPEN").is_some_and(|v| v == "1") {
+            faults
+                .force_pin_path_reopen
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let (Some(input), Some(with), Some(after)) = (
+            std::env::var_os("PBFHOGG_TEST_REPLACE_INPUT"),
+            std::env::var_os("PBFHOGG_TEST_REPLACE_WITH"),
+            std::env::var_os("PBFHOGG_TEST_REPLACE_AFTER"),
+        ) else {
+            return;
+        };
+        let Some(after) = after.to_str().and_then(|a| a.parse::<u64>().ok()) else {
+            return;
+        };
+        faults.arm_input_replacement(
+            std::path::Path::new(&input),
+            std::path::Path::new(&with),
+            after,
+        );
+    }
+
+    /// `PBFHOGG_TEST_REPLACE_REPORT=<file>`: write the armed replacement's
+    /// observations as one line, `fired attempts verified refused
+    /// attempts_after_fired` (`fired` as 0 or 1).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test-only hook file, outside every output and scratch API"
+    )]
+    pub(crate) fn write_replacement_report(cancel: &Cancel) {
+        let Some(path) = std::env::var_os("PBFHOGG_TEST_REPLACE_REPORT") else {
+            return;
+        };
+        let Some(r) = cancel.faults().input_replacement() else {
+            return;
+        };
+        drop(std::fs::write(
+            path,
+            format!(
+                "{} {} {} {} {}",
+                u8::from(r.fired),
+                r.attempts,
+                r.verified,
+                r.refused,
+                r.attempts_after_fired
+            ),
+        ));
+    }
+
     /// Write the checkpoint count for `PBFHOGG_TEST_CANCEL_COUNT`.
     #[allow(
         clippy::disallowed_methods,

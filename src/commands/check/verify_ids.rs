@@ -1,11 +1,10 @@
 //! Validate PBF ID integrity: monotonicity, type ordering, and optional duplicate detection.
 
-use std::path::Path;
-
 use crate::error::Result;
 use crate::idset::IdSet;
 use crate::osm_id::osm_id_cmp;
 use crate::owned::TypeFilter;
+use crate::read::input::{InputSource, PinnedInput};
 
 /// True when `id` does not strictly follow `prev` in canonical OSM ID order.
 ///
@@ -310,17 +309,35 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
 /// corresponding `type_filter` bit is set. Pre-allocation is mandatory
 /// for `set_atomic_if_new` (workers panic on unallocated chunks). Total
 /// full-mode RSS at planet: ~1.8 GB.
+///
+/// # Input
+///
+/// The input must be a regular file or a block device (`InvalidArgument`
+/// otherwise), and is pinned for the run (see [`PinnedInput`]); a caller's
+/// pin is used as it is. Where a later open cannot reach the pinned file, an
+/// input replaced mid-run fails with `InputReplaced`.
 #[hotpath::measure]
-pub fn verify_ids(
-    path: &Path,
+pub fn verify_ids<'a>(
+    input: impl Into<InputSource<'a>>,
     opts: &VerifyIdsOptions,
     host: &crate::host::Host,
 ) -> Result<VerifyIdsReport> {
+    let input = input.into();
     host.cancel.decided(|| {
+        // Both engines open the input twice, each through its own open file
+        // description: the header and indexdata probe (O_DIRECT when asked),
+        // then the schedule walk whose descriptor the classify pool preads.
+        // Both are derived from this one pin, so a file renamed over the
+        // input between them cannot be probed as one file and checked as the
+        // other: where `/proc/self/fd` reopens the pin both opens reach the
+        // pinned file, otherwise on Unix a replaced input fails the run
+        // (`PinnedInput` says what it does off Unix). Taken before any other
+        // open of the input.
+        let pin = input.pin(host)?;
         if opts.full {
-            return verify_ids_full_parallel(path, opts, host);
+            return verify_ids_full_parallel(&pin, opts, host);
         }
-        verify_ids_streaming_parallel(path, opts, host)
+        verify_ids_streaming_parallel(&pin, opts, host)
     })
 }
 
@@ -363,7 +380,7 @@ fn warn_unindexed_triple_scan(indexed: bool, host: &crate::host::Host) {
 }
 
 fn verify_ids_streaming_parallel(
-    path: &Path,
+    pin: &PinnedInput,
     opts: &VerifyIdsOptions,
     host: &crate::host::Host,
 ) -> Result<VerifyIdsReport> {
@@ -379,13 +396,13 @@ fn verify_ids_streaming_parallel(
     host.process.cross_thread_alloc_pool();
 
     let (header_sorted, indexed) =
-        crate::commands::input_front::sorted_and_indexed(path, opts.check.direct_io, host)?;
+        crate::commands::input_front::sorted_and_indexed(pin, opts.check.direct_io, host)?;
     warn_unindexed_triple_scan(indexed, host);
 
     let type_filter = TypeFilter::or_all(opts.type_filter);
 
     let (node_schedule, way_schedule, rel_schedule, shared_file, _max_ids) =
-        crate::scan::classify::build_classify_schedules_split(path, host)?;
+        crate::scan::classify::build_classify_schedules_split(pin, host)?;
 
     let mut node_count: u64 = 0;
     let mut way_count: u64 = 0;
@@ -624,7 +641,7 @@ impl BlobVerifyResult {
 // This pass owns all three ID sets and their ordered phase merges.
 #[allow(clippy::too_many_lines)]
 fn verify_ids_full_parallel(
-    path: &Path,
+    pin: &PinnedInput,
     opts: &VerifyIdsOptions,
     host: &crate::host::Host,
 ) -> Result<VerifyIdsReport> {
@@ -639,18 +656,19 @@ fn verify_ids_full_parallel(
     // parallel_classify_phase reads through its own descriptor, the
     // shared_file from build_classify_schedules_split.
     let (header_sorted, indexed) =
-        crate::commands::input_front::sorted_and_indexed(path, opts.check.direct_io, host)?;
+        crate::commands::input_front::sorted_and_indexed(pin, opts.check.direct_io, host)?;
     warn_unindexed_triple_scan(indexed, host);
 
     let type_filter = TypeFilter::or_all(opts.type_filter);
 
     let (node_schedule, way_schedule, rel_schedule, shared_file, max_ids) =
-        crate::scan::classify::build_classify_schedules_split(path, host)?;
+        crate::scan::classify::build_classify_schedules_split(pin, host)?;
 
     // Indexdata only sizes the bounded parallel allocation. Decoded IDs
     // outside it are retained and inserted serially after each phase, so
-    // regional files with sparse global IDs need no moving ID ceiling.
-    let file_len = std::fs::metadata(path).map_or(0, |m| m.len());
+    // regional files with sparse global IDs need no moving ID ceiling. The
+    // size is the pinned file's, the one both opens read.
+    let file_len = pin.metadata()?.len();
     let mut node_ids = IdSet::new();
     let mut way_ids = IdSet::new();
     let mut relation_ids = IdSet::new();

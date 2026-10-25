@@ -32,7 +32,9 @@ pub(crate) struct StreamingBlocks {
     /// Captured once; failures are located with the blob's true index and
     /// offset in this input.
     source: Option<std::sync::Arc<std::path::Path>>,
-    decompress_buf: Vec<u8>,
+    /// Decompression buffers, shared with the other side of the merge; see
+    /// [`MergeBuffers`].
+    pool: MergeBuffers,
     st_scratch: Vec<(u32, u32)>,
     gr_scratch: Vec<(u32, u32)>,
     stashed: Option<PrimitiveBlock>,
@@ -47,10 +49,12 @@ pub(crate) struct StreamingBlocks {
 
 impl StreamingBlocks {
     /// Create from a sequential BlobReader. Avoids PrimitiveBlock cross-thread
-    /// alloc/free retention from the pipelined reader.
+    /// alloc/free retention from the pipelined reader. Both sides of one
+    /// merge take clones of the same `pool`.
     pub(crate) fn new_sequential(
         path: &std::path::Path,
         direct_io: bool,
+        pool: MergeBuffers,
         host: &crate::host::Host,
     ) -> crate::error::Result<Self> {
         let mut reader = crate::blob::BlobReader::open_in(path, direct_io, host)?;
@@ -60,7 +64,7 @@ impl StreamingBlocks {
         Ok(Self {
             reader,
             source,
-            decompress_buf: Vec::new(),
+            pool,
             st_scratch: Vec::new(),
             gr_scratch: Vec::new(),
             stashed: None,
@@ -82,11 +86,9 @@ impl StreamingBlocks {
                 continue;
             }
             self.last_blob = (blob.blob_index(), blob.offset());
-            if let Err(e) = blob.decompress_into(&mut self.decompress_buf) {
-                return Err(blob.locate_error(self.source.as_ref(), e));
-            }
-            return PrimitiveBlock::from_vec_with_scratch(
-                std::mem::take(&mut self.decompress_buf),
+            return decode_blob(
+                &blob,
+                &self.pool,
                 &mut self.st_scratch,
                 &mut self.gr_scratch,
             )
@@ -479,7 +481,9 @@ struct PendingBlob {
 /// state that carries across phases.
 struct MergeSide {
     reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
-    buf: Vec<u8>,
+    /// Decompression buffers, shared with the other side; see
+    /// [`MergeBuffers`].
+    pool: MergeBuffers,
     st: Vec<(u32, u32)>,
     gr: Vec<(u32, u32)>,
     /// The first data frame of a later kind, read during an earlier phase
@@ -498,10 +502,13 @@ struct MergeSide {
 }
 
 impl MergeSide {
-    fn new(reader: crate::blob::BlobReader<crate::file_reader::FileReader>) -> Self {
+    fn new(
+        reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
+        pool: MergeBuffers,
+    ) -> Self {
         Self {
             reader,
-            buf: Vec::new(),
+            pool,
             st: Vec::new(),
             gr: Vec::new(),
             stash: None,
@@ -594,7 +601,7 @@ impl MergeSide {
     /// dropped once it is decoded.
     fn decode(&mut self, pending: PendingBlob) -> Result<BlockState> {
         let blob = pending.blob;
-        let block = decode_blob(&blob, &mut self.buf, &mut self.st, &mut self.gr)
+        let block = decode_blob(&blob, &self.pool, &mut self.st, &mut self.gr)
             .map_err(|e| blob.locate_error(self.reader.source(), e))?;
         Ok(BlockState {
             block,
@@ -653,16 +660,41 @@ impl MergeSide {
     }
 }
 
-/// Decompress and parse a blob's block. Unlocated; the caller locates.
+/// The decompression buffers one sequential merge recycles, shared by both
+/// of its sides and every phase, for the indexed block-pair merge and the
+/// unindexed streaming merge alike.
+///
+/// Each decoded block holds its buffer and hands it back here when it drops
+/// ([`PrimitiveBlock::from_vec_pooled_with_scratch`]), so the next decode on
+/// either side reuses it instead of allocating a fresh, often megabyte-sized
+/// one per block. One pool rather than one per side, so a buffer freed on
+/// one side or in one phase serves the other. The idle buffers it retains
+/// never outnumber the decoded blocks the merge has held at once (a current
+/// block per side, a stashed one, and a block still alive while
+/// [`drain_remaining`] decodes the next), within the pool's own count and
+/// per-buffer capacity limits. A buffer whose decompression fails, or whose
+/// parse fails before the block wraps it, is freed rather than returned; one
+/// that fails validation after wrapping returns as usual. Everything runs on the merge's one thread, so
+/// the pool's lock is never contended.
+pub(crate) type MergeBuffers = std::sync::Arc<crate::blob::DecompressPool>;
+
+/// A fresh, empty [`MergeBuffers`] for one merge.
+pub(crate) fn merge_buffers() -> MergeBuffers {
+    crate::blob::DecompressPool::new()
+}
+
+/// Decompress and parse a blob's block into a buffer from `pool`, which the
+/// block returns there when it drops. Unlocated; the caller locates.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn decode_blob(
     blob: &crate::blob::Blob,
-    buf: &mut Vec<u8>,
+    pool: &MergeBuffers,
     st_scratch: &mut Vec<(u32, u32)>,
     gr_scratch: &mut Vec<(u32, u32)>,
 ) -> crate::error::Result<PrimitiveBlock> {
-    blob.decompress_into(buf)?;
-    PrimitiveBlock::from_vec_with_scratch(std::mem::take(buf), st_scratch, gr_scratch)
+    let mut buf = pool.get();
+    blob.decompress_into(&mut buf)?;
+    PrimitiveBlock::from_vec_pooled_with_scratch(buf, pool, st_scratch, gr_scratch)
 }
 
 /// Running canonical-order check over one file's blob sequence, in FILE
@@ -760,9 +792,10 @@ impl BlockPairMergeState {
         old_reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
         new_reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
     ) -> Self {
+        let pool = merge_buffers();
         Self {
-            old: MergeSide::new(old_reader),
-            new: MergeSide::new(new_reader),
+            old: MergeSide::new(old_reader, std::sync::Arc::clone(&pool)),
+            new: MergeSide::new(new_reader, pool),
             stats: BlockPairMergeStats::default(),
         }
     }

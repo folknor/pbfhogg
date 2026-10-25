@@ -4600,17 +4600,29 @@ fn run_bench_read(
             // Route through the library's buffered path (256 KiB FileReader)
             // so this arm measures decode architecture, not the syscall
             // overhead of a default 8 KiB BufReader.
-            let reader = pbfhogg::BlobReader::from_path(path)?
+            let mut reader = pbfhogg::BlobReader::from_path(path)?
                 .evict_page_cache(true)
                 .diagnostics(host.diagnostics.clone())
                 .cancel(host.cancel.clone());
+            let source: std::sync::Arc<std::path::Path> = std::sync::Arc::from(path);
+            // The leading OsmHeader is required like everywhere else: a
+            // zero-byte or header-less file is the one missing-header error,
+            // not an empty run. Taken and decoded before the timer, as the
+            // other modes' ElementReader does at open.
+            let header = reader.leading_header()?;
+            header
+                .decode()
+                .map_err(|e| header.locate_error(Some(&source), e))?;
             let mut nodes = 0u64;
             let mut ways = 0u64;
             let mut rels = 0u64;
             let start = Instant::now();
             for blob_result in reader {
                 let blob = blob_result?;
-                if let pbfhogg::BlobDecode::OsmData(block) = blob.decode()? {
+                let decoded = blob
+                    .decode()
+                    .map_err(|e| blob.locate_error(Some(&source), e))?;
+                if let pbfhogg::BlobDecode::OsmData(block) = decoded {
                     for el in block.elements() {
                         match el {
                             pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => {

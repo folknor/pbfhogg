@@ -343,6 +343,11 @@ const ROWS: &[Row] = &[
         ..row("check", "check --index", check_index)
     },
     row("bench-read", "bench-read", bench_read),
+    row(
+        "bench-read",
+        "bench-read --mode blobreader",
+        bench_read_blobreader,
+    ),
     row("bench-write", "bench-write", bench_write),
 ];
 
@@ -677,6 +682,12 @@ fn bench_read(_: &Ctx, input: &Path) -> Invocation {
     Invocation::new(&["bench-read"])
         .arg(input)
         .words(&["--mode", "sequential"])
+}
+
+fn bench_read_blobreader(_: &Ctx, input: &Path) -> Invocation {
+    Invocation::new(&["bench-read"])
+        .arg(input)
+        .words(&["--mode", "blobreader"])
 }
 
 fn bench_write(_: &Ctx, input: &Path) -> Invocation {

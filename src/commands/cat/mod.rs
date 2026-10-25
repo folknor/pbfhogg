@@ -265,6 +265,8 @@ fn cat_passthrough(
     let mut blobs: u64 = 0;
     // Touched only by the unclassifiable-block arm.
     let mut blobs_reencoded: u64 = 0;
+    // The subset of `blobs_reencoded` that yielded no elements.
+    let mut blobs_omitted: u64 = 0;
     let mut elements_reencoded: u64 = 0;
     let mut decompress_buf: Vec<u8> = Vec::new();
 
@@ -304,6 +306,9 @@ fn cat_passthrough(
                                     reencode_unclassifiable(&decompress_buf, declared)
                                         .map_err(locate)?;
                                 decompress_buf.clear();
+                                if blocks.is_empty() {
+                                    blobs_omitted += 1;
+                                }
                                 for OwnedBlock {
                                     bytes: block_bytes,
                                     index,
@@ -347,11 +352,48 @@ fn cat_passthrough(
     }
 
     writer.flush()?;
+    note_reencoded(host, blobs_reencoded - blobs_omitted, blobs_omitted);
     Ok(CatStats {
         blobs_passthrough: blobs,
         blobs_decoded: blobs_reencoded,
         elements_written: elements_reencoded,
     })
+}
+
+/// Announce the blobs plain cat did not copy byte for byte: the summary
+/// counts them as decoded, which alone does not say their content was
+/// normalised (rebuilt) or dropped (omitted). The note states the rules
+/// that applied, not that each one changed a value in the run's input.
+fn note_reencoded(host: &crate::host::Host, rebuilt: u64, omitted: u64) {
+    if rebuilt > 0 {
+        let omitted_clause = if omitted == 0 {
+            String::new()
+        } else {
+            format!(
+                "; {omitted} more such blobs yielded no elements and were omitted, with \
+                 any unknown fields they carried"
+            )
+        };
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "cat.reencoded_unclassifiable",
+            "{rebuilt} blobs held blocks no single index describes and were rebuilt into \
+             single-kind blocks by the full re-encode rules: nodes written dense, \
+             coordinates truncated toward zero to decimicrodegrees, retained timestamps \
+             truncated to whole seconds, metadata with an absent or sentinel version \
+             discarded, missing fields of retained metadata written as defaults, unknown \
+             fields discarded{omitted_clause}"
+        );
+    } else if omitted > 0 {
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "cat.reencoded_unclassifiable",
+            "{omitted} blobs held blocks no single index describes, yielded no elements \
+             and were omitted, with any unknown fields they carried"
+        );
+    }
 }
 
 /// Re-encode a block the index scan cannot classify into single-kind blocks,
@@ -364,10 +406,29 @@ fn cat_passthrough(
 /// change of kind and at the builder's element cap; a block with no elements
 /// yields nothing. Adjacent groups of one kind share a block.
 ///
-/// Content is what the builder normally writes: every node dense, coordinates
-/// in decimicrodegrees, metadata through
-/// [`Metadata`](crate::block_builder::Metadata) (whole seconds, absent
-/// optional fields as defaults). Beyond that nothing is lost or invented:
+/// Content is what the builder normally writes, the same normalisation
+/// `cat --type` and `--clean` apply. Kept: ids, the decoded decimicrodegree
+/// coordinates of nodes and of inline way locations, tags, refs, members
+/// and roles, element order as above, and the presence of retained metadata
+/// (no metadata is backfilled onto a node that had none).
+/// Normalised or lost (`cat_passthrough` announces both in one note):
+///
+/// - Every node is written dense, on the default granularity with zero
+///   offsets. The decoder truncates each coordinate toward zero to
+///   decimicrodegrees before the builder sees it, so a finer granularity or
+///   a non-zero offset can move a value, even at the default granularity.
+/// - Timestamps are truncated toward zero to whole seconds, whatever the
+///   input's date granularity.
+/// - Metadata is discarded when its version is absent or the `-1` sentinel
+///   (plain `Info` and dense alike; version 0 keeps it). Retained metadata
+///   gets explicit defaults for its absent fields, and a `-1` changeset, the
+///   sentinel for "none", is written as 0.
+/// - Unknown fields of the block, its groups and its elements are dropped,
+///   and so are pins the header does not declare (below). A block that
+///   yields no elements writes nothing at all, so whatever unknown fields it
+///   carried are gone with it.
+///
+/// Nothing is invented beyond those defaults:
 ///
 /// - A node run is also split where metadata presence flips. One builder
 ///   block holding nodes with and without metadata would backfill zeroed
@@ -385,6 +446,31 @@ fn cat_passthrough(
 /// The cold arm owns everything it allocates: a copy of the payload (so the
 /// caller's decompression buffer keeps its capacity), the builder and the
 /// scratch vectors all live here.
+///
+/// These blocks are not refused: an empty block loses nothing of OSM
+/// content, kinds changing across groups is legal per the PBF spec and older
+/// producers wrote it, libosmium reads even multi-field groups, and this
+/// command is the indexing recipe every indexdata refusal points at, so a
+/// refusal here loops the advice. Refusing only when the re-encode would
+/// change a value was also rejected: plain `cat` would then disagree with
+/// `--type` and `--clean`, which normalise the same way.
+///
+/// A split that keeps more is possible without the builder, and is worth
+/// building only if a producer writing these shapes turns up and the
+/// normalisation matters to someone. Copy the block's string table,
+/// granularity, offsets and date granularity verbatim into each output
+/// block, and regroup the raw element messages by kind, splitting at each
+/// change of kind and at the element cap; each piece is then scanned and
+/// indexed as the ordinary reindex arm does. String-table bytes and plain
+/// node, way and relation messages would pass through byte for byte. Dense
+/// nodes keep their recognised content but not their bytes: a dense group
+/// split by a cap or a kind change must have its packed delta arrays
+/// re-delta-encoded. It still would not be lossless: unknown fields of the
+/// block and of its groups have no home once groups are regrouped, so it
+/// needs a policy for them. Its costs: a protobuf-level regrouper the crate
+/// does not have (the builder works from decoded elements), the dense
+/// re-delta encoder, and the whole string table carried into every piece
+/// (wasted bytes unless pruned, which is a re-encode of its own).
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_lines)]

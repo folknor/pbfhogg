@@ -708,9 +708,28 @@ pbfhogg cat [OPTIONS] --output <OUTPUT> <FILES>...
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
 
-**Output header.** Follows [Output header](#output-header). Plain `cat` and
-`--type` copy way blobs whole, so the way enrichments the input declares are
-kept (`--clean` re-encodes, and drops them); `--dedupe` re-encodes the way
+**Blocks no single index describes.** Plain `cat` copies an indexed blob
+whole and an unindexed blob's payload unchanged, rebuilding only its blob
+header to add indexdata (which drops any field 5 the header carried). The
+exception is an unindexed blob whose block no single index can describe (no
+elements, a group carrying more than one element field, kinds changing
+across groups); an indexed blob is never scanned, so it passes through
+whatever its block holds. Such an unindexed block is rebuilt into
+single-kind blocks by the same rules `--type` and `--clean` re-encode with:
+nodes written dense, coordinates truncated toward zero to decimicrodegrees,
+timestamps truncated to whole seconds, metadata with an absent or sentinel
+version discarded, missing fields of retained metadata written as defaults,
+unknown fields discarded. One that yields no elements is omitted, with any
+unknown fields it carried. A `Note:` line says how many blobs were rebuilt
+and how many omitted; the summary counts both as decoded. A way in such a
+block is refused under a declared `WayMembers-v1`, and a way carrying pins
+under a declared `SharedNodePins-v1`, since the rebuild cannot write either.
+
+**Output header.** Follows [Output header](#output-header). Plain `cat` copies way
+payloads whole and `--type` copies indexed way blobs whole, so the way
+enrichments the input declares are kept (a rebuilt block keeps inline
+locations and refuses the rest, as above; `--clean` re-encodes, and drops
+them); `--dedupe` re-encodes the way
 blobs in its overlap runs. With several inputs the header is reconciled across
 all of them, the output is not declared sorted (`--dedupe` excepted), and the
 prepass features are never declared. osmium writes a wholly blank header for

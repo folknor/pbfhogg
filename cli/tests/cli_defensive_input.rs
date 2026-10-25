@@ -508,7 +508,8 @@ fn bench_commands_report_unrecognised_indexdata() {
             "bench-read {mode}: {stderr}"
         );
         if mode == "blobreader" {
-            // The warning names the file and where in it the header sits.
+            // The warning names the file and the byte offset of the data
+            // blob whose header carries the bad indexdata.
             assert!(
                 stderr.contains("bad-indexdata.osm.pbf") && stderr.contains("at byte offset"),
                 "bench-read {mode}: {stderr}"

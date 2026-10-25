@@ -550,8 +550,10 @@ fn diff_element_stream<W: Write>(
     filter: &TypeFilter,
     host: &crate::host::Host,
 ) -> Result<DiffStats> {
-    let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io, host)?;
-    let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io, host)?;
+    let pool = crate::osc::merge_join::merge_buffers();
+    let mut old_src =
+        StreamingBlocks::new_sequential(old_path, direct_io, std::sync::Arc::clone(&pool), host)?;
+    let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io, pool, host)?;
 
     let mut stats = DiffStats::default();
     let mut sink = DiffSink {

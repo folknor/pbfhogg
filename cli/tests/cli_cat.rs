@@ -1828,6 +1828,9 @@ fn passthrough_reencodes_unclassifiable_blocks_into_indexed_ones() {
         .run();
     assert!(out.status.success(), "cat failed:\n{}", out.stderr_str());
     out.assert_stderr_contains("Decoded 4 blobs, wrote 8009 elements; 2 blobs passed through");
+    // The note tells the three rebuilt blobs from the omitted empty one.
+    out.assert_stderr_contains("Note: 3 blobs held blocks no single index describes");
+    out.assert_stderr_contains("; 1 more such blobs yielded no elements and were omitted");
 
     // Every data blob is indexed, and the splits are the expected ones. The
     // empty block is gone.

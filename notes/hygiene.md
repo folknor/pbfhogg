@@ -57,7 +57,6 @@ entry; the split-off entries took fresh IDs.
 
 Launch order, one agent per line, run serially:
 
-2. HYG-149, BUG-152, HYG-137
 3. HYG-121, HYG-128
 4. HYG-061
 5. HYG-152
@@ -396,6 +395,25 @@ The judgement calls already known, to be checked first:
   separate descriptors on an argument (commit `a3f1a1bc`) that was never
   measured. One matched `--bench 1` A/B per side, for example on altw
   external stage 4 at Europe scale, would settle it.
+- The sequential diff and derive merges (indexed block-pair under `-j 1`
+  or `--verbose`, the unindexed element stream always) recycle their
+  decompression buffers through one `DecompressPool` per merge, shared by
+  both sides and every phase (`MergeBuffers` in `osc/merge_join.rs`),
+  instead of allocating a fresh buffer per block. Judgement calls, none
+  measured:
+  - The gain is reasoned only: glibc malloc's dynamic mmap threshold
+    probably already serves a freed buffer back after the first few blocks.
+    Recycling cannot plausibly allocate more, but it adds an `Arc` owner
+    allocation and an uncontended mutex per block.
+  - Peak memory gains the pool's idle buffers, bounded by the most decoded
+    blocks the merge held at once (current per side, a stash, the block
+    alive while `drain_remaining` decodes the next) and by the pool's
+    4 MiB-per-buffer and 64-buffer limits. Buffers over 4 MiB are dropped
+    and now show in the diff and derive runs' `DECOMPRESS_POOL_METRICS`
+    oversize-drop counters, which these paths never fed before.
+  - The parallel shard decoders (`diff/parallel.rs` and
+    `diff/derive_parallel.rs` `pread_decode`), the measured default path,
+    still allocate per block; left alone (HYG-181).
 
 ---
 
@@ -813,7 +831,8 @@ refuses, as the borrowed OSC writers already do since the unindexed-diff
 change; the four commands pick the refusal up through this one API (new
 refusal, CHANGELOG line; the existing fault test flips to assert the error).
 Absent fields becoming `0` stay: that is the block builder's documented
-normalisation (see HYG-137), so it gets a comment, not a change.
+normalisation (spelled out in `reencode_unclassifiable`'s doc in
+`src/commands/cat/mod.rs`), so it gets a comment, not a change.
 
 Reported by: as HYG-034.
 
@@ -1540,81 +1559,37 @@ was about carrying input headers faithfully, not about flags. No
 
 Reported by: the scratch-lifecycle review fixes.
 
-## HYG-137 - `cat` could split unclassifiable blobs losslessly
+## HYG-181 - The parallel diff and derive shard decoders allocate a fresh buffer per block
 
-Anger: 4 - cold path only; speculative.
+Anger: 9 - the measured default path of diff and derive.
 
-Speculative: nothing is known to need it. Plain `cat` re-encodes a blob
-the index scan cannot classify (no elements, a group carrying more than
-one element field, kinds changing across groups) through the block builder
-(`reencode_unclassifiable` in `src/commands/cat/mod.rs`), so those blobs
-take the builder's normalisation, the same `cat --type` and `--clean`
-apply: every node comes out dense, coordinates finer than the default
-granularity are rounded to decimicrodegrees, timestamps are truncated to
-whole seconds, an `Info` with a version gains explicit defaults for its
-absent fields, an `Info` without a version loses its metadata, and
-unknown protobuf fields are dropped. Every other blob `cat` writes is
-byte-preserved or reframed without re-encoding, so these are the only
-blobs plain `cat` alters.
+`pread_decode` in `src/commands/diff/parallel.rs` and
+`src/commands/diff/derive_parallel.rs` decompresses every blob into a fresh
+`Vec` and hands it to `PrimitiveBlock::from_vec_with_scratch`, so each shard
+worker allocates a new, often megabyte-sized, buffer per block. The
+sequential merges now recycle theirs through one `DecompressPool` per merge
+(`MergeBuffers` in `osc/merge_join.rs`); the classify workers keep one pool
+per worker. The same change fits here, one pool per shard worker, but this
+is the headline planet path (`diff-snapshots -j 16` in
+`reference/performance.md`), and the sequential change itself is unmeasured
+("Review once drained"). Whether glibc already recycles these frees well
+enough is unknown (rule 8).
 
-A lossless split is possible at the byte level: copy the block's string
-table (and granularity, offsets and date granularity) verbatim into each
-output block, and regroup the raw element messages by kind, splitting at
-each change of kind and at the element cap. Element bytes would then pass
-through untouched, and each output block would be scanned and indexed as
-the ordinary reindex arm does. Costs: a protobuf-level regrouper the crate
-does not have today (the builder works from decoded elements), dense-node
-groups that must be split by re-delta-encoding their packed arrays when a
-cap split falls inside one, and string tables carried whole into every
-piece (wasted bytes, unless pruned, which is a re-encode of its own).
+Reported by: the HYG-149 fix.
 
-Worth doing only if a producer whose blocks fall in these shapes turns up
-and the normalisation matters to someone; otherwise it stays parked.
+## HYG-180 - Two counter families still build their names with `format!`
 
-Recommendation (2026-10-25), agreed with the maintainer: do not refuse
-these blobs. Empty blobs lose nothing; kinds changing across groups is
-legal per the PBF spec and older producers wrote it; libosmium reads even
-multi-field groups. Refusing would bring back what commit `1ee8ae2d` fixed
-(the indexing advice looping, since `cat` is the indexing recipe). The
-losses are real only for non-default granularity, sub-second date
-granularity, versionless `Info` or unknown fields, and `cat --type` /
-`--clean` normalise the same way without refusing. What is missing is the
-announcement: the summary counts these blobs as "decoded" and nothing says
-they were normalised. So: (1) one `Note:` when `blobs_reencoded > 0`, and
-the same sentence in the CLI reference's `cat` section; (2) under rule 3, a
-paragraph in `reencode_unclassifiable`'s doc on the lossless split, its
-costs and when it would be worth building; (3) remove the entry. Refusing
-only when the re-encode would change values was considered and not
-recommended (plain `cat` would disagree with `--type` and `--clean`, for an
-input nobody has seen).
+Anger: 6 - sidecar counter plumbing on per-blob command paths.
 
-Reported by: the BUG-113 implementation.
+Repack's `repack_{kind}_*` and derive-parallel's `derivepar_{tag}_*` counter
+names are built with `format!` from a prefix, so they cannot be grepped
+verbatim - the problem renumber had until commit `13dd02aa` gave it literal
+names per phase (a local `stage_counters!` macro, a `Phase` value picking
+the name column at emission, a unit test pinning every name against the old
+spelling). The same treatment fits both; no emitted name or value may
+change.
 
-## HYG-149 - The sequential merges allocate a fresh decompress buffer per block
-
-Anger: 9 - buffer reuse on the diff and derive sequential paths.
-
-Both sequential merges in `osc/merge_join.rs` (the indexed block-pair merge
-and the unindexed `stream_merge_phase`) hand the decompress buffer to each
-decoded block and never get it back, so every block allocates a new, often
-large, buffer. The pipelined readers recycle theirs. Whether this costs
-anything measurable at planet scale is unknown (rule 8); a fix would return
-the buffer when the block drops, or decode into a pooled buffer.
-
-Recommendation (2026-10-25), accepted by the maintainer: hand both merges'
-buffers back through a `DecompressPool` with
-`PrimitiveBlock::from_vec_pooled_with_scratch` (`src/read/block.rs`), as the
-`parallel_classify_phase` workers already do; one small pool shared by both
-sides. Peak memory keeps its bound (two live decoded blocks plus the pool's
-idle buffers). Reasoned, not measured: the binary runs on glibc malloc (the
-only `#[global_allocator]` is hotpath's counting one), whose dynamic mmap
-threshold probably already serves a freed buffer back after the first few
-blocks, so the gain may be small; recycling cannot plausibly allocate more.
-Affected: unindexed diff and derive (always sequential), indexed under
-`-j 1` or `--verbose`. Add the change to "Review once drained" as
-unmeasured, then remove the entry.
-
-Reported by: the BUG-146 fix.
+Reported by: the HYG-150 implementation.
 
 ## HYG-151 - Every pass reopens its input by path, so a replaced input gives mixed reads
 

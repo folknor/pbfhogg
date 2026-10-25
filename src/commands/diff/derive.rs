@@ -414,8 +414,10 @@ fn derive_changes_element_stream(
     sink: &mut ChangeSink,
     host: &crate::host::Host,
 ) -> Result<()> {
-    let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io, host)?;
-    let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io, host)?;
+    let pool = crate::osc::merge_join::merge_buffers();
+    let mut old_src =
+        StreamingBlocks::new_sequential(old_path, direct_io, std::sync::Arc::clone(&pool), host)?;
+    let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io, pool, host)?;
 
     let phases = [
         (

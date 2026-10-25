@@ -884,6 +884,16 @@
 
 ### Added
 
+- **Plain `cat` says when it rebuilt or omitted a block.** An unindexed
+  blob whose block no single index can describe (no elements, a group with
+  more than one element field, kinds changing across groups) is rebuilt
+  into single-kind blocks, normalised as `--type` and `--clean` write them,
+  or omitted when it holds no elements, and the summary counts these only
+  as decoded. A `Note:` line now gives how many were
+  rebuilt and omitted and the rules that applied (dense nodes, coordinates
+  truncated to decimicrodegrees, whole-second timestamps, versionless
+  metadata discarded, unknown fields dropped). Output is unchanged.
+
 - **A global `-q, --quiet` on every command: the exit code is the
   answer.** It drops every `Note:`, progress line and closing summary
   (including `inspect tags`' `N distinct tag values` and `extract --config`'s

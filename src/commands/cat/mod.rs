@@ -121,7 +121,7 @@ pub(crate) fn cat_to(
     if type_filter.is_some() {
         for file in files {
             require_indexdata(
-                file,
+                *file,
                 direct_io,
                 force,
                 "input PBF has no blob-level indexdata. Without indexdata, the type \

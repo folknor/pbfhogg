@@ -712,6 +712,21 @@ The judgement calls already known, to be checked first:
     description as before) and one per overlap-run worker. The
     `sort_total_bytes_in` counter now reads the pin's `fstat`; no test
     observes that conversion.
+  - tags-filter adopted it in `tags_filter_to`, after the option and
+    expression refusals, so a bad expression is still refused before the
+    input is touched; the public `tags_filter` stays `&Path`. It pins in
+    every mode, including `-R` with `--invert-match` or
+    `--distrust-metadata`, which open the input once and used to accept a
+    FIFO: the options pick the mode, and one input contract per command
+    was preferred over one per option set (sparred with codex). Unlike
+    sort, its probe stayed `require_indexdata`, which now takes
+    `impl Into<InputSource>` and probes through the pin directly (not via
+    the public `has_indexdata`), skipping the OSMHeader payload as before;
+    `cat` and `cat --dedupe` gained a `&&Path` deref. Every open became one
+    derived open, descriptions unchanged. Not done: the closure, way-deps
+    and pass-2 schedules each walk the headers again where pass 1's walk
+    could feed them all - repeated work on a measured planet path, not an
+    identity hole, so it was left for a measured change of its own.
 
 ---
 
@@ -1403,22 +1418,14 @@ path went. What each entry owes, settled in a codex spar on 2026-10-25:
   other Unix hosts; off Unix a pin verifies nothing, so do not claim
   "elsewhere").
 - The classify schedule builders already take `impl Into<InputSource>`;
-  a `&&Path` caller needs a deref.
+  a `&&Path` caller needs a deref. So does `require_indexdata` (since
+  tags-filter's entry): hand it the pin and the probe reads through it.
 
 Commands confirmed to open their input once per run, not needing a pin:
 export, check refs, check index (one open each). inspect's index-only scan
 and its full-decode fallback each read the whole report from one open, but
 the full decode takes its file size from a separate path `stat`, which
 HYG-187 covers.
-
-## HYG-172 - tags-filter reopens its input by path per pass
-
-Anger: 8 - planet-scale command.
-
-See "Adopting `PinnedInput`" above. Recommendation (2026-10-25): follow
-the brief.
-
-Reported by: the HYG-078 resolution.
 
 ## HYG-173 - getid reopens its input by path per pass
 

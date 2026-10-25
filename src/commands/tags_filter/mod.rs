@@ -11,6 +11,7 @@ use super::{
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::idset::IdSet;
 use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
+use crate::read::input::PinnedInput;
 use crate::tag_expr::{Expression, StringMatcher, parse_expressions, tag_matches};
 use crate::write::WriteOptions;
 use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
@@ -252,6 +253,12 @@ impl TagsFilterOptions<'_> {
 /// If `omit_referenced` is true (`-R` flag), only directly matching elements
 /// are output (single pass, faster). Otherwise, referenced nodes of matching
 /// ways are also included (two-pass).
+///
+/// The input must be a regular file or a block device (`InvalidArgument`
+/// otherwise), in every mode, and is pinned for the run once the options
+/// and expressions are accepted (see [`PinnedInput`]): where a later open
+/// cannot reach the pinned file, an input replaced mid-run fails with
+/// `InputReplaced`.
 pub fn tags_filter(
     input: &Path,
     output: crate::output::Output,
@@ -278,6 +285,19 @@ pub(crate) fn tags_filter_to(
     // is touched, and so is a malformed expression.
     opts.validate()?;
     let expressions = parse_expressions(opts.expression_strs)?;
+
+    // Every pass opens the input again, each through its own open file
+    // description (the indexdata probe, the header reads, the schedule walks
+    // whose descriptors serve the worker pools, `-R`'s reader), and each is
+    // derived from this one pin, so a file renamed over the input mid-run
+    // cannot be read partly from each: where `/proc/self/fd` reopens the pin
+    // every open reaches the pinned file, otherwise on Unix a replaced input
+    // fails the run (`PinnedInput` says what it does off Unix). Taken before
+    // any other open of it, and in every mode: `-R` with `invert` or
+    // `distrust_metadata` opens the input once, but one input contract for
+    // the command beats one that depends on the options.
+    let pin = PinnedInput::pin(input, host)?;
+    let input = &pin;
 
     // Blob-level filtering can't help in invert mode (we want non-matching
     // blobs), and `--distrust-metadata` declines to use it at all - demanding
@@ -449,7 +469,7 @@ fn filter_block_parallel(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn tags_filter_single_pass(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     expressions: &[Expression],
     invert: bool,
@@ -674,7 +694,7 @@ fn filter_block_pass2(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 fn tags_filter_two_pass(
-    input: &Path,
+    input: &PinnedInput,
     output: &crate::output::Output,
     expressions: &[Expression],
     invert: bool,
@@ -740,7 +760,7 @@ fn tags_filter_two_pass(
         let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
         let _ = walker
             .next_header()?
-            .ok_or_else(|| crate::error::new_missing_header(input))?;
+            .ok_or_else(|| crate::error::new_missing_header(input.path()))?;
 
         let expr_filter = trusted_blob_filter(expressions, invert, distrust_metadata);
 
@@ -882,7 +902,6 @@ fn tags_filter_two_pass(
     if has_included_relation {
         let closure = collect_relation_member_closure(
             input,
-            direct_io,
             distrust_metadata,
             &mut included_relation_ids,
             &mut included_way_ids,
@@ -899,7 +918,6 @@ fn tags_filter_two_pass(
     crate::debug::emit_marker("TAGSFILTER_WAYDEPS_START");
     collect_way_node_dependencies(
         input,
-        direct_io,
         distrust_metadata,
         &included_way_ids,
         Some(&direct_way_ids),
@@ -948,7 +966,7 @@ fn tags_filter_two_pass(
     let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let _ = walker
         .next_header()?
-        .ok_or_else(|| crate::error::new_missing_header(input))?;
+        .ok_or_else(|| crate::error::new_missing_header(input.path()))?;
 
     let mut schedule: Vec<crate::scan::classify::ScheduledBlob> = Vec::new();
     let mut blobs_skipped: u64 = 0;
@@ -1218,8 +1236,7 @@ struct RelationClosureSummary {
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 fn collect_relation_member_closure(
-    input: &Path,
-    _direct_io: bool,
+    input: &PinnedInput,
     distrust_metadata: bool,
     included_relation_ids: &mut IdSet,
     included_way_ids: &mut IdSet,
@@ -1346,8 +1363,7 @@ fn kind_schedule_filter(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 fn collect_way_node_dependencies(
-    input: &Path,
-    _direct_io: bool,
+    input: &PinnedInput,
     distrust_metadata: bool,
     included_way_ids: &IdSet,
     skip_way_ids: Option<&IdSet>,
@@ -1524,7 +1540,7 @@ mod tests {
         )
         .unwrap();
         tags_filter_single_pass(
-            &input,
+            &PinnedInput::pin(&input, &crate::host::Host::for_tests()).unwrap(),
             &staged,
             &expressions,
             false,

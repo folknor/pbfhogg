@@ -496,15 +496,19 @@ pub(crate) fn clean_metadata<'a>(
 // renumber requires metadata in every scheduled blob with no force fallback.
 // Do not infer those decisions from this shared first-blob probe. Geocode
 // separately grants unindexed input via allow_unindexed without overwrite.
-pub(crate) fn require_indexdata(
-    path: &Path,
+//
+// A pinned `input` is probed through its pin, so a command that pins reads
+// the same file here as in its passes.
+pub(crate) fn require_indexdata<'a>(
+    input: impl Into<crate::read::input::InputSource<'a>>,
     direct_io: bool,
     force: bool,
     reason: &str,
     host: &crate::host::Host,
 ) -> Result<bool> {
-    let present = has_indexdata(path, direct_io, &host.diagnostics)?;
-    indexdata_policy(present, path, force, reason, host)
+    let source = input.into();
+    let (present, _) = probe_first_data_blob(source, direct_io, &host.diagnostics)?;
+    indexdata_policy(present, source.path(), force, reason, host)
 }
 
 /// The acceptance half of [`require_indexdata`], for a caller that already
@@ -621,12 +625,14 @@ pub fn has_tagdata(
 // across header-walking commands (reference/performance-history.md). Consumers
 // decide what absent metadata in later blobs means (fallback decode or a
 // mid-run error); `inspect --indexed` reports this same hint.
-fn probe_first_data_blob(
-    path: &Path,
+fn probe_first_data_blob<'a>(
+    input: impl Into<crate::read::input::InputSource<'a>>,
     direct_io: bool,
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<(bool, bool)> {
-    let mut reader = FileReader::open(path, direct_io)?;
+    let source = input.into();
+    let path = source.path();
+    let mut reader = FileReader::open(source, direct_io)?;
     let mut offset = 0u64;
     // The header comes first or the file is not a PBF: a zero-byte or
     // header-less file gets the one missing-header error here, ahead of any

@@ -65,6 +65,8 @@ mod fault_parallel_writer;
 mod fault_read_pipeline;
 #[cfg(feature = "test-hooks")]
 mod fault_sort_input;
+#[cfg(feature = "test-hooks")]
+mod fault_tags_filter_input;
 #[cfg(all(feature = "test-hooks", feature = "linux-io-uring"))]
 mod fault_uring_writer;
 mod fixture_helpers;

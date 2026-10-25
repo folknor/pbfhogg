@@ -204,7 +204,7 @@ fn plan_merge(
     // Validate inputs have indexdata
     for input in inputs {
         require_indexdata(
-            input,
+            *input,
             opts.direct_reads,
             opts.force,
             "input PBF has no blob-level indexdata. Without indexdata, every blob must be \

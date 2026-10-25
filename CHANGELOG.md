@@ -1158,6 +1158,20 @@
 
 ### Fixed
 
+- **`tags-filter` reads one input file even if it is replaced mid-run.**
+  The PBF input is opened several times per run (the indexdata check, the
+  header reads, the schedule walks of pass 1, the relation closure, the
+  way dependencies and pass 2, and under `-R` the check and the read), and
+  each open used to resolve the path again, so an input renamed over
+  during the run was read partly from each file, with no error. The input
+  is now pinned when the run starts, after the expressions are accepted:
+  on Linux with `/proc` a replaced or deleted input does not affect the
+  run; on other Unix hosts the run fails with `ErrorKind::InputReplaced`
+  and publishes nothing. An input that is a FIFO, socket or character
+  device is now refused up front in every mode, including `-R` with
+  `--invert-match` or `--distrust-metadata`, which read the input once and
+  used to accept one. `--input-kind osc` is unchanged.
+
 - **`extract` and `multi-extract` read one input file even if it is
   replaced mid-run.** Every strategy opens the input several times per run
   (the sortedness and indexdata checks, the schedule walks, the header

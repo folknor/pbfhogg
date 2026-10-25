@@ -681,6 +681,25 @@ mod tests {
     ///   way blob:      way 10 -> refs [1, 2]
     ///   relation blob: rel 100 -> [node 1, way 10]; rel 101 -> [rel 100]
     fn write_rich_fixture(path: &std::path::Path) {
+        write_rich_fixture_indexed(path, [true; 3]);
+    }
+
+    /// [`write_rich_fixture`] with indexdata on the node, way and relation
+    /// blob only where `indexed` says so, to model a partially indexed input.
+    fn write_rich_fixture_indexed(path: &std::path::Path, indexed: [bool; 3]) {
+        fn write(
+            writer: &mut PbfWriter<std::io::BufWriter<std::fs::File>>,
+            bytes: &[u8],
+            indexed: bool,
+        ) {
+            if indexed {
+                writer.write_primitive_block(bytes).expect("write block");
+            } else {
+                writer
+                    .write_primitive_block_no_indexdata(bytes)
+                    .expect("write block");
+            }
+        }
         let file = std::fs::File::create(path).expect("create fixture");
         let mut writer = PbfWriter::new(
             std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
@@ -689,17 +708,31 @@ mod tests {
         writer
             .write_header(&HeaderBuilder::new().sorted().build().expect("header"))
             .expect("write header");
+        // Populated metadata, so a byte comparison of outputs covers it too.
+        let meta = crate::block_builder::Metadata {
+            version: 3,
+            timestamp: 1_600_000_000,
+            changeset: 42,
+            uid: 7,
+            user: "u",
+            visible: true,
+        };
+        let meta = Some(&meta);
         let mut block = BlockBuilder::new();
         for id in [1i64, 2] {
-            block.add_node(id, 0, 0, std::iter::empty::<(&str, &str)>(), None);
+            block.add_node(id, 0, 0, [("amenity", "cafe")], meta);
         }
-        writer
-            .write_primitive_block(block.take().expect("node block").expect("nodes"))
-            .expect("write nodes");
-        block.add_way(10, std::iter::empty::<(&str, &str)>(), &[1, 2], None);
-        writer
-            .write_primitive_block(block.take().expect("way block").expect("way"))
-            .expect("write way");
+        write(
+            &mut writer,
+            block.take().expect("node block").expect("nodes"),
+            indexed[0],
+        );
+        block.add_way(10, [("highway", "path")], &[1, 2], meta);
+        write(
+            &mut writer,
+            block.take().expect("way block").expect("way"),
+            indexed[1],
+        );
         let rel100 = [
             MemberData {
                 id: MemberId::Node(1),
@@ -710,16 +743,150 @@ mod tests {
                 role: "",
             },
         ];
-        block.add_relation(100, std::iter::empty::<(&str, &str)>(), &rel100, None);
+        block.add_relation(100, [("type", "route")], &rel100, meta);
         let rel101 = [MemberData {
             id: MemberId::Relation(100),
             role: "",
         }];
-        block.add_relation(101, std::iter::empty::<(&str, &str)>(), &rel101, None);
-        writer
-            .write_primitive_block(block.take().expect("relation block").expect("relations"))
-            .expect("write relations");
+        block.add_relation(101, std::iter::empty::<(&str, &str)>(), &rel101, meta);
+        write(
+            &mut writer,
+            block.take().expect("relation block").expect("relations"),
+            indexed[2],
+        );
         writer.flush().expect("flush fixture");
+    }
+
+    /// The output's elements as (kind, id), in file order.
+    fn ordered(path: &std::path::Path) -> Vec<(char, i64)> {
+        let mut out = Vec::new();
+        ElementReader::open_in(path, false, &crate::host::Host::for_tests())
+            .expect("read output")
+            .for_each(|element| match element {
+                Element::DenseNode(node) => out.push(('n', node.id())),
+                Element::Node(node) => out.push(('n', node.id())),
+                Element::Way(way) => out.push(('w', way.id())),
+                Element::Relation(relation) => out.push(('r', relation.id())),
+            })
+            .expect("iterate output");
+        out
+    }
+
+    /// One arm's run: output bytes, ordered elements and stats.
+    struct ArmRun {
+        bytes: Vec<u8>,
+        elements: Vec<(char, i64)>,
+        stats: (u64, u64, u64),
+    }
+
+    /// A query, whether `--add-self` is set, and the expected output.
+    struct Case {
+        query: &'static [&'static str],
+        add_self: bool,
+        expected: &'static [(char, i64)],
+    }
+
+    fn run_arm(input: &std::path::Path, query: &[&str], add_self: bool, arm: ScanArm) -> ArmRun {
+        let dir = crate::path_guard::tests::scratch();
+        let query: Vec<String> = query.iter().map(|s| (*s).to_owned()).collect();
+        let query = parse_ids(&query).expect("ids");
+        let output = dir.path().join("out.pbf");
+        let staged = crate::output::Output::new(
+            &output,
+            crate::output::Overwrite::Refuse,
+            &crate::host::Diagnostics::discard(),
+        )
+        .expect("stage output");
+        let stats = getparents_with_arm(
+            input,
+            &staged,
+            &query,
+            &GetparentsOptions { add_self },
+            &WriteOptions::default(),
+            &HeaderOverrides::default(),
+            arm,
+            &crate::host::Host::for_tests(),
+        )
+        .expect("getparents");
+        staged
+            .publish(&crate::host::Cancel::new())
+            .expect("publish");
+        ArmRun {
+            bytes: std::fs::read(&output).expect("read output bytes"),
+            elements: ordered(&output),
+            stats: (
+                stats.nodes_written,
+                stats.ways_written,
+                stats.relations_written,
+            ),
+        }
+    }
+
+    /// A partially indexed input, in either order, is accepted on both arms
+    /// and gives the wholly indexed file's output byte for byte: every path
+    /// decodes a blob without indexdata and selects from its actual
+    /// elements, so the missing index costs a decode, never a result. Each
+    /// query reaches a different unindexed blob: the queried node itself
+    /// (`--add-self`), a way parent, a relation parent, and a
+    /// relation-of-relation parent.
+    #[test]
+    fn partial_index_in_either_order_matches_the_wholly_indexed_output() {
+        let dir = crate::path_guard::tests::scratch();
+        let whole = dir.path().join("whole.pbf");
+        write_rich_fixture_indexed(&whole, [true; 3]);
+        let partials = [
+            ("indexed head", [true, false, false]),
+            ("unindexed head", [false, true, true]),
+        ];
+        let cases = [
+            Case {
+                query: &["n1"],
+                add_self: false,
+                expected: &[('w', 10), ('r', 100)],
+            },
+            Case {
+                query: &["n1"],
+                add_self: true,
+                expected: &[('n', 1), ('w', 10), ('r', 100)],
+            },
+            Case {
+                query: &["w10"],
+                add_self: false,
+                expected: &[('r', 100)],
+            },
+            Case {
+                query: &["r100"],
+                add_self: false,
+                expected: &[('r', 101)],
+            },
+        ];
+        for (name, mask) in partials {
+            let partial = dir.path().join(format!("{name}.pbf"));
+            write_rich_fixture_indexed(&partial, mask);
+            for case in &cases {
+                for arm in [ScanArm::Walker, ScanArm::FullScan] {
+                    let reference = run_arm(&whole, case.query, case.add_self, arm);
+                    let got = run_arm(&partial, case.query, case.add_self, arm);
+                    let what = format!(
+                        "{name}, {:?}, add_self {}, {arm:?}",
+                        case.query, case.add_self
+                    );
+                    assert_eq!(reference.elements, case.expected, "reference: {what}");
+                    assert_eq!(got.elements, case.expected, "{what}");
+                    let count = |kind| {
+                        let n = case.expected.iter().filter(|(k, _)| *k == kind).count();
+                        u64::try_from(n).expect("count fits")
+                    };
+                    assert_eq!(
+                        got.stats,
+                        (count('n'), count('w'), count('r')),
+                        "stats: {what}"
+                    );
+                    assert_eq!(got.stats, reference.stats, "reference stats: {what}");
+                    assert!(got.bytes == reference.bytes, "output bytes differ: {what}");
+                }
+            }
+        }
     }
 
     // The four tests below assert against hand-computed parent sets, NOT just

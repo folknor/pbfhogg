@@ -160,7 +160,7 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   `HeaderWalker::refusing_partial_index` refuses it with the typed
   missing-indexdata error, in either order (indexed then unindexed, or the
   reverse), located at the first unindexed data blob. Most schedule walks
-  opt in; `getid`'s and `getparents`' do not. `renumber`,
+  opt in; `getid`'s and `getparents`' do not (below). `renumber`,
   `add-locations-to-ways --index-type external` and `diff`'s indexed
   block-pair paths refuse any unindexed blob (a wholly unindexed `diff`
   input takes the sequential fallback instead). Commands whose arm the first
@@ -178,9 +178,13 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   `--add-referenced`'s classify walk and second pass, and the `-I` ID file
   reader (shared with `getparents`) all decode such a blob. The one refusal
   left is `getid --invert`'s, for an unindexed blob holding ways under a
-  carried way-enrichment declaration, which re-encoding would break. The
-  other refusals on this page are recorded as current behaviour, not
-  justified by this rule.
+  carried way-enrichment declaration, which re-encoding would break.
+  `getparents` accepts on both arms by the same rule, in either order, and
+  has no `--force` gate: its walker schedules a blob without indexdata
+  whatever the query and its full-scan arm's blob filter passes one through
+  to a decode, so both select parents from actual elements, and its output
+  is the wholly indexed file's. The other refusals on this page are
+  recorded as current behaviour, not justified by this rule.
 - **What a command does with a wholly unindexed file** - refuse and offer
   `--force`, refuse with no escape, fall back, or verify - is per command.
   The user-facing statement is the `--force` section of

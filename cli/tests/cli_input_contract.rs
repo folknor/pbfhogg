@@ -540,6 +540,12 @@ fn getparents_add_self(c: &Ctx, input: &Path) -> Invocation {
     getparents(c, input).words(&["--add-self"])
 }
 
+/// getparents on its full-scan arm, which a small file reaches only through
+/// the hidden threshold instrument.
+fn getparents_full_scan(c: &Ctx, input: &Path) -> Invocation {
+    getparents(c, input).words(&["--full-scan-min-blobs", "1"])
+}
+
 fn extract_complete(c: &Ctx, input: &Path) -> Invocation {
     Invocation::new(&["extract"])
         .arg(input)
@@ -1455,6 +1461,19 @@ const FIRST_BLOB_ONLY: &[MixedRow] = &[
     ),
     ("getid -I", getid_id_osm_file, Mixed::Accepts),
     ("getparents -I", getparents_id_osm_file, Mixed::Accepts),
+    // getparents accepts on both arms by the same rule: each decodes a blob
+    // without indexdata and selects from its actual elements. The walker
+    // notes the unindexed blob its kind filter cannot skip; the full-scan
+    // arm's note reads the first data blob only, so it says nothing here
+    // (Accepts pins the run, not that silence), and with --add-self every
+    // kind is wanted, so neither arm prunes.
+    ("getparents", getparents, Mixed::Reports(BLOBS_NOTE)),
+    ("getparents --add-self", getparents_add_self, Mixed::Accepts),
+    (
+        "getparents --full-scan-min-blobs 1",
+        getparents_full_scan,
+        Mixed::Accepts,
+    ),
     ("apply-changes", apply_changes, Mixed::RefusesPartial),
     (
         "extract (complete)",

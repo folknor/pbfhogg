@@ -288,8 +288,10 @@ impl HeaderWalker {
     /// a blob without indexdata and filters its actual elements, so a
     /// partially indexed file is correct input for it and is accepted
     /// (`scan::classify::PartialIndex::Accept` on its classify walks).
-    /// getparents' walker and full-scan arms do not opt in either; being
-    /// chosen by input size, they must not refuse on one arm only.
+    /// getparents' walker does not opt in for the same reason: it schedules
+    /// a blob without indexdata whatever the query, and its full-scan arm's
+    /// blob filter passes one through to a decode, so both arms select from
+    /// actual elements.
     #[must_use]
     pub(crate) fn refusing_partial_index(mut self) -> Self {
         self.partial_index = Some(PartialIndexGuard::default());

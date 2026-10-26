@@ -618,9 +618,10 @@ impl BlobOrderGuard {
             .observe(index.kind.ordinal(), index.min_id, index.max_id)
         {
             return Err(crate::error::new_unsorted(format!(
-                "block-pair merge: a {} blob holding id {} follows {} \
-                 output already reaching id {}. The input's header claims \
-                 Sort.Type_then_ID but its blobs are not in canonical order.",
+                "block-pair merge: a {} blob holding id {} follows {} blobs \
+                 already reaching id {} earlier in this file. The input's header \
+                 claims Sort.Type_then_ID but, according to its indexdata, its \
+                 blobs are not in canonical order.",
                 index.kind.as_str(),
                 v.first_id,
                 ElementKind::from_ordinal(v.previous_kind).map_or("unknown", ElementKind::as_str),

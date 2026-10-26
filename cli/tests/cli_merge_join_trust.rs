@@ -210,7 +210,10 @@ fn node_blob_after_way_blobs_is_rejected_not_dropped() {
         "error should name the ordering problem; got:\n{stderr}"
     );
     assert!(
-        stderr.contains("a node blob holding id 3 follows way output"),
+        stderr.contains(
+            "a node blob holding id 3 follows way blobs already reaching id 200 \
+             earlier in this file"
+        ),
         "error should name which kind turned up after which; got:\n{stderr}"
     );
 

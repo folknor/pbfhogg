@@ -904,6 +904,47 @@ the ones below.
     block-device inputs are supported at all is the question to settle
     first.
 
+- Slice A, the defect (`BlobOrderGuard::observe`, the diff blob-order
+  message): confirmed and **resolved** (sparred with codex to consensus).
+  - Confirmed in the code: the guard's only caller is `RawWalk::bucket` in
+    `src/commands/diff/shard.rs`, which runs it over each input's blobs in
+    file order for text diff, `diff_stats` and derive alike, yet the message
+    said "follows {kind} output already reaching id". The wording came from
+    apply-changes' `check_output_order`, where "output" is right. No other
+    copy of the mislabel exists.
+  - Fix: "follows {kind} blobs already reaching id {id} earlier in this
+    file", plus "according to its indexdata" before "its blobs are not in
+    canonical order": the guard reads only the indexdata ranges, so a lying
+    range (sorted contents, overstated `max_id`) trips it too, the
+    distinction `reference/indexdata-trust.md` draws. The rest was checked
+    and kept: both entry points refuse an unsorted header before the walk,
+    so "The input's header claims Sort.Type_then_ID" holds; the caller
+    locates the error with path, blob index and frame offset, so the
+    message need not say old or new; `previous_id` is the furthest id in
+    OSM order (not numerically greatest when negative) that earlier blobs
+    of that kind reached. The `block-pair merge:` prefix stays: it names
+    the engine whose precondition failed, the convention every other
+    message in `merge_join.rs` follows (codex first proposed
+    `input blob order:` and withdrew it). The substring the trust tests
+    match is unchanged; `node_blob_after_way_blobs_is_rejected_not_dropped`,
+    which pinned the old clause, now pins the new one. `brokkr check`
+    (tier1) passes.
+  - Laterals from the spar, all **open** (checked against the code, not
+    fixed):
+    - `require_sorted` (`src/commands/mod.rs`) says "{file} is not sorted"
+      when it only knows the header does not declare `Sort.Type_then_ID`.
+      A sorted file without the flag gets that message.
+    - diff and derive give "Streaming diff requires sorted inputs to
+      operate in constant memory" as the reason, but the indexed engine
+      holds one descriptor per blob, so its memory grows with blob count.
+    - `walk_file`'s "requires indexdata on every data blob" also fires for
+      indexdata that is present but unreadable: `BlobIndex::deserialize`
+      returns `None` for an unknown version, kind or an inverted range.
+    - `diff -v` relation member details compare member sets
+      (`write_member_diff_borrowed`), so a reorder (`[A,B]` to `[B,A]`) or
+      a dropped duplicate (`[A,A]` to `[A]`) prints the modification with
+      no member lines. The modification itself is still reported.
+
 Notes made while the audit ran, not findings of it:
 
 - protohoggr 0.4.0 to 0.5.0 (bz `pbfhogg#15`) was applied after slices C,

@@ -23,32 +23,9 @@ numbered items carry the current state.
 | `.plans/` | gitignored |
 
 Root files: `AGENTS.md`, `CLAUDE.md`, `README.md`, `CHANGELOG.md` (exempt),
-plus `CORRECTNESS.md`, `DEVIATIONS.md`, `LIBRARY.md`, `LLM.md`, `TODO.md`.
-
-## 1. Durable files cite `notes/`: RESOLVED for `notes/` and `.plans/`, open for `TODO.md`
-
-`AGENTS.md`: "nothing durable may cite `notes/` - not a code comment, not
-`docs/`, not `reference/`."
-
-Resolved: every `notes/` citation in `reference/`, `docs/`, `decisions/`, code
-comments and tests has been removed, and the `.plans/merry-watching-lake.md`
-citation is gone. `scripts/check_doc_links.py` (the `doc-links` script_check in
-`brokkr.toml`, run by `brokkr check`) now fails on any durable file that cites
-`notes/` or the gitignored `.plans/`, or names a repository path that does not
-exist, so the class cannot regress.
-
-Still open: durable files cite `TODO.md`, transient by the same argument
-(`src/geocode_index/reader.rs`, `src/commands/extract/common.rs`,
-`cli/tests/cli_sort.rs`, and others). The script does not claim root-level
-`TODO.md`, so nothing enforces this half; it is coupled to item 2.
-
-## 2. `TODO.md` is `notes/todo.md` by the convention's own wording
-
-The `AGENTS.md` table literally names `todo.md` as `notes/` content: "work
-items (`todo.md`)". It sits at root and is cited from `reference/testing.md`,
-`reference/blob-density.md`, `reference/performance-history.md`,
-`decisions/README.md` and several source files, so moving it is entangled with
-the `TODO.md` half of item 1.
+plus `CORRECTNESS.md`, `DEVIATIONS.md`, `LIBRARY.md`, `LLM.md`. Items 1 and 2
+(durable files citing `notes/` and the root `TODO.md`, and moving the latter to
+`notes/todo.md`) are resolved; `scripts/check_doc_links.py` enforces both.
 
 ## 3. `CORRECTNESS.md` and `DEVIATIONS.md` belong in `reference/`
 
@@ -91,9 +68,9 @@ the reference/docs split working as intended and should be left alone.
 
 Durable and binding, cited from `src/path_guard.rs`,
 `reference/technical-implementation-spec.md`, `reference/blob-density.md`,
-`reference/performance.md`, `DEVIATIONS.md`, `TODO.md` and several notes.
+`reference/performance.md`, `DEVIATIONS.md` and several notes.
 `decisions/README.md` documents its own relationship to `DEVIATIONS.md` and
-`TODO.md`, so it is a deliberate, load-bearing folder that the `AGENTS.md`
+the work-item list, so it is a deliberate, load-bearing folder that the `AGENTS.md`
 table simply predates. `scripts/check_doc_links.py` already treats
 `decisions/` as a path root it validates.
 
@@ -119,10 +96,8 @@ citation is gone. Remaining:
 
 ## Suggested order of work
 
-Item 2 and the `TODO.md` half of item 1, plus item 3, are one entangled
-link-rewrite job and are best done in a single pass: move `TODO.md`,
-`CORRECTNESS.md` and `DEVIATIONS.md`, then fix every citation including the
-anchored ones and the source comments.
+Item 3 is a link-rewrite job: move `CORRECTNESS.md` and `DEVIATIONS.md`, then
+fix every citation including the anchored ones and the source comments.
 
 Items 4 and 5 are independent and each need a decision before any editing:
 whether the `docs/` forks become includes, redirects, or genuinely

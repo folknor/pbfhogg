@@ -1126,7 +1126,7 @@ mod platform {
 
     #[cfg(feature = "linux-io-uring")]
     #[test]
-    #[ignore = "pre-existing io_uring writer bug for small outputs; see TODO.md"]
+    #[ignore = "pre-existing io_uring writer bug for small outputs; not re-verified on a host that can run io_uring"]
     fn sort_overlapping_blobs_uring() {
         let dir = crate::common::test_scratch();
         let input = dir.path().join("overlapping.osm.pbf");

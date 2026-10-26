@@ -19,10 +19,10 @@
 //! are NOT named as enforcement sites in DEVIATIONS. The contract this
 //! file pins for them is panic-freedom on mixed-sign input. Their
 //! current behavior varies (cat/sort preserve, tags-filter silently
-//! drops the negative-id ways through its parallel-classify path) -
-//! see TODO.md for the open question of whether they should promote
-//! to clean-error rejection. The tests below pin the *current* status
-//! quo, not a forward-looking contract.
+//! drops the negative-id ways through its parallel-classify path).
+//! Whether they should instead refuse mixed-sign input with a clean
+//! error, as renumber does, is an open question. The tests below pin
+//! the *current* status quo, not a forward-looking contract.
 //!
 //! Tests use only the stable allowlist (CliInvoker + the existing
 //! fixture writers) so internal-module rewrites cannot break them.
@@ -216,9 +216,8 @@ fn tags_filter_handles_mixed_sign_ids() {
     assert!(
         out.status.success(),
         "tags-filter currently succeeds on mixed-sign input. If it \
-         has been promoted to clean rejection per TODO.md 'Promote \
-         silent passthrough/drop to clean error', invert this \
-         assertion deliberately and update the TODO entry. \
+         has been changed to refuse mixed-sign input with a clean \
+         error, invert this assertion deliberately. \
          stderr:\n{stderr}",
     );
     let contents = read_all_elements_id_only(&output);

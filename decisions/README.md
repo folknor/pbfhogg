@@ -100,12 +100,13 @@ The skeleton has exactly two sections. `Context`, `Consequences`, and
 - **`CLAUDE.md`** owns rules for AI-assisted work. When an ADR
   establishes a coding rule, a one-liner in `CLAUDE.md` can mirror it
   with a pointer to the ADR.
-- **`TODO.md`** cites ADRs from decision paragraphs at the top of each
-  bug-sweep cluster. The ADR does *not* link back to `TODO.md` - the
-  ADR is the permanent decision, the TODO cluster is a transient
-  organizing artifact. An ADR also must not name a specific bug-sweep
-  cluster or release label in its title or filename; cluster labels
-  live in `TODO.md` and evolve, the ADR stays.
+- **The work-item list** (the todo file under `notes/`) cites ADRs
+  from its decision paragraphs. The ADR does *not* link back to it -
+  the ADR is the permanent decision, the work item a transient
+  organizing artifact, and nothing durable cites `notes/`. An ADR also
+  must not name a specific bug-sweep cluster or release label in its
+  title or filename; those labels live in the work-item list and
+  evolve, the ADR stays.
 
 ## Index
 

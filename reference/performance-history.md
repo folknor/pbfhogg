@@ -630,7 +630,7 @@ Multi-extract Japan 5-region node classify (commit `c3b271f`, plantasjen):
 ASM inspection confirms LLVM does NOT autovectorize the bbox loop - the
 `push()` side effect blocks it, so explicit AVX2 intrinsics are the only
 SIMD path. The multi-bbox loop is the designated SIMD target (N region
-tests per node amortize setup); tracked under TODO.md Milestone B.
+tests per node amortize setup); not yet built.
 
 ### IdSetDense accumulation: Vec-push-then-drain wins (do-not-reattempt, `e94c3c8`)
 
@@ -676,9 +676,8 @@ classify multi/5-region `Vec<Vec<i64>>` ~3.5 GB, way classify single
 1.6 GB way + 9.5 GB refs, way classify multi/5-region 8 GB, tags_filter
 pass 1 2.9 GB - all "per-blob send". Sparse paths stay on accumulate:
 relation classify (3x IdSetDense) ~68 MB, tags_filter relation closure
-~13 MB. The live audit checklist of remaining `parallel_classify_accumulate`
-callers and their per-worker planet bounds lives in TODO.md
-"Other parallel_classify_accumulate callers".
+~13 MB. Any remaining `parallel_classify_accumulate` caller is owed the same
+per-worker planet bound before it is trusted at planet scale.
 
 Note: the review's original *mechanism* diagnosis (a chunk-spread model
 pinning the planet blocker on `extract.rs:2813`) was investigated over
@@ -1032,9 +1031,8 @@ old commit messages. By topic:
 - Columnar integration and hybrid-batching research (deleted 2026-07-13;
   measured findings absorbed into the "Parallel classify" section above).
 - apply-changes opportunities (deleted 2026-07-13; all items landed or
-  absorbed into TODO.md's apply-changes entry - 80.9 s planet best,
-  deferred #11 splice-in-place and #13 exact-membership metadata tracked
-  there).
+  were carried into the work-item list - 80.9 s planet best, with
+  splice-in-place and exact-membership metadata deferred).
 - zlib level tuning (deleted 2026-07-13; superseded by the write-path
   plan's item-2 compression matrix; the zstd:1 internal-pipeline
   recommendation lives in README.md and `reference/performance.md`).
@@ -1047,4 +1045,4 @@ old commit messages. By topic:
   doc comments).
 - Spatial index in PBF and way-blob bbox speculation (deleted
   2026-07-13; speculative research, no measurements; conclusions
-  retained in TODO.md's research / stretch list).
+  carried into the work-item list's research ideas).

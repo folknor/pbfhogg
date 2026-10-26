@@ -424,7 +424,7 @@ the read-only pair; do not expect it to rescue the write-heavy four.
 Side finding (`check --ids` run): the 8k snapshot has 7 non-monotonic
 relation violations (repack relation-blob ordering; nodes/ways clean).
 Timing-neutral - the walk is ID-order-independent - so the sweep numbers
-stand. Tracked under the repack entry in TODO.md.
+stand. Open as a repack work item.
 
 ### Correctness across the encoding axis
 
@@ -440,8 +440,7 @@ encoding-sensitive.
 `brokkr read --dataset planet --snapshot 8k --bench 1`: 3 of 4 variants
 completed; the **parallel variant was killed by signal** on the 8k
 encoding. It survives primary planet (50.8 k blobs), so per-blob memory
-accumulation at 28.6x blob count is implicated. Uninvestigated; tracked
-in TODO.md.
+accumulation at 28.6x blob count is implicated. Uninvestigated.
 
 ## Cross-references
 
@@ -457,7 +456,7 @@ in TODO.md.
 - getparents - second instance of the same asymmetry, larger
   magnitude; its full measurement record (a note since retired to git
   history) is condensed into the matrix
-  above and TODO.md's getparents entry.
+  above.
 - [`reference/pipelined-reader-paths.md`](pipelined-reader-paths.md) -
   existing callers of `into_blocks_pipelined`, candidates for
   threshold dispatch.

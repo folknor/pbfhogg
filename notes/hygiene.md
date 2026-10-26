@@ -71,8 +71,9 @@ goes on "Review once drained" as a bisect candidate, named by commit.
 Launch order: every queued entry has run.
 
 Every entry still open in this file and `notes/bugs.md` is owed a resolution
-in this drain. HYG-002, HYG-011, HYG-036, HYG-037, HYG-053, HYG-081, HYG-109,
-HYG-181 and HYG-182 were deferred by the 2026-10-25 session, not dropped:
+in this drain, except what the maintainer moved to the CLI-surface redesign
+in `notes/todo.md` (the `--direct-io` reach and `--json` entries). HYG-002,
+HYG-011, HYG-036, HYG-053, HYG-081, HYG-181 and HYG-182 were deferred by the 2026-10-25 session, not dropped:
 "skipped for now" in their Maintainer paragraphs means that session did not
 take them, and the paragraphs are guidance on how to resolve them, not a
 ruling that they stay. BUG-009 is the maintainer's own project.
@@ -1258,74 +1259,6 @@ fails the build when an exemption goes stale), and ban
 Reported by: CLI and plumbing, filtering and spatial, change application, altw
 and scanning, re-encoding.
 
-## HYG-037 - `--direct-io` is accepted and ignored on many paths
-
-Anger: 9 - validate flags earlier, refuse no-op flags.
-
-The parameter is taken and discarded in altw `stage1_way_pass(_direct_io)`,
-`build_node_index_sparse(_direct_io)`, `collect_way_referenced_node_ids`,
-`collect_relation_member_ids` (every pread path, so the flag does nothing to
-reads in passes 0 and 1, stage 1 or stage 2), `sort::build_blob_index`
-(kept "for signature stability" in a private pre-1.0 function),
-`diff`'s and derive's block-pair paths (`diff_block_pair`,
-`derive_changes_block_pair`, `_direct_io`: both pread through
-`HeaderWalker`, so `diff --direct-io` on indexed inputs reads buffered at
-every `-j`, `-j 1` included since the one-engine merge replaced the
-streaming `-j 1` reader that honoured it),
-`getid::parse_ids_from_pbf(_direct_io)` (the CLI threads `write.direct_io`
-into it), and `check_refs` (`let _ = direct_io;`). Extract's pread passes open
-buffered regardless (a comment explains alignment), `multi.rs` writes through
-`PbfWriter::new(BufWriter)` regardless, `export` has no I/O flag. `inspect`
-prints that it ignored the flag. An operator who chose O_DIRECT to protect the
-page cache still fills it, with nothing logged.
-
-Where the flag is honoured it is often only for the header read and the
-first-blob indexdata probe: renumber (header only), repack and degrade's decode
-path (probe and header, the classify pools pread through a buffered shared
-fd), time-filter's snapshot path, tags-filter's two-pass scans, and
-getparents' dispatch probe all read their bulk data buffered. The `sort`
-reads and `check --refs` (`let _ = direct_io`, with a comment that it is
-"accepted silently for now") discard it. The writes are honoured by every
-PBF writer that goes through `Output::pbf_writer`, except multi-extract's
-single-pass path (a synchronous `BufWriter`).
-
-Two consequences are visible to a user. The "I/O capability matrix" in
-`reference/cli-reference.md` marks sort, renumber, repack, degrade, extract,
-tags-filter, getid, getparents, time-filter, add-locations-to-ways, apply-changes
-and `check --refs` as "Yes (R+W)" or "Yes", and has no row for `digest`: it
-describes the flag's presence, not its reach. And in a build without the
-`linux-direct-io` feature, whether `--direct-io` is refused ("requires the
-linux-direct-io feature", exit 2) depends on whether the command happens to
-open a reader with the flag set: `check --ids --direct-io` is refused,
-`check --refs --direct-io` runs and ignores it.
-
-Even an honoured open can be silently buffered: `statx(STATX_DIOALIGN)`
-reports zero alignment for a file whose filesystem falls back to buffered
-I/O (ext4 `data=journal`, inline-data or verity files; f2fs files whose
-writes are forced buffered). `src/direct_io.rs` treats that as "nothing
-reported" and keeps the 4096 floor, since the run stays correct; whether
-`--direct-io` should say so, or refuse, belongs with this entry.
-
-Fix: remove the parameters, and have the CLI refuse or say so where a command
-honours the flag on some passes only, so `--direct-io` help can say what it
-affects; regenerate the matrix from a per-command table in code (read passes
-honoured, write honoured) rather than by hand. Enforce with one contract test
-per command that a no-feature build refuses `--direct-io` before opening any
-input, and a unit test of the table against the capability matrix.
-
-Maintainer (2026-10-25): skipped for now. The session's notes for whoever
-picks it up: do not remove the ignored `direct_io` parameters - the first
-drain round did that to the parallel diff and it was put back as deliberate
-plumbing; they are where the flag reaches once those passes honour it. The
-suggestion was a per-command reach table in the CLI that generates the
-capability matrix and the help text, refusing the flag where it reaches
-nothing (`check --refs`, under the existing no-op-flag rule), parse-time
-refusal in every no-feature build, and one `Note:` per run when statx
-reports zero alignment.
-
-Reported by: altw and scanning, re-encoding, filtering and spatial, CLI and
-plumbing.
-
 ## HYG-053 - Reorder buffers are bounded only statistically
 
 Anger: 10 - a credit scheme inside the read engine and blob pools.
@@ -1394,36 +1327,6 @@ channel; or at least a crossbeam `select` over both channels. Until then, a
 drain's last node item.
 
 Reported by: change application.
-
-## HYG-109 - No `--json` diagnostics mode
-
-Anger: 7 - CLI behaviour.
-
-The global `-q, --quiet` landed (`reference/cli-reference.md` "Quiet": a kind
-filter in `StderrSink::event`, `cli/src/host.rs`). Still open: `--json`, a
-second sink serializing each event's kind, key and arguments, which needs no
-library changes. Facts it has to cope with:
-
-- Raw `cli_eprintln!` lines that are not events: getid's `-v` requested and
-  missing ID lists (refused with `-q`, so quiet never had to cover them), the
-  `bench-read`, `bench-write` and `bench-merge` key=value blocks (brokkr may
-  parse them; the quiet ruling left them as they are), and the final `Error:`
-  line. A `--json` covering them routes them through the sink first.
-- Summary lines have no common shape: some lead with the command name
-  (`time-filter:`, `add-locations-to-ways:`), some with a verb (`Wrote`,
-  `Sorted`, `Renumbered`, `Merged`), apply-changes prints a multi-line block,
-  each `extract --config` region's line carries its own `  [i] path - `
-  label, `export` keys itself `export_to.summary`, and getid and
-  `getid --invert` share the key `getid.summary` while `cat --dedupe` has its
-  own. A `--json` sink would inherit all of it.
-- `Developer` events (`[altw external] ...`, the geocode hotpath counters)
-  carry `key=value` text or a bracketed prefix of their own.
-
-Maintainer (2026-10-25): skipped for now. The session's view: this is a new
-capability with a public format to design, not hygiene; if it comes back,
-normalising the summary-line shapes and keys is the first step.
-
-Reported by: split out of the diagnostic-wording item.
 
 ## HYG-182 - `cat --dedupe` indexes an unindexed blob differently from plain `cat`
 

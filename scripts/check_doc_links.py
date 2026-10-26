@@ -7,8 +7,8 @@ other ignored trees never matter:
 
   1. durable-cites-notes: nothing durable cites ``notes/``. Durable is
      everything outside ``notes/`` except the root-level files, which AGENTS.md
-     exempts (AGENTS.md, CLAUDE.md, README.md, CHANGELOG.md, TODO.md and their
-     kin): the folders govern documents we chose where to put, not files whose
+     exempts (AGENTS.md, CLAUDE.md, README.md, CHANGELOG.md and their kin):
+     the folders govern documents we chose where to put, not files whose
      location is dictated. Markdown and Rust are read in full, other text files
      (scripts, TOML, workflows) on their comment lines only. Naming the folder
      itself, a bare `notes/`, describes the layout and is allowed; any path or
@@ -37,10 +37,10 @@ other ignored trees never matter:
      code files only comment text is read: a string literal legitimately
      carries a path that need not exist, such as a test's invented argv.
 
-  3. source-comment-citations: comments under ``src/`` do not cite the
-     transient root-level ``TODO.md`` or a Rust source line number. These
-     references lose their context as code moves; the comment must carry the
-     needed context inline.
+  3. source-comment-citations: comments under ``src/`` do not cite a Rust
+     source line number. It loses its context as code moves; the comment must
+     carry the needed context inline. (The work-item list lives in ``notes/``,
+     so check 1 refuses a citation of it.)
 
 Root-level files and ``notes/`` are not scanned at all: the first are exempt,
 the second carries no truth guarantee, so a dead link there is its own business.
@@ -92,7 +92,7 @@ BARE_PATH_RE = re.compile(
 )
 ROOT_DOC_RE = re.compile(r"^[A-Z][A-Z0-9_-]*\.md$")
 PLACEHOLDER_RE =re.compile(r"N{3,}|X{3,}")
-SOURCE_COMMENT_CITATION_RE = re.compile(r"TODO\.md|\.rs:[0-9]+")
+SOURCE_COMMENT_CITATION_RE = re.compile(r"\.rs:[0-9]+")
 SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 FENCE_RE = re.compile(r"^ {0,3}(```|~~~)")
 

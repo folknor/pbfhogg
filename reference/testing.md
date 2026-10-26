@@ -1,9 +1,9 @@
 # Testing
 
 Test placement, validation tiers, and conventions for pbfhogg.
-Cross-ref `reference/performance.md` for perf baselines and
-TODO.md's "Important: ignored tests" for the runbook on tests that
-don't run by default.
+Cross-ref `reference/performance.md` for perf baselines, and
+"Tests that do not run everywhere" below for the runbook on tests
+that skip or compile out by default.
 
 ## Test placement
 
@@ -230,6 +230,26 @@ Each `cli/tests/cli_<command>.rs` splits intent inside the file:
 
 `cli/tests/cli_sort.rs` is the canonical template for new `cli_*.rs`
 files.
+
+### Tests that do not run everywhere
+
+- `sorted_flag_but_unsorted_nodes_panics` (`tests/read_paths.rs`)
+  checks that the debug monotonicity assertion fires on unsorted
+  nodes under a declared `Sort.Type_then_ID`. It is gated on
+  `cfg(debug_assertions)`, not `#[ignore]`, so a build without debug
+  assertions compiles it out and it cannot be run there at all; its
+  doc comment says why the gate replaced `#[ignore]`.
+- The io_uring tests (`roundtrip_uring_*` in `tests/roundtrip.rs`,
+  `tests/fault_uring_writer.rs`) skip and pass when io_uring setup
+  fails for an environmental reason, most often an `RLIMIT_MEMLOCK`
+  soft limit too low for the writer's registered buffers. To run
+  them on a development host, raise the limit system-wide in
+  `/etc/security/limits.conf` (`@<your-group> - memlock unlimited`)
+  and log in again.
+- Fault-injection tests are neither `#[ignore]`d nor serial: their
+  faults ride on the invocation's cancellation token, so they are
+  ordinary modules of the `all` binaries and run with
+  `brokkr test <name>` like any other test.
 
 ## External cross-validation
 

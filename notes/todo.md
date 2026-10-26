@@ -200,8 +200,11 @@ together so the surface changes once.
   O_DIRECT to protect the page cache still fills it, with nothing logged.
 
   Where the flag is honoured it is often only for the header read and the
-  first-blob indexdata probe: sort (its front read only; the pass 1 header
-  walk and pass 2 read buffered), renumber (header only), repack and degrade's
+  first-blob indexdata probe: sort and `cat --dedupe` (the front read and
+  the pass 1 header walk, which `HeaderWalker::open_direct` reads
+  `O_DIRECT`; pass 2 reads buffered: its splice paths copy from the same
+  descriptor at unaligned offsets, so honouring it under `--io-uring` needs
+  a second descriptor per input), renumber (header only), repack and degrade's
   decode path (the classify pools pread through a buffered shared fd),
   time-filter's snapshot path, tags-filter's two-pass mode (pass 1, the
   relation closure, the way dependencies and pass 2 pread through walker
@@ -226,7 +229,11 @@ together so the surface changes once.
   Shape suggested so far: do NOT remove the ignored `direct_io`
   parameters - an earlier drain removed the parallel diff's and it was put
   back as deliberate plumbing; they are where the flag reaches once those
-  passes honour it. Instead, a per-command reach table in the CLI (read
+  passes honour it. A walk can already honour it single-threaded
+  (`HeaderWalker::open_direct` over `direct_reader::DirectPositional`);
+  the classify and shard pools that pread the walker's descriptor from
+  worker threads would each need a direct transport per worker, since that
+  one shares a single aligned scratch buffer. For the surface, a per-command reach table in the CLI (read
   passes honoured, write honoured) that generates both the capability
   matrix and the `--direct-io` help text; refuse the flag where it reaches
   nothing (`check --refs`, under the existing no-op-flag rule);

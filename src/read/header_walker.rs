@@ -4,7 +4,9 @@
 //! and header bytes per blob, skipping data bytes without reading them.
 //! The file is opened with `posix_fadvise(RANDOM)` so the kernel does
 //! not speculatively prefetch the blob bodies that the header walk
-//! skips over.
+//! skips over; a walk honouring `--direct-io` opens it `O_DIRECT`
+//! instead (`HeaderWalker::open_direct`) and reads aligned spans that
+//! bypass the page cache.
 //!
 //! # When to use
 //!
@@ -152,6 +154,31 @@ pub(crate) struct BlobHeaderMeta {
     pub frame_size: usize,
 }
 
+/// How a walk reads its file by position: exactly `buf.len()` bytes at
+/// `offset`, `UnexpectedEof` when the file ends first. A plain [`File`]
+/// (buffered, through the page cache) or, with `linux-direct-io`, a
+/// [`DirectPositional`] (`O_DIRECT`, aligned reads that bypass it).
+///
+/// [`File`]: std::fs::File
+/// [`DirectPositional`]: crate::read::direct_reader::DirectPositional
+pub(crate) trait Positional {
+    fn pread_exact(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()>;
+}
+
+impl Positional for std::fs::File {
+    fn pread_exact(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt as _;
+        self.read_exact_at(buf, offset)
+    }
+}
+
+#[cfg(feature = "linux-direct-io")]
+impl Positional for crate::read::direct_reader::DirectPositional {
+    fn pread_exact(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        self.read_exact_at(buf, offset)
+    }
+}
+
 /// The walker's byte source: `pread` at the walk's position on the shared
 /// file, bounded by the size captured at open.
 ///
@@ -166,8 +193,13 @@ pub(crate) struct BlobHeaderMeta {
 /// open fails the `pread` (`UnexpectedEof`, an error) rather than reading as
 /// a shorter file. Only a captured remainder of 0-3 bytes at a frame boundary
 /// is the clean tail, and it is recognised without reading it.
-pub(crate) struct PreadSource {
-    file: Arc<std::fs::File>,
+///
+/// The extent policy lives here for every transport `P`: a transport only
+/// reads exactly the bytes it is asked for, so the direct one's aligned
+/// padding can neither widen the probe past the captured size nor turn a
+/// shrunk file into a clean end.
+pub(crate) struct PreadSource<P = std::fs::File> {
+    file: Arc<P>,
     pos: u64,
     file_size: u64,
     /// The current frame's probe: `window_len` bytes of the file read at
@@ -177,7 +209,7 @@ pub(crate) struct PreadSource {
     window_len: usize,
 }
 
-impl PreadSource {
+impl<P> PreadSource<P> {
     /// The bytes left in the captured extent from the current position.
     fn remaining(&self) -> u64 {
         self.file_size.saturating_sub(self.pos)
@@ -198,9 +230,8 @@ impl PreadSource {
     }
 }
 
-impl crate::frame::FrameSource for PreadSource {
+impl<P: Positional> crate::frame::FrameSource for PreadSource<P> {
     fn fill(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        use std::os::unix::fs::FileExt as _;
         let remaining = self.remaining();
         if remaining < buf.len() as u64 && self.windowed().is_empty() {
             // The clean tail (or the end): not read, as the walk always did.
@@ -213,7 +244,7 @@ impl crate::frame::FrameSource for PreadSource {
                 .unwrap_or(usize::MAX)
                 .min(HEADER_PROBE_SIZE);
             self.window.resize(probe, 0);
-            self.file.read_exact_at(&mut self.window, self.pos)?;
+            self.file.pread_exact(&mut self.window, self.pos)?;
             self.window_at = self.pos;
             self.window_len = probe;
         }
@@ -225,7 +256,6 @@ impl crate::frame::FrameSource for PreadSource {
     }
 
     fn append(&mut self, n: usize, out: &mut Vec<u8>) -> std::io::Result<usize> {
-        use std::os::unix::fs::FileExt as _;
         let take = usize::try_from(self.remaining())
             .unwrap_or(usize::MAX)
             .min(n);
@@ -239,7 +269,7 @@ impl crate::frame::FrameSource for PreadSource {
             // The part past the probe window, in one pread.
             let start = out.len();
             out.resize(start + rest, 0);
-            if let Err(e) = self.file.read_exact_at(&mut out[start..], self.pos) {
+            if let Err(e) = self.file.pread_exact(&mut out[start..], self.pos) {
                 out.truncate(start);
                 return Err(e);
             }
@@ -249,7 +279,7 @@ impl crate::frame::FrameSource for PreadSource {
     }
 }
 
-impl crate::frame::FrameSkip for PreadSource {
+impl<P: Positional> crate::frame::FrameSkip for PreadSource<P> {
     fn skip_bytes(&mut self, n: u64) -> std::io::Result<bool> {
         self.window_len = 0;
         if n > self.remaining() {
@@ -263,17 +293,24 @@ impl crate::frame::FrameSkip for PreadSource {
 /// Walks blob headers via `pread`. Call [`Self::next_header`] repeatedly
 /// until it returns `None`. Use [`Self::pread_data`] to fetch a blob's
 /// data payload on demand.
-pub(crate) struct HeaderWalker {
+///
+/// `P` is how the file is read ([`Positional`]): buffered by default
+/// ([`Self::open`]), or `O_DIRECT` ([`Self::open_direct`]). Only a buffered
+/// walker hands its file to other threads ([`Self::input`],
+/// [`Self::shared_file`]): the pools that take it pread unaligned ranges,
+/// which an `O_DIRECT` descriptor refuses, so a direct walker offering its
+/// descriptor is a compile error rather than a run-time `EINVAL`.
+pub(crate) struct HeaderWalker<P = std::fs::File> {
     /// The frame walk over the file. It owns the frame policy and locates
     /// every error it raises at the frame, naming this walker's file: a byte
     /// offset on a multi-input command does not say which input it indexes,
     /// and this walker is the preflight that most multi-input commands fail
     /// in first. A tripped cancellation token ends the walk with
     /// `ErrorKind::Cancelled`, unlocated.
-    frames: Frames<PreadSource>,
+    frames: Frames<PreadSource<P>>,
     diagnostics: crate::host::Diagnostics,
     reported_unindexed_filter: bool,
-    file: Arc<std::fs::File>,
+    file: Arc<P>,
     /// The file this walker was opened from.
     path: Arc<Path>,
     file_size: u64,
@@ -338,19 +375,16 @@ pub(crate) fn partial_index_error() -> crate::error::Error {
 }
 
 impl HeaderWalker {
-    /// Open `source` (a new open file description of it, so the advice
-    /// below stays this walker's) and hint `posix_fadvise(RANDOM)` to the
-    /// kernel.
+    /// Open `source` buffered (a new open file description of it, so the
+    /// advice below stays this walker's) and hint `posix_fadvise(RANDOM)` to
+    /// the kernel.
     /// Errors if the file cannot be opened or metadata read.
     ///
-    /// Intentionally opens a plain buffered fd regardless of whether
-    /// the CLI caller passed `--direct-io`. Header walking is a
-    /// tiny-read pattern where direct I/O would mean one aligned
-    /// page-sized pread per header; buffered reads amortise that
-    /// overhead. Callers that want direct I/O for the data-path
-    /// body reads open their own worker fds alongside the walker's
-    /// `shared_file()`, rather than flowing `--direct-io` through
-    /// this helper.
+    /// Buffered probes and payload reads go through the page cache, so the
+    /// headers a walk read stay cached for a later walk of the same file
+    /// (a warm walk is far cheaper than a cold one; reference/performance.md
+    /// records the swing). A caller honouring `--direct-io` opens the walk
+    /// with [`Self::open_direct`] instead, giving that residency up.
     pub(crate) fn open<'a>(
         source: impl Into<crate::read::input::InputSource<'a>>,
         host: &crate::host::Host,
@@ -358,12 +392,7 @@ impl HeaderWalker {
         let source = source.into();
         let path = source.path();
         let file = source.open()?;
-        let file_size = file
-            .metadata()
-            .map_err(|e| {
-                crate::Error::from(e).context(format!("failed to stat {}", path.display()))
-            })?
-            .len();
+        let file_size = stat_size(&file, path)?;
         // POSIX_FADV_RANDOM: suppresses readahead. Our pread pattern is
         // header-at-a-time (tiny reads) with big gaps, plus occasional
         // full-blob body preads that are also not in a sequential stream
@@ -371,7 +400,87 @@ impl HeaderWalker {
         // would pull blob bodies adjacent to each header into the page
         // cache and never be reused.
         crate::fadvise::advise(&file, 0, 0, crate::fadvise::Advice::Random);
-        let file = Arc::new(file);
+        Ok(Self::over(Arc::new(file), file_size, path, host))
+    }
+
+    /// The walker's file handle and path, for the pools that pread the blobs
+    /// this walk scheduled and locate their failures in this input.
+    pub(crate) fn input(&self) -> crate::read::input::InputFile {
+        crate::read::input::InputFile::from_parts(Arc::clone(&self.file), Arc::clone(&self.path))
+    }
+
+    /// Shared `Arc<File>` for worker threads to `pread` data bodies.
+    /// Used when the walker is handed off as a plan producer and the
+    /// actual body reads happen on rayon workers (e.g. the diff
+    /// parallel shard path, or the shared `scan::classify`
+    /// schedule builders). Single-threaded callers ignore this.
+    pub(crate) fn shared_file(&self) -> &Arc<std::fs::File> {
+        &self.file
+    }
+}
+
+#[cfg(feature = "linux-direct-io")]
+impl HeaderWalker<crate::read::direct_reader::DirectPositional> {
+    /// Open `source` with `O_DIRECT`: every header probe and payload read
+    /// is an aligned read of the enclosing aligned span
+    /// (`direct_reader::read_aligned`), so the walk does not fill the page
+    /// cache, nor find in it what an earlier walk read. A probe is one read
+    /// of the aligned blocks covering its window, which a buffered probe
+    /// could instead find already cached. The usual caveat holds: a
+    /// filesystem may serve an `O_DIRECT` read through its cache anyway
+    /// (`crate::direct_io`).
+    ///
+    /// A filesystem that refuses `O_DIRECT`, or an alignment the buffers
+    /// cannot keep, is the `direct-io` platform refusal, and a replaced
+    /// pinned input its own refusal; any other open failure names the
+    /// input, as `FileReader` names it. No advice is given: there is no
+    /// readahead to suppress. The walker cannot be moved to another thread
+    /// (its reads share one aligned scratch buffer).
+    pub(crate) fn open_direct<'a>(
+        source: impl Into<crate::read::input::InputSource<'a>>,
+        host: &crate::host::Host,
+    ) -> Result<Self> {
+        let source = source.into();
+        let path = source.path();
+        let (file, align) = source.open_direct().map_err(|e| {
+            if matches!(
+                e.kind(),
+                crate::ErrorKind::PlatformUnsupported { .. } | crate::ErrorKind::InputReplaced
+            ) {
+                e
+            } else {
+                e.context(format!("failed to open {}", path.display()))
+            }
+        })?;
+        let file_size = stat_size(&file, path)?;
+        #[cfg(test)]
+        tests::record_direct_open();
+        #[expect(
+            clippy::arc_with_non_send_sync,
+            reason = "shared only between this walker and its own frame source, on the \
+                      thread that opened it; the walker generic over Arc<P> keeps one \
+                      shape for the buffered walker, whose Arc does cross threads"
+        )]
+        let file = Arc::new(crate::read::direct_reader::DirectPositional::new(
+            file, align,
+        ));
+        Ok(Self::over(file, file_size, path, host))
+    }
+}
+
+/// The size of `file`, captured once: the one extent the walk checks
+/// against, whatever the transport.
+fn stat_size(file: &std::fs::File, path: &Path) -> Result<u64> {
+    Ok(file
+        .metadata()
+        .map_err(|e| crate::Error::from(e).context(format!("failed to stat {}", path.display())))?
+        .len())
+}
+
+impl<P: Positional> HeaderWalker<P> {
+    /// A walk from the start of `file`, whose size was captured as
+    /// `file_size`.
+    fn over(file: Arc<P>, file_size: u64, path: &Path, host: &crate::host::Host) -> Self {
         let source = PreadSource {
             file: Arc::clone(&file),
             pos: 0,
@@ -380,7 +489,7 @@ impl HeaderWalker {
             window_at: 0,
             window_len: 0,
         };
-        Ok(Self {
+        Self {
             frames: Frames::of_input(source, path, host),
             diagnostics: host.diagnostics.clone(),
             reported_unindexed_filter: false,
@@ -388,7 +497,7 @@ impl HeaderWalker {
             path: Arc::from(path),
             file_size,
             partial_index: None,
-        })
+        }
     }
 
     /// Make this walk refuse a partially indexed file: once the data blobs
@@ -461,21 +570,6 @@ impl HeaderWalker {
         ))
     }
 
-    /// The walker's file handle and path, for the pools that pread the blobs
-    /// this walk scheduled and locate their failures in this input.
-    pub(crate) fn input(&self) -> crate::read::input::InputFile {
-        crate::read::input::InputFile::from_parts(Arc::clone(&self.file), Arc::clone(&self.path))
-    }
-
-    /// Shared `Arc<File>` for worker threads to `pread` data bodies.
-    /// Used when the walker is handed off as a plan producer and the
-    /// actual body reads happen on rayon workers (e.g. the diff
-    /// parallel shard path, or the shared `scan::classify`
-    /// schedule builders). Single-threaded callers ignore this.
-    pub(crate) fn shared_file(&self) -> &Arc<std::fs::File> {
-        &self.file
-    }
-
     /// Total file size captured at `open()` time.
     ///
     /// The walk owns the payload-extent check: [`Self::next_header`] refuses
@@ -545,15 +639,188 @@ impl HeaderWalker {
 
     /// `pread` a blob's data payload into `buf`. Resizes `buf` to `size`.
     pub(crate) fn pread_data(&self, offset: u64, size: usize, buf: &mut Vec<u8>) -> Result<()> {
-        use std::os::unix::fs::FileExt as _;
         buf.resize(size, 0);
-        Ok(self.file.read_exact_at(buf, offset)?)
+        Ok(self.file.pread_exact(buf, offset)?)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{BlobCountEstimate, SAMPLE_CAP, ScanArm, choose_scan_arm_at, estimate_blob_count};
+
+    #[cfg(feature = "linux-direct-io")]
+    thread_local! {
+        /// `O_DIRECT` walks opened on this thread. Thread-local so tests
+        /// running concurrently cannot see each other's opens.
+        static DIRECT_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(feature = "linux-direct-io")]
+    pub(super) fn record_direct_open() {
+        DIRECT_OPENS.with(|n| n.set(n.get() + 1));
+    }
+
+    /// How many `O_DIRECT` walks this thread has opened so far.
+    #[cfg(feature = "linux-direct-io")]
+    pub(crate) fn direct_opens() -> usize {
+        DIRECT_OPENS.with(std::cell::Cell::get)
+    }
+
+    /// Whether files in `dir` open `O_DIRECT`. A platform refusal is the one
+    /// `false` (the caller skips); any other failure fails the test.
+    #[cfg(feature = "linux-direct-io")]
+    pub(crate) fn direct_reads_supported(dir: &std::path::Path) -> bool {
+        let probe = dir.join("direct-probe.bin");
+        std::fs::write(&probe, [0_u8; 16]).expect("write probe");
+        match crate::direct_io::open_for_read(&probe) {
+            Ok(_) => true,
+            Err(e) if matches!(e.kind(), crate::ErrorKind::PlatformUnsupported { .. }) => false,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// Walk the whole file, returning the frame count or the first error.
+    fn count_frames<P: super::Positional>(
+        mut walker: super::HeaderWalker<P>,
+    ) -> super::Result<usize> {
+        let mut n = 0;
+        while walker.next_header()?.is_some() {
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Open a walk of `path` (`O_DIRECT` when `direct`), then grow the file
+    /// by a copy of itself or cut its last ten bytes, then walk it.
+    fn walk_after_change(path: &std::path::Path, direct: bool, grow: bool) -> super::Result<usize> {
+        let host = crate::host::Host::for_tests();
+        let intact = std::fs::read(path)?;
+        let change = || {
+            if grow {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .expect("open to grow");
+                file.write_all(&intact).expect("grow");
+            } else {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .expect("open to shrink")
+                    .set_len(intact.len() as u64 - 10)
+                    .expect("shrink");
+            }
+        };
+        #[cfg(feature = "linux-direct-io")]
+        if direct {
+            let walker = super::HeaderWalker::open_direct(path, &host)?;
+            change();
+            return count_frames(walker);
+        }
+        assert!(!direct, "a direct walk needs linux-direct-io");
+        let walker = super::HeaderWalker::open(path, &host)?;
+        change();
+        count_frames(walker)
+    }
+
+    /// The captured extent holds for every transport: bytes appended after
+    /// open are not walked, and committed bytes that vanish after open fail
+    /// the walk instead of ending it cleanly.
+    #[test]
+    fn the_walk_keeps_the_extent_captured_at_open() {
+        let dir = crate::path_guard::tests::scratch();
+        #[cfg_attr(not(feature = "linux-direct-io"), allow(unused_mut))]
+        let mut transports = vec![false];
+        #[cfg(feature = "linux-direct-io")]
+        if direct_reads_supported(dir.path()) {
+            transports.push(true);
+        }
+        let path = dir.path().join("extent.pbf");
+        for direct in transports {
+            write_index_pattern(&path, &[true, true, true]);
+            let frames = walk_all(&path, false).expect("intact walk");
+            assert_eq!(
+                walk_after_change(&path, direct, true).expect("grown walk"),
+                frames,
+                "direct {direct}: a file grown after open walked further"
+            );
+            write_index_pattern(&path, &[true, true, true]);
+            let err = walk_after_change(&path, direct, false)
+                .expect_err("a file shrunk after open must fail the walk");
+            assert!(
+                matches!(err.kind(), crate::ErrorKind::Io(io)
+                    if io.kind() == std::io::ErrorKind::UnexpectedEof),
+                "direct {direct}: {err:?}"
+            );
+        }
+    }
+
+    /// A direct walk sees what a buffered one sees: the same metas and the
+    /// same payload bytes, frame for frame, over frames at unaligned offsets
+    /// and a file whose end is not block-aligned.
+    #[cfg(feature = "linux-direct-io")]
+    #[test]
+    fn a_direct_walk_reads_what_a_buffered_walk_reads() {
+        let dir = crate::path_guard::tests::scratch();
+        if !direct_reads_supported(dir.path()) {
+            return;
+        }
+        let path = dir.path().join("walk.pbf");
+        write_index_pattern(&path, &[true, false, true, true, false]);
+        let host = crate::host::Host::for_tests();
+        let mut buffered = super::HeaderWalker::open(&path, &host).expect("buffered");
+        let before = direct_opens();
+        let mut direct = super::HeaderWalker::open_direct(&path, &host).expect("direct");
+        assert_eq!(direct_opens(), before + 1);
+        assert_eq!(direct.file_size(), buffered.file_size());
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let mut frames = 0;
+        while let Some(want) = buffered.next_header().expect("buffered walk") {
+            let got = direct.next_header().expect("direct walk").expect("a frame");
+            assert_eq!(
+                (
+                    got.blob_type,
+                    got.frame_start,
+                    got.blob_index,
+                    got.data_offset
+                ),
+                (
+                    want.blob_type,
+                    want.frame_start,
+                    want.blob_index,
+                    want.data_offset
+                )
+            );
+            let index = |i: Option<crate::blob_meta::BlobIndex>| {
+                i.map(|i| (i.kind, i.min_id, i.max_id, i.count))
+            };
+            assert_eq!(
+                (
+                    got.data_size,
+                    got.frame_size,
+                    index(got.index),
+                    &got.tagdata
+                ),
+                (
+                    want.data_size,
+                    want.frame_size,
+                    index(want.index),
+                    &want.tagdata
+                )
+            );
+            buffered
+                .pread_data(want.data_offset, want.data_size, &mut a)
+                .expect("buffered payload");
+            direct
+                .pread_data(got.data_offset, got.data_size, &mut b)
+                .expect("direct payload");
+            assert_eq!(a, b, "payload of frame {frames}");
+            frames += 1;
+        }
+        assert!(direct.next_header().expect("direct end").is_none());
+        assert_eq!(frames, 6);
+    }
     use crate::block_builder::{BlockBuilder, HeaderBuilder};
     use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
     use crate::writer::{Compression, PbfWriter};

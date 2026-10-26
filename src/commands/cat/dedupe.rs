@@ -183,6 +183,7 @@ fn plan_merge(
             ),
             refuse_partial_index: false,
         },
+        opts.direct_reads,
         host,
     )?;
     crate::host::diag!(
@@ -309,6 +310,11 @@ mod tests {
 
     /// A sorted, indexed PBF holding `blobs`, one block each, in order.
     fn write_fixture(path: &Path, blobs: &[Blob<'_>]) {
+        write_fixture_indexed(path, blobs, true);
+    }
+
+    /// [`write_fixture`], the blobs carrying indexdata only when `indexed`.
+    fn write_fixture_indexed(path: &Path, blobs: &[Blob<'_>], indexed: bool) {
         use crate::block_builder::HeaderBuilder;
         use crate::writer::Compression;
         let file = std::fs::File::create(path).expect("create fixture");
@@ -332,7 +338,13 @@ mod tests {
                 Blob::Relation(id) => bb.add_relation(*id, none(), &[], None),
             }
             let bytes = bb.take().expect("encode").expect("non-empty block");
-            writer.write_primitive_block(bytes).expect("write block");
+            if indexed {
+                writer.write_primitive_block(bytes).expect("write block");
+            } else {
+                writer
+                    .write_primitive_block_no_indexdata(bytes)
+                    .expect("write block");
+            }
         }
         writer.flush().expect("flush fixture");
     }
@@ -383,6 +395,90 @@ mod tests {
             .find(|(e, _)| e.index.kind == kind && frames[e.frame].source == source)
             .expect("planned entry");
         (&frames[entry.frame], rewrite)
+    }
+
+    /// `--direct-io` reaches pass 1: every input is walked `O_DIRECT` (the
+    /// count is of direct walks, which the indexdata probe never opens), an
+    /// unindexed input's payloads read through it, and the plan and the
+    /// merge are the buffered run's.
+    #[cfg(feature = "linux-direct-io")]
+    #[test]
+    fn direct_reads_walk_every_input_direct_in_pass_1() {
+        use crate::read::header_walker::tests::{direct_opens, direct_reads_supported};
+        let dir = crate::path_guard::tests::scratch();
+        if !direct_reads_supported(dir.path()) {
+            return;
+        }
+        let (a, b) = fixtures(dir.path());
+        let c = dir.path().join("c.osm.pbf");
+        write_fixture_indexed(&c, &[Blob::Nodes(&[3, 4, 5]), Blob::Way(11)], false);
+        let host = crate::host::Host::for_tests();
+        let opts = |direct_reads| WriteOptions {
+            direct_reads,
+            force: true,
+            ..WriteOptions::default()
+        };
+        let summary = |merge: &MergePlan| {
+            let frames = &merge.plan.frames;
+            merge
+                .plan
+                .entries
+                .iter()
+                .zip(&merge.plan.rewrite)
+                .map(|(e, &rewrite)| {
+                    let f = &frames[e.frame];
+                    (
+                        (f.source, f.file_offset, f.frame_len, f.reindex.is_some()),
+                        (e.index.kind, e.index.min_id, e.index.max_id, e.index.count),
+                        (e.index_scanned, e.intra_unsorted, e.restructured, rewrite),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = direct_opens();
+        let buffered = plan_merge(&[&a, &b, &c], &opts(false), &host).expect("buffered pass 1");
+        assert_eq!(direct_opens(), before, "a buffered run walked direct");
+        let direct = plan_merge(&[&a, &b, &c], &opts(true), &host).expect("direct pass 1");
+        assert_eq!(
+            direct_opens(),
+            before + 3,
+            "pass 1 did not walk every input direct"
+        );
+        assert_eq!(summary(&direct), summary(&buffered));
+        assert!(
+            summary(&direct)
+                .iter()
+                .any(|(_, _, (scanned, ..))| *scanned),
+            "the unindexed input's payloads were scanned"
+        );
+
+        let merged = |merge, name: &str| {
+            let path = dir.path().join(name);
+            let output = crate::output::Output::new(
+                path.clone(),
+                crate::output::Overwrite::Refuse,
+                &crate::host::Diagnostics::discard(),
+            )
+            .expect("output");
+            let stats = write_merge(
+                merge,
+                &output,
+                &WriteOptions::default(),
+                &HeaderOverrides::default(),
+                &host,
+            )
+            .expect("pass 2");
+            output.publish(&host.cancel).expect("publish");
+            (
+                (stats.nodes, stats.ways, stats.relations),
+                (stats.blobs_rewritten, stats.duplicates_removed),
+                std::fs::read(&path).expect("read merged"),
+            )
+        };
+        assert_eq!(
+            merged(direct, "direct.osm.pbf"),
+            merged(buffered, "buffered.osm.pbf")
+        );
     }
 
     /// The untouched plan merges: the two shared nodes are deduped.

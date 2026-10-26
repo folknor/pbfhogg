@@ -391,7 +391,7 @@ Platform setup refusals use `ErrorKind::PlatformUnsupported { feature, source }`
 `Write`/`Read`/`Seek` impls keep their `io::Result` signatures and carry the
 error inside `io::Error`; conversion to the library error restores the typed
 variant. Every `O_DIRECT`
-open (reader, direct writer, io_uring writer) classifies its refusal through
+open (reader, direct header walk, direct writer, io_uring writer) classifies its refusal through
 one helper, and path context added above it must keep the carrier typed. The
 CLI exits 3 for this variant (see the exit-code table in
 `reference/cli-reference.md`) and keeps its feature label in stderr; CLI skip

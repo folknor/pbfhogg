@@ -40,6 +40,16 @@ fn open_error(path: &Path, err: impl Into<Error>) -> Error {
         .context(format!("failed to open {}", path.display()))
 }
 
+/// The refusal of an `O_DIRECT` read in a build without `linux-direct-io`,
+/// shared by every read path that can be asked for one.
+#[cfg(not(feature = "linux-direct-io"))]
+pub(crate) fn direct_reads_unsupported() -> Error {
+    Error::invalid_argument(
+        "O_DIRECT reads need the linux-direct-io feature, which this build \
+         was compiled without",
+    )
+}
+
 impl FileReader {
     /// Advise away a consumed prefix using the currently owned file.
     /// Returns whether an advisory syscall was issued; O_DIRECT has no cache.
@@ -124,10 +134,7 @@ impl FileReader {
             }
             #[cfg(not(feature = "linux-direct-io"))]
             {
-                return Err(Error::invalid_argument(
-                    "O_DIRECT reads need the linux-direct-io feature, which this build \
-                     was compiled without",
-                ));
+                return Err(direct_reads_unsupported());
             }
         }
         Self::buffered_from(source)

@@ -3,7 +3,7 @@
 //! duplicates dropped).
 //!
 //! Pass 1 ([`index_inputs`]) walks every input's blob headers with
-//! [`HeaderWalker`] and records one [`Frame`] per OSMData blob it keeps, with
+//! [`HeaderWalker`] (`O_DIRECT` under `--direct-io`) and records one [`Frame`] per OSMData blob it keeps, with
 //! one [`BlobEntry`] per element kind the frame holds: one for an ordinary
 //! blob, one per kind present for a block no single index describes. [`plan`]
 //! orders the entries by (kind, first key), flags those whose ID ranges
@@ -48,7 +48,7 @@ use crate::owned::{
     OwnedNode, OwnedRelation, OwnedWay, read_dense_node, read_node, read_relation, read_way,
     write_single_node_local, write_single_relation_local, write_single_way_local,
 };
-use crate::read::header_walker::{BlobHeaderMeta, HeaderWalker};
+use crate::read::header_walker::{BlobHeaderMeta, HeaderWalker, Positional};
 use crate::read::input::{InputFile, PinnedInput};
 use crate::scan::classify::recv_checked;
 use crate::writer::{PbfWriter, reframe_raw_with_index};
@@ -169,12 +169,23 @@ pub(crate) struct IndexPolicy {
 /// copied with the false one; its claim holds when kind, count and ID range
 /// are equal and a bbox it carries contains the scanned one (the
 /// `check --index` rule, which reads an absent bbox as no claim).
+///
+/// `direct_io` (the `--direct-io` flag) walks every input `O_DIRECT`
+/// ([`HeaderWalker::open_direct`]): the same probes and payload reads, as
+/// aligned reads that bypass the page cache (where the filesystem honours
+/// `O_DIRECT`; `crate::direct_io` names the ones that may not). Without the
+/// `linux-direct-io` feature it is refused before any input is walked.
 #[hotpath::measure]
 pub(crate) fn index_inputs(
     inputs: &[PinnedInput],
     policy: &IndexPolicy,
+    direct_io: bool,
     host: &crate::host::Host,
 ) -> Result<(Vec<crate::HeaderBlock>, Indexed)> {
+    #[cfg(not(feature = "linux-direct-io"))]
+    if direct_io {
+        return Err(crate::file_reader::direct_reads_unsupported());
+    }
     let mut walk = Walk {
         policy,
         host,
@@ -189,7 +200,14 @@ pub(crate) fn index_inputs(
     };
     let mut headers = Vec::with_capacity(inputs.len());
     for (source, input) in inputs.iter().enumerate() {
-        headers.push(walk.input(source, input)?);
+        #[cfg(feature = "linux-direct-io")]
+        if direct_io {
+            let walker = HeaderWalker::open_direct(input, host)?;
+            headers.push(walk.input(source, input, walker)?);
+            continue;
+        }
+        let walker = HeaderWalker::open(input, host)?;
+        headers.push(walk.input(source, input, walker)?);
     }
     Ok((headers, walk.indexed))
 }
@@ -219,8 +237,13 @@ enum Scanned {
 }
 
 impl Walk<'_> {
-    fn input(&mut self, source: usize, input: &PinnedInput) -> Result<crate::HeaderBlock> {
-        let mut walker = HeaderWalker::open(input, self.host)?;
+    /// Index one input over `walker`, freshly opened on it.
+    fn input<P: Positional>(
+        &mut self,
+        source: usize,
+        input: &PinnedInput,
+        mut walker: HeaderWalker<P>,
+    ) -> Result<crate::HeaderBlock> {
         if self.policy.refuse_partial_index {
             walker = walker.refusing_partial_index();
         }
@@ -243,9 +266,9 @@ impl Walk<'_> {
         header.ok_or_else(|| crate::error::new_missing_header(input.path()))
     }
 
-    fn header(
+    fn header<P: Positional>(
         &mut self,
-        walker: &HeaderWalker,
+        walker: &HeaderWalker<P>,
         meta: &BlobHeaderMeta,
     ) -> Result<crate::HeaderBlock> {
         let located = |e| walker.locate_meta(meta, e);
@@ -268,10 +291,10 @@ impl Walk<'_> {
 
     /// Index one OSMData blob: push its frame and entries, or count it
     /// omitted. See [`index_inputs`] for the outcomes.
-    fn data_blob(
+    fn data_blob<P: Positional>(
         &mut self,
         source: usize,
-        walker: &HeaderWalker,
+        walker: &HeaderWalker<P>,
         meta: &BlobHeaderMeta,
         claims_sorted: bool,
     ) -> Result<()> {
@@ -366,9 +389,9 @@ impl Walk<'_> {
     /// monotonicity on the way (one compare per element, on a scan that
     /// visits every ID anyway), and its tag keys when `with_tags`. A block
     /// no single index describes is decoded for the kinds it holds.
-    fn scan_payload(
+    fn scan_payload<P: Positional>(
         &mut self,
-        walker: &HeaderWalker,
+        walker: &HeaderWalker<P>,
         meta: &BlobHeaderMeta,
         with_tags: bool,
     ) -> Result<Scanned> {
@@ -698,8 +721,16 @@ fn overlap_components(entries: &[BlobEntry]) -> Vec<(usize, usize)> {
 /// (a repeated argument's shared pin goes with its last argument). An open,
 /// verified source reads its file whatever its path names later, so the run
 /// holds about one input descriptor per argument from here on, which is what
-/// `cat --dedupe` asks the host for. The walk's `FADV_RANDOM` descriptions
-/// are closed by now; these are fresh ones.
+/// `cat --dedupe` asks the host for. The walk's descriptions are closed by
+/// now; these are fresh ones.
+///
+/// They are buffered whatever `--direct-io` says: pass 2 has never honoured
+/// the flag. The splicing backends (`--io-uring` among them, which
+/// `--direct-io` does not turn off) copy from these descriptors at unaligned
+/// frame offsets, so there a direct pass 2 needs a second descriptor per
+/// input beside the one the copy uses, which changes what the run asks the
+/// host for; only on a backend that cannot splice could one direct
+/// descriptor serve.
 pub(crate) fn open_sources(inputs: Vec<PinnedInput>) -> Result<Vec<InputFile>> {
     let mut sources = Vec::with_capacity(inputs.len());
     for pin in inputs {

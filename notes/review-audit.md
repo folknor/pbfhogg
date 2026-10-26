@@ -797,6 +797,70 @@ the ones below.
     dedupe index pass that honoured the flag (Slice E item 5). The merge
     engine in `src/commands/blob_merge.rs` has no `direct_io` parameter at
     all now, so the sort side needs the plumbing back as well as dedupe.
+    Resolved in the next entry.
+
+- Slice E, item 5 (`79d2e923`, the dedupe `--direct-io` index pass):
+  confirmed and **resolved** (sparred with codex to consensus, the diff
+  reviewed by a fresh codex session).
+  - Confirmed in the code and history: `79d2e923^` dedupe pass 1 walked
+    each input through `FileReader::open(pin, direct_io)` (sequential
+    `O_DIRECT` reads of the whole file); the engine's `index_inputs` walked
+    with `HeaderWalker::open`, always buffered, and took no flag. Old sort
+    pass 1 already walked buffered (`build_blob_index(_direct_io)`). Pass 2
+    of both commands read buffered before and after. The change never
+    shipped (the engine entry is under Unreleased in the CHANGELOG).
+  - Fix: the flag is honoured, not just plumbed. `HeaderWalker` is generic
+    over a `Positional` transport (a plain `File` by default, so every
+    other caller is unchanged), and `HeaderWalker::open_direct` reads
+    through `direct_reader::DirectPositional`, which serves any byte range
+    from aligned preads (`read_aligned`: offset, address and length aligned;
+    a short transfer rebased to the aligned offset below the missing bytes;
+    stops once the requested bytes are held; a zero or no-progress transfer
+    is `UnexpectedEof`). The captured-extent policy stays in `PreadSource`,
+    so alignment padding neither widens a probe nor turns a shrunk file into
+    a clean end. `input()` and `shared_file()` exist only on the buffered
+    walker, so a direct descriptor cannot reach the pools that pread
+    unaligned. The open goes through `InputSource::open_direct`, so pinned
+    inputs and the shared `direct_io_open_error_at` classification are
+    reused (no new message). `index_inputs` takes `direct_io`; sort and
+    `cat --dedupe` both pass `direct_reads`, so `sort --direct-io` pass 1 is
+    now `O_DIRECT` too (one engine). A no-feature build refuses with the
+    message `FileReader` uses, now one shared function.
+  - Not the old shape: the old dedupe pass 1 read every payload byte
+    `O_DIRECT`; the new one reads only header probes (one aligned read of
+    the blocks covering the 4 KiB window) and the payloads it scans.
+    Unmeasured; no `--direct-io` number exists for either command.
+  - Pass 2 stays buffered and is recorded (the `open_sources` doc, the
+    `notes/todo.md` reach inventory, the CHANGELOG engine entry): the
+    splicing backends, `--io-uring` among them, copy from the same
+    descriptor at unaligned offsets, so a direct pass 2 there needs a
+    second descriptor per input. `DirectPositional` keeps one scratch
+    buffer behind a `RefCell`, so it is single-thread; the pools of the
+    other walker users would need one transport per worker.
+  - Tests: `read_aligned` over injected transfer sequences (partial,
+    unaligned, interrupted, no-progress, EOF, overflow refused before any
+    read); a real `O_DIRECT` file including truncation after open; the
+    frame conformance table gains the direct walk as a source; buffered and
+    direct walks give identical metas and payloads; both walks keep the
+    extent captured at open (growth not walked, shrink an error); sort and
+    `cat --dedupe` unit tests count direct walk opens (one per input) and
+    compare plans and output bytes with the buffered run. Mutation-checked:
+    opening the buffered walker in the direct branch fails both command
+    tests. `brokkr check` (tier1, platform) passes; `cat --dedupe` and
+    `sort` with `--direct-io` run on Denmark.
+  - Doc corrections: the `HeaderWalker::open` comment that justified
+    ignoring the flag ("buffered reads amortise that overhead") was wrong
+    under `FADV_RANDOM`; it now says what buffered actually buys (cache
+    residency for a later walk). Also `crate::direct_io`'s backend list,
+    `alloc_aligned_zeroed`'s safety argument (now a checked zero size),
+    `reference/testing.md`'s list of classified direct opens, the sort
+    front-read comment and the frame conformance module doc.
+  - Lateral, left open: `DirectReader::fill` (the sequential `O_DIRECT`
+    reader behind `FileReader::open(.., true)`, used by both commands'
+    front probes and many other commands) advances its fd position by a
+    short read's count and reads again from there; a short transfer that
+    is not a multiple of the alignment before EOF would issue an unaligned
+    read (`EINVAL`). Pre-existing; `read_aligned` shows the rebasing fix.
 
 Notes made while the audit ran, not findings of it:
 

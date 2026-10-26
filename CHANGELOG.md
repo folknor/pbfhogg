@@ -2652,7 +2652,10 @@
 - **`cat --dedupe` runs on `sort`'s engine, and `sort` no longer buffers
   its overlap output.** The two were one blob-level merge in two copies;
   they now share one. For `cat --dedupe` that means pass 1 walks blob
-  headers by `pread` instead of reading every input sequentially, blobs
+  headers by `pread` instead of reading every input sequentially (under
+  `--direct-io` still with `O_DIRECT`, as aligned reads; `sort --direct-io`
+  now walks its pass 1 that way too, where it used to read it through the
+  page cache; pass 2 of both reads buffered, as it always did), blobs
   that overlap nothing are copied with `copy_file_range` (coalesced per
   contiguous stretch of an input) instead of being read and rewritten, and
   overlapping blobs are merged on worker threads instead of one. A blob

@@ -1,11 +1,17 @@
-//! O_DIRECT file reader with aligned buffering.
+//! O_DIRECT file readers with aligned buffering.
 //!
 //! [`DirectReader`] maintains an aligned internal buffer and reads in
 //! aligned chunks via `read(2)`, at the alignment `crate::direct_io`
 //! discovered for the file. This bypasses the kernel page cache entirely,
 //! preventing cache pollution during planet-scale (80 GB+) PBF reads.
+//!
+//! [`DirectPositional`] is its positional twin: an exact read of any byte
+//! range at any offset, served from aligned `pread(2)` calls over the range's
+//! enclosing aligned span ([`read_aligned`]). It is the transport of the
+//! direct header walk (`HeaderWalker::open_direct`).
 
 use std::alloc::{self, Layout};
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::io::AsRawFd;
@@ -286,10 +292,322 @@ impl Read for DirectReader {
     }
 }
 
+// ---------------------------------------------------------------------------
+// DirectPositional - exact positional reads through O_DIRECT
+// ---------------------------------------------------------------------------
+
+/// A growable aligned byte buffer, zeroed on every growth so the whole of it
+/// can be handed to `pread` as an initialised slice. Never shrinks.
+pub(crate) struct AlignedScratch {
+    align: usize,
+    alloc: Option<(NonNull<u8>, Layout)>,
+}
+
+impl AlignedScratch {
+    /// An empty buffer whose allocations are aligned to `align`, a power of
+    /// two.
+    pub(crate) fn new(align: usize) -> Self {
+        Self { align, alloc: None }
+    }
+
+    /// The first `len` bytes, growing the allocation to hold them.
+    fn slice_mut(&mut self, len: usize) -> io::Result<&mut [u8]> {
+        let held = self.alloc.map_or(0, |(_, layout)| layout.size());
+        if held < len {
+            let (ptr, layout) = crate::direct_io::alloc_aligned_zeroed(len, self.align)?;
+            if let Some((old, old_layout)) = self.alloc.replace((ptr, layout)) {
+                // Safety: allocated with this layout by `alloc_aligned_zeroed`.
+                unsafe { alloc::dealloc(old.as_ptr(), old_layout) };
+            }
+        }
+        match self.alloc {
+            // Safety: the allocation holds at least `len` zeroed (so
+            // initialised) bytes, exclusively owned through `&mut self`.
+            Some((ptr, _)) => Ok(unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), len) }),
+            // Only `len == 0` leaves nothing allocated.
+            None => Ok(&mut []),
+        }
+    }
+}
+
+impl Drop for AlignedScratch {
+    fn drop(&mut self) {
+        if let Some((ptr, layout)) = self.alloc.take() {
+            // Safety: allocated with this layout by `alloc_aligned_zeroed`.
+            unsafe { alloc::dealloc(ptr.as_ptr(), layout) };
+        }
+    }
+}
+
+/// Fill `out` exactly with the bytes at `offset`, through `pread` calls that
+/// each keep `align` (a power of two) in file offset, buffer address and
+/// length, as `O_DIRECT` requires.
+///
+/// The bytes are read over the enclosing aligned span into `scratch` (whose
+/// allocations are aligned to `align`) and only the requested part is copied
+/// out. The read stops as soon as the requested bytes are present: the
+/// span's padding exists to make the calls legal, so a range ending at the
+/// file's end inside an aligned block is a complete read. A short transfer is
+/// not taken for the end of the file: the next call is rebased to the aligned
+/// offset at or below the bytes still missing, re-reading at most one partial
+/// block, so a filesystem whose real alignment is finer than `align` and
+/// returns a count that is not a multiple of it is still read to the end.
+/// A call that delivers nothing, or nothing past what is already held, ends
+/// the read with `UnexpectedEof` (the kind `FileExt::read_exact_at` gives a
+/// short file); because every other call adds bytes, the loop terminates.
+/// `Interrupted` is retried. `pread(buf, at)` is the raw positional read,
+/// injected so tests can drive any sequence of transfers.
+pub(crate) fn read_aligned(
+    out: &mut [u8],
+    offset: u64,
+    align: usize,
+    scratch: &mut AlignedScratch,
+    mut pread: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
+) -> io::Result<()> {
+    if out.is_empty() {
+        return Ok(());
+    }
+    debug_assert!(align.is_power_of_two() && align == scratch.align);
+    let overflow = || io::Error::new(io::ErrorKind::InvalidInput, "direct read range overflows");
+    let align64 = u64::try_from(align).map_err(|_| overflow())?;
+    let start = offset & !(align64 - 1);
+    // offset - start < align, a usize.
+    let lead = usize::try_from(offset - start).map_err(|_| overflow())?;
+    let need = lead.checked_add(out.len()).ok_or_else(overflow)?;
+    let span = need
+        .checked_add(align - 1)
+        .map(|n| n & !(align - 1))
+        .ok_or_else(overflow)?;
+    start
+        .checked_add(u64::try_from(span).map_err(|_| overflow())?)
+        .ok_or_else(overflow)?;
+    let buf = scratch.slice_mut(span)?;
+    let mut have = 0_usize;
+    while have < need {
+        let base = have & !(align - 1);
+        // base < span, so start + base was checked above.
+        let at = start + base as u64;
+        let n = match pread(&mut buf[base..span], at) {
+            Ok(n) => n.min(span - base),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if n == 0 || base + n <= have {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "direct read ended short of the requested bytes",
+            ));
+        }
+        have = base + n;
+    }
+    out.copy_from_slice(&buf[lead..need]);
+    Ok(())
+}
+
+/// An `O_DIRECT` file read by position: any byte range at any offset, read
+/// through [`read_aligned`] at the file's direct I/O alignment. The aligned
+/// scratch it reads into sits behind a `RefCell`, so a read takes `&self` as
+/// a buffered `pread` does; the price is that this type, and anything sharing
+/// it through an `Arc`, stays on the thread that made it.
+pub(crate) struct DirectPositional {
+    file: File,
+    align: usize,
+    scratch: RefCell<AlignedScratch>,
+}
+
+impl DirectPositional {
+    /// `file`, opened `O_DIRECT` by `crate::direct_io` with the alignment
+    /// `align` it reported.
+    pub(crate) fn new(file: File, align: usize) -> Self {
+        Self {
+            file,
+            align,
+            scratch: RefCell::new(AlignedScratch::new(align)),
+        }
+    }
+
+    /// Fill `buf` exactly with the bytes at `offset`; `UnexpectedEof` when
+    /// the file ends first.
+    pub(crate) fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        use std::os::unix::fs::FileExt as _;
+        let mut scratch = self.scratch.borrow_mut();
+        read_aligned(buf, offset, self.align, &mut scratch, |dst, at| {
+            self.file.read_at(dst, at)
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    const ALIGN: usize = crate::direct_io::DIO_ALIGN_FLOOR;
+
+    /// A file of `len` bytes, byte `i` being `i % 251`, read by a fake
+    /// `pread` that asserts every call is aligned and serves at most
+    /// `chunks[k]` bytes on call `k` (the last entry repeating), or
+    /// `Interrupted` for a zero entry.
+    fn fake_read(
+        len: usize,
+        chunks: &[usize],
+        offset: u64,
+        want: usize,
+    ) -> (io::Result<Vec<u8>>, usize) {
+        let file: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
+        let mut scratch = AlignedScratch::new(ALIGN);
+        let mut out = vec![0xEE_u8; want];
+        let mut calls = 0_usize;
+        let result = read_aligned(&mut out, offset, ALIGN, &mut scratch, |dst, at| {
+            assert_eq!(at % ALIGN as u64, 0, "unaligned offset {at}");
+            assert_eq!(dst.as_ptr() as usize % ALIGN, 0, "unaligned buffer");
+            assert_eq!(dst.len() % ALIGN, 0, "unaligned length {}", dst.len());
+            let chunk = chunks[calls.min(chunks.len() - 1)];
+            calls += 1;
+            if chunk == 0 {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            let at = usize::try_from(at).unwrap();
+            let avail = file.len().saturating_sub(at);
+            let n = dst.len().min(avail).min(chunk);
+            if n > 0 {
+                dst[..n].copy_from_slice(&file[at..at + n]);
+            }
+            Ok(n)
+        });
+        let expect = (offset..offset + want as u64)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect::<Vec<_>>();
+        (
+            result.map(|()| {
+                assert_eq!(out, expect, "wrong bytes copied out");
+                out
+            }),
+            calls,
+        )
+    }
+
+    #[test]
+    fn a_read_returns_exactly_the_requested_bytes() {
+        let big = usize::MAX;
+        // Zero length: no call at all.
+        assert_eq!(fake_read(100, &[big], 7, 0).1, 0);
+        for (offset, want) in [
+            (0, 1),
+            (1, 10),
+            (ALIGN as u64 - 1, 2),
+            (ALIGN as u64, ALIGN),
+            (100, 3 * ALIGN + 17),
+        ] {
+            let (r, calls) = fake_read(8 * ALIGN, &[big], offset, want);
+            r.unwrap_or_else(|e| panic!("{offset}+{want}: {e}"));
+            assert_eq!(calls, 1, "{offset}+{want}");
+        }
+    }
+
+    #[test]
+    fn a_range_ending_at_the_file_end_inside_a_block_is_complete() {
+        let len = 2 * ALIGN + 300;
+        // Ends exactly at EOF, mid block; and an exact aligned EOF.
+        fake_read(len, &[usize::MAX], 50, len - 50).0.unwrap();
+        fake_read(2 * ALIGN, &[usize::MAX], 10, 2 * ALIGN - 10)
+            .0
+            .unwrap();
+    }
+
+    #[test]
+    fn a_range_past_the_file_end_is_unexpected_eof() {
+        let len = 2 * ALIGN + 300;
+        for (offset, want) in [(0, len + 1), (len as u64, 1), (len as u64 + 5000, 4)] {
+            let err = fake_read(len, &[usize::MAX], offset, want).0.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{offset}+{want}");
+        }
+    }
+
+    #[test]
+    fn short_transfers_are_rebased_and_retried() {
+        let len = 8 * ALIGN;
+        // Aligned partial transfers, unaligned ones (a filesystem whose real
+        // alignment is finer), interruptions, and one that already covers
+        // the request before the padding is read.
+        for chunks in [
+            &[ALIGN][..],
+            &[512, usize::MAX][..],
+            &[ALIGN + 100, ALIGN][..],
+            &[0, 0, 700, usize::MAX][..],
+            &[300, 0, ALIGN][..],
+        ] {
+            fake_read(len, chunks, 123, 3 * ALIGN)
+                .0
+                .unwrap_or_else(|e| panic!("{chunks:?}: {e}"));
+        }
+        // The first transfer covers the requested bytes: no second call for
+        // the rest of the span.
+        let (r, calls) = fake_read(len, &[ALIGN, 0], 10, 100);
+        r.unwrap();
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_range_whose_span_overflows_is_refused_before_any_read() {
+        let mut scratch = AlignedScratch::new(ALIGN);
+        for offset in [u64::MAX - 1, u64::MAX - ALIGN as u64 + 2] {
+            let mut out = [0_u8; 4];
+            let err = read_aligned(&mut out, offset, ALIGN, &mut scratch, |_, _| {
+                panic!("a read was issued for an overflowing range")
+            })
+            .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{offset}");
+        }
+    }
+
+    #[test]
+    fn a_transfer_that_adds_nothing_ends_the_read() {
+        // Every call returns only bytes already held: no progress, so the
+        // read fails rather than looping.
+        let (r, calls) = fake_read(8 * ALIGN, &[ALIGN + 10, 10], 0, 3 * ALIGN);
+        assert_eq!(r.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn a_real_direct_file_reads_like_a_buffered_one() {
+        let dir = crate::path_guard::tests::scratch();
+        let path = dir.path().join("positional.bin");
+        let bytes: Vec<u8> = (0..3 * ALIGN + 777)
+            .map(|i| u8::try_from(i % 253).unwrap())
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        // A platform refusal skips; any other failure fails.
+        let (file, align) = match crate::direct_io::open_for_read(&path) {
+            Ok(opened) => opened,
+            Err(e) if matches!(e.kind(), crate::ErrorKind::PlatformUnsupported { .. }) => return,
+            Err(e) => panic!("{e}"),
+        };
+        let reader = DirectPositional::new(file, align);
+        for (offset, want) in [(0, 1), (5, 4000), (4095, 2), (100, bytes.len() - 100)] {
+            let mut out = vec![0_u8; want];
+            reader.read_exact_at(&mut out, offset as u64).unwrap();
+            assert_eq!(out, bytes[offset..offset + want], "{offset}+{want}");
+        }
+        let mut out = vec![0_u8; 10];
+        let err = reader
+            .read_exact_at(&mut out, bytes.len() as u64 - 5)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        // A file truncated after open fails the bytes it lost.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(ALIGN as u64)
+            .unwrap();
+        let mut out = vec![0_u8; 10];
+        let err = reader
+            .read_exact_at(&mut out, ALIGN as u64 + 1)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
 
     #[test]
     fn aligned_read_buffer_basics() {

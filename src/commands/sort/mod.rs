@@ -120,7 +120,7 @@ pub(crate) fn sort_to(
     let pin = PinnedInput::pin(input, host)?;
     // The indexdata precondition is answered by a front read of its own,
     // dropped at once: pass 1's walker reads the header again on its own
-    // `FADV_RANDOM` description.
+    // description (`FADV_RANDOM`, or `O_DIRECT` under `--direct-io`).
     let indexed = crate::commands::input_front::InputFront::open(&pin, direct_io, host)?
         .require_indexdata(
             force,
@@ -160,6 +160,7 @@ pub(crate) fn sort_to(
             require_sorted: None,
             refuse_partial_index: true,
         },
+        direct_io,
         host,
     )?;
     crate::debug::emit_marker("SORT_INDEX_BUILD_END");
@@ -300,4 +301,76 @@ pub(crate) fn sort_to(
         blobs_omitted: plan.omitted,
         blobs_total: plan.blobs_total(),
     })
+}
+
+#[cfg(test)]
+#[cfg(feature = "linux-direct-io")]
+mod tests {
+    use super::*;
+    use crate::block_builder::{BlockBuilder, HeaderBuilder};
+    use crate::read::header_walker::tests::{direct_opens, direct_reads_supported};
+    use crate::writer::{Compression, PbfWriter};
+
+    /// An indexed input whose header does not claim sorted order, so pass 1
+    /// reads and scans every payload, with two overlapping node blobs and a
+    /// way, so pass 2 sweeps a run.
+    fn write_unsorted(path: &Path) {
+        let file = std::fs::File::create(path).expect("create fixture");
+        let mut writer = PbfWriter::new(
+            std::io::BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file),
+            Compression::default(),
+        );
+        writer
+            .write_header(&HeaderBuilder::new().build().expect("header"))
+            .expect("write header");
+        let none = std::iter::empty::<(&str, &str)>;
+        let mut bb = BlockBuilder::new();
+        for ids in [&[5_i64, 9][..], &[1, 2, 7][..]] {
+            for &id in ids {
+                bb.add_node(id, 10, 20, [("k", "v")].iter().copied(), None);
+            }
+            let bytes = bb.take().expect("encode").expect("block");
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        bb.add_way(10, none(), &[1, 2], None);
+        let bytes = bb.take().expect("encode").expect("block");
+        writer.write_primitive_block(bytes).expect("write block");
+        writer.flush().expect("flush fixture");
+    }
+
+    fn run(input: &Path, output: &Path, direct_reads: bool) -> Vec<u8> {
+        let host = crate::host::Host::for_tests();
+        let out = crate::output::Output::new(
+            output,
+            crate::output::Overwrite::Refuse,
+            &crate::host::Diagnostics::discard(),
+        )
+        .expect("output");
+        let opts = WriteOptions {
+            direct_reads,
+            ..WriteOptions::default()
+        };
+        let stats = sort(input, out, &opts, &HeaderOverrides::default(), &host).expect("sort");
+        assert_eq!((stats.nodes, stats.ways, stats.blobs_rewritten), (5, 1, 2));
+        std::fs::read(output).expect("read output")
+    }
+
+    /// `--direct-io` reaches pass 1: its walk opens the input `O_DIRECT` (the
+    /// count is of direct walks, which the front read never opens), and the
+    /// output is the buffered run's, byte for byte.
+    #[test]
+    fn direct_reads_walk_pass_1_direct() {
+        let dir = crate::path_guard::tests::scratch();
+        if !direct_reads_supported(dir.path()) {
+            return;
+        }
+        let input = dir.path().join("unsorted.osm.pbf");
+        write_unsorted(&input);
+        let before = direct_opens();
+        let buffered = run(&input, &dir.path().join("buffered.osm.pbf"), false);
+        assert_eq!(direct_opens(), before, "a buffered run walked direct");
+        let direct = run(&input, &dir.path().join("direct.osm.pbf"), true);
+        assert_eq!(direct_opens(), before + 1, "pass 1 did not walk direct");
+        assert_eq!(direct, buffered);
+    }
 }

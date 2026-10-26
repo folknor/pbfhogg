@@ -7,8 +7,9 @@
 //! `statx(STATX_DIOALIGN)`. An `O_DIRECT` open succeeds whatever the
 //! requirement is; a transfer that misses it fails later with a bare `EINVAL`.
 //! So the requirement is discovered here, once per open, and every direct
-//! backend (`DirectWriter`, the `io_uring` writer, `DirectReader`) carries the
-//! value it was handed instead of assuming one.
+//! backend (`DirectWriter`, the `io_uring` writer, `DirectReader`,
+//! `DirectPositional`) carries the value it was handed instead of assuming
+//! one.
 //!
 //! The alignment used is never below [`DIO_ALIGN_FLOOR`] (4096): a host
 //! reporting 512 gets exactly the I/O it got before discovery existed, and
@@ -240,16 +241,23 @@ mod imp {
     }
 
     /// Allocate `size` zeroed bytes aligned to `align`. Returns the pointer
-    /// and the layout needed to deallocate it. The write-side buffers
-    /// (`DirectWriter`'s and the `io_uring` pool) come from here.
+    /// and the layout needed to deallocate it. The direct buffers
+    /// (`DirectWriter`'s, the `io_uring` pool, `DirectReader`'s and the
+    /// positional reader's scratch) come from here. A zero `size` is
+    /// refused: a zero-sized allocation is not one the allocator may make.
     pub(crate) fn alloc_aligned_zeroed(
         size: usize,
         align: usize,
     ) -> io::Result<(std::ptr::NonNull<u8>, std::alloc::Layout)> {
+        if size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "zero-sized aligned allocation",
+            ));
+        }
         let layout = std::alloc::Layout::from_size_align(size, align)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        // Safety: layout has non-zero size (callers pass IO_BUF_BYTES or a
-        // whole pool of them).
+        // Safety: layout has non-zero size (checked above).
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         let ptr = std::ptr::NonNull::new(ptr)
             .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "aligned alloc failed"))?;

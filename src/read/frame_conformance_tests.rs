@@ -7,7 +7,8 @@
 //! path (`next`) and its seek-and-sentinel skip path
 //! (`next_header_skip_blob`), the raw-frame walk over a buffered
 //! `FileReader` (`Frames::next_raw`), the front probes' header-then-skip
-//! over the same reader, and the pread `HeaderWalker`. They used to be
+//! over the same reader, and the pread `HeaderWalker`, buffered and
+//! `O_DIRECT`. They used to be
 //! separate decoders that disagreed about where an error was located,
 //! whether it named the blob and how a truncation was worded; this table is
 //! what keeps a source-specific path from bringing a disagreement back. A
@@ -49,15 +50,35 @@ enum Source {
     /// `HeaderWalker::next_header`: pread, payload extent checked against the
     /// file size taken at open.
     Walk,
+    /// The same walk opened `O_DIRECT` (`HeaderWalker::open_direct`): every
+    /// probe an aligned read of the blocks covering it.
+    #[cfg(feature = "linux-direct-io")]
+    DirectWalk,
 }
 
-const SOURCES: [Source; 5] = [
-    Source::Read,
-    Source::Skip,
-    Source::Raw,
-    Source::HeaderThenSkip,
-    Source::Walk,
-];
+/// Every source, less the direct walk where this filesystem refuses
+/// `O_DIRECT` (a platform refusal, the one skip; any other open failure
+/// fails the test).
+fn sources(dir: &Path) -> Vec<Source> {
+    let all = vec![
+        Source::Read,
+        Source::Skip,
+        Source::Raw,
+        Source::HeaderThenSkip,
+        Source::Walk,
+    ];
+    #[cfg(feature = "linux-direct-io")]
+    let all = {
+        let mut all = all;
+        if crate::read::header_walker::tests::direct_reads_supported(dir) {
+            all.push(Source::DirectWalk);
+        }
+        all
+    };
+    #[cfg(not(feature = "linux-direct-io"))]
+    let _ = dir;
+    all
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -136,7 +157,15 @@ fn run(source: Source, path: &Path) -> Outcome {
         Source::Skip => run_skip(path),
         Source::Raw => run_raw(path),
         Source::HeaderThenSkip => run_header_then_skip(path),
-        Source::Walk => run_walk(path),
+        Source::Walk => walk_all(
+            HeaderWalker::open(path, &crate::host::Host::for_tests()),
+            path,
+        ),
+        #[cfg(feature = "linux-direct-io")]
+        Source::DirectWalk => walk_all(
+            HeaderWalker::open_direct(path, &crate::host::Host::for_tests()),
+            path,
+        ),
     }
 }
 
@@ -200,8 +229,11 @@ fn run_header_then_skip(path: &Path) -> Outcome {
     }
 }
 
-fn run_walk(path: &Path) -> Outcome {
-    let mut walker = HeaderWalker::open(path, &crate::host::Host::for_tests()).unwrap();
+fn walk_all<P: crate::read::header_walker::Positional>(
+    walker: crate::error::Result<HeaderWalker<P>>,
+    path: &Path,
+) -> Outcome {
+    let mut walker = walker.unwrap();
     let mut frames = 0;
     loop {
         match walker.next_header() {
@@ -639,12 +671,13 @@ fn every_frame_source_on_every_truncation_shape() {
     cases.extend(guard_cases(&fx));
     cases.extend(boundary_cases(&fx));
 
+    let sources = sources(fx.dir.path());
     let mut mismatches = Vec::new();
     for (i, case) in cases.iter().enumerate() {
         let path = fx.dir.path().join(format!("case{i}.osm.pbf"));
         std::fs::write(&path, &case.bytes).unwrap();
         let mut texts: Vec<(Source, String)> = Vec::new();
-        for source in SOURCES {
+        for &source in &sources {
             let (seen, text) = run(source, &path);
             if seen != case.expect {
                 mismatches.push(format!(
@@ -696,7 +729,7 @@ fn only_the_blob_reader_parses_the_envelope() {
     garbage[fx.p..].fill(0);
     let path = fx.dir.path().join("garbage-payload.osm.pbf");
     std::fs::write(&path, &garbage).unwrap();
-    for source in SOURCES {
+    for source in sources(fx.dir.path()) {
         let expect = match source {
             Source::Read => fx.refusal(Kind::Wire),
             _ => Seen::End { frames: 3 },

@@ -1283,6 +1283,43 @@ The judgement calls already known, to be checked first:
     write loop.
   - `sort` on an unclaimed-order indexed input gives up `copy_file_range`
     for each blob whose claim is false (reframed through the write loop).
+- The last pools without stall counters (bz `pbfhogg#16`, sparred with
+  codex to consensus). Judgement calls on measured paths, none measured:
+  - The merge engine's pass 2 (`blob_merge::write_plan`, planet `sort`
+    and `cat --dedupe`) runs on `ordered_pool::run_ordered_streams`: the
+    write loop issues each overlap run itself (its own channel, the sender
+    queued FIFO), so the dispatcher thread, the shared admission gate and
+    the order channel are gone. Same window (`OVERLAP_RUN_WINDOW_PER_WORKER`
+    per worker) and per-run depth, so the same block bound. What moved: one
+    thread fewer; a run is issued when the write loop finishes the one a
+    window back, where the dispatcher admitted it at the gate's wakeup. As
+    before, a failing run does not stop later runs from starting (up to a
+    window of them may start before the write loop reaches the failure,
+    which still surfaces in run order). A sweep now also checks
+    cancellation and abandonment every `SWEEP_CHECKPOINT_REMOVALS` heap
+    removals, duplicate discards included (two atomic loads per check), so
+    a run's final heap
+    drain and a long duplicate stretch are bounded; before, an abandoned
+    sweep ran its heap out to the first failed send. Production `sort` on
+    sorted input has no runs and starts no thread, as before.
+  - Gated stall counters on every blocking point of that pass:
+    `ordered_pool_result_send_wait_ns`, `_result_recv_wait_ns`, and the new
+    `ordered_pool_job_lock_wait_ns` and `_job_recv_wait_ns`. The job pair
+    reads together: the holder keeps the lock across its receive, so the
+    lock wait is about the receive wait times the idle peers (seen on a
+    forced Denmark run).
+  - `cat --dedupe` gained nested markers (`MERGEPBF_PASS1`, `_PASS2`,
+    `_WRITE_LOOP`, `_FLUSH` inside the kept `MERGEPBF` pair) and
+    `cat_dedupe_*` counters.
+  - Extract simple's node and way classify phases left their two
+    hand-built `Mutex<Receiver>` pools for `run_unordered_per_blob`
+    (through `parallel_scan_blobs_raw`, whose work now receives the
+    schedule position). They record the `classify_unordered_*` set and now
+    get the dispatcher's sliding `WILLNEED` advice over their schedules,
+    which they never had (planet `extract --simple` is a recorded row),
+    and the driver's cancellation checks before each wait, not only after
+    each result. The unordered pools now emit their counters from a drop
+    guard, so a panicking run still emits them.
 
 No findings remain open; the file stays until the list above is reviewed
 (rule 4).

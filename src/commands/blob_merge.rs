@@ -29,7 +29,6 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::os::unix::fs::FileExt as _;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use crate::Element;
 use crate::ElementKind;
@@ -43,14 +42,12 @@ use crate::blob_meta::{
 use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::error::{Error, Result};
 use crate::file_writer::FileWriter;
-use crate::ordered_pool::{CloseOnDrop, OrderedGate};
 use crate::owned::{
     OwnedNode, OwnedRelation, OwnedWay, read_dense_node, read_node, read_relation, read_way,
     write_single_node_local, write_single_relation_local, write_single_way_local,
 };
 use crate::read::header_walker::{BlobHeaderMeta, HeaderWalker, Positional};
 use crate::read::input::{InputFile, PinnedInput};
-use crate::scan::classify::recv_checked;
 use crate::writer::{PbfWriter, reframe_raw_with_index};
 
 // ---------------------------------------------------------------------------
@@ -768,15 +765,6 @@ struct RunCounts {
     duplicates: u64,
 }
 
-/// A message on one overlap run's channel. A run ends with exactly one of
-/// `Finished` or `Failed`; a channel that closes without either is a worker
-/// that died mid-run, never a short run.
-enum RunMsg {
-    Block(OwnedBlock),
-    Finished(RunCounts),
-    Failed(Error),
-}
-
 /// Pass 2: write the plan in order to `writer`.
 ///
 /// `dedupe` drops, inside overlap runs, an element whose (id, version)
@@ -784,33 +772,24 @@ enum RunMsg {
 /// splice (`OutputBackend::supports_copy_range`).
 ///
 /// With no overlap runs (an already-sorted input: production `sort`) this is
-/// one serial loop and no thread starts. Otherwise the runs are swept on
-/// worker threads (sized as the decode pools are) while this thread writes:
-///
-/// - A dispatcher walks the runs in order and admits run `k` only while
-///   `k < drained + window`. For each it makes a channel of
-///   [`OVERLAP_RUN_CHANNEL_DEPTH`] messages, queues the job (FIFO) and hands
-///   the receiver to this thread over an ordered channel.
-/// - A worker sweeps its run, sending each block as the builder fills it and
-///   then the run's terminal message; a full channel parks it.
-/// - This thread writes entries in order; at a run it takes the run's
-///   receiver and writes its blocks as they arrive until the terminal message,
-///   then credits the run.
-///
-/// Progress: when this thread waits on run `k`, every earlier run is drained
-/// and run `k` was dequeued before any later one, so a worker is on it, and
-/// that worker never waits on a later run. Memory: at most `window x depth`
-/// blocks buffered plus one blocked send per worker, beside each active
-/// sweep's heap (bounded by its run's overlap depth, as before; up to
-/// `min(window, workers)` heaps at once). Shutdown: every receiver and the
-/// consumer's gate guard live in the scope closure, so any return from it
-/// (an error, a cancellation, a write failure) drops them before the join:
-/// workers parked in a send fail it and stop, the dispatcher parked on the
-/// gate wakes to it closed and drops the job queue, idle workers see it
-/// close. The first error met in run order is returned, unless a worker
-/// panicked, which the scope re-raises at the join.
+/// one serial loop and no thread starts. Otherwise each run is one task of a
+/// streamed ordered pool ([`crate::ordered_pool::run_ordered_streams`]):
+/// runs are swept on worker threads (sized as the decode pools are), each
+/// sending its blocks as the builder fills them through a channel of
+/// [`OVERLAP_RUN_CHANNEL_DEPTH`] messages, while this thread writes the
+/// entries in order, a run's blocks as they arrive. At most `window` runs
+/// ([`OVERLAP_RUN_WINDOW_PER_WORKER`] per worker) are issued ahead of the
+/// one being written. Memory: at most `window x depth` blocks buffered plus
+/// one blocked send per worker, beside each active sweep's heap (bounded by
+/// its run's overlap depth; up to `min(window, workers)` heaps at once).
+/// Progress, shutdown and the failure order are the pool's; the first error
+/// met in run order is returned, unless a worker panicked, which the join
+/// re-raises. Its stall counters (`ordered_pool_*_wait_ns`) are this pass's:
+/// the write loop waiting on a sweep is `ordered_pool_result_recv_wait_ns`,
+/// a sweep blocked behind the write loop `ordered_pool_result_send_wait_ns`.
 ///
 /// [`OVERLAP_RUN_CHANNEL_DEPTH`]: crate::tunables::OVERLAP_RUN_CHANNEL_DEPTH
+/// [`OVERLAP_RUN_WINDOW_PER_WORKER`]: crate::tunables::OVERLAP_RUN_WINDOW_PER_WORKER
 #[hotpath::measure]
 pub(crate) fn write_plan(
     plan: &Plan,
@@ -820,211 +799,150 @@ pub(crate) fn write_plan(
     use_copy_range: bool,
     host: &crate::host::Host,
 ) -> Result<WriteCounts> {
-    if plan.runs.is_empty() {
-        return write_loop(plan, sources, writer, use_copy_range, |_, _| {
-            Err(Error::internal("overlap run written with no runs planned"))
-        });
-    }
-
-    let workers = crate::host::sized_workers(
-        &*host.resources,
-        crate::tunables::DECODE_WORKERS_RESERVED,
-        crate::tunables::DECODE_WORKERS_MIN,
-        crate::tunables::DECODE_WORKERS_FALLBACK,
-    )
-    .clamp(1, plan.runs.len());
-    let window = std::num::NonZeroUsize::new(
-        workers.saturating_mul(crate::tunables::OVERLAP_RUN_WINDOW_PER_WORKER),
-    )
-    .unwrap_or(std::num::NonZeroUsize::MIN);
-    // The ordered pool's admission gate, shared rather than the pool itself:
-    // a run streams its blocks before it finishes, so it is not one result
-    // per task. Only `close` is used (never `stop_claims`): a closed gate
-    // admits nothing, which is this protocol's contract.
-    let gate = OrderedGate::new();
-
-    std::thread::scope(|scope| -> Result<WriteCounts> {
-        let gate_ref = &gate;
-        // Before any thread starts, so even a failed spawn unwinding out of
-        // this closure closes the gate a parked dispatcher waits on. Every
-        // receiver is declared after it and so drops first (locals drop in
-        // reverse order): run receivers are gone before the gate closes,
-        // and both before the scope joins.
-        let _close = CloseOnDrop(gate_ref);
-        let (job_tx, job_rx) = sync_channel::<(usize, SyncSender<RunMsg>)>(window.get());
-        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
-        let (order_tx, order_rx) = sync_channel::<Receiver<RunMsg>>(window.get());
-
-        scope.spawn(move || {
-            for k in 0..plan.runs.len() {
-                if !gate_ref.admit(k, window, None) {
-                    break;
-                }
-                let (tx, rx) = sync_channel(crate::tunables::OVERLAP_RUN_CHANNEL_DEPTH);
-                if job_tx.send((k, tx)).is_err() || order_tx.send(rx).is_err() {
-                    break;
-                }
-            }
-        });
-
-        for _ in 0..workers {
-            let jobs = std::sync::Arc::clone(&job_rx);
-            scope.spawn(move || {
-                loop {
-                    let job = jobs
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .recv();
-                    let Ok((k, tx)) = job else { break };
-                    if !sweep_job(plan, &plan.runs[k], sources, dedupe, &tx, &host.cancel) {
-                        // The write loop is gone: nothing will read this run
-                        // or any later one.
-                        break;
-                    }
-                }
-            });
-        }
-        // Workers hold the only job receivers now, so their exit closes the
-        // queue for a dispatcher still sending.
-        drop(job_rx);
-
-        let mut drained = 0_usize;
-        write_loop(plan, sources, writer, use_copy_range, |k, writer| {
-            let rx = recv_checked(&order_rx, &host.cancel)?
-                .ok_or_else(|| Error::internal("overlap run dispatcher ended early"))?;
-            debug_assert_eq!(k, drained, "overlap runs drained out of order");
-            let counts = drain_run(&rx, &host.cancel, |block| {
-                writer.write_primitive_block_owned(block)
-            })?;
-            drained += 1;
-            gate_ref.advance(drained);
-            Ok(counts)
-        })
-    })
-}
-
-/// Sweep run `run` and send its blocks and terminal message on `tx`.
-/// Returns false when the receiver is gone (the write loop stopped).
-fn sweep_job(
-    plan: &Plan,
-    run: &Run,
-    sources: &[InputFile],
-    dedupe: bool,
-    tx: &SyncSender<RunMsg>,
-    cancel: &crate::host::Cancel,
-) -> bool {
-    let mut receiver_gone = false;
-    let result = sweep_run(
-        &plan.entries[run.start..run.end],
-        &plan.frames,
-        run.kind,
+    let mut out = PlanWriter {
+        plan,
         sources,
-        dedupe,
-        |block| {
-            if tx.send(RunMsg::Block(block)).is_err() {
-                receiver_gone = true;
-                return Err(Error::internal("overlap run receiver dropped"));
-            }
-            Ok(())
+        writer,
+        use_copy_range,
+        // Counted per frame by the plan: a blob holding several kinds is
+        // rewritten in several runs but is one blob.
+        counts: WriteCounts {
+            blobs_rewritten: plan.blobs_rewritten,
+            ..WriteCounts::default()
         },
-        cancel,
-    );
-    if receiver_gone {
-        return false;
-    }
-    let terminal = match result {
-        Ok(counts) => RunMsg::Finished(counts),
-        Err(e) => RunMsg::Failed(e),
+        copy: CopyRun::default(),
+        frame_buf: Vec::new(),
+        cursor: 0,
     };
-    tx.send(terminal).is_ok()
-}
-
-/// Hand one run's blocks to `write` as they arrive, until its terminal
-/// message.
-fn drain_run(
-    rx: &Receiver<RunMsg>,
-    cancel: &crate::host::Cancel,
-    mut write: impl FnMut(OwnedBlock) -> Result<()>,
-) -> Result<RunCounts> {
-    loop {
-        match recv_checked(rx, cancel)? {
-            Some(RunMsg::Block(block)) => write(block)?,
-            Some(RunMsg::Finished(counts)) => return Ok(counts),
-            Some(RunMsg::Failed(e)) => return Err(e),
-            None => {
-                return Err(Error::internal(
-                    "overlap worker ended a run without finishing it",
-                ));
-            }
-        }
+    if !plan.runs.is_empty() {
+        let workers = crate::host::sized_workers(
+            &*host.resources,
+            crate::tunables::DECODE_WORKERS_RESERVED,
+            crate::tunables::DECODE_WORKERS_MIN,
+            crate::tunables::DECODE_WORKERS_FALLBACK,
+        )
+        .clamp(1, plan.runs.len());
+        let window = std::num::NonZeroUsize::new(
+            workers.saturating_mul(crate::tunables::OVERLAP_RUN_WINDOW_PER_WORKER),
+        )
+        .unwrap_or(std::num::NonZeroUsize::MIN);
+        crate::ordered_pool::run_ordered_streams(
+            plan.runs.len(),
+            workers,
+            crate::ordered_pool::StreamConfig {
+                window,
+                depth: crate::tunables::OVERLAP_RUN_CHANNEL_DEPTH,
+                cancel: &host.cancel,
+            },
+            |_| Vec::new(),
+            |frame_buf: &mut Vec<u8>, k, emitter| {
+                let run = &plan.runs[k];
+                Sweep {
+                    entries: &plan.entries[run.start..run.end],
+                    frames: &plan.frames,
+                    sources,
+                    dedupe,
+                    cancel: &host.cancel,
+                    emitter,
+                }
+                .run_kind(run.kind, frame_buf)
+            },
+            &mut out,
+        )?;
     }
+    out.passthrough_until(plan.entries.len())?;
+    let PlanWriter {
+        mut copy,
+        writer,
+        mut counts,
+        ..
+    } = out;
+    copy.flush(writer, sources, &mut counts)?;
+    Ok(counts)
 }
 
-/// The ordered write loop. `run_output(k, writer)` writes run `k`'s blocks
-/// and returns its counts; it is called once per run, in order.
-fn write_loop(
-    plan: &Plan,
-    sources: &[InputFile],
-    writer: &mut PbfWriter<FileWriter>,
+/// The ordered write loop: passthrough entries written (or coalesced into a
+/// copy) in plan order, each overlap run's blocks at its position.
+struct PlanWriter<'a> {
+    plan: &'a Plan,
+    sources: &'a [InputFile],
+    writer: &'a mut PbfWriter<FileWriter>,
     use_copy_range: bool,
-    mut run_output: impl FnMut(usize, &mut PbfWriter<FileWriter>) -> Result<RunCounts>,
-) -> Result<WriteCounts> {
-    // Counted per frame by the plan: a blob holding several kinds is
-    // rewritten in several runs but is one blob.
-    let mut counts = WriteCounts {
-        blobs_rewritten: plan.blobs_rewritten,
-        ..WriteCounts::default()
-    };
-    // Passthrough coalescer: adjacent blobs contiguous in one input collapse
-    // into one `copy_file_range`. On already-sorted input this is the entire
-    // file, cutting the syscall count from O(blobs) to O(1). Mirrors the
-    // contiguous-range coalescer in apply_changes.
-    let mut copy = CopyRun::default();
-    let mut frame_buf: Vec<u8> = Vec::new();
-    let mut next_run = 0_usize;
-    let mut i = 0;
-    while i < plan.entries.len() {
-        if plan.rewrite[i] {
-            copy.flush(writer, sources, &mut counts)?;
-            let run = plan
-                .runs
-                .get(next_run)
-                .filter(|run| run.start == i)
-                .ok_or_else(|| Error::internal("rewrite entry outside its planned run"))?;
-            let emitted = run_output(next_run, writer)?;
-            match run.kind {
-                ElementKind::Node => counts.nodes += emitted.elements,
-                ElementKind::Way => counts.ways += emitted.elements,
-                ElementKind::Relation => counts.relations += emitted.elements,
+    counts: WriteCounts,
+    /// Passthrough coalescer: adjacent blobs contiguous in one input collapse
+    /// into one `copy_file_range`. On already-sorted input this is the entire
+    /// file, cutting the syscall count from O(blobs) to O(1). Mirrors the
+    /// contiguous-range coalescer in apply_changes.
+    copy: CopyRun,
+    frame_buf: Vec<u8>,
+    /// The next plan entry to write.
+    cursor: usize,
+}
+
+impl PlanWriter<'_> {
+    /// Write the passthrough entries from the cursor up to `end`. Every one
+    /// must be a copy: a rewrite entry the runs do not start at is a plan
+    /// defect.
+    fn passthrough_until(&mut self, end: usize) -> Result<()> {
+        while self.cursor < end {
+            let i = self.cursor;
+            if self.plan.rewrite[i] {
+                return Err(Error::internal("rewrite entry outside its planned run"));
             }
-            counts.duplicates_removed += emitted.duplicates;
-            next_run += 1;
-            i = run.end;
-        } else {
             // A copied entry is its frame's only one: a frame with several
             // is restructured, and every restructured entry is rewritten.
-            let entry = &plan.entries[i];
-            let frame = &plan.frames[entry.frame];
+            let entry = &self.plan.entries[i];
+            let frame = &self.plan.frames[entry.frame];
             match &frame.reindex {
-                None if use_copy_range => copy.offer(frame, writer, sources, &mut counts)?,
+                None if self.use_copy_range => {
+                    self.copy
+                        .offer(frame, self.writer, self.sources, &mut self.counts)?;
+                }
                 reindex => {
-                    copy.flush(writer, sources, &mut counts)?;
+                    self.copy
+                        .flush(self.writer, self.sources, &mut self.counts)?;
                     write_passthrough(
                         frame,
                         reindex.as_ref(),
-                        &sources[frame.source],
-                        writer,
-                        &mut frame_buf,
+                        &self.sources[frame.source],
+                        self.writer,
+                        &mut self.frame_buf,
                     )?;
                 }
             }
-            count_passthrough(entry, &mut counts);
-            counts.blobs_passthrough += 1;
-            i += 1;
+            count_passthrough(entry, &mut self.counts);
+            self.counts.blobs_passthrough += 1;
+            self.cursor += 1;
         }
+        Ok(())
     }
-    copy.flush(writer, sources, &mut counts)?;
-    Ok(counts)
+}
+
+impl crate::ordered_pool::StreamConsumer<OwnedBlock, RunCounts> for PlanWriter<'_> {
+    fn before_task(&mut self, k: usize) -> Result<()> {
+        let start = self.plan.runs[k].start;
+        self.passthrough_until(start)?;
+        if self.cursor != start {
+            return Err(Error::internal("rewrite entry outside its planned run"));
+        }
+        self.copy.flush(self.writer, self.sources, &mut self.counts)
+    }
+
+    fn item(&mut self, _k: usize, block: OwnedBlock) -> Result<()> {
+        self.writer.write_primitive_block_owned(block)
+    }
+
+    fn finish_task(&mut self, k: usize, emitted: RunCounts) -> Result<()> {
+        let run = &self.plan.runs[k];
+        match run.kind {
+            ElementKind::Node => self.counts.nodes += emitted.elements,
+            ElementKind::Way => self.counts.ways += emitted.elements,
+            ElementKind::Relation => self.counts.relations += emitted.elements,
+        }
+        self.counts.duplicates_removed += emitted.duplicates;
+        self.cursor = run.end;
+        Ok(())
+    }
 }
 
 /// The in-flight `copy_file_range` stretch: (source, start, end).
@@ -1203,72 +1121,75 @@ impl SweepElement for OwnedRelation {
     }
 }
 
-/// Sweep one run of `kind`, handing each block to `emit` as it fills.
-///
-/// The extraction closures take only `kind`'s elements from each frame, and
-/// that is what lets a restructured frame (several kinds in one block) give
-/// each of its entries just its own kind's share.
-fn sweep_run(
-    entries: &[BlobEntry],
-    frames: &[Frame],
-    kind: ElementKind,
-    sources: &[InputFile],
-    dedupe: bool,
-    emit: impl FnMut(OwnedBlock) -> Result<()>,
-    cancel: &crate::host::Cancel,
-) -> Result<RunCounts> {
-    let sweep = Sweep {
-        entries,
-        frames,
-        sources,
-        dedupe,
-        cancel,
-    };
-    match kind {
-        ElementKind::Node => sweep.run(
-            |e, heap| {
-                match e {
-                    Element::DenseNode(dn) => heap.push(Reverse(read_dense_node(dn)?)),
-                    Element::Node(n) => heap.push(Reverse(read_node(n)?)),
-                    _ => {}
-                }
-                Ok(())
-            },
-            write_single_node_local,
-            emit,
-        ),
-        ElementKind::Way => sweep.run(
-            |e, heap| {
-                if let Element::Way(w) = e {
-                    heap.push(Reverse(read_way(w)?));
-                }
-                Ok(())
-            },
-            write_single_way_local,
-            emit,
-        ),
-        ElementKind::Relation => sweep.run(
-            |e, heap| {
-                if let Element::Relation(r) = e {
-                    heap.push(Reverse(read_relation(r)?));
-                }
-                Ok(())
-            },
-            write_single_relation_local,
-            emit,
-        ),
-    }
-}
-
-struct Sweep<'a> {
+/// One overlap run's sweep, on its worker: its entries, the inputs, and the
+/// run's way out to the write loop.
+struct Sweep<'a, 'e> {
     entries: &'a [BlobEntry],
     frames: &'a [Frame],
     sources: &'a [InputFile],
     dedupe: bool,
     cancel: &'a crate::host::Cancel,
+    emitter: &'a crate::ordered_pool::Emitter<'e, OwnedBlock, RunCounts>,
 }
 
-impl Sweep<'_> {
+impl Sweep<'_, '_> {
+    /// Sweep the run, as `kind`, handing each block to the write loop as it
+    /// fills.
+    ///
+    /// The extraction closures take only `kind`'s elements from each frame, and
+    /// that is what lets a restructured frame (several kinds in one block) give
+    /// each of its entries just its own kind's share.
+    fn run_kind(&self, kind: ElementKind, frame_buf: &mut Vec<u8>) -> Result<RunCounts> {
+        match kind {
+            ElementKind::Node => self.run(
+                |e, heap| {
+                    match e {
+                        Element::DenseNode(dn) => heap.push(Reverse(read_dense_node(dn)?)),
+                        Element::Node(n) => heap.push(Reverse(read_node(n)?)),
+                        _ => {}
+                    }
+                    Ok(())
+                },
+                write_single_node_local,
+                frame_buf,
+            ),
+            ElementKind::Way => self.run(
+                |e, heap| {
+                    if let Element::Way(w) = e {
+                        heap.push(Reverse(read_way(w)?));
+                    }
+                    Ok(())
+                },
+                write_single_way_local,
+                frame_buf,
+            ),
+            ElementKind::Relation => self.run(
+                |e, heap| {
+                    if let Element::Relation(r) = e {
+                        heap.push(Reverse(read_relation(r)?));
+                    }
+                    Ok(())
+                },
+                write_single_relation_local,
+                frame_buf,
+            ),
+        }
+    }
+
+    /// The sweep's cooperative stop: the run cancelled, or abandoned (the
+    /// write loop has returned, or a thread unwound), so nothing it still
+    /// produces can be written. An abandoned sweep's error is never
+    /// delivered as the run's: the run has already ended.
+    fn checkpoint(&self) -> Result<()> {
+        self.cancel.check()?;
+        if self.emitter.abandoned() {
+            return Err(Error::internal(
+                "overlap run abandoned: its write loop is gone",
+            ));
+        }
+        Ok(())
+    }
+
     /// Before each blob, emit every element below the blob's first ID; push
     /// the blob's elements; at the end, drain the heap. One `BlockBuilder`
     /// for the run, flushed at its end.
@@ -1280,62 +1201,77 @@ impl Sweep<'_> {
     /// hold whatever overlaps the current position - and bounding it would
     /// take an external merge. Streaming bounds only what the sweep has
     /// already re-encoded.
+    ///
+    /// [`checkpoint`](Self::checkpoint) runs before each blob is read and
+    /// after every [`SWEEP_CHECKPOINT_REMOVALS`] heap removals (duplicate
+    /// discards included), so neither a growing heap nor its final drain
+    /// runs on unchecked: at most that many removals, or one blob's read and
+    /// decode, pass between checks. That bounds work, not wall time.
+    ///
+    /// [`SWEEP_CHECKPOINT_REMOVALS`]: crate::tunables::SWEEP_CHECKPOINT_REMOVALS
     fn run<T: SweepElement>(
         &self,
         mut extract: impl FnMut(&Element<'_>, &mut BinaryHeap<Reverse<T>>) -> Result<()>,
         mut write_elem: impl FnMut(&T, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> Result<()>,
-        mut emit: impl FnMut(OwnedBlock) -> Result<()>,
+        frame_buf: &mut Vec<u8>,
     ) -> Result<RunCounts> {
         let mut heap: BinaryHeap<Reverse<T>> = BinaryHeap::new();
         let mut bb = BlockBuilder::new();
         let mut filled: Vec<OwnedBlock> = Vec::new();
-        let mut frame_buf: Vec<u8> = Vec::new();
         let mut counts = RunCounts::default();
+        let mut removals = 0_usize;
         let mut write = |elem: &T, counts: &mut RunCounts| -> Result<()> {
             write_elem(elem, &mut bb, &mut filled)?;
             counts.elements += 1;
-            filled.drain(..).try_for_each(&mut emit)
+            filled
+                .drain(..)
+                .try_for_each(|block| self.emitter.send(block))
         };
 
         for entry in self.entries {
             // Once per blob, before it is read: a pathological input can put
             // most of a file into one run, swept on one worker, and a run
             // whose heap only grows writes nothing until it drains.
-            self.cancel.check()?;
+            self.checkpoint()?;
             let below = crate::osm_id::blob_osm_first_id(entry.index.min_id, entry.index.max_id);
             while heap
                 .peek()
                 .is_some_and(|Reverse(e)| crate::osm_id::osm_id_cmp(e.id(), below).is_lt())
             {
-                self.pop_one(&mut heap, &mut counts, &mut write)?;
+                self.pop_one(&mut heap, &mut counts, &mut removals, &mut write)?;
             }
             let frame = &self.frames[entry.frame];
             let source = &self.sources[frame.source];
-            let block = read_block(source, frame, &mut frame_buf)?;
+            let block = read_block(source, frame, frame_buf)?;
             for element in block.elements() {
                 extract(&element, &mut heap).map_err(|e| source.locate_at(frame.file_offset, e))?;
             }
         }
         while !heap.is_empty() {
-            self.pop_one(&mut heap, &mut counts, &mut write)?;
+            self.pop_one(&mut heap, &mut counts, &mut removals, &mut write)?;
         }
         drop(write);
         crate::commands::flush_local(&mut bb, &mut filled)?;
-        filled.into_iter().try_for_each(emit)?;
+        filled
+            .into_iter()
+            .try_for_each(|block| self.emitter.send(block))?;
         Ok(counts)
     }
 
     /// Pop and write the smallest element; under dedupe, then drop every
-    /// element equal to it in (id, version).
+    /// element equal to it in (id, version). Every removal counts toward
+    /// the next [`checkpoint`](Self::checkpoint).
     fn pop_one<T: SweepElement>(
         &self,
         heap: &mut BinaryHeap<Reverse<T>>,
         counts: &mut RunCounts,
+        removals: &mut usize,
         write: &mut impl FnMut(&T, &mut RunCounts) -> Result<()>,
     ) -> Result<()> {
         let Some(Reverse(elem)) = heap.pop() else {
             return Ok(());
         };
+        self.count_removal(removals)?;
         write(&elem, counts)?;
         if self.dedupe {
             let (id, version) = (elem.id(), elem.version());
@@ -1345,7 +1281,21 @@ impl Sweep<'_> {
             {
                 heap.pop();
                 counts.duplicates += 1;
+                self.count_removal(removals)?;
             }
+        }
+        Ok(())
+    }
+
+    /// One heap removal; a checkpoint on every
+    /// [`SWEEP_CHECKPOINT_REMOVALS`]th.
+    ///
+    /// [`SWEEP_CHECKPOINT_REMOVALS`]: crate::tunables::SWEEP_CHECKPOINT_REMOVALS
+    fn count_removal(&self, removals: &mut usize) -> Result<()> {
+        *removals += 1;
+        if *removals >= crate::tunables::SWEEP_CHECKPOINT_REMOVALS {
+            *removals = 0;
+            self.checkpoint()?;
         }
         Ok(())
     }
@@ -1594,69 +1544,6 @@ mod tests {
             "a node blob the scan gives no box has a coordinate out of range, \
              which no claimed box contains"
         );
-    }
-
-    fn one_block() -> OwnedBlock {
-        let mut bb = BlockBuilder::new();
-        bb.add_node(1, 0, 0, std::iter::empty::<(&str, &str)>(), None);
-        bb.take_owned().expect("encode").expect("non-empty block")
-    }
-
-    /// A run ends only on its terminal message: blocks before it are written,
-    /// `Finished` carries the counts, `Failed` is the run's error.
-    #[test]
-    fn a_run_is_drained_up_to_its_terminal_message() {
-        let cancel = crate::host::Cancel::new();
-        let (tx, rx) = sync_channel(4);
-        tx.send(RunMsg::Block(one_block())).expect("send");
-        tx.send(RunMsg::Finished(RunCounts {
-            elements: 1,
-            duplicates: 0,
-        }))
-        .expect("send");
-        let mut written = 0;
-        let counts = drain_run(&rx, &cancel, |_| {
-            written += 1;
-            Ok(())
-        })
-        .expect("finished run");
-        assert_eq!((written, counts.elements), (1, 1));
-
-        let (tx, rx) = sync_channel(4);
-        tx.send(RunMsg::Failed(Error::invalid_data("bad blob")))
-            .expect("send");
-        let err = drain_run(&rx, &cancel, |_| Ok(())).expect_err("failed run");
-        assert!(err.to_string().contains("bad blob"), "{err}");
-    }
-
-    /// A channel that closes without a terminal message is a worker that
-    /// died mid-run (a panic), never a shorter run: the blocks it did send
-    /// must not pass for the whole run.
-    #[test]
-    fn a_run_that_closes_without_finishing_is_an_error() {
-        let cancel = crate::host::Cancel::new();
-        let (tx, rx) = sync_channel(4);
-        tx.send(RunMsg::Block(one_block())).expect("send");
-        drop(tx);
-        let err = drain_run(&rx, &cancel, |_| Ok(())).expect_err("unfinished run");
-        assert!(
-            matches!(err.kind(), crate::ErrorKind::Internal { .. }),
-            "{err:?}"
-        );
-    }
-
-    /// A cancelled run stops at the consumer's checkpoint even when its
-    /// worker would still finish it.
-    #[test]
-    fn a_cancelled_drain_stops_at_its_checkpoint() {
-        let cancel = crate::host::Cancel::new();
-        let (tx, rx) = sync_channel(4);
-        tx.send(RunMsg::Block(one_block())).expect("send");
-        tx.send(RunMsg::Finished(RunCounts::default()))
-            .expect("send");
-        cancel.cancel();
-        let err = drain_run(&rx, &cancel, |_| Ok(())).expect_err("cancelled");
-        assert!(err.is_cancelled(), "{err:?}");
     }
 
     /// A passthrough blob's count is a claim when it came from indexdata and

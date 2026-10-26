@@ -1006,6 +1006,73 @@ the ones below.
       a dropped duplicate (`[A,A]` to `[A]`) prints the modification with
       no member lines. The modification itself is still reported.
 
+- bz `pbfhogg#16` (pools still silent to `--stalls`; Slice E item 5's
+  pass-1/pass-2 markers and write-loop run-receive counter for the merge
+  engine; Slice F item 5's note on extract simple): **resolved** (sparred
+  with codex to consensus over three rounds, the diff reviewed by a fresh
+  codex session).
+  - Confirmed in the code: `blob_merge::write_plan` (sort, `cat --dedupe`)
+    blocked at five points with no counter (dispatcher at the gate, workers
+    on the job lock and empty job queue, workers on a full run channel, the
+    write loop on an empty one), and extract simple's node and way classify
+    phases were two hand-built `Mutex<Receiver>` pools with none.
+  - Shapes considered for the engine: its own counter set on the hand
+    protocol; recording into the engine set from it (rejected: the
+    dispatcher, not a worker, parks at the gate); moving the protocol as is;
+    collecting each run into one `run_ordered` result (rejected: drops the
+    streaming bound a giant overlap component needs); a gate plus a slot
+    table of per-task senders (rejected in the spar: the table needs its own
+    permanent closure against a panic racing the consumer's publication,
+    and adds an uncounted mutex). Taken: `ordered_pool::run_ordered_streams`,
+    where the consumer dispatches (each task its own channel, the sender
+    queued FIFO, a window of tasks issued ahead), so no gate and no
+    dispatcher thread. Codex's first-round finding held: a worker waiting
+    for a job is not an admission wait, so streams record
+    `ordered_pool_result_send_wait_ns` / `_recv_wait_ns` with run_ordered
+    and two counters of their own, `ordered_pool_job_lock_wait_ns` and
+    `_job_recv_wait_ns`, never `window_wait_ns`.
+  - Also from the spar: an abandonment flag (consumer exit or a worker
+    unwind) workers check before taking a job and sweeps check, with
+    cancellation, before each blob and every `SWEEP_CHECKPOINT_REMOVALS`
+    heap removals; before, a sweep whose write loop had gone ran its heap
+    out to its first failed send, and the final heap drain and a duplicate
+    stretch had no cancellation check at all.
+  - `cat --dedupe`: `MERGEPBF_PASS1`, `_PASS2`, `_WRITE_LOOP` and `_FLUSH`
+    pairs nested in the kept `MERGEPBF` pair, and `cat_dedupe_*` counters
+    (blobs total, omitted, passthrough, rewritten; overlap runs; copy-range
+    calls and coalesced; duplicates removed). Seen on a forced Denmark run
+    on bygg (self-merge, not stored): pass 1 0.64 s, write loop 2.0 s, flush
+    0.14 s; `ordered_pool_result_recv` 1.8 s (the write loop waiting on the
+    sweeps), `ordered_pool_job_lock` 2.9 s against `_job_recv` 0.18 s, which
+    is the holder keeping the lock across its receive with the idle peers
+    queued behind it, as the counter doc now says.
+  - Extract simple's two pools run on `run_unordered_per_blob` through
+    `parallel_scan_blobs_raw`, whose work now receives the schedule
+    position (the node phase needs it to verify only passthrough
+    candidates). They record `classify_unordered_*` and gain the
+    dispatcher's `WILLNEED` advice. Lateral, from the spar: the unordered
+    pools emitted their counters after the scope returned, so a panicking
+    run emitted none; they now emit from a drop guard as the ordered engine
+    does.
+  - Tests: eight streamed-pool unit tests in `ordered_pool.rs` (order,
+    zero tasks, ordered failure, before-task and item-write precedence,
+    consumer error releasing blocked senders and abandoning a long task,
+    one and every worker panicking, each wait recorded apart). Mutation-
+    checked: the abandonment guard on a dummy flag fails the abandonment
+    test. Keeping the consumer's clone of the job receiver did not fail the
+    all-workers-panic test, and cannot: jobs are taken FIFO, so the dead
+    worker's task is always reached before any queued one. The sweep's
+    removal checkpoint has no dedicated test (it needs cancellation to trip
+    after a run's last blob is read). `brokkr check` (tier1) passes;
+    `brokkr verify` sort, extract and multi-extract pass on Denmark
+    (extract's informational osmium differences are the same at HEAD).
+  - Docs: `reference/pipeline.md` (the streamed entry point; dedupe's
+    phases), `reference/performance.md` (what a fresh planet dedupe cell
+    can now read), `reference/performance-history.md` (sort entry and
+    "Worker-pool unification"), the `hygiene.md` review list. Unmeasured.
+  - The audit's measurement plan for Slice E item 5 stands; the planet
+    `cat --dedupe` cell now has its phase split and stall attribution.
+
 Notes made while the audit ran, not findings of it:
 
 - protohoggr 0.4.0 to 0.5.0 (bz `pbfhogg#15`) was applied after slices C,

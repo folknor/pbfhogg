@@ -80,8 +80,15 @@ consumer emits the passthrough positions between them (`Interleaved`), so
 passthrough takes no worker, channel slot or window slot, and output and
 failure order are the full schedule's. `commands::blob_merge` (sort,
 `cat --dedupe`) streams each overlap run's blocks before the run finishes,
-so it is not one result per task; it shares only the admission gate
-(`OrderedGate`). The read pipeline above keeps its own permit gate.
+so it is not one result per task; it runs on the engine's streamed entry
+point, `run_ordered_streams`. There each task has its own channel (an
+overlap run's `OVERLAP_RUN_CHANNEL_DEPTH` blocks), and the consumer
+dispatches: it issues a task by making its channel and queueing the sender
+on a FIFO job queue, at most a window of tasks ahead of the one it is
+reading, so no gate is involved. Its result send and receive waits go to
+the same `ordered_pool_*_wait_ns` counters, and its workers' wait for a job
+to `ordered_pool_job_lock_wait_ns` and `ordered_pool_job_recv_wait_ns`. The
+read pipeline above keeps its own permit gate.
 
 ### Blob Filtering (pre-decode)
 
@@ -201,6 +208,12 @@ phase per kind (see `src/commands/cat/mod.rs`).
 ### cat --dedupe
 
 K-way sorted merge of multiple PBFs. Blob-level passthrough for non-overlapping ranges, decode + dedup for overlaps. All inputs must be sorted. The same engine as `sort` (below, `src/commands/blob_merge.rs`), over several inputs, dropping an element equal in (type, id, version) to the one just emitted; an absent version is 0.
+Sidecar phases: `MERGEPBF_*` spans both passes (from after the input pins
+and indexdata probes to the writer's flush, before publication), with
+`MERGEPBF_PASS1_*` (index walk and plan) and `MERGEPBF_PASS2_*` inside it,
+and `MERGEPBF_WRITE_LOOP_*` (the ordered write with the overlap sweeps
+beside it, the pool's join included) and `MERGEPBF_FLUSH_*` (the writer
+draining) inside pass 2, as `sort`'s `SORT_*` phases nest.
 
 ### sort
 

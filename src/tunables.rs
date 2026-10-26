@@ -570,6 +570,14 @@ pub(crate) const OVERLAP_RUN_WINDOW_PER_WORKER: usize = 2;
 /// the writer instead of being held whole.
 pub(crate) const OVERLAP_RUN_CHANNEL_DEPTH: usize = 4;
 
+/// Heap removals (emitted elements and dropped duplicates alike) an overlap
+/// sweep makes between two checks of cancellation and abandonment, beside
+/// the check before each blob it reads. Without it a run's final heap drain,
+/// or a long stretch of exact duplicates that fills no block, ran unchecked
+/// to the end. Two atomic loads per check, so the interval only has to
+/// keep a check's cost far below the removals it covers; not measured.
+pub(crate) const SWEEP_CHECKPOINT_REMOVALS: usize = 4096;
+
 // ---------------------------------------------------------------------------
 // Cat
 // ---------------------------------------------------------------------------

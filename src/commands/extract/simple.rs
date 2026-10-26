@@ -1,7 +1,5 @@
 //! Simple extraction strategy: single-pass for sorted inputs, two-pass fallback for unsorted.
 
-use std::path::Path;
-
 use rayon::prelude::*;
 
 use crate::block_builder::{BlockBuilder, OwnedBlock};
@@ -389,134 +387,51 @@ fn extract_simple_single_pass(
     crate::debug::emit_marker("SIMPLE_NODE_CLASSIFY_START");
     let mut verified_nodes: Vec<Option<u64>> = vec![None; node_schedule.len()];
     {
-        use std::os::unix::fs::FileExt as _;
-
-        // node_schedule already filtered to node blobs.
-
-        let classify_file = std::sync::Arc::new(input.open()?);
-        // The input's identity, captured once; each worker borrows it.
-        let source: std::sync::Arc<Path> = std::sync::Arc::from(input.path());
-        let source = &source;
-
-        let decode_threads = crate::host::sized_workers(
-            &*host.resources,
-            crate::tunables::DECODE_WORKERS_RESERVED,
-            crate::tunables::DECODE_WORKERS_MIN,
-            crate::tunables::DECODE_WORKERS_FALLBACK,
-        );
-
+        let classify_schedule = scheduled(&node_schedule)?;
+        let classify_input = crate::read::input::InputFile::open(input)?;
+        let region_ref = region;
+        let bbox_int_ref = &bbox_int;
+        let node_schedule_ref = &node_schedule;
         // Per blob: the matching node ids, plus - for a passthrough candidate
         // - the observed node count if the blob verified (see `Passthrough`).
-        type ClassifyResult = (usize, crate::error::Result<(Vec<i64>, Option<u64>)>);
-        let (cls_tx, cls_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize, bool, u64)>(
-            crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
-        );
-        let cls_rx = std::sync::Arc::new(std::sync::Mutex::new(cls_rx));
-        let (ids_tx, ids_rx) = std::sync::mpsc::sync_channel::<ClassifyResult>(
-            crate::tunables::POOL_RESULT_CHANNEL_DEPTH,
-        );
-
-        std::thread::scope(|scope| -> Result<()> {
-            // Dispatcher: send node blob descriptors.
-            let descs: Vec<(usize, u64, usize, bool, u64)> = node_schedule
-                .iter()
-                .enumerate()
-                .map(|(i, d)| {
-                    let candidate = d.passthrough == Passthrough::Candidate;
-                    (i, d.offset, d.size, candidate, d.frame_offset)
-                })
-                .collect();
-            scope.spawn(move || {
-                for item in descs {
-                    if cls_tx.send(item).is_err() {
-                        break;
-                    }
-                }
-            });
-
-            // Workers: pread → decompress → node scanner → bbox check → Vec<i64>.
-            let region_ref = region;
-            let bbox_int_ref = &bbox_int;
-            for _ in 0..decode_threads {
-                let rx = std::sync::Arc::clone(&cls_rx);
-                let tx = ids_tx.clone();
-                let file = std::sync::Arc::clone(&classify_file);
-                scope.spawn(move || {
-                    let mut read_buf: Vec<u8> = Vec::new();
-                    let mut decompress_buf: Vec<u8> = Vec::new();
-                    let mut tuples: Vec<crate::scan::node::NodeTuple> = Vec::new();
-                    let mut group_starts: Vec<(usize, usize)> = Vec::new();
-
-                    loop {
-                        let (seq, data_offset, data_size, candidate, frame_offset) = {
-                            let guard =
-                                rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                            match guard.recv() {
-                                Ok(d) => d,
-                                Err(_) => break,
-                            }
-                        };
-
-                        let r: crate::error::Result<(Vec<i64>, Option<u64>)> =
-                            (|| -> crate::error::Result<(Vec<i64>, Option<u64>)> {
-                                read_buf.resize(data_size, 0);
-                                file.read_exact_at(&mut read_buf, data_offset)?;
-                                crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
-                                tuples.clear();
-                                crate::scan::node::extract_node_tuples(
-                                    &decompress_buf,
-                                    &mut tuples,
-                                    &mut group_starts,
-                                )?;
-                                // Classification is the same for every blob,
-                                // candidate or not, so verification can never
-                                // change which nodes are selected.
-                                let matching: Vec<i64> = tuples
-                                    .iter()
-                                    .filter(|t| {
-                                        region_ref.contains_decimicro(bbox_int_ref, t.lat, t.lon)
-                                    })
-                                    .map(|t| t.id)
-                                    .collect();
-                                let verified = if candidate {
-                                    verify_candidate(&decompress_buf, tuples.len(), matching.len())?
-                                } else {
-                                    None
-                                };
-                                Ok((matching, verified))
-                            })()
-                            // Cold: only a failure builds the location.
-                            .map_err(|e| {
-                                e.locate(crate::error::Location::new(
-                                    Some(source),
-                                    None,
-                                    Some(crate::ByteOffset(frame_offset)),
-                                ))
-                            });
-                        if tx.send((seq, r)).is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
-            drop(cls_rx);
-            drop(ids_tx);
-
-            // Consumer: merge matching IDs into bbox_node_ids, and record
-            // which candidates verified, by node-schedule position.
-            // Cancellation is checked per result on this consumer; an early
-            // return drops the receiver (moved into the loop), failing the
-            // workers' sends and then the dispatcher's.
-            for (seq, result) in ids_rx {
-                host.cancel.check()?;
-                let (matching_ids, verified) = result?;
+        // Positions index `node_schedule`, which `verified_nodes` follows.
+        crate::scan::classify::parallel_scan_blobs_raw(
+            &classify_input,
+            &classify_schedule,
+            None,
+            || {
+                (
+                    Vec::<crate::scan::node::NodeTuple>::new(),
+                    Vec::<(usize, usize)>::new(),
+                )
+            },
+            |position, decompressed, (tuples, group_starts)| {
+                tuples.clear();
+                crate::scan::node::extract_node_tuples(decompressed, tuples, group_starts)?;
+                // Classification is the same for every blob, candidate or
+                // not, so verification can never change which nodes are
+                // selected.
+                let matching: Vec<i64> = tuples
+                    .iter()
+                    .filter(|t| region_ref.contains_decimicro(bbox_int_ref, t.lat, t.lon))
+                    .map(|t| t.id)
+                    .collect();
+                let verified = if node_schedule_ref[position].passthrough == Passthrough::Candidate
+                {
+                    verify_candidate(decompressed, tuples.len(), matching.len())?
+                } else {
+                    None
+                };
+                Ok((matching, verified))
+            },
+            |position, (matching_ids, verified): (Vec<i64>, Option<u64>)| {
                 for id in matching_ids {
                     bbox_node_ids.set(id);
                 }
-                verified_nodes[seq] = verified;
-            }
-            Ok(())
-        })?;
+                verified_nodes[position] = verified;
+            },
+            host,
+        )?;
     }
     crate::debug::emit_marker("SIMPLE_NODE_CLASSIFY_END");
     // bbox_node_ids frozen. Write matching nodes via pread-from-workers.
@@ -554,109 +469,35 @@ fn extract_simple_single_pass(
     // --- Phase 2: Classify ways (scanner) + write ways (pread-from-workers) ---
     crate::debug::emit_marker("SIMPLE_WAY_CLASSIFY_START");
     {
-        use std::os::unix::fs::FileExt as _;
-
-        let classify_file = std::sync::Arc::new(input.open()?);
-        // The input's identity, captured once; each worker borrows it.
-        let source: std::sync::Arc<Path> = std::sync::Arc::from(input.path());
-        let source = &source;
-        let decode_threads = crate::host::sized_workers(
-            &*host.resources,
-            crate::tunables::DECODE_WORKERS_RESERVED,
-            crate::tunables::DECODE_WORKERS_MIN,
-            crate::tunables::DECODE_WORKERS_FALLBACK,
-        );
-
-        type WayClassifyResult = (usize, crate::error::Result<Vec<i64>>);
-        let (cls_tx, cls_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize, u64)>(
-            crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
-        );
-        let cls_rx = std::sync::Arc::new(std::sync::Mutex::new(cls_rx));
-        let (ids_tx, ids_rx) = std::sync::mpsc::sync_channel::<WayClassifyResult>(
-            crate::tunables::POOL_RESULT_CHANNEL_DEPTH,
-        );
-
-        std::thread::scope(|scope| -> Result<()> {
-            let descs: Vec<(usize, u64, usize, u64)> = way_schedule
-                .iter()
-                .enumerate()
-                .map(|(i, d)| (i, d.offset, d.size, d.frame_offset))
-                .collect();
-            scope.spawn(move || {
-                for item in descs {
-                    if cls_tx.send(item).is_err() {
-                        break;
-                    }
-                }
-            });
-
-            // Workers: pread → decompress → way-ref scanner → check bbox_node_ids → Vec<i64>.
-            let bbox_ids_ref = &bbox_node_ids;
-            for _ in 0..decode_threads {
-                let rx = std::sync::Arc::clone(&cls_rx);
-                let tx = ids_tx.clone();
-                let file = std::sync::Arc::clone(&classify_file);
-                scope.spawn(move || {
-                    let mut read_buf: Vec<u8> = Vec::new();
-                    let mut decompress_buf: Vec<u8> = Vec::new();
-                    let mut refs_buf: Vec<i64> = Vec::new();
-                    let mut group_starts: Vec<(usize, usize)> = Vec::new();
-
-                    loop {
-                        let (seq, data_offset, data_size, frame_offset) = {
-                            let guard =
-                                rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                            match guard.recv() {
-                                Ok(d) => d,
-                                Err(_) => break,
-                            }
-                        };
-
-                        let r: crate::error::Result<Vec<i64>> =
-                            (|| -> crate::error::Result<Vec<i64>> {
-                                read_buf.resize(data_size, 0);
-                                file.read_exact_at(&mut read_buf, data_offset)?;
-                                crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
-                                let mut matching: Vec<i64> = Vec::new();
-                                crate::scan::way::scan_way_refs(
-                                    &decompress_buf,
-                                    &mut refs_buf,
-                                    &mut group_starts,
-                                    |way_id, refs| {
-                                        if refs.iter().any(|&r| bbox_ids_ref.get(r)) {
-                                            matching.push(way_id);
-                                        }
-                                    },
-                                )?;
-                                Ok(matching)
-                            })()
-                            // Cold: only a failure builds the location.
-                            .map_err(|e| {
-                                e.locate(crate::error::Location::new(
-                                    Some(source),
-                                    None,
-                                    Some(crate::ByteOffset(frame_offset)),
-                                ))
-                            });
-                        if tx.send((seq, r)).is_err() {
-                            break;
+        let classify_schedule = scheduled(&way_schedule)?;
+        let classify_input = crate::read::input::InputFile::open(input)?;
+        let bbox_ids_ref = &bbox_node_ids;
+        crate::scan::classify::parallel_scan_blobs_raw(
+            &classify_input,
+            &classify_schedule,
+            None,
+            || (Vec::<i64>::new(), Vec::<(usize, usize)>::new()),
+            |_position, decompressed, (refs_buf, group_starts)| {
+                let mut matching: Vec<i64> = Vec::new();
+                crate::scan::way::scan_way_refs(
+                    decompressed,
+                    refs_buf,
+                    group_starts,
+                    |way_id, refs| {
+                        if refs.iter().any(|&r| bbox_ids_ref.get(r)) {
+                            matching.push(way_id);
                         }
-                    }
-                });
-            }
-            drop(cls_rx);
-            drop(ids_tx);
-
-            // Cancellation as in the node classify consumer above.
-            for (_seq, result) in ids_rx {
-                host.cancel.check()?;
-                let matching_ids = result?;
+                    },
+                )?;
+                Ok(matching)
+            },
+            |_position, matching_ids: Vec<i64>| {
                 for id in matching_ids {
                     matched_way_ids.set(id);
                 }
-            }
-            Ok(())
-        })?;
+            },
+            host,
+        )?;
     }
     crate::debug::emit_marker("SIMPLE_WAY_CLASSIFY_END");
     // matched_way_ids frozen. Write matching ways via pread-from-workers.
@@ -701,16 +542,7 @@ fn extract_simple_single_pass(
     crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_START");
     let mut matched_relation_ids = IdSet::new();
     {
-        let rel_classify_schedule = relation_schedule
-            .iter()
-            .map(|desc| {
-                crate::scan::classify::ScheduledBlob::at_frame(
-                    desc.frame_offset,
-                    desc.offset,
-                    desc.size,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let rel_classify_schedule = scheduled(&relation_schedule)?;
         let rel_classify_file = crate::read::input::InputFile::open(input)?;
         crate::scan::classify::parallel_classify_accumulate(
             &rel_classify_file,
@@ -774,6 +606,16 @@ fn extract_simple_single_pass(
     writer.flush()?;
     crate::debug::emit_marker("EXTRACT_SCAN_END");
     Ok(stats)
+}
+
+/// The classify pools' schedule for `descs`, in the same order, so a pool
+/// position indexes `descs`. Failures are located by file and frame offset
+/// (an extract schedule carries no blob ordinal).
+fn scheduled(descs: &[&BlobDesc]) -> Result<Vec<crate::scan::classify::ScheduledBlob>> {
+    descs
+        .iter()
+        .map(|d| crate::scan::classify::ScheduledBlob::at_frame(d.frame_offset, d.offset, d.size))
+        .collect()
 }
 
 /// Verify one passthrough candidate from its classify-phase decode: the

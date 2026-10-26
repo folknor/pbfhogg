@@ -686,32 +686,12 @@ fn next_position(
 }
 
 /// The consumer's cancellation checkpoint for the pread pools: before each
-/// wait for a result, after each arrival and after normal closure. Returning
-/// the error from the consumer is the pools' existing early exit: the result
-/// receiver drops, the workers' sends fail, and the dispatcher's send fails
-/// once the last worker has gone. Workers and dispatchers of the ordered
-/// pools never check, so no admitted sequence position is abandoned while
-/// the consumer still waits for it.
-pub(crate) fn recv_checked<T>(
-    rx: &std::sync::mpsc::Receiver<T>,
-    cancel: &crate::host::Cancel,
-) -> Result<Option<T>> {
-    cancel.check()?;
-    match rx.recv() {
-        Ok(item) => {
-            cancel.check()?;
-            Ok(Some(item))
-        }
-        Err(_) => {
-            cancel.check()?;
-            Ok(None)
-        }
-    }
-}
-
-/// [`recv_checked`] with its receive gated through
-/// `crate::counters::recv_recording_wait`: the same checkpoints, and a wait
-/// on an empty channel added to `wait_ns`.
+/// wait for a result, after each arrival and after normal closure, with the
+/// receive gated through `crate::counters::recv_recording_wait` (a wait on
+/// an empty channel added to `wait_ns`). Returning the error from the
+/// consumer is the pools' existing early exit: the result receiver drops,
+/// the workers' sends fail, and the dispatcher's send fails once the last
+/// worker has gone.
 fn recv_checked_recording_wait<T>(
     rx: &std::sync::mpsc::Receiver<T>,
     cancel: &crate::host::Cancel,
@@ -755,7 +735,7 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
             gr_scratch: Vec::new(),
             state: worker_init(),
         },
-        |local: &mut DecodeLocal<S>, raw: &[u8]| {
+        |local: &mut DecodeLocal<S>, _position, raw: &[u8]| {
             let mut buf =
                 crate::blob::pool_get(Some(&local.pool), raw.len() * DECOMPRESS_EXPANSION_GUESS);
             crate::blob::decompress_blob_raw(raw, &mut buf)?;
@@ -810,7 +790,7 @@ fn run_unordered_per_blob<L, R: Send>(
     schedule: &[ScheduledBlob],
     threads: Option<usize>,
     local: impl Fn() -> L + Sync,
-    work: impl Fn(&mut L, &[u8]) -> Result<R> + Sync,
+    work: impl Fn(&mut L, usize, &[u8]) -> Result<R> + Sync,
     mut merge: impl FnMut(usize, R) -> std::ops::ControlFlow<()>,
     host: &crate::host::Host,
     metrics: &UnorderedPoolMetrics,
@@ -832,7 +812,10 @@ fn run_unordered_per_blob<L, R: Send>(
     );
     let shared_file = input.file();
 
-    let outcome = std::thread::scope(|scope| -> Result<()> {
+    // Declared before the scope, so it emits after the scope has joined the
+    // workers, on a return or an unwind alike.
+    let _emit = EmitOnDrop(metrics);
+    std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
             for (position, entry) in schedule.iter().enumerate() {
                 willneed.before_dispatch(shared_file, entry);
@@ -864,7 +847,7 @@ fn run_unordered_per_blob<L, R: Send>(
                     let r: crate::error::Result<R> = (|| {
                         read_buf.resize(entry.data_size(), 0);
                         file.read_exact_at(&mut read_buf, entry.data_offset())?;
-                        work_ref(&mut state, &read_buf)
+                        work_ref(&mut state, position, &read_buf)
                     })()
                     .map_err(|e| input.locate_blob(entry, e));
                     if crate::counters::send_recording_wait(
@@ -898,10 +881,17 @@ fn run_unordered_per_blob<L, R: Send>(
             }
         }
         Ok(())
-    });
-    // After the join, so every thread's waits are in; on failure too.
-    metrics.emit_all();
-    outcome
+    })
+}
+
+/// Emits an unordered metrics set when dropped: after a run's scope has
+/// joined its threads, whether the run returned or unwound.
+struct EmitOnDrop<'a>(&'a UnorderedPoolMetrics);
+
+impl Drop for EmitOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.emit_all();
+    }
 }
 
 /// One ordered-classify worker's thread-local state: its read buffer,
@@ -1049,7 +1039,7 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
     schedule: &[ScheduledBlob],
     threads: Option<usize>,
     worker_init: impl Fn() -> S + Send + Sync,
-    classify: impl Fn(&[u8], &mut S) -> crate::error::Result<R> + Send + Sync,
+    classify: impl Fn(usize, &[u8], &mut S) -> crate::error::Result<R> + Send + Sync,
     mut merge: impl FnMut(usize, R),
     host: &crate::host::Host,
 ) -> Result<()> {
@@ -1058,10 +1048,10 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
         schedule,
         threads,
         || (Vec::<u8>::new(), worker_init()),
-        |local: &mut (Vec<u8>, S), raw: &[u8]| {
+        |local: &mut (Vec<u8>, S), position, raw: &[u8]| {
             let (decompress_buf, state) = local;
             crate::blob::decompress_blob_raw(raw, decompress_buf)?;
-            classify(decompress_buf, state)
+            classify(position, decompress_buf, state)
         },
         |seq, r| {
             merge(seq, r);
@@ -1186,7 +1176,10 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
     let shared_file = input.file();
     let metrics = &UNORDERED_POOL_METRICS;
 
-    let outcome = std::thread::scope(|scope| -> Result<()> {
+    // Emits after the scope has joined, so every thread's waits are in; on
+    // a failure or an unwind too.
+    let _emit = EmitOnDrop(metrics);
+    std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
             for (position, entry) in schedule.iter().enumerate() {
                 willneed.before_dispatch(shared_file, entry);
@@ -1275,10 +1268,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
             merge(result?);
         }
         Ok(())
-    });
-    // After the join, so every thread's waits are in; on failure too.
-    metrics.emit_all();
-    outcome
+    })
 }
 
 #[cfg(test)]
@@ -1512,7 +1502,7 @@ mod tests {
             &schedule,
             Some(1),
             || (),
-            |_: &mut (), _: &[u8]| -> crate::Result<()> {
+            |_: &mut (), _: usize, _: &[u8]| -> crate::Result<()> {
                 std::thread::sleep(std::time::Duration::from_millis(2));
                 Ok(())
             },
@@ -1685,7 +1675,9 @@ mod tests {
             &schedule[3..4],
             Some(1),
             || (),
-            |_bytes, ()| -> crate::Result<()> { Err(crate::Error::invalid_data("forced failure")) },
+            |_position, _bytes, ()| -> crate::Result<()> {
+                Err(crate::Error::invalid_data("forced failure"))
+            },
             |_, ()| {},
             &host,
         )

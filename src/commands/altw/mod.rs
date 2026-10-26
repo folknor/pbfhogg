@@ -912,7 +912,7 @@ fn collect_way_referenced_node_ids(
         &schedule,
         None,
         || (Vec::<i64>::new(), Vec::<(usize, usize)>::new()),
-        |decompressed, (refs_buf, group_starts)| {
+        |_position, decompressed, (refs_buf, group_starts)| {
             let mut refs_vec: Vec<i64> = Vec::new();
             crate::scan::way::scan_way_refs(
                 decompressed,

@@ -165,7 +165,15 @@ fn plan_merge(
         )?;
     }
 
+    // MERGEPBF_START/END span both passes, from here (after the descriptor
+    // admission, the pins and the indexdata probes) to the writer's flush
+    // (before publication). Inside it MERGEPBF_PASS1 spans the index walk
+    // and the plan, MERGEPBF_PASS2 the rest, with MERGEPBF_WRITE_LOOP (the
+    // ordered write and the overlap sweeps beside it, the pool's join
+    // included) and MERGEPBF_FLUSH (the writer draining) nested in it, as
+    // sort's SORT_* phases are.
     crate::debug::emit_marker("MERGEPBF_START");
+    crate::debug::emit_marker("MERGEPBF_PASS1_START");
     crate::host::diag!(
         host.diagnostics,
         Progress,
@@ -226,6 +234,10 @@ fn plan_merge(
             plan.omitted
         );
     }
+    crate::debug::emit_counter("cat_dedupe_blobs_total", plan.blobs_total());
+    crate::debug::emit_counter("cat_dedupe_blobs_omitted", plan.omitted);
+    crate::debug::emit_counter("cat_dedupe_overlap_runs", plan.runs.len());
+    crate::debug::emit_marker("MERGEPBF_PASS1_END");
 
     Ok(MergePlan {
         inputs: pins,
@@ -251,6 +263,7 @@ fn write_merge(
         plan,
     } = merge;
 
+    crate::debug::emit_marker("MERGEPBF_PASS2_START");
     crate::host::diag!(
         host.diagnostics,
         Progress,
@@ -270,6 +283,7 @@ fn write_merge(
         writer_from_header_bytes(output, opts.compression, &header.bytes, opts.backend, host)?;
 
     let sources = blob_merge::open_sources(inputs)?;
+    crate::debug::emit_marker("MERGEPBF_WRITE_LOOP_START");
     let counts = blob_merge::write_plan(
         &plan,
         &sources,
@@ -278,7 +292,21 @@ fn write_merge(
         opts.backend.supports_copy_range(),
         host,
     )?;
+    crate::debug::emit_marker("MERGEPBF_WRITE_LOOP_END");
+    // Input blobs, not output blocks: a rewritten blob is counted once
+    // however many runs its kinds joined, and a run emits its own blocks.
+    crate::debug::emit_counter("cat_dedupe_blobs_passthrough", counts.blobs_passthrough);
+    crate::debug::emit_counter("cat_dedupe_blobs_rewritten", counts.blobs_rewritten);
+    crate::debug::emit_counter("cat_dedupe_copy_range_calls", counts.copy_range_calls);
+    crate::debug::emit_counter(
+        "cat_dedupe_copy_range_coalesced",
+        counts.copy_range_coalesced,
+    );
+    crate::debug::emit_counter("cat_dedupe_duplicates_removed", counts.duplicates_removed);
+    crate::debug::emit_marker("MERGEPBF_FLUSH_START");
     writer.flush()?;
+    crate::debug::emit_marker("MERGEPBF_FLUSH_END");
+    crate::debug::emit_marker("MERGEPBF_PASS2_END");
     crate::debug::emit_marker("MERGEPBF_END");
     Ok(MergePbfStats {
         nodes: counts.nodes,

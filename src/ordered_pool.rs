@@ -5,8 +5,9 @@
 //! Every pool that hands results to its caller in schedule order runs here
 //! (classify's ordered phase, renumber's rewrite stages, extract, tags-filter
 //! pass 2, altw passthrough and stage 4, ...), or, where its work is not one
-//! result per task (`commands::blob_merge`'s streamed overlap runs), shares
-//! the admission gate. The read pipeline (`read::pipeline`) is the deliberate
+//! result per task but a stream of them (`commands::blob_merge`'s overlap
+//! runs), on [`run_ordered_streams`] (see "Streamed runs" below). The read
+//! pipeline (`read::pipeline`) is the deliberate
 //! exception: its permit rides with each decoded item and is released when
 //! the item is delivered or dropped, which fits rayon tasks and filtered
 //! items, and it is already a hard bound.
@@ -67,6 +68,53 @@
 //! blocked sending into a full result channel, and the consumer blocked on
 //! an empty one. These are `*_wait_ns` counters for `brokkr sidecar
 //! --stalls`, separate from the per-site [`Waits`] timers a pool inherited.
+//!
+//! # Streamed runs
+//!
+//! [`run_ordered_streams`] runs tasks that each emit any number of items
+//! followed by one terminal, and hands the consumer every item of task `k`
+//! before any of task `k + 1`, streaming: a task's items reach the consumer
+//! while it is still running. Each task has its own channel of `depth`
+//! messages, so a task the consumer is not reading yet can only run `depth`
+//! messages ahead; a shared channel would let later tasks fill it while the
+//! consumer waits on the head. The admission gate does not fit: a worker
+//! would claim a task whose channel the consumer must already hold, and
+//! publishing per-task senders through a second shared table needs its own
+//! closure protocol. So the consumer dispatches instead:
+//!
+//! - It issues task `k` by making its channel, keeping the receiver (in task
+//!   order) and queueing `(k, sender)` on a FIFO job queue. It issues the
+//!   first `window` tasks up front and task `k + window` once it has
+//!   finished with task `k`, and drops the queue's sender after the last
+//!   issue. At most `window` tasks are issued and unfinished, so the queue
+//!   (capacity `window`) never refuses an issue, and at most `window x
+//!   depth` messages are buffered, plus one blocked send per worker.
+//! - Workers take jobs FIFO, run the task, send its items and then exactly
+//!   one terminal (`Ok(end)` or the task's error).
+//! - Progress: job `k` is queued before every later job and taken first, so
+//!   while the consumer waits on task `k` its worker is running it or the
+//!   next free worker will take it, and no worker waits on any task but its
+//!   own.
+//! - A worker that dies holding task `k`'s sender drops it, which the
+//!   consumer sees as a disconnect without a terminal; if every worker
+//!   dies, the job queue's receiver goes and the queued senders with it.
+//! - Failures surface in task order: `before_task(k)` first, then an item
+//!   write error, then task `k`'s terminal, with cancellation checked before
+//!   and after every receive and a worker panic re-raised at the join. A
+//!   failing task does not stop the issue of later ones (there is no claim
+//!   to stop): until the consumer reaches it, up to a window of later tasks
+//!   may start, speculatively.
+//! - Any return or unwind of the consumer side drops every receiver and the
+//!   queue's sender before the join, which fails blocked sends and closes
+//!   the queue, and sets an abandonment flag workers check before taking a
+//!   job and that [`Emitter::abandoned`] exposes to long tasks. The flag
+//!   wakes nobody; the dropped channel ends do. A worker unwinding sets it
+//!   too.
+//!
+//! A streamed run records the result send and receive waits above, and two
+//! counters of its own for the job queue (`ordered_pool_job_lock_wait_ns`,
+//! `ordered_pool_job_recv_wait_ns`); it never records `window_wait_ns`,
+//! since no worker there holds a task outside the window.
 
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -109,14 +157,34 @@ crate::counters::counter_set! {
         window_parks,
         /// A worker blocked sending its result into a full result channel:
         /// the consumer behind the workers. Recorded also when the blocked
-        /// send ends because the consumer went away.
+        /// send ends because the consumer went away. In a streamed run the
+        /// channel is the task's own and the message an item or the task's
+        /// terminal.
         result_send_wait_ns => "ordered_pool_result_send_wait_ns",
         result_send_blocks,
         /// The consumer blocked on an empty result channel: idle for want of
         /// a finished task (workers, or a wait they are parked on, behind the
-        /// consumer).
+        /// consumer). In a streamed run, idle on the head task's own channel
+        /// for its next item or its terminal (the head task's worker behind
+        /// the consumer).
         result_recv_wait_ns => "ordered_pool_result_recv_wait_ns",
         result_recv_blocks,
+        /// Streamed runs only ([`run_ordered_streams`]): a worker queued on
+        /// the job receiver's mutex behind a peer holding it. The holder
+        /// keeps the lock across its receive, so while the queue is empty
+        /// every other idle worker queues here: this is roughly
+        /// `ordered_pool_job_recv_wait_ns` times the idle peers, plus the
+        /// mutex's own cost, which is all of it only while the receive wait
+        /// stays near zero. The two together are worker idle time for want
+        /// of an issued task.
+        job_lock_wait_ns => "ordered_pool_job_lock_wait_ns",
+        job_lock_blocks,
+        /// Streamed runs only: a worker holding the job receiver blocked on
+        /// an empty job queue, for want of an issued task (the window full
+        /// behind the consumer, or the consumer still issuing the first
+        /// window). Not an admission wait: these workers hold no task.
+        job_recv_wait_ns => "ordered_pool_job_recv_wait_ns",
+        job_recv_blocks,
     }
 }
 
@@ -152,7 +220,7 @@ pub(crate) fn default_window(workers: usize) -> NonZeroUsize {
 /// never the wait predicate. A worker can pass that check and claim just
 /// after another sets it; the claim still goes through [`OrderedGate::admit`],
 /// which judges it under the lock, so the race is harmless.
-pub(crate) struct OrderedGate {
+struct OrderedGate {
     state: Mutex<GateState>,
     cv: Condvar,
     stopped: AtomicBool,
@@ -171,7 +239,7 @@ struct GateState {
 }
 
 impl OrderedGate {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         Self {
             state: Mutex::new(GateState {
                 consumed: 0,
@@ -190,27 +258,27 @@ impl OrderedGate {
     }
 
     /// Lock-free: claiming has stopped or the run is closed.
-    pub(crate) fn is_stopped(&self) -> bool {
+    fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
     }
 
     /// A task failed: stop new claims, keep admitting the claimed ones
     /// inside the window.
-    pub(crate) fn stop_claims(&self) {
+    fn stop_claims(&self) {
         self.stopped.store(true, Ordering::Release);
         self.lock().stop_claims = true;
         self.cv.notify_all();
     }
 
     /// The consumer is gone: admit nothing more.
-    pub(crate) fn close(&self) {
+    fn close(&self) {
         self.stopped.store(true, Ordering::Release);
         self.lock().closed = true;
         self.cv.notify_all();
     }
 
     /// The consumer has finished with every task below `consumed`.
-    pub(crate) fn advance(&self, consumed: usize) {
+    fn advance(&self, consumed: usize) {
         self.lock().consumed = consumed;
         self.cv.notify_all();
     }
@@ -222,7 +290,7 @@ impl OrderedGate {
     /// With `metrics`, a call that has to wait adds its whole wait, across
     /// every wakeup until it returns either way, to `window_wait_ns`; a
     /// call that can answer at once touches no clock.
-    pub(crate) fn admit(
+    fn admit(
         &self,
         position: usize,
         window: NonZeroUsize,
@@ -260,7 +328,7 @@ impl OrderedGate {
 /// installed before the first worker spawns, so every exit - a return, `?`,
 /// a panic, a failed spawn - wakes workers parked in [`OrderedGate::admit`].
 /// Dropping the result receiver alone only wakes workers parked in `send`.
-pub(crate) struct CloseOnDrop<'a>(pub(crate) &'a OrderedGate);
+struct CloseOnDrop<'a>(&'a OrderedGate);
 
 impl Drop for CloseOnDrop<'_> {
     fn drop(&mut self) {
@@ -269,9 +337,9 @@ impl Drop for CloseOnDrop<'_> {
 }
 
 /// Closes the gate if the holding thread unwinds, so the other workers stop
-/// claiming and a dispatcher or consumer parked on the gate wakes. Workers
+/// claiming and the ones parked on the gate wake. Workers
 /// install it before running any caller code (their local init included).
-pub(crate) struct CloseOnUnwind<'a>(pub(crate) &'a OrderedGate);
+struct CloseOnUnwind<'a>(&'a OrderedGate);
 
 impl Drop for CloseOnUnwind<'_> {
     fn drop(&mut self) {
@@ -730,6 +798,320 @@ fn recv_counted<M>(
             received
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Streamed runs
+// ---------------------------------------------------------------------------
+
+/// A message on one streamed task's channel: items, then exactly one
+/// terminal. A channel that closes without the terminal is a worker that
+/// died mid-task, never a shorter task.
+enum StreamMsg<T, E> {
+    Item(T),
+    End(crate::Result<E>),
+}
+
+/// The calling thread's side of a [`run_ordered_streams`] run. Called in
+/// task order: `before_task(k)`, every item of task `k`, `finish_task(k)`.
+pub(crate) trait StreamConsumer<T, E> {
+    /// Before task `task`'s first item, even when that task failed, so output
+    /// that belongs before it is written (and can fail) in its true position.
+    fn before_task(&mut self, task: usize) -> crate::Result<()> {
+        let _ = task;
+        Ok(())
+    }
+
+    /// One item of task `task`, in the order the task emitted it.
+    fn item(&mut self, task: usize, item: T) -> crate::Result<()>;
+
+    /// Task `task` ended successfully with `end`.
+    fn finish_task(&mut self, task: usize, end: E) -> crate::Result<()>;
+}
+
+/// How a streamed run is sized.
+#[derive(Clone, Copy)]
+pub(crate) struct StreamConfig<'a> {
+    /// Tasks issued and not yet finished with, at most.
+    pub(crate) window: NonZeroUsize,
+    /// Messages one task's channel holds (its terminal included) before its
+    /// worker blocks.
+    pub(crate) depth: usize,
+    pub(crate) cancel: &'a crate::host::Cancel,
+}
+
+/// A streamed task's way out: its items go to the consumer through it.
+/// Used on the task's own worker thread only.
+pub(crate) struct Emitter<'a, T, E> {
+    tx: std::sync::mpsc::SyncSender<StreamMsg<T, E>>,
+    abandoned: &'a AtomicBool,
+    metrics: &'a OrderedPoolMetrics,
+    /// A send failed: the consumer is gone. Latched, so a task that ignores
+    /// the error still ends its worker.
+    gone: std::cell::Cell<bool>,
+}
+
+impl<T, E> Emitter<'_, T, E> {
+    /// Hand one item to the consumer, blocking while the task's channel is
+    /// full. Fails once the consumer is gone.
+    pub(crate) fn send(&self, item: T) -> crate::Result<()> {
+        if self.gone.get() || !self.deliver(StreamMsg::Item(item)) {
+            return Err(Error::internal(
+                "ordered pool: the consumer of a streamed task is gone",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The run is being abandoned (the consumer has returned or a thread
+    /// unwound), or a send already failed: nothing this task produces from
+    /// here can be delivered, so a long task may stop early.
+    pub(crate) fn abandoned(&self) -> bool {
+        self.gone.get() || self.abandoned.load(Ordering::Acquire)
+    }
+
+    /// Send `msg`, recording a blocked send; `false` (and latched) when the
+    /// consumer is gone.
+    fn deliver(&self, msg: StreamMsg<T, E>) -> bool {
+        let sent = match self.tx.try_send(msg) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TrySendError::Full(msg)) => {
+                self.metrics
+                    .result_send_blocks
+                    .fetch_add(1, Ordering::Relaxed);
+                let blocked = crate::counters::Stopwatch::start();
+                let sent = self.tx.send(msg).is_ok();
+                blocked.record_ns(&self.metrics.result_send_wait_ns);
+                sent
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+        };
+        if !sent {
+            self.gone.set(true);
+        }
+        sent
+    }
+}
+
+/// Sets the abandonment flag when dropped: the consumer side's guard, so
+/// every return and unwind of it raises the flag.
+struct AbandonOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for AbandonOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Sets the abandonment flag if the holding worker unwinds.
+struct AbandonOnUnwind<'a>(&'a AtomicBool);
+
+impl Drop for AbandonOnUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// A queued streamed task: its index and the sender of its channel.
+type StreamJob<T, E> = (usize, std::sync::mpsc::SyncSender<StreamMsg<T, E>>);
+
+/// A worker's next job, or `Err` once the queue is closed and empty. Waiting
+/// for the lock behind a peer and on an empty queue are recorded apart, each
+/// only when it blocks (and tallied, so a test can wait for it to begin).
+/// The mutex guards nothing a panic could leave half updated, so a poisoned
+/// one is used as is.
+fn next_job<T, E>(
+    jobs: &std::sync::Mutex<std::sync::mpsc::Receiver<StreamJob<T, E>>>,
+    metrics: &OrderedPoolMetrics,
+) -> Result<StreamJob<T, E>, std::sync::mpsc::RecvError> {
+    let guard = match jobs.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            metrics.job_lock_blocks.fetch_add(1, Ordering::Relaxed);
+            let blocked = crate::counters::Stopwatch::start();
+            let guard = jobs.lock().unwrap_or_else(PoisonError::into_inner);
+            blocked.record_ns(&metrics.job_lock_wait_ns);
+            guard
+        }
+    };
+    match guard.try_recv() {
+        Ok(job) => Ok(job),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(std::sync::mpsc::RecvError),
+        Err(std::sync::mpsc::TryRecvError::Empty) => {
+            metrics.job_recv_blocks.fetch_add(1, Ordering::Relaxed);
+            let blocked = crate::counters::Stopwatch::start();
+            let job = guard.recv();
+            blocked.record_ns(&metrics.job_recv_wait_ns);
+            job
+        }
+    }
+}
+
+/// Run `work` for every task in `0..n_tasks` on `workers` worker threads,
+/// each task emitting items through its [`Emitter`] and ending with
+/// `Ok(end)` or an error, and hand every item to `consumer` on the calling
+/// thread in task order, task by task. See the module docs ("Streamed runs")
+/// for the protocol, the memory bound and the failure order.
+///
+/// `local` builds each worker's state on its own thread, with its index.
+pub(crate) fn run_ordered_streams<L, T, E, I, W, C>(
+    n_tasks: usize,
+    workers: usize,
+    config: StreamConfig<'_>,
+    local: I,
+    work: W,
+    consumer: &mut C,
+) -> crate::Result<()>
+where
+    T: Send,
+    E: Send,
+    I: Fn(usize) -> L + Sync,
+    W: Fn(&mut L, usize, &Emitter<'_, T, E>) -> crate::Result<E> + Sync,
+    C: StreamConsumer<T, E>,
+{
+    run_ordered_streams_in(
+        n_tasks,
+        workers,
+        config,
+        local,
+        work,
+        consumer,
+        &ORDERED_POOL_METRICS,
+    )
+}
+
+/// [`run_ordered_streams`] recording into `metrics`: production passes the
+/// process set, a test its own.
+fn run_ordered_streams_in<L, T, E, I, W, C>(
+    n_tasks: usize,
+    workers: usize,
+    config: StreamConfig<'_>,
+    local: I,
+    work: W,
+    consumer: &mut C,
+    metrics: &OrderedPoolMetrics,
+) -> crate::Result<()>
+where
+    T: Send,
+    E: Send,
+    I: Fn(usize) -> L + Sync,
+    W: Fn(&mut L, usize, &Emitter<'_, T, E>) -> crate::Result<E> + Sync,
+    C: StreamConsumer<T, E>,
+{
+    let StreamConfig {
+        window,
+        depth,
+        cancel,
+    } = config;
+    cancel.check()?;
+    if n_tasks == 0 {
+        return Ok(());
+    }
+    if workers == 0 {
+        return Err(Error::internal("ordered pool started with no workers"));
+    }
+    let abandoned = AtomicBool::new(false);
+    // Declared before the scope, so it drops after the scope has joined the
+    // workers, on a return or an unwind alike.
+    let _emit = EmitOnDrop(metrics);
+
+    std::thread::scope(|scope| -> crate::Result<()> {
+        // Every channel end below is a local of this closure, so any return
+        // drops it before the scope joins the workers.
+        let (job_tx, job_rx) = std::sync::mpsc::sync_channel::<StreamJob<T, E>>(window.get());
+        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+        let mut job_tx = Some(job_tx);
+        let mut pending: std::collections::VecDeque<std::sync::mpsc::Receiver<StreamMsg<T, E>>> =
+            std::collections::VecDeque::with_capacity(window.get());
+        let mut next_to_issue = 0_usize;
+        let mut issue = |pending: &mut std::collections::VecDeque<_>, next_to_issue: &mut usize| {
+            let (tx, rx) = std::sync::mpsc::sync_channel(depth);
+            pending.push_back(rx);
+            if let Some(job_tx) = &job_tx {
+                // Never full (see the module docs). Refused only once every
+                // worker is gone, which drops this task's sender with the
+                // job, so the consumer sees it disconnect.
+                job_tx.send((*next_to_issue, tx)).ok();
+            }
+            *next_to_issue += 1;
+            if *next_to_issue == n_tasks {
+                job_tx = None;
+            }
+        };
+        while next_to_issue < n_tasks.min(window.get()) {
+            issue(&mut pending, &mut next_to_issue);
+        }
+        // Declared after every channel end, so it drops first: the flag is
+        // up before the receivers and the queue's sender go.
+        let _abandon = AbandonOnDrop(&abandoned);
+
+        for worker in 0..workers {
+            let jobs = std::sync::Arc::clone(&job_rx);
+            let (work, local, abandoned) = (&work, &local, &abandoned);
+            scope.spawn(move || {
+                // Before any caller code, and dropped after the local state.
+                let _unwind = AbandonOnUnwind(abandoned);
+                let mut local = local(worker);
+                loop {
+                    if abandoned.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let job = next_job(&jobs, metrics);
+                    let Ok((task, tx)) = job else { break };
+                    let emitter = Emitter {
+                        tx,
+                        abandoned,
+                        metrics,
+                        gone: std::cell::Cell::new(false),
+                    };
+                    let end = work(&mut local, task, &emitter);
+                    if emitter.gone.get() || !emitter.deliver(StreamMsg::End(end)) {
+                        break;
+                    }
+                }
+            });
+        }
+        // Workers hold the only job receivers now, so their exit drops any
+        // task sender still queued.
+        drop(job_rx);
+
+        for task in 0..n_tasks {
+            cancel.check()?;
+            consumer.before_task(task)?;
+            let rx = pending
+                .front()
+                .ok_or_else(|| Error::internal("ordered pool: a streamed task was never issued"))?;
+            loop {
+                cancel.check()?;
+                let msg = recv_counted(rx, metrics);
+                cancel.check()?;
+                match msg {
+                    Ok(StreamMsg::Item(item)) => consumer.item(task, item)?,
+                    Ok(StreamMsg::End(Ok(end))) => {
+                        consumer.finish_task(task, end)?;
+                        break;
+                    }
+                    Ok(StreamMsg::End(Err(e))) => return Err(e),
+                    Err(_) => {
+                        // Only a worker that died holding the task gets
+                        // here; its panic takes precedence at the join.
+                        return Err(Error::internal(format!(
+                            "ordered pool: a worker ended streamed task {task} of {n_tasks} \
+                             without finishing it"
+                        )));
+                    }
+                }
+            }
+            pending.pop_front();
+            if next_to_issue < n_tasks {
+                issue(&mut pending, &mut next_to_issue);
+            }
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1302,7 +1684,366 @@ mod tests {
                 "ordered_pool_window_wait_ns",
                 "ordered_pool_result_send_wait_ns",
                 "ordered_pool_result_recv_wait_ns",
+                "ordered_pool_job_lock_wait_ns",
+                "ordered_pool_job_recv_wait_ns",
             ]
+        );
+    }
+
+    // ---- streamed runs ----------------------------------------------------
+
+    /// Streamed consumer recording everything it sees, failing where told.
+    #[derive(Default)]
+    struct Recorder {
+        items: Vec<(usize, usize)>,
+        ends: Vec<(usize, usize)>,
+        before: Vec<usize>,
+        fail_before: Option<usize>,
+        fail_item: Option<(usize, usize)>,
+    }
+
+    impl StreamConsumer<usize, usize> for Recorder {
+        fn before_task(&mut self, task: usize) -> crate::Result<()> {
+            if self.fail_before == Some(task) {
+                return Err(Error::internal(format!("before {task} failed")));
+            }
+            self.before.push(task);
+            Ok(())
+        }
+        fn item(&mut self, task: usize, item: usize) -> crate::Result<()> {
+            if self.fail_item == Some((task, item)) {
+                return Err(Error::internal(format!("write {task}/{item} failed")));
+            }
+            self.items.push((task, item));
+            Ok(())
+        }
+        fn finish_task(&mut self, task: usize, end: usize) -> crate::Result<()> {
+            self.ends.push((task, end));
+            Ok(())
+        }
+    }
+
+    fn streams_in(
+        n: usize,
+        workers: usize,
+        window: usize,
+        depth: usize,
+        metrics: &OrderedPoolMetrics,
+        work: impl Fn(usize, &Emitter<'_, usize, usize>) -> crate::Result<usize> + Sync,
+        consumer: &mut Recorder,
+    ) -> crate::Result<()> {
+        run_ordered_streams_in(
+            n,
+            workers,
+            StreamConfig {
+                window: NonZeroUsize::new(window).unwrap(),
+                depth,
+                cancel: &crate::host::Cancel::new(),
+            },
+            |_| (),
+            |(), task, emitter| work(task, emitter),
+            consumer,
+            metrics,
+        )
+    }
+
+    /// Task `task` emits `task % 7` items then ends with its item count.
+    fn emit_some(task: usize, emitter: &Emitter<'_, usize, usize>) -> crate::Result<usize> {
+        for i in 0..task % 7 {
+            emitter.send(i)?;
+        }
+        Ok(task % 7)
+    }
+
+    /// Every item of every task, in task order then emission order, with
+    /// more tasks than the window and items past the channel depth.
+    #[test]
+    fn streams_deliver_every_item_in_task_order() {
+        let consumer = within_deadline(|| {
+            let mut consumer = Recorder::default();
+            streams_in(
+                500,
+                4,
+                8,
+                2,
+                &OrderedPoolMetrics::new(),
+                emit_some,
+                &mut consumer,
+            )
+            .unwrap();
+            consumer
+        });
+        let expected: Vec<(usize, usize)> = (0..500)
+            .flat_map(|t| (0..t % 7).map(move |i| (t, i)))
+            .collect();
+        assert_eq!(consumer.items, expected);
+        assert_eq!(
+            consumer.ends,
+            (0..500).map(|t| (t, t % 7)).collect::<Vec<_>>()
+        );
+        assert_eq!(consumer.before, (0..500).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn streams_with_zero_tasks_start_nothing() {
+        let mut consumer = Recorder::default();
+        streams_in(
+            0,
+            0,
+            1,
+            1,
+            &OrderedPoolMetrics::new(),
+            emit_some,
+            &mut consumer,
+        )
+        .unwrap();
+        assert!(consumer.before.is_empty());
+    }
+
+    /// A later task failing first does not win: the reported error is the
+    /// lowest failing task's, after every item of the tasks before it.
+    #[test]
+    fn a_streamed_failure_surfaces_in_task_order() {
+        let (err, consumer) = within_deadline(|| {
+            let mut consumer = Recorder::default();
+            let err = streams_in(
+                200,
+                4,
+                8,
+                2,
+                &OrderedPoolMetrics::new(),
+                |task, emitter| {
+                    if task == 20 {
+                        std::thread::sleep(Duration::from_millis(20));
+                        return Err(Error::internal("task 20 failed"));
+                    }
+                    if task == 23 {
+                        return Err(Error::internal("task 23 failed"));
+                    }
+                    emit_some(task, emitter)
+                },
+                &mut consumer,
+            )
+            .unwrap_err();
+            (err, consumer)
+        });
+        assert_eq!(err.to_string(), "task 20 failed");
+        assert_eq!(consumer.ends.len(), 20, "every task below 20 finished");
+        assert_eq!(consumer.before.last(), Some(&20));
+    }
+
+    /// `before_task` runs ahead of a failed task, and an item's write error
+    /// ahead of its task's own failure.
+    #[test]
+    fn streamed_consumer_failures_take_their_position() {
+        let err = within_deadline(|| {
+            let mut consumer = Recorder {
+                fail_before: Some(5),
+                ..Recorder::default()
+            };
+            streams_in(
+                50,
+                3,
+                6,
+                1,
+                &OrderedPoolMetrics::new(),
+                |task, emitter| {
+                    if task == 5 {
+                        return Err(Error::internal("task 5 failed"));
+                    }
+                    emit_some(task, emitter)
+                },
+                &mut consumer,
+            )
+            .unwrap_err()
+        });
+        assert_eq!(err.to_string(), "before 5 failed");
+
+        let err = within_deadline(|| {
+            let mut consumer = Recorder {
+                fail_item: Some((6, 2)),
+                ..Recorder::default()
+            };
+            streams_in(
+                50,
+                3,
+                6,
+                1,
+                &OrderedPoolMetrics::new(),
+                |task, emitter| {
+                    emit_some(task, emitter)?;
+                    if task == 6 {
+                        return Err(Error::internal("task 6 failed"));
+                    }
+                    Ok(0)
+                },
+                &mut consumer,
+            )
+            .unwrap_err()
+        });
+        assert_eq!(err.to_string(), "write 6/2 failed");
+    }
+
+    /// The consumer failing while workers are blocked on full channels ends
+    /// the run promptly, and a long task sees the run abandoned.
+    #[test]
+    fn a_streamed_consumer_error_releases_and_abandons_workers() {
+        let (err, send_wait, saw_abandoned) = within_deadline(|| {
+            let metrics = OrderedPoolMetrics::new();
+            let saw_abandoned = AtomicBool::new(false);
+            let mut consumer = Recorder {
+                fail_item: Some((0, 0)),
+                ..Recorder::default()
+            };
+            let err = streams_in(
+                40,
+                4,
+                8,
+                1,
+                &metrics,
+                |task, emitter| {
+                    if task == 0 {
+                        // Hold the consumer's first item back until another
+                        // task has blocked on its full channel.
+                        assert!(eventually(|| metrics
+                            .result_send_blocks
+                            .load(Ordering::Relaxed)
+                            > 0));
+                        emitter.send(0)?;
+                        return Ok(1);
+                    }
+                    if task == 1 {
+                        // A long task: it stops once the run is abandoned.
+                        assert!(eventually(|| emitter.abandoned()));
+                        saw_abandoned.store(true, Ordering::SeqCst);
+                        return Ok(0);
+                    }
+                    for i in 0..10 {
+                        emitter.send(i)?;
+                    }
+                    Ok(10)
+                },
+                &mut consumer,
+            )
+            .unwrap_err();
+            (
+                err,
+                metrics.result_send_wait_ns.load(Ordering::Relaxed),
+                saw_abandoned.load(Ordering::SeqCst),
+            )
+        });
+        assert_eq!(err.to_string(), "write 0/0 failed");
+        assert!(send_wait > 0, "the blocked send recorded no wait");
+        assert!(saw_abandoned, "the long task never saw the run abandoned");
+    }
+
+    /// A worker panic surfaces at the join rather than hanging the consumer
+    /// on the task the dead worker held.
+    #[test]
+    fn a_streamed_worker_panic_surfaces_instead_of_hanging() {
+        let panicked = within_deadline(|| {
+            std::panic::catch_unwind(|| {
+                let mut consumer = Recorder::default();
+                streams_in(
+                    300,
+                    4,
+                    8,
+                    2,
+                    &OrderedPoolMetrics::new(),
+                    |task, emitter| {
+                        assert!(task != 30, "injected worker panic");
+                        emit_some(task, emitter)
+                    },
+                    &mut consumer,
+                )
+            })
+            .is_err()
+        });
+        assert!(panicked, "a worker panic must propagate, not be swallowed");
+    }
+
+    /// Every worker panicking: the queued tasks' senders go with the job
+    /// queue, so the consumer is not left waiting on one.
+    #[test]
+    fn every_streamed_worker_panicking_does_not_hang() {
+        let panicked = within_deadline(|| {
+            std::panic::catch_unwind(|| {
+                let mut consumer = Recorder::default();
+                streams_in(
+                    100,
+                    2,
+                    8,
+                    2,
+                    &OrderedPoolMetrics::new(),
+                    |_, _| panic!("every worker panics"),
+                    &mut consumer,
+                )
+            })
+            .is_err()
+        });
+        assert!(panicked);
+    }
+
+    /// A consumer idle on the head task records its receive wait; with a
+    /// window of one, the idle workers block on the empty job queue (one
+    /// holding the lock) and behind it on the lock, each recorded apart.
+    /// Task 0 holds until all three blocks have begun.
+    #[test]
+    fn streamed_waits_are_recorded_where_they_block() {
+        let (blocked, recv_wait, job_recv_wait, job_lock_wait, window_wait) =
+            within_deadline(|| {
+                let metrics = OrderedPoolMetrics::new();
+                let blocked = AtomicBool::new(false);
+                let mut consumer = Recorder::default();
+                streams_in(
+                    3,
+                    4,
+                    1,
+                    2,
+                    &metrics,
+                    |task, emitter| {
+                        if task == 0 {
+                            blocked.store(
+                                eventually(|| {
+                                    metrics.result_recv_blocks.load(Ordering::Relaxed) > 0
+                                        && metrics.job_recv_blocks.load(Ordering::Relaxed) > 0
+                                        && metrics.job_lock_blocks.load(Ordering::Relaxed) > 0
+                                }),
+                                Ordering::SeqCst,
+                            );
+                        }
+                        emit_some(task, emitter)
+                    },
+                    &mut consumer,
+                )
+                .unwrap();
+                (
+                    blocked.load(Ordering::SeqCst),
+                    metrics.result_recv_wait_ns.load(Ordering::Relaxed),
+                    metrics.job_recv_wait_ns.load(Ordering::Relaxed),
+                    metrics.job_lock_wait_ns.load(Ordering::Relaxed),
+                    metrics.window_wait_ns.load(Ordering::Relaxed),
+                )
+            });
+        assert!(
+            blocked,
+            "the consumer and the idle workers never all blocked"
+        );
+        assert!(
+            recv_wait > 0,
+            "the consumer's wait on the head was not recorded"
+        );
+        assert!(
+            job_recv_wait > 0,
+            "the worker on the empty job queue recorded no wait"
+        );
+        assert!(
+            job_lock_wait > 0,
+            "the workers behind the job lock recorded no wait"
+        );
+        assert_eq!(
+            window_wait, 0,
+            "a streamed run never records an admission wait"
         );
     }
 }

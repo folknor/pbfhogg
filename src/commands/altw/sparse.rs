@@ -280,7 +280,7 @@ pub(super) fn build_node_index_sparse(
         &schedule,
         None,
         || -> Scratch { (Vec::new(), Vec::new()) },
-        |decompressed, (tuples, group_starts)| -> crate::error::Result<()> {
+        |_position, decompressed, (tuples, group_starts)| -> crate::error::Result<()> {
             tuples.clear();
             crate::scan::node::extract_node_tuples(decompressed, tuples, group_starts)?;
             let mut blob_stored: u64 = 0;

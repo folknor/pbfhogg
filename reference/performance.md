@@ -633,7 +633,15 @@ suite; the rest still carry their older commit in the Notes column.
 > engine (`src/commands/blob_merge.rs`): pass 1 is the `HeaderWalker`
 > walk, passthrough is coalesced `copy_file_range`, and each overlap
 > group is swept on a worker thread with bounded streaming. **Unmeasured** -
-> the 133-minute row predates all three and needs a fresh cell.
+> the 133-minute row predates all three and needs a fresh cell. A fresh
+> cell has more to read than that row: `MERGEPBF_*` now nests
+> `MERGEPBF_PASS1_*`, `MERGEPBF_PASS2_*`, `MERGEPBF_WRITE_LOOP_*` and
+> `MERGEPBF_FLUSH_*`, the `cat_dedupe_*` counters give the plan's and the
+> write's blob, run and duplicate counts, and `--stalls` attributes pass 2:
+> `ordered_pool_result_recv` is the write loop waiting on a sweep,
+> `ordered_pool_result_send` a sweep waiting on the write loop, and
+> `ordered_pool_job_lock` plus `ordered_pool_job_recv` sweep workers idle
+> for want of an issued run.
 
 > **Renumber `+10 s` - CLOSED 2026-07-14, no regression.** The matched
 > `--bench 3` pair the flag asked for has run: HEAD **191.1 s**

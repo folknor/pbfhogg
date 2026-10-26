@@ -421,7 +421,7 @@ pub(super) fn try_extract_multi_single_pass(
             &candidate_schedule,
             None,
             worker_init,
-            |bytes, (columns, scratch)| {
+            |_position, bytes, (columns, scratch)| {
                 let eligible = dense_only_payload(bytes)?;
                 // What the decode path would do with this blob; a block it
                 // rejects must not be copied raw.

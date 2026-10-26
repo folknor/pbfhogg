@@ -456,7 +456,12 @@ the cargo `target/` dir, not the sort scratch path).
   the old `par_iter` was serial there.
   Workers read the pass-2 source by position instead of opening the input
   once per run. On already-sorted input (no runs) nothing starts and the
-  pass is the coalesced copy as before.
+  pass is the coalesced copy as before. Later (2026-10-26, unmeasured) the
+  runs moved onto the ordered pool engine's streamed entry point
+  (`ordered_pool::run_ordered_streams`): the write loop issues runs itself,
+  so the dispatcher thread, the admission gate and the order channel went,
+  with the same window and per-run depth, and pass 2 now records stall
+  counters (see "Worker-pool unification" below).
 
 ### Planet writer-side floor (storage-stack bound, not software)
 
@@ -1058,6 +1063,26 @@ measured, recorded so a fourth starts from them.
   send and receive waits (`ordered_pool_*_wait_ns`) for every ordered pool,
   the classify-ordered callers, altw stage 1 and extract included, which
   reported none before. Unmeasured.
+- **The last silent pools (2026-10-26).** Two kinds of pool still recorded
+  no wait. The merge engine behind `sort` and `cat --dedupe` streamed its
+  overlap runs through a hand-driven protocol beside the ordered engine (a
+  dispatcher thread at the shared admission gate, a `Mutex<Receiver>` job
+  queue, an order channel). It now runs on the engine's streamed entry
+  point, `run_ordered_streams`, where the consumer issues each task with its
+  own channel; its blocked sends and receives go to
+  `ordered_pool_result_send_wait_ns` and `_recv_wait_ns` (the write loop
+  waiting on a sweep is the receive), and its workers' wait for a job to
+  two counters of its own, `ordered_pool_job_lock_wait_ns` and
+  `_job_recv_wait_ns`, since a worker with no task is not parked at an
+  admission gate. A Denmark `cat --dedupe` of a file with itself (forced
+  run on bygg, not stored) showed the job lock wait at about the receive
+  wait times the idle peers, as the holder keeps the lock across its
+  receive. Extract simple's node and way classify phases were two
+  hand-built unordered pools; they now run on `run_unordered_per_blob`
+  (through `parallel_scan_blobs_raw`, whose work now gets the schedule
+  position) and record the `classify_unordered_*` set, and in exchange gain
+  the dispatcher's sliding `WILLNEED` advice the other classify pools have.
+  Unmeasured.
 
 ## Retired plan docs
 

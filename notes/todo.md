@@ -4,24 +4,11 @@
 
 Picked 2026-07-30, right after the 0.5.0 release.
 
-- [ ] **Release gate: instrumentation is per invocation, not per process**
-  (raised 2026-10-26). The release is gated on verifying pbfhogg used as a
-  library, which brokkr has never done: everything measured so far went
-  through the CLI, one command per process. That is what the `Host`
-  work of the last weeks serves. The stall counter sets
-  (`PIPELINE_METRICS`, `UNORDERED_POOL_METRICS`, and any later one) are
-  process-global statics that are never reset, so two library calls in
-  one process, concurrent or one after the other, mix their totals and
-  cannot be attributed to a call; that contradicts ADR-0016. The marker
-  FIFO is caller-armed and process-wide by design
-  (`debug::initialize_marker_fifo`), so the accumulators are the part to
-  fix. `8384fa29` rejected per-run instances because brokkr's `--stalls`
-  takes the maximum per counter name and assumes totals only grow, so
-  per-pass sets would report only the largest pass. The fix that keeps
-  those semantics: one metric set per invocation, carried on the `Host`,
-  accumulating across every pass of that invocation and emitted as
-  before, so a CLI run reports the same totals. Cost is threading the
-  set through every pool; nothing on normal input.
+- [ ] **Release gates for library use** (raised 2026-10-26): library use
+  verified by brokkr, per-invocation instrumentation, and cat's descriptor
+  admission for library callers. Tracked, with their open design
+  questions, in [notes/pre-release.md](pre-release.md) "Release gates",
+  together with the measurement campaign that comes before the release.
 
 - [ ] **GeoParquet export**
   ([notes/geoparquet-export.md](geoparquet-export.md)).
@@ -922,11 +909,21 @@ inside `src/write/uring_writer.rs` during the write-path bug hunt with
 compile-time and unit coverage only - the `Drop` teardown drain
 (`drain_best_effort`), the `NUM_BUFS <= 64` assertion against the six-bit
 mask in `ud_buf_idx`, and `OutputChunk::CopyRange` carrying an `Arc<File>`
-instead of a `RawFd`. Close the gap by running one `--io-uring` command on
-a host whose limit is raised; do not raise it from inside a work session,
-it is a host-configuration change. Full entry, with the other work the
-same limit blocks, under "Deferred with explicit triggers" at the top of
-this file.
+instead of a `RawFd`. The October 2026 hygiene drain added more
+with the same coverage: passthrough copies under io_uring read straight into
+the registered buffers through a `ReadSink` impl in `write/copy_range.rs`
+(`bd2de78d`), every pipelined backend delivers through the shared
+`pipeline::deliver_in_order` loop (`7abba0df`), the CopyRange loop accepts
+a short pread as progress (`1dd2ea09`), and the buffer pool is allocated
+after the output open (`ea17fd86`). Close the gap on a host whose limit is
+raised: `brokkr check --profile platform`, the ignored
+`sort_overlapping_blobs_uring` (see "Ignored tests"), and `--io-uring` runs
+that take a passthrough copy as well as fresh blocks (plain `cat`, sort, or
+apply-changes on its splice route), since a command writing only fresh
+blocks never reaches `ReadSink`. Do not raise the limit from inside a work
+session; it is a host-configuration change. Full entry, with the other work
+the same limit blocks, under "Deferred with explicit triggers" at the top
+of this file.
 
 ### 1.0 blockers (planet OOM or RSS-exceeds-ceiling)
 
@@ -1095,10 +1092,18 @@ Known to work, no performance question open, but not in the results DB:
     shared cache-line traffic. Planet-measured paths: needs its own A/B.
   - Every altw router publish takes a global `stats` mutex and the global
     `notify_mu`. Same caveat.
-  - Once measurement is allowed: read `classify_unordered_desc_lock_wait_ns`
-    against `classify_unordered_desc_recv_wait_ns` on a planet tags-filter
-    or extract run to settle the `Mutex<Receiver>` dispatch question
-    (`reference/performance-history.md`).
+  - The first bullet is a prerequisite of the altw cells in
+    [notes/pre-release.md](pre-release.md)'s measurement campaign, which
+    also carries the `Mutex<Receiver>` reading that used to be listed here.
+
+- [ ] **tags-filter walks the headers again for each later pass.** The
+  relation closure, the way dependencies and the pass-2 schedule each run
+  their own header walk where pass 1's walk could feed them all: repeated
+  work on a measured planet path, left alone when tags-filter adopted input
+  pinning (`0f64d8f4`) for a measured change of its own. Read altw sparse
+  P4 first (Roadmap, "four redundant header walks", built and reverted
+  twice): consolidating walks pays only where something evicts the headers
+  between them, and never sum per-phase walk durations.
 
 - [x] ~~**ALTW planet drift: confirm or dismiss (+10-17 % vs April).**~~
   **DISMISSED 2026-07-14 - drive state, not code.** The `--bench 3`
@@ -1363,12 +1368,23 @@ deferred ledger live in
   `cat` is the one command that turns such a file into a valid one, outside
   its hot standard paths (plain passthrough and indexdata generation stay as
   they are). It already plays that role for missing and partial indexdata,
-  and `cat --clean user` is ruled to skip resolving a user index it drops
-  (`notes/review-audit.md`, Slice C item 14). The project: decide which
-  refusals `cat` should recover from instead, under which flags, and how
-  each recovery is reported. First candidate: a repeated `Info` or
+  and `cat --clean user` skips resolving a user index it drops (ruled
+  2026-10-26, `cat_clean_user_rescues_a_bad_user_string_index`). The
+  project: decide which refusals `cat` should recover from instead, under
+  which flags, and how each recovery is reported. First candidate: a repeated `Info` or
   `DenseInfo` message, refused while the block is parsed, before any
   `--clean` applies, so `cat --clean` cannot rescue that file today.
+- [ ] **`check --ids --index` and `check --refs --index` lose the index
+  report on a partially indexed file** (found 2026-10-26, older than
+  `84f50b31`). `--ids --index` stops before printing the index report;
+  `--refs --index` computes it and exits without printing it. Plain
+  `check --index` reports the file as a violation, as intended. Noted on
+  `reference/indexdata-trust.md`; not fixed.
+- [ ] **A mislabelled row in the partial-index contract table** (found
+  2026-10-26). In `cli/tests/cli_input_contract.rs`, the reverse-order
+  table's `getparents --full-scan-min-blobs 1` row runs the walker arm,
+  not the full scan: an unindexed first blob makes dispatch pick the
+  walker. The result is right; the label is misleading.
 - [ ] **Indexdata refusals name both remedies** (raised 2026-10-26). A
   command that fails loudly over missing, partial or contradicted
   indexdata should name `check --index` (to find out what is wrong) as

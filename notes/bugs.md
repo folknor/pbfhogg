@@ -25,9 +25,9 @@ are marked "likely" by the hunter who found them.
    touching code under a higher-index entry, read
    `reference/performance-history.md` and `reference/performance.md`. The
    current code is likely not an accident.
-8. Nothing is measured - no benchmark, A/B, planet run or profiling cell -
-   until this document and `notes/hygiene.md` are both drained. An entry
-   whose only remaining work is a measurement is removed, not kept waiting.
+8. The measurement gate this rule held lifted when the hygiene drain
+   finished (2026-10-26). An entry whose only remaining work is a
+   measurement moves to the campaign in `notes/pre-release.md`.
 ```
 
 Each entry carries an `Anger:` rating from 0 to 10: how likely resolving it

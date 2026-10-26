@@ -91,8 +91,10 @@ citation is gone. Remaining:
 - `reference/performance-history.md` cites `extract.rs:2813` twice.
 - `reference/pipeline.md` cites line ranges in `~/Programs/nidhogg/`, a
   different repository on one developer's machine.
-- Source comments such as `coord_payloads.rs:398` and `drain.rs:408-410`
-  (tracked in `notes/hygiene.md`).
+- Test comments: `tests/geocode_index.rs`, `tests/getid.rs`,
+  `tests/inspect.rs`, `tests/read_paths.rs` and
+  `cli/tests/cli_defensive_input.rs` cite source line numbers. No such
+  citation remains under `src/` or `cli/src/` (checked 2026-10-26).
 
 ## Suggested order of work
 

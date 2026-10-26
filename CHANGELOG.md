@@ -993,6 +993,14 @@
   `impl Into<InputSource>` (a `&Path`, `&PathBuf`, `&Arc<Path>` or
   `&PinnedInput`); a caller passing `&&Path` dereferences it. The commands
   adopt it one by one; until a command does, it still reopens by path.
+  `sort::sort`, `tags_filter::tags_filter`,
+  `add_locations_to_ways::add_locations_to_ways`, `extract::extract`,
+  `extract::extract_multi` and `apply_changes::merge` (its base PBF) take
+  `impl Into<InputSource>` too, so no input-taking entry point is left on
+  `&Path` alone, and a `&PinnedInput` handed to them is used as it is.
+  `cat::cat` and `cat::dedupe::merge_pbf` take a slice of them
+  (`&[S]` for any `Copy` `S: Into<InputSource>`), so `&[&Path]` and
+  `&[&PathBuf]` still work, and a slice may mix paths with `&PinnedInput`s.
 
 - **A run says when passthrough copies left the kernel fast path.** When
   the kernel refuses `copy_file_range` (cross-filesystem output, FUSE or

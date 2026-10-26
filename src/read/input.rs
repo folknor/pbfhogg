@@ -512,13 +512,20 @@ fn repeats(earlier: &Path, path: &Path) -> bool {
     earlier.as_os_str() == path.as_os_str()
 }
 
-/// How many pins [`pin_inputs`] takes for `paths`: one per distinct
-/// spelling.
-pub(crate) fn distinct_inputs(paths: &[&Path]) -> usize {
-    paths
+/// How many pins [`pin_sources`] takes for `sources`: one per distinct
+/// spelling among the paths, and one per caller's pin argument (a caller's
+/// pin is shared, not taken again, but it is counted per position so the
+/// descriptor admission stays conservative).
+pub(crate) fn distinct_inputs(sources: &[InputSource<'_>]) -> usize {
+    sources
         .iter()
         .enumerate()
-        .filter(|&(i, path)| !paths[..i].iter().any(|earlier| repeats(earlier, path)))
+        .filter(|&(i, source)| match *source {
+            InputSource::Path(path) => !sources[..i].iter().any(
+                |earlier| matches!(*earlier, InputSource::Path(earlier) if repeats(earlier, path)),
+            ),
+            InputSource::Pinned(_) => true,
+        })
         .count()
 }
 
@@ -530,24 +537,17 @@ pub(crate) fn distinct_inputs(paths: &[&Path]) -> usize {
 /// files if the path were replaced between them. Every other open of each
 /// argument stays its own, derived from its pin.
 ///
+/// A caller may hand some inputs over already pinned: a
+/// [`InputSource::Pinned`] source is used as it is (see
+/// [`InputSource::pin`]), and only [`InputSource::Path`] sources take part in
+/// the exact-spelling rule, sharing the pin of an earlier `Path` source
+/// spelled the same. A caller's pin never stands in for a path, nor a path
+/// for a caller's pin, whatever their spellings: two pins of one path may
+/// identify different files on purpose.
+///
 /// Holds one descriptor per distinct input until the pins are dropped; a
 /// caller that may be handed many inputs asks the host for them first
 /// (`ProcessActions::fd_allowance`).
-///
-/// # Errors
-/// As [`PinnedInput::pin`], for the first argument that fails.
-pub(crate) fn pin_inputs(paths: &[&Path], host: &crate::host::Host) -> Result<Vec<PinnedInput>> {
-    let sources: Vec<InputSource<'_>> = paths.iter().map(|&path| InputSource::Path(path)).collect();
-    pin_sources(&sources, host)
-}
-
-/// [`pin_inputs`] for a library entry point whose caller may hand some
-/// inputs over already pinned: a [`InputSource::Pinned`] source is used as
-/// it is (see [`InputSource::pin`]), and only [`InputSource::Path`] sources
-/// take part in the exact-spelling rule, sharing the pin of an earlier
-/// `Path` source spelled the same. A caller's pin never stands in for a
-/// path, nor a path for a caller's pin, whatever their spellings: two pins
-/// of one path may identify different files on purpose.
 ///
 /// # Errors
 /// As [`PinnedInput::pin`], for the first path that fails.
@@ -748,17 +748,18 @@ mod pin_tests {
     /// other spelling, even of the same file, gets its own, and the count
     /// of pins taken agrees with `distinct_inputs`.
     #[test]
-    fn pin_inputs_shares_a_pin_per_exact_spelling() {
+    fn pin_sources_shares_a_pin_per_exact_spelling() {
         let dir = crate::path_guard::tests::scratch();
         let (input, other) = fixture(dir.path());
         let dotted = dir.path().join(".").join("in.osm.pbf");
         assert_eq!(input, dotted, "Path equality folds the `.`");
         let paths: [&Path; 5] = [&input, &other, &input, &dotted, &other];
-        let pins = super::pin_inputs(&paths, &Host::for_tests()).unwrap();
+        let sources = paths.map(InputSource::Path);
+        let pins = super::pin_sources(&sources, &Host::for_tests()).unwrap();
         let same = |i: usize, j: usize| std::sync::Arc::ptr_eq(&pins[i].0, &pins[j].0);
         assert!(same(0, 2) && same(1, 4));
         assert!(!same(0, 1) && !same(0, 3) && !same(1, 3));
-        assert_eq!(super::distinct_inputs(&paths), 3);
+        assert_eq!(super::distinct_inputs(&sources), 3);
         for (pin, path) in pins.iter().zip(paths) {
             assert_eq!(pin.path().as_os_str(), path.as_os_str());
         }

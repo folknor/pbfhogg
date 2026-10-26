@@ -14,12 +14,10 @@
 //! The output header is reconciled across every input's header by the same
 //! owner every command uses (`commands::output_header::build`).
 
-use std::path::Path;
-
 use crate::commands::blob_merge::{self, IndexPolicy, Plan};
 use crate::commands::{HeaderOverrides, writer_from_header_bytes};
 use crate::error::{Error, Result};
-use crate::read::input::PinnedInput;
+use crate::read::input::{InputSource, PinnedInput};
 use crate::write::WriteOptions;
 
 /// Statistics from a multi-PBF merge operation.
@@ -88,12 +86,13 @@ impl MergePbfStats {
 /// duplicates inside it survive.
 ///
 /// Every input is pinned before any is read, as in [`cat`](super::cat), so
-/// each is read from the file the run started on. Pass 2 holds one source
+/// each is read from the file the run started on; a caller's pin is used as
+/// it is. Pass 2 holds one source
 /// per argument, so the run asks the host for one descriptor per argument
 /// (`ProcessActions::fd_allowance`) and is refused up front when allowed
 /// fewer.
-pub fn merge_pbf(
-    inputs: &[&Path],
+pub fn merge_pbf<'a, S: Into<InputSource<'a>> + Copy>(
+    inputs: &[S],
     output: crate::output::Output,
     opts: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -107,14 +106,15 @@ pub fn merge_pbf(
 
 /// [`merge_pbf`] writing to a borrowed output it does not publish.
 #[hotpath::measure]
-pub(crate) fn merge_pbf_to(
-    inputs: &[&Path],
+pub(crate) fn merge_pbf_to<'a, S: Into<InputSource<'a>> + Copy>(
+    inputs: &[S],
     output: &crate::output::Output,
     opts: &WriteOptions,
     overrides: &HeaderOverrides,
     host: &crate::host::Host,
 ) -> Result<MergePbfStats> {
-    let plan = plan_merge(inputs, opts, host)?;
+    let sources: Vec<InputSource<'a>> = inputs.iter().map(|&input| input.into()).collect();
+    let plan = plan_merge(&sources, opts, host)?;
     write_merge(plan, output, opts, overrides, host)
 }
 
@@ -132,7 +132,7 @@ struct MergePlan {
 /// Pass 1: check the inputs, index every blob, order the index and find the
 /// overlap runs.
 fn plan_merge(
-    inputs: &[&Path],
+    inputs: &[InputSource<'_>],
     opts: &WriteOptions,
     host: &crate::host::Host,
 ) -> Result<MergePlan> {
@@ -151,7 +151,7 @@ fn plan_merge(
         crate::read::input::distinct_inputs(inputs),
         host,
     )?;
-    let pins = crate::read::input::pin_inputs(inputs, host)?;
+    let pins = crate::read::input::pin_sources(inputs, host)?;
 
     // Validate inputs have indexdata
     for input in &pins {
@@ -328,6 +328,7 @@ mod tests {
     use crate::block_builder::BlockBuilder;
     use crate::commands::blob_merge::Frame;
     use crate::writer::PbfWriter;
+    use std::path::Path;
 
     /// Kind of the one data blob a fixture writes into its own block.
     enum Blob<'a> {
@@ -389,7 +390,7 @@ mod tests {
 
     fn plan(a: &Path, b: &Path) -> MergePlan {
         plan_merge(
-            &[a, b],
+            &[a.into(), b.into()],
             &WriteOptions::default(),
             &crate::host::Host::for_tests(),
         )
@@ -464,9 +465,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let before = direct_opens();
-        let buffered = plan_merge(&[&a, &b, &c], &opts(false), &host).expect("buffered pass 1");
+        let sources: [InputSource<'_>; 3] = [(&a).into(), (&b).into(), (&c).into()];
+        let buffered = plan_merge(&sources, &opts(false), &host).expect("buffered pass 1");
         assert_eq!(direct_opens(), before, "a buffered run walked direct");
-        let direct = plan_merge(&[&a, &b, &c], &opts(true), &host).expect("direct pass 1");
+        let direct = plan_merge(&sources, &opts(true), &host).expect("direct pass 1");
         assert_eq!(
             direct_opens(),
             before + 3,

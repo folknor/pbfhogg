@@ -8,10 +8,8 @@
 //! each active sweep's overlap depth and a bounded window of re-encoded
 //! blocks when blobs overlap.
 
-use std::path::Path;
-
 use crate::commands::blob_merge::{self, IndexPolicy};
-use crate::read::input::PinnedInput;
+use crate::read::input::InputSource;
 use crate::write::WriteOptions;
 
 use super::{HeaderOverrides, Result, writer_from_header_bytes};
@@ -78,11 +76,12 @@ pub(crate) fn omitted_clause(omitted: u64) -> String {
 ///
 /// The input is read in several passes, so it must be a regular file
 /// (`InvalidArgument` otherwise), and is pinned for the run
-/// (see [`PinnedInput`](crate::read::input::PinnedInput)): where a later
+/// (see [`InputSource::pin`](crate::read::input::InputSource::pin)): a path
+/// is pinned here, a caller's [`PinnedInput`](crate::read::input::PinnedInput) is used as it is. Where a later
 /// open cannot reach the pinned file, an input replaced mid-run fails with
 /// `InputReplaced`.
-pub fn sort(
-    input: &Path,
+pub fn sort<'a>(
+    input: impl Into<InputSource<'a>>,
     output: crate::output::Output,
     opts: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -97,8 +96,8 @@ pub fn sort(
 /// [`sort`] writing to a borrowed output it does not publish.
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
-pub(crate) fn sort_to(
-    input: &Path,
+pub(crate) fn sort_to<'a>(
+    input: impl Into<InputSource<'a>>,
     output: &crate::output::Output,
     opts: &WriteOptions,
     overrides: &HeaderOverrides,
@@ -117,7 +116,7 @@ pub(crate) fn sort_to(
     // `/proc/self/fd` reopens the pin every open reaches the pinned file,
     // otherwise on Unix a replaced input fails the run (`PinnedInput` says
     // what it does off Unix). Taken before any other open of it.
-    let pin = PinnedInput::pin(input, host)?;
+    let pin = input.into().pin(host)?;
     // The indexdata precondition is answered by a front read of its own,
     // dropped at once: pass 1's walker reads the header again on its own
     // description (`FADV_RANDOM`, or `O_DIRECT` under `--direct-io`).
@@ -310,6 +309,7 @@ mod tests {
     use crate::block_builder::{BlockBuilder, HeaderBuilder};
     use crate::read::header_walker::tests::{direct_opens, direct_reads_supported};
     use crate::writer::{Compression, PbfWriter};
+    use std::path::Path;
 
     /// An indexed input whose header does not claim sorted order, so pass 1
     /// reads and scans every payload, with two overlapping node blobs and a

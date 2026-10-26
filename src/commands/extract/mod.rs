@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::cat::CleanAttrs;
 use crate::coord_fmt::e7_to_deg;
 use crate::error::Error;
-use crate::read::input::PinnedInput;
+use crate::read::input::{InputSource, PinnedInput};
 use crate::write::WriteOptions;
 
 use super::{HeaderOverrides, Result};
@@ -628,12 +628,13 @@ fn parse_extract_geometry(
 ///
 /// The input is read in several passes, so it must be a regular file
 /// (`InvalidArgument` otherwise), and is pinned once for the
-/// whole run, every region included (see [`PinnedInput`]): where a later
-/// open cannot reach the pinned file, an input replaced mid-run fails with
-/// `InputReplaced`.
+/// whole run, every region included (see [`InputSource::pin`] and
+/// [`PinnedInput`]): a path is pinned here, a caller's pin is used as it is.
+/// Where a later open cannot reach the pinned file, an input replaced
+/// mid-run fails with `InputReplaced`.
 #[allow(clippy::too_many_arguments)]
-pub fn extract_multi(
-    input: &Path,
+pub fn extract_multi<'a>(
+    input: impl Into<InputSource<'a>>,
     regions: &[Region],
     outputs: crate::output::OutputSet,
     strategy: ExtractStrategy,
@@ -653,7 +654,7 @@ pub fn extract_multi(
     }
     // One pin for the run: the single-pass attempt and, when it declines or
     // is not tried, every region's extract open the input again through it.
-    let pin = PinnedInput::pin(input, host)?;
+    let pin = input.into().pin(host)?;
     let stats = extract_multi_to(
         &pin, regions, &outputs, strategy, set_bounds, clean, write, overrides, host,
     )?;
@@ -824,11 +825,12 @@ fn output_facts(set_bounds: bool, bbox: &Bbox) -> crate::commands::output_header
 ///
 /// The input is read in several passes, so it must be a regular file
 /// (`InvalidArgument` otherwise), and is pinned for the run
-/// (see [`PinnedInput`]): where a later open cannot reach the pinned file,
-/// an input replaced mid-run fails with `InputReplaced`.
+/// (see [`InputSource::pin`] and [`PinnedInput`]): a path is pinned here, a
+/// caller's pin is used as it is. Where a later open cannot reach the pinned
+/// file, an input replaced mid-run fails with `InputReplaced`.
 #[allow(clippy::too_many_arguments)]
-pub fn extract(
-    input: &Path,
+pub fn extract<'a>(
+    input: impl Into<InputSource<'a>>,
     output: crate::output::Output,
     region: &Region,
     strategy: ExtractStrategy,
@@ -847,7 +849,7 @@ pub fn extract(
     // reaches the pinned file, otherwise on Unix a replaced input fails the
     // run (`PinnedInput` says what it does off Unix). Taken before any
     // other open of it.
-    let pin = PinnedInput::pin(input, host)?;
+    let pin = input.into().pin(host)?;
     let result = extract_to(
         &pin, &output, region, strategy, set_bounds, clean, write, overrides, host,
     )?;

@@ -11,7 +11,7 @@ use crate::write::WriteOptions;
 use crate::commands::input_front::InputFront;
 use crate::commands::output_header::{Bbox, OutputFacts, Replication, Ways};
 use crate::commands::{HeaderOverrides, writer_from_header_bytes};
-use crate::read::input::PinnedInput;
+use crate::read::input::InputSource;
 
 use super::descriptor::{DrainMessage, Route};
 use super::diff_ranges::DiffRanges;
@@ -155,11 +155,12 @@ fn build_header_bytes(
 /// output path aliases the base PBF, the output file cannot be written, or
 /// any PBF parsing/encoding fails. The base is read in several passes, so
 /// it must be a regular file (`InvalidArgument` otherwise), and is pinned for the run (see
-/// [`PinnedInput`](crate::read::input::PinnedInput)): where a later open
-/// cannot reach the pinned file, a base replaced mid-run fails with
+/// [`InputSource::pin`](crate::read::input::InputSource::pin)): a path is
+/// pinned here, a caller's [`PinnedInput`] is used as it is. Where a later
+/// open cannot reach the pinned file, a base replaced mid-run fails with
 /// `InputReplaced`.
-pub fn merge(
-    base_pbf: &Path,
+pub fn merge<'a>(
+    base_pbf: impl Into<InputSource<'a>>,
     osc_file: &Path,
     output_pbf: crate::output::Output,
     opts: &MergeOptions,
@@ -179,8 +180,8 @@ pub fn merge(
     clippy::cast_precision_loss
 )]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(crate) fn merge_to(
-    base_pbf: &Path,
+pub(crate) fn merge_to<'a>(
+    base_pbf: impl Into<InputSource<'a>>,
     osc_file: &Path,
     output_pbf: &crate::output::Output,
     opts: &MergeOptions,
@@ -189,6 +190,8 @@ pub(crate) fn merge_to(
 ) -> Result<MergeStats> {
     // Option refusals first: none of them needs the input.
     opts.validate()?;
+    let base_source: InputSource<'_> = base_pbf.into();
+    let base_pbf = base_source.path();
 
     // `merge` is public library API, so direct callers need the same refusal
     // as CLI callers. Writing goes to a staging file, so the base is never
@@ -230,7 +233,7 @@ pub(crate) fn merge_to(
     // `/proc/self/fd` reopens the pin every open reaches the pinned file,
     // otherwise on Unix a replaced base fails the run (`PinnedInput` says
     // what it does off Unix). Taken before any other open of it.
-    let base = PinnedInput::pin(base_pbf, host)?;
+    let base = base_source.pin(host)?;
 
     // One open answers both the indexdata question and the header, in that
     // order, so a forced run's Note and the missing-indexdata refusal still

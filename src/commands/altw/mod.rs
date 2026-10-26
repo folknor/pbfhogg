@@ -19,7 +19,7 @@ use super::{
 };
 use crate::commands::input_front::InputFront;
 use crate::idset::IdSet;
-use crate::read::input::PinnedInput;
+use crate::read::input::{InputSource, PinnedInput};
 
 use super::Result;
 use crate::error::Error;
@@ -358,11 +358,11 @@ impl Stats {
 ///
 /// The input is read in several passes, so it must be a regular file
 /// (`InvalidArgument` otherwise), and is pinned for the run
-/// (see [`PinnedInput`](crate::read::input::PinnedInput)): where a later
-/// open cannot reach the pinned file, an input replaced mid-run fails with
-/// `InputReplaced`.
-pub fn add_locations_to_ways(
-    input: &Path,
+/// (see [`InputSource::pin`]): a path is pinned here, a caller's
+/// [`PinnedInput`] is used as it is. Where a later open cannot reach the
+/// pinned file, an input replaced mid-run fails with `InputReplaced`.
+pub fn add_locations_to_ways<'a>(
+    input: impl Into<InputSource<'a>>,
     output: crate::output::Output,
     options: &AltwOptions,
     overrides: &HeaderOverrides,
@@ -379,8 +379,8 @@ pub fn add_locations_to_ways(
 /// [`add_locations_to_ways`] writing to a borrowed output it does not publish.
 #[hotpath::measure]
 #[allow(clippy::too_many_lines)]
-pub(crate) fn add_locations_to_ways_to(
-    input: &Path,
+pub(crate) fn add_locations_to_ways_to<'a>(
+    input: impl Into<InputSource<'a>>,
     output: &crate::output::Output,
     options: &AltwOptions,
     overrides: &HeaderOverrides,
@@ -396,7 +396,7 @@ pub(crate) fn add_locations_to_ways_to(
     // the pinned file, otherwise on Unix a replaced input fails the run
     // (`PinnedInput` says what it does off Unix). Taken before any other
     // open of it.
-    let pin = PinnedInput::pin(input, host)?;
+    let pin = input.into().pin(host)?;
     let input = &pin;
     // Every precondition that depends on the input (sorted, indexed, the
     // header) is answered by this one front read, whichever backend runs.

@@ -2,8 +2,6 @@
 
 pub mod dedupe;
 
-use std::path::Path;
-
 use super::{
     HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
     ensure_way_capacity_local, require_indexdata,
@@ -21,7 +19,7 @@ use super::output_header::{Declared, OutputFacts, OutputHeader, Ways};
 use super::{Result, flush_local};
 use crate::error::Error;
 use crate::read::frame::Frames;
-use crate::read::input::PinnedInput;
+use crate::read::input::{InputSource, PinnedInput};
 use crate::writer::frame_blob_pipelined;
 
 /// Which metadata attributes to strip via `--clean`.
@@ -80,16 +78,19 @@ impl CatStats {
 ///
 /// Every input is pinned before any is read
 /// ([`PinnedInput`](crate::read::input::PinnedInput)), a path given twice
-/// sharing one pin, so each is read from the file the run started on. The
-/// pins are held for the whole run, one descriptor per distinct input, which
-/// the run first asks the host for (`ProcessActions::fd_allowance`).
+/// sharing one pin, so each is read from the file the run started on. An
+/// input handed over as a caller's pin is used as it is (see
+/// [`InputSource::pin`](crate::read::input::InputSource::pin)) and never
+/// shared with a path. The pins are held for the whole run, one descriptor
+/// per distinct input, which the run first asks the host for
+/// (`ProcessActions::fd_allowance`).
 ///
 /// # Errors
 /// Besides read, decode and write failures: an input that is not a regular
 /// file, or a host that allows fewer descriptors than
 /// the run holds, is refused before any input is read.
-pub fn cat(
-    files: &[&Path],
+pub fn cat<'a, S: Into<InputSource<'a>> + Copy>(
+    files: &[S],
     output: crate::output::Output,
     type_filter: Option<TypeFilter>,
     clean: &CleanAttrs,
@@ -105,8 +106,8 @@ pub fn cat(
 
 /// [`cat`] writing to a borrowed output it does not publish.
 #[hotpath::measure]
-pub(crate) fn cat_to(
-    files: &[&Path],
+pub(crate) fn cat_to<'a, S: Into<InputSource<'a>> + Copy>(
+    files: &[S],
     output: &crate::output::Output,
     type_filter: Option<TypeFilter>,
     clean: &CleanAttrs,
@@ -123,9 +124,10 @@ pub(crate) fn cat_to(
     // between them an indexdata probe on some routes), with every header
     // read before any blob, so every input is pinned up front and holds its
     // pin for the run: one descriptor per distinct input.
-    let distinct = crate::read::input::distinct_inputs(files);
+    let sources: Vec<InputSource<'a>> = files.iter().map(|&file| file.into()).collect();
+    let distinct = crate::read::input::distinct_inputs(&sources);
     admit_descriptors(distinct, files.len(), distinct, host)?;
-    let pins = crate::read::input::pin_inputs(files, host)?;
+    let pins = crate::read::input::pin_sources(&sources, host)?;
     let files = pins.as_slice();
 
     // Selecting every kind while cleaning skips nothing, so it is the clean

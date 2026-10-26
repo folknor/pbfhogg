@@ -2,8 +2,6 @@
 
 pub mod osc;
 
-use std::path::Path;
-
 use super::{
     HeaderOverrides, ensure_node_capacity_local, ensure_relation_capacity_local,
     ensure_way_capacity_local, flush_local, require_indexdata, writer_from_header,
@@ -11,7 +9,7 @@ use super::{
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::idset::IdSet;
 use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
-use crate::read::input::PinnedInput;
+use crate::read::input::{InputSource, PinnedInput};
 use crate::tag_expr::{Expression, StringMatcher, parse_expressions, tag_matches};
 use crate::write::WriteOptions;
 use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
@@ -256,11 +254,12 @@ impl TagsFilterOptions<'_> {
 ///
 /// The input must be a regular file (`InvalidArgument`
 /// otherwise), in every mode, and is pinned for the run once the options
-/// and expressions are accepted (see [`PinnedInput`]): where a later open
-/// cannot reach the pinned file, an input replaced mid-run fails with
-/// `InputReplaced`.
-pub fn tags_filter(
-    input: &Path,
+/// and expressions are accepted (see [`InputSource::pin`] and
+/// [`PinnedInput`]): a path is pinned here, a caller's pin is used as it is.
+/// Where a later open cannot reach the pinned file, an input replaced
+/// mid-run fails with `InputReplaced`.
+pub fn tags_filter<'a>(
+    input: impl Into<InputSource<'a>>,
     output: crate::output::Output,
     opts: &TagsFilterOptions<'_>,
     overrides: &HeaderOverrides,
@@ -274,8 +273,8 @@ pub fn tags_filter(
 
 /// [`tags_filter`] writing to a borrowed output it does not publish.
 #[hotpath::measure]
-pub(crate) fn tags_filter_to(
-    input: &Path,
+pub(crate) fn tags_filter_to<'a>(
+    input: impl Into<InputSource<'a>>,
     output: &crate::output::Output,
     opts: &TagsFilterOptions<'_>,
     overrides: &HeaderOverrides,
@@ -296,7 +295,7 @@ pub(crate) fn tags_filter_to(
     // any other open of it, and in every mode: `-R` with `invert` or
     // `distrust_metadata` opens the input once, but one input contract for
     // the command beats one that depends on the options.
-    let pin = PinnedInput::pin(input, host)?;
+    let pin = input.into().pin(host)?;
     let input = &pin;
 
     // Blob-level filtering can't help in invert mode (we want non-matching
@@ -1333,6 +1332,7 @@ mod tests {
     use crate::ElementKind;
     use crate::owned::TypeFilter;
     use crate::writer::{Compression, PbfWriter};
+    use std::path::Path;
 
     fn filter_for(expressions: &[&str]) -> Option<BlobFilter> {
         let strs: Vec<String> = expressions.iter().map(|s| (*s).to_string()).collect();

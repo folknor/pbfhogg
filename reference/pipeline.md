@@ -579,7 +579,8 @@ reading any ID file. `has_indexdata` opens once and does not pin: handed a
 pin, it probes through it.
 
 `cat`, which takes any number of inputs, pins them all, in argument order,
-before it opens any (`read::input::pin_inputs`). An argument spelled exactly
+before it opens any (`read::input::pin_sources`, which uses a caller's pin
+as it is, as `diff` does below). An argument spelled exactly
 as an earlier one shares that argument's pin, so `cat a a` reads one file
 twice rather than two files if `a` is replaced while the pins are taken;
 other spellings of one file are pinned separately. Each argument's opens

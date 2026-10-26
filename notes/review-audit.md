@@ -1122,6 +1122,11 @@ maintainer accepted:
   per invocation on the `Host`).
 - Input API styles: convert `sort`, `tags_filter`, `add_locations_to_ways`,
   `extract`, `cat` and `merge` to `impl Into<InputSource>` before 0.6.0.
+  **Done:** also `extract_multi`; `apply_changes::merge` converts its base
+  only (the OSC is not a pinned input); `cat` and `dedupe::merge_pbf` take
+  `&[S]` for `Copy` `S: Into<InputSource>` through `pin_sources`
+  (`pin_inputs` removed). `tags_filter_osc` stays a `&Path` (OSC, one pass,
+  no pin).
 - diff counting a single-sided run from its claimed `index.count`:
   accepted under ADR-0013. Separately, a `notes/todo.md` project: refusals
   over indexdata problems name both `pbfhogg cat` and `check --index`.

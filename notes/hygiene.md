@@ -70,7 +70,6 @@ goes on "Review once drained" as a bisect candidate, named by commit.
 
 Launch order, one agent per line, run serially:
 
-36. HYG-192
 37. HYG-193
 38. HYG-194
 39. HYG-016
@@ -1176,19 +1175,6 @@ catalogued; if it is done at all, it is done last.
 
 Reported by: altw and scanning, re-encoding, filtering and spatial, read path,
 geocode index.
-
-## HYG-192 - The writer's four constructors build the same pipeline by hand
-
-Anger: 5 - once-per-run setup.
-
-Split out of HYG-015. `to_path_uring` and `to_path_parallel` carry the same
-spawn plus `init_rx` match (messages differ by one word), all four
-constructors build the same `WritePipeline` literal, and a test helper builds
-a fifth. Fix: one `WritePipeline::spawn`. `to_path_uring`'s unbounded
-`init_rx.recv()` is documented and left. Setup code that runs once per run;
-no throughput effect.
-
-Reported by: write path.
 
 ## HYG-193 - Two framing questions nobody decided
 

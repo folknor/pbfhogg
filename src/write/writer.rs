@@ -24,7 +24,6 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::mpsc::sync_channel;
 
 // Compression type moved to the sibling `compression` module; re-exported
 // here to preserve the public `crate::writer::Compression` API.
@@ -40,11 +39,10 @@ pub(crate) use super::framing::{
 // Pipeline plumbing (ordered channel items, sink trait, permit pool, writer
 // thread) lives in the sibling `pipeline` module.
 use super::pipeline::{
-    FileOutputSink, OutputChunk, PermitGuard, PipelineItem, SeqTotal, WritePipeline, drain_permits,
+    FileOutputSink, OutputChunk, PermitGuard, PipelineItem, WritePipeline, drain_permits,
     record_send_wait, recv_permit, writer_thread,
 };
 use crate::host::{Diagnostics, Executor};
-use crate::tunables::WRITE_AHEAD;
 
 /// Returned when a write is attempted on a `PbfWriter` whose inner writer was
 /// moved into a pipeline writer thread (every pipelined constructor, and every
@@ -107,7 +105,7 @@ fn sync_buffered_file(writer: &mut BufWriter<File>) -> Result<()> {
 /// released after the closure's `tx.send` (or on its unwind).
 ///
 /// Every send path participates in the dispatch bound, including raw writes;
-/// see [`WRITE_AHEAD`] for how channel backpressure differs from that bound.
+/// see [`WRITE_AHEAD`](crate::tunables::WRITE_AHEAD) for how channel backpressure differs from that bound.
 fn acquire_permit(pipeline: &WritePipeline) -> Result<PermitGuard> {
     let t_permit = crate::counters::Stopwatch::start();
     recv_permit(&pipeline.permit_rx, &pipeline.executor)
@@ -193,7 +191,7 @@ impl RawPayload<'_> {
 /// Send one already-framed item from the producer thread: reserve a slot,
 /// count it under its payload counters, and send it with the permit held
 /// across the send, so raw writes share the dispatch bound with framing
-/// tasks. The send can still block; see [`WRITE_AHEAD`].
+/// tasks. The send can still block; see [`WRITE_AHEAD`](crate::tunables::WRITE_AHEAD).
 ///
 /// Everything per payload happens after the reservation: the byte count
 /// (a walk over the chunks for `Chunks`) before the send timer starts, and
@@ -490,59 +488,24 @@ impl PbfWriter<FileWriter> {
         drop(diagnostics);
         let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
 
-        // Oneshot channel for init errors from the writer thread.
-        let (init_tx, init_rx) = sync_channel(1);
-
-        let (tx, rx) = sync_channel(WRITE_AHEAD);
         let path_owned = path.to_path_buf();
-        let expected = SeqTotal::new();
-        let thread_expected = expected.clone();
         let thread_cancel = cancel.clone();
-        let handle = std::thread::spawn(move || {
-            uring_writer::uring_writer_thread(
-                rx,
-                path_owned,
-                framed_header,
-                init_tx,
-                &thread_expected,
-                finish,
-                &thread_cancel,
-            )
-        });
-
-        // Wait for the writer thread to complete initialization.
-        // If init fails, we get the error here before returning to the caller.
-        match init_rx.recv() {
-            Ok(Ok(())) => {} // init succeeded
-            Ok(Err(e)) => {
-                // Init failed. Join the thread to clean up.
-                drop(tx);
-                drop(handle.join());
-                return Err(e);
-            }
-            Err(_) => {
-                // Thread panicked or exited before sending init result.
-                drop(tx);
-                return Err(match handle.join() {
-                    Ok(Ok(())) => Error::internal("writer thread exited without init signal"),
-                    Ok(Err(e)) => e,
-                    Err(payload) => panic_error("writer thread (during init)", payload.as_ref()),
-                });
-            }
-        }
-
-        Ok(PbfWriter {
-            writer: None,
-            compression,
-            pipeline: Some(WritePipeline::new(tx, handle, expected, executor)),
-            finalize_writer: flush_wrapped_writer::<FileWriter>,
-            #[cfg(test)]
-            finished: false,
-            scratch: FrameScratch::new(),
-            completion: None,
-            output_name: None,
-            cancel,
-        })
+        let pipeline = WritePipeline::spawn_with_init(
+            "writer thread",
+            executor,
+            move |rx, init_tx, expected| {
+                uring_writer::uring_writer_thread(
+                    rx,
+                    path_owned,
+                    framed_header,
+                    init_tx,
+                    expected,
+                    finish,
+                    &thread_cancel,
+                )
+            },
+        )?;
+        Ok(Self::from_pipeline(compression, pipeline, cancel))
     }
 
     /// Create a pipelined `PbfWriter` that fans disk writes out across
@@ -590,58 +553,24 @@ impl PbfWriter<FileWriter> {
         drop(diagnostics);
         let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
 
-        let (init_tx, init_rx) = sync_channel(1);
-        let (tx, rx) = sync_channel(WRITE_AHEAD);
         let path_owned = path.to_path_buf();
-        let expected = SeqTotal::new();
-        let thread_expected = expected.clone();
         let thread_cancel = cancel.clone();
-        let handle = std::thread::spawn(move || {
-            parallel_writer::parallel_writer_thread(
-                rx,
-                path_owned,
-                framed_header,
-                init_tx,
-                &thread_expected,
-                finish,
-                &thread_cancel,
-            )
-        });
-
-        // Propagate init errors eagerly - mirrors to_path_uring.
-        match init_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                drop(tx);
-                drop(handle.join());
-                return Err(e);
-            }
-            Err(_) => {
-                drop(tx);
-                return Err(match handle.join() {
-                    Ok(Ok(())) => {
-                        Error::internal("parallel writer thread exited without init signal")
-                    }
-                    Ok(Err(e)) => e,
-                    Err(payload) => {
-                        panic_error("parallel writer thread (during init)", payload.as_ref())
-                    }
-                });
-            }
-        }
-
-        Ok(PbfWriter {
-            writer: None,
-            compression,
-            pipeline: Some(WritePipeline::new(tx, handle, expected, executor)),
-            finalize_writer: flush_wrapped_writer::<FileWriter>,
-            #[cfg(test)]
-            finished: false,
-            scratch: FrameScratch::new(),
-            completion: None,
-            output_name: None,
-            cancel,
-        })
+        let pipeline = WritePipeline::spawn_with_init(
+            "parallel writer thread",
+            executor,
+            move |rx, init_tx, expected| {
+                parallel_writer::parallel_writer_thread(
+                    rx,
+                    path_owned,
+                    framed_header,
+                    init_tx,
+                    expected,
+                    finish,
+                    &thread_cancel,
+                )
+            },
+        )?;
+        Ok(Self::from_pipeline(compression, pipeline, cancel))
     }
 
     /// Shared pipelined setup: write header, spawn writer thread.
@@ -658,28 +587,36 @@ impl PbfWriter<FileWriter> {
         writer.write_all(&framed_header)?;
 
         // Spawn the writer thread and hand it the writer wrapped in a sink.
-        let (tx, rx) = sync_channel(WRITE_AHEAD);
-        let expected = SeqTotal::new();
-        let thread_expected = expected.clone();
         let sink = FileOutputSink::new(writer, finish, cancel.clone());
-        let handle = std::thread::spawn(move || writer_thread(rx, sink, &thread_expected));
+        let pipeline = WritePipeline::spawn(executor, move |rx, expected| {
+            writer_thread(rx, sink, expected)
+        });
+        Ok(Self::from_pipeline(compression, pipeline, cancel))
+    }
+}
 
-        Ok(PbfWriter {
+impl<W: Write> PbfWriter<W> {
+    /// A writer driving an already spawned pipeline: no inline writer, the
+    /// pipeline's thread owns the output.
+    fn from_pipeline(
+        compression: Compression,
+        pipeline: WritePipeline,
+        cancel: crate::host::Cancel,
+    ) -> Self {
+        PbfWriter {
             writer: None,
             compression,
-            pipeline: Some(WritePipeline::new(tx, handle, expected, executor)),
-            finalize_writer: flush_wrapped_writer::<FileWriter>,
+            pipeline: Some(pipeline),
+            finalize_writer: flush_wrapped_writer::<W>,
             #[cfg(test)]
             finished: false,
             scratch: FrameScratch::new(),
             completion: None,
             output_name: None,
             cancel,
-        })
+        }
     }
-}
 
-impl<W: Write> PbfWriter<W> {
     /// Create a new `PbfWriter` wrapping the given writer.
     ///
     /// If `writer` is backed by a file, callers should wrap it in
@@ -1390,7 +1327,6 @@ mod tests {
     use super::{Compression, Executor, PbfWriter, WritePipeline};
     use crate::block_builder::OwnedBlock;
     use crate::error::{Error, ErrorKind, Result};
-    use crate::write::framing::FrameScratch;
     use crate::write::pipeline::{PipelineItem, SeqTotal};
     use std::io;
     use std::sync::mpsc::sync_channel;
@@ -1442,23 +1378,11 @@ mod tests {
         // guaranteed to fail without a race to synchronise against.
         drop(rx);
         let handle = std::thread::spawn(move || outcome);
-        PbfWriter {
-            writer: None,
-            compression: Compression::None,
-            pipeline: Some(WritePipeline::new(
-                tx,
-                handle,
-                SeqTotal::new(),
-                Executor::Ambient,
-            )),
-            finalize_writer: super::flush_wrapped_writer::<Vec<u8>>,
-            #[cfg(test)]
-            finished: false,
-            scratch: FrameScratch::new(),
-            completion: None,
-            output_name: None,
-            cancel: crate::host::Cancel::new(),
-        }
+        PbfWriter::from_pipeline(
+            Compression::None,
+            WritePipeline::new(tx, handle, SeqTotal::new(), Executor::Ambient),
+            crate::host::Cancel::new(),
+        )
     }
 
     /// The writer thread's real error must survive, not be replaced.

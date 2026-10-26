@@ -248,6 +248,69 @@ impl WritePipeline {
             completion: None,
         }
     }
+
+    /// Spawn a writer thread running `body` over a fresh channel and
+    /// end-of-stream handshake, and wrap it in a pipeline.
+    pub(super) fn spawn<F>(executor: crate::host::Executor, body: F) -> Self
+    where
+        F: FnOnce(Receiver<PipelineItem>, &SeqTotal) -> Result<()> + Send + 'static,
+    {
+        let (tx, rx) = sync_channel(WRITE_AHEAD);
+        let expected = SeqTotal::new();
+        let thread_expected = expected.clone();
+        let handle = std::thread::spawn(move || body(rx, &thread_expected));
+        Self::new(tx, handle, expected, executor)
+    }
+
+    /// [`spawn`](Self::spawn) for a thread that does its own setup (opening
+    /// the file, registering buffers) and reports the outcome through the
+    /// `init_tx` it is handed before entering its loop. An init failure is
+    /// returned here, before the caller gets a writer; `label` names the
+    /// thread in the errors for a thread that died without reporting.
+    ///
+    /// The wait on the init result is unbounded; see
+    /// `PbfWriter::to_path_uring` for why that is deliberate.
+    pub(super) fn spawn_with_init<F>(
+        label: &str,
+        executor: crate::host::Executor,
+        body: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(Receiver<PipelineItem>, SyncSender<Result<()>>, &SeqTotal) -> Result<()>
+            + Send
+            + 'static,
+    {
+        let (init_tx, init_rx) = sync_channel(1);
+        let mut pipeline = Self::spawn(executor, move |rx, expected| body(rx, init_tx, expected));
+        match init_rx.recv() {
+            Ok(Ok(())) => Ok(pipeline),
+            Ok(Err(e)) => {
+                // Init failed. Join the thread to clean up.
+                let handle = pipeline.join_handle.take();
+                drop(pipeline);
+                if let Some(h) = handle {
+                    drop(h.join());
+                }
+                Err(e)
+            }
+            Err(_) => {
+                // Thread panicked or exited before sending init result.
+                let handle = pipeline.join_handle.take();
+                drop(pipeline);
+                Err(match handle.map(JoinHandle::join) {
+                    Some(Ok(Ok(()))) => {
+                        Error::internal(format!("{label} exited without init signal"))
+                    }
+                    Some(Ok(Err(e))) => e,
+                    Some(Err(payload)) => crate::error::panic_error(
+                        &format!("{label} (during init)"),
+                        payload.as_ref(),
+                    ),
+                    None => Error::internal(format!("{label} handle missing")),
+                })
+            }
+        }
+    }
 }
 
 /// Take one dispatch permit.

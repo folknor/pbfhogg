@@ -114,8 +114,33 @@ fn parse_block_top(
     decompressed: &[u8],
     scratch: &mut WayReframeScratch,
 ) -> crate::Result<(usize, usize)> {
-    scratch.group_ranges.clear();
-    scratch.scalar_fields.clear();
+    parse_way_block_top(
+        decompressed,
+        &mut scratch.group_ranges,
+        &mut scratch.scalar_fields,
+    )
+}
+
+/// The block-level walk both way reframes share (this sparse one and
+/// external stage 4's): the StringTable's byte range, which is returned,
+/// each PrimitiveGroup's range into `group_ranges`, and the scalar framing
+/// fields 17 to 20 re-encoded into `scalar_fields` after
+/// [`check_default_coord_framing`] has refused any that is not the PBF
+/// default. Both buffers are cleared first. A block without a StringTable is
+/// refused.
+///
+/// Only the block level is shared. Below it the two differ by design: this
+/// path resolves each ref against a random-access `NodeIndex` and encodes
+/// the deltas itself, while stage 4 consumes coordinates stage 3 already
+/// resolved and delta-encoded, positional per way, so its per-way step is a
+/// byte copy with its own timers.
+pub(super) fn parse_way_block_top(
+    decompressed: &[u8],
+    group_ranges: &mut Vec<(usize, usize)>,
+    scalar_fields: &mut Vec<u8>,
+) -> crate::Result<(usize, usize)> {
+    group_ranges.clear();
+    scalar_fields.clear();
     let mut stringtable_range: Option<(usize, usize)> = None;
 
     let mut cursor = Cursor::new(decompressed);
@@ -136,15 +161,15 @@ fn parse_block_top(
                     .read_len_delimited()
                     .map_err(|e| crate::Error::from(e).context("reframe group"))?;
                 let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
-                scratch.group_ranges.push((offset, data.len()));
+                group_ranges.push((offset, data.len()));
             }
             (17..=20, WIRE_VARINT) => {
                 let raw = cursor
                     .read_raw_field(wire_type)
                     .map_err(|e| crate::Error::from(e).context("reframe scalar"))?;
                 check_default_coord_framing(field, raw)?;
-                encode_tag(&mut scratch.scalar_fields, field, wire_type);
-                scratch.scalar_fields.extend_from_slice(raw);
+                encode_tag(scalar_fields, field, wire_type);
+                scalar_fields.extend_from_slice(raw);
             }
             _ => cursor
                 .skip_field(wire_type)

@@ -1197,8 +1197,17 @@ The judgement calls already known, to be checked first:
   init and consumer loop; the per-blob work is a monomorphized closure over
   per-worker local state. Hotpath names stay on the wrappers. Reviewed by a
   fresh codex session; codegen argued equivalent, not measured. Every
-  per-blob classify caller (the extract, tags-filter, getparents, check
-  and altw pass 0 scans) runs through it.
+  caller of the two functions runs through it.
+- The two altw way reframes share their block-level walk,
+  `altw::reframe::parse_way_block_top` (StringTable range, group ranges,
+  the framing scalars and their default-framing refusal); the per-way
+  coordinate steps stay separate by design (random-access `NodeIndex`
+  lookups against stage 3's pre-encoded positional payload), and a
+  `CoordSource` trait was rejected after a codex spar. Stage 4's
+  `parse_block_ns` stopwatch still spans exactly that walk, now a call
+  across modules; once per way blob, argued neutral, not measured. A
+  malformed block tag in stage 4 now reads "reframe block tag", as sparse
+  did. `brokkr verify add-locations-to-ways --dataset denmark` passes.
 ---
 
 ## HYG-011 - The pread-decompress-dispatch-reorder pool is hand-built about fifteen times

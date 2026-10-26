@@ -911,56 +911,21 @@ fn reframe_way_blob_with_locations(
     use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
     use std::sync::atomic::Ordering::Relaxed;
 
-    scratch.group_ranges.clear();
-    scratch.scalar_fields.clear();
     scratch.member_ways.clear();
     if inject_prepass {
         scratch.pin_tally = PinTally::default();
     }
-    let mut stringtable_range: Option<(usize, usize)> = None;
 
-    // Level 1: PrimitiveBlock - find string table + groups.
+    // Level 1: PrimitiveBlock - find string table + groups. Shared with the
+    // sparse reframe, including its coordinate-framing refusal: this path
+    // appends decimicrodegree fields 9 / 10 alongside a copied granularity /
+    // offset triple exactly as that one does.
     let t_block = crate::counters::Stopwatch::start();
-    let mut cursor = Cursor::new(decompressed);
-    while let Some((field, wire_type)) = cursor
-        .read_tag()
-        .map_err(|e| Error::from(e).context("reframe block"))?
-    {
-        match (field, wire_type) {
-            (1, WIRE_LEN) => {
-                let data = cursor
-                    .read_len_delimited()
-                    .map_err(|e| Error::from(e).context("reframe st"))?;
-                let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
-                stringtable_range = Some((offset, data.len()));
-            }
-            (2, WIRE_LEN) => {
-                let data = cursor
-                    .read_len_delimited()
-                    .map_err(|e| Error::from(e).context("reframe group"))?;
-                let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
-                scratch.group_ranges.push((offset, data.len()));
-            }
-            (17..=20, WIRE_VARINT) => {
-                let raw = cursor
-                    .read_raw_field(wire_type)
-                    .map_err(|e| Error::from(e).context("reframe scalar"))?;
-                // Same coordinate-framing refusal as the sparse arm; see
-                // `altw::reframe::check_default_coord_framing`. This path
-                // appends decimicrodegree fields 9 / 10 alongside a copied
-                // granularity / offset triple exactly as that one does.
-                super::super::reframe::check_default_coord_framing(field, raw)?;
-                protohoggr::encode_tag(&mut scratch.scalar_fields, field, wire_type);
-                scratch.scalar_fields.extend_from_slice(raw);
-            }
-            _ => cursor
-                .skip_field(wire_type)
-                .map_err(|e| Error::from(e).context("reframe skip"))?,
-        }
-    }
-
-    let (st_offset, st_len) = stringtable_range
-        .ok_or_else(|| Error::invalid_data("reframe: no StringTable in PrimitiveBlock"))?;
+    let (st_offset, st_len) = super::super::reframe::parse_way_block_top(
+        decompressed,
+        &mut scratch.group_ranges,
+        &mut scratch.scalar_fields,
+    )?;
     let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
 
     t_block.record_ns(&counters.parse_block_ns);

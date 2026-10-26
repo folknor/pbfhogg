@@ -125,7 +125,9 @@ fn walk_file(source: InputSource<'_>, host: &crate::host::Host) -> Result<RawWal
             return Err(walker.locate_meta(
                 &meta,
                 crate::error::new_missing_indexdata(
-                    "block-pair merge requires indexdata on every data blob",
+                    "block-pair merge requires readable indexdata on every data blob \
+                     (this blob has none, or its indexdata has an unknown version, \
+                     an unknown kind or an inverted id range)",
                 ),
             ));
         };

@@ -1020,7 +1020,7 @@ fn altw_external_refuses_an_unsorted_header_with_sort_advice() {
         "external must refuse; stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("not sorted") && stderr.contains("Sort.Type_then_ID"),
+        stderr.contains("does not declare Sort.Type_then_ID"),
         "expected the unsorted refusal; stderr:\n{stderr}"
     );
     assert!(

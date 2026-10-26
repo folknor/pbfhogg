@@ -131,13 +131,13 @@ pub(crate) fn derive_changes_to(
         old_sorted,
         old_path,
         "Old PBF",
-        "Streaming diff requires sorted inputs to operate in constant memory.",
+        "Streaming diff merge-walks both inputs in id order.",
     )?;
     crate::commands::require_sorted(
         new_sorted,
         new_path,
         "New PBF",
-        "Streaming diff requires sorted inputs to operate in constant memory.",
+        "Streaming diff merge-walks both inputs in id order.",
     )?;
     let both_indexed = old_indexed && new_indexed;
     if jobs > 1 && !both_indexed {

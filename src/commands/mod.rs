@@ -533,7 +533,7 @@ pub(crate) fn require_sorted(
 ) -> Result<()> {
     if !is_sorted {
         return Err(crate::error::new_unsorted(format!(
-            "{context} is not sorted (missing Sort.Type_then_ID optional feature). {reason}"
+            "{context} does not declare Sort.Type_then_ID in its header. {reason}"
         ))
         .locate(crate::error::Location::in_file(path)));
     }

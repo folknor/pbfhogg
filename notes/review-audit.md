@@ -929,8 +929,21 @@ the ones below.
     match is unchanged; `node_blob_after_way_blobs_is_rejected_not_dropped`,
     which pinned the old clause, now pins the new one. `brokkr check`
     (tier1) passes.
-  - Laterals from the spar, all **open** (checked against the code, not
-    fixed):
+  - Laterals from the spar. Resolved: the first three (below). Filed:
+    the fourth as bz `pbfhogg#20`. Each was re-verified against the code
+    first. Fixes: `require_sorted` now says "{file} does not declare
+    Sort.Type_then_ID in its header"; diff and derive give "Streaming diff
+    merge-walks both inputs in id order" as the reason (no memory claim);
+    `walk_file` says "requires readable indexdata on every data blob" and
+    lists the unreadable cases, since `BlobMeta.index` is already an
+    `Option` and cannot tell absent from unreadable. The tests that
+    matched "not sorted" (diff, derive-changes, altw external) now pin the
+    new phrase. `docs/` and `reference/` held no copy of the old wording.
+    `brokkr check` (tier1) passes. For the fourth, osmium's diff
+    (`command_diff.cpp`) decides modified-or-same from a CRC over the
+    ordered member list, so it counts both cases as a change too; whether
+    pbfhogg should diff member order is left open in the bz.
+  - Original laterals as reported:
     - `require_sorted` (`src/commands/mod.rs`) says "{file} is not sorted"
       when it only knows the header does not declare `Sort.Type_then_ID`.
       A sorted file without the flag gets that message.

@@ -871,7 +871,10 @@ fn unsorted_input_rejected() {
         out.stderr_str()
     );
     let stderr = out.stderr_str();
-    assert!(stderr.contains("not sorted"), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("does not declare Sort.Type_then_ID"),
+        "stderr:\n{stderr}"
+    );
     assert!(stderr.contains("Sort.Type_then_ID"), "stderr:\n{stderr}");
     assert!(stderr.contains("pbfhogg sort"), "stderr:\n{stderr}");
 }

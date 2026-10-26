@@ -65,7 +65,11 @@ pub(crate) fn estimate_blob_count<'a>(
 ) -> Result<BlobCountEstimate> {
     let source = input.into();
     let path = source.path();
-    let mut walker = HeaderWalker::open(source, host)?;
+    // A probe of the leading frames, not a read of the file: exempt from the
+    // partial-index refusal, which the chosen arm's own read makes over the
+    // whole file. Refusing here would judge only the sample, and would keep
+    // the arm that does the work from ever meeting the file.
+    let mut walker = HeaderWalker::open(source, host)?.accepting_partial_index();
     let file_size = walker.file_size();
     if file_size == 0 {
         return Err(crate::error::new_missing_header(path));
@@ -314,64 +318,6 @@ pub(crate) struct HeaderWalker<P = std::fs::File> {
     /// The file this walker was opened from.
     path: Arc<Path>,
     file_size: u64,
-    /// Present when this walk refuses a partially indexed file; see
-    /// [`Self::refusing_partial_index`].
-    partial_index: Option<PartialIndexGuard<(u64, u64)>>,
-}
-
-/// The partially-indexed rule, one owner for every reader that enforces it
-/// (the state behind [`HeaderWalker::refusing_partial_index`], and `digest`,
-/// which checks it in its decoding pass): what the first data blob said
-/// about indexdata, and where the first data blob without it sits. `L` is
-/// that location, in whatever form the reader knows it. Fed every data
-/// blob in file order; a file is partial once it has shown both kinds, and
-/// the refusal names the first unindexed data blob, whether it came before
-/// or after the first indexed one.
-pub(crate) struct PartialIndexGuard<L> {
-    /// Whether the first data blob carried readable indexdata; `None` until
-    /// the walk has seen one.
-    first_indexed: Option<bool>,
-    /// Where the first data blob without readable indexdata sits; `None`
-    /// until one has been seen (an unknown location is an `L` the caller
-    /// chose, never a missing entry).
-    first_unindexed: Option<L>,
-}
-
-impl<L> Default for PartialIndexGuard<L> {
-    fn default() -> Self {
-        Self {
-            first_indexed: None,
-            first_unindexed: None,
-        }
-    }
-}
-
-impl<L: Copy> PartialIndexGuard<L> {
-    /// Record one data blob, `indexed` when it carries readable indexdata.
-    /// Returns the location of the first unindexed data blob once the file
-    /// has shown both kinds.
-    pub(crate) fn observe(&mut self, indexed: bool, at: L) -> Option<L> {
-        if !indexed && self.first_unindexed.is_none() {
-            self.first_unindexed = Some(at);
-        }
-        match self.first_indexed {
-            None => {
-                self.first_indexed = Some(indexed);
-                None
-            }
-            Some(first) if first != indexed => self.first_unindexed,
-            Some(_) => None,
-        }
-    }
-}
-
-/// The refusal [`PartialIndexGuard`] raises, unlocated: the caller locates
-/// it at the blob the guard returned.
-pub(crate) fn partial_index_error() -> crate::error::Error {
-    crate::error::new_partial_indexdata(
-        "the file is partially indexed: indexdata on some data blobs and not \
-         others, and this is the first data blob without indexdata",
-    )
 }
 
 impl HeaderWalker {
@@ -496,37 +442,20 @@ impl<P: Positional> HeaderWalker<P> {
             file,
             path: Arc::from(path),
             file_size,
-            partial_index: None,
         }
     }
 
-    /// Make this walk refuse a partially indexed file: once the data blobs
-    /// seen so far include one with readable indexdata and one without,
-    /// [`Self::next_header`] returns the typed missing-indexdata error
-    /// located at the first data blob without it. Indexdata that is present
-    /// but unreadable counts as absent, as it does for every consumer. A
-    /// wholly indexed file and a wholly unindexed one both pass; whether a
-    /// wholly unindexed one is acceptable stays the caller's first-blob gate.
-    ///
-    /// For walks that already visit every header to build a command's
-    /// schedule, so the refusal costs no extra read. The first-blob probe
-    /// (`has_indexdata`) is what decides elsewhere whether a file is indexed,
-    /// so a file indexed on its first blob and not on a later one would
-    /// otherwise pass as indexed and run on an index it does not have.
-    /// Walks that do not build a schedule (inspect's description, the blob
-    /// count probe) do not opt in. Nor do getid's: every getid path decodes
-    /// a blob without indexdata and filters its actual elements, so a
-    /// partially indexed file is correct input for it and is accepted
-    /// (`scan::classify::PartialIndex::Accept` on its classify walks).
-    /// getparents' walker does not opt in for the same reason: it schedules
-    /// a blob without indexdata whatever the query, and its full-scan arm's
-    /// blob filter passes one through to a decode, so both arms select from
-    /// actual elements. tags-filter's pass 1 and pass 2 walks do not opt in
-    /// either: each schedules a blob without indexdata and matches or writes
-    /// its decoded elements by their actual kind and ID.
+    /// Exempt this walk from the command-input refusal of a partially
+    /// indexed file (`Frames::refuse_partial_index`), which every walk has
+    /// by default: without this, [`Self::next_header`] ends the walk with
+    /// the typed missing-indexdata error, located at the first data blob
+    /// without readable indexdata, once both kinds have been seen. Only for
+    /// `cat` (the remedy), `inspect`'s descriptions and the blob-count
+    /// probe, whose caller's chosen arm judges the file; the call site says
+    /// which.
     #[must_use]
-    pub(crate) fn refusing_partial_index(mut self) -> Self {
-        self.partial_index = Some(PartialIndexGuard::default());
+    pub(crate) fn accepting_partial_index(mut self) -> Self {
+        self.frames.accept_partial_index();
         self
     }
 
@@ -619,21 +548,6 @@ impl<P: Positional> HeaderWalker<P> {
             tagdata,
             frame_size: payload_offset + header.data_size,
         };
-        // The partial-index refusal names the first unindexed data blob,
-        // which may be an earlier frame than this one, so it is located here
-        // and not by the frame walk. It ends the walk like a frame failure.
-        if meta.blob_type == BlobKind::OsmData
-            && let Some(guard) = self.partial_index.as_mut()
-            && let Some((blob, frame_start)) =
-                guard.observe(meta.index.is_some(), (meta.blob_index, meta.frame_start))
-        {
-            self.frames.poison();
-            return Err(partial_index_error().locate(crate::error::Location::new(
-                Some(&self.path),
-                Some(blob),
-                Some(crate::ByteOffset(frame_start)),
-            )));
-        }
         Ok(Some(meta))
     }
 
@@ -769,9 +683,16 @@ pub(crate) mod tests {
         let path = dir.path().join("walk.pbf");
         write_index_pattern(&path, &[true, false, true, true, false]);
         let host = crate::host::Host::for_tests();
-        let mut buffered = super::HeaderWalker::open(&path, &host).expect("buffered");
+        // The fixture is partially indexed on purpose (metas with and without
+        // an index); the walks compared here are the transports, not the
+        // command-input policy.
+        let mut buffered = super::HeaderWalker::open(&path, &host)
+            .expect("buffered")
+            .accepting_partial_index();
         let before = direct_opens();
-        let mut direct = super::HeaderWalker::open_direct(&path, &host).expect("direct");
+        let mut direct = super::HeaderWalker::open_direct(&path, &host)
+            .expect("direct")
+            .accepting_partial_index();
         assert_eq!(direct_opens(), before + 1);
         assert_eq!(direct.file_size(), buffered.file_size());
         let (mut a, mut b) = (Vec::new(), Vec::new());
@@ -933,8 +854,8 @@ pub(crate) mod tests {
 
     fn walk_all(path: &std::path::Path, refusing: bool) -> super::Result<usize> {
         let mut walker = super::HeaderWalker::open(path, &crate::host::Host::for_tests())?;
-        if refusing {
-            walker = walker.refusing_partial_index();
+        if !refusing {
+            walker = walker.accepting_partial_index();
         }
         let mut n = 0;
         while walker.next_header()?.is_some() {
@@ -945,9 +866,9 @@ pub(crate) mod tests {
 
     /// A partially indexed file is the typed missing-indexdata error, located
     /// at the first data blob without indexdata, whichever kind comes first.
-    /// Uniform files pass, and a walk that did not opt in never refuses.
+    /// Uniform files pass, and a walk that opted out never refuses.
     #[test]
-    fn a_refusing_walk_stops_a_partially_indexed_file_at_its_first_unindexed_blob() {
+    fn a_walk_stops_a_partially_indexed_file_at_its_first_unindexed_blob() {
         let dir = crate::path_guard::tests::scratch();
         // (pattern, blob ordinal of the first unindexed data blob; the header
         // is blob 0).
@@ -974,9 +895,8 @@ pub(crate) mod tests {
         // The refusal ends the walk: it does not resume at the next frame.
         let path = dir.path().join("partial-stop.pbf");
         write_index_pattern(&path, &[true, false, true]);
-        let mut walker = super::HeaderWalker::open(&path, &crate::host::Host::for_tests())
-            .expect("walker")
-            .refusing_partial_index();
+        let mut walker =
+            super::HeaderWalker::open(&path, &crate::host::Host::for_tests()).expect("walker");
         while let Ok(Some(_)) = walker.next_header() {}
         assert!(walker.next_header().is_err(), "a refused walk resumed");
 

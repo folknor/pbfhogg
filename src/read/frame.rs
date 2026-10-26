@@ -190,6 +190,65 @@ impl FrameHeader {
 struct Pending {
     id: FrameId,
     data_size: usize,
+    /// For a data frame on a walk that refuses a partially indexed input,
+    /// whether its header carried readable indexdata; `None` otherwise. Fed
+    /// to the guard once the frame is complete.
+    readable_index: Option<bool>,
+}
+
+/// The partially-indexed rule, owned by the frame walk: what the first data
+/// blob said about indexdata, and where the first data blob without it sits.
+/// `L` is that location. Fed every data blob in file order; a file is
+/// partial once it has shown both kinds, and the refusal names the first
+/// unindexed data blob, whether it came before or after the first indexed
+/// one.
+#[derive(Clone, Debug)]
+pub(crate) struct PartialIndexGuard<L> {
+    /// Whether the first data blob carried readable indexdata; `None` until
+    /// the walk has seen one.
+    first_indexed: Option<bool>,
+    /// Where the first data blob without readable indexdata sits; `None`
+    /// until one has been seen.
+    first_unindexed: Option<L>,
+}
+
+impl<L> Default for PartialIndexGuard<L> {
+    fn default() -> Self {
+        Self {
+            first_indexed: None,
+            first_unindexed: None,
+        }
+    }
+}
+
+impl<L: Copy> PartialIndexGuard<L> {
+    /// Record one data blob, `indexed` when it carries readable indexdata.
+    /// Returns the location of the first unindexed data blob once the file
+    /// has shown both kinds.
+    pub(crate) fn observe(&mut self, indexed: bool, at: L) -> Option<L> {
+        if !indexed && self.first_unindexed.is_none() {
+            self.first_unindexed = Some(at);
+        }
+        match self.first_indexed {
+            None => {
+                self.first_indexed = Some(indexed);
+                None
+            }
+            Some(first) if first != indexed => self.first_unindexed,
+            Some(_) => None,
+        }
+    }
+}
+
+/// The refusal [`PartialIndexGuard`] raises, unlocated: the caller locates
+/// it at the blob the guard returned. Typed `MissingIndexdata` with
+/// `partial`, so a front end can point at the remedy (`pbfhogg cat`
+/// indexes every blob).
+pub(crate) fn partial_index_error() -> Error {
+    crate::error::new_partial_indexdata(
+        "the file is partially indexed: indexdata on some data blobs and not \
+         others, and this is the first data blob without indexdata",
+    )
 }
 
 /// The frame state machine over a source `S`. See the module doc.
@@ -222,6 +281,10 @@ pub(crate) struct Frames<S> {
     pub(crate) fields: HeaderFields,
     pending: Option<Pending>,
     failed: bool,
+    /// Present when this walk refuses a partially indexed input. Armed by
+    /// default on a command input ([`Self::of_input`], and
+    /// `BlobReader::open_in`); see [`Self::accept_partial_index`].
+    partial_index: Option<PartialIndexGuard<FrameId>>,
 }
 
 impl<S> Frames<S> {
@@ -242,17 +305,50 @@ impl<S> Frames<S> {
             fields,
             pending: None,
             failed: false,
+            partial_index: None,
         }
     }
 
     /// A walk over a command input from its first byte, with the run's
-    /// diagnostics and cancellation, its errors naming `path`.
+    /// diagnostics and cancellation, its errors naming `path`. It refuses a
+    /// partially indexed input ([`Self::refuse_partial_index`]); a command
+    /// exempt from that policy opts out with [`Self::accept_partial_index`].
     pub(crate) fn of_input(src: S, path: &Path, host: &crate::host::Host) -> Self {
         let mut frames = Self::new(src, Some(0), HeaderFields::INDEXES);
         frames.path = Some(Arc::from(path));
         frames.diagnostics = host.diagnostics.clone();
         frames.cancel = host.cancel.clone();
+        frames.refuse_partial_index();
         frames
+    }
+
+    /// Refuse a partially indexed input: data blobs with readable indexdata
+    /// on some and not others, in either order. Once a completed data frame
+    /// shows the mixture, the walk ends with the typed missing-indexdata
+    /// error (`partial`), located at the first data blob without readable
+    /// indexdata. A wholly indexed and a wholly unindexed input both pass;
+    /// whether a wholly unindexed one is acceptable stays the caller's
+    /// first-blob gate. Indexdata that is present but unreadable counts as
+    /// absent, as it does for every consumer.
+    ///
+    /// This is the project's policy for command inputs (ruled 2026-10-26):
+    /// a command fails loudly on such a file and the front end points at
+    /// `pbfhogg cat`, which indexes every blob, rather than each path
+    /// arguing whether it could cope with the missing indexdata. It is
+    /// judged here, in the one frame walk every reader shares, so a command
+    /// cannot accept the file on one path and refuse it on another. The
+    /// observation needs the indexdata parsed, so an armed walk parses it
+    /// even where the caller asked not to keep it, and then drops it.
+    pub(crate) fn refuse_partial_index(&mut self) {
+        self.partial_index = Some(PartialIndexGuard::default());
+    }
+
+    /// Exempt this walk from [`Self::refuse_partial_index`]. Only for a
+    /// command whose job is the file as it is: `cat` (the remedy), `check
+    /// --index` (which reports the mixture as a violation) and `inspect`'s
+    /// descriptions. The call site says which.
+    pub(crate) fn accept_partial_index(&mut self) {
+        self.partial_index = None;
     }
 
     pub(crate) fn set_path(&mut self, path: Option<Arc<Path>>) {
@@ -312,6 +408,12 @@ impl<S> Frames<S> {
     /// A failure is not cleared: see [`Self::clear_failure`].
     pub(crate) fn reposition(&mut self, pos: Option<u64>) {
         self.pending = None;
+        // A refusing walk stays refusing, but what it saw before the move is
+        // forgotten: a rewind restarts the traversal, and after any other
+        // move the guard judges only the frames it walks from there.
+        if let Some(guard) = self.partial_index.as_mut() {
+            *guard = PartialIndexGuard::default();
+        }
         self.pos = pos;
         self.next_ordinal = pos.and_then(|pos| (pos == 0 && self.stream_start == 0).then_some(0));
     }
@@ -362,11 +464,26 @@ impl<S> Frames<S> {
 
     /// The pending payload was consumed in full: the walk is at the next
     /// frame boundary.
-    fn finish(&mut self, pending: Pending) {
+    ///
+    /// A refusing walk then judges the completed frame: it is observed only
+    /// once whole, so a frame whose payload is truncated is the truncation
+    /// error, and a probe that drops the walk at a header observes nothing.
+    fn finish(&mut self, pending: Pending) -> Result<()> {
         self.pos = self
             .pos
             .map(|payload_start| payload_start + pending.data_size as u64);
         self.next_ordinal = self.next_ordinal.map(|n| n + 1);
+        if let Some(readable) = pending.readable_index
+            && let Some(guard) = self.partial_index.as_mut()
+            && let Some(first_unindexed) = guard.observe(readable, pending.id)
+        {
+            // Located at the first unindexed data blob, which may be an
+            // earlier frame than this one, and then the walk ends.
+            let err = partial_index_error().locate(self.location(first_unindexed));
+            self.poison();
+            return Err(err);
+        }
+        Ok(())
     }
 }
 
@@ -425,12 +542,31 @@ impl<S: FrameSource> Frames<S> {
             return Err(truncated(TruncatedPart::Header, header_len, header_start));
         }
 
-        let header = WireBlobHeader::parse(
+        let refusing = self.partial_index.is_some();
+        let mut header = WireBlobHeader::parse(
             &self.header_buf,
             self.fields.tagdata,
-            self.fields.indexdata,
+            self.fields.indexdata || refusing,
             self.fields.waymembers,
         )?;
+        // The partial-index observation: readable means a claim a consumer
+        // could act on (an unknown version or kind, an inverted range or a
+        // repeated field read as absent), not merely a present field.
+        let readable_index =
+            (refusing && matches!(header.blob_type, BlobKind::OsmData)).then(|| {
+                header
+                    .indexdata
+                    .as_ref()
+                    .and_then(|data| BlobIndex::deserialize(data))
+                    .is_some()
+            });
+        if refusing && !self.fields.indexdata {
+            // Parsed for the guard only: the caller sees what it asked for,
+            // and no warning about a field it did not ask to read.
+            header.indexdata = None;
+            header.indexdata_present = false;
+            header.unrecognised_indexdata_len = None;
+        }
         if let Some(len) = header.unrecognised_indexdata_len {
             warn_unrecognised_indexdata(
                 &self.diagnostics,
@@ -464,7 +600,11 @@ impl<S: FrameSource> Frames<S> {
         let data_size = datasize as usize;
 
         self.pos = header_start.map(|s| s + header_len as u64);
-        self.pending = Some(Pending { id, data_size });
+        self.pending = Some(Pending {
+            id,
+            data_size,
+            readable_index,
+        });
         Ok(Some(FrameHeader {
             id,
             header_len,
@@ -485,8 +625,7 @@ impl<S: FrameSource> Frames<S> {
             let err = truncated(TruncatedPart::Payload, pending.data_size, self.pos);
             return Err(self.fail(pending.id, err));
         }
-        self.finish(pending);
-        Ok(())
+        self.finish(pending)
     }
 
     /// The next frame whole, as raw bytes for passthrough or selective
@@ -529,10 +668,7 @@ impl<S: FrameSkip> Frames<S> {
     pub(crate) fn skip_payload(&mut self) -> Result<()> {
         let pending = self.take_pending()?;
         match self.src.skip_bytes(pending.data_size as u64) {
-            Ok(true) => {
-                self.finish(pending);
-                Ok(())
-            }
+            Ok(true) => self.finish(pending),
             Ok(false) => {
                 let err = truncated(TruncatedPart::Payload, pending.data_size, self.pos);
                 Err(self.fail(pending.id, err))
@@ -853,5 +989,174 @@ mod tests {
         walk.seek(std::io::SeekFrom::Start(0)).unwrap();
         walk.clear_failure();
         assert_eq!(walk.next_header().unwrap().unwrap().id.ordinal, Some(0));
+    }
+
+    /// What a fixture data blob's header carries.
+    #[derive(Clone, Copy)]
+    enum Index {
+        /// Indexdata scanned from the payload.
+        Readable,
+        /// No indexdata.
+        Absent,
+        /// Indexdata present on the wire but unreadable (an inverted range).
+        Unreadable,
+    }
+
+    /// A header, then one single-node data blob per entry.
+    fn pbf(blobs: &[Index]) -> Vec<u8> {
+        let mut writer =
+            crate::writer::PbfWriter::new(Vec::new(), crate::writer::Compression::None);
+        writer
+            .write_header(&crate::block_builder::HeaderBuilder::new().build().unwrap())
+            .unwrap();
+        let mut block = crate::block_builder::BlockBuilder::new();
+        for (id, index) in (1_i64..).zip(blobs) {
+            block.add_node(id, 0, 0, std::iter::empty::<(&str, &str)>(), None);
+            let bytes = block.take().unwrap().unwrap();
+            match index {
+                Index::Readable => writer.write_primitive_block(bytes).unwrap(),
+                Index::Absent => writer.write_primitive_block_no_indexdata(bytes).unwrap(),
+                Index::Unreadable => writer
+                    .write_primitive_block_owned(crate::block_builder::OwnedBlock {
+                        bytes: bytes.to_vec(),
+                        index: crate::blob_meta::BlobIndex {
+                            kind: crate::ElementKind::Node,
+                            min_id: id + 1,
+                            max_id: id,
+                            count: 1,
+                            bbox: None,
+                        },
+                        tagdata: None,
+                        way_members: None,
+                    })
+                    .unwrap(),
+            }
+        }
+        writer.into_inner().unwrap()
+    }
+
+    /// Walk every frame, reading or skipping each payload; the frames
+    /// completed, or the error.
+    fn walk_all(walk: &mut Frames<std::io::Cursor<Vec<u8>>>, read: bool) -> crate::Result<usize> {
+        let mut n = 0;
+        while walk.next_header()?.is_some() {
+            if read {
+                walk.read_payload(&mut Vec::new())?;
+            } else {
+                walk.skip_payload()?;
+            }
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    fn refusing(bytes: Vec<u8>) -> Frames<std::io::Cursor<Vec<u8>>> {
+        let mut walk = frames(bytes);
+        walk.refuse_partial_index();
+        walk
+    }
+
+    /// A refusing walk stops a mixture at its first data blob without
+    /// readable indexdata, in either order, reading or skipping payloads;
+    /// indexdata present but unreadable counts as absent; a uniform file
+    /// passes; an accepting walk never refuses.
+    #[test]
+    fn a_refusing_walk_refuses_a_mixture_at_the_first_unreadable_index() {
+        use Index::{Absent as A, Readable as R, Unreadable as U};
+        // (pattern, ordinal of the first data blob without readable
+        // indexdata; the header is 0).
+        for (pattern, first) in [
+            (&[R, R, A, R][..], 3_u64),
+            (&[A, R][..], 1),
+            (&[A, A, R][..], 1),
+            (&[R, U][..], 2),
+            (&[U, R][..], 1),
+        ] {
+            for read in [false, true] {
+                let err = walk_all(&mut refusing(pbf(pattern)), read)
+                    .expect_err("a partially indexed walk ran");
+                assert!(
+                    matches!(
+                        err.kind(),
+                        ErrorKind::MissingIndexdata { partial: true, .. }
+                    ),
+                    "{err:?}"
+                );
+                assert_eq!(err.blob_index(), Some(first));
+                let mut accepting = refusing(pbf(pattern));
+                accepting.accept_partial_index();
+                assert_eq!(walk_all(&mut accepting, read).unwrap(), pattern.len() + 1);
+            }
+        }
+        for pattern in [&[R, R][..], &[A, A][..], &[U, A][..], &[][..]] {
+            assert_eq!(
+                walk_all(&mut refusing(pbf(pattern)), false).unwrap(),
+                pattern.len() + 1
+            );
+        }
+    }
+
+    /// The frame that shows the mixture is judged only once complete: a
+    /// payload cut short there is the truncation error, not the refusal.
+    #[test]
+    fn a_truncated_detecting_frame_is_the_truncation() {
+        let bytes = pbf(&[Index::Readable, Index::Absent]);
+        let cut = bytes[..bytes.len() - 1].to_vec();
+        let err = walk_all(&mut refusing(cut), true).unwrap_err();
+        assert!(
+            matches!(err.kind(), ErrorKind::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+            "{err:?}"
+        );
+    }
+
+    /// An armed walk parses indexdata to observe it, but a caller that did
+    /// not ask to keep it still gets none.
+    #[test]
+    fn an_armed_walk_keeps_only_the_fields_asked_for() {
+        let mut walk = Frames::new(
+            std::io::Cursor::new(pbf(&[Index::Readable])),
+            Some(0),
+            HeaderFields {
+                tagdata: false,
+                indexdata: false,
+                waymembers: false,
+            },
+        );
+        walk.refuse_partial_index();
+        walk.next_header().unwrap().unwrap();
+        walk.skip_payload().unwrap();
+        let data = walk.next_header().unwrap().unwrap();
+        assert!(data.header.indexdata.is_none());
+        assert!(!data.header.indexdata_present);
+    }
+
+    /// A move forgets what the guard saw before it, and the walk stays
+    /// refusing: an indexed blob seen before a seek and an unindexed one
+    /// after are not judged together, while the same file walked through is
+    /// refused.
+    #[test]
+    fn a_reposition_resets_what_the_guard_saw() {
+        let bytes = pbf(&[Index::Readable, Index::Absent, Index::Readable]);
+        let mut walk = refusing(bytes.clone());
+        for _ in 0..2 {
+            walk.next_header().unwrap().unwrap();
+            walk.skip_payload().unwrap();
+        }
+        let second = walk.next_header().unwrap().unwrap().id.start.unwrap();
+        walk.seek(std::io::SeekFrom::Start(second)).unwrap();
+        walk.next_header().unwrap().unwrap();
+        walk.skip_payload().unwrap();
+        let err = walk
+            .next_header()
+            .and_then(|_| walk.skip_payload())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                ErrorKind::MissingIndexdata { partial: true, .. }
+            ),
+            "still refusing after the move: {err:?}"
+        );
+        assert!(walk_all(&mut refusing(bytes), false).is_err());
     }
 }

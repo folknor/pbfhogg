@@ -104,10 +104,10 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
 
     crate::debug::emit_marker("MERGE_SCANNER_START");
 
-    // A partially indexed base is refused at the blob that shows it: the walk
-    // reads every header anyway. Descriptors already dispatched are discarded
+    // A partially indexed base is refused at the blob that shows it, as by
+    // every command-input walk. Descriptors already dispatched are discarded
     // with the run, whose output is never published.
-    let mut walker = HeaderWalker::open(base, host)?.refusing_partial_index();
+    let mut walker = HeaderWalker::open(base, host)?;
     let mut seq: u64 = 0;
     // Intentionally unbounded under --locations-on-ways: the non-node
     // branch below appends and continues without polling barrier_rx. On a

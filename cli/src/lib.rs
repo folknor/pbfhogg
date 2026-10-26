@@ -4584,6 +4584,9 @@ fn run_bench_read(
     // change.
     use std::time::Instant;
 
+    // Every mode reads through the library's public constructors on purpose:
+    // it measures the readers a library user gets, so, like them, it reads a
+    // partially indexed file the commands would refuse.
     let (elapsed_ms, nodes, ways, rels): (u128, u64, u64, u64) = match mode {
         BenchReadMode::Sequential => {
             let reader = pbfhogg::ElementReader::from_path_with_eviction(path, true)?
@@ -4695,7 +4698,8 @@ fn bench_write_loop<W: std::io::Write>(
     use std::io::BufReader;
 
     // The same default-capacity BufReader this benchmark has always read
-    // through, named so its errors carry the file and byte offset.
+    // through, named so its errors carry the file and byte offset. A public
+    // library reader, as bench-read uses: it accepts a partially indexed file.
     let mut reader = pbfhogg::BlobReader::new_named(BufReader::new(open_input(path)?), path)
         .diagnostics(host.diagnostics.clone())
         .cancel(host.cancel.clone());

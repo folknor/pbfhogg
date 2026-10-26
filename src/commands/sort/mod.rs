@@ -151,13 +151,13 @@ pub(crate) fn sort_to<'a>(
     );
     crate::debug::emit_marker("SORT_INDEX_BUILD_START");
     // Any input order is accepted (sorting it is the point). The walk
-    // visits every header anyway, so it refuses a partially indexed input
-    // at no extra read; a wholly unindexed one takes the payload scan.
+    // refuses a partially indexed input, as every command-input walk does;
+    // a wholly unindexed one takes the payload scan.
     let (headers, indexed) = blob_merge::index_inputs(
         std::slice::from_ref(&pin),
         &IndexPolicy {
             require_sorted: None,
-            refuse_partial_index: true,
+            accept_partial_index: false,
         },
         direct_io,
         host,

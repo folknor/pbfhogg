@@ -254,8 +254,8 @@ fn id_file_token(raw: &str) -> Option<&str> {
 /// top-level element IDs (matching osmium's `--id-osm-file` behavior).
 ///
 /// Every data blob is decoded and its IDs read from the elements, so
-/// indexdata decides nothing here and a partially indexed file gives the
-/// same set as a wholly indexed one: the walk accepts it.
+/// indexdata decides nothing here; a partially indexed file is still
+/// refused, as by every command input walk (`Frames::refuse_partial_index`).
 ///
 /// The input is opened once, and that one description serves the whole
 /// read, so a path reads one file without a pin. A caller that pins it
@@ -267,12 +267,8 @@ pub fn parse_ids_from_pbf<'a>(
 ) -> Result<ElementIds> {
     let mut set = ElementIds::empty();
 
-    let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
-        input,
-        None,
-        crate::scan::classify::PartialIndex::Accept,
-        host,
-    )?;
+    let (schedule, shared_file) =
+        crate::scan::classify::build_classify_schedule(input, None, host)?;
 
     struct IdBatch {
         node_ids: Vec<i64>,
@@ -492,17 +488,14 @@ fn getid_dispatched<'a>(
     // add_referenced still shares the refusal above: --force explicitly opts
     // into its slower unindexed scans even though it does not dispatch an arm.
     //
-    // This first-blob probe is the only indexing decision getid makes. A
-    // partially indexed file (indexed first data blob, a later one without
-    // indexdata) is accepted on every path, deliberately and without a
-    // refusing walk: no getid path skips, copies or counts a blob on the
-    // strength of indexdata it lacks. Both include arms, the invert walker,
-    // `--add-referenced`'s two passes and `-I`'s walk decompress such a blob
-    // and filter its actual elements, so the output equals the one from the
-    // same file wholly indexed; only the decode costs more. The one refusal
-    // that can follow is the invert walker's, for an unindexed way blob under
-    // a carried way-enrichment declaration, which re-encoding would break.
-    // reference/indexdata-trust.md, "Missing and partial indexdata".
+    // A partially indexed file (indexdata on some data blobs and not others,
+    // in either order) is refused on every path: both include arms, the
+    // invert walker, `--add-referenced`'s two passes and `-I`'s walk each
+    // read through a command-input walk, which refuses it once both kinds of
+    // blob have been seen (`Frames::refuse_partial_index`), whichever arm the
+    // blob count picked. An unindexed first data blob is refused by the probe
+    // above before that, unless `--force`. reference/indexdata-trust.md,
+    // "Missing and partial indexdata".
     let (arm, result) = if opts.add_referenced {
         let stats = getid_with_refs(input, output, ids, opts, write, overrides, host)?;
         (None, stats)
@@ -574,10 +567,10 @@ pub(crate) fn removeid_to<'a>(
         host,
     )?;
     // Every way blob is copied whole when no way ID is removed and the blobs
-    // carry indexdata (a blob without it is decoded to find its IDs, and the
-    // walker refuses an unindexed way blob behind an indexed first blob when
-    // the header has declared a way enrichment). The output is a subset of
-    // the input with nothing changed, so the copied declarations still hold.
+    // carry indexdata (an unindexed blob behind an indexed first blob makes
+    // the file partially indexed, which the walk refuses). The output is a
+    // subset of the input with nothing changed, so the copied declarations
+    // still hold.
     let ways = if indexed && !ids.way_ids.has_any() {
         Ways::BlobsCopied
     } else {
@@ -791,7 +784,10 @@ fn filter_by_id_walker(
                 flush_local(&mut bb, &mut output_blocks)?;
                 // Only an unindexed blob can be a way blob decoded under a
                 // header that declared way enrichment (with one, no way ID is
-                // removed, so an indexed way blob never matches).
+                // removed, so an indexed way blob never matches). The walk
+                // refuses a partially indexed file at that blob's frame, before
+                // this decode, so this is a backstop for the declaration: it
+                // must hold whatever the indexing policy becomes.
                 if meta.index.is_none()
                     && declared.way_enrichment()
                     && output_blocks
@@ -1029,14 +1025,11 @@ fn getid_with_refs(
 
     if ids.way_ids.has_any() {
         // Parallel classification: pread workers scan way blobs for matching
-        // way IDs and collect their node refs. A blob without indexdata is
-        // scheduled and decoded, and the worker looks only at the ways it
-        // actually holds, so a partially indexed file is accepted here as on
-        // every other getid path (see `getid_dispatched`).
+        // way IDs and collect their node refs. A partially indexed file is
+        // refused here as on every getid path (see `getid_dispatched`).
         let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
             input,
             Some(crate::ElementKind::Way),
-            crate::scan::classify::PartialIndex::Accept,
             host,
         )?;
 
@@ -1590,49 +1583,61 @@ mod tests {
         );
     }
 
-    /// A file indexed on its node blob and not on its way blob is accepted by
-    /// `--add-referenced`'s classify walk and by the `-I` reader, and both
-    /// read the unindexed blob's actual elements: the way and the nodes it
-    /// references come out, and every ID is collected.
+    /// A file indexed on its node blob and not on its way blob is refused by
+    /// the two walks that run before any output is written:
+    /// `--add-referenced`'s pass 1 classify walk (way IDs) and the `-I`
+    /// reader, each with the typed partial missing-indexdata error located
+    /// at the way blob (ordinal 2: the header is 0, the node blob 1). The
+    /// paths that refuse mid-write (both include arms, the invert walker,
+    /// pass 2) are pinned by the CLI input-contract table, in both orders:
+    /// this crate's test builds assert on a writer dropped unflushed, which
+    /// is what an error return mid-write does.
     #[test]
-    fn partially_indexed_input_is_read_in_full_by_the_classify_walks() {
+    fn partially_indexed_input_is_refused_before_any_output() {
         let dir = crate::path_guard::tests::scratch();
         let input = dir.path().join("partial.pbf");
         write_blocks(&input, &[1, 2, 3], Some((10, &[1, 2])), false);
         let host = crate::host::Host::for_tests();
+        let pin = PinnedInput::pin(&input, &host).unwrap();
+        let refused = |label: &str, result: Result<()>| {
+            let err = result.expect_err(label);
+            assert!(
+                matches!(
+                    err.kind(),
+                    crate::error::ErrorKind::MissingIndexdata { partial: true, .. }
+                ),
+                "{label}: {err:?}"
+            );
+            assert_eq!(err.blob_index(), Some(2), "{label}: {err:?}");
+        };
+        let staged = || {
+            crate::output::Output::new(
+                dir.path().join("output.pbf"),
+                crate::output::Overwrite::Replace,
+                &crate::host::Diagnostics::discard(),
+            )
+            .unwrap()
+        };
         let ids = parse_ids(&["w10".to_owned()]).unwrap();
         let opts = GetidOptions {
             add_referenced: true,
             remove_tags: false,
             report_found: false,
         };
-        let output = dir.path().join("output.pbf");
-        let staged = crate::output::Output::new(
-            &output,
-            crate::output::Overwrite::Refuse,
-            &crate::host::Diagnostics::discard(),
-        )
-        .unwrap();
-        let (arm, stats) = getid_dispatched(
-            &input,
-            &staged,
-            &ids,
-            &opts,
-            &WriteOptions::default(),
-            &HeaderOverrides::default(),
-            FULL_SCAN_ARM_MIN_BLOBS,
-            &host,
-        )
-        .unwrap();
-        staged.publish(&crate::host::Cancel::new()).unwrap();
-        assert_eq!(arm, None);
-        assert_eq!((stats.nodes_written, stats.ways_written), (2, 1));
-        assert_eq!(read_ids(&output, &host), vec![1, 2, 10]);
-
-        let collected = parse_ids_from_pbf(&input, false, &host).unwrap();
-        assert!((1..=3).all(|id| collected.node_ids.get(id)));
-        assert!(collected.way_ids.get(10));
-        assert!(!collected.relation_ids.has_any());
+        refused(
+            "add-referenced pass 1",
+            getid_with_refs(
+                &pin,
+                &staged(),
+                &ids,
+                &opts,
+                &WriteOptions::default(),
+                &HeaderOverrides::default(),
+                &host,
+            )
+            .map(drop),
+        );
+        refused("-I", parse_ids_from_pbf(&input, false, &host).map(drop));
     }
 
     /// Run the same include-mode query under both arms, assert they emit
@@ -1697,17 +1702,6 @@ mod tests {
         assert_eq!(
             ids_from_both_arms(&input, &["n2"], &crate::host::Host::for_tests()),
             vec![2]
-        );
-    }
-
-    #[test]
-    fn include_arms_agree_when_a_blob_lacks_indexdata() {
-        let dir = crate::path_guard::tests::scratch();
-        let input = dir.path().join("input.pbf");
-        write_blocks(&input, &[1, 2], Some((10, &[1, 2])), false);
-        assert_eq!(
-            ids_from_both_arms(&input, &["n1", "w10"], &crate::host::Host::for_tests()),
-            vec![1, 10]
         );
     }
 

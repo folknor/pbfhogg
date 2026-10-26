@@ -191,8 +191,7 @@ pub(super) fn try_extract_multi_single_pass(
     // re-judging it; the walker would accept a data blob there, so it is
     // not a second missing-header check.
     crate::debug::emit_marker("MULTI_SCHEDULE_SCAN_START");
-    let mut walker =
-        crate::read::header_walker::HeaderWalker::open(input, host)?.refusing_partial_index();
+    let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
     let _ = walker
         .next_header()?
         .ok_or_else(|| crate::error::new_missing_header(input.path()))?;

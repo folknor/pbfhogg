@@ -98,9 +98,9 @@ The escape, and whether a command refuses at all, is decided per command:
 - `renumber` has no escape. It reads each blob's element count from indexdata
   to assign new IDs without a decode pass, so its header scan refuses the
   input if any data blob lacks indexdata.
-- `getparents` and `check --ids` do not refuse: `getparents` uses indexdata
-  to choose a scan strategy, and `check --ids` warns that unindexed input
-  is scanned more slowly.
+- `getparents` and `check --ids` do not refuse a wholly unindexed input:
+  `getparents` uses indexdata to choose a scan strategy, and `check --ids`
+  warns that unindexed input is scanned more slowly.
 - `tags-filter` asks for indexdata only when it would use it: not with
   `--invert` or `--distrust-metadata`.
 - `cat --clean` without `--type` does not refuse: it decodes every blob
@@ -110,27 +110,25 @@ The escape, and whether a command refuses at all, is decided per command:
 Except for renumber's scan, the check reads only the first data blob's
 header. It is not a whole-file validation: a file whose first data blob is
 indexed passes it even if later blobs are not. Such a partially indexed file
-is refused, with the same missing-indexdata error and advice, by most commands
-that read all blob headers to plan their work (among them `sort`,
-`apply-changes`, `repack`, `extract`, `add-locations-to-ways`,
-`build-geocode-index` and `diff`), at the first data blob without
-indexdata; `--force` does not lift that refusal. `digest` refuses it the
-same way, located at the same blob, while it reads the file. `pbfhogg cat`
-indexes every blob of such a file, and every `cat` mode runs on it: `--type`,
+(indexdata on some data blobs and not others, in either order) is refused by
+every command except `cat`, `check --index` and `inspect`, once its reads
+have met both kinds of blob, with the missing-indexdata error located at the
+first data blob without indexdata and this advice:
+
+```sh
+pbfhogg cat input.osm.pbf -o indexed.osm.pbf
+```
+
+`--force` does not lift that refusal, and it holds whether or not a command
+would have used the indexdata: `getid`, `getparents`, `tags-filter` (with
+`-R`, `--invert-match` and `--distrust-metadata` too), `time-filter` and
+`export` refuse it like the rest. If the first data blob is the unindexed
+one, a command that asks for indexdata refuses the file as unindexed first;
+with `--force` it then stops at the partial refusal. `pbfhogg cat` indexes
+every blob of such a file, and every `cat` mode runs on it: `--type`,
 `--clean` and `--dedupe` decode or scan each blob that lacks indexdata, so
-their output is the same as from the file fully indexed. Other commands that
-do not read every header first, `digest` aside, run on it.
-`getid` and `getparents` run on it by design, `getid` in every mode and both
-as a `-I` ID file: they decode each blob that lacks indexdata, so their
-output is the same as from the file fully indexed, only slower. One case
-still fails: `getid --invert` on a file whose header
-declares way enrichment (such as `LocationsOnWays`) and one of whose blobs
-without indexdata holds ways, since re-encoding those ways would break the
-declaration. `tags-filter` runs on it by the same design, with and without
-`-R`: it decodes each blob that lacks indexdata, so its output is the same
-as from the file fully indexed, only slower. `time-filter` reads no
-indexdata at all, so it runs on such a file, as on an unindexed one, with
-the same output.
+their output is the same as from the file fully indexed. `check --index`
+reports the file as a violation, and `inspect` describes it.
 
 ## The --force flag
 

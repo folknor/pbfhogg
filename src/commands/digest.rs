@@ -69,7 +69,6 @@ use crate::blob::{Blob, BlobType};
 use crate::blob_meta::BlobIndex;
 use crate::content::write_record;
 use crate::error::{Error, Location};
-use crate::read::header_walker::{PartialIndexGuard, partial_index_error};
 use crate::read::input::InputSource;
 use crate::read::pipeline::DecodeTransform;
 use crate::{BlockType, ByteOffset, Element, ElementKind, ElementReader, PrimitiveBlock};
@@ -320,14 +319,12 @@ fn check_user(element: &Element<'_>) -> crate::error::Result<()> {
 /// streaming hash states. Nothing leaves it until [`Self::finish`], so a
 /// refusal anywhere in the file prints no digest at all.
 struct DigestState {
-    /// The input, to locate the refusals raised here.
+    /// The input, to locate the refusals raised here. Domain rule 3's
+    /// either-or (a partially indexed file is refused, a wholly unindexed one
+    /// digested) is not judged here: the reader refuses a partially indexed
+    /// command input itself, located at its first unindexed data blob, as
+    /// every command does (`Frames::refuse_partial_index`).
     path: Arc<Path>,
-    /// Domain rule 3's either-or, over the data blobs in file order. A
-    /// partially indexed file is refused with the missing-indexdata error
-    /// located at its first unindexed data blob (as the header walks of
-    /// the commands that plan from indexdata refuse it), at the first data
-    /// blob that shows the mixture; a wholly unindexed one is digested.
-    partial: PartialIndexGuard<(Option<u64>, Option<ByteOffset>)>,
     /// Kind and ID of the last element seen.
     last: Option<(ElementKind, i64)>,
     all: Xxh3,
@@ -338,7 +335,6 @@ impl DigestState {
     fn new(path: Arc<Path>) -> Self {
         Self {
             path,
-            partial: PartialIndexGuard::default(),
             last: None,
             all: Xxh3::new(),
             kinds: [(0, Xxh3::new()), (0, Xxh3::new()), (0, Xxh3::new())],
@@ -349,16 +345,6 @@ impl DigestState {
     /// at the blob that raised it.
     fn absorb(&mut self, summary: BlockSummary) -> crate::Result<()> {
         let (blob, offset) = (summary.blob, summary.offset);
-        if let Some((blob, offset)) = self
-            .partial
-            .observe(summary.index.is_some(), (blob, offset))
-        {
-            return Err(partial_index_error().locate(Location::new(
-                Some(&self.path),
-                blob,
-                offset,
-            )));
-        }
         self.absorb_checked(summary)
             .map_err(|e| e.locate_blob(Location::new(Some(&self.path), blob, offset)))
     }

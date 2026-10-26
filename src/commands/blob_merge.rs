@@ -130,10 +130,12 @@ pub(crate) struct IndexPolicy {
     /// Refuse an input whose header does not claim `Sort.Type_then_ID`, with
     /// this reason (`cat --dedupe`, which promises a merge of sorted inputs).
     pub(crate) require_sorted: Option<&'static str>,
-    /// Refuse a partially indexed input (`HeaderWalker::refusing_partial_index`).
-    /// `sort` does; `cat --dedupe` accepts one, scanning each unindexed blob
-    /// (reference/indexdata-trust.md, "Missing and partial indexdata").
-    pub(crate) refuse_partial_index: bool,
+    /// Exempt the walk from the command-input refusal of a partially indexed
+    /// input (`HeaderWalker::accepting_partial_index`). `sort` refuses one,
+    /// as every command does; `cat --dedupe` accepts it, because `cat` is
+    /// the remedy, scanning each unindexed blob (reference/indexdata-trust.md,
+    /// "Missing and partial indexdata").
+    pub(crate) accept_partial_index: bool,
 }
 
 /// Pass 1: walk every input, in order, and index its OSMData blobs.
@@ -244,8 +246,8 @@ impl Walk<'_> {
         input: &PinnedInput,
         mut walker: HeaderWalker<P>,
     ) -> Result<crate::HeaderBlock> {
-        if self.policy.refuse_partial_index {
-            walker = walker.refusing_partial_index();
+        if self.policy.accept_partial_index {
+            walker = walker.accepting_partial_index();
         }
         let mut header: Option<crate::HeaderBlock> = None;
         while let Some(meta) = walker.next_header()? {

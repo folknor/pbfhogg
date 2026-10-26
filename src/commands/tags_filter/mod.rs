@@ -302,16 +302,16 @@ pub(crate) fn tags_filter_to<'a>(
     // blobs), and `--distrust-metadata` declines to use it at all - demanding
     // indexdata the run will not consult would be a pointless refusal.
     //
-    // This first-blob probe is the only indexing decision tags-filter makes.
     // A partially indexed file (some data blobs with indexdata, some without,
-    // in either order) is accepted on every path, deliberately and without a
-    // refusing walk: no path skips a blob on indexdata it lacks. `-R`'s
-    // pipelined reader, pass 1, the relation closure, the way-dependency scan
-    // and pass 2 each decode such a blob (unless its tagdata, a separate
-    // claim, excludes it) and select from its actual elements by kind and ID,
-    // so the output equals the one from the same file wholly indexed; only
-    // the decode costs more. reference/indexdata-trust.md, "Missing and
-    // partial indexdata".
+    // in either order) is refused on every path, `--invert-match` and
+    // `--distrust-metadata` included: `-R`'s pipelined reader and pass 1's
+    // schedule walk (the first read of the file on each path) refuse it once
+    // both kinds of blob have been seen, as every command-input read does
+    // (`Frames::refuse_partial_index`). Those two modes consult no
+    // indexdata, but the refusal is the command's input contract, not a
+    // question of whether a path could cope; distrusting the claims is not
+    // waiving it. reference/indexdata-trust.md, "Missing and partial
+    // indexdata".
     if !opts.invert && !opts.distrust_metadata {
         require_indexdata(
             input,
@@ -741,9 +741,8 @@ fn tags_filter_two_pass(
 
         // Build schedule from header-only scan via the pread-only HeaderWalker.
         // Avoids pulling blob bodies into the page cache for blobs we'll decide
-        // to skip on the tag-index filter anyway. A partially indexed file is
-        // accepted (see `tags_filter_to`): a blob without indexdata is
-        // scheduled and its elements matched by their actual kind.
+        // to skip on the tag-index filter anyway. The walk refuses a
+        // partially indexed file (see `tags_filter_to`).
         crate::debug::emit_marker("TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_START");
         let mut walker = crate::read::header_walker::HeaderWalker::open(input, host)?;
         let _ = walker
@@ -971,8 +970,8 @@ fn tags_filter_two_pass(
         //
         // The `if let Some(idx) = meta.index.as_ref()` gate means a blob
         // without indexdata falls through unskipped and decodes fully in
-        // pass 2, whether the whole file lacks indexdata (`--force`) or only
-        // some blobs do (a partially indexed file, accepted). That costs a
+        // pass 2 when the whole file lacks indexdata (`--force`; a partially
+        // indexed file never gets here, the walks refuse it). That costs a
         // decode and nothing else: `filter_block_pass2` writes an element
         // only when its ID is in the set for its actual kind, so a blob of a
         // kind the filter would have skipped contributes nothing.
@@ -1136,9 +1135,6 @@ fn collect_relation_member_closure(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         kind_schedule_filter(crate::ElementKind::Relation, distrust_metadata),
-        // A blob without indexdata is scheduled and only its decoded
-        // relations are read, so a partially indexed file is accepted.
-        crate::scan::classify::PartialIndex::Accept,
         host,
     )?;
 
@@ -1264,9 +1260,6 @@ fn collect_way_node_dependencies(
     let (schedule, shared_file) = crate::scan::classify::build_classify_schedule(
         input,
         kind_schedule_filter(crate::ElementKind::Way, distrust_metadata),
-        // A blob without indexdata is scheduled and only its decoded ways
-        // are read, so a partially indexed file is accepted.
-        crate::scan::classify::PartialIndex::Accept,
         host,
     )?;
 
@@ -1524,13 +1517,21 @@ mod tests {
         writer.flush().unwrap();
     }
 
-    /// One run: output bytes, (kind, id) in file order, and the stats.
+    /// What one run gave: output bytes, (kind, id) in file order, the stats.
+    type FilterRun = (Vec<u8>, Vec<(char, i64)>, [u64; 7]);
+
+    /// One run, or the library's refusal of it.
+    #[expect(
+        clippy::unwrap_in_result,
+        reason = "test helper: the command's result is what is under test, the fixture I/O \
+                  around it is not"
+    )]
     fn run_filter(
         input: &Path,
         expression: &str,
         mode: &str,
         force: bool,
-    ) -> (Vec<u8>, Vec<(char, i64)>, [u64; 7]) {
+    ) -> crate::Result<FilterRun> {
         let dir = crate::path_guard::tests::scratch();
         let expression_strs = [expression.to_owned()];
         let opts = TagsFilterOptions {
@@ -1553,7 +1554,7 @@ mod tests {
         )
         .unwrap();
         let host = crate::host::Host::for_tests();
-        let s = tags_filter(input, staged, &opts, &HeaderOverrides::default(), &host).unwrap();
+        let s = tags_filter(input, staged, &opts, &HeaderOverrides::default(), &host)?;
         let mut elements = Vec::new();
         ElementReader::open_in(&output, false, &host)
             .unwrap()
@@ -1573,17 +1574,17 @@ mod tests {
             s.relations_matched,
             s.relations_from_relations,
         ];
-        (std::fs::read(&output).unwrap(), elements, stats)
+        Ok((std::fs::read(&output).unwrap(), elements, stats))
     }
 
-    /// A partially indexed input, in either order, is accepted on every path
-    /// and gives the wholly indexed file's output byte for byte, with the
-    /// same stats: each path decodes a blob without indexdata and selects
-    /// from its actual elements, so the missing index costs a decode, never
-    /// a result. The unindexed blobs cover every kind, and the relation
-    /// query needs both dependency walks, the closure over two iterations.
+    /// A partially indexed input, in either order, is refused on every
+    /// two-pass path, `--invert-match` and `--distrust-metadata` included,
+    /// with the typed partial missing-indexdata error located at the first
+    /// unindexed data blob. An unindexed head is refused by the first-blob gate first where
+    /// a mode has one, and by the partial refusal under `--force`. The wholly
+    /// indexed file runs every case, so the fixture itself is sound.
     #[test]
-    fn partial_index_in_either_order_matches_the_wholly_indexed_output() {
+    fn partial_index_in_either_order_is_refused_on_every_path() {
         let dir = crate::path_guard::tests::scratch();
         let whole = dir.path().join("whole.pbf");
         write_partial_fixture(&whole, [true; 3]);
@@ -1615,23 +1616,39 @@ mod tests {
             ("r/type=route", "omit-referenced", &[('r', 100)]),
             ("amenity", "omit-referenced", &[('n', 1)]),
         ];
-        for (name, mask) in [
-            ("indexed head", [true, false, false]),
-            ("unindexed head", [false, true, true]),
+        for (expression, mode, expected) in cases {
+            let reference = run_filter(&whole, expression, mode, false).unwrap();
+            assert_eq!(reference.1, expected, "reference: {expression}, {mode}");
+        }
+        // (name, mask, ordinal of the first unindexed data blob; the header
+        // is 0).
+        for (name, mask, first_unindexed) in [
+            ("indexed head", [true, false, false], 2_u64),
+            ("unindexed head", [false, true, true], 1),
         ] {
             let partial = dir.path().join(format!("{name}.pbf"));
             write_partial_fixture(&partial, mask);
-            // The first-blob probe asks for `--force` only when the first
-            // data blob lacks indexdata.
-            let force = !mask[0];
-            for (expression, mode, expected) in cases {
-                let what = format!("{name}, {expression}, {mode}");
-                let reference = run_filter(&whole, expression, mode, false);
-                let got = run_filter(&partial, expression, mode, force);
-                assert_eq!(reference.1, expected, "reference: {what}");
-                assert_eq!(got.1, expected, "{what}");
-                assert_eq!(got.2, reference.2, "stats: {what}");
-                assert!(got.0 == reference.0, "output bytes differ: {what}");
+            // `-R` refuses mid-write, which this crate's test builds assert
+            // on (a writer dropped unflushed); the CLI input-contract table
+            // pins it, in both orders.
+            for &(expression, mode, _) in cases.iter().filter(|c| c.1 != "omit-referenced") {
+                for force in [false, true] {
+                    let what = format!("{name}, {expression}, {mode}, force {force}");
+                    let err = run_filter(&partial, expression, mode, force)
+                        .expect_err(&format!("{what}: a partially indexed input ran"));
+                    let crate::error::ErrorKind::MissingIndexdata { partial, .. } = err.kind()
+                    else {
+                        panic!("{what}: {err:?}");
+                    };
+                    // Only an unindexed head meets a first-blob gate, and only
+                    // in a mode that has one and without --force.
+                    let gated =
+                        !mask[0] && !force && !matches!(mode, "invert" | "distrust-metadata");
+                    assert_eq!(*partial, !gated, "{what}: {err:?}");
+                    if *partial {
+                        assert_eq!(err.blob_index(), Some(first_unindexed), "{what}");
+                    }
+                }
             }
         }
     }

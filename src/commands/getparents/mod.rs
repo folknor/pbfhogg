@@ -649,14 +649,6 @@ mod tests {
         assert_eq!(ids_from_both_arms(&input, &["n1"], true), vec![1]);
     }
 
-    #[test]
-    fn arms_agree_when_a_blob_lacks_indexdata() {
-        let dir = crate::path_guard::tests::scratch();
-        let input = dir.path().join("input.pbf");
-        write_blocks(&input, &[1, 2], Some((10, &[1, 2])), false);
-        assert_eq!(ids_from_both_arms(&input, &["n1"], false), vec![10]);
-    }
-
     /// Fixture exercising cross-kind blob skipping. Each kind lands in its
     /// own indexed blob so the walker's `needed_blob_kinds` skip applies per
     /// kind, and the relation-of-relation pins single-level parent semantics:
@@ -769,7 +761,17 @@ mod tests {
         expected: &'static [(char, i64)],
     }
 
-    fn run_arm(input: &std::path::Path, query: &[&str], add_self: bool, arm: ScanArm) -> ArmRun {
+    #[expect(
+        clippy::unwrap_in_result,
+        reason = "test helper: the command's result is what is under test, the fixture I/O \
+                  around it is not"
+    )]
+    fn run_arm(
+        input: &std::path::Path,
+        query: &[&str],
+        add_self: bool,
+        arm: ScanArm,
+    ) -> crate::Result<ArmRun> {
         let dir = crate::path_guard::tests::scratch();
         let query: Vec<String> = query.iter().map(|s| (*s).to_owned()).collect();
         let query = parse_ids(&query).expect("ids");
@@ -789,12 +791,11 @@ mod tests {
             &HeaderOverrides::default(),
             arm,
             &crate::host::Host::for_tests(),
-        )
-        .expect("getparents");
+        )?;
         staged
             .publish(&crate::host::Cancel::new())
             .expect("publish");
-        ArmRun {
+        Ok(ArmRun {
             bytes: std::fs::read(&output).expect("read output bytes"),
             elements: ordered(&output),
             stats: (
@@ -802,25 +803,20 @@ mod tests {
                 stats.ways_written,
                 stats.relations_written,
             ),
-        }
+        })
     }
 
-    /// A partially indexed input, in either order, is accepted on both arms
-    /// and gives the wholly indexed file's output byte for byte: every path
-    /// decodes a blob without indexdata and selects from its actual
-    /// elements, so the missing index costs a decode, never a result. Each
-    /// query reaches a different unindexed blob: the queried node itself
-    /// (`--add-self`), a way parent, a relation parent, and a
-    /// relation-of-relation parent.
+    /// Both arms give every case's output byte for byte alike, with the
+    /// same stats: the queried node itself (`--add-self`), a way parent, a
+    /// relation parent, a relation-of-relation parent. (A partially indexed
+    /// input is refused on both arms mid-write, which this crate's test
+    /// builds assert on as a writer dropped unflushed; the CLI input-contract
+    /// table pins that refusal, in both orders.)
     #[test]
-    fn partial_index_in_either_order_matches_the_wholly_indexed_output() {
+    fn arms_agree_byte_for_byte_on_every_parent_kind() {
         let dir = crate::path_guard::tests::scratch();
         let whole = dir.path().join("whole.pbf");
         write_rich_fixture_indexed(&whole, [true; 3]);
-        let partials = [
-            ("indexed head", [true, false, false]),
-            ("unindexed head", [false, true, true]),
-        ];
         let cases = [
             Case {
                 query: &["n1"],
@@ -843,32 +839,24 @@ mod tests {
                 expected: &[('r', 101)],
             },
         ];
-        for (name, mask) in partials {
-            let partial = dir.path().join(format!("{name}.pbf"));
-            write_rich_fixture_indexed(&partial, mask);
-            for case in &cases {
-                for arm in [ScanArm::Walker, ScanArm::FullScan] {
-                    let reference = run_arm(&whole, case.query, case.add_self, arm);
-                    let got = run_arm(&partial, case.query, case.add_self, arm);
-                    let what = format!(
-                        "{name}, {:?}, add_self {}, {arm:?}",
-                        case.query, case.add_self
-                    );
-                    assert_eq!(reference.elements, case.expected, "reference: {what}");
-                    assert_eq!(got.elements, case.expected, "{what}");
-                    let count = |kind| {
-                        let n = case.expected.iter().filter(|(k, _)| *k == kind).count();
-                        u64::try_from(n).expect("count fits")
-                    };
-                    assert_eq!(
-                        got.stats,
-                        (count('n'), count('w'), count('r')),
-                        "stats: {what}"
-                    );
-                    assert_eq!(got.stats, reference.stats, "reference stats: {what}");
-                    assert!(got.bytes == reference.bytes, "output bytes differ: {what}");
-                }
-            }
+        for case in &cases {
+            let walker =
+                run_arm(&whole, case.query, case.add_self, ScanArm::Walker).expect("walker");
+            let full =
+                run_arm(&whole, case.query, case.add_self, ScanArm::FullScan).expect("full scan");
+            let what = format!("{:?}, add_self {}", case.query, case.add_self);
+            assert_eq!(walker.elements, case.expected, "{what}");
+            let count = |kind| {
+                let n = case.expected.iter().filter(|(k, _)| *k == kind).count();
+                u64::try_from(n).expect("count fits")
+            };
+            assert_eq!(
+                walker.stats,
+                (count('n'), count('w'), count('r')),
+                "stats: {what}"
+            );
+            assert_eq!(full.stats, walker.stats, "full-scan stats: {what}");
+            assert!(full.bytes == walker.bytes, "arm outputs differ: {what}");
         }
     }
 

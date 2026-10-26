@@ -530,6 +530,15 @@ impl<R: Read + Send> BlobReader<R> {
         self.frames.fields.indexdata = enable;
     }
 
+    /// Exempt a command-input reader from the refusal of a partially
+    /// indexed file ([`Self::open_in`]). Only for `inspect`'s descriptions
+    /// and `cat`; the call site says which.
+    #[must_use]
+    pub(crate) fn accepting_partial_index(mut self) -> Self {
+        self.frames.accept_partial_index();
+        self
+    }
+
     /// Enable or disable way-member bitmap parsing (BlobHeader field 5).
     /// Disabled by default to avoid allocating metadata unused by normal reads.
     pub fn set_parse_waymembers(&mut self, enable: bool) {
@@ -639,19 +648,23 @@ impl BlobReader<FileReader> {
     }
 
     /// Open a file for a command run under `host`: buffered or O_DIRECT per
-    /// `direct`, with the host's diagnostics and page-cache policy.
+    /// `direct`, with the host's diagnostics and page-cache policy. As a
+    /// command input it refuses a partially indexed file
+    /// (`Frames::refuse_partial_index`) unless the command opts out with
+    /// [`Self::accepting_partial_index`]; the public constructors do not, so
+    /// pbfhogg as a library reads any file.
     pub(crate) fn open_in<'a>(
         source: impl Into<crate::read::input::InputSource<'a>>,
         direct: bool,
         host: &crate::host::Host,
     ) -> Result<Self> {
         let source = source.into();
-        Ok(
-            Self::from_reader(FileReader::open(source, direct)?, source.path())
-                .diagnostics(host.diagnostics.clone())
-                .cancel(host.cancel.clone())
-                .evict_page_cache(host.page_cache == crate::host::PageCachePolicy::Evict),
-        )
+        let mut reader = Self::from_reader(FileReader::open(source, direct)?, source.path())
+            .diagnostics(host.diagnostics.clone())
+            .cancel(host.cancel.clone())
+            .evict_page_cache(host.page_cache == crate::host::PageCachePolicy::Evict);
+        reader.frames.refuse_partial_index();
+        Ok(reader)
     }
 
     /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.

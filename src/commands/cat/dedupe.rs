@@ -180,16 +180,17 @@ fn plan_merge(
         "cat.dedupe.pass1",
         "Pass 1: indexing blobs..."
     );
-    // A partially indexed input is accepted: each blob without indexdata is
-    // scanned, so the plan rests on observed ranges for it
-    // (reference/indexdata-trust.md, "Missing and partial indexdata").
+    // A partially indexed input is accepted, because cat is the remedy for
+    // one: each blob without indexdata is scanned, so the plan rests on
+    // observed ranges for it (reference/indexdata-trust.md, "Missing and
+    // partial indexdata").
     let (headers, indexed) = blob_merge::index_inputs(
         &pins,
         &IndexPolicy {
             require_sorted: Some(
                 "Cat dedupe requires sorted inputs so it can merge them in type-then-ID order.",
             ),
-            refuse_partial_index: false,
+            accept_partial_index: true,
         },
         opts.direct_reads,
         host,

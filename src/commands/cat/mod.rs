@@ -335,6 +335,9 @@ fn cat_passthrough(
     for input in files {
         let file = input.path();
         let mut frames = Frames::of_input(FileReader::open(input, direct_io)?, file, host);
+        // cat is the remedy for a partially indexed file: it indexes every
+        // blob that lacks indexdata, so it is exempt from the refusal.
+        frames.accept_partial_index();
 
         while let Some(mut frame) = frames.next_raw()? {
             match &frame.blob_type {
@@ -693,6 +696,10 @@ fn cat_type_passthrough(
     for input in files {
         let file = input.path();
         let mut frames = Frames::of_input(FileReader::open(input, direct_io)?, file, host);
+        // cat is the remedy for a partially indexed file, so `--type` is
+        // exempt from the refusal: a blob without indexdata is decoded and
+        // its selected elements re-encoded with fresh indexdata.
+        frames.accept_partial_index();
 
         while let Some(mut frame) = frames.next_raw()? {
             match &frame.blob_type {
@@ -941,14 +948,14 @@ fn cat_filtered(
     let kind_filter = (tf.count() < 3).then(|| BlobFilter::new(tf.nodes, tf.ways, tf.relations));
 
     for file in files {
-        // A blob without indexdata is scheduled whatever the selection and
-        // decoded like the rest, so a partially indexed file is accepted.
+        // cat is the remedy for a partially indexed file, so this walk is
+        // exempt from the command-input refusal: a blob without indexdata is
+        // scheduled whatever the selection and decoded like the rest.
         let (schedule, shared_file, _) =
-            crate::scan::classify::build_classify_schedule_blob_filtered(
+            crate::scan::classify::build_classify_schedule_blob_filtered_accepting_partial(
                 file,
                 None,
                 kind_filter.as_ref(),
-                crate::scan::classify::PartialIndex::Accept,
                 host,
             )?;
         // The ordered pass of one input, kind phases nested inside (see

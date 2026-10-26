@@ -97,18 +97,23 @@
   `merge-changes`). New public function `osc::output_is_gzip` carries the
   rule.
 
-- **A partially indexed input is refused instead of run on an index it
-  lacks.** A file whose first data blob carries indexdata and a later one
-  does not used to pass the first-blob indexdata check. Every command that
-  already reads every blob header to plan its work now refuses it with the
-  missing-indexdata error, located at the first data blob without
-  indexdata: sort, apply-changes, repack, degrade, tags-count,
-  extract, add-locations-to-ways, build-geocode-index,
-  `inspect --nodes`, `inspect tags`, `check --refs`,
-  `check --ids` and digest. `--force` and `--allow-unindexed` do not lift
-  this refusal; `pbfhogg cat` re-indexes such a file. A wholly unindexed
-  input is handled as before. `ErrorKind::MissingIndexdata` gains a
-  `partial` field that marks this case.
+- **Every command refuses a partially indexed input, except `cat`.** A file
+  whose data blobs carry indexdata on some and not others (in either order)
+  used to pass the first-blob indexdata check, and then some commands ran on
+  it and others refused it, depending on the command, its options and even
+  the input size. Every command now refuses it once its reads have seen both
+  kinds of blob, with the missing-indexdata error located at the first data
+  blob without indexdata and advice to index it with `pbfhogg cat`. That
+  includes the commands and modes that had accepted it: `getid` in every
+  mode and as a `-I` ID file (`getparents -I` too), `getparents`,
+  `tags-filter` with or without `-R`, `--invert-match` or
+  `--distrust-metadata`, `time-filter` on both paths, `export` and
+  `degrade --strip-indexdata`. `cat` in every mode, the remedy, still runs
+  on it; `check --index` reports it as a violation and `inspect` describes
+  it. `--force` and `--allow-unindexed` do not lift the refusal. A wholly
+  unindexed input is handled as before. `ErrorKind::MissingIndexdata` gains
+  a `partial` field that marks this case. The library's public readers
+  (`BlobReader`, `ElementReader`) still read any file.
 
 - **`cat --clean` writes in input order, needs no indexdata, and takes
   `--force` only with `--type`.** It used to run one pass per element kind,
@@ -1636,17 +1641,6 @@
   `ways`, `relations`) and dense node tags follow the same rule: where they
   once read such a failure as no dense nodes, absent dense metadata, a
   skipped element or a shortened tag list, they now panic.
-
-- **`getid` accepts a partially indexed input in every mode.** A file whose
-  first data blob carries indexdata and a later one does not was refused by
-  `getid --add-referenced` when way IDs were requested, and as a
-  `-I`/`--id-osm-file` ID file by `getid` and `getparents`, while every
-  other `getid` mode ran on it. Every `getid` path decodes a blob that
-  lacks indexdata, so the output is the same as from the file fully
-  indexed; these now run too. A primary input whose first data blob lacks
-  indexdata still needs `--force` (an `-I` file never did), and
-  `getid --invert` still refuses an unindexed blob holding ways under a
-  header that declares way enrichment.
 
 - **`apply-changes --force` writes a wholly indexed output.** On an
   unindexed base, the blobs the diff rewrote got indexdata and the ones it

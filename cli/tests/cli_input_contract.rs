@@ -127,6 +127,22 @@ fn write_policy_fixtures(dir: &Path) {
     assert!(blobs.len() >= 2, "fixture must hold a header and data");
     bytes.extend_from_slice(&tail_bytes[blobs[1].frame_start..]);
     std::fs::write(dir.join("first-blob-only.osm.pbf"), bytes).unwrap();
+
+    // The reverse order: the first data blob unindexed (nodes 1..=5), every
+    // later one indexed. The first-blob gates call it unindexed, so a
+    // command with one refuses it as unindexed and runs on it under
+    // `--force`, where the partial refusal is what stops it.
+    let head = dir.join("head-unindexed.osm.pbf");
+    crate::common::write_test_pbf_non_indexed(&head, &policy_elements(1).0, &[], &[]);
+    let tail = dir.join("tail-indexed.osm.pbf");
+    let (nodes, ways, relations) = policy_elements(6);
+    crate::common::write_test_pbf_sorted(&tail, &nodes, &ways, &relations);
+    let mut bytes = std::fs::read(&head).unwrap();
+    let tail_bytes = std::fs::read(&tail).unwrap();
+    let blobs = crate::common::adversarial::locate_blobs(&tail_bytes);
+    assert!(blobs.len() >= 2, "fixture must hold a header and data");
+    bytes.extend_from_slice(&tail_bytes[blobs[1].frame_start..]);
+    std::fs::write(dir.join("first-blob-unindexed.osm.pbf"), bytes).unwrap();
 }
 
 /// The inputs every row draws from.
@@ -175,12 +191,15 @@ impl Fx {
         // time-filter reads through its other path.
         write_history_header_only(&p.join("header-only-history.osm.pbf"));
         write_policy_fixtures(p);
-        // The first-blob-only file under the history header, for the same.
-        let mut history = std::fs::read(p.join("header-only-history.osm.pbf")).unwrap();
-        let partial = std::fs::read(p.join("first-blob-only.osm.pbf")).unwrap();
-        let blobs = crate::common::adversarial::locate_blobs(&partial);
-        history.extend_from_slice(&partial[blobs[1].frame_start..]);
-        std::fs::write(p.join("first-blob-only-history.osm.pbf"), history).unwrap();
+        // Both partially indexed files under the history header, for the
+        // same.
+        for name in ["first-blob-only", "first-blob-unindexed"] {
+            let mut history = std::fs::read(p.join("header-only-history.osm.pbf")).unwrap();
+            let partial = std::fs::read(p.join(format!("{name}.osm.pbf"))).unwrap();
+            let blobs = crate::common::adversarial::locate_blobs(&partial);
+            history.extend_from_slice(&partial[blobs[1].frame_start..]);
+            std::fs::write(p.join(format!("{name}-history.osm.pbf")), history).unwrap();
+        }
         std::fs::write(p.join("a.osc"), OSC).unwrap();
         std::fs::write(p.join("b.osc"), OSC).unwrap();
         std::fs::write(p.join("good.osc"), OSC).unwrap();
@@ -616,17 +635,14 @@ fn time_filter(c: &Ctx, input: &Path) -> Invocation {
         .arg("2030-01-01T00:00:00Z")
 }
 
-/// The header-only and first-blob-only inputs become their history-header
-/// twins, so the history path is the one that reads them; any other file
-/// stays as given.
+/// The header-only and both partially indexed inputs become their
+/// history-header twins, so the history path is the one that reads them; any
+/// other file stays as given.
 fn time_filter_history(c: &Ctx, input: &Path) -> Invocation {
-    let twin = if input == c.fx.path("header-only.osm.pbf") {
-        Some(c.fx.path("header-only-history.osm.pbf"))
-    } else if input == c.fx.path("first-blob-only.osm.pbf") {
-        Some(c.fx.path("first-blob-only-history.osm.pbf"))
-    } else {
-        None
-    };
+    let twin = ["header-only", "first-blob-only", "first-blob-unindexed"]
+        .into_iter()
+        .find(|name| input == c.fx.path(&format!("{name}.osm.pbf")))
+        .map(|name| c.fx.path(&format!("{name}-history.osm.pbf")));
     time_filter(c, twin.as_deref().unwrap_or(input))
 }
 
@@ -1458,50 +1474,63 @@ const INDEXING_ADVICE: &str = "Generate an indexed PBF first";
 type MixedRow = (&'static str, fn(&Ctx, &Path) -> Invocation, Mixed);
 
 /// Every gate above looks at the first data blob only, so this file passes
-/// all of them. Rows pin what happens after that: a command whose schedule is
-/// built by walking every blob header refuses the file at that walk, and
-/// the others run on it.
+/// all of them. Rows pin what happens after that: every command refuses a
+/// partially indexed input once its reads have seen both kinds of data blob
+/// and points at `pbfhogg cat`, except `cat` itself (the remedy), `check
+/// --index` (which reports it as a violation) and `inspect` (which
+/// describes it). A few commands refuse any unindexed blob with their own
+/// reason first.
 const FIRST_BLOB_ONLY: &[MixedRow] = &[
     ("sort", sort, Mixed::RefusesPartial),
     ("repack", repack, Mixed::RefusesPartial),
-    // tags-filter accepts on every path: -R's reader, both two-pass schedule
-    // walks and the dependency walks decode a blob without indexdata and
-    // select from its actual elements. The way-dependency walk's kind filter
-    // notes the unindexed tail it cannot skip; -R's tag-key-only filter
-    // prunes through tagdata, so it has no such note.
-    ("tags-filter", tags_filter, Mixed::Reports(BLOBS_NOTE)),
-    ("tags-filter -R", tags_filter_omit, Mixed::Accepts),
-    // getid accepts on every path: each one decodes a blob without indexdata
-    // and filters its actual elements, so the output is the wholly indexed
-    // file's. The way-ID row runs `--add-referenced`'s classify walk, and the
-    // `-I` rows read this file as the ID source (getparents shares that
-    // reader).
-    ("getid", getid, Mixed::Accepts),
-    ("getid --invert", getid_invert, Mixed::Accepts),
+    // tags-filter refuses on every path, -R's reader included, and with
+    // --invert-match and --distrust-metadata, which consult no indexdata:
+    // the refusal is the command's input contract.
+    ("tags-filter", tags_filter, Mixed::RefusesPartial),
+    ("tags-filter -R", tags_filter_omit, Mixed::RefusesPartial),
+    (
+        "tags-filter --invert-match",
+        tags_filter_invert,
+        Mixed::RefusesPartial,
+    ),
+    (
+        "tags-filter --distrust-metadata",
+        tags_filter_distrust,
+        Mixed::RefusesPartial,
+    ),
+    // getid refuses on every path, whichever arm the blob count picks. The
+    // way-ID row runs `--add-referenced`'s classify walk, the other its
+    // second pass alone, and the `-I` rows read this file as the ID source
+    // (getparents shares that reader).
+    ("getid", getid, Mixed::RefusesPartial),
+    ("getid --invert", getid_invert, Mixed::RefusesPartial),
     (
         "getid --add-referenced",
         getid_add_referenced,
-        Mixed::Accepts,
+        Mixed::RefusesPartial,
     ),
     (
         "getid --add-referenced w1",
         getid_add_referenced_way,
-        Mixed::Accepts,
+        Mixed::RefusesPartial,
     ),
-    ("getid -I", getid_id_osm_file, Mixed::Accepts),
-    ("getparents -I", getparents_id_osm_file, Mixed::Accepts),
-    // getparents accepts on both arms by the same rule: each decodes a blob
-    // without indexdata and selects from its actual elements. The walker
-    // notes the unindexed blob its kind filter cannot skip; the full-scan
-    // arm's note reads the first data blob only, so it says nothing here
-    // (Accepts pins the run, not that silence), and with --add-self every
-    // kind is wanted, so neither arm prunes.
-    ("getparents", getparents, Mixed::Reports(BLOBS_NOTE)),
-    ("getparents --add-self", getparents_add_self, Mixed::Accepts),
+    ("getid -I", getid_id_osm_file, Mixed::RefusesPartial),
+    (
+        "getparents -I",
+        getparents_id_osm_file,
+        Mixed::RefusesPartial,
+    ),
+    // getparents refuses on both arms.
+    ("getparents", getparents, Mixed::RefusesPartial),
+    (
+        "getparents --add-self",
+        getparents_add_self,
+        Mixed::RefusesPartial,
+    ),
     (
         "getparents --full-scan-min-blobs 1",
         getparents_full_scan,
-        Mixed::Accepts,
+        Mixed::RefusesPartial,
     ),
     ("apply-changes", apply_changes, Mixed::RefusesPartial),
     (
@@ -1511,14 +1540,25 @@ const FIRST_BLOB_ONLY: &[MixedRow] = &[
     ),
     ("extract --simple", extract_simple, Mixed::RefusesPartial),
     ("extract --smart", extract_smart, Mixed::RefusesPartial),
-    // time-filter reads no indexdata on either path: the snapshot schedule
-    // takes every blob and the history path's reader decodes every blob, and
-    // both work on the decoded elements.
-    ("time-filter", time_filter, Mixed::Accepts),
-    ("time-filter (history)", time_filter_history, Mixed::Accepts),
-    // cat accepts in every mode: --type decodes a blob without indexdata
-    // and filters its actual elements, --dedupe's first pass scans its IDs,
-    // and --clean schedules and decodes every blob whatever its indexdata.
+    // time-filter reads no indexdata on either path, and refuses on both.
+    ("time-filter", time_filter, Mixed::RefusesPartial),
+    (
+        "time-filter (history)",
+        time_filter_history,
+        Mixed::RefusesPartial,
+    ),
+    // export reads no indexdata either, and refuses.
+    ("export", export, Mixed::RefusesPartial),
+    (
+        "degrade --strip-indexdata",
+        degrade_strip,
+        Mixed::RefusesPartial,
+    ),
+    // cat is the remedy and accepts in every mode: plain cat indexes each
+    // blob without indexdata, --type decodes one and filters its actual
+    // elements, --dedupe's first pass scans its IDs, and --clean schedules
+    // and decodes every blob whatever its indexdata.
+    ("cat", cat, Mixed::Accepts),
     ("cat --type node", cat_type, Mixed::Accepts),
     ("cat --dedupe", cat_dedupe, Mixed::Accepts),
     ("cat --clean", cat_clean, Mixed::Accepts),
@@ -1539,16 +1579,12 @@ const FIRST_BLOB_ONLY: &[MixedRow] = &[
     // same blob.
     ("digest", digest, Mixed::RefusesPartial),
     // These refuse any unindexed data blob at their own walk, with their own
-    // reason.
-    (
-        "renumber",
-        renumber,
-        Mixed::Fails("renumber requires indexdata on every OsmData blob"),
-    ),
+    // reason; behind an indexed first blob the partial refusal comes first.
+    ("renumber", renumber, Mixed::RefusesPartial),
     (
         "altw --index-type external",
         altw_external,
-        Mixed::Fails("OsmData blob missing indexdata"),
+        Mixed::RefusesPartial,
     ),
     // diff chooses its arm from the first blob, so a partial index is neither
     // the sequential fallback it takes for a wholly unindexed file nor
@@ -1575,11 +1611,130 @@ const FIRST_BLOB_ONLY: &[MixedRow] = &[
         inspect_indexed,
         Mixed::Reports("Indexed: yes"),
     ),
+    // inspect describes the file as it is: its index-only scan falls back to
+    // a full decode at the unindexed blob.
+    ("inspect", inspect_full, Mixed::Accepts),
     // Some blobs indexed and some not is a violation, unlike a wholly
     // unindexed file.
     (
         "check --index",
         check_index,
+        Mixed::Violates("partially indexed"),
+    ),
+];
+
+/// One row: label, invocation builder, the words added to it, outcome.
+type ForcedMixedRow = (
+    &'static str,
+    fn(&Ctx, &Path) -> Invocation,
+    &'static [&'static str],
+    Mixed,
+);
+
+/// The reverse order: the first data blob unindexed, the rest indexed. A
+/// command with a first-blob gate refuses this file as unindexed (the
+/// `POLICY` table pins that refusal); each row passes the switch that lifts
+/// the gate, if any, and must then refuse the file as partially indexed, as
+/// in the other order, or accept it where the command is exempt.
+const FIRST_BLOB_UNINDEXED: &[ForcedMixedRow] = &[
+    ("sort --force", sort, &["--force"], Mixed::RefusesPartial),
+    (
+        "repack --force",
+        repack,
+        &["--force"],
+        Mixed::RefusesPartial,
+    ),
+    (
+        "apply-changes --force",
+        apply_changes,
+        &["--force"],
+        Mixed::RefusesPartial,
+    ),
+    (
+        "tags-filter --force",
+        tags_filter,
+        &["--force"],
+        Mixed::RefusesPartial,
+    ),
+    (
+        "tags-filter -R --force",
+        tags_filter_omit,
+        &["--force"],
+        Mixed::RefusesPartial,
+    ),
+    (
+        "tags-filter --invert-match",
+        tags_filter_invert,
+        &[],
+        Mixed::RefusesPartial,
+    ),
+    (
+        "tags-filter --distrust-metadata",
+        tags_filter_distrust,
+        &[],
+        Mixed::RefusesPartial,
+    ),
+    ("getid --force", getid, &["--force"], Mixed::RefusesPartial),
+    (
+        "getid --invert --force",
+        getid_invert,
+        &["--force"],
+        Mixed::RefusesPartial,
+    ),
+    (
+        "getid --add-referenced --force",
+        getid_add_referenced,
+        &["--force"],
+        Mixed::RefusesPartial,
+    ),
+    (
+        "getid --add-referenced w1 --force",
+        getid_add_referenced_way,
+        &["--force"],
+        Mixed::RefusesPartial,
+    ),
+    ("getid -I", getid_id_osm_file, &[], Mixed::RefusesPartial),
+    (
+        "getparents -I",
+        getparents_id_osm_file,
+        &[],
+        Mixed::RefusesPartial,
+    ),
+    ("getparents", getparents, &[], Mixed::RefusesPartial),
+    (
+        "getparents --full-scan-min-blobs 1",
+        getparents_full_scan,
+        &[],
+        Mixed::RefusesPartial,
+    ),
+    ("time-filter", time_filter, &[], Mixed::RefusesPartial),
+    (
+        "time-filter (history)",
+        time_filter_history,
+        &[],
+        Mixed::RefusesPartial,
+    ),
+    ("export", export, &[], Mixed::RefusesPartial),
+    ("digest", digest, &[], Mixed::RefusesPartial),
+    ("cat", cat, &[], Mixed::Accepts),
+    (
+        "cat --type node --force",
+        cat_type,
+        &["--force"],
+        Mixed::Accepts,
+    ),
+    (
+        "cat --dedupe --force",
+        cat_dedupe,
+        &["--force"],
+        Mixed::Accepts,
+    ),
+    ("cat --clean", cat_clean, &[], Mixed::Accepts),
+    ("inspect", inspect_full, &[], Mixed::Accepts),
+    (
+        "check --index",
+        check_index,
+        &[],
         Mixed::Violates("partially indexed"),
     ),
 ];
@@ -1590,14 +1745,26 @@ fn first_blob_only_holds(
     build: fn(&Ctx, &Path) -> Invocation,
     mixed: Mixed,
 ) -> Result<(), String> {
+    mixed_holds(fx, "first-blob-only.osm.pbf", label, build, &[], mixed)
+}
+
+fn mixed_holds(
+    fx: &Fx,
+    fixture: &str,
+    label: &str,
+    build: fn(&Ctx, &Path) -> Invocation,
+    extra: &[&str],
+    mixed: Mixed,
+) -> Result<(), String> {
     let dir = crate::common::test_scratch();
     let inv = build(
         &Ctx {
             fx,
             out: dir.path(),
         },
-        &fx.path("first-blob-only.osm.pbf"),
-    );
+        &fx.path(fixture),
+    )
+    .words(extra);
     let out = run(&inv);
     let text = format!("{}{}", out.stdout_str(), out.stderr_str());
     let code = out.status.code();
@@ -2190,6 +2357,26 @@ fn what_each_command_does_with_input_indexed_on_its_first_blob_only_is_pinned() 
     let failures: Vec<String> = FIRST_BLOB_ONLY
         .iter()
         .filter_map(|(label, build, mixed)| first_blob_only_holds(&fx, label, *build, *mixed).err())
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn what_each_command_does_with_input_unindexed_on_its_first_blob_only_is_pinned() {
+    let fx = Fx::new();
+    let failures: Vec<String> = FIRST_BLOB_UNINDEXED
+        .iter()
+        .filter_map(|(label, build, extra, mixed)| {
+            mixed_holds(
+                &fx,
+                "first-blob-unindexed.osm.pbf",
+                label,
+                *build,
+                extra,
+                *mixed,
+            )
+            .err()
+        })
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }

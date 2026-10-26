@@ -463,31 +463,26 @@ The judgement calls already known, to be checked first:
     kind's modifications and put its creates out of type order. A new
     `DrainItem::Omitted` drops a blob with no element instead of copying it
     unindexed (it also used to fake a type transition to Node).
-- getid accepts a partially indexed file on every path, a contract choice
-  against the uniform refusal the schedule walks introduced: the finding
-  asked for refusals where a full walk already happens, and the drain
-  decided instead that refusal is owed only where a path cannot do without
-  the missing indexdata (`reference/indexdata-trust.md`). Classify builders
-  take a `PartialIndex` policy; getid's `--add-referenced` pass 1 and the
-  `-I` reader (`parse_ids_from_pbf`, shared with getparents) accept, every
-  other caller refuses as before. A reviewer should confirm no getid path
-  decides from indexdata a blob lacks, and judge whether the other
-  refusals should follow the same rule. The builder change adds one branch
-  at walker open; not measured.
-- getparents accepts a partially indexed file on both arms by the same
-  rule, with no code change: only its stated reason changed (the trust
-  page, the `refusing_partial_index` doc comment, the guide). Pinned by a
-  unit test comparing output bytes, element order and stats against the
-  wholly indexed file, in both orders on both arms, and by three
-  first-blob-only contract rows. The arms differ in one diagnostic: the
-  full-scan arm's filter note reads the first data blob only, so it is
-  silent on an indexed head with an unindexed tail where the walker notes
-  it; left as is.
+- Partially indexed input, ruled 2026-10-26 (`notes/review-audit.md`,
+  Slice C): every command refuses it except `cat`, `check --index` and
+  `inspect`. The drain's acceptances (getid on every path, getparents on
+  both arms, tags-filter on every path, time-filter on both paths) are
+  reverted, and the refusal moved from opt-in walks into `read::frame::Frames`,
+  armed by default on every command-input read (`Frames::of_input`,
+  `BlobReader::open_in`), observed at frame completion; `PartialIndex`,
+  `HeaderWalker::refusing_partial_index` and digest's own guard are gone.
+  Judgement calls on measured paths, not measured: an armed frame parses
+  indexdata (a 42-byte copy and a deserialize) on reads that skipped it
+  (the pipelined reader without a blob filter, `par_map_reduce`), one
+  compare per data frame everywhere; export, degrade's passthrough and
+  geocode pass 1 now refuse at their own reads. Hotpath: cat `--clean`'s
+  schedule walk reports as
+  `build_classify_schedule_blob_filtered_accepting_partial`.
 - cat's `--clean` path (`cat_filtered`, with or without `--type`) was
   rewritten from three per-kind phases (`build_classify_schedules_split`,
   `parallel_classify_phase` plus a `ReorderBuffer` per phase) into one pass
   per input: one header walk (`build_classify_schedule_blob_filtered`,
-  `PartialIndex::Accept`, a kind-only `BlobFilter` when a kind is
+  exempt from the partial-index refusal, a kind-only `BlobFilter` when a kind is
   unselected) and one `parallel_classify_phase_ordered` run with an
   admission window of `POOL_REORDER_CAPACITY_WIDE`, the merge writing
   straight to the writer. A planet production command (5m34s planet in
@@ -506,36 +501,6 @@ The judgement calls already known, to be checked first:
   summary's "Decoded N blobs" now counts input blobs decoded, where it
   counted framed output blobs. The old per-phase reorder buffer was the
   unbounded shape HYG-053 describes; the ordered pool bounds it.
-- tags-filter accepts a partially indexed file on every path, by the same
-  rule, reversing the refusal its two-pass walks had: pass 1 and pass 2
-  walkers no longer opt into `refusing_partial_index`, and the relation
-  closure and way-dependency walks pass `PartialIndex::Accept`. `-R` already
-  ran on such a file. Sparred with codex, which found no path deciding from
-  indexdata a blob lacks; the cost is the extra decode of unindexed blobs in
-  every closure iteration. On a wholly indexed planet run only a per-header
-  guard branch goes; not measured. Pinned by a unit test (both orders,
-  every kind unindexed, -R, two-pass, closure over two iterations, invert,
-  remove-tags, distrust; bytes and stats equal to the wholly indexed run)
-  and two first-blob-only contract rows. Lateral: tags-count shares the
-  tag-key skip and still refuses through
-  `build_classify_schedule_blob_filtered`; whether its workers count by
-  actual kind was not checked, so a reviewer should judge it under the same
-  rule.
-- time-filter accepts a partially indexed file on both paths (HYG-157).
-  The entry's premise was wrong: the history path reads no indexdata at
-  all (the pipelined reader parses none without a blob filter, and the
-  path is picked by `HistoricalInformation`), so there was no first-blob
-  decision to record. The snapshot path's classify walk, with no kind or
-  blob filter, now passes `PartialIndex::Accept`: the refusal protected
-  nothing, and it was the odd one out against the wholly unindexed file
-  the same path already accepted. The trust page's kind-claim row no
-  longer lists time-filter. Sparred with codex, which found no
-  counterexample and asked for false-claim and straddling-history
-  coverage: a unit test pins byte-identical output and stats for both
-  paths under partial (both orders), alternating and parseable-but-false
-  indexdata, with history versions straddling the blob boundaries; two
-  first-blob-only contract rows (snapshot and history). On a wholly
-  indexed planet run only a per-header guard branch goes; not measured.
 - The five passthrough copy loops are two, both in `write/copy_range.rs`
   (HYG-017): `copy_range` (the one `copy_file_range`, `CopyOut::Cursor` for
   the buffered sink and unpipelined `write_raw_copy`, `CopyOut::At` for the

@@ -192,12 +192,17 @@ fn run_skip(path: &Path) -> Outcome {
     ended(frames)
 }
 
+/// The command-input walks refuse a partially indexed file, which some
+/// fixtures here are by construction; the frame layer under test is the same
+/// with the refusal off, as on the public `BlobReader` sources.
 fn file_frames(path: &Path) -> Frames<FileReader> {
-    Frames::of_input(
+    let mut frames = Frames::of_input(
         FileReader::buffered(path).unwrap(),
         path,
         &crate::host::Host::for_tests(),
-    )
+    );
+    frames.accept_partial_index();
+    frames
 }
 
 fn run_raw(path: &Path) -> Outcome {
@@ -233,7 +238,8 @@ fn walk_all<P: crate::read::header_walker::Positional>(
     walker: crate::error::Result<HeaderWalker<P>>,
     path: &Path,
 ) -> Outcome {
-    let mut walker = walker.unwrap();
+    // As in `file_frames`: the frame layer, without the partial-index policy.
+    let mut walker = walker.unwrap().accepting_partial_index();
     let mut frames = 0;
     loop {
         match walker.next_header() {

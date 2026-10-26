@@ -323,30 +323,6 @@ pub(crate) fn blob_filter_check(
     (false, false)
 }
 
-/// What a schedule walk does with a partially indexed file: data blobs with
-/// indexdata on some and not others. Every caller of the per-kind builders
-/// states its policy at the call site, so a difference between commands is
-/// visible where it is made.
-///
-/// The schedule and the workers are the same either way: missing indexdata
-/// alone never excludes a blob (a kind filter skips only a blob whose
-/// readable indexdata claims another kind; a tag-key blob filter still
-/// applies through tagdata), and a scheduled blob is decoded. What `Accept` asks
-/// of the caller is that its per-block work look at the elements actually
-/// in a blob, whatever kind they are, and never treat a bound derived from
-/// indexdata as a complete observation of the file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PartialIndex {
-    /// Refuse the file with the typed missing-indexdata error, located at
-    /// the first data blob without indexdata
-    /// ([`HeaderWalker::refusing_partial_index`]).
-    ///
-    /// [`HeaderWalker::refusing_partial_index`]: crate::read::header_walker::HeaderWalker::refusing_partial_index
-    Refuse,
-    /// Schedule it, decoding the blobs without indexdata.
-    Accept,
-}
-
 /// Build a classification schedule from a header-only scan, optionally
 /// filtering by element type. Returns `(schedule, shared_file)` ready for
 /// [`parallel_classify_phase`].
@@ -354,8 +330,8 @@ pub(crate) enum PartialIndex {
 /// Only OsmData blobs are included. When `kind_filter` is `Some`, only blobs
 /// whose indexdata matches the given element type (plus blobs without
 /// indexdata) are included. A file whose data blobs carry indexdata on some
-/// and not others is refused or scheduled as `partial` says; a wholly
-/// unindexed one is scheduled.
+/// and not others is refused, as every command-input walk refuses it
+/// (`Frames::refuse_partial_index`); a wholly unindexed one is scheduled.
 ///
 /// Walks headers via [`HeaderWalker`](crate::read::header_walker::HeaderWalker)
 /// so blob bodies are not dragged into the page cache during the scan. The
@@ -366,11 +342,10 @@ pub(crate) enum PartialIndex {
 pub(crate) fn build_classify_schedule<'a>(
     input: impl Into<InputSource<'a>>,
     kind_filter: Option<crate::ElementKind>,
-    partial: PartialIndex,
     host: &crate::host::Host,
 ) -> Result<(Vec<ScheduledBlob>, InputFile)> {
     let (schedule, file, _skipped) =
-        build_classify_schedule_blob_filtered(input, kind_filter, None, partial, host)?;
+        build_classify_schedule_blob_filtered(input, kind_filter, None, host)?;
     Ok((schedule, file))
 }
 
@@ -403,15 +378,38 @@ pub(crate) fn build_classify_schedule_blob_filtered<'a>(
     input: impl Into<InputSource<'a>>,
     kind_filter: Option<crate::ElementKind>,
     blob_filter: Option<&crate::blob_meta::BlobFilter>,
-    partial: PartialIndex,
+    host: &crate::host::Host,
+) -> Result<(Vec<ScheduledBlob>, InputFile, u64)> {
+    schedule_walk(input, kind_filter, blob_filter, false, host)
+}
+
+/// [`build_classify_schedule_blob_filtered`] exempt from the partial-index
+/// refusal. Only for `cat --clean`: `cat` is the remedy for a partially
+/// indexed file, and its clean pass decodes every scheduled blob and keeps
+/// elements by their actual kind.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn build_classify_schedule_blob_filtered_accepting_partial<'a>(
+    input: impl Into<InputSource<'a>>,
+    kind_filter: Option<crate::ElementKind>,
+    blob_filter: Option<&crate::blob_meta::BlobFilter>,
+    host: &crate::host::Host,
+) -> Result<(Vec<ScheduledBlob>, InputFile, u64)> {
+    schedule_walk(input, kind_filter, blob_filter, true, host)
+}
+
+fn schedule_walk<'a>(
+    input: impl Into<InputSource<'a>>,
+    kind_filter: Option<crate::ElementKind>,
+    blob_filter: Option<&crate::blob_meta::BlobFilter>,
+    accept_partial: bool,
     host: &crate::host::Host,
 ) -> Result<(Vec<ScheduledBlob>, InputFile, u64)> {
     let source = input.into();
     let input = source.path();
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
     let mut walker = crate::read::header_walker::HeaderWalker::open(source, host)?;
-    if partial == PartialIndex::Refuse {
-        walker = walker.refusing_partial_index();
+    if accept_partial {
+        walker = walker.accepting_partial_index();
     }
     // Consume the first blob, which must be the OSMHeader: an empty file or
     // one that opens with anything else is MissingHeader.
@@ -504,8 +502,7 @@ pub(crate) fn build_classify_schedules_split<'a>(
     let source = input.into();
     let input = source.path();
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
-    let mut walker =
-        crate::read::header_walker::HeaderWalker::open(source, host)?.refusing_partial_index();
+    let mut walker = crate::read::header_walker::HeaderWalker::open(source, host)?;
     consume_leading_header(&mut walker, input)?;
     crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
@@ -1317,13 +1314,8 @@ mod tests {
         const BLOBS: usize = 400;
         let path = write_many_blob_pbf(dir.path(), BLOBS);
 
-        let (schedule, shared_file) = super::build_classify_schedule(
-            &path,
-            None,
-            super::PartialIndex::Refuse,
-            &crate::host::Host::for_tests(),
-        )
-        .unwrap();
+        let (schedule, shared_file) =
+            super::build_classify_schedule(&path, None, &crate::host::Host::for_tests()).unwrap();
         assert_eq!(
             schedule.len(),
             BLOBS,
@@ -1396,13 +1388,8 @@ mod tests {
         let dir = crate::path_guard::tests::scratch();
         const BLOBS: usize = 400;
         let path = write_many_blob_pbf(dir.path(), BLOBS);
-        let (schedule, shared_file) = super::build_classify_schedule(
-            &path,
-            None,
-            super::PartialIndex::Refuse,
-            &crate::host::Host::for_tests(),
-        )
-        .unwrap();
+        let (schedule, shared_file) =
+            super::build_classify_schedule(&path, None, &crate::host::Host::for_tests()).unwrap();
         assert_eq!(schedule.len(), BLOBS);
 
         let run = |fail: &(dyn Fn(usize) + Sync)| {
@@ -1492,9 +1479,7 @@ mod tests {
         let blobs = super::POOL_DESCRIPTOR_CHANNEL_DEPTH + 8;
         let path = write_many_blob_pbf(dir.path(), blobs);
         let host = crate::host::Host::for_tests();
-        let (schedule, input) =
-            super::build_classify_schedule(&path, None, super::PartialIndex::Refuse, &host)
-                .unwrap();
+        let (schedule, input) = super::build_classify_schedule(&path, None, &host).unwrap();
         assert_eq!(schedule.len(), blobs);
 
         let metrics = super::UnorderedPoolMetrics::new();
@@ -1548,13 +1533,8 @@ mod tests {
         const BLOBS: usize = 40;
         const WINDOW: usize = 4;
         let path = write_many_blob_pbf(dir.path(), BLOBS);
-        let (schedule, shared_file) = super::build_classify_schedule(
-            &path,
-            None,
-            super::PartialIndex::Refuse,
-            &crate::host::Host::for_tests(),
-        )
-        .unwrap();
+        let (schedule, shared_file) =
+            super::build_classify_schedule(&path, None, &crate::host::Host::for_tests()).unwrap();
         assert_eq!(schedule.len(), BLOBS);
 
         let classified = AtomicUsize::new(0);
@@ -1598,9 +1578,7 @@ mod tests {
         const BLOBS: usize = 6;
         let path = write_many_blob_pbf(dir.path(), BLOBS);
         let host = crate::host::Host::for_tests();
-        let (schedule, input) =
-            super::build_classify_schedule(&path, None, super::PartialIndex::Refuse, &host)
-                .unwrap();
+        let (schedule, input) = super::build_classify_schedule(&path, None, &host).unwrap();
         assert_eq!(schedule.len(), BLOBS);
         // Fail on the blob holding node 4: schedule position 3, file blob 4
         // (blob 0 is the OSMHeader).

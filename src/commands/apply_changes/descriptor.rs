@@ -205,7 +205,7 @@ impl BlobDescriptor {
     ///
     /// `None` when the descriptor carries no indexdata. Copying such a frame
     /// would put an unindexed blob in the output beside the indexed ones the
-    /// rewrites produce, a partially indexed file every schedule walk
+    /// rewrites produce, a partially indexed file every command but `cat`
     /// refuses; the worker reframes it with an index derived from the
     /// payload instead.
     ///

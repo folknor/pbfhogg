@@ -189,7 +189,10 @@ fn try_index_only_scan(
     let path = input.path();
     let file_name = file_name_of(path);
 
-    let mut walker = HeaderWalker::open(input, host)?;
+    // inspect describes the file as it is, so its description is exempt
+    // from the command-input refusal of a partially indexed file: a blob
+    // without indexdata falls back to the full decode below.
+    let mut walker = HeaderWalker::open(input, host)?.accepting_partial_index();
     let file_size = walker.file_size();
     let mut saw_header = false;
     let mut header_meta = HeaderMeta::default();
@@ -374,6 +377,9 @@ fn full_decode_scan(
         .map_err(|e| crate::Error::from(e).context(format!("failed to stat {}", path.display())))?
         .len();
     let mut frames = Frames::of_input(reader, path, host);
+    // A description, exempt from the partial-index refusal (it counts the
+    // indexed blobs instead).
+    frames.accept_partial_index();
     let mut saw_header = false;
     let mut decompress_buf = Vec::new();
     let mut header_meta = HeaderMeta::default();

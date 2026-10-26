@@ -162,80 +162,80 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   commands ([performance-history.md](performance-history.md), "TAINTED
   window"), so the probe stays first-blob-only. A header-only file counts as
   indexed: no blob lacks indexdata.
-- **A partially indexed file lies about nothing**: it is in-contract input.
-  A schedule-building walk over every blob header that opts into
-  `HeaderWalker::refusing_partial_index` refuses it with the typed
-  missing-indexdata error, in either order (indexed then unindexed, or the
-  reverse), located at the first unindexed data blob. Most schedule walks
-  opt in; `getid`'s, `getparents`', `tags-filter`'s and `time-filter`'s do
-  not (below). `renumber`,
+- **A partially indexed file lies about nothing, and every command refuses
+  it** (ruled 2026-10-26). Indexdata on some data blobs and not others, in
+  either order, is refused with the typed missing-indexdata error
+  (`ErrorKind::MissingIndexdata` with `partial`), located at the first data
+  blob without readable indexdata, and the CLI points at `pbfhogg cat`,
+  which indexes every blob. `--force` and `--allow-unindexed` do not lift
+  it. This is the command input contract, not a judgement of whether a path
+  could cope: many paths decode a blob that lacks indexdata and would give
+  the wholly indexed file's output (`time-filter`, `export`, `tags-filter
+  --invert-match` and `--distrust-metadata` consult no indexdata at all),
+  and they refuse all the same, so that a command never accepts the file on
+  one path, option or input size and refuses it on another. The earlier
+  rule, that a refusal was owed only where a path could not do without the
+  missing indexdata, is retired.
+- **The refusal is judged in the one frame walk every reader shares**
+  (`read::frame::Frames::refuse_partial_index`). Every command-input read is
+  armed by default: `Frames::of_input`, hence every `HeaderWalker` and every
+  classify schedule walk, and `BlobReader::open_in`, hence every
+  `ElementReader::open_in` and the pipelined reader on every iteration
+  method. A frame is judged once complete, so a payload truncated on the
+  frame that shows the mixture is the truncation error, and the
+  observation precedes any blob filter (a blob a kind, tag or bbox filter
+  skips still counts). An armed walk parses indexdata to observe it even
+  where its caller does not keep it. Indexdata present but unreadable
+  counts as absent. A move of the walk (`reposition`) restarts the
+  observation; each input of a multi-input command is judged alone. The
+  public library constructors (`BlobReader::new`, `new_named`,
+  `from_path`, `open`, `ElementReader::new`, `from_path`, and the like) are
+  not armed: pbfhogg as a library reads any file, and the CLI's
+  `bench-read` and `bench-write` read through them on purpose.
+- **Exempt, each at its call site with its reason**: `cat` in every mode,
+  the remedy (plain `cat` indexes every blob that lacks indexdata, `--type`
+  decodes such a blob and filters its actual elements, `--dedupe`'s first
+  pass scans its IDs and tag keys, `--clean` schedules and decodes every
+  blob whatever its indexdata); `check --index`, the verifier, which
+  reports the file as a violation (exit 1); and `inspect`'s descriptions
+  (the default index-only scan, which falls back to a full decode at the
+  first unindexed blob, `--extended` and `--show`). `inspect --nodes` and
+  `inspect tags` are not descriptions of the file but analyses of its
+  elements, and refuse. Probes that look at the front of a file only are
+  not reads of it and are not armed: the first-blob gate, and the
+  blob-count estimate `getid` and `getparents` pick their arm with, whose
+  chosen arm then reads, and judges, the whole file.
+- **Which refusal comes first depends on the order.** With the first data
+  blob indexed, the first-blob gate passes and the partial refusal stops
+  the run at the first unindexed blob. With it unindexed, a command with a
+  first-blob gate refuses the file as unindexed (the CLI advises `cat` and
+  `--force`); under `--force` the run goes on and the partial refusal stops
+  it at the first indexed blob, located at the first data blob. `renumber`,
   `add-locations-to-ways --index-type external` and `diff`'s indexed
-  block-pair paths refuse any unindexed blob (a wholly unindexed `diff`
-  input takes the sequential fallback instead). Commands whose arm the first
-  blob alone decides, and walks that do not opt in, run on such a file.
-- **Refusing a partially indexed file is owed only where a path cannot do
-  without the missing indexdata.** A path that decodes a blob lacking
-  indexdata and works from its actual elements produces the same output as
-  on the wholly indexed file, so for it the refusal removes a capability and
-  protects nothing. Each classify-schedule caller states its policy
-  (`scan::classify::PartialIndex`). `getid` accepts on every path by this
-  rule: the first-blob probe only decides whether the primary input needs
-  `--force` (its first data blob unindexed) and picks the scan arm, and no
-  path skips, copies raw or counts a blob on
-  indexdata it lacks - both include arms, the `--invert` walker,
-  `--add-referenced`'s classify walk and second pass, and the `-I` ID file
-  reader (shared with `getparents`) all decode such a blob. The one refusal
-  left is `getid --invert`'s, for an unindexed blob holding ways under a
-  carried way-enrichment declaration, which re-encoding would break.
-  `getparents` accepts on both arms by the same rule, in either order, and
-  has no `--force` gate: its walker schedules a blob without indexdata
-  whatever the query and its full-scan arm's blob filter passes one through
-  to a decode, so both select parents from actual elements, and its output
-  is the wholly indexed file's. `cat` accepts in every mode by the same
-  rule, in either order. Its first-blob probes decide only whether `--type`
-  or `--dedupe` needs `--force` (first data blob unindexed) and, under a
-  declared way enrichment, which way declaration the output header makes;
-  no blob is skipped, copied raw or counted on indexdata it lacks. `--type`
-  decodes an unindexed blob and filters its actual elements; `--dedupe`'s
-  first pass scans the IDs and tag keys of every unindexed blob (checking
-  their order, as `sort`'s shared pass 1 does), so its overlap plan and way
-  declaration rest on observed ranges and a blob it copies is indexed as
-  plain `cat` indexes it; `--clean` schedules and decodes
-  every blob once whatever its indexdata. The refusals that remain are not
-  about indexing but about way enrichments the header already declared and
-  a re-encode would break: `--type` refuses an unindexed blob that yields
-  ways (as `getid --invert` does), and plain `cat` a way in an unindexed
-  block no single index describes under a declared `WayMembers-v1`, or one
-  carrying pins under a declared `SharedNodePins-v1`. `--dedupe` declares
-  its output from what it writes, so it refuses neither. `tags-filter`
-  accepts on
-  every path by the same rule, in either order. Its first-blob probe decides
-  only whether `--force` is needed (first data blob unindexed; never under
-  `--invert-match` or `--distrust-metadata`). `-R`'s pipelined reader, the
-  two-pass schedule walks for pass 1 and pass 2, the relation closure and the
-  way-dependency scan each decode a blob lacking indexdata, unless its
-  tagdata (a separate claim) excludes it, and match or write its elements
-  by their actual kind and ID, so the output is the wholly indexed file's.
-  `time-filter` reads no indexdata at all, so it accepts on both paths, in
-  either order, and has no `--force`: the header's `HistoricalInformation`
-  picks the path, the history path's pipelined reader decodes every blob,
-  and the snapshot path schedules every blob with no kind filter; both
-  select from decoded elements by their actual kind and ID. For the same
-  reason it believes no sidecar claim, false ones included (it does believe
-  `Sort.Type_then_ID` and `HistoricalInformation`).
-  The other refusals on this page are recorded as current behaviour, not
-  justified by this rule.
+  block-pair paths refuse any unindexed blob with their own reason, which
+  comes first when the first data blob is unindexed; behind an indexed one
+  the partial refusal comes first. Each way, the run fails and the advice
+  is `pbfhogg cat`. `cli/tests/cli_input_contract.rs` pins both orders.
+- **`cat`'s own refusals are not about indexing** but about way
+  enrichments the header already declared and a re-encode would break:
+  `--type` refuses an unindexed blob that yields ways, and plain `cat` a
+  way in an unindexed block no single index describes under a declared
+  `WayMembers-v1`, or one carrying pins under a declared
+  `SharedNodePins-v1`. `--dedupe` declares its output from what it writes,
+  so it refuses neither. Its first-blob probes decide only whether
+  `--type` or `--dedupe` needs `--force` and, under a declared way
+  enrichment, which way declaration the output header makes.
 - **What a command does with a wholly unindexed file** - refuse and offer
   `--force`, refuse with no escape, fall back, or verify - is per command.
   The user-facing statement is the `--force` section of
   [cli-reference.md](cli-reference.md#--force); the outcome of every command
-  line on an unindexed file, and on one indexed on its first blob only, is
-  pinned by the two tables in `cli/tests/cli_input_contract.rs`. A change to
-  either outcome moves a row there. `renumber` has no `--force` and
+  line on an unindexed file, and on a partially indexed one in either
+  order, is pinned by the tables in `cli/tests/cli_input_contract.rs`. A
+  change to any outcome moves a row there. `renumber` has no `--force` and
   `add-locations-to-ways --index-type external` refuses it at parse time:
   both are deliberate, since neither has an unindexed fallback.
 - **Plain `cat`, `cat --dedupe`, `sort` and `apply-changes --force` write
-  no partially indexed file**, which pbfhogg's own schedule walks would
+  no partially indexed file**, which every other pbfhogg command would
   refuse. All index every blob they write from an unindexed input: an
   untouched blob keeps its compressed payload under a header carrying
   indexdata scanned from it (and, from `cat` in every mode and `sort`, its
@@ -257,18 +257,17 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
 
 Current behaviour recorded as such, not as a contract to preserve:
 
-- `check --refs`, `check --ids`, `inspect --nodes` and `inspect tags`
-  refuse a partially indexed file through their classify walks, although
-  `check` answers "is this file right?" and `check --index` reports the
-  same file as a violation (exit 1). `extract --simple` refuses it too,
-  although it accepts a wholly unindexed file.
+- `check --refs` and `check --ids` refuse a partially indexed file,
+  although `check` answers "is this file right?" and `check --index`
+  reports the same file as a violation (exit 1). Combined with `--index`,
+  the other check's refusal ends the run: `check --ids --index` stops
+  before the index report, and `check --refs --index` computes it and
+  then exits on the refusal without printing it.
 - The walks see headers only, so they cannot tell a blob no index can
   describe (empty, or mixed kinds), which carries no indexdata legitimately,
   from an unindexed one; such a blob among indexed ones is refused.
   `check --index` exempts it. Since `cat` (and `sort`, and `cat --dedupe`)
   re-encode such blocks into indexable ones, only a hand-made file has one.
-- The geocode builder refuses a partially indexed file at its Pass 1.5
-  schedule walk, after Pass 1 has decoded the whole file once.
 - `inspect --indexed` reports the first-blob probe, so it says yes for a
   partially indexed file whose first data blob is indexed, and no for one
   whose first data blob is not.

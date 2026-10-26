@@ -256,7 +256,6 @@ pub(super) fn build_node_index_sparse(
     let (schedule, shared_input) = crate::scan::classify::build_classify_schedule(
         input,
         Some(crate::ElementKind::Node),
-        crate::scan::classify::PartialIndex::Refuse,
         host,
     )?;
 

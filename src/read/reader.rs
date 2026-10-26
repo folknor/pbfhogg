@@ -1109,7 +1109,9 @@ impl ElementReader<FileReader> {
 
     /// Open a file for a command run under `host`: buffered or O_DIRECT per
     /// `direct`, with the host's diagnostics, resources and page-cache policy,
-    /// the latter applied before the header blob is read.
+    /// the latter applied before the header blob is read. As a command input
+    /// it refuses a partially indexed file in every iteration mode, whatever
+    /// blob filter is set ([`BlobReader::open_in`]).
     pub(crate) fn open_in<'a>(
         source: impl Into<crate::read::input::InputSource<'a>>,
         direct: bool,

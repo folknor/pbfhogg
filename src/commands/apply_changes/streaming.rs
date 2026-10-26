@@ -469,7 +469,7 @@ fn handle_candidate(
     // kind and range below, and a blob the diff leaves alone is reframed
     // with them rather than copied: a raw copy would leave it unindexed
     // beside the indexed blobs the rewrites produce, a partially indexed
-    // output that every schedule walk (diff, sort, apply-changes itself)
+    // output that every command but cat (diff, sort, apply-changes itself)
     // refuses. Indexed blobs skip this; their claims are believed
     // (reference/indexdata-trust.md).
     let scanned = if desc.index.is_none() {

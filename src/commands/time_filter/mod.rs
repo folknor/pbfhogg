@@ -15,7 +15,10 @@
 //! Neither path reads blob indexdata: every data blob is decoded and its
 //! elements are handled by their actual kind and ID, and the output's
 //! indexdata is built fresh. So time-filter has no `--force`, accepts a
-//! wholly or partially indexed input alike, and believes no sidecar claim.
+//! wholly unindexed input as it accepts an indexed one, and believes no
+//! sidecar claim. A partially indexed input is refused on both paths, as by
+//! every command (the reader and the schedule walk refuse it once both
+//! kinds of data blob have been seen).
 //! It does believe two header declarations: `Sort.Type_then_ID` (required;
 //! the history path's grouping needs each object's versions contiguous) and
 //! `HistoricalInformation` (which picks the path).
@@ -30,9 +33,7 @@ use crate::owned::{
     read_node, read_relation, read_way, relation_members_into,
 };
 use crate::read::input::{InputSource, PinnedInput};
-use crate::scan::classify::{
-    PartialIndex, build_classify_schedule, parallel_classify_phase_ordered,
-};
+use crate::scan::classify::{build_classify_schedule, parallel_classify_phase_ordered};
 use crate::write::WriteOptions;
 use crate::writer::{Compression, PbfWriter};
 use crate::{DenseNode, Element, ElementKind, ElementReader, Node, PrimitiveBlock, Relation, Way};
@@ -341,10 +342,10 @@ fn time_filter_snapshot(
 
     // No kind or blob filter: every OsmData blob is scheduled whatever its
     // indexdata says or lacks, and `filter_block_snapshot` works on the
-    // decoded elements by their actual kind. A partially indexed file
-    // therefore gives the wholly indexed file's output, so it is accepted
+    // decoded elements by their actual kind. A partially indexed file is
+    // refused by the walk all the same, as by every command-input read
     // (reference/indexdata-trust.md, "Missing and partial indexdata").
-    let (schedule, shared_file) = build_classify_schedule(input, None, PartialIndex::Accept, host)?;
+    let (schedule, shared_file) = build_classify_schedule(input, None, host)?;
 
     if schedule.is_empty() {
         crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_END");
@@ -863,7 +864,12 @@ mod tests {
     type Written = (char, i64, i32);
 
     /// One run: output bytes, the written elements in file order, and stats.
-    fn run(input: &Path) -> (Vec<u8>, Vec<Written>, [u64; 5]) {
+    #[expect(
+        clippy::unwrap_in_result,
+        reason = "test helper: the command's result is what is under test, the fixture I/O \
+                  around it is not"
+    )]
+    fn run(input: &Path) -> crate::Result<(Vec<u8>, Vec<Written>, [u64; 5])> {
         let dir = crate::path_guard::tests::scratch();
         let output = dir.path().join("out.pbf");
         let staged = crate::output::Output::new(
@@ -880,8 +886,7 @@ mod tests {
             &WriteOptions::default(),
             &HeaderOverrides::default(),
             &host,
-        )
-        .unwrap();
+        )?;
         let mut elements = Vec::new();
         ElementReader::open_in(&output, false, &host)
             .unwrap()
@@ -901,13 +906,15 @@ mod tests {
             s.dropped_deleted,
             s.dropped_no_snapshot_version,
         ];
-        (std::fs::read(&output).unwrap(), elements, stats)
+        Ok((std::fs::read(&output).unwrap(), elements, stats))
     }
 
-    /// Neither path reads indexdata, so a partially indexed input (in either
-    /// order) and one whose indexdata is false on every field give the
-    /// wholly indexed file's output byte for byte, with the same stats. On
-    /// the history path the claims change across versions of one object.
+    /// Neither path reads indexdata, so an input whose indexdata is false on
+    /// every field, or absent on every blob, gives the wholly indexed file's
+    /// output byte for byte, with the same stats. (A partially indexed input
+    /// is refused on both paths mid-write, which this crate's test builds
+    /// assert on as a writer dropped unflushed; the CLI input-contract table
+    /// pins that refusal, in both orders.)
     #[test]
     fn indexdata_never_changes_the_output() {
         use Claim::{Absent as A, False as F, Honest as H};
@@ -927,23 +934,17 @@ mod tests {
         ] {
             let whole = dir.path().join(format!("whole-{history}.pbf"));
             write_fixture(&whole, history, &[H; 5]);
-            let reference = run(&whole);
+            let reference = run(&whole).unwrap();
             assert_eq!(reference.1, expected, "reference, history {history}");
             assert_eq!(
                 reference.2, expected_stats,
                 "reference stats, history {history}"
             );
-            for (name, claims) in [
-                ("indexed head", [H, A, A, A, A]),
-                ("unindexed head", [A, H, H, H, H]),
-                ("alternating", [H, A, H, A, H]),
-                ("all false", [F; 5]),
-                ("false and missing", [F, A, H, F, A]),
-            ] {
+            for (name, claims) in [("all false", [F; 5]), ("all absent", [A; 5])] {
                 let what = format!("{name}, history {history}");
                 let input = dir.path().join(format!("{name}-{history}.pbf"));
                 write_fixture(&input, history, &claims);
-                let got = run(&input);
+                let got = run(&input).unwrap();
                 assert_eq!(got.1, expected, "{what}");
                 assert_eq!(got.2, reference.2, "stats: {what}");
                 assert!(got.0 == reference.0, "output bytes differ: {what}");

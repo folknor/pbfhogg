@@ -33,7 +33,11 @@ fn show_element_inner<W: Write>(
     out: &mut W,
     host: &crate::host::Host,
 ) -> Result<bool> {
-    let mut reader = crate::blob::BlobReader::open_in(path, direct_io, host)?;
+    // An inspect description, exempt from the command-input refusal of a
+    // partially indexed file: a blob without indexdata is decoded and
+    // searched like the rest.
+    let mut reader =
+        crate::blob::BlobReader::open_in(path, direct_io, host)?.accepting_partial_index();
     reader.set_parse_indexdata(true);
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();

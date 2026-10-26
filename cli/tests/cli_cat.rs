@@ -1872,13 +1872,19 @@ fn write_raw_block_pbf(path: &Path, sorted: bool, features: &[&str], blocks: &[(
 /// For every OsmData frame, whether its `BlobHeader` carries indexdata
 /// (field 2). Parsed independently of the crate's own frame reader.
 fn data_blob_indexdata(path: &Path) -> Vec<bool> {
+    data_blob_header_field(path, 2)
+}
+
+/// For every OsmData frame, whether its `BlobHeader` carries the
+/// length-delimited `field` (2 indexdata, 4 tagdata).
+fn data_blob_header_field(path: &Path, wanted: u64) -> Vec<bool> {
     use crate::common::adversarial::{locate_blobs, read_varint};
 
     let bytes = std::fs::read(path).expect("read pbf");
     let mut out = Vec::new();
     for frame in locate_blobs(&bytes) {
         let header = &bytes[frame.header_start..frame.header_end];
-        let (mut pos, mut is_data, mut indexed) = (0, false, false);
+        let (mut pos, mut is_data, mut present) = (0, false, false);
         while pos < header.len() {
             let (tag, n) = read_varint(&header[pos..]).expect("tag");
             pos += n;
@@ -1890,12 +1896,12 @@ fn data_blob_indexdata(path: &Path) -> Vec<bool> {
                 if field == 1 {
                     is_data = &header[pos..pos + len] == b"OSMData";
                 }
-                indexed |= field == 2;
+                present |= field == wanted;
                 pos += len;
             }
         }
         if is_data {
-            out.push(indexed);
+            out.push(present);
         }
     }
     out
@@ -2081,6 +2087,236 @@ fn passthrough_reencode_keeps_unsorted_element_order() {
         ]
     );
     assert_eq!(data_blob_indexdata(&output), [true; 4]);
+}
+
+/// `cat --dedupe` and `sort` share one merge engine, and on an unindexed
+/// input it indexes the way plain `cat` does: a blob one index describes is
+/// copied under indexdata and tagdata scanned from it, an element-less blob
+/// is omitted, and a block holding several kinds is merged per kind into
+/// type order (plain `cat` keeps input order, so it only splits). Both used
+/// to fail on the empty and the mixed blocks with "failed to scan block IDs".
+#[test]
+fn merge_engine_places_blocks_no_single_index_describes() {
+    use pbfhogg::block_builder::BlockBuilder;
+
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("unclassifiable.osm.pbf");
+    let meta = pb::info(3, 8);
+    let mut bb = BlockBuilder::new();
+    bb.add_node(3, 30, 60, [("name", "a")], None);
+    bb.add_node(4, 40, 80, [], None);
+    let ordinary = bb.take().expect("take").expect("block").to_vec();
+    write_raw_block_pbf(
+        &input,
+        true,
+        &[],
+        &[
+            // Holds nothing: omitted.
+            (false, pb::block(&[vec![]])),
+            // Nodes 1 and 2, then way 10.
+            (
+                false,
+                pb::block(&[
+                    vec![(2, pb::dense(&[(1, 3), (2, 3)], 8))],
+                    vec![(3, pb::way(10, &[1, 2], None, &meta))],
+                ]),
+            ),
+            // One kind: reframed with its scanned index and tag keys.
+            (false, ordinary),
+            // One group carrying dense nodes 5 and a plain node 6: one kind,
+            // but no single index, so restructured all the same.
+            (
+                false,
+                pb::block(&[vec![(2, pb::dense(&[(5, 3)], 8)), (1, pb::node(6, None))]]),
+            ),
+            // Way 11, then relation 20.
+            (
+                false,
+                pb::block(&[
+                    vec![(3, pb::way(11, &[3, 4], None, &meta))],
+                    vec![(4, pb::relation(20, &[(10, 1, 7)], &meta))],
+                ]),
+            ),
+        ],
+    );
+    assert_eq!(
+        data_blob_header_field(&input, 4),
+        [false; 5],
+        "the input carries no tagdata, so the output's must be scanned"
+    );
+
+    let dedupe_out = dir.path().join("dedupe.osm.pbf");
+    let sort_out = dir.path().join("sort.osm.pbf");
+    let dedupe = run_dedupe(&[&input], &dedupe_out);
+    let sort = CliInvoker::new()
+        .arg("sort")
+        .arg(&input)
+        .arg("-o")
+        .arg(&sort_out)
+        .arg("--force")
+        .run();
+    for (name, out) in [("dedupe", &dedupe), ("sort", &sort)] {
+        assert!(out.status.success(), "{name}:\n{}", out.stderr_str());
+        out.assert_stderr_contains("3 blobs held blocks no single index describes");
+        out.assert_stderr_contains("1 blobs held no elements and were omitted");
+    }
+    dedupe.assert_stderr_contains(
+        "Merged 9 elements: 6 nodes, 2 ways, 1 relations \
+         (5 blobs: 1 passthrough, 3 rewritten, 1 omitted, 0 duplicates removed)",
+    );
+    sort.assert_stderr_contains(
+        "Sorted 6 nodes, 2 ways, 1 relations (5 blobs: 1 passthrough, 3 rewritten, 1 omitted)",
+    );
+
+    for output in [&dedupe_out, &sort_out] {
+        assert_eq!(
+            block_layout(output),
+            [
+                ("node", 1, 2, 2),
+                ("node", 3, 4, 2),
+                ("node", 5, 6, 2),
+                ("way", 10, 10, 1),
+                ("way", 11, 11, 1),
+                ("relation", 20, 20, 1),
+            ]
+        );
+        assert_eq!(data_blob_indexdata(output), [true; 6]);
+        assert!(
+            data_blob_header_field(output, 4)[1],
+            "the reframed passthrough carries its scanned tag keys"
+        );
+        // The pass that refuses an unindexed blob accepts the output.
+        CliInvoker::new()
+            .arg("check")
+            .arg("--index")
+            .arg(output)
+            .assert_success();
+    }
+}
+
+/// A malformed payload keeps its own error through the merge engine's scan,
+/// located at its frame, rather than the old "failed to scan block IDs".
+#[test]
+fn merge_engine_reports_a_malformed_payload_as_itself() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("malformed.osm.pbf");
+    write_raw_block_pbf(&input, true, &[], &[(false, vec![0x80])]);
+    let output = dir.path().join("out.osm.pbf");
+    let out = run_dedupe(&[&input], &output);
+    assert_eq!(out.status.code(), Some(2), "{}", out.stderr_str());
+    let stderr = out.stderr_str();
+    assert!(!stderr.contains("failed to scan block IDs"), "{stderr}");
+    assert!(
+        stderr.contains(&input.display().to_string()) && stderr.contains("at byte offset"),
+        "the error must name its frame; stderr:\n{stderr}"
+    );
+}
+
+/// `sort` decodes every blob of an input whose header does not claim
+/// `Sort.Type_then_ID`, so it knows when a blob's indexdata is false. It
+/// plans on the scanned index, and must not then copy the false claim into
+/// an output declared sorted: such a blob is copied under indexdata scanned
+/// from its payload, and the output passes `check --index`.
+#[test]
+fn sort_replaces_indexdata_it_found_false() {
+    use pbfhogg::block_builder::BlockBuilder;
+
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    let mut bb = BlockBuilder::new();
+    bb.add_node(1, 10, 10, [("name", "a")], None);
+    bb.add_node(2, 20, 20, [], None);
+    let nodes = bb.take().expect("take").expect("block").to_vec();
+    bb.add_way(10, [("highway", "path")], &[1, 2], None);
+    let ways = bb.take().expect("take").expect("block").to_vec();
+    write_raw_block_pbf(&honest, false, &[], &[(true, nodes), (true, ways)]);
+
+    // `--corrupt-indexdata` inflates every blob's count and max_id.
+    let lying = dir.path().join("lying.osm.pbf");
+    CliInvoker::new()
+        .arg("degrade")
+        .arg(&honest)
+        .arg("-o")
+        .arg(&lying)
+        .arg("--corrupt-indexdata")
+        .assert_success();
+    let refused = CliInvoker::new()
+        .arg("check")
+        .arg("--index")
+        .arg(&lying)
+        .run();
+    assert_eq!(refused.status.code(), Some(1), "{}", refused.stderr_str());
+
+    let output = dir.path().join("sorted.osm.pbf");
+    let out = CliInvoker::new()
+        .arg("sort")
+        .arg(&lying)
+        .arg("-o")
+        .arg(&output)
+        .run();
+    assert!(out.status.success(), "{}", out.stderr_str());
+    out.assert_stderr_contains("2 blobs carried indexdata their payload contradicts");
+    out.assert_stderr_contains("(2 blobs: 2 passthrough, 0 rewritten)");
+    CliInvoker::new()
+        .arg("check")
+        .arg("--index")
+        .arg(&output)
+        .assert_success();
+    assert_eq!(ordered_elements(&output), ordered_elements(&honest));
+}
+
+/// A way blob `sort` reframes for a false index loses its blob-header field
+/// 5, so the output may no longer declare `WayMembers-v1`, although the blob
+/// carried indexdata in the input. The declaration follows what pass 2
+/// writes, not what the input header said.
+#[test]
+fn sort_drops_way_members_when_it_reframes_a_false_way_index() {
+    use pbfhogg::block_builder::BlockBuilder;
+
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    let mut bb = BlockBuilder::new();
+    bb.add_node(1, 10, 10, [], None);
+    bb.add_node(2, 20, 20, [], None);
+    let nodes = bb.take().expect("take").expect("block").to_vec();
+    bb.add_way(10, [("highway", "path")], &[1, 2], None);
+    let ways = bb.take().expect("take").expect("block").to_vec();
+    write_raw_block_pbf(
+        &honest,
+        false,
+        &["pbfhogg.WayMembers-v1"],
+        &[(true, nodes), (true, ways)],
+    );
+
+    // Frames: the header, the node blob, the way blob. Inflate the way
+    // blob's count (bytes 18..26 of the index).
+    let bytes = std::fs::read(&honest).expect("read fixture");
+    let lying_bytes = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, 2, |ix| {
+        let count = u64::from_le_bytes(ix[18..26].try_into().expect("count"));
+        ix[18..26].copy_from_slice(&(count + 1).to_le_bytes());
+    });
+    let lying = dir.path().join("lying.osm.pbf");
+    std::fs::write(&lying, lying_bytes).expect("write lying fixture");
+    assert!(crate::common::read_header(&lying).has_way_members_v1());
+
+    let output = dir.path().join("sorted.osm.pbf");
+    let out = CliInvoker::new()
+        .arg("sort")
+        .arg(&lying)
+        .arg("-o")
+        .arg(&output)
+        .run();
+    assert!(out.status.success(), "{}", out.stderr_str());
+    out.assert_stderr_contains("1 blobs carried indexdata their payload contradicts");
+    assert!(
+        !crate::common::read_header(&output).has_way_members_v1(),
+        "a reframed way blob has no field 5, so WayMembers-v1 must go"
+    );
+    CliInvoker::new()
+        .arg("check")
+        .arg("--index")
+        .arg(&output)
+        .assert_success();
 }
 
 /// The re-encode cannot write `WayMembers-v1` (blob field 5) or

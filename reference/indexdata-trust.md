@@ -190,14 +190,18 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   declared way enrichment, which way declaration the output header makes;
   no blob is skipped, copied raw or counted on indexdata it lacks. `--type`
   decodes an unindexed blob and filters its actual elements; `--dedupe`'s
-  first pass scans the IDs of every unindexed blob (checking their order, as
-  `sort`'s shared pass 1 does), so its overlap plan and way declaration rest
-  on observed ranges; `--clean` schedules and decodes
-  every blob once whatever its indexdata. Two refusals remain, neither about
-  indexing: `--type` refuses an unindexed blob that yields ways when the
-  header already declared a way enrichment re-encoding would break (as
-  `getid --invert` does), and `--dedupe` cannot place an unindexed blob no
-  single index describes (empty, or kinds mixed). `tags-filter` accepts on
+  first pass scans the IDs and tag keys of every unindexed blob (checking
+  their order, as `sort`'s shared pass 1 does), so its overlap plan and way
+  declaration rest on observed ranges and a blob it copies is indexed as
+  plain `cat` indexes it; `--clean` schedules and decodes
+  every blob once whatever its indexdata. The refusals that remain are not
+  about indexing but about way enrichments the header already declared and
+  a re-encode would break: `--type` refuses an unindexed blob that yields
+  ways (as `getid --invert` does), and plain `cat` a way in an unindexed
+  block no single index describes under a declared `WayMembers-v1`, or one
+  carrying pins under a declared `SharedNodePins-v1`. `--dedupe` declares
+  its output from what it writes, so it refuses neither. `tags-filter`
+  accepts on
   every path by the same rule, in either order. Its first-blob probe decides
   only whether `--force` is needed (first data blob unindexed; never under
   `--invert-match` or `--distrust-metadata`). `-R`'s pipelined reader, the
@@ -223,13 +227,25 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
   either outcome moves a row there. `renumber` has no `--force` and
   `add-locations-to-ways --index-type external` refuses it at parse time:
   both are deliberate, since neither has an unindexed fallback.
-- **Plain `cat` and `apply-changes --force` write no partially indexed
-  file**, which pbfhogg's own schedule walks would refuse. Both index every
-  blob they write from an unindexed input: an untouched blob keeps its compressed payload under a header
-  carrying indexdata scanned from it, a blob no single index describes is
-  re-encoded into single-kind blocks, and one holding no element is
-  dropped. `apply-changes` refuses a blob whose elements span more than one
-  kind, which it cannot place in type order, where `cat` splits it.
+- **Plain `cat`, `cat --dedupe`, `sort` and `apply-changes --force` write
+  no partially indexed file**, which pbfhogg's own schedule walks would
+  refuse. All index every blob they write from an unindexed input: an
+  untouched blob keeps its compressed payload under a header carrying
+  indexdata scanned from it (and, from `cat` in every mode and `sort`, its
+  scanned tag keys), a blob no single index describes is re-encoded into
+  single-kind blocks, and one holding no element is dropped. `apply-changes`
+  refuses a blob whose elements span more than one kind, which it cannot
+  place in type order; plain `cat` splits it in input order, and the merge
+  engine behind `cat --dedupe` and `sort` merges each kind's share of it
+  into type order.
+- **`sort` does not copy indexdata it has found false.** Under a header
+  that does not claim `Sort.Type_then_ID` it scans every blob, indexed ones
+  included, to check their order. A blob whose indexdata disagrees with the
+  scan (kind, count or ID range unequal, or a bbox not containing the
+  scanned one, the `check --index` rule) is copied under indexdata and tag
+  keys scanned from its payload, with a `Note:`. Under the sorted claim an
+  indexed blob is not scanned, so its indexdata is believed and copied, as
+  everywhere else on this page.
 
 Current behaviour recorded as such, not as a contract to preserve:
 
@@ -241,8 +257,8 @@ Current behaviour recorded as such, not as a contract to preserve:
 - The walks see headers only, so they cannot tell a blob no index can
   describe (empty, or mixed kinds), which carries no indexdata legitimately,
   from an unindexed one; such a blob among indexed ones is refused.
-  `check --index` exempts it. Since `cat` re-encodes such blocks into
-  indexable ones, only a hand-made file has one.
+  `check --index` exempts it. Since `cat` (and `sort`, and `cat --dedupe`)
+  re-encode such blocks into indexable ones, only a hand-made file has one.
 - The geocode builder refuses a partially indexed file at its Pass 1.5
   schedule walk, after Pass 1 has decoded the whole file once.
 - `inspect --indexed` reports the first-blob probe, so it says yes for a

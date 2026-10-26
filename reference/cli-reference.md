@@ -753,6 +753,17 @@ and how many omitted; the summary counts both as decoded. A way in such a
 block is refused under a declared `WayMembers-v1`, and a way carrying pins
 under a declared `SharedNodePins-v1`, since the rebuild cannot write either.
 
+`--dedupe` (and `sort`, which shares its engine) treats an unindexed blob the
+same way where it can: a blob one index describes passes through under
+indexdata and tag keys scanned from its payload, and one holding no element
+is omitted. A block no single index describes is not split in input order
+but merged: each kind's elements join that kind's merge, are re-encoded as
+the overlap runs are (the way blobs among them losing their enrichments, so
+the output header declares none), and come out in type-then-ID order, with
+exact duplicates dropped under `--dedupe`. A `Note:` line says how many blobs
+were restructured and how many omitted, and the summary counts a
+restructured blob once, as rewritten, and an omitted one as omitted.
+
 **Output header.** Follows [Output header](#output-header). Plain `cat` copies way
 payloads whole and `--type` copies indexed way blobs whole, so the way
 enrichments the input declares are kept (a rebuilt block keeps inline
@@ -782,6 +793,14 @@ pbfhogg sort [OPTIONS] --output <OUTPUT> <FILE>
 | `--force` | Proceed on unindexed input with the slower fallback (see [`--force`](#--force)) |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
+
+An input whose header does not claim `Sort.Type_then_ID` has every blob
+decoded in pass 1 to check its order. An indexed blob whose indexdata that
+scan contradicts is copied under indexdata and tag keys scanned from its
+payload rather than with the false claim, and a `Note:` line counts them.
+Unindexed blobs, and blocks no single index describes, are handled as
+`cat --dedupe` handles them (see [cat](#cat), "Blocks no single index
+describes").
 
 ### repack
 

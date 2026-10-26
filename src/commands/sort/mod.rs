@@ -29,6 +29,9 @@ pub struct SortStats {
     pub passthrough_claimed: u64,
     pub blobs_passthrough: u64,
     pub blobs_rewritten: u64,
+    /// Blobs holding no element, left out of the output.
+    pub blobs_omitted: u64,
+    /// Every input data blob: passthrough, rewritten and omitted together.
     pub blobs_total: u64,
 }
 
@@ -36,13 +39,14 @@ impl SortStats {
     pub fn write_summary(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         writeln!(
             w,
-            "Sorted {} nodes, {} ways, {} relations ({} blobs: {} passthrough, {} rewritten)",
+            "Sorted {} nodes, {} ways, {} relations ({} blobs: {} passthrough, {} rewritten{})",
             self.nodes,
             self.ways,
             self.relations,
             self.blobs_total,
             self.blobs_passthrough,
             self.blobs_rewritten,
+            omitted_clause(self.blobs_omitted),
         )?;
         if self.passthrough_claimed > 0 {
             writeln!(
@@ -54,6 +58,15 @@ impl SortStats {
         }
 
         Ok(())
+    }
+}
+
+/// The summary's omitted count, shown only when there is one.
+pub(crate) fn omitted_clause(omitted: u64) -> String {
+    if omitted == 0 {
+        String::new()
+    } else {
+        format!(", {omitted} omitted")
     }
 }
 
@@ -141,7 +154,7 @@ pub(crate) fn sort_to(
     // Any input order is accepted (sorting it is the point). The walk
     // visits every header anyway, so it refuses a partially indexed input
     // at no extra read; a wholly unindexed one takes the payload scan.
-    let (headers, entries) = blob_merge::index_inputs(
+    let (headers, indexed) = blob_merge::index_inputs(
         std::slice::from_ref(&pin),
         &IndexPolicy {
             require_sorted: None,
@@ -150,17 +163,17 @@ pub(crate) fn sort_to(
         host,
     )?;
     crate::debug::emit_marker("SORT_INDEX_BUILD_END");
+    let blobs_total = indexed.frames.len() as u64 + indexed.omitted;
     crate::host::diag!(
         host.diagnostics,
         Progress,
         "sort.indexed",
-        "  {} OSMData blobs indexed",
-        entries.len()
+        "  {blobs_total} OSMData blobs indexed"
     );
-    crate::debug::emit_counter("sort_blobs_total", entries.len());
+    crate::debug::emit_counter("sort_blobs_total", blobs_total);
 
     crate::debug::emit_marker("SORT_OVERLAP_DETECT_START");
-    let plan = blob_merge::plan(entries);
+    let plan = blob_merge::plan(indexed);
     crate::debug::emit_marker("SORT_OVERLAP_DETECT_END");
     // `sort_blobs_overlap` counts blobs whose range overlaps a same-kind
     // neighbour; blobs rewritten only for intra-blob disorder are counted
@@ -183,6 +196,40 @@ pub(crate) fn sort_to(
             Progress,
             "sort.intra_unsorted",
             "  {intra_unsorted_blobs} blobs internally unsorted (decode + re-encode)"
+        );
+    }
+    crate::debug::emit_counter("sort_blobs_restructured", plan.restructured);
+    crate::debug::emit_counter("sort_blobs_omitted", plan.omitted);
+    crate::debug::emit_counter("sort_false_indexdata_replaced", plan.false_claims_replaced);
+    if plan.restructured > 0 {
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "sort.restructured",
+            "{} blobs held blocks no single index describes (kinds changing across \
+             groups, or a group carrying more than one element field); each kind's \
+             elements were decoded and re-encoded in type order, as overlapping blobs are",
+            plan.restructured
+        );
+    }
+    if plan.omitted > 0 {
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "sort.omitted",
+            "{} blobs held no elements and were omitted, with any unknown fields they \
+             carried",
+            plan.omitted
+        );
+    }
+    if plan.false_claims_replaced > 0 {
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "sort.false_indexdata",
+            "{} blobs carried indexdata their payload contradicts; they were copied \
+             under indexdata and tagdata scanned from the payload",
+            plan.false_claims_replaced
         );
     }
 
@@ -250,6 +297,7 @@ pub(crate) fn sort_to(
         passthrough_claimed: counts.passthrough_claimed,
         blobs_passthrough: counts.blobs_passthrough,
         blobs_rewritten: counts.blobs_rewritten,
-        blobs_total: plan.entries.len() as u64,
+        blobs_omitted: plan.omitted,
+        blobs_total: plan.blobs_total(),
     })
 }

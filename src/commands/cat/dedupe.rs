@@ -42,6 +42,9 @@ pub struct MergePbfStats {
     pub passthrough_claimed: u64,
     pub blobs_passthrough: u64,
     pub blobs_rewritten: u64,
+    /// Blobs holding no element, left out of the output.
+    pub blobs_omitted: u64,
+    /// Every input data blob: passthrough, rewritten and omitted together.
     pub blobs_total: u64,
     pub duplicates_removed: u64,
 }
@@ -52,13 +55,14 @@ impl MergePbfStats {
         writeln!(
             w,
             "Merged {total} elements: {} nodes, {} ways, {} relations \
-             ({} blobs: {} passthrough, {} rewritten, {} duplicates removed)",
+             ({} blobs: {} passthrough, {} rewritten{}, {} duplicates removed)",
             self.nodes,
             self.ways,
             self.relations,
             self.blobs_total,
             self.blobs_passthrough,
             self.blobs_rewritten,
+            crate::commands::sort::omitted_clause(self.blobs_omitted),
             self.duplicates_removed,
         )?;
         if self.passthrough_claimed > 0 {
@@ -171,7 +175,7 @@ fn plan_merge(
     // A partially indexed input is accepted: each blob without indexdata is
     // scanned, so the plan rests on observed ranges for it
     // (reference/indexdata-trust.md, "Missing and partial indexdata").
-    let (headers, entries) = blob_merge::index_inputs(
+    let (headers, indexed) = blob_merge::index_inputs(
         &pins,
         &IndexPolicy {
             require_sorted: Some(
@@ -186,18 +190,39 @@ fn plan_merge(
         Progress,
         "cat.dedupe.indexed",
         "  {} OSMData blobs indexed from {} files",
-        entries.len(),
+        indexed.frames.len() as u64 + indexed.omitted,
         inputs.len()
     );
 
-    let plan = blob_merge::plan(entries);
-    let rewritten = plan.overlapping + plan.intra_unsorted;
-    if rewritten > 0 {
+    let plan = blob_merge::plan(indexed);
+    if plan.blobs_rewritten > 0 {
         crate::host::diag!(
             host.diagnostics,
             Progress,
             "cat.dedupe.overlap_runs",
-            "  {rewritten} blobs in overlap runs (decode + merge + dedup)"
+            "  {} blobs in overlap runs (decode + merge + dedup)",
+            plan.blobs_rewritten
+        );
+    }
+    if plan.restructured > 0 {
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "cat.dedupe.restructured",
+            "{} blobs held blocks no single index describes (kinds changing across \
+             groups, or a group carrying more than one element field); each kind's \
+             elements were decoded and re-encoded in type order, as overlapping blobs are",
+            plan.restructured
+        );
+    }
+    if plan.omitted > 0 {
+        crate::host::diag!(
+            host.diagnostics,
+            Note,
+            "cat.dedupe.omitted",
+            "{} blobs held no elements and were omitted, with any unknown fields they \
+             carried",
+            plan.omitted
         );
     }
 
@@ -261,7 +286,8 @@ fn write_merge(
         passthrough_claimed: counts.passthrough_claimed,
         blobs_passthrough: counts.blobs_passthrough,
         blobs_rewritten: counts.blobs_rewritten,
-        blobs_total: plan.entries.len() as u64,
+        blobs_omitted: plan.omitted,
+        blobs_total: plan.blobs_total(),
         duplicates_removed: counts.duplicates_removed,
     })
 }
@@ -271,7 +297,7 @@ mod tests {
     use super::*;
     use crate::ElementKind;
     use crate::block_builder::BlockBuilder;
-    use crate::commands::blob_merge::BlobEntry;
+    use crate::commands::blob_merge::Frame;
     use crate::writer::PbfWriter;
 
     /// Kind of the one data blob a fixture writes into its own block.
@@ -345,17 +371,18 @@ mod tests {
         )
     }
 
-    /// The entry of `kind` that pass 1 indexed from input `source`, and
-    /// whether it is in an overlap run.
-    fn entry_of(merge: &MergePlan, kind: ElementKind, source: usize) -> (&BlobEntry, bool) {
+    /// The frame of the entry of `kind` that pass 1 indexed from input
+    /// `source`, and whether that entry is in an overlap run.
+    fn entry_of(merge: &MergePlan, kind: ElementKind, source: usize) -> (&Frame, bool) {
+        let frames = &merge.plan.frames;
         let (entry, &rewrite) = merge
             .plan
             .entries
             .iter()
             .zip(&merge.plan.rewrite)
-            .find(|(e, _)| e.index.kind == kind && e.source == source)
+            .find(|(e, _)| e.index.kind == kind && frames[e.frame].source == source)
             .expect("planned entry");
-        (entry, rewrite)
+        (&frames[entry.frame], rewrite)
     }
 
     /// The untouched plan merges: the two shared nodes are deduped.

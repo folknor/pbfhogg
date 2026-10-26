@@ -231,6 +231,40 @@ together so the surface changes once.
   that a no-feature build refuses `--direct-io` before opening any input,
   and a unit test of the table against the capability matrix.
 
+## Lint exemptions (moved out of the hygiene drain 2026-10-26)
+
+The maintainer wants this resolved, but not in the drain.
+
+- [ ] **`too_many_arguments` and `too_many_lines` are denied and then
+  allowed locally all over.** Both are `deny` in the workspace
+  `[workspace.lints.clippy]` (root `Cargo.toml`), yet many functions carry
+  a local `#[allow]`, often both lints in one attribute, across `src/`,
+  `cli/src/` and the tests: the extract entry points,
+  `writer_from_header`, `getid_dispatched`, `filter_by_id`, the getparents
+  dispatchers, altw's `write_output_*`, `tags_filter_*`, apply-changes'
+  `worker_loop` and `handle_candidate`, several CLI `run_*` functions, and
+  more. A denied lint with that many local exemptions enforces nothing.
+  The flag-refusal half of the original finding is done
+  (`reference/cli-reference.md`, "Flag rules"), and the library already
+  takes one `WriteOptions` instead of positional bools.
+
+  Suggested shape, from the 2026-10-25 and 2026-10-26 sessions, to spar
+  before acting:
+  - Convert every exemption to `#[expect(..., reason = "...")]` with a
+    real reason. That changes no codegen, and an `expect` fails the build
+    once its exemption goes stale, so some allows will turn out to be
+    removable rather than convertible.
+  - Group parameters into a struct only on crate-private entry points
+    called once per run. Never on hot inner helpers (`write/encode.rs`,
+    apply-changes' worker and drain, the altw stages, the diff and derive
+    block-pair shard engine), and never on public signatures without a
+    decision of their own, since that is a breaking change.
+  - Then ban new `allow(clippy::too_many_` with a `[[textlint]]` rule in
+    `brokkr.toml` (the existing rules there show the syntax).
+
+  The alternative the finding offered, no longer denying the lints, is
+  still open.
+
 ## Roadmap at a glance
 
 Open work is grouped here by what actually gates it. The completed

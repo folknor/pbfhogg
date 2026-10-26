@@ -3,13 +3,17 @@
 //! duplicates dropped).
 //!
 //! Pass 1 ([`index_inputs`]) walks every input's blob headers with
-//! [`HeaderWalker`] and builds one [`BlobEntry`] per OSMData blob. [`plan`]
-//! orders the entries by (kind, first key), flags the blobs whose ID ranges
-//! overlap a same-kind neighbour plus those found internally out of order,
-//! and groups the flagged ones into kind-bounded overlap runs. Pass 2
-//! ([`write_plan`]) writes the entries in order: a blob outside every run is
-//! copied through raw (coalesced into one `copy_file_range` per contiguous
-//! stretch of one input where the output can splice), and each overlap run is
+//! [`HeaderWalker`] and records one [`Frame`] per OSMData blob it keeps, with
+//! one [`BlobEntry`] per element kind the frame holds: one for an ordinary
+//! blob, one per kind present for a block no single index describes. [`plan`]
+//! orders the entries by (kind, first key), flags those whose ID ranges
+//! overlap a same-kind neighbour plus those that must be rewritten whatever
+//! their range (internally out of order, or a block no single index
+//! describes), and groups the flagged ones into kind-bounded overlap runs.
+//! Pass 2 ([`write_plan`]) writes the entries in order: a frame outside every
+//! run is copied through (coalesced into one `copy_file_range` per contiguous
+//! stretch of one input where the output can splice, or reframed with a
+//! scanned index where its own is missing or false), and each overlap run is
 //! decoded and merged through a binary heap and re-encoded.
 //!
 //! Overlap runs are swept on worker threads and stream their blocks to the
@@ -32,7 +36,10 @@ use crate::ElementKind;
 use crate::blob::{
     BlobKind, decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
 };
-use crate::blob_meta::{BlobIndex, scan_block_ids_checked};
+use crate::blob_meta::{
+    BlobIndex, TagIndex, try_scan_block_ids_and_tags, try_scan_block_ids_checked,
+    try_scan_block_tags,
+};
 use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::error::{Error, Result};
 use crate::file_writer::FileWriter;
@@ -50,8 +57,9 @@ use crate::writer::{PbfWriter, reframe_raw_with_index};
 // Blob index
 // ---------------------------------------------------------------------------
 
-/// One OSMData blob of one input.
-pub(crate) struct BlobEntry {
+/// One OSMData blob of one input that pass 1 kept: where its frame is, and
+/// what a passthrough of it writes.
+pub(crate) struct Frame {
     /// Which input (an index into the slice handed to [`index_inputs`], and
     /// into the sources pass 2 opens from it).
     pub(crate) source: usize,
@@ -59,25 +67,64 @@ pub(crate) struct BlobEntry {
     pub(crate) file_offset: u64,
     /// Length of the complete frame (4 + header_len + data_size).
     pub(crate) frame_len: u64,
-    /// Element kind + ID range.
+    /// The blob header a passthrough gives this frame instead of its own:
+    /// set for a frame without indexdata, and for one whose indexdata pass 1
+    /// scanned and found false. `None` copies the frame whole. [`plan`]
+    /// clears it on a rewritten frame, so after planning it is exactly "this
+    /// passthrough is reframed".
+    pub(crate) reindex: Option<Reindex>,
+}
+
+/// The index and tag key set a reframed passthrough carries, both scanned
+/// from its payload, so it is indexed as plain `cat` indexes it.
+pub(crate) struct Reindex {
+    index: BlobIndex,
+    tagdata: Option<Box<[u8]>>,
+    /// The frame carried indexdata its payload contradicts (only `sort`,
+    /// under a header that does not claim `Sort.Type_then_ID`, scans an
+    /// indexed blob and can find this).
+    replaces_false_claim: bool,
+}
+
+/// One element kind's share of a [`Frame`]: what the plan orders and the
+/// sweep merges. An ordinary blob has one; a block no single index describes
+/// has one per kind it holds, all of the same frame and all rewritten.
+pub(crate) struct BlobEntry {
+    /// The frame (an index into [`Plan::frames`]).
+    pub(crate) frame: usize,
+    /// Element kind + ID range of this kind's elements in the frame.
     pub(crate) index: BlobIndex,
-    /// Whether the BlobHeader already carries indexdata.
-    pub(crate) has_indexdata: bool,
-    /// Per-blob tag key data from BlobHeader field 4, kept for a reframe.
-    pub(crate) tagdata: Option<Box<[u8]>>,
     /// True when this blob's elements are internally out of canonical OSM ID
     /// order. Set by the payload scan, which runs for every blob except an
     /// indexed one under a header claiming `Sort.Type_then_ID`: intra-blob
     /// order there is a precondition of the claim itself (see
     /// CORRECTNESS.md). A flagged blob is routed into the rewrite path so the
-    /// sweep reorders it, even when its range overlaps no neighbour.
+    /// sweep reorders it, even when its range overlaps no neighbour. Not
+    /// computed for a restructured entry, which is rewritten anyway.
     pub(crate) intra_unsorted: bool,
+    /// The frame's block has no single index (kinds change across groups,
+    /// or a group carries more than one element field), so it can never be
+    /// copied: every one of its entries is rewritten through the sweep,
+    /// whose extraction takes only the entry's kind from the frame.
+    pub(crate) restructured: bool,
     /// True when `index` was derived by decoding the payload, false when it
     /// was read out of the BlobHeader and believed. Only the element counters
     /// need this: a passthrough blob's `index.count` on the header-only path
     /// is the file's own unverified claim, reported apart from the observed
     /// counts (`passthrough_claimed`).
     pub(crate) index_scanned: bool,
+}
+
+/// What pass 1 found: the frames it kept, their entries in input then file
+/// order, and the blobs it dropped.
+pub(crate) struct Indexed {
+    pub(crate) frames: Vec<Frame>,
+    pub(crate) entries: Vec<BlobEntry>,
+    /// Blobs whose block decoded to no element at all. They are left out of
+    /// the output, as plain `cat` leaves them out: no index can describe
+    /// them, and they hold no OSM content (only whatever unknown fields they
+    /// carried, which go with them).
+    pub(crate) omitted: u64,
 }
 
 /// What pass 1 accepts and refuses: the part of a command's input contract
@@ -94,8 +141,8 @@ pub(crate) struct IndexPolicy {
 
 /// Pass 1: walk every input, in order, and index its OSMData blobs.
 ///
-/// Returns one header per input, in input order, and the entries in input
-/// then file order. Each input must start with its one OSMHeader: a first
+/// Returns one header per input, in input order, and what the walk indexed.
+/// Each input must start with its one OSMHeader: a first
 /// frame of any other type is the missing-header error at once, and a later
 /// OSMHeader is refused by the walk's shared framing policy
 /// (`read::frame::check_header_position`) rather than ignored, because what
@@ -110,16 +157,32 @@ pub(crate) struct IndexPolicy {
 /// order: indexdata alone does not prove it (`cat` attaches indexdata to
 /// payloads it never reorders), and the trusted ordering signal is the header
 /// claim, the contract `ElementReader` keys its guarantees on.
+///
+/// A scanned payload ends in one of four ways. Malformed bytes fail the run
+/// with the scan's own error. A block one index describes becomes one entry;
+/// without indexdata it is also scanned for its tag keys, so a passthrough of
+/// it is reframed with both, as plain `cat` indexes it. A block no single
+/// index describes is decoded: with no element it is omitted, otherwise it
+/// gets one restructured entry per kind it holds. An indexed blob scanned for
+/// order (`sort` under a header without the sorted claim) whose indexdata
+/// its payload contradicts is reframed with the scanned index rather than
+/// copied with the false one; its claim holds when kind, count and ID range
+/// are equal and a bbox it carries contains the scanned one (the
+/// `check --index` rule, which reads an absent bbox as no claim).
 #[hotpath::measure]
 pub(crate) fn index_inputs(
     inputs: &[PinnedInput],
     policy: &IndexPolicy,
     host: &crate::host::Host,
-) -> Result<(Vec<crate::HeaderBlock>, Vec<BlobEntry>)> {
+) -> Result<(Vec<crate::HeaderBlock>, Indexed)> {
     let mut walk = Walk {
         policy,
         host,
-        entries: Vec::new(),
+        indexed: Indexed {
+            frames: Vec::new(),
+            entries: Vec::new(),
+            omitted: 0,
+        },
         data_buf: Vec::new(),
         decompress_buf: Vec::new(),
         noted_unclaimed: false,
@@ -128,17 +191,31 @@ pub(crate) fn index_inputs(
     for (source, input) in inputs.iter().enumerate() {
         headers.push(walk.input(source, input)?);
     }
-    Ok((headers, walk.entries))
+    Ok((headers, walk.indexed))
 }
 
 /// Pass-1 state shared across every input of a run.
 struct Walk<'a> {
     policy: &'a IndexPolicy,
     host: &'a crate::host::Host,
-    entries: Vec<BlobEntry>,
+    indexed: Indexed,
     data_buf: Vec<u8>,
     decompress_buf: Vec<u8>,
     noted_unclaimed: bool,
+}
+
+/// What the payload scan made of one block.
+enum Scanned {
+    /// One index describes it. `tagdata` is its serialized tag key set, when
+    /// the scan was asked for it and the key set encodes.
+    Block {
+        index: BlobIndex,
+        sorted: bool,
+        tagdata: Option<Box<[u8]>>,
+    },
+    /// No single index does: the index of each kind it holds, in kind order,
+    /// empty when it holds no element.
+    Kinds(Vec<BlobIndex>),
 }
 
 impl Walk<'_> {
@@ -157,9 +234,7 @@ impl Walk<'_> {
                     return Err(crate::error::new_missing_header(input.path()));
                 }
                 BlobKind::OsmData => {
-                    let entry =
-                        self.data_blob(source, &walker, meta, claims_sorted == Some(true))?;
-                    self.entries.push(entry);
+                    self.data_blob(source, &walker, &meta, claims_sorted == Some(true))?;
                 }
                 // Unknown extension blob: the walk has already stepped past it.
                 _ => {}
@@ -191,65 +266,195 @@ impl Walk<'_> {
         Ok(hdr)
     }
 
+    /// Index one OSMData blob: push its frame and entries, or count it
+    /// omitted. See [`index_inputs`] for the outcomes.
     fn data_blob(
         &mut self,
         source: usize,
         walker: &HeaderWalker,
-        mut meta: BlobHeaderMeta,
+        meta: &BlobHeaderMeta,
         claims_sorted: bool,
-    ) -> Result<BlobEntry> {
-        let has_indexdata = meta.index.is_some();
-        let (index, intra_unsorted, index_scanned) =
-            match meta.index.take().filter(|_| claims_sorted) {
-                Some(index) => (index, false, false),
-                None => {
-                    if has_indexdata && !self.noted_unclaimed {
-                        self.noted_unclaimed = true;
-                        // Only `sort` reaches this: `cat --dedupe` refuses an
-                        // input whose header does not claim sorted.
-                        crate::host::diag!(
-                            self.host.diagnostics,
-                            Note,
-                            "sort.verify_unclaimed_order",
-                            "input does not declare Sort.Type_then_ID; verifying \
-                         intra-blob order (pass 1 decodes every blob payload)"
-                        );
-                    }
-                    let (index, sorted) = self
-                        .scan_payload(walker, &meta)
-                        .map_err(|e| walker.locate_meta(&meta, e))?;
-                    (index, !sorted, true)
-                }
-            };
-        Ok(BlobEntry {
+    ) -> Result<()> {
+        let frame = self.indexed.frames.len();
+        let mut new_frame = Frame {
             source,
             file_offset: meta.frame_start,
             frame_len: meta.frame_size as u64,
-            index,
-            has_indexdata,
-            tagdata: meta.tagdata,
-            intra_unsorted,
-            index_scanned,
-        })
+            reindex: None,
+        };
+        let claimed = match meta.index {
+            // Believed: the frame's own header (its tagdata included) is
+            // what a passthrough copies.
+            Some(index) if claims_sorted => {
+                self.indexed.frames.push(new_frame);
+                self.indexed.entries.push(BlobEntry {
+                    frame,
+                    index,
+                    intra_unsorted: false,
+                    restructured: false,
+                    index_scanned: false,
+                });
+                return Ok(());
+            }
+            claimed => claimed,
+        };
+        if claimed.is_some() && !self.noted_unclaimed {
+            self.noted_unclaimed = true;
+            // Only `sort` reaches this: `cat --dedupe` refuses an input
+            // whose header does not claim sorted.
+            crate::host::diag!(
+                self.host.diagnostics,
+                Note,
+                "sort.verify_unclaimed_order",
+                "input does not declare Sort.Type_then_ID; verifying \
+                 intra-blob order (pass 1 decodes every blob payload)"
+            );
+        }
+        let located = |e| walker.locate_meta(meta, e);
+        // Tag keys are wanted only where a passthrough is reframed: a blob
+        // without indexdata. An indexed one is copied whole unless its claim
+        // turns out false, which rescans the buffer below.
+        let scanned = self
+            .scan_payload(walker, meta, claimed.is_none())
+            .map_err(located)?;
+        match scanned {
+            Scanned::Block {
+                index,
+                sorted,
+                tagdata,
+            } => {
+                new_frame.reindex = match claimed {
+                    None => Some(Reindex {
+                        index,
+                        tagdata,
+                        replaces_false_claim: false,
+                    }),
+                    Some(claim) if claim_holds(&claim, &index) => None,
+                    Some(_) => Some(Reindex {
+                        index,
+                        tagdata: scanned_tagdata(&self.decompress_buf).map_err(located)?,
+                        replaces_false_claim: true,
+                    }),
+                };
+                self.indexed.frames.push(new_frame);
+                self.indexed.entries.push(BlobEntry {
+                    frame,
+                    index,
+                    intra_unsorted: !sorted,
+                    restructured: false,
+                    index_scanned: true,
+                });
+            }
+            Scanned::Kinds(kinds) if kinds.is_empty() => self.indexed.omitted += 1,
+            Scanned::Kinds(kinds) => {
+                self.indexed.frames.push(new_frame);
+                self.indexed
+                    .entries
+                    .extend(kinds.into_iter().map(|index| BlobEntry {
+                        frame,
+                        index,
+                        intra_unsorted: false,
+                        restructured: true,
+                        index_scanned: true,
+                    }));
+            }
+        }
+        Ok(())
     }
 
     /// Pread, decompress and scan one payload's IDs, checking intra-blob
     /// monotonicity on the way (one compare per element, on a scan that
-    /// visits every ID anyway). A blob no single index describes (empty, or
-    /// kinds mixed) cannot be placed and is refused.
+    /// visits every ID anyway), and its tag keys when `with_tags`. A block
+    /// no single index describes is decoded for the kinds it holds.
     fn scan_payload(
         &mut self,
         walker: &HeaderWalker,
         meta: &BlobHeaderMeta,
-    ) -> Result<(BlobIndex, bool)> {
+        with_tags: bool,
+    ) -> Result<Scanned> {
         walker.pread_data(meta.data_offset, meta.data_size, &mut self.data_buf)?;
         decompress_blob_data_into(&self.data_buf, &mut self.decompress_buf)?;
-        // The collapsing scan is safe here although a reframed passthrough
-        // carries this index: `None` - malformed bytes or a blob no single
-        // index describes - refuses the run either way.
-        scan_block_ids_checked(&self.decompress_buf)
-            .ok_or_else(|| Error::invalid_data("failed to scan block IDs"))
+        let (index, tags) = if with_tags {
+            try_scan_block_ids_and_tags(&self.decompress_buf)?
+        } else {
+            (try_scan_block_ids_checked(&self.decompress_buf)?, None)
+        };
+        match index {
+            Some((index, sorted)) => Ok(Scanned::Block {
+                index,
+                sorted,
+                tagdata: tags.as_ref().and_then(serialize_tags),
+            }),
+            None => kind_indexes(&self.decompress_buf, &self.host.cancel).map(Scanned::Kinds),
+        }
     }
+}
+
+/// Whether a blob's indexdata claim is true of the index scanned from its
+/// payload: kind, count and ID range exact, and a claimed bbox containing
+/// the scanned one. An absent claimed bbox makes no spatial claim; a present
+/// one the scan could not confirm (no scanned box) is not believed.
+fn claim_holds(claim: &BlobIndex, scanned: &BlobIndex) -> bool {
+    let bbox_holds = match (claim.bbox, scanned.bbox) {
+        (None, _) => true,
+        (Some(claimed), Some(observed)) => claimed.contains(&observed),
+        (Some(_), None) => false,
+    };
+    claim.kind == scanned.kind
+        && claim.count == scanned.count
+        && claim.min_id == scanned.min_id
+        && claim.max_id == scanned.max_id
+        && bbox_holds
+}
+
+/// The serialized tag key set of a block one index describes.
+fn scanned_tagdata(block: &[u8]) -> Result<Option<Box<[u8]>>> {
+    Ok(try_scan_block_tags(block)?
+        .as_ref()
+        .and_then(serialize_tags))
+}
+
+fn serialize_tags(tags: &TagIndex) -> Option<Box<[u8]>> {
+    tags.serialize().map(Vec::into_boxed_slice)
+}
+
+/// The index of each element kind a block holds, in kind order, for a block
+/// the scan found no single index for. Decoding is the cold path's cost: such
+/// blocks come only from third-party producers, and a decode failure here is
+/// the block's real error (the scan validates less than the decoder does).
+/// The bbox is left out, since these entries are rewritten, never copied.
+/// One cancellation check before the decode: the walk checks between blobs,
+/// and one block is bounded by the blob size limit.
+fn kind_indexes(block: &[u8], cancel: &crate::host::Cancel) -> Result<Vec<BlobIndex>> {
+    cancel.check()?;
+    let block = crate::PrimitiveBlock::from_vec(block.to_vec())?;
+    let mut ranges: [Option<(i64, i64, u64)>; 3] = [None; 3];
+    for element in block.elements() {
+        let (kind, id) = match &element {
+            Element::DenseNode(dn) => (ElementKind::Node, dn.id()),
+            Element::Node(n) => (ElementKind::Node, n.id()),
+            Element::Way(w) => (ElementKind::Way, w.id()),
+            Element::Relation(r) => (ElementKind::Relation, r.id()),
+        };
+        let range = &mut ranges[usize::from(type_order(kind))];
+        *range = Some(match *range {
+            None => (id, id, 1),
+            Some((min, max, count)) => (min.min(id), max.max(id), count + 1),
+        });
+    }
+    Ok([ElementKind::Node, ElementKind::Way, ElementKind::Relation]
+        .into_iter()
+        .zip(ranges)
+        .filter_map(|(kind, range)| {
+            range.map(|(min_id, max_id, count)| BlobIndex {
+                kind,
+                min_id,
+                max_id,
+                count,
+                bbox: None,
+            })
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +462,7 @@ impl Walk<'_> {
 // ---------------------------------------------------------------------------
 
 /// One rewrite run, `entries[start..end]`, all of `kind`: an overlap
-/// component, or one internally unsorted blob that overlaps nothing.
+/// component, or one entry that overlaps nothing but must be rewritten.
 pub(crate) struct Run {
     start: usize,
     end: usize,
@@ -265,25 +470,54 @@ pub(crate) struct Run {
 }
 
 /// The entries in output order and what pass 2 does with each.
+///
+/// The counts are of input blobs (frames), never of entries, so a blob that
+/// holds several kinds counts once in each total: `blobs_total` is
+/// `omitted + passthrough + rewritten`, the passthroughs being exactly the
+/// frames no entry of which is rewritten. The attributions (`overlapping`,
+/// `intra_unsorted`, `restructured`) are not additive: a restructured blob
+/// whose way entry joins an overlap component counts in both.
 pub(crate) struct Plan {
+    pub(crate) frames: Vec<Frame>,
     pub(crate) entries: Vec<BlobEntry>,
     /// Per entry: rewritten in an overlap run, rather than copied through.
     pub(crate) rewrite: Vec<bool>,
-    /// Blobs in genuine range-overlap runs.
+    /// Blobs with an entry in a genuine range-overlap run.
     pub(crate) overlapping: usize,
     /// Blobs routed to rewrite only for intra-blob disorder (disjoint from
-    /// `overlapping`).
+    /// `overlapping` and `restructured`).
     pub(crate) intra_unsorted: usize,
+    /// Blobs whose block no single index describes, rewritten whatever their
+    /// ranges.
+    pub(crate) restructured: usize,
+    /// Blobs left out because they hold no element ([`Indexed::omitted`]).
+    pub(crate) omitted: u64,
+    /// Blobs with at least one rewritten entry.
+    pub(crate) blobs_rewritten: u64,
+    /// Passthrough blobs reframed because their indexdata was false.
+    pub(crate) false_claims_replaced: u64,
     pub(crate) runs: Vec<Run>,
 }
 
+impl Plan {
+    /// Every input data blob pass 1 saw, omitted ones included.
+    pub(crate) fn blobs_total(&self) -> u64 {
+        self.frames.len() as u64 + self.omitted
+    }
+}
+
 /// Order the entries by (kind, first key), find the overlap runs and fold
-/// in intra-blob disorder.
+/// in the entries that must be rewritten whatever their range.
 ///
 /// The sort is stable, so entries with equal keys keep input then file
 /// order, which the sweep's heap pushes (and so which of two exact
 /// duplicates survives) depend on.
-pub(crate) fn plan(mut entries: Vec<BlobEntry>) -> Plan {
+pub(crate) fn plan(indexed: Indexed) -> Plan {
+    let Indexed {
+        mut frames,
+        mut entries,
+        omitted,
+    } = indexed;
     entries.sort_by_key(|e| {
         (
             type_order(e.index.kind),
@@ -292,7 +526,10 @@ pub(crate) fn plan(mut entries: Vec<BlobEntry>) -> Plan {
     });
     let mut rewrite = vec![false; entries.len()];
     let mut runs = Vec::new();
-    let (mut overlapping, mut intra_unsorted) = (0, 0);
+    // Per frame: an entry in an overlap component, rewritten for disorder
+    // alone, restructured.
+    let mut in_overlap = vec![false; frames.len()];
+    let mut for_disorder = vec![false; frames.len()];
     let mut components = overlap_components(&entries).into_iter().peekable();
     let mut i = 0;
     while i < entries.len() {
@@ -302,18 +539,24 @@ pub(crate) fn plan(mut entries: Vec<BlobEntry>) -> Plan {
         {
             components.next();
             rewrite[start..end].fill(true);
-            overlapping += end - start;
+            for entry in &entries[start..end] {
+                in_overlap[entry.frame] = true;
+            }
             runs.push(Run { start, end, kind });
             i = end;
             continue;
         }
-        // Disorder inside a blob that overlaps nothing: rewritten alone, so
-        // the sweep reorders it. A blob both unsorted and overlapping is in
-        // its component already and counted there, keeping the two
-        // attributions disjoint.
-        if entries[i].intra_unsorted {
+        // An entry that overlaps nothing but cannot be copied: rewritten
+        // alone, so the sweep reorders it (disorder) or re-encodes its kind's
+        // share of the block (restructured). One both unsorted and
+        // overlapping is in its component already and counted there,
+        // keeping the attributions disjoint.
+        let entry = &entries[i];
+        if entry.restructured || entry.intra_unsorted {
             rewrite[i] = true;
-            intra_unsorted += 1;
+            if !entry.restructured {
+                for_disorder[entry.frame] = true;
+            }
             runs.push(Run {
                 start: i,
                 end: i + 1,
@@ -322,20 +565,51 @@ pub(crate) fn plan(mut entries: Vec<BlobEntry>) -> Plan {
         }
         i += 1;
     }
+
+    let mut rewritten = vec![false; frames.len()];
+    let mut restructured = vec![false; frames.len()];
+    for (entry, &r) in entries.iter().zip(&rewrite) {
+        rewritten[entry.frame] |= r;
+        restructured[entry.frame] |= entry.restructured;
+    }
+    debug_assert!(
+        entries
+            .iter()
+            .zip(&rewrite)
+            .all(|(e, &r)| r || !e.restructured),
+        "a restructured entry is never copied",
+    );
+    // A rewritten frame is never reframed: what its passthrough would have
+    // carried goes, so `reindex` now means "this passthrough is reframed".
+    for (frame, &r) in frames.iter_mut().zip(&rewritten) {
+        if r {
+            frame.reindex = None;
+        }
+    }
+    let count = |flags: &[bool]| flags.iter().filter(|&&f| f).count();
+    let false_claims_replaced = frames
+        .iter()
+        .filter(|f| f.reindex.as_ref().is_some_and(|r| r.replaces_false_claim))
+        .count() as u64;
     Plan {
+        overlapping: count(&in_overlap),
+        intra_unsorted: count(&for_disorder),
+        restructured: count(&restructured),
+        omitted,
+        blobs_rewritten: count(&rewritten) as u64,
+        false_claims_replaced,
+        frames,
         entries,
         rewrite,
-        overlapping,
-        intra_unsorted,
         runs,
     }
 }
 
 impl Plan {
     /// What the output's way blobs are, for the output header: a way blob in
-    /// a rewrite run is re-encoded without enrichments, an unindexed
-    /// passthrough way blob is reframed (field 5 dropped), every other way
-    /// blob is copied whole.
+    /// a rewrite run is re-encoded without enrichments, a reframed
+    /// passthrough way blob keeps its payload under a new header (field 5
+    /// dropped), every other way blob is copied whole.
     pub(crate) fn ways(&self) -> crate::commands::output_header::Ways {
         let way_blobs = || {
             self.entries
@@ -345,7 +619,7 @@ impl Plan {
         };
         crate::commands::output_header::Ways::from_copy(
             way_blobs().any(|(_, &r)| r),
-            way_blobs().any(|(e, &r)| !r && !e.has_indexdata),
+            way_blobs().any(|(e, &r)| !r && self.frames[e.frame].reindex.is_some()),
         )
     }
 }
@@ -445,7 +719,9 @@ pub(crate) struct WriteCounts {
     /// Elements in passthrough blobs counted from their own unverified
     /// indexdata.
     pub(crate) passthrough_claimed: u64,
+    /// Input blobs copied through, raw or reframed.
     pub(crate) blobs_passthrough: u64,
+    /// Input blobs with at least one entry rewritten ([`Plan::blobs_rewritten`]).
     pub(crate) blobs_rewritten: u64,
     pub(crate) duplicates_removed: u64,
     pub(crate) copy_range_calls: u64,
@@ -607,6 +883,7 @@ fn sweep_job(
     let mut receiver_gone = false;
     let result = sweep_run(
         &plan.entries[run.start..run.end],
+        &plan.frames,
         run.kind,
         sources,
         dedupe,
@@ -659,7 +936,12 @@ fn write_loop(
     use_copy_range: bool,
     mut run_output: impl FnMut(usize, &mut PbfWriter<FileWriter>) -> Result<RunCounts>,
 ) -> Result<WriteCounts> {
-    let mut counts = WriteCounts::default();
+    // Counted per frame by the plan: a blob holding several kinds is
+    // rewritten in several runs but is one blob.
+    let mut counts = WriteCounts {
+        blobs_rewritten: plan.blobs_rewritten,
+        ..WriteCounts::default()
+    };
     // Passthrough coalescer: adjacent blobs contiguous in one input collapse
     // into one `copy_file_range`. On already-sorted input this is the entire
     // file, cutting the syscall count from O(blobs) to O(1). Mirrors the
@@ -683,16 +965,25 @@ fn write_loop(
                 ElementKind::Relation => counts.relations += emitted.elements,
             }
             counts.duplicates_removed += emitted.duplicates;
-            counts.blobs_rewritten += (run.end - run.start) as u64;
             next_run += 1;
             i = run.end;
         } else {
+            // A copied entry is its frame's only one: a frame with several
+            // is restructured, and every restructured entry is rewritten.
             let entry = &plan.entries[i];
-            if entry.has_indexdata && use_copy_range {
-                copy.offer(entry, writer, sources, &mut counts)?;
-            } else {
-                copy.flush(writer, sources, &mut counts)?;
-                write_passthrough(entry, &sources[entry.source], writer, &mut frame_buf)?;
+            let frame = &plan.frames[entry.frame];
+            match &frame.reindex {
+                None if use_copy_range => copy.offer(frame, writer, sources, &mut counts)?,
+                reindex => {
+                    copy.flush(writer, sources, &mut counts)?;
+                    write_passthrough(
+                        frame,
+                        reindex.as_ref(),
+                        &sources[frame.source],
+                        writer,
+                        &mut frame_buf,
+                    )?;
+                }
             }
             count_passthrough(entry, &mut counts);
             counts.blobs_passthrough += 1;
@@ -712,22 +1003,22 @@ impl CopyRun {
     /// input, otherwise flush the stretch and start a new one.
     fn offer(
         &mut self,
-        entry: &BlobEntry,
+        frame: &Frame,
         writer: &mut PbfWriter<FileWriter>,
         sources: &[InputFile],
         counts: &mut WriteCounts,
     ) -> Result<()> {
         match &mut self.0 {
-            Some((source, _, end)) if *source == entry.source && *end == entry.file_offset => {
-                *end += entry.frame_len;
+            Some((source, _, end)) if *source == frame.source && *end == frame.file_offset => {
+                *end += frame.frame_len;
                 counts.copy_range_coalesced += 1;
             }
             _ => {
                 self.flush(writer, sources, counts)?;
                 self.0 = Some((
-                    entry.source,
-                    entry.file_offset,
-                    entry.file_offset + entry.frame_len,
+                    frame.source,
+                    frame.file_offset,
+                    frame.file_offset + frame.frame_len,
                 ));
             }
         }
@@ -749,25 +1040,31 @@ impl CopyRun {
     }
 }
 
-/// Passthrough without the copy path: the frame raw when it carries
-/// indexdata (an output that cannot splice, such as `--direct-io`), else
-/// reframed with the index pass 1 scanned.
+/// Passthrough without the copy path: the frame raw when it keeps its own
+/// header (an output that cannot splice, such as `--direct-io`), else
+/// reframed with the index and tag keys pass 1 scanned.
 fn write_passthrough(
-    entry: &BlobEntry,
+    frame: &Frame,
+    reindex: Option<&Reindex>,
     source: &InputFile,
     writer: &mut PbfWriter<FileWriter>,
     frame_buf: &mut Vec<u8>,
 ) -> Result<()> {
-    read_frame(source, entry, frame_buf)?;
-    if entry.has_indexdata {
-        writer.write_raw(frame_buf)?;
-    } else {
-        let reframed = blob_bytes(frame_buf)
-            .and_then(|blob| {
-                reframe_raw_with_index(blob, &entry.index.serialize(), entry.tagdata.as_deref())
-            })
-            .map_err(|e| source.locate_at(entry.file_offset, e))?;
-        writer.write_raw(&reframed)?;
+    read_frame(source, frame, frame_buf)?;
+    match reindex {
+        None => writer.write_raw(frame_buf)?,
+        Some(reindex) => {
+            let reframed = blob_bytes(frame_buf)
+                .and_then(|blob| {
+                    reframe_raw_with_index(
+                        blob,
+                        &reindex.index.serialize(),
+                        reindex.tagdata.as_deref(),
+                    )
+                })
+                .map_err(|e| source.locate_at(frame.file_offset, e))?;
+            writer.write_raw(&reframed)?;
+        }
     }
     Ok(())
 }
@@ -786,31 +1083,31 @@ fn count_passthrough(entry: &BlobEntry, counts: &mut WriteCounts) {
     }
 }
 
-/// Re-read `entry`'s complete frame from its input. A frame that no longer
-/// reads (the input changed between the passes) fails located at the input
-/// and the frame's offset.
-pub(crate) fn read_frame(source: &InputFile, entry: &BlobEntry, buf: &mut Vec<u8>) -> Result<()> {
+/// Re-read a complete frame from its input. A frame that no longer reads
+/// (the input changed between the passes) fails located at the input and
+/// the frame's offset.
+pub(crate) fn read_frame(source: &InputFile, frame: &Frame, buf: &mut Vec<u8>) -> Result<()> {
     #[allow(clippy::cast_possible_truncation)]
-    let len = entry.frame_len as usize;
+    let len = frame.frame_len as usize;
     buf.clear();
     buf.resize(len, 0);
     source
         .file()
-        .read_exact_at(buf, entry.file_offset)
-        .map_err(|e| source.locate_at(entry.file_offset, Error::from(e)))
+        .read_exact_at(buf, frame.file_offset)
+        .map_err(|e| source.locate_at(frame.file_offset, Error::from(e)))
 }
 
 /// Re-read and decode an overlap-run entry's frame, a read or decode
 /// failure located at its input and frame offset.
 pub(crate) fn read_block(
     source: &InputFile,
-    entry: &BlobEntry,
+    frame: &Frame,
     buf: &mut Vec<u8>,
 ) -> Result<crate::PrimitiveBlock> {
-    read_frame(source, entry, buf)?;
+    read_frame(source, frame, buf)?;
     blob_bytes(buf)
         .and_then(decode_blob_to_primitiveblock)
-        .map_err(|e| source.locate_at(entry.file_offset, e))
+        .map_err(|e| source.locate_at(frame.file_offset, e))
 }
 
 /// The Blob bytes of a complete frame, `[4-byte header_len][BlobHeader][Blob]`.
@@ -874,8 +1171,13 @@ impl SweepElement for OwnedRelation {
 }
 
 /// Sweep one run of `kind`, handing each block to `emit` as it fills.
+///
+/// The extraction closures take only `kind`'s elements from each frame, and
+/// that is what lets a restructured frame (several kinds in one block) give
+/// each of its entries just its own kind's share.
 fn sweep_run(
     entries: &[BlobEntry],
+    frames: &[Frame],
     kind: ElementKind,
     sources: &[InputFile],
     dedupe: bool,
@@ -884,6 +1186,7 @@ fn sweep_run(
 ) -> Result<RunCounts> {
     let sweep = Sweep {
         entries,
+        frames,
         sources,
         dedupe,
         cancel,
@@ -926,6 +1229,7 @@ fn sweep_run(
 
 struct Sweep<'a> {
     entries: &'a [BlobEntry],
+    frames: &'a [Frame],
     sources: &'a [InputFile],
     dedupe: bool,
     cancel: &'a crate::host::Cancel,
@@ -972,10 +1276,11 @@ impl Sweep<'_> {
             {
                 self.pop_one(&mut heap, &mut counts, &mut write)?;
             }
-            let source = &self.sources[entry.source];
-            let block = read_block(source, entry, &mut frame_buf)?;
+            let frame = &self.frames[entry.frame];
+            let source = &self.sources[frame.source];
+            let block = read_block(source, frame, &mut frame_buf)?;
             for element in block.elements() {
-                extract(&element, &mut heap).map_err(|e| source.locate_at(entry.file_offset, e))?;
+                extract(&element, &mut heap).map_err(|e| source.locate_at(frame.file_offset, e))?;
             }
         }
         while !heap.is_empty() {
@@ -1019,9 +1324,7 @@ mod tests {
 
     fn entry(kind: ElementKind, min_id: i64, max_id: i64) -> BlobEntry {
         BlobEntry {
-            source: 0,
-            file_offset: 0,
-            frame_len: 0,
+            frame: 0,
             index: BlobIndex {
                 kind,
                 min_id,
@@ -1029,10 +1332,30 @@ mod tests {
                 count: 1,
                 bbox: None,
             },
-            has_indexdata: true,
-            tagdata: None,
             intra_unsorted: false,
+            restructured: false,
             index_scanned: true,
+        }
+    }
+
+    fn frame() -> Frame {
+        Frame {
+            source: 0,
+            file_offset: 0,
+            frame_len: 0,
+            reindex: None,
+        }
+    }
+
+    /// Each entry on a frame of its own, numbered in order.
+    fn indexed(mut entries: Vec<BlobEntry>) -> Indexed {
+        for (i, entry) in entries.iter_mut().enumerate() {
+            entry.frame = i;
+        }
+        Indexed {
+            frames: entries.iter().map(|_| frame()).collect(),
+            entries,
+            omitted: 0,
         }
     }
 
@@ -1137,7 +1460,7 @@ mod tests {
         ];
         entries[1].intra_unsorted = true;
         entries[4].intra_unsorted = true;
-        let plan = plan(entries);
+        let plan = plan(indexed(entries));
         let runs: Vec<_> = plan.runs.iter().map(|r| (r.start, r.end, r.kind)).collect();
         assert_eq!(
             runs,
@@ -1152,6 +1475,89 @@ mod tests {
         assert_eq!(
             plan.rewrite,
             vec![true, true, true, true, true, true, true, false]
+        );
+    }
+
+    /// A restructured frame's entries are each rewritten, wherever their
+    /// kinds sort, and the frame counts once: as restructured, as rewritten,
+    /// and as overlapping when one of its entries joins a component.
+    #[test]
+    fn a_restructured_frame_is_rewritten_per_kind_and_counted_once() {
+        let mut entries = vec![
+            entry(ElementKind::Node, 1, 5),
+            entry(ElementKind::Way, 1, 5),
+            entry(ElementKind::Way, 3, 9),
+            entry(ElementKind::Relation, 50, 60),
+        ];
+        for e in &mut entries[..2] {
+            e.restructured = true;
+        }
+        let mut indexed = indexed(entries);
+        // Frame 0 holds the node and the first way entry.
+        indexed.entries[1].frame = 0;
+        indexed.frames.pop();
+        indexed.entries[2].frame = 1;
+        indexed.entries[3].frame = 2;
+        indexed.frames[1].reindex = Some(Reindex {
+            index: indexed.entries[2].index,
+            tagdata: None,
+            replaces_false_claim: true,
+        });
+        indexed.omitted = 4;
+        let plan = plan(indexed);
+
+        let runs: Vec<_> = plan.runs.iter().map(|r| (r.start, r.end, r.kind)).collect();
+        assert_eq!(
+            runs,
+            vec![(0, 1, ElementKind::Node), (1, 3, ElementKind::Way)],
+            "the node share is rewritten alone, the way share in its component"
+        );
+        assert_eq!(plan.rewrite, vec![true, true, true, false]);
+        assert_eq!(
+            (plan.overlapping, plan.intra_unsorted, plan.restructured),
+            (2, 0, 1)
+        );
+        assert_eq!(plan.blobs_rewritten, 2, "frame 0 once, frame 1 once");
+        assert_eq!(plan.blobs_total(), 7, "three frames plus four omitted");
+        assert!(
+            plan.frames[1].reindex.is_none(),
+            "a rewritten frame is never reframed"
+        );
+        assert_eq!(plan.false_claims_replaced, 0);
+    }
+
+    /// The claim rule is `check --index`'s: kind, count and range exact, a
+    /// claimed bbox containing the scanned one, an absent one no claim.
+    #[test]
+    fn a_claim_holds_on_exact_ranges_and_a_containing_bbox() {
+        let scanned = BlobIndex {
+            bbox: Some(crate::blob_meta::BlobBbox::new(10, 20, 10, 20)),
+            ..entry(ElementKind::Node, 1, 10).index
+        };
+        let claim = |f: fn(&mut BlobIndex)| {
+            let mut c = scanned;
+            f(&mut c);
+            claim_holds(&c, &scanned)
+        };
+        assert!(claim(|_| {}));
+        assert!(claim(|c| c.bbox = None), "no bbox is no spatial claim");
+        assert!(claim(|c| {
+            c.bbox = Some(crate::blob_meta::BlobBbox::new(0, 30, 0, 30));
+        }));
+        assert!(!claim(|c| {
+            c.bbox = Some(crate::blob_meta::BlobBbox::new(15, 20, 10, 20));
+        }));
+        assert!(!claim(|c| c.count = 2));
+        assert!(!claim(|c| c.max_id = 11));
+        assert!(!claim(|c| c.min_id = 0));
+        assert!(!claim(|c| c.kind = ElementKind::Way));
+        let boxless = BlobIndex {
+            bbox: None,
+            ..scanned
+        };
+        assert!(
+            !claim_holds(&scanned, &boxless),
+            "a claimed bbox the scan cannot confirm is not believed"
         );
     }
 
@@ -1232,7 +1638,6 @@ mod tests {
         assert_eq!(counts.passthrough_claimed, 1_000_000);
 
         let mut scanned = entry(ElementKind::Way, 1, 10);
-        scanned.has_indexdata = false;
         scanned.index.count = 7;
         count_passthrough(&scanned, &mut counts);
         assert_eq!(counts.ways, 7, "a pass-1 scan count is observed");

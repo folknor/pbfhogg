@@ -109,7 +109,34 @@ shape. Takeaways:
 
 ## Suggested order
 
-HYG-036 (clippy exemptions) next, then HYG-182 (`cat --dedupe` indexing).
+No findings remain in `notes/hygiene.md`; `notes/bugs.md` holds only
+BUG-009 (the maintainer's). HYG-036 (the clippy exemptions) moved to
+`notes/todo.md` ("Lint exemptions") on 2026-10-26: the maintainer wants it
+resolved, but not in this drain. HYG-182 was resolved 2026-10-26 (see
+below).
+
+1. **The drain is done** (rule 4): review "Review once drained" before
+   deleting `hygiene.md`, then the measurement campaign rule 8 has held back.
+   Bisect candidates most likely to matter at planet, by how much hot path
+   they touch: the unified frame decoder (`307982d7`), every ordered pool
+   on one engine (`56a50e0d`), the `PbfWriter` per-block dispatch, the
+   diff and derive one-engine merge, cat `--clean` on the ordered pool, and
+   the decode-buffer doubling at the inline reserve (a measurement, not a
+   bisect: it predates the drain). For the apply-changes barrier work,
+   compare `-l` on a LocationsOnWays planet; Denmark has no such variant, so
+   `brokkr verify merge` never runs `-l`.
+2. **The stall-counter follow-ups** in `notes/todo.md` ("Performance"):
+   the `s4_readiness_wait_ns` twin first, since stage 3 to 4 readiness is
+   the named planet streaming constraint and `--stalls` cannot see it.
+
+HYG-182 (`cat --dedupe` indexing) was resolved 2026-10-26 in one commit
+after a spar: the merge engine shared by `sort` and `cat --dedupe` now
+indexes as plain `cat` does (scanned tagdata on reframed passthroughs, an
+empty block omitted, a mixed block merged per kind into type order, a
+malformed payload its own error), with physical frames separated from
+per-kind entries for the counts. The spar also found that `sort` under an
+unclaimed-order header copied indexdata its own scan had contradicted; that
+blob is now reframed. The judgement calls are on "Review once drained".
 
 HYG-081 (the apply-changes barrier) was resolved 2026-10-26 in five commits
 after a spar: comment corrections; the node boundary moved onto the drain
@@ -128,8 +155,10 @@ its peers), the two per-blob classify pools on one private driver, and the
 two altw way reframes on one block-level walk. No unordered mode on
 `ordered_pool`: it would drop the dispatcher the measured `WILLNEED` advice
 rides on. The pool-unification history now lives in
-`reference/performance-history.md` ("Worker-pool unification"). Not done,
-noted there: the unordered pools emit no `*_wait_ns` counters.
+`reference/performance-history.md` ("Worker-pool unification"). The
+unordered pools' `*_wait_ns` counters followed in `003fe717` (an Opus
+agent, approved by the maintainer); its lateral findings are the
+stall-counter follow-ups in `notes/todo.md`.
 
 HYG-002 was resolved 2026-10-26 by rejecting public tuning structs (the
 reasons are in the `src/tunables.rs` module doc and `reference/testing.md`)
@@ -187,3 +216,76 @@ one; read it rather than reasoning from memory.
   blocks and `StallGauge` uses before and after.
 - Durable docs that state a number or name drifted often; reword rather than
   restate (the global rules say so).
+
+## Learned 2026-10-26, not easily rediscovered
+
+Performance and memory:
+
+- **Every decode buffer typically doubles.** The decompressors size a fresh
+  buffer to the blob's `raw_size` exactly (zlib and zstd alike, verified by
+  a throwaway test), and `parse_and_inline_with_scratch`'s inline-metadata
+  `reserve` on that full Vec takes amortized growth, so a 1.4 MB buffer
+  becomes 2.8 MB, possibly moving. Pooled paths keep the doubled capacity
+  (which is what lets a recycled buffer take the next block without a
+  realloc); a final capacity past `DecompressPool`'s 4 MiB retain cap is
+  dropped and re-grown every time, which hits payloads above about 2 MiB.
+  `reserve_exact` is not a safe swap (it also hits pooled first use and
+  changes which buffers the pool keeps). The 886.6 MB
+  `parse_and_inline_with_scratch` share in the planet getparents alloc
+  profile is probably this. Unmeasured; on the review list.
+- **glibc realloc, from `research/glibc/malloc/malloc.c`:** an mmapped chunk
+  grows by `mremap` (no copy); an arena chunk grows in place into the top
+  chunk or a free neighbour, else malloc, copy, free. Freeing an mmapped
+  chunk raises the process-wide `mmap_threshold` to its size (32 MiB cap)
+  and `trim_threshold` to twice that. Process-wide, not per thread, and
+  arenas can still trim; "malloc already recycles it" is plausible, never
+  guaranteed.
+- **`par_fold_blobs` has a budget rule** (`read/reader.rs`): the pump
+  reserves a blob's bytes before flushing its own partial batch, so a
+  budget below a full partial batch plus one maximum blob would block
+  forever. Compile-time asserted for the production constants; a test that
+  shrinks the budget with more than one blob per batch will hang.
+- **The claim-counter pools** (altw external stages 2 and 3, geocode pass
+  1.5) lock a first-error mutex on every claim; stage 3's two error stores
+  serve different recipients (its caller, and stage 4 via the router).
+  Their only cross-thread wait worth counting is stage 2's slot-bucket
+  writers.
+- **Reading the new stall counters:** `classify_unordered_desc_lock_wait_ns`
+  is the shared-receiver mutex's own cost only while
+  `classify_unordered_desc_recv_wait_ns` stays near zero. They are one
+  process-wide set emitted as running totals after every pool run, so the
+  step between emissions inside a phase is that run's share.
+
+apply-changes `-l` barrier, as it now stands:
+
+- The scanner's node boundary is a `DrainMessage::NodeBoundary` on the drain
+  channel (exclusive end; zero means no nodes) and the drain has one
+  publication check after each receive. The 25 ms `DRAIN_RECV_TIMEOUT` is
+  no longer about the barrier: it is the only thing that wakes the drain to
+  notice a published failure or a cancellation.
+- On unsorted input a node after a way is dispatched past the boundary,
+  misses publication, and is refused later by the drain's output-order
+  guard. Not a hang.
+- Fault-plan hooks exist for every barrier ordering
+  (`apply_changes_late_boundary`, `_panic_waits_for_barrier_wait`,
+  `_hold_workers_until_dispatch_blocked`, `_park_at_blob_seq`,
+  `_force_owned_route`); `tests/fault_apply_changes.rs` shows the use.
+
+Working practice:
+
+- **Several entry premises were wrong when checked against the code**:
+  stages 2 and 3 and pass 1.5 were never `Mutex<Receiver>` pools; worker
+  counts were already injectable; the barrier's type-transition trigger
+  could never fire; the `-j 1` refusal was a missing validation, not a
+  known deadlock. Read the code before sparring the entry's own framing.
+- **Sparring found real bugs each time** it was asked to look past the
+  entry (altw external kept unpacked stale way locations; a failing
+  accumulate worker drained the schedule). Ask codex to flag anything,
+  not only to judge the proposal.
+- **Mutation-check concurrency tests**: break the mechanism on purpose and
+  confirm the test fails or hangs before trusting a first-time pass.
+- **`review` refuses stdin over 20,000 bytes.** For a large diff, tell codex
+  to read `git diff <paths>` itself instead of piping it.
+- **Shell quirks here:** `mv` is not allowlisted (use `cp` then `rm -f`),
+  and `rm` prompts interactively, so `rm -f`. A subagent working
+  alongside you will report your own uncommitted edits as someone else's.

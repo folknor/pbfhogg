@@ -72,11 +72,9 @@ Launch order: every queued entry has run.
 
 Every entry still open in this file and `notes/bugs.md` is owed a resolution
 in this drain, except what the maintainer moved to the CLI-surface redesign
-in `notes/todo.md` (the `--direct-io` reach and `--json` entries). HYG-036
-and HYG-182 were deferred by the 2026-10-25 session, not dropped:
-"skipped for now" in their Maintainer paragraphs means that session did not
-take them, and the paragraphs are guidance on how to resolve them, not a
-ruling that they stay. BUG-009 is the maintainer's own project.
+in `notes/todo.md` (the `--direct-io` reach and `--json` entries, and the
+clippy-exemption entry, which the maintainer wants resolved outside the
+drain). BUG-009 is the maintainer's own project.
 
 ---
 
@@ -1246,57 +1244,33 @@ The judgement calls already known, to be checked first:
     block sending it while the drain is behind, which it already could for
     every splice item. Sparred with codex and reviewed by a fresh session,
     which found no regression.
+- The merge engine behind `sort` and `cat --dedupe` (`blob_merge.rs`)
+  indexes as plain `cat` does (the dedupe-indexing entry's drain, sparred
+  with codex to consensus, then reviewed by a fresh session): pass 1 keeps
+  the scan's outcomes apart (a malformed payload is its own located error),
+  omits an element-less block, and gives a block no single index describes
+  one forced-rewrite entry per kind, which the kind-gated sweep merges into
+  type order; an unindexed passthrough is reframed with scanned tagdata
+  beside its scanned indexdata. Pass 1 now records physical `Frame`s with
+  per-kind `BlobEntry`s pointing at them, and every count is per frame.
+  Found on the way and fixed: `sort` under an unclaimed-order header
+  planned on scanned indices but copied each blob's original indexdata even
+  when the scan contradicted it; such a blob is now reframed. Judgement
+  calls on the planet-measured sort path, none measured:
+  - Production sort (indexed, sorted claim) scans nothing either way, but
+    `plan` now allocates four per-frame `Vec<bool>`s and walks the entries
+    twice more, and `BlobEntry` shrank (offsets and tagdata moved to
+    `Frame`, which no longer keeps an indexed blob's tagdata, never read
+    on a raw copy). Pass 1's retained memory per indexed blob falls by its
+    tagdata; argued below noise in wall, not measured.
+  - On forced unindexed input (`sort --force`, `cat --dedupe --force`)
+    every scanned blob now collects its tag keys (the combined scan), and
+    the serialized key set is held from pass 1 to pass 2 for every
+    passthrough candidate: memory proportional to unindexed blob count
+    times key-set size, chosen over a second decompress in the serial
+    write loop.
+  - `sort` on an unclaimed-order indexed input gives up `copy_file_range`
+    for each blob whose claim is false (reframed through the write loop).
 
----
-
-## HYG-036 - `too_many_arguments` is denied and then allowed locally all over
-
-Anger: 9 - validate flags earlier, refuse no-op flags.
-
-The flag-refusal policy is done (`reference/cli-reference.md`, "Flag rules").
-What remains is the lint side: the library takes one `WriteOptions`
-(compression, `OutputBackend`, direct reads, force) instead of positional
-bools, but `too_many_arguments` is still `#[allow]`ed on the extract entry
-points, `writer_from_header`, `getid_dispatched`, `filter_by_id`, the
-getparents dispatchers, altw's `write_output_*`, `tags_filter_*`,
-apply-changes' `worker_loop` and `handle_candidate`, several CLI `run_*`
-functions, and more; `too_many_lines` likewise. A denied lint with that many
-local exemptions does not enforce anything. Fix: group the parameters into
-option structs and drop the exemptions, or stop denying the lint.
-
-Maintainer (2026-10-25): not worth the effort now; skipped. For whoever
-picks it up: about 90 `too_many_arguments` and 50 `too_many_lines`
-exemptions, many on hot inner helpers (`write/encode.rs`, apply-changes'
-worker and drain, the altw stages, the diff and derive parallel files). The
-session's suggestion was to group parameters only on once-per-run entry
-points, turn the rest into `#[expect(..., reason = "...")]` (which also
-fails the build when an exemption goes stale), and ban
-`allow(clippy::too_many_` with a `brokkr.toml` text rule.
-
-Reported by: CLI and plumbing, filtering and spatial, change application, altw
-and scanning, re-encoding.
-
-## HYG-182 - `cat --dedupe` indexes an unindexed blob differently from plain `cat`
-
-Anger: 5 - a forced or partially indexed input to one cat mode.
-
-Plain `cat` indexes a blob without indexdata through `scan_block_ids_and_tags`
-and re-encodes one no single index describes (`reencode_unclassifiable`).
-`cat --dedupe`'s pass 1 (`Walk::scan_payload` in
-`src/commands/blob_merge.rs`, shared with `sort` since the two merged) runs
-its own copy: `scan_block_ids_checked` only, so a passthrough blob it reframes gets
-indexdata but no tagdata (it keeps the input's, usually none), and an empty
-or kind-mixed block fails the run with "failed to scan block IDs", which
-names neither the cause nor plain `cat` as the way out. One indexing rule
-for both, or at least the scan with tags and a refusal that says what the
-block is, would fit. Not a partial-index matter: a wholly unindexed input
-under `--force` meets the same.
-
-Maintainer (2026-10-25): skipped for now. Clarified 2026-10-26: "not to be
-touched" meant only that the 2026-10-25 session would not take it. Like
-every entry, it is owed a resolution in this drain, and that may include
-changing dedupe's indexing.
-
-Reported by: the HYG-155 resolution (sparred with codex).
-
-Reported by: the HYG-149 fix.
+No findings remain open; the file stays until the list above is reviewed
+(rule 4).

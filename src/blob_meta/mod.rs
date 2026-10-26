@@ -49,9 +49,9 @@ pub(crate) fn scan_block_ids(raw: &[u8]) -> Option<BlobIndex> {
 
 /// A decompressed PrimitiveBlock's [`BlobIndex`] and whether its elements
 /// are in canonical ID order, or `None`. `None` collapses
-/// malformed bytes into "no index"; callers that build an index the output
-/// file will carry should use [`try_scan_block_ids_checked`] and treat its
-/// `Err` as an error.
+/// malformed bytes into "no index", which no production caller wants: they
+/// use [`try_scan_block_ids_checked`] and treat its `Err` as an error.
+#[cfg(test)]
 pub(crate) fn scan_block_ids_checked(raw: &[u8]) -> Option<(BlobIndex, bool)> {
     try_scan_block_ids_checked(raw).ok().flatten() // ok-deliberate: advisory, see doc
 }
@@ -116,7 +116,7 @@ impl BlobBbox {
 
 /// Blob-level index: element type, ID range, element count, and optional spatial bbox.
 ///
-/// Produced by [`scan_block_ids_checked`] from decompressed PrimitiveBlock bytes,
+/// Produced by [`try_scan_block_ids_checked`] from decompressed PrimitiveBlock bytes,
 /// or deserialized from BlobHeader `indexdata`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BlobIndex {

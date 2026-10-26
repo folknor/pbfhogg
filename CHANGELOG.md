@@ -1197,6 +1197,26 @@
 
 ### Fixed
 
+- **`cat --dedupe` and `sort` accept blocks no single index describes, and
+  index unindexed blobs as plain `cat` does.** On a forced unindexed input
+  (or, for `sort`, one whose header does not claim sorted), an empty block, a
+  block whose kinds change across groups, or a group carrying more than one
+  element field used to fail the run with "failed to scan block IDs", and a
+  malformed payload lost its own error to the same message. An empty block
+  is now omitted and a mixed one merged per kind into type order, each with
+  a `Note:`; a malformed payload reports its real error at its frame. An
+  unindexed blob copied through now carries scanned tagdata beside its
+  scanned indexdata, so the output is indexed as plain `cat`'s is. The
+  summaries count physical blobs and gain an "N omitted" clause; library
+  `SortStats` and `MergePbfStats` gain `blobs_omitted`.
+
+- **`sort` no longer copies indexdata it found false.** Under a header
+  without `Sort.Type_then_ID` it decodes every blob to check its order, but
+  then copied each blob's original indexdata even when that scan
+  contradicted it, writing a sorted output with false indexdata. Such a blob
+  is now copied under indexdata and tagdata scanned from its payload, with
+  a `Note:`.
+
 - **`add-locations-to-ways --index-type external` replaces unpacked
   existing way locations.** A way whose input already carried lat / lon
   (or the injected field 20) written in protobuf's unpacked form kept those

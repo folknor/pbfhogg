@@ -1600,12 +1600,13 @@ mod tests {
     /// End-of-stream finalization must still `fsync`.
     ///
     /// `FileWriter::flush` stopped meaning `fsync` this round, and
-    /// `FileOutputSink::flush` was changed to call the new `sync()` instead so
+    /// the sink's finalization (now `FileOutputSink::finish`) was changed to
+    /// call the new `sync()` instead so
     /// that a completed write is still durable. Only the first half of that
     /// pair had a test: `flush_pushes_bytes_onward_without_fsyncing` pins
     /// `FileWriter`'s new behaviour, and nothing at all pinned the sink that
     /// has to ask for the durability the writer stopped providing. Revert
-    /// `FileOutputSink::flush` to `self.writer.flush()` and every pipelined
+    /// `FileOutputSink::finish` to `self.writer.flush()` and every pipelined
     /// write silently loses its fsync with a green suite - which is precisely
     /// the "tested the producer, forgot the consumer" shape.
     ///
@@ -1630,7 +1631,7 @@ mod tests {
             w.test_faults().sync_calls.load(Relaxed),
             1,
             "a completed pipelined write must fsync its output exactly once; \
-             FileOutputSink::flush has to call FileWriter::sync, not \
+             FileOutputSink::finish has to call FileWriter::sync, not \
              FileWriter::flush"
         );
 

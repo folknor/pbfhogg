@@ -70,7 +70,6 @@ goes on "Review once drained" as a bisect candidate, named by commit.
 
 Launch order, one agent per line, run serially:
 
-39. HYG-016
 40. HYG-195
 41. HYG-196
 42. HYG-077 (last: it annotates files across the crate)
@@ -1076,6 +1075,19 @@ The judgement calls already known, to be checked first:
   region writer; `writer_bytes_written` is now bumped per constituent write
   (each `RawChunks` chunk, each of a synchronous frame's three parts)
   instead of once per chunk.
+- The three pipelined writer loops became one, `pipeline::deliver_in_order`,
+  with each backend an `OutputSink` (commit "The pipelined writer backends
+  share one ordered-delivery loop"; ADR-0014 amended). Sparred to
+  equivalence, not measured: io_uring's non-blocking reap and the pool's
+  stopped check run in `after_drain` (after each received item, never before
+  the first, so a large header's failed write cannot preempt the stream's
+  own first error); the pool loses its vacuous pre-first-receive stopped
+  check; the uring `uring_panic_at_dispatch` hook now counts per handoff
+  operation, not per item. Every chunk now reaches the sink as owned
+  buffers through one generic `hand_off`, monomorphized per backend; the
+  data flow, channel and buffer shapes are unchanged. The io_uring sink
+  could not run on the bench host (`RLIMIT_MEMLOCK` 8 MB hard) and is
+  compile-checked only.
 
 ---
 
@@ -1194,33 +1206,6 @@ catalogued; if it is done at all, it is done last.
 Reported by: altw and scanning, re-encoding, filtering and spatial, read path,
 geocode index.
 
-## HYG-016 - Writer loops are copied per backend
-
-Anger: 9 - writer loops on a hot path.
-
-`pipeline::writer_thread`, `uring_writer::uring_main_loop` and
-`parallel_writer::dispatch_loop` each reimplement recv, `record_recv_wait`,
-push, high-water, `pop_ready`, the per-chunk `time_handoff` and
-`check_stream_complete`, and every backend reimplements the `OutputChunk`
-match with its `record_accepted` byte bookkeeping. ADR
-`0014-output-backends-stay-separate` argues against unifying backends, but
-the loop is not backend logic; uring could be an `OutputSink` whose
-`write_chunk` does the opportunistic `reap_cqes(false)`. Fix:
-`writer_thread<S: OutputSink>` as the only loop with an `on_idle()` hook; a
-source-scan test that only `pipeline.rs` calls `pop_ready()` under
-`src/write/`. The writer counters' per-backend meanings are settled (each
-counter's doc in `src/write/metrics.rs`): the unified loop must keep
-`writer_handoff_ns` around the sink call only, with io_uring's idle reap
-outside it.
-
-Maintainer (2026-10-25): split into three entries, one commit each. This
-entry keeps the PBF writer-loop unification (`writer_thread<S: OutputSink>`,
-io_uring as a sink). ADR-0014 is binding: argue explicitly why the loop is
-not backend logic, or update the ADR. The `parallel_gzip` reorder map is
-HYG-195, which runs after this one.
-
-Reported by: write path.
-
 ## HYG-196 - `reference/pipelined-reader-paths.md` has gone stale
 
 Anger: 2 - a reference doc, no code.
@@ -1240,11 +1225,17 @@ Reported by: the HYG-010 resolution.
 
 Anger: 8 - the gzip output writer's memory behaviour.
 
-Split out of HYG-016; runs after it. `parallel_gzip::writer_loop` has its own
+Split out of the PBF writer-loop unification (resolved). `parallel_gzip::writer_loop` has its own
 completeness check with a `BTreeMap` reorder buffer instead of
 `ReorderBuffer`, and no announced total. It is a separate writer (OSC gzip
 output) with its own loop and memory shape. HYG-053 (skipped) holds the
 bounding question for reorder buffers; read it before changing this one.
+The PBF backends now share `pipeline::deliver_in_order`, and the brokkr.toml
+textlint `writer-loop-primitives-only-in-the-shared-loop` bans `pop_ready`
+and the loop's records anywhere else under `src/write/`: adopting
+`ReorderBuffer` here needs an exclude there with the reason beside it (the
+gzip writer carries its own item type), or a reason to fit this writer to
+the shared loop instead.
 
 Reported by: write path.
 

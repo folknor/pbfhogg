@@ -89,13 +89,70 @@ pub(crate) struct PipelineItem {
     pub(crate) data: Result<OutputChunk>,
 }
 
-/// A sink that consumes ordered [`OutputChunk`]s and writes them to a backend.
+/// A backend's byte path: what it does with the bytes [`deliver_in_order`]
+/// hands it, one operation at a time, in output order.
 ///
-/// Each backend is free to flatten, batch, or scatter-gather as it sees fit -
-/// the pipeline machinery only cares about ordering and error propagation.
+/// The sink owns only what differs per backend - copying into a `BufWriter`
+/// or registered buffers, queueing `pwrite`s at an offset, splicing a copy
+/// range. Receiving, reordering, the handoff timer, accepted-byte accounting
+/// and the end-of-stream completeness proof are the loop's, so every backend
+/// gets them identically (see `decisions/0014-output-backends-stay-separate.md`).
+/// Finalization (last flush, ring drain, pool join, fsync) is not part of
+/// the sink: each backend does it after the loop returns.
 pub(crate) trait OutputSink {
-    fn write_chunk(&mut self, chunk: OutputChunk) -> Result<()>;
-    fn flush(&mut self) -> Result<()>;
+    /// Names the backend in the end-of-stream errors.
+    const BACKEND: &'static str;
+
+    /// Accept one whole buffer of output bytes, consuming it.
+    fn write_owned(&mut self, bytes: Vec<u8>) -> Result<()>;
+
+    /// Accept `len` bytes of `in_file` from `offset` as the next output.
+    fn copy_range(
+        &mut self,
+        in_file: crate::read::input::InputFile,
+        offset: u64,
+        len: u64,
+    ) -> Result<()>;
+
+    /// Steady-state maintenance after each received item has been pushed and
+    /// its ready run handed off: io_uring's non-blocking CQE reap, the
+    /// `pwrite` pool's stopped check. Outside every timer (see
+    /// `writer_handoff_ns`). Not called before the first receive, where io_uring
+    /// could otherwise reap a failed header write ahead of the stream's own
+    /// first error.
+    fn after_drain(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Hand one ordered chunk to `sink`; the caller times it as one handoff.
+/// Every chunk is flattened to owned buffers, and accepted bytes are counted
+/// per successful constituent operation (`writer_bytes_written`). A free
+/// function rather than a trait method, so no backend can override the
+/// bookkeeping.
+fn hand_off<S: OutputSink>(sink: &mut S, chunk: OutputChunk) -> Result<()> {
+    fn accept<S: OutputSink>(sink: &mut S, bytes: Vec<u8>) -> Result<()> {
+        let len = bytes.len() as u64;
+        sink.write_owned(bytes)?;
+        WRITER_METRICS.record_accepted(len);
+        Ok(())
+    }
+    match chunk {
+        OutputChunk::Framed(parts) => accept(sink, parts.into_vec()),
+        OutputChunk::Raw(bytes) => accept(sink, bytes),
+        OutputChunk::RawChunks(chunks) => {
+            chunks.into_iter().try_for_each(|chunk| accept(sink, chunk))
+        }
+        OutputChunk::CopyRange {
+            in_file,
+            offset,
+            len,
+        } => {
+            sink.copy_range(in_file, offset, len)?;
+            WRITER_METRICS.record_accepted(len);
+            Ok(())
+        }
+    }
 }
 
 /// `write_all` `bytes` and, on success, count them as accepted
@@ -134,52 +191,46 @@ impl FileOutputSink {
 }
 
 impl OutputSink for FileOutputSink {
-    /// Timed by the caller (`writer_thread`) as one handoff; counts accepted
-    /// bytes per constituent write.
-    fn write_chunk(&mut self, chunk: OutputChunk) -> Result<()> {
-        match chunk {
-            OutputChunk::Framed(parts) => {
-                let bytes = parts.into_vec();
-                write_accepted(&mut self.writer, &bytes)
-            }
-            OutputChunk::Raw(bytes) => write_accepted(&mut self.writer, &bytes),
-            OutputChunk::RawChunks(chunks) => chunks
-                .iter()
-                .try_for_each(|chunk| write_accepted(&mut self.writer, chunk)),
-            OutputChunk::CopyRange {
-                in_file,
-                offset,
-                len,
-            } => {
-                let out = self.writer.flush_and_file()?.ok_or_else(|| {
-                    Error::invalid_argument("copy_file_range incompatible with O_DIRECT output")
-                })?;
-                super::copy_range::copy_range(
-                    &in_file,
-                    super::copy_range::CopyOut::Cursor(out),
-                    offset,
-                    len,
-                    &self.cancel,
-                )?;
-                // Hold the input open until the splice has actually happened.
-                drop(in_file);
-                WRITER_METRICS.record_accepted(len);
-                Ok(())
-            }
-        }
+    const BACKEND: &'static str = "pipelined writer";
+
+    fn write_owned(&mut self, bytes: Vec<u8>) -> Result<()> {
+        Ok(self.writer.write_all(&bytes)?)
     }
 
+    fn copy_range(
+        &mut self,
+        in_file: crate::read::input::InputFile,
+        offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        let out = self.writer.flush_and_file()?.ok_or_else(|| {
+            Error::invalid_argument("copy_file_range incompatible with O_DIRECT output")
+        })?;
+        super::copy_range::copy_range(
+            &in_file,
+            super::copy_range::CopyOut::Cursor(out),
+            offset,
+            len,
+            &self.cancel,
+        )?;
+        // Hold the input open until the splice has actually happened.
+        drop(in_file);
+        Ok(())
+    }
+}
+
+impl FileOutputSink {
     /// End of stream: finalize *and* make durable.
     ///
-    /// `OutputSink::flush` is the pipeline's finalization hook, not a
-    /// `Write::flush`, so it asks for the durability explicitly. The two used
-    /// to be the same method on [`FileWriter`], which meant every incidental
-    /// `flush()` anywhere bought an `fsync`; the sibling uring and parallel
-    /// backends already `sync_all` by name at this point.
+    /// This is the pipeline's finalization, not a `Write::flush`, so it asks
+    /// for the durability explicitly. The two used to be the same method on
+    /// [`FileWriter`], which meant every incidental `flush()` anywhere bought
+    /// an `fsync`; the sibling uring and parallel backends `sync_all` by name
+    /// at this point.
     ///
     /// A `Deferred` sink only finishes the file (for `O_DIRECT`, the tail
     /// padding and truncation); its owner syncs it.
-    fn flush(&mut self) -> Result<()> {
+    fn finish(mut self) -> Result<()> {
         let (writer, finish) = (&mut self.writer, self.finish);
         crate::write::metrics::with_sync_observer(&self.cancel, || match finish {
             super::Finish::Durable => writer.sync(),
@@ -495,8 +546,9 @@ impl Default for SeqTotal {
 
 /// End-of-stream completeness check shared by every pipeline backend.
 ///
-/// `pending_len` and `delivered` come from the backend's reorder buffer after
-/// its receive loop breaks on channel close. Two distinct failures:
+/// `pending_len` and `delivered` come from [`deliver_in_order`]'s reorder
+/// buffer after its receive loop breaks on channel close. Two distinct
+/// failures:
 ///
 /// * `pending_len > 0` - an *interior* gap. Items arrived that could never
 ///   pop because an earlier seq never showed up.
@@ -504,7 +556,7 @@ impl Default for SeqTotal {
 ///   nothing came after the missing seq; only the announced total reveals it.
 ///
 /// Both mean the file on disk is short. Neither may be reported as success.
-pub(crate) fn check_stream_complete(
+fn check_stream_complete(
     backend: &str,
     pending_len: usize,
     delivered: usize,
@@ -531,16 +583,31 @@ pub(super) fn record_send_wait(send_start: crate::counters::Stopwatch) {
     send_start.record_ns(&WRITER_METRICS.pipeline_send_wait_ns);
 }
 
-/// Writer thread: receives [`OutputChunk`]s and hands them to the sink in
-/// sequence order.
+/// The one ordered-delivery loop every pipelined backend runs: receive
+/// [`PipelineItem`]s, put them back in sequence order, hand each chunk to
+/// `sink`, and on channel close prove the stream complete.
 ///
 /// Uses a shared sequence-number reorder buffer to handle out-of-order
 /// arrivals from parallel rayon tasks. Framing errors produced on rayon
-/// workers are propagated in order via `Result<OutputChunk>`.
-#[allow(clippy::needless_pass_by_value)] // Thread entry point owns the sink moved into std::thread::spawn.
-pub(super) fn writer_thread<S: OutputSink>(
-    rx: std::sync::mpsc::Receiver<PipelineItem>,
-    mut sink: S,
+/// workers are propagated in order via `Result<OutputChunk>`. For pipeline
+/// items, every backend records `writer_recv_wait_ns`,
+/// `writer_reorder_high_water`, `writer_handoff_ns` (around [`hand_off`]
+/// only; the sink's [`after_drain`](OutputSink::after_drain) is outside it)
+/// and `writer_bytes_written` here; the header frame and the synchronous
+/// writer account for themselves at their own sites.
+///
+/// Returns once the stream is proved complete, without finalizing: on `Ok`
+/// the caller finishes the output (flush, drain, join, sync). On an error it
+/// must not finish it as a success, though teardown still runs (the pool
+/// joins every worker, io_uring drains its ring). A dead
+/// upstream framer closes the channel exactly the way a finished one does,
+/// so finalizing on close alone would turn a file short by an arbitrary
+/// number of blobs into a successful write - for io_uring and `O_DIRECT`,
+/// padded and `set_len`'d into a well-formed-looking one. Hence
+/// [`check_stream_complete`], for an interior gap and for a missing tail.
+pub(super) fn deliver_in_order<S: OutputSink>(
+    rx: &Receiver<PipelineItem>,
+    sink: &mut S,
     expected: &SeqTotal,
 ) -> Result<()> {
     let mut pending: ReorderBuffer<Result<OutputChunk>> = ReorderBuffer::with_capacity(WRITE_AHEAD);
@@ -558,69 +625,85 @@ pub(super) fn writer_thread<S: OutputSink>(
         // Drain consecutive ready items from the front.
         while let Some(result) = pending.pop_ready() {
             let chunk = result?;
-            WRITER_METRICS.time_handoff(|| sink.write_chunk(chunk))?;
+            WRITER_METRICS.time_handoff(|| hand_off(sink, chunk))?;
         }
+
+        sink.after_drain()?;
     }
 
-    // Channel closed. Flushing unconditionally here would finalise a file
-    // that is short by an arbitrary number of blobs and report it as a
-    // successful write, so the stream has to be proved complete first - both
-    // for an interior gap and for a missing tail. See
-    // [`check_stream_complete`].
-    //
-    // On this error path the sink is NOT flushed, so an O_DIRECT sink is
-    // finalised by `DirectWriter::Drop` calling `flush_final` best-effort -
-    // the short file still gets padded and `set_len`'d. That is deliberate.
-    // The padding is not what makes a truncated file look plausible: every
-    // backend writes whole blobs, so a short file ends on a blob boundary and
-    // reads as a valid shorter PBF regardless. Skipping the O_DIRECT
-    // finalisation would only leave a partial page of alignment zeros on the
-    // end, which is harder to diagnose, not easier. The thing that must not
-    // be lost is the *report*, and that is the error returned here.
     check_stream_complete(
-        "pipelined writer",
+        S::BACKEND,
         pending.pending_len(),
         pending.next_seq(),
         expected,
-    )?;
+    )
+}
 
-    sink.flush()?;
-    Ok(())
+/// Writer thread of the buffered and `O_DIRECT` backends: deliver, then
+/// finish the file.
+///
+/// On an error the sink is NOT finished, so an `O_DIRECT` sink is finalised
+/// by `DirectWriter::Drop` calling `flush_final` best-effort - the short file
+/// still gets padded and `set_len`'d. That is deliberate. The padding is not
+/// what makes a truncated file look plausible: every backend writes whole
+/// blobs, so a short file ends on a blob boundary and reads as a valid
+/// shorter PBF regardless. Skipping the `O_DIRECT` finalisation would only
+/// leave a partial page of alignment zeros on the end, which is harder to
+/// diagnose, not easier. The thing that must not be lost is the *report*,
+/// and that is the error returned here.
+#[allow(clippy::needless_pass_by_value)] // Thread entry point owns the receiver moved into std::thread::spawn.
+pub(super) fn writer_thread(
+    rx: Receiver<PipelineItem>,
+    mut sink: FileOutputSink,
+    expected: &SeqTotal,
+) -> Result<()> {
+    deliver_in_order(&rx, &mut sink, expected)?;
+    sink.finish()
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{OutputChunk, OutputSink, PipelineItem, SeqTotal, WRITE_AHEAD, writer_thread};
+    use super::{OutputChunk, OutputSink, PipelineItem, SeqTotal, WRITE_AHEAD, deliver_in_order};
     use crate::error::Result;
     use std::sync::mpsc::sync_channel;
 
-    /// Records what actually reached the backend, and whether it was flushed.
+    /// Records what actually reached the backend, and how often the loop ran
+    /// the sink's between-items maintenance.
     struct RecordingSink {
         written: Vec<Vec<u8>>,
-        flushed: bool,
+        after_drains: usize,
     }
 
     impl OutputSink for RecordingSink {
-        fn write_chunk(&mut self, chunk: OutputChunk) -> Result<()> {
-            match chunk {
-                OutputChunk::Raw(bytes) => self.written.push(bytes),
-                _ => panic!("test fixture only sends Raw chunks"),
-            }
+        const BACKEND: &'static str = "recording sink";
+
+        fn write_owned(&mut self, bytes: Vec<u8>) -> Result<()> {
+            self.written.push(bytes);
             Ok(())
         }
 
-        fn flush(&mut self) -> Result<()> {
-            self.flushed = true;
+        fn copy_range(
+            &mut self,
+            _in_file: crate::read::input::InputFile,
+            _offset: u64,
+            _len: u64,
+        ) -> Result<()> {
+            panic!("test fixture only sends Raw chunks")
+        }
+
+        fn after_drain(&mut self) -> Result<()> {
+            self.after_drains += 1;
             Ok(())
         }
     }
 
-    /// Drive `writer_thread` over `seqs`, optionally announcing a final item
-    /// count the way `PbfWriter::flush` does before dropping its sender.
+    /// Drive `deliver_in_order` over `seqs`, optionally announcing a final
+    /// item count the way `PbfWriter::flush` does before dropping its sender.
+    /// An `Err` is what keeps every backend from finalizing the file.
     ///
     /// `announce: None` models the `Drop` path, which never announces.
-    fn run(seqs: &[usize], announce: Option<usize>) -> (Result<()>, Vec<Vec<u8>>, bool) {
+    fn run(seqs: &[usize], announce: Option<usize>) -> (Result<()>, Vec<Vec<u8>>, usize) {
         let (tx, rx) = sync_channel::<PipelineItem>(WRITE_AHEAD);
         for &seq in seqs {
             tx.send(PipelineItem {
@@ -636,26 +719,27 @@ mod tests {
         drop(tx);
         let mut sink = RecordingSink {
             written: Vec::new(),
-            flushed: false,
+            after_drains: 0,
         };
-        // `writer_thread` is a plain function - run it on this thread so the
-        // sink can be inspected afterwards through the borrowed adapter.
-        let result = writer_thread(rx, SinkHandle(&mut sink), &expected);
-        (result, sink.written, sink.flushed)
+        let result = deliver_in_order(&rx, &mut sink, &expected);
+        (result, sink.written, sink.after_drains)
     }
 
-    /// Borrowed adapter so the test can inspect the sink after the loop
-    /// returns, which `writer_thread`'s owned-sink signature otherwise
-    /// forbids.
-    struct SinkHandle<'a>(&'a mut RecordingSink);
+    /// The between-items hook runs once per received item and never before
+    /// the first receive: io_uring reaps there, and a reap ahead of the first
+    /// item could surface a failed header write before the stream's own first
+    /// error.
+    #[test]
+    fn after_drain_runs_once_per_received_item_and_never_before_the_first() {
+        let (result, _written, after_drains) = run(&[], Some(0));
+        result.unwrap();
+        assert_eq!(after_drains, 0, "nothing received, so no maintenance");
 
-    impl OutputSink for SinkHandle<'_> {
-        fn write_chunk(&mut self, chunk: OutputChunk) -> Result<()> {
-            self.0.write_chunk(chunk)
-        }
-        fn flush(&mut self) -> Result<()> {
-            self.0.flush()
-        }
+        // Seq 2 arrives first and pops nothing; the hook still runs for it.
+        let (result, written, after_drains) = run(&[2, 0, 1], Some(3));
+        result.unwrap();
+        assert_eq!(written, vec![vec![0u8], vec![1u8], vec![2u8]]);
+        assert_eq!(after_drains, 3);
     }
 
     /// A seq gap at channel close is silent truncation and must be an error.
@@ -667,7 +751,7 @@ mod tests {
     /// short by an arbitrary number of blobs and the command exited zero.
     #[test]
     fn an_interior_sequence_gap_at_channel_close_fails_instead_of_reporting_success() {
-        let (result, written, flushed) = run(&[0, 2, 3], Some(4));
+        let (result, written, _) = run(&[0, 2, 3], Some(4));
         let err = result.expect_err(
             "seq 1 never arrived, so seqs 2 and 3 were dropped - that is a \
              short file and must not be reported as a successful write",
@@ -682,11 +766,6 @@ mod tests {
             vec![vec![0u8]],
             "only seq 0 was contiguous, so only seq 0 should have been written"
         );
-        assert!(
-            !flushed,
-            "a truncated write must not be finalised by a flush that makes it \
-             look complete"
-        );
     }
 
     /// The interior guard must stand on its own, with no announced total.
@@ -695,7 +774,7 @@ mod tests {
     /// evidence available and it still has to be read.
     #[test]
     fn an_interior_gap_is_caught_even_when_no_total_was_announced() {
-        let (result, _written, flushed) = run(&[0, 2, 3], None);
+        let (result, _written, _) = run(&[0, 2, 3], None);
         let msg = result
             .expect_err("an interior gap is visible without any announced total")
             .to_string();
@@ -703,7 +782,6 @@ mod tests {
             msg.contains("still in reorder buffer"),
             "expected the stranded-items diagnosis, got: {msg}"
         );
-        assert!(!flushed, "a truncated write must not be flushed");
     }
 
     /// A gap at the TAIL strands nothing, so `pending_len` stays zero.
@@ -717,7 +795,7 @@ mod tests {
     /// complete two-item run.
     #[test]
     fn a_dropped_final_task_fails_even_though_nothing_is_stranded() {
-        let (result, written, flushed) = run(&[0], Some(2));
+        let (result, written, _) = run(&[0], Some(2));
         let msg = result
             .expect_err(
                 "seq 1 was the final task and never arrived; the file is short \
@@ -734,11 +812,6 @@ mod tests {
             "seq 0 is contiguous and is legitimately written; the defect is \
              calling that a complete file"
         );
-        assert!(
-            !flushed,
-            "a short file must not be finalised by a flush that makes it look \
-             complete"
-        );
     }
 
     /// The degenerate tail case: the only task dies, so nothing arrives at
@@ -748,7 +821,7 @@ mod tests {
     /// announced total.
     #[test]
     fn a_single_dropped_task_fails_rather_than_writing_a_header_only_file() {
-        let (result, written, flushed) = run(&[], Some(1));
+        let (result, written, _) = run(&[], Some(1));
         let msg = result
             .expect_err("the one and only blob never arrived")
             .to_string();
@@ -757,16 +830,14 @@ mod tests {
             "expected the count mismatch, got: {msg}"
         );
         assert!(written.is_empty());
-        assert!(!flushed);
     }
 
     /// The guard must fire on a gap, not on every clean run.
     #[test]
-    fn a_complete_sequence_still_writes_and_flushes() {
-        let (result, written, flushed) = run(&[2, 0, 1], Some(3));
+    fn a_complete_sequence_still_writes_and_succeeds() {
+        let (result, written, _) = run(&[2, 0, 1], Some(3));
         result.unwrap();
         assert_eq!(written, vec![vec![0u8], vec![1u8], vec![2u8]]);
-        assert!(flushed, "a complete run must still flush the sink");
     }
 
     /// Passing counterpart to `a_dropped_final_task_fails...`: the same two
@@ -774,22 +845,17 @@ mod tests {
     /// a regression that failed every run would still pass the gap tests.
     #[test]
     fn a_complete_two_item_run_with_its_tail_present_succeeds() {
-        let (result, written, flushed) = run(&[0, 1], Some(2));
+        let (result, written, _) = run(&[0, 1], Some(2));
         result.unwrap();
         assert_eq!(written, vec![vec![0u8], vec![1u8]]);
-        assert!(flushed);
     }
 
     /// Passing counterpart to the degenerate case: a writer that legitimately
     /// emits no data blobs at all (header-only output) must still succeed.
     #[test]
     fn an_announced_empty_stream_succeeds() {
-        let (result, written, flushed) = run(&[], Some(0));
+        let (result, written, _) = run(&[], Some(0));
         result.unwrap();
         assert!(written.is_empty());
-        assert!(
-            flushed,
-            "a header-only file is complete and must be flushed"
-        );
     }
 }

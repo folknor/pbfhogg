@@ -188,8 +188,9 @@ impl WriterMetrics {
     /// Record time spent blocked in a writer-thread `recv`.
     ///
     /// Feeds `brokkr sidecar --stalls` via the `writer_recv_wait_ns`
-    /// convention. Every backend's writer loop must call it, or that backend
-    /// reports as never having stalled on its input.
+    /// convention. Called by the one ordered-delivery loop every pipelined
+    /// backend runs (`pipeline::deliver_in_order`); a backend with a loop of
+    /// its own would report as never having stalled on its input.
     ///
     /// Recorded after a successful `recv`, so the final wait that ends in
     /// the channel's disconnect is never counted, on any backend.
@@ -307,7 +308,7 @@ pub(crate) static WRITER_METRICS: WriterMetrics = WriterMetrics::new();
 /// `cancel`'s fault plan (`FaultPlan::sync_calls`), so a test can assert the
 /// exact number of fsyncs one run performed while other tests sync
 /// concurrently. Installed by each scope that finishes or publishes an
-/// output on its own thread: `FileOutputSink::flush`, the `pwrite` pool's
+/// output on its own thread: `FileOutputSink::finish`, the `pwrite` pool's
 /// and io_uring's durable finish, `PbfWriter`'s synchronous finalizer, and
 /// the three `publish` methods. A thread-local selects the active plan; the
 /// plan owns the count. The scope is a closure so the previous selection is

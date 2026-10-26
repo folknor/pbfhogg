@@ -1349,6 +1349,28 @@ must_scan = [
 ]
 message = "writer counters sync_all_ns, sync_all_calls and recv_wait_ns are moved only by WriterMetrics::sync_recorded and record_recv_wait in write/metrics.rs, so the paired counters cannot drift apart"
 
+# One ordered-delivery loop. Every pipelined PBF backend runs
+# `pipeline::deliver_in_order` and supplies only an `OutputSink`; the loop's
+# primitives (popping the reorder buffer, the recv-wait and high-water
+# records, the completeness check) appear nowhere else under src/write/, so a
+# backend cannot grow a private copy of the loop whose counters drift from
+# the others (decisions/0014-output-backends-stay-separate.md, amendment).
+# metrics.rs defines the records. A writer with its own item type and loop
+# (the OSC gzip writer) that adopts `ReorderBuffer` needs an exclude here and
+# the reason beside it.
+[[textlint]]
+name = "writer-loop-primitives-only-in-the-shared-loop"
+pattern = '\b(?:pop_ready|check_stream_complete|record_recv_wait|record_reorder_high_water)\b'
+paths = ["src/write/**/*.rs"]
+exclude = ["src/write/pipeline.rs", "src/write/metrics.rs"]
+region = "code"
+must_scan = [
+    "src/write/parallel_writer.rs",
+    "src/write/uring_writer.rs",
+    "src/write/writer.rs",
+]
+message = "the receive, reorder and completeness loop is pipeline::deliver_in_order; a backend implements OutputSink instead of looping itself"
+
 # Writer counter emission. `WRITER_METRICS` is a process-global total, so
 # emitting it from a per-writer path (`PbfWriter::flush` once did) publishes N
 # sidecar samples of one process total that a reader takes for N per-writer

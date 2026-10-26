@@ -1,7 +1,8 @@
 //! io_uring writer thread with registered buffers for pipelined PBF output.
 //!
-//! Replaces the buffered sink used by
-//! [`super::pipeline::writer_thread`] with an io_uring submission loop. Uses
+//! Runs the shared ordered-delivery loop
+//! ([`super::pipeline::deliver_in_order`]) into an io_uring sink instead of
+//! the buffered one. Uses
 //! `O_DIRECT` + `WriteFixed` with pre-registered
 //! aligned buffers for maximum throughput when the pipeline is I/O-bound
 //! (e.g. `Compression::None` on erofs).
@@ -15,9 +16,8 @@ use super::IO_BUF_BYTES;
 use std::collections::VecDeque;
 
 use crate::error::{Error, Result};
-use crate::reorder_buffer::ReorderBuffer;
-use crate::tunables::{NUM_BUFS, WRITE_AHEAD};
-use crate::write::pipeline::{OutputChunk, PipelineItem, SeqTotal, check_stream_complete};
+use crate::tunables::NUM_BUFS;
+use crate::write::pipeline::{OutputSink, PipelineItem, SeqTotal, deliver_in_order};
 use io_uring::IoUring;
 use io_uring::opcode;
 use io_uring::types::Fixed;
@@ -710,8 +710,17 @@ fn uring_init_and_run(
     WRITER_METRICS.time_handoff(|| state.write(framed_header))?;
     WRITER_METRICS.record_accepted(framed_header.len() as u64);
 
-    // Step 8: Main reorder + write loop (same as writer_thread in writer.rs).
-    uring_main_loop(rx, &mut state, expected, cancel)?;
+    // Step 8: The shared ordered-delivery loop, into the ring's buffers. It
+    // proves the stream complete before returning `Ok`; finalizing a short
+    // stream here would pad and `set_len` it into a well-formed-looking file.
+    deliver_in_order(
+        rx,
+        &mut UringSink {
+            state: &mut state,
+            cancel,
+        },
+        expected,
+    )?;
 
     // Step 9: Flush and finalize.
     crate::write::metrics::with_sync_observer(cancel, || state.flush_final(&file, finish))?;
@@ -719,99 +728,54 @@ fn uring_init_and_run(
     Ok(())
 }
 
-/// Reorder and write loop using the shared sequence-number reorder buffer,
-/// then dispatches to [`UringState::write`].
-fn uring_main_loop(
-    rx: &Receiver<PipelineItem>,
-    state: &mut UringState,
-    expected: &SeqTotal,
-    cancel: &crate::host::Cancel,
-) -> Result<()> {
-    let mut pending: ReorderBuffer<Result<OutputChunk>> = ReorderBuffer::with_capacity(WRITE_AHEAD);
-
-    loop {
-        let t_recv = crate::counters::Stopwatch::start();
-        let item = match rx.recv() {
-            Ok(item) => item,
-            Err(_) => break,
-        };
-        WRITER_METRICS.record_recv_wait(t_recv);
-        pending.push(item.seq, item.data);
-        WRITER_METRICS.record_reorder_high_water(pending.pending_len());
-
-        // Drain consecutive ready items from the front.
-        while let Some(result) = pending.pop_ready() {
-            let chunk = result?;
-
-            // Test-only: the fault plan's `uring_panic_at_dispatch`, counted
-            // per item popped from the reorder buffer. Simulates a
-            // mid-stream panic in the uring writer thread; the writer's
-            // join surfaces it as an error. Release builds compile this
-            // out entirely.
-            #[cfg(feature = "test-hooks")]
-            cancel.faults().on_uring_dispatch();
-
-            WRITER_METRICS.time_handoff(|| hand_off_chunk(state, chunk, cancel))?;
-        }
-
-        // Opportunistically reap CQEs without blocking to recycle buffers.
-        // Steady-state backend maintenance, deliberately outside the handoff
-        // timer (see `writer_handoff_ns`).
-        state.reap_cqes(false)?;
-    }
-
-    // Channel closed. A dead upstream framer closes the channel exactly the
-    // way a finished one does, so completeness has to be proved rather than
-    // assumed - for a gap that stranded later items AND for a gap at the tail
-    // that stranded nothing. Getting this wrong here is worse than in the
-    // other backends: step 9 would go on to `flush_final`, padding and
-    // `set_len`-ing a short file into a well-formed-looking one. See
-    // `check_stream_complete`.
-    check_stream_complete(
-        "uring writer",
-        pending.pending_len(),
-        pending.next_seq(),
-        expected,
-    )
+/// The io_uring byte path for [`deliver_in_order`]: copy into the ring's
+/// registered buffers (flattening at the backend boundary), and between
+/// items reap completions without blocking.
+struct UringSink<'a> {
+    state: &'a mut UringState,
+    cancel: &'a crate::host::Cancel,
 }
 
-/// Hand one ordered chunk to the ring's buffers; the caller times it as one
-/// handoff. Accepted bytes are counted per constituent write.
-fn hand_off_chunk(
-    state: &mut UringState,
-    chunk: OutputChunk,
-    cancel: &crate::host::Cancel,
-) -> Result<()> {
-    match chunk {
-        OutputChunk::Framed(parts) => {
-            // io_uring backend flattens at the backend boundary
-            // (registered-buffer copy is backend-local).
-            let bytes = parts.into_vec();
-            state.write(&bytes)?;
-            WRITER_METRICS.record_accepted(bytes.len() as u64);
-        }
-        OutputChunk::Raw(bytes) => {
-            state.write(&bytes)?;
-            WRITER_METRICS.record_accepted(bytes.len() as u64);
-        }
-        OutputChunk::RawChunks(chunks) => {
-            for chunk in &chunks {
-                state.write(chunk)?;
-                WRITER_METRICS.record_accepted(chunk.len() as u64);
-            }
-        }
-        OutputChunk::CopyRange {
-            in_file,
-            offset,
-            len,
-        } => {
-            super::copy_range::read_range(&in_file, offset, len, cancel, state)?;
-            // The Arc keeps the input open across the read loop.
-            drop(in_file);
-            WRITER_METRICS.record_accepted(len);
-        }
+impl UringSink<'_> {
+    /// Test-only: the fault plan's `uring_panic_at_dispatch`, counted per
+    /// handoff operation (each `Framed` or `Raw` chunk, each piece of a
+    /// `RawChunks`, each `CopyRange`). Simulates a mid-stream panic in the
+    /// uring writer thread; the writer's join surfaces it as an error.
+    /// Release builds compile this out entirely.
+    #[cfg_attr(not(feature = "test-hooks"), inline(always))]
+    fn fault_point(&self) {
+        #[cfg(feature = "test-hooks")]
+        self.cancel.faults().on_uring_dispatch();
     }
-    Ok(())
+}
+
+impl OutputSink for UringSink<'_> {
+    const BACKEND: &'static str = "uring writer";
+
+    fn write_owned(&mut self, bytes: Vec<u8>) -> Result<()> {
+        self.fault_point();
+        self.state.write(&bytes)
+    }
+
+    fn copy_range(
+        &mut self,
+        in_file: crate::read::input::InputFile,
+        offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        self.fault_point();
+        super::copy_range::read_range(&in_file, offset, len, self.cancel, self.state)?;
+        // The Arc keeps the input open across the read loop.
+        drop(in_file);
+        Ok(())
+    }
+
+    /// Opportunistically reap CQEs without blocking to recycle buffers.
+    /// Steady-state backend maintenance, deliberately outside the handoff
+    /// timer (see `writer_handoff_ns`).
+    fn after_drain(&mut self) -> Result<()> {
+        self.state.reap_cqes(false)
+    }
 }
 
 // ---------------------------------------------------------------------------

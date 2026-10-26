@@ -14,7 +14,8 @@ What they must share, they share explicitly and by name: the
 `PermitGuard` write-ahead discipline, `WriterMetrics::sync_recorded` (the
 one recorded fsync), `record_recv_wait`, `time_handoff` and
 `record_accepted` (so each writer counter means one thing on every
-backend), and the `flush`-versus-`sync` split. Adding a fifth
+backend) - since 2026-10-26 composed in one ordered-delivery loop, see the
+amendment below - and the `flush`-versus-`sync` split. Adding a fifth
 backend, or changing any of those shared contracts, is the trigger to
 revisit this.
 
@@ -27,6 +28,32 @@ whole owned buffers at pre-computed absolute offsets, never accumulate,
 never align, and deliberately never `set_len` on the success path, because
 the kernel extends EOF to the highest offset written. The genuine
 duplication is one pair, not a set of four.
+
+## Amendment (2026-10-26): one ordered-delivery loop
+
+The three pipelined writer threads (buffered and `O_DIRECT` through
+`FileOutputSink`, `io_uring`, the `pwrite` pool's dispatcher) used to carry
+three copies of one receive loop: timed `recv`, reorder buffer push and
+high-water, drain of the ready run with each chunk timed as one handoff,
+the `OutputChunk` match with its per-operation accepted-byte count, and
+the end-of-stream completeness check. That loop is now one function,
+`pipeline::deliver_in_order`, and each backend is an `OutputSink`
+supplying only its byte path (`write_owned`, `copy_range`) and its
+between-items maintenance (`after_drain`: io_uring's non-blocking CQE
+reap, the pool's stopped check). Finalization - last flush, ring drain,
+pool join, fsync - stays with each backend, after the loop returns.
+
+This does not reverse the decision above. The loop is the composition of
+contracts this ADR already requires every backend to share
+(`check_stream_complete`, `record_recv_wait`, `time_handoff`,
+`record_accepted`); it flattens chunks into owned byte buffers but manages
+no backend buffer, alignment, submission or completion. What the decision rejects is a shared buffering and
+alignment core, and the four byte paths remain four implementations with
+their own guards. Sharing the loop by code rather than by convention is
+what keeps each writer counter meaning one thing on every backend: a
+fourth copy of the loop could drift where a shared function cannot. A
+`brokkr.toml` textlint keeps the loop's primitives out of every other
+file under `src/write/`.
 
 ## Alternatives considered
 

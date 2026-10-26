@@ -15,6 +15,12 @@
 //! `WriterMetrics::sync_recorded` / `record_recv_wait` funnels, and the
 //! `flush`-versus-`sync` split. Each of those is enforced or asserted
 //! somewhere concrete; changing one is the trigger to re-read the ADR.
+//!
+//! The pipelined backends also share one receive loop,
+//! `pipeline::deliver_in_order`: receive, reorder, time and count each
+//! handoff, prove the stream complete. It touches no bytes, so it is not the
+//! unified buffering core the ADR rejects; each backend is an `OutputSink`
+//! for its byte path and finalizes on its own after the loop returns.
 
 pub mod block_builder;
 pub mod compression;

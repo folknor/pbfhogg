@@ -267,7 +267,8 @@ pub(crate) const PER_WORKER_CAPACITY: usize = 8;
 /// even while its item is still buffered. They therefore do not bound channel
 /// occupancy together with active tasks, or items held in the reorder buffer.
 ///
-/// A send can block on a full channel while the writer is inside `write_chunk`.
+/// A send can block on a full channel while the writer is handing a chunk to
+/// its backend.
 /// This cannot create a scheduling deadlock with framing: the writer uses a
 /// dedicated OS thread and receives items into its `ReorderBuffer` without
 /// waiting for a particular seq. It can drain the channel even when all rayon

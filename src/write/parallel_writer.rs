@@ -10,8 +10,8 @@
 //!
 //! ## Design
 //!
-//! - One **writer-thread** receives `PipelineItem` in send-order, uses a
-//!   `ReorderBuffer` (capacity `WRITE_AHEAD`) to pop in global-seq
+//! - One **writer-thread** runs the shared ordered-delivery loop
+//!   (`pipeline::deliver_in_order`) to hand items on in global-seq
 //!   order, computes each item's final byte offset by accumulating
 //!   lengths, and dispatches a `WriteOp` (Write { offset, bytes } |
 //!   CopyRange { out_offset, in_fd, src_offset, len }) to the pool.
@@ -50,10 +50,9 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{Scope, ScopedJoinHandle};
 
 use crate::error::{Error, Result};
-use crate::reorder_buffer::ReorderBuffer;
-use crate::tunables::{PER_WORKER_CAPACITY, POOL_SIZE, WRITE_AHEAD};
+use crate::tunables::{PER_WORKER_CAPACITY, POOL_SIZE};
 use crate::write::metrics::WRITER_METRICS;
-use crate::write::pipeline::{OutputChunk, PipelineItem, SeqTotal, check_stream_complete};
+use crate::write::pipeline::{OutputSink, PipelineItem, SeqTotal, deliver_in_order};
 use crate::write::pool_failure::FirstFailure;
 
 /// One unit of work dispatched from the writer-thread to the pool.
@@ -212,7 +211,16 @@ fn run_pool<'scope, 'env>(
         // drained their queues into the file, and a worker failure recorded
         // earlier would be lost to the re-raised dispatcher panic.
         let dispatched = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            dispatch_loop(rx, &worker_txs, failure, header_len, expected)
+            deliver_in_order(
+                rx,
+                &mut PoolDispatch {
+                    worker_txs: &worker_txs,
+                    failure,
+                    offset: header_len,
+                    next_worker: 0,
+                },
+                expected,
+            )
         }));
         match dispatched {
             Ok(Ok(())) => {}
@@ -238,171 +246,93 @@ fn run_pool<'scope, 'env>(
     }
 }
 
-/// Main dispatch loop: pop pipeline items in seq order, assign offsets,
-/// round-robin WriteOps across the pool.
+/// The pool's byte path for [`deliver_in_order`]: assign each operation the
+/// next output offset and round-robin it to a worker as a `WriteOp`.
 ///
-/// Returns as soon as `failure` reports a stopped pool. Any error it
-/// returns is recorded by the caller; when it is a consequence of a pool
-/// failure (a closed worker channel, a stop) the cause is already recorded
-/// and outranks it.
-fn dispatch_loop(
-    rx: &Receiver<PipelineItem>,
-    worker_txs: &[SyncSender<WriteOp>],
-    failure: &FirstFailure,
-    header_len: u64,
-    expected: &SeqTotal,
-) -> Result<()> {
-    let mut pending: ReorderBuffer<Result<OutputChunk>> = ReorderBuffer::with_capacity(WRITE_AHEAD);
-    let mut current_offset: u64 = header_len;
-    let mut next_worker: usize = 0;
+/// The handoff here is the dispatch: flattening and the round-robin send,
+/// which blocks on that one worker's full queue. The pool's own execution
+/// time is `writer_pool_write_ns`. Queued to a worker is "handed to the
+/// backend", the same boundary as the buffered backend's `BufWriter` copy and
+/// io_uring's registered-buffer copy, neither of which is on disk yet either;
+/// see `writer_bytes_written`.
+///
+/// Any error the loop returns is recorded by the caller; when it is a
+/// consequence of a pool failure (a closed worker channel, a stop) the cause
+/// is already recorded and outranks it.
+struct PoolDispatch<'a> {
+    worker_txs: &'a [SyncSender<WriteOp>],
+    failure: &'a FirstFailure,
+    /// Output offset of the next operation; starts after the header.
+    offset: u64,
+    next_worker: usize,
+}
 
-    loop {
-        // One Acquire load per pipeline item. A worker failure is otherwise
-        // only seen when the next send to that worker fails, up to a full
-        // round-robin pass later.
-        if failure.stopped() {
+impl PoolDispatch<'_> {
+    /// Send `op` to the next worker, then advance round-robin and the output
+    /// offset by `len`.
+    ///
+    /// A closed channel means that worker exited, which it only does after
+    /// recording its failure (or on a stop, which also implies a recorded
+    /// failure). The error returned here is the consequence; the caller
+    /// records it and the cause, already recorded, outranks it.
+    ///
+    /// Deliberately does NOT reroute a dead worker's `op` to a healthy
+    /// worker: each `op` carries the absolute file offset it must pwrite
+    /// to, and earlier `op`s routed to the now-dead worker cover the
+    /// offsets immediately before this one. Rerouting would leave a hole
+    /// in the file at those earlier offsets. Surfacing the worker's
+    /// captured error is the correct response.
+    fn send(&mut self, op: WriteOp, len: u64) -> Result<()> {
+        if self.worker_txs[self.next_worker].send(op).is_err() {
+            return Err(Error::internal("parallel writer worker channel closed"));
+        }
+        self.next_worker = (self.next_worker + 1) % self.worker_txs.len();
+        self.offset += len;
+        Ok(())
+    }
+}
+
+impl OutputSink for PoolDispatch<'_> {
+    const BACKEND: &'static str = "parallel writer";
+
+    fn write_owned(&mut self, bytes: Vec<u8>) -> Result<()> {
+        let len = bytes.len() as u64;
+        let offset = self.offset;
+        self.send(WriteOp::Write { offset, bytes }, len)
+    }
+
+    fn copy_range(
+        &mut self,
+        in_file: crate::read::input::InputFile,
+        src_offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        let out_offset = self.offset;
+        self.send(
+            WriteOp::CopyRange {
+                out_offset,
+                in_file,
+                src_offset,
+                len,
+            },
+            len,
+        )
+    }
+
+    /// Stop dispatching once the pool has failed: one Acquire load per
+    /// received item, before the next receive. A worker failure is otherwise
+    /// only seen when the next send to that worker fails, up to a full
+    /// round-robin pass later. Not checked before the first receive, where it
+    /// would be vacuous: `run_pool` enters the loop only on a pool that has
+    /// not stopped, and no worker can fail before it has been sent an op.
+    fn after_drain(&mut self) -> Result<()> {
+        if self.failure.stopped() {
             return Err(Error::internal(
                 "parallel writer stopped after a pool failure",
             ));
         }
-        // Same `writer_recv_wait_ns` accounting as the pipelined and io_uring
-        // writer loops. This backend used to omit it, so a parallel-backend
-        // run reported as never having waited on its producer - the same
-        // one-backend-only counter shape as the `sync_all_calls` gap.
-        let t_recv = crate::counters::Stopwatch::start();
-        let item = match rx.recv() {
-            Ok(item) => item,
-            Err(_) => break,
-        };
-        WRITER_METRICS.record_recv_wait(t_recv);
-        pending.push(item.seq, item.data);
-        WRITER_METRICS.record_reorder_high_water(pending.pending_len());
-
-        while let Some(result) = pending.pop_ready() {
-            let chunk = result?;
-            // The handoff here is the dispatch: flattening and the
-            // round-robin send, which blocks on that one worker's full queue.
-            // The pool's own execution time is `writer_pool_write_ns`.
-            WRITER_METRICS.time_handoff(|| {
-                dispatch_chunk(chunk, worker_txs, &mut current_offset, &mut next_worker)
-            })?;
-        }
+        Ok(())
     }
-    // Channel closed cleanly. That proves nothing about completeness on its
-    // own: an upstream framer that died took its `tx` clone with it, so the
-    // close looks identical either way. Returning `Ok(())` without checking
-    // would claim success for a truncated file - and the check has to cover
-    // BOTH a gap that stranded later items and a gap at the tail that
-    // stranded nothing. See `check_stream_complete`.
-    check_stream_complete(
-        "parallel writer",
-        pending.pending_len(),
-        pending.next_seq(),
-        expected,
-    )
-}
-
-/// Dispatch one `OutputChunk` to the pool. Handles each variant,
-/// updates `current_offset`, and rotates `next_worker`.
-///
-/// Accepted bytes are counted per successful send. Queued to a worker is
-/// "handed to the backend", the same boundary as the buffered backend's
-/// `BufWriter` copy and io_uring's registered-buffer copy, neither of which
-/// is on disk yet either; see `writer_bytes_written`.
-fn dispatch_chunk(
-    chunk: OutputChunk,
-    worker_txs: &[SyncSender<WriteOp>],
-    current_offset: &mut u64,
-    next_worker: &mut usize,
-) -> Result<()> {
-    match chunk {
-        OutputChunk::Framed(parts) => {
-            let bytes = parts.into_vec();
-            let len = bytes.len() as u64;
-            send_to_worker(
-                worker_txs,
-                next_worker,
-                WriteOp::Write {
-                    offset: *current_offset,
-                    bytes,
-                },
-            )?;
-            *current_offset += len;
-            WRITER_METRICS.record_accepted(len);
-        }
-        OutputChunk::Raw(bytes) => {
-            let len = bytes.len() as u64;
-            send_to_worker(
-                worker_txs,
-                next_worker,
-                WriteOp::Write {
-                    offset: *current_offset,
-                    bytes,
-                },
-            )?;
-            *current_offset += len;
-            WRITER_METRICS.record_accepted(len);
-        }
-        OutputChunk::RawChunks(chunks) => {
-            for c in chunks {
-                let len = c.len() as u64;
-                send_to_worker(
-                    worker_txs,
-                    next_worker,
-                    WriteOp::Write {
-                        offset: *current_offset,
-                        bytes: c,
-                    },
-                )?;
-                *current_offset += len;
-                WRITER_METRICS.record_accepted(len);
-            }
-        }
-        OutputChunk::CopyRange {
-            in_file,
-            offset: src_offset,
-            len,
-        } => {
-            send_to_worker(
-                worker_txs,
-                next_worker,
-                WriteOp::CopyRange {
-                    out_offset: *current_offset,
-                    in_file,
-                    src_offset,
-                    len,
-                },
-            )?;
-            *current_offset += len;
-            WRITER_METRICS.record_accepted(len);
-        }
-    }
-    Ok(())
-}
-
-/// Send `op` to `worker_txs[*next_worker]`, then advance round-robin.
-///
-/// A closed channel means that worker exited, which it only does after
-/// recording its failure (or on a stop, which also implies a recorded
-/// failure). The error returned here is the consequence; the caller
-/// records it and the cause, already recorded, outranks it.
-///
-/// Deliberately does NOT reroute a dead worker's `op` to a healthy
-/// worker: each `op` carries the absolute file offset it must pwrite
-/// to, and earlier `op`s routed to the now-dead worker cover the
-/// offsets immediately before this one. Rerouting would leave a hole
-/// in the file at those earlier offsets. Surfacing the worker's
-/// captured error is the correct response.
-fn send_to_worker(
-    worker_txs: &[SyncSender<WriteOp>],
-    next_worker: &mut usize,
-    op: WriteOp,
-) -> Result<()> {
-    if worker_txs[*next_worker].send(op).is_err() {
-        return Err(Error::internal("parallel writer worker channel closed"));
-    }
-    *next_worker = (*next_worker + 1) % worker_txs.len();
-    Ok(())
 }
 
 /// Body of one pool thread: run [`worker_loop`] with its panics caught.
@@ -494,7 +424,29 @@ fn worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tunables::WRITE_AHEAD;
+    use crate::write::pipeline::OutputChunk;
     use std::io::Read;
+
+    /// The pool's ordered-delivery loop over `worker_txs`, as `run_pool` runs
+    /// it, with the header taking no space.
+    fn dispatch_loop(
+        rx: &Receiver<PipelineItem>,
+        worker_txs: &[SyncSender<WriteOp>],
+        failure: &FirstFailure,
+        expected: &SeqTotal,
+    ) -> Result<()> {
+        deliver_in_order(
+            rx,
+            &mut PoolDispatch {
+                worker_txs,
+                failure,
+                offset: 0,
+                next_worker: 0,
+            },
+            expected,
+        )
+    }
 
     #[test]
     fn parallel_writer_basic() -> Result<()> {
@@ -574,13 +526,13 @@ mod tests {
         drop(tx);
 
         // Empty worker_txs is fine: seq=2 can't pop (gap at 0,1) so
-        // dispatch_chunk is never called.
+        // nothing is ever sent to a worker.
         let worker_txs: Vec<SyncSender<WriteOp>> = Vec::new();
         let failure = FirstFailure::new();
 
         let seq_total = SeqTotal::new();
         seq_total.announce(3);
-        let result = dispatch_loop(&rx, &worker_txs, &failure, 0, &seq_total);
+        let result = dispatch_loop(&rx, &worker_txs, &failure, &seq_total);
         let err = result.expect_err("gap at channel close must surface as Err");
         let msg = err.to_string();
         assert!(
@@ -614,7 +566,7 @@ mod tests {
         // Two blobs were dispatched upstream; only seq 0 ever arrived.
         seq_total.announce(2);
 
-        let result = dispatch_loop(&rx, &worker_txs, &failure, 0, &seq_total);
+        let result = dispatch_loop(&rx, &worker_txs, &failure, &seq_total);
         let msg = result
             .expect_err("a missing final seq is a short file, not a success")
             .to_string();
@@ -643,7 +595,7 @@ mod tests {
         let seq_total = SeqTotal::new();
         seq_total.announce(1);
 
-        dispatch_loop(&rx, &worker_txs, &failure, 0, &seq_total)
+        dispatch_loop(&rx, &worker_txs, &failure, &seq_total)
             .expect("a complete one-item stream is not a truncation");
         drop(worker_rx);
     }

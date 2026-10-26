@@ -1125,10 +1125,15 @@ The judgement calls already known, to be checked first:
   candidate on several axes, none measured:
   - Windows where there were none: every converted pool now admits at most
     `default_window(threads)` tasks (8 per worker, floor 32) past the
-    consumed head, where before only the channel and an effectively
-    unbounded reorder buffer limited it. Workers can now park behind a slow
-    head blob; altw stage 4's way workers can park behind an unpublished
-    router slot. Window sizes were not tuned.
+    consumed head (cat `--clean` and geocode pass 2 keep their own wider
+    windows). Before, a 32-slot result channel bounded ordinary run-ahead
+    and only an effectively unbounded reorder buffer bounded the slow-head
+    case. Workers can now park behind a slow head blob; altw stage 4's way
+    workers can park behind an unpublished router slot. Window sizes were
+    not tuned. As landed, the result channel was as deep as the window,
+    which no run can fill: send-side counters went blind and consumer-bound
+    pools held up to a window of results. Fixed later (review-audit Slice F
+    item 2): the channel is capped at `POOL_RESULT_CHANNEL_DEPTH` again.
   - Claim-based workers replace the dispatcher thread and
     `Mutex<Receiver>` fan-out. The sliding WILLNEED advice (classify's
     callers, tags-filter pass 2) moved from the dispatcher to the consumer,
@@ -1153,7 +1158,11 @@ The judgement calls already known, to be checked first:
   - Sidecar counters keep their names and units (`Timer::Ms` for the
     inherited per-sample-truncated `_ms` counters); `s4_channel_high_water`
     is now measured by the engine with the same workers-up, consumer-down
-    accounting.
+    accounting. Their meaning held only once the channel cap was restored
+    (above); every ordered pool also records `ordered_pool_*_wait_ns` now.
+  - Multi-extract's region writer gained the sliding WILLNEED advice
+    (through the ordered classify phase); its old dispatcher had none, and
+    the advice was measured a win on europe only.
 - Decode-buffer growth, a measurement candidate rather than a change
   (resolving the diff shard-decoder pooling entry, sparred with codex; no
   code changed, only the comments in `WireBlock::parse_and_inline_with_scratch`

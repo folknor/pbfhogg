@@ -59,11 +59,16 @@ atomic counter; a task may only be worked once it is inside a window of
 the results the consumer has finished with, so at most a window of tasks is
 admitted and not yet consumed however slow one blob is (the bound counts
 tasks, not bytes). The default window is `ORDERED_POOL_WINDOW_PER_WORKER` per
-worker with a floor of `ORDERED_POOL_WINDOW_MIN`. Worker failures surface
-in schedule order (the lowest failing task's error, or the consumer's own at
-its position), cancellation is checked on the consumer, and any consumer
-exit closes the gate and drops the result receiver before the scope joins;
-work already admitted is not interrupted.
+worker with a floor of `ORDERED_POOL_WINDOW_MIN`. Results reach the consumer
+through a channel no deeper than `POOL_RESULT_CHANNEL_DEPTH`, the depth the
+hand-built pools used: a consumer-bound run blocks its workers in `send`,
+as those pools did, and the window binds only behind a slow head, when the
+consumer drains the channel into its reorder buffer while it waits. Worker
+failures surface in schedule order (the lowest failing task's error, or the
+consumer's own at its position), cancellation is checked on the consumer,
+and any consumer exit closes the gate and drops the result receiver before
+the scope joins; work already admitted is not interrupted. Every run records its gate, send and receive waits into one
+process-wide set of stall counters (`ordered_pool_*_wait_ns`).
 
 Where only some schedule positions are decoded and the rest are passthrough
 frames the consumer copies itself (extract, multi-extract's node pass, altw

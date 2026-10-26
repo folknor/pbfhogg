@@ -87,7 +87,8 @@ NAME` list each harness in turn to find one test.
 - **What the shared binary shares.** Every module of `all` runs
   concurrently in one process with: the global rayon pool; and
   `RLIMIT_NOFILE`, raised once per process by `common::test_host()`.
-  Child processes inherit that limit. `WRITER_METRICS` and `PIPELINE_METRICS` are process-global
+  Child processes inherit that limit. The sidecar metric sets (`WRITER_METRICS`,
+  `PIPELINE_METRICS` and the worker pools' stall-counter sets among them) are process-global
   accumulators by design (the sidecar reads them as process totals), so
   concurrent tests contribute to the same totals and a delta of one
   can be moved, either way, by another test. A test that needs one

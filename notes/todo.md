@@ -1087,10 +1087,6 @@ Known to work, no performance question open, but not in the results DB:
     handoff that `reference/performance.md` names as planet's streaming
     constraint. Add an `s4_readiness_wait_ns` twin (names are a contract;
     no rename).
-  - `parallel_classify_phase_ordered` passes `ordered_pool::Waits::default()`,
-    so the ordered classify phase (repack, degrade, getparents, time-filter,
-    tags-filter pass 2, cat `--clean`, geocode pass 2) records no waits
-    though the engine supports them.
   - apply-changes' `candidate_rx` is its own uncounted `Mutex<Receiver>`
     fan-out (`apply_changes/streaming.rs`).
   - The first-error slot is a mutex locked on every claim in altw stages 2

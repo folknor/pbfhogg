@@ -82,11 +82,14 @@ crate::counters::counter_set! {
         readiness_wait_ns => "s4_readiness_wait_ms" / 1_000_000,
         readiness_wait_blobs => "s4_readiness_wait_blobs",
         readiness_wait_max_ns => "s4_readiness_wait_max_ms" / 1_000_000,
-        /// Result-channel depth high-water (workers ++ before send, consumer
-        /// -- after recv). Reaching `decoded_tx` capacity means the channel
-        /// was the binding queue at some point; staying well below capacity
-        /// says workers were never able to fill it (so consumer/writer is
-        /// the limiter, not the channel).
+        /// Result-channel depth high-water as the workers count it: up
+        /// before a send, down after the consumer's receive, so blocked
+        /// senders count and it can exceed the channel's capacity by up to
+        /// one per worker. A worker counts before it tries to send, so a
+        /// value at or past capacity does not by itself prove the channel
+        /// filled (`s4_send_ms`, the `WAIT_S4_SEND` span and
+        /// `ordered_pool_result_send_wait_ns` are that evidence); staying
+        /// well below it says the workers never could.
         channel_high_water => "s4_channel_high_water",
     }
 }
@@ -673,8 +676,8 @@ pub(super) fn stage4_assembly(
 
     // Time the final writer flush. `write_raw_owned` and
     // `write_primitive_block_owned` hand work to the writer thread
-    // (compression + file I/O); when the decoded_tx channel grows,
-    // backpressure that used to surface as `s4_send_ms` shifts into
+    // (compression + file I/O); were the pool's result channel made deeper,
+    // backpressure that surfaces as `s4_send_ms` would shift into
     // the writer pipeline and only materialises here. Isolating
     // flush makes the channel-vs-writer attribution legible.
     let t_flush = crate::counters::Stopwatch::start();

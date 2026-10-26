@@ -614,8 +614,8 @@ crate::counters::counter_set! {
     /// [`run_unordered_per_blob`] (behind [`parallel_classify_phase`],
     /// [`parallel_classify_phase_abortable`] and [`parallel_scan_blobs_raw`])
     /// and [`parallel_classify_accumulate`], for `brokkr sidecar --stalls`.
-    /// The ordered phase runs on `crate::ordered_pool` and reports none of
-    /// these.
+    /// The ordered phase runs on `crate::ordered_pool`, which records into
+    /// that engine's own set (`ordered_pool_*_wait_ns`) instead.
     ///
     /// Every field is a `*_wait_ns` stall counter recorded through the gated
     /// operations in `crate::counters`: an operation that does not block costs
@@ -946,9 +946,11 @@ impl<R, M: FnMut(usize, R) -> Result<()>> crate::ordered_pool::OrderedConsumer<R
 /// them - one slow blob at the head lets workers race arbitrarily far ahead -
 /// so a worker may only start schedule position `k` once `k < merged +
 /// window`. At most `window` results are therefore alive between classify
-/// and the end of their merge, and workers only stall when the head blob is a
-/// full window behind the fastest one. `None` takes the pool's default window
-/// for the thread count.
+/// and the end of their merge. Workers stall in two places: sending into the
+/// pool's result channel when the merge is behind (the channel is shallower
+/// than a wide window), and at the window when the head blob is a full
+/// window behind the fastest one. `None` takes the pool's default window for
+/// the thread count.
 ///
 /// The workers persist (with their `S` state, scratch and decompress pools)
 /// across the whole schedule, and merge overlaps classification; a batch

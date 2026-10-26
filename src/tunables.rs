@@ -114,16 +114,17 @@ pub(crate) const DERIVE_GZIP_WORKERS_FALLBACK: usize = 4;
 /// workers.
 pub(crate) const POOL_DESCRIPTOR_CHANNEL_DEPTH: usize = 16;
 
-/// Depth of the result channel a hand-rolled decode pool's workers send to.
-/// Altw stage 4 records why 32 is right there: the 256-depth A/B probe
-/// confirmed that `s4_send_ms` pressure is steady-state consumer/compression
-/// saturation, not burst absorption. A deeper channel just moves the wait into
-/// the writer pipeline with no wall change.
+/// Depth of the result channel a decode pool's workers send to: the
+/// unordered classify pools, extract's hand-built ones, and every ordered
+/// pool (`crate::ordered_pool`, capped there at the run's window). Altw stage
+/// 4's 256-depth A/B probe, from when it was a hand-built pool, showed the
+/// `s4_send_ms` pressure was steady-state consumer/compression saturation,
+/// not burst absorption: a deeper channel just moved the wait into the
+/// writer pipeline with no wall change.
 pub(crate) const POOL_RESULT_CHANNEL_DEPTH: usize = 32;
 
-/// Capacity of the wider reorder buffers (time-filter and altw stage 1's
-/// per-way stream), and the admission window of cat `--clean`'s ordered
-/// pool (at most this many decoded results alive between decode and write).
+/// Admission window of cat `--clean`'s ordered pool (at most this many
+/// decoded results alive between decode and write).
 pub(crate) const POOL_REORDER_CAPACITY_WIDE: usize = 64;
 
 /// Default result window of the ordered pool (`crate::ordered_pool`), per

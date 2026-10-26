@@ -824,7 +824,7 @@ pub(crate) fn write_plan(
 
         scope.spawn(move || {
             for k in 0..plan.runs.len() {
-                if !gate_ref.admit(k, window) {
+                if !gate_ref.admit(k, window, None) {
                     break;
                 }
                 let (tx, rx) = sync_channel(crate::tunables::OVERLAP_RUN_CHANNEL_DEPTH);

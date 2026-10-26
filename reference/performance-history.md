@@ -1045,6 +1045,19 @@ measured, recorded so a fourth starts from them.
   such wait goes through the gated helpers in `src/counters.rs`, which
   touch no clock unless the `try_*` attempt fails. All unmeasured; each
   step is its own commit.
+- **The ordered engine's result channel.** `56a50e0d` sized it to the
+  admission window, which no run can fill (at most a window of results is
+  ever in flight), so from that commit until the fix every send-side
+  counter of a converted pool could not see backpressure: `s4_send_ms`, the
+  `WAIT_S4_SEND` and `WAIT_P2_SEND` spans and `altw_pass2_send_ms` read near
+  zero because the wait had moved to the uncounted admission gate, and
+  consumer-bound pools held up to a window of results where the hand-built
+  ones held about 32 plus one per worker. A sidecar row from that range is
+  not comparable on those counters. The channel is now no deeper than
+  `POOL_RESULT_CHANNEL_DEPTH` again, and the engine records its own gate,
+  send and receive waits (`ordered_pool_*_wait_ns`) for every ordered pool,
+  the classify-ordered callers, altw stage 1 and extract included, which
+  reported none before. Unmeasured.
 
 ## Retired plan docs
 

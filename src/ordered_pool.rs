@@ -19,6 +19,21 @@
 //!   the reorder buffer, or in the consumer's hands - however slow one task
 //!   is. The bound counts tasks, not bytes: a task whose result is large
 //!   (multi-extract's per-region blocks) holds that much per slot.
+//! - **Two limits, two jobs.** Results travel to the consumer through a
+//!   channel of `min(window, POOL_RESULT_CHANNEL_DEPTH)` slots, the depth
+//!   every hand-built pool before this engine used. When the consumer is the
+//!   bottleneck, workers block sending into that full channel, each holding
+//!   one finished result, so ordinary run-ahead stays near the channel depth
+//!   plus one result per worker, and the wait shows where the old pools
+//!   showed it (stage 4's `s4_send_ms`, the `WAIT_*_SEND` spans). The window
+//!   is the hard bound behind a slow head: while the consumer waits for task
+//!   `consumed` it keeps draining the channel into its reorder buffer, so
+//!   later results pile up there, up to the window, and workers then park at
+//!   the admission gate; that backlog stays alive until it is consumed, so
+//!   the total bound, slow head or not, is the window. A channel as deep as
+//!   the window would never fill,
+//!   since no more than a window of results is ever in flight, which once
+//!   left every send-side counter unable to see backpressure.
 //! - **Ordered failures.** Worker results travel as `Result<T>` and surface in
 //!   task order: the reported error is the lowest failing task's, or the
 //!   consumer's own at its position, whichever comes first in task order.
@@ -39,13 +54,83 @@
 //!   for it.
 //! - **Panics** in a worker close the gate, so the others stop, and re-raise
 //!   when the scope joins; a consumer panic does the same through its guard.
+//!   After a worker panic the consumer learns of it only once every other
+//!   worker has finished its admitted task and gone (the missing task then
+//!   fails the run), so a worker parked on a wait outside the pool keeps the
+//!   run alive until that wait ends.
+//!
+//! # Stall counters
+//!
+//! Every run records where it blocked into one process-wide set
+//! ([`OrderedPoolMetrics`]): workers parked at the admission gate, workers
+//! blocked sending into a full result channel, and the consumer blocked on
+//! an empty one. These are `*_wait_ns` counters for `brokkr sidecar
+//! --stalls`, separate from the per-site [`Waits`] timers a pool inherited.
 
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 use crate::error::Error;
-use crate::tunables::{ORDERED_POOL_WINDOW_MIN, ORDERED_POOL_WINDOW_PER_WORKER};
+use crate::tunables::{
+    ORDERED_POOL_WINDOW_MIN, ORDERED_POOL_WINDOW_PER_WORKER, POOL_RESULT_CHANNEL_DEPTH,
+};
+
+crate::counters::counter_set! {
+    /// Blocking time in every ordered pool run, for `brokkr sidecar
+    /// --stalls`.
+    ///
+    /// Each named field is a `*_wait_ns` stall counter recorded only on a
+    /// genuine block: an admission that is immediately possible, a send that
+    /// finds room and a receive that finds a result touch no clock. Sums
+    /// across threads, so a total can exceed wall time.
+    ///
+    /// One set for the engine, not one per command or phase, as with the
+    /// unordered classify pools' set (`scan::classify`): the question these
+    /// answer is about the mechanism, and per-caller names would need a name
+    /// threaded through every site. The set is emitted as the process totals
+    /// so far at the end of every run (success, failure or unwind), so each
+    /// emission lands inside the caller's own phase markers where it has
+    /// them. Every counter only grows, so the last emission is the process
+    /// total, which is what `--stalls` reads. The step from the previous
+    /// emission is one run's share only while runs are sequential: two
+    /// concurrent runs (two library calls, or nested pools) add into the same
+    /// totals.
+    ///
+    /// The unnamed counters are never emitted; they count how often each
+    /// slow path was entered, which lets a test wait until a block has
+    /// provably begun.
+    pub(crate) struct OrderedPoolMetrics {
+        /// A worker parked at the admission gate: its claimed task is a full
+        /// window ahead of the consumer, which is behind a slow head (the
+        /// reorder buffer holds the rest of the window).
+        window_wait_ns => "ordered_pool_window_wait_ns",
+        window_parks,
+        /// A worker blocked sending its result into a full result channel:
+        /// the consumer behind the workers. Recorded also when the blocked
+        /// send ends because the consumer went away.
+        result_send_wait_ns => "ordered_pool_result_send_wait_ns",
+        result_send_blocks,
+        /// The consumer blocked on an empty result channel: idle for want of
+        /// a finished task (workers, or a wait they are parked on, behind the
+        /// consumer).
+        result_recv_wait_ns => "ordered_pool_result_recv_wait_ns",
+        result_recv_blocks,
+    }
+}
+
+/// Process totals of every ordered pool run (see [`OrderedPoolMetrics`]).
+static ORDERED_POOL_METRICS: OrderedPoolMetrics = OrderedPoolMetrics::new();
+
+/// Emits a metrics set when dropped: after the run's scope has joined its
+/// workers, whether the run returned or unwound.
+struct EmitOnDrop<'a>(&'a OrderedPoolMetrics);
+
+impl Drop for EmitOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.emit_all();
+    }
+}
 
 /// The default window for `workers` workers: `ORDERED_POOL_WINDOW_PER_WORKER`
 /// each, at least `ORDERED_POOL_WINDOW_MIN`.
@@ -132,20 +217,41 @@ impl OrderedGate {
     /// Block until task `position` is inside the window (`true`), or until
     /// it can never be worked (`false`): the run closed, or claims stopped
     /// while `position` was still outside the window.
-    pub(crate) fn admit(&self, position: usize, window: NonZeroUsize) -> bool {
+    ///
+    /// With `metrics`, a call that has to wait adds its whole wait, across
+    /// every wakeup until it returns either way, to `window_wait_ns`; a
+    /// call that can answer at once touches no clock.
+    pub(crate) fn admit(
+        &self,
+        position: usize,
+        window: NonZeroUsize,
+        metrics: Option<&OrderedPoolMetrics>,
+    ) -> bool {
         let mut state = self.lock();
-        loop {
+        let mut parked: Option<crate::counters::Stopwatch> = None;
+        let admitted = loop {
             if state.closed {
-                return false;
+                break false;
             }
             if position < state.consumed.saturating_add(window.get()) {
-                return true;
+                break true;
             }
             if state.stop_claims {
-                return false;
+                break false;
+            }
+            if parked.is_none()
+                && let Some(m) = metrics
+            {
+                m.window_parks.fetch_add(1, Ordering::Relaxed);
+                parked = Some(crate::counters::Stopwatch::start());
             }
             state = self.cv.wait(state).unwrap_or_else(PoisonError::into_inner);
+        };
+        drop(state);
+        if let (Some(parked), Some(m)) = (parked, metrics) {
+            parked.record_ns(&m.window_wait_ns);
         }
+        admitted
     }
 }
 
@@ -192,8 +298,12 @@ impl Timer<'_> {
     }
 }
 
-/// What a run reports to the sidecar. Every field is optional; a pool with
-/// no counter set passes `Waits::default()`.
+/// The per-site counters a pool kept from before this engine, under their
+/// old names and units. Every field is optional; a pool with no counter set
+/// of its own passes `Waits::default()`. A timer that is set times every
+/// call, blocked or not, as it always did (one that is not set reads no
+/// clock); the engine's own gated stall counters are
+/// [`OrderedPoolMetrics`], recorded for every run whatever is passed here.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Waits<'a> {
     /// Workers parked because the consumer is a full window behind.
@@ -206,8 +316,12 @@ pub(crate) struct Waits<'a> {
     /// Entered only when a send finds the result channel full (after a
     /// failed `try_send`), so unblocked sends never touch it.
     pub(crate) send_stall: Option<&'a crate::counters::StallGauge>,
-    /// High-water of the result channel's depth (workers count up before a
-    /// send, the consumer down after a receive).
+    /// High-water of the result channel's depth as the workers count it: up
+    /// before a send, down after the consumer's receive. Blocked senders
+    /// count, so it can exceed the channel's capacity by up to one per
+    /// worker; and a sender counts before it tries, so reaching a value
+    /// does not prove the channel filled. The send stall counters are that
+    /// evidence.
     pub(crate) queue_high_water: Option<&'a AtomicU64>,
 }
 
@@ -322,6 +436,7 @@ struct WorkerShared<'a, T> {
     n_tasks: usize,
     window: NonZeroUsize,
     waits: Waits<'a>,
+    metrics: &'a OrderedPoolMetrics,
 }
 
 impl<T> WorkerShared<'_, T> {
@@ -338,9 +453,12 @@ impl<T> WorkerShared<'_, T> {
             }
             // A claimed task always reaches `admit`: returning between the
             // claim and the admission could strand a task below a failing one.
-            let t = crate::counters::Stopwatch::start();
-            let admitted = self.gate.admit(task, self.window);
-            if let Some(timer) = self.waits.window {
+            let timed = self
+                .waits
+                .window
+                .map(|timer| (timer, crate::counters::Stopwatch::start()));
+            let admitted = self.gate.admit(task, self.window, Some(self.metrics));
+            if let Some((timer, t)) = timed {
                 timer.record(t);
             }
             if !admitted {
@@ -358,7 +476,10 @@ impl<T> WorkerShared<'_, T> {
 
     /// Hand one result to the consumer; `false` when it is gone.
     fn send(&self, task: usize, result: crate::Result<T>) -> bool {
-        let t = crate::counters::Stopwatch::start();
+        let timed = self
+            .waits
+            .send
+            .map(|timer| (timer, crate::counters::Stopwatch::start()));
         if let Some(high_water) = self.waits.queue_high_water {
             let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
             crate::counters::record_max(high_water, depth as u64);
@@ -370,13 +491,19 @@ impl<T> WorkerShared<'_, T> {
                     .waits
                     .send_stall
                     .map(crate::counters::StallGauge::track);
-                if self.tx.send(item).is_err() {
+                let blocked = crate::counters::Stopwatch::start();
+                self.metrics
+                    .result_send_blocks
+                    .fetch_add(1, Ordering::Relaxed);
+                let sent = self.tx.send(item);
+                blocked.record_ns(&self.metrics.result_send_wait_ns);
+                if sent.is_err() {
                     return false;
                 }
             }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
         }
-        if let Some(timer) = self.waits.send {
+        if let Some((timer, t)) = timed {
             timer.record(t);
         }
         true
@@ -415,11 +542,36 @@ where
     W: Fn(&mut S, &mut L, usize) -> crate::Result<T> + Sync,
     C: OrderedConsumer<T>,
 {
-    let PoolConfig {
-        window,
-        cancel,
-        waits,
-    } = config;
+    run_ordered_in(
+        n_tasks,
+        shards,
+        config,
+        local,
+        work,
+        consumer,
+        &ORDERED_POOL_METRICS,
+    )
+}
+
+/// [`run_ordered`] recording into `metrics`: production passes the process
+/// set, a test its own.
+fn run_ordered_in<S, L, T, I, W, C>(
+    n_tasks: usize,
+    shards: &mut [S],
+    config: PoolConfig<'_>,
+    local: I,
+    work: W,
+    consumer: &mut C,
+    metrics: &OrderedPoolMetrics,
+) -> crate::Result<()>
+where
+    S: Send,
+    T: Send,
+    I: Fn(usize) -> L + Sync,
+    W: Fn(&mut S, &mut L, usize) -> crate::Result<T> + Sync,
+    C: OrderedConsumer<T>,
+{
+    let PoolConfig { window, cancel, .. } = config;
     cancel.check()?;
     if n_tasks == 0 {
         return Ok(());
@@ -432,11 +584,16 @@ where
     let next = AtomicUsize::new(0);
     // Result-channel depth, kept only when its high-water is reported.
     let queue_depth = AtomicUsize::new(0);
+    // Declared before the scope, so it drops after the scope has joined the
+    // workers, on a return or an unwind alike.
+    let _emit = EmitOnDrop(metrics);
 
     std::thread::scope(|scope| -> crate::Result<()> {
         // A local of this closure, so every return drops it before the scope
-        // joins the workers.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, crate::Result<T>)>(window.get());
+        // joins the workers. See the module docs ("Two limits, two jobs") for
+        // why it is not as deep as the window.
+        let depth = window.get().min(POOL_RESULT_CHANNEL_DEPTH);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, crate::Result<T>)>(depth);
         // Installed before the first spawn, so even a failed spawn closes the
         // gate for the workers already parked on it. Declared after `rx`, so
         // it drops first: the gate closes, then the receiver goes.
@@ -449,7 +606,8 @@ where
                 queue_depth: &queue_depth,
                 n_tasks,
                 window,
-                waits,
+                waits: config.waits,
+                metrics,
             };
             let (work, local) = (&work, &local);
             scope.spawn(move || {
@@ -460,50 +618,93 @@ where
         }
         drop(tx);
 
-        let mut reorder =
-            crate::reorder_buffer::ReorderBuffer::with_max_window(window.get(), window.get());
-        // The gate's count of consumed tasks. Kept apart from the reorder
-        // buffer's `next_seq`, which moves when an item is popped, before it
-        // is consumed.
-        let mut consumed = 0_usize;
-        loop {
-            cancel.check()?;
-            let t = crate::counters::Stopwatch::start();
-            let msg = rx.recv();
-            if let Some(timer) = waits.recv {
-                timer.record(t);
-            }
-            let Ok((task, result)) = msg else {
-                break;
-            };
-            if waits.queue_high_water.is_some() {
-                queue_depth.fetch_sub(1, Ordering::Relaxed);
-            }
-            cancel.check()?;
-            // `push` panics on a stale, duplicate or out-of-window position.
-            // None can reach it: every task is claimed once from the counter,
-            // and only worked once `task < consumed + window`, where
-            // `consumed` never passes the buffer's `next_seq`.
-            reorder.push(task, result);
-            while let Some(result) = reorder.pop_ready() {
-                cancel.check()?;
-                consumer.before_item(consumed)?;
-                consumer.consume(consumed, result?)?;
-                consumed += 1;
-                consumer.on_advance(consumed.saturating_add(window.get()).min(n_tasks));
-                gate.advance(consumed);
-            }
+        deliver(&rx, &gate, &queue_depth, n_tasks, config, metrics, consumer)
+    })
+}
+
+/// The calling thread's side of a run: receive results, put them in task
+/// order and hand them to `consumer`, returning credit to the gate after
+/// each. Ends when every worker has gone, or at the first error in task
+/// order.
+fn deliver<T, C: OrderedConsumer<T>>(
+    rx: &std::sync::mpsc::Receiver<(usize, crate::Result<T>)>,
+    gate: &OrderedGate,
+    queue_depth: &AtomicUsize,
+    n_tasks: usize,
+    config: PoolConfig<'_>,
+    metrics: &OrderedPoolMetrics,
+    consumer: &mut C,
+) -> crate::Result<()> {
+    let PoolConfig {
+        window,
+        cancel,
+        waits,
+    } = config;
+    let mut reorder =
+        crate::reorder_buffer::ReorderBuffer::with_max_window(window.get(), window.get());
+    // The gate's count of consumed tasks. Kept apart from the reorder
+    // buffer's `next_seq`, which moves when an item is popped, before it is
+    // consumed.
+    let mut consumed = 0_usize;
+    loop {
+        cancel.check()?;
+        let timed = waits
+            .recv
+            .map(|timer| (timer, crate::counters::Stopwatch::start()));
+        let msg = recv_counted(rx, metrics);
+        if let Some((timer, t)) = timed {
+            timer.record(t);
+        }
+        let Ok((task, result)) = msg else {
+            break;
+        };
+        if waits.queue_high_water.is_some() {
+            queue_depth.fetch_sub(1, Ordering::Relaxed);
         }
         cancel.check()?;
-        if consumed != n_tasks {
-            // Only a worker that died without sending gets here; its panic
-            // takes precedence when the scope joins.
-            return Err(Error::internal(format!(
-                "ordered pool: a worker exited without delivering task {consumed} of {n_tasks}"
-            )));
+        // `push` panics on a stale, duplicate or out-of-window position.
+        // None can reach it: every task is claimed once from the counter,
+        // and only worked once `task < consumed + window`, where `consumed`
+        // never passes the buffer's `next_seq`.
+        reorder.push(task, result);
+        while let Some(result) = reorder.pop_ready() {
+            cancel.check()?;
+            consumer.before_item(consumed)?;
+            consumer.consume(consumed, result?)?;
+            consumed += 1;
+            consumer.on_advance(consumed.saturating_add(window.get()).min(n_tasks));
+            gate.advance(consumed);
         }
-        Ok(())
-    })
+    }
+    cancel.check()?;
+    if consumed != n_tasks {
+        // Only a worker that died without sending gets here; its panic takes
+        // precedence when the scope joins.
+        return Err(Error::internal(format!(
+            "ordered pool: a worker exited without delivering task {consumed} of {n_tasks}"
+        )));
+    }
+    Ok(())
+}
+
+/// `rx.recv()`, adding a wait on an empty channel to the run's receive
+/// stall counter. A receive that finds a result, or finds every worker gone,
+/// touches no clock.
+fn recv_counted<M>(
+    rx: &std::sync::mpsc::Receiver<M>,
+    metrics: &OrderedPoolMetrics,
+) -> Result<M, std::sync::mpsc::RecvError> {
+    match rx.try_recv() {
+        Ok(msg) => Ok(msg),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(std::sync::mpsc::RecvError),
+        Err(std::sync::mpsc::TryRecvError::Empty) => {
+            metrics.result_recv_blocks.fetch_add(1, Ordering::Relaxed);
+            let blocked = crate::counters::Stopwatch::start();
+            let received = rx.recv();
+            blocked.record_ns(&metrics.result_recv_wait_ns);
+            received
+        }
+    }
 }
 
 #[cfg(test)]
@@ -809,5 +1010,268 @@ mod tests {
         )
         .unwrap();
         assert_eq!(shards.iter().sum::<usize>(), 1_000);
+    }
+
+    // ---- the result channel and the stall counters ------------------------
+    //
+    // These run with a window wider than `POOL_RESULT_CHANNEL_DEPTH`, so the
+    // result channel is shallower than the window and can fill, and record
+    // into a set of their own. Each waits for the slow path it is about to
+    // test to have been entered (the set's unnamed counters), never for a
+    // sleep to have probably been long enough.
+
+    /// Poll `cond` for up to the deadline; whether it came true.
+    fn eventually(cond: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !cond() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
+    fn run_in(
+        n: usize,
+        workers: usize,
+        window: usize,
+        metrics: &OrderedPoolMetrics,
+        work: impl Fn(usize) -> crate::Result<usize> + Sync,
+        consume: impl FnMut(usize) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        let mut consume = consume;
+        let mut shards = vec![(); workers];
+        run_ordered_in(
+            n,
+            &mut shards,
+            PoolConfig {
+                window: NonZeroUsize::new(window).unwrap(),
+                cancel: &crate::host::Cancel::new(),
+                waits: Waits::default(),
+            },
+            |_| (),
+            |(), (), task| work(task),
+            &mut ConsumeFn(|_, v| consume(v)),
+            metrics,
+        )
+    }
+
+    const WIDE_WINDOW: usize = 4 * POOL_RESULT_CHANNEL_DEPTH;
+    const WIDE_TASKS: usize = WIDE_WINDOW + 50;
+
+    /// A consumer stuck on its first result while the workers race on: the
+    /// channel fills, a worker blocks in `send`, and once the consumer moves
+    /// on every result still arrives, in order. A channel as deep as the
+    /// window could never fill here.
+    #[test]
+    fn a_full_result_channel_blocks_senders_and_still_delivers_in_order() {
+        let (got, saw_block, send_wait) = within_deadline(|| {
+            let metrics = OrderedPoolMetrics::new();
+            let mut got = Vec::new();
+            let mut saw_block = false;
+            run_in(WIDE_TASKS, 4, WIDE_WINDOW, &metrics, Ok, |v| {
+                if v == 0 {
+                    saw_block =
+                        eventually(|| metrics.result_send_blocks.load(Ordering::Relaxed) > 0);
+                }
+                got.push(v);
+                Ok(())
+            })
+            .unwrap();
+            (
+                got,
+                saw_block,
+                metrics.result_send_wait_ns.load(Ordering::Relaxed),
+            )
+        });
+        assert!(saw_block, "no worker blocked on the full result channel");
+        assert!(send_wait > 0, "the blocked send recorded no wait");
+        assert_eq!(got, (0..WIDE_TASKS).collect::<Vec<_>>());
+    }
+
+    /// The consumer fails while workers are blocked sending: the run ends
+    /// with its error, the blocked senders are released by the dropped
+    /// receiver, and a send that ended that way still records its wait.
+    #[test]
+    fn a_consumer_error_releases_blocked_senders() {
+        let (err, send_wait) = within_deadline(|| {
+            let metrics = OrderedPoolMetrics::new();
+            let err = run_in(WIDE_TASKS, 4, WIDE_WINDOW, &metrics, Ok, |v| {
+                assert_eq!(v, 0, "the consumer fails on its first result");
+                assert!(eventually(|| metrics
+                    .result_send_blocks
+                    .load(Ordering::Relaxed)
+                    > 0));
+                Err(Error::internal("disk full"))
+            })
+            .unwrap_err();
+            (err, metrics.result_send_wait_ns.load(Ordering::Relaxed))
+        });
+        assert_eq!(err.to_string(), "disk full");
+        assert!(send_wait > 0, "the released send recorded no wait");
+    }
+
+    /// The same with a consumer panic: it surfaces, it does not hang. The
+    /// handshake's outcome is kept apart from the panic, so a failed
+    /// handshake cannot pass as the injected panic.
+    #[test]
+    fn a_consumer_panic_with_blocked_senders_surfaces() {
+        let (panicked, saw_block) = within_deadline(|| {
+            let metrics = OrderedPoolMetrics::new();
+            let saw_block = AtomicBool::new(false);
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_in(WIDE_TASKS, 4, WIDE_WINDOW, &metrics, Ok, |_| {
+                    saw_block.store(
+                        eventually(|| metrics.result_send_blocks.load(Ordering::Relaxed) > 0),
+                        Ordering::SeqCst,
+                    );
+                    panic!("injected consumer panic");
+                })
+            }))
+            .is_err();
+            (panicked, saw_block.load(Ordering::SeqCst))
+        });
+        assert!(saw_block, "no worker blocked on the full result channel");
+        assert!(
+            panicked,
+            "a consumer panic must propagate, not be swallowed"
+        );
+    }
+
+    /// A later task fails first, the lowest failing task fails afterwards,
+    /// and the channel filled on the way: the reported error is still the
+    /// lowest task's.
+    #[test]
+    fn the_lowest_failure_wins_past_a_full_channel() {
+        let (err, ordered) = within_deadline(|| {
+            let metrics = OrderedPoolMetrics::new();
+            let later_failed = AtomicBool::new(false);
+            let ordered = AtomicBool::new(false);
+            let err = run_in(
+                WIDE_TASKS,
+                4,
+                WIDE_WINDOW,
+                &metrics,
+                |i| match i {
+                    5 => {
+                        ordered.store(
+                            eventually(|| later_failed.load(Ordering::SeqCst)),
+                            Ordering::SeqCst,
+                        );
+                        Err(Error::internal("bad 5"))
+                    }
+                    50 => {
+                        later_failed.store(true, Ordering::SeqCst);
+                        Err(Error::internal("bad 50"))
+                    }
+                    _ => Ok(i),
+                },
+                |v| {
+                    if v == 0 {
+                        assert!(eventually(|| metrics
+                            .result_send_blocks
+                            .load(Ordering::Relaxed)
+                            > 0));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            (err, ordered.load(Ordering::SeqCst))
+        });
+        assert!(ordered, "task 50 never failed ahead of task 5");
+        assert_eq!(err.to_string(), "bad 5");
+    }
+
+    /// A slow head: the others run a full window ahead and park at the gate,
+    /// which records the wait; the run then completes in order.
+    #[test]
+    fn a_slow_head_parks_workers_at_the_gate() {
+        let (got, parked, window_wait) = within_deadline(|| {
+            let metrics = OrderedPoolMetrics::new();
+            let parked = AtomicBool::new(false);
+            let mut got = Vec::new();
+            run_in(
+                50,
+                2,
+                8,
+                &metrics,
+                |i| {
+                    if i == 0 {
+                        parked.store(
+                            eventually(|| metrics.window_parks.load(Ordering::Relaxed) > 0),
+                            Ordering::SeqCst,
+                        );
+                    }
+                    Ok(i)
+                },
+                |v| {
+                    got.push(v);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            (
+                got,
+                parked.load(Ordering::SeqCst),
+                metrics.window_wait_ns.load(Ordering::Relaxed),
+            )
+        });
+        assert!(parked, "no worker parked at the gate behind the slow head");
+        assert!(window_wait > 0, "the parked admission recorded no wait");
+        assert_eq!(got, (0..50).collect::<Vec<_>>());
+    }
+
+    /// A consumer waiting on a slow worker records its receive wait; a run
+    /// whose one task is admitted at once and sent into an empty channel
+    /// records no window or send wait at all.
+    #[test]
+    fn an_idle_consumer_records_its_wait_and_nothing_else_blocks() {
+        let (waited, recv_wait, window_wait, send_wait) = within_deadline(|| {
+            let metrics = OrderedPoolMetrics::new();
+            let waited = AtomicBool::new(false);
+            run_in(
+                1,
+                1,
+                WIDE_WINDOW,
+                &metrics,
+                |i| {
+                    waited.store(
+                        eventually(|| metrics.result_recv_blocks.load(Ordering::Relaxed) > 0),
+                        Ordering::SeqCst,
+                    );
+                    Ok(i)
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+            (
+                waited.load(Ordering::SeqCst),
+                metrics.result_recv_wait_ns.load(Ordering::Relaxed),
+                metrics.window_wait_ns.load(Ordering::Relaxed),
+                metrics.result_send_wait_ns.load(Ordering::Relaxed),
+            )
+        });
+        assert!(waited, "the consumer never waited for the slow worker");
+        assert!(recv_wait > 0, "the consumer's wait was not recorded");
+        assert_eq!(window_wait, 0);
+        assert_eq!(send_wait, 0);
+    }
+
+    /// The emitted names are the ones `--stalls` reads; the slow-path
+    /// tallies are not emitted.
+    #[test]
+    fn the_stall_counters_are_emitted_under_their_names() {
+        let mut names = Vec::new();
+        OrderedPoolMetrics::new().for_each(|name, _| names.push(name));
+        assert_eq!(
+            names,
+            [
+                "ordered_pool_window_wait_ns",
+                "ordered_pool_result_send_wait_ns",
+                "ordered_pool_result_recv_wait_ns",
+            ]
+        );
     }
 }

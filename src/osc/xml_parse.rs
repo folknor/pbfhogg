@@ -154,21 +154,42 @@ pub(crate) fn parse_str_attr(
     Err(missing_attr(name))
 }
 
-// Deliberately treat malformed optional roles as absent. Refusing them would
-// change the accepted OSC input contract; all sinks retain their old fallback.
+// A malformed attribute is an error even when the attribute is optional.
+// Until 2026-10-26 a malformed optional `role` read as absent and an empty
+// role was written; that silently altered the data. The accepted OSC contract
+// changed (maintainer ruling, review audit) to match the PBF re-encoding
+// paths, the OSC arena and libosmium, whose expat parser rejects malformed XML
+// outright. Absent stays `Ok(None)`; only a malformed attribute is refused.
 pub(crate) fn parse_str_attr_optional(
     e: &quick_xml::events::BytesStart<'_>,
     name: &str,
-) -> Option<String> {
-    for attr in e.attributes().flatten() {
+) -> ParseResult<Option<String>> {
+    for attr_result in e.attributes() {
+        let attr = attr_result.map_err(|err| {
+            Error::invalid_data_with(
+                format!(
+                    "malformed attribute on <{}> while reading '{name}'",
+                    e.name().into_inner()
+                ),
+                err,
+            )
+        })?;
         if attr.key.as_ref() == name {
-            return attr
+            let val = attr
                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)
-                .ok() // ok-deliberate: malformed optional attr reads as absent, see above
-                .map(std::borrow::Cow::into_owned);
+                .map_err(|err| {
+                    Error::invalid_data_with(
+                        format!(
+                            "malformed '{name}' attribute on <{}>",
+                            e.name().into_inner()
+                        ),
+                        err,
+                    )
+                })?;
+            return Ok(Some(val.into_owned()));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Convert an OSC XML member type string to the crate's `MemberType`.
@@ -926,19 +947,17 @@ mod tests {
     }
 
     #[test]
-    fn absent_and_malformed_roles_both_default_to_empty() {
+    fn absent_role_is_none_and_malformed_role_is_refused() -> crate::Result<()> {
         let absent = quick_xml::events::BytesStart::new("member");
         let malformed = quick_xml::events::BytesStart::from_content("member role=broken", 6);
-        assert_eq!(
-            parse_str_attr_optional(&absent, "role").unwrap_or_default(),
-            ""
-        );
-        assert_eq!(
-            parse_str_attr_optional(&malformed, "role").unwrap_or_default(),
-            ""
-        );
-        assert_eq!(parse_str_attr(&malformed, "role").unwrap_or_default(), "");
+        assert_eq!(parse_str_attr_optional(&absent, "role")?, None);
+        let err = parse_str_attr_optional(&malformed, "role")
+            .err()
+            .ok_or_else(|| Error::internal("malformed role accepted"))?;
+        assert!(err.to_string().contains("member"), "{err}");
+        assert!(parse_str_attr(&malformed, "role").is_err());
         assert!(parse_member_type("unknown").is_err());
+        Ok(())
     }
 
     #[test]

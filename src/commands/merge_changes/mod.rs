@@ -444,9 +444,9 @@ impl<D: ChangeDest> OscSink for OwnedSink<D> {
 
     fn member(&mut self, e: &BytesStart<'_>) -> crate::Result<()> {
         let ref_id = parse_i64_attr(e, "ref")?;
-        // Deliberately normalize readable roles and replace malformed roles with
-        // empty text. Rejecting them would break the accepted OSC input contract.
-        let role = parse_str_attr_optional(e, "role").unwrap_or_default();
+        // An absent role is empty; a malformed one is refused (see
+        // `parse_str_attr_optional`).
+        let role = parse_str_attr_optional(e, "role")?.unwrap_or_default();
         let member_id = match parse_member_type(&parse_str_attr(e, "type")?)? {
             crate::MemberType::Node => MemberId::Node(ref_id),
             crate::MemberType::Way => MemberId::Way(ref_id),

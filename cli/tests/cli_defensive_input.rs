@@ -664,13 +664,48 @@ fn bad_user_and_role_string_indices_are_refused_on_reencode() {
         }
         let input = dir.path().join("bad-string.osm.pbf");
         write_bad_string_pbf(&input, bad, false);
+        // Re-encoding that keeps the user refuses it.
         let out = CliInvoker::new()
             .arg("cat")
             .arg(&input)
             .arg("-o")
             .arg(dir.path().join("cat.osm.pbf"))
-            .args(["--clean", "user"])
+            .args(["--clean", "uid"])
             .run();
-        assert_refused(&out, needle, "cat --clean user");
+        assert_refused(&out, needle, "cat --clean uid");
     }
+    // Roles have no --clean and stay refused under `--clean user`.
+    let input = dir.path().join("bad-string.osm.pbf");
+    write_bad_string_pbf(&input, BadString::Role, false);
+    let out = CliInvoker::new()
+        .arg("cat")
+        .arg(&input)
+        .arg("-o")
+        .arg(dir.path().join("cat.osm.pbf"))
+        .args(["--clean", "user"])
+        .run();
+    assert_refused(&out, role_needle, "cat --clean user, bad role");
+}
+
+/// `cat --clean user` drops the user, so it never resolves it: a file with an
+/// out-of-range user string index is rescued by it.
+#[test]
+fn cat_clean_user_rescues_a_bad_user_string_index() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("bad-user.osm.pbf");
+    write_bad_string_pbf(&input, BadString::User, false);
+    let output = dir.path().join("rescued.osm.pbf");
+    let out = CliInvoker::new()
+        .arg("cat")
+        .arg(&input)
+        .arg("-o")
+        .arg(&output)
+        .args(["--clean", "user"])
+        .run();
+    assert!(
+        out.status.success(),
+        "cat --clean user must rescue a bad user index; stderr:\n{}",
+        out.stderr_str()
+    );
+    assert!(output.exists());
 }

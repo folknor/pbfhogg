@@ -4,6 +4,12 @@
 
 ### Breaking
 
+- **A malformed attribute in OSC XML is refused, not dropped.** A relation
+  member `role` that is not well-formed (for example an unquoted value) used
+  to read as absent, so `merge-changes` and `tags-filter --input-kind osc`
+  wrote an empty role. Any malformed attribute now fails the run with an error
+  naming the element, as the PBF re-encoding paths and osmium (expat rejects
+  malformed XML) do. An absent `role` is still an empty role.
 - **`PbfWriter::into_inner` returns a `Result`.** On a pipelined writer,
   whose output file lives on the writer thread, it used to panic; it now
   returns an invalid-argument error, as the writer's other methods do.
@@ -1209,6 +1215,11 @@
 
 ### Fixed
 
+- **`cat --clean user` rescues a file with a bad user string index.** The
+  flag drops the user, so it no longer resolves it: a file whose user string
+  index is past its block's string table can be repaired with it. Every other
+  re-encoding command and flag keeps refusing such an index, and member roles
+  (which have no `--clean`) stay refused everywhere.
 - **A blob header whose indexdata, tagdata or waymembers field has the wrong
   wire type is read, not refused.** Such a field is skipped as an unknown
   field on every read path, as protobuf specifies and osmium does; a skipped
@@ -1596,8 +1607,7 @@
   `add-locations-to-ways`. They now fail with an error naming the element
   and the index (`node 1: user name string index 9`,
   `relation 1 member 0: role string index 9`), as the OSC writers already
-  did; `cat --clean user` refuses too, since the input is corrupt whichever
-  fields are kept. Tag string indices are unchanged (see CORRECTNESS.md).
+  did; `cat --clean user` is the one exception (see below). Tag string indices are unchanged (see CORRECTNESS.md).
   Library: `Info::user` and `DenseNodeInfo::user` report a negative index as
   `ErrorKind::WireFormat` instead of `StringtableIndexOutOfBounds` for index 0.
 

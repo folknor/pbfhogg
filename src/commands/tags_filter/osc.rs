@@ -280,9 +280,9 @@ impl OscSink for FilterSink<'_> {
 
     fn member(&mut self, e: &BytesStart<'_>) -> Result<()> {
         let id = parse_i64_attr(e, "ref")?;
-        // Deliberately normalize readable roles and replace malformed roles with
-        // empty text. Rejecting them would break the accepted OSC input contract.
-        let role = parse_str_attr_optional(e, "role").unwrap_or_default();
+        // An absent role is empty; a malformed one is refused (see
+        // `parse_str_attr_optional`).
+        let role = parse_str_attr_optional(e, "role")?.unwrap_or_default();
         // The shared `parse_member_type` refuses anything that is not
         // node/way/relation, so there is no `MemberId::Unknown` arm to
         // write here any more. This parser used to construct one - and

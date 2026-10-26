@@ -341,8 +341,29 @@ fn map_sentinel(value: i64) -> i64 {
 /// element and the index, not an empty user. Only the metadata this returns
 /// is resolved - a versionless `Info` is dropped whole, so its user is never
 /// looked up - and the refusal stands even where the caller later clears the
-/// user (`cat --clean user`), since the input is corrupt either way.
+/// user, except for `cat --clean user`, which uses
+/// [`element_metadata_dropping_user`] and never resolves it.
 pub(crate) fn element_metadata<'a>(
+    kind: crate::ElementKind,
+    id: i64,
+    info: &crate::Info<'a>,
+) -> Result<Option<Metadata<'a>>> {
+    element_metadata_impl::<true>(kind, id, info)
+}
+
+/// [`element_metadata`] for `cat --clean user` alone: the user is not resolved
+/// (it comes back empty), so a bad user string index does not fail the run.
+/// See [`dense_node_metadata_dropping_user`] for why this exists.
+pub(crate) fn element_metadata_dropping_user<'a>(
+    kind: crate::ElementKind,
+    id: i64,
+    info: &crate::Info<'a>,
+) -> Result<Option<Metadata<'a>>> {
+    element_metadata_impl::<false>(kind, id, info)
+}
+
+#[inline]
+fn element_metadata_impl<'a, const RESOLVE_USER: bool>(
     kind: crate::ElementKind,
     id: i64,
     info: &crate::Info<'a>,
@@ -351,6 +372,7 @@ pub(crate) fn element_metadata<'a>(
         return Ok(None);
     };
     let user = match info.user() {
+        _ if !RESOLVE_USER => "",
         None => "",
         Some(user) => user.map_err(|e| bad_user(e, kind, id, info.raw_user_sid()))?,
     };
@@ -374,17 +396,42 @@ pub(crate) fn element_metadata<'a>(
 pub(crate) fn dense_node_metadata<'a>(
     dn: &'a crate::DenseNode<'a>,
 ) -> Result<Option<Metadata<'a>>> {
+    dense_node_metadata_impl::<true>(dn)
+}
+
+/// [`dense_node_metadata`] for `cat --clean user` alone: the user is not
+/// resolved (it comes back empty).
+///
+/// `cat` is the recovery command, and `--clean user` drops the user, so the
+/// user string index of an element it is about to discard is never looked up:
+/// a file whose user index is out of range can be rescued with it. Every other
+/// re-encoding command and flag keeps the refusal, because it writes or acts
+/// on the user. Roles have no `--clean` and stay refused.
+pub(crate) fn dense_node_metadata_dropping_user<'a>(
+    dn: &'a crate::DenseNode<'a>,
+) -> Result<Option<Metadata<'a>>> {
+    dense_node_metadata_impl::<false>(dn)
+}
+
+#[inline]
+fn dense_node_metadata_impl<'a, const RESOLVE_USER: bool>(
+    dn: &'a crate::DenseNode<'a>,
+) -> Result<Option<Metadata<'a>>> {
     let Some(info) = dn.info().filter(|info| info.version() != -1) else {
         return Ok(None);
     };
-    let user = info.user().map_err(|e| {
-        bad_user(
-            e,
-            crate::ElementKind::Node,
-            dn.id(),
-            Some(info.raw_user_sid()),
-        )
-    })?;
+    let user = if RESOLVE_USER {
+        info.user().map_err(|e| {
+            bad_user(
+                e,
+                crate::ElementKind::Node,
+                dn.id(),
+                Some(info.raw_user_sid()),
+            )
+        })?
+    } else {
+        ""
+    };
     Ok(Some(Metadata {
         version: info.version(),
         timestamp: info.milli_timestamp() / 1000,

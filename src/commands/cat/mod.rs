@@ -787,7 +787,7 @@ fn process_block(
         match &element {
             Element::DenseNode(dn) if filter_node => {
                 ensure_node_capacity_local(bb, output)?;
-                let meta = clean_metadata(dense_node_metadata(dn)?, clean);
+                let meta = clean_metadata(dense_meta(dn, clean)?, clean);
                 bb.add_node(
                     dn.id(),
                     dn.decimicro_lat(),
@@ -800,7 +800,7 @@ fn process_block(
             Element::Node(n) if filter_node => {
                 ensure_node_capacity_local(bb, output)?;
                 let meta = clean_metadata(
-                    element_metadata(ElementKind::Node, n.id(), &n.info())?,
+                    element_meta(clean, ElementKind::Node, n.id(), &n.info())?,
                     clean,
                 );
                 bb.add_node(
@@ -817,7 +817,7 @@ fn process_block(
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
                 let meta = clean_metadata(
-                    element_metadata(ElementKind::Way, w.id(), &w.info())?,
+                    element_meta(clean, ElementKind::Way, w.id(), &w.info())?,
                     clean,
                 );
                 bb.add_way(w.id(), w.tags(), refs_buf, meta.as_ref());
@@ -827,7 +827,7 @@ fn process_block(
                 ensure_relation_capacity_local(bb, output)?;
                 relation_members_into(r, &mut members_buf)?;
                 let meta = clean_metadata(
-                    element_metadata(ElementKind::Relation, r.id(), &r.info())?,
+                    element_meta(clean, ElementKind::Relation, r.id(), &r.info())?,
                     clean,
                 );
                 bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
@@ -841,6 +841,36 @@ fn process_block(
 }
 
 use super::clean_metadata;
+
+/// Resolve metadata for re-encoding. Under `--clean user` the user is dropped
+/// afterwards, so it is not resolved at all: `cat` is the recovery command and
+/// a file with an out-of-range user string index must be rescuable with it.
+/// Every other re-encoding path refuses such an index; roles have no
+/// `--clean` and stay refused.
+fn element_meta<'a>(
+    clean: &CleanAttrs,
+    kind: ElementKind,
+    id: i64,
+    info: &crate::Info<'a>,
+) -> crate::Result<Option<crate::block_builder::Metadata<'a>>> {
+    if clean.user {
+        crate::owned::element_metadata_dropping_user(kind, id, info)
+    } else {
+        element_metadata(kind, id, info)
+    }
+}
+
+/// Dense-node counterpart of [`element_meta`].
+fn dense_meta<'a>(
+    dn: &'a crate::DenseNode<'a>,
+    clean: &CleanAttrs,
+) -> crate::Result<Option<crate::block_builder::Metadata<'a>>> {
+    if clean.user {
+        crate::owned::dense_node_metadata_dropping_user(dn)
+    } else {
+        dense_node_metadata(dn)
+    }
+}
 
 /// Cat with full decode + re-encode, the `--clean` path (with or without a
 /// type filter).

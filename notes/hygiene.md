@@ -70,7 +70,6 @@ goes on "Review once drained" as a bisect candidate, named by commit.
 
 Launch order, one agent per line, run serially:
 
-40. HYG-195
 41. HYG-196
 42. HYG-077 (last: it annotates files across the crate)
 
@@ -1088,6 +1087,21 @@ The judgement calls already known, to be checked first:
   data flow, channel and buffer shapes are unchanged. The io_uring sink
   could not run on the bench host (`RLIMIT_MEMLOCK` 8 MB hard) and is
   compile-checked only.
+- The OSC gzip writer (`write/parallel_gzip.rs`, planet `diff --format osc`
+  assembly) swapped its `BTreeMap` reorder map for
+  `ReorderBuffer::with_max_window(permit window, permit window)` and
+  inserts with the new fallible `try_push`; it was deliberately NOT fitted
+  to `deliver_in_order` (barriers, keep-draining after failure, own
+  counters). Sparred, not measured. Same threads, queues, chunk size and
+  credit window; the map's per-insert tree nodes became one up-front
+  window-sized slot array (tens of small slots). Behaviour changes: a seq
+  breaching the window is now a recorded failure in release builds (was a
+  debug assert); `finish` refuses a delivered-count mismatch against the
+  producer's sent count (argued unreachable today); failure-path permit
+  returns are `try_send`; `parallel_gzip_reorder_high_water` counts filled
+  slots, as the map's length did. `ReorderBuffer::push` is now a panicking
+  wrapper over `try_push` on every read and write pipeline's per-blob path:
+  no allocation on success, machine code not compared.
 
 ---
 
@@ -1221,24 +1235,6 @@ rather than hard-coding today's values.
 
 Reported by: the HYG-010 resolution.
 
-## HYG-195 - `parallel_gzip` has its own reorder map
-
-Anger: 8 - the gzip output writer's memory behaviour.
-
-Split out of the PBF writer-loop unification (resolved). `parallel_gzip::writer_loop` has its own
-completeness check with a `BTreeMap` reorder buffer instead of
-`ReorderBuffer`, and no announced total. It is a separate writer (OSC gzip
-output) with its own loop and memory shape. HYG-053 (skipped) holds the
-bounding question for reorder buffers; read it before changing this one.
-The PBF backends now share `pipeline::deliver_in_order`, and the brokkr.toml
-textlint `writer-loop-primitives-only-in-the-shared-loop` bans `pop_ready`
-and the loop's records anywhere else under `src/write/`: adopting
-`ReorderBuffer` here needs an exclude there with the reason beside it (the
-gzip writer carries its own item type), or a reason to fit this writer to
-the shared loop instead.
-
-Reported by: write path.
-
 ## HYG-036 - `too_many_arguments` is denied and then allowed locally all over
 
 Anger: 9 - validate flags earlier, refuse no-op flags.
@@ -1345,8 +1341,9 @@ This holds for the three renumber loops,
 repack/degrade, and the read pipeline's decode window, which uses
 `decode_ahead` for both admission and the decoded channel depth (one number for
 two meanings). `ReorderBuffer::with_capacity(capacity)` sets
-`max_window = DEFAULT_MAX_WINDOW.max(capacity)`; `with_max_window` has no
-production caller, so every buffer runs at 65 536 slots, and
+`max_window = DEFAULT_MAX_WINDOW.max(capacity)`; the only production caller
+of `with_max_window` is the OSC gzip writer, whose permits make its window a
+real bound, so every other buffer runs at 65 536 slots, and
 `altw/passthrough.rs` passes `passthrough_items.len() + decode_threads`, so its
 window is as large as the input. Stage 4 and `pread_execute` pre-insert every
 passthrough item before any worker result arrives, so ordering correctness
@@ -1366,7 +1363,10 @@ documented as programming errors because seqs come from `enumerate()`; that
 holds for the read pipeline, not structurally, since about fifteen callers
 feed it, some from worker-computed seqs, and a panicking consumer inside
 `thread::scope` re-raises at join. The 2026-10-25 triage left this here: with a
-credit scheme in one engine, `push` can return `Err` instead.
+credit scheme in one engine, `push` can return `Err` instead. That
+fallible form now exists as `ReorderBuffer::try_push` (the item comes back
+with the reason), used by the OSC gzip writer, whose permit-bounded window
+and record-then-discard handling are a second precedent.
 
 Reported by: re-encoding, read path, filtering and spatial, altw and scanning.
 

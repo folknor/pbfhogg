@@ -18,7 +18,8 @@ crate::counters::counter_set! {
         pub parallel_gzip_reorder_wait_ns => "writer_parallel_gzip_reorder_wait_ns",
         /// Number of `ParallelGzipWriter` dispatches that waited for a sequence permit.
         pub parallel_gzip_reorder_blocked => "writer_parallel_gzip_reorder_blocked",
-        /// Peak `ParallelGzipWriter` reorder-map length, in gzip chunks. Kept
+        /// Peak filled slots in `ParallelGzipWriter`'s reorder buffer, in
+        /// gzip chunks and flush barriers. Kept
         /// apart from `reorder_high_water`, which counts PBF blobs in the
         /// writer backends' reorder buffers.
         pub parallel_gzip_reorder_high_water => "writer_parallel_gzip_reorder_high_water",

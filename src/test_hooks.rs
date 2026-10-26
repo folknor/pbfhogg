@@ -468,7 +468,7 @@ impl FaultPlan {
 
     /// Called by a gzip worker after it dequeues chunk `seq`, before it
     /// compresses it.
-    pub(crate) fn on_gzip_compress(&self, seq: u64) {
+    pub(crate) fn on_gzip_compress(&self, seq: usize) {
         let n = self.gzip_op_count.fetch_add(1, Ordering::SeqCst) + 1;
         if n == self.gzip_panic_at_op.load(Ordering::SeqCst) {
             if self.gzip_panic_waits_for_barrier.load(Ordering::SeqCst) {

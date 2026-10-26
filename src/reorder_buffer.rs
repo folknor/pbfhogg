@@ -13,6 +13,12 @@ pub(crate) struct ReorderBuffer<T> {
     pending: VecDeque<Option<T>>,
 }
 
+/// An item [`ReorderBuffer::try_push`] refused, handed back with the reason.
+pub(crate) struct Rejected<T> {
+    pub(crate) item: T,
+    pub(crate) reason: String,
+}
+
 impl<T> ReorderBuffer<T> {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self::with_max_window(capacity, DEFAULT_MAX_WINDOW.max(capacity))
@@ -36,36 +42,66 @@ impl<T> ReorderBuffer<T> {
 
     /// Insert an item at sequence number `seq`.
     ///
-    /// The stale-seq and duplicate-seq asserts panic deliberately:
-    /// seqs originate from `enumerate()` in the producer, so hitting
-    /// either condition is an upstream programming error (retry loop
-    /// re-sending a seq, wrong seq source, etc.), not a recoverable
-    /// runtime condition. A panic kills the writer thread and surfaces
-    /// via `join().map_err(...)?` so the caller sees a hard failure
-    /// rather than silent drift.
+    /// A stale, out-of-window or duplicate seq panics deliberately: each
+    /// is an upstream programming error (a retry re-sending a seq, a wrong
+    /// seq source), not a recoverable runtime condition, and a hard failure
+    /// beats silent drift. A caller whose held items must be discharged even
+    /// then uses [`try_push`](Self::try_push).
     pub(crate) fn push(&mut self, seq: usize, item: T) {
-        assert!(
-            seq >= self.next_seq,
-            "reorder buffer received stale sequence number: {seq} < {}",
-            self.next_seq
-        );
+        if let Err(rejected) = self.try_push(seq, item) {
+            panic!("{}", rejected.reason);
+        }
+    }
+
+    /// As [`push`](Self::push), but a stale, out-of-window or duplicate seq
+    /// is returned to the caller together with the item instead of
+    /// panicking. For a consumer whose items carry obligations that must be
+    /// discharged even on a programming error - the gzip writer's flush
+    /// barriers each hold an ack a blocked producer is waiting on, and a
+    /// panic would drop it during the unwind, before the failure is on
+    /// record.
+    pub(crate) fn try_push(&mut self, seq: usize, item: T) -> Result<(), Rejected<T>> {
+        if seq < self.next_seq {
+            return Err(Rejected {
+                item,
+                reason: format!(
+                    "reorder buffer received stale sequence number: {seq} < {}",
+                    self.next_seq
+                ),
+            });
+        }
         let slot_idx = seq - self.next_seq;
-        assert!(
-            slot_idx < self.max_window,
-            "reorder buffer window exceeded: seq {seq} is {slot_idx} ahead of \
-             {} (max {})",
-            self.next_seq,
-            self.max_window
-        );
+        if slot_idx >= self.max_window {
+            return Err(Rejected {
+                item,
+                reason: format!(
+                    "reorder buffer window exceeded: seq {seq} is {slot_idx} ahead of \
+                     {} (max {})",
+                    self.next_seq, self.max_window
+                ),
+            });
+        }
         if slot_idx >= self.pending.len() {
             self.pending.resize_with(slot_idx + 1, || None);
         }
-        assert!(
-            self.pending[slot_idx].is_none(),
-            "duplicate sequence number: {seq}"
-        );
+        if self.pending[slot_idx].is_some() {
+            return Err(Rejected {
+                item,
+                reason: format!("duplicate sequence number: {seq}"),
+            });
+        }
         self.pending[slot_idx] = Some(item);
         self.filled += 1;
+        Ok(())
+    }
+
+    /// Remove and return every filled slot, front to back, leaving the
+    /// buffer empty. Nothing drained counts as delivered: `next_seq` does
+    /// not move. For a consumer abandoning ordered delivery after a
+    /// failure, which still owes each held item some cleanup.
+    pub(crate) fn drain_filled(&mut self) -> impl Iterator<Item = T> + '_ {
+        self.filled = 0;
+        self.pending.drain(..).flatten()
     }
 
     /// Pop the next contiguous ready item, if available.
@@ -190,6 +226,50 @@ mod tests {
         assert_eq!(rb.pop_ready(), Some("a"));
         rb.push(4, "e");
         assert_eq!(rb.filled_len(), 2);
+    }
+
+    /// Every refusal hands the item back, so a caller can discharge whatever
+    /// the item owes, and leaves the buffer as it was.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn try_push_returns_the_item_on_every_refusal() {
+        let mut rb = ReorderBuffer::with_max_window(2, 2);
+        rb.try_push(0, "a").ok().unwrap();
+        assert_eq!(rb.pop_ready(), Some("a"));
+
+        let stale = rb.try_push(0, "stale").err().unwrap();
+        assert_eq!(stale.item, "stale");
+        assert!(stale.reason.contains("stale sequence number"));
+
+        let ahead = rb.try_push(3, "ahead").err().unwrap();
+        assert_eq!(ahead.item, "ahead");
+        assert!(ahead.reason.contains("window exceeded"));
+
+        rb.try_push(2, "c").ok().unwrap();
+        let dup = rb.try_push(2, "dup").err().unwrap();
+        assert_eq!(dup.item, "dup");
+        assert!(dup.reason.contains("duplicate sequence number"));
+
+        assert_eq!(rb.filled_len(), 1);
+        rb.try_push(1, "b").ok().unwrap();
+        assert_eq!(rb.pop_ready(), Some("b"));
+        assert_eq!(rb.pop_ready(), Some("c"));
+    }
+
+    /// Draining yields every held item in seq order, skips the gaps, and
+    /// does not count anything as delivered.
+    #[test]
+    fn drain_filled_empties_without_advancing() {
+        let mut rb = ReorderBuffer::with_capacity(4);
+        rb.push(0, "a");
+        assert_eq!(rb.pop_ready(), Some("a"));
+        rb.push(2, "c");
+        rb.push(4, "e");
+        let drained: Vec<_> = rb.drain_filled().collect();
+        assert_eq!(drained, vec!["c", "e"]);
+        assert_eq!(rb.filled_len(), 0);
+        assert_eq!(rb.pending_len(), 0);
+        assert_eq!(rb.next_seq(), 1);
     }
 
     #[test]

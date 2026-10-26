@@ -53,7 +53,13 @@ their own guards. Sharing the loop by code rather than by convention is
 what keeps each writer counter meaning one thing on every backend: a
 fourth copy of the loop could drift where a shared function cannot. A
 `brokkr.toml` textlint keeps the loop's primitives out of every other
-file under `src/write/`.
+file under `src/write/` except `parallel_gzip.rs`. The OSC gzip writer is
+not a PBF backend: it reorders with the same `ReorderBuffer`, but carries
+flush barriers and failed-chunk placeholders rather than `OutputChunk`s,
+keeps draining after a failure so every barrier is answered, keeps its own
+`parallel_gzip_*` counters, and proves completeness against the count its
+own producer sent. A second textlint keeps the PBF loop's records and
+completeness check out of it.
 
 ## Alternatives considered
 

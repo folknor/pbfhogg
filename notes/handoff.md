@@ -44,10 +44,10 @@ learned that neither drain file states. Delete it when the drain is done.
   unordered trio, geocode pass1_5, and altw external stages 2 and 3 if
   bucket dispatch fits a task index. The diff and derive shard runs sit
   outside it. A design to spar, not a given.
-- **HYG-182 carries a conflicting instruction.** Its Maintainer paragraph
-  says dedupe's indexing "is not to be touched in this drain", which
-  contradicts "every entry is owed a resolution now". Ask the maintainer
-  before taking it rather than guess which wins.
+- **HYG-182 is open like every other entry.** Its Maintainer paragraph once
+  read as "dedupe's indexing is not to be touched in this drain"; the
+  maintainer clarified (2026-10-26) that this only meant the 2026-10-25
+  session would not take it. Changing dedupe's indexing is in scope.
 - **The protohoggr encoder fix changes pbfhogg's output bytes** (filed as
   bz `protohoggr#1`). Once
   `zigzag_encode_32` writes canonical five-byte varints and pbfhogg bumps

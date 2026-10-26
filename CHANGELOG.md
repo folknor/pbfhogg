@@ -1189,6 +1189,13 @@
 
 ### Fixed
 
+- **`add-locations-to-ways --index-type external` replaces unpacked
+  existing way locations.** A way whose input already carried lat / lon
+  (or the injected field 20) written in protobuf's unpacked form kept those
+  stale values beside the fresh ones, so readers saw extra coordinates. Only
+  the packed form was recognised. The external index now strips both forms,
+  as the sparse index already did.
+
 - **`add-locations-to-ways --index-type external` reports a scratch-file
   creation failure instead of panicking.** When a stage-1 worker failed to
   create one of its id-shard scratch files partway through (out of

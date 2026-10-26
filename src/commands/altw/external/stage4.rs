@@ -1036,7 +1036,11 @@ fn reframe_way_blob_with_locations(
                                 .read_varint_i64()
                                 .map_err(|e| Error::from(e).context("reframe id"))?;
                         }
-                        (9 | 10 | 20, WIRE_LEN) => {
+                        // Both wire forms, as the sparse splice strips them:
+                        // matching only the packed form let an unpacked stale
+                        // lat / lon through the whole-way copy below, beside
+                        // the fresh packed fields this reframe appends.
+                        (9 | 10 | 20, WIRE_LEN | WIRE_VARINT) => {
                             has_existing_way_locations = true;
                             way_cursor
                                 .skip_field(wt)
@@ -1129,7 +1133,7 @@ fn reframe_way_blob_with_locations(
                         let raw = copy_cursor
                             .read_raw_field(wt)
                             .map_err(|e| Error::from(e).context("reframe copy field"))?;
-                        if !matches!((wf, wt), (9 | 10 | 20, WIRE_LEN)) {
+                        if !matches!((wf, wt), (9 | 10 | 20, WIRE_LEN | WIRE_VARINT)) {
                             protohoggr::encode_tag(&mut scratch.reframed_way, wf, wt);
                             scratch.reframed_way.extend_from_slice(raw);
                         }
@@ -1212,6 +1216,96 @@ fn reframe_way_blob_with_locations(
     }
 
     Ok((total_ways, min_way_id, max_way_id))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod reframe_tests {
+    use super::{WayReframeCounters, WayReframeScratch, reframe_way_blob_with_locations};
+
+    fn varint(mut v: u64, out: &mut Vec<u8>) {
+        loop {
+            #[allow(clippy::cast_possible_truncation)]
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if v == 0 {
+                break;
+            }
+        }
+    }
+
+    fn len_delimited(field: u32, payload: &[u8], out: &mut Vec<u8>) {
+        varint(u64::from((field << 3) | 2), out);
+        varint(payload.len() as u64, out);
+        out.extend_from_slice(payload);
+    }
+
+    /// A block holding one way (id 42, one ref to node 9) followed by
+    /// `stale`, raw way-field bytes the reframe must strip.
+    fn way_block(stale: &[u8]) -> Vec<u8> {
+        let mut way = vec![0x08, 42]; // field 1 (id) = 42
+        len_delimited(8, &[18], &mut way); // refs: zigzag(9)
+        way.extend_from_slice(stale);
+        let mut group = Vec::new();
+        len_delimited(3, &way, &mut group);
+        let mut block = Vec::new();
+        len_delimited(1, &[], &mut block);
+        len_delimited(2, &group, &mut block);
+        block
+    }
+
+    fn reframe(block: &[u8]) -> Vec<u8> {
+        // One way with one ref; its coordinate pair as stage 3 encodes it.
+        let refcounts = [1_u8, 1];
+        let payload = [0x02_u8, 0x04]; // zigzag(1), zigzag(2)
+        let mut out = Vec::new();
+        let mut scratch = WayReframeScratch::new();
+        let counters = WayReframeCounters::new();
+        reframe_way_blob_with_locations(
+            block,
+            &payload,
+            &refcounts,
+            0,
+            &mut out,
+            &mut scratch,
+            &counters,
+            None,
+            false,
+        )
+        .unwrap();
+        out
+    }
+
+    /// Existing location fields are the reframe's to replace, in either wire
+    /// form. Only the packed form used to be recognised, so a way carrying an
+    /// unpacked stale lat or lon was copied whole and came out with the stale
+    /// value beside the fresh packed one: two field-9 occurrences, which a
+    /// reader concatenates into one coordinate too many.
+    #[test]
+    fn stale_locations_are_stripped_in_both_wire_forms() {
+        let clean = reframe(&way_block(&[]));
+        let mut unpacked = Vec::new();
+        unpacked.extend_from_slice(&[0x48, 0x7E]); // field 9, varint
+        unpacked.extend_from_slice(&[0x50, 0x7C]); // field 10, varint
+        assert_eq!(
+            reframe(&way_block(&unpacked)),
+            clean,
+            "unpacked stale fields"
+        );
+        let mut mixed = Vec::new();
+        len_delimited(9, &[0x7E], &mut mixed);
+        mixed.extend_from_slice(&[0x50, 0x7C]); // field 10, varint
+        mixed.extend_from_slice(&[0xA0, 0x01, 0x01]); // field 20, varint
+        assert_eq!(reframe(&way_block(&mixed)), clean, "mixed stale fields");
+        let mut packed = Vec::new();
+        len_delimited(9, &[0x7E], &mut packed);
+        len_delimited(10, &[0x7C], &mut packed);
+        assert_eq!(reframe(&way_block(&packed)), clean, "packed stale fields");
+    }
 }
 
 #[cfg(test)]

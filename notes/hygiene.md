@@ -1357,8 +1357,10 @@ for both, or at least the scan with tags and a refusal that says what the
 block is, would fit. Not a partial-index matter: a wholly unindexed input
 under `--force` meets the same.
 
-Maintainer (2026-10-25): skipped for now; dedupe's indexing is not to be
-touched in this drain.
+Maintainer (2026-10-25): skipped for now. Clarified 2026-10-26: "not to be
+touched" meant only that the 2026-10-25 session would not take it. Like
+every entry, it is owed a resolution in this drain, and that may include
+changing dedupe's indexing.
 
 Reported by: the HYG-155 resolution (sparred with codex).
 

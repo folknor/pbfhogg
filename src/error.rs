@@ -977,7 +977,7 @@ impl From<io::Error> for Error {
 
 impl From<protohoggr::WireError> for Error {
     fn from(err: protohoggr::WireError) -> Error {
-        new_error(ErrorKind::WireFormat { msg: err.msg })
+        new_error(ErrorKind::WireFormat { msg: err.as_str() })
     }
 }
 

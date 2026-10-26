@@ -3108,6 +3108,11 @@
   `default-features = false`.
 - `zstd` 0.13 → 0.14.
 - New: `xxhash-rust` 0.8 (pure Rust, `xxh3` only), for `digest`.
+- **`protohoggr` 0.4.0 → 0.5.0.** Its `sint32` encoder now writes a value
+  whose zigzag form has bit 31 set as a canonical five-byte varint instead
+  of a sign-extended ten-byte one, so dense-node `uid` and `user_sid`
+  deltas of magnitude `2^30` or more are written five bytes shorter. Files
+  written earlier keep the ten-byte form, which every reader still accepts.
 
 ## 0.5.0 - 2026-07-16
 

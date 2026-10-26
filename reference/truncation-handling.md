@@ -309,12 +309,13 @@ relation rewriter dispatches on the same truncated member type, so
 the two paths agree.
 
 The non-canonical form real files do carry is one this rule reads
-correctly: `protohoggr::zigzag_encode_32` (0.4.0) converts the
-zigzagged `i32` with `as u64`, which sign-extends a zigzag value
-with bit 31 set (a delta `v >= 2^30` or `v < -2^30`) to ten bytes,
-and `BlockBuilder` writes the dense `uid` and `user_sid` deltas
-through it. Truncation reads those back exactly. The fix for the
-encoder belongs in protohoggr.
+correctly: protohoggr before 0.5.0 converted the zigzagged `i32`
+with `as u64`, which sign-extends a zigzag value with bit 31 set (a
+delta `v >= 2^30` or `v < -2^30`) to ten bytes, and `BlockBuilder`
+writes the dense `uid` and `user_sid` deltas through it. Since
+protohoggr 0.5.0 those deltas are written as canonical five-byte
+varints, but files written earlier keep the ten-byte form, and
+truncation reads both back exactly.
 
 Two string-index bounds are the exception and stay: `keys` / `vals`
 must fit `u32`, and dense `keys_vals` entries must fit a

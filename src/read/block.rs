@@ -1042,8 +1042,9 @@ fn validate_dense_keys_vals(keys_vals_data: &[u8], node_count: usize) -> Result<
 /// was tried and rejected, since it adds per-byte work to every well-formed
 /// dense block to refuse only malformed input.
 /// Truncation is also what
-/// reads back the ten-byte sign-extended sint32 deltas `BlockBuilder` writes
-/// through `protohoggr::zigzag_encode_32`. See
+/// reads back the ten-byte sign-extended sint32 deltas that `BlockBuilder`
+/// wrote through protohoggr before 0.5.0, which files already on disk still
+/// carry. See
 /// `reference/truncation-handling.md`, "Which varints count as complete".
 fn validate_dense_info_arrays(info_data: &[u8], node_count: usize) -> Result<()> {
     let info = WireDenseInfo::parse(info_data)?;

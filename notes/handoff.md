@@ -19,10 +19,9 @@ learned that neither drain file states. Delete it when the drain is done.
   ground: the narrowing it guarded against is protobuf's own specified
   decoding. Prefer ending such entries as comments plus a reference-doc
   correction (rule 3), especially high-anger ones.
-- **protohoggr is the maintainer's own crate** (`~/Programs/protohoggr`,
-  published as 0.4.0). Read-side narrowing there follows protobuf and is
-  correct. The encoder bug found here (`zigzag_encode_32` sign-extends to ten
-  bytes) is being fixed there by the maintainer. A defect in protohoggr is
+- **protohoggr is the maintainer's own crate** (`~/Programs/protohoggr`). Read-side narrowing there follows protobuf and is
+  correct. The encoder bug found here (`zigzag_encode_32` sign-extended to
+  ten bytes) was fixed there in 0.5.0. A defect in protohoggr is
   fixed in protohoggr, not worked around in pbfhogg; pbfhogg's reader must
   still accept forms that old files carry.
 - **The CLI surface redesign is deferred past 0.6.0.** HYG-037 (`--direct-io`
@@ -37,13 +36,11 @@ learned that neither drain file states. Delete it when the drain is done.
   read as "dedupe's indexing is not to be touched in this drain"; the
   maintainer clarified (2026-10-26) that this only meant the 2026-10-25
   session would not take it. Changing dedupe's indexing is in scope.
-- **The protohoggr encoder fix changes pbfhogg's output bytes** (filed as
-  bz `protohoggr#1`). Once
-  `zigzag_encode_32` writes canonical five-byte varints and pbfhogg bumps
-  the dependency, `BlockBuilder` output shrinks for dense uid / user_sid
-  deltas of magnitude `2^30` or more. Check any test or verify that pins
-  output bytes when bumping; `dense_node_deltas_decode_at_signed_boundaries`
-  (`src/read/dense.rs`) exercises exactly that case. The reader keeps
+- **pbfhogg is on protohoggr 0.5.0** (2026-10-26, bz `pbfhogg#15`). Its
+  encoder fix changed pbfhogg's output bytes: `BlockBuilder` output shrinks
+  for dense uid / user_sid deltas of magnitude `2^30` or more. The tests
+  (`dense_node_deltas_decode_at_signed_boundaries` among them) and
+  `brokkr verify all --dataset denmark` passed on the bump. The reader keeps
   accepting the old ten-byte form (`reference/truncation-handling.md`).
 - The maintainer asked for commits once a slice is verified ("commit when
   satisfied"); each resolved entry got its own commit, with the drain notes

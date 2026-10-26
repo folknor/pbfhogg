@@ -4,6 +4,25 @@
 
 Picked 2026-07-30, right after the 0.5.0 release.
 
+- [ ] **Release gate: instrumentation is per invocation, not per process**
+  (raised 2026-10-26). The release is gated on verifying pbfhogg used as a
+  library, which brokkr has never done: everything measured so far went
+  through the CLI, one command per process. That is what the `Host`
+  work of the last weeks serves. The stall counter sets
+  (`PIPELINE_METRICS`, `UNORDERED_POOL_METRICS`, and any later one) are
+  process-global statics that are never reset, so two library calls in
+  one process, concurrent or one after the other, mix their totals and
+  cannot be attributed to a call; that contradicts ADR-0016. The marker
+  FIFO is caller-armed and process-wide by design
+  (`debug::initialize_marker_fifo`), so the accumulators are the part to
+  fix. `8384fa29` rejected per-run instances because brokkr's `--stalls`
+  takes the maximum per counter name and assumes totals only grow, so
+  per-pass sets would report only the largest pass. The fix that keeps
+  those semantics: one metric set per invocation, carried on the `Host`,
+  accumulating across every pass of that invocation and emitted as
+  before, so a CLI run reports the same totals. Cost is threading the
+  set through every pool; nothing on normal input.
+
 - [ ] **GeoParquet export**
   ([notes/geoparquet-export.md](geoparquet-export.md)).
   `pbfhogg export --format geoparquet`: stream tagged nodes and
@@ -1368,6 +1387,24 @@ deferred ledger live in
 
 ### Command surface
 
+- [ ] **`cat` as the universal cleaner** (raised 2026-10-26). Every other
+  command refuses malformed or incomplete input loudly and points at `cat`;
+  `cat` is the one command that turns such a file into a valid one, outside
+  its hot standard paths (plain passthrough and indexdata generation stay as
+  they are). It already plays that role for missing and partial indexdata,
+  and `cat --clean user` is ruled to skip resolving a user index it drops
+  (`notes/review-audit.md`, Slice C item 14). The project: decide which
+  refusals `cat` should recover from instead, under which flags, and how
+  each recovery is reported. First candidate: a repeated `Info` or
+  `DenseInfo` message, refused while the block is parsed, before any
+  `--clean` applies, so `cat --clean` cannot rescue that file today.
+- [ ] **Indexdata refusals name both remedies** (raised 2026-10-26). A
+  command that fails loudly over missing, partial or contradicted
+  indexdata should name `check --index` (to find out what is wrong) as
+  well as `pbfhogg cat` (to regenerate it). The CLI's `MissingIndexdata`
+  advice names `cat` only; the order and range refusals (`Unsorted`,
+  `IndexdataMismatch`) and diff's claimed-count trust are the other
+  sites to cover.
 - [ ] Resolve or document known semantic differences in verify output.
   Three commands have known diffs: extract (relation inclusion criteria),
   diff (14-element version comparison), check-refs (occurrences vs unique).

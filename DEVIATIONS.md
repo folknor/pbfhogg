@@ -344,16 +344,24 @@ any negative ID runs as one shard instead (`src/commands/diff/shard.rs`).
   Negatives in the target PBF are still absent from output because
   `IdSet::set` is a silent no-op on negatives (no positive request
   id can match a negative element id).
+- `add-locations-to-ways --index-type external` - **hard reject** of
+  any node blob whose indexdata range holds a negative ID, in its
+  metadata scan (`check_range` in
+  `src/commands/altw/external/blob_meta.rs`), before any join work.
+  Stage 2 partitions and walks node IDs as unsigned values, so a
+  mixed-sign range would silently turn present nodes, positive ones
+  included, into missing locations. The error names the sparse index,
+  which joins such input. Way and relation blobs may hold negative IDs.
 - `add-locations-to-ways` (both backends) - **silent**, by
-  inheritance from `IdSet`. Relation-member node IDs are collected
-  into an `IdSet` that decides which untagged nodes to keep; the
-  external backend's stage 4 also consults
-  `relation_member_node_ids.any_in_range(min_id, max_id)` to skip
-  node blobs that contain no relation-referenced nodes. The
-  `any_in_range` clamp covers the straddling-blob case as for
-  `getid` above; the per-id silent no-op on `IdSet::set` (and the
-  matching abs-fold absence on the pbfhogg side) is the residual
-  divergence below.
+  inheritance from `IdSet`, for negative relation-member refs.
+  Relation-member node IDs are collected into an `IdSet` that decides
+  which untagged nodes to keep; the external backend's stage 4 also
+  consults `relation_member_node_ids.any_in_range(min_id, max_id)` to
+  skip node blobs that contain no relation-referenced nodes (no node
+  blob reaching that check holds a negative ID, given the reject
+  above). The per-id silent no-op on `IdSet::set` (and the matching
+  abs-fold absence on the pbfhogg side) is the residual divergence
+  below.
 
 `inspect --show` accepts signed query IDs. It is a read-only lookup into the
 PBF payload, not an ID set passed through `IdSet`; the shared typed-ID parser
@@ -378,7 +386,7 @@ no-op on negative ids, where osmium's equivalent paths abs-fold via
 
 Both behaviors are silent; neither matches the project-wide reject
 stance, and neither matches osmium's abs-fold. Promoting either to
-a fourth hard-reject site is not planned: osmium's own behavior is
+a further hard-reject site is not planned: osmium's own behavior is
 also a silent miscount (just a *different* silent miscount), so
 neither tool offers a clean precedent for forced rejection here. A
 user who needs deterministic behavior on mixed-sign input must run

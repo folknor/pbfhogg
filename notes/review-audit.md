@@ -35,6 +35,8 @@ I've reviewed all 20 items in lines 81-198. One is a defect, none needs revertin
 
 **Needs a ruling:** record external as a hard-reject site in ADR-0002 and DEVIATIONS, or fix stage 2 for mixed-sign ranges instead.
 
+**Ruled 2026-10-26:** kept the refusal and amended the records. Before `1db71d8a` a wholly negative node blob was already a hard error (`max_node_id_from_blob_meta`), so external was never silent on negative node ranges; reverting would only restore the mixed-sign corruption. ADR-0002 gains a 2026-10-26 amendment and a hard-reject bullet, DEVIATIONS.md lists external as a hard-reject site for negative node ranges and keeps the silent `IdSet` inheritance for relation-member refs. The error's "the sparse index can" holds for the positive refs (`external_refuses_a_node_blob_reaching_below_zero`); a ref to a negative node stays the documented silent inheritance. The CHANGELOG's Unreleased entry already records the refusal; `16e36941`'s entry describes the prefilter fix of its time and stays.
+
 **3. `blob_body_within_file` and getparents' duplicate deleted** (`1db71d8a`, `1dd2ea09`). Not reverted to anything deliberate. The walker's `PreadSource::skip_bytes` refuses a payload past the captured size, and every builder walks with it. **Fine.**
 
 **4. `frame_in_scratch` refactor** (`1db71d8a`, then `f9625b94`). The sync path now has the pipelined path's shape: the entry trim sits inside `compress_ns` and an oversize `compress_buf` is freed before the write. Both trims are capacity compares. A free happens only above the 4 MiB retain cap, and it happened per blob before too, just later. The swap-vs-clone history in `frame_blob_into`'s doc is untouched. The only side effect is that sync-path `compress_ns` now includes the trim. **Fine.**
@@ -66,6 +68,7 @@ I've reviewed all 20 items in lines 81-198. One is a defect, none needs revertin
 **17. Text diff drivers take an optional writer** (`dfe45a35`). The item text is **partly stale**. `2c12a955` left two drivers, not three: the sharded block-pair engine (with an inline single shard) and the element stream. The optional writer now lives in `DiffSink`. The cost is still one predictable branch per write site, including per common element when `-c` is off.
 - **Needs measurement:** `brokkr diff --dataset planet`, text output, matched `--bench 1` pairs of `dfe45a35^` against `dfe45a35`, at the default `-j` and at `-j 1`.
 - **Related, for your ruling:** `-q` refuses `-c` and `diff_stats` hard-codes `suppress_common: false`, so a quiet diff never takes the byte-equal skip. `diff -q` on base vs apply-changes output decodes every blob pair, while `diff -c >/dev/null` skips the identical ones. That is deliberate (counts equal an unsuppressed diff's), but it could be a large cost on exactly the brokkr diff case.
+  - **Ruled 2026-10-26, work pending:** `diff_stats` takes the byte-equal skip. The verdict is unchanged (a byte-identical pair holds no difference), the CLI's `-q` prints no counts, and only the library's `DiffStats.common` becomes the claimed `index.count` on equal pairs, as `diff -c` already reports. osmium's `-q` decodes and CRCs every object with no early exit, so this is no parity loss. Measure on the planet `brokkr diff` cell. Stopping at the first difference was not taken.
 
 **18. `CommandPaths` and the geocode alias refusal** (`58228260`). CLI preflight only. The symlink rule is correct: `remove_dir_all` does not follow links, and the hard-link case is safe. **Fine.**
 
@@ -75,6 +78,7 @@ I've reviewed all 20 items in lines 81-198. One is a defect, none needs revertin
 - **(c) Per-blob order guard plus trailing `HeaderWalker`.** **Stale.** `2c12a955` deleted the sequential block-pair merge, `verify_rest` and `resume_at`. What exists now is an up-front `walk_pair` on every indexed run, including `-j 1`. Retire or rewrite this sub-item. The real `-j 1` cost (a full header walk of both files, pread with SEQUENTIAL advice, `--direct-io` not honoured) belongs with `2c12a955`'s own entry.
 - **(d) Unindexed element stream.** The text is accurate: per-element `admit`, `element_kinds` classification, excluded kinds dropped. The old `drain_phase` also decoded every block, so nothing new is decompressed. **Needs measurement:** `brokkr diff --dataset denmark --variant raw` (europe if it shows), with and without `--type way`, `8881415e^` against `8881415e`. `94743e65` touched this path again, so measure it separately.
 - **(e) `WireBlobHeader` refuses a wrong-wire-type known field.** Cost is about five compares per header. But the unification picked the stricter side. libosmium's `decode_blob_header` (`research/libosmium/.../pbf_input_format.hpp`) skips any (tag, type) it doesn't expect, and protobuf treats such a field as unknown. So pbfhogg now refuses files osmium reads whenever field 2, 4 or 5 carries a varint; 4 and 5 are pbfhogg's own extensions, which another producer could reuse. There is no DEVIATIONS entry. **Needs a ruling**, in line with the BUG-191 "protobuf's specified decoding" stance: refuse, or skip as unknown the way the reader used to.
+  - **Ruled 2026-10-26, work pending:** reverse it for the optional fields. A wrong-typed indexdata (2), tagdata (4) or waymembers (5) is skipped as an unknown field on every path, as protobuf specifies and libosmium's `decode_blob_header` does; a wrong-typed `type` (1) or `datasize` (3) stays refused, since the blob cannot be framed without them. Before `8881415e` (2026-10-24) no path checked: paths retaining a field misread a varint as a length and refused by accident, paths skipping it skipped correctly; the unification chose the accidental side without weighing the other. The rule stays in the one parser so every path agrees. The maintainer requires a code comment at the check saying this is deliberate and why (protobuf's unknown-field rule, osmium parity, fields 4 and 5 being pbfhogg extensions another producer may reuse, a skipped indexdata leaving the blob unindexed); update `known_field_with_wrong_wire_type_is_refused_whatever_is_retained` accordingly.
 
 ### The defect: diff blob-order message mislabels its input
 `BlobOrderGuard::observe` in `src/osc/merge_join.rs` checks diff's **input** but its message reads "follows {kind} output already reaching id ...". The wording was copied from apply-changes' output guard. A reword fixes it.
@@ -132,6 +136,7 @@ I've reviewed all 20 items in lines 81-198. One is a defect, none needs revertin
 - **Counts:** fsync counts are unchanged on every path: `FileWriter::sync` gives one record, as before. Without `test-hooks`, `with_sync_observer` is an `#[inline(always)] f()`.
 - **Values:** `writer_sync_all_ns` shrinks a little on the buffered path (the `EINVAL` fstat now falls outside the timed span), and failed fsyncs now count.
 - **Ruling needed (small):** a stage panic now emits no `PIPELINE_METRICS`; before, they were emitted and then the panic re-raised. That is a small observability loss on exactly the crash runs that `brokkr sidecar dirty` exists to diagnose. A drop guard that emits on unwind would restore it.
+  - **Ruled 2026-10-26, work pending:** restore it with a drop guard that emits on unwind, the mechanism the ordered pool engine and (since the bz pbfhogg#16 fix) the unordered classify pools use. Success and error paths keep emitting after the join, so `8384fa29`'s shutdown waits stay in the snapshot. The panic-path loss was a side effect of that commit, not a decision.
 - **Coverage note:** the fsync-count tests now compile only under `test-hooks`, so the `consumer`, `musl` and `minimal` sweeps no longer run them.
 - **Verdict:** fine; the panic-path emission is the one ruling.
 
@@ -140,6 +145,7 @@ I've reviewed all 20 items in lines 81-198. One is a defect, none needs revertin
 - **Descriptors:** `InputFront` drops its descriptor as soon as `indexed()` runs. altw external calls `require_indexdata` before stage 1, so no extra fd is held while external budgets its descriptors (`ca15f441`). The sparse path drops the front before pass 0.
 - **Cost:** none. The per-frame `saw_header` bool in inspect is noise.
 - **Ruling needed:** `merge_header_read_ms` changed meaning on a measured command. It now times open + header frame + probe to the first data blob + decode, not the header read alone. That is documented in a code comment, but the handoff calls counter units and meaning a contract. The maintainer should either accept the new meaning or put the timer back around the header-only portion.
+  - **Ruled 2026-10-26, work pending:** accept the new meaning; from `a3f1a1bc` the counter also covers the indexdata probe to the first data blob (one pread of a blob header). No durable doc cites its values, and `reference/performance-history.md` is a record of numbers, not of counter machinery, so nothing goes there. The maintainer also requires the code comment at the timer in `apply_changes/rewrite.rs` to say the wider span is deliberate and why (the front read is one step answering both the indexdata question and the header, so timing the header alone would time a fragment of it), and that values from before `a3f1a1bc` exclude the probe.
 - **Behaviour changes, all listed in the entry and fine:**
   - A library build without `linux-direct-io` now accepts `direct_io = true` on inspect's index-only path.
   - Auto selection reads the hint from the first data blob.
@@ -264,13 +270,18 @@ I've reviewed all 15 items in my slice. One is wrong: the cat `--clean` rewrite 
 
 ### Needs your ruling
 - **Remaining partial-index refusals.** They are altw (way refs, relation members, sparse node index), extract smart, inspect `--nodes` and tags-count. tags-count at least would be safe to accept.
+  - **Ruled 2026-10-26, work pending:** the other way. Commands fail loudly on a partially indexed input and point at `pbfhogg cat`; the CLI's `MissingIndexdata { partial: true }` advice already prints `pbfhogg cat <input> -o indexed.osm.pbf`. The remaining refusals stay, and the drain's acceptances are reverted: getid (`720682a1`), tags-filter (`54e04055`) and time-filter's snapshot walk (`063ea4d0`). `cat` itself, the remedy, keeps accepting, `cat --dedupe` included. `reference/indexdata-trust.md`'s rule that a refusal is owed only where a path cannot do without the indexdata is replaced by this policy, and `docs/guide/indexdata.md`, the CHANGELOG entries and `cli/tests/cli_input_contract.rs` follow.
 - **Repeated `Info` / `DenseInfo`** (item 12): refuse, keep-last, or merge.
+  - **Ruled 2026-10-26, work pending:** keep refusing, matching the `DenseNodes` duplicate refusal (`DUP_GROUP_DENSE`). It deviates from protobuf's merge rule, so it owes a DEVIATIONS.md entry and a code comment at `take_message` saying the refusal is deliberate and why (no producer emits it; keep-last silently lost the earlier copy's fields; a merge is code for a case nobody produces).
 - **`cat --clean user`** refusing a bad user it would drop (item 14).
+  - **Ruled 2026-10-26, work pending:** `cat` is the recovery command, as it is for indexdata, so `cat --clean user` does not resolve the user it drops, and a file with a bad user string index can be rescued with it. Every other re-encoding command keeps refusing. Today no pbfhogg command can repair such a file (plain `cat` passes the blob through unchanged; every re-encoding path refuses), and neither can osmium (libosmium resolves through `m_stringtable.at`, which throws, before `--clean` strips). Code comment at the resolution site saying why. Roles have no `--clean` and stay refused.
 - **ADR-0013's extension to `Sort.Type_then_ID`,** and whether to add altw external's intra-blob order check (item 1).
+  - **Ruled 2026-10-26:** the extension stands. As written (`98ce4840`) the ADR covered indexdata and tagdata and called sortedness a distinct boundary; `4c254750` rewrote its closing paragraph to cover the sort claim, which matches how every sorted-input path behaves. The intra-blob order check is not added: a violation already fails the run as unresolved node references, and is silent only under the opt-in `--ignore-missing-nodes`, so a per-node compare on the planet altw path buys nothing on normal input.
 
 ### Other things I noticed
 - **Two counter meanings changed quietly.** `merge_streaming_blobs_forced_rewrite` now also counts unindexed blobs re-encoded on `--force` (item 2). cat's `blobs_decoded` now counts input blobs. Anyone comparing old sidecar runs should know.
 - **Empty roles are still written on two paths.** `parse_str_attr_optional` (`src/osc/xml_parse.rs`) still reads a malformed optional `role` as absent, and `merge-changes` and the tags-filter OSC path then write an empty role. That contradicts the stance items 14 and 15 take (an empty role is a silent wrong answer). It is pre-existing and commented as deliberate. `e.attributes().flatten()` also swallows malformed attributes.
+  - **Ruled 2026-10-26, work pending:** refuse. A malformed `role`, and a malformed attribute generally (replacing the `flatten()`), is an error naming the element, matching the PBF re-encoding paths, the OSC arena and libosmium (expat rejects malformed XML outright). Rewrite the "deliberately treat malformed optional roles as absent" comment to say why the accepted OSC contract changed; CHANGELOG entry, since it is user-visible.
 - **One item 14 call site to recheck.** cat's `reencode_unclassifiable` dropped its separate `check_user`. `element_metadata` now covers it, but only when a version is present, which matches the old `kept` guard. It's equivalent; it is just the one place where the old check was explicit.
 
 I edited nothing and ran no cargo or brokkr. The reading needed is in the commits named above, plus `src/commands/cat/mod.rs`, `src/write/copy_range.rs`, `src/read/block.rs`, `src/read/dense.rs`, `src/owned.rs`, `src/osc/interner.rs` and `src/commands/apply_changes/streaming.rs`.
@@ -373,6 +384,7 @@ The check commit's CLI env-var replacement hooks are inside `#[cfg(feature = "te
 ### For you to rule on
 
 1. **Streams refused on single-read routes:** the time-filter history route, tags-filter `-R` with invert or distrust, and any two-check `check` run. These used to read a FIFO or `/dev/stdin` and now refuse it.
+   - **Ruled 2026-10-26, work pending:** keep refusing; inputs are regular files in every mode. Reword the refusal, which says "this command reads its input more than once" (false on these routes), to say the command needs a regular file and to write the stream to one first.
 2. **Block devices refused** on every pinning command. `DirectReader` deliberately supports them (its `read_limit` doc), and a single-read route could read one. The refusal message also says "this command reads its input more than once", which is misleading on those routes.
 3. **cat's fd admission** for library callers (above).
 4. **API consistency:** about a dozen entries now take `impl Into<InputSource>`, while `sort`, `tags_filter`, `add_locations_to_ways`, `extract`, `cat` and `merge` still take `&Path`. Callers passing `&&Path`, `&Box<Path>` or `&Cow<Path>` lose deref coercion. The CHANGELOG records this, which is acceptable for 0.6.0, but the two styles are now mixed.
@@ -422,6 +434,7 @@ Cheaper way to run it: one `brokkr read --dataset planet` A/B of `ce6f20d9^` aga
 - **Cost:** the old loop (count bytes below 0x80, remember the last continuation bit) is very likely auto-vectorizable. The new one has an early `return Err` and a loop-carried `pos` recurrence, so it can't vectorize. Rough estimate: 2-5 % on decode-bound planet commands, more per byte on dense data.
 - **Text:** misses the vectorization loss and the BUG-191 conflict.
 - **Verdict:** needs your ruling first. It does prevent a silently wrong answer (one fewer node, or ids paired with the wrong coordinates in the columnar decoder), but only for a writer bug. Then measure: `brokkr read --dataset planet --bench 1`, interleaved `e61e0ad7` against `e61e0ad7^`, plus one decode-bound command such as `cat --clean` on europe. If it costs, the cheaper route keeps the vectorizable terminal-byte count and runs the slow scan only when a long run of continuation bytes exists.
+  - **Ruled 2026-10-26, measurement pending:** measure first, in the campaign: `brokkr read --dataset planet`, matched and interleaved `--bench 1`, `e61e0ad7` against `e61e0ad7^`, plus one decode-bound command (`cat --clean` on europe). Inside the 2-3 % noise floor: keep the current code. Above it: keep the exact refusal but restore the vectorizable terminal-byte count, adding a masked eight-bytes-at-a-time check for a run of nine continuation bytes and taking the per-byte scan only for an array that has one. The maintainer may instead revert to the plain terminal-byte count (option A, accepting that a malformed tenth byte slips through, the BUG-191 reasoning); the measurement decides between keeping, the masked fast path and that revert. Note that `packed_uint32_count` (keys and vals) has tracked byte position since before this change.
 
 **4. One `run_pipeline` engine** (`dd312160`)
 - **Deliberate undone:** no. I checked the plain engine body before and after: it is unchanged; the fused copy was dropped. The plain path gains one duplicate blob-type compare per blob.
@@ -455,6 +468,8 @@ Cheaper way to run it: one `brokkr read --dataset planet` A/B of `ce6f20d9^` aga
   - "computes each head's ID once per step (the old copies twice)" is wrong. `element_merge_pair` still calls `element_id` twice per head per step, through the `in_range` filter and then `.map(element_id)`, the same as before.
   - It misses a behaviour change: single-sided runs now add the blob's claimed `index.count` (`DiffSink`: `stats.deleted += run.count`) while the text path prints the actual elements. The summary, and a quiet run's counts, follow wrong indexdata, where the old shard copies counted each element. Under ADR-0013 that needs your ruling.
 - **Verdict:** needs measurement: `diff-snapshots --dataset planet --from base --to 20260411` in both formats, `2c12a955` against its parent; `diff` on planet (should show the byte-equal win); one `-j 1` cell on europe. Needs your ruling on `-j 1 --direct-io` and on claimed counts.
+  - **History, traced 2026-10-26:** the multi-engine question was never adjudicated in writing. The sequential engine was the original March streaming merge-join; the sharded copies were a stated reimplementation (`dae9a0f6`) that omitted the byte-equal skip on purpose, because planet shadow counters (`a9d430f2`) showed it never fires on independent snapshots (`notes/diff-snapshots-opportunities.md`, deleted in `e38fae9a`). `-j 1` and `-v` stayed sequential only because shards lacked verbose detail and `-j 1` needed no scratch (`76ed9174`). When `76ed9174` made sharding the default in July, the default path silently lost the byte-equal skip on the `brokkr diff` workload (japan `diff -c` 50.0 s `31c04532` to 6.8 s `be576c77` with it); no diff run is recorded after 2026-04-27. HYG-013 asked only for one shared shard core; `2c12a955` also removed the sequential engine, without the history search the hygiene preamble requires. Recorded sequential planet figures: text 2134 s (`a9d430f2`), osc 2225.6 s, peak anon about 28-41 MB per phase; header walk about 15 s cold.
+  - **Ruled 2026-10-26, measurement pending:** keep the one engine. Claimed counts on single-sided runs accepted under ADR-0013. Campaign cells, matched and interleaved, `2c12a955` against its parent: planet `brokkr diff` (the restored byte-equal skip), planet `diff-snapshots` text and osc (expected unchanged), and a `-j 1` europe cell for wall and peak anon. If `-j 1` is clearly worse, give one-shard runs a streaming read back without restoring a second engine. Stale text to fix: `notes/todo.md`'s "`brokkr verify` cannot reach the sequential diff path" section, `DEVIATIONS.md`'s negative-ID routing sentence, and `reference/performance.md`'s "vs sequential" column, whose denominator is no longer in the tree.
 
 **7. One frame decoder** (`307982d7`)
 - **Deliberate undone:** no.
@@ -621,6 +636,7 @@ I've reviewed every item in my slice, lines 1105-1273. I found one defect that s
 - **Verdict: fine as is.** Text accurate.
 - **Notes:**
   - `UNORDERED_POOL_METRICS` is a process-global static in library code. `PIPELINE_METRICS` sets the precedent, but it sits awkwardly with ADR-0016 and mixes totals if two library calls run concurrently.
+    - **Ruled 2026-10-26, release gate:** the next release is gated on verifying pbfhogg used as a library, which brokkr has never done, so this is fixed before release: one metric set per invocation on the `Host`, keeping `--stalls` semantics for CLI runs. Recorded under "0.6.0 headline items" in `notes/todo.md`.
   - The ordered pools, now the majority of pools, report nothing to `--stalls` (see item 2).
 
 ### 8. apply-changes node-to-way barrier (`ff0b0a37`, `37e6ab1e`, `887fe273`, `9744a9fc`)
@@ -1072,6 +1088,51 @@ the ones below.
     "Worker-pool unification"), the `hygiene.md` review list. Unmeasured.
   - The audit's measurement plan for Slice E item 5 stands; the planet
     `cat --dedupe` cell now has its phase split and stall attribution.
+
+Rulings of 2026-10-26 on the remaining open questions, defaults the
+maintainer accepted:
+
+- Block devices: keep refusing at pinning (`st_size` is 0). Close bz
+  pbfhogg#19 as unreachable and drop the block-device claim from
+  `DirectReader::read_limit`'s doc.
+- cat's fd admission for library callers: reopened, because the release
+  is gated on library use. Plain cat now pins every input for the whole
+  run and refuses up front past the fd allowance; the CLI raises its soft
+  limit, the library cannot (ADR-0016), so a library caller at a soft
+  limit of 1024 can no longer cat about 1000 files, which it could before
+  pinning. A library-only regression the CLI hides. Candidate fixes: pin
+  each input only while cat reads it, or take an fd budget from the
+  caller on the `Host`. Undecided.
+- `pbfhogg::debug::emit_counter` changed its public signature to
+  `impl CounterValue` (`9dcf53a7`); source-compatible for `i64` callers
+  but a library-surface change missing from the CHANGELOG. Add the entry.
+- `8384fa29` kept `PIPELINE_METRICS` process-global on the ground that
+  "each production command does at most one pipelined read". That holds
+  per CLI process and fails for a library caller making several calls.
+  Covered by the release-gate entry in `notes/todo.md` (one metric set
+  per invocation on the `Host`).
+- Input API styles: convert `sort`, `tags_filter`, `add_locations_to_ways`,
+  `extract`, `cat` and `merge` to `impl Into<InputSource>` before 0.6.0.
+- diff counting a single-sided run from its claimed `index.count`:
+  accepted under ADR-0013. Separately, a `notes/todo.md` project: refusals
+  over indexdata problems name both `pbfhogg cat` and `check --index`.
+- `writer_write_ns` retired and the `DIGEST_ENVELOPE_*` and
+  `SORT_OVERLAP_PARALLEL_*` markers removed: accepted, since their phases
+  are gone. Counter and marker meanings are documented on their
+  definitions, with `reference/performance.md` noting changes that affect
+  reading stored numbers (it already covers `writer_write_ns`).
+  `reference/performance-history.md` is a record of numbers, not of
+  machinery: the comparability note the defect 1 fix put there (sidecar
+  rows from `56a50e0d` until `c2409c45` not comparable on send-side
+  counters) moves to `reference/performance.md`.
+- `BlockBuilder` dropped poisoned without a `take`: add a debug assert in
+  `Drop`.
+- `SortStats` and `MergePbfStats` public fields: accepted for 0.6.0; move
+  the CHANGELOG lines from Fixed to the breaking changes.
+- apply-changes accepting `-j 1` (`9744a9fc`): accepted; add it to the
+  hygiene review list.
+- WILLNEED newly on multi-extract and extract simple: kept, measured in
+  the campaign.
 
 Notes made while the audit ran, not findings of it:
 

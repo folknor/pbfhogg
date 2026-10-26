@@ -13,6 +13,14 @@ Amended: 2026-10-25 - the sequential block-pair merge is gone; every
 indexed comparison runs one engine over ID-range shards, and an input
 holding a negative ID is planned as one unbounded shard of that engine,
 which still orders by `osm_id_cmp`.
+Amended: 2026-10-26 - `add-locations-to-ways --index-type external`
+recorded as a hard-reject site for negative node IDs. It already refused
+a node blob whose range is wholly negative; since `1db71d8a` its
+metadata scan refuses any node blob whose indexdata range reaches below
+zero, because stage 2 partitions and walks node IDs as unsigned values
+and a mixed-sign range silently turned present nodes into missing ones.
+The silent `IdSet` inheritance for negative relation-member refs is
+unchanged.
 Status: Accepted
 
 ## Decision
@@ -29,6 +37,12 @@ invariant. Enforcement is layered by site:
   whose man page documents the same restriction; it is the one
   enforcement site in this ADR that converges with osmium rather
   than diverging from it.
+- **Hard reject of negative node ranges** in
+  `add-locations-to-ways --index-type external` (amended 2026-10-26).
+  Its metadata scan refuses a node blob whose indexdata range holds a
+  negative ID, before any join work, naming the sparse index as the
+  backend that joins such input. A cost of one compare per blob in a
+  header-only scan.
 - **Routing, not enforcement**, for the shard planners in `diff` and
   `derive-changes` (amended 2026-10-22). Their threshold compares are
   raw `i64`, which order negative IDs wrongly, so the shard planner
@@ -41,7 +55,7 @@ invariant. Enforcement is layered by site:
   retention for negative relation-member refs). Both differ from
   osmium, which abs-folds negatives via `positive_id()` /
   `positive_ref()` at the call site - itself a silent miscount,
-  just a different one. Neither is promoted to a fourth
+  just a different one. Neither is promoted to a further
   hard-reject site because osmium offers no clean precedent for
   forced rejection on these paths.
 

@@ -700,8 +700,8 @@ pub enum ErrorKind {
 pub enum OversizePart {
     /// The `BlobHeader`, even with its droppable tag index removed.
     Header,
-    /// The `BlobHeader`, dominated by the `WayMembers-v1` bitmap, which
-    /// cannot be dropped without misreporting way-member nodes.
+    /// The `BlobHeader`, which would fit without the `WayMembers-v1` bitmap;
+    /// the bitmap cannot be dropped without misreporting way-member nodes.
     HeaderWayMembers,
     /// The encoded `Blob` message.
     Body,

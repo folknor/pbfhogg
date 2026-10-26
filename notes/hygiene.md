@@ -70,7 +70,6 @@ goes on "Review once drained" as a bisect candidate, named by commit.
 
 Launch order, one agent per line, run serially:
 
-37. HYG-193
 38. HYG-194
 39. HYG-016
 40. HYG-195
@@ -134,6 +133,15 @@ The judgement calls already known, to be checked first:
   call on a measured command, from the pin adoption; unmeasured, though it
   is one `getrlimit`, one `setrlimit` and one `/proc/self/fd` listing per
   run.
+- `reframe_raw_with_index` (cat, merge and apply-changes passthrough) now
+  builds its header through the same `encode_frame_header` as freshly
+  encoded blocks, so it gained the `MAX_BLOB_DATASIZE` body refusal. Argued
+  unreachable today (the frame decoder refuses the same bound on every
+  passthrough body) and kept as framing policy owned by frame construction;
+  one compare per reframed blob on planet cat, byte-identical output,
+  unmeasured. The `OversizePart::HeaderWayMembers` attribution is now
+  computed (the header would fit without the bitmap) instead of
+  `len > 1024`.
 - `CliInvoker::child_limits` was deleted with the other unused builders, and
   the docs that cited it reworded.
 - Degrade's sort-preservation guard now also checks `pending`, which was
@@ -1175,21 +1183,6 @@ catalogued; if it is done at all, it is done last.
 
 Reported by: altw and scanning, re-encoding, filtering and spatial, read path,
 geocode index.
-
-## HYG-193 - Two framing questions nobody decided
-
-Anger: 7 - refusals and error messages on the write path.
-
-Split out of HYG-015. These are behaviour decisions, not refactors, and may
-change what a user sees:
-
-- `reframe_raw_with_index_scratch` is a second framing assembly that skips
-  the `MAX_BLOB_DATASIZE` check. Arguably right for passthrough (the bytes
-  are copied, not built), but nobody decided; decide, and state it.
-- `encode_blob_header_into`'s WayMembers culprit heuristic (`len > 1024`)
-  guesses which field overflowed instead of computing sizes.
-
-Reported by: write path.
 
 ## HYG-016 - Writer loops are copied per backend and their metrics mean different things
 

@@ -269,10 +269,11 @@ pub(super) struct ScratchFrame<'a> {
 ///   through `frame_blob_into` would cost it the two replacement buffers
 ///   `take_with_capacity` installs on every call.
 ///
-/// On an error return, oversize retained buffers have been trimmed (except
-/// after the two integer-conversion checks, which the format limits checked
-/// before them make unreachable; the caller's or the next call's trim covers
-/// them).
+/// The frame-assembly rules themselves (size limits, header encoding) are
+/// [`encode_frame_header`], shared with the passthrough reframe; compression,
+/// scratch retention and the metrics stay here.
+///
+/// On an error return, oversize retained buffers have been trimmed.
 pub(super) fn frame_in_scratch<'a>(
     blob_type: &str,
     uncompressed: &[u8],
@@ -291,7 +292,62 @@ pub(super) fn frame_in_scratch<'a>(
     t_compress.record_ns(&WRITER_METRICS.compress_ns);
     let t_frame = crate::counters::Stopwatch::start();
 
-    // The format caps a Blob body at `MAX_BLOB_DATASIZE`, and our own reader
+    let prefix = match encode_frame_header(
+        blob_type,
+        scratch.blob_buf.len(),
+        indexdata,
+        tagdata,
+        way_members,
+        &mut scratch.header_buf,
+    ) {
+        Ok(prefix) => prefix,
+        Err(error) => {
+            scratch.trim_oversize_retained_buffers();
+            return Err(error);
+        }
+    };
+    // `compress_buf` is never handed off, so drop an outlier before the next
+    // blob can reuse this scratch. The error return above ran the full trim
+    // already.
+    scratch.trim_oversize_compress_buffer();
+
+    let total_len = 4 + scratch.header_buf.len() + scratch.blob_buf.len();
+    t_frame.record_ns(&WRITER_METRICS.frame_ns);
+    WRITER_METRICS
+        .bytes_framed
+        .fetch_add(total_len as u64, Relaxed);
+    Ok(ScratchFrame {
+        prefix,
+        header: &scratch.header_buf,
+        blob: &scratch.blob_buf,
+    })
+}
+
+/// Encode the `BlobHeader` for a `body_len`-byte Blob body into `header_buf`
+/// and return the frame's 4-byte big-endian header-length prefix.
+///
+/// The one owner of the frame-assembly rules, for every writer path that
+/// builds a frame: freshly encoded blocks ([`frame_in_scratch`]) and
+/// already-compressed bodies under a rebuilt header
+/// ([`reframe_raw_with_index`]). A newly assembled frame obeys the reader's
+/// datasize and header-length bounds. Paths that copy an existing frame
+/// verbatim (`write_raw`, `write_raw_copy`) assemble nothing and do not come
+/// through here.
+///
+/// The body refusal is policy that belongs to frame construction, so it
+/// applies to the reframe as well, where no input can reach it today: every
+/// passthrough body was read through the frame decoder, which refuses the
+/// same bound. That is a precondition of the callers, and keeping the rule
+/// here means no caller has to be trusted with it.
+fn encode_frame_header(
+    blob_type: &str,
+    body_len: usize,
+    indexdata: Option<&[u8]>,
+    tagdata: Option<&[u8]>,
+    way_members: Option<&[u8]>,
+    header_buf: &mut Vec<u8>,
+) -> Result<[u8; 4]> {
+    // pbfhogg caps a Blob body at `MAX_BLOB_DATASIZE`, and our own reader
     // enforces it on the way back in ("blob header declares datasize too
     // big"). Without this guard the writer happily emitted a larger body and
     // the check fired only when someone later tried to *read* the file - found
@@ -299,51 +355,26 @@ pub(super) fn frame_in_scratch<'a>(
     // 143 MB blob body and a PBF that pbfhogg itself refuses to open. Fail at
     // the write, with a typed error a front end can answer with the knob
     // that caused it.
-    if scratch.blob_buf.len() as u64 >= MAX_BLOB_DATASIZE {
-        let body_len = scratch.blob_buf.len() as u64;
-        let error =
-            crate::error::new_blob_too_large(OversizePart::Body, body_len, MAX_BLOB_DATASIZE);
-        scratch.trim_oversize_retained_buffers();
-        return Err(error);
+    if body_len as u64 >= MAX_BLOB_DATASIZE {
+        return Err(crate::error::new_blob_too_large(
+            OversizePart::Body,
+            body_len as u64,
+            MAX_BLOB_DATASIZE,
+        ));
     }
-    let datasize = i32::try_from(scratch.blob_buf.len()).map_err(|_| {
-        Error::internal(format!(
-            "blob datasize overflow: {} bytes",
-            scratch.blob_buf.len()
-        ))
-    })?;
-    if let Err(error) = encode_blob_header_into(
+    let datasize = i32::try_from(body_len)
+        .map_err(|_| Error::internal(format!("blob datasize overflow: {body_len} bytes")))?;
+    encode_blob_header_into(
         blob_type,
         datasize,
         indexdata,
         tagdata,
         way_members,
-        &mut scratch.header_buf,
-    ) {
-        scratch.trim_oversize_retained_buffers();
-        return Err(error);
-    }
-    // `compress_buf` is never handed off, so drop an outlier before the next
-    // blob can reuse this scratch. The error returns above ran the full trim
-    // already.
-    scratch.trim_oversize_compress_buffer();
-
-    let header_len = u32::try_from(scratch.header_buf.len()).map_err(|_| {
-        Error::internal(format!(
-            "header too large: {} bytes",
-            scratch.header_buf.len()
-        ))
-    })?;
-    let total_len = 4 + scratch.header_buf.len() + scratch.blob_buf.len();
-    t_frame.record_ns(&WRITER_METRICS.frame_ns);
-    WRITER_METRICS
-        .bytes_framed
-        .fetch_add(total_len as u64, Relaxed);
-    Ok(ScratchFrame {
-        prefix: header_len.to_be_bytes(),
-        header: &scratch.header_buf,
-        blob: &scratch.blob_buf,
-    })
+        header_buf,
+    )?;
+    let header_len = u32::try_from(header_buf.len())
+        .map_err(|_| Error::internal(format!("header too large: {} bytes", header_buf.len())))?;
+    Ok(header_len.to_be_bytes())
 }
 
 /// Encode the Blob protobuf body (optionally compressed) into scratch buffers.
@@ -537,14 +568,21 @@ pub(crate) fn encode_blob_header_into(
             return Ok(());
         }
     }
-    let part = if way_members.is_some_and(|d| d.len() > 1024) {
-        OversizePart::HeaderWayMembers
-    } else {
-        OversizePart::Header
-    };
+    // Name the culprit by computing it, not by guessing from the bitmap's
+    // size: the bitmap is to blame exactly when the header, already without
+    // its tag index, would fit without the bitmap too. The probe is the cold
+    // error path and reuses `buf`, so the reported size is captured first.
+    let oversize = buf.len() as u64;
+    let mut part = OversizePart::Header;
+    if way_members.is_some() {
+        encode_blob_header_fields(blob_type, datasize, indexdata, None, None, buf);
+        if (buf.len() as u64) < MAX_BLOB_HEADER_SIZE {
+            part = OversizePart::HeaderWayMembers;
+        }
+    }
     Err(crate::error::new_blob_too_large(
         part,
-        buf.len() as u64,
+        oversize,
         MAX_BLOB_HEADER_SIZE,
     ))
 }
@@ -686,46 +724,29 @@ fn strip_message_fields(
 /// builds a new frame `[4-byte header_len][BlobHeader][Blob]` with the indexdata
 /// field set. The Blob bytes are not modified - only the BlobHeader is rebuilt.
 ///
-/// This is used by merge to add blob-level index metadata to passthrough blobs
-/// so that subsequent merges can classify them without decompression.
+/// This is used by cat, merge and apply-changes to add blob-level index
+/// metadata to passthrough blobs so that later runs can classify them without
+/// decompression. The frame goes through the same assembly rules as a freshly
+/// encoded block ([`encode_frame_header`]), including the body-size refusal.
 pub(crate) fn reframe_raw_with_index(
     blob_bytes: &[u8],
     indexdata: &[u8],
     tagdata: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let mut header_buf = Vec::new();
-    reframe_raw_with_index_scratch(blob_bytes, indexdata, tagdata, &mut header_buf)
-}
-
-pub(crate) fn reframe_raw_with_index_scratch(
-    blob_bytes: &[u8],
-    indexdata: &[u8],
-    tagdata: Option<&[u8]>,
-    header_buf: &mut Vec<u8>,
-) -> Result<Vec<u8>> {
-    let datasize = i32::try_from(blob_bytes.len()).map_err(|_| {
-        Error::internal(format!(
-            "blob datasize overflow: {} bytes",
-            blob_bytes.len()
-        ))
-    })?;
-    header_buf.clear();
-    encode_blob_header_into(
+    let prefix = encode_frame_header(
         "OSMData",
-        datasize,
+        blob_bytes.len(),
         Some(indexdata),
         tagdata,
         None,
-        header_buf,
+        &mut header_buf,
     )?;
-
-    let header_len = u32::try_from(header_buf.len())
-        .map_err(|_| Error::internal(format!("header too large: {} bytes", header_buf.len())))?;
     let total_len = 4 + header_buf.len() + blob_bytes.len();
 
     let mut out = Vec::with_capacity(total_len);
-    out.extend_from_slice(&header_len.to_be_bytes());
-    out.extend_from_slice(header_buf);
+    out.extend_from_slice(&prefix);
+    out.extend_from_slice(&header_buf);
     out.extend_from_slice(blob_bytes);
     Ok(out)
 }
@@ -1398,5 +1419,81 @@ mod tests {
             msg.contains("WayMembers-v1 bitmap cannot be dropped"),
             "the error must name the undroppable field, got: {msg}"
         );
+    }
+
+    fn oversize_part_and_size(err: &Error) -> (OversizePart, u64) {
+        match err.kind() {
+            crate::ErrorKind::BlobTooLarge { part, size, .. } => (*part, *size),
+            other => panic!("expected BlobTooLarge, got {other:?}"),
+        }
+    }
+
+    /// The culprit is computed, not guessed from the bitmap's size: a small
+    /// bitmap that tips an otherwise fitting header over the cap is named,
+    /// and a large bitmap beside a header that overflows without it is not.
+    /// The reported size is the failing header's, not the probe's.
+    #[test]
+    fn oversize_header_culprit_is_computed_from_sizes() {
+        let cap = usize::try_from(MAX_BLOB_HEADER_SIZE).unwrap_or(usize::MAX);
+        let mut buf = Vec::new();
+
+        // Indexdata alone lands on the last legal byte; a 16-byte bitmap tips
+        // it. Measure the fixed overhead once (the length varint stays 3 bytes
+        // across this size range), then size the indexdata to fit exactly.
+        let probe = vec![0u8; 60_000];
+        encode_blob_header_into("OSMData", 1, Some(&probe), None, None, &mut buf)
+            .expect("probe header must encode");
+        let overhead = buf.len() - probe.len();
+        let near_cap = vec![0xABu8; cap - 1 - overhead];
+        let small_bitmap = [0xCDu8; 16];
+        encode_blob_header_into("OSMData", 1, Some(&near_cap), None, None, &mut buf)
+            .expect("the header without the bitmap must fit");
+        let fitting_len = buf.len();
+        assert_eq!(fitting_len, cap - 1);
+        // A tag index rides along, so a size reported from before its drop
+        // would show up as a mismatch below.
+        let tagdata = [0x11u8; 100];
+        let err = encode_blob_header_into(
+            "OSMData",
+            1,
+            Some(&near_cap),
+            Some(&tagdata),
+            Some(&small_bitmap),
+            &mut buf,
+        )
+        .expect_err("the bitmap pushes the header over the cap");
+        let (part, size) = oversize_part_and_size(&err);
+        assert_eq!(part, OversizePart::HeaderWayMembers);
+        assert_eq!(size, (fitting_len + 2 + small_bitmap.len()) as u64);
+
+        // Indexdata alone already overflows; a large bitmap is not the culprit.
+        let over_cap = vec![0xABu8; cap];
+        let big_bitmap = vec![0xCDu8; 4096];
+        let err = encode_blob_header_into(
+            "OSMData",
+            1,
+            Some(&over_cap),
+            None,
+            Some(&big_bitmap),
+            &mut buf,
+        )
+        .expect_err("the header overflows without the bitmap");
+        let (part, size) = oversize_part_and_size(&err);
+        assert_eq!(part, OversizePart::Header);
+        assert!(size > (cap + big_bitmap.len()) as u64, "size {size}");
+    }
+
+    /// The passthrough reframe assembles a frame, so it obeys the same body
+    /// bound as a freshly encoded block.
+    #[test]
+    fn reframe_refuses_a_body_at_the_datasize_cap() {
+        let cap = usize::try_from(MAX_BLOB_DATASIZE).unwrap_or(usize::MAX);
+        let index = [0u8; 42];
+        let body = vec![0u8; cap];
+        let err = reframe_raw_with_index(&body, &index, None)
+            .expect_err("a body at the datasize cap must not be reframed");
+        assert_eq!(oversize_part_and_size(&err).0, OversizePart::Body);
+        reframe_raw_with_index(&body[..cap - 1], &index, None)
+            .expect("the largest legal body must reframe");
     }
 }

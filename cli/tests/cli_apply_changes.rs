@@ -2361,56 +2361,72 @@ fn merge_refuses_locations_on_ways_on_non_indexed() {
     );
 }
 
-/// `-j 1` remains outside the validated barrier/shutdown configurations.
-/// The refusal must not attribute this limit to the old worker-panic hazard.
+/// `-j 1` runs, through the node-to-way barrier too, and writes what
+/// `-j 2` writes. It used to be refused as an unvalidated configuration;
+/// the barrier fault tests (`tests/fault_apply_changes.rs`) now run every
+/// ordering at one worker.
 #[test]
-fn merge_rejects_jobs_equal_one() {
+fn merge_runs_at_one_worker() {
     let dir = crate::common::test_scratch();
     let base = dir.path().join("base.osm.pbf");
     let osc = dir.path().join("diff.osc.gz");
-    let output = dir.path().join("out.osm.pbf");
 
-    write_test_pbf_sorted(
+    let node = |id: i32| TestNode {
+        id: i64::from(id),
+        lat: 100_000_000 + id,
+        lon: 200_000_000 + id,
+        tags: vec![],
+        meta: None,
+    };
+    write_test_pbf_with_locations(
         &base,
-        &[TestNode {
-            id: 1,
-            lat: 100_000_000,
-            lon: 200_000_000,
-            tags: vec![],
-            meta: None,
-        }],
-        &[],
+        &[node(1), node(2), node(3)],
+        &[(
+            10,
+            vec![1, 2],
+            vec![(100_000_001, 200_000_001), (100_000_002, 200_000_002)],
+            vec![("highway", "road")],
+        )],
         &[],
     );
-
     write_osc(
         &osc,
         r#"<?xml version="1.0" encoding="UTF-8"?>
-<osmChange version="0.6"></osmChange>"#,
+<osmChange version="0.6">
+  <modify>
+    <way id="10" version="2"><nd ref="1"/><nd ref="3"/></way>
+  </modify>
+</osmChange>"#,
     );
 
-    let out = run_apply_changes(
-        &base,
-        &osc,
-        &output,
-        ApplyOpts {
-            jobs: Some(1),
-            ..ApplyOpts::default()
-        },
-    );
-    assert!(
-        !out.status.success(),
-        "must reject -j 1; stderr:\n{}",
-        out.stderr_str(),
-    );
-    let stderr = out.stderr_str();
-    assert!(
-        stderr.contains("at least 2") || stderr.contains(">= 2"),
-        "error should name the minimum worker count; stderr:\n{stderr}",
-    );
-    assert!(
-        stderr.contains("has not been validated") && !stderr.contains("deadlock hazard"),
-        "error should describe the validation limit; stderr:\n{stderr}",
+    let run = |jobs: usize| {
+        let output = dir.path().join(format!("out-{jobs}.osm.pbf"));
+        let out = run_apply_changes(
+            &base,
+            &osc,
+            &output,
+            ApplyOpts {
+                jobs: Some(jobs),
+                locations_on_ways: true,
+                ..ApplyOpts::default()
+            },
+        );
+        assert!(
+            out.status.success(),
+            "-j {jobs} must run; stderr:\n{}",
+            out.stderr_str(),
+        );
+        std::fs::read(&output).expect("read output")
+    };
+    let one = run(1);
+    assert_eq!(one, run(2), "-j 1 output differs from -j 2");
+    let locs = read_way_locations(&dir.path().join("out-1.osm.pbf"));
+    assert_eq!(
+        locs,
+        vec![(
+            10,
+            vec![(100_000_001, 200_000_001), (100_000_003, 200_000_003)]
+        )]
     );
 }
 

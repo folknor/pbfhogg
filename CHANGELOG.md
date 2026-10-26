@@ -947,6 +947,14 @@
 
 ### Added
 
+- **`apply-changes -j 1` runs.** It used to be refused as an unvalidated
+  configuration of the `--locations-on-ways` node-to-way barrier; the
+  barrier is now tested at one worker under every ordering it has (a late
+  node boundary, empty, node-only and way-only inputs, a worker failure
+  while the scanner waits or is blocked, cancellation), on both output
+  routes. Library: `MergeOptions::validate` no longer refuses
+  `Parallelism::Fixed(1)`. Automatic sizing is unchanged (at least two).
+
 - **Library: `has_indexdata_in` runs the indexdata probe under a `Host`.**
   It reports to the host's diagnostics and stops with `Cancelled` once the
   host's token is tripped, checked before each frame it reads on the way to

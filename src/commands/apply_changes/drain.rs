@@ -39,6 +39,13 @@
 //! `barrier_tx` (so it can release its buffered way/relation descriptors).
 //! No way or relation item can arrive before that.
 //!
+//! One pipeline run serves both phases: the scanner keeps walking the way
+//! and relation headers while node items are still being processed, and
+//! holds those descriptors back instead of starting a second run. Splitting
+//! the node phase into its own run was considered and not taken: it would
+//! change worker lifetime and scheduling on this measured path, and the
+//! barrier's correctness does not need it.
+//!
 //! ## Trailing creates
 //!
 //! After the drain channel closes and the reorder buffer empties, the

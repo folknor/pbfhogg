@@ -72,8 +72,8 @@ Launch order: every queued entry has run.
 
 Every entry still open in this file and `notes/bugs.md` is owed a resolution
 in this drain, except what the maintainer moved to the CLI-surface redesign
-in `notes/todo.md` (the `--direct-io` reach and `--json` entries). HYG-036,
-HYG-081 and HYG-182 were deferred by the 2026-10-25 session, not dropped:
+in `notes/todo.md` (the `--direct-io` reach and `--json` entries). HYG-036
+and HYG-182 were deferred by the 2026-10-25 session, not dropped:
 "skipped for now" in their Maintainer paragraphs means that session did not
 take them, and the paragraphs are guidance on how to resolve them, not a
 ruling that they stay. BUG-009 is the maintainer's own project.
@@ -1229,7 +1229,7 @@ The judgement calls already known, to be checked first:
   itself) are deliberately not counted. Once measurement is allowed, these
   counters are how to settle the `Mutex<Receiver>` question in
   `reference/performance-history.md`.
-- apply-changes' node-to-way barrier (the HYG-081 drain): the scanner's
+- apply-changes' node-to-way barrier (the barrier entry's drain): the scanner's
   node boundary travels on the drain channel as
   `DrainMessage::NodeBoundary { node_end_seq }` (exclusive end, no
   `u64::MAX` sentinel) instead of its own polled channel, and the drain's
@@ -1275,35 +1275,6 @@ fails the build when an exemption goes stale), and ban
 
 Reported by: CLI and plumbing, filtering and spatial, change application, altw
 and scanning, re-encoding.
-
-## HYG-081 - The apply-changes node-to-way barrier is a three-party protocol held together by polling
-
-Anger: 10 - rewrites apply-changes' barrier.
-
-Scanner, workers and drain coordinate through `last_node_seq_tx`, `barrier_tx`,
-an `OnceLock` loc map and per-worker `Arc<Mutex<FxHashMap>>` coord slots.
-Deadlock freedom rests on the drain's 25 ms `recv_timeout` re-polling, the
-"idle barrier fire" block that `scanner.rs` warns not to remove, workers
-flushing `local_coords` before sending each node item, and the scanner holding
-back way descriptors; scanner and drain know of each other only through comments
-citing each other. The `-j 1` refusal exists because one deadlock case is
-unhandled. The drain's final read of the slots happens while a worker's
-end-of-loop flush may still land after the merge and be lost; it is always
-empty today because each candidate flushes before sending. The two barrier
-triggers (idle fire vs type transition) are indistinguishable in the markers.
-`candidate_rx` is behind a `Mutex` held across a blocking `recv()`. Channel-
-closed handling is decided per site (`scanner::send_err`,
-`streaming::send_drain`, the drain, `barrier_tx`) with comments contradicting
-the code. Poison is ignored at five sites, each continuing after a worker
-panicked holding a coord slot. Fix: make the node phase a separate pipeline run
-(scan nodes, join, merge, publish, then scan ways and relations), so the barrier
-is a function return, the timeout and idle fire disappear and `-j 1` stops
-deadlocking; return coordinates inside the node `DrainItem` instead of the side
-channel; or at least a crossbeam `select` over both channels. Until then, a
-`test-hooks` stress test delaying the scanner's `last_node_seq` send past the
-drain's last node item.
-
-Reported by: change application.
 
 ## HYG-182 - `cat --dedupe` indexes an unindexed blob differently from plain `cat`
 

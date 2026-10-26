@@ -109,8 +109,17 @@ shape. Takeaways:
 
 ## Suggested order
 
-HYG-081 (apply-changes barrier, its own design) next, then HYG-036,
-HYG-182.
+HYG-036 (clippy exemptions) next, then HYG-182 (`cat --dedupe` indexing).
+
+HYG-081 (the apply-changes barrier) was resolved 2026-10-26 in five commits
+after a spar: comment corrections; the node boundary moved onto the drain
+channel with one readiness check (the dead type-transition trigger gone);
+leftover worker coordinates made an error; deterministic barrier tests
+through new fault-plan hooks (late boundary, panics while the scanner
+waits or is blocked, cancellation, forced owned route); and `-j 1`
+accepted, since those tests pass at one worker. The separate node-phase
+run the entry proposed was not taken (reason in `apply_changes/drain.rs`'s
+module doc); BUG-009's note says why it need not be either.
 
 HYG-011 was resolved 2026-10-26 in four commits after a spar: two real
 bugs codex found on the way (altw external stage 4 kept unpacked stale

@@ -85,7 +85,7 @@ These flags appear on most commands that produce PBF output:
   opened.
 - `-j/--jobs`, on every command that has it: `0` (default) sizes the worker
   pools automatically, `1` runs sequentially, `N` caps them at `N` threads.
-  For `diff`, `N` is also the shard count; `apply-changes` refuses `-j 1`.
+  For `diff`, `N` is also the shard count.
   Commands without `-j` size their pools themselves.
 - `--force`: a command that would refuse unindexed input proceeds with the
   slower fallback. `build-geocode-index --force` is the exception: a legacy
@@ -869,7 +869,7 @@ pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
 | `--locations-on-ways` | Preserve way-node locations through the merge (requires base PBF with LocationsOnWays). Ways the OSC creates or modifies get locations from the merged nodes; base ways the OSC does not touch keep their existing locations, even when the OSC moves or deletes a node they reference. Rerun `add-locations-to-ways` on the output for a full refresh |
 | `--ignore-missing-nodes` | With `--locations-on-ways`, permit unresolved references to retain the legacy `(0,0)` fallback instead of failing |
-| `-j, --jobs <N>` | Worker threads for the descriptor-first pipeline. `0` (default) uses the `nproc - 2` heuristic (leaves two cores for the scanner + drain threads, minimum 2). An explicit `-j 1` is refused |
+| `-j, --jobs <N>` | Worker threads for the descriptor-first pipeline. `0` (default) uses the `nproc - 2` heuristic (leaves two cores for the scanner + drain threads, minimum 2). An explicit `-j N` runs exactly `N` workers, `1` included |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--io-uring` | Use io_uring for output I/O |

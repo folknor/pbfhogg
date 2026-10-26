@@ -44,11 +44,10 @@ pub struct MergeOptions {
     pub ignore_missing_nodes: bool,
     /// Worker-pool size for the descriptor-first pipeline. `Auto` keeps the
     /// `nproc - 2` heuristic (leaves two cores for scanner + drain, minimum
-    /// 2 workers). `Fixed(1)` is refused by [`MergeOptions::validate`]:
-    /// single-worker operation has not been validated through the
-    /// node-to-way barrier and its failure shutdown. This is a
-    /// supported-configuration limit, not a claim that a single worker
-    /// necessarily deadlocks.
+    /// 2 workers). `Fixed(n)` runs exactly `n`, one included: the scanner,
+    /// the workers and the drain are separate threads, and nothing in the
+    /// node-to-way barrier or its failure shutdown depends on a second
+    /// worker (the barrier fault tests run at one worker too).
     pub parallelism: crate::host::Parallelism,
     /// Accept a change whose `version` is lower than the version already
     /// held for that object in the overlay. Off by default; see
@@ -61,8 +60,6 @@ impl MergeOptions {
     /// before any input is opened. [`merge`] calls it first; a caller can
     /// call it earlier to refuse before reserving an output.
     ///
-    /// - A single worker: not a validated configuration (see
-    ///   [`MergeOptions::parallelism`]).
     /// - `force` with `locations_on_ways`: on an indexed base `force` does
     ///   nothing, and on an unindexed one the combination is unsound (the
     ///   scanner cannot tell node blobs from way blobs, which defeats the
@@ -72,12 +69,6 @@ impl MergeOptions {
     ///
     /// `InvalidArgument` naming the refused option.
     pub fn validate(&self) -> Result<()> {
-        if self.parallelism.fixed() == Some(1) {
-            return Err(crate::Error::invalid_argument(
-                "apply-changes needs at least 2 workers: a single worker has not been \
-                 validated",
-            ));
-        }
         if self.write.force && self.locations_on_ways {
             return Err(crate::Error::invalid_argument(
                 "apply-changes: force has no effect with locations_on_ways, which \
@@ -375,28 +366,22 @@ pub(crate) fn merge_to(
         None
     };
 
-    // Worker count: a fixed parallelism if supplied, else the default
-    // `nproc - 2` heuristic (leaves two cores for the scanner and drain
-    // threads). `MergeOptions::validate` refused a single worker.
+    // Worker count: a fixed parallelism if supplied, one included, else the
+    // default `nproc - 2` heuristic (leaves two cores for the scanner and
+    // drain threads; its minimum of two is a sizing choice, separate from
+    // what an explicit count may be).
     //
-    // Retain the supported minimum until single-worker barrier progress
-    // and shutdown have been validated. The former panic rationale no
-    // longer applies: run_workers catches and publishes worker panics to
-    // FailureSlot, and the drain polls it, drops its receiver and barrier
-    // sender on failure, then merge joins both producer threads. With one
-    // failed worker, run_workers also leaves its scope and drops the shared
-    // candidate receiver, releasing a scanner blocked in send.
-    //
-    // Normal barrier progress depends separately on the scanner's boundary
-    // message (on the drain channel, acted on at receipt), the drain's one
-    // barrier check after each receive, and workers flushing coord slots
-    // before sending node outputs. These paths do not
-    // by themselves demonstrate a remaining single-worker deadlock. Before
-    // widening the supported configuration, exercise a boundary message
-    // delayed until after the final node output, empty/node-only inputs,
-    // and producer failures while scanner dispatch or its barrier wait is
-    // blocked, across splice and worker-only routing. Until that validation,
-    // keep the explicit refusal rather than silently substituting workers.
+    // A single worker is safe through the barrier and its shutdown: worker
+    // panics are caught and published to FailureSlot, the drain sees them
+    // within one receive timeout, drops its receiver and barrier sender,
+    // and merge joins both producers; a failed worker's pool leaves its
+    // scope and drops the candidate receiver, releasing a scanner blocked in
+    // send. Barrier progress rests on the scanner's boundary message, the
+    // drain's barrier check after each receive, and workers flushing coord
+    // slots before sending node outputs, none of which needs a second
+    // worker. `tests/fault_apply_changes.rs` runs a late boundary, empty,
+    // node-only and way-only inputs, and failures while dispatch or the
+    // barrier wait is blocked, on both routes, at one worker and more.
     let worker_count = parallelism.resolve(|| {
         crate::host::sized_workers(
             &*host.resources,

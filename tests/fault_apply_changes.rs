@@ -109,11 +109,9 @@ mod apply_changes {
         // arbitrary early-middle blob that
         // corresponds to a Candidate dispatched to the worker pool).
         //
-        // Two workers is the minimum supported worker count.
-        // FailureSlot publication and drain shutdown handle the panic;
-        // this test does not establish single-worker barrier safety.
-        // One worker remains rejected up front by `merge()`; see
-        // `merge_rejects_jobs_equal_one`. `force` is refused alongside
+        // Two workers, so the panic lands while another worker is alive;
+        // the barrier tests below cover one worker. FailureSlot publication
+        // and drain shutdown handle the panic. `force` is refused alongside
         // `locations_on_ways` (it can never take effect there).
         let opts = MergeOptions {
             write: WriteOptions {
@@ -399,7 +397,7 @@ mod apply_changes {
     }
 
     /// Worker counts the barrier is exercised at.
-    const JOBS: &[usize] = &[2, 3];
+    const JOBS: &[usize] = &[1, 2, 3];
 
     /// Every barrier shape, at every worker count, on both routes, with the
     /// node boundary on time and held until after the last node item: the

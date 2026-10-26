@@ -394,10 +394,6 @@ const REFUSALS: &[(&[&str], &str)] = &[
         &["merge-changes", "OSC", "-o", "OUT", "-j", "many"],
         "worker count",
     ),
-    (
-        &["apply-changes", "IN", "OSC", "-o", "OUT", "-j", "1"],
-        "at least 2 workers",
-    ),
     (&["tags-filter", "IN", "-o", "OUT", "=primary"], "empty"),
     (&["getid", "IN", "-o", "OUT", "x12"], "x12"),
     (&["export", "IN", "=primary"], "empty"),
@@ -548,9 +544,9 @@ const JOBS: &[JobsRow] = &[
         accepts: [true, true, true],
     },
     JobsRow {
-        label: "apply-changes (one worker is not validated)",
+        label: "apply-changes",
         words: &["apply-changes", "IN", "OSC", "-o", "OUT", "-j", "J"],
-        accepts: [true, false, true],
+        accepts: [true, true, true],
     },
     JobsRow {
         label: "merge-changes",

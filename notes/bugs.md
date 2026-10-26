@@ -65,4 +65,11 @@ an opt-in flag is the fallback. Enforce with a cross-validation test against
 `osmium apply-changes -l` on a diff that moves a node referenced only by an
 untouched way, and on one that deletes such a node.
 
+Interplay with the barrier (2026-10-26): the barrier hygiene entry kept one
+pipeline run for both phases and did not split out the node phase. The
+scanner's node boundary now rides the drain channel and the drain publishes
+the coordinate map from one readiness check. This project's need,
+coordinates from the merged node population for every way that must be
+refreshed, can keep that barrier; nothing there commits it to separate runs.
+
 Reported by: change application.

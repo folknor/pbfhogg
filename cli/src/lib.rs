@@ -907,7 +907,7 @@ fn parse_start_ids(value: &str) -> Result<StartIds, String> {
 /// The one help text of `-j/--jobs`, on every command that has it.
 const JOBS_HELP: &str = "Worker threads: 0 (default) sizes the worker pools automatically, \
      1 runs sequentially, N caps the worker pools at N threads. For diff, N is also the number \
-     of ID-range shards; apply-changes refuses 1";
+     of ID-range shards";
 
 /// `-j/--jobs`: `0` is auto, any other count a cap.
 fn parse_jobs(value: &str) -> Result<pbfhogg::Parallelism, String> {
@@ -915,21 +915,6 @@ fn parse_jobs(value: &str) -> Result<pbfhogg::Parallelism, String> {
         .parse::<usize>()
         .map(pbfhogg::Parallelism::from_jobs)
         .map_err(|_| format!("'{value}' is not a worker count (0 for automatic, or N >= 1)"))
-}
-
-/// apply-changes' `-j`: as [`parse_jobs`], refusing `1`. A single worker has
-/// not been validated through the node-to-way barrier and its failure
-/// shutdown, so it stays refused until that barrier is reworked.
-fn parse_apply_changes_jobs(value: &str) -> Result<pbfhogg::Parallelism, String> {
-    let parallelism = parse_jobs(value)?;
-    if parallelism.fixed() == Some(1) {
-        return Err(
-            "apply-changes needs at least 2 workers (-j 2 or more, or 0 for automatic): \
-             a single worker has not been validated"
-                .to_owned(),
-        );
-    }
-    Ok(parallelism)
 }
 
 /// The one help text of `--force`, on every command that has it.
@@ -1924,14 +1909,13 @@ enum Command {
         #[arg(long)]
         allow_version_regression: bool,
         // Auto keeps the `nproc - 2` heuristic (two cores left for the
-        // scanner and drain threads, minimum 2 workers). `-j 1` is refused:
-        // single-worker operation is not a validated configuration.
+        // scanner and drain threads, minimum 2 workers); `-j 1` runs one.
         #[arg(
             short = 'j',
             long = "jobs",
             value_name = "N",
             default_value = "0",
-            value_parser = parse_apply_changes_jobs,
+            value_parser = parse_jobs,
             help = JOBS_HELP
         )]
         jobs: pbfhogg::Parallelism,

@@ -97,7 +97,7 @@ memmap2 = "0.9.11"
 rayon = "1.12.0"
 rustc-hash = "2.1.3"
 zstd = "0.14.0"
-hotpath = "0.28.7"
+hotpath = "0.29.2"
 quick-xml = "0.42.0"
 # XXH3-128 for `digest`; pure Rust, xxh3 only.
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }

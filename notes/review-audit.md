@@ -728,6 +728,45 @@ the ones below.
     phase recording no waits is gone. Unmeasured, per the drain rule; the
     audit's measurement order for `56a50e0d` stands, now with live counters.
 
+- Slice C, item 5 (`8da26b23`, the cat `--clean` markers): confirmed and
+  **resolved** (sparred with codex to consensus).
+  - Confirmed in the code: the per-kind `CAT_NODES_*`, `CAT_WAYS_*` and
+    `CAT_RELATIONS_*` pairs went with the per-kind phases, replaced by one
+    `CAT_FILTERED_*` pair per input; `brokkr sidecar --compare` matches
+    rows by name, so the planet baseline `f2315551` had nothing to line up
+    with. No result was ever recorded on the `CAT_FILTERED_*`-only shape.
+    One correction to the audit's framing: `handoff.md` names counters,
+    units and the `WAIT_*` spans as the contract, not every phase marker;
+    the rename still broke the baseline compare, which is the real cost.
+  - Fix: the per-kind names are back, nested inside the kept
+    `CAT_FILTERED_*` pair, driven from the ordered merge (`KindPhase` in
+    `src/commands/cat/mod.rs`): a phase opens at the first written blob of
+    its kind and closes at the first of a greater kind or at the pass end;
+    a lower kind on unsorted input changes nothing (at most three pairs per
+    input); both pairs are closed before an error propagates.
+  - What they mean now, settled in the spar: write-side kind transitions,
+    not barriers. Decode of the next kind overlaps a row by up to the
+    admission window of tasks, and the wait for the first next-kind result
+    lands in the row before, with no time bound the code enforces, so a
+    per-kind row against the baseline is approximate. Seen on Denmark
+    (forced run, not stored): the relation row is 0 ms because every
+    relation blob was decoded while the last ways were written.
+    `reference/performance.md` beside the baseline and
+    `reference/pipeline.md` say this; the wall stays the exact comparison
+    and `CAT_FILTERED_*` the exact ordered-pass total.
+  - Pinned by `cli_cat::clean_marks_each_kind_phase` (sorted, two inputs,
+    a two-kind `--type`, unsorted, a pass writing nothing, a failing pass),
+    mutation-checked on the monotone rule and on the error-path close.
+  - Not verified (brokkr's source was not readable here): codex reported
+    that the human compare view matches a repeated name to its first
+    occurrence, so a multi-input run's per-input rows do not align by
+    input. Pre-existing either way. Also seen: when run A lacks a marker
+    (the baseline has no `CAT_FILTERED_*`) the compare shows no row for it.
+  - For the item's measurement: a cell built at `8da26b23` or `56a50e0d`
+    carries only `CAT_FILTERED_*`, so the A/B against the parent there can
+    compare wall, peak anon and stall counters but not per-kind rows; the
+    HEAD repeat has them, approximately.
+
 Notes made while the audit ran, not findings of it:
 
 - protohoggr 0.4.0 to 0.5.0 (bz `pbfhogg#15`) was applied after slices C,

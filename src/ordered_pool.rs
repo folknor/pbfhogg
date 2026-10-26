@@ -744,11 +744,17 @@ mod tests {
     fn within_deadline<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            // The receiver is gone only if the deadline already failed.
-            tx.send(f()).ok();
+            // Carry a panic over as a value so it is re-raised with its own
+            // payload rather than read as a hang. The receiver is gone only
+            // if the deadline already failed.
+            tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)))
+                .ok();
         });
-        rx.recv_timeout(Duration::from_secs(10))
-            .expect("the pool hung instead of returning")
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(value)) => value,
+            Ok(Err(payload)) => std::panic::resume_unwind(payload),
+            Err(_) => panic!("the pool hung: no return within the deadline"),
+        }
     }
 
     fn run_with(

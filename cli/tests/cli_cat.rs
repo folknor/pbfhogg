@@ -957,33 +957,7 @@ fn clean_needs_no_indexdata_but_a_type_filter_does() {
 fn clean_keeps_input_order() {
     let dir = crate::common::test_scratch();
     let input = dir.path().join("unsorted.osm.pbf");
-    let meta = pb::info(1, 8);
-    write_raw_block_pbf(
-        &input,
-        false,
-        &[],
-        &[
-            (
-                true,
-                pb::block(&[vec![(3, pb::way(31, &[9, 5], None, &meta))]]),
-            ),
-            (
-                true,
-                pb::block(&[vec![
-                    (1, pb::node(9, Some(&meta))),
-                    (1, pb::node(5, Some(&meta))),
-                ]]),
-            ),
-            (
-                false,
-                pb::block(&[
-                    vec![(3, pb::way(30, &[5, 9], None, &meta))],
-                    vec![(1, pb::node(1, Some(&meta)))],
-                    vec![(4, pb::relation(7, &[(30, 1, 7)], &meta))],
-                ]),
-            ),
-        ],
-    );
+    write_raw_block_pbf(&input, false, &[], &unsorted_clean_blocks());
 
     // The same file with the indexed node blob's payload overwritten: its
     // header (and indexdata) intact, its Blob no longer decodable.
@@ -1041,6 +1015,159 @@ fn clean_keeps_input_order() {
         .args(["--clean", "version", "--type", "node"])
         .run();
     assert!(!out.status.success(), "{}", out.stderr_str());
+}
+
+/// The `CAT_FILTERED_*` and kind-phase marker names of one `cat` run, in
+/// order, with the marker stream armed at a fresh file. Counter lines are
+/// left out.
+fn clean_phase_markers(
+    dir: &Path,
+    label: &str,
+    inputs: &[&Path],
+    flags: &[&str],
+) -> (crate::invoker::CliOutput, Vec<String>) {
+    let markers = dir.join(format!("{label}.markers"));
+    std::fs::write(&markers, []).unwrap();
+    let mut cli = CliInvoker::new()
+        .env("BROKKR_MARKER_FIFO", &markers)
+        .arg("cat");
+    for input in inputs {
+        cli = cli.arg(*input);
+    }
+    let out = cli
+        .arg("-o")
+        .arg(dir.join(format!("{label}.out.osm.pbf")))
+        .args(flags.iter().copied())
+        .run();
+    let names = std::fs::read_to_string(&markers)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.split_once(' ').map(|(_, name)| name.to_owned()))
+        .filter(|name| {
+            ["CAT_FILTERED_", "CAT_NODES_", "CAT_WAYS_", "CAT_RELATIONS_"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
+        .collect();
+    (out, names)
+}
+
+/// `--clean` marks its kind phases with the names the earlier one-phase-per-
+/// kind shape emitted, so a sidecar compare against a run of that shape
+/// lines up: a phase opens at the first written blob of its kind and closes
+/// at the first of a greater kind, nested in one `CAT_FILTERED_*` pair per
+/// input. An unsorted input folds a lower kind into the open phase rather
+/// than reopening one, a pass that writes nothing has the outer pair alone,
+/// and a failing pass still closes every pair it opened.
+#[test]
+fn clean_marks_each_kind_phase() {
+    let dir = crate::common::test_scratch();
+    let sorted = dir.path().join("sorted.osm.pbf");
+    let blocks: Vec<(bool, Vec<u8>)> = partial_index_blocks()
+        .into_iter()
+        .map(|block| (true, block))
+        .collect();
+    write_raw_block_pbf(&sorted, true, &[], &blocks);
+
+    let unsorted = dir.path().join("unsorted.osm.pbf");
+    write_raw_block_pbf(&unsorted, false, &[], &unsorted_clean_blocks());
+    // The same file with the node blob undecodable: the pass fails after
+    // writing the way blob ahead of it.
+    let poisoned = dir.path().join("poisoned.osm.pbf");
+    let mut bytes = std::fs::read(&unsorted).unwrap();
+    let frames = crate::common::adversarial::locate_blobs(&bytes);
+    bytes[frames[2].blob_start..frames[2].blob_end].fill(0xff);
+    std::fs::write(&poisoned, &bytes).unwrap();
+
+    // One unindexed node-only blob: decoded under `--type way`, nothing
+    // written.
+    let nodes_only = dir.path().join("nodes-only.osm.pbf");
+    let meta = pb::info(1, 8);
+    write_raw_block_pbf(
+        &nodes_only,
+        true,
+        &[],
+        &[(false, pb::block(&[vec![(1, pb::node(1, Some(&meta)))]]))],
+    );
+
+    let (sorted, unsorted, poisoned, nodes_only) = (
+        sorted.as_path(),
+        unsorted.as_path(),
+        poisoned.as_path(),
+        nodes_only.as_path(),
+    );
+    let pass = |kinds: &[&str]| {
+        let mut names = vec!["CAT_FILTERED_START".to_owned()];
+        for kind in kinds {
+            names.push(format!("CAT_{kind}_START"));
+            names.push(format!("CAT_{kind}_END"));
+        }
+        names.push("CAT_FILTERED_END".to_owned());
+        names
+    };
+    let check = |label: &str, inputs: &[&Path], extra: &[&str], succeeds: bool| {
+        let flags = [&["--clean", "version"][..], extra].concat();
+        let (out, names) = clean_phase_markers(dir.path(), label, inputs, &flags);
+        assert_eq!(
+            out.status.success(),
+            succeeds,
+            "{label}: {}",
+            out.stderr_str()
+        );
+        names
+    };
+    let every = ["NODES", "WAYS", "RELATIONS"];
+    assert_eq!(check("sorted", &[sorted], &[], true), pass(&every));
+    assert_eq!(
+        check("two-inputs", &[sorted, sorted], &[], true),
+        [pass(&every), pass(&every)].concat()
+    );
+    assert_eq!(
+        check("way-relation", &[sorted], &["--type", "way,relation"], true),
+        pass(&["WAYS", "RELATIONS"])
+    );
+    assert_eq!(
+        check("unsorted", &[unsorted], &[], true),
+        pass(&["WAYS", "RELATIONS"])
+    );
+    assert_eq!(
+        check(
+            "nothing-written",
+            &[nodes_only],
+            &["--type", "way", "--force"],
+            true
+        ),
+        pass(&[])
+    );
+    assert_eq!(check("failing", &[poisoned], &[], false), pass(&["WAYS"]));
+}
+
+/// Ways 31, nodes 9 and 5, then one unindexed block of way 30, node 1 and
+/// relation 7: an unsorted file whose `--clean` output is way, node, way,
+/// node, relation.
+fn unsorted_clean_blocks() -> Vec<(bool, Vec<u8>)> {
+    let meta = pb::info(1, 8);
+    vec![
+        (
+            true,
+            pb::block(&[vec![(3, pb::way(31, &[9, 5], None, &meta))]]),
+        ),
+        (
+            true,
+            pb::block(&[vec![
+                (1, pb::node(9, Some(&meta))),
+                (1, pb::node(5, Some(&meta))),
+            ]]),
+        ),
+        (
+            false,
+            pb::block(&[
+                vec![(3, pb::way(30, &[5, 9], None, &meta))],
+                vec![(1, pb::node(1, Some(&meta)))],
+                vec![(4, pb::relation(7, &[(30, 1, 7)], &meta))],
+            ]),
+        ),
+    ]
 }
 
 /// The kinds and ids of a file every `cat` partial-index fixture holds, in

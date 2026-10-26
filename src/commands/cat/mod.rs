@@ -919,8 +919,11 @@ fn cat_filtered(
                 crate::scan::classify::PartialIndex::Accept,
                 host,
             )?;
+        // The ordered pass of one input, kind phases nested inside (see
+        // `KindPhase`). Closed before an error propagates, so the pair holds
+        // on a failing run too.
         crate::debug::emit_marker("CAT_FILTERED_START");
-        let (b, e) = run_filtered_pass(
+        let pass = run_filtered_pass(
             &shared_file,
             &schedule,
             tf,
@@ -928,10 +931,11 @@ fn cat_filtered(
             compression,
             &mut writer,
             host,
-        )?;
+        );
+        crate::debug::emit_marker("CAT_FILTERED_END");
+        let (b, e) = pass?;
         blobs_decoded += b;
         elements += e;
-        crate::debug::emit_marker("CAT_FILTERED_END");
     }
 
     writer.flush()?;
@@ -965,16 +969,17 @@ fn run_filtered_pass(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     host: &crate::host::Host,
 ) -> Result<(u64, u64)> {
-    type PassResult = crate::Result<(Vec<Vec<u8>>, u64)>;
+    type PassResult = crate::Result<(Vec<(ElementKind, Vec<u8>)>, u64)>;
     let mut blobs_decoded: u64 = 0;
     let mut total_elements: u64 = 0;
+    let mut phase = KindPhase::default();
 
     // A fresh BlockBuilder per blob (BlockBuilder::new is just a few empty
     // Vec/HashMap initialisers; no heap reservation until elements are
     // added), as before the worker state could hold a non-Send one: keeping
     // one per worker would change what each worker retains between blobs. A
     // failed blob ends the pool, located with its input and ordinal.
-    crate::scan::classify::parallel_classify_phase_ordered(
+    let pass = crate::scan::classify::parallel_classify_phase_ordered(
         input,
         schedule,
         None,
@@ -987,7 +992,7 @@ fn run_filtered_pass(
             let count = process_block(block, &mut bb, &mut output, &tf, clean, &mut refs_buf)?;
             flush_local(&mut bb, &mut output)?;
 
-            let mut framed: Vec<Vec<u8>> = Vec::with_capacity(output.len());
+            let mut framed: Vec<(ElementKind, Vec<u8>)> = Vec::with_capacity(output.len());
             for OwnedBlock {
                 bytes: block_bytes,
                 index,
@@ -1003,21 +1008,75 @@ fn run_filtered_pass(
                     tagdata.as_deref(),
                     way_members.as_deref(),
                 )?;
-                framed.push(blob.into_vec());
+                framed.push((index.kind, blob.into_vec()));
             }
             Ok((framed, count))
         },
         |_position, (framed, count)| {
             // Called in schedule order; a write error ends the pass at once.
             blobs_decoded += 1;
-            for blob in framed {
+            for (kind, blob) in framed {
+                phase.enter(kind);
                 writer.write_raw_owned(blob)?;
             }
             total_elements += count;
             Ok(())
         },
         host,
-    )?;
+    );
+    phase.close();
+    pass?;
 
     Ok((blobs_decoded, total_elements))
+}
+
+/// The sidecar kind phase of one `--clean` pass: `CAT_NODES_*`,
+/// `CAT_WAYS_*` and `CAT_RELATIONS_*`, the names the earlier one-phase-per-kind
+/// shape emitted (the recorded planet baseline's phases), now driven by the
+/// output.
+///
+/// A phase opens when the first blob of its kind is about to be written, and
+/// closes when a blob of a greater kind (node < way < relation) is, or when
+/// the pass ends. They are write-side kind transitions, not execution
+/// barriers: the pool decodes up to its admission window of tasks ahead of
+/// the write, so work on the next kind overlaps the phase before it, and the
+/// wait for the first next-kind result is charged to the phase before. A
+/// per-phase comparison against the per-kind shape is therefore approximate,
+/// with no time bound the code enforces; the wall and the enclosing
+/// `CAT_FILTERED_*` pair are the exact figures.
+///
+/// A blob of an equal or lower kind changes nothing, so an unsorted input
+/// cannot flood the marker stream: each phase is named by the greatest kind
+/// written so far, at most three pairs per input. Work that writes nothing (an
+/// unselected kind's unindexed blobs) opens no phase, so a pass that writes
+/// nothing has the `CAT_FILTERED_*` pair alone.
+#[derive(Default)]
+struct KindPhase(Option<ElementKind>);
+
+impl KindPhase {
+    fn enter(&mut self, kind: ElementKind) {
+        if self.0.is_some_and(|open| kind <= open) {
+            return;
+        }
+        self.close();
+        crate::debug::emit_marker(Self::marker(kind, true));
+        self.0 = Some(kind);
+    }
+
+    fn close(&mut self) {
+        if let Some(open) = self.0.take() {
+            crate::debug::emit_marker(Self::marker(open, false));
+        }
+    }
+
+    fn marker(kind: ElementKind, start: bool) -> &'static str {
+        match (kind, start) {
+            (ElementKind::Node, true) => "CAT_NODES_START",
+            (ElementKind::Node, false) => "CAT_NODES_END",
+            (ElementKind::Way, true) => "CAT_WAYS_START",
+            (ElementKind::Way, false) => "CAT_WAYS_END",
+            (ElementKind::Relation, true) => "CAT_RELATIONS_START",
+            (ElementKind::Relation, false) => "CAT_RELATIONS_END",
+        }
+    }
 }

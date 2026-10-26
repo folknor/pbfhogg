@@ -190,7 +190,11 @@ whose indexdata names an unselected kind; pread workers decode each scheduled
 blob once, keep the selected elements by actual kind, clean and re-encode them
 through `BlockBuilder` and frame the output; the ordered pool
 (`parallel_classify_phase_ordered`) merges in schedule order, so output order
-is input order, with at most its admission window of results alive. Migrated
+is input order, with at most its admission window of results alive. Sidecar
+phases: one `CAT_FILTERED_*` pair per input, with `CAT_NODES_*`,
+`CAT_WAYS_*` and `CAT_RELATIONS_*` nested inside as write-side kind
+transitions, not barriers (see `reference/performance.md` before comparing
+them with the per-kind shape). Migrated
 off the earlier `into_blocks_pipelined` + batch-budget path, then off one
 phase per kind (see `src/commands/cat/mod.rs`).
 

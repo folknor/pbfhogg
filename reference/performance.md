@@ -119,6 +119,19 @@ one `parallel_classify_phase_ordered` pass per input (every scheduled blob
 decoded once, output in input order); that shape has not been measured yet,
 so these figures describe the per-kind one.
 
+Sidecar phases across the two shapes: the per-kind shape's `CAT_NODES_*`,
+`CAT_WAYS_*` and `CAT_RELATIONS_*` pairs bracketed execution barriers. The
+one-pass shape at `8da26b23` replaced them with a single `CAT_FILTERED_*`
+pair; a later change (2026-10-26) brought the per-kind names back inside it,
+as write-side kind transitions (`KindPhase` in `src/commands/cat/mod.rs`).
+Decode of the next kind overlaps a row by up to the pool's admission window
+of tasks, and the wait for the first next-kind result lands in the row
+before, with no time bound the code enforces. So a per-kind row compared
+against this baseline is approximate, the short relation row least of all;
+the wall is the exact comparison, and `CAT_FILTERED_*` the exact ordered-pass
+total (it excludes the schedule walk and the final flush). Runs from
+`8da26b23` until that change carry no per-kind rows.
+
 ## Merge (apply-changes)
 
 Best results per dataset.

@@ -33,17 +33,6 @@ learned that neither drain file states. Delete it when the drain is done.
   `reference/`, `docs/`, `decisions/`, tests) may cite anything under
   `notes/`; `scripts/check_doc_links.py` enforces it. Durable text carries its
   context inline.
-- **HYG-011 (unified pool) has history**: two earlier verdicts against it,
-  now recorded in the entry's History section. The maintainer's question was
-  whether resolving other entries reworks the same sites, and if so, to queue
-  HYG-011 behind them. HYG-053 has since put every *ordered* pool on one
-  engine (`src/ordered_pool.rs`); what remains of HYG-011 is the unordered
-  family (see the entry). Judge it against the tree as it is now. An
-  unordered mode for `ordered_pool` (claim counter and exit contract, no
-  window or reorder) would absorb most of that remainder: the classify
-  unordered trio, geocode pass1_5, and altw external stages 2 and 3 if
-  bucket dispatch fits a task index. The diff and derive shard runs sit
-  outside it. A design to spar, not a given.
 - **HYG-182 is open like every other entry.** Its Maintainer paragraph once
   read as "dedupe's indexing is not to be touched in this drain"; the
   maintainer clarified (2026-10-26) that this only meant the 2026-10-25
@@ -120,8 +109,18 @@ shape. Takeaways:
 
 ## Suggested order
 
-The rest of HYG-011 next, then HYG-081 (apply-changes barrier, its own
-design), HYG-036, HYG-182.
+HYG-081 (apply-changes barrier, its own design) next, then HYG-036,
+HYG-182.
+
+HYG-011 was resolved 2026-10-26 in four commits after a spar: two real
+bugs codex found on the way (altw external stage 4 kept unpacked stale
+way locations; a failing `parallel_classify_accumulate` worker did not stop
+its peers), the two per-blob classify pools on one private driver, and the
+two altw way reframes on one block-level walk. No unordered mode on
+`ordered_pool`: it would drop the dispatcher the measured `WILLNEED` advice
+rides on. The pool-unification history now lives in
+`reference/performance-history.md` ("Worker-pool unification"). Not done,
+noted there: the unordered pools emit no `*_wait_ns` counters.
 
 HYG-002 was resolved 2026-10-26 by rejecting public tuning structs (the
 reasons are in the `src/tunables.rs` module doc and `reference/testing.md`)

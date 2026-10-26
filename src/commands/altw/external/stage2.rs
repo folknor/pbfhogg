@@ -327,6 +327,13 @@ pub(super) fn stage2_node_join(
 
     use std::os::unix::fs::FileExt as _;
 
+    // A hand-built claim-counter pool, deliberately not on
+    // `crate::ordered_pool`: it has no consumer and no order to keep.
+    // Workers claim id buckets with one `fetch_add`, each holding its own
+    // bucket scratch and buffered slot writes, under the stage's worker cap.
+    // The first recorded error (not the lowest bucket) stops the others at
+    // their next claim, and work in flight finishes; cancellation is checked
+    // per non-empty bucket and per node blob inside it.
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let resolved_total = std::sync::atomic::AtomicU64::new(0);
     let counters = Stage2Counters::new();

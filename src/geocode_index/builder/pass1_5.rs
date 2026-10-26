@@ -199,7 +199,14 @@ pub(super) fn run_pass1_5(
         let literals_ref = &literals;
         let needed_admin_ways_ref = needed_admin_ways;
 
-        // Work-stealing dispatch over way blobs via AtomicUsize::fetch_add.
+        // Work-stealing dispatch over way blobs via AtomicUsize::fetch_add:
+        // a hand-built claim-counter pool, deliberately not on
+        // `crate::ordered_pool` or the classify pools. It has no consumer and
+        // no order to keep, and every worker writes the one shared atomic
+        // `IdSet` and publishes its overflow list and tallies at its end. The
+        // first recorded error (not the lowest blob) stops the others at
+        // their next claim, and work in flight finishes; cancellation is
+        // checked per claimed blob.
         let next_idx = AtomicUsize::new(0);
         let next_ref = &next_idx;
         // First error observed across all workers. Workers drain until

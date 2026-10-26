@@ -120,6 +120,19 @@ pub(super) fn stage3_slot_reorder(
 
     // `num_workers` is sized by the caller, which opens exactly that many
     // router worker files; `router.worker_file(worker_id)` relies on it.
+    //
+    // A hand-built claim-counter pool, deliberately not on
+    // `crate::ordered_pool`: workers claim slot buckets with one
+    // `fetch_add`, each bound for the run to its own router worker file, and
+    // stage 4 consumes the router concurrently. Two error stores serve two
+    // recipients: `s3_error` keeps this stage's cause for its caller, however
+    // the handles join, and the router's abort error (raised here, and by
+    // `AbortOnDrop` on a panic) wakes stage 4's readiness waits. A stage 4
+    // failure aborts the router and stops these workers without becoming a
+    // stage 3 error, and `external_join` prefers a stage 3 error when both
+    // fail; so "first error" means first recorded, not lowest bucket, and the
+    // two stores can name different concurrent causes. Work in flight
+    // finishes after another worker fails.
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let counters = Stage3Counters::new();
     let s3_error: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
@@ -168,10 +181,11 @@ pub(super) fn stage3_slot_reorder(
                     // path as a bucket failure: record the cause first, then
                     // abort the router (waking stage 4's `wait_ready`).
                     // There is no check inside a bucket: after the token
-                    // trips each worker finishes the bucket in hand (at most
-                    // 256 buckets in all, about 1/256 of this stage's work
-                    // per worker). A check inside would be per element in
-                    // the hot loop; if a stop proves too slow, split the
+                    // trips each worker finishes the bucket in hand, so the
+                    // stop latency is that bucket's work, which depends on
+                    // its population (buckets can be skewed, and there may
+                    // be fewer than 256). A check inside would be per element
+                    // in the hot loop; if a stop proves too slow, split the
                     // bucket and check per chunk, with a matched A/B.
                     if let Err(e) = cancel.check() {
                         err_ref

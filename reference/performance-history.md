@@ -1001,6 +1001,38 @@ note deleted on landing; this is the durable record.
   Europe-only: planet is larger than RAM so prefetched pages evict before
   reuse.
 
+## Worker-pool unification
+
+Three looks at folding the hand-built blob pools into one engine, none
+measured, recorded so a fourth starts from them.
+
+- **March 2026, one blob pipeline: not done.** A consolidation review
+  (removed in `8bcc00b6`, repeated in a note removed in `97a8d697`)
+  catalogued every raw-frame pipeline of the time (cat,
+  add-locations-to-ways, sort, merge) and ruled against a shared frame
+  source and sink: orchestration differed per command, sort is random
+  access, altw's two-phase read was unique, merge was bound to the diff
+  overlay; upside estimated at best -2 %, downside +3 % to +12 %, never
+  measured. It predates every pread-worker pool.
+- **April 2026, pread-from-workers dedup: skipped** (introduced in
+  `025a8b07`): two copies with different payloads and stats types, judged
+  harder to read generic, "only after the pread API shape stabilizes".
+- **October 2026, done in part.** Every pool that delivers in schedule
+  order runs on `src/ordered_pool.rs`, and sort and `cat --dedupe` on one
+  blob-merge engine. Of the unordered pools, the two per-blob classify
+  pools share one driver (`run_unordered_per_blob`, `scan/classify.rs`),
+  keeping their dispatcher thread because the measured `WILLNEED` advice
+  (europe item 5 above) rides on it; the accumulate pool keeps its own
+  loop, since per-blob send and per-worker accumulation must both survive.
+  altw external stages 2 and 3 and geocode pass 1.5 stay hand-built
+  claim-counter pools with purposeful differences (their comments say
+  which), and the two altw way reframes share only their block-level walk
+  (`altw::reframe::parse_way_block_top`): a coordinate-source trait was
+  rejected because sparse resolves refs while stage 4 copies coordinates
+  stage 3 already encoded. The unordered pools still emit no `*_wait_ns`
+  counters; that is instrumentation, not unification. All unmeasured;
+  each step is its own commit.
+
 ## Retired plan docs
 
 Plan and research docs live in `notes/` while their work is active and

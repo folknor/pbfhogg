@@ -72,8 +72,8 @@ Launch order: every queued entry has run.
 
 Every entry still open in this file and `notes/bugs.md` is owed a resolution
 in this drain, except what the maintainer moved to the CLI-surface redesign
-in `notes/todo.md` (the `--direct-io` reach and `--json` entries). HYG-011,
-HYG-036, HYG-081 and HYG-182 were deferred by the 2026-10-25 session, not dropped:
+in `notes/todo.md` (the `--direct-io` reach and `--json` entries). HYG-036,
+HYG-081 and HYG-182 were deferred by the 2026-10-25 session, not dropped:
 "skipped for now" in their Maintainer paragraphs means that session did not
 take them, and the paragraphs are guidance on how to resolve them, not a
 ruling that they stay. BUG-009 is the maintainer's own project.
@@ -1209,106 +1209,6 @@ The judgement calls already known, to be checked first:
   malformed block tag in stage 4 now reads "reframe block tag", as sparse
   did. `brokkr verify add-locations-to-ways --dataset denmark` passes.
 ---
-
-## HYG-011 - The pread-decompress-dispatch-reorder pool is hand-built about fifteen times
-
-Anger: 10 - unifies the blob pools on measured paths; two earlier verdicts said don't (see History).
-
-Since the HYG-053 drain (2026-10-26), every pool that delivers results in
-schedule order runs on one engine, `src/ordered_pool.rs` (claim-based
-workers, an admission window, ordered failures, one cancellation and exit
-contract, optional wait/send/stall/queue counters): classify's ordered
-phase and through it repack, degrade, getparents, time-filter's snapshot
-path, tags-filter pass 2, multi-extract's region writer, cat `--clean` and
-geocode pass 2; renumber's stages; extract's `pread_execute`;
-multi-extract's node pass; altw sparse passthrough and external stages 1
-and 4. `blob_merge.rs` (sort, `cat --dedupe`) shares its gate. What is still
-built by hand is the unordered family - a dispatcher feeding
-`Arc<Mutex<Receiver>>`, N workers doing pread, `decompress_blob_raw` and the
-per-blob work, a result channel, a first-error slot - in:
-
-- `scan/classify.rs`: `parallel_classify_phase_abortable` (and
-  `parallel_classify_phase` on it), `parallel_scan_blobs_raw`,
-  `parallel_classify_accumulate`, three near-verbatim copies in one file.
-- Altw external `stage2.rs` and `stage3.rs`, which dispatch buckets rather
-  than blobs.
-- `geocode_index/builder/pass1_5.rs`.
-- The diff and derive shard runs, and apply-changes' scanner and workers
-  (HYG-081), which are their own designs.
-
-Divergence across the unordered copies:
-
-- Error policy: stage 2 keeps the first error, stage 3 has both a first-wins
-  `s3_error` and the router's `abort_error`, classify relies on channel drop.
-- Cancellation: each copy wires `host.cancel` by hand, in the worker; stage 2
-  polls the error mutex per bucket.
-- Stall counters: none of these emit `*_wait_ns`.
-- The `Mutex<Receiver>` lock is held across a blocking `recv()`, so idle
-  workers queue on the mutex, and it poisons silently
-  (`unwrap_or_else(PoisonError::into_inner)`). A hygiene complaint, not a
-  speed one: the 2026-07-13 hybrid-batching research (deleted note,
-  `notes/hybrid-batching-research.md` before commit `856efc33`) put the
-  queueing at roughly 50-500 ms at Europe scale, under 1 % of wall, and no
-  profile has surfaced it. The ordered engine has no such lock.
-
-Fix, if any remains worth doing: an unordered mode on the same engine (the
-claim counter and exit contract carry over; there is no reorder or window),
-and the altw `passthrough` / `stage4` fork, now two consumers of one engine,
-merged through a `CoordSource` trait (sparse `NodeIndex`, external router
-payloads), which also merges the two `reframe_way_blob_with_locations`.
-The read pipeline (`read/pipeline.rs::run_pipeline`) stays its own engine:
-its permit rides with each decoded item, which fits rayon tasks and
-filtered items.
-
-Maintainer (2026-10-25): skipped for now. A unified pool has been considered
-twice before and judged not worth doing once every implementation was
-catalogued; if it is done at all, it is done last.
-
-History (researched 2026-10-26 from deleted notes; read them with
-`git show <commit>^:<path>`):
-
-- March 2026, the full inventory. `notes/business-logic-consolidation-deep-dive-2026-03-03.md`
-  proposed one blob pipeline (shared frame source, passthrough sink, decode
-  batching); `notes/consolidation-review-3-blob-pipeline.md` (deleted in
-  `8bcc00b6`) catalogued every raw-frame pipeline of the time (cat,
-  add-locations-to-ways, sort, merge) and ruled "DO NOT DO", repeated by
-  `notes/consolidation-analysis-2026-03-07.md` (deleted in `97a8d697`).
-  Its sibling review of the rayon rewrite skeleton said the same. Its
-  reasons: orchestration differs per command and a pipeline would be
-  callback soup; sort is random access, so a streaming frame source is
-  useless to it; add-locations-to-ways' two-phase read is unique; merge is
-  bound up with diff-overlay semantics; upside "at best -2 %", downside
-  "+3 % to +12 %" (estimates, never measured). It predates every pread-worker
-  pool (the first landed 2026-03-28), so it judged a different family.
-- 2026-04-10, TODO "pread-from-workers boilerplate dedup (SKIP)", 4 of 4
-  reviewers (introduced in `025a8b07`): different payloads, consumers and
-  stats types make the generic helper harder to read than the duplication;
-  "only do this after the pread API shape stabilizes". Two copies (extract
-  and tags-filter), not the family.
-- Not an attempt: the July 2026 batched read-pipeline rebuild (measured,
-  reverted, `reference/performance-history.md` "Env-gated read-path
-  batch") ruled engine unification out of scope in its spec; it measured
-  `run_pipeline`'s seams, not pool unification.
-
-Which reasons are stale against today's tree: sort and `cat --dedupe` are
-one pread-schedule engine (`blob_merge.rs`), a header walk plus pread is the
-common shape rather than add-locations-to-ways' alone, and
-`parallel_classify_phase<S, R>` is already a closure-generic engine with
-many callers, so "callback soup" holds only for altw stages 2 and 3 (bucket
-dispatch) and the stage 4 / passthrough fork. Which still bind, and which a
-third attempt must answer: the API shape is still moving (three admission
-mechanisms, see HYG-053); the I/O mechanism must stay per command (ADR-0006
-measured a pipelined arm at 53.9 s against a 33.2 s sequential baseline);
-per-blob send and per-worker accumulation must both survive (accumulation
-is not planet-safe on dense paths); a credit window added to a pool that has
-none can park workers behind a slow head blob, which the July rebuild
-measured as deeper reorder skew, so its cost is per command; and
-apply-changes stays out. ADR-0014's route is the lighter alternative: share
-named primitives (first error, credit, cancellation wiring, counters) and
-leave the pools.
-
-Reported by: altw and scanning, re-encoding, filtering and spatial, read path,
-geocode index.
 
 ## HYG-036 - `too_many_arguments` is denied and then allowed locally all over
 

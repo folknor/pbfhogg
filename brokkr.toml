@@ -1110,6 +1110,15 @@ file = "planet-20260223-altw.osm.pbf"
 xxhash = "e83b43b8b1883efcc252e47b5c275535"
 seq = 4912
 
+# Made with `pbfhogg add-locations-to-ways <pbf.indexed> --keep-untagged-nodes
+# --index-type external` (2026-10-26): every node kept, so apply-changes
+# --locations-on-ways resolves every OSC-way ref. The plain `altw` variant
+# drops untagged nodes and cannot take -l on a real diff.
+[bygg.datasets.planet.pbf.altw-keep-untagged]
+file = "planet-20260223-altw-keep-untagged.osm.pbf"
+xxhash = "bdf1f1b6b242b3650ce2dca39ee868c7"
+seq = 4912
+
 [bygg.datasets.planet.pbf.raw]
 file = "planet-20260223.osm.pbf"
 xxhash = "ad3c909d39350709d0918f1f78e1a94d"

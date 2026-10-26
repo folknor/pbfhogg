@@ -11,6 +11,11 @@ pub struct MergeStats {
     pub deleted: u64,
     pub blobs_passthrough: u64,
     pub blobs_rewritten: u64,
+    /// Passthrough blobs written as the input's own indexed frame, unchanged,
+    /// whether the scanner passed them on their indexdata or a worker found
+    /// nothing to change in them; the same on every output route. Of
+    /// `blobs_passthrough`, only an unindexed `--force` blob reframed with
+    /// the sidecars derived from its payload is not one.
     pub blobs_index_hit: u64,
     /// Bytes of raw passthrough frames (wire size including framing).
     pub bytes_passthrough: u64,

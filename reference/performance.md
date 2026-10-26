@@ -172,7 +172,10 @@ Three-stage pipeline replacing the per-batch rayon barrier:
 
 - Scanner walks blob headers via `HeaderWalker`; non-overlap indexed
   blobs route to the drain as `DrainItem::CopyRange` (never reach the
-  worker pool); overlap candidates go to a long-lived worker pool.
+  worker pool); overlap candidates go to a long-lived worker pool. Under
+  `--locations-on-ways`, when the OSC creates or modifies a node, way
+  blobs are the exception: every one goes to the workers to be searched
+  for stale inline coordinates (see "Inline-location refresh" below).
 - Workers pread body, decompress, precise-check; under
   `--locations-on-ways` they extract node coords during the node phase
   into per-worker `Arc<Mutex<FxHashMap>>` slots. Drain merges slots at
@@ -183,6 +186,16 @@ Three-stage pipeline replacing the per-batch rayon barrier:
   `Vec<u8>` chunks to `DrainItem::Rewritten`; drain uses
   `write_raw_owned` per chunk (avoids the writer's
   rayon-spawn-per-block dispatch).
+
+Caveat on the planet and europe LOW figures in this section: they were
+taken on the `altw` variants, which `add-locations-to-ways` made without
+`--keep-untagged-nodes`. On those bases most way-node refs of the OSC's
+ways point at dropped nodes, so these runs left millions of refs
+unresolved (planet `2161ea62`: 4,237,222) and wrote `(0, 0)` for them,
+before the missing-node guard existed. They time a merge that resolved
+little, and the current code refuses that run unless
+`--ignore-missing-nodes` is passed. "Inline-location refresh" below has
+figures on a base that keeps its untagged nodes.
 
 Planet LOW altw + OSC 4913, `--bench 1`, plantasjen (source on
 Banan/nvme1n1; cross-disk scratch on Booty/nvme0n1p3 for the
@@ -257,6 +270,60 @@ Saturates at `j16`; `j24` is within single-shot noise. Matches the
 table-row same-disk parallel pwrite zstd:1 (104.5 s) within noise -
 confirming the writer-pool ceiling at POOL_SIZE=16, not the scanner
 ceiling.
+
+### Inline-location refresh (`--locations-on-ways`, commit `81f3fbe4`)
+
+Since `81f3fbe4` a surviving base way takes the OSC coordinate for every
+ref whose node the OSC creates or modifies. Way blobs the merge used to
+splice unread are now read, decompressed and searched by a wire-level scan
+(clean ones are still spliced); surviving ways in rewritten blobs are
+refreshed while being written. The same commit seeds
+`block_overlaps_diff`'s cursors by binary search, which used to walk the
+whole diff ID prefix for every candidate blob.
+
+Europe `altw-keep-untagged` (seq 4714, every node kept) + OSC 4715,
+bygg (Ryzen 9 9950X3D2, 30.5 GiB, one WD SN850X for source, output and
+scratch), interleaved `--bench 1` cells, no trim between them:
+
+| Commit | Walls (s), in run order | UUIDs |
+|---|---|---|
+| `8f8ef92a` (before) | 45.9 (an hour earlier), 60.8, 63.3, 56.8 | `78858442`, `6c41fa81`, `191f94a0`, `f93ebae1` |
+| `81f3fbe4` (fix) | 48.9, 55.8, 62.1 | `6d0d2213`, `2dc84b53`, `32c37ec1` |
+
+The walls do not separate: each cell writes a 56 GB output and drive
+state drifts across the series, and the fix comes out faster in two of
+three adjacent pairs. The worker counters do (summed elapsed over 22
+workers, `6c41fa81` before, `2dc84b53` after): decompress +42.6 s (way
+blobs that used to be spliced unread), refresh scan +30.8 s, rewrite
++34.5 s, frame +29.5 s (the about 5% more way blobs recompressed), and
+precise check -86.2 s from the cursor seeding. Net about +55 s summed,
+about 2.5 s per worker; the sidecar's way phase went from 28.1 s at 18.8
+cores to 30.0 s at 22.2 cores. The refresh refreshed 74,194 refs in
+23,221 ways, scanned 29,766 way blobs and rewrote 2,951 only for the
+refresh.
+
+Planet `altw-keep-untagged` (seq 4912, made with `--index-type external`,
+10,447,738,627 nodes, about 17.5K way blobs) + OSC 4913, bygg, the same
+interleaving, both arms built through `--commit`:
+
+| Commit | Walls (s), in run order | Peak anon | UUIDs |
+|---|---|---:|---|
+| `81f3fbe4` (fix) | 305.3, 304.7 | 3.84 GB | `d6f87532`, `76050327` |
+| `8f8ef92a` (before) | 304.6, 304.4 | 3.72 GB | `2aa41b13`, `1f3505e7` |
+
+Both arms run at about 28 of 32 cores. In the fix the way phase grows by
+about 6 s (126.5 s against 120.5 s) and the node phase shrinks by about
+5.5 s from the cursor seeding, so the walls match. The fix refreshed
+244,817 refs in 58,701 ways (the read-only measurement predicted exactly
+that), searched 505 way blobs and rewrote 163 only for the refresh; on
+this base most way blobs are already rewritten for merge work.
+`loc_missing` 0. The refresh probe is 100 MB
+(`merge_loc_refresh_probe_bytes`), about the peak-anon difference.
+
+Plain merge (no `--locations-on-ways`, europe indexed + OSC 4715), the
+same interleaving: `8f8ef92a` 52.5 s and 25.0 s, `81f3fbe4` 50.7 s and
+26.4 s (UUIDs `49d6c2b4`, `2c21e88c`, `040ad80b`, `08bc51e8`); first pair
+cold, second warm. No regression outside the noise.
 
 ### OSC-only path (no `--locations-on-ways`, planet, commit `16e3694`)
 

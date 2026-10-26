@@ -7,10 +7,12 @@
 //! overlap candidate (routes to the worker pool for decompress + precise
 //! check + maybe rewrite).
 //!
-//! Workers emit [`DrainItem`]s after processing candidates: false positives
-//! become `CopyRange` items, and true overlaps become rewritten blocks.
-//! Under `--direct-io` output, passthrough descriptors also route through
-//! workers so they can pread the full frame bytes and emit `OwnedBytes`.
+//! Workers emit [`DrainItem`]s after processing candidates: indexed false
+//! positives become `CopyRange` items (`OwnedBytes` under `--direct-io`
+//! output), unindexed ones reframed `OwnedBytes`, and true overlaps
+//! rewritten blocks. Under `--direct-io` output,
+//! passthrough descriptors also route through workers so they can pread the
+//! full frame bytes and emit `OwnedBytes`.
 //!
 //! The drain actor consumes a unified [`DrainItem`] stream (scanner's
 //! passthrough stream + worker outputs merged into an unbounded reorder
@@ -108,9 +110,11 @@ pub(super) enum ScannedBlob {
 /// Unified drain input. Arrives from two sources:
 /// - Scanner's passthrough stream (splice-capable backends) emits
 ///   [`DrainItem::CopyRange`].
-/// - Workers emit [`DrainItem::CopyRange`] for false positives,
-///   [`DrainItem::OwnedBytes`] for `--direct-io` passthrough, and
-///   [`DrainItem::Rewritten`] for actual rewrites.
+/// - Workers emit [`DrainItem::CopyRange`] for indexed false positives on
+///   the splice route, [`DrainItem::OwnedBytes`] for every indexed
+///   passthrough on the owned route (`--direct-io`) and for reframed
+///   unindexed blobs on either route, and [`DrainItem::Rewritten`] for
+///   actual rewrites.
 ///
 /// The drain's reorder buffer keys on `seq` and processes items in file
 /// order. Handles type transitions, gap creates, passthrough coalescing,
@@ -131,19 +135,30 @@ pub(super) enum DrainItem {
         index: BlobIndex,
         tagdata: Option<Box<[u8]>>,
     },
-    /// Owned frame bytes from a passthrough pread. Drain writes via
-    /// `write_raw_owned`, no re-framing needed. Emitted by the scanner
-    /// passthrough path under `--direct-io` and (since 2026-04-23) by
-    /// the consumer-build false-positive path on the `Route::Owned` route. `count` is the element count the blob contributes to
-    /// the output - the drain credits it to `base_<kind>` so merge
-    /// stats match all-features parity regardless of which
-    /// passthrough path the blob took.
+    /// A complete frame held in memory, which the drain writes via
+    /// `write_raw_owned` without re-framing. Two producers, both workers:
+    ///
+    /// - On the owned route (`--direct-io`), an indexed blob that leaves
+    ///   unchanged - a scanner passthrough, a precise-check false positive,
+    ///   or a way blob a refresh scan found clean - as the frame the worker
+    ///   read (`verbatim`). This is the owned route's `CopyRange`.
+    /// - On either route, an unindexed blob (`--force`) the diff leaves
+    ///   alone, its original body under a rebuilt header carrying the
+    ///   sidecars derived from its payload (not `verbatim`).
+    ///
+    /// `count` is the element count the blob contributes to the output; the
+    /// drain credits it to `base_<kind>`, as it does a `CopyRange`'s, so the
+    /// stats do not depend on the route.
     OwnedBytes {
         seq: u64,
         frame_bytes: Vec<u8>,
         kind: ElementKind,
         id_range: (i64, i64),
         count: u64,
+        /// The bytes are the input blob's own indexed frame, unchanged: the
+        /// drain counts the blob as an index hit, as it counts a
+        /// `CopyRange`.
+        verbatim: bool,
     },
     /// Rewritten blob, with each output block already framed by the
     /// worker (compression + protobuf framing applied in-line via

@@ -1293,6 +1293,20 @@
 
 ### Fixed
 
+- **`apply-changes --direct-io` reports its index hits.** The summary's
+  `Blobs: N passthrough (M index-hit)` read `0 index-hit` under
+  `--direct-io` (library: `MergeStats::blobs_index_hit`), however many blobs
+  passed through as they were; it now counts them as the default output
+  does, every blob written as the input's own indexed frame. A blob the
+  precise check passes through is also read once instead of twice there.
+
+- **`check --refs` says that `--direct-io` has no effect on it.** The flag
+  was accepted and silently ignored (its parallel readers read unaligned
+  blob ranges), while the I/O matrix listed `--refs` as supporting it; it
+  now prints a note, as `--locations` does. The matrix also says that
+  `check --ids` reads only the front of the file (the header and the first
+  blob header) with `O_DIRECT`.
+
 - **`apply-changes --locations-on-ways` updates ways the OSC does not
   touch.** A way's version changes only when its tags or node list do, so
   moving a node usually leaves the ways using it out of the diff; those ways
@@ -2644,9 +2658,10 @@
 
 - **`check --refs` reported untrackable element IDs as missing references,
   indistinguishably from real ones.** An ID the tracking bitset cannot
-  represent - a negative ID, or one above the range sized from the file's
-  own indexdata - is never recorded as present, so every reference to it is
-  counted missing. That over-report is deliberate (the alternative was a
+  represent - a negative ID - is never recorded as present, so every
+  reference to it is counted missing (a positive ID above the range sized
+  from the file's own indexdata is inserted after the parallel phase and
+  tracked). That over-report is deliberate (the alternative was a
   panicking worker), but it was silent: the reader could not tell "your file
   references a node it does not contain" from "your file contains a node
   this check could not track". The count is now reported on its own line and
@@ -2752,7 +2767,9 @@
   was read. The bitset may now never exceed the size of the input file,
   floored at the live OSM ID space, so the sizing still tracks real files
   of any scale while a small hostile one cannot request an unbounded
-  allocation. An ID above the chosen bound is reported, as above.
+  allocation. A positive ID above the chosen bound is still tracked,
+  inserted after the parallel phase; only a negative ID is reported, as
+  above.
 
 - **`renumber` reports rather than panics when a file's indexdata
   understates its own ID range.** The node bitset is sized from

@@ -194,6 +194,168 @@ fn check_refs_reports_untrackable_ids_separately_from_missing_refs() {
     );
 }
 
+/// IDs above what a small file pre-allocates: its kind's floor
+/// (`*_ID_FLOOR` in `src/tunables.rs`), rounded up to the 2^25-ID chunk
+/// `IdSet` allocates whole.
+const HIGH_NODE: i64 = 15_000_000_000;
+const HIGH_WAY: i64 = 2_500_000_000;
+const HIGH_RELATION: i64 = 40_000_000;
+
+fn node(id: i64) -> TestNode {
+    TestNode {
+        id,
+        lat: 0,
+        lon: 0,
+        tags: vec![],
+        meta: None,
+    }
+}
+
+/// IDs above a small file's pre-allocation (its floor; an indexed file's
+/// claim cannot raise it past the file's size) take the serial overflow
+/// path, counted on the run's token in test-hooks builds. Every reference
+/// among them still resolves, for nodes, ways and relations, indexed or not.
+#[test]
+fn check_refs_resolves_ids_above_the_allocation() {
+    let dir = crate::common::test_scratch();
+    let nodes = [node(1), node(HIGH_NODE)];
+    let ways = [
+        TestWay {
+            id: 10,
+            refs: vec![1, HIGH_NODE],
+            tags: vec![],
+            meta: None,
+        },
+        TestWay {
+            id: HIGH_WAY,
+            refs: vec![HIGH_NODE, 1],
+            tags: vec![],
+            meta: None,
+        },
+    ];
+    let relations = [
+        TestRelation {
+            id: 7,
+            members: vec![TestMember {
+                id: MemberId::Relation(HIGH_RELATION),
+                role: "subarea",
+            }],
+            tags: vec![],
+            meta: None,
+        },
+        TestRelation {
+            id: HIGH_RELATION,
+            members: vec![
+                TestMember {
+                    id: MemberId::Node(HIGH_NODE),
+                    role: "label",
+                },
+                TestMember {
+                    id: MemberId::Way(HIGH_WAY),
+                    role: "outer",
+                },
+                TestMember {
+                    id: MemberId::Relation(7),
+                    role: "subarea",
+                },
+            ],
+            tags: vec![],
+            meta: None,
+        },
+    ];
+    let indexed = dir.path().join("indexed.osm.pbf");
+    write_test_pbf_sorted(&indexed, &nodes, &ways, &relations);
+    let unindexed = dir.path().join("unindexed.osm.pbf");
+    crate::common::write_test_pbf_non_indexed(&unindexed, &nodes, &ways, &relations);
+
+    for path in [&indexed, &unindexed] {
+        let host = crate::common::test_host();
+        let opts = pbfhogg::check::refs::CheckRefsOptions {
+            check: pbfhogg::check::CheckOptions {
+                max_errors: 0,
+                direct_io: false,
+            },
+            check_relations: true,
+            show_ids: true,
+        };
+        let report = pbfhogg::check::refs::check_refs(path, &opts, &host).expect("check_refs");
+        // The high node, way and relation lay above the pre-allocation.
+        #[cfg(feature = "test-hooks")]
+        assert_eq!(
+            host.cancel
+                .faults()
+                .check_overflow_ids
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "{}: the high IDs must take the overflow path",
+            path.display()
+        );
+        let missing: Vec<_> = report
+            .missing_refs
+            .iter()
+            .map(|m| (m.missing_type, m.missing_id))
+            .collect();
+        assert!(
+            report.is_valid(),
+            "{}: every reference resolves, missing {missing:?}",
+            path.display()
+        );
+        assert_eq!(
+            (report.node_count, report.way_count, report.relation_count),
+            (2, 2, 2)
+        );
+        assert_eq!(report.total_untrackable(), 0);
+    }
+
+    // Passing counterpart: drop the high node and its references go missing,
+    // so the overflow path is what resolved them above.
+    let without = dir.path().join("without.osm.pbf");
+    write_test_pbf_sorted(&without, &nodes[..1], &ways, &relations);
+    let report = run_check_refs(&without, true, false, 0).expect("check_refs");
+    assert_eq!(report.missing_node_refs, 1);
+    assert_eq!(report.missing_node_members, 1);
+}
+
+/// `--ids --full` finds a duplicate of an ID above the file's pre-allocation
+/// across blobs, as it does one inside it.
+#[test]
+fn check_ids_full_finds_a_duplicate_above_the_allocation() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("dup.osm.pbf");
+    let nodes = [node(1), node(HIGH_NODE), node(HIGH_NODE)];
+    crate::common::write_multi_block_test_pbf(&input, &nodes, &[], &[], 1);
+
+    let opts = pbfhogg::check::verify_ids::VerifyIdsOptions {
+        check: pbfhogg::check::CheckOptions {
+            max_errors: 0,
+            direct_io: false,
+        },
+        full: true,
+        type_filter: None,
+    };
+    let host = crate::common::test_host();
+    let report = pbfhogg::check::verify_ids::verify_ids(&input, &opts, &host).expect("verify_ids");
+    // Both copies of the high node lay above the pre-allocation, so the
+    // duplicate was found by the serial overflow insertion.
+    #[cfg(feature = "test-hooks")]
+    assert_eq!(
+        host.cancel
+            .faults()
+            .check_overflow_ids
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+    assert!(!report.passed);
+    assert!(
+        report.violations.iter().any(|v| matches!(
+            v,
+            pbfhogg::check::verify_ids::IdViolation::Duplicate { id, .. } if *id == HIGH_NODE
+        )),
+        "{} violations, none a duplicate of {HIGH_NODE}",
+        report.violations.len()
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn check_refs_show_ids_reports_unique_counts_and_occurrences() {

@@ -89,8 +89,14 @@ claim, so a false bbox survives into a fully renumbered output and a later
 ## Allocation from claims
 
 Anything sized from a claim must survive the claim being wrong (ADR-0013,
-consequence 2). `check` bounds its ID bitsets by the input file's size, and
-`check --ids` / `--refs` report an out-of-range ID as a property of the input.
+consequence 2). `check --refs` and `check --ids --full` pre-allocate their
+ID bitsets to the claimed `max_id` bounded by the input file's size,
+floored at the live-OSM ID range (`id_alloc_bound` in
+`src/commands/check/mod.rs`), and insert any decoded positive ID above the
+allocation after the parallel phase. A claim therefore cannot cause an
+unbounded allocation, and an ID beyond the allocation is still tracked
+correctly; a wrong claim can change the run's memory and time, not its
+answer. A negative ID is reported as a property of the input.
 `repack` bounds its `BlockBuilder` pre-allocation the same way. `renumber`
 pre-allocates its node set to the smaller of the claimed `max_id` and a
 file-size bound and inserts any ID above it afterwards, so an overstated or

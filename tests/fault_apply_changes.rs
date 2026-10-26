@@ -544,6 +544,267 @@ mod apply_changes {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Route parity of the merge statistics
+    // ---------------------------------------------------------------------
+
+    /// Every `MergeStats` figure a route could move, by name.
+    fn stats_figures(s: &pbfhogg::apply_changes::MergeStats) -> Vec<(&'static str, u64)> {
+        vec![
+            ("base_nodes", s.base_nodes),
+            ("base_ways", s.base_ways),
+            ("base_relations", s.base_relations),
+            ("diff_nodes", s.diff_nodes),
+            ("diff_ways", s.diff_ways),
+            ("diff_relations", s.diff_relations),
+            ("deleted", s.deleted),
+            ("blobs_passthrough", s.blobs_passthrough),
+            ("blobs_rewritten", s.blobs_rewritten),
+            ("blobs_index_hit", s.blobs_index_hit),
+            ("bytes_passthrough", s.bytes_passthrough),
+            ("bytes_rewritten", s.bytes_rewritten),
+            ("loc_nodes_from_base", s.loc_nodes_from_base),
+            ("loc_missing", s.loc_missing),
+            ("loc_node_blobs_scanned", s.loc_node_blobs_scanned),
+            ("loc_refresh_blobs_scanned", s.loc_refresh_blobs_scanned),
+            ("loc_refresh_only_blobs", s.loc_refresh_only_blobs),
+            ("loc_refreshed_ways", s.loc_refreshed_ways),
+            ("loc_refreshed_refs", s.loc_refreshed_refs),
+        ]
+    }
+
+    /// Merge `base` and `osc` on the splice route and on the owned route
+    /// (what `--direct-io` takes), assert the two outputs are the same bytes
+    /// and every statistic agrees, and return the splice run's figures.
+    ///
+    /// `workers` is what each route's worker pool must report, splice first:
+    /// `[preads, blobs processed, precise-check false positives, owned
+    /// passthroughs]`. One pread and one processed count per blob a worker
+    /// handles is what pins the owned route's false positive to a single
+    /// read: it once read its frame a second time and counted itself twice.
+    fn merge_on_both_routes(
+        base: &Path,
+        osc: &Path,
+        opts: &MergeOptions,
+        label: &str,
+        workers: [[u64; 4]; 2],
+    ) -> Vec<(&'static str, u64)> {
+        const WORKER_COUNTERS: [&str; 4] = [
+            "merge_streaming_blob_reads",
+            "merge_streaming_blobs_processed",
+            "merge_streaming_blobs_false_positive",
+            "merge_streaming_blobs_owned_passthrough",
+        ];
+        let dir = crate::common::test_scratch();
+        let mut runs = Vec::new();
+        for (owned, expected) in [false, true].into_iter().zip(workers) {
+            let output = dir.path().join(format!("owned-{owned}.osm.pbf"));
+            let host = crate::common::test_host();
+            host.cancel
+                .faults()
+                .apply_changes_force_owned_route
+                .store(owned, std::sync::atomic::Ordering::SeqCst);
+            let stats = merge(
+                base,
+                osc,
+                common::out(&output),
+                opts,
+                &pbfhogg::HeaderOverrides::default(),
+                &host,
+            )
+            .unwrap_or_else(|e| panic!("{label} owned={owned}: {e}"));
+            let got = WORKER_COUNTERS.map(|name| {
+                host.cancel
+                    .faults()
+                    .apply_changes_worker_counter(name)
+                    .unwrap_or_else(|| panic!("{label} owned={owned}: no counter {name}"))
+            });
+            assert_eq!(
+                got, expected,
+                "{label} owned={owned}: worker {WORKER_COUNTERS:?}"
+            );
+            runs.push((
+                stats_figures(&stats),
+                std::fs::read(&output).expect("read output"),
+            ));
+        }
+        let (owned_figures, owned_bytes) = runs.pop().expect("owned run");
+        let (splice_figures, splice_bytes) = runs.pop().expect("splice run");
+        assert_eq!(
+            owned_bytes, splice_bytes,
+            "{label}: the owned route's output differs from the splice route's"
+        );
+        assert_eq!(
+            owned_figures, splice_figures,
+            "{label}: the owned route's statistics differ from the splice route's"
+        );
+        splice_figures
+    }
+
+    fn figure(figures: &[(&'static str, u64)], name: &str) -> u64 {
+        figures
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| *v)
+            .unwrap_or_else(|| panic!("no figure {name}"))
+    }
+
+    /// The statistics of a merge do not depend on the output route. Every
+    /// way a blob can pass through is exercised: the scanner passing it on
+    /// its indexdata, a worker finding a precise-check false positive (a
+    /// delete of a node in a gap of the blob's range, and under
+    /// `--locations-on-ways` a node blob decompressed only for its
+    /// coordinates), and a refresh scan finding a way blob clean. On the
+    /// owned route each of them is the input's own frame, so it is an index
+    /// hit as its splice is; `blobs_index_hit` used to read 0 there. An
+    /// unindexed `--force` base, whose untouched blobs are reframed with
+    /// derived sidecars, has no index hit on either route.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn merge_statistics_are_the_same_on_both_routes() {
+        use crate::common::{TestMember, TestRelation, TestWay};
+
+        let dir = crate::common::test_scratch();
+        let osc = dir.path().join("diff.osc.gz");
+
+        // Plain merge: five node blobs of odd IDs 1..=39, two way blobs and
+        // one relation blob. Node 3 is modified (its blob is rewritten) and
+        // node 10, inside the second blob's range but absent, is deleted (a
+        // false positive). The rest pass through on their indexdata.
+        let nodes: Vec<TestNode> = generate_nodes(40, 1)
+            .into_iter()
+            .filter(|n| n.id % 2 == 1)
+            .collect();
+        let ways: Vec<TestWay> = (0..8)
+            .map(|i| TestWay {
+                id: 100 + i,
+                refs: vec![2 * i + 1, 2 * i + 3],
+                tags: vec![("highway", "road")],
+                meta: None,
+            })
+            .collect();
+        let relations = vec![
+            TestRelation {
+                id: 500,
+                members: vec![TestMember {
+                    id: pbfhogg::MemberId::Way(100),
+                    role: "outer",
+                }],
+                tags: vec![("type", "multipolygon")],
+                meta: None,
+            },
+            TestRelation {
+                id: 501,
+                members: vec![TestMember {
+                    id: pbfhogg::MemberId::Way(101),
+                    role: "outer",
+                }],
+                tags: vec![("type", "multipolygon")],
+                meta: None,
+            },
+        ];
+        write_osc_body(
+            &osc,
+            "<modify><node id=\"3\" lat=\"1.5\" lon=\"2.5\" version=\"2\"/></modify>\
+             <delete><node id=\"10\" version=\"2\"/></delete>",
+        );
+        let plain = MergeOptions {
+            parallelism: pbfhogg::Parallelism::from_jobs(2),
+            ..MergeOptions::default()
+        };
+
+        let indexed = dir.path().join("indexed.osm.pbf");
+        write_multi_block_test_pbf(&indexed, &nodes, &ways, &relations, 4);
+        // Splice: workers see the two candidates. Owned: also the six
+        // scanner passthroughs, and the false positive leaves as the frame
+        // it read, so eight blobs cost eight reads.
+        let figures = merge_on_both_routes(
+            &indexed,
+            &osc,
+            &plain,
+            "indexed",
+            [[2, 2, 1, 0], [8, 8, 1, 7]],
+        );
+        assert_eq!(figure(&figures, "blobs_rewritten"), 1, "{figures:?}");
+        assert_eq!(figure(&figures, "blobs_passthrough"), 7, "{figures:?}");
+        assert_eq!(
+            figure(&figures, "blobs_index_hit"),
+            7,
+            "every blob of an indexed base that passes through is an index hit: {figures:?}"
+        );
+
+        let unindexed = dir.path().join("unindexed.osm.pbf");
+        crate::common::write_multi_block_non_indexed_pbf(&unindexed, &nodes, &ways, &relations, 4);
+        let forced = MergeOptions {
+            write: WriteOptions {
+                force: true,
+                ..WriteOptions::default()
+            },
+            ..plain
+        };
+        // Every unindexed blob is a candidate on both routes; the reframed
+        // false positives are not owned passthroughs.
+        let figures = merge_on_both_routes(
+            &unindexed,
+            &osc,
+            &forced,
+            "unindexed",
+            [[8, 8, 7, 0], [8, 8, 7, 0]],
+        );
+        assert_eq!(figure(&figures, "blobs_rewritten"), 1, "{figures:?}");
+        assert_eq!(figure(&figures, "blobs_passthrough"), 7, "{figures:?}");
+        assert_eq!(
+            figure(&figures, "blobs_index_hit"),
+            0,
+            "a reframed unindexed blob is not an index hit: {figures:?}"
+        );
+
+        // --locations-on-ways: node blobs [1, 3], [5, 7], [9, 11], one blob
+        // per way, a relation blob. Node 1 moves, so way 100's blob is
+        // rewritten only for that; way 101 is modified; way 102's blob misses
+        // the way diff and holds no stale way, so a refresh scan passes it
+        // through. Node 6 is deleted inside the second node blob's range (a
+        // false positive), and the third node blob is decompressed only for
+        // its coordinates. Four blobs pass through.
+        let low = dir.path().join("low.osm.pbf");
+        write_low_base(
+            &low,
+            &[1, 3, 5, 7, 9, 11],
+            2,
+            &[(100, vec![1, 3]), (101, vec![5, 7]), (102, vec![9, 11])],
+            &[(500, 100)],
+        );
+        let low_osc = dir.path().join("low.osc.gz");
+        write_osc_body(
+            &low_osc,
+            &format!(
+                "<modify><node id=\"1\" lat=\"1.5\" lon=\"2.5\" version=\"2\"/>{}</modify>\
+                 <delete><node id=\"6\" version=\"2\"/></delete>",
+                osc_way(101, 2, &[5, 7]),
+            ),
+        );
+        // Splice: the three node blobs and three way blobs are candidates,
+        // two node blobs false positives (the refresh-clean way blob is not
+        // counted as one). Owned: also the relation blob, and four blobs
+        // leave as the frames read.
+        let figures = merge_on_both_routes(
+            &low,
+            &low_osc,
+            &low_options(2),
+            "locations",
+            [[6, 6, 2, 0], [7, 7, 2, 4]],
+        );
+        assert_eq!(figure(&figures, "blobs_rewritten"), 3, "{figures:?}");
+        assert_eq!(figure(&figures, "blobs_passthrough"), 4, "{figures:?}");
+        assert_eq!(figure(&figures, "blobs_index_hit"), 4, "{figures:?}");
+        assert_eq!(figure(&figures, "loc_refresh_only_blobs"), 1, "{figures:?}");
+        assert_eq!(
+            figure(&figures, "loc_refresh_blobs_scanned"),
+            2,
+            "ways 100 and 102 are scanned: {figures:?}"
+        );
+    }
+
     /// A way blob outside every OSC range used to be spliced unread. Under a
     /// refresh it is searched, and a malformed coordinate array in it (one
     /// latitude for two refs) fails the run on both routes: nothing is

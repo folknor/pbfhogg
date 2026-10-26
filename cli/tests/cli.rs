@@ -174,6 +174,42 @@ fn cli_check() {
     );
 }
 
+/// `--refs` reads nothing with O_DIRECT, so `--direct-io` is accepted, has
+/// no effect, and says so; it used to be ignored silently. `--refs` alone
+/// opens nothing with O_DIRECT, so this runs on any filesystem. A build
+/// without `linux-direct-io` refuses the flag before any check runs.
+#[cfg(feature = "linux-direct-io")]
+#[test]
+fn cli_check_refs_reports_direct_io_as_having_no_effect() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("input.osm.pbf");
+    write_minimal_pbf(&input);
+
+    let result = Command::new(pbfhogg_bin())
+        .arg("check")
+        .arg(&input)
+        .args(["--refs", "--direct-io"])
+        .output()
+        .expect("run pbfhogg check");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("--direct-io has no effect on --refs"),
+        "{stderr}"
+    );
+
+    // Without the flag there is nothing to say.
+    let result = Command::new(pbfhogg_bin())
+        .arg("check")
+        .arg(&input)
+        .arg("--refs")
+        .output()
+        .expect("run pbfhogg check");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "{stderr}");
+    assert!(!stderr.contains("--direct-io"), "{stderr}");
+}
+
 // ---------------------------------------------------------------------------
 // Renumber CLI
 // ---------------------------------------------------------------------------

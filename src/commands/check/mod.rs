@@ -23,7 +23,10 @@ pub struct CheckOptions {
     /// check's working memory: exact counting and deferred reference checks
     /// retain intermediate data independently of this display limit.
     pub max_errors: usize,
-    /// Read the input with `O_DIRECT` where the check supports it.
+    /// Read the input with `O_DIRECT` where the check supports it: the index
+    /// check's reads and the ID check's front read. The reference and
+    /// location checks, and the ID check's blob reads, are parallel preads of
+    /// unaligned blob ranges that ignore it.
     pub direct_io: bool,
 }
 
@@ -69,6 +72,25 @@ use crate::tunables::CHECK_IDS_PER_BYTE;
 /// IDs can allocate sparse overflow chunks; unverified indexdata cannot.
 pub(super) fn id_alloc_bound(indexdata_max: i64, floor: i64, file_len: u64) -> i64 {
     crate::idset::IdSet::file_bounded_max_id(indexdata_max, file_len, CHECK_IDS_PER_BYTE).max(floor)
+}
+
+/// Insert the positive IDs a parallel phase found above its pre-allocation
+/// (`ids`, drained) into `set`. Test builds count them on the run's token.
+pub(super) fn insert_overflow_ids(
+    set: &mut crate::idset::IdSet,
+    ids: &mut Vec<i64>,
+    host: &crate::host::Host,
+) {
+    #[cfg(feature = "test-hooks")]
+    host.cancel
+        .faults()
+        .check_overflow_ids
+        .fetch_add(ids.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "test-hooks"))]
+    let _ = host;
+    for id in ids.drain(..) {
+        set.set(id);
+    }
 }
 
 #[cfg(test)]

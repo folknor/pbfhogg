@@ -28,6 +28,16 @@ Reaffirmed 2026-10-26, after weighing "it is documented, so leave it" and
 Before touching code, read `reference/performance-history.md` and
 `reference/performance.md`. The current code is likely not an accident.
 
+Status (2026-10-26): fixed in `81f3fbe4`, with `check --locations`
+(`669a31e6`) as its oracle and the docs corrected alongside. Europe A/B
+recorded in `reference/performance.md` "Inline-location refresh": worker
+time up about 55 s net summed over 22 workers, walls inside drive noise,
+plain merge unchanged. Planet A/B on a base that keeps its untagged nodes
+(bygg, interleaved): 305.3 and 304.7 s with the fix against 304.6 and
+304.4 s before, refreshing exactly the 244,817 refs in 58,701 ways
+measured earlier; recorded in the same section, and the README's planet
+row now uses it. Remaining: brokkr#43.
+
 ## The defect
 
 Only ways the OSC touches get fresh coordinates.
@@ -831,6 +841,20 @@ baseline; the matched A/B is pending.
   ways' raw coordinates, while its commit message claimed it removed the
   need to rerun altw. An original semantic limitation, not a regression
   from the splice architecture.
+- K. `check --refs` and `check --ids --full` collect every positive ID
+  above the bitset allocation into an overflow `Vec` (8 bytes per element,
+  kept per phase in `refs.rs`, per blob until the serial merge in
+  `verify_ids.rs`) and insert them serially. A compressible file holding
+  billions of distinct IDs above the 14B floor can therefore cost tens of
+  GB; this exists on current code. A sizing change that let small files
+  reserve less was tried on 2026-10-26 and reverted after two review
+  rounds, because it moved that exposure below the floor. A reviewer's
+  proposed fix: the merge callbacks already run serially on the consumer
+  thread, so insert overflow IDs there into a separate `IdSet` the workers
+  never see and merge it after the phase (`set` then `merge_from` for
+  refs, `set_if_new` with duplicate counting for verify_ids). Overflow
+  memory then follows the ID range, not the element count, and the
+  small-file saving becomes safe. Unmeasured.
 - J. Section 1's negative-ID point overgeneralizes: the shared relation
   scan does skip negative member IDs, but external altw rejects node blobs
   whose indexdata includes negative node IDs

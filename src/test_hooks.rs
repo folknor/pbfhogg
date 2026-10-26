@@ -187,6 +187,15 @@ pub struct FaultPlan {
     /// A bounded apply-changes hook wait expired: the handshake did not
     /// happen, and a test relying on it proved nothing.
     pub apply_changes_hook_timed_out: AtomicBool,
+    /// The streaming worker pool's counters as the last run under this token
+    /// left them, by their sidecar names; see
+    /// [`apply_changes_worker_counter`](Self::apply_changes_worker_counter).
+    apply_changes_worker_counters: Mutex<Vec<(&'static str, u64)>>,
+
+    // --- check ID sets (`commands::check::{refs, verify_ids}`) ---
+    /// Positive element IDs `check --refs` or `check --ids --full` inserted
+    /// after a parallel phase because they lay above the pre-allocated range.
+    pub check_overflow_ids: AtomicU64,
 
     // --- altw external stage 3 ---
     /// Slot bucket index at which the stage 3 worker claiming it panics.
@@ -314,6 +323,8 @@ impl FaultPlan {
             apply_changes_scanner_in_barrier_wait: AtomicBool::new(false),
             apply_changes_force_owned_route: AtomicBool::new(false),
             apply_changes_hook_timed_out: AtomicBool::new(false),
+            apply_changes_worker_counters: Mutex::new(Vec::new()),
+            check_overflow_ids: AtomicU64::new(0),
             altw_stage3_panic_at_bucket: AtomicUsize::new(usize::MAX),
             altw_stage3_hold_bucket: AtomicUsize::new(usize::MAX),
             altw_stage3_bucket_held: AtomicBool::new(false),
@@ -641,6 +652,27 @@ impl FaultPlan {
                 self.apply_changes_drain_next_seq.load(Ordering::SeqCst) >= node_end_seq
             });
         }
+    }
+
+    /// A streaming-worker counter of the last apply-changes run under this
+    /// token, by its sidecar name (`merge_streaming_blobs_processed` and
+    /// kin); `None` before a run or for a name the pool does not emit.
+    pub fn apply_changes_worker_counter(&self, name: &str) -> Option<u64> {
+        self.apply_changes_worker_counters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| *v)
+    }
+
+    /// Called by the streaming pool as it finishes, with every counter it
+    /// emits.
+    pub(crate) fn record_apply_changes_worker_counters(&self, counters: Vec<(&'static str, u64)>) {
+        *self
+            .apply_changes_worker_counters
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = counters;
     }
 
     /// Called by the drain when the node boundary arrives, with the seq it

@@ -38,7 +38,7 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 |---------|------|---------------|
 | `add-locations-to-ways --index-type external` | 9m52s | 12.0 GB |
 | `apply-changes` (OSC-only daily diff, `zstd:1`) | 4m29s | 2.4 GB |
-| `apply-changes --locations-on-ways` (daily diff) | 2m15s | ~3.3 GB |
+| `apply-changes --locations-on-ways` (daily diff, base keeps untagged nodes) ¹ | 5m05s | 3.8 GB |
 | `build-geocode-index` | 5m47s | ~25 GB |
 | `cat` (indexdata generation) | 1m27s | ~200 MB |
 | `cat --clean version` | 5m34s | 750 MB |
@@ -69,6 +69,8 @@ Every command listed below runs on the full planet on normal hardware. Measured 
 | `tags-filter -i w/highway=primary` (invert-match) | 7m57s | 7.0 GB |
 | `tags-filter -R highway=primary` | 52s | 688 MB |
 | `time-filter` (snapshot, cutoff 2024-01-01) | 4m24s | 812 MB |
+
+¹ Measured on a different host (Ryzen 9 9950X3D2, 30.5 GiB, commit `81f3fbe4`), on a base made with `add-locations-to-ways --keep-untagged-nodes`, which the flag needs. The earlier figure in this row came from a base without its untagged nodes, where most of the diff's way references went unresolved; see [reference/performance.md](reference/performance.md).
 
 Three commands write temp files to the output's parent directory: `add-locations-to-ways --index-type external` (~246 GB), `diff` (parallel by default; ~30 GB text shards at planet), `diff --format osc` (~45 GB XML shards). The others are scratch-free. A text `diff -j 1` runs one shard and writes no scratch, if temp disk is scarce.
 

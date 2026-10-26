@@ -86,7 +86,13 @@ Denmark (501 MB with LocationsOnWays, daily diff, commit `e7bbfa2`):
 | apply-changes `--locations-on-ways` | **3.9s** | 8.3s | **2.1x** |
 | apply-changes + ALTW (separate) | 2.7s + 6.5s = 9.2s | 4.3s + 9.5s = 13.8s | -- |
 
-The `--locations-on-ways` flag replaces a two-step pipeline with a single command.
+These figures predate the inline-location refresh (commit `81f3fbe4`):
+at `e7bbfa2` the flag did not update ways the diff left alone, so a node
+the diff moved left them stale, and the run did less work than it does
+now. Since the refresh, the flag replaces the two-step pipeline with a
+single command, provided the base was made with
+`add-locations-to-ways --keep-untagged-nodes`; see
+`reference/performance.md` for measurements of the current code.
 
 ## Planet-scale pipeline
 

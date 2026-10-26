@@ -11,14 +11,17 @@
 //! ## Per-blob worker logic
 //!
 //! - [`ScannedBlob::Candidate`]: pread the Blob protobuf body via
-//!   `(frame_start + blob_offset, data_size)`, decompress through the
+//!   `(frame_start + blob_offset, data_size)` (on the owned route an
+//!   indexed blob's whole frame, `(frame_start, frame_len)`, so that it can
+//!   leave as read), decompress through the
 //!   thread-local scratch, extract node coords (checked, dense and plain
 //!   encodings, see `node_coords.rs`) if the blob is a Node and
 //!   `--locations-on-ways` is active, parse via
 //!   [`PrimitiveBlock::from_vec_with_scratch`], precise-check via
 //!   [`block_overlaps_diff`]. False positives emit a `DrainItem::CopyRange`
 //!   carrying the original descriptor so the drain can `copy_file_range`
-//!   the raw frame. An unindexed blob (`--force`) is scanned for the
+//!   the raw frame, or on the owned route a verbatim `DrainItem::OwnedBytes`
+//!   of the frame already read. An unindexed blob (`--force`) is scanned for the
 //!   sidecars the writer would give it, and a false positive among those
 //!   is reframed with them (`DrainItem::OwnedBytes`), so the output is
 //!   wholly indexed; one no index can describe is re-encoded, omitted when
@@ -30,7 +33,8 @@
 //! - Under `--locations-on-ways`, when the OSC creates or modifies a node, every
 //!   indexed way blob is a Candidate, so that surviving base ways whose
 //!   inline coordinates the OSC makes stale are refreshed (`refresh.rs`). A
-//!   way blob whose range misses the diff reads its whole frame once,
+//!   way blob whose range misses the diff reads its whole frame once (on
+//!   both routes),
 //!   decompresses, and is searched without a full parse; it is passed
 //!   through (`CopyRange`, or `OwnedBytes` from that frame) unless a way in
 //!   it is stale, and parsed and rewritten if one is. A false positive among
@@ -124,9 +128,9 @@ pub(super) struct StreamingConfig {
     pub compression: Compression,
     /// `Splice` when the output backend supports `copy_file_range` (so the
     /// drain accepts `DrainItem::CopyRange`). On `Owned` (when
-    /// `--direct-io` is selected), false-positive candidates must be
-    /// routed through the owned-passthrough path instead - the drain
-    /// rejects `CopyRange` items up front.
+    /// `--direct-io` is selected) the drain rejects `CopyRange` items up
+    /// front, so an indexed candidate's whole frame is read and a blob that
+    /// passes through leaves as that frame, a verbatim `OwnedBytes`.
     pub route: Route<()>,
     /// Shared with the drain; see the module doc's "Failure" section.
     pub failure: Arc<FailureSlot>,
@@ -165,6 +169,9 @@ crate::counters::counter_set! {
         /// output is indexed. A subset of `blobs_rewritten`.
         pub blobs_forced_rewrite => "merge_streaming_blobs_forced_rewrite",
         pub blobs_owned_passthrough => "merge_streaming_blobs_owned_passthrough",
+        /// Base preads the workers issued, a body or a whole frame each: one
+        /// per blob a worker handles.
+        pub blob_reads => "merge_streaming_blob_reads",
         /// Decompress wall summed across all workers (cumulative ns).
         pub decompress_ns => "merge_streaming_decompress_ns",
         /// Parse wall summed across all workers.
@@ -343,6 +350,16 @@ pub(super) fn run_workers(
 
     crate::debug::emit_marker("MERGE_STREAMING_END");
     counters.emit_all();
+    // Test-only: the same counters, kept on the run's token, so a test can
+    // assert on them without the process-wide sidecar FIFO.
+    #[cfg(feature = "test-hooks")]
+    {
+        let mut recorded = Vec::new();
+        counters.for_each(|name, value| recorded.push((name, value)));
+        cancel
+            .faults()
+            .record_apply_changes_worker_counters(recorded);
+    }
 }
 
 /// Per-worker hot loop. Pulls candidates until the channel closes; for
@@ -435,7 +452,7 @@ fn worker_loop(
                 )
                 .map_err(|e| blob_err(&desc, source, e))?;
             }
-            ScannedBlob::Passthrough(desc) => {
+            ScannedBlob::Passthrough(mut desc) => {
                 // Only seen here under --direct-io output (scanner routes
                 // splice-capable passthroughs straight to the drain).
                 // Scanner only emits Passthrough for indexed blobs
@@ -444,8 +461,7 @@ fn worker_loop(
                 // are present and are used as given: they are indexdata
                 // claims, believed and never checked against this
                 // undecoded blob (reference/indexdata-trust.md).
-                let count = desc.index.as_ref().map_or(0, |i| i.count);
-                handle_owned_passthrough(file, &desc, drain_tx, counters, &mut read_buf, count)
+                handle_owned_passthrough(file, &mut desc, drain_tx, counters, &mut read_buf)
                     .map_err(|e| blob_err(&desc, source, e))?;
             }
         }
@@ -518,19 +534,31 @@ fn handle_candidate(
     // Set when the only reason to rewrite this blob is a stale way.
     let mut refresh_only = false;
 
-    if refresh_scan {
-        // The whole frame in one read: a clean blob on the owned route is
-        // shipped from it, and only the body is decompressed.
-        pread_into(file, read_buf, desc.frame_start, desc.frame_len)?;
-        let body = desc
-            .blob_offset
+    // One read per blob. An indexed blob on the owned route may leave as its
+    // own frame (a false positive, or a refresh scan that finds nothing), so
+    // the whole frame is read once and shipped from `read_buf` without a
+    // second pread; only the body is decompressed. A refresh scan reads the
+    // whole frame on both routes. Every other read, every splice-route
+    // candidate's included, is the body alone, which is all a rewrite, a
+    // `CopyRange` or an unindexed blob's reframe needs.
+    let whole_frame = refresh_scan || (!route.is_splice() && desc.index.is_some());
+    let body = if whole_frame {
+        pread_into(file, read_buf, desc.frame_start, desc.frame_len, counters)?;
+        desc.blob_offset
             .checked_add(desc.data_size)
-            .and_then(|end| read_buf.get(desc.blob_offset..end))
-            .ok_or_else(|| Error::internal("streaming: blob body outside its frame"))?;
-        let t_decompress = crate::counters::Stopwatch::start();
-        decompress_blob_raw(body, decompress_buf)?;
-        t_decompress.record_ns(&counters.decompress_ns);
+            .filter(|&end| end <= read_buf.len())
+            .map(|end| desc.blob_offset..end)
+            .ok_or_else(|| Error::internal("streaming: blob body outside its frame"))?
+    } else {
+        let body_offset = desc.frame_start + desc.blob_offset as u64;
+        pread_into(file, read_buf, body_offset, desc.data_size, counters)?;
+        0..desc.data_size
+    };
+    let t_decompress = crate::counters::Stopwatch::start();
+    decompress_blob_raw(&read_buf[body.clone()], decompress_buf)?;
+    t_decompress.record_ns(&counters.decompress_ns);
 
+    if refresh_scan {
         counters
             .loc_refresh_blobs_scanned
             .fetch_add(1, Ordering::Relaxed);
@@ -546,35 +574,9 @@ fn handle_candidate(
             counters
                 .loc_deleted_node_refs
                 .fetch_add(detection.deleted_refs, Ordering::Relaxed);
-            if route.is_splice() {
-                let item = desc.take_copy_range().ok_or_else(|| {
-                    Error::internal("streaming: refresh scan of a blob without indexdata")
-                })?;
-                return send_drain(drain_tx, item);
-            }
-            counters
-                .blobs_owned_passthrough
-                .fetch_add(1, Ordering::Relaxed);
-            let count = desc.index.as_ref().map_or(0, |i| i.count);
-            return send_drain(
-                drain_tx,
-                DrainItem::OwnedBytes {
-                    seq: desc.seq,
-                    frame_bytes: std::mem::take(read_buf),
-                    kind: desc.kind,
-                    id_range: desc.id_range.unwrap_or((0, 0)),
-                    count,
-                },
-            );
+            return pass_through_indexed(desc, drain_tx, counters, read_buf, route);
         }
         refresh_only = true;
-    } else {
-        let body_offset = desc.frame_start + desc.blob_offset as u64;
-        pread_into(file, read_buf, body_offset, desc.data_size)?;
-
-        let t_decompress = crate::counters::Stopwatch::start();
-        decompress_blob_raw(read_buf, decompress_buf)?;
-        t_decompress.record_ns(&counters.decompress_ns);
     }
 
     // An unindexed blob (`--force`; the scanner sends every one here) gets
@@ -738,7 +740,7 @@ fn handle_candidate(
             // the output header allows: it declares no way enrichment
             // (`Ways::Reencoded` in `build_header_bytes`).
             let frame_bytes =
-                reframe_raw_with_index(read_buf, &index.serialize(), tagdata.as_deref())?;
+                reframe_raw_with_index(&read_buf[body], &index.serialize(), tagdata.as_deref())?;
             return send_drain(
                 drain_tx,
                 DrainItem::OwnedBytes {
@@ -747,25 +749,13 @@ fn handle_candidate(
                     kind: effective_kind,
                     id_range: (effective_min_id, effective_max_id),
                     count: index.count,
+                    verbatim: false,
                 },
             );
         }
-        // An indexed blob: the drain needs an element count for per-kind
-        // `base_*` stats (gap #7), and takes the `desc.index.count` claim,
-        // believed like every other here (reference/indexdata-trust.md).
-        if route.is_splice() {
-            let item = desc.take_copy_range().ok_or_else(|| {
-                Error::internal("streaming: false positive without indexdata reached the splice")
-            })?;
-            return send_drain(drain_tx, item);
-        }
-        // `--direct-io` output: the drain rejects `DrainItem::CopyRange` up front, so
-        // route the false-positive through the owned-passthrough path
-        // (pread the full frame, ship the bytes via
-        // `DrainItem::OwnedBytes`). `handle_owned_passthrough` does
-        // exactly that for the scanner-side passthrough case.
-        let count = desc.index.as_ref().map_or(0, |i| i.count);
-        return handle_owned_passthrough(file, desc, drain_tx, counters, read_buf, count);
+        // An indexed blob, which leaves as it came: spliced, or on the owned
+        // route shipped from the frame read above.
+        return pass_through_indexed(desc, drain_tx, counters, read_buf, route);
     }
     if refresh_only {
         counters
@@ -910,44 +900,77 @@ fn single_kind_range(block: &crate::PrimitiveBlock) -> Result<Option<(ElementKin
     Ok(found)
 }
 
-/// `--direct-io` (or consumer-build false-positive) passthrough of an
-/// indexed blob: pread the **full framed bytes** so the drain can
-/// `write_raw_owned` without re-framing. `count` is the blob's element
-/// count; the drain uses it to credit `base_<kind>` stats and must not be
-/// zero or per-kind merge totals drift (gap #7).
+/// The scanner's passthrough of an indexed blob on the owned route
+/// (`--direct-io`): pread the **full framed bytes** and ship them so the
+/// drain can `write_raw_owned` without re-framing.
 fn handle_owned_passthrough(
     file: &std::fs::File,
-    desc: &BlobDescriptor,
+    desc: &mut BlobDescriptor,
     drain_tx: &mpsc::SyncSender<DrainMessage>,
     counters: &WorkerCounters,
     read_buf: &mut Vec<u8>,
-    count: u64,
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
+    pread_into(file, read_buf, desc.frame_start, desc.frame_len, counters)?;
+    pass_through_indexed(desc, drain_tx, counters, read_buf, Route::Owned)
+}
+
+/// Pass an indexed blob through unchanged. On the splice route the drain
+/// copies its frame (`CopyRange`); on the owned route `read_buf` must hold
+/// that whole frame, which moves into a verbatim `OwnedBytes` without
+/// another read, leaving `read_buf` empty for the next pread. Either way
+/// the drain credits the blob's indexdata `count` to `base_<kind>` (a zero
+/// would make the per-kind totals drift, gap #7), believed like every claim
+/// here (reference/indexdata-trust.md), and counts it as an index hit.
+fn pass_through_indexed(
+    desc: &mut BlobDescriptor,
+    drain_tx: &mpsc::SyncSender<DrainMessage>,
+    counters: &WorkerCounters,
+    read_buf: &mut Vec<u8>,
+    route: Route<()>,
+) -> Result<()> {
+    if route.is_splice() {
+        let item = desc.take_copy_range().ok_or_else(|| {
+            Error::internal("streaming: a blob without indexdata reached the splice")
+        })?;
+        return send_drain(drain_tx, item);
+    }
+    let (Some(index), Some(id_range)) = (desc.index.as_ref(), desc.id_range) else {
+        return Err(Error::internal(
+            "streaming: owned passthrough of a blob without indexdata",
+        ));
+    };
+    if read_buf.len() != desc.frame_len {
+        return Err(Error::internal(
+            "streaming: owned passthrough without its whole frame read",
+        ));
+    }
     counters
         .blobs_owned_passthrough
         .fetch_add(1, Ordering::Relaxed);
-
-    pread_into(file, read_buf, desc.frame_start, desc.frame_len)?;
-
-    // Move the bytes into the DrainItem; reset read_buf for the next
-    // pread without keeping the per-blob allocation alive.
-    let frame_bytes = std::mem::take(read_buf);
-
     send_drain(
         drain_tx,
         DrainItem::OwnedBytes {
             seq: desc.seq,
-            frame_bytes,
+            frame_bytes: std::mem::take(read_buf),
             kind: desc.kind,
-            id_range: desc.id_range.unwrap_or((0, 0)),
-            count,
+            id_range,
+            count: index.count,
+            verbatim: true,
         },
     )
 }
 
-/// Resize `buf` to `len` and pread `len` bytes at `offset`.
-fn pread_into(file: &std::fs::File, buf: &mut Vec<u8>, offset: u64, len: usize) -> Result<()> {
+/// Resize `buf` to `len` and pread `len` bytes at `offset`, counted in
+/// `blob_reads`.
+fn pread_into(
+    file: &std::fs::File,
+    buf: &mut Vec<u8>,
+    offset: u64,
+    len: usize,
+    counters: &WorkerCounters,
+) -> Result<()> {
+    counters.blob_reads.fetch_add(1, Ordering::Relaxed);
     buf.resize(len, 0);
     Ok(file.read_exact_at(buf, offset)?)
 }

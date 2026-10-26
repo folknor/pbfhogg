@@ -134,6 +134,25 @@ Same axis points re-measured at europe scale on the fixed writer
 Original tainted values were 47.2 s / 55.3 s / 39.2 s at `6c9dbc7`
 (UUIDs `36dee15a` / `5647f9fa` / `72413ff3`).
 
+Every `--locations-on-ways` figure in this section ran on an `altw` base
+made without `--keep-untagged-nodes`, so most OSC-way refs resolved to
+nothing and were written as `(0, 0)`; those runs time a merge that did
+little coordinate work, and the current code refuses them.
+
+### Inline-location refresh (2026-10-26, commit `81f3fbe4`)
+
+`--locations-on-ways` used to splice way blobs the OSC did not touch,
+leaving ways that use a moved node stale. The fix searches those blobs
+(wire-level scan, clean ones still spliced) and refreshes surviving ways
+in rewritten blobs. Before it landed, a read-only measurement
+(`examples/stale_way_blobs.rs`) put the cost at about 5% more way blobs
+rewritten at europe and 4% at planet, with detection, not recompression,
+the work to manage. On europe the added worker time (about +137 s summed
+over 22 workers: decompress, scan, rewrite, frame) was mostly offset by
+seeding `block_overlaps_diff`'s cursors by binary search (-86 s precise
+check), and interleaved walls on bygg did not separate from the drive
+noise. Figures in `reference/performance.md` "Inline-location refresh".
+
 Pool-size sweep at cross-disk zstd:1 (plantasjen, Samsung 990 PRO):
 4 → 89.2 s, 8 → 83.4 s, 16 → 80.9-82.1 s (two runs), 32 → 82.2 s.
 POOL_SIZE=16 is hard-coded in `src/write/parallel_writer.rs`. Over-contends

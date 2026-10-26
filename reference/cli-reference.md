@@ -621,7 +621,7 @@ pbfhogg check [OPTIONS] <FILE>
 | `--check-relations` | Also check relation member references (applies to ref check) |
 | `--show-ids` | Show IDs of missing objects, format: `n123 in w456` (applies to ref check) |
 | `--json` | Machine-readable JSON output |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT to bypass page cache where the check supports it: the ID check's front read and `--index`. It has no effect on `--refs` and `--locations`, whose parallel readers pread unaligned blob ranges, and each says so on stderr when it runs |
 
 With the global [`-q, --quiet`](#quiet) `check` prints no report: the exit
 code is the answer. `--json`, `--show-ids` and `--max-errors`, which only
@@ -1565,10 +1565,10 @@ Which commands support `--direct-io` (O_DIRECT bypass of page cache) and `--io-u
 | inspect | Yes | - | Yes | - | Read-only |
 | inspect tags | Yes | - | Yes | - | Read-only |
 | inspect --nodes | Yes | - | Yes | - | Read-only |
-| check --ids | Yes | - | Yes | - | Read-only |
-| check --refs | Yes | - | Yes | - | Read-only |
+| check --ids | Yes | - | Partly | - | Read-only; `--direct-io` covers only the front read (header and first blob header); the blob reads are parallel unaligned preads without it |
+| check --refs | Yes | - | No | - | Read-only; `--direct-io` accepted and ignored, with a note (parallel unaligned preads) |
 | check --index | Yes | - | Yes | - | Read-only; decompresses every blob |
-| check --locations | Yes | - | No | - | Read-only; `--direct-io` accepted and ignored (parallel unaligned preads) |
+| check --locations | Yes | - | No | - | Read-only; `--direct-io` accepted and ignored, with a note (parallel unaligned preads) |
 | cat | Yes | Yes | Yes (R+W) | - | Passthrough + filtered paths |
 | cat --dedupe | Yes | Yes | Yes (R+W) | Yes | Via merge-pbf path |
 | sort | Yes | Yes | Yes (R+W) | Yes | |

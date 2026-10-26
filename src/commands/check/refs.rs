@@ -105,7 +105,9 @@ struct RelBlobResult {
 /// Options for [`check_refs`].
 #[derive(Debug, Clone, Copy)]
 pub struct CheckRefsOptions {
-    /// Options shared with the ID and index checks.
+    /// Options shared with the ID and index checks. `direct_io` is accepted
+    /// and has no effect: the check reads only through the schedule walk and
+    /// the parallel readers' unaligned blob preads.
     pub check: super::CheckOptions,
     /// Also check relation member references.
     pub check_relations: bool,
@@ -160,10 +162,11 @@ fn append_capped_missing_refs(
 ///
 /// # Planet-scale memory usage
 ///
-/// Uses [`IdSet`] for all three ID sets, pre-allocated to OSM ID
-/// ceilings. Memory is bounded by the ID space, not the population:
-/// ~1.6 GB for nodes (pre-allocated to 14 B), ~175 MB for ways (1.5 B),
-/// ~3 MB for relations (25 M).
+/// Uses [`IdSet`] for all three ID sets, each pre-allocated as a bitset over
+/// the ID range `check::id_alloc_bound` chooses (at least the live-OSM range
+/// for the kind, whatever the file's size) and grown after each phase by the
+/// IDs above it. The node set is about 1.6 GB, ways about 175 MB and
+/// relations about 3 MB.
 ///
 /// `max_errors` caps retained display details, not working memory. The three
 /// missing-ID vectors retain occurrences until sort/dedup computes exact
@@ -217,14 +220,11 @@ fn check_refs_inner(
 ) -> Result<RefCheckResult> {
     let check_relations = opts.check_relations;
     let show_ids = opts.show_ids;
-    let direct_io = opts.check.direct_io;
     let max_errors = opts.check.max_errors;
-
-    // `direct_io` is not plumbed through the parallel pread workers yet
-    // (parallel_classify_phase opens the input via a shared Arc<File>
-    // without O_DIRECT). Accept silently for now; if this matters for a
-    // workload it can be added to build_classify_schedule's contract.
-    let _ = direct_io;
+    // `opts.check.direct_io` is accepted and has no effect: every read here
+    // is the schedule walk or a `parallel_classify_phase` pread of an
+    // unaligned blob range, neither of which takes O_DIRECT. The CLI says so
+    // when the flag is given.
 
     crate::debug::emit_marker("CHECKREFS_SCAN_START");
 
@@ -334,9 +334,7 @@ fn check_refs_inner(
             host,
         )?;
     }
-    for id in overflow_ids.drain(..) {
-        node_ids.set(id);
-    }
+    super::insert_overflow_ids(&mut node_ids, &mut overflow_ids, host);
     crate::debug::emit_marker("CHECKREFS_NODES_END");
     // Brokkr stores named counters generically and reports changes in sidecar
     // comparisons; this sample is inert unless the CLI initialized the FIFO.
@@ -402,9 +400,7 @@ fn check_refs_inner(
             host,
         )?;
     }
-    for id in overflow_ids.drain(..) {
-        way_ids.set(id);
-    }
+    super::insert_overflow_ids(&mut way_ids, &mut overflow_ids, host);
     crate::debug::emit_marker("CHECKREFS_WAYS_END");
     // Brokkr stores named counters generically and reports changes in sidecar
     // comparisons; this sample is inert unless the CLI initialized the FIFO.
@@ -519,9 +515,7 @@ fn check_refs_inner(
                 host,
             )?;
         }
-        for id in overflow_ids.drain(..) {
-            relation_ids.set(id);
-        }
+        super::insert_overflow_ids(&mut relation_ids, &mut overflow_ids, host);
         crate::debug::emit_marker("CHECKREFS_RELATIONS_END");
         // Brokkr stores named counters generically and reports changes in sidecar
         // comparisons; this sample is inert unless the CLI initialized the FIFO.

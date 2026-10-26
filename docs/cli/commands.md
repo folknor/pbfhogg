@@ -348,7 +348,7 @@ pbfhogg check [OPTIONS] <FILE>
 | `--check-relations` | Also check relation member references (applies to ref check) |
 | `--show-ids` | Show IDs of missing objects, format: `n123 in w456` (applies to ref check) |
 | `--json` | Machine-readable JSON output |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--direct-io` | Use O_DIRECT to bypass page cache where the check supports it: the ID check's first read of the file, and `--index`. No effect on `--refs` and `--locations` (their parallel readers read unaligned blob ranges), which say so when given |
 
 With the global `-q, --quiet`, `check` prints no report and the exit code is
 the answer; `--json`, `--show-ids` and `--max-errors` are refused with it.

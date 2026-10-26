@@ -33,10 +33,13 @@ Three consequences follow, and are binding on new code:
    a flag for it would be a no-op that implied a choice existed.
 
 2. **Anything sized from unverified metadata must survive that metadata being
-   wrong.** `check`'s `id_alloc_bound` bounds the ID bitset by the input file's
-   own length rather than by the claimed `max_id`; `verify_ids` and
-   `check_refs` report an out-of-range ID as an input property rather than
-   panicking; `repack` bounds its `BlockBuilder` pre-allocation the same way.
+   wrong.** `check`'s `id_alloc_bound` sizes the ID bitset from the claimed
+   `max_id` bounded by the input file's own length and floored at the
+   live-OSM ID range, so a claim can neither request an unbounded allocation
+   nor shrink it below that range; `verify_ids --full` and `check_refs`
+   insert decoded positive IDs above the allocation after the parallel
+   pass, and report only a negative ID as an input property; `repack`
+   bounds its `BlockBuilder` pre-allocation by the file size.
    A new consumer that allocates from `indexdata` inherits this obligation.
    `renumber` bounds its initial node bitmap by the file size and inserts
    decoded IDs beyond that allocation after the parallel pass, preserving

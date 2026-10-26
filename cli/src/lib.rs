@@ -3444,6 +3444,15 @@ fn run_check(
     };
 
     let refs_result = if run_refs {
+        if direct_io {
+            host::cli_note(
+                "cli.check_refs_direct_io",
+                format_args!(
+                    "--direct-io has no effect on --refs, whose parallel \
+                     readers pread unaligned blob ranges"
+                ),
+            );
+        }
         let opts = pbfhogg::check::refs::CheckRefsOptions {
             check: check_options,
             check_relations,

@@ -304,11 +304,11 @@ fn violation_to_json(v: &IdViolation) -> serde_json::Value {
 /// Streaming mode: per-blob `BlobVerifyResult` plus the schedule vec;
 /// peak anon RSS in the same ~2 GB range as `--full`.
 ///
-/// `--full` mode: three `IdSet` pre-allocated to OSM ID ceilings
-/// (~1.6 GB for nodes, 175 MB for ways, 3 MB for relations) when the
-/// corresponding `type_filter` bit is set. Pre-allocation is mandatory
-/// for `set_atomic_if_new` (workers panic on unallocated chunks). Total
-/// full-mode RSS at planet: ~1.8 GB.
+/// `--full` mode: an `IdSet` per kind selected by `type_filter`, its bitset
+/// pre-allocated over the range `check::id_alloc_bound` chooses (at least the
+/// live-OSM range for the kind) for the workers' atomic setters; an ID above
+/// it is inserted serially after the phase. The node set is about 1.6 GB;
+/// total full-mode RSS at planet was about 1.8 GB.
 ///
 /// # Input
 ///
@@ -914,14 +914,7 @@ fn verify_single_kind_parallel(
             }
         }
         for id in r.out_of_range_ids {
-            let violation = if id < 0 {
-                Some(IdViolation::IdOutOfRange { elem_type, id })
-            } else if !id_set.set_if_new(id) {
-                Some(IdViolation::Duplicate { elem_type, id })
-            } else {
-                None
-            };
-            if let Some(violation) = violation {
+            if let Some(violation) = overflow_violation(id_set, elem_type, id, host) {
                 total_violations += 1;
                 if should_store_violation(violations.len(), max_errors_remaining) {
                     violations.push(violation);
@@ -934,6 +927,28 @@ fn verify_single_kind_parallel(
     }
 
     Ok((count, violations, total_violations))
+}
+
+/// An ID a phase's pre-allocation could not hold: a negative one is out of
+/// range; a positive one is inserted now, and is a duplicate if already
+/// present. Test builds count the insertion on the run's token.
+fn overflow_violation(
+    id_set: &mut IdSet,
+    elem_type: &'static str,
+    id: i64,
+    host: &crate::host::Host,
+) -> Option<IdViolation> {
+    if id < 0 {
+        return Some(IdViolation::IdOutOfRange { elem_type, id });
+    }
+    #[cfg(feature = "test-hooks")]
+    host.cancel
+        .faults()
+        .check_overflow_ids
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "test-hooks"))]
+    let _ = host;
+    (!id_set.set_if_new(id)).then_some(IdViolation::Duplicate { elem_type, id })
 }
 
 /// Verify that schedules appear in canonical file order: all node blobs

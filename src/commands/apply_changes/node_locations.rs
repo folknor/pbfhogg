@@ -16,7 +16,8 @@ use crate::osc::CompactDiffOverlay;
 /// merges. Built once from the OSC overlay; the drain takes ownership of
 /// `locations` (consumed at the node→way barrier as the seed for the
 /// merged `loc_map`) and the worker pool takes a shared `Arc` reference
-/// to `needed_set` (used to filter `extract_node_tuples` output).
+/// to `needed_set` (it keeps only the coordinates `extract_node_coords`
+/// reports for IDs in the set).
 pub(super) struct NodeLocationIndex {
     /// Coordinates pre-seeded from OSC node creates/modifications.
     pub(super) locations: FxHashMap<i64, (i32, i32)>,

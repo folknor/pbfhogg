@@ -133,6 +133,15 @@ pub(super) fn stage3_slot_reorder(
     // fail; so "first error" means first recorded, not lowest bucket, and the
     // two stores can name different concurrent causes. Work in flight
     // finishes after another worker fails.
+    //
+    // No `*_wait_ns` stall counter: nothing here blocks on another thread.
+    // The claim is a `fetch_add`, the bucket reads and payload `pwrite`s go to
+    // per-bucket and per-worker files, and the first-error slot is locked once
+    // per bucket, held for a load. Publishing to the router takes its locks
+    // (a per-blob slot, the straddler map, its stats and notify gate) only
+    // around a store, a counter bump or a `notify_all`, never across I/O or
+    // encoding. The blocking side of the router is stage 4's readiness wait,
+    // which stage 4 records itself (`s4_readiness_wait_ms`).
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let counters = Stage3Counters::new();
     let s3_error: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);

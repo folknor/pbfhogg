@@ -90,6 +90,15 @@ crate::counters::counter_set! {
         prepare_sort_ms => "s2_prepare_sort_ms",
         orphan_records => "s2_orphan_records",
         slot_flush_lock_wait_ms => "s2_slot_flush_lock_wait_ms",
+        /// Time workers spent blocked acquiring a shared slot-bucket writer's
+        /// mutex, queued behind a peer flushing into the same bucket (the
+        /// holder keeps it across its `write_all`, which can reach the
+        /// file). The stage's one wait on another thread, as a `--stalls`
+        /// counter: gated (an uncontended lock adds nothing) and in
+        /// nanoseconds. `s2_slot_flush_lock_wait_ms` keeps timing every
+        /// acquisition with per-sample millisecond truncation, so it reads
+        /// zero for any wait under a millisecond.
+        slot_flush_lock_wait_ns => "s2_slot_flush_lock_wait_ns",
         slot_flush_write_ms => "s2_slot_flush_write_ms",
         slot_bytes_written => "s2_slot_bytes_written",
         slot_flush_calls => "s2_slot_flush_calls",
@@ -333,7 +342,10 @@ pub(super) fn stage2_node_join(
     // bucket scratch and buffered slot writes, under the stage's worker cap.
     // The first recorded error (not the lowest bucket) stops the others at
     // their next claim, and work in flight finishes; cancellation is checked
-    // per non-empty bucket and per node blob inside it.
+    // per non-empty bucket and per node blob inside it. Its one wait on
+    // another thread is a shared slot-bucket writer's mutex, recorded as
+    // `s2_slot_flush_lock_wait_ns`; the claim is a `fetch_add` and the
+    // first-error slot is locked once per bucket, held for a load.
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let resolved_total = std::sync::atomic::AtomicU64::new(0);
     let counters = Stage2Counters::new();
@@ -638,9 +650,10 @@ pub(super) fn stage2_node_join(
                                     local_resolved += 1;
                                     if slot_bufs[bucket].len() >= STAGE2_FLUSH_THRESHOLD {
                                         let t_lock = crate::counters::Stopwatch::start();
-                                        let mut w = slot_buckets.writers[bucket]
-                                            .lock()
-                                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        let mut w = crate::counters::lock_recording_wait(
+                                            &slot_buckets.writers[bucket],
+                                            &c.slot_flush_lock_wait_ns,
+                                        );
                                         t_lock.record_ms(&c.slot_flush_lock_wait_ms);
                                         let t_wr = crate::counters::Stopwatch::start();
                                         let flush_bytes = slot_bufs[bucket].len() as u64;
@@ -694,9 +707,10 @@ pub(super) fn stage2_node_join(
                             if slot_bufs[sb].is_empty() { continue; }
                             nonempty_count += 1;
                             let t_lock = crate::counters::Stopwatch::start();
-                            let mut w = slot_buckets.writers[sb]
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut w = crate::counters::lock_recording_wait(
+                                &slot_buckets.writers[sb],
+                                &c.slot_flush_lock_wait_ns,
+                            );
                             t_lock.record_ms(&c.slot_flush_lock_wait_ms);
                             let t_wr = crate::counters::Stopwatch::start();
                             let flush_bytes = slot_bufs[sb].len() as u64;

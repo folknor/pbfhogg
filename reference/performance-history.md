@@ -707,7 +707,11 @@ tags-filter two-pass drop from 366 s (sequential BlobReader, `1e6e70c`) to
 105 s (pread workers, `75ad21d`: pass 1 classify 34 s / closure+deps 33 s /
 pass 2 write 37 s), a 3.4x improvement whose accounting is the tags-filter
 arc above. Do not build a batch-drain over this dispatch on "one lock per
-blob" reasoning without first measuring the lock is the binding cost.
+blob" reasoning without first measuring the lock is the binding cost. The
+classify pools that keep the dispatch record it: workers queued on the lock
+in `classify_unordered_desc_lock_wait_ns`, the holder waiting on an empty
+channel in `classify_unordered_desc_recv_wait_ns` (the first is the mutex's
+own cost only while the second stays near zero).
 
 ---
 
@@ -1029,9 +1033,18 @@ measured, recorded so a fourth starts from them.
   which), and the two altw way reframes share only their block-level walk
   (`altw::reframe::parse_way_block_top`): a coordinate-source trait was
   rejected because sparse resolves refs while stage 4 copies coordinates
-  stage 3 already encoded. The unordered pools still emit no `*_wait_ns`
-  counters; that is instrumentation, not unification. All unmeasured;
-  each step is its own commit.
+  stage 3 already encoded. The unordered classify pools now record their
+  blocking points as `*_wait_ns` stall counters, one process-wide set
+  emitted after every run (`classify_unordered_dispatch_send_wait_ns`,
+  `_desc_lock_wait_ns`, `_desc_recv_wait_ns`, `_result_send_wait_ns`,
+  `_result_recv_wait_ns`; the accumulate pool records only the first three,
+  as its result send cannot block and its consumer's wait is the scan
+  itself). Of the claim-counter pools only altw stage 2 blocks on another
+  thread, on its shared slot-bucket writers (`s2_slot_flush_lock_wait_ns`);
+  stage 3 and pass 1.5 say at the pool why they have no counter. Every
+  such wait goes through the gated helpers in `src/counters.rs`, which
+  touch no clock unless the `try_*` attempt fails. All unmeasured; each
+  step is its own commit.
 
 ## Retired plan docs
 

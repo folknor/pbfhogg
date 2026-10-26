@@ -207,6 +207,12 @@ pub(super) fn run_pass1_5(
         // first recorded error (not the lowest blob) stops the others at
         // their next claim, and work in flight finishes; cancellation is
         // checked per claimed blob.
+        //
+        // No `*_wait_ns` stall counter: nothing here blocks on another
+        // thread. The claim is a `fetch_add`, the `IdSet` writes are atomic
+        // sets, each worker preads the shared file on its own, and the
+        // mutexes are the first-error slot (locked per blob, held for a load)
+        // and the end-of-worker hand-offs (once per worker).
         let next_idx = AtomicUsize::new(0);
         let next_ref = &next_idx;
         // First error observed across all workers. Workers drain until

@@ -1208,6 +1208,28 @@ The judgement calls already known, to be checked first:
   across modules; once per way blob, argued neutral, not measured. A
   malformed block tag in stage 4 now reads "reframe block tag", as sparse
   did. `brokkr verify add-locations-to-ways --dataset denmark` passes.
+- The unordered classify pools (`run_unordered_per_blob`, hence
+  `parallel_classify_phase`, `_abortable` and `parallel_scan_blobs_raw`, and
+  `parallel_classify_accumulate`) gained `*_wait_ns` stall counters, one
+  process-global set emitted (process totals so far) after every run, success
+  or failure: `classify_unordered_dispatch_send_wait_ns`,
+  `_desc_lock_wait_ns`, `_desc_recv_wait_ns`, `_result_send_wait_ns` and
+  `_result_recv_wait_ns`. Altw stage 2 gained `s2_slot_flush_lock_wait_ns`
+  beside the unchanged `s2_slot_flush_lock_wait_ms`. Stage 3 and geocode
+  pass 1.5 have no blocking point and say so at the pool. Every blocking
+  operation goes through new gated helpers in `src/counters.rs`
+  (`lock_recording_wait`, `send_recording_wait`, `recv_recording_wait`):
+  the `try_*` form first, so an unblocked operation costs the attempt in
+  place of the blocking call's own fast path (no clock, no counter), and a
+  blocked one adds two clock reads and one relaxed `fetch_add`. The changed
+  sites run on every blob of every caller of those pools (dispatcher send,
+  worker lock, receive and send, consumer receive) and on every altw stage 2
+  slot flush; argued free, not measured. The accumulate pool's result send
+  (one slot per worker, one send each) and its consumer's receive (the scan
+  itself) are deliberately not counted. Once measurement is allowed, these
+  counters are how to settle the `Mutex<Receiver>` question in
+  `reference/performance-history.md`.
+
 ---
 
 ## HYG-036 - `too_many_arguments` is denied and then allowed locally all over

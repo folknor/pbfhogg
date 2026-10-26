@@ -1,10 +1,10 @@
 //! Sidecar counter machinery.
 //!
-//! Three shared pieces; counter code uses them rather than hand-rolling its
-//! own. Plain values (stats fields, schedule lengths, local tallies) need none
-//! of them: `crate::debug::emit_counter` takes unsigned integers directly and
-//! saturates, so they are passed without an `as i64` cast (a source check in
-//! `scripts/check_source_invariants.py` refuses one inside its arguments).
+//! The shared pieces below; counter code uses them rather than hand-rolling
+//! its own. Plain values (stats fields, schedule lengths, local tallies) need
+//! none of them: `crate::debug::emit_counter` takes unsigned integers directly
+//! and saturates, so they are passed without an `as i64` cast (a source check
+//! in `scripts/check_source_invariants.py` refuses one inside its arguments).
 //!
 //! - [`counter_set!`] declares a set of `AtomicU64` counters from one list
 //!   that pairs every field with the exact name it is emitted under, so a
@@ -12,8 +12,14 @@
 //!   from the same line) and every sidecar name stays greppable verbatim.
 //! - [`record_max`] is the "track the maximum" update.
 //! - [`Stopwatch`] turns elapsed time into a `u64` for timed counters.
+//! - [`lock_recording_wait`], [`send_recording_wait`] and
+//!   [`recv_recording_wait`] are the gated blocking operations behind a
+//!   `*_wait_ns` stall counter (see their section below).
+//! - [`StallGauge`] is the depth-gated `WAIT_*` marker span.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::mpsc::{Receiver, RecvError, SendError, SyncSender, TryRecvError, TrySendError};
+use std::sync::{Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Instant;
 
 /// Declare a set of sidecar counters.
@@ -195,6 +201,90 @@ impl Stopwatch {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Gated blocking operations for `*_wait_ns` stall counters
+// ---------------------------------------------------------------------------
+//
+// `brokkr sidecar --stalls` reads every `*_wait_ns` counter as a strictly
+// monotonic total of time some thread spent blocked on another (the maximum
+// per name, the suffix stripped for the category). The convention is one
+// atomic add per genuine blocking event, so these try the non-blocking form
+// first and start a clock only when it fails: an operation that does not
+// block costs exactly the attempt (one `try_lock`, `try_send` or `try_recv`,
+// which is the same compare-exchange or slot claim the blocking form makes on
+// its own fast path) and touches no clock and no counter. Only the slow path
+// reads the clock twice and adds once.
+//
+// Several older `*_wait_ns` counters (the read pipeline's, the ordered pool's
+// timers) time every call, blocked or not; they keep that for continuity.
+// New stall counters go through these.
+
+/// Lock `mutex`, adding the time spent blocked behind another holder to
+/// `wait_ns`. An uncontended lock records nothing.
+///
+/// Poison-tolerant, like every caller it serves: a poisoned mutex yields its
+/// guard, on the fast path and the slow one alike. Use it only where the
+/// caller would otherwise write `lock().unwrap_or_else(PoisonError::into_inner)`.
+#[inline]
+pub(crate) fn lock_recording_wait<'a, T>(
+    mutex: &'a Mutex<T>,
+    wait_ns: &AtomicU64,
+) -> MutexGuard<'a, T> {
+    match mutex.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            let blocked = Stopwatch::start();
+            let guard = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+            blocked.record_ns(wait_ns);
+            guard
+        }
+    }
+}
+
+/// `tx.send(item)`, adding the time spent blocked on a full channel to
+/// `wait_ns`. A send that finds room, or finds the receiver gone, records
+/// nothing; a blocked send that then fails because the receiver went away
+/// records its wait.
+#[inline]
+pub(crate) fn send_recording_wait<T>(
+    tx: &SyncSender<T>,
+    item: T,
+    wait_ns: &AtomicU64,
+) -> Result<(), SendError<T>> {
+    match tx.try_send(item) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Disconnected(item)) => Err(SendError(item)),
+        Err(TrySendError::Full(item)) => {
+            let blocked = Stopwatch::start();
+            let sent = tx.send(item);
+            blocked.record_ns(wait_ns);
+            sent
+        }
+    }
+}
+
+/// `rx.recv()`, adding the time spent blocked on an empty channel to
+/// `wait_ns`. A receive that finds an item, or finds every sender gone,
+/// records nothing; a blocked receive that ends in the channel closing
+/// records its wait (it was waiting for the last sender to finish).
+#[inline]
+pub(crate) fn recv_recording_wait<T>(
+    rx: &Receiver<T>,
+    wait_ns: &AtomicU64,
+) -> Result<T, RecvError> {
+    match rx.try_recv() {
+        Ok(item) => Ok(item),
+        Err(TryRecvError::Disconnected) => Err(RecvError),
+        Err(TryRecvError::Empty) => {
+            let blocked = Stopwatch::start();
+            let received = rx.recv();
+            blocked.record_ns(wait_ns);
+            received
+        }
+    }
+}
+
 /// Depth-gated stall span shared by concurrent blockers.
 ///
 /// `brokkr sidecar --durations` pairs `WAIT_<CATEGORY>_START/_END` markers
@@ -301,5 +391,117 @@ mod tests {
         assert!(ms.load(Relaxed) >= 2);
         assert!(ns.load(Relaxed) >= 2_000_000);
         assert!(watch.elapsed_ns() >= ns.load(Relaxed));
+    }
+
+    /// An operation that does not block records nothing: not a clock read's
+    /// worth, exactly zero. This is the property the stall counters' cost
+    /// argument rests on.
+    #[test]
+    fn unblocked_operations_record_no_wait() {
+        let wait = AtomicU64::new(0);
+
+        let mutex = std::sync::Mutex::new(5_u32);
+        assert_eq!(*super::lock_recording_wait(&mutex, &wait), 5);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(1);
+        super::send_recording_wait(&tx, 7, &wait).expect("room in the channel");
+        assert_eq!(super::recv_recording_wait(&rx, &wait), Ok(7));
+        drop(tx);
+        assert_eq!(
+            super::recv_recording_wait(&rx, &wait),
+            Err(std::sync::mpsc::RecvError),
+            "a closed channel answers at once"
+        );
+        let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(1);
+        drop(rx);
+        assert!(super::send_recording_wait(&tx, 1, &wait).is_err());
+
+        assert_eq!(wait.load(Relaxed), 0);
+    }
+
+    /// The lock is poison-tolerant, as its callers are.
+    #[test]
+    fn a_poisoned_lock_still_yields_its_guard() {
+        fn poison(mutex: &std::sync::Mutex<u32>) {
+            let _guard = mutex.lock().expect("not yet poisoned");
+            panic!("poison the mutex");
+        }
+        let mutex = std::sync::Mutex::new(3_u32);
+        std::thread::scope(|scope| {
+            let poisoner = scope.spawn(|| poison(&mutex));
+            assert!(poisoner.join().is_err());
+        });
+        assert!(mutex.is_poisoned());
+        let wait = AtomicU64::new(0);
+        assert_eq!(*super::lock_recording_wait(&mutex, &wait), 3);
+        assert_eq!(wait.load(Relaxed), 0);
+    }
+
+    /// Runs `attempt` until one reports a recorded wait. Each attempt has a
+    /// peer release the operation after a pause; an attempt whose peer
+    /// released before the operation was tried takes the fast path and
+    /// records nothing, which is correct and proves nothing, so it is tried
+    /// again. Nothing here asserts how long a wait was, only that a blocked
+    /// operation recorded one.
+    fn some_attempt_blocks(mut attempt: impl FnMut() -> u64) -> bool {
+        (0..20).any(|_| attempt() > 0)
+    }
+
+    const RELEASE_AFTER: std::time::Duration = std::time::Duration::from_millis(10);
+
+    #[test]
+    fn a_blocked_lock_records_its_wait() {
+        assert!(some_attempt_blocks(|| {
+            let mutex = std::sync::Mutex::new(0_u32);
+            let wait = AtomicU64::new(0);
+            let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+            std::thread::scope(|scope| {
+                let mutex = &mutex;
+                scope.spawn(move || {
+                    let mut guard = mutex.lock().expect("unpoisoned");
+                    held_tx.send(()).expect("the test is listening");
+                    std::thread::sleep(RELEASE_AFTER);
+                    *guard += 1;
+                });
+                held_rx.recv().expect("the holder reports");
+                let guard = super::lock_recording_wait(mutex, &wait);
+                assert_eq!(*guard, 1, "the holder's write precedes our guard");
+            });
+            wait.load(Relaxed)
+        }));
+    }
+
+    #[test]
+    fn a_blocked_send_records_its_wait() {
+        assert!(some_attempt_blocks(|| {
+            let wait = AtomicU64::new(0);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(1);
+            tx.send(1).expect("room for the first item");
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    std::thread::sleep(RELEASE_AFTER);
+                    assert_eq!(rx.recv(), Ok(1));
+                    assert_eq!(rx.recv(), Ok(2));
+                });
+                super::send_recording_wait(&tx, 2, &wait).expect("the receiver drains");
+            });
+            wait.load(Relaxed)
+        }));
+    }
+
+    #[test]
+    fn a_blocked_recv_records_its_wait() {
+        assert!(some_attempt_blocks(|| {
+            let wait = AtomicU64::new(0);
+            let (tx, rx) = std::sync::mpsc::sync_channel::<u32>(1);
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    std::thread::sleep(RELEASE_AFTER);
+                    tx.send(9).expect("the test is listening");
+                });
+                assert_eq!(super::recv_recording_wait(&rx, &wait), Ok(9));
+            });
+            wait.load(Relaxed)
+        }));
     }
 }

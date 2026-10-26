@@ -609,6 +609,82 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
     )
 }
 
+crate::counters::counter_set! {
+    /// Blocking time in this module's two unordered pools,
+    /// [`run_unordered_per_blob`] (behind [`parallel_classify_phase`],
+    /// [`parallel_classify_phase_abortable`] and [`parallel_scan_blobs_raw`])
+    /// and [`parallel_classify_accumulate`], for `brokkr sidecar --stalls`.
+    /// The ordered phase runs on `crate::ordered_pool` and reports none of
+    /// these.
+    ///
+    /// Every field is a `*_wait_ns` stall counter recorded through the gated
+    /// operations in `crate::counters`: an operation that does not block costs
+    /// only its `try_*` attempt, and one that blocks adds its wait once. Sums
+    /// across threads, so a total can exceed wall time.
+    ///
+    /// One set for every caller, not one per command or phase: the pools are
+    /// the same mechanism whoever runs them, and the question these answer
+    /// (does the shared-receiver fan-out, the result channel or the consumer
+    /// stall) is a question about the mechanism. Per-caller names would need a
+    /// name threaded through every call site and would split one stall
+    /// category per phase. Phase attribution comes instead from when the set
+    /// is emitted: the process totals so far, at the end of every run (success
+    /// or failure), so each emission lands inside the caller's own phase
+    /// markers, where it has them, and the step from the previous emission is
+    /// that run's share.
+    /// Every counter only grows, so the last emission is the process total
+    /// and the maximum per name, which `--stalls` reads, is that total; the
+    /// read pipeline's `PIPELINE_METRICS` set is emitted the same way.
+    struct UnorderedPoolMetrics {
+        /// The dispatcher blocked on a full descriptor channel: every worker
+        /// busy and the channel's queue of schedule positions full. Expected
+        /// on any decode-bound phase (one thread parked, by design); it is
+        /// the read pipeline's `pipeline_raw_send_wait_ns` analogue.
+        dispatch_send_wait_ns => "classify_unordered_dispatch_send_wait_ns",
+        /// A worker blocked acquiring the mutex over the shared descriptor
+        /// receiver, queued behind a peer that holds it. The holder keeps the
+        /// lock across its receive, so this is the fan-out's queueing. Read
+        /// it against `classify_unordered_desc_recv_wait_ns`: with that near
+        /// zero (positions always waiting) this is the mutex's own cost; with
+        /// that large, the holder was starved of positions and this is mostly
+        /// peers queued behind the starved holder.
+        desc_lock_wait_ns => "classify_unordered_desc_lock_wait_ns",
+        /// A worker holding the descriptor receiver blocked on an empty
+        /// channel: the dispatcher (and its `WILLNEED` advice) behind the
+        /// workers.
+        desc_recv_wait_ns => "classify_unordered_desc_recv_wait_ns",
+        /// A per-blob worker blocked sending its result on a full result
+        /// channel: the consumer's merge behind the workers. The accumulate
+        /// pool records none: its result channel holds one slot per worker
+        /// and each worker sends at most once, so that send never blocks.
+        result_send_wait_ns => "classify_unordered_result_send_wait_ns",
+        /// The per-blob pool's consumer blocked on an empty result channel:
+        /// the calling thread idle for want of a decoded blob to merge
+        /// (workers, or the dispatcher feeding them, behind the merge). The
+        /// accumulate pool records none: its consumer has nothing to merge
+        /// until workers finish their whole share, so its wait is the scan
+        /// itself rather than a stall.
+        result_recv_wait_ns => "classify_unordered_result_recv_wait_ns",
+    }
+}
+
+/// Process totals of every unordered pool run (see [`UnorderedPoolMetrics`]).
+static UNORDERED_POOL_METRICS: UnorderedPoolMetrics = UnorderedPoolMetrics::new();
+
+/// A worker's next schedule position from the shared descriptor receiver, or
+/// `None` once the dispatcher has finished (or gone). The guard covers only
+/// the receive; the blob's work, the caller's callbacks and any send run
+/// after it is released. The mutex guards no application state that recovery
+/// could expose half updated, so a poisoned guard lets the remaining workers
+/// go on; a worker's panic still propagates when the scope joins.
+fn next_position(
+    rx: &std::sync::Mutex<std::sync::mpsc::Receiver<usize>>,
+    metrics: &UnorderedPoolMetrics,
+) -> Option<usize> {
+    let guard = crate::counters::lock_recording_wait(rx, &metrics.desc_lock_wait_ns);
+    crate::counters::recv_recording_wait(&guard, &metrics.desc_recv_wait_ns).ok()
+}
+
 /// The consumer's cancellation checkpoint for the pread pools: before each
 /// wait for a result, after each arrival and after normal closure. Returning
 /// the error from the consumer is the pools' existing early exit: the result
@@ -631,6 +707,20 @@ pub(crate) fn recv_checked<T>(
             Ok(None)
         }
     }
+}
+
+/// [`recv_checked`] with its receive gated through
+/// `crate::counters::recv_recording_wait`: the same checkpoints, and a wait
+/// on an empty channel added to `wait_ns`.
+fn recv_checked_recording_wait<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+    cancel: &crate::host::Cancel,
+    wait_ns: &std::sync::atomic::AtomicU64,
+) -> Result<Option<T>> {
+    cancel.check()?;
+    let received = crate::counters::recv_recording_wait(rx, wait_ns);
+    cancel.check()?;
+    Ok(received.ok())
 }
 
 /// [`parallel_classify_phase`] whose merge closure can stop the scan.
@@ -679,6 +769,7 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
         },
         merge,
         host,
+        &UNORDERED_POOL_METRICS,
     )
 }
 
@@ -705,6 +796,15 @@ struct DecodeLocal<S> {
 /// sends and then the dispatcher's. The ordered pools moved to
 /// `crate::ordered_pool`; this one keeps its dispatcher because that is
 /// where the advice lives, and no dispatch cost has been shown to recover.
+///
+/// Its four blocking points (dispatcher send, descriptor lock and receive,
+/// result send, consumer receive) record into `metrics`, which is emitted
+/// once the run's threads have joined; production callers pass the process
+/// set [`UNORDERED_POOL_METRICS`], a test its own.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a private driver: the wrappers' parameters plus the counter set a test substitutes"
+)]
 fn run_unordered_per_blob<L, R: Send>(
     input: &InputFile,
     schedule: &[ScheduledBlob],
@@ -713,6 +813,7 @@ fn run_unordered_per_blob<L, R: Send>(
     work: impl Fn(&mut L, &[u8]) -> Result<R> + Sync,
     mut merge: impl FnMut(usize, R) -> std::ops::ControlFlow<()>,
     host: &crate::host::Host,
+    metrics: &UnorderedPoolMetrics,
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
@@ -731,11 +832,17 @@ fn run_unordered_per_blob<L, R: Send>(
     );
     let shared_file = input.file();
 
-    std::thread::scope(|scope| -> Result<()> {
+    let outcome = std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
             for (position, entry) in schedule.iter().enumerate() {
                 willneed.before_dispatch(shared_file, entry);
-                if desc_tx.send(position).is_err() {
+                if crate::counters::send_recording_wait(
+                    &desc_tx,
+                    position,
+                    &metrics.dispatch_send_wait_ns,
+                )
+                .is_err()
+                {
                     break;
                 }
             }
@@ -751,21 +858,7 @@ fn run_unordered_per_blob<L, R: Send>(
                 let mut read_buf: Vec<u8> = Vec::new();
                 let mut state = local_ref();
 
-                loop {
-                    // The guard covers only receiving a schedule position;
-                    // the blob's work, the caller's callbacks and the result
-                    // send all run after it is released. The mutex guards no
-                    // application state that recovery could expose half
-                    // updated, so a poisoned guard lets the remaining workers
-                    // go on; a worker's panic still propagates when the scope
-                    // joins.
-                    let position = {
-                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match guard.recv() {
-                            Ok(d) => d,
-                            Err(_) => break,
-                        }
-                    };
+                while let Some(position) = next_position(&rx, metrics) {
                     let entry = &schedule[position];
 
                     let r: crate::error::Result<R> = (|| {
@@ -774,7 +867,13 @@ fn run_unordered_per_blob<L, R: Send>(
                         work_ref(&mut state, &read_buf)
                     })()
                     .map_err(|e| input.locate_blob(entry, e));
-                    if tx.send((position, r)).is_err() {
+                    if crate::counters::send_recording_wait(
+                        &tx,
+                        (position, r),
+                        &metrics.result_send_wait_ns,
+                    )
+                    .is_err()
+                    {
                         break;
                     }
                 }
@@ -787,7 +886,9 @@ fn run_unordered_per_blob<L, R: Send>(
         // joins the workers (a borrow would keep it alive past the join and
         // leave a worker parked in `send`).
         let result_rx = result_rx;
-        while let Some((seq, result)) = recv_checked(&result_rx, &host.cancel)? {
+        while let Some((seq, result)) =
+            recv_checked_recording_wait(&result_rx, &host.cancel, &metrics.result_recv_wait_ns)?
+        {
             if merge(seq, result?).is_break() {
                 // Dropping the receiver - it falls out of scope when this
                 // closure returns, before the scope joins - fails the workers'
@@ -797,9 +898,10 @@ fn run_unordered_per_blob<L, R: Send>(
             }
         }
         Ok(())
-    })?;
-
-    Ok(())
+    });
+    // After the join, so every thread's waits are in; on failure too.
+    metrics.emit_all();
+    outcome
 }
 
 /// One ordered-classify worker's thread-local state: its read buffer,
@@ -964,6 +1066,7 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
             std::ops::ControlFlow::Continue(())
         },
         host,
+        &UNORDERED_POOL_METRICS,
     )
 }
 
@@ -1073,15 +1176,25 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
 
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<usize>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    // One slot per worker, and each worker sends at most once, so a send
+    // never blocks: no stall counter on it, nor on the consumer's receive,
+    // whose wait is the scan itself (see `UnorderedPoolMetrics`).
     let (result_tx, result_rx) =
         std::sync::mpsc::sync_channel::<crate::error::Result<S>>(decode_threads);
     let shared_file = input.file();
+    let metrics = &UNORDERED_POOL_METRICS;
 
-    std::thread::scope(|scope| -> Result<()> {
+    let outcome = std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
             for (position, entry) in schedule.iter().enumerate() {
                 willneed.before_dispatch(shared_file, entry);
-                if desc_tx.send(position).is_err() {
+                if crate::counters::send_recording_wait(
+                    &desc_tx,
+                    position,
+                    &metrics.dispatch_send_wait_ns,
+                )
+                .is_err()
+                {
                     break;
                 }
             }
@@ -1113,13 +1226,8 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
                         if stop.load(std::sync::atomic::Ordering::Relaxed) {
                             return Ok(false);
                         }
-                        let position = {
-                            let guard =
-                                rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                            match guard.recv() {
-                                Ok(d) => d,
-                                Err(_) => return Ok(true),
-                            }
+                        let Some(position) = next_position(&rx, metrics) else {
+                            return Ok(true);
                         };
                         let entry = &schedule[position];
 
@@ -1165,9 +1273,10 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
             merge(result?);
         }
         Ok(())
-    })?;
-
-    Ok(())
+    });
+    // After the join, so every thread's waits are in; on failure too.
+    metrics.emit_all();
+    outcome
 }
 
 #[cfg(test)]
@@ -1370,6 +1479,67 @@ mod tests {
         )
         .unwrap();
         assert_eq!(all.into_inner(), BLOBS, "a clean run classifies every blob");
+    }
+
+    /// The per-blob pool records its stalls into the set it is given, under
+    /// the names `--stalls` reads.
+    ///
+    /// One worker, slower per blob than its dispatcher and its consumer, and
+    /// more blobs than the descriptor channel holds: the dispatcher must find
+    /// that channel full, and the consumer must find the result channel empty,
+    /// so both record a wait. No duration is asserted, only that a wait was
+    /// recorded where the pool blocked, and that a lone worker, which no peer
+    /// can hold the descriptor lock against, records no lock wait at all.
+    #[test]
+    fn the_unordered_pool_records_where_it_blocks() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let dir = crate::path_guard::tests::scratch();
+        let blobs = super::POOL_DESCRIPTOR_CHANNEL_DEPTH + 8;
+        let path = write_many_blob_pbf(dir.path(), blobs);
+        let host = crate::host::Host::for_tests();
+        let (schedule, input) =
+            super::build_classify_schedule(&path, None, super::PartialIndex::Refuse, &host)
+                .unwrap();
+        assert_eq!(schedule.len(), blobs);
+
+        let metrics = super::UnorderedPoolMetrics::new();
+        let mut merged = 0_usize;
+        super::run_unordered_per_blob(
+            &input,
+            &schedule,
+            Some(1),
+            || (),
+            |_: &mut (), _: &[u8]| -> crate::Result<()> {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                Ok(())
+            },
+            |_, ()| {
+                merged += 1;
+                std::ops::ControlFlow::Continue(())
+            },
+            &host,
+            &metrics,
+        )
+        .unwrap();
+        assert_eq!(merged, blobs);
+
+        assert!(metrics.dispatch_send_wait_ns.load(Relaxed) > 0);
+        assert!(metrics.result_recv_wait_ns.load(Relaxed) > 0);
+        assert_eq!(metrics.desc_lock_wait_ns.load(Relaxed), 0);
+
+        let mut names = Vec::new();
+        metrics.for_each(|name, _| names.push(name));
+        assert_eq!(
+            names,
+            [
+                "classify_unordered_dispatch_send_wait_ns",
+                "classify_unordered_desc_lock_wait_ns",
+                "classify_unordered_desc_recv_wait_ns",
+                "classify_unordered_result_send_wait_ns",
+                "classify_unordered_result_recv_wait_ns",
+            ]
+        );
     }
 
     /// The ordered phase merges in schedule order whatever the completion

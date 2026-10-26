@@ -46,7 +46,6 @@ use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{Scope, ScopedJoinHandle};
 
@@ -145,11 +144,13 @@ fn parallel_writer_thread_inner(
 
     // Write the header at offset 0. Everything after grows from
     // `framed_header.len()`.
-    if let Err(e) = file.write_all_at(&framed_header, 0) {
+    // A handoff like any chunk, though this thread writes it itself.
+    if let Err(e) = WRITER_METRICS.time_handoff(|| file.write_all_at(&framed_header, 0)) {
         let error = Error::from(e).context("header write");
         init_tx.send(Err(error.clone())).ok();
         return Err(error);
     }
+    WRITER_METRICS.record_accepted(framed_header.len() as u64);
 
     // Signal init success so the constructor can return.
     init_tx.send(Ok(())).ok();
@@ -279,7 +280,12 @@ fn dispatch_loop(
 
         while let Some(result) = pending.pop_ready() {
             let chunk = result?;
-            dispatch_chunk(chunk, worker_txs, &mut current_offset, &mut next_worker)?;
+            // The handoff here is the dispatch: flattening and the
+            // round-robin send, which blocks on that one worker's full queue.
+            // The pool's own execution time is `writer_pool_write_ns`.
+            WRITER_METRICS.time_handoff(|| {
+                dispatch_chunk(chunk, worker_txs, &mut current_offset, &mut next_worker)
+            })?;
         }
     }
     // Channel closed cleanly. That proves nothing about completeness on its
@@ -298,6 +304,11 @@ fn dispatch_loop(
 
 /// Dispatch one `OutputChunk` to the pool. Handles each variant,
 /// updates `current_offset`, and rotates `next_worker`.
+///
+/// Accepted bytes are counted per successful send. Queued to a worker is
+/// "handed to the backend", the same boundary as the buffered backend's
+/// `BufWriter` copy and io_uring's registered-buffer copy, neither of which
+/// is on disk yet either; see `writer_bytes_written`.
 fn dispatch_chunk(
     chunk: OutputChunk,
     worker_txs: &[SyncSender<WriteOp>],
@@ -317,9 +328,7 @@ fn dispatch_chunk(
                 },
             )?;
             *current_offset += len;
-            WRITER_METRICS
-                .bytes_written
-                .fetch_add(len, Ordering::Relaxed);
+            WRITER_METRICS.record_accepted(len);
         }
         OutputChunk::Raw(bytes) => {
             let len = bytes.len() as u64;
@@ -332,9 +341,7 @@ fn dispatch_chunk(
                 },
             )?;
             *current_offset += len;
-            WRITER_METRICS
-                .bytes_written
-                .fetch_add(len, Ordering::Relaxed);
+            WRITER_METRICS.record_accepted(len);
         }
         OutputChunk::RawChunks(chunks) => {
             for c in chunks {
@@ -348,9 +355,7 @@ fn dispatch_chunk(
                     },
                 )?;
                 *current_offset += len;
-                WRITER_METRICS
-                    .bytes_written
-                    .fetch_add(len, Ordering::Relaxed);
+                WRITER_METRICS.record_accepted(len);
             }
         }
         OutputChunk::CopyRange {
@@ -369,9 +374,7 @@ fn dispatch_chunk(
                 },
             )?;
             *current_offset += len;
-            WRITER_METRICS
-                .bytes_written
-                .fetch_add(len, Ordering::Relaxed);
+            WRITER_METRICS.record_accepted(len);
         }
     }
     Ok(())
@@ -439,7 +442,7 @@ fn worker_loop(
     #[cfg(not(feature = "test-hooks"))]
     let _ = index;
     while let Ok(op) = rx.recv() {
-        // One Acquire load per op - next to two Relaxed RMWs on the shared
+        // One Acquire load per op - next to the Relaxed RMW on the shared
         // `WRITER_METRICS` and a multi-hundred-KB pwrite.
         if failure.stopped() {
             return;
@@ -479,7 +482,7 @@ fn worker_loop(
                 r
             }
         };
-        t.record_ns(&WRITER_METRICS.write_ns);
+        t.record_ns(&WRITER_METRICS.pool_write_ns);
         if let Err(e) = result {
             failure.record(e);
             return;

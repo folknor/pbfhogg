@@ -40,7 +40,7 @@ pub(crate) use super::framing::{
 // thread) lives in the sibling `pipeline` module.
 use super::pipeline::{
     FileOutputSink, OutputChunk, PermitGuard, PipelineItem, WritePipeline, drain_permits,
-    record_send_wait, recv_permit, writer_thread,
+    record_send_wait, recv_permit, write_accepted, writer_thread,
 };
 use crate::host::{Diagnostics, Executor};
 
@@ -169,6 +169,14 @@ impl RawPayload<'_> {
         }
     }
 
+    /// Count this payload under its item and byte counters, as submitted
+    /// (before the handoff, which may still fail).
+    fn count(&self) {
+        let (items, bytes, len) = self.metrics();
+        items.fetch_add(1, Relaxed);
+        bytes.fetch_add(len, Relaxed);
+    }
+
     /// The channel item. A borrowed payload is copied here.
     fn into_chunk(self) -> OutputChunk {
         match self {
@@ -199,9 +207,7 @@ impl RawPayload<'_> {
 /// send joins the writer thread and returns its own error.
 fn send_raw(pipeline: &mut WritePipeline, payload: RawPayload<'_>) -> Result<()> {
     let (_permit, seq) = reserve(pipeline)?;
-    let (items, bytes, len) = payload.metrics();
-    items.fetch_add(1, Relaxed);
-    bytes.fetch_add(len, Relaxed);
+    payload.count();
     let t_send = crate::counters::Stopwatch::start();
     let sent = pipeline.tx.send(PipelineItem {
         seq,
@@ -584,7 +590,7 @@ impl PbfWriter<FileWriter> {
     ) -> Result<Self> {
         // Write header synchronously before starting the pipeline.
         let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
-        writer.write_all(&framed_header)?;
+        WRITER_METRICS.time_handoff(|| write_accepted(&mut writer, &framed_header))?;
 
         // Spawn the writer thread and hand it the writer wrapped in a sink.
         let sink = FileOutputSink::new(writer, finish, cancel.clone());
@@ -913,12 +919,33 @@ impl<W: Write> PbfWriter<W> {
             self.mark_pending();
             Ok(())
         } else {
-            let result = self.writer_mut()?.write_all(raw_framed_bytes);
-            if result.is_ok() {
-                self.mark_pending();
-            }
-            Ok(result?)
+            self.write_raw_sync(RawPayload::Borrowed(raw_framed_bytes))
         }
+    }
+
+    /// The synchronous writer's raw write: the same payload and byte
+    /// accounting as the pipelined path (`send_raw` plus the writer thread's
+    /// handoff), so the counters mean the same thing on both.
+    fn write_raw_sync(&mut self, payload: RawPayload<'_>) -> Result<()> {
+        payload.count();
+        let w = self.writer_mut()?;
+        let result = WRITER_METRICS.time_handoff(|| match payload {
+            RawPayload::Borrowed(bytes) => write_accepted(w, bytes),
+            RawPayload::Owned(bytes) => write_accepted(w, &bytes),
+            RawPayload::Chunks(chunks) => chunks
+                .iter()
+                .try_for_each(|chunk| write_accepted(&mut *w, chunk)),
+            // A splice needs the file under the writer; only
+            // `PbfWriter<FileWriter>::write_raw_copy` has it, and it writes
+            // its copy range itself.
+            RawPayload::CopyRange { .. } => Err(Error::internal(
+                "a synchronous copy range is written by write_raw_copy",
+            )),
+        });
+        if result.is_ok() {
+            self.mark_pending();
+        }
+        result
     }
 
     /// Write pre-framed raw blob bytes, taking ownership of the Vec.
@@ -940,11 +967,7 @@ impl<W: Write> PbfWriter<W> {
             self.mark_pending();
             Ok(())
         } else {
-            let result = self.writer_mut()?.write_all(&raw_framed_bytes);
-            if result.is_ok() {
-                self.mark_pending();
-            }
-            Ok(result?)
+            self.write_raw_sync(RawPayload::Owned(raw_framed_bytes))
         }
     }
 
@@ -966,12 +989,7 @@ impl<W: Write> PbfWriter<W> {
             self.mark_pending();
             Ok(())
         } else {
-            let w = self.writer_mut()?;
-            for chunk in &chunks {
-                w.write_all(chunk)?;
-            }
-            self.mark_pending();
-            Ok(())
+            self.write_raw_sync(RawPayload::Chunks(chunks))
         }
     }
 
@@ -1139,21 +1157,26 @@ impl<W: Write> PbfWriter<W> {
             way_members,
             &mut self.scratch,
         )?;
-        let total_len = 4 + frame.header.len() + frame.blob.len();
-        // Write the 3 frame parts directly - no intermediate `out` Vec.
+        // Counted once framing succeeds, before the write, as the pipelined
+        // framing closure does; the header frame is not a payload.
+        if blob_type == "OSMData" {
+            WRITER_METRICS.payload_framed_items.fetch_add(1, Relaxed);
+            WRITER_METRICS.payload_framed_bytes.fetch_add(
+                (frame.prefix.len() + frame.header.len() + frame.blob.len()) as u64,
+                Relaxed,
+            );
+        }
+        // Write the 3 frame parts directly - no intermediate `out` Vec. One
+        // handoff; bytes counted per part, like every other backend.
         let writer = self
             .writer
             .as_mut()
             .ok_or_else(|| Error::invalid_argument(WRITER_CONSUMED))?;
-        let t_write = crate::counters::Stopwatch::start();
-        writer.write_all(&frame.prefix)?;
-        writer.write_all(frame.header)?;
-        writer.write_all(frame.blob)?;
-        t_write.record_ns(&WRITER_METRICS.write_ns);
-        WRITER_METRICS
-            .bytes_written
-            .fetch_add(total_len as u64, Relaxed);
-        Ok(())
+        WRITER_METRICS.time_handoff(|| {
+            write_accepted(&mut *writer, &frame.prefix)?;
+            write_accepted(&mut *writer, frame.header)?;
+            write_accepted(&mut *writer, frame.blob)
+        })
     }
 }
 
@@ -1301,18 +1324,29 @@ impl PbfWriter<FileWriter> {
             Ok(())
         } else {
             // This is reachable through FileWriter::buffered plus the public
-            // generic PbfWriter::new constructor.
-            let out = self
+            // generic PbfWriter::new constructor. Counted and timed like the
+            // pipelined sink's copy range (see `write_raw_sync`).
+            RawPayload::CopyRange {
+                in_file,
+                offset,
+                len,
+            }
+            .count();
+            let writer = self
                 .writer
                 .as_mut()
-                .ok_or_else(|| Error::invalid_argument(WRITER_CONSUMED))?
-                .flush_and_file()?
-                .ok_or_else(|| {
+                .ok_or_else(|| Error::invalid_argument(WRITER_CONSUMED))?;
+            let cancel = &self.cancel;
+            let result = WRITER_METRICS.time_handoff(|| -> Result<()> {
+                let out = writer.flush_and_file()?.ok_or_else(|| {
                     Error::invalid_argument("copy_file_range incompatible with O_DIRECT output")
                 })?;
-            // `copy_range` decides on the original errno (whether the
-            // userspace fallback takes over) before anything converts it.
-            let result = copy_range(in_file, CopyOut::Cursor(out), offset, len, &self.cancel);
+                // `copy_range` decides on the original errno (whether the
+                // userspace fallback takes over) before anything converts it.
+                copy_range(in_file, CopyOut::Cursor(out), offset, len, cancel)?;
+                WRITER_METRICS.record_accepted(len);
+                Ok(())
+            });
             if result.is_ok() {
                 self.mark_pending();
             }
@@ -1725,6 +1759,74 @@ mod tests {
                     .count();
                 assert_eq!(blobs, 203, "owned={owned}, flush={flush}");
             }
+        }
+    }
+
+    /// `writer_bytes_written` does not undercount the output, header and raw
+    /// writes included, on the synchronous, buffered and `pwrite` pool
+    /// writers.
+    ///
+    /// The synchronous writer used to count only framed blobs (the header
+    /// among them) and skip its raw paths, and the pipelined backends skipped
+    /// the header, so the counter meant a different subset per backend.
+    ///
+    /// Limits: the counter is process-global and other tests move it
+    /// concurrently, so only a lower bound can be asserted, and concurrent
+    /// writes can mask an undercount (run alone with `brokkr test`, they
+    /// cannot). Double counting passes. `CopyRange`, `O_DIRECT` and io_uring
+    /// are not exercised. Exact accounting would need an invocation-scoped
+    /// observer, as fsyncs have (`with_sync_observer`).
+    #[test]
+    fn bytes_written_does_not_undercount_the_output() {
+        use crate::write::metrics::WRITER_METRICS;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        fn fill<W: std::io::Write>(writer: &mut PbfWriter<W>, block: &[u8], raw: &[u8]) {
+            writer.write_primitive_block(block).unwrap();
+            writer.write_raw(raw).unwrap();
+            writer.write_raw_owned(raw.to_vec()).unwrap();
+            writer
+                .write_raw_chunks(vec![raw.to_vec(), raw.to_vec()])
+                .unwrap();
+            writer.flush().unwrap();
+        }
+
+        let dir = crate::path_guard::tests::scratch();
+        let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
+        let block = [0x12u8, 0x00];
+        let raw = super::frame_blob("OSMData", &block, &Compression::None, None).unwrap();
+        for backend in ["sync", "buffered", "parallel"] {
+            let path = dir.path().join(format!("{backend}.pbf"));
+            let before = WRITER_METRICS.bytes_written.load(Relaxed);
+            match backend {
+                "sync" => {
+                    let mut w = PbfWriter::to_path_sync(&path, Compression::None).unwrap();
+                    w.write_header(&header).unwrap();
+                    fill(&mut w, &block, &raw);
+                }
+                "buffered" => {
+                    let mut w =
+                        PbfWriter::to_path(&path, Compression::None, &header, Executor::Ambient)
+                            .unwrap();
+                    fill(&mut w, &block, &raw);
+                }
+                _ => {
+                    let mut w = PbfWriter::to_path_parallel(
+                        &path,
+                        Compression::None,
+                        &header,
+                        Executor::Ambient,
+                    )
+                    .unwrap();
+                    fill(&mut w, &block, &raw);
+                }
+            }
+            let counted = WRITER_METRICS.bytes_written.load(Relaxed) - before;
+            let size = std::fs::metadata(&path).unwrap().len();
+            assert!(
+                counted >= size,
+                "{backend}: writer_bytes_written moved {counted} for a {size}-byte output"
+            );
         }
     }
 }

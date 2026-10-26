@@ -5,6 +5,10 @@ use crate::counters::Stopwatch;
 crate::counters::counter_set! {
     pub(crate) struct WriterMetrics {
         pub permit_wait_ns => "writer_permit_wait_ns",
+        /// `frame_ns` and `compress_ns` are summed across whichever threads
+        /// framed - the executor's workers on a pipelined writer, the caller
+        /// on a synchronous one - so they are not components of any one
+        /// thread's wall time.
         pub frame_ns => "writer_frame_ns",
         pub compress_ns => "writer_compress_ns",
         pub pipeline_send_wait_ns => "writer_pipeline_send_wait_ns",
@@ -18,11 +22,61 @@ crate::counters::counter_set! {
         /// apart from `reorder_high_water`, which counts PBF blobs in the
         /// writer backends' reorder buffers.
         pub parallel_gzip_reorder_high_water => "writer_parallel_gzip_reorder_high_water",
-        pub write_ns => "writer_write_ns",
+        /// Elapsed time of ordered output handoff, on every backend: from a
+        /// ready chunk (or the header frame) being handed to the backend's
+        /// write path until that call returns, on the thread doing it - the
+        /// pipelined writer thread, the constructor for a pipelined header,
+        /// or the caller of a synchronous writer. Includes flattening a
+        /// framed chunk, memcpy into the backend's buffers, syscalls,
+        /// submission, backpressure waits (a full `BufWriter` flushing,
+        /// io_uring waiting for a free registered buffer, the `pwrite` pool's
+        /// round-robin send blocking on one worker's full queue, which is
+        /// head-of-line blocking rather than pool saturation), input reads
+        /// and userspace copy fallback when that thread performs a
+        /// `CopyRange`, and dropping the consumed payload. Recorded for
+        /// operations that return an error too. Framing is `writer_frame_ns`,
+        /// and an upstream framing failure is not a handoff.
+        ///
+        /// Not a partition of the writer's lifetime: io_uring's opportunistic
+        /// non-blocking CQE reap between chunks (steady-state backend
+        /// maintenance) is outside it, and so is end-of-stream finalization
+        /// (the last buffer flush, io_uring drain, `O_DIRECT` tail padding and
+        /// truncation, joining the pool, the fsync in `writer_sync_all_ns`).
+        /// A small output can fit entirely in backend buffering and spend its
+        /// time in finalization instead. Summed across writers, so a process
+        /// with several concurrent writers (`multi-extract`) can exceed wall.
+        ///
+        /// Replaces `writer_write_ns`, which meant writer-thread wall on the
+        /// buffered and io_uring backends but summed pool-thread time on the
+        /// `pwrite` pool; the pool time is now `writer_pool_write_ns`. The
+        /// old name was retired, not redefined, so a name-keyed comparison
+        /// against stored runs finds no counterpart instead of a false one.
+        pub handoff_ns => "writer_handoff_ns",
+        /// `pwrite` / `copy_file_range` execution time summed across the
+        /// `pwrite` pool's threads, including dropping the written buffer,
+        /// failed operations too. Thread-time: up to the pool size times wall.
+        /// Zero on every other backend, which has no pool.
+        pub pool_write_ns => "writer_pool_write_ns",
         pub flush_ns => "writer_flush_ns",
         pub bytes_framed => "writer_bytes_framed",
+        /// Bytes covered by successful handoff operations, header frame
+        /// included, counted per constituent operation (each chunk of a
+        /// `RawChunks`, each of a synchronous frame's three writes, a whole
+        /// `CopyRange` on success). "Handed to the backend", not "on disk":
+        /// the buffered backend counts bytes copied into its `BufWriter`,
+        /// io_uring bytes copied into a registered buffer the kernel writes
+        /// later, and the `pwrite` pool bytes queued to a worker - so the pool
+        /// counting at dispatch is the same boundary as the others, not an
+        /// earlier one. Bytes partially accepted inside a failing operation
+        /// are not counted, and on a failed run accepted bytes may never reach
+        /// the file. On success, for fresh regular-file outputs, it equals the
+        /// sum of the output files' sizes (alignment padding never counts).
         pub bytes_written => "writer_bytes_written",
 
+        /// The `payload_*` pairs count what callers submitted, on synchronous
+        /// and pipelined writers alike: `OSMData` blobs once framing succeeds
+        /// (the header frame is not a payload), raw items and copy ranges as
+        /// they are submitted, before the handoff that may then fail.
         pub payload_framed_items => "writer_payload_framed_items",
         pub payload_framed_bytes => "writer_payload_framed_bytes",
         pub payload_raw_items => "writer_payload_raw_items",
@@ -42,6 +96,12 @@ crate::counters::counter_set! {
         /// range is routed (a fallback that then fails is still counted).
         pub copy_range_fallback_bytes => "writer_copy_range_fallback_bytes",
 
+        /// `buffered_write_*` and `direct_write_*` count successful
+        /// `FileWriter::write` calls and the logical bytes they accepted - not
+        /// syscalls, not physical bytes (`CopyRange`, internal buffer flushes
+        /// and `O_DIRECT` padding bypass them). The synchronous writers over a
+        /// plain `BufWriter<File>` or an arbitrary `Write` never go through
+        /// `FileWriter`, so zero here does not mean no buffered output.
         pub buffered_write_calls => "writer_buffered_write_calls",
         pub buffered_write_bytes => "writer_buffered_write_bytes",
         pub direct_write_calls => "writer_direct_write_calls",
@@ -130,8 +190,29 @@ impl WriterMetrics {
     /// Feeds `brokkr sidecar --stalls` via the `writer_recv_wait_ns`
     /// convention. Every backend's writer loop must call it, or that backend
     /// reports as never having stalled on its input.
+    ///
+    /// Recorded after a successful `recv`, so the final wait that ends in
+    /// the channel's disconnect is never counted, on any backend.
     pub fn record_recv_wait(&self, start: Stopwatch) {
         start.record_ns(&self.recv_wait_ns);
+    }
+
+    /// Run one handoff operation and record its elapsed time into
+    /// `writer_handoff_ns` whatever it returns (see that counter). The one
+    /// way every backend times a handoff, so an early `?` cannot skip the
+    /// recording on one backend and not another.
+    pub(crate) fn time_handoff<R>(&self, op: impl FnOnce() -> R) -> R {
+        let start = Stopwatch::start();
+        let result = op();
+        start.record_ns(&self.handoff_ns);
+        result
+    }
+
+    /// Count `len` bytes as accepted by the backend (`writer_bytes_written`).
+    /// Called after each successful constituent operation.
+    #[inline]
+    pub(crate) fn record_accepted(&self, len: u64) {
+        self.bytes_written.fetch_add(len, Relaxed);
     }
 
     pub fn record_reorder_high_water(&self, len: usize) {
@@ -328,7 +409,7 @@ mod tests {
         // counter is zero, and `emit_once` correctly declines to emit that -
         // so asserting `emit_once() == true` on a fresh instance would fail
         // for a reason that has nothing to do with the latch.
-        metrics.bytes_written.fetch_add(4096, Relaxed);
+        metrics.record_accepted(4096);
         assert!(
             metrics.emit_once(),
             "the first emit_once must be the one that emits"

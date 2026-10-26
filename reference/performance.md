@@ -74,6 +74,26 @@ usually small.
   `678478d`, so its ~7 GB churn - led by `parse_and_inline_with_scratch`
   1.7 GB, `parallel_scan_blobs_raw` and `parallel_classify_phase` 1.6 GB
   each - is real; older alloc profiles do not compare.
+- **`writer_write_ns` is retired (2026-10-26); it never meant one thing.**
+  On the buffered, `O_DIRECT` and io_uring backends it was writer-thread
+  wall inside the backend write; on the `pwrite` pool (the default for
+  `apply-changes` and add-locations-to-ways pass 2) it was pool-thread time
+  summed across every worker, up to the pool size times wall. Runs from that
+  date carry `writer_handoff_ns` (the handoff thread's elapsed time per
+  chunk, the same definition on every backend, the pool's dispatch
+  included) and `writer_pool_write_ns` (the pool's summed execution time,
+  pool backend only); the definitions are on the counters in
+  `src/write/metrics.rs`. An old `writer_write_ns` compares with
+  `writer_pool_write_ns` on a pool-backend command (the pool's timer did not
+  move) and roughly with `writer_handoff_ns` on every other backend, whose
+  timer now also covers flattening a framed chunk, dropping the payload and
+  the header write. `writer_bytes_written` kept its name but
+  now covers the header frame and the synchronous writer's raw writes
+  (`multi-extract`), so on a successful run writing fresh regular files it
+  equals the summed output size on every backend; older
+  rows undercount by the header on pipelined backends and by every raw
+  write on synchronous ones. The synchronous writer's `writer_payload_*`
+  counters, previously always zero, count too.
 
 ## Cat passthrough (indexdata generation)
 

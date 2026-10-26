@@ -12,8 +12,10 @@ into one buffering-and-alignment core parameterized by submit strategy.
 What they must share, they share explicitly and by name: the
 `SeqTotal`/`check_stream_complete` end-of-stream handshake, the
 `PermitGuard` write-ahead discipline, `WriterMetrics::sync_recorded` (the
-one recorded fsync) and `record_recv_wait`, and the `flush`-versus-`sync` split. Adding a fifth
-backend, or changing any of those four shared contracts, is the trigger to
+one recorded fsync), `record_recv_wait`, `time_handoff` and
+`record_accepted` (so each writer counter means one thing on every
+backend), and the `flush`-versus-`sync` split. Adding a fifth
+backend, or changing any of those shared contracts, is the trigger to
 revisit this.
 
 The premise usually offered for unification does not survive checking. The

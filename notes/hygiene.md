@@ -70,7 +70,6 @@ goes on "Review once drained" as a bisect candidate, named by commit.
 
 Launch order, one agent per line, run serially:
 
-38. HYG-194
 39. HYG-016
 40. HYG-195
 41. HYG-196
@@ -1066,6 +1065,17 @@ The judgement calls already known, to be checked first:
     after a framing closure saw the writer thread die they return its error
     without copying or sending. They used to reach the same error at the
     failed send.
+- The writer counters were given one meaning per name across backends
+  (commit "Writer counters mean one thing on every backend"):
+  `writer_write_ns` was retired for `writer_handoff_ns` (timed once per
+  chunk at the writer loop, `time_handoff`) and `writer_pool_write_ns`.
+  Judgement calls on the write hot path, none measured: the `pwrite` pool's
+  dispatcher gained a stopwatch per chunk; the synchronous writer's raw
+  writes (`multi-extract`'s passthrough) gained a stopwatch and the
+  payload and byte atomics per write, on a process-global shared by every
+  region writer; `writer_bytes_written` is now bumped per constituent write
+  (each `RawChunks` chunk, each of a synchronous frame's three parts)
+  instead of once per chunk.
 
 ---
 
@@ -1184,45 +1194,30 @@ catalogued; if it is done at all, it is done last.
 Reported by: altw and scanning, re-encoding, filtering and spatial, read path,
 geocode index.
 
-## HYG-016 - Writer loops are copied per backend and their metrics mean different things
+## HYG-016 - Writer loops are copied per backend
 
 Anger: 9 - writer loops on a hot path.
 
 `pipeline::writer_thread`, `uring_writer::uring_main_loop` and
 `parallel_writer::dispatch_loop` each reimplement recv, `record_recv_wait`,
-push, high-water, `pop_ready` and `check_stream_complete`, and every backend
-reimplements the `OutputChunk` match with `write_ns` and `bytes_written`
-bookkeeping. `parallel_gzip::writer_loop` has its own completeness check with a
-`BTreeMap` reorder buffer instead of `ReorderBuffer` and no announced total.
-ADR `0014-output-backends-stay-separate` argues against unifying backends, but
+push, high-water, `pop_ready`, the per-chunk `time_handoff` and
+`check_stream_complete`, and every backend reimplements the `OutputChunk`
+match with its `record_accepted` byte bookkeeping. ADR
+`0014-output-backends-stay-separate` argues against unifying backends, but
 the loop is not backend logic; uring could be an `OutputSink` whose
-`write_chunk` does the opportunistic `reap_cqes(false)`. Meanings have
-diverged: `writer_write_ns` is wall time on the writer thread for buffered and
-uring, summed across 16 pool threads for parallel; and parallel counts
-`writer_bytes_written` at dispatch, others after the write. Fix: `writer_thread<S: OutputSink>`
-as the only loop with an `on_idle()` hook; a source-scan test that only
-`pipeline.rs` calls `pop_ready()` under `src/write/`.
+`write_chunk` does the opportunistic `reap_cqes(false)`. Fix:
+`writer_thread<S: OutputSink>` as the only loop with an `on_idle()` hook; a
+source-scan test that only `pipeline.rs` calls `pop_ready()` under
+`src/write/`. The writer counters' per-backend meanings are settled (each
+counter's doc in `src/write/metrics.rs`): the unified loop must keep
+`writer_handoff_ns` around the sink call only, with io_uring's idle reap
+outside it.
 
 Maintainer (2026-10-25): split into three entries, one commit each. This
 entry keeps the PBF writer-loop unification (`writer_thread<S: OutputSink>`,
 io_uring as a sink). ADR-0014 is binding: argue explicitly why the loop is
-not backend logic, or update the ADR. The metric meanings are HYG-194, which
-runs first so cross-backend comparisons mean the same thing; the
-`parallel_gzip` reorder map is HYG-195, which runs after this one.
-
-Reported by: write path.
-
-## HYG-194 - Writer metrics mean different things per backend
-
-Anger: 6 - sidecar meaning; brokkr history reads these names.
-
-Split out of HYG-016. `writer_write_ns` is wall time on the writer thread
-for buffered and uring, but summed across 16 pool threads for parallel; and
-parallel counts `writer_bytes_written` at dispatch, the others after the
-write. Comparing writer metrics across backends compares different
-quantities. Make each name mean one thing on every backend, or give the
-diverging ones their own names. brokkr's stored history reads these names, so
-a meaning change needs saying where brokkr users will see it.
+not backend logic, or update the ADR. The `parallel_gzip` reorder map is
+HYG-195, which runs after this one.
 
 Reported by: write path.
 

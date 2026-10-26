@@ -12,7 +12,6 @@ use crate::tunables::{EXECUTOR_IDLE_RECV_TIMEOUT, PIPELINE_DISPATCH_PERMITS, WRI
 use crate::write::file_writer::FileWriter;
 use crate::write::metrics::WRITER_METRICS;
 use std::io::Write;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
@@ -99,6 +98,15 @@ pub(crate) trait OutputSink {
     fn flush(&mut self) -> Result<()>;
 }
 
+/// `write_all` `bytes` and, on success, count them as accepted
+/// (`writer_bytes_written`). The per-operation byte accounting shared by the
+/// buffered sink and the synchronous `PbfWriter`.
+pub(crate) fn write_accepted<W: Write + ?Sized>(writer: &mut W, bytes: &[u8]) -> Result<()> {
+    writer.write_all(bytes)?;
+    WRITER_METRICS.record_accepted(bytes.len() as u64);
+    Ok(())
+}
+
 /// Default sink that wraps a [`FileWriter`] (buffered or O_DIRECT).
 ///
 /// Flattens `Framed` chunks via [`FramedBlobParts::into_vec`] before handing
@@ -126,41 +134,23 @@ impl FileOutputSink {
 }
 
 impl OutputSink for FileOutputSink {
+    /// Timed by the caller (`writer_thread`) as one handoff; counts accepted
+    /// bytes per constituent write.
     fn write_chunk(&mut self, chunk: OutputChunk) -> Result<()> {
         match chunk {
             OutputChunk::Framed(parts) => {
-                let len = parts.total_len();
                 let bytes = parts.into_vec();
-                let t_write = crate::counters::Stopwatch::start();
-                self.writer.write_all(&bytes)?;
-                t_write.record_ns(&WRITER_METRICS.write_ns);
-                WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
-                Ok(())
+                write_accepted(&mut self.writer, &bytes)
             }
-            OutputChunk::Raw(bytes) => {
-                let len = bytes.len() as u64;
-                let t_write = crate::counters::Stopwatch::start();
-                self.writer.write_all(&bytes)?;
-                t_write.record_ns(&WRITER_METRICS.write_ns);
-                WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
-                Ok(())
-            }
-            OutputChunk::RawChunks(chunks) => {
-                let total_bytes: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
-                let t_write = crate::counters::Stopwatch::start();
-                for chunk in &chunks {
-                    self.writer.write_all(chunk)?;
-                }
-                t_write.record_ns(&WRITER_METRICS.write_ns);
-                WRITER_METRICS.bytes_written.fetch_add(total_bytes, Relaxed);
-                Ok(())
-            }
+            OutputChunk::Raw(bytes) => write_accepted(&mut self.writer, &bytes),
+            OutputChunk::RawChunks(chunks) => chunks
+                .iter()
+                .try_for_each(|chunk| write_accepted(&mut self.writer, chunk)),
             OutputChunk::CopyRange {
                 in_file,
                 offset,
                 len,
             } => {
-                let t_write = crate::counters::Stopwatch::start();
                 let out = self.writer.flush_and_file()?.ok_or_else(|| {
                     Error::invalid_argument("copy_file_range incompatible with O_DIRECT output")
                 })?;
@@ -173,8 +163,7 @@ impl OutputSink for FileOutputSink {
                 )?;
                 // Hold the input open until the splice has actually happened.
                 drop(in_file);
-                t_write.record_ns(&WRITER_METRICS.write_ns);
-                WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
+                WRITER_METRICS.record_accepted(len);
                 Ok(())
             }
         }
@@ -569,7 +558,7 @@ pub(super) fn writer_thread<S: OutputSink>(
         // Drain consecutive ready items from the front.
         while let Some(result) = pending.pop_ready() {
             let chunk = result?;
-            sink.write_chunk(chunk)?;
+            WRITER_METRICS.time_handoff(|| sink.write_chunk(chunk))?;
         }
     }
 

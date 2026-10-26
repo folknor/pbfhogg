@@ -706,8 +706,9 @@ fn uring_init_and_run(
         in_flight: 0,
     };
 
-    // Step 7: Write header.
-    state.write(framed_header)?;
+    // Step 7: Write header, a handoff like any chunk.
+    WRITER_METRICS.time_handoff(|| state.write(framed_header))?;
+    WRITER_METRICS.record_accepted(framed_header.len() as u64);
 
     // Step 8: Main reorder + write loop (same as writer_thread in writer.rs).
     uring_main_loop(rx, &mut state, expected, cancel)?;
@@ -750,49 +751,12 @@ fn uring_main_loop(
             #[cfg(feature = "test-hooks")]
             cancel.faults().on_uring_dispatch();
 
-            match chunk {
-                OutputChunk::Framed(parts) => {
-                    // io_uring backend flattens at the backend boundary
-                    // (registered-buffer copy is backend-local).
-                    let bytes = parts.into_vec();
-                    let len = bytes.len() as u64;
-                    let t_write = crate::counters::Stopwatch::start();
-                    state.write(&bytes)?;
-                    t_write.record_ns(&WRITER_METRICS.write_ns);
-                    WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
-                }
-                OutputChunk::Raw(bytes) => {
-                    let len = bytes.len() as u64;
-                    let t_write = crate::counters::Stopwatch::start();
-                    state.write(&bytes)?;
-                    t_write.record_ns(&WRITER_METRICS.write_ns);
-                    WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
-                }
-                OutputChunk::RawChunks(chunks) => {
-                    let total_bytes: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
-                    let t_write = crate::counters::Stopwatch::start();
-                    for chunk in &chunks {
-                        state.write(chunk)?;
-                    }
-                    t_write.record_ns(&WRITER_METRICS.write_ns);
-                    WRITER_METRICS.bytes_written.fetch_add(total_bytes, Relaxed);
-                }
-                OutputChunk::CopyRange {
-                    in_file,
-                    offset,
-                    len,
-                } => {
-                    let t_write = crate::counters::Stopwatch::start();
-                    super::copy_range::read_range(&in_file, offset, len, cancel, state)?;
-                    // The Arc keeps the input open across the read loop.
-                    drop(in_file);
-                    t_write.record_ns(&WRITER_METRICS.write_ns);
-                    WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
-                }
-            }
+            WRITER_METRICS.time_handoff(|| hand_off_chunk(state, chunk, cancel))?;
         }
 
         // Opportunistically reap CQEs without blocking to recycle buffers.
+        // Steady-state backend maintenance, deliberately outside the handoff
+        // timer (see `writer_handoff_ns`).
         state.reap_cqes(false)?;
     }
 
@@ -809,6 +773,45 @@ fn uring_main_loop(
         pending.next_seq(),
         expected,
     )
+}
+
+/// Hand one ordered chunk to the ring's buffers; the caller times it as one
+/// handoff. Accepted bytes are counted per constituent write.
+fn hand_off_chunk(
+    state: &mut UringState,
+    chunk: OutputChunk,
+    cancel: &crate::host::Cancel,
+) -> Result<()> {
+    match chunk {
+        OutputChunk::Framed(parts) => {
+            // io_uring backend flattens at the backend boundary
+            // (registered-buffer copy is backend-local).
+            let bytes = parts.into_vec();
+            state.write(&bytes)?;
+            WRITER_METRICS.record_accepted(bytes.len() as u64);
+        }
+        OutputChunk::Raw(bytes) => {
+            state.write(&bytes)?;
+            WRITER_METRICS.record_accepted(bytes.len() as u64);
+        }
+        OutputChunk::RawChunks(chunks) => {
+            for chunk in &chunks {
+                state.write(chunk)?;
+                WRITER_METRICS.record_accepted(chunk.len() as u64);
+            }
+        }
+        OutputChunk::CopyRange {
+            in_file,
+            offset,
+            len,
+        } => {
+            super::copy_range::read_range(&in_file, offset, len, cancel, state)?;
+            // The Arc keeps the input open across the read loop.
+            drop(in_file);
+            WRITER_METRICS.record_accepted(len);
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

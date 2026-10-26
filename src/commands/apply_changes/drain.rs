@@ -222,8 +222,10 @@ pub(super) fn run_drain(
     // reorder buffer is empty.
     let mut drain_disconnected = false;
     // The invocation's token, checked beside the producer-failure poll
-    // below: at most one `DRAIN_RECV_TIMEOUT` plus the item in hand after
-    // a cancellation. Returning it leaves through the drain's existing error
+    // below, once per receive: after a cancellation the drain stops within
+    // one `DRAIN_RECV_TIMEOUT` plus the contiguous run of buffered items it
+    // is already writing (the advance loop below does not check between
+    // items). Returning it leaves through the drain's existing error
     // exit (receiver and barrier sender dropped, producers unblocked, both
     // joined by `merge`), the same one a failed output write takes.
     let cancel = writer.cancel_token().clone();
@@ -825,6 +827,10 @@ fn barrier_publish_loc_map(
     // extending with per-worker accumulators. Take ownership via the
     // Mutex so subsequent calls (defensive; barrier should fire once)
     // see an empty map.
+    // The seeded map is drain-owned state taken once, never written
+    // concurrently, so poison there is moot. A worker slot recovered from
+    // poison does not validate its contents: see `flush_local_coords` for
+    // why a panicking worker still fails the run.
     let mut merged: FxHashMap<i64, (i32, i32)> = cfg
         .seeded_locations
         .as_ref()
@@ -862,11 +868,12 @@ fn barrier_publish_loc_map(
     state.barrier_done = true;
 
     if let Some(barrier_tx) = cfg.barrier_tx.as_ref() {
-        // Send is fire-and-forget: scanner may have already exited
-        // (small datasets) and dropped its receiver. Either way the
-        // drain is done with the barrier; a closed channel here is not
-        // an error.
-        // Closed receiver = scanner already exited; benign at end-of-stream.
+        // A scanner that succeeds always receives this before exiting, small
+        // inputs included: if it has not already picked it up between node
+        // descriptors, it blocks on it after its walk. A
+        // closed receiver therefore means the scanner exited or unwound
+        // early, and that cause is reported through the failure slot, so the
+        // send error itself carries nothing to report.
         if let Err(e) = barrier_tx.send(()) {
             let _: mpsc::SendError<()> = e;
         }

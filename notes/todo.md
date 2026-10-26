@@ -975,21 +975,9 @@ The pattern that bit tags-filter (`parallel_classify_accumulate` +
 per-worker `IdSet`) lives in at least one other place that's
 already documented:
 
-- **geocode pass 1.5** - per-worker IdSet of way node refs. Documented
-  at `src/scan/classify.rs:302-308` as "shipping at 14.59 GB peak RSS
-  (planet) - OK in practice, but on the rewrite list in
-  `notes/geocode-build-opportunities.md`." Migration template applies
-  identically: per-blob `Vec<i64>` of node refs through the bounded
-  result channel. **Borrow caveat:** the geocode pass 1.5 merge
-  step's mutability vs. the classify step's read access has not been
-  audited in this context - if the same `&X` / `&mut X` conflict
-  arises that prevented `tags_filter::collect_relation_member_closure`
-  from migrating, fall back on `parallel_classify_accumulate` and
-  size the per-worker state explicitly. The
-  `tags_filter::collect_relation_member_closure` precedent at
-  `src/commands/tags_filter/mod.rs:984-1066` shows the unmigratable
-  shape and the trade-off (bounded per-worker `Vec<i64>` is fine
-  when state grows with element count, not ID space).
+- **geocode pass 1.5** - no longer a caller (checked 2026-10-26): it
+  writes one shared pre-allocated `IdSet` with atomic sets from its own
+  claim-counter pool (`run_pass1_5`), which ended the per-worker bitmaps.
 
 - **`tags_filter::collect_relation_member_closure`** itself - kept
   on `parallel_classify_accumulate` *deliberately* (per the borrow
@@ -1057,6 +1045,29 @@ Known to work, no performance question open, but not in the results DB:
   target.
 
 ## Performance
+
+- [ ] **Stall-counter follow-ups (found 2026-10-26 adding the unordered
+  pools' `*_wait_ns` counters).** Each is its own change; none is measured.
+  - altw stage 4's readiness wait is accumulated in ns but emitted only as
+    `s4_readiness_wait_ms`, so `--stalls` cannot see the stage-3 -> stage-4
+    handoff that `reference/performance.md` names as planet's streaming
+    constraint. Add an `s4_readiness_wait_ns` twin (names are a contract;
+    no rename).
+  - `parallel_classify_phase_ordered` passes `ordered_pool::Waits::default()`,
+    so the ordered classify phase (repack, degrade, getparents, time-filter,
+    tags-filter pass 2, cat `--clean`, geocode pass 2) records no waits
+    though the engine supports them.
+  - apply-changes' `candidate_rx` is its own uncounted `Mutex<Receiver>`
+    fan-out (`apply_changes/streaming.rs`).
+  - The first-error slot is a mutex locked on every claim in altw stages 2
+    and 3 and geocode pass 1.5; an `AtomicBool` fast check would avoid the
+    shared cache-line traffic. Planet-measured paths: needs its own A/B.
+  - Every altw router publish takes a global `stats` mutex and the global
+    `notify_mu`. Same caveat.
+  - Once measurement is allowed: read `classify_unordered_desc_lock_wait_ns`
+    against `classify_unordered_desc_recv_wait_ns` on a planet tags-filter
+    or extract run to settle the `Mutex<Receiver>` dispatch question
+    (`reference/performance-history.md`).
 
 - [x] ~~**ALTW planet drift: confirm or dismiss (+10-17 % vs April).**~~
   **DISMISSED 2026-07-14 - drive state, not code.** The `--bench 3`

@@ -412,8 +412,12 @@ pub(crate) const DRAIN_CHANNEL_CAPACITY: usize = 256;
 /// workers fed during scanner pauses.
 pub(crate) const CANDIDATE_CHANNEL_CAPACITY: usize = 64;
 
-/// Drain `recv_timeout` that breaks the drain/scanner barrier cycle by
-/// letting drain re-poll `last_node_seq` and fire the barrier from idle.
+/// Drain `recv_timeout`: how long the drain blocks on an empty item channel
+/// before checking the producer failure slot and the cancellation token, and
+/// re-polling the scanner's node boundary so the barrier can fire from idle.
+/// A failed worker never delivers its seq while the scanner can sit in its
+/// barrier wait and the other workers idle on the candidate channel, so no
+/// channel disconnect would wake the drain; the timeout does.
 ///
 /// 25 ms is a tradeoff: tighter polling adds CPU at very small
 /// dataset sizes; looser polling adds latency at the moment of

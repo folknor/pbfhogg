@@ -241,9 +241,11 @@ pub(super) fn run_workers(
     };
 
     // mpsc::Receiver isn't Sync, so workers serialize their `recv()` calls
-    // through this Mutex. The lock is only held for the duration of one
-    // `recv()` (microseconds); workers spend their time in pread +
-    // decompress + parse, not queued on the receiver lock.
+    // through this Mutex. The guard spans a blocking `recv()`, so an idle
+    // worker can hold it for as long as the channel stays empty (the whole
+    // scanner barrier wait, under `--locations-on-ways`) while the others
+    // queue behind it; it serializes only dequeueing, and every blob's work
+    // runs after the guard is released.
     let candidate_rx = Mutex::new(candidate_rx);
     // Worker errors are located against the base PBF; captured once, not per
     // blob.
@@ -337,6 +339,10 @@ fn worker_loop(
 
     loop {
         let item = {
+            // Poison recovery keeps the channel usable for the remaining
+            // workers. Nothing can panic while the guard is held (it covers
+            // only the receive), and a worker that panics elsewhere is caught
+            // and published to the failure slot by `run_workers`.
             let rx = candidate_rx
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -794,6 +800,12 @@ fn upsert_slice(ranges: &DiffRanges, kind: ElementKind, min_id: i64, max_id: i64
 /// Drain `local` into the worker's shared coord slot. Acquires the mutex
 /// for the duration of the merge; the drain reads via the same Arc so
 /// the publish is atomic from its perspective.
+///
+/// A poisoned slot is recovered, but its contents are not evidence of a
+/// complete node phase: a worker panic invalidates the run. The panicking
+/// worker publishes its caught panic shortly after unwinding, and never
+/// delivers the node item it was processing, so the drain cannot publish a
+/// map built without it; the failure is checked again at shutdown.
 fn flush_local_coords(
     slot: &Arc<Mutex<FxHashMap<i64, (i32, i32)>>>,
     local: &mut FxHashMap<i64, (i32, i32)>,
@@ -811,8 +823,9 @@ fn flush_local_coords(
     }
 }
 
-/// Send to the drain. Returns `Err` only if the drain has already exited
-/// (channel closed) - treat as graceful shutdown.
+/// Send to the drain. Fails only once the drain has dropped its receiver,
+/// which it does on its own error or cancellation; the worker propagates
+/// this error, which ends it, and the drain's cause is what the run reports.
 fn send_drain(drain_tx: &mpsc::SyncSender<DrainItem>, item: DrainItem) -> Result<()> {
     drain_tx
         .send(item)

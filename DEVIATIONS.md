@@ -85,7 +85,8 @@ position.
 merged nodes. A base way the OSC does not touch is copied through with the
 locations it already carried, even when the OSC moves or deletes a node it
 references; a deleted node leaves its last position in such a way. Rerun
-`add-locations-to-ways` on the output for a full refresh.
+`add-locations-to-ways` on the output for a full refresh. `check --locations`
+reports every such stale coordinate whose node the file still contains.
 
 **Rationale:** Most way blobs are spliced into the output without decoding.
 Finding every base way that references a changed node needs a node-to-way
@@ -352,6 +353,12 @@ any negative ID runs as one shard instead (`src/commands/diff/shard.rs`).
   mixed-sign range would silently turn present nodes, positive ones
   included, into missing locations. The error names the sparse index,
   which joins such input. Way and relation blobs may hold negative IDs.
+- `check --locations` - **hard reject** of any way referencing a
+  negative node ID. Its coordinate store is keyed through an `IdSet`,
+  so such a reference could not be compared, and a verifier that
+  skipped it would pass a stale coordinate unseen. Negative node
+  records are still counted and their coordinates domain-checked.
+  osmium has no equivalent check.
 - `add-locations-to-ways` (both backends) - **silent**, by
   inheritance from `IdSet`, for negative relation-member refs.
   Relation-member node IDs are collected into an `IdSet` that decides

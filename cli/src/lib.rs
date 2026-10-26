@@ -737,6 +737,8 @@ fn validate_check(
         ids,
         refs,
         index,
+        locations,
+        agreement,
         check_relations,
         show_ids,
         full,
@@ -765,26 +767,43 @@ fn validate_check(
             }
         }
     }
-    // With no selector the --ids + --refs pair runs; --index alone runs only
-    // the metadata verification.
-    let any_selector = *ids || *refs || *index;
+    // With no selector the --ids + --refs pair runs; --index or --locations
+    // alone runs only that verification.
+    let any_selector = *ids || *refs || *index || *locations;
     let run_ids = *ids || !any_selector;
     let run_refs = *refs || !any_selector;
     let refuse = |message: &str| Err(usage(&["check"], message));
+    if *agreement && !*locations {
+        return refuse("--agreement requires --locations");
+    }
+    // Name what the user can do from the command line they gave: add the
+    // selector, or drop every selector to get the default pair.
     if !run_ids {
         if *full {
-            return refuse("--full requires --ids (or omit --refs to run both checks)");
+            return refuse(
+                "--full applies to the ID check: add --ids, or pass no selector \
+                 to run the default --ids + --refs pair",
+            );
         }
         if type_filter.is_some() {
-            return refuse("--type requires --ids (or omit --refs to run both checks)");
+            return refuse(
+                "--type applies to the ID check: add --ids, or pass no selector \
+                 to run the default --ids + --refs pair",
+            );
         }
     }
     if !run_refs {
         if *check_relations {
-            return refuse("--check-relations requires --refs (or omit --ids to run both checks)");
+            return refuse(
+                "--check-relations applies to the ref check: add --refs, or pass \
+                 no selector to run the default --ids + --refs pair",
+            );
         }
         if *show_ids {
-            return refuse("--show-ids requires --refs (or omit --ids to run both checks)");
+            return refuse(
+                "--show-ids applies to the ref check: add --refs, or pass no \
+                 selector to run the default --ids + --refs pair",
+            );
         }
     }
     Ok(())
@@ -1954,7 +1973,8 @@ enum Command {
         )]
         jobs: pbfhogg::Parallelism,
     },
-    /// Validate PBF file integrity (IDs + referential integrity)
+    /// Validate PBF file integrity (IDs + referential integrity; opt-in
+    /// blob metadata and inline way locations)
     Check {
         /// Input PBF file
         file: PathBuf,
@@ -1969,6 +1989,18 @@ enum Command {
         /// the default --ids + --refs pair.
         #[arg(long)]
         index: bool,
+        /// Verify a LocationsOnWays file's inline way-node coordinates
+        /// against its node records. References to nodes the file does not
+        /// contain are counted, not failed. Opt-in: not part of the default
+        /// --ids + --refs pair.
+        #[arg(long)]
+        locations: bool,
+        /// Also require every inline coordinate of a node the file does not
+        /// contain to agree across the ways referencing it (use with
+        /// --locations). Needs a slot per referenced node, not per present
+        /// one, so it can take more passes.
+        #[arg(long)]
+        agreement: bool,
         /// Also check relation member references (use with --refs)
         #[arg(long)]
         check_relations: bool,
@@ -2144,6 +2176,8 @@ struct CheckFlags {
     ids: bool,
     refs: bool,
     index: bool,
+    locations: bool,
+    agreement: bool,
     check_relations: bool,
     show_ids: bool,
     full: bool,
@@ -3057,6 +3091,8 @@ pub fn run() -> process::ExitCode {
                 ids,
                 refs,
                 index,
+                locations,
+                agreement,
                 check_relations,
                 show_ids,
                 full,
@@ -3072,6 +3108,8 @@ pub fn run() -> process::ExitCode {
                         ids,
                         refs,
                         index,
+                        locations,
+                        agreement,
                         check_relations,
                         show_ids,
                         full,
@@ -3286,6 +3324,8 @@ fn run_check(
         ids,
         refs,
         index,
+        locations,
+        agreement,
         check_relations,
         show_ids,
         full,
@@ -3294,15 +3334,18 @@ fn run_check(
     } = flags;
     // Default: run the --ids + --refs pair when no selector is given.
     //
-    // `--index` is a selector like the other two, but it is NOT part of the
-    // default set: it decompresses the entire file to re-derive every blob's
-    // metadata, so folding it into a bare `check` would silently multiply the
-    // cost of the command everyone already runs. It does suppress the default,
-    // so `check --index` runs only the metadata verification.
-    let any_selector = ids || refs || index;
+    // `--index` and `--locations` are selectors like the other two, but NOT
+    // part of the default set: each decompresses the entire file (locations
+    // the way blobs once per partition), so folding them into a bare `check`
+    // would silently multiply the cost of the command everyone already runs,
+    // and `--locations` applies only to LocationsOnWays files. Either one
+    // suppresses the default, so `check --index` runs only the metadata
+    // verification.
+    let any_selector = ids || refs || index || locations;
     let run_ids = ids || !any_selector;
     let run_refs = refs || !any_selector;
     let run_index = index;
+    let run_locations = locations;
     // Flags that apply to one check mode only were refused by
     // `validate_check`.
 
@@ -3321,9 +3364,10 @@ fn run_check(
     // the input is pinned here, before any of them, and each reads through
     // the pin: a file renamed over the input between two checks cannot have
     // one checked as one file and the next as the other. Alone, each check
-    // decides for itself: `--ids` pins (it opens twice), `--index` and
-    // `--refs` open once, so `--index` alone still reads a FIFO.
-    let pin = if [run_ids, run_index, run_refs]
+    // decides for itself: `--ids` and `--locations` pin (they open more than
+    // once), `--index` and `--refs` open once, so `--index` alone still reads
+    // a FIFO.
+    let pin = if [run_ids, run_index, run_refs, run_locations]
         .into_iter()
         .filter(|&run| run)
         .count()
@@ -3335,7 +3379,36 @@ fn run_check(
     };
     let input: pbfhogg::read::input::InputSource<'_> = pin.as_ref().map_or(path.into(), Into::into);
 
-    // Run checks and collect results
+    // Run checks and collect results. The location check runs first: it
+    // sizes its store from the memory the host reports available before it
+    // reads a blob, and on a host that charges page cache to the process (a
+    // cgroup v2 limit) another check streaming the whole file first would
+    // leave that figure far below what the run can use. The report order
+    // below is unchanged.
+    let locations_report = if run_locations {
+        if direct_io {
+            host::cli_note(
+                "cli.check_locations_direct_io",
+                format_args!(
+                    "--direct-io has no effect on --locations, whose parallel \
+                     readers pread unaligned blob ranges"
+                ),
+            );
+        }
+        let opts = pbfhogg::check::locations::CheckLocationsOptions {
+            check: check_options,
+            agreement,
+            store_budget_bytes: None,
+        };
+        let report = pbfhogg::check::locations::check_locations(input, &opts, host)?;
+        if !report.passed() {
+            failed = true;
+        }
+        Some(report)
+    } else {
+        None
+    };
+
     let ids_report = if run_ids {
         use pbfhogg::check::verify_ids::VerifyIdsOptions;
         let opts = VerifyIdsOptions {
@@ -3420,6 +3493,9 @@ fn run_check(
                     }
                 }
                 combined.insert("refs".to_string(), refs_obj);
+            }
+            if let Some(ref report) = locations_report {
+                combined.insert("locations".to_string(), report.to_json_value(&file_name));
             }
             writeln!(
                 out,
@@ -3525,6 +3601,18 @@ fn run_check(
                         "Referential integrity: FAILED ({} missing references)",
                         result.total_missing()
                     )?;
+                }
+            }
+            if let Some(ref report) = locations_report {
+                if ids_report.is_some() || index_report.is_some() || refs_result.is_some() {
+                    writeln!(out, "\n---\n")?;
+                }
+                report.write_human(&mut out, &file_name)?;
+                if report.total_violations() > report.violations.len() as u64 {
+                    host::cli_note(
+                        "cli.check_locations_capped",
+                        format_args!("raise --max-errors to see every violation"),
+                    );
                 }
             }
         }

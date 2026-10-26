@@ -21,6 +21,12 @@ zero, because stage 2 partitions and walks node IDs as unsigned values
 and a mixed-sign range silently turned present nodes into missing ones.
 The silent `IdSet` inheritance for negative relation-member refs is
 unchanged.
+Amended: 2026-10-26 - `check --locations` recorded as a hard-reject site
+for negative way refs. Its slot store is keyed through an `IdSet`, so a
+negative ref could not be compared, and a check that skipped it would
+pass a stale coordinate unseen; it refuses the input instead. Negative
+node records it is not asked to compare are still counted and
+domain-checked.
 Status: Accepted
 
 ## Decision
@@ -43,6 +49,9 @@ invariant. Enforcement is layered by site:
   negative ID, before any join work, naming the sparse index as the
   backend that joins such input. A cost of one compare per blob in a
   header-only scan.
+- **Hard reject of negative way refs** in `check --locations`
+  (amended 2026-10-26): a verifier cannot certify a comparison it
+  skipped.
 - **Routing, not enforcement**, for the shard planners in `diff` and
   `derive-changes` (amended 2026-10-22). Their threshold compares are
   raw `i64`, which order negative IDs wrongly, so the shard planner

@@ -641,6 +641,43 @@ pub(crate) const RELATION_ID_FLOOR: i64 = 25_000_000;
 /// at one bit per ID, a bitset no larger than the input file.
 pub(crate) const CHECK_IDS_PER_BYTE: u64 = 8;
 
+/// `check --locations`: share, in percent, of the host's available memory
+/// (measured before the check reads any blob, less
+/// `CHECK_LOCATIONS_HEADROOM_BYTES` and an upper bound on the node-ID set and
+/// its rank index) that one partition's coordinate store may take. The store is anonymous memory touched at random by every way
+/// worker, so it must stay resident; the remainder is left for the page
+/// cache the sequential blob reads stream through and for worker buffers.
+pub(crate) const CHECK_LOCATIONS_STORE_BUDGET_PCT: u64 = 60;
+
+/// `check --locations`: memory held back from the store budget for the
+/// decode workers' blob buffers and the rest of the process.
+pub(crate) const CHECK_LOCATIONS_HEADROOM_BYTES: u64 = 2 << 30;
+
+/// `check --locations`: store budget when the host reports no available
+/// memory. Planet needs several partitions at this size; a smaller file runs
+/// in one.
+pub(crate) const CHECK_LOCATIONS_FALLBACK_BUDGET_BYTES: u64 = 4 << 30;
+
+/// `check --locations`: the least store budget a run is given, so a host
+/// whose available memory is already spent still makes progress rather than
+/// planning one partition per handful of nodes.
+pub(crate) const CHECK_LOCATIONS_MIN_BUDGET_BYTES: u64 = 64 << 20;
+
+/// `check --locations`: planned partitions above which the run warns that it
+/// will read every way blob that many times (the budget it was given and the
+/// reason are in the warning).
+pub(crate) const CHECK_LOCATIONS_PARTITION_WARN: usize = 16;
+
+/// `check --locations`: shards of the key-set build. Workers insert IDs
+/// straight into the shard owning their `IdSet` chunk, so the build is not
+/// serialised on one merge thread and no per-blob ID vector is queued.
+pub(crate) const CHECK_LOCATIONS_KEY_SHARDS: usize = 64;
+
+/// `check --locations`: IDs a worker buffers before inserting them into the
+/// key-set shards, bounding its buffer at 512 KiB however many IDs a blob
+/// holds.
+pub(crate) const CHECK_LOCATIONS_KEY_BATCH: usize = 1 << 16;
+
 /// `inspect --anomalies` flags a block whose element count is below
 /// `ANOMALY_SMALL_NUMERATOR / ANOMALY_SMALL_DENOMINATOR` of its type's median.
 pub(crate) const ANOMALY_SMALL_NUMERATOR: u64 = 1;

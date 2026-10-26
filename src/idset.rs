@@ -844,6 +844,56 @@ impl IdSet {
         })
     }
 
+    /// An upper bound, in bytes, on this set plus the rank index
+    /// [`into_ranked`](Self::into_ranked) would build for it: the direct
+    /// directory and its per-entry rank vectors (allocated across the whole
+    /// directory, empty entries included), and per allocated chunk a 4 MiB
+    /// bit array (an array chunk is at most `SPARSE_MAX` `u32`s, far less),
+    /// its block prefixes and an overflow-map entry.
+    pub(crate) fn ranked_bytes_upper_bound(&self) -> u64 {
+        use std::mem::size_of;
+        let per_entry =
+            size_of::<Option<Chunk>>() + size_of::<u64>() + size_of::<Option<Vec<u32>>>();
+        let per_chunk = CHUNK_BYTES + BLOCKS_PER_CHUNK * size_of::<u32>() + 128;
+        let directory = (self.chunks.len() + 1) as u64 * per_entry as u64;
+        directory + self.allocated_chunk_count() as u64 * per_chunk as u64
+    }
+
+    /// The chunk `id` lives in, or `None` for a negative ID. Two sets built
+    /// over disjoint chunks [`merge`](Self::merge) by moving chunks, with no
+    /// copy, which is what lets a caller shard one set's construction across
+    /// threads by chunk.
+    pub(crate) fn chunk_of(id: i64) -> Option<u64> {
+        split(id).map(|(cid, _)| cid)
+    }
+
+    /// Iterate over the set IDs at or above `start`, in ascending order.
+    /// Chunks wholly below `start` are skipped without being walked.
+    pub fn iter_from(&self, start: i64) -> impl Iterator<Item = i64> + '_ {
+        #[allow(clippy::cast_sign_loss)]
+        let first_cid = (start.max(0) as u64) >> ID_SHIFT;
+        let direct_skip = usize::try_from(first_cid).unwrap_or(usize::MAX);
+        let direct = self
+            .chunks
+            .iter()
+            .enumerate()
+            .skip(direct_skip)
+            .filter_map(|(cid, chunk)| chunk.as_ref().map(|chunk| (cid as u64, chunk)));
+        let overflow = self
+            .overflow
+            .range(first_cid.max(DIRECT_CHUNKS)..)
+            .map(|(&cid, chunk)| (cid, chunk));
+        direct
+            .chain(overflow)
+            .flat_map(|(cid, chunk)| {
+                let base = cid << ID_SHIFT;
+                chunk
+                    .offsets()
+                    .map(move |off| (base + u64::from(off)) as i64)
+            })
+            .filter(move |&id| id >= start)
+    }
+
     /// Merge all set bits from `other` into `self` (union).
     pub fn merge_from(&mut self, other: &IdSet) {
         if other.chunks.len() > self.chunks.len() {
@@ -1038,6 +1088,12 @@ impl RankedIdSet {
         self.rank.total()
     }
 
+    /// The set IDs at or above `start`, ascending. The first one yielded has
+    /// rank `self.rank(start)`, and each next one the rank after it.
+    pub fn iter_from(&self, start: i64) -> impl Iterator<Item = i64> + '_ {
+        self.set.iter_from(start)
+    }
+
     /// Discard the rank index and hand the set back for further mutation.
     /// Consuming, so no ranked view of the set can outlive the change.
     #[cfg(test)]
@@ -1049,6 +1105,42 @@ impl RankedIdSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `iter_from` skips whole chunks below `start`, filters the rest of its
+    /// chunk, and pairs with `rank`: the first ID it yields has rank
+    /// `rank(start)`.
+    #[test]
+    fn iter_from_starts_at_the_first_member_not_below_start() {
+        let mut set = IdSet::new();
+        let ids = [0_i64, 3, 1 << 25, (1 << 25) + 9, 1 << 44, (1 << 44) + 1];
+        for id in ids {
+            set.set(id);
+        }
+        let ranked = set.into_ranked();
+        for start in [
+            i64::MIN,
+            0,
+            1,
+            4,
+            1 << 25,
+            (1 << 25) + 1,
+            1 << 40,
+            (1 << 44) + 1,
+            i64::MAX,
+        ] {
+            let want: Vec<i64> = ids.iter().copied().filter(|&id| id >= start).collect();
+            assert_eq!(
+                ranked.iter_from(start).collect::<Vec<_>>(),
+                want,
+                "start {start}"
+            );
+            assert_eq!(
+                ranked.rank(start),
+                (ids.len() - want.len()) as u64,
+                "start {start}"
+            );
+        }
+    }
 
     /// A false indexdata claim from a small file cannot size the bitmap; an
     /// honest planet-scale claim passes untouched; nothing overflows.

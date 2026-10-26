@@ -588,20 +588,21 @@ global map. No approximate counts or silent truncation are used.
 
 ### check
 
-Validate PBF file integrity (IDs + referential integrity).
+Validate PBF file integrity (IDs + referential integrity; opt-in blob metadata and inline way locations).
 
 `check` verifies a file: its contents against its claims and against the
 format's invariants, exiting 1 on a violation. Describing a file - what it
 claims, cheaply - is [`inspect`](#inspect)'s job.
 
-Validate PBF integrity along three independent axes, selected by flag. With no
+Validate PBF integrity along four independent axes, selected by flag. With no
 flag, the ID and referential integrity checks both run.
 
-`--index` is a selector like the other two but is deliberately **not** in the
-default set: it decompresses every blob in the file, and folding that into a
-bare `check` would multiply the cost of the command everyone already runs.
-Passing it suppresses the default pair; combine it with `--ids` / `--refs` to
-run more than one.
+`--index` and `--locations` are selectors like the other two but are
+deliberately **not** in the default set: each decompresses every blob in the
+file (`--locations` the way blobs once per pass), and folding that into a
+bare `check` would multiply the cost of the command everyone already runs;
+`--locations` also applies only to LocationsOnWays files. Passing either
+suppresses the default pair; combine selectors to run more than one.
 
 ```
 pbfhogg check [OPTIONS] <FILE>
@@ -612,6 +613,8 @@ pbfhogg check [OPTIONS] <FILE>
 | `--ids` | Check ID uniqueness and ordering only |
 | `--refs` | Check referential integrity only |
 | `--index` | Verify blob-level metadata against the blobs. Decompresses every blob |
+| `--locations` | Verify a LocationsOnWays file's inline way-node coordinates against its node records |
+| `--agreement` | Also require every inline coordinate of a node the file does not contain to agree across the ways referencing it. Requires `--locations` |
 | `--full` | Full duplicate detection via bitmap (slower, more memory; applies to ID check) |
 | `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation; applies to ID check) |
 | `--max-errors <N>` | Retain at most N violation details per check (0 = unlimited); scanning and total counts continue [default: 100] |
@@ -626,8 +629,9 @@ shape the report, are refused with it.
 
 `--full` and `-t/--type` apply to the ID check and are rejected under
 `--refs` alone; `--check-relations` and `--show-ids` apply to the ref
-check and are rejected under `--ids` alone. Violations exit `1`, not
-`2` - see [Exit codes](#exit-codes).
+check and are rejected under `--ids` alone; `--agreement` is rejected
+without `--locations`. Violations exit `1`, not `2` - see
+[Exit codes](#exit-codes).
 
 For missing relation-to-relation members, reports unique missing IDs with occurrence count when they differ: `Missing relation members: 706 (777 references)`.
 
@@ -694,6 +698,117 @@ Two checks are containment rather than equality:
 | tag key set | stored must contain every key the blob carries | an omitted key makes `tags-filter` skip a blob holding matches. A key listed but not present is sound - it only costs a decode - and is reported as a separate, distinct violation |
 
 Exit `1` means mismatches were found, exit `2` that the check could not run.
+
+#### `--locations`: inline way locations against node records
+
+A `LocationsOnWays` header claims every way carries, per node reference, that
+node's location. `check --locations` compares each inline coordinate with the
+same file's record of that node. It exists because nothing else answers
+whether such a file is right - `inspect --locations` only counts ways with and
+without coordinates - and because it is an oracle independent of osmium for
+any producer of such files, `add-locations-to-ways` and `apply-changes
+--locations-on-ways` included.
+
+**Violations (exit 1).** A reference whose inline coordinate differs from its
+node's record; a way with references but no coordinate arrays; an inline
+coordinate outside the geographic domain, judged on the exact nanodegree value
+(osmium's undefined location, `2147483647` on both axes, is one); a node whose
+valid records disagree with each other; a node record outside the domain
+(each record counted once). References to a node with conflicting or
+out-of-domain records are counted and not compared, since the node already
+carries its own violation. With `--agreement`, an absent node whose references
+carry two or more different coordinates.
+
+**Counted, not failed.** A reference to a node the file has no record of.
+`add-locations-to-ways` keeps a node only if it is tagged, a relation member,
+or `--keep-untagged-nodes` is given, so on its default output most references
+have no record. Nothing in `LocationsOnWays` requires the record, so its
+absence is not a violation; the report counts such references, and those of
+them at exactly `0,0`, the placeholder `--ignore-missing-nodes` writes. The
+count is of references, not distinct nodes: a distinct count would need
+another ID set that grows after the store is sized. `--agreement` checks the
+one thing the file can still show about those nodes, that all their inline
+copies agree, and reports the distinct number of absent nodes. That is
+consistency, not freshness.
+
+Every reference is counted once, in one of: verified, mismatched, not
+compared (a node with one valid record, referenced by a way without
+coordinates or with an out-of-domain one, each reported as such), to a node
+with conflicting records, to a node with an out-of-domain record, and
+without a node record. The six sum to the reference count.
+
+**Refused (exit 2).** A header without `LocationsOnWays` (no claim to check);
+a header declaring `HistoricalInformation` (several versions of a node
+legitimately disagree); a way referencing a negative node ID (ADR-0002: the
+store is keyed through an `IdSet`, and a skipped comparison cannot be
+certified); a partially indexed file (a blob whose indexdata cannot be read,
+a reversed range included, counts as unindexed, so among indexed blobs it
+makes the file partially indexed); any data blob the reader refuses to build
+a block from - every blob is validated once with the reader's own
+construction, which checks group and element framing, tag, `Info` and
+`DenseInfo` arrays, way geometry and relation member arrays and string table
+UTF-8, but not what the reader only finds when it resolves strings (a tag's
+string-table index past the end of the table passes); and a blob whose indexdata claims ways while its groups hold another
+kind, since the check reads such a blob only in its way passes.
+
+**Comparison.** Each coordinate is `offset + granularity * raw` nanodegrees,
+computed in 128-bit arithmetic (a product that overflows `i64` can be brought
+back into range by the offset), judged against the domain exactly, then
+truncated toward zero to decimicrodegrees as the reader's `decimicro_lat`
+does. Inline and node values are compared there: values equal to the
+decimicrodegree are equal, which only blocks with a granularity below 100 or
+an offset that is not a multiple of 100 can distinguish further.
+
+**Mechanism and scale.** An up-front pass decodes every blob that does not
+claim ways (node, relation and unindexed blobs) once: it validates it, counts
+node records and invalid ones, inserts their IDs into the key set (the node
+IDs that get a slot; with `--agreement`, a further pass over the way blobs
+adds every referenced ID), and records which element kinds and which node-ID
+range the blob actually holds. Later passes route those blobs on what this
+pass saw, never on their indexdata, so after it an unindexed file costs the
+same passes as an indexed one; the up-front pass itself reads an unindexed
+file's way blobs too, which an indexed file's it skips. The key set is built by the workers directly, sharded by
+`IdSet` chunk, so no per-blob ID vector waits in a queue. It is then ranked
+and its rank space cut into partitions whose store fits the budget;
+partition `k` owns the node IDs of a contiguous ID interval, the intervals
+cover all of `i64`, and each ID belongs to exactly one. Per partition, the
+blobs holding nodes in the interval are decoded and their records joined into
+the store (a join over `empty < coordinate < conflicting < out of domain`, so
+the result is independent of worker order), then every blob holding ways is
+decoded and each reference the partition owns is compared, streaming one
+reference at a time and scaling a coordinate only for an owned reference.
+The first partition also makes the partition-independent checks (missing
+arrays, out-of-domain inline values, negative references) and validates the
+blobs claiming ways, which the up-front pass did not read. Counts come from
+a scan of the final slot states, never from which worker won a race, and the
+retained details are the smallest by file position or node ID, so neither
+depends on timing or on the number of partitions.
+
+**Memory.** The store costs 8 bytes per slot and two bits for the record and
+mismatch flags. Its budget is 60 % of the memory the host reported available
+before the run read any blob, less 2 GiB of headroom and an upper bound on
+the key set and its rank index (`IdSet::ranked_bytes_upper_bound`: 4 MiB
+and its block prefixes per allocated chunk, plus the chunk directory and its
+rank vectors); 4 GiB
+when the host reports none; never below 64 MiB (`CHECK_LOCATIONS_*` in
+`src/tunables.rs`). It is read before the passes because a host that charges
+page cache to the process (a cgroup v2 limit) reports far less available
+once the file has streamed through; for the same reason `check` runs
+`--locations` before any other selected check (the report order is
+unchanged). More than 16 planned partitions draw a
+warning naming the count and the budget. The budget bounds the store only:
+the key set (about 1.7 GB over a planet's node ID range) follows the number
+of distinct IDs; each worker holds its decompressed blob, a copy for
+validation and a fixed ID batch; and retained violation details are at most
+`--max-errors` per blob in flight and in total, but unbounded with
+`--max-errors 0`. No scratch disk is used. A planet that keeps every node has
+about 10 billion slots, about 85 GB of store: on a host with 28 GB free that
+is several partitions, so the way blobs are read several times and, the
+planet being sorted, each node blob about twice (in an unsorted file a node
+blob whose IDs are spread out can meet every partition). A default `add-locations-to-ways` planet keeps a few
+percent of its nodes and fits one partition; with `--agreement` it needs as
+many as a complete one. The `partitions` and `blob_decodes` fields of the
+JSON report are these cost figures; they follow the host, not the file.
 
 The ref check reports element IDs it could not track - negative IDs; a
 positive ID above the range it sized from the file's own indexdata is still
@@ -1383,6 +1498,7 @@ Which commands support `--direct-io` (O_DIRECT bypass of page cache) and `--io-u
 | check --ids | Yes | - | Yes | - | Read-only |
 | check --refs | Yes | - | Yes | - | Read-only |
 | check --index | Yes | - | Yes | - | Read-only; decompresses every blob |
+| check --locations | Yes | - | No | - | Read-only; `--direct-io` accepted and ignored (parallel unaligned preads) |
 | cat | Yes | Yes | Yes (R+W) | - | Passthrough + filtered paths |
 | cat --dedupe | Yes | Yes | Yes (R+W) | Yes | Via merge-pbf path |
 | sort | Yes | Yes | Yes (R+W) | Yes | |

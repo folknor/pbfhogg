@@ -39,6 +39,7 @@ mod cli_apply_changes;
 mod cli_apply_changes_invariants;
 mod cli_cat;
 mod cli_check_index;
+mod cli_check_locations;
 mod cli_defensive_input;
 mod cli_degrade;
 mod cli_derive_changes;

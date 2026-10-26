@@ -147,6 +147,7 @@ pbfhogg inspect --indexed <file>          Check if PBF has indexdata (exit code 
 pbfhogg inspect tags <file>               Tag key=value frequencies
 pbfhogg check <file> --ids                Validate ID uniqueness and ordering
 pbfhogg check <file> --refs               Validate referential integrity
+pbfhogg check <file> --locations          Validate inline way locations against node records
 pbfhogg cat <files...> -o <out>           Concatenate PBFs (-t node,way,relation to filter)
 pbfhogg sort <file> -o <out>              Sort into standard order (nodes, ways, relations by ID)
 pbfhogg repack <file> -o <out>            Re-encode at a configurable --elements-per-blob N cap

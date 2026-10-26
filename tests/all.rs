@@ -46,6 +46,8 @@ mod cancel;
 #[cfg(feature = "commands")]
 mod check;
 #[cfg(feature = "commands")]
+mod check_locations;
+#[cfg(feature = "commands")]
 mod geocode_index;
 #[cfg(feature = "commands")]
 mod inspect;

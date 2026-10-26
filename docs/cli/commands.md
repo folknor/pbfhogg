@@ -320,15 +320,16 @@ global map. No approximate counts or silent truncation are used.
 
 ### check
 
-Validate PBF file integrity (IDs + referential integrity).
+Validate PBF file integrity (IDs + referential integrity; opt-in blob metadata and inline way locations).
 
 `check` verifies a file: its contents against its claims and against the
 format's invariants, exiting 1 on a violation. Describing a file - what it
 claims, cheaply - is [`inspect`](#inspect)'s job.
 
 With no flags, runs the ID and referential integrity checks. Use `--ids`,
-`--refs` or `--index` to select. `--index` is not part of the default pair: it
-decompresses every blob in the file, so it is opt-in.
+`--refs`, `--index` or `--locations` to select. `--index` and `--locations`
+are not part of the default pair: each decompresses the whole file (the way
+blobs once per pass, for `--locations`), so they are opt-in.
 
 ```
 pbfhogg check [OPTIONS] <FILE>
@@ -339,6 +340,8 @@ pbfhogg check [OPTIONS] <FILE>
 | `--ids` | Check ID uniqueness and ordering only |
 | `--refs` | Check referential integrity only |
 | `--index` | Verify blob-level metadata (`BlobHeader` indexdata and tagdata) against the blobs themselves. Decompresses every blob |
+| `--locations` | Verify a LocationsOnWays file's inline way-node coordinates against its node records (see below) |
+| `--agreement` | Also require every inline coordinate of a node the file does not contain to agree across the ways referencing it (applies to the locations check) |
 | `--full` | Full duplicate detection via bitmap (slower, more memory; applies to ID check) |
 | `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation; applies to ID check) |
 | `--max-errors <N>` | Retain at most N violation details per check (0 = unlimited); scanning and total counts continue [default: 100] |
@@ -398,6 +401,80 @@ Kind, count and ID range are checked for exact equality, because every consumer
 treats them as exact.
 
 Exit 1 means mismatches were found; exit 2 means the check could not run.
+
+#### `--locations`: verifying inline way locations
+
+A file whose header declares `LocationsOnWays` (what `add-locations-to-ways`
+writes, and what `apply-changes --locations-on-ways` maintains) claims that
+every way carries, for each node it references, that node's location.
+`check --locations` compares every inline coordinate with the record of the
+same node in the same file and reports each disagreement as
+`w<way> ref <position> (n<node>): inline <lat,lon>, node record <lat,lon>`.
+
+What fails the check (exit 1):
+
+- an inline coordinate that differs from its node's record;
+- a way with node references but no coordinate arrays;
+- an inline coordinate outside the geographic domain, including the
+  undefined location (`2147483647` on both axes) osmium writes for a node it
+  could not resolve;
+- two records of one node at different coordinates, or a node record outside
+  the domain (references to such a node are counted, not compared);
+- with `--agreement`, a node the file does not contain whose references carry
+  different coordinates.
+
+**References to nodes the file does not contain are counted, not failed.**
+`add-locations-to-ways` drops untagged nodes that no relation references
+unless given `--keep-untagged-nodes`, so on its default output most references
+have no node record, and nothing in `LocationsOnWays` requires one. Such a
+reference cannot be verified; the report counts them (`Refs without a node
+record`), and among them those at exactly `0,0`, the placeholder
+`--ignore-missing-nodes` writes. A pass on a file that verified little says
+so in those counts. `--agreement` adds what the file can still show about
+those nodes - that every way carrying one agrees on where it is - which is
+consistency, not freshness: ways that all carry the same stale position pass.
+
+Every reference is counted in exactly one of: verified, mismatched, without
+a valid inline coordinate (a way with no coordinates, or one outside the
+domain, referencing a node that has a record), to a node with conflicting or
+out-of-domain records, and without a node record.
+
+Coordinates are compared in decimicrodegrees, after each block's
+`granularity`, `lat_offset` and `lon_offset` are applied exactly; two values
+equal to the decimicrodegree are equal. Refused (exit 2) rather than checked:
+a file without the `LocationsOnWays` header claim, a history file, a
+partially indexed file, a way referencing a negative node ID, a blob whose
+indexdata claims ways while it holds other elements, and any blob that fails
+the validation the reader makes when it builds a block (malformed framing,
+tag, `Info` or `DenseInfo` arrays, way or relation arrays, a string table
+that is not UTF-8). Faults the reader only finds later, such as a tag's
+string-table index past the end of the table, are not looked for.
+
+The node IDs that get a slot are held in a bit set (about 1.7 GB across the
+planet's ID range), and their coordinates in a store of about 8.25 bytes per
+slot. The store is sized to 60 % of the memory available when the check
+starts (with other selectors, `--locations` runs first), less a 2 GiB
+headroom and the bit set; when it does not fit, the node
+ID space is split into parts and the way blobs are read once per part. A run
+that plans more than 16 parts says so on stderr. The first pass records
+what every blob holds, and later passes read only the blobs that can matter
+to them, so on a sorted file each node blob is read about twice in all; on an
+unsorted one a node blob whose IDs are spread out can be read once per part.
+No scratch disk is used. A file that keeps every node gets a slot per node, so a
+planet of about 10 billion nodes needs about 85 GB of store, which a host
+with 28 GB free covers in several passes; a default `add-locations-to-ways`
+output keeps a few percent of the nodes and needs a small fraction of that.
+`--agreement` gives every referenced node a slot, present or not, so on a
+default output it costs as much as on a complete one.
+
+The budget bounds the store, not the whole run: the bit set grows with the
+number of distinct node IDs, each worker holds its decompressed blob and a
+copy for validation, and the violation details are held until the report is
+printed - at most `--max-errors` of them, but every one with
+`--max-errors 0`, which on a badly broken file can be one per reference. The
+`partitions` and `blob_decodes` fields of the JSON report follow the memory
+available, not the file. `--direct-io` has no effect on this check (its
+parallel readers read unaligned blob ranges) and says so when given.
 
 The ref check reports element IDs it could not track (negative IDs; a positive
 ID above the range sized from the file's own indexdata is still tracked) on their

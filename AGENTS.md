@@ -101,7 +101,7 @@ I/O flags (`--direct-io`, `--io-uring`) create named variants in results. `--for
 - `brokkr sidecar dirty` - sidecar data from the most recent forced/failed run (even if OOM-killed). UUID is required; `dirty` is the alias for that latest non-DB run.
 - All `[sidecar]` narration lines (run provenance, run-index hints) go to stderr so stdout stays pure JSONL for piping into `jq`.
 - `brokkr download <region> [--osc-seq N] [--as-snapshot <key> | --refresh] [--force]` - download datasets. Primary PBF: no-op once configured (use `--refresh` to rotate). OSC: rolls forward. Indexed PBF: regenerated on cache miss. `--as-snapshot <key>` registers additional snapshot. `--refresh` archives primary into `snapshot.<key>` and downloads new. Planet uses planet.openstreetmap.org; others use Geofabrik. Short aliases (denmark, europe) or full paths (europe/france).
-- `brokkr lock` - check if a command is running. Never run `brokkr check` while the lock is held.
+- `brokkr lock` - show which command holds brokkr's machine-wide lock. Every brokkr command queues behind that lock on its own, so there is no need to check it before running anything. The lock is the point of brokkr: it is held machine-wide so that development work in any project never stalls on work in another.
 - `brokkr kill [--hard]` - asks the brokkr process holding the lock to wrap up cleanly and exit ASAP.
 - `brokkr clean` - remove scratch temp files.
 - `brokkr history [--command CMD] [--failed] [--since DATE] [--slow MS] [-n N]` - global command history.

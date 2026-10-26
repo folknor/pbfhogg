@@ -1,17 +1,21 @@
 //! `check` command: integrity checks over a PBF file.
 //!
-//! Three modes selected by CLI flags:
+//! Four modes selected by CLI flags:
 //! - `--refs`: referential integrity (way refs, relation members) via [`refs::check_refs`].
 //! - `--ids --full`: ID uniqueness and ordering via [`verify_ids::verify_ids`].
 //! - `--index`: blob-level sidecar metadata (`indexdata`, `tagdata`) against
 //!   the blobs themselves, via [`index::check_index`]. Opt-in rather than part
 //!   of the default pair, because it decompresses the whole file.
+//! - `--locations`: a LocationsOnWays file's inline way-node coordinates
+//!   against its node records, via [`locations::check_locations`]. Opt-in for
+//!   the same reason, and because it only applies to such files.
 
 pub mod index;
+pub mod locations;
 pub mod refs;
 pub mod verify_ids;
 
-/// Options shared by the ID, index, and reference checks.
+/// Options shared by the ID, index, reference and location checks.
 #[derive(Debug, Clone, Copy)]
 pub struct CheckOptions {
     /// Maximum number of detail entries to retain in this check.

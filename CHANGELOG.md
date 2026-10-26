@@ -970,6 +970,22 @@
 
 ### Added
 
+- **`check --locations` verifies a LocationsOnWays file.** It compares every
+  way's inline node coordinates with the same file's node records (after
+  each block's granularity and offsets) and exits 1 on a mismatch, a way
+  without coordinate arrays, an out-of-domain inline coordinate (including
+  osmium's undefined location), or conflicting or out-of-domain node
+  records. References to nodes the file does not contain, which is most of
+  them on a default `add-locations-to-ways` output, are counted and reported,
+  not failed; `--agreement` additionally requires all inline copies of such a
+  node to agree. Every blob is validated as the reader validates a block
+  when it builds one, and refused if that fails. No scratch
+  disk: the coordinate store is sized to the memory available when the run
+  starts, and when it does not fit the node ID space is split and the way
+  blobs are read once per part. That budget covers the store; the node ID
+  set, worker buffers and (with `--max-errors 0`) the violation details come
+  on top. Library: `check::locations::check_locations`.
+
 - **`apply-changes -j 1` runs.** It used to be refused as an unvalidated
   configuration of the `--locations-on-ways` node-to-way barrier; the
   barrier is now tested at one worker under every ordering it has (a late

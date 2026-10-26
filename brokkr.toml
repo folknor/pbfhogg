@@ -1048,6 +1048,15 @@ file = "europe-20260301-seq4714-altw.osm.pbf"
 xxhash = "28fb583aea9731c01390b64e5ab3a182"
 seq = 4714
 
+# Made with `pbfhogg add-locations-to-ways <pbf.indexed> --keep-untagged-nodes`
+# (default sparse index, 2026-10-26): every node kept, so apply-changes
+# --locations-on-ways can resolve every OSC-way ref. The plain `altw` variant
+# drops untagged nodes and cannot take -l on a real diff.
+[bygg.datasets.europe.pbf.altw-keep-untagged]
+file = "europe-20260301-seq4714-altw-keep-untagged.osm.pbf"
+xxhash = "e2807be01ca65674fb9becce07ee5457"
+seq = 4714
+
 [bygg.datasets.europe.pbf.raw]
 file = "europe-20260301-seq4714.osm.pbf"
 xxhash = "4bffe84a25c009f8d720745c6fce45c6"

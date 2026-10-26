@@ -72,14 +72,12 @@ impl WireBlobHeader {
     /// of copied. Hot read paths that never call `Blob::index()` (e.g.
     /// `par_map_reduce`, unfiltered pipeline) can skip the 42-byte per-blob copy.
     ///
-    /// The retention flags decide copy versus skip and nothing else: every
-    /// field this parser knows must carry its schema's wire type whether or
+    /// The retention flags decide copy versus skip and nothing else: a
+    /// field with the wrong wire type is handled the same way whether or
     /// not it is retained, so one header is accepted or refused the same way
-    /// by every caller. A header walk (which retains tagdata) and a
-    /// `BlobReader` (which by default does not) used to disagree about a
-    /// tagdata field with the varint wire type - the walk read its value as a
-    /// length and refused the frame, the reader skipped it - so whether a file
-    /// was refused depended on which read path met that blob.
+    /// by every caller. A wrong-typed `type` or `datasize` is refused; a
+    /// wrong-typed indexdata, tagdata or waymembers is skipped as an unknown
+    /// field (see the check in the loop for why).
     #[hotpath::measure]
     pub fn parse(
         data: &[u8],
@@ -108,11 +106,31 @@ impl WireBlobHeader {
                 _ => None,
             };
             if expected.is_some_and(|w| w != wire_type) {
-                return Err(new_wire_error(
-                    "BlobHeader field carries a wire type its schema does not allow \
-                     (type, indexdata, tagdata and waymembers are length-delimited, \
-                     datasize is a varint)",
-                ));
+                // Deliberate asymmetry, ruled 2026-10-26. `type` and
+                // `datasize` are what frame the blob; without them the next
+                // frame boundary is unknowable, so a wrong wire type there
+                // is refused. The optional fields (indexdata, tagdata,
+                // waymembers) are skipped as unknown fields instead:
+                // - protobuf says a field whose wire type does not match
+                //   the schema is treated as an unknown field;
+                // - libosmium's decode_blob_header skips them the same way,
+                //   so refusing would reject files osmium reads;
+                // - tagdata (4) and waymembers (5) are pbfhogg extensions,
+                //   so another producer may legitimately reuse those
+                //   numbers with another type;
+                // - a skipped indexdata leaves the blob unindexed
+                //   (`indexdata_present` stays false), the safe direction
+                //   for a reader.
+                // The rule lives here, in the one parser, so every read path
+                // and the header walk agree whatever fields they retain.
+                if matches!(field, blob_header::TYPE | blob_header::DATASIZE) {
+                    return Err(new_wire_error(
+                        "BlobHeader type is length-delimited and datasize is a varint; \
+                         the blob cannot be framed otherwise",
+                    ));
+                }
+                cursor.skip_field(wire_type)?;
+                continue;
             }
             match field {
                 blob_header::TYPE => {
@@ -579,23 +597,36 @@ mod tests {
         }
     }
 
-    /// A known field with the wrong wire type is refused under every
-    /// combination of retention flags, so a header walk (which retains
-    /// tagdata) and a `BlobReader` (which does not) agree on the frame. A
-    /// tagdata field encoded as a varint used to be skipped by the reader and
-    /// read as a length by the walk.
+    /// A wrong-typed `type` or `datasize` is refused under every combination
+    /// of retention flags, so a header walk and a `BlobReader` agree on the
+    /// frame. A wrong-typed indexdata, tagdata or waymembers is skipped as an
+    /// unknown field under every combination, leaving the blob unindexed.
     #[test]
-    fn known_field_with_wrong_wire_type_is_refused_whatever_is_retained() {
+    fn wrong_wire_type_framing_fields_refused_optional_fields_skipped() {
         let valid = header_with_datasize(10);
-        // (field 2, varint), (field 4, varint), (field 5, varint),
+        // (field 2, varint), (field 4, varint), (field 5, varint).
+        let skipped_fields: [&[u8]; 3] = [&[0x10, 0x01], &[0x20, 0x01], &[0x28, 0x01]];
+        for skipped in skipped_fields {
+            let mut bytes = valid.clone();
+            bytes.extend_from_slice(skipped);
+            for flags in 0..8u8 {
+                let (tagdata, indexdata, waymembers) =
+                    (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
+                let parsed = WireBlobHeader::parse(&bytes, tagdata, indexdata, waymembers)
+                    .unwrap_or_else(|e| panic!("{skipped:02x?} flags {flags:03b}: {e}"));
+                assert!(!parsed.indexdata_present);
+                assert!(parsed.indexdata.is_none());
+                assert!(!parsed.tagdata_present);
+                assert!(parsed.tagdata.is_none());
+                assert!(parsed.waymembers.is_none());
+            }
+            assert!(
+                parse_blob_header_with_index(&bytes, &crate::host::Diagnostics::discard()).is_ok(),
+                "{skipped:02x?} must be skipped by the header walk's parser"
+            );
+        }
         // (field 1, varint) and (field 3, length-delimited).
-        let bad_fields: [&[u8]; 5] = [
-            &[0x10, 0x01],
-            &[0x20, 0x01],
-            &[0x28, 0x01],
-            &[0x08, 0x01],
-            &[0x1A, 0x01, 0x05],
-        ];
+        let bad_fields: [&[u8]; 2] = [&[0x08, 0x01], &[0x1A, 0x01, 0x05]];
         for bad in bad_fields {
             let mut bytes = valid.clone();
             bytes.extend_from_slice(bad);

@@ -508,6 +508,8 @@ where
     let (decoded_tx, decoded_rx) =
         sync_channel::<DecodedItem<X::Out>>(pipeline_config.decode_ahead.get());
 
+    // Declared before the scope so it drops after the scope has joined.
+    let _emit = EmitOnDrop;
     let result = std::thread::scope(|scope| {
         // Stage 1: Sequential I/O reader thread
         scope.spawn(move || {
@@ -638,15 +640,25 @@ where
             &mut consume,
         )
     });
-    // After the scope has joined every stage, on every returning path (a
-    // stage thread's panic re-raised by the scope emits nothing), so the
-    // snapshot includes the waits recorded while the stages shut down
-    // (an error, a cancellation or an early drop wakes blocked senders,
-    // which record their waits after the consumer has returned).
-    // Process-wide pool-drop totals are emitted separately by the host
-    // after dispatch.
-    PIPELINE_METRICS.emit();
+    // `_emit` drops here, after the scope has joined every stage, on every
+    // path: success, error, and a stage thread's panic re-raised by the scope
+    // (the guard emits on unwind). So the snapshot includes the waits
+    // recorded while the stages shut down (an error, a cancellation or an
+    // early drop wakes blocked senders, which record their waits after the
+    // consumer has returned). Process-wide pool-drop totals are emitted
+    // separately by the host after dispatch.
     result
+}
+
+/// Emits [`PIPELINE_METRICS`] when dropped: after a run's scope has joined its
+/// stages, whether the run returned or unwound. The same mechanism as the
+/// ordered pool engine's and the unordered classify pools' guards.
+struct EmitOnDrop;
+
+impl Drop for EmitOnDrop {
+    fn drop(&mut self) {
+        PIPELINE_METRICS.emit();
+    }
 }
 
 #[cfg(test)]

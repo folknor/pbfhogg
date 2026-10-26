@@ -97,6 +97,12 @@ fn take_packed<'a>(
 ///
 /// The effect is that the slice left in `slot` is the only metadata the
 /// message carries, so validating it validates the element's metadata.
+///
+/// The refusal is deliberate (ruled 2026-10-26), not a missing merge, and
+/// matches the `DenseNodes` duplicate refusal (`DUP_GROUP_DENSE`): no producer
+/// emits a repeated `Info` or `DenseInfo`; keep-last silently lost the earlier
+/// copy's fields; and a merge would be code for a case nobody produces. It
+/// deviates from protobuf's merge rule, so DEVIATIONS.md records it.
 #[inline]
 fn take_message<'a>(
     cursor: &mut Cursor<'a>,

@@ -211,6 +211,30 @@ pub struct BlockBuilder {
     // against it (that would cost every element a load and a branch): they
     // may still mutate the doomed block's buffers, but nothing is emitted.
     poison: Option<String>,
+
+    // Set once `encode_block` has refused because of `poison`, i.e. the
+    // caller was told. Debug-only bookkeeping for the `Drop` assert: a
+    // poisoned builder dropped without ever reaching `take` / `take_owned`
+    // has lost its element silently.
+    #[cfg(debug_assertions)]
+    poison_surfaced: bool,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for BlockBuilder {
+    fn drop(&mut self) {
+        // Not during unwind: a panic legitimately abandons a builder, and a
+        // second panic would abort. An early error return is not exempt: the
+        // `add_*` methods poison silently, so a poisoned builder dropped on an
+        // unrelated `?` still never told its caller, and the assert says so.
+        if !std::thread::panicking() {
+            debug_assert!(
+                self.poison.is_none() || self.poison_surfaced,
+                "BlockBuilder dropped poisoned without a take: {:?}",
+                self.poison
+            );
+        }
+    }
 }
 
 impl Default for BlockBuilder {
@@ -306,6 +330,8 @@ impl BlockBuilder {
 
             pre_seeded: false,
             poison: None,
+            #[cfg(debug_assertions)]
+            poison_surfaced: false,
         }
     }
 
@@ -994,6 +1020,10 @@ impl BlockBuilder {
     /// contents (element type, ID range, count).
     fn encode_block(&mut self) -> Result<Option<BlobIndex>> {
         if let Some(reason) = self.poison.as_deref() {
+            #[cfg(debug_assertions)]
+            {
+                self.poison_surfaced = true;
+            }
             return Err(crate::error::Error::invalid_data(format!(
                 "BlockBuilder refused to encode a block: {reason}"
             )));

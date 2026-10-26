@@ -584,3 +584,15 @@ removes one trailing `\r` before reading the line, so a CRLF file works.
 osmium sheds the `\r` only when a space or `#` cut happens to remove it, so it
 rejects `n123\r` and `n123#c\r` while accepting `n123 #c\r`, and rejects a
 line holding only `\r`, which pbfhogg skips.
+
+## PBF decoding: a repeated Info or DenseInfo is refused, not merged
+
+Protobuf merges repeated occurrences of a singular embedded message field:
+scalars set later override, scalars set only earlier survive, and repeated
+fields concatenate. pbfhogg does not implement that merge for an element's
+`Info` or a dense group's `DenseInfo`. A second non-empty occurrence is a hard
+error naming the field; an empty occurrence merges to nothing and is ignored.
+This matches the refusal of a `PrimitiveGroup` carrying two `DenseNodes`
+messages. No producer emits either shape, keeping the last occurrence silently
+lost the earlier copy's fields, and a merge would be code for a case nobody
+produces.

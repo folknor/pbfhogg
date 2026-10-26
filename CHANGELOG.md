@@ -1197,6 +1197,12 @@
 
 ### Fixed
 
+- **A blob header whose indexdata, tagdata or waymembers field has the wrong
+  wire type is read, not refused.** Such a field is skipped as an unknown
+  field on every read path, as protobuf specifies and osmium does; a skipped
+  indexdata leaves the blob unindexed. A wrong-typed `type` or `datasize`
+  is still refused, since the blob cannot be framed without them.
+
 - **`cat --dedupe` and `sort` accept blocks no single index describes, and
   index unindexed blobs as plain `cat` does.** On a forced unindexed input
   (or, for `sort`, one whose header does not claim sorted), an empty block, a

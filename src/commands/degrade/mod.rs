@@ -90,8 +90,8 @@ use crate::owned::{
     OwnedElement, OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata,
     read_dense_node, read_node, read_relation, read_way, relation_members_into,
 };
+use crate::read::frame::Frames;
 use crate::read::input::InputSource;
-use crate::read::raw_frame::{frame_location, read_raw_frame};
 use crate::write::WriteOptions;
 use crate::writer::{Compression, PbfWriter, frame_blob_pipelined, strip_blob_header_fields};
 use crate::{Element, ElementReader};
@@ -561,20 +561,19 @@ pub(crate) fn degrade_to(
 /// `--generator` / `--output-header` override replaces only the field it
 /// names, so adding `--generator` no longer changes the declared features.
 ///
-/// Reads the first frame from `reader`, advancing `file_offset` past it, so
-/// the caller goes on to the data frames through the same reader.
+/// Reads the first frame from `frames`, so the caller goes on to the data
+/// frames through the same walk.
 fn passthrough_header_bytes(
-    reader: &mut FileReader,
-    file_offset: &mut u64,
+    frames: &mut Frames<FileReader>,
     input: &std::path::Path,
     flags: DegradeFlags,
     overrides: &HeaderOverrides,
-    host: &crate::host::Host,
 ) -> Result<Vec<u8>> {
     // The OSMHeader is always the first blob in a well-formed PBF.
-    let frame = read_raw_frame(reader, file_offset, host, input)?
+    let frame = frames
+        .next_raw()?
         .ok_or_else(|| crate::error::new_missing_header(input))?;
-    let locate = |e: Error| e.locate(frame_location(input, frame.file_offset));
+    let locate = |e: Error| frames.locate(frame.id, e);
     if !matches!(frame.blob_type, BlobKind::OsmHeader) {
         return Err(crate::error::new_missing_header(input));
     }
@@ -599,10 +598,8 @@ fn degrade_passthrough(
     // takes no pin of its own (a FIFO or stdin serves it, buffered) and the
     // decode path does; a caller's pin is opened as the file it pinned.
     let input = source.path();
-    let mut reader = FileReader::open(source, write.direct_reads)?;
-    let mut file_offset: u64 = 0;
-    let header_bytes =
-        passthrough_header_bytes(&mut reader, &mut file_offset, input, flags, overrides, host)?;
+    let mut frames = Frames::of_input(FileReader::open(source, write.direct_reads)?, input, host);
+    let header_bytes = passthrough_header_bytes(&mut frames, input, flags, overrides)?;
 
     let mut writer = writer_from_header_bytes(
         output,
@@ -615,7 +612,7 @@ fn degrade_passthrough(
     let mut blobs_written: u64 = 0;
 
     crate::debug::emit_marker("DEGRADE_PASSTHROUGH_START");
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, host, input)? {
+    while let Some(frame) = frames.next_raw()? {
         match &frame.blob_type {
             BlobKind::OsmHeader => {}
             BlobKind::OsmData => {
@@ -634,7 +631,7 @@ fn degrade_passthrough(
                     flags.corrupt_tagdata,
                     corrupt_index,
                 )
-                .map_err(|e| e.locate(frame_location(input, frame.file_offset)))?;
+                .map_err(|e| frames.locate(frame.id, e))?;
                 writer.write_raw_owned(reframed)?;
                 blobs_written += 1;
             }

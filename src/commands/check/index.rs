@@ -82,8 +82,8 @@ use crate::blob_meta::{BlobBbox, BlobIndex, scan_block_tags};
 use crate::error::Result;
 use crate::file_reader::FileReader;
 use crate::read::decompress::decompress_blob_data_into;
+use crate::read::frame::Frames;
 use crate::read::input::InputSource;
-use crate::read::raw_frame::read_raw_frame;
 
 /// Compatibility name for the options shared by all check modes.
 pub type CheckIndexOptions = super::CheckOptions;
@@ -478,8 +478,7 @@ fn check_index_inner(
     host: &crate::host::Host,
 ) -> Result<IndexReport> {
     let path = input.path();
-    let mut reader = FileReader::open(input, opts.direct_io)?;
-    let mut file_offset: u64 = 0;
+    let mut frames = Frames::of_input(FileReader::open(input, opts.direct_io)?, path, host);
     let mut block = Vec::new();
     let mut report = IndexReport::default();
     let mut found = Vec::new();
@@ -488,7 +487,7 @@ fn check_index_inner(
 
     crate::debug::emit_marker("CHECK_INDEX_START");
     let mut first = true;
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, host, path)? {
+    while let Some(frame) = frames.next_raw()? {
         // The header comes first or the file is not a PBF: a zero-byte or
         // header-less file gets the one missing-header error, not a clean
         // report over data blobs it cannot place.
@@ -510,27 +509,22 @@ fn check_index_inner(
 
         // Unconditional decode: the stored metadata is under test, so it must
         // not be allowed to decide which blobs get looked at.
-        decompress_blob_data_into(frame.blob_bytes(), &mut block).map_err(|e| {
-            e.locate(crate::read::raw_frame::frame_location(
-                path,
-                frame.file_offset,
-            ))
-        })?;
+        decompress_blob_data_into(frame.blob_bytes(), &mut block)
+            .map_err(|e| frames.locate(frame.id, e))?;
         // A malformed payload is an error even when no metadata was stored.
         // Valid unsupported shapes remain unindexable rather than malformed.
         let observed = crate::blob_meta::try_scan_block_ids_checked(&block)
             .map_err(|e| {
-                e.context(format!("OsmData blob {ordinal}: malformed payload"))
-                    .locate(crate::read::raw_frame::frame_location(
-                        path,
-                        frame.file_offset,
-                    ))
+                frames.locate(
+                    frame.id,
+                    e.context(format!("OsmData blob {ordinal}: malformed payload")),
+                )
             })?
             .map(|(index, _sorted)| index);
         if observed.is_none() {
             report.blobs_unindexable += 1;
         } else if !frame.index_present && first_unindexed.is_none() {
-            first_unindexed = Some((ordinal, frame.file_offset));
+            first_unindexed = Some((ordinal, frame.file_offset()));
         }
 
         found.clear();
@@ -552,7 +546,7 @@ fn check_index_inner(
             if opts.max_errors == 0 || report.violations.len() < opts.max_errors {
                 report.violations.push(IndexViolation {
                     blob_ordinal: ordinal,
-                    file_offset: frame.file_offset,
+                    file_offset: frame.file_offset(),
                     kind,
                 });
             }
@@ -756,7 +750,7 @@ mod tests {
     /// Indexdata the reader cannot read is a claim the file cannot back up,
     /// and it must not be excused as "this blob makes no claim".
     ///
-    /// `read_raw_frame` deserializes the raw field into an `Option<BlobIndex>`,
+    /// `Frames::next_raw` deserializes the raw field into an `Option<BlobIndex>`,
     /// so invalid bytes reach `diff_blob` as `None` - byte-identical, at this
     /// boundary, to a file that carries no indexdata at all. Without the
     /// separate presence flag the verifier silently passed the single most

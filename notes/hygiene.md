@@ -70,7 +70,6 @@ goes on "Review once drained" as a bisect candidate, named by commit.
 
 Launch order, one agent per line, run serially:
 
-34. HYG-014
 35. HYG-015
 36. HYG-192
 37. HYG-193
@@ -1015,6 +1014,29 @@ The judgement calls already known, to be checked first:
   - Single-shard phases of a multi-shard run (a kind with one old blob)
     run inline on the calling thread and write the final destination
     directly instead of a scratch file plus copy.
+- The three frame decoders (`BlobReader`'s, the streaming helper behind the
+  raw-frame and front-probe reads, `HeaderWalker`'s) became one state
+  machine, `read::frame::Frames`, over a byte source. Error locations and
+  truncation messages changed by design (every frame error at its frame
+  start with its blob index; `BlobReader` used to name the exact byte).
+  Judgement calls on the hottest read paths, none measured:
+  - `BlobReader` iteration, under every `ElementReader` and pipeline: the
+    prefix is one `fill` instead of two `read_exact`s, and each frame passes
+    through the walk's pending and poison bookkeeping. Header reads (clear +
+    bounded `read_to_end`) and payload reads (`Vec::with_capacity(datasize)`
+    + bounded `read_to_end`) keep their shape.
+  - `HeaderWalker`: same syscalls (one probe pread per frame, one remainder
+    pread for a header past the window, none for a payload), but every
+    header is now copied from the probe window into the walk's reusable
+    header buffer (the whole header, unknown fields included) where the old
+    walk parsed it in place. Warm-cache dense inputs are where it would show.
+  - The raw-frame walks (cat passthrough, getid streaming scan, inspect,
+    check --index, degrade) read each frame into a capacity-sized `Vec`
+    with a bounded `read_to_end` instead of a zero-filled `vec!` and
+    `read_exact`, and reuse one header buffer instead of allocating one per
+    frame.
+  - The front probes (`has_indexdata_in`, `InputFront`, `require_indexdata`)
+    now check the run's cancellation token before each frame.
 
 ---
 
@@ -1132,39 +1154,6 @@ catalogued; if it is done at all, it is done last.
 
 Reported by: altw and scanning, re-encoding, filtering and spatial, read path,
 geocode index.
-
-## HYG-014 - Three frame decoders for one frame format
-
-Anger: 9 - frame decoders on a hot path.
-
-`BlobReader::read_blob_header` (streaming, stamps offsets),
-`frame::read_frame_header` (streaming, used by `raw_frame.rs`) and
-`HeaderWalker::next_header_inner` (pread). `frame.rs` is called the one owner
-of frame policy but owns only the length-prefix guard and the header-position
-rule (`check_header_position`, which every decoder applies). Each decoder
-reimplements the EOF policy (1-3 trailing bytes tolerated), the datasize guard
-(`BlobReader` carries "the inline twin of the check in
-`parse_blob_header_with_index`"), the truncation messages (the "shape 3" /
-"shape 4" text is worded differently in `BlobReader` and `HeaderWalker`, and is
-jargon from `reference/truncation-handling.md` an operator cannot decode), and
-provenance stamping. `src/read/frame_conformance_tests.rs` now pins every
-truncation shape through five sources (`BlobReader` read and skip,
-`read_raw_frame`, `read_blob_header_only` plus `FileReader::skip`, and
-`HeaderWalker`), and the disagreements it pins are: `BlobReader` locates
-header-level refusals at frame start + 4 where every other source uses the
-frame start, and its skip path names the last declared payload byte where
-its read path names the first missing one; `read_raw_frame` and
-`read_blob_header_only` never give a blob index; the caller-side
-`FileReader::skip` raises a payload truncation with no path, blob or offset;
-only the `BlobReader` read path parses the Blob envelope, so a garbage
-payload is refused there and passed by the other four; only `BlobReader`
-says "(shape N)". `reference/truncation-handling.md` states these
-disagreements. Fix: one frame state machine over an abstract byte source
-(stream and pread-at-offset as two impls), returning a stamped
-`FrameHeader`; the conformance test's disagreement rows then collapse to one
-expectation per shape.
-
-Reported by: read path.
 
 ## HYG-015 - Write-side blob framing and dispatch are copied
 

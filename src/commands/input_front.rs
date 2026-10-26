@@ -20,12 +20,12 @@
 //! after it, from the [`PinnedInput`](crate::read::input::PinnedInput), so
 //! the separate descriptions are all of one file.
 
-use std::io::Read as _;
 use std::path::Path;
 
 use crate::HeaderBlock;
 use crate::error::{Error, Result};
 use crate::file_reader::FileReader;
+use crate::frame::Frames;
 
 /// Where a failure on the header frame sits: the input, blob 0, byte 0 (the
 /// location the header readers this replaced stamped).
@@ -57,11 +57,9 @@ pub(crate) fn sorted_and_indexed<'a>(
 /// See the module doc.
 pub(crate) struct InputFront<'a> {
     path: &'a Path,
-    diagnostics: crate::host::Diagnostics,
     /// Positioned after the header frame until the indexdata hint is read,
     /// then dropped, so the descriptor does not outlive the questions.
-    reader: Option<FileReader>,
-    offset: u64,
+    frames: Option<Frames<FileReader>>,
     /// The header frame's Blob payload, until [`Self::header`] decodes it.
     header_payload: Vec<u8>,
     header: Option<HeaderBlock>,
@@ -82,19 +80,18 @@ impl<'a> InputFront<'a> {
     ) -> Result<Self> {
         let source = source.into();
         let path = source.path();
-        let mut reader = FileReader::open(source, direct_io)?;
-        let mut offset = 0u64;
-        let size = super::leading_header_frame(&mut reader, &mut offset, &host.diagnostics, path)?;
-        let mut header_payload = vec![0u8; size];
-        reader
-            .read_exact(&mut header_payload)
-            .map_err(|e| Error::from(e).locate(header_location(path)))?;
-        offset += size as u64;
+        let mut frames = super::front_frames(
+            FileReader::open(source, direct_io)?,
+            path,
+            &host.diagnostics,
+            &host.cancel,
+        );
+        super::leading_header_frame(&mut frames, path)?;
+        let mut header_payload = Vec::new();
+        frames.read_payload(&mut header_payload)?;
         Ok(Self {
             path,
-            diagnostics: host.diagnostics.clone(),
-            reader: Some(reader),
-            offset,
+            frames: Some(frames),
             header_payload,
             header: None,
             hint: None,
@@ -134,16 +131,11 @@ impl<'a> InputFront<'a> {
         if let Some((indexed, _)) = self.hint {
             return Ok(indexed);
         }
-        let mut reader = self
-            .reader
+        let mut frames = self
+            .frames
             .take()
             .ok_or_else(|| Error::internal("input front: reader released before the hint"))?;
-        let hint = super::probe_to_first_data_blob(
-            &mut reader,
-            &mut self.offset,
-            &self.diagnostics,
-            self.path,
-        )?;
+        let hint = super::probe_to_first_data_blob(&mut frames)?;
         self.hint = Some(hint);
         Ok(hint.0)
     }

@@ -853,7 +853,7 @@ fn filter_by_id_walker(
 }
 
 /// Sequential full-read include scan: stream every frame with
-/// `read_raw_frame` (one buffered, readahead-friendly pass), skip
+/// `Frames::next_raw` (one buffered, readahead-friendly pass), skip
 /// non-matching OSMData blobs via the indexdata kind + ID-range prescreen
 /// before decompression, and decode + filter only intersecting blobs.
 ///
@@ -875,7 +875,7 @@ fn filter_by_id_streaming(
 ) -> Result<GetidStats> {
     use crate::blob::{BlobKind, decode_blob_to_headerblock};
     use crate::file_reader::FileReader;
-    use crate::read::raw_frame::{frame_location, read_raw_frame};
+    use crate::read::frame::Frames;
 
     crate::debug::emit_marker("GETID_SCAN_START");
 
@@ -895,20 +895,24 @@ fn filter_by_id_streaming(
     let mut blobs_skipped: u64 = 0;
     let mut osmdata_blobs: u64 = 0;
 
-    let mut reader = FileReader::open(input, write.direct_reads)?;
-    let mut file_offset: u64 = 0;
+    let mut frames = Frames::of_input(
+        FileReader::open(input, write.direct_reads)?,
+        input.path(),
+        host,
+    );
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut bb = BlockBuilder::new();
     let mut output_blocks: Vec<OwnedBlock> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset, host, input.path())? {
+    while let Some(frame) = frames.next_raw()? {
         // The frame loop owns the provenance of failures on this frame.
-        let locate = |e: Error| e.locate(frame_location(input.path(), frame.file_offset));
+        let id = frame.id;
+        let locate = |e: Error| frames.locate(id, e);
         match frame.blob_type {
-            // `read_raw_frame` refuses a second OSMHeader, so this is the
-            // only one.
+            // The frame walk refuses a second OSMHeader, so this is the only
+            // one.
             BlobKind::OsmHeader => {
                 let header = decode_blob_to_headerblock(frame.blob_bytes()).map_err(locate)?;
                 let header_bytes = super::output_header::build_one(

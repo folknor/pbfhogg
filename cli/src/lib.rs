@@ -4358,10 +4358,11 @@ fn run_inspect(
 
     match mode {
         InspectMode::IndexedOnly => {
-            // Reads a header and at most one data blob: no checkpoint inside,
-            // so it is decided before and after like every read-only command.
+            // Reads frame headers up to the first data blob, checking the
+            // token before each; decided before and after like every
+            // read-only command.
             host.cancel.check()?;
-            let has_index = pbfhogg::has_indexdata(path, direct_io, &host.diagnostics)?;
+            let has_index = pbfhogg::has_indexdata_in(path, direct_io, host)?;
             host.cancel.check()?;
             let mut out = output::buffered();
             let printed = if quiet {
@@ -4477,7 +4478,7 @@ fn run_inspect(
 
     // --indexed combined with other flags: check and report, set exit code
     let has_index = if indexed {
-        Some(pbfhogg::has_indexdata(input, direct_io, &host.diagnostics)?)
+        Some(pbfhogg::has_indexdata_in(input, direct_io, host)?)
     } else {
         None
     };

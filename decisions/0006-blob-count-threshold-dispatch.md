@@ -15,7 +15,7 @@ baselines actually measured. `getparents` decodes a large byte fraction
 (every way and relation blob), so its scan is the pipelined reader with
 classify parallelized across rayon batch workers. `getid` include
 decodes almost nothing under its ID-range prescreen, so its scan is a
-sequential `read_raw_frame` streaming loop; routing millions of small
+sequential raw-frame streaming loop (`Frames::next_raw`); routing millions of small
 frames through the pipeline's per-blob machinery measured 62 % slower
 than plain sequential reads on the 8k-packed planet.
 

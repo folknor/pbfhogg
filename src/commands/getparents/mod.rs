@@ -165,7 +165,7 @@ fn getparents_dispatched<'a>(
     let input = &pin;
     let arm = super::dispatch_scan_arm(
         input,
-        super::has_indexdata(input, write.direct_reads, &host.diagnostics)?,
+        super::has_indexdata_in(input, write.direct_reads, host)?,
         min_blobs,
         host,
     )?;

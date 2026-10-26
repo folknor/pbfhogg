@@ -25,9 +25,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::blob::{BlobKind, parse_blob_header_with_index};
+use crate::blob::BlobKind;
 use crate::blob_meta::BlobIndex;
 use crate::error::Result;
+use crate::frame::Frames;
 use crate::tunables::{HEADER_PROBE_SIZE, SAMPLE_CAP};
 
 /// Estimate of the OSMData blob count of a PBF, from a bounded probe walk of
@@ -151,27 +152,131 @@ pub(crate) struct BlobHeaderMeta {
     pub frame_size: usize,
 }
 
+/// The walker's byte source: `pread` at the walk's position on the shared
+/// file, bounded by the size captured at open.
+///
+/// The I/O shape is the measured one. Each frame starts with one probe
+/// `pread` of up to [`HEADER_PROBE_SIZE`] bytes covering the length prefix
+/// and (in the common case) the whole header; a header past the probe window
+/// costs one more `pread` for exactly its remainder. A payload is never read:
+/// skipping it is a check of its extent against the captured size, and drops
+/// the probe window, so every frame gets a fresh probe.
+///
+/// Bytes inside the captured extent are committed: a file that shrank after
+/// open fails the `pread` (`UnexpectedEof`, an error) rather than reading as
+/// a shorter file. Only a captured remainder of 0-3 bytes at a frame boundary
+/// is the clean tail, and it is recognised without reading it.
+pub(crate) struct PreadSource {
+    file: Arc<std::fs::File>,
+    pos: u64,
+    file_size: u64,
+    /// The current frame's probe: `window_len` bytes of the file read at
+    /// `window_at`.
+    window: Vec<u8>,
+    window_at: u64,
+    window_len: usize,
+}
+
+impl PreadSource {
+    /// The bytes left in the captured extent from the current position.
+    fn remaining(&self) -> u64 {
+        self.file_size.saturating_sub(self.pos)
+    }
+
+    /// The window bytes from the current position on, if it lies inside the
+    /// window.
+    fn windowed(&self) -> &[u8] {
+        match self.pos.checked_sub(self.window_at) {
+            Some(skip) if skip < self.window_len as u64 => {
+                // skip < window_len, a usize.
+                #[allow(clippy::cast_possible_truncation)]
+                let skip = skip as usize;
+                &self.window[skip..self.window_len]
+            }
+            _ => &[],
+        }
+    }
+}
+
+impl crate::frame::FrameSource for PreadSource {
+    fn fill(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::unix::fs::FileExt as _;
+        let remaining = self.remaining();
+        if remaining < buf.len() as u64 && self.windowed().is_empty() {
+            // The clean tail (or the end): not read, as the walk always did.
+            return Ok(0);
+        }
+        if self.windowed().is_empty() {
+            // A frame boundary: one probe pread covering the prefix and,
+            // usually, the whole header.
+            let probe = usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(HEADER_PROBE_SIZE);
+            self.window.resize(probe, 0);
+            self.file.read_exact_at(&mut self.window, self.pos)?;
+            self.window_at = self.pos;
+            self.window_len = probe;
+        }
+        let have = self.windowed();
+        let n = have.len().min(buf.len());
+        buf[..n].copy_from_slice(&have[..n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+
+    fn append(&mut self, n: usize, out: &mut Vec<u8>) -> std::io::Result<usize> {
+        use std::os::unix::fs::FileExt as _;
+        let take = usize::try_from(self.remaining())
+            .unwrap_or(usize::MAX)
+            .min(n);
+        out.reserve(take);
+        let have = self.windowed();
+        let from_window = have.len().min(take);
+        out.extend_from_slice(&have[..from_window]);
+        self.pos += from_window as u64;
+        let rest = take - from_window;
+        if rest > 0 {
+            // The part past the probe window, in one pread.
+            let start = out.len();
+            out.resize(start + rest, 0);
+            if let Err(e) = self.file.read_exact_at(&mut out[start..], self.pos) {
+                out.truncate(start);
+                return Err(e);
+            }
+            self.pos += rest as u64;
+        }
+        Ok(take)
+    }
+}
+
+impl crate::frame::FrameSkip for PreadSource {
+    fn skip_bytes(&mut self, n: u64) -> std::io::Result<bool> {
+        self.window_len = 0;
+        if n > self.remaining() {
+            return Ok(false);
+        }
+        self.pos += n;
+        Ok(true)
+    }
+}
+
 /// Walks blob headers via `pread`. Call [`Self::next_header`] repeatedly
 /// until it returns `None`. Use [`Self::pread_data`] to fetch a blob's
 /// data payload on demand.
 pub(crate) struct HeaderWalker {
+    /// The frame walk over the file. It owns the frame policy and locates
+    /// every error it raises at the frame, naming this walker's file: a byte
+    /// offset on a multi-input command does not say which input it indexes,
+    /// and this walker is the preflight that most multi-input commands fail
+    /// in first. A tripped cancellation token ends the walk with
+    /// `ErrorKind::Cancelled`, unlocated.
+    frames: Frames<PreadSource>,
     diagnostics: crate::host::Diagnostics,
-    /// Checked before every header: a tripped token ends the walk with
-    /// `ErrorKind::Cancelled`.
-    cancel: crate::host::Cancel,
     reported_unindexed_filter: bool,
     file: Arc<std::fs::File>,
-    /// The file this walker was opened from. Stamped onto every error it
-    /// raises, for the same reason `BlobReader` keeps one: a byte offset
-    /// on a multi-input command does not say which input it indexes, and
-    /// this walker is the preflight that most multi-input commands fail
-    /// in first.
+    /// The file this walker was opened from.
     path: Arc<Path>,
-    offset: u64,
     file_size: u64,
-    header_buf: Vec<u8>,
-    /// 0-based index of the blob whose header was last returned.
-    blob_index: u64,
     /// Present when this walk refuses a partially indexed file; see
     /// [`Self::refusing_partial_index`].
     partial_index: Option<PartialIndexGuard<(u64, u64)>>,
@@ -266,16 +371,22 @@ impl HeaderWalker {
         // would pull blob bodies adjacent to each header into the page
         // cache and never be reused.
         crate::fadvise::advise(&file, 0, 0, crate::fadvise::Advice::Random);
-        Ok(Self {
-            diagnostics: host.diagnostics.clone(),
-            cancel: host.cancel.clone(),
-            reported_unindexed_filter: false,
-            file: Arc::new(file),
-            path: Arc::from(path),
-            offset: 0,
+        let file = Arc::new(file);
+        let source = PreadSource {
+            file: Arc::clone(&file),
+            pos: 0,
             file_size,
-            header_buf: Vec::new(),
-            blob_index: 0,
+            window: Vec::new(),
+            window_at: 0,
+            window_len: 0,
+        };
+        Ok(Self {
+            frames: Frames::of_input(source, path, host),
+            diagnostics: host.diagnostics.clone(),
+            reported_unindexed_filter: false,
+            file,
+            path: Arc::from(path),
+            file_size,
             partial_index: None,
         })
     }
@@ -308,20 +419,6 @@ impl HeaderWalker {
     pub(crate) fn refusing_partial_index(mut self) -> Self {
         self.partial_index = Some(PartialIndexGuard::default());
         self
-    }
-
-    /// Attach this walker's input identity, the blob it was reading and that
-    /// blob's frame start to an error, as one location. Every error path
-    /// out of `next_header` goes through here; one that does not makes
-    /// `Error::source_path` lie by omission on that path only, which is
-    /// worse than never having had it. `self.offset` is the frame start
-    /// here: it only advances once a frame has been fully validated.
-    fn locate(&self, err: crate::error::Error) -> crate::error::Error {
-        err.locate(crate::error::Location::new(
-            Some(&self.path),
-            Some(self.blob_index),
-            Some(crate::ByteOffset(self.offset)),
-        ))
     }
 
     /// Report a filtered schedule retaining an unindexed data blob. Call only
@@ -397,130 +494,53 @@ impl HeaderWalker {
     /// covering the 4-byte length prefix plus the blob header in the common
     /// case (typical headers run ~100-200 B; indexed blobs with tagdata a
     /// bit more). A second `pread` is only needed for the rare header that
-    /// extends past the probe window.
+    /// extends past the probe window. The payload is not read: the walk
+    /// refuses a frame whose declared payload runs past the file, located at
+    /// that frame, so a truncated tail blob cannot end the walk silently.
     pub(crate) fn next_header(&mut self) -> Result<Option<BlobHeaderMeta>> {
-        // A cancellation is not a fault of the input: returned unlocated.
-        self.cancel.check()?;
-        // One funnel for both the success counter and the error stamp, so
-        // no early return inside the walk can escape unattributed.
-        match self.next_header_inner() {
-            Ok(Some(meta)) => {
-                self.blob_index += 1;
-                if meta.blob_type == BlobKind::OsmData
-                    && let Some(guard) = self.partial_index.as_mut()
-                    && let Some((blob, frame_start)) =
-                        guard.observe(meta.index.is_some(), (meta.blob_index, meta.frame_start))
-                {
-                    return Err(partial_index_error().locate(crate::error::Location::new(
-                        Some(&self.path),
-                        Some(blob),
-                        Some(crate::ByteOffset(frame_start)),
-                    )));
-                }
-                Ok(Some(meta))
-            }
-            Ok(None) => Ok(None),
-            Err(err) => Err(self.locate(err)),
-        }
-    }
-
-    fn next_header_inner(&mut self) -> Result<Option<BlobHeaderMeta>> {
-        use std::os::unix::fs::FileExt as _;
-
-        if self.offset >= self.file_size {
+        let Some(header) = self.frames.next_header()? else {
             return Ok(None);
-        }
-        let frame_start = self.offset;
-
-        // Probe: one pread covering length prefix + (usually) full header.
-        let remaining = self.file_size - self.offset;
-        let probe_len = usize::try_from(remaining)
-            .unwrap_or(usize::MAX)
-            .min(HEADER_PROBE_SIZE);
-        if probe_len < 4 {
-            // Not enough bytes left to parse a length prefix; treat as
-            // clean EOF, matching prior UnexpectedEof-tolerant behavior.
-            return Ok(None);
-        }
-        self.header_buf.resize(probe_len, 0);
-        // Per `reference/truncation-handling.md`: a committed read past
-        // EOF (i.e. probe_len bytes promised by `remaining` derived from
-        // `file_size`) is shape 2 or 3 - hard error, not silent EOF.
-        // The clean-EOF case is handled above at the `probe_len < 4`
-        // guard.
-        self.file.read_exact_at(&mut self.header_buf, self.offset)?;
-
-        let header_len = u32::from_be_bytes([
-            self.header_buf[0],
-            self.header_buf[1],
-            self.header_buf[2],
-            self.header_buf[3],
-        ]);
-        // Both length-prefix guards come from `read::frame`, the one owner of
-        // frame policy. The walk preads rather than streams, so it shares the
-        // policy but not the I/O.
-        let header_len = crate::frame::check_header_len(header_len)?;
-        let header_end = 4 + header_len;
-
-        if header_end > probe_len {
-            // Fallback: header extends past the probe window. Top up with a
-            // second pread for just the tail.
-            self.header_buf.resize(header_end, 0);
-            let tail_offset = self.offset + probe_len as u64;
-            self.file
-                .read_exact_at(&mut self.header_buf[probe_len..header_end], tail_offset)?;
-        }
-
-        // parse_blob_header_with_index rejects an oversized declared datasize
-        // (>= MAX_BLOB_DATASIZE) before returning, so the `data_size` below -
-        // and every `pread_data(data_offset, data_size, ..)` a consumer later
-        // issues against it - is bounded, never a hostile multi-GB size.
-        let (blob_type, data_size, raw_index, _index_present, tagdata, _tagdata_present) =
-            parse_blob_header_with_index(
-                &self.header_buf[4..header_end],
-                &self.diagnostics,
-                crate::blob::BlobSite {
-                    source: Some(&*self.path),
-                    offset: Some(frame_start),
-                },
-            )?;
-        crate::frame::check_header_position(&blob_type, frame_start == 0)?;
-        let index = raw_index.as_ref().and_then(|b| BlobIndex::deserialize(b));
-
-        let data_offset = self.offset + header_end as u64;
-        // Per `reference/truncation-handling.md` shape 4: the declared
-        // payload must fit within the file. Without this check, a
-        // truncated tail blob would silently terminate the walk on the
-        // next call (offset >= file_size returns Ok(None)).
-        let payload_end = data_offset.checked_add(data_size as u64).ok_or_else(|| {
-            crate::error::Error::invalid_data(format!(
-                "blob at offset {} declares overflowing payload size {data_size}",
-                self.offset
-            ))
-        })?;
-        if payload_end > self.file_size {
-            return Err(crate::error::Error::io_kind(
-                ::std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "blob payload truncated: declared {data_size} bytes \
-                     from offset {data_offset}, file_size {}",
-                    self.file_size
-                ),
-            ));
-        }
-        self.offset = payload_end;
-        let frame_size = 4 + header_len + data_size;
-
-        Ok(Some(BlobHeaderMeta {
+        };
+        // The frame's declared datasize is bounded by `MAX_BLOB_DATASIZE`, so
+        // every `pread_data(data_offset, data_size, ..)` a consumer later
+        // issues against this meta is bounded too.
+        self.frames.skip_payload()?;
+        // A walk from offset 0 that has not seeked always knows both.
+        let frame_start = header.id.start.unwrap_or(0);
+        let blob_index = header.id.ordinal.unwrap_or(0);
+        let payload_offset = header.payload_offset();
+        let crate::blob::WireBlobHeader {
+            blob_type,
+            indexdata,
+            tagdata,
+            ..
+        } = header.header;
+        let meta = BlobHeaderMeta {
             blob_type,
             frame_start,
-            blob_index: self.blob_index,
-            data_offset,
-            data_size,
-            index,
+            blob_index,
+            data_offset: frame_start + payload_offset as u64,
+            data_size: header.data_size,
+            index: indexdata.and_then(|b| BlobIndex::deserialize(&b)),
             tagdata,
-            frame_size,
-        }))
+            frame_size: payload_offset + header.data_size,
+        };
+        // The partial-index refusal names the first unindexed data blob,
+        // which may be an earlier frame than this one, so it is located here
+        // and not by the frame walk. It ends the walk like a frame failure.
+        if meta.blob_type == BlobKind::OsmData
+            && let Some(guard) = self.partial_index.as_mut()
+            && let Some((blob, frame_start)) =
+                guard.observe(meta.index.is_some(), (meta.blob_index, meta.frame_start))
+        {
+            self.frames.poison();
+            return Err(partial_index_error().locate(crate::error::Location::new(
+                Some(&self.path),
+                Some(blob),
+                Some(crate::ByteOffset(frame_start)),
+            )));
+        }
+        Ok(Some(meta))
     }
 
     /// `pread` a blob's data payload into `buf`. Resizes `buf` to `size`.
@@ -684,6 +704,15 @@ mod tests {
                 "{pattern:?}"
             );
         }
+        // The refusal ends the walk: it does not resume at the next frame.
+        let path = dir.path().join("partial-stop.pbf");
+        write_index_pattern(&path, &[true, false, true]);
+        let mut walker = super::HeaderWalker::open(&path, &crate::host::Host::for_tests())
+            .expect("walker")
+            .refusing_partial_index();
+        while let Ok(Some(_)) = walker.next_header() {}
+        assert!(walker.next_header().is_err(), "a refused walk resumed");
+
         for pattern in [&[true, true][..], &[false, false][..], &[][..]] {
             let path = dir.path().join("uniform.pbf");
             write_index_pattern(&path, pattern);
@@ -695,15 +724,13 @@ mod tests {
         }
     }
 
-    /// The walk's own spelling of the shared EOF policy, pinned at the call
-    /// site rather than only in `read::frame`.
+    /// The shared EOF policy through the pread source, which recognises the
+    /// tolerated tail from the captured file size without reading it.
     ///
     /// `read::frame` owns one policy - a 0-3 byte tail at a frame boundary is
-    /// clean EOF, a complete 4-byte prefix is a committed frame - but only the
-    /// streaming decoders that call it share its I/O. `HeaderWalker` preads, so it
-    /// spells the same rule as `probe_len < 4` and a unit test of the helper
-    /// cannot reach it; `BlobReader`'s third spelling is pinned by
-    /// `tests/read_paths.rs::trailing_partial_length_prefix_*`. Without this
+    /// clean EOF, a complete 4-byte prefix is a committed frame - and
+    /// `PreadSource::fill` is where the walk decides how short the tail is,
+    /// so a unit test over a stream source cannot reach it. Without this
     /// test the walk could drift back to erroring on a tolerated tail, or to
     /// swallowing a committed frame as EOF, with both gates green.
     #[test]

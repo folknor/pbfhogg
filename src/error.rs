@@ -176,7 +176,8 @@ pub(crate) struct Location {
     pub(crate) file: Option<Arc<Path>>,
     /// 0-based index of the blob being read when the error was detected.
     pub(crate) blob: Option<u64>,
-    /// Byte offset into the input stream.
+    /// Byte offset into the input stream: for an error about a blob, the
+    /// start of that blob's frame.
     pub(crate) offset: Option<ByteOffset>,
 }
 
@@ -551,13 +552,18 @@ impl Error {
         io::Error::from(self)
     }
 
-    /// Byte offset into the input stream at which the error was detected,
-    /// when the detecting layer knew it.
+    /// Byte offset into the input stream that the error is located at, when
+    /// the reporting layer knew it.
     ///
     /// A wire-format or blob error carries no useful diagnosis on its own
-    /// when the input is a 90 GB planet file; this is the "where". Errors
-    /// raised below the framing layer (decompression, element decoding) do
-    /// not know their own position and report `None`.
+    /// when the input is a 90 GB planet file; this is the "where". An error
+    /// about a blob - a malformed or truncated frame, or a failure decoding
+    /// it - names the start of that blob's frame, the same offset whichever
+    /// reader found it, paired with the blob's index; where the frame is
+    /// cut short, the message names the declared extent that runs past the
+    /// end of the input. Errors raised below the framing layer
+    /// (decompression, element decoding) do not know their own position and
+    /// report `None` until the caller that read the blob locates them.
     #[inline]
     pub fn byte_offset(&self) -> Option<ByteOffset> {
         self.0.location.as_ref().and_then(|l| l.offset)

@@ -8,7 +8,7 @@ use bytes::Bytes;
 use super::wire_schema::{blob, blob_header};
 
 use crate::blob_meta::{INDEX_SIZE, INDEX_SIZE_V1, WireIndexdata};
-use crate::error::{BlobError, Result, new_blob_error, new_wire_error};
+use crate::error::{Result, new_wire_error};
 
 /// Blob type parsed from BlobHeader, avoiding per-blob String allocation.
 ///
@@ -443,82 +443,18 @@ pub const MAX_BLOB_MESSAGE_SIZE: u64 = 32 * 1024 * 1024;
 /// explicit.
 pub const MAX_BLOB_DATASIZE: u64 = MAX_BLOB_MESSAGE_SIZE;
 
-/// Parse a blob header and extract type, datasize, indexdata, whether an
-/// indexdata field was present at all, tagdata, and whether a tagdata field
-/// was present at all.
-///
-/// Used by the pread-from-workers pattern to classify and dispatch raw
-/// blobs without decompression. The tagdata contains per-blob tag key metadata.
-///
-/// The presence flags are deliberately separate from the values: an indexdata
-/// of an unrecognised length, or a duplicated indexdata or tagdata, parses to
-/// `None` here, and every reader is right to treat that as "no index". A
-/// verifier is not - see [`WireBlobHeader::indexdata_present`] and
-/// [`WireBlobHeader::tagdata_present`].
-///
-/// `site` only feeds the one-shot unrecognised-indexdata warning, so it names
-/// where the first offender was found.
-#[allow(clippy::type_complexity)]
-pub(crate) fn parse_blob_header_with_index(
-    header_bytes: &[u8],
-    diagnostics: &crate::host::Diagnostics,
-    site: BlobSite<'_>,
-) -> Result<(
-    BlobKind,
-    usize,
-    Option<[u8; INDEX_SIZE]>,
-    bool,
-    Option<Box<[u8]>>,
-    bool,
-)> {
-    let header = WireBlobHeader::parse(header_bytes, true, true, false)?;
-    if let Some(len) = header.unrecognised_indexdata_len {
-        warn_unrecognised_indexdata(diagnostics, len, site);
-    }
-
-    if header.datasize < 0 {
-        return Err(new_blob_error(BlobError::InvalidDataSize {
-            size: header.datasize,
-        }));
-    }
-    // Reject an oversized declared datasize before any downstream site
-    // preallocates or preads the compressed body. This is the shared funnel
-    // for `HeaderWalker::next_header` and for `read::frame::read_frame_header`
-    // (hence `read_raw_frame` and `read_blob_header_only`); enforcing here
-    // bounds the `data_size`
-    // every one of those returns, so none can drive an outsized allocation
-    // ahead of the 32 MiB post-decompression `MAX_BLOB_MESSAGE_SIZE` guard.
-    // `BlobReader::read_blob_header` bypasses this funnel and carries the
-    // equivalent check inline. datasize is known non-negative here (checked
-    // above), so the u64 cast cannot lose sign.
-    #[allow(clippy::cast_sign_loss)]
-    let datasize_u64 = header.datasize as u64;
-    if datasize_u64 >= MAX_BLOB_DATASIZE {
-        return Err(new_blob_error(BlobError::DataSizeTooBig {
-            size: datasize_u64,
-        }));
-    }
-    #[allow(clippy::cast_sign_loss)]
-    Ok((
-        header.blob_type,
-        header.datasize as usize,
-        header.indexdata,
-        header.indexdata_present,
-        header.tagdata,
-        header.tagdata_present,
-    ))
-}
-
 // Tests use `unwrap()` throughout because panicking is the correct failure mode
 // for unit tests. See the note in `blob.rs`'s test module for the rationale and
 // the crate-wide `unwrap_used = "deny"` exemption.
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::cast_possible_truncation)]
 mod tests {
-    use super::{BlobError, BlobKind, BlobSite, MAX_BLOB_DATASIZE, WireBlobHeader};
-    use crate::error::ErrorKind;
+    use super::{BlobKind, MAX_BLOB_DATASIZE, WireBlobHeader};
+    use crate::error::{BlobError, ErrorKind};
 
-    /// The production parser with no known site.
+    /// `header_bytes` framed and read by the frame walk the header walks and
+    /// raw passthrough use (tagdata and indexdata kept), with no known path:
+    /// the header parse plus every guard the walk applies to it.
     #[allow(clippy::type_complexity)]
     fn parse_blob_header_with_index(
         header_bytes: &[u8],
@@ -531,7 +467,23 @@ mod tests {
         Option<Box<[u8]>>,
         bool,
     )> {
-        super::parse_blob_header_with_index(header_bytes, diagnostics, BlobSite::default())
+        use crate::frame::{Frames, HeaderFields};
+        let mut frame = (header_bytes.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(header_bytes);
+        let mut frames = Frames::new(std::io::Cursor::new(frame), Some(0), HeaderFields::INDEXES);
+        frames.set_diagnostics(diagnostics.clone());
+        let header = frames
+            .next_header()?
+            .ok_or_else(|| crate::error::Error::internal("a framed header read as EOF"))?;
+        let h = header.header;
+        Ok((
+            h.blob_type,
+            header.data_size,
+            h.indexdata,
+            h.indexdata_present,
+            h.tagdata,
+            h.tagdata_present,
+        ))
     }
 
     /// Hand-encode a minimal BlobHeader protobuf (`OSMData` type + a chosen
@@ -611,8 +563,8 @@ mod tests {
     fn datasize_overflow_cannot_alias_a_small_frame_length() {
         for value in [1_u64 << 31, (1_u64 << 32) + 100, 0xffff_fffe_ffff_ffff] {
             let bytes = header_with_datasize(value);
-            // Both the direct BlobReader parser and the indexed framing
-            // funnel must refuse the original value before reading a body.
+            // Both the bare parser and the frame walk must refuse the
+            // original value before reading a body.
             let err = WireBlobHeader::parse(&bytes, false, false, false).unwrap_err();
             assert!(
                 err.to_string()
@@ -695,16 +647,13 @@ mod tests {
         assert_eq!(data_size, 1234);
     }
 
-    /// A `BlobHeader` with no `type` field is rejected here, at the one site
-    /// every frame decoder funnels through.
+    /// A `BlobHeader` with no `type` field is rejected by the header parse,
+    /// which the frame walk runs on every frame.
     ///
     /// `type` is required by the format, but an absent (or empty) one used to
     /// parse to `BlobKind::Unknown("")`, which every consumer skips as an
     /// unrecognised blob type - so a garbage frame read as clean success with
-    /// no output. Rejecting inside `WireBlobHeader::parse` covers
-    /// `BlobReader`, `read_raw_frame`, `read_blob_header_only` and
-    /// `HeaderWalker::next_header` at once,
-    /// which is why the check lives here rather than at each decoder.
+    /// no output.
     ///
     /// An unknown but non-empty type stays acceptable: forward compatibility
     /// with future blob types is a property of the format, and conflating

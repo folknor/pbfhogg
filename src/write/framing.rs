@@ -1177,7 +1177,7 @@ mod tests {
     /// Hand-rolled `BlobHeader` field scanner.
     ///
     /// Deliberately shares no code with the encoder under test: `encode_block`
-    /// and `parse_blob_header_with_index` are two halves of the same model, so
+    /// and `WireBlobHeader::parse` are two halves of the same model, so
     /// round-tripping through them proves only self-consistency. This walks
     /// raw protobuf tags and returns `(field_number, payload)` for every
     /// length-delimited field, so "was tagdata actually emitted" is answered

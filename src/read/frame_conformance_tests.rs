@@ -1,49 +1,39 @@
 //! Frame-decoder conformance: every truncation shape of
 //! `reference/truncation-handling.md`, plus the frame size guards, run
-//! through every frame decoder, with each decoder's behaviour today pinned.
+//! through every frame source, each held to one expectation per case.
 //!
-//! The crate decodes one frame format in three places, each with its own I/O
-//! and its own copy of the EOF policy, the datasize guard and the truncation
-//! messages: `BlobReader` (streaming; its read path `next` and its skip path
-//! `next_header_skip_blob` handle the payload differently), the streaming
-//! helper `frame::read_frame_header` behind `raw_frame.rs` (driven here both
-//! as `read_raw_frame` and as `read_blob_header_only` followed by the
-//! caller-side `FileReader::skip`), and the pread `HeaderWalker`. The table
-//! below is what keeps them from drifting apart unseen, and it is the
-//! acceptance test for unifying them: a change to any cell is a behaviour
-//! change at that decoder.
+//! The crate decodes the frame format in one place, `read::frame::Frames`,
+//! over several sources with different I/O: `BlobReader`'s streaming read
+//! path (`next`) and its seek-and-sentinel skip path
+//! (`next_header_skip_blob`), the raw-frame walk over a buffered
+//! `FileReader` (`Frames::next_raw`), the front probes' header-then-skip
+//! over the same reader, and the pread `HeaderWalker`. They used to be
+//! separate decoders that disagreed about where an error was located,
+//! whether it named the blob and how a truncation was worded; this table is
+//! what keeps a source-specific path from bringing a disagreement back. A
+//! change to any expectation is a behaviour change at every source.
+//!
+//! Every refusal is located at the frame - the file, blob 2 and the frame's
+//! start - and every source words it the same: the test compares the whole
+//! error text across sources, not only its kind.
 //!
 //! Scope is the frame layer. Shape 5 (decompression failure) is invisible to
 //! every source here, which none of them decompress; the separate test below
-//! shows the damage is real and is caught at decode.
-//!
-//! The cells are what the code does, not what it should do. Where the
-//! sources disagree, each is pinned as it is and the disagreement is named
-//! beside the expectation that encodes it:
-//!
-//! * Offsets. Both `BlobReader` paths name the exact byte for a truncated
-//!   header, and the first missing byte for a truncated payload on the read
-//!   path - but the skip path names the last declared payload byte (its
-//!   sentinel), whatever the cut. Their header-level refusals (size guards,
-//!   header parse, header position) sit at the frame start plus 4, past the
-//!   length prefix. The other sources locate every refusal at the frame start.
-//! * Blob index. `read_raw_frame` and `read_blob_header_only` name no blob
-//!   index; `BlobReader` and `HeaderWalker` do.
-//! * The caller-side `FileReader::skip` raises a bare I/O error: no path, no
-//!   blob, no offset.
-//! * Only `BlobReader`'s read path parses the Blob envelope, so a payload
-//!   that is not a Blob message is refused there and passed by the rest.
+//! shows the damage is real and is caught at decode. The one case where the
+//! sources differ is a payload that is not a `Blob` message: only
+//! `BlobReader::next` parses the envelope, because a parsed `Blob` is what it
+//! returns, while passthrough and header walks never look inside a payload.
 
 #![allow(clippy::unwrap_used)]
 
 use super::{BlobReader, MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE, WireBlobHeader};
 use crate::error::{BlobError, Error, ErrorKind};
 use crate::read::file_reader::FileReader;
+use crate::read::frame::Frames;
 use crate::read::header_walker::HeaderWalker;
-use crate::read::raw_frame::{read_blob_header_only, read_raw_frame};
 use std::path::Path;
 
-/// One frame decoder, driven over a whole file.
+/// One frame source, driven over a whole file.
 #[derive(Clone, Copy, Debug)]
 enum Source {
     /// `BlobReader::from_path`, iterated: reads every payload.
@@ -51,18 +41,16 @@ enum Source {
     /// `BlobReader::seekable_from_path` + `next_header_skip_blob`: seeks past
     /// every payload and probes one sentinel byte.
     Skip,
-    /// `read_raw_frame` over a buffered `FileReader`.
+    /// `Frames::next_raw` over a buffered `FileReader`.
     Raw,
-    /// `read_blob_header_only`, then `FileReader::skip` over the payload with
-    /// a bare `?`, as its caller in `commands` does. A frame counts once its
-    /// payload skip succeeds.
+    /// `Frames::next_header` then `skip_payload` over a buffered
+    /// `FileReader`, as the front probes walk.
     HeaderThenSkip,
     /// `HeaderWalker::next_header`: pread, payload extent checked against the
     /// file size taken at open.
     Walk,
 }
 
-/// The order of every expectation row.
 const SOURCES: [Source; 5] = [
     Source::Read,
     Source::Skip,
@@ -86,10 +74,8 @@ enum Kind {
 /// What one source did with one file.
 #[derive(Debug, PartialEq, Eq)]
 enum Seen {
-    /// `frames` frames delivered, then end of input with no error. `at` is
-    /// the logical offset a raw-frame walk ended on, for the two sources that
-    /// keep one: a tolerated tail is skipped without being counted.
-    End { frames: usize, at: Option<u64> },
+    /// `frames` frames delivered, then end of input with no error.
+    End { frames: usize },
     /// `frames` frames delivered, then this error. `named` is whether it
     /// names the input file (checked to be the right one when it does).
     Refused {
@@ -117,7 +103,10 @@ fn kind_of(err: &Error) -> Kind {
     }
 }
 
-fn refused(frames: usize, err: &Error, path: &Path) -> Seen {
+/// The outcome, and the error text when there was an error.
+type Outcome = (Seen, Option<String>);
+
+fn refused(frames: usize, err: &Error, path: &Path) -> Outcome {
     let named = match err.source_path() {
         Some(named) => {
             assert_eq!(named, path, "an error naming the wrong file: {err}");
@@ -125,16 +114,23 @@ fn refused(frames: usize, err: &Error, path: &Path) -> Seen {
         }
         None => false,
     };
-    Seen::Refused {
-        frames,
-        kind: kind_of(err),
-        named,
-        blob: err.blob_index(),
-        offset: err.byte_offset().map(|o| o.0),
-    }
+    (
+        Seen::Refused {
+            frames,
+            kind: kind_of(err),
+            named,
+            blob: err.blob_index(),
+            offset: err.byte_offset().map(|o| o.0),
+        },
+        Some(err.to_string()),
+    )
 }
 
-fn run(source: Source, path: &Path) -> Seen {
+fn ended(frames: usize) -> Outcome {
+    (Seen::End { frames }, None)
+}
+
+fn run(source: Source, path: &Path) -> Outcome {
     match source {
         Source::Read => run_read(path),
         Source::Skip => run_skip(path),
@@ -144,7 +140,7 @@ fn run(source: Source, path: &Path) -> Seen {
     }
 }
 
-fn run_read(path: &Path) -> Seen {
+fn run_read(path: &Path) -> Outcome {
     let mut frames = 0;
     for item in BlobReader::from_path(path).unwrap() {
         match item {
@@ -152,10 +148,10 @@ fn run_read(path: &Path) -> Seen {
             Err(e) => return refused(frames, &e, path),
         }
     }
-    Seen::End { frames, at: None }
+    ended(frames)
 }
 
-fn run_skip(path: &Path) -> Seen {
+fn run_skip(path: &Path) -> Outcome {
     let mut reader = BlobReader::seekable_from_path(path).unwrap();
     let mut frames = 0;
     while let Some(item) = reader.next_header_skip_blob() {
@@ -164,61 +160,53 @@ fn run_skip(path: &Path) -> Seen {
             Err(e) => return refused(frames, &e, path),
         }
     }
-    Seen::End { frames, at: None }
+    ended(frames)
 }
 
-fn run_raw(path: &Path) -> Seen {
-    let host = crate::host::Host::for_tests();
-    let mut reader = FileReader::buffered(path).unwrap();
-    let mut at = 0u64;
+fn file_frames(path: &Path) -> Frames<FileReader> {
+    Frames::of_input(
+        FileReader::buffered(path).unwrap(),
+        path,
+        &crate::host::Host::for_tests(),
+    )
+}
+
+fn run_raw(path: &Path) -> Outcome {
+    let mut walk = file_frames(path);
     let mut frames = 0;
     loop {
-        match read_raw_frame(&mut reader, &mut at, &host, path) {
+        match walk.next_raw() {
             Ok(Some(_)) => frames += 1,
-            Ok(None) => {
-                return Seen::End {
-                    frames,
-                    at: Some(at),
-                };
-            }
+            Ok(None) => return ended(frames),
             Err(e) => return refused(frames, &e, path),
         }
     }
 }
 
-fn run_header_then_skip(path: &Path) -> Seen {
-    let host = crate::host::Host::for_tests();
-    let mut reader = FileReader::buffered(path).unwrap();
-    let mut at = 0u64;
+fn run_header_then_skip(path: &Path) -> Outcome {
+    let mut walk = file_frames(path);
     let mut frames = 0;
     loop {
-        match read_blob_header_only(&mut reader, &mut at, &host.diagnostics, path) {
-            Ok(Some(info)) => {
-                let size = u(info.data_size);
-                if let Err(e) = reader.skip(size) {
-                    return refused(frames, &Error::from(e), path);
+        match walk.next_header() {
+            Ok(Some(_)) => {
+                if let Err(e) = walk.skip_payload() {
+                    return refused(frames, &e, path);
                 }
-                at += size;
                 frames += 1;
             }
-            Ok(None) => {
-                return Seen::End {
-                    frames,
-                    at: Some(at),
-                };
-            }
+            Ok(None) => return ended(frames),
             Err(e) => return refused(frames, &e, path),
         }
     }
 }
 
-fn run_walk(path: &Path) -> Seen {
+fn run_walk(path: &Path) -> Outcome {
     let mut walker = HeaderWalker::open(path, &crate::host::Host::for_tests()).unwrap();
     let mut frames = 0;
     loop {
         match walker.next_header() {
             Ok(Some(_)) => frames += 1,
-            Ok(None) => return Seen::End { frames, at: None },
+            Ok(None) => return ended(frames),
             Err(e) => return refused(frames, &e, path),
         }
     }
@@ -369,8 +357,6 @@ struct Fixture {
     h: usize,
     p: usize,
     d: usize,
-    /// Intact file length; the last payload ends here.
-    l: usize,
 }
 
 impl Fixture {
@@ -381,12 +367,11 @@ impl Fixture {
         let last = frames[2];
         let (f, h, d) = (last.start, last.header_len, last.datasize);
         let p = f + 4 + h;
-        let l = intact.len();
         assert!(
             h > 1 && d > 1,
             "the last frame must be cuttable mid-header and mid-payload"
         );
-        assert_eq!(p + d, l, "the last payload ends the file");
+        assert_eq!(p + d, intact.len(), "the last payload ends the file");
         assert!(
             u(h + d + 1) < MAX_BLOB_HEADER_SIZE,
             "the past-EOF prefix must stay under the cap"
@@ -398,7 +383,6 @@ impl Fixture {
             h,
             p,
             d,
-            l,
         }
     }
 
@@ -443,176 +427,114 @@ impl Fixture {
         bytes
     }
 
-    // -- expectations ------------------------------------------------------
-
-    /// Every source delivers `frames` and ends; the raw walks end at `at`.
-    fn all_end(frames: usize, at: usize) -> [Seen; 5] {
-        let end = |at| Seen::End { frames, at };
-        [
-            end(None),
-            end(None),
-            end(Some(u(at))),
-            end(Some(u(at))),
-            end(None),
-        ]
-    }
-
-    fn located(kind: Kind, blob: Option<u64>, offset: usize) -> Seen {
+    /// A refusal of the last frame: two frames delivered, then `kind`,
+    /// located at the file, blob 2 and the frame start.
+    fn refusal(&self, kind: Kind) -> Seen {
         Seen::Refused {
             frames: 2,
             kind,
             named: true,
-            blob,
-            offset: Some(u(offset)),
+            blob: Some(2),
+            offset: Some(u(self.f)),
         }
-    }
-
-    /// A refusal of the last frame before its payload is touched.
-    ///
-    /// Disagreement: `BlobReader` stamps `blob_reader_at` (the exact byte for
-    /// a truncated header, the frame start plus 4 for every other header-level
-    /// refusal); the rest stamp the frame start. The raw-frame helpers name no
-    /// blob index.
-    fn header_refusal(&self, kind: Kind, blob_reader_at: usize) -> [Seen; 5] {
-        [
-            Self::located(kind, Some(2), blob_reader_at),
-            Self::located(kind, Some(2), blob_reader_at),
-            Self::located(kind, None, self.f),
-            Self::located(kind, None, self.f),
-            Self::located(kind, Some(2), self.f),
-        ]
-    }
-
-    /// A last frame whose header is fine and whose payload is short.
-    ///
-    /// Disagreement: the read path names the first missing byte (`read_at`),
-    /// the skip path its sentinel, the last declared byte (`skip_at`); the
-    /// caller-side `FileReader::skip` names nothing at all; the raw read and
-    /// the walk name the frame start.
-    fn payload_refusal(&self, read_at: usize, skip_at: usize) -> [Seen; 5] {
-        [
-            Self::located(Kind::Eof, Some(2), read_at),
-            Self::located(Kind::Eof, Some(2), skip_at),
-            Self::located(Kind::Eof, None, self.f),
-            Seen::Refused {
-                frames: 2,
-                kind: Kind::Eof,
-                named: false,
-                blob: None,
-                offset: None,
-            },
-            Self::located(Kind::Eof, Some(2), self.f),
-        ]
     }
 }
 
 struct Case {
     name: String,
     bytes: Vec<u8>,
-    expect: [Seen; 5],
+    expect: Seen,
+    /// A substring every source's error text must contain.
+    text: Option<String>,
 }
 
-fn case(name: impl Into<String>, bytes: Vec<u8>, expect: [Seen; 5]) -> Case {
+fn case(name: impl Into<String>, bytes: Vec<u8>, expect: Seen) -> Case {
     Case {
         name: name.into(),
         bytes,
         expect,
+        text: None,
     }
+}
+
+/// The truncation of `len` bytes of `what` from `start`, as every source
+/// words it.
+fn truncation(by: &str, what: &str, len: usize, start: usize) -> Option<String> {
+    Some(format!(
+        "frame truncated: {by} declares a {len}-byte {what} at bytes [{start}, {}), \
+         past the end of the input",
+        start + len
+    ))
 }
 
 /// Shapes 1-3: the frame boundary, the length prefix and the BlobHeader.
 fn frame_and_header_cases(fx: &Fixture) -> Vec<Case> {
-    let (f, h, d, l) = (fx.f, fx.h, fx.d, fx.l);
+    let (f, h, d) = (fx.f, fx.h, fx.d);
     let cap = u32::try_from(MAX_BLOB_HEADER_SIZE).unwrap();
-    let mut cases = vec![case("intact", fx.intact.clone(), Fixture::all_end(3, l))];
+    let header_cut = |name: &str, bytes: Vec<u8>, len: usize| Case {
+        text: truncation("its length prefix", "BlobHeader", len, f + 4),
+        ..case(name, bytes, fx.refusal(Kind::Eof))
+    };
+    let mut cases = vec![case("intact", fx.intact.clone(), Seen::End { frames: 3 })];
     for tail in 1..=3 {
-        // Every source ends silently; none reports the tail. The raw walks
-        // end on the last real frame boundary, so the tail is skipped, not
-        // counted.
+        // Every source ends silently; none reports the tail.
         cases.push(case(
             format!("shape 1: {tail}-byte tail"),
             fx.with_tail(tail),
-            Fixture::all_end(3, l),
+            Seen::End { frames: 3 },
         ));
     }
     cases.extend([
         case(
             "shape 1: cut 2 bytes into the last prefix",
             fx.cut(f + 2),
-            Fixture::all_end(2, f),
+            Seen::End { frames: 2 },
         ),
-        case(
-            "shape 2: cut right after the last prefix",
-            fx.cut(f + 4),
-            fx.header_refusal(Kind::Eof, f + 4),
-        ),
-        case(
+        header_cut("shape 2: cut right after the last prefix", fx.cut(f + 4), h),
+        header_cut(
             "shape 3: cut inside the last BlobHeader",
             fx.cut(f + 4 + h / 2),
-            fx.header_refusal(Kind::Eof, f + 4 + h / 2),
+            h,
         ),
-        case(
+        header_cut(
             "shape 2: last prefix runs one byte past EOF",
             fx.with_prefix(u32::try_from(h + d + 1).unwrap()),
-            fx.header_refusal(Kind::Eof, l),
+            h + d + 1,
         ),
-        case(
+        header_cut(
             "shape 2: last prefix one below the cap, past EOF",
             fx.with_prefix(cap - 1),
-            fx.header_refusal(Kind::Eof, l),
+            usize::try_from(cap - 1).unwrap(),
         ),
     ]);
     cases
 }
 
-/// Shapes 4 and 5, and a payload that is not a Blob message.
+/// Shapes 4 and 5. A payload that is not a Blob message is the one case
+/// the sources do not share; it is pinned by its own test below.
 fn payload_cases(fx: &Fixture) -> Vec<Case> {
-    let (p, d, l) = (fx.p, fx.d, fx.l);
+    let (p, d) = (fx.p, fx.d);
     let mut cases = Vec::new();
     for (label, cut) in [
         ("at the payload start", p),
         ("mid-payload", p + d / 2),
         ("one byte short", p + d - 1),
     ] {
-        cases.push(case(
-            format!("shape 4: last payload cut {label}"),
-            fx.cut(cut),
-            fx.payload_refusal(cut, p + d - 1),
-        ));
+        cases.push(Case {
+            text: truncation("its BlobHeader", "Blob", d, p),
+            ..case(
+                format!("shape 4: last payload cut {label}"),
+                fx.cut(cut),
+                fx.refusal(Kind::Eof),
+            )
+        });
     }
     // Shape 5 is not a frame-layer shape: every source passes the frame,
     // and the damage surfaces at decode (pinned by the test below).
     cases.push(case(
         "shape 5: zlib stream damaged",
         fx.zlib_damaged(),
-        Fixture::all_end(3, l),
-    ));
-    // Disagreement: only the read path parses the Blob envelope, and refuses
-    // it at the payload start; the rest deliver the frame.
-    let mut garbage = fx.intact.clone();
-    garbage[p..].fill(0);
-    cases.push(case(
-        "payload is not a Blob message",
-        garbage,
-        [
-            Fixture::located(Kind::Wire, Some(2), p),
-            Seen::End {
-                frames: 3,
-                at: None,
-            },
-            Seen::End {
-                frames: 3,
-                at: Some(u(l)),
-            },
-            Seen::End {
-                frames: 3,
-                at: Some(u(l)),
-            },
-            Seen::End {
-                frames: 3,
-                at: None,
-            },
-        ],
+        Seen::End { frames: 3 },
     ));
     cases
 }
@@ -620,57 +542,56 @@ fn payload_cases(fx: &Fixture) -> Vec<Case> {
 /// The size guards, the BlobHeader parse and the header-position rule, all
 /// refused before the payload is touched.
 fn guard_cases(fx: &Fixture) -> Vec<Case> {
-    let (f, h, d) = (fx.f, fx.h, fx.d);
+    let (h, d) = (fx.h, fx.d);
     let cap = u32::try_from(MAX_BLOB_HEADER_SIZE).unwrap();
-    let at = f + 4;
     let data =
         |datasize: u64| fx.with_last_frame(&blob_header("OSMData", Some(datasize)), fx.payload());
     vec![
         case(
             "prefix 0",
             fx.with_prefix(0),
-            fx.header_refusal(Kind::InvalidHeaderSize, at),
+            fx.refusal(Kind::InvalidHeaderSize),
         ),
         case(
             "prefix at the header cap",
             fx.with_prefix(cap),
-            fx.header_refusal(Kind::HeaderTooBig(u64::from(cap)), at),
+            fx.refusal(Kind::HeaderTooBig(u64::from(cap))),
         ),
         case(
             "prefix 0xFFFFFFFF",
             fx.with_prefix(u32::MAX),
-            fx.header_refusal(Kind::HeaderTooBig(u64::from(u32::MAX)), at),
+            fx.refusal(Kind::HeaderTooBig(u64::from(u32::MAX))),
         ),
         case(
             "datasize at the cap",
             data(MAX_BLOB_DATASIZE),
-            fx.header_refusal(Kind::DataSizeTooBig(MAX_BLOB_DATASIZE), at),
+            fx.refusal(Kind::DataSizeTooBig(MAX_BLOB_DATASIZE)),
         ),
         case(
             "datasize -1",
             data(u64::MAX),
-            fx.header_refusal(Kind::InvalidDataSize(-1), at),
+            fx.refusal(Kind::InvalidDataSize(-1)),
         ),
         case(
             "datasize past int32",
             data((1_u64 << 32) + 100),
-            fx.header_refusal(Kind::Wire, at),
+            fx.refusal(Kind::Wire),
         ),
         case(
             "BlobHeader bytes unparseable",
             fx.with_last_frame(&vec![0u8; h], fx.payload()),
-            fx.header_refusal(Kind::Wire, at),
+            fx.refusal(Kind::Wire),
         ),
         case(
             "BlobHeader without a type",
             fx.with_last_frame(&blob_header("", Some(u(d))), fx.payload()),
-            fx.header_refusal(Kind::Wire, at),
+            fx.refusal(Kind::Wire),
         ),
         // The position rule fires before the missing payload is noticed.
         case(
             "second OSMHeader, payload absent",
             fx.with_last_frame(&blob_header("OSMHeader", Some(u(d))), &[]),
-            fx.header_refusal(Kind::Wire, at),
+            fx.refusal(Kind::Wire),
         ),
     ]
 }
@@ -682,34 +603,36 @@ fn boundary_cases(fx: &Fixture) -> Vec<Case> {
 
     let below_cap = blob_header("OSMData", Some(u(max_data - 1)));
     let below_cap_payload = fx.f + 4 + below_cap.len();
-    let empty_payload = fx.with_last_frame(&blob_header("OSMData", Some(0)), &[]);
-    let widest_header = fx.with_last_frame(&padded_header(fx.d, header_max), fx.payload());
-    let (empty_len, widest_len) = (empty_payload.len(), widest_header.len());
     vec![
         // Passes the datasize guard, then is shape 4.
-        case(
-            "datasize one below the cap, payload absent",
-            fx.with_last_frame(&below_cap, &[]),
-            fx.payload_refusal(below_cap_payload, below_cap_payload + max_data - 2),
-        ),
+        Case {
+            text: truncation("its BlobHeader", "Blob", max_data - 1, below_cap_payload),
+            ..case(
+                "datasize one below the cap, payload absent",
+                fx.with_last_frame(&below_cap, &[]),
+                fx.refusal(Kind::Eof),
+            )
+        },
         case(
             "datasize 0, file ends after the header",
-            empty_payload,
-            Fixture::all_end(3, empty_len),
+            fx.with_last_frame(&blob_header("OSMData", Some(0)), &[]),
+            Seen::End { frames: 3 },
         ),
         // Wider than the walk's probe window, so it takes the second pread.
         case(
             "valid BlobHeader one below the cap",
-            widest_header,
-            Fixture::all_end(3, widest_len),
+            fx.with_last_frame(&padded_header(fx.d, header_max), fx.payload()),
+            Seen::End { frames: 3 },
         ),
     ]
 }
 
-/// Every truncation shape, guard and boundary through every frame decoder.
-/// All mismatches are reported at once, as `case: source`.
+/// Every truncation shape, guard and boundary through every frame source,
+/// with one expectation per case, and the same error text from every
+/// source that refuses. All mismatches are reported at once, as
+/// `case: source`.
 #[test]
-fn every_frame_decoder_on_every_truncation_shape() {
+fn every_frame_source_on_every_truncation_shape() {
     let fx = Fixture::new();
     let mut cases = frame_and_header_cases(&fx);
     cases.extend(payload_cases(&fx));
@@ -720,25 +643,69 @@ fn every_frame_decoder_on_every_truncation_shape() {
     for (i, case) in cases.iter().enumerate() {
         let path = fx.dir.path().join(format!("case{i}.osm.pbf"));
         std::fs::write(&path, &case.bytes).unwrap();
-        for (source, expected) in SOURCES.iter().zip(&case.expect) {
-            let seen = run(*source, &path);
-            if seen != *expected {
+        let mut texts: Vec<(Source, String)> = Vec::new();
+        for source in SOURCES {
+            let (seen, text) = run(source, &path);
+            if seen != case.expect {
                 mismatches.push(format!(
-                    "{}: {source:?}\n  expected {expected:?}\n  seen     {seen:?}",
-                    case.name
+                    "{}: {source:?}\n  expected {:?}\n  seen     {seen:?}",
+                    case.name, case.expect
                 ));
+            }
+            if let Some(text) = text {
+                if let Some(want) = &case.text
+                    && !text.contains(want.as_str())
+                {
+                    mismatches.push(format!(
+                        "{}: {source:?}\n  text {text:?}\n  lacks {want:?}",
+                        case.name
+                    ));
+                }
+                texts.push((source, text));
+            }
+        }
+        if let Some((first_source, first)) = texts.first() {
+            for (source, text) in &texts[1..] {
+                if text != first {
+                    mismatches.push(format!(
+                        "{}: {source:?} words it differently from {first_source:?}\n  \
+                         {first:?}\n  {text:?}",
+                        case.name
+                    ));
+                }
             }
         }
     }
     assert!(
         mismatches.is_empty(),
-        "{} cell(s) differ from the pinned table:\n{}",
+        "{} cell(s) differ from the table:\n{}",
         mismatches.len(),
         mismatches.join("\n")
     );
 }
 
-/// The shape-5 fixture above really is shape 5: the frame every decoder
+/// The one difference between the sources, and it is not framing: only
+/// `BlobReader::next` parses the `Blob` envelope, so a payload that is not a
+/// `Blob` message is refused there - located at the frame, like every other
+/// failure of a blob - and delivered by the rest, which surface it at
+/// decode or pass it through untouched.
+#[test]
+fn only_the_blob_reader_parses_the_envelope() {
+    let fx = Fixture::new();
+    let mut garbage = fx.intact.clone();
+    garbage[fx.p..].fill(0);
+    let path = fx.dir.path().join("garbage-payload.osm.pbf");
+    std::fs::write(&path, &garbage).unwrap();
+    for source in SOURCES {
+        let expect = match source {
+            Source::Read => fx.refusal(Kind::Wire),
+            _ => Seen::End { frames: 3 },
+        };
+        assert_eq!(run(source, &path).0, expect, "{source:?}");
+    }
+}
+
+/// The shape-5 fixture above really is shape 5: the frame every source
 /// passed fails at decode, and the same blob intact decodes.
 #[test]
 fn the_damaged_zlib_stream_fails_at_decode() {

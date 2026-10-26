@@ -13,7 +13,6 @@ pub(crate) mod header_walker;
 pub mod input;
 pub(crate) mod pipeline;
 pub(crate) mod pipeline_metrics;
-pub(crate) mod raw_frame;
 pub mod reader;
 pub(crate) mod region_grid;
 pub(crate) mod wire;

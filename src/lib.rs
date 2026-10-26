@@ -255,7 +255,7 @@ pub use commands::{
 #[doc(hidden)]
 pub use commands::{check, export, extract};
 #[doc(hidden)]
-pub use commands::{has_indexdata, has_tagdata};
+pub use commands::{has_indexdata, has_indexdata_in, has_tagdata};
 pub use read::{blob, block, dense, elements, reader};
 pub(crate) use read::{file_reader, frame};
 pub(crate) use write::file_writer;

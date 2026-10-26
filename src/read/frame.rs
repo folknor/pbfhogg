@@ -1,47 +1,604 @@
 //! The one blob-frame decoder.
 //!
 //! Every PBF read path starts at the same envelope:
-//! `[4-byte BE header_len][BlobHeader protobuf][Blob protobuf]`. That envelope
-//! used to be hand-rolled at five sites (`BlobReader::read_blob_header`,
-//! `read_raw_frame`, `read_blob_header_only`, `HeaderWalker::next_header`, and
-//! the `cat --dedupe` frame loop), each with its own copy of the length-prefix
-//! read, the EOF-tolerance policy and the two size guards. The copies drifted:
-//! the `header_len == 0` rejection had to be added to four of them
-//! independently and was never added to the fifth, and the fifth also went
-//! without a `MAX_BLOB_HEADER_SIZE` guard, so four bytes of corrupt input drove
-//! an unbounded `resize`. (That loop is gone: `cat --dedupe` now walks its
-//! inputs with `HeaderWalker`, as `sort` does.)
+//! `[4-byte BE header_len][BlobHeader protobuf][Blob protobuf]`. [`Frames`]
+//! is the one state machine that walks it, generic over where the bytes come
+//! from. `BlobReader` (streaming, and its seek-and-sentinel header walk),
+//! `HeaderWalker` (`pread` at an offset), the raw-frame walks that pass
+//! frames through undecoded ([`Frames::next_raw`]) and the input-front probes
+//! all hold a `Frames` over their own source and nothing else of the frame
+//! format: the length prefix, the EOF policy, both size guards, the header
+//! parse, the leading-header rule, the declared-datasize guards, the
+//! truncation errors and the provenance stamped on every failure live here
+//! once.
 //!
-//! This module owns the policy so a future framing guard is a one-line change
-//! here rather than a five-line change spread across the crate:
+//! The frame format used to be decoded in three places with three copies of
+//! that policy, and the copies disagreed about everything a user sees: where
+//! an error was located, whether it named the blob, how a truncation was
+//! worded. The disagreements were pinned rather than fixed until the decoders
+//! became one; `src/read/frame_conformance_tests.rs` now holds every source to
+//! one expectation per case.
 //!
-//! * [`check_header_len`] - the two size guards, used by every decoder
-//!   including the two that cannot share the I/O (BlobReader, which stamps byte
-//!   offsets between the steps, and HeaderWalker, which preads).
-//! * [`read_frame_prefix`] - the length prefix plus the EOF policy, for
-//!   `Read`-based decoders.
-//! * [`read_frame_header`] - prefix, header bytes, and header parse in one
-//!   call, for the decoders that go on to materialise, skip, or index a
-//!   payload.
-//! * [`check_header_position`] - the leading-header rule (an OSMHeader only
-//!   as the first frame), applied by every decoder once per frame.
+//! # Sources
+//!
+//! A source is any [`FrameSource`]: every `Read` is one, and
+//! `HeaderWalker`'s `PreadSource` is the other. Skipping a payload unread
+//! needs [`FrameSkip`], whose implementations keep the I/O shape each caller
+//! was measured with: `BufReader::seek_relative` plus one sentinel byte for
+//! a seekable stream (a plain `Seek::seek` discards the buffer, see
+//! `reference/performance-history.md` "`seek_raw` BufReader-discard fix"),
+//! `FileReader::skip` for the command readers (the same for buffered input,
+//! `DirectReader::skip` for O_DIRECT), and an extent check against the size
+//! captured at open for the pread walker.
 //!
 //! # EOF policy
 //!
 //! A frame boundary with 0-3 bytes remaining is clean EOF: a partial length
 //! prefix cannot start a frame, and per
 //! [`reference/truncation-handling.md`](../../reference/truncation-handling.md)
-//! a clean cut at a frame boundary is tolerated. Every prior copy already
-//! agreed on this outcome despite spelling it three different ways
-//! (`BlobReader`'s two-part `read_exact`, `read_raw_frame`'s single
-//! `UnexpectedEof` arm, `HeaderWalker`'s `probe_len < 4`) - the divergence was
-//! cosmetic, not behavioural. Anything past the prefix is a committed read:
-//! truncation there is a hard error, not EOF.
+//! a clean cut at a frame boundary is tolerated. Anything past the prefix is
+//! a committed read: truncation there is a hard error, not EOF.
+//!
+//! # Provenance
+//!
+//! Every error out of a frame is located at the frame: the input's path (when
+//! the source was opened from one), the frame's 0-based ordinal (while the
+//! walk counts from the stream start) and the frame's start offset (when the
+//! source has a position). The same (ordinal, frame start) pair is what
+//! callers stamp on failures of the work they do with a frame afterwards, so
+//! a frame-level error and a decode error on the same blob name the same
+//! place. The precise extent a truncation broke is in the message.
+//! Cancellation is not a fault of the input and stays unlocated.
 
 use std::io::Read;
+use std::path::Path;
+use std::sync::Arc;
 
-use crate::blob::{BlobKind, MAX_BLOB_HEADER_SIZE, parse_blob_header_with_index};
-use crate::error::{BlobError, Result, new_blob_error};
+use crate::blob::{
+    BlobKind, BlobReaderSource, BlobSite, ByteOffset, MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE,
+    WireBlobHeader, warn_unrecognised_indexdata,
+};
+use crate::blob_meta::BlobIndex;
+use crate::error::{BlobError, Error, Location, Result, new_blob_error};
+use crate::file_reader::FileReader;
+
+/// Where frames come from.
+pub(crate) trait FrameSource {
+    /// Fill `buf` from the current position, stopping short only where the
+    /// input ends. Returns the bytes delivered. Used for the length prefix
+    /// alone, so a short count is the clean-EOF signal; every other failure
+    /// is an error and is never read as end of input.
+    fn fill(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
+
+    /// Append up to `n` bytes to `out`, stopping short only where the input
+    /// ends, and return how many were appended. Used for header and payload
+    /// bytes, whose shortfall is a truncation.
+    fn append(&mut self, n: usize, out: &mut Vec<u8>) -> std::io::Result<usize>;
+}
+
+impl<R: Read> FrameSource for R {
+    fn fill(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match self.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(filled)
+    }
+
+    /// A bounded `read_to_end` into the caller's buffer, reserved to `n`
+    /// first: no zero-fill, and a caller that sized `out` exactly gets no
+    /// reallocation. `Take` reports a short input as a short count.
+    fn append(&mut self, n: usize, out: &mut Vec<u8>) -> std::io::Result<usize> {
+        out.reserve(n);
+        self.by_ref().take(n as u64).read_to_end(out)
+    }
+}
+
+/// A source that can pass over a payload without delivering it.
+pub(crate) trait FrameSkip: FrameSource {
+    /// Move `n` bytes forward. `Ok(false)` when the input ends first.
+    fn skip_bytes(&mut self, n: u64) -> std::io::Result<bool>;
+}
+
+/// Seek `n - 1` bytes relative (which keeps a `BufReader`'s buffer when the
+/// target lies inside it), then read the last byte, because a seek past the
+/// end succeeds and only the read can tell. A zero-byte skip reads nothing.
+impl<R: BlobReaderSource> FrameSkip for R {
+    fn skip_bytes(&mut self, n: u64) -> std::io::Result<bool> {
+        if n == 0 {
+            return Ok(true);
+        }
+        let back = i64::try_from(n - 1)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "skip too long"))?;
+        self.skip_relative(back)?;
+        let mut sentinel = [0u8; 1];
+        Ok(self.fill(&mut sentinel)? == 1)
+    }
+}
+
+/// `FileReader::skip`: the seek-and-sentinel above for buffered input,
+/// `DirectReader::skip` (which validates its target itself) for O_DIRECT.
+impl FrameSkip for FileReader {
+    fn skip_bytes(&mut self, n: u64) -> std::io::Result<bool> {
+        match self.skip(n) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Which optional `BlobHeader` fields a walk keeps. Each consumer sets its
+/// own: a sequential element read skips tagdata and way members (and, on
+/// hot paths that never ask for a blob index, indexdata), while header
+/// walks and raw passthrough keep tagdata and indexdata. The flags decide
+/// copy versus skip only; see [`WireBlobHeader::parse`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeaderFields {
+    pub(crate) tagdata: bool,
+    pub(crate) indexdata: bool,
+    pub(crate) waymembers: bool,
+}
+
+impl HeaderFields {
+    /// Tagdata and indexdata, no way members: header walks and passthrough.
+    pub(crate) const INDEXES: HeaderFields = HeaderFields {
+        tagdata: true,
+        indexdata: true,
+        waymembers: false,
+    };
+}
+
+/// Which frame a header, payload or error belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameId {
+    /// Offset of the frame's length prefix; `None` when the source has no
+    /// position (a bare `Read`).
+    pub(crate) start: Option<u64>,
+    /// 0-based ordinal of the frame in its stream; `None` once a seek has
+    /// broken the count from the stream start.
+    pub(crate) ordinal: Option<u64>,
+}
+
+/// A frame's header, parsed. The payload has not been touched.
+pub(crate) struct FrameHeader {
+    pub(crate) id: FrameId,
+    /// Length of the `BlobHeader` protobuf, i.e. the frame's prefix value.
+    pub(crate) header_len: usize,
+    /// Declared payload length, bounded by `MAX_BLOB_DATASIZE`.
+    pub(crate) data_size: usize,
+    pub(crate) header: WireBlobHeader,
+}
+
+impl FrameHeader {
+    /// Bytes consumed by prefix + header, i.e. the offset of the payload
+    /// within the frame.
+    pub(crate) fn payload_offset(&self) -> usize {
+        4 + self.header_len
+    }
+}
+
+/// A header returned and its payload not yet consumed.
+#[derive(Clone, Copy, Debug)]
+struct Pending {
+    id: FrameId,
+    data_size: usize,
+}
+
+/// The frame state machine over a source `S`. See the module doc.
+///
+/// Protocol: [`Self::next_header`], then at most one of
+/// [`Self::read_payload`] or [`Self::skip_payload`] before the next header.
+/// Dropping the walk with a payload pending is fine (a probe that stops at a
+/// header); asking for another header first is a bug and an error. Any
+/// located failure ends the walk: every later call is an error until
+/// [`Self::reposition`] and [`Self::clear_failure`], because a source that
+/// failed partway through a frame would otherwise have the rest of that frame
+/// read as the next one.
+#[derive(Clone, Debug)]
+pub(crate) struct Frames<S> {
+    pub(crate) src: S,
+    /// The source's position: a frame boundary between frames, the payload
+    /// start while one is pending. `None` when the source has no position or
+    /// a failure left it unknown.
+    pos: Option<u64>,
+    /// Where the stream starts: the construction position, fixed across
+    /// seeks. An OSMHeader is leading only here.
+    stream_start: u64,
+    /// The ordinal of the next frame; `None` once the count is unknowable.
+    next_ordinal: Option<u64>,
+    path: Option<Arc<Path>>,
+    diagnostics: crate::host::Diagnostics,
+    cancel: crate::host::Cancel,
+    /// The current frame's `BlobHeader` bytes, reused across frames.
+    header_buf: Vec<u8>,
+    pub(crate) fields: HeaderFields,
+    pending: Option<Pending>,
+    failed: bool,
+}
+
+impl<S> Frames<S> {
+    /// A walk over `src`, whose position is `start` (`None` for a source
+    /// with none). The ordinal counts from 0 when the walk starts at the
+    /// beginning of the input or has no position to say otherwise, and is
+    /// unknown for a walk that starts mid-input.
+    pub(crate) fn new(src: S, start: Option<u64>, fields: HeaderFields) -> Self {
+        Frames {
+            src,
+            pos: start,
+            stream_start: start.unwrap_or(0),
+            next_ordinal: matches!(start, None | Some(0)).then_some(0),
+            path: None,
+            diagnostics: crate::host::Diagnostics::discard(),
+            cancel: crate::host::Cancel::new(),
+            header_buf: Vec::new(),
+            fields,
+            pending: None,
+            failed: false,
+        }
+    }
+
+    /// A walk over a command input from its first byte, with the run's
+    /// diagnostics and cancellation, its errors naming `path`.
+    pub(crate) fn of_input(src: S, path: &Path, host: &crate::host::Host) -> Self {
+        let mut frames = Self::new(src, Some(0), HeaderFields::INDEXES);
+        frames.path = Some(Arc::from(path));
+        frames.diagnostics = host.diagnostics.clone();
+        frames.cancel = host.cancel.clone();
+        frames
+    }
+
+    pub(crate) fn set_path(&mut self, path: Option<Arc<Path>>) {
+        self.path = path;
+    }
+
+    pub(crate) fn path(&self) -> Option<&Arc<Path>> {
+        self.path.as_ref()
+    }
+
+    pub(crate) fn set_diagnostics(&mut self, diagnostics: crate::host::Diagnostics) {
+        self.diagnostics = diagnostics;
+    }
+
+    pub(crate) fn set_cancel(&mut self, cancel: crate::host::Cancel) {
+        self.cancel = cancel;
+    }
+
+    pub(crate) fn cancel_token(&self) -> &crate::host::Cancel {
+        &self.cancel
+    }
+
+    /// The source's current position, when known.
+    pub(crate) fn position(&self) -> Option<u64> {
+        self.pos
+    }
+
+    /// The identity the next frame will have: the current position and
+    /// ordinal. Meaningful between frames.
+    pub(crate) fn next_id(&self) -> FrameId {
+        FrameId {
+            start: self.pos,
+            ordinal: self.next_ordinal,
+        }
+    }
+
+    /// Whether a failure has ended the walk.
+    pub(crate) fn failed(&self) -> bool {
+        self.failed
+    }
+
+    /// End the walk after a failure the caller found in a frame this walk
+    /// delivered (a `Blob` envelope that does not parse, say).
+    pub(crate) fn poison(&mut self) {
+        self.failed = true;
+        self.pending = None;
+        self.pos = None;
+    }
+
+    /// The source was moved to `pos` (`None`: a move that failed, leaving the
+    /// position unknown). Any pending payload is forgotten. A successful move
+    /// to the start of an input that begins at 0 restarts the ordinal count;
+    /// any other target loses it, because a stale count stamped on a later
+    /// error would name the wrong frame. A failed move loses both the
+    /// position and the count: the walk goes on as a positionless one, which
+    /// names no offset and no blob and never takes an OSMHeader as leading.
+    /// A failure is not cleared: see [`Self::clear_failure`].
+    pub(crate) fn reposition(&mut self, pos: Option<u64>) {
+        self.pending = None;
+        self.pos = pos;
+        self.next_ordinal = pos.and_then(|pos| (pos == 0 && self.stream_start == 0).then_some(0));
+    }
+
+    /// Resume a walk that a failure ended, after the caller repositioned it.
+    pub(crate) fn clear_failure(&mut self) {
+        self.failed = false;
+    }
+
+    /// The location of frame `id` in this walk's input.
+    #[cold]
+    pub(crate) fn location(&self, id: FrameId) -> Location {
+        Location::new(self.path.as_ref(), id.ordinal, id.start.map(ByteOffset))
+    }
+
+    /// Locate a failure of the work done with frame `id` after it was read
+    /// (its decode, say) at that frame. A cancellation stays unlocated and a
+    /// location already attached is kept.
+    #[cold]
+    pub(crate) fn locate(&self, id: FrameId, err: Error) -> Error {
+        err.locate_blob(self.location(id))
+    }
+
+    /// Locate `err` at frame `id` and end the walk.
+    #[cold]
+    fn fail(&mut self, id: FrameId, err: Error) -> Error {
+        let err = err.locate(self.location(id));
+        self.poison();
+        err
+    }
+
+    /// The pending frame, or the error for asking without one (which, as a
+    /// misuse of the walk, ends it like any other failure).
+    fn take_pending(&mut self) -> Result<Pending> {
+        if self.failed {
+            return Err(used_after_failure());
+        }
+        match self.pending.take() {
+            Some(pending) => Ok(pending),
+            None => {
+                self.poison();
+                Err(Error::internal(
+                    "frame payload requested with no frame header read",
+                ))
+            }
+        }
+    }
+
+    /// The pending payload was consumed in full: the walk is at the next
+    /// frame boundary.
+    fn finish(&mut self, pending: Pending) {
+        self.pos = self
+            .pos
+            .map(|payload_start| payload_start + pending.data_size as u64);
+        self.next_ordinal = self.next_ordinal.map(|n| n + 1);
+    }
+}
+
+impl<S: FrameSource> Frames<S> {
+    /// Read the next frame's length prefix and `BlobHeader`, leaving the
+    /// source at the payload. `Ok(None)` at clean EOF.
+    ///
+    /// A tripped cancellation token ends the walk with `Cancelled`,
+    /// unlocated; it is checked here only, before a frame is started, so a
+    /// frame whose header was read is always finished.
+    pub(crate) fn next_header(&mut self) -> Result<Option<FrameHeader>> {
+        if self.failed {
+            return Err(used_after_failure());
+        }
+        if self.pending.is_some() {
+            self.poison();
+            return Err(Error::internal(
+                "next frame requested before the last frame's payload was read or skipped",
+            ));
+        }
+        if let Err(e) = self.cancel.check() {
+            self.poison();
+            return Err(e);
+        }
+        let id = FrameId {
+            start: self.pos,
+            ordinal: self.next_ordinal,
+        };
+        match self.read_header(id) {
+            Ok(header) => Ok(header),
+            Err(e) => Err(self.fail(id, e)),
+        }
+    }
+
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    fn read_header(&mut self, id: FrameId) -> Result<Option<FrameHeader>> {
+        let mut prefix = [0u8; 4];
+        let got = self.src.fill(&mut prefix)?;
+        if got < prefix.len() {
+            // Clean EOF. A 1-3 byte tail was consumed: keep the position
+            // with the source, so a stream that delivers more later is not
+            // read as starting at this boundary.
+            self.pos = id.start.map(|s| s + got as u64);
+            return Ok(None);
+        }
+        let header_len = check_header_len(u32::from_be_bytes(prefix))?;
+
+        self.header_buf.clear();
+        let header_start = id.start.map(|s| s + 4);
+        let got = match self.src.append(header_len, &mut self.header_buf) {
+            Ok(got) => got,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+            Err(e) => return Err(e.into()),
+        };
+        if got < header_len {
+            return Err(truncated(TruncatedPart::Header, header_len, header_start));
+        }
+
+        let header = WireBlobHeader::parse(
+            &self.header_buf,
+            self.fields.tagdata,
+            self.fields.indexdata,
+            self.fields.waymembers,
+        )?;
+        if let Some(len) = header.unrecognised_indexdata_len {
+            warn_unrecognised_indexdata(
+                &self.diagnostics,
+                len,
+                BlobSite {
+                    source: self.path.as_deref(),
+                    offset: id.start,
+                },
+            );
+        }
+        // A positioned walk knows its stream start; one without a position
+        // knows only whether this is the first frame it counted.
+        let at_start = match id.start {
+            Some(start) => start == self.stream_start,
+            None => id.ordinal == Some(0),
+        };
+        check_header_position(&header.blob_type, at_start)?;
+        if header.datasize < 0 {
+            return Err(new_blob_error(BlobError::InvalidDataSize {
+                size: header.datasize,
+            }));
+        }
+        // Reject an oversized declared datasize before any caller allocates,
+        // reads or skips the payload. `MAX_BLOB_MESSAGE_SIZE` caps the
+        // decompressed block only after the compressed body is in memory, so
+        // without this a hostile datasize drives an outsized allocation.
+        let datasize = header.datasize as u64;
+        if datasize >= MAX_BLOB_DATASIZE {
+            return Err(new_blob_error(BlobError::DataSizeTooBig { size: datasize }));
+        }
+        let data_size = datasize as usize;
+
+        self.pos = header_start.map(|s| s + header_len as u64);
+        self.pending = Some(Pending { id, data_size });
+        Ok(Some(FrameHeader {
+            id,
+            header_len,
+            data_size,
+            header,
+        }))
+    }
+
+    /// Append the pending payload to `out`.
+    pub(crate) fn read_payload(&mut self, out: &mut Vec<u8>) -> Result<()> {
+        let pending = self.take_pending()?;
+        let got = match self.src.append(pending.data_size, out) {
+            Ok(got) => got,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
+            Err(e) => return Err(self.fail(pending.id, e.into())),
+        };
+        if got < pending.data_size {
+            let err = truncated(TruncatedPart::Payload, pending.data_size, self.pos);
+            return Err(self.fail(pending.id, err));
+        }
+        self.finish(pending);
+        Ok(())
+    }
+
+    /// The next frame whole, as raw bytes for passthrough or selective
+    /// decode: the prefix, the exact header bytes and the payload in one
+    /// buffer sized to the frame.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn next_raw(&mut self) -> Result<Option<RawBlobFrame>> {
+        let Some(header) = self.next_header()? else {
+            return Ok(None);
+        };
+        let blob_offset = header.payload_offset();
+        let mut frame_bytes = Vec::with_capacity(blob_offset + header.data_size);
+        frame_bytes.extend_from_slice(&(header.header_len as u32).to_be_bytes());
+        frame_bytes.extend_from_slice(&self.header_buf);
+        self.read_payload(&mut frame_bytes)?;
+        let WireBlobHeader {
+            blob_type,
+            indexdata,
+            indexdata_present,
+            tagdata,
+            tagdata_present,
+            ..
+        } = header.header;
+        Ok(Some(RawBlobFrame {
+            frame_bytes,
+            blob_type,
+            blob_offset,
+            index: indexdata.and_then(|data| BlobIndex::deserialize(&data)),
+            index_present: indexdata_present,
+            tagdata,
+            tagdata_present,
+            id: header.id,
+        }))
+    }
+}
+
+impl<S: FrameSkip> Frames<S> {
+    /// Pass over the pending payload without reading it.
+    pub(crate) fn skip_payload(&mut self) -> Result<()> {
+        let pending = self.take_pending()?;
+        match self.src.skip_bytes(pending.data_size as u64) {
+            Ok(true) => {
+                self.finish(pending);
+                Ok(())
+            }
+            Ok(false) => {
+                let err = truncated(TruncatedPart::Payload, pending.data_size, self.pos);
+                Err(self.fail(pending.id, err))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                let err = truncated(TruncatedPart::Payload, pending.data_size, self.pos);
+                Err(self.fail(pending.id, err))
+            }
+            Err(e) => Err(self.fail(pending.id, e.into())),
+        }
+    }
+}
+
+impl<S: Read + std::io::Seek> Frames<S> {
+    /// Seek the source to `pos` and reposition the walk there. A failure
+    /// leaves the position unknown and is located at the target when the
+    /// target is absolute.
+    pub(crate) fn seek(&mut self, pos: std::io::SeekFrom) -> Result<u64> {
+        match std::io::Seek::seek(&mut self.src, pos) {
+            Ok(offset) => {
+                self.reposition(Some(offset));
+                Ok(offset)
+            }
+            Err(e) => {
+                self.reposition(None);
+                let target = match pos {
+                    std::io::SeekFrom::Start(offset) => Some(ByteOffset(offset)),
+                    std::io::SeekFrom::End(_) | std::io::SeekFrom::Current(_) => None,
+                };
+                Err(Error::from(e).locate(Location::new(self.path.as_ref(), None, target)))
+            }
+        }
+    }
+}
+
+#[cold]
+fn used_after_failure() -> Error {
+    Error::internal("frame walk used after a failed frame")
+}
+
+/// Which part of a frame a truncation cut.
+#[derive(Clone, Copy)]
+enum TruncatedPart {
+    Header,
+    Payload,
+}
+
+/// The one truncation error: the frame's declared part of `len` bytes from
+/// `start` runs past the end of the input. Worded from what was declared,
+/// not from how the shortfall was noticed, so every source says the same
+/// thing; the extent is omitted when the source has no position.
+#[cold]
+fn truncated(part: TruncatedPart, len: usize, start: Option<u64>) -> Error {
+    let (what, by) = match part {
+        TruncatedPart::Header => ("BlobHeader", "its length prefix"),
+        TruncatedPart::Payload => ("Blob", "its BlobHeader"),
+    };
+    let extent = match start {
+        Some(start) => format!(" at bytes [{start}, {})", start + len as u64),
+        None => String::new(),
+    };
+    Error::io_kind(
+        std::io::ErrorKind::UnexpectedEof,
+        format!(
+            "frame truncated: {by} declares a {len}-byte {what}{extent}, past the end of the input"
+        ),
+    )
+}
 
 /// Apply both length-prefix guards and return the validated header length.
 ///
@@ -53,7 +610,7 @@ use crate::error::{BlobError, Result, new_blob_error};
 ///   and honouring it means allocating up to 4 GiB on the strength of four
 ///   unvalidated bytes.
 #[allow(clippy::cast_possible_truncation)]
-pub(crate) fn check_header_len(header_len: u32) -> Result<usize> {
+fn check_header_len(header_len: u32) -> Result<usize> {
     let len = u64::from(header_len);
     if len == 0 {
         return Err(new_blob_error(BlobError::InvalidHeaderSize));
@@ -71,8 +628,7 @@ pub(crate) fn check_header_len(header_len: u32) -> Result<usize> {
 /// their existing skip policy; low-level readers may still read data alone.
 /// For a seekable BlobReader, the stream starts at its construction position,
 /// which can be nonzero for an embedded PBF; later seeks keep that origin.
-/// Call once per frame, before reading or skipping its payload.
-pub(crate) fn check_header_position(blob_type: &BlobKind, at_start: bool) -> Result<()> {
+fn check_header_position(blob_type: &BlobKind, at_start: bool) -> Result<()> {
     if matches!(blob_type, BlobKind::OsmHeader) && !at_start {
         return Err(crate::error::new_wire_error(
             "a second OSMHeader blob follows the first frame; OSMHeader is allowed only as the first blob",
@@ -81,102 +637,70 @@ pub(crate) fn check_header_position(blob_type: &BlobKind, at_start: bool) -> Res
     Ok(())
 }
 
-/// Read and validate the 4-byte length prefix of the next frame.
+/// A raw blob frame for passthrough or selective decode.
 ///
-/// Returns `Ok(None)` at clean EOF (see the module's EOF policy), the
-/// validated header length otherwise.
-pub(crate) fn read_frame_prefix<R: Read>(reader: &mut R) -> Result<Option<usize>> {
-    let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    check_header_len(u32::from_be_bytes(len_buf)).map(Some)
-}
-
-/// A frame's header, parsed. The payload has not been touched.
-pub(crate) struct FrameHeader {
-    /// Length of the `BlobHeader` protobuf, i.e. the frame's prefix value.
-    pub(crate) header_len: usize,
+/// The Blob protobuf bytes are a suffix of `frame_bytes` starting at
+/// `blob_offset`, eliminating a separate allocation per blob.
+pub(crate) struct RawBlobFrame {
+    /// Complete framed bytes: `[4-byte header_len][BlobHeader][Blob]`.
+    pub(crate) frame_bytes: Vec<u8>,
     pub(crate) blob_type: BlobKind,
-    /// Declared payload length. Bounded by `MAX_BLOB_DATASIZE`.
-    pub(crate) data_size: usize,
-    pub(crate) raw_index: Option<[u8; crate::blob_meta::INDEX_SIZE]>,
-    /// Whether the header carried a non-empty `indexdata` field at all, even
-    /// one whose length this crate does not recognise and therefore did not
-    /// keep in `raw_index`. Only `check --index` reads it; see
-    /// `WireBlobHeader::indexdata_present` for why a verifier needs the
-    /// distinction every reader is right to collapse.
-    pub(crate) raw_index_present: bool,
-    /// Whether the header carried a non-empty `tagdata` field at all, even
-    /// when a duplicate occurrence left `tagdata` as `None`. Only
-    /// `check --index` reads it; see `WireBlobHeader::tagdata_present`.
-    pub(crate) tagdata_present: bool,
+    /// Byte offset within `frame_bytes` where the Blob protobuf starts.
+    pub(crate) blob_offset: usize,
+    /// Blob-level index from BlobHeader indexdata, if present *and* readable.
+    pub(crate) index: Option<BlobIndex>,
+    /// Whether the header carried a non-empty indexdata field at all.
+    ///
+    /// `index` collapses "absent" and "present but unreadable" into `None`,
+    /// which is correct for every reader - an index it cannot read is an index
+    /// it must not act on - and wrong for `check --index`, whose entire job is
+    /// to notice that the file claims something it cannot back up. Malformed
+    /// indexdata was passing verification silently until this field existed.
+    #[cfg_attr(not(feature = "commands"), allow(dead_code))]
+    pub(crate) index_present: bool,
+    /// Per-blob tag key data from BlobHeader field 4, if present. Retained
+    /// so `check --index` can compare the stored claim with decoded tags.
+    #[cfg_attr(not(feature = "commands"), allow(dead_code))]
     pub(crate) tagdata: Option<Box<[u8]>>,
+    /// Non-empty tagdata was present, including duplicate unreadable claims.
+    #[cfg_attr(not(feature = "commands"), allow(dead_code))]
+    pub(crate) tagdata_present: bool,
+    /// Which frame this is: its start offset and ordinal. Failures of the
+    /// work done with the frame are located through [`Frames::locate`].
+    pub(crate) id: FrameId,
 }
 
-impl FrameHeader {
-    /// Bytes consumed by prefix + header, i.e. the offset of the payload
-    /// within the frame.
-    pub(crate) fn payload_offset(&self) -> usize {
-        4 + self.header_len
+impl RawBlobFrame {
+    /// The raw Blob protobuf message bytes (for selective decoding).
+    pub(crate) fn blob_bytes(&self) -> &[u8] {
+        &self.frame_bytes[self.blob_offset..]
     }
-}
 
-/// Read the next frame's length prefix and `BlobHeader`, leaving the reader
-/// positioned at the payload. Returns `Ok(None)` at clean EOF.
-///
-/// `header_buf` is a caller-owned scratch buffer, resized to the header length
-/// and left holding exactly the header bytes so callers that reframe a
-/// passthrough blob can copy them verbatim. `frame_start` is the absolute
-/// prefix offset in the input, used to enforce the leading-header policy.
-pub(crate) fn read_frame_header<R: Read>(
-    reader: &mut R,
-    header_buf: &mut Vec<u8>,
-    frame_start: u64,
-    diagnostics: &crate::host::Diagnostics,
-    source: Option<&std::path::Path>,
-) -> Result<Option<FrameHeader>> {
-    let Some(header_len) = read_frame_prefix(reader)? else {
-        return Ok(None);
-    };
-    header_buf.clear();
-    header_buf.resize(header_len, 0);
-    reader.read_exact(header_buf)?;
+    /// The raw `BlobHeader` protobuf message bytes, sitting between the
+    /// 4-byte big-endian length prefix and the Blob payload. Callers that
+    /// reframe a passthrough blob use this to preserve every original header
+    /// field verbatim rather than reconstructing fields from parsed values.
+    pub(crate) fn header_bytes(&self) -> &[u8] {
+        &self.frame_bytes[4..self.blob_offset]
+    }
 
-    // `parse_blob_header_with_index` rejects an oversized declared datasize
-    // (>= MAX_BLOB_DATASIZE) before returning, so `data_size` is bounded here
-    // and no caller can be driven into an outsized payload allocation by a
-    // hostile `BlobHeader.datasize`.
-    let (blob_type, data_size, raw_index, raw_index_present, tagdata, tagdata_present) =
-        parse_blob_header_with_index(
-            header_buf,
-            diagnostics,
-            crate::blob::BlobSite {
-                source,
-                offset: Some(frame_start),
-            },
-        )?;
-    // No location here: the caller walks the input and owns provenance, so
-    // it locates this refusal with the file, blob and frame start it knows.
-    check_header_position(&blob_type, frame_start == 0)?;
-    Ok(Some(FrameHeader {
-        header_len,
-        blob_type,
-        data_size,
-        raw_index,
-        raw_index_present,
-        tagdata,
-        tagdata_present,
-    }))
+    /// Byte offset of this frame in its input (a raw-frame walk always
+    /// starts at offset 0 and so always knows it).
+    #[cfg_attr(not(feature = "commands"), allow(dead_code))]
+    pub(crate) fn file_offset(&self) -> u64 {
+        self.id.start.unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::{check_header_len, read_frame_header, read_frame_prefix};
+    use super::{FrameId, Frames, HeaderFields, check_header_len};
     use crate::error::{BlobError, ErrorKind};
+
+    fn frames(bytes: Vec<u8>) -> Frames<std::io::Cursor<Vec<u8>>> {
+        Frames::new(std::io::Cursor::new(bytes), Some(0), HeaderFields::INDEXES)
+    }
 
     #[test]
     fn only_leading_header_frames_are_accepted() {
@@ -191,8 +715,8 @@ mod tests {
         }
     }
 
-    /// The two guards every decoder shares, at their exact boundaries. The cap
-    /// is strict (`>=`) so the largest accepted prefix is one below it.
+    /// The two prefix guards at their exact boundaries. The cap is strict
+    /// (`>=`) so the largest accepted prefix is one below it.
     #[test]
     fn header_len_guards_bound_the_prefix() {
         assert!(matches!(
@@ -221,59 +745,111 @@ mod tests {
         }
     }
 
-    /// 0-3 trailing bytes at a frame boundary are clean EOF; a validated
-    /// prefix is returned otherwise.
-    ///
-    /// This pins the policy for the decoders that share this helper's
-    /// I/O. The other two spell it themselves and are pinned at their own call
-    /// sites, because a unit test here cannot reach them:
-    /// `tests/read_paths.rs::trailing_partial_length_prefix_returns_ok_none`
-    /// and its `_4_bytes_is_committed_frame` sibling cover `BlobReader`, and
-    /// `header_walker.rs`'s
-    /// `the_walk_tolerates_a_short_tail_but_not_a_complete_prefix` covers the
-    /// pread walk.
+    /// 0-3 trailing bytes at a frame boundary are clean EOF; a complete
+    /// prefix is a committed frame. Every source shares this through
+    /// `Frames`; the conformance table runs it through each of them.
     #[test]
-    fn prefix_read_tolerates_a_short_tail_only() {
+    fn a_short_tail_is_clean_eof_and_a_complete_prefix_is_not() {
         for tail in 0..4usize {
-            let bytes = vec![0xFFu8; tail];
-            let mut cursor = std::io::Cursor::new(bytes);
-            assert_eq!(
-                read_frame_prefix(&mut cursor).unwrap(),
-                None,
+            assert!(
+                frames(vec![0xFFu8; tail]).next_header().unwrap().is_none(),
                 "a {tail}-byte tail must read as clean EOF"
             );
         }
-        // A complete prefix is a committed frame, not a tail - a 4-byte input
-        // declaring 0xFFFFFFFF is the unbounded-allocation case and must fail
-        // rather than be excused as EOF.
-        let mut cursor = std::io::Cursor::new(vec![0xFFu8; 4]);
-        assert!(read_frame_prefix(&mut cursor).is_err());
+        // A 4-byte input declaring 0xFFFFFFFF is the unbounded-allocation
+        // case and must fail rather than be excused as EOF.
+        assert!(frames(vec![0xFFu8; 4]).next_header().is_err());
 
-        let mut cursor = std::io::Cursor::new(vec![0u8, 0, 0, 7]);
-        assert_eq!(read_frame_prefix(&mut cursor).unwrap(), Some(7));
+        // The tail a stream delivered is consumed, and the position keeps up
+        // with it, so a stream that delivers more later is not read as
+        // starting back at the boundary.
+        let mut walk = frames(vec![0xAA; 2]);
+        assert!(walk.next_header().unwrap().is_none());
+        assert_eq!(walk.position(), Some(2));
     }
 
-    /// A prefix promising header bytes the stream does not have is a
-    /// committed read: shape 3, a hard error, never EOF.
+    /// A prefix promising header bytes the input does not have is a
+    /// committed read: a hard error located at the frame, never EOF.
     #[test]
     fn truncated_header_bytes_are_an_error_not_eof() {
         // Declares 16 header bytes, supplies 3.
         let mut input = vec![0u8, 0, 0, 16];
         input.extend_from_slice(&[0x0A, 0x07, b'O']);
-        let mut cursor = std::io::Cursor::new(input);
-        let mut buf = Vec::new();
-        match read_frame_header(
-            &mut cursor,
-            &mut buf,
-            0,
-            &crate::host::Diagnostics::discard(),
-            None,
-        ) {
-            Err(err) => assert!(
-                matches!(err.kind(), ErrorKind::Io(_)),
-                "a truncated BlobHeader must surface as an I/O error"
-            ),
-            Ok(_) => panic!("a truncated BlobHeader must not read as EOF or success"),
-        }
+        let err = frames(input).next_header().err().unwrap();
+        assert!(
+            matches!(err.kind(), ErrorKind::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "{err:?}"
+        );
+        assert_eq!(err.byte_offset(), Some(crate::ByteOffset(0)));
+        assert_eq!(err.blob_index(), Some(0));
+        assert!(
+            err.to_string()
+                .contains("declares a 16-byte BlobHeader at bytes [4, 20)"),
+            "{err}"
+        );
+    }
+
+    /// One `OSMData` frame with a `len`-byte raw payload.
+    fn data_frame(len: u8) -> Vec<u8> {
+        let header = [0x0A, 7, b'O', b'S', b'M', b'D', b'a', b't', b'a', 0x18, len];
+        let mut out = u32::try_from(header.len()).unwrap().to_be_bytes().to_vec();
+        out.extend_from_slice(&header);
+        out.extend(std::iter::repeat_n(0u8, usize::from(len)));
+        out
+    }
+
+    /// The walk protocol: a header, then its payload, then the next header;
+    /// asking out of turn is an error, and a failure ends the walk until it
+    /// is repositioned and resumed.
+    #[test]
+    fn the_walk_enforces_header_then_payload_and_stops_after_a_failure() {
+        let mut bytes = data_frame(3);
+        bytes.extend_from_slice(&data_frame(5));
+        let mut walk = frames(bytes.clone());
+
+        assert!(walk.read_payload(&mut Vec::new()).is_err(), "no header yet");
+        let mut walk = frames(bytes.clone());
+        let first = walk.next_header().unwrap().unwrap();
+        assert_eq!(
+            first.id,
+            FrameId {
+                start: Some(0),
+                ordinal: Some(0)
+            }
+        );
+        assert!(walk.next_header().is_err(), "payload still pending");
+        assert!(walk.failed(), "a misuse ends the walk like any failure");
+        assert!(walk.skip_payload().is_err());
+
+        let mut walk = frames(bytes.clone());
+        walk.next_header().unwrap().unwrap();
+        walk.skip_payload().unwrap();
+        let second = walk.next_header().unwrap().unwrap();
+        assert_eq!(
+            second.id,
+            FrameId {
+                start: Some(18),
+                ordinal: Some(1)
+            }
+        );
+        let mut payload = Vec::new();
+        walk.read_payload(&mut payload).unwrap();
+        assert_eq!(payload.len(), 5);
+        assert!(walk.next_header().unwrap().is_none());
+
+        // A payload cut short fails at its frame and poisons the walk.
+        let cut = bytes[..bytes.len() - 1].to_vec();
+        let mut walk = frames(cut);
+        walk.next_header().unwrap().unwrap();
+        walk.read_payload(&mut Vec::new()).unwrap();
+        walk.next_header().unwrap().unwrap();
+        let err = walk.read_payload(&mut Vec::new()).unwrap_err();
+        assert_eq!(err.byte_offset(), Some(crate::ByteOffset(18)));
+        assert_eq!(err.blob_index(), Some(1));
+        assert!(walk.failed());
+        assert!(walk.next_header().is_err(), "a failed walk stays failed");
+        walk.seek(std::io::SeekFrom::Start(0)).unwrap();
+        walk.clear_failure();
+        assert_eq!(walk.next_header().unwrap().unwrap().id.ordinal, Some(0));
     }
 }

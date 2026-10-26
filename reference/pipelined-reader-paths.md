@@ -40,7 +40,7 @@ Alternative primitives used elsewhere in the codebase:
   (`src/scan/classify.rs`) - pread workers, no separate decode pool,
   no cross-thread-free churn, no oversubscription. Lower memory
   ceiling and lower thread count than pipelined decode.
-- Raw `read_raw_frame` / `HeaderWalker` (`src/read/raw_frame.rs`,
+- Raw `Frames::next_raw` / `HeaderWalker` (`src/read/frame.rs`,
   `src/read/header_walker.rs`) - sequential or pread-based,
   bypass the decode pool entirely.
 

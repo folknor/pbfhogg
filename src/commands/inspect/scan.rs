@@ -11,9 +11,9 @@ use super::types::{
 use crate::ElementKind;
 use crate::blob::{BlobKind, decode_blob_to_headerblock, decompress_blob_data_into};
 use crate::file_reader::FileReader;
+use crate::read::frame::Frames;
 use crate::read::header_walker::HeaderWalker;
 use crate::read::input::{InputSource, PinnedInput};
-use crate::read::raw_frame::read_raw_frame;
 
 /// The name a report gives the input at `path`.
 fn file_name_of(path: &Path) -> String {
@@ -366,15 +366,15 @@ fn full_decode_scan(
     let path = input.path();
     let file_name = file_name_of(path);
 
-    let mut reader = FileReader::open(input, direct_io)?;
+    let reader = FileReader::open(input, direct_io)?;
     // The size of the file this reader opened, not of whatever the path
     // names by now: a stat of the path is a second resolution of it.
     let file_size = reader
         .metadata()
         .map_err(|e| crate::Error::from(e).context(format!("failed to stat {}", path.display())))?
         .len();
+    let mut frames = Frames::of_input(reader, path, host);
     let mut saw_header = false;
-    let mut offset = 0u64;
     let mut decompress_buf = Vec::new();
     let mut header_meta = HeaderMeta::default();
 
@@ -388,7 +388,7 @@ fn full_decode_scan(
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    while let Some(frame) = read_raw_frame(&mut reader, &mut offset, host, path)? {
+    while let Some(frame) = frames.next_raw()? {
         // This scan is the file's only reader: it refuses a file that does
         // not open with an OsmHeader itself.
         if !saw_header && frame.blob_type != BlobKind::OsmHeader {
@@ -396,15 +396,8 @@ fn full_decode_scan(
         }
         match frame.blob_type {
             BlobKind::OsmHeader => {
-                let header = decode_blob_to_headerblock(frame.blob_bytes()).map_err(|e| {
-                    // The header is blob 0: the frame reader refuses a
-                    // later one.
-                    e.locate(crate::error::Location::new(
-                        Some(&std::sync::Arc::from(path)),
-                        Some(0),
-                        Some(crate::ByteOffset(frame.file_offset)),
-                    ))
-                })?;
+                let header = decode_blob_to_headerblock(frame.blob_bytes())
+                    .map_err(|e| frames.locate(frame.id, e))?;
                 header_meta = extract_header_metadata(&header);
                 saw_header = true;
             }
@@ -422,7 +415,8 @@ fn full_decode_scan(
                     &mut state,
                     block_number,
                     &mut accum,
-                )?;
+                )
+                .map_err(|e| frames.locate(frame.id, e))?;
             }
             BlobKind::Unknown(_) => {}
         }
@@ -465,7 +459,7 @@ fn full_decode_scan(
 
 /// Decompress, parse, and scan one OsmData blob. Updates all accumulators.
 fn scan_data_blob(
-    frame: &crate::read::raw_frame::RawBlobFrame,
+    frame: &crate::read::frame::RawBlobFrame,
     decompress_buf: &mut Vec<u8>,
     st_scratch: &mut Vec<(u32, u32)>,
     gr_scratch: &mut Vec<(u32, u32)>,

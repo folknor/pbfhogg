@@ -282,7 +282,7 @@ fn a_replaced_tag_key_set_is_detected() {
 /// Indexdata that is present but unreadable must be reported, not read as
 /// absent.
 ///
-/// `read_raw_frame` deserializes the raw field into an `Option<BlobIndex>`, so
+/// The raw-frame walk deserializes the raw field into an `Option<BlobIndex>`, so
 /// unreadable bytes arrive at the comparison as `None` - indistinguishable,
 /// there, from a file that carries no indexdata at all. The verifier therefore
 /// silently passed the one input it most obviously has to reject, and did so in

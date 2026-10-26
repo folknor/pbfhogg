@@ -1770,7 +1770,8 @@ fn a_payload_running_past_eof_is_refused_with_its_location_by_every_command() {
 /// the headers (an unindexed input always takes the walker); it refuses a
 /// second OSMHeader like the indexed route above. The streaming full-scan
 /// arm, which no CLI fixture reaches, takes its refusal from
-/// `read_raw_frame`, which the frame conformance tests cover.
+/// the raw-frame walk (`Frames::next_raw`), which the frame conformance
+/// tests cover.
 #[test]
 fn getid_forced_unindexed_route_refuses_a_second_header() {
     let fx = Fx::new();

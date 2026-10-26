@@ -32,6 +32,20 @@
   `HeaderBuilder` gains `without_replication_timestamp`,
   `without_replication_sequence_number` and `without_replication_base_url`.
 
+- **A frame error is located at its frame, the same way by every reader.**
+  `Error::byte_offset()` on a malformed or truncated blob frame is now the
+  start of that blob's frame, paired with its blob index, whichever reader
+  found it. `BlobReader` used to report a truncation at the first missing
+  byte (and, on `next_header_skip_blob`, at the last declared one) and a
+  bad length prefix or header four bytes past the frame start; commands
+  that pass frames through or probe the front of a file named no blob, or
+  in one probe nothing at all. A truncation's message no longer says
+  "(shape N)"; every reader now words it as "frame truncated: its
+  BlobHeader declares a N-byte Blob at bytes [A, B), past the end of the
+  input" (or the BlobHeader equivalent). A `Blob` envelope that does not
+  parse is located at its frame rather than at the payload start. Code
+  that matched on the old offsets or text needs updating.
+
 - **`DiffOptions::summary` is removed.** The library never read it: the
   caller chooses between `DiffStats::write_summary` and
   `DiffStats::write_osmium_summary` itself. Delete the field from any
@@ -925,6 +939,12 @@
   different header is rejected. Reported byte offsets remain absolute.
 
 ### Added
+
+- **Library: `has_indexdata_in` runs the indexdata probe under a `Host`.**
+  It reports to the host's diagnostics and stops with `Cancelled` once the
+  host's token is tripped, checked before each frame it reads on the way to
+  the first data blob. `has_indexdata` is unchanged and never cancels; cat,
+  getparents and `inspect --indexed` now use the cancellable one.
 
 - **Library: `read::input::PinnedInput` keeps a multi-pass read on one
   file.** A command that reads its input in several passes opens it several

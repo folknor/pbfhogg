@@ -37,6 +37,7 @@ use crate::block_builder::{BlockBuilder, HeaderBuilder, Metadata, OwnedBlock};
 use crate::error::Error;
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
+use crate::frame::{Frames, HeaderFields};
 use crate::write::OutputBackend;
 use crate::writer::{Compression, PbfWriter};
 
@@ -508,7 +509,7 @@ pub(crate) fn require_indexdata<'a>(
     host: &crate::host::Host,
 ) -> Result<bool> {
     let source = input.into();
-    let (present, _) = probe_first_data_blob(source, direct_io, &host.diagnostics)?;
+    let (present, _) = probe_first_data_blob(source, direct_io, &host.diagnostics, &host.cancel)?;
     indexdata_policy(present, source.path(), force, reason, host)
 }
 
@@ -606,7 +607,21 @@ pub fn has_indexdata<'a>(
     direct_io: bool,
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<bool> {
-    Ok(probe_first_data_blob(input, direct_io, diagnostics)?.0)
+    // A library probe with no run to observe: it is never cancelled.
+    let cancel = crate::host::Cancel::new();
+    Ok(probe_first_data_blob(input, direct_io, diagnostics, &cancel)?.0)
+}
+
+/// [`has_indexdata`] for a run under `host`: the same probe, reporting to the
+/// host's diagnostics and stopping at the next frame once its cancellation
+/// token is tripped. The probe walks every frame between the header and the
+/// first OsmData blob, however many extension frames that is.
+pub fn has_indexdata_in<'a>(
+    input: impl Into<crate::read::input::InputSource<'a>>,
+    direct_io: bool,
+    host: &crate::host::Host,
+) -> Result<bool> {
+    Ok(probe_first_data_blob(input, direct_io, &host.diagnostics, &host.cancel)?.0)
 }
 
 /// Check if the first OsmData blob in a PBF has tagdata (`BlobHeader`
@@ -622,7 +637,8 @@ pub fn has_tagdata(
     direct_io: bool,
     diagnostics: &crate::host::Diagnostics,
 ) -> Result<bool> {
-    Ok(probe_first_data_blob(path, direct_io, diagnostics)?.1)
+    let cancel = crate::host::Cancel::new();
+    Ok(probe_first_data_blob(path, direct_io, diagnostics, &cancel)?.1)
 }
 
 // This is a first-data-blob hint, not validation of every blob. Keep the
@@ -634,53 +650,64 @@ fn probe_first_data_blob<'a>(
     input: impl Into<crate::read::input::InputSource<'a>>,
     direct_io: bool,
     diagnostics: &crate::host::Diagnostics,
+    cancel: &crate::host::Cancel,
 ) -> Result<(bool, bool)> {
     let source = input.into();
     let path = source.path();
-    let mut reader = FileReader::open(source, direct_io)?;
-    let mut offset = 0u64;
+    let mut frames = front_frames(
+        FileReader::open(source, direct_io)?,
+        path,
+        diagnostics,
+        cancel,
+    );
     // The header comes first or the file is not a PBF: a zero-byte or
     // header-less file gets the one missing-header error here, ahead of any
     // question about indexdata. Its payload is skipped, not read.
-    let header_size = leading_header_frame(&mut reader, &mut offset, diagnostics, path)?;
-    reader.skip(header_size as u64)?;
-    offset += header_size as u64;
-    probe_to_first_data_blob(&mut reader, &mut offset, diagnostics, path)
+    leading_header_frame(&mut frames, path)?;
+    frames.skip_payload()?;
+    probe_to_first_data_blob(&mut frames)
 }
 
-/// Read the first frame's header and return its payload size, leaving the
-/// reader at the payload. A zero-byte file, or one whose first frame is not
-/// an OsmHeader, is the missing-header error, decided before any payload is
-/// read.
-pub(crate) fn leading_header_frame(
-    reader: &mut FileReader,
-    offset: &mut u64,
-    diagnostics: &crate::host::Diagnostics,
+/// A frame walk over the front of `path` for the precondition probes,
+/// observing `cancel` (the run's token, or a fresh one for a library probe
+/// that has no run).
+pub(crate) fn front_frames(
+    reader: FileReader,
     path: &Path,
-) -> Result<usize> {
-    match crate::read::raw_frame::read_blob_header_only(reader, offset, diagnostics, path)? {
-        Some(info) if matches!(info.blob_type, BlobKind::OsmHeader) => Ok(info.data_size),
+    diagnostics: &crate::host::Diagnostics,
+    cancel: &crate::host::Cancel,
+) -> Frames<FileReader> {
+    let mut frames = Frames::new(reader, Some(0), HeaderFields::INDEXES);
+    frames.set_path(Some(std::sync::Arc::from(path)));
+    frames.set_diagnostics(diagnostics.clone());
+    frames.set_cancel(cancel.clone());
+    frames
+}
+
+/// Read the first frame's header, leaving the walk at its payload. A
+/// zero-byte file, or one whose first frame is not an OsmHeader, is the
+/// missing-header error, decided before any payload is read.
+pub(crate) fn leading_header_frame(frames: &mut Frames<FileReader>, path: &Path) -> Result<()> {
+    match frames.next_header()? {
+        Some(header) if matches!(header.header.blob_type, BlobKind::OsmHeader) => Ok(()),
         _ => Err(crate::error::new_missing_header(path)),
     }
 }
 
 /// Continue a front-of-file read from the frame after the header to the
 /// first OsmData frame's header, returning its `(indexdata, tagdata)`
-/// presence. Frames in between are skipped, not read.
-pub(crate) fn probe_to_first_data_blob(
-    reader: &mut FileReader,
-    offset: &mut u64,
-    diagnostics: &crate::host::Diagnostics,
-    path: &Path,
-) -> Result<(bool, bool)> {
-    while let Some(info) =
-        crate::read::raw_frame::read_blob_header_only(reader, offset, diagnostics, path)?
-    {
-        if matches!(info.blob_type, BlobKind::OsmData) {
-            return Ok((info.index.is_some(), info.has_tagdata));
+/// presence. Frames in between are skipped, not read, and the data frame's
+/// payload is left unread.
+pub(crate) fn probe_to_first_data_blob(frames: &mut Frames<FileReader>) -> Result<(bool, bool)> {
+    while let Some(header) = frames.next_header()? {
+        if matches!(header.header.blob_type, BlobKind::OsmData) {
+            let indexed = header
+                .header
+                .indexdata
+                .is_some_and(|data| crate::blob_meta::BlobIndex::deserialize(&data).is_some());
+            return Ok((indexed, header.header.tagdata.is_some()));
         }
-        reader.skip(info.data_size as u64)?;
-        *offset += info.data_size as u64;
+        frames.skip_payload()?;
     }
     // No data blob: nothing lacks indexdata, so the file counts as indexed.
     // It carries no tagdata, which is a statement about presence, not a

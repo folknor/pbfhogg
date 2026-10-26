@@ -20,8 +20,8 @@ use crate::{BlobFilter, Element, ElementKind, PrimitiveBlock};
 use super::output_header::{Declared, OutputFacts, OutputHeader, Ways};
 use super::{Result, flush_local};
 use crate::error::Error;
+use crate::read::frame::Frames;
 use crate::read::input::PinnedInput;
-use crate::read::raw_frame::{frame_location, read_raw_frame};
 use crate::writer::frame_blob_pipelined;
 
 /// Which metadata attributes to strip via `--clean`.
@@ -227,12 +227,10 @@ fn read_header(
     host: &crate::host::Host,
 ) -> Result<crate::HeaderBlock> {
     let file = input.path();
-    let mut reader = FileReader::open(input, direct_io)?;
-    let mut file_offset: u64 = 0;
-    match read_raw_frame(&mut reader, &mut file_offset, host, file)? {
+    let mut frames = Frames::of_input(FileReader::open(input, direct_io)?, file, host);
+    match frames.next_raw()? {
         Some(frame) if frame.blob_type == BlobKind::OsmHeader => {
-            decode_blob_to_headerblock(frame.blob_bytes())
-                .map_err(|e| e.locate(frame_location(file, frame.file_offset)))
+            decode_blob_to_headerblock(frame.blob_bytes()).map_err(|e| frames.locate(frame.id, e))
         }
         _ => Err(crate::error::new_missing_header(file)),
     }
@@ -274,7 +272,7 @@ fn raw_copy_ways(
         return Ok(Ways::BlobsCopied);
     }
     for file in files {
-        if !super::has_indexdata(file, direct_io, &host.diagnostics)? {
+        if !super::has_indexdata_in(file, direct_io, host)? {
             return Ok(unindexed);
         }
     }
@@ -334,10 +332,9 @@ fn cat_passthrough(
 
     for input in files {
         let file = input.path();
-        let mut reader = FileReader::open(input, direct_io)?;
-        let mut file_offset: u64 = 0;
+        let mut frames = Frames::of_input(FileReader::open(input, direct_io)?, file, host);
 
-        while let Some(mut frame) = read_raw_frame(&mut reader, &mut file_offset, host, file)? {
+        while let Some(mut frame) = frames.next_raw()? {
             match &frame.blob_type {
                 BlobKind::OsmHeader => {}
                 BlobKind::OsmData => {
@@ -347,11 +344,12 @@ fn cat_passthrough(
                     } else {
                         // No indexdata - decompress to scan IDs/tags, reframe with index.
                         let blob_bytes = frame.blob_bytes();
-                        // Name the input and the blob's frame offset through
-                        // the crate error's own location, which prints as
-                        // "(in PATH, at byte offset N)". The walk owns the
-                        // provenance; the frame carries its true offset.
-                        let locate = |e: Error| e.locate(frame_location(file, frame.file_offset));
+                        // Name the input, the blob and its frame offset
+                        // through the crate error's own location, which
+                        // prints as "(in PATH, blob N, at byte offset M)".
+                        // The walk owns the provenance.
+                        let id = frame.id;
+                        let locate = |e: Error| frames.locate(id, e);
                         decompress_blob_data_into(blob_bytes, &mut decompress_buf)
                             .map_err(locate)?;
                         let (index, tagdata) =
@@ -703,10 +701,9 @@ fn cat_type_passthrough(
 
     for input in files {
         let file = input.path();
-        let mut reader = FileReader::open(input, direct_io)?;
-        let mut file_offset: u64 = 0;
+        let mut frames = Frames::of_input(FileReader::open(input, direct_io)?, file, host);
 
-        while let Some(mut frame) = read_raw_frame(&mut reader, &mut file_offset, host, file)? {
+        while let Some(mut frame) = frames.next_raw()? {
             match &frame.blob_type {
                 BlobKind::OsmHeader => {}
                 BlobKind::OsmData => {
@@ -719,7 +716,8 @@ fn cat_type_passthrough(
                     } else {
                         let blob_bytes = frame.blob_bytes();
                         decompress_buf.clear();
-                        let locate = |e: Error| e.locate(frame_location(file, frame.file_offset));
+                        let id = frame.id;
+                        let locate = |e: Error| frames.locate(id, e);
                         decompress_blob_data_into(blob_bytes, &mut decompress_buf)
                             .map_err(locate)?;
                         // Take the decompressed Vec straight into the block: no

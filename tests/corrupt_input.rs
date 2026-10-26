@@ -60,8 +60,8 @@ fn empty_file() {
 /// 1-3 bytes: not enough for the 4-byte header length prefix. Per
 /// `reference/truncation-handling.md` shape 1, this is a clean cut at
 /// a frame boundary (with 1-3 leftover bytes from a writer that
-/// crashed mid-prefix) - tolerated as EOF, no error. Aligns
-/// `BlobReader` with `read_raw_frame` and the documented stance.
+/// crashed mid-prefix) - tolerated as EOF, no error, as for every source
+/// of the frame walk.
 #[test]
 fn truncated_header_size() {
     for len in 1..=3 {
@@ -155,14 +155,15 @@ fn framing_error_carries_byte_offset() {
     let err = reader.next().expect("an item").expect_err("HeaderTooBig");
     assert_eq!(
         err.byte_offset().map(|o| o.0),
-        Some(4),
-        "offset should point past the consumed 4-byte length prefix"
+        Some(0),
+        "a frame error is located at its frame, whose prefix is the defect here"
     );
 }
 
 /// Build a one-block PBF truncated `got` bytes into the second blob's
-/// payload, and return it alongside the payload start offset. Shape 4.
-fn truncated_in_payload(got: usize) -> (Vec<u8>, u64) {
+/// payload, and return it alongside the frame start and payload start
+/// offsets. Shape 4.
+fn truncated_in_payload(got: usize) -> (Vec<u8>, u64, u64) {
     let full = write_one_block_pbf();
     let frame_start = {
         let mut r = BlobReader::new_seekable(Cursor::new(full.as_slice())).unwrap();
@@ -177,57 +178,48 @@ fn truncated_in_payload(got: usize) -> (Vec<u8>, u64) {
         payload_start + got < full.len(),
         "fixture must actually be truncated"
     );
-    (full[..payload_start + got].to_vec(), payload_start as u64)
+    (
+        full[..payload_start + got].to_vec(),
+        frame_start as u64,
+        payload_start as u64,
+    )
 }
 
-/// The reported offset must be the byte that could not be read, not the
-/// start of the frame it lives in. Those differ by the whole payload, so a
-/// frame-start offset points the user at the wrong place in the file.
+/// A truncation is located at the frame it broke, like every other failure
+/// of a blob (the ordinal and frame start a decode error on the same blob
+/// would carry), and the message names the declared extent that runs past
+/// the end of the input - the same words whether the payload was read or
+/// skipped, since how the shortfall was noticed is not something the user
+/// can act on.
 #[test]
-fn truncated_payload_offset_is_the_exact_truncation_byte() {
-    let got = 3usize;
-    let (data, payload_start) = truncated_in_payload(got);
-    let mut reader = BlobReader::new_seekable(Cursor::new(data)).unwrap();
+fn truncated_payload_is_located_at_its_frame_and_names_the_declared_extent() {
+    let (data, frame_start, payload_start) = truncated_in_payload(3);
+    let declared_end = write_one_block_pbf().len() as u64;
+    let extent = format!("[{payload_start}, {declared_end})");
+
+    let mut reader = BlobReader::new_seekable(Cursor::new(data.clone())).unwrap();
     let _ = reader.next().unwrap().unwrap(); // header blob
-    let err = reader.next().unwrap().unwrap_err();
-    assert_eq!(
-        err.byte_offset().map(|o| o.0),
-        Some(payload_start + got as u64),
-        "offset must be the truncation byte, not the payload start"
-    );
-    assert!(
-        format!("{err}").contains(&format!("{}", payload_start + got as u64)),
-        "Display and byte_offset must agree: {err}"
-    );
-}
+    let read = reader.next().unwrap().unwrap_err();
 
-/// Header-only consumers (`next_header_skip_blob`, the fast structural
-/// walk) return the skip error verbatim, so the offset has to be stamped
-/// inside `skip_blob_body` - the layer that clears the running position.
-#[test]
-fn header_only_consumer_gets_offset_on_truncated_payload() {
-    let (data, payload_start) = truncated_in_payload(3);
-    let full_len = write_one_block_pbf().len() as u64;
-    let declared_end = full_len - 1; // sentinel byte at payload_start + datasize - 1
+    // Header-only consumers return the skip error verbatim, so it has to be
+    // located by the frame walk itself.
     let mut reader = BlobReader::new_seekable(Cursor::new(data)).unwrap();
     let _ = reader.next_header_skip_blob().unwrap().unwrap(); // header blob
-    let err = reader.next_header_skip_blob().unwrap().unwrap_err();
-    assert_eq!(
-        err.byte_offset().map(|o| o.0),
-        Some(declared_end),
-        "skip path must report where the declared payload ran off the end"
-    );
-    assert!(
-        declared_end > payload_start,
-        "sanity: the sentinel sits past the payload start"
-    );
+    let skipped = reader.next_header_skip_blob().unwrap().unwrap_err();
+
+    for err in [&read, &skipped] {
+        assert_eq!(err.byte_offset().map(|o| o.0), Some(frame_start), "{err}");
+        assert_eq!(err.blob_index(), Some(1), "{err}");
+        assert!(err.to_string().contains(&extent), "{err}");
+    }
+    assert_eq!(read.to_string(), skipped.to_string());
 }
 
 /// Valid length prefix but too few bytes for the declared BlobHeader.
 /// Per `reference/truncation-handling.md` shape 3, this is a hard
-/// error - the BlobReader's post-`read_to_end` length check catches
-/// the short read and surfaces it as `Io(UnexpectedEof)` before the
-/// wire-format parser sees corrupt bytes.
+/// error - the frame walk's length check catches the short read and
+/// surfaces it as `Io(UnexpectedEof)` before the wire-format parser sees
+/// corrupt bytes.
 #[test]
 fn truncated_header_data() {
     let mut data = Vec::new();
@@ -248,7 +240,7 @@ fn truncated_header_data() {
 /// count because the sequence is genuinely restarting.
 #[test]
 fn blob_index_attribution_survives_iteration_but_not_seeks() {
-    let (data, _) = truncated_in_payload(3);
+    let (data, _, _) = truncated_in_payload(3);
 
     // The failing data blob's frame start, from the intact fixture.
     let second_offset = {
@@ -342,18 +334,17 @@ fn truncated_blob_data() {
 // ---------------------------------------------------------------------------
 // Raw-frame and HeaderWalker MAX_BLOB_HEADER_SIZE guards
 //
-// `BlobReader::read_blob_header` at blob.rs:390 has always had a
-// MAX_BLOB_HEADER_SIZE cap, but `read_raw_frame` / `read_blob_header_only`
-// (raw_frame.rs) and `HeaderWalker::next_header` (header_walker.rs) did
-// not. Without the cap, an adversarial 4-byte file (length prefix of
-// `u32::MAX`) triggers a multi-GB `vec![0u8; header_len]` allocation -
-// an OOM / process-abort DoS vector on every command that routes
-// through these primitives (cat passthrough, getid raw passthrough,
-// has_indexdata, check_sorted_and_indexed, apply-changes / altw /
-// extract strategies / geocode classify via HeaderWalker).
+// The raw-frame and header-walk paths once decoded frames separately from
+// `BlobReader` and went without its MAX_BLOB_HEADER_SIZE cap. Without the
+// cap, an adversarial 4-byte file (length prefix of `u32::MAX`) triggers a
+// multi-GB header allocation - an OOM / process-abort DoS vector on every
+// command that routes through these primitives (cat passthrough, getid raw
+// passthrough, has_indexdata, check_sorted_and_indexed, apply-changes /
+// altw / extract strategies / geocode classify via HeaderWalker). They now
+// share one frame walk; these tests keep each route covered end to end.
 // ---------------------------------------------------------------------------
 
-/// `read_blob_header_only` (via `has_indexdata`) rejects an oversized
+/// The front probe (via `has_indexdata`) rejects an oversized
 /// length prefix with HeaderTooBig rather than attempting a huge
 /// allocation.
 #[test]
@@ -377,7 +368,7 @@ fn has_indexdata_rejects_oversized_header_length() {
     );
 }
 
-/// `read_raw_frame` (via `cat`) rejects an oversized length prefix
+/// The raw-frame walk (via `cat`) rejects an oversized length prefix
 /// with HeaderTooBig rather than attempting a huge allocation.
 #[test]
 fn cat_rejects_oversized_header_length() {
@@ -452,7 +443,7 @@ fn check_refs_rejects_schedule_entry_past_eof() {
         .expect("fixture has frames")
         .frame_start;
     assert!(
-        msg.contains("blob payload truncated")
+        msg.contains("frame truncated")
             && msg.contains(&input.display().to_string())
             && msg.contains(&format!("at byte offset {frame_start}")),
         "expected the walker's located truncation error, got: {msg}",
@@ -499,7 +490,7 @@ fn inspect_rejects_oversized_header_length_via_walker() {
 // after a blob's compressed body has been read into memory. A hostile or
 // corrupt `BlobHeader.datasize` therefore forces the pre-decompression body
 // allocation (`Vec::with_capacity(datasize)` in `BlobReader::next`,
-// `vec![0u8; frame_len]` in `read_raw_frame`, `pread_data` in `HeaderWalker`
+// the frame-sized buffer of the raw-frame walk, `pread_data` in `HeaderWalker`
 // consumers) to an arbitrary size ahead of that guard - a memory-amplification
 // DoS. `MAX_BLOB_DATASIZE` (32 MiB, mirroring the reference reader's
 // `MAX_BODY_SIZE` applied directly to `BlobHeader.datasize`) rejects the
@@ -573,8 +564,8 @@ fn blob_reader_rejects_oversized_datasize() {
     }
 }
 
-/// `read_raw_frame` (via `cat` passthrough) rejects an oversized declared
-/// datasize before the `vec![0u8; frame_len]` frame allocation.
+/// The raw-frame walk (via `cat` passthrough) rejects an oversized declared
+/// datasize before the frame-sized buffer is allocated.
 #[test]
 fn cat_rejects_oversized_datasize() {
     let dir = crate::common::test_scratch();
@@ -600,10 +591,10 @@ fn cat_rejects_oversized_datasize() {
     assert_datasize_too_big(&err, MAX_BLOB_DATASIZE);
 }
 
-/// `read_blob_header_only` (via `has_indexdata`) rejects an oversized declared
+/// The front probe (via `has_indexdata`) rejects an oversized declared
 /// datasize with the typed `DataSizeTooBig` before any body allocation. This is
-/// the one funnel consumer not exercised by the cat / inspect / BlobReader
-/// tests: `has_indexdata` walks blob headers with `read_blob_header_only` until
+/// the one route not exercised by the cat / inspect / BlobReader
+/// tests: `has_indexdata` walks blob headers, skipping payloads, until
 /// the first OSMData blob. The fixture is a valid header-only PBF (whose
 /// OsmHeader blob is walked past) followed by an adversarial OSMData frame, so
 /// the guard trips on that second header.

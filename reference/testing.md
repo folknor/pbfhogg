@@ -277,14 +277,26 @@ Lives in `brokkr verify`, not the in-tree test crate:
 - An in-tree `mod external` tier would duplicate brokkr's verify
   machinery and act as a gravity well.
 
-**One in-tree test is a migration candidate:**
-`cli/tests/cli_sort.rs::sort_cross_validate_osmium` - handcrafted
-overlapping-blob fixture; `brokkr verify sort` on a configured
-dataset runs against real data only and doesn't exercise the
-streaming sweep merge's overlap-run path. `brokkr verify
-<command> --input <path>` already accepts a handcrafted PBF; the
-missing piece is an overlapping-fixture builder under `examples/`,
-after which the comparison moves to `brokkr verify sort --input`.
+**In-tree osmium checks are migration candidates.** Each is
+`#[ignore = "external"]`, skips where osmium is absent, and exists
+because its handcrafted fixture reaches a path a dataset run does not:
+
+- `cli/tests/cli_sort.rs::sort_cross_validate_osmium` - overlapping-blob
+  fixture; `brokkr verify sort` on a configured dataset runs against
+  real data only and doesn't exercise the streaming sweep merge's
+  overlap-run path. `brokkr verify <command> --input <path>` already
+  accepts a handcrafted PBF; the missing piece is an overlapping-fixture
+  builder under `examples/`, after which the comparison moves to
+  `brokkr verify sort --input`.
+- `cli/tests/cli_digest.rs::osmium_reencodings_digest_equal` - pins the
+  encodings a real dataset run does not vary.
+- `cli/tests/cli_apply_changes_osmium.rs` - `apply-changes
+  --locations-on-ways` against osmium on a base and change file built so
+  that both tools' documented semantics coincide (osmium's location
+  index has ordering defects that decide its output otherwise; the
+  module doc lists the fixture rules). `brokkr verify` has no
+  `--locations-on-ways` path and takes OSC files only from the dataset
+  configuration, so it cannot run this fixture yet.
 
 **Escape hatch.** A contributor mid-PR can write an osmium check
 next to a fixture for the duration of that PR as

@@ -37,6 +37,7 @@ mod cli;
 mod cli_add_locations_to_ways;
 mod cli_apply_changes;
 mod cli_apply_changes_invariants;
+mod cli_apply_changes_osmium;
 mod cli_cat;
 mod cli_check_index;
 mod cli_check_locations;

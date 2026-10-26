@@ -12,15 +12,17 @@ converting callers.
 
 ## Background
 
-Both surfaces spawn a private rayon decode pool
-(`available_parallelism() - 2` threads) that decompresses and parses
-blobs into `PrimitiveBlock`s and delivers them in file order to a
+Both surfaces spawn a private rayon decode pool, sized by
+`host::sized_workers` from the `DECODE_WORKERS_*` tunables in
+`src/tunables.rs` (host parallelism minus a reserve, with a floor and a
+fallback), unless the caller sets a thread count. It decompresses and
+parses blobs into `PrimitiveBlock`s and delivers them in file order to a
 consumer serialized on the calling thread.
 
 **Plain** (`into_blocks_pipelined` and friends): the decode pool
 produces `PrimitiveBlock`s and the consumer processes them directly.
-Callers today are the `read` bench, `time-filter` history, and
-`build-geocode-index` pass 1.
+Callers today are the `read` bench's pipelined mode, `time-filter`
+history, and `build-geocode-index` pass 1.
 
 **Fused** (`for_each_fused_block`, landed 2026-07-12, ADR-0009 in
 `decisions/0009-fused-command-transforms.md`): the per-block command
@@ -29,7 +31,7 @@ same thread - and only the compact `(Vec<OwnedBlock>, stats)` result
 crosses to the ordered consumer. There is no second rayon dispatch and
 no 64-block materialization. The earlier shape that batch-dispatched
 decoded blocks to the **global** rayon pool via `par_iter` (~14 threads
-on an 8-core host) is gone; the four full-scan commands below carry
+on an 8-core host) is gone; the fused callers below carry
 their transform on the decode workers instead. Measured wins at high
 blob count: getid `--add-referenced` -7.7 %, getparents FullScan
 -6.5 %, tags-filter `-R` -7.0 % (planet-8k, 2026-07-12).
@@ -49,7 +51,8 @@ Alternative primitives used elsewhere in the codebase:
 **Retention is solved.** `DecompressPool` in `src/read/blob.rs`
 (commit `8f6999b`, 2026-03-30) recycles decompression buffers via
 `PooledBuffer::drop` instead of cross-thread freeing. The pool caps
-at 64 buffers × 4 MB retained capacity. Any new pipelined caller
+its buffer count and per-buffer retained capacity
+(`DECOMPRESS_POOL_*` in `src/tunables.rs`). Any new pipelined caller
 inherits this for free; no action needed.
 
 **Thread oversubscription is a known architectural concern** but
@@ -65,8 +68,9 @@ If the 4.7× regression didn't flip for the lightest workload
 heavier. Adding to the list of pipelined callers is fine; removing
 from it is not.
 
-**Admission is bounded.** The decode stage gates `rayon::spawn`
-behind `decode_ahead` tokens. A token is released only after the
+**Admission is bounded.** The decode stage gates spawning decode
+tasks (inside a rayon scope on the private decode pool) behind
+`decode_ahead` admission permits. A permit is released only after the
 decoded item is delivered from the reorder buffer, so queued,
 decoding, blocked-on-send, channel-held, and reorder-held items are
 capped together. `pipeline_reorder_high_water` records filled slots
@@ -131,6 +135,15 @@ the file.
     index or pre-resolved map, `add_way_with_locations`
   - Relations: full member collection + `BlockBuilder` write
 
+### `digest`
+
+- **Surface:** fused (`for_each_fused_blob`, with `DigestTransform`)
+- **Path:** `src/commands/digest.rs`
+- **Scale:** every blob; the transform sees every blob, not only
+  element blocks, and returns a per-blob summary
+- **Per-block work:** the summary is computed on the decode worker;
+  only the summary crosses to the ordered consumer, which absorbs it
+
 ### `time-filter` history path
 
 - **Surface:** plain (`for_each_pipelined`)
@@ -138,6 +151,13 @@ the file.
 - **Scale:** history PBF scan; every element touched
 - **Per-block work:** medium - timestamp compare, `PendingGroup`
   latest-version tracking, re-encode survivors through `BlockBuilder`
+
+### `read` bench, pipelined mode
+
+- **Surface:** plain (`for_each_pipelined`)
+- **Path:** `cli/src/lib.rs`, `BenchReadMode::Pipelined`
+- **Scale:** whole file; counts elements by kind
+- **Per-block work:** trivial
 
 ### `build-geocode-index` pass 1
 
@@ -200,7 +220,8 @@ Decision order:
    `(Vec<OwnedBlock>, stats)` result crosses to the ordered consumer -
    no second rayon pool, no 64-block materialization. This replaced the
    earlier decode-then-`par_iter` shape (see the four fused callers
-   above).
+   above). A transform that must also see non-element blobs uses
+`for_each_fused_blob`.
 
 Do not convert an existing pipelined caller to sequential decode
 "to avoid oversubscription" without a fresh benchmark showing the

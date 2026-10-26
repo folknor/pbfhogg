@@ -411,11 +411,13 @@ pub(super) fn drain_permits(rx: &Receiver<()>, executor: &crate::host::Executor)
 /// Build a fresh permit pool pre-filled with `PIPELINE_DISPATCH_PERMITS`
 /// tokens. Called during pipelined-writer construction to seed the
 /// counting semaphore.
+#[expect(
+    clippy::expect_used,
+    reason = "the first N sends on a fresh channel of capacity N, whose receiver is held here, cannot fail or block"
+)]
 fn new_permit_pool() -> (SyncSender<()>, Receiver<()>) {
     let (permit_tx, permit_rx) = sync_channel::<()>(PIPELINE_DISPATCH_PERMITS);
     for _ in 0..PIPELINE_DISPATCH_PERMITS {
-        // `send` on a fresh channel with capacity = N can't fail or block
-        // for the first N sends. unwrap is sound here.
         permit_tx
             .send(())
             .expect("seeding permit pool on fresh channel");

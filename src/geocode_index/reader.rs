@@ -1301,6 +1301,10 @@ impl Reader {
         self.admin_polygons.table().get(index as usize)
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "Reader::open validated every string offset a query can reach"
+    )]
     fn read_string(&self, offset: u32) -> &str {
         // Open validates all referenced strings. The builder publishes separate
         // inodes, so refreshes preserve this invariant for existing mappings.

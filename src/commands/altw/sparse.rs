@@ -184,11 +184,12 @@ impl<'a> SharedSparseWriter<'a> {
     fn insert(&self, node_id: i64, rank: u64, lat: i32, lon: i32) -> crate::error::Result<()> {
         let packed =
             pack(lat, lon).ok_or_else(|| super::node_coordinate_domain_error(node_id, lat, lon))?;
+        // A broken invariant, not a refusal: the rank comes from the IdSet
+        // the store was sized from. Dropping the coordinate instead would
+        // silently turn a missing location into a (0, 0) way vertex.
         let slot = self.slots.get(rank as usize).unwrap_or_else(|| {
             panic!(
-                "sparse index rank {rank} is outside the {} slot store built from \
-                 the same IdSet that produced it; dropping this coordinate would \
-                 silently turn a missing location into a (0, 0) way vertex",
+                "sparse index rank {rank} is outside the {} slot store",
                 self.slots.len()
             )
         });

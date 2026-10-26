@@ -49,6 +49,7 @@ cast_sign_loss = "deny"
 cast_possible_truncation = "deny"
 cast_possible_wrap = "deny"
 unwrap_used = "deny"
+expect_used = "deny"
 too_many_lines = "deny"
 # Configured in clippy.toml and enabled only where the output choke point is
 # the rule: src/commands/mod.rs and cli/src/lib.rs deny it at module level.

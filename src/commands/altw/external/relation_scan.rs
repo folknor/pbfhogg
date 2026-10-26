@@ -65,10 +65,9 @@ pub(super) fn collect_relation_member_ids_indexed(
         )
         .map_err(locate)?;
         super::super::relation_member_ids(&block, want_nodes, want_ways, |way, id| {
-            if way {
-                way_ids.as_mut().expect("requested").set(id);
-            } else {
-                node_ids.as_mut().expect("requested").set(id);
+            // A kind that was not requested has no set and nothing to record.
+            if let Some(set) = if way { &mut way_ids } else { &mut node_ids } {
+                set.set(id);
             }
         });
     }

@@ -2980,6 +2980,10 @@ pub fn run() -> process::ExitCode {
                         &host,
                     )
                 } else {
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "clap requires the file unless a subcommand is given (required = true with subcommand_negates_reqs)"
+                    )]
                     let file = file.expect("clap requires a file without an inspect subcommand");
                     if let Some(show_id) = show {
                         return accept_outcome(

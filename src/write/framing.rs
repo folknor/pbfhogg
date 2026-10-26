@@ -426,21 +426,21 @@ fn encode_blob_body(
             compress_zlib(uncompressed, *level, scratch)?;
         }
         Compression::Zstd(level) => {
-            match &scratch.zstd_compressor {
-                Some((cached_level, _)) if *cached_level == *level => {}
-                _ => {
-                    // Built lazily, per worker, on its first zstd blob. A
-                    // parsed `Compression` (the CLI's argument boundary) has
-                    // its level range-checked already, so from the CLI a
-                    // failure here is a resource failure (zstd could not
-                    // allocate its context), not a configuration error found
-                    // late; only a library caller building
-                    // `Compression::Zstd` by hand can reach it with a bad
-                    // level.
-                    scratch.zstd_compressor = Some((*level, zstd::bulk::Compressor::new(*level)?));
+            let compressor = match &mut scratch.zstd_compressor {
+                Some((cached_level, compressor)) if *cached_level == *level => compressor,
+                // Built lazily, per worker, on its first zstd blob. A parsed
+                // `Compression` (the CLI's argument boundary) has its level
+                // range-checked already, so from the CLI a failure here is a
+                // resource failure (zstd could not allocate its context), not
+                // a configuration error found late; only a library caller
+                // building `Compression::Zstd` by hand can reach it with a
+                // bad level. Built before it replaces the cached one, so a
+                // failure leaves that one in place.
+                slot => {
+                    let built = zstd::bulk::Compressor::new(*level)?;
+                    &mut slot.insert((*level, built)).1
                 }
-            }
-            let (_, compressor) = scratch.zstd_compressor.as_mut().expect("just initialized");
+            };
             let bound = zstd::zstd_safe::compress_bound(uncompressed.len());
             scratch.compress_buf.clear();
             scratch.compress_buf.reserve(bound);
@@ -466,14 +466,14 @@ fn encode_blob_body(
 
 /// Zlib compression via reusable `flate2::Compress` with `reset()`.
 fn compress_zlib(uncompressed: &[u8], level: u32, scratch: &mut FrameScratch) -> Result<()> {
-    let needs_new = match &scratch.zlib_compressor {
-        Some((cached_level, _)) => *cached_level != level,
-        None => true,
+    let compressor = match &mut scratch.zlib_compressor {
+        Some((cached_level, compressor)) if *cached_level == level => compressor,
+        slot => {
+            &mut slot
+                .insert((level, Compress::new(FlateCompression::new(level), true)))
+                .1
+        }
     };
-    if needs_new {
-        scratch.zlib_compressor = Some((level, Compress::new(FlateCompression::new(level), true)));
-    }
-    let (_, compressor) = scratch.zlib_compressor.as_mut().expect("just initialized");
     scratch.compress_buf.clear();
     // Zlib worst-case bound: input + ~0.1% + header/trailer.
     scratch.compress_buf.reserve(

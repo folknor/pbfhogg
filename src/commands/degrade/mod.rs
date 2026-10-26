@@ -811,8 +811,14 @@ impl UnsortKindState {
         self.held.is_none() && !self.fired && self.seen + 1 == self.hold_at
     }
 
-    fn should_inject_after(&self) -> bool {
-        self.held.is_some() && self.seen == self.hold_at
+    /// The held element, taken, once the element after which it goes back
+    /// in has arrived; `None` otherwise.
+    fn take_due(&mut self) -> Option<OwnedElement> {
+        if self.seen == self.hold_at {
+            self.held.take()
+        } else {
+            None
+        }
     }
 }
 
@@ -1440,9 +1446,8 @@ fn feed_tail_unsort(
                 if unsort.should_hold() {
                     unsort.held = Some(OwnedElement::Node(n));
                     unsort.seen += 1;
-                } else if unsort.should_inject_after() {
+                } else if let Some(held) = unsort.take_due() {
                     crate::owned::write_single_node_local(&n, bb, output)?;
-                    let held = unsort.held.take().expect("checked");
                     write_owned_to_central(&held, bb, output)?;
                     unsort.fired = true;
                     unsort.seen += 1;
@@ -1457,9 +1462,8 @@ fn feed_tail_unsort(
                 if unsort.should_hold() {
                     unsort.held = Some(OwnedElement::Way(w));
                     unsort.seen += 1;
-                } else if unsort.should_inject_after() {
+                } else if let Some(held) = unsort.take_due() {
                     crate::owned::write_single_way_local(&w, bb, output)?;
-                    let held = unsort.held.take().expect("checked");
                     write_owned_to_central(&held, bb, output)?;
                     unsort.fired = true;
                     unsort.seen += 1;
@@ -1474,9 +1478,8 @@ fn feed_tail_unsort(
                 if unsort.should_hold() {
                     unsort.held = Some(OwnedElement::Relation(r));
                     unsort.seen += 1;
-                } else if unsort.should_inject_after() {
+                } else if let Some(held) = unsort.take_due() {
                     crate::owned::write_single_relation_local(&r, bb, output)?;
-                    let held = unsort.held.take().expect("checked");
                     write_owned_to_central(&held, bb, output)?;
                     unsort.fired = true;
                     unsort.seen += 1;
@@ -1630,10 +1633,10 @@ mod tests {
         };
         let mut state = super::UnsortKindState::new(flags, usize::MAX);
         assert!(!state.should_hold());
-        assert!(!state.should_inject_after());
+        assert!(state.take_due().is_none());
         state.seen = 1;
         assert!(!state.should_hold());
-        assert!(!state.should_inject_after());
+        assert!(state.take_due().is_none());
     }
 
     fn select(keys: impl IntoIterator<Item = DropKey>, n: u64) -> Vec<DropKey> {

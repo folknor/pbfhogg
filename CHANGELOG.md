@@ -1182,6 +1182,14 @@
 
 ### Fixed
 
+- **`add-locations-to-ways --index-type external` reports a scratch-file
+  creation failure instead of panicking.** When a stage-1 worker failed to
+  create one of its id-shard scratch files partway through (out of
+  descriptors or disk), it could go on to the next way blob with only some of
+  its shard files open and panic indexing a missing one, so the run died
+  with a panic rather than the I/O error. The worker now opens its shard
+  files all or nothing, and the run fails with the error naming the file.
+
 - **A corrupt dense node group is refused instead of silently losing
   nodes.** `add-locations-to-ways` (both index types), `extract --strategy
   simple` and `apply-changes --locations-on-ways` read node coordinates

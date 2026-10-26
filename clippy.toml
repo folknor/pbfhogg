@@ -1,3 +1,18 @@
+# `clippy::expect_used` is denied workspace-wide (Cargo.toml): an `expect` in
+# shipped code is a panic where a refusal may have been owed. Each remaining
+# one carries `#[expect(clippy::expect_used, reason = "...")]` saying why it
+# cannot fire. Tests are exempt here; clippy recognises only `#[test]`
+# functions and `#[cfg(test)]` modules, so the integration-test crates
+# (`tests/all.rs`, `cli/tests/all.rs`, `tests/process_nofile.rs`) allow it at
+# their root.
+#
+# The other enforcement levers (`disallowed-types`, `disallowed-macros`,
+# `panic`, `unreachable`, `arithmetic_side_effects`, `exit`,
+# `allow_attributes_without_reason`) are deliberately off. Each arrives with
+# the piece of work that needs it, scoped to what that work fixes, never as a
+# crate-wide sweep of its own.
+allow-expect-in-tests = true
+
 # Methods that write, or open for reading, a file by path, and the raw libc
 # byte-moving syscalls (see their group below). The lint is off workspace-wide
 # (`disallowed_methods = "allow"` in Cargo.toml) and denied by crate attribute in
@@ -61,6 +76,7 @@ disallowed-methods = [
     { path = "libc::write", reason = "use std::fs::File's Write, which issues the same write(2)" },
     # Page-cache advice has one owner, `crate::fadvise::advise`, which handles
     # the off_t range, the platform gate and the failure counter once.
-    { path = "libc::posix_fadvise", reason = "page-cache advice goes through crate::fadvise::advise" },    { path = "std::process::id", reason = "scratch is named by its run directory, not by pid" },
+    { path = "libc::posix_fadvise", reason = "page-cache advice goes through crate::fadvise::advise" },
+    { path = "std::process::id", reason = "scratch is named by its run directory, not by pid" },
     { path = "std::env::temp_dir", reason = "scratch goes where the caller put the run directory" },
 ]

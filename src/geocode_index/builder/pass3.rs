@@ -295,18 +295,6 @@ fn bucket_for_cell(cell_id: u64) -> usize {
     (cell_id >> 56) as usize
 }
 
-/// Ensure bucket writer exists, creating the file lazily.
-fn ensure_bucket_writer(
-    writers: &mut [Option<BufWriter<std::fs::File>>],
-    bucket: usize,
-    bucket_dir: &Path,
-) -> Result<()> {
-    if writers[bucket].is_none() {
-        writers[bucket] = Some(super::create_data_file(&bucket_path(bucket_dir, bucket))?);
-    }
-    Ok(())
-}
-
 fn bucket_path(bucket_dir: &Path, bucket: usize) -> std::path::PathBuf {
     bucket_dir.join(format!("{bucket:03}"))
 }
@@ -329,10 +317,11 @@ fn write_bucket_record(
     record: BucketRecord,
 ) -> Result<()> {
     let bucket = bucket_for_cell(record.cell_id);
-    ensure_bucket_writer(writers, bucket, bucket_dir)?;
-    writers[bucket]
-        .as_mut()
-        .expect("ensured")
+    let writer = match &mut writers[bucket] {
+        Some(writer) => writer,
+        slot => slot.insert(super::create_data_file(&bucket_path(bucket_dir, bucket))?),
+    };
+    writer
         .write_all(&record.to_bytes())
         .map_err(|e| bucket_write_error(e, bucket_dir, bucket))
 }
@@ -569,6 +558,10 @@ pub(super) fn bucketed_cell_assignment_fused(
     while chunk_start < addr_count {
         cancel.check()?;
         let chunk_end = (chunk_start + GEOCODE_ADDR_CHUNK).min(addr_count);
+        #[expect(
+            clippy::expect_used,
+            reason = "every index is below addr_point_count, a u32"
+        )]
         let addr_entries: Vec<(u64, u64, u32)> = executor.install(|| {
             (chunk_start..chunk_end)
                 .into_par_iter()
@@ -633,6 +626,10 @@ pub(super) fn bucketed_cell_assignment_fused(
                             first_missing_interp.fetch_min(way_idx, AtomicOrdering::Relaxed);
                             return out.into_iter();
                         };
+                        #[expect(
+                            clippy::expect_used,
+                            reason = "Pass 2 refuses an interpolation-way count over u32::MAX"
+                        )]
                         let way_index = u32::try_from(way_idx)
                             .expect("interpolation count checked before cell assignment");
                         out.reserve(nodes.len() * 2);
@@ -983,6 +980,11 @@ fn admin_cells_for_polygon(
     if ext_f64.len() < 3 {
         return Vec::new();
     }
+    #[expect(
+        clippy::expect_used,
+        reason = "the builder refuses an admin-polygon count over u32::MAX before cell assignment"
+    )]
+    let poly_index = u32::try_from(poly_idx).expect("admin count checked before cell assignment");
 
     let hole_slices: Vec<&[(f64, f64)]> = hole_rings.iter().map(Vec::as_slice).collect();
 
@@ -1014,8 +1016,7 @@ fn admin_cells_for_polygon(
         .iter()
         .map(|&cid| AdminCellEntry {
             cell_id: cid,
-            poly_index: u32::try_from(poly_idx)
-                .expect("admin count checked before cell assignment"),
+            poly_index,
             is_interior: false,
         })
         .collect();
@@ -1058,8 +1059,7 @@ fn admin_cells_for_polygon(
         ) {
             entries.push(AdminCellEntry {
                 cell_id: cell.0,
-                poly_index: u32::try_from(poly_idx)
-                    .expect("admin count checked before cell assignment"),
+                poly_index,
                 is_interior: true,
             });
             for n in cell.all_neighbors(admin_level as u64) {

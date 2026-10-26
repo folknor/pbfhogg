@@ -616,8 +616,10 @@ fn assemble_rings_search(
             chosen_segment: Option<usize>,
             ring_len_before: usize,
         }
-        let candidates = endpoint_map
-            .get(ring.last().expect("nonempty ring"))
+        // The ring so far is the start segment, so it ends where that does.
+        let candidates = segments[start_idx]
+            .last()
+            .and_then(|end| endpoint_map.get(end))
             .map(Vec::as_slice)
             .unwrap_or_default();
         let mut search = vec![SearchFrame {
@@ -627,7 +629,7 @@ fn assemble_rings_search(
             ring_len_before: ring.len(),
         }];
 
-        while !search.is_empty() {
+        while let Some(frame) = search.last_mut() {
             let current_end = ring[ring.len() - 1];
 
             // Ring is closed
@@ -635,17 +637,16 @@ fn assemble_rings_search(
                 break;
             }
 
-            let frame = search.last_mut().expect("search is nonempty");
             let next = frame.candidates[frame.next_candidate..]
                 .iter()
                 .position(|&idx| !used[idx])
                 .map(|offset| frame.next_candidate + offset);
             let Some(candidate_pos) = next else {
-                let exhausted = search.pop().expect("search is nonempty");
-                if let Some(segment_idx) = exhausted.chosen_segment {
+                if let Some(segment_idx) = frame.chosen_segment {
                     used[segment_idx] = false;
-                    ring.truncate(exhausted.ring_len_before);
+                    ring.truncate(frame.ring_len_before);
                 }
+                search.pop();
                 continue;
             };
             frame.next_candidate = candidate_pos + 1;
@@ -666,20 +667,21 @@ fn assemble_rings_search(
             let seg_start = seg[0];
             let seg_end = seg[seg.len() - 1];
 
-            if seg_start == current_end {
+            // The new ring end: the far end of the appended segment.
+            let new_end = if seg_start == current_end {
                 // Append forward (skip first point, it's the shared endpoint)
                 ring.extend_from_slice(&seg[1..]);
+                seg_end
             } else if seg_end == current_end {
                 // Append reversed (skip last point, it's the shared endpoint)
-                for &pt in seg[..seg.len() - 1].iter().rev() {
-                    ring.push(pt);
-                }
+                ring.extend(seg[..seg.len() - 1].iter().rev());
+                seg_start
             } else {
                 used[next_idx] = false;
                 continue;
-            }
+            };
             let candidates = endpoint_map
-                .get(ring.last().expect("nonempty ring"))
+                .get(&new_end)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             search.push(SearchFrame {

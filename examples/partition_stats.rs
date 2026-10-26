@@ -42,7 +42,7 @@ struct BlobStats {
     bitmaps: Vec<u64>,
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
         eprintln!("Usage: partition_stats <input.osm.pbf>");
@@ -52,9 +52,7 @@ fn main() {
 
     eprintln!("Scanning way blobs in {}...", input.display());
 
-    let reader = ElementReader::open(input, false)
-        .expect("failed to open PBF")
-        .with_blob_filter(BlobFilter::only_ways());
+    let reader = ElementReader::open(input, false)?.with_blob_filter(BlobFilter::only_ways());
 
     let mut blobs: Vec<BlobStats> = Vec::new();
     let mut current_blob_refs: Vec<i64> = Vec::new();
@@ -63,7 +61,7 @@ fn main() {
     // We need per-blob granularity. Use into_blocks_pipelined and treat each
     // PrimitiveBlock as one blob (which it is - one blob = one block).
     for block in reader.into_blocks_pipelined() {
-        let block = block.expect("failed to read block");
+        let block = block?;
         current_blob_refs.clear();
 
         for element in block.elements_skip_metadata() {
@@ -242,4 +240,5 @@ fn main() {
             bitmap_single.saturating_sub(minmax_single),
         );
     }
+    Ok(())
 }

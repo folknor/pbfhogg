@@ -654,6 +654,10 @@ impl<'a, T: Record> Table<'a, T> {
     }
 
     #[inline]
+    #[expect(
+        clippy::expect_used,
+        reason = "chunks_exact yields SIZE bytes, and Record::read is None only for any other length"
+    )]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = T> + 'a {
         self.bytes
             .chunks_exact(T::SIZE)

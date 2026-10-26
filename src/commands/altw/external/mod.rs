@@ -503,6 +503,10 @@ impl IdRecord {
             .copy_from_slice(&self.blob_local_slot.to_le_bytes());
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "each field is a four-byte subslice of a fixed-size record, so the conversion to [u8; 4] cannot fail"
+    )]
     pub(super) fn read_from(buf: &[u8; ID_RECORD_SIZE]) -> Self {
         let local_node_id = u32::from_le_bytes(
             buf[ID_OFF_LOCAL_NODE_ID..][..ID_W_LOCAL_NODE_ID]

@@ -1015,10 +1015,15 @@ pub(crate) fn collect_relation_member_ids(
         },
         |_seq, ids| {
             for (way, id) in ids {
-                if way {
-                    member_way_ids.as_mut().expect("requested").set(id);
+                // A kind that was not requested has no set and nothing to
+                // record.
+                let set = if way {
+                    &mut member_way_ids
                 } else {
-                    member_node_ids.as_mut().expect("requested").set(id);
+                    &mut member_node_ids
+                };
+                if let Some(set) = set {
+                    set.set(id);
                 }
             }
         },

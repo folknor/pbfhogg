@@ -931,6 +931,10 @@ impl BlockBuilder {
     // and add integer decoding to the byte-oriented structural validation.
     // Retain that policy rather than add incomplete per-element validation.
     #[cfg(debug_assertions)]
+    #[expect(
+        clippy::expect_used,
+        reason = "the raw bytes come from a PrimitiveBlock, whose construction checked packed varints and Info structurally; the string bounds asserted below are not checked there (see above)"
+    )]
     fn debug_assert_raw_strings(
         &self,
         keys: &[u8],

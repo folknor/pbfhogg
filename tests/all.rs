@@ -27,6 +27,14 @@
 //! fault reaches only the run that armed it. The `fault_*` modules exist only
 //! under `test-hooks`.
 
+// `allow-expect-in-tests` (clippy.toml) exempts only `#[test]` functions and
+// `#[cfg(test)]` modules, not the helpers of an integration-test crate, which
+// is test code throughout.
+#![allow(
+    clippy::expect_used,
+    reason = "an integration-test crate; a failed expect is a test failure"
+)]
+
 mod common;
 
 // Gated on `commands` because they reach modules that feature gates

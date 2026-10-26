@@ -14,18 +14,30 @@ use super::interner::{StringInterner, arena_invariant_broken};
 // ---------------------------------------------------------------------------
 
 #[inline]
+#[expect(
+    clippy::expect_used,
+    reason = "the subslice is exactly the array's width, so the conversion cannot fail"
+)]
 fn read_i64_le(data: &[u8], offset: usize) -> i64 {
     let bytes: [u8; 8] = data[offset..offset + 8].try_into().expect("slice length");
     i64::from_le_bytes(bytes)
 }
 
 #[inline]
+#[expect(
+    clippy::expect_used,
+    reason = "the subslice is exactly the array's width, so the conversion cannot fail"
+)]
 fn read_i32_le(data: &[u8], offset: usize) -> i32 {
     let bytes: [u8; 4] = data[offset..offset + 4].try_into().expect("slice length");
     i32::from_le_bytes(bytes)
 }
 
 #[inline]
+#[expect(
+    clippy::expect_used,
+    reason = "the subslice is exactly the array's width, so the conversion cannot fail"
+)]
 fn read_u32_le(data: &[u8], offset: usize) -> u32 {
     let bytes: [u8; 4] = data[offset..offset + 4].try_into().expect("slice length");
     u32::from_le_bytes(bytes)

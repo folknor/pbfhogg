@@ -21,6 +21,14 @@
 //! `common` is the library package's `tests/common`, mounted by path, so its
 //! `cfg(feature = ...)` gates read this package's features (the same names).
 
+// `allow-expect-in-tests` (clippy.toml) exempts only `#[test]` functions and
+// `#[cfg(test)]` modules, not the helpers of an integration-test crate, which
+// is test code throughout.
+#![allow(
+    clippy::expect_used,
+    reason = "an integration-test crate; a failed expect is a test failure"
+)]
+
 #[path = "../../tests/common/mod.rs"]
 mod common;
 mod invoker;

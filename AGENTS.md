@@ -182,7 +182,7 @@ CLI-driven integration tests live in the `pbfhogg-cli` package, `cli/tests/cli_*
 ## Conventions
 - Library code never mutates process state, reads the environment or writes stderr; see ADR-0016.
 - Performance numbers in markdown must include commit hash and hostname. Results auto-stored in `.brokkr/results.db`.
-- Strict clippy: `unwrap_used = "deny"`, `cognitive_complexity = "deny"`.
+- Strict clippy: `unwrap_used = "deny"`, `expect_used = "deny"` (tests exempt; a production `expect` carries `#[expect(clippy::expect_used, reason = "...")]` saying why it cannot fire - see `clippy.toml`), `cognitive_complexity = "deny"`.
 - Tunables (sizes, depths, worker counts and caps, channel and reorder capacities, timeouts, thresholds, geocode policy values) live in `src/tunables.rs`, grouped by scope with their rationale. A new tunable goes there, not in a local `const` or an inline literal. Format and protocol constants (field numbers, record layouts, spec limits) stay with the code that owns the format.
 - Coordinates: decimicrodegrees (10^-7 degrees) for node I/O.
 - Tests never read downloaded datasets (Denmark, planet, OSC diffs) - every test builds its own input in scratch, and the suite must pass with an empty `data/`. Real-data coverage belongs to `brokkr verify` and `brokkr bench`.

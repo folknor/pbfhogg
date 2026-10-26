@@ -111,6 +111,10 @@ fn pool_offset(current: usize, string_len: usize) -> Option<u32> {
 }
 
 /// Read a null-terminated string from the pool by offset.
+#[expect(
+    clippy::expect_used,
+    reason = "offsets come from this pool's own inserts of &str values, each NUL-terminated, so the read is valid UTF-8 up to a NUL"
+)]
 pub(super) fn read_string_from_pool(pool: &StringPool, offset: u32) -> &str {
     super::super::format::read_nul_string(&pool.data, offset)
         .expect("StringPool only contains NUL-terminated UTF-8 strings")

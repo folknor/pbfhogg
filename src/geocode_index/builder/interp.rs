@@ -36,6 +36,10 @@ struct CellAddrCsr {
     values: Vec<u32>,
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "Pass 2 refuses an address-point count over u32::MAX, and the CSR holds one value per address point"
+)]
 fn csr_offset(len: usize) -> u32 {
     u32::try_from(len)
         .expect("address CSR cannot exceed the u32 address-point count encoded by the index format")
@@ -69,6 +73,10 @@ fn build_cell_addr_csr(
     // hold ~2x the pair buffer. Every addr point projects to exactly one pair,
     // so no filter is needed. This also avoids the reverted fold/reduce hashmap
     // merge (commit 363c579) whose per-worker map union regressed the build.
+    #[expect(
+        clippy::expect_used,
+        reason = "every index is below Table::len, and Pass 2 refuses an address-point count over u32::MAX"
+    )]
     let mut pairs: Vec<(u64, u32)> = executor.install(|| {
         (0..addr_points.len())
             .into_par_iter()

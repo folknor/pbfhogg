@@ -205,9 +205,12 @@ pub(super) fn stage1_pass_a(
                     let mut group_starts: Vec<(usize, usize)> = Vec::new();
                     // Lazy-initialised on first blob so creation errors
                     // flow into the per-blob IIFE result and propagate
-                    // through the existing tx/rx channel.
-                    let mut id_shard_writers: Vec<Option<BufWriter<TimedShardWriter<'_>>>> =
-                        Vec::new();
+                    // through the existing tx/rx channel. All or nothing:
+                    // the set is built aside and installed whole, because a
+                    // worker that sent a creation error still claims blobs
+                    // until the consumer drops the receiver, and a partial
+                    // set would be indexed past its end on the next one.
+                    let mut id_shard_writers: Vec<BufWriter<TimedShardWriter<'_>>> = Vec::new();
                     let mut id_rec_buf = [0u8; ID_RECORD_SIZE];
                     let mut id_bucket_local_counts: Vec<u64> = vec![0; NUM_BUCKETS];
 
@@ -280,7 +283,7 @@ pub(super) fn stage1_pass_a(
                             // and stage 4 fills zero coordinates.
                             let t_id = crate::counters::Stopwatch::start();
                             if id_shard_writers.is_empty() {
-                                id_shard_writers.reserve(NUM_BUCKETS);
+                                let mut fresh = Vec::with_capacity(NUM_BUCKETS);
                                 for bucket_idx in 0..NUM_BUCKETS {
                                     let path = super::radix::id_shard_path(
                                         scratch_ref,
@@ -291,14 +294,15 @@ pub(super) fn stage1_pass_a(
                                         Error::from(e)
                                             .context(format!("create id shard {}", path.display()))
                                     })?;
-                                    id_shard_writers.push(Some(BufWriter::with_capacity(
+                                    fresh.push(BufWriter::with_capacity(
                                         BUCKET_BUF_SIZE,
                                         TimedShardWriter {
                                             file: f,
                                             counters: counters_ref,
                                         },
-                                    )));
+                                    ));
                                 }
+                                id_shard_writers = fresh;
                             }
                             let mut blob_emitted: u64 = 0;
                             let mut blob_skipped: u64 = 0;
@@ -327,12 +331,17 @@ pub(super) fn stage1_pass_a(
                                         blob_local_slot,
                                     };
                                     rec.write_to(&mut id_rec_buf);
-                                    let writer = id_shard_writers[bucket_idx]
-                                        .as_mut()
-                                        .expect("shard writer initialised");
-                                    writer.write_all(&id_rec_buf).map_err(|e| {
-                                        shard_error(e, "write", scratch_ref, worker_id, bucket_idx)
-                                    })?;
+                                    id_shard_writers[bucket_idx]
+                                        .write_all(&id_rec_buf)
+                                        .map_err(|e| {
+                                            shard_error(
+                                                e,
+                                                "write",
+                                                scratch_ref,
+                                                worker_id,
+                                                bucket_idx,
+                                            )
+                                        })?;
                                     id_bucket_local_counts[bucket_idx] += 1;
                                     blob_emitted += 1;
                                     blob_bytes += ID_RECORD_SIZE as u64;
@@ -365,11 +374,10 @@ pub(super) fn stage1_pass_a(
                     // the shared mutex; the orchestrator checks after
                     // the scope joins.
                     for (bucket_idx, w) in id_shard_writers.iter_mut().enumerate() {
-                        let Some(w) = w else { continue };
                         if let Err(e) = w.flush() {
                             let mut slot = s1a_id_flush_err_ref
                                 .lock()
-                                .expect("id shard flush error mutex");
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if slot.is_none() {
                                 *slot = Some(shard_error(
                                     e,

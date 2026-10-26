@@ -1,6 +1,14 @@
 //! Own process: this test deliberately lowers its soft descriptor limit.
 //! The scenarios share that process-wide limit, so they run in sequence
 //! inside one test function rather than as concurrent libtest tests.
+
+// As in `tests/all.rs`: `allow-expect-in-tests` does not reach the helpers of
+// an integration-test crate.
+#![allow(
+    clippy::expect_used,
+    reason = "an integration-test crate; a failed expect is a test failure"
+)]
+
 mod common;
 
 fn external_join(

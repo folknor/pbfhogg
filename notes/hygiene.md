@@ -68,10 +68,7 @@ reverted, say why the new attempt differs. Prefer changes that leave the data
 flow and each stage's memory shape untouched. Anything that changes them
 goes on "Review once drained" as a bisect candidate, named by commit.
 
-Launch order, one agent per line, run serially:
-
-41. HYG-196
-42. HYG-077 (last: it annotates files across the crate)
+Launch order: every queued entry has run.
 
 Discussed and skipped for now: HYG-002, HYG-011, HYG-036, HYG-037, HYG-053,
 HYG-081, HYG-109, HYG-181, HYG-182. Not discussed yet: BUG-009 (the
@@ -1102,6 +1099,18 @@ The judgement calls already known, to be checked first:
   slots, as the map's length did. `ReorderBuffer::push` is now a panicking
   wrapper over `try_push` on every read and write pipeline's per-blob path:
   no allocation on success, machine code not compared.
+- `clippy::expect_used` is denied workspace-wide (sparred, not measured).
+  Most production `expect`s were annotated; some were removed by
+  restructuring on measured or output-defining paths: altw external stage
+  1's id-shard writers are built all-or-nothing and installed whole (a
+  `Vec<BufWriter>`, the `Option` wrapper gone; same 256 writers and buffers
+  per worker), fixing a creation error that could turn into an index panic
+  on the worker's next blob; the per-blob zstd and zlib compressor caches in
+  `write/framing.rs` use a guarded match with `Option::insert`;
+  `geo::assemble_rings_search` takes the new ring end from the appended
+  segment and loops `while let` over the search stack (argued
+  traversal-identical; geocode admin polygons depend on it); degrade's
+  unsort hold takes the held element before writing the arriving one.
 
 ---
 
@@ -1219,21 +1228,6 @@ catalogued; if it is done at all, it is done last.
 
 Reported by: altw and scanning, re-encoding, filtering and spatial, read path,
 geocode index.
-
-## HYG-196 - `reference/pipelined-reader-paths.md` has gone stale
-
-Anger: 2 - a reference doc, no code.
-
-`reference/` must be true, and three claims in this page no longer are
-(found by the HYG-010 resolution, commit `dd312160`): its Callers list omits
-digest, which now uses the fused path; its Background section says the
-decode pool uses `available_parallelism() - 2` threads, where the code now
-uses `sized_workers`; and "Admission is bounded" talks about gating
-`rayon::spawn`, where tasks are now spawned inside a scope. Check the whole
-page against the code, not only these three, and reword drifting specifics
-rather than hard-coding today's values.
-
-Reported by: the HYG-010 resolution.
 
 ## HYG-036 - `too_many_arguments` is denied and then allowed locally all over
 
@@ -1369,44 +1363,6 @@ with the reason), used by the OSC gzip writer, whose permit-bounded window
 and record-then-discard handling are a second precedent.
 
 Reported by: re-encoding, read path, filtering and spatial, altw and scanning.
-
-## HYG-077 - The enforcement levers most of these findings need are unused
-
-Anger: 8 - clippy.toml with expect_used denied means hundreds of edits.
-
-Recommendation (2026-10-25), agreed with the maintainer; runs last of the
-queue, since it annotates files across the crate. Record the
-levers-per-entry ruling below as a comment in `clippy.toml`, and bring
-the panics-where-a-refusal-was-owed lever: deny `clippy::expect_used`
-workspace-wide with `allow-expect-in-tests = true` in `clippy.toml`; every
-remaining production `expect` gets `#[expect(clippy::expect_used, reason =
-"...")]` saying why it is sound. That includes the sound invariants the
-2026-10-25 triage named: `geo::assemble_rings`' `.expect("nonempty ring")`
-and `.expect("search is nonempty")`, true by construction; `new_permit_pool`'s
-`.expect`; and `SparseArrayIndex::get` / `SharedSparseWriter::insert`, which
-assert on a rank outside the store (a real internal invariant) with
-paragraph-length messages to shorten. Most of the roughly 700 `.expect(` hits are in test
-modules, which the setting exempts. `panic`, `unreachable` and
-`arithmetic_side_effects` stay off. The entry is then resolved: the other
-levers arrive with their own entries.
-
-`clippy.toml` exists but carries only the filesystem choke points for
-output publication, run scratch and path-naming input opens (`disallowed-methods`, allowed
-workspace-wide and denied across the library and the CLI);
-`disallowed-types` and `disallowed-macros` are unused; `expect_used`,
-`arithmetic_side_effects`, `panic`, `unreachable` and `exit` are not enabled;
-`allow_attributes_without_reason` is not enabled, so `#[allow(dead_code)]` and
-the many `too_many_*` exemptions (HYG-036) need no justification; the existing
-`include_str!` source-scan tests in `write/metrics.rs` are the in-repo template
-for text rules. Every hunter independently pointed most of its "enforceable
-by" answers at one of these.
-
-`clippy::print_stdout` and `clippy::print_stderr` are denied in the library
-(a crate attribute in `src/lib.rs`, outside `cfg(test)`). Decided: every
-other lever waits for the entry that needs it and arrives with that work,
-not as a sweep.
-
-Reported by: all nine scopes.
 
 ## HYG-081 - The apply-changes node-to-way barrier is a three-party protocol held together by polling
 

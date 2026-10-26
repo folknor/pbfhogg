@@ -945,6 +945,18 @@
   deprecation cycle. Call `getparents`; the dispatch threshold is not a
   tuning knob.
 
+- **`SortStats` and `MergePbfStats` gain a public `blobs_omitted` field.**
+  Code that builds either struct with a literal must add it. The `sort`
+  and `cat --dedupe` summaries count physical blobs and report how many
+  empty blocks were omitted.
+
+- **`pbfhogg::debug::emit_counter` takes `impl CounterValue`.** The value
+  parameter was `i64`; it is now any sealed `CounterValue` (`i64`, `i32`,
+  `u32`, `u64`, `usize` and `bool`; `u64` and `usize` saturate at
+  `i64::MAX`). Callers passing an `i64`
+  compile unchanged; code that names the function's type, such as a
+  function pointer to it, must be updated.
+
 ### Added
 
 - **`apply-changes -j 1` runs.** It used to be refused as an unvalidated
@@ -1213,8 +1225,7 @@
   a `Note:`; a malformed payload reports its real error at its frame. An
   unindexed blob copied through now carries scanned tagdata beside its
   scanned indexdata, so the output is indexed as plain `cat`'s is. The
-  summaries count physical blobs and gain an "N omitted" clause; library
-  `SortStats` and `MergePbfStats` gain `blobs_omitted`.
+  summaries count physical blobs and gain an "N omitted" clause.
 
 - **`sort` no longer copies indexdata it found false.** Under a header
   without `Sort.Type_then_ID` it decodes every blob to check its order, but

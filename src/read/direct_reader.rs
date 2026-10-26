@@ -120,9 +120,9 @@ pub struct DirectReader {
     file_len: u64,
     /// Where `fill` stops without a syscall: `file_len` for a regular file,
     /// whose last read there would only re-read the final partial block to
-    /// learn it is at the end, and unbounded otherwise, because a block
-    /// device's metadata length is zero whatever its capacity and its reads
-    /// must still reach the device.
+    /// learn it is at the end, and unbounded otherwise (a non-regular
+    /// file's metadata length says nothing about how much it serves). Block
+    /// devices are not supported: input pinning refuses them.
     read_limit: u64,
     /// The file offset just past the data in `buf`, possibly unaligned after
     /// a short transfer. Advanced by every successful fill and set by every

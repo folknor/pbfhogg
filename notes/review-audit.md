@@ -389,7 +389,7 @@ The check commit's CLI env-var replacement hooks are inside `#[cfg(feature = "te
 ### For you to rule on
 
 1. **Streams refused on single-read routes:** the time-filter history route, tags-filter `-R` with invert or distrust, and any two-check `check` run. These used to read a FIFO or `/dev/stdin` and now refuse it.
-   - **Ruled 2026-10-26, work pending:** keep refusing; inputs are regular files in every mode. Reword the refusal, which says "this command reads its input more than once" (false on these routes), to say the command needs a regular file and to write the stream to one first.
+   - **Ruled 2026-10-26, done:** both copies in `src/read/input.rs` now say the command needs a regular file and to write the stream to one first; the tests pin the unchanged "not a regular file" prefix. Keep refusing; inputs are regular files in every mode. Reword the refusal, which says "this command reads its input more than once" (false on these routes), to say the command needs a regular file and to write the stream to one first.
 2. **Block devices refused** on every pinning command. `DirectReader` deliberately supports them (its `read_limit` doc), and a single-read route could read one. The refusal message also says "this command reads its input more than once", which is misleading on those routes.
 3. **cat's fd admission** for library callers (above).
 4. **API consistency:** about a dozen entries now take `impl Into<InputSource>`, while `sort`, `tags_filter`, `add_locations_to_ways`, `extract`, `cat` and `merge` still take `&Path`. Callers passing `&&Path`, `&Box<Path>` or `&Cow<Path>` lose deref coercion. The CHANGELOG records this, which is acceptable for 0.6.0, but the two styles are now mixed.
@@ -1100,7 +1100,9 @@ maintainer accepted:
 
 - Block devices: keep refusing at pinning (`st_size` is 0). Close bz
   pbfhogg#19 as unreachable and drop the block-device claim from
-  `DirectReader::read_limit`'s doc.
+  `DirectReader::read_limit`'s doc. **Done:** doc reworded (the
+  unbounded non-regular branch stays, it is not block-device-only); bz
+  pbfhogg#19 closed; the refusal text now names devices generally.
 - cat's fd admission for library callers: reopened, because the release
   is gated on library use. Plain cat now pins every input for the whole
   run and refuses up front past the fd allowance; the CLI raises its soft
@@ -1111,7 +1113,8 @@ maintainer accepted:
   caller on the `Host`. Undecided.
 - `pbfhogg::debug::emit_counter` changed its public signature to
   `impl CounterValue` (`9dcf53a7`); source-compatible for `i64` callers
-  but a library-surface change missing from the CHANGELOG. Add the entry.
+  but a library-surface change missing from the CHANGELOG. Add the entry. **Done:** under Breaking, beside
+  the `SortStats` and `MergePbfStats` field additions moved there from Fixed.
 - `8384fa29` kept `PIPELINE_METRICS` process-global on the ground that
   "each production command does at most one pipelined read". That holds
   per CLI process and fails for a library caller making several calls.

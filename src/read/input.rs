@@ -332,9 +332,9 @@ impl PinnedInput {
         let kind = meta.file_type();
         if !kind.is_file() {
             return Err(Error::invalid_argument(format!(
-                "{} is not a regular file: this command reads its input more than once, \
-                 which needs one that serves the same bytes to every open (a block device \
-                 is refused too, its size is not known to the header walker)",
+                "{} is not a regular file: this command needs a regular file as input \
+                 (a FIFO, /dev/stdin, a socket or a device will not do); write the \
+                 stream to a file first and pass that",
                 path.display()
             )));
         }
@@ -361,8 +361,9 @@ impl PinnedInput {
         let meta = metadata(path)?;
         if !meta.is_file() {
             return Err(Error::invalid_argument(format!(
-                "{} is not a regular file: this command reads its input more than once, \
-                 which needs one that serves the same bytes to every open",
+                "{} is not a regular file: this command needs a regular file as input \
+                 (a FIFO, /dev/stdin, a socket or a device will not do); write the \
+                 stream to a file first and pass that",
                 path.display()
             )));
         }

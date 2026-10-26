@@ -974,6 +974,19 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
     Ok(())
 }
 
+/// Raises an accumulate run's stop flag if its worker unwinds, so a panic
+/// stops the peers as an error does; the scope still re-raises the panic
+/// when it joins.
+struct StopOnUnwind<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for StopOnUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// Per-worker accumulation classify: workers accumulate into `S` across
 /// all blobs, send `S` once at completion.
 ///
@@ -989,13 +1002,13 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
 /// `tags_filter::collect_relation_member_closure`). These are sparse paths
 /// where `S` is dominated by a small set of relation-local IDs or metadata.
 ///
-/// Borderline: per-worker `IdSet` accumulation of node IDs during
-/// way classify (geocode Pass 1.5). A worker can legitimately touch node
-/// IDs across the full planet range via referenced-node unions, so the
-/// worst-case per-worker bitmap is ~1.3 GB at planet scale (10.4 B node
-/// IDs × 1 bit). Shipping at 14.59 GB peak RSS (planet) - OK in practice,
-/// but a candidate for the same [`parallel_classify_phase`] migration
-/// described below. If you add another caller like this, measure first.
+/// Unsafe in practice: per-worker `IdSet` accumulation of node IDs during
+/// way classify. A worker can touch node IDs across the full planet range,
+/// so each worker's bitmap is bounded by ID space, not by its work. Geocode
+/// pass 1.5 left this pool for that reason: it writes one shared,
+/// pre-allocated `IdSet` with atomic sets from its own claim-counter pool
+/// (`geocode_index::builder::pass1_5`). If you add another caller like this,
+/// measure first.
 ///
 /// **A previous caller in this category was migrated to
 /// [`parallel_classify_phase`] on 2026-04-28** (commit `17b116c`,
@@ -1031,8 +1044,13 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
 /// (relation closure: ~tens of MB / worker at planet) rather than by
 /// ID space.
 ///
-/// If you change this comment, also update the caller audit in the
-/// geocode Pass 1.5 call site and the TODO item tracking it.
+/// # Failure
+///
+/// The first worker to fail (an error, or a panic) stops the others at
+/// their next blob, so an early failure does not cost the rest of the
+/// schedule; blobs already in hand still finish. A stopped worker sends no
+/// state (one that finished before the failure may already have been
+/// merged), and the run returns the failing worker's error.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn parallel_classify_accumulate<S: Send>(
     input: &InputFile,
@@ -1053,6 +1071,12 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
 
     let decode_threads = resolve_thread_count(threads, &*host.resources);
     let cancel = &host.cancel;
+    // Raised by the first worker to fail. The consumer drops its receiver on
+    // the first error it sees, but that does not reach the other workers:
+    // they only learn of it at their one send, after their whole share of
+    // the schedule, and the dispatcher keeps feeding them until then.
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let stop = &stop;
 
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<usize>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
@@ -1081,22 +1105,27 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
                 let worker_pool = crate::blob::DecompressPool::new();
                 let mut st_scratch: Vec<(u32, u32)> = Vec::new();
                 let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+                let unwind_stops_peers = StopOnUnwind(stop);
                 let mut state = worker_init_ref();
 
-                // This pool has no consumer loop while the scan runs (each
-                // worker sends one result at its end), so the workers check:
-                // inside the closure whose result is sent, so a cancelled
-                // worker still reports, and the consumer's first `?` then
-                // drops the receiver. There is no sequence to keep whole.
-                let result: crate::error::Result<()> = (|| {
+                // The consumer only hears from a worker once, at its end, so
+                // the workers check cancellation themselves: inside the
+                // closure whose result is sent, so a cancelled worker still
+                // reports, and the consumer's first `?` then drops the
+                // receiver. There is no sequence to keep whole. `Ok(false)`
+                // is a worker stopped by a peer's failure.
+                let result: crate::error::Result<bool> = (|| {
                     loop {
                         cancel.check()?;
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Ok(false);
+                        }
                         let position = {
                             let guard =
                                 rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             match guard.recv() {
                                 Ok(d) => d,
-                                Err(_) => return Ok(()),
+                                Err(_) => return Ok(true),
                             }
                         };
                         let entry = &schedule[position];
@@ -1122,13 +1151,18 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
                 })();
 
                 match result {
-                    Ok(()) => {
+                    Ok(true) => {
                         tx.send(Ok(state)).ok();
                     }
+                    Ok(false) => {}
                     Err(e) => {
+                        // Raised before the send, so no peer outlives the
+                        // error by more than the blob it has in hand.
+                        stop.store(true, std::sync::atomic::Ordering::Relaxed);
                         tx.send(Err(e)).ok();
                     }
                 }
+                drop(unwind_stops_peers);
             });
         }
         drop(desc_rx);
@@ -1249,6 +1283,100 @@ mod tests {
         )
         .unwrap();
         assert_eq!(all.into_inner(), BLOBS, "a non-breaking scan is exhaustive");
+    }
+
+    /// A failing accumulate worker stops its peers instead of leaving them to
+    /// drain the schedule.
+    ///
+    /// The consumer drops its receiver at the first error, but accumulate
+    /// workers send once, at their end, so they used to notice only after
+    /// scanning their whole share: an error on the first blob still cost the
+    /// rest of the schedule before the run returned. Same for a panic, which
+    /// the scope only re-raises once every worker has finished.
+    #[test]
+    fn a_failing_accumulate_worker_stops_its_peers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = crate::path_guard::tests::scratch();
+        const BLOBS: usize = 400;
+        let path = write_many_blob_pbf(dir.path(), BLOBS);
+        let (schedule, shared_file) = super::build_classify_schedule(
+            &path,
+            None,
+            super::PartialIndex::Refuse,
+            &crate::host::Host::for_tests(),
+        )
+        .unwrap();
+        assert_eq!(schedule.len(), BLOBS);
+
+        let run = |fail: &(dyn Fn(usize) + Sync)| {
+            let classified = AtomicUsize::new(0);
+            let merged = AtomicUsize::new(0);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::parallel_classify_accumulate(
+                    &shared_file,
+                    &schedule,
+                    Some(2),
+                    || (),
+                    |_block, ()| {
+                        let n = classified.fetch_add(1, Ordering::Relaxed);
+                        fail(n);
+                        if n == 0 {
+                            return Err(crate::Error::invalid_data("first blob fails"));
+                        }
+                        Ok(())
+                    },
+                    |()| {
+                        merged.fetch_add(1, Ordering::Relaxed);
+                    },
+                    &crate::host::Host::for_tests(),
+                )
+            }));
+            (outcome, classified.into_inner())
+        };
+
+        // An error on the first blob. The bound is wide (the descriptor
+        // channel holds 16, and each peer finishes the blob in hand) and
+        // still fails decisively against the old full drain.
+        let (outcome, classified) = run(&|_| {});
+        let err = outcome
+            .expect("an error is returned, not raised")
+            .unwrap_err();
+        assert!(err.to_string().contains("first blob fails"), "{err}");
+        assert!(
+            classified < BLOBS / 2,
+            "an early error must stop the peers; {classified} of {BLOBS} blobs \
+             were classified"
+        );
+
+        // A panic on the first blob stops the peers the same way, and is
+        // still re-raised.
+        let (outcome, classified) = run(&|n| assert_ne!(n, 0, "first blob panics"));
+        assert!(outcome.is_err(), "the panic must still propagate");
+        assert!(
+            classified < BLOBS / 2,
+            "an early panic must stop the peers; {classified} of {BLOBS} blobs \
+             were classified"
+        );
+
+        // Paired counterpart: a run that never fails is exhaustive.
+        let all = AtomicUsize::new(0);
+        super::parallel_classify_accumulate(
+            &shared_file,
+            &schedule,
+            Some(2),
+            || 0_usize,
+            |_block, seen| {
+                *seen += 1;
+                Ok(())
+            },
+            |seen| {
+                all.fetch_add(seen, Ordering::Relaxed);
+            },
+            &crate::host::Host::for_tests(),
+        )
+        .unwrap();
+        assert_eq!(all.into_inner(), BLOBS, "a clean run classifies every blob");
     }
 
     /// The ordered phase merges in schedule order whatever the completion

@@ -1183,6 +1183,13 @@ The judgement calls already known, to be checked first:
     in the parse (it also hits pooled first use and changes which buffers
     the pool retains) and a guessed headroom at decompression (changes
     every read path's memory shape on a heuristic).
+- `parallel_classify_accumulate` workers now stop at their next blob when
+  a peer fails or panics (a run-local `AtomicBool`, raised before the
+  failing worker's send and by an unwind guard), where they used to drain
+  their whole share of the schedule first; a stopped worker sends no
+  state. Found sparring HYG-011. Success path cost: one relaxed load per
+  blob on extract simple, smart and multi, tags-filter's relation closure,
+  getid and `inspect --nodes`; argued below noise, not measured.
 ---
 
 ## HYG-011 - The pread-decompress-dispatch-reorder pool is hand-built about fifteen times

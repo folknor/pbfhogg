@@ -100,8 +100,16 @@ pub(crate) fn getparents_to<'a>(
     Ok(stats)
 }
 
-/// Test instrument for exercising the FullScan arm on small fixtures. The
-/// input is pinned as in [`getparents`].
+/// Test instrument for exercising the FullScan arm on small fixtures: runs
+/// [`getparents`] with the blob-count dispatch threshold replaced by
+/// `min_blobs`. The input is pinned as in [`getparents`].
+///
+/// Not part of the supported library surface: it exists for this crate's
+/// own tests and for the CLI's hidden `--full-scan-min-blobs` flag, and may
+/// change or disappear without a deprecation cycle. It is public only
+/// because those callers live in other crates. The threshold is otherwise a
+/// constant, not a tuning knob (see `src/tunables.rs`).
+#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub fn getparents_with_min_blobs<'a>(
     input: impl Into<InputSource<'a>>,
@@ -121,7 +129,6 @@ pub fn getparents_with_min_blobs<'a>(
 }
 
 /// [`getparents_with_min_blobs`] writing to a borrowed output it does not publish.
-#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn getparents_with_min_blobs_to<'a>(
     input: impl Into<InputSource<'a>>,

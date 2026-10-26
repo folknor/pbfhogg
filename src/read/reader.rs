@@ -514,6 +514,11 @@ impl<R: Read + Send> ElementReader<R> {
 ///   normal, decode error, or mid-fold panic - after freeing the compressed
 ///   storage, so budget capacity never leaks and never frees before the bytes
 ///   it accounts for actually drop.
+///
+/// The budget must admit the pump's next blob even when only its own
+/// undispatched batch still holds capacity (see [`pump_blobs`]); the
+/// production constants are checked at compile time, and any other
+/// combination by a debug assertion here.
 #[allow(clippy::too_many_arguments)]
 fn par_fold_blobs<R, MP, RD, ID, T>(
     blob_iter: BlobReader<R>,
@@ -532,6 +537,11 @@ where
     ID: Fn() -> T + Sync + Send,
     T: Send,
 {
+    debug_assert!(
+        pump_cannot_wait_on_own_batch(budget_cap, batch_max_blobs, batch_max_bytes),
+        "par_fold_blobs budget {budget_cap} cannot hold a {batch_max_bytes}-byte \
+         partial batch plus one more blob"
+    );
     let queue = Arc::new(BatchQueue::new());
     let budget = Arc::new(ByteBudget::new(budget_cap));
     let pool = DecompressPool::new();
@@ -711,6 +721,40 @@ impl Drop for CancelGuard<'_> {
 /// error the pump has already obtained is never discarded because a worker
 /// happened to signal shutdown in the same window - read errors win over decode
 /// errors deterministically.
+/// Whether the pump can never wait in `ByteBudget::acquire` for capacity its
+/// own undispatched batch holds.
+///
+/// The pump acquires a blob's weight before deciding whether to flush the
+/// batch it is building, so that batch's bytes are admitted but no worker can
+/// release them. Once every dispatched batch has released, the budget holds
+/// only the partial batch (at most `batch_max_bytes`, or one lone blob of up
+/// to `MAX_BLOB_DATASIZE` that exceeds it), and the next blob (at most
+/// `MAX_BLOB_DATASIZE`) must fit beside it or the pump waits forever. A
+/// one-blob batch is flushed as soon as it forms, so it never holds anything
+/// at an acquire.
+const fn pump_cannot_wait_on_own_batch(
+    budget_cap: u64,
+    batch_max_blobs: usize,
+    batch_max_bytes: u64,
+) -> bool {
+    use crate::read::blob_wire::MAX_BLOB_DATASIZE;
+    let held = if batch_max_bytes > MAX_BLOB_DATASIZE {
+        batch_max_bytes
+    } else {
+        MAX_BLOB_DATASIZE
+    };
+    batch_max_blobs <= 1 || budget_cap >= held + MAX_BLOB_DATASIZE
+}
+
+const _: () = assert!(
+    pump_cannot_wait_on_own_batch(
+        PAR_INFLIGHT_BUDGET,
+        PAR_BATCH_MAX_BLOBS,
+        PAR_BATCH_MAX_BYTES
+    ),
+    "PAR_INFLIGHT_BUDGET must hold a full partial batch plus one more blob"
+);
+
 fn pump_blobs<R: Read + Send>(
     blob_iter: BlobReader<R>,
     queue: &BatchQueue,
@@ -1573,6 +1617,32 @@ mod tests {
             .par_map_reduce(|_e| 1_u64, || 0_u64, |a, b| a + b)
             .unwrap();
         assert_eq!(count, 12, "3 blobs x 4 dense nodes");
+    }
+
+    #[test]
+    fn pump_budget_rule_refuses_a_budget_its_own_batch_can_fill() {
+        use super::pump_cannot_wait_on_own_batch;
+        use crate::read::blob_wire::MAX_BLOB_DATASIZE;
+        // A one-blob batch never holds capacity at an acquire.
+        assert!(pump_cannot_wait_on_own_batch(1, 1, 4096));
+        // A multi-blob batch needs room for the largest partial batch (a lone
+        // maximum-size blob here) plus one more maximum-size blob.
+        assert!(pump_cannot_wait_on_own_batch(
+            2 * MAX_BLOB_DATASIZE,
+            2,
+            4096
+        ));
+        assert!(!pump_cannot_wait_on_own_batch(
+            2 * MAX_BLOB_DATASIZE - 1,
+            2,
+            4096
+        ));
+        // A byte target above the blob limit is what the partial batch holds.
+        assert!(!pump_cannot_wait_on_own_batch(
+            3 * MAX_BLOB_DATASIZE,
+            2,
+            3 * MAX_BLOB_DATASIZE
+        ));
     }
 
     #[test]

@@ -120,14 +120,16 @@ shape. Takeaways:
 
 ## Suggested order
 
-HYG-002 (tunables injectable) next: the window and depth knobs of every
-ordered pool now live in one engine (`ordered_pool::PoolConfig`), so the
-change is much smaller than the entry implies. The entry is also partly
-stale: worker counts are already injectable through `Resources::parallelism`
-(`host::Fixed`) and `Parallelism::Fixed`; what tests cannot reach is altw
-external's 256 buckets per worker, the pool windows and the full-scan
-threshold (getparents only through a hidden CLI flag). Then the rest of
-HYG-011, HYG-081 (apply-changes barrier, its own design), HYG-036, HYG-182.
+The rest of HYG-011 next, then HYG-081 (apply-changes barrier, its own
+design), HYG-036, HYG-182.
+
+HYG-002 was resolved 2026-10-26 by rejecting public tuning structs (the
+reasons are in the `src/tunables.rs` module doc and `reference/testing.md`)
+and hiding getparents' cross-crate test instrument. Sparring it turned up a
+latent rule in `par_fold_blobs`: the pump acquires budget before flushing
+its own partial batch, so a budget smaller than a full partial batch plus
+one blob would wait forever. The production constants satisfy it; it is now
+a compile-time assert plus a debug assert on the private seam.
 
 The diff shard-buffer entry was resolved 2026-10-26 as a measurement
 candidate ("Review once drained", decode-buffer growth item): codex and a

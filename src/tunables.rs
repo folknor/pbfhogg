@@ -16,6 +16,33 @@
 //!
 //! Public tunables (`pub const`) are re-exported from the path they were
 //! public at, so no public path changed.
+//!
+//! Centralized is not configurable. These stay constants that the engines
+//! read directly; there is deliberately no per-scope tuning struct (a read,
+//! writer, pipeline, altw or geocode "tuning" passed in by the caller). Some
+//! values were measured into place (the parallel writer's pool size came from
+//! a pool-size sweep, several worker caps and walker thresholds from planet
+//! runs), others are stated defaults (the ordered pool's window per worker
+//! says so); a public knob would make each a contract its value then has to
+//! defend, and would turn compile-time constants into runtime values on hot
+//! paths. That second point is a reason not to make the change unmeasured,
+//! not a finding that runtime values would be slower: nothing was measured
+//! for this decision. Public configuration gets added for a named consumer
+//! requirement, not to mirror this file.
+//!
+//! Tests reach small configurations through the seams that already exist:
+//! `host::Resources` (`host::Fixed`) and `host::Parallelism` for worker counts
+//! (each command keeps its own minimum, and the parallel writer always runs
+//! its fixed pool), the engines' own parameters (`ordered_pool::PoolConfig`,
+//! the private `par_fold_blobs` budget and batch sizes), and crate-private
+//! dispatch functions for thresholds. When a constant blocks a named
+//! small-fixture test, prefer a narrow private parameter at the mechanism that
+//! owns it. A test instrument public only because its callers live in another
+//! crate (`getparents_with_min_blobs`, behind the CLI's hidden
+//! `--full-scan-min-blobs`) is a documented exception, hidden and unsupported.
+//! Known and accepted: altw external's small fixtures still open all
+//! `NUM_BUCKETS` id-shard files per worker, which costs fixture time, not
+//! coverage. No tunable reads the environment (ADR-0016).
 
 // ---------------------------------------------------------------------------
 // Worker sizing

@@ -72,8 +72,8 @@ Launch order: every queued entry has run.
 
 Every entry still open in this file and `notes/bugs.md` is owed a resolution
 in this drain, except what the maintainer moved to the CLI-surface redesign
-in `notes/todo.md` (the `--direct-io` reach and `--json` entries). HYG-002,
-HYG-011, HYG-036, HYG-081 and HYG-182 were deferred by the 2026-10-25 session, not dropped:
+in `notes/todo.md` (the `--direct-io` reach and `--json` entries). HYG-011,
+HYG-036, HYG-081 and HYG-182 were deferred by the 2026-10-25 session, not dropped:
 "skipped for now" in their Maintainer paragraphs means that session did not
 take them, and the paragraphs are guidance on how to resolve them, not a
 ruling that they stay. BUG-009 is the maintainer's own project.
@@ -1184,31 +1184,6 @@ The judgement calls already known, to be checked first:
     the pool retains) and a guessed headroom at decompression (changes
     every read path's memory shape on a heuristic).
 ---
-
-## HYG-002 - Tunables are centralized but not injectable
-
-Anger: 10 - tunables, including POOL_SIZE, which was measured at 16.
-
-Every tunable now lives in `src/tunables.rs`, grouped by scope with its
-rationale, values unchanged; format and protocol constants (field numbers,
-record layouts, spec limits) stay where they are. What remains is the second
-half: the engines still read the constants directly, so nothing but a code
-edit changes a knob, and a test cannot drive a pool at one worker or a tiny
-bucket count (small fixtures still create 256 buckets times N workers' shard
-files). `ElementReader` exposes `read_ahead`, `decode_ahead` and
-`decode_threads`; `par_fold_blobs` takes the budget and batch sizes as
-parameters but the public method passes the constants, and `BLOCK_QUEUE` for
-`into_blocks_pipelined` is fixed. The one injected knob,
-`FULL_SCAN_ARM_MIN_BLOBS`, reaches `getparents` through a `#[doc(hidden)] pub`
-"test instrument" the CLI calls for a hidden `--full-scan-min-blobs` flag,
-while other `dispatch_scan_arm` users have no override.
-
-Fix: per-scope tuning structs (`ReadTuning`, `WriterConfig`, a
-`PipelineTuning` on `MergeOptions`, an altw `Tuning`, a `GeocodePolicy`)
-defaulted from `src/tunables.rs`, passed in rather than read as constants,
-documented in `reference/`.
-
-Reported by: all nine scopes.
 
 ## HYG-011 - The pread-decompress-dispatch-reorder pool is hand-built about fifteen times
 

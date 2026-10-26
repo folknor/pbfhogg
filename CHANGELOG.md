@@ -938,6 +938,13 @@
   that stream start; revisiting its header is allowed, while seeking to a
   different header is rejected. Reported byte offsets remain absolute.
 
+- **`getparents::getparents_with_min_blobs` is hidden and unsupported.** It
+  is a test instrument (the library side of the CLI's hidden
+  `--full-scan-min-blobs`) and is now `#[doc(hidden)]`, documented as
+  outside the supported surface, which may change or disappear without a
+  deprecation cycle. Call `getparents`; the dispatch threshold is not a
+  tuning knob.
+
 ### Added
 
 - **Library: `has_indexdata_in` runs the indexdata probe under a `Host`.**

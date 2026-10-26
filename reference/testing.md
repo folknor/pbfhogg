@@ -168,6 +168,17 @@ tests see the same machine everywhere; a test that needs a
 different machine sets its own `host::Fixed`. Tests may still skip where
 the host lacks a feature (O_DIRECT, io_uring, osmium in PATH).
 
+**Small configurations come through existing seams, not tunable
+overrides.** The constants in `src/tunables.rs` get no runtime or
+test-only override by default. A test that needs a small configuration
+uses the host's resources and `-j` for worker counts, the engine's own
+parameters (the ordered pool's `PoolConfig`, the parallel reader's
+private budget and batch sizes) or a crate-private dispatch function; a
+constant that blocks a named test gets a narrow private parameter at the
+mechanism that owns it. A cross-crate test instrument (getparents'
+full-scan threshold) is hidden and unsupported. The module doc of
+`src/tunables.rs` gives the reasons.
+
 **No checked-in input data.** Fixture PBFs are built at test time into
 scratch by the `tests/common` writers (`write_test_pbf*`,
 `write_multi_block_test_pbf`, `write_base_pbf` and its `changed` and

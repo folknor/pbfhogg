@@ -408,14 +408,18 @@ fn worker_loop(
         }
     }
 
-    // Final flush of this worker's coord accumulator into the shared slot.
-    // Safe regardless of whether the drain has merged yet - drain holds
-    // the same Arc and acquires when ready.
-    if locations_on_ways
-        && !local_coords.is_empty()
-        && let Some(slot) = coord_slot
-    {
-        flush_local_coords(slot, &mut local_coords);
+    // Nothing may be left to flush here. The candidate channel closes only
+    // after the scanner has released its ways, which needs the barrier, so
+    // the drain has already merged every slot: coordinates flushed now would
+    // never reach the published map. Every node candidate flushes before it
+    // sends its item, so a leftover means that rule broke, and it fails the
+    // run rather than silently losing coordinates.
+    if locations_on_ways && !local_coords.is_empty() {
+        return Err(Error::internal(format!(
+            "streaming: {} node coordinates were extracted but never flushed \
+             before the coordinate map was published",
+            local_coords.len()
+        )));
     }
 
     Ok(())

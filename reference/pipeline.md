@@ -67,7 +67,10 @@ consumer drains the channel into its reorder buffer while it waits. Worker
 failures surface in schedule order (the lowest failing task's error, or the
 consumer's own at its position), cancellation is checked on the consumer,
 and any consumer exit closes the gate and drops the result receiver before
-the scope joins; work already admitted is not interrupted. Every run records its gate, send and receive waits into one
+the scope joins. Work already admitted is not interrupted, but a failing run
+calls the consumer's `abandon` first, which altw stage 4 uses to abort its
+router so workers parked in its readiness wait are released before the
+join. Every run records its gate, send and receive waits into one
 process-wide set of stall counters (`ordered_pool_*_wait_ns`).
 
 Where only some schedule positions are decoded and the rest are passthrough

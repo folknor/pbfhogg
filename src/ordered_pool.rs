@@ -44,9 +44,10 @@
 //! - **Prompt exit.** Any return from the consumer side - success, an error,
 //!   a cancellation, a panic - closes the gate and drops the result receiver
 //!   before the scope joins: parked workers wake to a closed gate, workers in
-//!   `send` fail it. Work already admitted and running is not interrupted
-//!   (altw stage 4 may sit in its router's readiness wait); the pool does not
-//!   promise to cut that short.
+//!   `send` fail it. Work already admitted and running is not interrupted;
+//!   the pool cannot see a wait outside it (altw stage 4's router readiness
+//!   wait). A failing run calls [`OrderedConsumer::abandon`] before it joins,
+//!   so a consumer whose workers can park on such a wait can release it.
 //! - **Cancellation** is checked on the calling thread only: before each wait
 //!   for a result, on each arrival, before each consumed item, after the
 //!   channel closes, and on an empty run. Workers never check it, so an
@@ -349,6 +350,24 @@ pub(crate) trait OrderedConsumer<T> {
     fn on_advance(&mut self, edge: usize) {
         let _ = edge;
     }
+
+    /// The run is failing with `error` (a worker's, surfacing in task order;
+    /// the consumer's own; a cancellation; a worker that never delivered).
+    /// Called on the calling thread once that error leaves the delivery
+    /// loop, before the gate closes, the receiver drops and the workers are
+    /// joined, so a consumer whose workers can park on a wait outside the
+    /// pool (altw stage 4's router readiness) can release it. Every task
+    /// below a worker's failing one has been consumed by then, so releasing
+    /// the wait cannot fail an earlier task.
+    ///
+    /// Not called on success, on a consumer panic (a consumer that needs
+    /// the release then guards its own callbacks), or for a failure before
+    /// the workers start (an empty pool, a cancellation already tripped).
+    /// It must neither wait for the workers nor panic: it runs ahead of
+    /// their join, and a panic would replace `error`.
+    fn abandon(&mut self, error: &Error) {
+        let _ = error;
+    }
 }
 
 /// Adapts a closure to [`OrderedConsumer`] for runs that need only `consume`.
@@ -618,7 +637,13 @@ where
         }
         drop(tx);
 
-        deliver(&rx, &gate, &queue_depth, n_tasks, config, metrics, consumer)
+        let delivered = deliver(&rx, &gate, &queue_depth, n_tasks, config, metrics, consumer);
+        // Still before `_close` and `rx` drop and the scope joins: a consumer
+        // can release workers parked on a wait the pool cannot see.
+        if let Err(error) = &delivered {
+            consumer.abandon(error);
+        }
+        delivered
     })
 }
 

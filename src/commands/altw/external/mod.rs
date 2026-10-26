@@ -1090,8 +1090,16 @@ pub(crate) fn external_join_in(
             router_ref.mark_producer_done();
             result
         });
+        // A stage 4 failure aborts the router, so stage 3 stops at its next
+        // bucket claim instead of finishing the rest for nobody: on a returned
+        // error here, and through the guard on a panic. Failures inside the
+        // ordered pool abort earlier, before the pool joins its workers (see
+        // `S4Consumer`); this covers everything else (the schedule, the
+        // writer, the final flush). An abort already raised keeps its first
+        // error.
         let s4_handle = scope.spawn(move || -> crate::Result<Stats> {
-            stage4_assembly(
+            let guard = coord_payloads::AbortOnDrop::new(router_ref, "stage 4");
+            let result = stage4_assembly(
                 input,
                 output,
                 header_ref,
@@ -1107,7 +1115,12 @@ pub(crate) fn external_join_in(
                 write,
                 overrides,
                 host,
-            )
+            );
+            if let Err(error) = &result {
+                router_ref.abort(error.clone());
+            }
+            guard.disarm();
+            result
         });
 
         let s3_res = s3_handle

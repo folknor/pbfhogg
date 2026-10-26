@@ -57,6 +57,8 @@ mod edge_cases;
 mod fault_altw_input;
 #[cfg(feature = "test-hooks")]
 mod fault_altw_stage3;
+#[cfg(feature = "test-hooks")]
+mod fault_altw_stage4;
 mod fault_apply_changes;
 #[cfg(feature = "test-hooks")]
 mod fault_cat_input;

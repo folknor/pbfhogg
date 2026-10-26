@@ -191,6 +191,31 @@ pub struct FaultPlan {
     // --- altw external stage 3 ---
     /// Slot bucket index at which the stage 3 worker claiming it panics.
     pub altw_stage3_panic_at_bucket: AtomicUsize,
+    /// Slot bucket index the stage 3 worker claiming it holds, before any of
+    /// its work, until the router is aborted (bounded): its slots stay
+    /// unpublished, so a stage 4 worker waiting on one stays parked.
+    pub altw_stage3_hold_bucket: AtomicUsize,
+    /// Set when the held bucket is claimed.
+    pub altw_stage3_bucket_held: AtomicBool,
+    /// Set when the held bucket saw the router aborted before the bound.
+    pub altw_stage3_saw_abort: AtomicBool,
+
+    // --- altw external stage 4 ---
+    /// Stage 4 fails as it starts, before its ordered pool, once the held
+    /// stage 3 bucket is claimed (bounded).
+    pub altw_stage4_fail_at_start: AtomicBool,
+    /// Decode ordinal at which stage 4's consumer fails with an error, once
+    /// the held stage 3 bucket is claimed and a worker has reached its
+    /// readiness wait for way blob 0 (bounded).
+    pub altw_stage4_fail_consume_at: AtomicUsize,
+    /// The same, panicking instead of returning an error.
+    pub altw_stage4_panic_consume_at: AtomicUsize,
+    /// Set by a stage 4 worker just before it waits on the router for way
+    /// blob 0.
+    pub altw_stage4_way0_entered: AtomicBool,
+    /// A bounded altw hook wait expired: the handshake did not happen, and
+    /// a test relying on it proved nothing.
+    pub altw_hook_timed_out: AtomicBool,
 
     // --- geocode builder pass 3 ---
     /// Street way index at which the Stage A streets worker panics.
@@ -290,6 +315,14 @@ impl FaultPlan {
             apply_changes_force_owned_route: AtomicBool::new(false),
             apply_changes_hook_timed_out: AtomicBool::new(false),
             altw_stage3_panic_at_bucket: AtomicUsize::new(usize::MAX),
+            altw_stage3_hold_bucket: AtomicUsize::new(usize::MAX),
+            altw_stage3_bucket_held: AtomicBool::new(false),
+            altw_stage3_saw_abort: AtomicBool::new(false),
+            altw_stage4_fail_at_start: AtomicBool::new(false),
+            altw_stage4_fail_consume_at: AtomicUsize::new(usize::MAX),
+            altw_stage4_panic_consume_at: AtomicUsize::new(usize::MAX),
+            altw_stage4_way0_entered: AtomicBool::new(false),
+            altw_hook_timed_out: AtomicBool::new(false),
             geocode_streets_panic_at_way: AtomicU32::new(u32::MAX),
             force_pin_path_reopen: AtomicBool::new(false),
             input_replacement: Mutex::new(None),
@@ -617,6 +650,65 @@ impl FaultPlan {
             self.apply_changes_late_boundaries_seen
                 .fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    // ---- altw external stages 3 and 4 -------------------------------------
+
+    /// Called by a stage 3 worker as it claims slot bucket `bucket`, before
+    /// any of its work; `aborted` reads the router. Holds the armed bucket
+    /// until the router is aborted, and records whether it was.
+    pub(crate) fn on_altw_stage3_bucket(&self, bucket: usize, aborted: impl Fn() -> bool) {
+        if bucket != self.altw_stage3_hold_bucket.load(Ordering::SeqCst) {
+            return;
+        }
+        self.altw_stage3_bucket_held.store(true, Ordering::SeqCst);
+        self.wait_until(&self.altw_hook_timed_out, &aborted);
+        self.altw_stage3_saw_abort
+            .store(aborted(), Ordering::SeqCst);
+    }
+
+    /// Called by a stage 4 worker just before it waits on the router for way
+    /// blob `way_blob_idx`.
+    pub(crate) fn on_altw_stage4_ready_wait(&self, way_blob_idx: usize) {
+        if way_blob_idx == 0 {
+            self.altw_stage4_way0_entered.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Called as stage 4 starts: fails it, as armed, once the held stage 3
+    /// bucket has been claimed.
+    pub(crate) fn on_altw_stage4_start(&self) -> crate::Result<()> {
+        if !self.altw_stage4_fail_at_start.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.wait_until(&self.altw_hook_timed_out, || {
+            self.altw_stage3_bucket_held.load(Ordering::SeqCst)
+        });
+        Err(crate::Error::internal(
+            "test-hooks: stage 4 failing at start",
+        ))
+    }
+
+    /// Called by stage 4's consumer before it consumes decode ordinal
+    /// `ordinal`: fails or panics there, as armed, once the held stage 3
+    /// bucket has been claimed and a worker is at its readiness wait for way
+    /// blob 0.
+    pub(crate) fn on_altw_stage4_consume(&self, ordinal: usize) -> crate::Result<()> {
+        let fails = ordinal == self.altw_stage4_fail_consume_at.load(Ordering::SeqCst);
+        let panics = ordinal == self.altw_stage4_panic_consume_at.load(Ordering::SeqCst);
+        if !fails && !panics {
+            return Ok(());
+        }
+        self.wait_until(&self.altw_hook_timed_out, || {
+            self.altw_stage3_bucket_held.load(Ordering::SeqCst)
+                && self.altw_stage4_way0_entered.load(Ordering::SeqCst)
+        });
+        if panics {
+            panic!("test-hooks: stage 4 consumer panicking at ordinal {ordinal}");
+        }
+        Err(crate::Error::internal(format!(
+            "test-hooks: stage 4 consumer failing at ordinal {ordinal}"
+        )))
     }
 }
 

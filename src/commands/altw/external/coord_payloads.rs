@@ -106,9 +106,10 @@ pub(super) struct ConcurrentBlobLocationRouter {
     // compared to the earlier per-blob-Mutex Vec sized for all way blobs
     // (~3 MB committed at planet for <1% live entries).
     straddler_partials: std::sync::Mutex<rustc_hash::FxHashMap<usize, StraddlerPartial>>,
-    // Single global Condvar. `notify_all` is cheap at our scale (<=6
-    // stage-4 waiters at any moment) and avoids per-slot Condvar
-    // allocation at planet (~57K blobs would be ~3 MB of Condvars).
+    // Single global Condvar: at most one waiter per stage 4 decode worker at
+    // any moment, and it avoids a Condvar per way blob (megabytes of them at
+    // planet). Each publish wakes every waiter, so the wakeups grow with the
+    // decode worker count; that cost has not been measured.
     notify: std::sync::Condvar,
     // Notification gate: every publisher locks this after changing its
     // predicate, before notifying. Waiters hold it from their final predicate
@@ -489,10 +490,12 @@ impl Clone for BlobLocation {
     }
 }
 
-/// Panic-safe bilateral cancellation guard. Stage 3 and stage 4 workers
-/// build one at closure entry and call `disarm` on normal exit. If the
-/// worker panics instead, the `Drop` impl fires `router.abort`, which
-/// wakes every `wait_ready` caller on the other side via `notify_all`.
+/// Panic-safe bilateral cancellation guard. Each stage 3 worker, the stage 4
+/// thread and stage 4's consumer callbacks build one on entry and call
+/// `disarm` on every return, an error included. If the holder panics
+/// instead, the `Drop` impl fires `router.abort`, which wakes every
+/// `wait_ready` caller via `notify_all` and stops stage 3 at its next bucket
+/// claim.
 pub(super) struct AbortOnDrop<'a> {
     router: &'a ConcurrentBlobLocationRouter,
     label: &'static str,

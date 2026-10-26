@@ -206,6 +206,13 @@ pub(super) fn stage3_slot_reorder(
                         return Err(e);
                     }
 
+                    // Test-only: hold this bucket, before any of its work,
+                    // until stage 4 aborts the router (bounded).
+                    #[cfg(feature = "test-hooks")]
+                    cancel
+                        .faults()
+                        .on_altw_stage3_bucket(bucket_idx, || router.is_aborted());
+
                     // Test-only: the fault plan's
                     // `altw_stage3_panic_at_bucket`. Simulates a mid-phase
                     // stage 3 worker crash. The surrounding `AbortOnDrop`

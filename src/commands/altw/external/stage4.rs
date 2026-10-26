@@ -24,6 +24,7 @@ use crate::idset::IdSet;
 use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
 
 use super::blob_meta::BlobMeta;
+use super::coord_payloads::AbortOnDrop;
 
 /// Blob descriptor for the stage 4 pre-scan schedule.
 ///
@@ -162,7 +163,15 @@ struct S4Local {
 /// frames it preads itself, written in schedule order. `write_raw_owned`
 /// hands the pre-framed bytes to the writer thread verbatim. Its counters
 /// are plain fields on the single consumer thread.
+///
+/// It holds the router because a failing run must abort it before the pool
+/// joins its workers: an admitted worker may be parked in `wait_ready` for a
+/// slot stage 3 has not published, and the join would otherwise wait for
+/// stage 3 to get there. A returned error aborts through `abandon`; a panic
+/// in either callback aborts through the guard each one holds, during the
+/// unwind, which also runs before the join.
 struct S4Consumer<'a> {
+    router: &'a super::coord_payloads::ConcurrentBlobLocationRouter,
     interleaved: crate::ordered_pool::Interleaved<'a>,
     schedule: &'a [BlobDescriptor],
     file: &'a std::fs::File,
@@ -227,19 +236,23 @@ impl S4Consumer<'_> {
     }
 }
 
-impl crate::ordered_pool::OrderedConsumer<(Vec<OwnedBlock>, Stats)> for S4Consumer<'_> {
-    fn before_item(&mut self, ordinal: usize) -> crate::Result<()> {
+impl S4Consumer<'_> {
+    fn before_item_inner(&mut self, ordinal: usize) -> crate::Result<()> {
         for position in self.interleaved.before(ordinal) {
             self.passthrough(position)?;
         }
         Ok(())
     }
 
-    fn consume(
+    fn consume_inner(
         &mut self,
-        _ordinal: usize,
+        ordinal: usize,
         (blocks, block_stats): (Vec<OwnedBlock>, Stats),
     ) -> crate::Result<()> {
+        #[cfg(feature = "test-hooks")]
+        self.cancel.faults().on_altw_stage4_consume(ordinal)?;
+        #[cfg(not(feature = "test-hooks"))]
+        let _ = ordinal;
         self.total_stats.merge(&block_stats);
         for block in blocks {
             self.bytes_written += block.bytes.len() as u64;
@@ -249,6 +262,29 @@ impl crate::ordered_pool::OrderedConsumer<(Vec<OwnedBlock>, Stats)> for S4Consum
             self.write_ms += t_w.elapsed_ms();
         }
         Ok(())
+    }
+}
+
+impl crate::ordered_pool::OrderedConsumer<(Vec<OwnedBlock>, Stats)> for S4Consumer<'_> {
+    // Each callback disarms its guard on every return, an error included, so
+    // only a panic aborts through it; a returned error reaches the router
+    // through `abandon` with its own message.
+    fn before_item(&mut self, ordinal: usize) -> crate::Result<()> {
+        let guard = AbortOnDrop::new(self.router, "stage 4 consumer");
+        let result = self.before_item_inner(ordinal);
+        guard.disarm();
+        result
+    }
+
+    fn consume(&mut self, ordinal: usize, item: (Vec<OwnedBlock>, Stats)) -> crate::Result<()> {
+        let guard = AbortOnDrop::new(self.router, "stage 4 consumer");
+        let result = self.consume_inner(ordinal, item);
+        guard.disarm();
+        result
+    }
+
+    fn abandon(&mut self, error: &Error) {
+        self.router.abort(error.clone());
     }
 }
 
@@ -284,6 +320,8 @@ pub(super) fn stage4_assembly(
         backend,
         ..
     } = *write;
+    #[cfg(feature = "test-hooks")]
+    host.cancel.faults().on_altw_stage4_start()?;
     // Build the blob schedule from the shared metadata scan.
     crate::debug::emit_marker("EXTJOIN_S4_SCHEDULE_START");
     let t_schedule = crate::counters::Stopwatch::start();
@@ -439,6 +477,7 @@ pub(super) fn stage4_assembly(
     let s4_recv_ms = std::sync::atomic::AtomicU64::new(0);
 
     let mut consumer = S4Consumer {
+        router: coord_payloads_reader,
         interleaved: crate::ordered_pool::Interleaved::new(decode_at, schedule.len()),
         schedule,
         file: &shared_file,
@@ -521,6 +560,10 @@ pub(super) fn stage4_assembly(
                     // block + StringTable resident. Non-way blobs skip
                     // this entirely - they never consume a coord payload.
                     if desc.is_way_blob {
+                        #[cfg(feature = "test-hooks")]
+                        host.cancel
+                            .faults()
+                            .on_altw_stage4_ready_wait(desc.way_blob_idx);
                         let t_wait = crate::counters::Stopwatch::start();
                         coord_payloads_reader.wait_ready(desc.way_blob_idx)?;
                         // One sample feeds the total, the count and

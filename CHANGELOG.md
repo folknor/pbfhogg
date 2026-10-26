@@ -1217,6 +1217,14 @@
   is now copied under indexdata and tagdata scanned from its payload, with
   a `Note:`.
 
+- **`add-locations-to-ways --index-type external` stops promptly when its
+  output fails.** A failure in the final assembly stage (an output write
+  error, a malformed input blob) used to leave the concurrent slot-reorder
+  stage running through every remaining bucket, and the failing stage waited
+  for it to publish the coordinates its in-flight workers needed, before the
+  error was reported. Now the waiting workers are released at once and the
+  slot-reorder stage stops after the bucket each of its workers holds.
+
 - **`add-locations-to-ways --index-type external` replaces unpacked
   existing way locations.** A way whose input already carried lat / lon
   (or the injected field 20) written in protobuf's unpacked form kept those

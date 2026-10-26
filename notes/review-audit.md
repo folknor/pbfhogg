@@ -662,7 +662,7 @@ Files most relevant: `src/ordered_pool.rs`, `src/commands/altw/external/stage4.r
 ## Orchestrator's checks
 
 The agents' claims have not been re-verified against the code yet, except
-the one below, which concerns the orchestrating session's own commit.
+the ones below.
 
 - Slice F, item 9 (`060c2f74`, `claim_holds` versus `check --index`):
   confirmed. `claim_holds` in `src/commands/blob_merge.rs` returns false
@@ -674,6 +674,59 @@ the one below, which concerns the orchestrating session's own commit.
   cannot confirm is not believed); the defect is the claimed equivalence.
   Either the docs say "the `check --index` rule, stricter in one case",
   or the rule follows `check --index`.
+
+- Slice F, item 2 (`56a50e0d`, the result channel sized to the window):
+  confirmed and **resolved** in `c2409c45`, with the lateral stage 4 fix
+  below in the commit after it (sparred with codex to consensus, the diff
+  reviewed by a fresh codex session).
+  - Confirmed in the code: `run_ordered` made `sync_channel(window)`, and
+    every pool it replaced had used `POOL_RESULT_CHANNEL_DEPTH` (32) at
+    `60e1b691` (stage 4, sparse passthrough, stage 1, extract
+    `pread_execute`, both multi-extract pools, tags-filter pass 2,
+    classify's ordered phase); renumber's three stages used 32 before
+    `fa69b667`, whose own pool, unmeasured, introduced the window-deep
+    channel. Confirmed on data: Denmark altw external on bygg at 30 workers,
+    parent commit `6592af1f` (`e5e9b3fd`): `s4_send_ms` 10,
+    `s4_channel_high_water` 237 of a 240 window; with the fix (forced run,
+    not stored): `s4_send_ms` 7,425, high water 62 (32 plus 30 blocked
+    senders), `WAIT_S4_SEND` spans present again.
+  - Fix: the channel is `min(window, POOL_RESULT_CHANNEL_DEPTH)`. One
+    correction to the audit's memory claim: the total bound is still the
+    window. The channel restores the consumer-bound shape (about 32 plus one
+    result per worker), but a slow head can still fill the reorder buffer up
+    to the window, and that backlog stays until consumed.
+  - The suggested "wire `Waits.window` at every ordered site" was done as one
+    engine-wide gated stall set instead of per-site names, following the
+    unordered classify pools' precedent: `ordered_pool_window_wait_ns`,
+    `ordered_pool_result_send_wait_ns`, `ordered_pool_result_recv_wait_ns`,
+    emitted after every run. Every ordered pool now reports to `--stalls`,
+    the classify-ordered callers, stage 1, extract and multi-extract
+    included. The per-site legacy timers keep their names and units, and no
+    longer read the clock when not configured.
+  - Lateral, found while sparring and resolved in the same change: stage 4
+    never aborted the router on its own failure. The `stage3.rs` comment
+    ("a stage 4 failure aborts the router") and the `AbortOnDrop` doc were
+    false; a stage 4 output or input failure left stage 3 running every
+    remaining bucket, and the ordered pool's join waited for stage 3 to
+    publish the slots its admitted workers were parked on. Now the pool
+    calls a new `OrderedConsumer::abandon` before it joins (stage 4 aborts
+    the router there), stage 4's consumer callbacks guard panics with
+    `AbortOnDrop`, and the stage 4 thread aborts on any other error or
+    panic. Three fault tests (`tests/fault_altw_stage4.rs`) hold stage 3's
+    first bucket and fail stage 4 at start, in its consumer, and by a
+    consumer panic; each was mutation-checked (removing the matching abort
+    makes it fail).
+  - Docs corrected: `POOL_RESULT_CHANNEL_DEPTH` and
+    `POOL_REORDER_CAPACITY_WIDE` in `tunables.rs`, stage 4's
+    `channel_high_water` doc and flush comment, classify's ordered-phase and
+    unordered-metrics docs, the router's wakeup comment,
+    `reference/pipeline.md`, `reference/testing.md`, a
+    `reference/performance-history.md` note that sidecar rows from
+    `56a50e0d` until the fix are not comparable on the send-side counters,
+    and the `hygiene.md` item (which also now names multi-extract gaining
+    WILLNEED). The `notes/todo.md` stall follow-up about the classify-ordered
+    phase recording no waits is gone. Unmeasured, per the drain rule; the
+    audit's measurement order for `56a50e0d` stands, now with live counters.
 
 Notes made while the audit ran, not findings of it:
 

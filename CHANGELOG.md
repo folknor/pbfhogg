@@ -1215,7 +1215,17 @@
   then copied each blob's original indexdata even when that scan
   contradicted it, writing a sorted output with false indexdata. Such a blob
   is now copied under indexdata and tagdata scanned from its payload, with
-  a `Note:`.
+  a `Note:`. "False" is exactly what `check --index` reports.
+
+- **`check --index` reports a bbox over out-of-range node coordinates.** A
+  node blob with a coordinate outside the `i32` decimicrodegree range (about
+  214.7 degrees either way) passed with any stored bbox, although no box
+  contains such a coordinate (and far enough out the decoder wraps it to an
+  arbitrary position a spatial filter could skip). It is now a violation (library:
+  `IndexViolationKind::BboxOutOfRange`). Indexdata generation (`cat`, and
+  every reframe that scans a payload) also computes the bbox exactly, so a
+  node blob whose `lat_offset` / `lon_offset` cancels an overflowing
+  `granularity` product now gets its box instead of none.
 
 - **`add-locations-to-ways --index-type external` stops promptly when its
   output fails.** A failure in the final assembly stage (an output write

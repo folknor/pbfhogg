@@ -130,7 +130,14 @@ How `check --index` is built, so its verdict means what it says:
   obviously broken input there is. Absence itself is not reported: a blob
   without a sidecar claims nothing, and a v1 (26-byte) index has no bbox.
 - The bbox is containment, not equality: the scan rounds outward, so a
-  wider stored box is sound. For the key set, a missing key is the unsound
+  wider stored box is sound. What a box claims to contain is the exact
+  coordinate, `offset + granularity * raw` nanodegrees, computed without
+  intermediate overflow; outward rounding also covers the truncating
+  decimicrodegree accessors `extract` selects with. A node coordinate
+  outside the `i32` decimicrodegree range has no scanned box and lies
+  outside every stored one, so any stored box over it is reported. The
+  merge engine behind `sort` and `cat --dedupe` keeps indexdata by the same
+  rule. For the key set, a missing key is the unsound
   case (a skipped blob holding matches); a listed key the blob lacks only
   costs a decode, and is reported as a separate violation.
 - `degrade --corrupt-indexdata`, `--corrupt-indexdata-kind` and
@@ -241,8 +248,9 @@ Whether a file is indexed is not a claim the file makes; commands infer it.
 - **`sort` does not copy indexdata it has found false.** Under a header
   that does not claim `Sort.Type_then_ID` it scans every blob, indexed ones
   included, to check their order. A blob whose indexdata disagrees with the
-  scan (kind, count or ID range unequal, or a bbox not containing the
-  scanned one, the `check --index` rule) is copied under indexdata and tag
+  scan by the `check --index` rule (kind, count or ID range unequal, or a
+  bbox not containing the scanned one, or any bbox over a node coordinate
+  outside the decimicrodegree range) is copied under indexdata and tag
   keys scanned from its payload, with a `Note:`. Under the sorted claim an
   indexed blob is not scanned, so its indexdata is believed and copied, as
   everywhere else on this page.

@@ -690,7 +690,7 @@ Two checks are containment rather than equality:
 | Field | Test | Why |
 |-------|------|-----|
 | kind, count, min_id, max_id | exact equality | every consumer treats them as exact |
-| bbox | stored must **contain** the blob's coordinates | the scan rounds outward through `granularity`/`lat_offset`/`lon_offset`, so a stored box narrower than the scan is the only shape that can make a spatial filter skip a blob it should have read. A wider box is sound; an absent box is no claim |
+| bbox | stored must **contain** the blob's coordinates | the scan rounds outward through `granularity`/`lat_offset`/`lon_offset`, so a stored box narrower than the scan is the only shape that can make a spatial filter skip a blob it should have read. A wider box is sound; an absent box is no claim. A node coordinate outside the `i32` decimicrodegree range lies outside every box, so a stored box over it is reported |
 | tag key set | stored must contain every key the blob carries | an omitted key makes `tags-filter` skip a blob holding matches. A key listed but not present is sound - it only costs a decode - and is reported as a separate, distinct violation |
 
 Exit `1` means mismatches were found, exit `2` that the check could not run.

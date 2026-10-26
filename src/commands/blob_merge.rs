@@ -37,7 +37,7 @@ use crate::blob::{
     BlobKind, decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
 };
 use crate::blob_meta::{
-    BlobIndex, TagIndex, try_scan_block_ids_and_tags, try_scan_block_ids_checked,
+    BboxClaim, BlobIndex, TagIndex, try_scan_block_ids_and_tags, try_scan_block_ids_checked,
     try_scan_block_tags,
 };
 use crate::block_builder::{BlockBuilder, OwnedBlock};
@@ -166,9 +166,12 @@ pub(crate) struct IndexPolicy {
 /// gets one restructured entry per kind it holds. An indexed blob scanned for
 /// order (`sort` under a header without the sorted claim) whose indexdata
 /// its payload contradicts is reframed with the scanned index rather than
-/// copied with the false one; its claim holds when kind, count and ID range
-/// are equal and a bbox it carries contains the scanned one (the
-/// `check --index` rule, which reads an absent bbox as no claim).
+/// copied with the false one. Its claim holds exactly when `check --index`
+/// would report nothing against it: kind, count and ID range equal, and a
+/// bbox it carries containing the scanned one (an absent bbox is no claim;
+/// a node coordinate outside the decimicrodegree range, where the scan has
+/// no box, makes any carried box false). [`BlobIndex::bbox_claim`] is that
+/// rule's bbox half, shared with the check.
 ///
 /// `direct_io` (the `--direct-io` flag) walks every input `O_DIRECT`
 /// ([`HeaderWalker::open_direct`]): the same probes and payload reads, as
@@ -414,20 +417,19 @@ impl Walk<'_> {
 }
 
 /// Whether a blob's indexdata claim is true of the index scanned from its
-/// payload: kind, count and ID range exact, and a claimed bbox containing
-/// the scanned one. An absent claimed bbox makes no spatial claim; a present
-/// one the scan could not confirm (no scanned box) is not believed.
+/// payload, by `check --index`'s rule: kind, count and ID range exact, and
+/// the bbox judged by [`BlobIndex::bbox_claim`] (an absent one no claim, a
+/// present one containing the scanned box; a node coordinate outside the
+/// decimicrodegree range makes any box false).
 fn claim_holds(claim: &BlobIndex, scanned: &BlobIndex) -> bool {
-    let bbox_holds = match (claim.bbox, scanned.bbox) {
-        (None, _) => true,
-        (Some(claimed), Some(observed)) => claimed.contains(&observed),
-        (Some(_), None) => false,
-    };
     claim.kind == scanned.kind
         && claim.count == scanned.count
         && claim.min_id == scanned.min_id
         && claim.max_id == scanned.max_id
-        && bbox_holds
+        && matches!(
+            claim.bbox_claim(scanned),
+            BboxClaim::Absent | BboxClaim::Holds
+        )
 }
 
 /// The serialized tag key set of a block one index describes.
@@ -1558,7 +1560,8 @@ mod tests {
     }
 
     /// The claim rule is `check --index`'s: kind, count and range exact, a
-    /// claimed bbox containing the scanned one, an absent one no claim.
+    /// claimed bbox containing the scanned one, an absent one no claim, and
+    /// any claimed one false over a coordinate out of range.
     #[test]
     fn a_claim_holds_on_exact_ranges_and_a_containing_bbox() {
         let scanned = BlobIndex {
@@ -1588,7 +1591,8 @@ mod tests {
         };
         assert!(
             !claim_holds(&scanned, &boxless),
-            "a claimed bbox the scan cannot confirm is not believed"
+            "a node blob the scan gives no box has a coordinate out of range, \
+             which no claimed box contains"
         );
     }
 

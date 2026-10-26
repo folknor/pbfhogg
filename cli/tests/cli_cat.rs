@@ -2392,6 +2392,92 @@ fn sort_replaces_indexdata_it_found_false() {
     assert_eq!(ordered_elements(&output), ordered_elements(&honest));
 }
 
+/// The bbox half of the same rule, which is `check --index`'s: with kind,
+/// count and IDs honest, a stored node box too small for the nodes, and any
+/// stored box over a node coordinate outside the decimicrodegree range, are
+/// false claims `sort` replaces, and its output passes `check --index`.
+#[test]
+fn sort_replaces_a_false_bbox_by_the_check_index_rule() {
+    use pbfhogg::block_builder::BlockBuilder;
+
+    let dir = crate::common::test_scratch();
+    let honest = dir.path().join("honest.osm.pbf");
+    let mut bb = BlockBuilder::new();
+    bb.add_node(1, 10, 10, [], None);
+    bb.add_node(2, 20, 20, [], None);
+    let nodes = bb.take().expect("take").expect("block").to_vec();
+    write_raw_block_pbf(&honest, false, &[], &[(true, nodes)]);
+    let bytes = std::fs::read(&honest).expect("read fixture");
+
+    // Frame 1 is the node blob. Too small: a box at (1, 1), bytes 26..42 of
+    // the index. Out of range: a top-level lat_offset (field 19) of i64::MAX,
+    // the last occurrence and so the one the scan and the decoder read.
+    let too_small = crate::common::adversarial::mutate_blob_header_indexdata(&bytes, 1, |ix| {
+        for word in ix[26..42].as_chunks_mut::<4>().0 {
+            *word = 1i32.to_le_bytes();
+        }
+    });
+    let out_of_range = crate::common::adversarial::mutate_blob_payload(&bytes, 1, |p| {
+        p.extend_from_slice(&[0x98, 0x01]);
+        crate::common::adversarial::write_varint(p, i64::MAX.cast_unsigned());
+    });
+
+    for (name, lying_bytes, detail) in [
+        (
+            "small",
+            too_small,
+            "does not contain the blob's coordinates",
+        ),
+        ("far", out_of_range, "outside the decimicrodegree range"),
+    ] {
+        let lying = dir.path().join(format!("{name}.osm.pbf"));
+        std::fs::write(&lying, lying_bytes).expect("write lying fixture");
+        let refused = CliInvoker::new()
+            .arg("check")
+            .arg("--index")
+            .arg(&lying)
+            .run();
+        assert_eq!(
+            refused.status.code(),
+            Some(1),
+            "{name}: {}",
+            refused.stderr_str()
+        );
+        refused.assert_stdout_contains(detail);
+
+        let output = dir.path().join(format!("{name}-sorted.osm.pbf"));
+        let out = CliInvoker::new()
+            .arg("sort")
+            .arg(&lying)
+            .arg("-o")
+            .arg(&output)
+            .run();
+        assert!(out.status.success(), "{name}: {}", out.stderr_str());
+        out.assert_stderr_contains("1 blobs carried indexdata their payload contradicts");
+        CliInvoker::new()
+            .arg("check")
+            .arg("--index")
+            .arg(&output)
+            .assert_success();
+    }
+
+    // Counterpart: the honest file under the same unclaimed header keeps its
+    // indexdata, so the rule is not "always reframe".
+    let output = dir.path().join("honest-sorted.osm.pbf");
+    let out = CliInvoker::new()
+        .arg("sort")
+        .arg(&honest)
+        .arg("-o")
+        .arg(&output)
+        .run();
+    assert!(out.status.success(), "{}", out.stderr_str());
+    assert!(
+        !out.stderr_str().contains("their payload contradicts"),
+        "{}",
+        out.stderr_str()
+    );
+}
+
 /// A way blob `sort` reframes for a false index loses its blob-header field
 /// 5, so the output may no longer declare `WayMembers-v1`, although the blob
 /// carried indexdata in the input. The declaration follows what pass 2

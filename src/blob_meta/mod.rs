@@ -129,6 +129,57 @@ pub(crate) struct BlobIndex {
     pub bbox: Option<BlobBbox>,
 }
 
+/// What a stored bbox claim amounts to against the blob's payload: the one
+/// rule `check --index` reports on and the `sort` / `cat --dedupe` merge
+/// engine keeps or replaces indexdata by.
+///
+/// A bbox claims to contain the blob's exact coordinates, `offset +
+/// granularity * raw` nanodegrees, which is what the scan's outward-rounded
+/// box contains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BboxClaim {
+    /// The stored index carries no bbox: no spatial claim (every v1 index,
+    /// and v2 and v3 spelling absence).
+    Absent,
+    /// The payload holds no nodes, so there is no box to compare. A stored
+    /// bbox exists only on an index claiming nodes, so its kind claim is
+    /// already false, and that is the finding.
+    NotNodes,
+    /// The stored box contains the scanned one.
+    Holds,
+    /// The stored box, `claimed`, does not contain the scanned one,
+    /// `observed`.
+    TooSmall {
+        claimed: BlobBbox,
+        observed: BlobBbox,
+    },
+    /// A node coordinate lies outside the `i32` decimicrodegree range, so no
+    /// box can contain it and the stored one, `claimed`, is false.
+    OutOfRange { claimed: BlobBbox },
+}
+
+impl BlobIndex {
+    /// Compare this stored index's bbox claim with `scanned`.
+    ///
+    /// `scanned` must be the scan's index of this blob's payload
+    /// (`try_scan_block_ids_checked` and its siblings), not another stored
+    /// index: only from the scan does a node index without a box mean a
+    /// coordinate out of range rather than an index that never had one.
+    pub(crate) fn bbox_claim(&self, scanned: &BlobIndex) -> BboxClaim {
+        let Some(claimed) = self.bbox else {
+            return BboxClaim::Absent;
+        };
+        if scanned.kind != ElementKind::Node {
+            return BboxClaim::NotNodes;
+        }
+        match scanned.bbox {
+            Some(observed) if claimed.contains(&observed) => BboxClaim::Holds,
+            Some(observed) => BboxClaim::TooSmall { claimed, observed },
+            None => BboxClaim::OutOfRange { claimed },
+        }
+    }
+}
+
 /// Indexdata wire format version.
 const INDEX_VERSION_V1: u8 = 0x01;
 /// v2: adds the spatial bbox, with all-zero meaning "no bbox".

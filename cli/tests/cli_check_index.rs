@@ -356,6 +356,63 @@ fn indexdata_that_cannot_be_read_is_reported_rather_than_ignored() {
     );
 }
 
+/// Append a top-level `lat_offset` (PrimitiveBlock field 19) to a payload. The
+/// last occurrence wins, for the scan and the decoder alike.
+fn with_lat_offset(payload: &mut Vec<u8>, offset: i64) {
+    payload.extend_from_slice(&[0x98, 0x01]);
+    crate::common::adversarial::write_varint(payload, offset.cast_unsigned());
+}
+
+/// A stored bbox over a node whose coordinate lies outside the `i32`
+/// decimicrodegree range is false: no box contains such a coordinate, and at
+/// this offset the decoder wraps it to a position the box need not cover. The scan has no box
+/// for the blob; the check used to compare boxes only when both existed and
+/// passed it, while `sort`'s merge engine already refused to keep it.
+#[test]
+fn a_stored_bbox_over_out_of_range_coordinates_is_reported() {
+    let dir = crate::common::test_scratch();
+    let input = dir.path().join("in.osm.pbf");
+    write_fixture(&input);
+    let pbf = std::fs::read(&input).expect("read fixture");
+
+    // Blob 1 is the first node blob; its header keeps the bbox pbfhogg wrote.
+    let far = dir.path().join("far.osm.pbf");
+    std::fs::write(
+        &far,
+        crate::common::adversarial::mutate_blob_payload(&pbf, 1, |p| {
+            with_lat_offset(p, i64::MAX);
+        }),
+    )
+    .expect("write");
+    let out = check_index(&far);
+    let stdout = out.stdout_str();
+    assert_eq!(
+        out.status.code(),
+        Some(EXIT_ANSWER_NEGATIVE),
+        "stdout:\n{stdout}\nstderr:\n{}",
+        out.stderr_str(),
+    );
+    assert!(
+        stdout.contains("outside the decimicrodegree range"),
+        "the report must name the out-of-range coordinates: {stdout}"
+    );
+
+    // Paired counterpart: the same payload rewrite with an offset of zero is
+    // the honest file, and must verify clean.
+    let zero = dir.path().join("zero.osm.pbf");
+    std::fs::write(
+        &zero,
+        crate::common::adversarial::mutate_blob_payload(&pbf, 1, |p| with_lat_offset(p, 0)),
+    )
+    .expect("write");
+    let out = check_index(&zero);
+    assert!(
+        out.status.success(),
+        "an explicit zero offset changes no coordinate; stdout:\n{}",
+        out.stdout_str()
+    );
+}
+
 /// A valid tag index over a blob that cannot be indexed is a lie with a
 /// consumer, and must be reported even when indexdata is absent.
 ///

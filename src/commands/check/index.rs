@@ -66,7 +66,11 @@
 //!   because `BlobFilter::wants_index` passes a boxless blob straight through.
 //!   (v1 indexdata has no bbox field, so treating absence as a violation fails
 //!   on every v1 file, which is what the first Denmark run of this command
-//!   demonstrated.)
+//!   demonstrated.) The coordinates a box claims to contain are the exact
+//!   `offset + granularity * raw` nanodegrees; one outside the `i32`
+//!   decimicrodegree range, where the scan has no box, is outside every
+//!   stored box, and is reported as such. The `sort` / `cat --dedupe` merge
+//!   engine keeps indexdata by the same rule (`BlobIndex::bbox_claim`).
 //! * **tag keys** - a stored key set that *omits* a key the blob carries makes
 //!   `tags-filter` skip a blob that does contain matches, which is a wrong
 //!   answer. A stored key set that lists a key the blob does not carry only
@@ -78,7 +82,7 @@
 //! treats them as exact, so anything but equality is a lie with a consumer.
 
 use crate::blob::BlobKind;
-use crate::blob_meta::{BlobBbox, BlobIndex, scan_block_tags};
+use crate::blob_meta::{BboxClaim, BlobBbox, BlobIndex, scan_block_tags};
 use crate::error::Result;
 use crate::file_reader::FileReader;
 use crate::read::decompress::decompress_blob_data_into;
@@ -110,6 +114,13 @@ pub enum IndexViolationKind {
         claimed: [i32; 4],
         observed: [i32; 4],
     },
+    /// The stored bbox is present over a node blob with a coordinate outside
+    /// the `i32` decimicrodegree range (about +-214.7 degrees), which no box
+    /// can contain, so the claim is false. Far enough out, the decoder's
+    /// accessors also wrap such a coordinate to an arbitrary position the
+    /// box need not cover, where a spatial filter can skip a blob holding a
+    /// node a decode would place in the query region.
+    BboxOutOfRange { claimed: [i32; 4] },
     /// The header carries an indexdata for a well-formed blob this crate
     /// refuses to index at all (a group mixing element kinds). A malformed
     /// payload is not this: `check_index` fails with an error. Whatever
@@ -199,6 +210,12 @@ impl std::fmt::Display for IndexViolation {
                 "indexdata bbox [{},{},{},{}] does not contain the blob's coordinates \
                  [{},{},{},{}]",
                 c[0], c[1], c[2], c[3], observed[0], observed[1], observed[2], observed[3]
+            ),
+            IndexViolationKind::BboxOutOfRange { claimed: c } => write!(
+                f,
+                "indexdata bbox [{},{},{},{}] cannot contain the blob's coordinates: \
+                 some lie outside the decimicrodegree range",
+                c[0], c[1], c[2], c[3]
             ),
             IndexViolationKind::IndexOnUnindexableBlob => write!(
                 f,
@@ -381,7 +398,9 @@ fn diff_blob(
             observed: observed.max_id,
         });
     }
-    // Containment, not equality - see the module docs.
+    // Containment, not equality - see the module docs. The rule is shared
+    // with the merge engine, which keeps a blob's indexdata exactly when this
+    // check would report nothing against it.
     //
     // An *absent* stored bbox is not a violation, and getting that wrong was
     // the first thing the Denmark real-data run caught: every one of the file's
@@ -390,14 +409,21 @@ fn diff_blob(
     // is not a false claim - `BlobFilter::wants_index` treats a missing bbox as
     // "no spatial information, decode the blob", so a stored index without a
     // box cannot cause a wrong answer. Only a box that is *present* and *too
-    // small* can, because that is the one shape a spatial filter acts on.
-    if let (Some(stored_bbox), Some(obs_bbox)) = (stored.bbox, observed.bbox)
-        && !stored_bbox.contains(&obs_bbox)
-    {
-        out.push(IndexViolationKind::BboxTooSmall {
-            claimed: bbox_array(&stored_bbox),
-            observed: bbox_array(&obs_bbox),
-        });
+    // small* can, because that is the one shape a spatial filter acts on; a
+    // node coordinate outside the decimicrodegree range is outside every box.
+    match stored.bbox_claim(observed) {
+        BboxClaim::Absent | BboxClaim::NotNodes | BboxClaim::Holds => {}
+        BboxClaim::TooSmall { claimed, observed } => {
+            out.push(IndexViolationKind::BboxTooSmall {
+                claimed: bbox_array(&claimed),
+                observed: bbox_array(&observed),
+            });
+        }
+        BboxClaim::OutOfRange { claimed } => {
+            out.push(IndexViolationKind::BboxOutOfRange {
+                claimed: bbox_array(&claimed),
+            });
+        }
     }
 }
 
@@ -732,6 +758,41 @@ mod tests {
             vec![IndexViolationKind::BboxTooSmall {
                 claimed: [20, 90, 10, 90],
                 observed: [10, 90, 10, 90],
+            }]
+        );
+    }
+
+    /// A node blob the scan gives no box has a coordinate outside the
+    /// decimicrodegree range, which no stored box contains.
+    #[test]
+    fn a_stored_bbox_over_out_of_range_coordinates_is_reported() {
+        let mut stored = idx(ElementKind::Node, 1, 2, 2);
+        stored.bbox = Some(BlobBbox::new(i32::MIN, i32::MAX, i32::MIN, i32::MAX));
+        let boxless = idx(ElementKind::Node, 1, 2, 2);
+        let mut out = Vec::new();
+        diff_blob(Some(&stored), true, Some(&boxless), &mut out);
+        assert_eq!(
+            out,
+            vec![IndexViolationKind::BboxOutOfRange {
+                claimed: [i32::MIN, i32::MAX, i32::MIN, i32::MAX],
+            }],
+            "even the full-domain box cannot contain such a coordinate"
+        );
+
+        // Counterparts: the same boxless scan under a stored index without a
+        // box claims nothing, and a stored node box over a blob that holds
+        // ways is the kind finding alone.
+        let mut out = Vec::new();
+        diff_blob(Some(&boxless), true, Some(&boxless), &mut out);
+        assert!(out.is_empty(), "no stored box is no claim: {out:?}");
+        let ways = idx(ElementKind::Way, 1, 2, 2);
+        let mut out = Vec::new();
+        diff_blob(Some(&stored), true, Some(&ways), &mut out);
+        assert_eq!(
+            out,
+            vec![IndexViolationKind::Kind {
+                claimed: "node",
+                observed: "way"
             }]
         );
     }

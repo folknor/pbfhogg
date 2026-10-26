@@ -387,7 +387,9 @@ Two of the checks are containment rather than equality:
 - A stored **bbox** must contain every coordinate in the blob. A wider box is
   sound (and is what a non-default `granularity` legitimately produces), an
   absent box is no claim at all, and only a box that is present and too small
-  can make a spatial filter skip a blob it should have read.
+  can make a spatial filter skip a blob it should have read. A node coordinate
+  outside the decimicrodegree range (about 214.7 degrees either way) lies
+  outside every box, so any stored box over it is reported.
 - A stored **tag key set** that omits a key the blob carries makes `tags-filter`
   skip a blob holding matches; one that lists a key the blob does not carry only
   costs a needless decode. Both are reported, as distinct violations.

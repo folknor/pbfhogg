@@ -674,6 +674,54 @@ the ones below.
   cannot confirm is not believed); the defect is the claimed equivalence.
   Either the docs say "the `check --index` rule, stricter in one case",
   or the rule follows `check --index`.
+  **Resolved** the third way: `check --index` follows the merge engine,
+  after the scanner was fixed so that the strict rule is provably right
+  (sparred with codex to consensus, the diff reviewed by a fresh codex
+  session).
+  - Correction to the record: `reference/cli-reference.md` and the CHANGELOG
+    never called it the `check --index` rule; the claim was in the
+    `index_inputs` doc, the `claim_holds` test doc and
+    `reference/indexdata-trust.md` (and the `060c2f74` commit message).
+  - Found in the spar: the scan's "no box" did not mean what either side
+    assumed. `transform_range` checked `granularity * raw` and the offset
+    add separately in `i64`, so an honest encoding whose offset cancels an
+    overflowing product (granularity 100, raw 92_233_720_368_547_759,
+    offset -9_223_372_036_854_775_800 is 100 nanodegrees) got no box, and the
+    strict rule would have reframed a true claim. Now it computes the exact
+    affine value in `i128`, so a node blob has no scanned box if and only if
+    a coordinate lies outside the `i32` decimicrodegree range, where no box
+    can contain it: the claim is false, not merely unconfirmed. Indexdata
+    generation gives such cancelling blobs a box now.
+  - Semantics settled in the spar: a bbox claims the exact format
+    coordinates (`offset + granularity * raw` nanodegrees), not the
+    truncating accessor's; outward rounding covers both. So a stored
+    `[1,1]` over a node at 150 nanodegrees stays a violation.
+  - One shared verdict, `BlobIndex::bbox_claim` (`src/blob_meta/mod.rs`):
+    absent, not nodes, holds, too small, out of range. `diff_blob` reports
+    the new `IndexViolationKind::BboxOutOfRange`; `claim_holds` keeps
+    indexdata only for absent or holds. A stored node box over a blob of
+    another kind stays the kind finding alone.
+  - Tests: exact-transform unit tests (the cancellation, `4 * 2^62` which
+    wrapping arithmetic would call 0, the `i32` edge); a scan of a
+    cancelling block; `diff_blob` out of range with counterparts;
+    `cli_check_index::a_stored_bbox_over_out_of_range_coordinates_is_reported`;
+    `cli_cat::sort_replaces_a_false_bbox_by_the_check_index_rule` (too
+    small and out of range, honest counterpart). Mutation-checked: the
+    check ignoring out of range fails the CLI check test; `claim_holds`
+    accepting out of range fails the sort test. `brokkr check` (tier1)
+    passes. Docs: the `index_inputs` and `claim_holds` docs,
+    `check/index.rs` module doc, `reference/indexdata-trust.md`,
+    `reference/cli-reference.md`, `docs/cli/commands.md`, CHANGELOG
+    (the sort entry, and a new `check --index` entry naming the library
+    variant).
+  - Left open, found in the spar: `scan/node.rs`'s `decimicro` (altw and
+    apply-changes `-l` coordinate extraction) still checks the product and
+    the add separately in `i64`, so it refuses the cancelling encoding
+    `check --index` now accepts. It is per node on a hot path, so an
+    `i128` swap there is a measured-path judgement, not taken here. Also
+    pre-existing: the columnar granularity-100 fast path
+    (`read/columnar.rs`) may disagree with the element accessors on
+    overflowing coordinates, by its own doc.
 
 - Slice F, item 2 (`56a50e0d`, the result channel sized to the window):
   confirmed and **resolved** in `c2409c45`, with the lateral stage 4 fix

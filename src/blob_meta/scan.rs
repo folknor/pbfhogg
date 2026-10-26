@@ -37,8 +37,9 @@
 //! decode yields - including for a block the writer produced with deltas
 //! that wrap (IDs `i64::MIN` then `i64::MAX`). A checked sum here would make
 //! indexdata generation refuse, and the writer fail on, a block every reader
-//! accepts. Only the granularity/offset scaling of the bbox stays checked,
-//! and an overflow there means no bbox, never a refusal.
+//! accepts. The bbox scales the extent exactly (`offset + granularity * raw`
+//! in `i128`), and an extreme outside the `i32` decimicrodegree range means
+//! no bbox, never a refusal.
 //!
 //! Both scanners run the same walk, so they agree on what is an `Err`.
 //! What the walk validates is the index-relevant structure, not full decoder
@@ -460,8 +461,9 @@ impl<'a> Walk<'a> {
         Ok(())
     }
 
-    /// The blob's bbox in decimicrodegrees, or `None` when it has none or the
-    /// extent cannot be scaled into decimicrodegrees.
+    /// The blob's bbox in decimicrodegrees, or `None` when it has none (not
+    /// a node blob) or a coordinate lies outside the `i32` decimicrodegree
+    /// range ([`transform_range`]).
     fn bbox(&self, kind: ElementKind) -> Option<BlobBbox> {
         if kind != ElementKind::Node {
             return None;
@@ -488,14 +490,27 @@ fn dense_length_mismatch() -> crate::error::Error {
 /// (nanodegrees) to decimicrodegrees, rounding outward.
 ///
 /// Both endpoints are transformed and then ordered, because a negative
-/// granularity maps the raw minimum to the coordinate maximum. `granularity`
-/// and the offsets are attacker-controllable, so every step is checked; an
-/// overflow, or a result outside `i32`, means no bbox rather than a wrapped
-/// one that every spatial filter would trust.
+/// granularity maps the raw minimum to the coordinate maximum.
+///
+/// The affine value is computed exactly, in `i128`: `|granularity| <= 2^31`
+/// and `|raw|, |offset| <= 2^63`, so it cannot overflow there. Checking the
+/// multiplication and the addition separately in `i64` would refuse a box to
+/// an honest encoding whose product overflows and whose offset cancels it
+/// (granularity 100, raw `92_233_720_368_547_759`, offset
+/// `-9_223_372_036_854_775_800` is latitude 100 nanodegrees). So `None` here
+/// means exactly one thing: an extreme coordinate lies outside the `i32`
+/// decimicrodegree range, where no box can contain it. When a box is
+/// returned every nanodegree value fits `i64`, so the decoder's wrapping
+/// accessors (`DenseNode::nano_lat`) yield the same exact values. Outward
+/// rounding keeps the box sound for the truncating decimicrodegree accessors
+/// too: `floor(n/100) <= trunc(n/100) <= ceil(n/100)`. `granularity` and the
+/// offsets are attacker-controllable; a coordinate out of range means no
+/// bbox rather than a wrapped one that every spatial filter would trust.
 fn transform_range(lo: i64, hi: i64, offset: i64, granularity: i32) -> Option<(i32, i32)> {
-    let gran = i64::from(granularity);
-    let a = offset.checked_add(gran.checked_mul(lo)?)?;
-    let b = offset.checked_add(gran.checked_mul(hi)?)?;
+    let gran = i128::from(granularity);
+    let offset = i128::from(offset);
+    let a = offset + gran * i128::from(lo);
+    let b = offset + gran * i128::from(hi);
     let (min_nano, max_nano) = if a <= b { (a, b) } else { (b, a) };
     Some((
         i32::try_from(floor_div(min_nano, 100)).ok()?, // ok-deliberate: no bbox, see doc
@@ -504,14 +519,14 @@ fn transform_range(lo: i64, hi: i64, offset: i64, granularity: i32) -> Option<(i
 }
 
 /// Floor division for signed integers (rounds toward negative infinity).
-fn floor_div(a: i64, b: i64) -> i64 {
+fn floor_div(a: i128, b: i128) -> i128 {
     let d = a / b;
     let r = a % b;
     if (r != 0) && ((r ^ b) < 0) { d - 1 } else { d }
 }
 
 /// Ceiling division for signed integers (rounds toward positive infinity).
-fn ceil_div(a: i64, b: i64) -> i64 {
+fn ceil_div(a: i128, b: i128) -> i128 {
     let d = a / b;
     let r = a % b;
     if (r != 0) && ((r ^ b) >= 0) { d + 1 } else { d }
@@ -1080,9 +1095,9 @@ mod tests {
 
     // --- bbox -----------------------------------------------------------
 
-    /// A node blob whose second group's coordinates cannot be scaled into
-    /// decimicrodegrees must not carry the first group's box alone: a query
-    /// near the second group would skip the blob.
+    /// A node blob whose second group's coordinates lie outside the `i32`
+    /// decimicrodegree range must not carry the first group's box alone: a
+    /// query near the second group's decoded positions would skip the blob.
     #[test]
     fn an_unscalable_coordinate_drops_the_whole_bbox() {
         let a = dense_group_body(&[1]);
@@ -1134,5 +1149,57 @@ mod tests {
         assert_eq!(ceil_div(510_000_050, 100), 5_100_001);
         assert_eq!(floor_div(-510_000_050, 100), -5_100_001);
         assert_eq!(ceil_div(-510_000_050, 100), -5_100_000);
+    }
+
+    /// The affine value is exact: a product past `i64` that the offset
+    /// cancels is an ordinary coordinate, and only a coordinate outside the
+    /// `i32` decimicrodegree range has no box.
+    #[test]
+    fn the_coordinate_transform_is_exact_and_refuses_only_out_of_range() {
+        // 100 * raw overflows i64; the offset brings it back to 100 nanodegrees.
+        let raw = 92_233_720_368_547_759;
+        let offset = -9_223_372_036_854_775_800;
+        assert_eq!(transform_range(raw, raw, offset, 100), Some((1, 1)));
+        // 4 * 2^62 is 2^64 nanodegrees, far out of range; i64 wrapping
+        // arithmetic would call it 0.
+        assert_eq!(transform_range(1 << 62, 1 << 62, 0, 4), None);
+        // The extremes of every input never panic.
+        assert_eq!(
+            transform_range(i64::MIN, i64::MAX, i64::MIN, i32::MIN),
+            None
+        );
+        assert_eq!(
+            transform_range(i64::MIN, i64::MAX, i64::MAX, i32::MAX),
+            None
+        );
+        // The edge of the range: i32::MAX decimicrodegrees is representable,
+        // one nanodegree past it is not (ceil takes it to i32::MAX + 1).
+        let edge = i64::from(i32::MAX) * 100;
+        assert_eq!(
+            transform_range(edge, edge, 0, 1),
+            Some((i32::MAX, i32::MAX))
+        );
+        assert_eq!(transform_range(edge + 1, edge + 1, 0, 1), None);
+    }
+
+    /// The same cancellation inside a real block: the scan gives it a box.
+    #[test]
+    fn a_cancelling_offset_gets_a_bbox() {
+        let mut dense = Vec::new();
+        write_len_delimited(1, &packed_delta_sint64(&[1]), &mut dense);
+        write_len_delimited(
+            8,
+            &packed_delta_sint64(&[92_233_720_368_547_759]),
+            &mut dense,
+        );
+        write_len_delimited(9, &packed_delta_sint64(&[0]), &mut dense);
+        let mut g = Vec::new();
+        write_len_delimited(2, &dense, &mut g);
+        let mut block = block_from_groups(&[&g]);
+        write_tag(19, 0, &mut block);
+        encode_varint(-9_223_372_036_854_775_800i64 as u64, &mut block);
+        let bbox = scan_block_ids(&block).unwrap().bbox.unwrap();
+        assert_eq!((bbox.min_lat, bbox.max_lat), (1, 1));
+        assert_eq!((bbox.min_lon, bbox.max_lon), (0, 0));
     }
 }

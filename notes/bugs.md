@@ -776,6 +776,14 @@ That confirms section 1 on real data: the same diff resolves fully on a
 base with its untagged nodes and leaves 2.8M refs unresolved on the
 default altw base.
 
+The fix (uncommitted, 2026-10-26) on the same pair, bygg: its summary
+reported 74,194 refs refreshed in 23,221 ways, 29,766 way blobs scanned and
+2,951 rewritten only for the refresh, exactly the numbers
+`stale_way_blobs` measured independently. `check --locations` on the
+output: 4,690,811,662 way-node refs, all verified, 0 mismatched, 0 without
+a node record. One unstored single cell took 49.4 s against the 45.9 s
+baseline; the matched A/B is pending.
+
 ### Lateral findings
 
 - A. `block_overlaps_diff` (`classify.rs`) starts every per-kind cursor at

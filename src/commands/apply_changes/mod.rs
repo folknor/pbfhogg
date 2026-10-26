@@ -22,6 +22,7 @@ mod failure;
 mod loc_mode;
 mod node_coords;
 mod node_locations;
+mod refresh;
 mod rewrite;
 mod rewrite_block;
 mod scanner;

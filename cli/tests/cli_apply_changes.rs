@@ -1473,6 +1473,8 @@ fn merge_locations_on_ways_rejects_missing_node_unless_explicitly_ignored() {
     );
     assert_eq!(rejected.status.code(), Some(2));
     rejected.assert_stderr_contains("1 way node references could not be resolved");
+    rejected.assert_stderr_contains("--keep-untagged-nodes");
+    rejected.assert_stderr_contains("--ignore-missing-nodes");
     assert!(
         !output.exists(),
         "guarded output must discard the failed merge"
@@ -1884,6 +1886,685 @@ fn merge_locations_on_ways_counts_a_deleted_node_reference_as_missing() {
     // The library names no flag; the CLI adds the switch that allows it.
     out.assert_stderr_contains("--ignore-missing-nodes");
     assert!(!output.exists(), "failed merge must leave no output");
+}
+
+// ---------------------------------------------------------------------------
+// LocationsOnWays: refreshing surviving base ways
+// ---------------------------------------------------------------------------
+//
+// An OSC that moves a node without touching the ways using it must still
+// refresh those ways' inline coordinates, whether their blob is passed
+// through (its range misses the diff) or rewritten for other edits.
+
+type LowWay = (i64, Vec<i64>, Vec<(i32, i32)>);
+
+/// A sorted LocationsOnWays base: one node blob, then one way blob per entry
+/// of `way_blobs`, so each group's range is its own blob's.
+fn write_low_blobs(path: &Path, nodes: &[(i64, i32, i32)], way_blobs: &[Vec<LowWay>]) {
+    let mut blocks = Vec::new();
+    for blob in way_blobs {
+        let mut bb = BlockBuilder::new();
+        for (id, refs, coords) in blob {
+            bb.add_way_with_locations(*id, [("highway", "path")], refs, coords, None);
+        }
+        blocks.push(bb.take().expect("take").expect("way block").to_vec());
+    }
+    write_low_raw_way_blocks(path, nodes, &blocks);
+}
+
+/// Like [`write_low_blobs`], with the way blobs (and any relation blobs
+/// after them) given as serialized PrimitiveBlocks.
+fn write_low_raw_way_blocks(path: &Path, nodes: &[(i64, i32, i32)], way_blocks: &[Vec<u8>]) {
+    let file = std::fs::File::create(path).expect("create file");
+    let mut writer = PbfWriter::new(std::io::BufWriter::new(file), Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .optional_feature("LocationsOnWays")
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+    if !nodes.is_empty() {
+        let mut bb = BlockBuilder::new();
+        for &(id, lat, lon) in nodes {
+            bb.add_node(id, lat, lon, std::iter::empty(), None);
+        }
+        writer
+            .write_primitive_block(bb.take().expect("take").expect("node block"))
+            .expect("node blob");
+    }
+    for block in way_blocks {
+        writer.write_primitive_block(block).expect("way blob");
+    }
+    writer.flush().expect("flush");
+}
+
+/// Every blob frame of a PBF, header blob included, as raw bytes.
+fn raw_frames(path: &Path) -> Vec<Vec<u8>> {
+    let bytes = std::fs::read(path).expect("read pbf");
+    let mut offsets: Vec<usize> = BlobReader::from_path(path)
+        .expect("open pbf")
+        .map(|blob| {
+            let offset = blob.expect("blob").offset().expect("offset").0;
+            usize::try_from(offset).expect("offset fits usize")
+        })
+        .collect();
+    offsets.push(bytes.len());
+    offsets
+        .windows(2)
+        .map(|w| bytes[w[0]..w[1]].to_vec())
+        .collect()
+}
+
+/// True when `frame` appears byte for byte in the file at `path`: the merge
+/// passed that input blob through untouched.
+fn passed_through(path: &Path, frame: &[u8]) -> bool {
+    std::fs::read(path)
+        .expect("read output")
+        .windows(frame.len())
+        .any(|w| w == frame)
+}
+
+/// `pbfhogg check --locations` on an output: every inline coordinate
+/// agrees with its node record.
+fn assert_locations_check_passes(path: &Path) {
+    let out = CliInvoker::new()
+        .arg("check")
+        .arg("--locations")
+        .arg(path)
+        .run();
+    assert!(
+        out.status.success(),
+        "check --locations failed\nstdout:\n{}\nstderr:\n{}",
+        out.stdout_str(),
+        out.stderr_str()
+    );
+}
+
+fn way_coords(path: &Path, id: i64) -> Vec<(i32, i32)> {
+    read_way_locations(path)
+        .into_iter()
+        .find(|(way, _)| *way == id)
+        .unwrap_or_else(|| panic!("way {id} missing"))
+        .1
+}
+
+const REFRESH_NODES: [(i64, i32, i32); 4] = [
+    (1, 100_000_000, 200_000_000),
+    (2, 300_000_000, 400_000_000),
+    (3, 500_000_000, 600_000_000),
+    (4, 700_000_000, 800_000_000),
+];
+
+fn at(id: i64) -> (i32, i32) {
+    let (_, lat, lon) = REFRESH_NODES[usize::try_from(id - 1).unwrap()];
+    (lat, lon)
+}
+
+fn honest_way(id: i64, refs: &[i64]) -> LowWay {
+    (id, refs.to_vec(), refs.iter().map(|&r| at(r)).collect())
+}
+
+/// Way blobs: [10, 11] (rewritten when the OSC edits way 11) and [20] and
+/// [30] (their ranges miss every OSC way).
+fn refresh_base(path: &Path) {
+    write_low_blobs(
+        path,
+        &REFRESH_NODES,
+        &[
+            vec![honest_way(10, &[1, 3]), honest_way(11, &[1, 2])],
+            vec![honest_way(20, &[2, 3, 4, 2])],
+            vec![honest_way(30, &[4])],
+        ],
+    );
+}
+
+/// Node 3 moves and way 11 is edited; ways 10 and 20 use node 3 and are
+/// left alone by the OSC. Way 10 sits in a blob the merge rewrites for way
+/// 11, way 20 in one it would otherwise pass through.
+#[test]
+fn merge_locations_on_ways_refreshes_untouched_ways_on_both_blob_routes() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    refresh_base(&base);
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="3" lat="51.2345678" lon="61.8765432" version="2"/>
+    <way id="11" version="2"><nd ref="1"/><nd ref="4"/></way>
+  </modify>
+</osmChange>"#,
+    );
+    let frames = raw_frames(&base);
+
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    let moved = (512_345_678, 618_765_432);
+    assert_eq!(way_coords(&output, 10), vec![at(1), moved]);
+    assert_eq!(way_coords(&output, 11), vec![at(1), at(4)]);
+    assert_eq!(way_coords(&output, 20), vec![at(2), moved, at(4), at(2)]);
+    assert_eq!(way_coords(&output, 30), vec![at(4)]);
+    assert_locations_check_passes(&output);
+
+    // Way 30's blob holds no stale way: still passed through untouched.
+    assert!(
+        passed_through(&output, &frames[4]),
+        "way 30's blob was rewritten"
+    );
+    assert!(
+        !passed_through(&output, &frames[3]),
+        "way 20's blob was not refreshed"
+    );
+    out.assert_stderr_contains("Inline locations refreshed: 2 refs in 2 ways");
+    out.assert_stderr_contains("2 way blobs scanned, 1 rewritten only for this");
+}
+
+/// A tag-only node edit moves nothing: the way blob using the node is still
+/// passed through byte for byte.
+#[test]
+fn merge_locations_on_ways_tag_only_node_edit_keeps_the_splice() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    refresh_base(&base);
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="3" lat="50.0" lon="60.0" version="2"><tag k="name" v="x"/></node>
+  </modify>
+</osmChange>"#,
+    );
+    let frames = raw_frames(&base);
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    for (blob, frame) in frames.iter().enumerate().skip(2) {
+        assert!(
+            passed_through(&output, frame),
+            "way blob {blob} was rewritten"
+        );
+    }
+    out.assert_stderr_contains("Inline locations refreshed: 0 refs in 0 ways");
+    assert_locations_check_passes(&output);
+}
+
+/// A base without the moved node's record (as a default add-locations-to-ways
+/// output drops untagged nodes): the way's old position lives only inline,
+/// and it is still refreshed.
+#[test]
+fn merge_locations_on_ways_refreshes_a_way_whose_node_the_base_lacks() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_low_blobs(&base, &[REFRESH_NODES[0]], &[vec![honest_way(20, &[1, 3])]]);
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify><node id="3" lat="-10.5" lon="-20.25" version="2"/></modify>
+</osmChange>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    assert_eq!(
+        way_coords(&output, 20),
+        vec![at(1), (-105_000_000, -202_500_000)]
+    );
+}
+
+/// An untouched way using a node the OSC deletes keeps the old coordinate,
+/// is counted, and its blob is not rewritten for that alone.
+#[test]
+fn merge_locations_on_ways_counts_a_deleted_node_under_an_untouched_way() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    refresh_base(&base);
+    let frames = raw_frames(&base);
+    // With a node modify the way blobs are searched, and the refs counted;
+    // a delete-only diff cannot make a way stale, so they are not searched.
+    for (body, searched) in [
+        (
+            r#"<delete><node id="4" version="2"/></delete>
+  <modify><node id="1" lat="10.0" lon="20.0" version="2"/></modify>"#,
+            true,
+        ),
+        (r#"<delete><node id="4" version="2"/></delete>"#, false),
+    ] {
+        write_osc(
+            &osc,
+            &format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <osmChange version=\"0.6\">{body}</osmChange>"
+            ),
+        );
+        let out = run_apply_changes(&base, &osc, &output, low_opts());
+        assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+        assert_eq!(way_coords(&output, 20), vec![at(2), at(3), at(4), at(2)]);
+        assert_eq!(way_coords(&output, 30), vec![at(4)]);
+        for (blob, frame) in frames.iter().enumerate().skip(2) {
+            assert!(
+                passed_through(&output, frame),
+                "searched={searched}: way blob {blob} was rewritten"
+            );
+        }
+        if searched {
+            out.assert_stderr_contains(
+                "3 way blobs scanned, 0 rewritten only for this, 2 refs to deleted nodes kept",
+            );
+        } else {
+            out.assert_stderr_contains(
+                "0 way blobs scanned, 0 rewritten only for this, 0 refs to deleted nodes kept \
+                 (in rewritten or searched blobs only)",
+            );
+        }
+    }
+}
+
+/// A blob whose range meets the diff but holds none of its elements (the
+/// OSC deletes way 20, which the base lacks) is a precise-check false
+/// positive. It is searched on its parsed block: rewritten when it holds a
+/// stale way, passed through when it does not.
+#[test]
+fn merge_locations_on_ways_searches_precise_check_false_positives() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    write_low_blobs(
+        &base,
+        &REFRESH_NODES,
+        &[
+            vec![honest_way(10, &[1, 3]), honest_way(30, &[4])],
+            vec![honest_way(40, &[2])],
+        ],
+    );
+    let frames = raw_frames(&base);
+    for (node3, stale) in [("51.0\" lon=\"61.0", true), ("50.0\" lon=\"60.0", false)] {
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+        write_osc(
+            &osc,
+            &format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify><node id="3" lat="{node3}" version="2"/></modify>
+  <delete><way id="20" version="2"/></delete>
+</osmChange>"#
+            ),
+        );
+        let out = run_apply_changes(&base, &osc, &output, low_opts());
+        assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+        assert_eq!(passed_through(&output, &frames[2]), !stale, "stale={stale}");
+        assert!(passed_through(&output, &frames[3]), "stale={stale}");
+        let rewritten = usize::from(stale);
+        out.assert_stderr_contains(&format!(
+            "2 way blobs scanned, {rewritten} rewritten only for this"
+        ));
+        if stale {
+            assert_eq!(
+                way_coords(&output, 10),
+                vec![at(1), (510_000_000, 610_000_000)]
+            );
+        }
+        assert_locations_check_passes(&output);
+    }
+}
+
+/// A blob found stale by detection is counted by the rewrite alone. In
+/// each stale blob below, a way using a deleted node precedes the stale way,
+/// so detection has already counted that ref when it stops; adding its
+/// partial count as well would count the ref twice. Blob [19, 20] takes the
+/// unparsed search (its range misses the diff), blob [50, 52] the parsed one
+/// (the OSC deletes way 51, which it lacks, so its range meets the diff).
+#[test]
+fn merge_locations_on_ways_counts_each_reference_once() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    write_low_blobs(
+        &base,
+        &REFRESH_NODES,
+        &[
+            vec![honest_way(19, &[4]), honest_way(20, &[3])],
+            vec![honest_way(50, &[4]), honest_way(52, &[3])],
+            vec![honest_way(60, &[1])],
+        ],
+    );
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify><node id="3" lat="51.0" lon="61.0" version="2"/></modify>
+  <delete><node id="4" version="2"/><way id="51" version="2"/></delete>
+</osmChange>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    let moved = (510_000_000, 610_000_000);
+    assert_eq!(way_coords(&output, 19), vec![at(4)]);
+    assert_eq!(way_coords(&output, 20), vec![moved]);
+    assert_eq!(way_coords(&output, 50), vec![at(4)]);
+    assert_eq!(way_coords(&output, 52), vec![moved]);
+    out.assert_stderr_contains(
+        "Inline locations refreshed: 2 refs in 2 ways, 3 way blobs scanned, \
+         2 rewritten only for this, 2 refs to deleted nodes kept",
+    );
+}
+
+/// The refresh maintains, it does not repair: an inline coordinate already
+/// stale for a node the OSC does not carry stays as it is, though the base's
+/// node record disagrees, both in a blob rewritten for another way and in one
+/// rewritten only to refresh a different ref.
+#[test]
+fn merge_locations_on_ways_leaves_stale_coordinates_of_unchanged_nodes() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+    let wrong = (1, 2);
+    write_low_blobs(
+        &base,
+        &REFRESH_NODES,
+        &[
+            vec![(10, vec![1, 2], vec![wrong, at(2)]), honest_way(11, &[3])],
+            vec![(20, vec![1, 3], vec![wrong, at(3)])],
+        ],
+    );
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="3" lat="51.0" lon="61.0" version="2"/>
+    <way id="11" version="2"><nd ref="3"/><nd ref="4"/></way>
+  </modify>
+</osmChange>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+    let moved = (510_000_000, 610_000_000);
+    assert_eq!(way_coords(&output, 10), vec![wrong, at(2)]);
+    assert_eq!(way_coords(&output, 20), vec![wrong, moved]);
+}
+
+/// One Way message (no tags) for a hand-built block: raw refs, raw
+/// coordinate values (under the block's framing) and a raw Info timestamp.
+fn raw_way(id: i64, refs: &[i64], raw_coords: &[(i64, i64)], raw_timestamp: i64) -> Vec<u8> {
+    fn packed_deltas(values: impl Iterator<Item = i64>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut last = 0i64;
+        for v in values {
+            let d = v - last;
+            last = v;
+            #[allow(clippy::cast_sign_loss)]
+            pb_varint(((d << 1) ^ (d >> 63)) as u64, &mut out);
+        }
+        out
+    }
+    let mut way = Vec::new();
+    pb_varint(0x08, &mut way);
+    #[allow(clippy::cast_sign_loss)]
+    pb_varint(id as u64, &mut way);
+    let mut info = Vec::new();
+    pb_varint(0x08, &mut info); // version 1
+    pb_varint(1, &mut info);
+    pb_varint(0x10, &mut info); // timestamp
+    #[allow(clippy::cast_sign_loss)]
+    pb_varint(raw_timestamp as u64, &mut info);
+    pb_len_delimited(4, &info, &mut way);
+    pb_len_delimited(8, &packed_deltas(refs.iter().copied()), &mut way);
+    pb_len_delimited(9, &packed_deltas(raw_coords.iter().map(|c| c.0)), &mut way);
+    pb_len_delimited(10, &packed_deltas(raw_coords.iter().map(|c| c.1)), &mut way);
+    way
+}
+
+/// A way block with granularity 1000 nanodegrees, lat_offset 500
+/// nanodegrees and date_granularity 100 milliseconds.
+fn framed_way_block(ways: &[Vec<u8>]) -> Vec<u8> {
+    let mut group = Vec::new();
+    for way in ways {
+        pb_len_delimited(3, way, &mut group);
+    }
+    let mut block = Vec::new();
+    pb_len_delimited(1, &[0x0A, 0x00], &mut block);
+    pb_len_delimited(2, &group, &mut block);
+    for (field, value) in [(17u32, 1000u64), (18, 100), (19, 500)] {
+        pb_varint(u64::from(field << 3), &mut block);
+        pb_varint(value, &mut block);
+    }
+    block
+}
+
+fn way_timestamps(path: &Path) -> Vec<(i64, Option<i64>)> {
+    let mut out = Vec::new();
+    for blob in BlobReader::from_path(path).expect("open pbf") {
+        if let BlobDecode::OsmData(block) = blob.expect("blob").decode().expect("decode") {
+            for element in block.elements() {
+                if let Element::Way(w) = element {
+                    out.push((w.id(), w.info().milli_timestamp()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Ways in blocks with a non-default coordinate and date framing. A raw copy
+/// into a default-framed output block used to rescale both: every surviving
+/// way of a rewritten blob came out with moved coordinates and timestamps.
+/// Coordinates compare and are written in decimicrodegrees under the
+/// source framing; timestamps keep their whole seconds.
+#[test]
+fn merge_locations_on_ways_honours_non_default_block_framing() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    // decimicro = (500 + 1000 * raw) / 100 = 5 + 10 * raw for latitudes,
+    // 10 * raw for longitudes.
+    let nodes = [
+        (1, 100_000_005, 200_000_000),
+        (2, 300_000_005, 400_000_000),
+        (3, 500_000_005, 600_000_000),
+    ];
+    let raw = |n: usize| (i64::from(nodes[n].1 - 5) / 10, i64::from(nodes[n].2) / 10);
+    write_low_raw_way_blocks(
+        &base,
+        &nodes,
+        &[
+            // Rewritten by the merge for way 11.
+            framed_way_block(&[
+                raw_way(10, &[1, 2], &[raw(0), raw(1)], 20),
+                raw_way(11, &[1, 3], &[raw(0), raw(2)], 20),
+            ]),
+            // Rewritten only to refresh way 20.
+            framed_way_block(&[raw_way(20, &[2, 3], &[raw(1), raw(2)], 35)]),
+        ],
+    );
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="3" lat="51.0" lon="61.0" version="2"/>
+    <way id="11" version="2"><nd ref="1"/><nd ref="2"/></way>
+  </modify>
+</osmChange>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, low_opts());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+
+    let coord = |n: usize| (nodes[n].1, nodes[n].2);
+    assert_eq!(way_coords(&output, 10), vec![coord(0), coord(1)]);
+    assert_eq!(way_coords(&output, 11), vec![coord(0), coord(1)]);
+    assert_eq!(
+        way_coords(&output, 20),
+        vec![coord(1), (510_000_000, 610_000_000)]
+    );
+    // Raw 20 and 35 at 100 ms are 2.0 s and 3.5 s; the default-framed
+    // output keeps whole seconds. Way 11 is the OSC's.
+    let timestamps: Vec<_> = way_timestamps(&output)
+        .into_iter()
+        .filter(|(id, _)| *id != 11)
+        .collect();
+    assert_eq!(timestamps, vec![(10, Some(2000)), (20, Some(3000))]);
+    assert_locations_check_passes(&output);
+}
+
+/// A non-default-framed way blob outside every OSC range is searched
+/// without a full parse, and its framing decides the answer: an OSC
+/// coordinate equal to the raw value but not the scaled one is a move (the
+/// way is refreshed), and one equal to the scaled value is a tag-only edit
+/// (the blob is passed through byte for byte). A detector that ignored the
+/// framing would answer both the other way round.
+#[test]
+fn merge_locations_on_ways_searches_framed_blobs_under_their_framing() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let nodes = [(1, 100_000_005, 200_000_000), (2, 300_000_005, 400_000_000)];
+    write_low_raw_way_blocks(
+        &base,
+        &nodes,
+        &[framed_way_block(&[raw_way(
+            20,
+            &[1, 2],
+            &[(10_000_000, 20_000_000), (30_000_000, 40_000_000)],
+            20,
+        )])],
+    );
+    let frames = raw_frames(&base);
+    for (node2, moved) in [
+        ("lat=\"3.0\" lon=\"4.0\"", true),
+        ("lat=\"30.0000005\" lon=\"40.0\"", false),
+    ] {
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+        write_osc(
+            &osc,
+            &format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<osmChange version=\"0.6\">\
+                 <modify><node id=\"2\" {node2} version=\"2\"/></modify></osmChange>"
+            ),
+        );
+        let out = run_apply_changes(&base, &osc, &output, low_opts());
+        assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+        assert_eq!(passed_through(&output, &frames[2]), !moved, "moved={moved}");
+        let node2_now = if moved {
+            (30_000_000, 40_000_000)
+        } else {
+            (300_000_005, 400_000_000)
+        };
+        assert_eq!(
+            way_coords(&output, 20),
+            vec![(100_000_005, 200_000_000), node2_now],
+            "moved={moved}"
+        );
+        assert_locations_check_passes(&output);
+    }
+}
+
+/// One Relation message with a single way member and the given raw Info
+/// timestamp, or none.
+fn raw_relation(id: i64, member: i64, raw_timestamp: Option<i64>) -> Vec<u8> {
+    let mut rel = Vec::new();
+    pb_varint(0x08, &mut rel);
+    #[allow(clippy::cast_sign_loss)]
+    pb_varint(id as u64, &mut rel);
+    let mut info = Vec::new();
+    pb_varint(0x08, &mut info); // version 1
+    pb_varint(1, &mut info);
+    if let Some(ts) = raw_timestamp {
+        pb_varint(0x10, &mut info);
+        #[allow(clippy::cast_sign_loss)]
+        pb_varint(ts as u64, &mut info);
+    }
+    pb_len_delimited(4, &info, &mut rel);
+    pb_len_delimited(8, &[0x00], &mut rel); // roles_sid: ""
+    let mut memids = Vec::new();
+    #[allow(clippy::cast_sign_loss)]
+    pb_varint(((member << 1) ^ (member >> 63)) as u64, &mut memids);
+    pb_len_delimited(9, &memids, &mut rel);
+    pb_len_delimited(10, &[0x01], &mut rel); // types: way
+    rel
+}
+
+/// Without `--locations-on-ways` too, surviving ways and relations in a
+/// rewritten blob whose `date_granularity` is not the default keep their
+/// timestamps (in whole seconds); absent stays absent, zero and negative
+/// values scale like any other.
+#[test]
+fn merge_keeps_timestamps_under_a_non_default_date_granularity() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    let mut rel_group = Vec::new();
+    for (id, ts) in [(50, Some(-35)), (51, Some(20)), (52, None), (53, Some(0))] {
+        pb_len_delimited(4, &raw_relation(id, 10, ts), &mut rel_group);
+    }
+    let mut rel_block = Vec::new();
+    pb_len_delimited(1, &[0x0A, 0x00], &mut rel_block);
+    pb_len_delimited(2, &rel_group, &mut rel_block);
+    pb_varint(18 << 3, &mut rel_block);
+    pb_varint(100, &mut rel_block);
+
+    write_low_raw_way_blocks(
+        &base,
+        &REFRESH_NODES,
+        &[
+            framed_way_block(&[
+                raw_way(10, &[1, 2], &[(1, 1), (2, 2)], 47),
+                raw_way(11, &[1, 3], &[(1, 1), (3, 3)], 20),
+            ]),
+            rel_block,
+        ],
+    );
+
+    write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <way id="11" version="2"><nd ref="1"/><nd ref="2"/></way>
+    <relation id="51" version="2"><member type="way" ref="10" role=""/></relation>
+  </modify>
+</osmChange>"#,
+    );
+    let out = run_apply_changes(&base, &osc, &output, ApplyOpts::default());
+    assert!(out.status.success(), "stderr:\n{}", out.stderr_str());
+
+    let mut ways = Vec::new();
+    let mut relations = Vec::new();
+    for blob in BlobReader::from_path(&output).expect("open output") {
+        if let BlobDecode::OsmData(block) = blob.expect("blob").decode().expect("decode") {
+            for element in block.elements() {
+                match element {
+                    Element::Way(w) => ways.push((w.id(), w.info().milli_timestamp())),
+                    Element::Relation(r) => {
+                        relations.push((r.id(), r.info().milli_timestamp()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Raw 47 at 100 ms is 4.7 s: whole seconds, 4 s. Raw -35 is -3.5 s,
+    // truncated toward zero like the node path.
+    assert_eq!(ways[0], (10, Some(4000)));
+    let surviving: Vec<_> = relations.into_iter().filter(|(id, _)| *id != 51).collect();
+    assert_eq!(
+        surviving,
+        vec![(50, Some(-3000)), (52, None), (53, Some(0))]
+    );
 }
 
 // ---------------------------------------------------------------------------

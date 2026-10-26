@@ -351,7 +351,7 @@ fails with an error rather than write a header that lies.
 | `tags-filter`, `getid`, `getparents`, `extract` | input's | none |
 | `getid --invert` | input's | all when no way ID is removed, else none |
 | `add-locations-to-ways` | input's | `LocationsOnWays`, plus the prepass features with `--inject-prepass` |
-| `apply-changes` | sorted | `LocationsOnWays` with `-l`, else none |
+| `apply-changes` | sorted | `LocationsOnWays` with `--locations-on-ways`, else none |
 
 ## Output files
 
@@ -1340,7 +1340,7 @@ state, which the snapshot no longer is (see [Output header](#output-header)).
 
 ### apply-changes
 
-Apply an OSC diff to a sorted PBF file. Uses blob passthrough -- unmodified blobs are copied as raw bytes without decompression.
+Apply an OSC diff to a sorted PBF file. Uses blob passthrough -- unmodified blobs are copied as raw bytes without decompression (under `--locations-on-ways` some are decompressed first and then copied; see below).
 
 Which blobs are unmodified is decided from each blob's indexdata ID range,
 and a passed-through blob's element count in the statistics is its indexdata
@@ -1361,7 +1361,7 @@ pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
 | `-O, --overwrite` | Replace the output if it already exists. Without it an existing output is refused before any work is done; a symlink is refused either way |
-| `--locations-on-ways` | Preserve way-node locations through the merge (requires base PBF with LocationsOnWays). Ways the OSC creates or modifies get locations from the merged nodes; base ways the OSC does not touch keep their existing locations, even when the OSC moves or deletes a node they reference. Rerun `add-locations-to-ways` on the output for a full refresh. See DEVIATIONS.md. |
+| `--locations-on-ways` | Keep inline way-node locations current through the merge (see below and DEVIATIONS.md). |
 | `--ignore-missing-nodes` | With `--locations-on-ways`, permit unresolved references to retain the legacy `(0,0)` fallback instead of failing |
 | `-j, --jobs <N>` | Worker threads for the descriptor-first pipeline (see [`-j/--jobs`](#-j--jobs)). `0` (default) uses the `nproc - 2` heuristic (leaves two cores for scanner + drain, minimum 2). An explicit `-j N` runs exactly `N` workers, `1` included. |
 | `--compression` | Blob compression [default: zlib] |
@@ -1371,6 +1371,76 @@ pbfhogg apply-changes [OPTIONS] --output <OUTPUT> <BASE> <CHANGES>
 | `--allow-version-regression` | Accept a change whose `version` is lower than the version already held for that object. Off by default: precedence is by version, not by position, so feeding diffs out of sequence order is an error naming both versions rather than a silent downgrade. An equal version is always accepted and the later change wins by position (overlapping diffs, regional-extract deletes at the held version). Deletes count -- a delete leaves a versioned tombstone, so a later stale create or modify is refused too. Elements claiming no `version` are unaffected. See DEVIATIONS.md. |
 | `--generator` | Override writing program name |
 | `--output-header <K=V>` | Set output header fields (repeatable) |
+
+#### `--locations-on-ways`
+
+The base must be sorted, indexed and declare `LocationsOnWays` (refused before
+the OSC is parsed otherwise); the output declares it too.
+
+**Which coordinates change.** A surviving base way (one the OSC neither
+modifies nor deletes), whether its blob is rewritten or would have been
+copied, takes the OSC's coordinate (the OSC's final state of the node) for
+each existing inline coordinate whose node the OSC creates or modifies. It is
+never resolved against base node records: it keeps every other inline
+coordinate, one for a node the OSC deletes included (counted, see below), and
+a way with no coordinate arrays is left without them. A way the OSC creates or
+modifies is written from scratch: OSC coordinates for the nodes the OSC
+carries, the base's node records for the rest, and none of the old version's
+inline coordinates. A reference found in neither, or to a node the OSC
+deletes, fails the run with nothing published (`--ignore-missing-nodes`
+writes `(0, 0)` instead). Only coordinates that
+differ count as refreshed: a tag-only node edit refreshes nothing where the
+inline coordinate already agrees, and costs a way blob no rewrite.
+
+**Base preparation.** The node records a changed way needs must come from the
+OSC or the base. `add-locations-to-ways` drops untagged nodes unless given
+`--keep-untagged-nodes`, so its default output can fail on an ordinary daily
+diff: a changed way can reference unchanged untagged nodes whose records are
+in neither file. Make the base with `--keep-untagged-nodes`; osmium documents
+the same requirement.
+
+**What is read.** Node blobs are always decompressed, for their coordinates.
+When the OSC creates or modifies at least one node, every way blob is
+decompressed as well: one the merge would otherwise copy is searched at the
+wire level (refs and coordinate arrays, without a full parse) and still
+copied unchanged unless it holds a stale coordinate, in which case it is
+parsed and rewritten. A diff whose node changes are all deletes leaves those
+blobs unread. The search fails the run on a blob it cannot decompress, on
+malformed wire framing of the block, its groups or a Way message (fields
+it skips included), on malformed ref varints, and on coordinate arrays that
+are not both absent or both complete and as long as the refs. For a way with
+coordinate arrays and at least one reference to an OSC-upserted node it
+also checks that every coordinate of the way converts to an in-range
+decimicrodegree. It does not decode tag values, `Info` contents or the
+string table, so a blob found clean whose errors are confined to those is
+still copied unchanged; a blob rewritten for any reason is fully parsed.
+Which blobs are way blobs is their indexdata kind claim (see
+[indexdata-trust.md](indexdata-trust.md)). Relation blobs are never searched.
+
+**Framing.** Rewritten blocks are written in the default coordinate and date
+framing. A surviving way or relation from a source block with another
+`granularity`, `lat_offset`, `lon_offset` or `date_granularity` is converted:
+coordinates truncated toward zero to decimicrodegrees, timestamps to whole
+seconds (timestamps with or without `--locations-on-ways`). Blobs copied
+unchanged keep their own framing.
+
+**Summary.** A progress line reports the refresh probe's memory, and the
+summary adds `Inline locations refreshed: R refs in W ways, S way blobs
+scanned, O rewritten only for this, D refs to deleted nodes kept`. `S` counts
+way blobs searched that had no merge work of their own; `O` those rewritten
+only for a refresh; `D` references in surviving ways to OSC-deleted nodes,
+counted only in the way blobs the run searched or rewrote, so it is not a
+whole-file count. A nonzero `D` means base and OSC disagree: the OSM API
+refuses to delete a node a way still uses.
+
+**Not a repair.** The refresh corrects coordinates for nodes this OSC creates
+or modifies. A coordinate already stale for any other node stays stale, such
+as one left by a pbfhogg version that refreshed only the ways the OSC
+touched. `check --locations` reports stale coordinates where the file holds the node's
+record. Rebuilding with `add-locations-to-ways` recomputes coordinates only
+from node records, so it repairs a file only from an input holding the
+current record of every referenced node, not from a default
+`add-locations-to-ways` output.
 
 ### merge-changes
 

@@ -4,8 +4,9 @@
 //! The library tests (`tests/check_locations.rs`) pin the counts, categories
 //! and partition invariance. These pin the command surface: exit 1 is "ran,
 //! and the file is wrong", exit 2 "could not check it", the report and its
-//! JSON, the selector rules, and a whole-workflow case: a file whose
-//! metadata lies about a blob's kind.
+//! JSON, the selector rules, and two whole-workflow cases - a file whose
+//! metadata lies about a blob's kind, and an `apply-changes
+//! --locations-on-ways` output after a node move.
 
 #![allow(clippy::unwrap_used)]
 
@@ -259,5 +260,80 @@ fn a_relabelled_blob_is_refused_not_passed() {
         out.stderr_str().contains("check --index"),
         "{}",
         out.stderr_str()
+    );
+}
+
+/// The workflow the check exists for: an OSC that moves node 3 and touches
+/// no way must leave way 20, in a way blob the OSC does not overlap, carrying
+/// node 3's new position. `apply-changes --locations-on-ways` once copied
+/// such ways' coordinates unchanged, which this oracle reports as a
+/// mismatch on way 20.
+#[test]
+fn apply_changes_output_passes_after_a_node_move() {
+    let dir = crate::common::test_scratch();
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("move.osc.gz");
+    let output = dir.path().join("out.osm.pbf");
+    write_low(&base, true, &NODES, &honest_ways());
+    assert!(check(&base, &[]).status.success());
+    crate::cli_apply_changes::write_osc(
+        &osc,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="3" lat="51.0" lon="61.0" version="2"/>
+  </modify>
+</osmChange>"#,
+    );
+    CliInvoker::new()
+        .arg("apply-changes")
+        .arg(&base)
+        .arg(&osc)
+        .arg("-o")
+        .arg(&output)
+        .arg("--locations-on-ways")
+        .assert_success();
+
+    // Read the output independently of the check: node 3 and way 20's
+    // inline copy of it must both be at the new position, so a passing check
+    // cannot be explained by an output that kept the base unchanged.
+    let moved = (510_000_000, 610_000_000);
+    let mut node3 = None;
+    let mut way20 = None;
+    for blob in pbfhogg::BlobReader::from_path(&output).unwrap() {
+        if let pbfhogg::BlobDecode::OsmData(block) = blob.unwrap().decode().unwrap() {
+            for element in block.elements() {
+                match element {
+                    pbfhogg::Element::DenseNode(n) if n.id() == 3 => {
+                        node3 = Some((n.decimicro_lat(), n.decimicro_lon()));
+                    }
+                    pbfhogg::Element::Node(n) if n.id() == 3 => {
+                        node3 = Some((n.decimicro_lat(), n.decimicro_lon()));
+                    }
+                    pbfhogg::Element::Way(w) if w.id() == 20 => {
+                        way20 = Some(
+                            w.node_locations()
+                                .map(|l| (l.decimicro_lat(), l.decimicro_lon()))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert_eq!(node3, Some(moved), "node 3 must carry the OSC position");
+    assert_eq!(
+        way20,
+        Some(vec![(300_000_000, 400_000_000), moved]),
+        "way 20 must carry node 3's new position inline"
+    );
+
+    let out = check(&output, &[]);
+    assert!(out.status.success(), "{}", out.stdout_str());
+    assert!(
+        out.stdout_str().contains("4 verified, 0 mismatched"),
+        "{}",
+        out.stdout_str()
     );
 }

@@ -62,37 +62,98 @@ line is unchanged.
 
 ## apply-changes: missing LocationsOnWays nodes are an error
 
-**osmium behavior:** Under `--locations-on-ways`, an unresolved way-node
-reference is written with `(0, 0)` as its coordinate and no warning.
+**osmium behavior:** Under `--locations-on-ways`, a reference of a way from
+the change file whose location osmium finds neither among the change file's
+nodes nor among the base nodes it looks up keeps the location its `<nd>`
+carried. For an ordinary OSC `<nd>`, which carries none, that is libosmium's
+undefined location, which decodes to `2147483647` on each axis under the
+default framing. There is no warning and no option to fail. A reference to a
+node the change deletes may be resolved from the delete's own `lat`/`lon` or
+from the base's record of the node.
 
-**pbfhogg behavior:** The command fails and does not publish its output. Pass
-`--ignore-missing-nodes` to request the osmium-compatible `(0, 0)` fallback.
+**pbfhogg behavior:** The command fails and does not publish its output. A
+reference from an OSC way to a node the OSC deletes counts as unresolved too.
+`--ignore-missing-nodes` writes every unresolved reference as `(0, 0)` and
+publishes the output; that is pbfhogg's own placeholder, not osmium's output.
 
-**Rationale:** Null Island is a valid coordinate, so a sentinel-bearing output
-cannot distinguish missing data from real data. Failure by default matches
-`add-locations-to-ways` and keeps the lossy behavior explicit.
+**Rationale:** Null Island is a valid coordinate, so a placeholder-bearing
+output cannot distinguish missing data from real data. Failure by default
+matches `add-locations-to-ways` and keeps the lossy behavior explicit.
 
-The check covers the ways apply-changes writes locations for, which is the
-scope of the next section: a base way the OSC does not touch is not checked.
+Only the references of ways the OSC creates or modifies are resolved against
+the base's node records. A surviving base way is not: it keeps its inline
+coordinates except where the OSC supplies a new one (next section), so it has
+nothing to resolve. Node records for the references of changed ways must come
+from the OSC or from the base, so a base made by `add-locations-to-ways`
+without `--keep-untagged-nodes` can fail on an ordinary daily diff: a changed
+way can reference unchanged untagged nodes whose records are in neither file.
 
-## apply-changes: --locations-on-ways updates only the ways the OSC touches
+## apply-changes: --locations-on-ways takes new locations from the OSC only
 
-**osmium behavior:** `osmium apply-changes -l` recomputes way-node locations
-from the merged node set, so every way referencing a moved node gets the new
-position.
+**osmium behavior:** `osmium apply-changes --locations-on-ways` builds a
+location index from the change files: every version of every node in them,
+deletes included (a delete has a location only when it carries `lat`/`lon`).
+During the base's node pass it adds a base node's location when some way
+version in the change files references the node and the index lookup returns
+no location. Writing every way, untouched base ways included, it overwrites
+each reference whose node has a defined location in the index and leaves the
+others as they were. The index has ordering defects: during the base node
+pass it is searched before it has been sorted, so an entry can be missed and
+a base location added beside it, and after the sort at the base's node-to-way
+transition a node with several defined locations resolves to the smallest
+(longitude first), not to its latest version. The sort runs only when a base
+way follows a base node, so on a base with no nodes or no ways the index is
+never sorted and every lookup, for a node with a single version too, searches
+an unsorted index.
 
-**pbfhogg behavior:** Ways the OSC creates or modifies get locations from the
-merged nodes. A base way the OSC does not touch is copied through with the
-locations it already carried, even when the OSC moves or deletes a node it
-references; a deleted node leaves its last position in such a way. Rerun
-`add-locations-to-ways` on the output for a full refresh. `check --locations`
-reports every such stale coordinate whose node the file still contains.
+**pbfhogg behavior:** The OSC holds one final state per node. A surviving
+base way, whether in a blob the merge rewrites or one it would copy, takes
+the OSC coordinate for each existing inline coordinate whose node the OSC
+creates or modifies; a way with no coordinate arrays is left without them.
+It keeps every other inline coordinate and is never resolved against base
+node records. Ways the OSC creates or modifies take the OSC coordinates too,
+and resolve their other references as in the previous section. A reference
+in a surviving way to a node the OSC deletes keeps its coordinate and is
+counted in the summary (`refs to deleted nodes kept`), in the way blobs the
+run searched or rewrote; a diff that creates or modifies no node leaves
+untouched way blobs unsearched.
 
-**Rationale:** Most way blobs are spliced into the output without decoding.
-Finding every base way that references a changed node needs a node-to-way
-lookup across the whole file and would send those blobs through the rewrite
-path, a cost the splice exists to avoid. The behaviour is documented rather
-than approximated.
+**Where the coordinates differ:**
+
+- A surviving way referencing a node the OSC deletes: osmium may write the
+  delete's coordinate or the base node's; pbfhogg keeps the way's own and
+  counts the reference. The OSM API refuses to delete a node a way still
+  uses, so on a base matched to its replication diffs this does not occur.
+- A surviving way whose inline coordinate for node N disagrees with the
+  base's record of N, when the OSC leaves N unchanged and some way in the OSC
+  references N: osmium overwrites the coordinate with the base record;
+  pbfhogg keeps it. On a base whose inline coordinates agree with its node
+  records the two are the same.
+- A node with several versions in the change, or one an OSC way also
+  references: pbfhogg uses the final state; osmium's choice depends on the
+  index defects above (on a base with no nodes or no ways, any moved node).
+- A surviving way with no coordinate arrays: osmium writes arrays anyway,
+  with the index's location where it has one and the undefined location
+  elsewhere; pbfhogg leaves the way without them.
+
+pbfhogg also refuses a base whose header does not declare `LocationsOnWays`;
+osmium does not check.
+
+**Cross-validation:** pbfhogg does not repair a coordinate that was already
+stale for a node the OSC does not carry, and osmium repairs one only in the
+second case above, so compare outputs from a base whose inline coordinates
+agree with its node records. A blob pbfhogg rewrites is written in the
+default framing, so coordinates and timestamps from a source block with
+non-default `granularity`, offsets or `date_granularity` are truncated to
+decimicrodegrees and whole seconds there; blobs copied unchanged keep their
+own framing. The summary's refresh counts cover the way blobs the
+run searched or rewrote, not the whole file.
+
+**Rationale:** The OSC is the only source of new coordinates, which is what
+incremental maintenance of a consistent file needs. A delete under a live way
+is a mismatch between base and OSC; it is left as it was, and counted where
+the run searched the way, rather than resolved with a coordinate chosen for
+a node the output no longer holds.
 
 ## diff: content equality vs version ordering
 

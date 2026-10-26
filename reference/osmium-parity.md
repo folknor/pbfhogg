@@ -258,9 +258,10 @@ These osmium flags have no pbfhogg equivalent:
 ## apply-changes: permissive missing-element semantics (parity)
 
 Both tools silently tolerate the missing-element edge cases in
-`apply-changes` - with one deliberate exception: an unresolvable
-way-node reference under `--locations-on-ways` is a hard error in
-pbfhogg (last table row; see `DEVIATIONS.md`). The other rows are
+`apply-changes` - with one deliberate exception: under
+`--locations-on-ways`, an unresolvable node reference of a way the OSC
+creates or modifies is a hard error in pbfhogg (last table row; see
+`DEVIATIONS.md`). The other rows are
 positive parity - users migrating from osmium can rely on the same
 behaviour, no flag required in either tool.
 
@@ -269,7 +270,7 @@ behaviour, no flag required in either tool.
 | `<create>` on existing ID | present | Silent overwrite (treated as modify). Base record is replaced with the OSC record. |
 | `<modify>` on absent ID | absent | Silent insert (treated as create). OSC record is written. |
 | `<delete>` on absent ID | absent | Silent no-op. |
-| way/relation ref to absent node | absent from base AND from OSC | pbfhogg under `--locations-on-ways`: fails without publishing output; `--ignore-missing-nodes` explicitly restores the `(0, 0)` fallback. Without `--locations-on-ways`, the ref is written bare. osmium with `--locations-on-ways` writes `(0, 0)` without warning. |
+| node ref of a way the OSC creates or modifies, to an absent node | absent from base AND from OSC | pbfhogg under `--locations-on-ways`: fails without publishing output; `--ignore-missing-nodes` explicitly writes the `(0, 0)` placeholder instead. Without `--locations-on-ways`, the ref is written bare. osmium with `--locations-on-ways` keeps the location the OSC `<nd>` carried, normally libosmium's undefined location (decodes to `2147483647` on each axis), without warning. A base way the OSC does not modify cannot fail this way in either tool: a ref given no new location keeps its inline one. Relation members carry no locations and are never resolved. |
 
 **Rationale (applies to both projects).** The motivating workload is
 incremental-extract - region-extracted base PBF plus a full-planet
@@ -281,8 +282,10 @@ also tolerates the missing-location case.
 
 For the missing-location row pbfhogg's default differs deliberately:
 `(0, 0)` is a real coordinate and cannot safely encode absence, so the
-run fails instead. See `DEVIATIONS.md`. `--ignore-missing-nodes` retains
-osmium compatibility for incomplete regional change streams.
+run fails instead. See `DEVIATIONS.md`.
+`--ignore-missing-nodes` lets incomplete regional change streams through,
+like osmium, but with a different placeholder: `(0, 0)`, where osmium
+writes its undefined location.
 
 **pbfhogg implementation anchors:**
 
@@ -295,7 +298,7 @@ osmium compatibility for incomplete regional change streams.
   skip.
 - `(0, 0)` fallback under `--locations-on-ways`:
   `src/commands/apply_changes/element_writes.rs` (search
-  `locations.push((0, 0))`).
+  `unwrap_or((0, 0))`).
 - `loc_missing` counter: defined in
   `src/commands/apply_changes/stats.rs`, computed in
   `src/commands/apply_changes/rewrite.rs` as the required-id total minus
@@ -306,16 +309,20 @@ osmium compatibility for incomplete regional change streams.
 
 **osmium implementation anchors:**
 
-- `osmium apply-changes` runs `copy_first_with_id` plus
-  `std::set_union` over reverse-version-sorted inputs to dedup by
-  ID and merge. The write is gated on `obj.visible()`.
+- Without `--locations-on-ways`, `osmium apply-changes` runs
+  `copy_first_with_id` plus `std::set_union` over reverse-version-sorted
+  inputs to dedup by ID and merge, gated on `obj.visible()`. With it,
+  `apply_changes_and_write` does the same merge in its own loop: it
+  writes a change object only if it is visible and a base object only
+  if no change object has its type and ID.
 - `<delete>` entries arrive from the XML input format with
-  `visible=false`, so `copy_first_with_id` skips them on absent IDs
-  with no error path.
-- `update_nodes_if_way` looks up coordinates via
+  `visible=false`, so both paths skip them on absent IDs with no error
+  path.
+- Under `--locations-on-ways`, `update_nodes_if_way` looks up coordinates via
   `location_index.get_noexcept(...)` followed by an
-  `if (location) set_location(...)` guard, so missing nodes fall
-  through silently.
+  `if (location.is_defined()) set_location(...)` guard, so a missing
+  node falls through silently and the reference keeps the location it
+  already had (for an OSC `<nd>`, normally the undefined location).
 
 No `throw`, `std::cerr` warning, or validation is raised on any of
 the four scenarios in the osmium apply-changes code path.
@@ -324,9 +331,11 @@ the four scenarios in the osmium apply-changes code path.
 pins the three non-ALTW scenarios as regression anchors:
 `modify_on_missing_id_silently_inserts`,
 `delete_on_missing_id_is_noop`,
-`create_on_existing_id_overwrites_base`. The ALTW `(0, 0)` fallback
-is exercised end-to-end by the Denmark byte-equal cross-validation
-against osmium (`brokkr verify apply-changes`).
+`create_on_existing_id_overwrites_base`. The refusal and the `(0, 0)`
+fallback are pinned by
+`merge_locations_on_ways_rejects_missing_node_unless_explicitly_ignored`
+in `cli/tests/cli_apply_changes.rs`. The fallback cannot match osmium
+byte for byte, since osmium writes its undefined location there.
 
 ## Indexdata
 

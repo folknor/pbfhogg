@@ -16,6 +16,7 @@ use crate::commands::{
 
 use super::Result;
 use super::loc_mode::{LocMap, LocMode};
+use super::refresh::{CoordFraming, StaleProbe, evaluate_way, refreshed_locations};
 
 // ---------------------------------------------------------------------------
 // Writing OSC elements (from diff, metadata carried from the OSC attributes)
@@ -146,50 +147,209 @@ pub(super) fn write_base_node_local(
     Ok(())
 }
 
+/// What the raw writers of one source block's surviving base ways and
+/// relations need beyond the element itself: the block's framing, which the
+/// output block (always default-framed, see `BlockBuilder`) does not carry,
+/// the OSC probe for refreshing inline coordinates, the worker's scratch,
+/// and the refresh counts for the block.
+pub(super) struct BaseWrites<'a> {
+    framing: CoordFraming,
+    date_granularity: i32,
+    probe: &'a StaleProbe,
+    scratch: &'a mut RefreshScratch,
+    pub(super) tally: RefreshTally,
+}
+
+/// Buffers the surviving-base-way writers and staleness detection reuse,
+/// one set per worker.
+#[derive(Default)]
+pub(super) struct RefreshScratch {
+    info: Vec<u8>,
+    lats: Vec<u8>,
+    lons: Vec<u8>,
+    pub(super) hits: Vec<(usize, (i32, i32))>,
+}
+
+/// Coordinate-refresh counts for surviving base ways.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct RefreshTally {
+    /// Ways written with at least one coordinate changed to the OSC's.
+    pub(super) ways: u64,
+    /// Positions whose coordinate changed to the OSC's.
+    pub(super) refs: u64,
+    /// Positions naming a node the OSC deletes (coordinate kept).
+    pub(super) deleted_refs: u64,
+}
+
+impl<'a> BaseWrites<'a> {
+    pub(super) fn new(
+        block: &PrimitiveBlock,
+        probe: &'a StaleProbe,
+        scratch: &'a mut RefreshScratch,
+    ) -> Self {
+        Self {
+            framing: CoordFraming::of_block(block),
+            date_granularity: block.date_granularity(),
+            probe,
+            scratch,
+            tally: RefreshTally::default(),
+        }
+    }
+}
+
+/// The source block's `date_granularity` that `BlockBuilder`'s output blocks
+/// declare (by omitting the field).
+const DEFAULT_DATE_GRANULARITY: i32 = 1000;
+
+/// A raw `Info` sub-message as the default-framed output block must carry it.
+///
+/// `Info.timestamp` is in units of the block's `date_granularity`
+/// milliseconds, and an output block declares the default 1000. Under the
+/// default the bytes are copied as they are. Otherwise every timestamp field
+/// is rewritten as `raw * date_granularity / 1000` seconds (wrapping, as the
+/// read accessor scales), the conversion the base nodes of the same rewrite
+/// get, so one rewritten blob keeps one whole-second contract. Every other
+/// field keeps its bytes, unknown fields included; a timestamp field that is
+/// absent stays absent, and one not varint-typed is copied like an unknown
+/// field, as the parser treats it.
+fn output_info<'b>(
+    info: Option<&'b [u8]>,
+    date_granularity: i32,
+    buf: &'b mut Vec<u8>,
+) -> Result<Option<&'b [u8]>> {
+    use crate::read::wire::{Cursor, WIRE_VARINT};
+    use protohoggr::{encode_tag, encode_varint};
+
+    let Some(info) = info else {
+        return Ok(None);
+    };
+    if date_granularity == DEFAULT_DATE_GRANULARITY {
+        return Ok(Some(info));
+    }
+    buf.clear();
+    let mut cursor = Cursor::new(info);
+    while let Some((field, wire_type)) = cursor.read_tag()? {
+        if field == 2 && wire_type == WIRE_VARINT {
+            let raw = cursor.read_varint_i64()?;
+            let seconds = raw.wrapping_mul(i64::from(date_granularity)) / 1000;
+            encode_tag(buf, 2, WIRE_VARINT);
+            encode_varint(buf, seconds.cast_unsigned());
+        } else {
+            let bytes = cursor.read_raw_field(wire_type)?;
+            encode_tag(buf, field, wire_type);
+            buf.extend_from_slice(bytes);
+        }
+    }
+    Ok(Some(buf))
+}
+
 pub(super) fn write_base_way_local(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
     way: &crate::Way<'_>,
     block: &PrimitiveBlock,
+    ctx: &mut BaseWrites<'_>,
 ) -> Result<()> {
     ensure_way_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
         flush_local(bb, output)?;
         bb.pre_seed_string_table(block);
     }
+    let info = output_info(way.info_data(), ctx.date_granularity, &mut ctx.scratch.info)?;
     bb.add_way_raw_bytes(
         way.id(),
         way.keys_data(),
         way.vals_data(),
         way.refs_data(),
-        way.info_data(),
+        info,
     );
     Ok(())
 }
 
-/// Write a surviving base way with LocationsOnWays data preserved.
+/// Write a surviving base way under LocationsOnWays.
 ///
-/// Like `write_base_way_local` but also forwards raw `lat_data`/`lon_data` bytes.
+/// Its inline coordinates are refreshed by the rule in `refresh.rs`: each
+/// position naming a node the OSC creates or modifies takes the OSC's
+/// coordinate where it differs. Keys, values, refs and Info keep their raw
+/// bytes (Info's timestamps rescaled by [`output_info`] under a non-default
+/// `date_granularity`). The coordinate bytes are copied as they are when the
+/// block's framing is the default and nothing changed; otherwise every
+/// coordinate is re-encoded in decimicrodegrees under the default framing the
+/// output block declares, since a raw copy would be read back rescaled.
 pub(super) fn write_base_way_local_with_locations(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
     way: &crate::Way<'_>,
     block: &PrimitiveBlock,
+    ctx: &mut BaseWrites<'_>,
 ) -> Result<()> {
     ensure_way_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
         flush_local(bb, output)?;
         bb.pre_seed_string_table(block);
     }
-    bb.add_way_raw_bytes_with_locations(
-        way.id(),
-        way.keys_data(),
-        way.vals_data(),
-        way.refs_data(),
-        way.lat_data(),
-        way.lon_data(),
-        way.info_data(),
-    );
+    let BaseWrites {
+        framing,
+        date_granularity,
+        probe,
+        scratch,
+        tally,
+    } = ctx;
+    let RefreshScratch {
+        info,
+        lats,
+        lons,
+        hits,
+    } = &mut **scratch;
+    let has_coords = !(way.lat_data().is_empty() && way.lon_data().is_empty());
+    let mut reencode = has_coords && !framing.is_default();
+    if !probe.is_empty() {
+        let eval = evaluate_way(
+            way.refs_data(),
+            way.lat_data(),
+            way.lon_data(),
+            *framing,
+            probe,
+            hits,
+        )?;
+        tally.deleted_refs += eval.deleted_refs;
+        reencode |= eval.stale_refs > 0;
+    }
+    let info = output_info(way.info_data(), *date_granularity, info)?;
+    if reencode {
+        let changed = refreshed_locations(
+            way.refs_data(),
+            way.lat_data(),
+            way.lon_data(),
+            *framing,
+            probe,
+            lats,
+            lons,
+        )?;
+        if changed > 0 {
+            tally.ways += 1;
+            tally.refs += changed;
+        }
+        bb.add_way_raw_bytes_with_locations(
+            way.id(),
+            way.keys_data(),
+            way.vals_data(),
+            way.refs_data(),
+            lats,
+            lons,
+            info,
+        );
+    } else {
+        bb.add_way_raw_bytes_with_locations(
+            way.id(),
+            way.keys_data(),
+            way.vals_data(),
+            way.refs_data(),
+            way.lat_data(),
+            way.lon_data(),
+            info,
+        );
+    }
     Ok(())
 }
 
@@ -211,12 +371,14 @@ pub(super) fn write_base_relation_local(
     output: &mut Vec<OwnedBlock>,
     rel: &crate::Relation<'_>,
     block: &PrimitiveBlock,
+    ctx: &mut BaseWrites<'_>,
 ) -> Result<()> {
     ensure_relation_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
         flush_local(bb, output)?;
         bb.pre_seed_string_table(block);
     }
+    let info = output_info(rel.info_data(), ctx.date_granularity, &mut ctx.scratch.info)?;
     bb.add_relation_raw_bytes(
         rel.id(),
         rel.keys_data(),
@@ -224,7 +386,7 @@ pub(super) fn write_base_relation_local(
         rel.roles_sid_data(),
         rel.memids_data(),
         rel.types_data(),
-        rel.info_data(),
+        info,
     );
     Ok(())
 }

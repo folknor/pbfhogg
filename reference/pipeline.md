@@ -262,7 +262,12 @@ Stages:
 2. **Workers** (`rewrite.rs`, `rewrite_block.rs`) - pull candidate descriptors, perform precise overlap check, emit rewritten `OwnedBlock`s or demote to false-positive passthrough.
 3. **Drain / stream output** (`drain.rs`, `stream_output.rs`, `streaming.rs`) - results reordered to file order; consecutive passthroughs coalesced; gap creates interleaved at sorted positions.
 
-Optional `--locations-on-ways` (`node_locations.rs`): preserves/updates inline way-node coordinates through the merge.
+Optional `--locations-on-ways` keeps inline way-node coordinates current through the merge, from two separate sources:
+
+- **Coordinate map for OSC ways** (`node_locations.rs`): seeded from the OSC nodes that OSC ways reference; every node blob (by indexdata kind) is a Candidate, so workers decompress it and extract base records for the remaining refs; the drain publishes the merged map at the node-to-way barrier, and the scanner holds way descriptors until then. `loc_missing` is the number of unique node IDs referenced by OSC ways that the map lacks, and fails the run unless `--ignore-missing-nodes`.
+- **Refresh probe for surviving base ways** (`refresh.rs`): every node the OSC creates, modifies or deletes, built before the pipeline starts and kept apart from the map, whose size `loc_missing` is computed from. A surviving base way takes the OSC coordinate at each position naming an upserted node whose coordinate differs; base node records are never consulted for it. When the OSC upserts any node, every indexed way blob is a Candidate: one whose range misses the diff is read as a whole frame, decompressed and searched at the wire level without a full parse, and passed through (`CopyRange`, or `OwnedBytes` from that frame) unless a way in it is stale; a range-overlapping false positive is searched on its parsed block. A blob found stale by either search has no merge work of its own; it is rewritten through `rewrite_block_parallel` and counted in `loc_refresh_only_blobs`, not `blobs_forced_rewrite`. Blobs rewritten for merge work refresh their surviving ways in the same rewrite. Relation blobs keep the splice.
+
+Surviving base ways and relations in a rewritten blob are written into a default-framed block, so a source block's non-default coordinate framing or `date_granularity` is converted on the way (coordinates to decimicrodegrees, timestamps to whole seconds), as base nodes already were.
 
 ### diff / derive-changes
 

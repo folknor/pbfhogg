@@ -1909,12 +1909,15 @@ enum Command {
         /// says
         #[arg(long, conflicts_with = "locations_on_ways")]
         force: bool,
-        /// Preserve way-node locations through the merge. Ways the OSC
-        /// creates or modifies get locations from the merged nodes; base
-        /// ways the OSC does not touch keep their existing locations, even
-        /// if the OSC moves or deletes a node they reference. Rerun
-        /// add-locations-to-ways on the output for a full refresh.
-        /// Requires the base PBF to have LocationsOnWays and be sorted.
+        /// Keep inline way-node locations (LocationsOnWays) current through
+        /// the merge. A base way the OSC does not modify or delete keeps its
+        /// inline locations except for nodes the OSC creates or modifies,
+        /// which take the OSC's location. A way the OSC creates or modifies
+        /// is written with locations from the OSC's nodes and the base's
+        /// node records, and the run fails if one is missing. Requires a sorted, indexed base with
+        /// LocationsOnWays. Make it with
+        /// add-locations-to-ways --keep-untagged-nodes: a base without its
+        /// untagged nodes can fail on an ordinary daily diff.
         #[arg(long)]
         locations_on_ways: bool,
         /// Permit unresolved references to use the legacy (0,0) fallback.
@@ -2354,6 +2357,11 @@ fn advice(command: &Command, matches: &clap::ArgMatches) -> exit_code::Advice {
         element_cap,
         allow_version_regression: switch_on_offer(leaf, "allow_version_regression"),
         ignore_missing_nodes: switch_on_offer(leaf, "ignore_missing_nodes"),
+        merge_locations: leaf
+            .try_get_one::<bool>("locations_on_ways")
+            .ok()
+            .flatten()
+            .is_some_and(|on| *on),
     }
 }
 

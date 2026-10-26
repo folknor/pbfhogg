@@ -20,6 +20,7 @@ use super::drain::{
 };
 use super::failure::FailureSlot;
 use super::node_locations::NodeLocationIndex;
+use super::refresh::StaleProbe;
 use super::scanner::{self, ScannerChannels, ScannerConfig};
 use super::stats::MergeStats;
 use super::streaming::{self, CoordSlots, StreamingChannels, StreamingConfig, WorkerCounters};
@@ -106,11 +107,15 @@ fn build_header_bytes(
     if locations_on_ways && !header.has_locations_on_ways() {
         return Err(crate::Error::invalid_data(
             "apply-changes with locations_on_ways requires the base PBF to have LocationsOnWays. \
-             Run add-locations-to-ways first to bootstrap coordinates.",
+             Run add-locations-to-ways first to bootstrap coordinates, with its \
+             keep_untagged_nodes option set: later runs need the node records of \
+             untagged nodes that changed ways reference.",
         ));
     }
-    // Sorted by construction. Under -l every way keeps or gets inline
-    // coordinates; the prepass fields of spliced blobs are stale against the
+    // Sorted by construction. Under -l every OSC way gets inline
+    // coordinates, and every surviving base way keeps the ones it carries
+    // (one written without coordinate arrays stays without them), refreshed
+    // wherever the OSC moves a node it uses (`refresh.rs`); the prepass fields of spliced blobs are stale against the
     // changed relations and ways, so they are not declared. Without -l a
     // rewritten way blob loses its coordinates. An OSC can create or move a
     // node outside the base's bbox, so no bbox is declared. The output is
@@ -335,6 +340,26 @@ pub(crate) fn merge_to<'a>(
     } else {
         (None, None, (0, 0, 0))
     };
+    // The refresh probe for surviving base ways (`refresh.rs`): every node
+    // the OSC upserts or deletes, kept apart from the coordinate map
+    // published at the barrier, whose size `loc_missing` is computed from.
+    let probe = Arc::new(if locations_on_ways {
+        StaleProbe::from_diff(&diff)
+    } else {
+        StaleProbe::empty()
+    });
+    if locations_on_ways {
+        let probe_bytes = probe.heap_bytes();
+        crate::debug::emit_counter("merge_loc_refresh_probe_bytes", probe_bytes);
+        #[allow(clippy::cast_precision_loss)]
+        let probe_mb = probe_bytes as f64 / (1024.0 * 1024.0);
+        crate::host::diag!(
+            host.diagnostics,
+            Progress,
+            "apply_changes.refresh_probe",
+            "  inline location refresh probe: {probe_mb:.1} MB"
+        );
+    }
 
     let writer_setup_start = crate::counters::Stopwatch::start();
     // Apply-changes' output pass is writer-bound at default compression, so
@@ -453,6 +478,7 @@ pub(crate) fn merge_to<'a>(
         base: &base,
         ranges: &ranges,
         locations_on_ways,
+        refresh_ways: locations_on_ways && probe.has_upserts(),
         channels: ScannerChannels {
             candidate_tx,
             route: scanner_route,
@@ -472,6 +498,7 @@ pub(crate) fn merge_to<'a>(
             .map(|s| s.iter().map(Arc::clone).collect()),
         loc_map_handle: loc_map_handle.as_ref().map(Arc::clone),
         needed_set: needed_set.as_ref().map(Arc::clone),
+        probe: Arc::clone(&probe),
         compression,
         route: worker_route,
         failure: Arc::clone(&failure),
@@ -552,6 +579,7 @@ pub(crate) fn merge_to<'a>(
 
     let mut final_stats = stats;
     final_stats.diff_heap_bytes = diff_heap_bytes;
+    final_stats.locations_on_ways = locations_on_ways;
     if locations_on_ways {
         final_stats.loc_nodes_needed = loc_stats_pre.0;
         final_stats.loc_nodes_from_diff = loc_stats_pre.1;
@@ -570,6 +598,12 @@ pub(crate) fn merge_to<'a>(
         final_stats.loc_node_blobs_scanned = worker_counters
             .loc_node_blobs_scanned
             .load(std::sync::atomic::Ordering::Relaxed);
+        let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+        final_stats.loc_refresh_blobs_scanned = load(&worker_counters.loc_refresh_blobs_scanned);
+        final_stats.loc_refresh_only_blobs = load(&worker_counters.loc_refresh_only_blobs);
+        final_stats.loc_refreshed_ways = load(&worker_counters.loc_refreshed_ways);
+        final_stats.loc_refreshed_refs = load(&worker_counters.loc_refreshed_refs);
+        final_stats.loc_deleted_node_refs = load(&worker_counters.loc_deleted_node_refs);
     }
 
     if locations_on_ways && final_stats.loc_missing != 0 && !ignore_missing_nodes {
@@ -607,6 +641,20 @@ pub(crate) fn merge_to<'a>(
         crate::debug::emit_counter(
             "merge_loc_node_blobs_scanned",
             final_stats.loc_node_blobs_scanned,
+        );
+        crate::debug::emit_counter(
+            "merge_loc_refresh_blobs_scanned",
+            final_stats.loc_refresh_blobs_scanned,
+        );
+        crate::debug::emit_counter(
+            "merge_loc_refresh_only_blobs",
+            final_stats.loc_refresh_only_blobs,
+        );
+        crate::debug::emit_counter("merge_loc_refreshed_ways", final_stats.loc_refreshed_ways);
+        crate::debug::emit_counter("merge_loc_refreshed_refs", final_stats.loc_refreshed_refs);
+        crate::debug::emit_counter(
+            "merge_loc_deleted_node_refs",
+            final_stats.loc_deleted_node_refs,
         );
     }
 

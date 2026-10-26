@@ -14,7 +14,7 @@ pub struct MergeStats {
     pub blobs_index_hit: u64,
     /// Bytes of raw passthrough frames (wire size including framing).
     pub bytes_passthrough: u64,
-    /// Bytes of rewritten blocks (pre-compression protobuf size).
+    /// Bytes of rewritten blobs as written (framed, compressed).
     pub bytes_rewritten: u64,
     /// Heap bytes used by the CompactDiffOverlay after OSC parsing.
     pub diff_heap_bytes: u64,
@@ -26,6 +26,8 @@ pub struct MergeStats {
     /// with overlay and decoded-block RSS before trading observability for a
     /// bound. An exact size-frequency map can cost more on varied frame sizes.
     pub(super) blob_sizes: Vec<u32>,
+    /// The run had `--locations-on-ways`: the summary reports the refresh.
+    pub(super) locations_on_ways: bool,
     // -- locations-on-ways stats (only populated when flag is on) --
     /// Unique node IDs referenced by OSC ways.
     pub loc_nodes_needed: u64,
@@ -40,6 +42,28 @@ pub struct MergeStats {
     /// Base node blobs decompressed for coordinate extraction (every node
     /// blob, whether it was then passed through or rewritten).
     pub loc_node_blobs_scanned: u64,
+    /// Way blobs with no merge work of their own, searched for surviving
+    /// base ways whose inline coordinates the OSC makes stale. Most were
+    /// passed through undecoded before the search existed.
+    pub loc_refresh_blobs_scanned: u64,
+    /// Blobs rewritten only because they held such a way (no element of
+    /// theirs in the OSC, no create in their range).
+    pub loc_refresh_only_blobs: u64,
+    /// Surviving base ways written with at least one inline coordinate
+    /// changed to the OSC's.
+    pub loc_refreshed_ways: u64,
+    /// Inline coordinates changed to the OSC's, one per way-node position.
+    pub loc_refreshed_refs: u64,
+    /// Surviving base ways' references to nodes the OSC deletes, counted in
+    /// rewritten and searched way blobs only. Way blobs passed through
+    /// unsearched are not counted, and an OSC that creates or modifies no
+    /// node searches none, so on a delete-only node diff (exactly where a
+    /// mismatch is likeliest) this covers only blobs rewritten for other
+    /// edits. Zero therefore does not show that no surviving way uses a
+    /// deleted node. Such refs keep their coordinate; nonzero means the base
+    /// and the OSC disagree (the OSM API does not delete a node a way still
+    /// uses).
+    pub loc_deleted_node_refs: u64,
 }
 
 impl MergeStats {
@@ -59,11 +83,17 @@ impl MergeStats {
             bytes_rewritten: 0,
             diff_heap_bytes: 0,
             blob_sizes: Vec::new(),
+            locations_on_ways: false,
             loc_nodes_needed: 0,
             loc_nodes_from_diff: 0,
             loc_nodes_from_base: 0,
             loc_missing: 0,
             loc_node_blobs_scanned: 0,
+            loc_refresh_blobs_scanned: 0,
+            loc_refresh_only_blobs: 0,
+            loc_refreshed_ways: 0,
+            loc_refreshed_refs: 0,
+            loc_deleted_node_refs: 0,
         }
     }
 
@@ -140,6 +170,17 @@ impl MergeStats {
                 self.loc_nodes_from_base,
                 self.loc_missing,
                 self.loc_node_blobs_scanned,
+            )?;
+        }
+        if self.locations_on_ways {
+            writeln!(
+                w,
+                "  Inline locations refreshed: {} refs in {} ways, {} way blobs scanned, {} rewritten only for this, {} refs to deleted nodes kept (in rewritten or searched blobs only)",
+                self.loc_refreshed_refs,
+                self.loc_refreshed_ways,
+                self.loc_refresh_blobs_scanned,
+                self.loc_refresh_only_blobs,
+                self.loc_deleted_node_refs,
             )?;
         }
 

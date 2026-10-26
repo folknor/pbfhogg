@@ -27,6 +27,15 @@
 //!   diff's sorted upsert vector and call [`rewrite_block_parallel`] on the
 //!   worker's persistent `BlockBuilder`, emitting
 //!   `DrainItem::Rewritten`.
+//! - Under `--locations-on-ways`, when the OSC creates or modifies a node, every
+//!   indexed way blob is a Candidate, so that surviving base ways whose
+//!   inline coordinates the OSC makes stale are refreshed (`refresh.rs`). A
+//!   way blob whose range misses the diff reads its whole frame once,
+//!   decompresses, and is searched without a full parse; it is passed
+//!   through (`CopyRange`, or `OwnedBytes` from that frame) unless a way in
+//!   it is stale, and parsed and rewritten if one is. A false positive among
+//!   the range-overlapping way candidates is searched on its parsed block
+//!   the same way before it is passed through.
 //! - [`ScannedBlob::Passthrough`]: only routed through workers under
 //!   `--direct-io` output (where the drain can't `copy_file_range`).
 //!   Workers pread the **full framed bytes** via
@@ -58,9 +67,11 @@ use super::classify::block_overlaps_diff;
 use super::descriptor::{BlobDescriptor, DrainItem, DrainMessage, Route, ScannedBlob};
 use super::diff_ranges::DiffRanges;
 use super::drain::LocMapHandle;
+use super::element_writes::RefreshScratch;
 use super::failure::FailureSlot;
 use super::loc_mode::LocMode;
 use super::node_coords::extract_node_coords;
+use super::refresh::{StaleProbe, detect_stale_block, detect_stale_wire};
 use super::rewrite_block::rewrite_block_parallel;
 
 use crate::osc::CompactDiffOverlay;
@@ -103,6 +114,10 @@ pub(super) struct StreamingConfig {
     /// blow per-worker RSS by capturing every coord in the file.
     /// `None` when `locations_on_ways` is false.
     pub needed_set: Option<Arc<FxHashSet<i64>>>,
+    /// The OSC's node upserts and deletes, for refreshing surviving base
+    /// ways' inline coordinates (`refresh.rs`). Empty without
+    /// `--locations-on-ways`.
+    pub probe: Arc<StaleProbe>,
     /// Output compression. Workers frame each rewrite output via
     /// `frame_blob_pipelined` so the drain side avoids the writer's
     /// `rayon::spawn`-per-block dispatch (P1.5).
@@ -168,6 +183,27 @@ crate::counters::counter_set! {
         /// passthrough of every kind. Not emitted by this set: `merge`
         /// reads it into the stats it emits as `merge_loc_node_blobs_scanned`.
         pub loc_node_blobs_scanned,
+        /// Way blobs with no merge work of their own, searched under
+        /// `--locations-on-ways` for ways whose inline coordinates the OSC
+        /// makes stale (`refresh.rs`): those whose range misses the diff,
+        /// decompressed only for this, and range-overlapping false positives.
+        /// Emitted through the stats as `merge_loc_refresh_blobs_scanned`.
+        pub loc_refresh_blobs_scanned,
+        /// Blobs rewritten only because a way in them is stale: no element
+        /// of theirs is in the OSC and no create lands in their range. Not
+        /// counted in `blobs_forced_rewrite`. A subset of `blobs_rewritten`.
+        pub loc_refresh_only_blobs,
+        /// Surviving base ways written with at least one coordinate changed
+        /// to the OSC's, on every rewritten blob.
+        pub loc_refreshed_ways,
+        /// Positions whose coordinate changed to the OSC's.
+        pub loc_refreshed_refs,
+        /// Surviving base ways' refs to nodes the OSC deletes, which keep
+        /// their coordinate (base and OSC disagree), counted in rewritten
+        /// and searched way blobs only; see `MergeStats::loc_deleted_node_refs`.
+        pub loc_deleted_node_refs,
+        /// Staleness-detection wall summed across all workers.
+        pub refresh_scan_ns => "merge_streaming_refresh_scan_ns",
         /// In-line framing wall summed across all workers (P1.5: avoids
         /// the writer's rayon-spawn-per-block dispatch).
         pub frame_ns => "merge_streaming_frame_ns",
@@ -201,6 +237,7 @@ pub(super) fn run_workers(
         coord_slots,
         loc_map_handle,
         needed_set,
+        probe,
         compression,
         route,
         failure,
@@ -262,6 +299,7 @@ pub(super) fn run_workers(
             let failure = &*failure;
             let ranges = &*ranges;
             let diff = &*diff;
+            let probe = &*probe;
             #[cfg(feature = "test-hooks")]
             let cancel = &cancel;
 
@@ -280,6 +318,7 @@ pub(super) fn run_workers(
                         coord_slot.as_ref(),
                         loc_map_handle.as_ref(),
                         needed_set.as_deref(),
+                        probe,
                         &compression,
                         route,
                         #[cfg(feature = "test-hooks")]
@@ -322,6 +361,7 @@ fn worker_loop(
     coord_slot: Option<&CoordSlot>,
     loc_map_handle: Option<&LocMapHandle>,
     needed_set: Option<&FxHashSet<i64>>,
+    probe: &StaleProbe,
     compression: &Compression,
     route: Route<()>,
     #[cfg(feature = "test-hooks")] cancel: &crate::host::Cancel,
@@ -337,6 +377,7 @@ fn worker_loop(
     // `locations_on_ways` is false.
     let mut local_coords: FxHashMap<i64, (i32, i32)> = FxHashMap::default();
     let mut node_groups_scratch: Vec<(usize, usize)> = Vec::new();
+    let mut refresh_scratch = RefreshScratch::default();
 
     loop {
         let item = {
@@ -384,9 +425,11 @@ fn worker_loop(
                     locations_on_ways,
                     &mut local_coords,
                     &mut node_groups_scratch,
+                    &mut refresh_scratch,
                     coord_slot,
                     loc_map_handle,
                     needed_set,
+                    probe,
                     compression,
                     route,
                 )
@@ -448,20 +491,91 @@ fn handle_candidate(
     locations_on_ways: bool,
     local_coords: &mut FxHashMap<i64, (i32, i32)>,
     node_groups_scratch: &mut Vec<(usize, usize)>,
+    refresh_scratch: &mut RefreshScratch,
     coord_slot: Option<&CoordSlot>,
     loc_map_handle: Option<&LocMapHandle>,
     needed_set: Option<&FxHashSet<i64>>,
+    probe: &StaleProbe,
     compression: &Compression,
     route: Route<()>,
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
 
-    let body_offset = desc.frame_start + desc.blob_offset as u64;
-    pread_into(file, read_buf, body_offset, desc.data_size)?;
+    // Under --locations-on-ways an OSC that moves a node makes every way
+    // using it stale, whether or not the OSC touches the way. So the scanner
+    // sends every indexed way blob here, not only those whose range meets
+    // the diff (`scanner.rs`). One whose range misses the diff would have
+    // been passed through untouched: it is decompressed and searched for a
+    // stale way without a full parse, and passed through as before when it
+    // holds none (see `refresh::detect_stale_wire`).
+    let refresh_scan = locations_on_ways
+        && probe.has_upserts()
+        && desc.kind == ElementKind::Way
+        && desc.index.is_some()
+        && desc
+            .id_range
+            .is_some_and(|(min, max)| !ranges.range_overlaps(ElementKind::Way, min, max));
+    // Set when the only reason to rewrite this blob is a stale way.
+    let mut refresh_only = false;
 
-    let t_decompress = crate::counters::Stopwatch::start();
-    decompress_blob_raw(read_buf, decompress_buf)?;
-    t_decompress.record_ns(&counters.decompress_ns);
+    if refresh_scan {
+        // The whole frame in one read: a clean blob on the owned route is
+        // shipped from it, and only the body is decompressed.
+        pread_into(file, read_buf, desc.frame_start, desc.frame_len)?;
+        let body = desc
+            .blob_offset
+            .checked_add(desc.data_size)
+            .and_then(|end| read_buf.get(desc.blob_offset..end))
+            .ok_or_else(|| Error::internal("streaming: blob body outside its frame"))?;
+        let t_decompress = crate::counters::Stopwatch::start();
+        decompress_blob_raw(body, decompress_buf)?;
+        t_decompress.record_ns(&counters.decompress_ns);
+
+        counters
+            .loc_refresh_blobs_scanned
+            .fetch_add(1, Ordering::Relaxed);
+        let t_scan = crate::counters::Stopwatch::start();
+        let detection = detect_stale_wire(
+            decompress_buf,
+            probe,
+            node_groups_scratch,
+            &mut refresh_scratch.hits,
+        )?;
+        t_scan.record_ns(&counters.refresh_scan_ns);
+        if !detection.stale {
+            counters
+                .loc_deleted_node_refs
+                .fetch_add(detection.deleted_refs, Ordering::Relaxed);
+            if route.is_splice() {
+                let item = desc.take_copy_range().ok_or_else(|| {
+                    Error::internal("streaming: refresh scan of a blob without indexdata")
+                })?;
+                return send_drain(drain_tx, item);
+            }
+            counters
+                .blobs_owned_passthrough
+                .fetch_add(1, Ordering::Relaxed);
+            let count = desc.index.as_ref().map_or(0, |i| i.count);
+            return send_drain(
+                drain_tx,
+                DrainItem::OwnedBytes {
+                    seq: desc.seq,
+                    frame_bytes: std::mem::take(read_buf),
+                    kind: desc.kind,
+                    id_range: desc.id_range.unwrap_or((0, 0)),
+                    count,
+                },
+            );
+        }
+        refresh_only = true;
+    } else {
+        let body_offset = desc.frame_start + desc.blob_offset as u64;
+        pread_into(file, read_buf, body_offset, desc.data_size)?;
+
+        let t_decompress = crate::counters::Stopwatch::start();
+        decompress_blob_raw(read_buf, decompress_buf)?;
+        t_decompress.record_ns(&counters.decompress_ns);
+    }
 
     // An unindexed blob (`--force`; the scanner sends every one here) gets
     // the sidecars the writer would give it, derived from the payload by the
@@ -588,7 +702,32 @@ fn handle_candidate(
     // Forcing the rewrite lets `rewrite_block_parallel` interleave the
     // create at its sorted position and lets the drain advance the upsert
     // cursor past this blob's range.
-    if !overlaps && inline_upserts.is_empty() && !must_reencode {
+    // A candidate that needs no merge work may still hold a stale way under
+    // --locations-on-ways; its ways all survive (none is in the diff).
+    if !overlaps
+        && inline_upserts.is_empty()
+        && !must_reencode
+        && !refresh_only
+        && locations_on_ways
+        && probe.has_upserts()
+        && effective_kind == ElementKind::Way
+    {
+        counters
+            .loc_refresh_blobs_scanned
+            .fetch_add(1, Ordering::Relaxed);
+        let t_scan = crate::counters::Stopwatch::start();
+        let detection = detect_stale_block(&block, probe, &mut refresh_scratch.hits)?;
+        t_scan.record_ns(&counters.refresh_scan_ns);
+        if detection.stale {
+            refresh_only = true;
+        } else {
+            counters
+                .loc_deleted_node_refs
+                .fetch_add(detection.deleted_refs, Ordering::Relaxed);
+        }
+    }
+
+    if !overlaps && inline_upserts.is_empty() && !must_reencode && !refresh_only {
         counters
             .blobs_false_positive
             .fetch_add(1, Ordering::Relaxed);
@@ -628,7 +767,11 @@ fn handle_candidate(
         let count = desc.index.as_ref().map_or(0, |i| i.count);
         return handle_owned_passthrough(file, desc, drain_tx, counters, read_buf, count);
     }
-    if !overlaps {
+    if refresh_only {
+        counters
+            .loc_refresh_only_blobs
+            .fetch_add(1, Ordering::Relaxed);
+    } else if !overlaps {
         counters
             .blobs_forced_rewrite
             .fetch_add(1, Ordering::Relaxed);
@@ -648,8 +791,26 @@ fn handle_candidate(
     let loc = LocMode::new(locations_on_ways, loc_arc.as_deref());
 
     let t_rewrite = crate::counters::Stopwatch::start();
-    let output = rewrite_block_parallel(&block, diff, bb, inline_upserts, effective_kind, loc)?;
+    let output = rewrite_block_parallel(
+        &block,
+        diff,
+        bb,
+        inline_upserts,
+        effective_kind,
+        loc,
+        probe,
+        refresh_scratch,
+    )?;
     t_rewrite.record_ns(&counters.rewrite_ns);
+    counters
+        .loc_refreshed_ways
+        .fetch_add(output.refresh.ways, Ordering::Relaxed);
+    counters
+        .loc_refreshed_refs
+        .fetch_add(output.refresh.refs, Ordering::Relaxed);
+    counters
+        .loc_deleted_node_refs
+        .fetch_add(output.refresh.deleted_refs, Ordering::Relaxed);
 
     // P1.5: frame each output block in-line via per-thread scratch so the
     // drain side can `write_raw_owned` without the writer's

@@ -14,8 +14,9 @@ use super::diff_ranges::DiffRanges;
 ///
 /// Sorted-merge has a per-kind cursor that only advances forward. Since
 /// block elements within a kind are sorted and `DiffRanges` IDs are
-/// sorted by `osm_id_cmp`, the cursor visits at most the sub-slice of
-/// diff IDs spanning the block's ID range.
+/// sorted by `osm_id_cmp`, each cursor starts by binary search at the first
+/// diff ID not before the kind's first element, and then visits at most the
+/// sub-slice of diff IDs spanning the block's ID range.
 ///
 /// **Key distinction from `range_overlaps`**: a diff with only pure
 /// creates (new IDs not present in the base PBF) can cause
@@ -27,9 +28,11 @@ use super::diff_ranges::DiffRanges;
 pub(super) fn block_overlaps_diff(block: &PrimitiveBlock, ranges: &DiffRanges) -> bool {
     use std::cmp::Ordering;
 
-    let mut node_cursor: usize = 0;
-    let mut way_cursor: usize = 0;
-    let mut rel_cursor: usize = 0;
+    // `None` until the kind's first element seeds it by binary search;
+    // starting at 0 walked the whole diff prefix below every blob.
+    let mut node_cursor: Option<usize> = None;
+    let mut way_cursor: Option<usize> = None;
+    let mut rel_cursor: Option<usize> = None;
 
     for element in block.elements_skip_metadata() {
         let (cursor, sorted, id) = match &element {
@@ -38,6 +41,9 @@ pub(super) fn block_overlaps_diff(block: &PrimitiveBlock, ranges: &DiffRanges) -
             Element::Way(w) => (&mut way_cursor, &ranges.way_ids[..], w.id()),
             Element::Relation(r) => (&mut rel_cursor, &ranges.rel_ids[..], r.id()),
         };
+        let cursor = cursor.get_or_insert_with(|| {
+            sorted.partition_point(|&x| crate::osm_id::osm_id_cmp(x, id) == Ordering::Less)
+        });
         while *cursor < sorted.len()
             && crate::osm_id::osm_id_cmp(sorted[*cursor], id) == Ordering::Less
         {

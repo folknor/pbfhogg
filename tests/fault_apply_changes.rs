@@ -464,6 +464,169 @@ mod apply_changes {
         }
     }
 
+    /// A node the OSC moves without touching the ways using it is refreshed
+    /// in every way, on both output routes and at every worker count, with
+    /// the same bytes each time: way 102's blob is rewritten only for that,
+    /// and ways 100 and 103's blobs are searched and passed through (from
+    /// the frame the worker read, on the owned route).
+    #[test]
+    fn untouched_ways_are_refreshed_the_same_on_both_routes() {
+        let dir = crate::common::test_scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        write_low_base(
+            &base,
+            &(1..=12).collect::<Vec<_>>(),
+            2,
+            &[
+                (100, vec![1, 2]),
+                (101, vec![3, 4]),
+                (102, vec![5, 6, 5]),
+                (103, vec![7, 8]),
+            ],
+            &[(500, 100)],
+        );
+        write_osc_body(
+            &osc,
+            &format!(
+                "<modify><node id=\"5\" lat=\"1.2345678\" lon=\"-2.3456789\" \
+                 version=\"2\"/>{}</modify>",
+                osc_way(101, 2, &[1, 5]),
+            ),
+        );
+        let moved = (12_345_678, -23_456_789);
+        let expected = vec![
+            (100, vec![coord(1), coord(2)]),
+            (101, vec![coord(1), moved]),
+            (102, vec![moved, coord(6), moved]),
+            (103, vec![coord(7), coord(8)]),
+        ];
+
+        let reference = dir.path().join("reference.osm.pbf");
+        let (result, _) = run_low(&base, &osc, &reference, 2, false, |_| {});
+        result.expect("reference run");
+        assert_eq!(way_locations(&reference), expected);
+        let reference = std::fs::read(&reference).expect("read reference");
+
+        // The base's frames: header, six node blobs, then one blob per way
+        // (100, 101, 102, 103) and the relation blob.
+        let base_bytes = std::fs::read(&base).expect("read base");
+        let mut offsets: Vec<usize> = pbfhogg::BlobReader::from_path(&base)
+            .expect("open base")
+            .map(|blob| usize::try_from(blob.expect("blob").offset().expect("offset").0).unwrap())
+            .collect();
+        offsets.push(base_bytes.len());
+        let frame = |i: usize| &base_bytes[offsets[i]..offsets[i + 1]];
+        let holds = |out: &[u8], f: &[u8]| out.windows(f.len()).any(|w| w == f);
+
+        for &jobs in JOBS {
+            for owned in [false, true] {
+                let label = format!("jobs={jobs} owned={owned}");
+                let output = dir.path().join("output.osm.pbf");
+                let (result, _) = run_low(&base, &osc, &output, jobs, owned, |_| {});
+                result.unwrap_or_else(|e| panic!("{label}: {e}"));
+                let bytes = std::fs::read(&output).expect("read output");
+                // Ways 100 and 103 were searched and passed through as read;
+                // 101 (edited) and 102 (stale) were rewritten.
+                assert!(holds(&bytes, frame(7)), "{label}: way 100's blob rewritten");
+                assert!(
+                    holds(&bytes, frame(10)),
+                    "{label}: way 103's blob rewritten"
+                );
+                assert!(!holds(&bytes, frame(8)), "{label}: way 101's blob copied");
+                assert!(!holds(&bytes, frame(9)), "{label}: way 102's blob copied");
+                assert_eq!(
+                    bytes, reference,
+                    "{label}: output differs from the reference"
+                );
+                std::fs::remove_file(&output).expect("remove output");
+            }
+        }
+    }
+
+    /// A way blob outside every OSC range used to be spliced unread. Under a
+    /// refresh it is searched, and a malformed coordinate array in it (one
+    /// latitude for two refs) fails the run on both routes: nothing is
+    /// published and no scratch is left behind.
+    #[test]
+    fn a_malformed_way_in_an_untouched_blob_fails_the_run_cleanly() {
+        fn varint(mut v: u64, out: &mut Vec<u8>) {
+            loop {
+                #[allow(clippy::cast_possible_truncation)]
+                let byte = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(byte);
+                    break;
+                }
+                out.push(byte | 0x80);
+            }
+        }
+        fn len_field(field: u32, payload: &[u8], out: &mut Vec<u8>) {
+            varint(u64::from((field << 3) | 2), out);
+            varint(payload.len() as u64, out);
+            out.extend_from_slice(payload);
+        }
+        // Way 300: refs 1, 2 (zigzag deltas 2, 2), one latitude, two
+        // longitudes.
+        let mut way = vec![0x08];
+        varint(300, &mut way);
+        len_field(8, &[2, 2], &mut way);
+        len_field(9, &[2], &mut way);
+        len_field(10, &[2, 2], &mut way);
+        let mut group = Vec::new();
+        len_field(3, &way, &mut group);
+        let mut way_block = Vec::new();
+        len_field(1, &[0x0A, 0x00], &mut way_block);
+        len_field(2, &group, &mut way_block);
+
+        for owned in [false, true] {
+            let dir = crate::common::test_scratch();
+            let base = dir.path().join("base.osm.pbf");
+            let osc = dir.path().join("diff.osc.gz");
+            let output = dir.path().join("output.osm.pbf");
+            let mut writer = PbfWriter::new(
+                File::create(&base).expect("create base"),
+                Compression::default(),
+            );
+            let header = block_builder::HeaderBuilder::new()
+                .sorted()
+                .optional_feature("LocationsOnWays")
+                .build()
+                .expect("build header");
+            writer.write_header(&header).expect("write header");
+            let mut bb = BlockBuilder::new();
+            for id in 1..=4 {
+                let (lat, lon) = coord(id);
+                bb.add_node(id, lat, lon, std::iter::empty(), None);
+            }
+            writer
+                .write_primitive_block(bb.take().expect("take").expect("node block"))
+                .expect("node blob");
+            writer.write_primitive_block(&way_block).expect("way blob");
+            writer.flush().expect("flush base");
+            write_osc_body(
+                &osc,
+                "<modify><node id=\"1\" lat=\"5.0\" lon=\"6.0\" version=\"2\"/></modify>",
+            );
+
+            let before = common::snapshot_dir(dir.path());
+            let (result, _) = run_low(&base, &osc, &output, 2, owned, |_| {});
+            let err = result
+                .err()
+                .unwrap_or_else(|| panic!("owned={owned}: must fail"));
+            assert!(
+                err.to_string().contains("node-location array"),
+                "owned={owned}: {err}"
+            );
+            assert!(
+                !output.exists(),
+                "owned={owned}: a failed run must publish nothing"
+            );
+            common::assert_scratch_unchanged(&before, &common::snapshot_dir(dir.path()));
+        }
+    }
+
     /// Run the ordinary shape with `nodes` single-node blobs, armed by
     /// `arm`, and require it to fail with `expect` in its message, publish
     /// nothing and leave no scratch.

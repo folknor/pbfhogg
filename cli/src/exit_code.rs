@@ -123,6 +123,10 @@ pub struct Advice {
     pub allow_version_regression: bool,
     /// Whether `--ignore-missing-nodes` is on offer.
     pub ignore_missing_nodes: bool,
+    /// Whether the run maintains locations through a merge
+    /// (`apply-changes --locations-on-ways`), where unresolved node
+    /// locations most often mean a base that lost its untagged nodes.
+    pub merge_locations: bool,
 }
 
 /// `path` as a shell word: bare when it is plain, single-quoted otherwise.
@@ -169,8 +173,20 @@ fn hint_for(error: &pbfhogg::Error, advice: &Advice) -> Option<String> {
             "; `pbfhogg check --index {}` reports which blobs disagree with their contents",
             input_word(error, "input.osm.pbf")
         )),
-        ErrorKind::MissingNodeLocations { .. } if advice.ignore_missing_nodes => {
-            Some("; pass --ignore-missing-nodes to write them as (0, 0)".to_owned())
+        ErrorKind::MissingNodeLocations { .. }
+            if advice.merge_locations || advice.ignore_missing_nodes =>
+        {
+            let mut hint = String::new();
+            if advice.merge_locations {
+                hint.push_str(
+                    "; a base made by add-locations-to-ways must keep its untagged nodes \
+                     (--keep-untagged-nodes) for the merge to resolve them",
+                );
+            }
+            if advice.ignore_missing_nodes {
+                hint.push_str("; pass --ignore-missing-nodes to write them as (0, 0)");
+            }
+            Some(hint)
         }
         ErrorKind::BlobTooLarge { .. } => advice.element_cap.map(|flag| format!("; lower {flag}")),
         ErrorKind::VersionRegression { .. } if advice.allow_version_regression => {

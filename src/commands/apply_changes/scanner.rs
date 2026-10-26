@@ -60,6 +60,11 @@ pub(super) struct ScannerConfig<'a> {
     /// way descriptor is seen, waits on `barrier_rx` for the drain's
     /// signal that `Arc<loc_map>` is published, then drains the buffer.
     pub locations_on_ways: bool,
+    /// Under `--locations-on-ways`, the OSC creates or modifies a node, so
+    /// any way may hold a stale inline coordinate: every indexed way
+    /// blob goes to the workers to be searched (`refresh.rs`), not only those
+    /// whose range meets the diff.
+    pub refresh_ways: bool,
     pub channels: ScannerChannels,
     /// Drain → scanner signal. Present when `locations_on_ways` is true.
     /// Drain sends one unit value after it has processed the last node
@@ -90,6 +95,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         base,
         ranges,
         locations_on_ways,
+        refresh_ways,
         channels,
         barrier_rx,
         boundary_tx,
@@ -179,8 +185,9 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         // Under `--locations-on-ways`, Node blobs CANNOT take the
         // splice fast-path: workers must decompress them to extract
         // coord tuples for the barrier merge, even when the blob
-        // doesn't overlap the diff. Way/Relation blobs are still
-        // eligible for the splice fast-path under LOW.
+        // doesn't overlap the diff. Relation blobs are still eligible for
+        // the splice fast-path under LOW, and way blobs are when the OSC
+        // changes no node (see the last paragraph).
         //
         // "Node" here is an indexdata claim, not an observed payload kind.
         // A node blob mislabelled Way/Relation can bypass extraction (via
@@ -200,10 +207,18 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         // elements. Claims are believed, not verified, and a file whose
         // claims lie is outside the contract (reference/indexdata-trust.md);
         // `check --index` is the verifier.
-        let low_node_must_decompress = locations_on_ways && matches!(kind, ElementKind::Node);
+        //
+        // Under `--locations-on-ways` with node creates or modifies in the OSC, way blobs
+        // cannot be spliced unseen either: a moved node makes stale every way
+        // using it, and the OSC need not touch the way. Workers decompress
+        // each one and pass it through unchanged unless a way in it is stale
+        // (`refresh.rs`). Like the node rule, this rests on the kind claim; a
+        // way blob labelled otherwise is not searched.
+        let low_must_decompress = (locations_on_ways && matches!(kind, ElementKind::Node))
+            || (refresh_ways && matches!(kind, ElementKind::Way));
         let item = if let Some(drain_tx) = splice_tx
             && has_indexdata
-            && !low_node_must_decompress
+            && !low_must_decompress
             && !ranges.range_overlaps(
                 kind,
                 id_range.map_or(0, |r| r.0),
@@ -221,7 +236,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
                     )
                 })?,
             )
-        } else if !low_node_must_decompress
+        } else if !low_must_decompress
             && has_indexdata
             && !ranges.range_overlaps(
                 kind,
@@ -231,9 +246,9 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         {
             // No-overlap indexed blob under --direct-io: route through
             // the worker pool so a worker can pread the full frame and
-            // emit `DrainItem::OwnedBytes`. Skipped for Node
-            // blobs under LOW - those route as `Candidate` below so
-            // workers decompress and extract coords.
+            // emit `DrainItem::OwnedBytes`. Skipped for Node blobs under
+            // LOW, and way blobs under a refresh - those route as
+            // `Candidate` below so workers decompress them.
             ScannerEmit::Candidate(ScannedBlob::Passthrough(descriptor))
         } else {
             ScannerEmit::Candidate(ScannedBlob::Candidate(descriptor))

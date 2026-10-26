@@ -12,17 +12,21 @@ use crate::commands::{ensure_node_capacity_local, ensure_relation_capacity_local
 
 use super::Result;
 use super::element_writes::{
-    add_osc_node, add_osc_relation, write_base_dense_node_local, write_base_node_local,
-    write_base_relation_local, write_base_way_local, write_base_way_local_with_locations,
-    write_osc_way_local,
+    BaseWrites, RefreshScratch, RefreshTally, add_osc_node, add_osc_relation,
+    write_base_dense_node_local, write_base_node_local, write_base_relation_local,
+    write_base_way_local, write_base_way_local_with_locations, write_osc_way_local,
 };
 use super::loc_mode::LocMode;
+use super::refresh::StaleProbe;
 use super::stats::MergeStats;
 
 /// Output from `rewrite_block_parallel`: serialized blocks + local stats.
 pub(super) struct RewriteOutput {
     pub(super) blocks: Vec<OwnedBlock>,
     pub(super) stats: MergeStats,
+    /// Inline-coordinate refresh counts for the block's surviving base ways
+    /// (all zero without `--locations-on-ways`).
+    pub(super) refresh: RefreshTally,
 }
 
 // The create dispatch mirrors stream_output, but capacity checks below must
@@ -72,8 +76,10 @@ fn emit_create_local(
 ///
 /// `loc` governs every way written, base or OSC: see [`LocMode`]. Writing
 /// a way under `LocMode::Pending` is an error, never a silent refs-only
-/// write.
-#[allow(clippy::too_many_lines)]
+/// write. Under `LocMode::Required` a surviving base way's inline
+/// coordinates are refreshed against `probe` (see `refresh.rs`); `probe` is
+/// empty without `--locations-on-ways`.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn rewrite_block_parallel(
     block: &PrimitiveBlock,
@@ -82,10 +88,13 @@ pub(super) fn rewrite_block_parallel(
     inline_upserts: &[i64],
     kind: ElementKind,
     loc: LocMode<'_>,
+    probe: &StaleProbe,
+    scratch: &mut RefreshScratch,
 ) -> Result<RewriteOutput> {
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut stats = MergeStats::new();
     let mut upsert_cursor: usize = 0;
+    let mut base_writes = BaseWrites::new(block, probe, scratch);
 
     bb.pre_seed_string_table(block);
 
@@ -154,11 +163,16 @@ pub(super) fn rewrite_block_parallel(
                     write_osc_way_local(bb, &mut output, &osc, loc)?;
                     stats.diff_ways += 1;
                 } else if loc.for_way(id)?.is_some() {
-                    // Forward existing raw lat/lon data for LocationsOnWays
-                    write_base_way_local_with_locations(bb, &mut output, w, block)?;
+                    write_base_way_local_with_locations(
+                        bb,
+                        &mut output,
+                        w,
+                        block,
+                        &mut base_writes,
+                    )?;
                     stats.base_ways += 1;
                 } else {
-                    write_base_way_local(bb, &mut output, w, block)?;
+                    write_base_way_local(bb, &mut output, w, block, &mut base_writes)?;
                     stats.base_ways += 1;
                 }
             }
@@ -172,7 +186,7 @@ pub(super) fn rewrite_block_parallel(
 
                     stats.diff_relations += 1;
                 } else {
-                    write_base_relation_local(bb, &mut output, r, block)?;
+                    write_base_relation_local(bb, &mut output, r, block, &mut base_writes)?;
                     stats.base_relations += 1;
                 }
             }
@@ -192,5 +206,6 @@ pub(super) fn rewrite_block_parallel(
     Ok(RewriteOutput {
         blocks: output,
         stats,
+        refresh: base_writes.tally,
     })
 }

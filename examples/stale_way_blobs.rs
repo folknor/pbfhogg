@@ -4,13 +4,14 @@
 //!     cargo run --release --example stale_way_blobs -- <base-altw.osm.pbf> <next.osc.gz>
 //!         [--verify-output <apply-changes-l-output.osm.pbf>]
 //!
-//! Research program for the `apply-changes --locations-on-ways` defect: today
-//! a base way the OSC does not touch keeps its old inline coordinates, so a
-//! node the OSC moves leaves every untouched way using it stale. A fix scans
-//! way blobs and rewrites the ones holding a stale way; how much of the way
-//! splice fast path survives depends on the numbers this program reports.
-//! Read-only: it writes nothing but its report (stdout) and progress
-//! (stderr).
+//! A way stores node IDs and changes version only when its tags or node list
+//! do, so a node the OSC moves leaves every untouched way using it with a
+//! stale inline coordinate. `apply-changes --locations-on-ways` refreshes
+//! those ways: it searches way blobs and rewrites the ones holding a stale
+//! way. This program measures, for a base and the OSC that follows it, how
+//! many way blobs the OSC makes stale and so how much of the way splice
+//! fast path the refresh leaves. Read-only: it writes nothing but its report
+//! (stdout) and progress (stderr).
 //!
 //! What it measures, per way blob of the base, against the OSC's final state
 //! (the parsed overlay: live nodes are creates and modifies with their target
@@ -27,8 +28,8 @@
 //! - M, ID-only membership: the blob holds an untouched way with some ref
 //!   that is a live OSC node at all, whether or not its coordinate differs.
 //!   The gap between S and M is what tag-only node edits cost an ID rule.
-//! - T, what today's merge already rewrites (an emulation of the indexed
-//!   worker path): some way in the blob is live or deleted in the OSC, or a
+//! - T, what the merge rewrites for merge work alone, before any refresh (an
+//!   emulation of the indexed worker path): some way in the blob is live or deleted in the OSC, or a
 //!   live OSC way ID lies inside the blob's way-ID range. Ways the OSC
 //!   itself replaces or deletes are rewritten anyway, so they never count
 //!   toward S or M; their stale refs are reported separately. Production
@@ -44,11 +45,12 @@
 //! body does not appear there (a splice or an owned passthrough keeps the
 //! compressed body byte for byte, whatever its header). It then reports
 //! predicted T against actual rewrites for way blobs, and actual rewrites
-//! for the other kinds.
+//! for the other kinds. Under the refresh, the actual way-blob rewrites are
+//! T plus the blobs rewritten only for a stale way (S minus T).
 //!
 //! The report gives these sets and their combinations (S minus T is the
-//! extra work a fix adds, S intersect T the stale survivors inside blobs
-//! today's merge already rewrites) in blobs, framed compressed bytes (the
+//! extra work the refresh adds, S intersect T the stale survivors inside
+//! blobs the merge rewrites anyway) in blobs, framed compressed bytes (the
 //! bytes a splice copies) and decompressed bytes; stale ways and refs by
 //! way class; probe nodes that differ from or agree with base inline
 //! coordinates; refs to OSC-deleted nodes; ways without inline geometry;
@@ -108,7 +110,8 @@ const DEL_REF_DELETED: u8 = 4;
 const DEL_OSC_WAY_REF: u8 = 8;
 
 // Per way blob, on the compact record.
-/// T: today's merge rewrites the blob.
+/// T: the merge rewrites the blob for merge work alone (way edits, deletes,
+/// in-range creates), before any coordinate refresh.
 const REC_T: u16 = 1;
 /// S: an untouched way holds a coordinate that differs from the OSC's.
 const REC_S: u16 = 2;
@@ -1038,7 +1041,7 @@ fn has(bits: u16, flag: u16) -> bool {
 
 const SETS: &[BlobSet] = &[
     BlobSet {
-        name: "T   rewritten by today's merge (predicted)",
+        name: "T   rewritten for merge work (predicted)",
         test: |b| has(b, REC_T),
     },
     BlobSet {
@@ -1228,7 +1231,9 @@ fn print_bounds(recs: &[WayBlobRec], all: &SetSums) {
     let s_un = sum_set(recs, |b| !sup(b) && has(b, REC_S));
     let m_lo = sum_set(recs, |b| sup(b) && has(b, REC_M) && !has(b, REC_T));
     let m_un = sum_set(recs, |b| !sup(b) && has(b, REC_M));
-    println!("  Extra rewrite bounds (U blobs counted as already rewritten / as spliced today):");
+    println!(
+        "  Extra rewrite bounds (U blobs counted as already rewritten / as spliced without a refresh):"
+    );
     println!(
         "    inline rule:  {:.2}% .. {:.2}% of framed way bytes",
         pct(s_lo.frame, all.frame),
@@ -1269,7 +1274,7 @@ fn print_splice(recs: &[WayBlobRec], all: &SetSums) {
     );
     let policies = [
         BlobSet {
-            name: "today (rewrite T)",
+            name: "no refresh (rewrite T)",
             test: |b| has(b, REC_T),
         },
         BlobSet {

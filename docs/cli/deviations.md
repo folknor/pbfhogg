@@ -42,17 +42,55 @@ callers who want it, and the summary line is unchanged. See
 
 ## apply-changes: missing LocationsOnWays nodes are an error
 
-**osmium behavior:** Under `--locations-on-ways`, an unresolved way-node
-reference is written with `(0, 0)` as its coordinate and no warning.
+**osmium behavior:** Under `--locations-on-ways`, a way reference osmium
+cannot resolve keeps the location its OSC `<nd>` carried, normally none:
+libosmium's undefined location, which decodes to `2147483647` on each axis.
+There is no warning and no option to fail.
 
-**pbfhogg behavior:** The command fails and does not publish its output. Pass
-`--ignore-missing-nodes` to request the osmium-compatible `(0, 0)` fallback.
+**pbfhogg behavior:** The command fails and does not publish its output. A
+reference from an OSC way to a node the OSC deletes counts as unresolved too.
+`--ignore-missing-nodes` writes every unresolved reference as `(0, 0)` and
+publishes the output; that is pbfhogg's own placeholder, not osmium's output.
 
-**Rationale:** Null Island is a valid coordinate, so a sentinel-bearing output
-cannot distinguish missing data from real data. Failure by default matches
-`add-locations-to-ways` and keeps the lossy behavior explicit. The escape
-hatch matters for incremental extracts, where a regional base plus a
+**Rationale:** Null Island is a valid coordinate, so a placeholder-bearing
+output cannot distinguish missing data from real data. Failure by default
+matches `add-locations-to-ways` and keeps the lossy behavior explicit. The
+escape hatch matters for incremental extracts, where a regional base plus a
 full-planet change stream legitimately references nodes outside the region.
+
+Only ways the OSC creates or modifies are resolved against node records, so a
+base made by `add-locations-to-ways` without `--keep-untagged-nodes` can fail
+on an ordinary daily diff: a changed way can reference unchanged untagged
+nodes whose records are in neither the base nor the OSC.
+
+## apply-changes: --locations-on-ways takes new locations from the OSC only
+
+**osmium behavior:** Overwrites each reference of every way it writes,
+untouched base ways included, wherever its change-derived location index has
+a location: the change file's nodes (deletes that carry `lat`/`lon`
+included), plus base locations it adds, under conditions, for nodes that
+ways in the change reference. The index has ordering defects: during the
+base node pass it is searched before it has been sorted, so an entry can be
+missed and a base location added beside it, and after the sort at the base's
+node-to-way transition a node with several defined locations resolves to the
+smallest (longitude first), not to its latest version. The sort runs only
+when a base way follows a base node, so on a base with no nodes or no ways
+every lookup searches an unsorted index, for a node with a single version
+too. A way without coordinate arrays is written with them.
+
+**pbfhogg behavior:** A surviving base way (one the OSC neither modifies nor
+deletes), whether its blob is rewritten or copied, takes the OSC coordinate
+for each existing inline coordinate whose node the OSC creates or modifies. It keeps every other inline coordinate, including one
+for a node the OSC deletes, which is counted in the summary for the way
+blobs the run searched or rewrote; a way without coordinate arrays is left
+without them.
+
+**Impact:** On a base whose inline coordinates agree with its node records
+and a matching replication diff, both tools write the same coordinates
+(osmium's index defects aside). They differ for a surviving way referencing a
+deleted node (osmium may write the delete's or the base node's coordinate)
+and for one whose inline coordinate disagrees with the base's node record
+(osmium may overwrite it from the record).
 
 ## diff: content equality vs version ordering
 

@@ -541,6 +541,26 @@ impl PrimitiveBlock {
         self.block.proto_len as usize
     }
 
+    /// The block's coordinate framing as `(granularity, lat_offset,
+    /// lon_offset)`: a coordinate is `offset + granularity * raw`
+    /// nanodegrees. `(100, 0, 0)` unless the block declares otherwise.
+    /// For writers that copy raw coordinate bytes and must know whether the
+    /// output block's (default) framing reads them the same way.
+    pub(crate) fn coord_framing(&self) -> (i32, i64, i64) {
+        (
+            self.block.granularity,
+            self.block.lat_offset,
+            self.block.lon_offset,
+        )
+    }
+
+    /// The block's `date_granularity` (milliseconds per raw timestamp unit,
+    /// 1000 unless the block declares otherwise). For writers that copy raw
+    /// `Info` bytes.
+    pub(crate) fn date_granularity(&self) -> i32 {
+        self.block.date_granularity
+    }
+
     /// Returns the element type contained in this block.
     ///
     /// Inspects only the first protobuf field tag of each group - typically a
@@ -690,7 +710,7 @@ impl PrimitiveBlock {
 /// reconstructed. `packed_varint_count_matches_read_varint` pins the
 /// equivalence against the decoder itself.
 #[inline]
-fn packed_varint_count(data: &[u8]) -> Result<usize> {
+pub(crate) fn packed_varint_count(data: &[u8]) -> Result<usize> {
     let mut count = 0usize;
     // Index of the current byte within its varint.
     let mut pos = 0u8;

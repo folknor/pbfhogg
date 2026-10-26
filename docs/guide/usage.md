@@ -70,11 +70,23 @@ Apply an OSC change file to a sorted PBF:
 pbfhogg apply-changes denmark.osm.pbf changes.osc.gz -o updated.osm.pbf
 ```
 
-To preserve and update inline way-node coordinates through the merge (avoids re-running `add-locations-to-ways` after each update):
+To keep a file with inline way-node coordinates (`LocationsOnWays`) current
+without re-running `add-locations-to-ways` after each update, build it once
+from a sorted, indexed PBF with untagged nodes kept (`add-locations-to-ways`
+keeps its order and indexdata), then apply each diff with
+`--locations-on-ways`:
 
 ```sh
-pbfhogg apply-changes denmark.osm.pbf changes.osc.gz -o updated.osm.pbf --locations-on-ways
+pbfhogg add-locations-to-ways denmark.osm.pbf -o denmark-low.osm.pbf --keep-untagged-nodes
+pbfhogg apply-changes denmark-low.osm.pbf changes.osc.gz -o updated.osm.pbf --locations-on-ways
 ```
+
+Each way's inline coordinates get the new position of every node the diff
+moves, whether the diff touches the way or not. The kept untagged nodes are
+what makes this work: a way the diff changes takes the coordinates of its
+unchanged nodes from the base's node records, and a default
+`add-locations-to-ways` output, which drops untagged nodes, lacks many of
+them, so the update can fail on an ordinary daily diff.
 
 ## Filtering by tags
 

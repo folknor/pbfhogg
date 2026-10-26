@@ -215,8 +215,8 @@
   `--direct-io` / `--io-uring` in a build without the feature, are refused
   as usage errors before the command touches its input (a missing feature
   used to be found when a reader or writer first opened, minutes into some
-  runs). `apply-changes` refuses an unsorted base, or `-l` on a base without
-  `LocationsOnWays`, before parsing the OSC, and `-j 1` before anything.
+  runs). `apply-changes` refuses an unsorted base, or `--locations-on-ways`
+  on a base without `LocationsOnWays`, before parsing the OSC.
   `add-locations-to-ways` and `diff` check their output before making their
   scratch directory, so a missing output directory reports the output.
 
@@ -968,6 +968,55 @@
   compile unchanged; code that names the function's type, such as a
   function pointer to it, must be updated.
 
+- Library: errors detected by the blob framing layer now carry the byte
+  offset at which they were found, reachable via `Error::byte_offset()`
+  and appended to the `Display` output as ` (at byte offset N)`. A
+  wire-format or blob error from a 90 GB file previously said nothing
+  about where. `ErrorKind` is unchanged; code matching on error *text*
+  for these variants may need updating. For a truncated blob the offset
+  is the exact byte that could not be read, not the start of the frame
+  it sits in, and it is reported identically by the full-read path and
+  by the header-only structural walk `next_header_skip_blob`. Offsets
+  are present only for readers that know their stream position
+  (`BlobReader::from_path` / `open` / `new_seekable`, and everything
+  built on them - not `BlobReader::new`, which wraps an arbitrary
+  reader).
+
+- **Exit codes now distinguish "the answer is no" from "the command
+  failed".** A command that ran to completion and answered negatively
+  exits `1` - `diff` with differences, `inspect --indexed` on a
+  non-indexed file, `inspect --show` on an absent element, `check` with
+  integrity violations. Every failure path now exits `2` (matching what
+  clap already returned for a usage error). Previously both meanings
+  shared `1`, so `pbfhogg diff a.osm.pbf missing.osm.pbf` was
+  indistinguishable from "the files differ". Scripts branching on `1`
+  for the semantic answer, or on any non-zero for failure, are
+  unaffected; a script reading `1` as "failed" must widen to `!= 0`.
+  See the exit-code table in `reference/cli-reference.md`.
+
+- `inspect` rejects the flag combinations it used to accept and discard.
+  `--show` is now mutually exclusive with every other `inspect` flag
+  (it returned early and threw the rest away), and `-j/--jobs` and
+  `--force` require `--nodes`, the only mode that reads them.
+
+- `diff` rejects an explicit `-j/--jobs` together with `-v/--verbose`.
+  Verbose output is sequential-only, so the job count was accepted and
+  ignored; `tags-filter` already rejected the equivalent `-R` + `-j`.
+
+- Library: `cat::cat`, `diff::DiffOptions`, `check::verify_ids::
+  VerifyIdsOptions` and `tags_count::TagCountOptions` take a typed
+  `Option<TypeFilter>` instead of an unvalidated type string, and
+  `VerifyIdsOptions` loses its lifetime parameter. `TypeFilter` is now
+  public and implements `FromStr`, which rejects unknown types instead
+  of quietly matching nothing.
+
+- Library: `getid::GetidOptions` gains `report_found` and
+  `getid::GetidStats` gains `found`.
+
+- `ErrorKind::MissingFeature("LocationsOnWays")` no longer names CLI
+  flags in its `Display` output; the `--type node` hint is added by the
+  CLI. Same for the `dense` index-type parse error.
+
 ### Added
 
 - **`check --locations` verifies a LocationsOnWays file.** It compares every
@@ -1243,6 +1292,39 @@
   makes the decision before the header is read.
 
 ### Fixed
+
+- **`apply-changes --locations-on-ways` updates ways the OSC does not
+  touch.** A way's version changes only when its tags or node list do, so
+  moving a node usually leaves the ways using it out of the diff; those ways
+  kept the node's old position inline. A way's inline coordinates now take
+  the OSC's coordinate for each node the OSC creates or modifies, whether its
+  blob is rewritten or would have been copied unchanged. Files written by
+  earlier versions are not healed: later updates do not repair every
+  coordinate that is already stale. `check --locations` finds such
+  coordinates where the file holds the node's record; to rebuild a file, run
+  `add-locations-to-ways` on an input holding the current record of every
+  node. A reference in an untouched way to a node the OSC deletes keeps its
+  coordinate, and is counted in the way blobs the run searched or rewrote.
+  The summary gains a line `Inline locations refreshed: ...` (refs and ways
+  refreshed, way blobs searched, blobs rewritten only for the refresh, refs
+  to deleted nodes kept). When the OSC creates or modifies any node, every
+  way blob is now decompressed and searched, though most are still copied
+  unchanged, so a way blob that is corrupt in its compression, framing, refs
+  or coordinate arrays fails the run where it used to be copied unread. The docs now say
+  what the base needs: `add-locations-to-ways --keep-untagged-nodes`, since a
+  default output lacks the untagged node records a changed way's unchanged
+  vertices resolve from, and can fail on an ordinary daily diff. Library:
+  `MergeStats` gains `loc_refresh_blobs_scanned`, `loc_refresh_only_blobs`,
+  `loc_refreshed_ways`, `loc_refreshed_refs` and `loc_deleted_node_refs`.
+
+- **`apply-changes` keeps coordinates and timestamps from blocks with
+  non-default framing.** A rewritten blob's surviving ways and relations were
+  copied raw into a block with the default `granularity`, offsets and
+  `date_granularity`, so under a source block's non-default values their
+  timestamps came out rescaled (with or without `--locations-on-ways`) and,
+  under `--locations-on-ways`, so did their inline coordinates. They are now
+  converted, truncating to decimicrodegrees and whole seconds as base nodes
+  already were. Blobs copied unchanged keep their framing.
 
 - **`cat --clean user` rescues a file with a bad user string index.** The
   flag drops the user, so it no longer resolves it: a file whose user string
@@ -2678,6 +2760,129 @@
   a node ID overshoot the allocation and crash a worker with an opaque
   bitset message. It is now an input error naming the problem.
 
+- **Packed repeated fields written in the unpacked wire form are no
+  longer read as empty.** Protobuf allows a packed repeated field to be
+  written either as a packed segment or as individually tagged varints,
+  and libosmium accepts both for every packed field of `Node`, `Way`,
+  `Relation`, `DenseNodes` and `DenseInfo`. Our parser matched only the
+  packed segment; the unpacked form was skipped and the field decoded as
+  empty. For `DenseNodes.keys_vals` that meant "no node in this block has
+  tags" - a whole block's tags lost, with no error, from a spec-legal
+  encoding that the reference implementation reads correctly. The
+  unpacked form is now accepted for every packed field on the read path,
+  with no copy.
+
+  In the same pass, a packed field that appears twice with data in both
+  occurrences is now a hard error naming the message and field. The spec
+  says concatenate; this parser used to keep the last occurrence and drop
+  the rest, silently, as libosmium still does. No known writer emits the
+  shape, and the read path cannot express a concatenation without giving
+  up the borrowed slices that make strict validation free, so it is
+  rejected rather than silently truncated.
+
+- **The last tag of a dense node survives a `keys_vals` run that ends
+  without its delimiter.** The dense iterator derived the end of a tag
+  run by subtracting one byte from its cursor, assuming the run always
+  ended at a `0` delimiter. When the array ran out instead, that chopped
+  the last byte off the final value varint and the tag was dropped with
+  no signal.
+
+- **A panicking pipeline thread no longer reads as a clean end of file.**
+  `ElementReader::into_blocks_pipelined` delivers blocks over a channel
+  whose only sender lives on the pipeline thread, so an unwind there
+  closed the channel exactly as normal completion does - and the
+  iterator's `Drop` joins and discards the panic. A crashed pipeline
+  therefore looked like a file that had simply ended, with a zero exit
+  code. The iterator now yields an error in that case.
+
+- **A `BlobHeader.indexdata` of an unrecognised length is reported.** A
+  length that is neither 26 nor 42 is still ignored - the blob reads as
+  "no index" and consumers conservatively fall back to a full decode,
+  which is the safe direction - but it was completely invisible, so a
+  systematically corrupt index silently degraded every filtered read with
+  no way to tell from the outside. One warning per process now says so.
+
+- **A truncated or corrupt zlib blob no longer hangs.** A deflate stream
+  that ended before its final block left the inflate loop consuming
+  nothing, producing nothing and never reaching stream end - spinning at
+  100 % CPU with no output, no timeout and no diagnostic, and presenting
+  as a deadlock when it happened on a parallel decode worker. It is now a
+  typed error naming the byte counts at the point of failure.
+
+- **Decompression bombs are bounded during inflation.** The 32 MiB
+  decompressed-content cap was only checked after decompression had run
+  to completion, so a blob whose compressed size passed the pre-read
+  guard could inflate to tens of GB (far more with zstd) and exhaust
+  memory before the guard fired. Inflation now stops one byte past the
+  cap for both zlib and zstd and reports `MessageTooBig`. Relatedly, the
+  `Blob.raw_size` capacity hint - an unvalidated `int32` - is clamped to
+  the same cap before it reaches `Vec::reserve`, where it could
+  previously request 2 GiB.
+
+- **A malformed dense block no longer panics `extract --strategy smart`
+  or `multi-extract`.** The columnar decoder built its id, lat and lon
+  arrays in three independent loops and then indexed lat and lon by the
+  id count, so a dense group with a truncated or absent `lat` array
+  panicked with index-out-of-bounds on untrusted input. Such a group is
+  now rejected at block construction, and the columnar node count is the
+  shortest of the three columns so positional indexing cannot go out of
+  range regardless.
+
+- **A failing run no longer destroys a pre-existing file that shares the
+  output name.** Every command that writes a `--output` used to open the
+  destination immediately, truncating it before the first byte of new
+  output existed, and a mid-run error left a partial file under the name
+  the user chose. Pointing `-o` at an unrelated file cost you that file.
+
+  This now applies to *every* command with an output, not only `export`
+  and `renumber`: `sort`, `cat` (both plain and `--dedupe`), `repack`,
+  `degrade`, `renumber`, `tags-filter` (PBF and OSC), `export`, `diff`
+  (text `-o` and `--format osc`), `getid`, `getparents`,
+  `extract` (single and `--config` multi-extract),
+  `add-locations-to-ways`, `time-filter`, `apply-changes` and
+  `merge-changes`, and the synthetic `bench-merge` benchmark, which no
+  longer deletes a pre-existing `-o` file before it starts and commits
+  outside its timed region. Each writes to a scratch sibling in the
+  destination's directory and renames it into place only once the run has
+  succeeded, so the destination is untouched until then and is replaced
+  by a single `rename` - atomic on Unix.
+
+  A multi-extract extracts all-or-nothing: no region is published unless
+  every region succeeded. Publishing them is not a transaction, though -
+  it is a sequence of renames, and there is no N-way atomic rename. Every
+  destination is now checked immediately before the first one is
+  published, so the ordinary reasons a rename fails (the destination is a
+  directory, its parent has gone) refuse the whole publication with
+  nothing written. Another process changing a destination between that
+  check and the rename that reaches it can still leave a partial set.
+
+  Three side effects worth knowing. While a run is in flight the output
+  directory holds a dot-prefixed `.pbfhogg-tmp-*` file next to the
+  destination, and a hard kill leaves it behind. A destination whose
+  *directory* is not writable now fails, where overwriting an existing
+  writable file in a read-only directory used to work. And the output
+  does not appear at its final path until the run finishes, so anything
+  polling for the file's existence to gauge progress will no longer see
+  it grow.
+
+- Errors from the blob framing layer now name the input file and the blob
+  index, not only the byte offset: `... (in planet.osm.pbf, blob 4312, at
+  byte offset 91827364)`. On `cat a.pbf b.pbf`, `apply-changes` and
+  `merge-changes` an offset alone did not say which input failed. New
+  accessors `Error::source_path()` and `Error::blob_index()` expose them;
+  both are `None` for readers built from a bare `Read`, which have no
+  path to report, and the blob index is only stamped while iteration is
+  sequential from the stream start - a seek away from offset 0 drops it
+  rather than reporting a count that no longer matches the position. Failing to open an input now names the path as well
+  (`failed to open <path>: ...`) instead of a bare
+  `No such file or directory (os error 2)`.
+
+- A dense node whose metadata carries an out-of-range user string index no
+  longer loses its entire metadata record. Version, timestamp, changeset,
+  uid and visibility are preserved and only the user name falls back to
+  empty, so a single bad string-table reference in an input no longer
+  strips authorship from the surrounding node on the way through.
+
 ### Changed
 
 - **`diff -q` and `diff::diff_stats` skip byte-equal blobs.** A count-only
@@ -2956,184 +3161,6 @@
   valid header followed by 64 zero bytes read as 16 extra blobs, exit 0,
   empty output. A `BlobHeader` carrying no `type` field is rejected for
   the same reason.
-
-### Fixed
-
-- **Packed repeated fields written in the unpacked wire form are no
-  longer read as empty.** Protobuf allows a packed repeated field to be
-  written either as a packed segment or as individually tagged varints,
-  and libosmium accepts both for every packed field of `Node`, `Way`,
-  `Relation`, `DenseNodes` and `DenseInfo`. Our parser matched only the
-  packed segment; the unpacked form was skipped and the field decoded as
-  empty. For `DenseNodes.keys_vals` that meant "no node in this block has
-  tags" - a whole block's tags lost, with no error, from a spec-legal
-  encoding that the reference implementation reads correctly. The
-  unpacked form is now accepted for every packed field on the read path,
-  with no copy.
-
-  In the same pass, a packed field that appears twice with data in both
-  occurrences is now a hard error naming the message and field. The spec
-  says concatenate; this parser used to keep the last occurrence and drop
-  the rest, silently, as libosmium still does. No known writer emits the
-  shape, and the read path cannot express a concatenation without giving
-  up the borrowed slices that make strict validation free, so it is
-  rejected rather than silently truncated.
-
-- **The last tag of a dense node survives a `keys_vals` run that ends
-  without its delimiter.** The dense iterator derived the end of a tag
-  run by subtracting one byte from its cursor, assuming the run always
-  ended at a `0` delimiter. When the array ran out instead, that chopped
-  the last byte off the final value varint and the tag was dropped with
-  no signal.
-
-- **A panicking pipeline thread no longer reads as a clean end of file.**
-  `ElementReader::into_blocks_pipelined` delivers blocks over a channel
-  whose only sender lives on the pipeline thread, so an unwind there
-  closed the channel exactly as normal completion does - and the
-  iterator's `Drop` joins and discards the panic. A crashed pipeline
-  therefore looked like a file that had simply ended, with a zero exit
-  code. The iterator now yields an error in that case.
-
-- **A `BlobHeader.indexdata` of an unrecognised length is reported.** A
-  length that is neither 26 nor 42 is still ignored - the blob reads as
-  "no index" and consumers conservatively fall back to a full decode,
-  which is the safe direction - but it was completely invisible, so a
-  systematically corrupt index silently degraded every filtered read with
-  no way to tell from the outside. One warning per process now says so.
-
-- **A truncated or corrupt zlib blob no longer hangs.** A deflate stream
-  that ended before its final block left the inflate loop consuming
-  nothing, producing nothing and never reaching stream end - spinning at
-  100 % CPU with no output, no timeout and no diagnostic, and presenting
-  as a deadlock when it happened on a parallel decode worker. It is now a
-  typed error naming the byte counts at the point of failure.
-
-- **Decompression bombs are bounded during inflation.** The 32 MiB
-  decompressed-content cap was only checked after decompression had run
-  to completion, so a blob whose compressed size passed the pre-read
-  guard could inflate to tens of GB (far more with zstd) and exhaust
-  memory before the guard fired. Inflation now stops one byte past the
-  cap for both zlib and zstd and reports `MessageTooBig`. Relatedly, the
-  `Blob.raw_size` capacity hint - an unvalidated `int32` - is clamped to
-  the same cap before it reaches `Vec::reserve`, where it could
-  previously request 2 GiB.
-
-- **A malformed dense block no longer panics `extract --strategy smart`
-  or `multi-extract`.** The columnar decoder built its id, lat and lon
-  arrays in three independent loops and then indexed lat and lon by the
-  id count, so a dense group with a truncated or absent `lat` array
-  panicked with index-out-of-bounds on untrusted input. Such a group is
-  now rejected at block construction, and the columnar node count is the
-  shortest of the three columns so positional indexing cannot go out of
-  range regardless.
-
-- **A failing run no longer destroys a pre-existing file that shares the
-  output name.** Every command that writes a `--output` used to open the
-  destination immediately, truncating it before the first byte of new
-  output existed, and a mid-run error left a partial file under the name
-  the user chose. Pointing `-o` at an unrelated file cost you that file.
-
-  This now applies to *every* command with an output, not only `export`
-  and `renumber`: `sort`, `cat` (both plain and `--dedupe`), `repack`,
-  `degrade`, `renumber`, `tags-filter` (PBF and OSC), `export`, `diff`
-  (text `-o` and `--format osc`), `getid`, `getparents`,
-  `extract` (single and `--config` multi-extract),
-  `add-locations-to-ways`, `time-filter`, `apply-changes` and
-  `merge-changes`, and the synthetic `bench-merge` benchmark, which no
-  longer deletes a pre-existing `-o` file before it starts and commits
-  outside its timed region. Each writes to a scratch sibling in the
-  destination's directory and renames it into place only once the run has
-  succeeded, so the destination is untouched until then and is replaced
-  by a single `rename` - atomic on Unix.
-
-  A multi-extract extracts all-or-nothing: no region is published unless
-  every region succeeded. Publishing them is not a transaction, though -
-  it is a sequence of renames, and there is no N-way atomic rename. Every
-  destination is now checked immediately before the first one is
-  published, so the ordinary reasons a rename fails (the destination is a
-  directory, its parent has gone) refuse the whole publication with
-  nothing written. Another process changing a destination between that
-  check and the rename that reaches it can still leave a partial set.
-
-  Three side effects worth knowing. While a run is in flight the output
-  directory holds a dot-prefixed `.pbfhogg-tmp-*` file next to the
-  destination, and a hard kill leaves it behind. A destination whose
-  *directory* is not writable now fails, where overwriting an existing
-  writable file in a read-only directory used to work. And the output
-  does not appear at its final path until the run finishes, so anything
-  polling for the file's existence to gauge progress will no longer see
-  it grow.
-
-- Errors from the blob framing layer now name the input file and the blob
-  index, not only the byte offset: `... (in planet.osm.pbf, blob 4312, at
-  byte offset 91827364)`. On `cat a.pbf b.pbf`, `apply-changes` and
-  `merge-changes` an offset alone did not say which input failed. New
-  accessors `Error::source_path()` and `Error::blob_index()` expose them;
-  both are `None` for readers built from a bare `Read`, which have no
-  path to report, and the blob index is only stamped while iteration is
-  sequential from the stream start - a seek away from offset 0 drops it
-  rather than reporting a count that no longer matches the position. Failing to open an input now names the path as well
-  (`failed to open <path>: ...`) instead of a bare
-  `No such file or directory (os error 2)`.
-
-- A dense node whose metadata carries an out-of-range user string index no
-  longer loses its entire metadata record. Version, timestamp, changeset,
-  uid and visibility are preserved and only the user name falls back to
-  empty, so a single bad string-table reference in an input no longer
-  strips authorship from the surrounding node on the way through.
-
-### Breaking changes
-
-- Library: errors detected by the blob framing layer now carry the byte
-  offset at which they were found, reachable via `Error::byte_offset()`
-  and appended to the `Display` output as ` (at byte offset N)`. A
-  wire-format or blob error from a 90 GB file previously said nothing
-  about where. `ErrorKind` is unchanged; code matching on error *text*
-  for these variants may need updating. For a truncated blob the offset
-  is the exact byte that could not be read, not the start of the frame
-  it sits in, and it is reported identically by the full-read path and
-  by the header-only structural walk `next_header_skip_blob`. Offsets
-  are present only for readers that know their stream position
-  (`BlobReader::from_path` / `open` / `new_seekable`, and everything
-  built on them - not `BlobReader::new`, which wraps an arbitrary
-  reader).
-
-- **Exit codes now distinguish "the answer is no" from "the command
-  failed".** A command that ran to completion and answered negatively
-  exits `1` - `diff` with differences, `inspect --indexed` on a
-  non-indexed file, `inspect --show` on an absent element, `check` with
-  integrity violations. Every failure path now exits `2` (matching what
-  clap already returned for a usage error). Previously both meanings
-  shared `1`, so `pbfhogg diff a.osm.pbf missing.osm.pbf` was
-  indistinguishable from "the files differ". Scripts branching on `1`
-  for the semantic answer, or on any non-zero for failure, are
-  unaffected; a script reading `1` as "failed" must widen to `!= 0`.
-  See the exit-code table in `reference/cli-reference.md`.
-
-- `inspect` rejects the flag combinations it used to accept and discard.
-  `--show` is now mutually exclusive with every other `inspect` flag
-  (it returned early and threw the rest away), and `-j/--jobs` and
-  `--force` require `--nodes`, the only mode that reads them.
-
-- `diff` rejects an explicit `-j/--jobs` together with `-v/--verbose`.
-  Verbose output is sequential-only, so the job count was accepted and
-  ignored; `tags-filter` already rejected the equivalent `-R` + `-j`.
-
-- Library: `cat::cat`, `diff::DiffOptions`, `check::verify_ids::
-  VerifyIdsOptions` and `tags_count::TagCountOptions` take a typed
-  `Option<TypeFilter>` instead of an unvalidated type string, and
-  `VerifyIdsOptions` loses its lifetime parameter. `TypeFilter` is now
-  public and implements `FromStr`, which rejects unknown types instead
-  of quietly matching nothing.
-
-- Library: `getid::GetidOptions` gains `report_found` and
-  `getid::GetidStats` gains `found`.
-
-- `ErrorKind::MissingFeature("LocationsOnWays")` no longer names CLI
-  flags in its `Display` output; the `--type node` hint is added by the
-  CLI. Same for the `dense` index-type parse error.
-
-### Changed
 
 - `getid --verbose-ids` no longer decodes the finished output PBF a
   second time to work out which requested IDs were missing. The found

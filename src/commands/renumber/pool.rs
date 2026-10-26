@@ -333,7 +333,12 @@ where
                 // Deliberately write no tagdata: terminal renumber output is not
                 // tag-filtered. Carrying headers or rebuilding keys would add per-blob
                 // or per-tag work and change the historical output bytes.
-                writer.write_primitive_block_owned(bytes, index, None, None)?;
+                writer.write_primitive_block_owned(crate::block_builder::OwnedBlock {
+                    bytes,
+                    index,
+                    tagdata: None,
+                    way_members: None,
+                })?;
                 t.record_ns(&counters.consumer_write_ns);
             }
             // Counted after the write, so on a mid-stream error the totals cover

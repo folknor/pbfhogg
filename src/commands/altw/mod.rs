@@ -1137,19 +1137,8 @@ fn write_output_decode_all(
             Ok((output, block_stats))
         },
         |(blocks, block_stats)| {
-            for OwnedBlock {
-                bytes,
-                index,
-                tagdata,
-                way_members,
-            } in blocks
-            {
-                writer.write_primitive_block_owned(
-                    bytes,
-                    index,
-                    tagdata.as_deref(),
-                    way_members.as_deref(),
-                )?;
+            for block in blocks {
+                writer.write_primitive_block_owned(block)?;
             }
             stats.merge(&block_stats);
             decoded_blocks += 1;

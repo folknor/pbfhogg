@@ -456,19 +456,8 @@ where
                     ConsumerItem::Decoded(r) => {
                         let (blocks, block_stats) = r?;
                         merge_extract_stats(stats, &block_stats);
-                        for OwnedBlock {
-                            bytes: block_bytes,
-                            index,
-                            tagdata,
-                            way_members,
-                        } in blocks
-                        {
-                            writer.write_primitive_block_owned(
-                                block_bytes,
-                                index,
-                                tagdata.as_deref(),
-                                way_members.as_deref(),
-                            )?;
+                        for block in blocks {
+                            writer.write_primitive_block_owned(block)?;
                         }
                     }
                     ConsumerItem::Passthrough(frame_offset, frame_size, count) => {
@@ -489,19 +478,8 @@ where
                 ConsumerItem::Decoded(r) => {
                     let (blocks, block_stats) = r?;
                     merge_extract_stats(stats, &block_stats);
-                    for OwnedBlock {
-                        bytes: block_bytes,
-                        index,
-                        tagdata,
-                        way_members,
-                    } in blocks
-                    {
-                        writer.write_primitive_block_owned(
-                            block_bytes,
-                            index,
-                            tagdata.as_deref(),
-                            way_members.as_deref(),
-                        )?;
+                    for block in blocks {
+                        writer.write_primitive_block_owned(block)?;
                     }
                 }
                 ConsumerItem::Passthrough(frame_offset, frame_size, count) => {

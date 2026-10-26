@@ -579,12 +579,7 @@ pub(crate) fn write_plan(
                 .ok_or_else(|| Error::internal("overlap run dispatcher ended early"))?;
             debug_assert_eq!(k, drained, "overlap runs drained out of order");
             let counts = drain_run(&rx, &host.cancel, |block| {
-                writer.write_primitive_block_owned(
-                    block.bytes,
-                    block.index,
-                    block.tagdata.as_deref(),
-                    block.way_members.as_deref(),
-                )
+                writer.write_primitive_block_owned(block)
             })?;
             drained += 1;
             publish_merged(credit_ref, drained);

@@ -11,15 +11,18 @@
 //! back into sequence order. Raw passthrough blobs bypass compression entirely.
 
 use crate::blob_meta;
+use crate::block_builder::OwnedBlock;
 use crate::error::{Error, Result, panic_error};
 use crate::output::Completion;
 use crate::write::Finish;
 use crate::write::copy_range::{CopyOut, copy_range};
 use crate::write::file_writer::FileWriter;
 use crate::write::metrics::WRITER_METRICS;
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::sync_channel;
 
@@ -98,9 +101,9 @@ fn sync_buffered_file(writer: &mut BufWriter<File>) -> Result<()> {
 /// The wait goes through [`recv_permit`] and is timed into
 /// `writer_permit_wait_ns`.
 ///
-/// The producer's own send paths (`write_raw*`) hold the guard across their
-/// send. The `write_primitive_block*` framing paths move it into the spawned
-/// closure and bind it there first, so the permit outlives the spawn and is
+/// The producer's own send paths ([`send_raw`]) hold the guard across their
+/// send. The framing path (`write_osm_data`) moves it into the spawned
+/// closure and binds it there first, so the permit outlives the spawn and is
 /// released after the closure's `tx.send` (or on its unwind).
 ///
 /// Every send path participates in the dispatch bound, including raw writes;
@@ -111,6 +114,161 @@ fn acquire_permit(pipeline: &WritePipeline) -> Result<PermitGuard> {
         .map_err(|_| Error::internal("pipelined writer permit pool disconnected"))?;
     t_permit.record_ns(&WRITER_METRICS.permit_wait_ns);
     Ok(PermitGuard::new(pipeline.permit_tx.clone()))
+}
+
+/// Reserve the next output slot: a dispatch permit and the sequence number
+/// the writer thread will place the item at. Every pipelined write, framed
+/// or raw, starts here.
+///
+/// If a framing closure already found the writer thread gone, join it now
+/// and return its real cause, rather than reading, copying or framing the
+/// rest of the dataset into a channel nobody is reading (see `WriterGone`).
+///
+/// Nothing fallible may sit between this and arranging the slot's delivery
+/// unless its failure becomes the slot's ordered result: a sequence number
+/// that never reaches the writer thread is a gap it reports at end of stream.
+fn reserve(pipeline: &mut WritePipeline) -> Result<(PermitGuard, usize)> {
+    if pipeline.writer_gone.observed() {
+        return Err(pipeline_send_error(pipeline));
+    }
+    let permit = acquire_permit(pipeline)?;
+    let seq = pipeline.seq;
+    pipeline.seq += 1;
+    Ok((permit, seq))
+}
+
+/// An already-framed item the producer sends itself, as the caller handed
+/// it over: nothing is copied or measured until [`send_raw`] holds a slot.
+enum RawPayload<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+    Chunks(Vec<Vec<u8>>),
+    CopyRange {
+        in_file: &'a crate::read::input::InputFile,
+        offset: u64,
+        len: u64,
+    },
+}
+
+impl RawPayload<'_> {
+    /// The item and byte counters this payload is reported under, and its
+    /// byte count.
+    fn metrics(&self) -> (&'static AtomicU64, &'static AtomicU64, u64) {
+        let m = &WRITER_METRICS;
+        match self {
+            Self::Borrowed(b) => (&m.payload_raw_items, &m.payload_raw_bytes, b.len() as u64),
+            Self::Owned(b) => (&m.payload_raw_items, &m.payload_raw_bytes, b.len() as u64),
+            Self::Chunks(chunks) => (
+                &m.payload_raw_chunk_items,
+                &m.payload_raw_chunk_bytes,
+                chunks.iter().map(|c| c.len() as u64).sum(),
+            ),
+            Self::CopyRange { len, .. } => (
+                &m.payload_copy_range_items,
+                &m.payload_copy_range_bytes,
+                *len,
+            ),
+        }
+    }
+
+    /// The channel item. A borrowed payload is copied here.
+    fn into_chunk(self) -> OutputChunk {
+        match self {
+            Self::Borrowed(b) => OutputChunk::Raw(b.to_vec()),
+            Self::Owned(b) => OutputChunk::Raw(b),
+            Self::Chunks(chunks) => OutputChunk::RawChunks(chunks),
+            Self::CopyRange {
+                in_file,
+                offset,
+                len,
+            } => OutputChunk::CopyRange {
+                in_file: in_file.clone(),
+                offset,
+                len,
+            },
+        }
+    }
+}
+
+/// Send one already-framed item from the producer thread: reserve a slot,
+/// count it under its payload counters, and send it with the permit held
+/// across the send, so raw writes share the dispatch bound with framing
+/// tasks. The send can still block; see [`WRITE_AHEAD`].
+///
+/// Everything per payload happens after the reservation: the byte count
+/// (a walk over the chunks for `Chunks`) before the send timer starts, and
+/// building the item (the copy of a borrowed payload) inside it. A failed
+/// send joins the writer thread and returns its own error.
+fn send_raw(pipeline: &mut WritePipeline, payload: RawPayload<'_>) -> Result<()> {
+    let (_permit, seq) = reserve(pipeline)?;
+    let (items, bytes, len) = payload.metrics();
+    items.fetch_add(1, Relaxed);
+    bytes.fetch_add(len, Relaxed);
+    let t_send = crate::counters::Stopwatch::start();
+    let sent = pipeline.tx.send(PipelineItem {
+        seq,
+        data: Ok(payload.into_chunk()),
+    });
+    if sent.is_err() {
+        return Err(pipeline_send_error(pipeline));
+    }
+    record_send_wait(t_send);
+    Ok(())
+}
+
+/// Where an `OSMData` blob's optional `BlobHeader` fields (indexdata,
+/// tagdata, WayMembers) come from. Owned, so the pipelined path moves it
+/// into the framing closure without copying.
+enum BlobMeta {
+    /// Scan the serialized block for its id range and tag keys. Runs on the
+    /// framing worker in pipelined mode. A malformed block is an error; a
+    /// valid block of a shape the index cannot describe gets no field.
+    Scan,
+    /// Emit none of the optional fields.
+    Bare,
+    /// The caller's pre-computed index and payloads, emitted exactly as
+    /// given: an absent tagdata or WayMembers is not recomputed.
+    Given {
+        index: blob_meta::BlobIndex,
+        tagdata: Option<Vec<u8>>,
+        way_members: Option<Vec<u8>>,
+    },
+}
+
+impl BlobMeta {
+    /// Resolve against `block` and hand the three header fields
+    /// (indexdata, tagdata, WayMembers) to `frame`, borrowed for the call.
+    fn with_fields<R>(
+        &self,
+        block: &[u8],
+        frame: impl FnOnce(Option<&[u8]>, Option<&[u8]>, Option<&[u8]>) -> Result<R>,
+    ) -> Result<R> {
+        match self {
+            Self::Scan => {
+                let (index, tags) = blob_meta::scan_block_ids_and_tags(block)?;
+                let indexdata = index.map(|idx| idx.serialize());
+                let tagdata = tags.and_then(|ti| ti.serialize());
+                frame(
+                    indexdata.as_ref().map(<[u8; 42]>::as_slice),
+                    tagdata.as_deref(),
+                    None,
+                )
+            }
+            Self::Bare => frame(None, None, None),
+            Self::Given {
+                index,
+                tagdata,
+                way_members,
+            } => {
+                let indexdata = index.serialize();
+                frame(
+                    Some(indexdata.as_slice()),
+                    tagdata.as_deref(),
+                    way_members.as_deref(),
+                )
+            }
+        }
+    }
 }
 
 /// Test hook: whether the framing closure for `seq` should panic (the
@@ -666,97 +824,8 @@ impl<W: Write> PbfWriter<W> {
     pub fn write_primitive_block(&mut self, block_bytes: &[u8]) -> Result<()> {
         let result = self
             .check_cancel()
-            .and_then(|()| self.write_primitive_block_unchecked(block_bytes));
+            .and_then(|()| self.write_osm_data(Cow::Borrowed(block_bytes), BlobMeta::Scan));
         self.poison_on_error(result)
-    }
-
-    fn write_primitive_block_unchecked(&mut self, block_bytes: &[u8]) -> Result<()> {
-        if let Some(ref mut pipeline) = self.pipeline {
-            // Acquire a dispatch permit before enqueuing new work on rayon.
-            // This blocks the caller when `PIPELINE_DISPATCH_PERMITS` blocks
-            // are already in flight, preventing rayon's internal task queue
-            // from growing without bound (see `PIPELINE_DISPATCH_PERMITS`
-            // doc comment for the planet-scale OOM story that motivated
-            // this).
-            // A framing closure already found the writer thread gone. Join
-            // it now and return its real cause, rather than framing the rest
-            // of the dataset into a channel nobody is reading. See
-            // `WriterGone`.
-            if pipeline.writer_gone.observed() {
-                return Err(pipeline_send_error(pipeline));
-            }
-            let permit = acquire_permit(pipeline)?;
-            let seq = pipeline.seq;
-            pipeline.seq += 1;
-            let compression = self.compression;
-            let uncompressed = block_bytes.to_vec();
-            let tx = pipeline.tx.clone();
-            let writer_gone = pipeline.writer_gone.clone();
-            let panic_here = framing_panics_at(&self.cancel, seq);
-            pipeline.executor.spawn(move || {
-                // Bound first so it drops last - the permit is released
-                // after `tx.send` below, and also on the unwind path if any
-                // of the framing work panics. See `PermitGuard`.
-                let _permit = permit;
-                assert!(!panic_here, "test hook: framing panic at seq {seq}");
-                // Keep scanner failures on the existing ordered error channel.
-                // Scanning still happens once, inside the framing worker.
-                let result =
-                    blob_meta::scan_block_ids_and_tags(&uncompressed).and_then(|(index, tags)| {
-                        let indexdata = index.map(|idx| idx.serialize());
-                        let tagdata = tags.and_then(|ti| ti.serialize());
-                        PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
-                            frame_blob_into(
-                                "OSMData",
-                                &uncompressed,
-                                &compression,
-                                indexdata.as_ref().map(<[u8; 42]>::as_slice),
-                                tagdata.as_deref(),
-                                None,
-                                scratch,
-                            )
-                        })
-                    });
-                if let Ok(ref parts) = result {
-                    WRITER_METRICS.payload_framed_items.fetch_add(1, Relaxed);
-                    WRITER_METRICS
-                        .payload_framed_bytes
-                        .fetch_add(parts.total_len(), Relaxed);
-                }
-                let t_send = crate::counters::Stopwatch::start();
-                // A failed send means the writer thread has already exited,
-                // and this closure has no `Result` to return it in. Record it
-                // so the producer's next call can join and surface the real
-                // cause instead of grinding on to `flush()`. See `WriterGone`.
-                if tx
-                    .send(PipelineItem {
-                        seq,
-                        data: result.map(OutputChunk::Framed),
-                    })
-                    .is_err()
-                {
-                    writer_gone.record();
-                }
-                record_send_wait(t_send);
-            });
-            self.mark_pending();
-            Ok(())
-        } else {
-            let (index, tags) = blob_meta::scan_block_ids_and_tags(block_bytes)?;
-            let indexdata = index.map(|idx| idx.serialize());
-            let tagdata = tags.and_then(|ti| ti.serialize());
-            let result = self.write_framed_blob(
-                "OSMData",
-                block_bytes,
-                indexdata.as_ref().map(<[u8; 42]>::as_slice),
-                tagdata.as_deref(),
-                None,
-            );
-            if result.is_ok() {
-                self.mark_pending();
-            }
-            result
-        }
     }
 
     /// Write an `OSMData` blob without the `indexdata` / `tagdata`
@@ -779,144 +848,77 @@ impl<W: Write> PbfWriter<W> {
     pub fn write_primitive_block_no_indexdata(&mut self, block_bytes: &[u8]) -> Result<()> {
         let result = self
             .check_cancel()
-            .and_then(|()| self.write_primitive_block_no_indexdata_unchecked(block_bytes));
+            .and_then(|()| self.write_osm_data(Cow::Borrowed(block_bytes), BlobMeta::Bare));
         self.poison_on_error(result)
     }
 
-    fn write_primitive_block_no_indexdata_unchecked(&mut self, block_bytes: &[u8]) -> Result<()> {
-        if let Some(ref mut pipeline) = self.pipeline {
-            // A framing closure already found the writer thread gone. Join
-            // it now and return its real cause, rather than framing the rest
-            // of the dataset into a channel nobody is reading. See
-            // `WriterGone`.
-            if pipeline.writer_gone.observed() {
-                return Err(pipeline_send_error(pipeline));
-            }
-            let permit = acquire_permit(pipeline)?;
-            let seq = pipeline.seq;
-            pipeline.seq += 1;
-            let compression = self.compression;
-            let uncompressed = block_bytes.to_vec();
-            let tx = pipeline.tx.clone();
-            let writer_gone = pipeline.writer_gone.clone();
-            let panic_here = framing_panics_at(&self.cancel, seq);
-            pipeline.executor.spawn(move || {
-                // Drops last - releases the permit after `tx.send`, and on
-                // the unwind path too. See `PermitGuard`.
-                let _permit = permit;
-                assert!(!panic_here, "test hook: framing panic at seq {seq}");
-                let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
-                    frame_blob_into(
-                        "OSMData",
-                        &uncompressed,
-                        &compression,
-                        None,
-                        None,
-                        None,
-                        scratch,
-                    )
-                });
-                if let Ok(ref parts) = result {
-                    WRITER_METRICS.payload_framed_items.fetch_add(1, Relaxed);
-                    WRITER_METRICS
-                        .payload_framed_bytes
-                        .fetch_add(parts.total_len(), Relaxed);
-                }
-                let t_send = crate::counters::Stopwatch::start();
-                // A failed send means the writer thread has already exited,
-                // and this closure has no `Result` to return it in. Record it
-                // so the producer's next call can join and surface the real
-                // cause instead of grinding on to `flush()`. See `WriterGone`.
-                if tx
-                    .send(PipelineItem {
-                        seq,
-                        data: result.map(OutputChunk::Framed),
-                    })
-                    .is_err()
-                {
-                    writer_gone.record();
-                }
-                record_send_wait(t_send);
-            });
-            self.mark_pending();
-            Ok(())
-        } else {
-            let result = self.write_framed_blob("OSMData", block_bytes, None, None, None);
-            if result.is_ok() {
-                self.mark_pending();
-            }
-            result
-        }
-    }
-
-    /// Write an `OSMData` blob, taking ownership of the serialized bytes.
+    /// Write an `OSMData` blob, taking ownership of an encoded block.
     ///
     /// Like [`write_primitive_block`](Self::write_primitive_block) but moves
-    /// the `Vec` into the pipeline closure instead of copying, and uses a
-    /// pre-computed [`BlobIndex`](crate::blob_meta::BlobIndex) and optional
-    /// pre-serialized tagdata from
+    /// the block bytes and its tagdata and WayMembers payloads into the
+    /// pipeline closure instead of copying them, and frames with the block's
+    /// pre-computed [`BlobIndex`](crate::blob_meta::BlobIndex) from
     /// [`BlockBuilder::take_owned`](crate::block_builder::BlockBuilder::take_owned)
-    /// instead of rescanning the serialized bytes.
-    ///
-    /// The optional `way_members` payload is emitted as `BlobHeader` field 5
-    /// (`pbfhogg.WayMembers-v1`); all non-enrichment callers pass `None`.
+    /// instead of rescanning the serialized bytes. The block's tagdata and
+    /// WayMembers are emitted exactly as given: an absent one is not
+    /// recomputed.
     #[hotpath::measure]
-    pub(crate) fn write_primitive_block_owned(
-        &mut self,
-        block_bytes: Vec<u8>,
-        index: blob_meta::BlobIndex,
-        tagdata: Option<&[u8]>,
-        way_members: Option<&[u8]>,
-    ) -> Result<()> {
-        let result = self.check_cancel().and_then(|()| {
-            self.write_primitive_block_owned_unchecked(block_bytes, index, tagdata, way_members)
-        });
+    pub(crate) fn write_primitive_block_owned(&mut self, block: OwnedBlock) -> Result<()> {
+        let OwnedBlock {
+            bytes,
+            index,
+            tagdata,
+            way_members,
+        } = block;
+        let meta = BlobMeta::Given {
+            index,
+            tagdata,
+            way_members,
+        };
+        let result = self
+            .check_cancel()
+            .and_then(|()| self.write_osm_data(Cow::Owned(bytes), meta));
         self.poison_on_error(result)
     }
 
-    fn write_primitive_block_owned_unchecked(
-        &mut self,
-        block_bytes: Vec<u8>,
-        index: blob_meta::BlobIndex,
-        tagdata: Option<&[u8]>,
-        way_members: Option<&[u8]>,
-    ) -> Result<()> {
-        let indexdata = index.serialize();
+    /// The one per-block dispatch behind the three `write_primitive_block*`
+    /// entry points, which differ only in where the block's index fields
+    /// come from ([`BlobMeta`]) and whether the bytes arrive owned.
+    ///
+    /// Pipelined: reserve a slot (the dispatch permit bounds in-flight
+    /// framing work; see `PIPELINE_DISPATCH_PERMITS` for the planet-scale
+    /// OOM story behind it), only then take ownership of borrowed bytes,
+    /// and frame on the writer's executor. A scan or framing failure travels
+    /// as that slot's ordered result. Sync: resolve and frame on the caller,
+    /// writing straight from the scratch with no copy of the block.
+    fn write_osm_data(&mut self, block: Cow<'_, [u8]>, meta: BlobMeta) -> Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
-            // Bound in-flight rayon dispatches - see the sibling
-            // `write_primitive_block` above and the
-            // `PIPELINE_DISPATCH_PERMITS` doc comment for why.
-            // A framing closure already found the writer thread gone. Join
-            // it now and return its real cause, rather than framing the rest
-            // of the dataset into a channel nobody is reading. See
-            // `WriterGone`.
-            if pipeline.writer_gone.observed() {
-                return Err(pipeline_send_error(pipeline));
-            }
-            let permit = acquire_permit(pipeline)?;
-            let seq = pipeline.seq;
-            pipeline.seq += 1;
+            let (permit, seq) = reserve(pipeline)?;
             let compression = self.compression;
+            let uncompressed = block.into_owned();
             let tx = pipeline.tx.clone();
-            let tagdata_owned = tagdata.map(<[u8]>::to_vec);
-            let way_members_owned = way_members.map(<[u8]>::to_vec);
             let writer_gone = pipeline.writer_gone.clone();
             let panic_here = framing_panics_at(&self.cancel, seq);
             pipeline.executor.spawn(move || {
-                // Drops last - releases the permit after `tx.send`, and on
-                // the unwind path too. See `PermitGuard`.
+                // Bound first so it drops last - the permit is released
+                // after `tx.send` below, and also on the unwind path if any
+                // of the framing work panics. See `PermitGuard`.
                 let _permit = permit;
                 assert!(!panic_here, "test hook: framing panic at seq {seq}");
-                let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
-                    frame_blob_into(
-                        "OSMData",
-                        &block_bytes,
-                        &compression,
-                        Some(indexdata.as_slice()),
-                        tagdata_owned.as_deref(),
-                        way_members_owned.as_deref(),
-                        scratch,
-                    )
+                // A scan runs here, on the framing worker, outside the
+                // scratch borrow; its failure is this slot's ordered result.
+                let result = meta.with_fields(&uncompressed, |indexdata, tagdata, way_members| {
+                    PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
+                        frame_blob_into(
+                            "OSMData",
+                            &uncompressed,
+                            &compression,
+                            indexdata,
+                            tagdata,
+                            way_members,
+                            scratch,
+                        )
+                    })
                 });
                 if let Ok(ref parts) = result {
                     WRITER_METRICS.payload_framed_items.fetch_add(1, Relaxed);
@@ -943,13 +945,9 @@ impl<W: Write> PbfWriter<W> {
             self.mark_pending();
             Ok(())
         } else {
-            let result = self.write_framed_blob(
-                "OSMData",
-                &block_bytes,
-                Some(indexdata.as_slice()),
-                tagdata,
-                way_members,
-            );
+            let result = meta.with_fields(&block, |indexdata, tagdata, way_members| {
+                self.write_framed_blob("OSMData", &block, indexdata, tagdata, way_members)
+            });
             if result.is_ok() {
                 self.mark_pending();
             }
@@ -974,25 +972,7 @@ impl<W: Write> PbfWriter<W> {
 
     fn write_raw_unchecked(&mut self, raw_framed_bytes: &[u8]) -> Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
-            // Hold a dispatch permit across the send so raw writes share the
-            // dispatch bound with framing tasks. The send can still block;
-            // see `WRITE_AHEAD`.
-            let _permit = acquire_permit(pipeline)?;
-            let seq = pipeline.seq;
-            pipeline.seq += 1;
-            WRITER_METRICS.payload_raw_items.fetch_add(1, Relaxed);
-            WRITER_METRICS
-                .payload_raw_bytes
-                .fetch_add(raw_framed_bytes.len() as u64, Relaxed);
-            let t_send = crate::counters::Stopwatch::start();
-            let sent = pipeline.tx.send(PipelineItem {
-                seq,
-                data: Ok(OutputChunk::Raw(raw_framed_bytes.to_vec())),
-            });
-            if sent.is_err() {
-                return Err(pipeline_send_error(pipeline));
-            }
-            record_send_wait(t_send);
+            send_raw(pipeline, RawPayload::Borrowed(raw_framed_bytes))?;
             self.mark_pending();
             Ok(())
         } else {
@@ -1019,25 +999,7 @@ impl<W: Write> PbfWriter<W> {
 
     fn write_raw_owned_unchecked(&mut self, raw_framed_bytes: Vec<u8>) -> Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
-            // Hold a dispatch permit across the send so raw writes share the
-            // dispatch bound with framing tasks. The send can still block;
-            // see `WRITE_AHEAD`.
-            let _permit = acquire_permit(pipeline)?;
-            let seq = pipeline.seq;
-            pipeline.seq += 1;
-            WRITER_METRICS.payload_raw_items.fetch_add(1, Relaxed);
-            WRITER_METRICS
-                .payload_raw_bytes
-                .fetch_add(raw_framed_bytes.len() as u64, Relaxed);
-            let t_send = crate::counters::Stopwatch::start();
-            let sent = pipeline.tx.send(PipelineItem {
-                seq,
-                data: Ok(OutputChunk::Raw(raw_framed_bytes)),
-            });
-            if sent.is_err() {
-                return Err(pipeline_send_error(pipeline));
-            }
-            record_send_wait(t_send);
+            send_raw(pipeline, RawPayload::Owned(raw_framed_bytes))?;
             self.mark_pending();
             Ok(())
         } else {
@@ -1063,26 +1025,7 @@ impl<W: Write> PbfWriter<W> {
 
     fn write_raw_chunks_unchecked(&mut self, chunks: Vec<Vec<u8>>) -> Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
-            // Hold a dispatch permit across the send so raw writes share the
-            // dispatch bound with framing tasks. The send can still block;
-            // see `WRITE_AHEAD`.
-            let _permit = acquire_permit(pipeline)?;
-            let seq = pipeline.seq;
-            pipeline.seq += 1;
-            let total_bytes: u64 = chunks.iter().map(|c| c.len() as u64).sum();
-            WRITER_METRICS.payload_raw_chunk_items.fetch_add(1, Relaxed);
-            WRITER_METRICS
-                .payload_raw_chunk_bytes
-                .fetch_add(total_bytes, Relaxed);
-            let t_send = crate::counters::Stopwatch::start();
-            let sent = pipeline.tx.send(PipelineItem {
-                seq,
-                data: Ok(OutputChunk::RawChunks(chunks)),
-            });
-            if sent.is_err() {
-                return Err(pipeline_send_error(pipeline));
-            }
-            record_send_wait(t_send);
+            send_raw(pipeline, RawPayload::Chunks(chunks))?;
             self.mark_pending();
             Ok(())
         } else {
@@ -1409,31 +1352,14 @@ impl PbfWriter<FileWriter> {
         len: u64,
     ) -> Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
-            // Hold a dispatch permit across the send so raw writes share the
-            // dispatch bound with framing tasks. The send can still block;
-            // see `WRITE_AHEAD`.
-            let _permit = acquire_permit(pipeline)?;
-            let seq = pipeline.seq;
-            pipeline.seq += 1;
-            WRITER_METRICS
-                .payload_copy_range_items
-                .fetch_add(1, Relaxed);
-            WRITER_METRICS
-                .payload_copy_range_bytes
-                .fetch_add(len, Relaxed);
-            let t_send = crate::counters::Stopwatch::start();
-            let sent = pipeline.tx.send(PipelineItem {
-                seq,
-                data: Ok(OutputChunk::CopyRange {
-                    in_file: in_file.clone(),
+            send_raw(
+                pipeline,
+                RawPayload::CopyRange {
+                    in_file,
                     offset,
                     len,
-                }),
-            });
-            if sent.is_err() {
-                return Err(pipeline_send_error(pipeline));
-            }
-            record_send_wait(t_send);
+                },
+            )?;
             self.mark_pending();
             Ok(())
         } else {
@@ -1462,6 +1388,7 @@ impl PbfWriter<FileWriter> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::{Compression, Executor, PbfWriter, WritePipeline};
+    use crate::block_builder::OwnedBlock;
     use crate::error::{Error, ErrorKind, Result};
     use crate::write::framing::FrameScratch;
     use crate::write::pipeline::{PipelineItem, SeqTotal};
@@ -1761,27 +1688,38 @@ mod tests {
         );
     }
 
+    /// An owned block with a fixed node index and no tagdata or WayMembers.
+    fn owned_block(bytes: &[u8]) -> OwnedBlock {
+        OwnedBlock {
+            bytes: bytes.to_vec(),
+            index: crate::blob_meta::BlobIndex {
+                kind: crate::ElementKind::Node,
+                min_id: 0,
+                max_id: 0,
+                count: 0,
+                bbox: None,
+            },
+            tagdata: None,
+            way_members: None,
+        }
+    }
+
     /// The same gap, on the owned-bytes and no-indexdata siblings.
     ///
-    /// All three `write_primitive_block*` methods carry their own copy of the
-    /// rayon-spawn body, so a fix applied to the representative one leaves the
-    /// others silently broken. Every shape gets tested.
+    /// The three `write_primitive_block*` methods share one dispatch, but
+    /// each resolves its header fields differently (scan, given, none), and
+    /// these three methods once carried a copy of the dispatch each, where a
+    /// fix to one missed the others. Every entry point stays tested so a
+    /// future split cannot regress one of them silently.
     #[test]
     fn every_primitive_block_variant_stops_once_the_writer_thread_is_dead() {
         let block = [0x12u8, 0x00];
-        let index = crate::blob_meta::BlobIndex {
-            kind: crate::ElementKind::Node,
-            min_id: 0,
-            max_id: 0,
-            count: 0,
-            bbox: None,
-        };
 
         let mut w =
             writer_with_dead_thread(Err(storage_full("owned variant: no space left on device")));
         let mut err = None;
         for _ in 0..2_000 {
-            if let Err(e) = w.write_primitive_block_owned(block.to_vec(), index, None, None) {
+            if let Err(e) = w.write_primitive_block_owned(owned_block(&block)) {
                 err = Some(e);
                 break;
             }
@@ -1824,13 +1762,6 @@ mod tests {
         let dir = crate::path_guard::tests::scratch();
         let header = crate::block_builder::HeaderBuilder::new().build().unwrap();
         let block = [0x12u8, 0x00];
-        let index = crate::blob_meta::BlobIndex {
-            kind: crate::ElementKind::Node,
-            min_id: 0,
-            max_id: 0,
-            count: 0,
-            bbox: None,
-        };
         let raw = super::frame_blob("OSMData", &block, &Compression::None, None).unwrap();
         for owned in [false, true] {
             for flush in [false, true] {
@@ -1846,12 +1777,7 @@ mod tests {
                         .unwrap();
                         for _ in 0..200 {
                             if owned {
-                                writer.write_primitive_block_owned(
-                                    block.to_vec(),
-                                    index,
-                                    None,
-                                    None,
-                                )
+                                writer.write_primitive_block_owned(owned_block(&block))
                             } else {
                                 writer.write_primitive_block_no_indexdata(&block)
                             }

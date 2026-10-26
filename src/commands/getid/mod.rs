@@ -802,19 +802,8 @@ fn filter_by_id_walker(
                         declared.broken_by_unindexed_way_blob("re-encoding it"),
                     ));
                 }
-                for OwnedBlock {
-                    bytes: block_bytes,
-                    index,
-                    tagdata,
-                    way_members,
-                } in output_blocks.drain(..)
-                {
-                    w.write_primitive_block_owned(
-                        block_bytes,
-                        index,
-                        tagdata.as_deref(),
-                        way_members.as_deref(),
-                    )?;
+                for block in output_blocks.drain(..) {
+                    w.write_primitive_block_owned(block)?;
                 }
                 stats.nodes_written += outcome.nodes;
                 stats.ways_written += outcome.ways;
@@ -979,19 +968,8 @@ fn filter_by_id_streaming(
                 )
                 .map_err(locate)?;
                 flush_local(&mut bb, &mut output_blocks)?;
-                for OwnedBlock {
-                    bytes: block_bytes,
-                    index,
-                    tagdata,
-                    way_members,
-                } in output_blocks.drain(..)
-                {
-                    w.write_primitive_block_owned(
-                        block_bytes,
-                        index,
-                        tagdata.as_deref(),
-                        way_members.as_deref(),
-                    )?;
+                for block in output_blocks.drain(..) {
+                    w.write_primitive_block_owned(block)?;
                 }
                 stats.nodes_written += outcome.nodes;
                 stats.ways_written += outcome.ways;
@@ -1144,19 +1122,8 @@ fn getid_with_refs(
             Ok((output, outcome))
         },
         |(blocks, outcome)| {
-            for OwnedBlock {
-                bytes,
-                index,
-                tagdata,
-                way_members,
-            } in blocks
-            {
-                writer.write_primitive_block_owned(
-                    bytes,
-                    index,
-                    tagdata.as_deref(),
-                    way_members.as_deref(),
-                )?;
+            for block in blocks {
+                writer.write_primitive_block_owned(block)?;
             }
             stats.nodes_written += outcome.nodes;
             stats.ways_written += outcome.ways;

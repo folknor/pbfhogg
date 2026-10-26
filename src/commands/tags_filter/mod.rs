@@ -520,19 +520,8 @@ fn tags_filter_single_pass(
             Ok((output, block_stats))
         },
         |(blocks, block_stats)| {
-            for OwnedBlock {
-                bytes,
-                index,
-                tagdata,
-                way_members,
-            } in blocks
-            {
-                writer.write_primitive_block_owned(
-                    bytes,
-                    index,
-                    tagdata.as_deref(),
-                    way_members.as_deref(),
-                )?;
+            for block in blocks {
+                writer.write_primitive_block_owned(block)?;
             }
             stats.nodes_matched += block_stats.nodes_matched;
             stats.ways_matched += block_stats.ways_matched;
@@ -1177,19 +1166,8 @@ fn tags_filter_two_pass(
                         stats.ways_from_relations += block_stats.ways_from_relations;
                         stats.relations_matched += block_stats.relations_matched;
                         stats.relations_from_relations += block_stats.relations_from_relations;
-                        for OwnedBlock {
-                            bytes: block_bytes,
-                            index,
-                            tagdata,
-                            way_members,
-                        } in blocks
-                        {
-                            writer.write_primitive_block_owned(
-                                block_bytes,
-                                index,
-                                tagdata.as_deref(),
-                                way_members.as_deref(),
-                            )?;
+                        for block in blocks {
+                            writer.write_primitive_block_owned(block)?;
                         }
                     }
                     Ok(())

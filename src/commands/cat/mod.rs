@@ -370,19 +370,8 @@ fn cat_passthrough(
                                 if blocks.is_empty() {
                                     blobs_omitted += 1;
                                 }
-                                for OwnedBlock {
-                                    bytes: block_bytes,
-                                    index,
-                                    tagdata,
-                                    way_members,
-                                } in blocks
-                                {
-                                    writer.write_primitive_block_owned(
-                                        block_bytes,
-                                        index,
-                                        tagdata.as_deref(),
-                                        way_members.as_deref(),
-                                    )?;
+                                for block in blocks {
+                                    writer.write_primitive_block_owned(block)?;
                                 }
                                 blobs_reencoded += 1;
                                 elements_reencoded += count;
@@ -749,19 +738,8 @@ fn cat_type_passthrough(
                                 declared.broken_by_unindexed_way_blob("re-encoding it"),
                             ));
                         }
-                        for OwnedBlock {
-                            bytes: block_bytes,
-                            index,
-                            tagdata,
-                            way_members,
-                        } in output_blocks.drain(..)
-                        {
-                            writer.write_primitive_block_owned(
-                                block_bytes,
-                                index,
-                                tagdata.as_deref(),
-                                way_members.as_deref(),
-                            )?;
+                        for block in output_blocks.drain(..) {
+                            writer.write_primitive_block_owned(block)?;
                         }
                         blobs_decoded += 1;
                         elements_written += count;

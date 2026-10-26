@@ -333,19 +333,8 @@ fn getparents_walker(
             }
             reorder.push(seq, result);
             while let Some((blocks, (n, w, r))) = reorder.pop_ready() {
-                for OwnedBlock {
-                    bytes: block_bytes,
-                    index,
-                    tagdata,
-                    way_members,
-                } in blocks
-                {
-                    if let Err(e) = writer.write_primitive_block_owned(
-                        block_bytes,
-                        index,
-                        tagdata.as_deref(),
-                        way_members.as_deref(),
-                    ) {
+                for block in blocks {
+                    if let Err(e) = writer.write_primitive_block_owned(block) {
                         write_err = Some(e);
                         return ControlFlow::Break(());
                     }
@@ -413,19 +402,8 @@ fn getparents_pipelined(
             Ok((output, counts))
         },
         |(blocks, (nodes, ways, relations))| {
-            for OwnedBlock {
-                bytes,
-                index,
-                tagdata,
-                way_members,
-            } in blocks
-            {
-                writer.write_primitive_block_owned(
-                    bytes,
-                    index,
-                    tagdata.as_deref(),
-                    way_members.as_deref(),
-                )?;
+            for block in blocks {
+                writer.write_primitive_block_owned(block)?;
             }
             stats.nodes_written += nodes;
             stats.ways_written += ways;

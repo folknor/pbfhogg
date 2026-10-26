@@ -637,22 +637,11 @@ pub(super) fn stage4_assembly(
                     ConsumerItem::Decoded(result) => {
                         let (blocks, block_stats) = result?;
                         total_stats.merge(&block_stats);
-                        for OwnedBlock {
-                            bytes: block_bytes,
-                            index,
-                            tagdata,
-                            way_members,
-                        } in blocks
-                        {
-                            *s4_bytes_written += block_bytes.len() as u64;
+                        for block in blocks {
+                            *s4_bytes_written += block.bytes.len() as u64;
                             *s4_write_calls += 1;
                             let t_w = crate::counters::Stopwatch::start();
-                            writer.write_primitive_block_owned(
-                                block_bytes,
-                                index,
-                                tagdata.as_deref(),
-                                way_members.as_deref(),
-                            )?;
+                            writer.write_primitive_block_owned(block)?;
                             *s4_write_ms += t_w.elapsed_ms();
                         }
                     }

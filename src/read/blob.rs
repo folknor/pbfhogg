@@ -1679,7 +1679,7 @@ mod tests {
                 None,
             );
         }
-        let owned = bb.take_owned().expect("encode").expect("nonempty block");
+        let mut owned = bb.take_owned().expect("encode").expect("nonempty block");
 
         // Preamble: version 1, way_count 7 (one short of the 8 real ways), one
         // bitmap byte. ceil(7/8) == ceil(8/8) == 1, so the gap stays within the
@@ -1691,8 +1691,10 @@ mod tests {
         {
             let mut writer = PbfWriter::new(&mut buf, Compression::default());
             writer.write_header(&header).expect("write header");
+            owned.tagdata = None;
+            owned.way_members = Some(field5.to_vec());
             writer
-                .write_primitive_block_owned(owned.bytes, owned.index, None, Some(&field5))
+                .write_primitive_block_owned(owned)
                 .expect("write block");
             writer.flush().expect("flush");
         }

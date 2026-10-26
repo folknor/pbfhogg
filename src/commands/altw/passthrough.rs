@@ -546,19 +546,8 @@ pub(super) fn write_output_passthrough(
                         let (blocks, block_stats) = result?;
                         total_stats.merge(&block_stats);
                         let t_write = crate::counters::Stopwatch::start();
-                        for OwnedBlock {
-                            bytes: block_bytes,
-                            index,
-                            tagdata,
-                            way_members,
-                        } in blocks
-                        {
-                            writer.write_primitive_block_owned(
-                                block_bytes,
-                                index,
-                                tagdata.as_deref(),
-                                way_members.as_deref(),
-                            )?;
+                        for block in blocks {
+                            writer.write_primitive_block_owned(block)?;
                         }
                         p2_write_ns += t_write.elapsed_ns();
                         // Emit the progress counter every 64 blobs (the

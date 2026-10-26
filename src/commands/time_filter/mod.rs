@@ -270,19 +270,8 @@ fn time_filter_history(
     if let Some(group) = pending.take() {
         flush_group(group, &mut bb, writer, &mut stats)?;
     }
-    if let Some(OwnedBlock {
-        bytes,
-        index,
-        tagdata,
-        way_members,
-    }) = bb.take_owned()?
-    {
-        writer.write_primitive_block_owned(
-            bytes,
-            index,
-            tagdata.as_deref(),
-            way_members.as_deref(),
-        )?;
+    if let Some(block) = bb.take_owned()? {
+        writer.write_primitive_block_owned(block)?;
     }
     crate::debug::emit_marker("TIMEFILTER_HISTORY_END");
     Ok(stats)
@@ -636,19 +625,9 @@ fn write_owned_element(
     match elem {
         OwnedElement::Node(n) => {
             if !bb.can_add_node()
-                && let Some(OwnedBlock {
-                    bytes,
-                    index,
-                    tagdata,
-                    way_members,
-                }) = bb.take_owned()?
+                && let Some(block) = bb.take_owned()?
             {
-                writer.write_primitive_block_owned(
-                    bytes,
-                    index,
-                    tagdata.as_deref(),
-                    way_members.as_deref(),
-                )?;
+                writer.write_primitive_block_owned(block)?;
             }
             let meta = owned_to_metadata(n.metadata.as_ref());
             bb.add_node(
@@ -661,19 +640,9 @@ fn write_owned_element(
         }
         OwnedElement::Way(w) => {
             if !bb.can_add_way()
-                && let Some(OwnedBlock {
-                    bytes,
-                    index,
-                    tagdata,
-                    way_members,
-                }) = bb.take_owned()?
+                && let Some(block) = bb.take_owned()?
             {
-                writer.write_primitive_block_owned(
-                    bytes,
-                    index,
-                    tagdata.as_deref(),
-                    way_members.as_deref(),
-                )?;
+                writer.write_primitive_block_owned(block)?;
             }
             let meta = owned_to_metadata(w.metadata.as_ref());
             bb.add_way(
@@ -685,19 +654,9 @@ fn write_owned_element(
         }
         OwnedElement::Relation(r) => {
             if !bb.can_add_relation()
-                && let Some(OwnedBlock {
-                    bytes,
-                    index,
-                    tagdata,
-                    way_members,
-                }) = bb.take_owned()?
+                && let Some(block) = bb.take_owned()?
             {
-                writer.write_primitive_block_owned(
-                    bytes,
-                    index,
-                    tagdata.as_deref(),
-                    way_members.as_deref(),
-                )?;
+                writer.write_primitive_block_owned(block)?;
             }
             let meta = owned_to_metadata(r.metadata.as_ref());
             let members: Vec<MemberData<'_>> = r
@@ -907,7 +866,12 @@ mod tests {
                         bbox: None,
                     };
                     writer
-                        .write_primitive_block_owned(bytes.to_vec(), index, None, None)
+                        .write_primitive_block_owned(OwnedBlock {
+                            bytes: bytes.to_vec(),
+                            index,
+                            tagdata: None,
+                            way_members: None,
+                        })
                         .unwrap();
                 }
             }

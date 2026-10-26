@@ -70,7 +70,6 @@ goes on "Review once drained" as a bisect candidate, named by commit.
 
 Launch order, one agent per line, run serially:
 
-35. HYG-015
 36. HYG-192
 37. HYG-193
 38. HYG-194
@@ -1016,7 +1015,8 @@ The judgement calls already known, to be checked first:
     directly instead of a scratch file plus copy.
 - The three frame decoders (`BlobReader`'s, the streaming helper behind the
   raw-frame and front-probe reads, `HeaderWalker`'s) became one state
-  machine, `read::frame::Frames`, over a byte source. Error locations and
+  machine, `read::frame::Frames`, over a byte source (commit `307982d7`,
+  the bisect candidate for any read-path delta). Error locations and
   truncation messages changed by design (every frame error at its frame
   start with its blob index; `BlobReader` used to name the exact byte).
   Judgement calls on the hottest read paths, none measured:
@@ -1037,6 +1037,28 @@ The judgement calls already known, to be checked first:
     frame.
   - The front probes (`has_indexdata_in`, `InputFront`, `require_indexdata`)
     now check the run's cancellation token before each frame.
+- `PbfWriter`'s three `write_primitive_block*` methods are one dispatch,
+  `write_osm_data` with a `BlobMeta::{Scan, Bare, Given}`, and every
+  pipelined write (framed and the four raw forms) takes its slot through one
+  `reserve` (commit "PbfWriter's per-block writes are one dispatch", the
+  bisect candidate for any write-side delta on every command that encodes
+  blocks). Judgement calls on the per-block hot path, none measured:
+  - `write_primitive_block_owned` takes the `OwnedBlock` itself, so its
+    tagdata and WayMembers `Vec`s move into the framing closure instead of
+    being copied on the producer thread after the permit. In-flight jobs
+    now carry the original allocation's capacity slack (bounded by the
+    dispatch permits) instead of a length-sized copy, and the producer no
+    longer holds the original while the worker holds the copy.
+  - The owned path's 42-byte index serialization moved from the producer,
+    before the permit, to the framing worker.
+  - The Scan and Bare closures capture the whole `BlobMeta` enum (sized for
+    `Given`), so their rayon job box grew by roughly a `BlobIndex` and two
+    `Option<Vec>`s; no added allocation.
+  - The raw writes (`write_raw`, `write_raw_owned`, `write_raw_chunks`,
+    `write_raw_copy`) now check `writer_gone` before taking a permit, so
+    after a framing closure saw the writer thread die they return its error
+    without copying or sending. They used to reach the same error at the
+    failed send.
 
 ---
 
@@ -1154,39 +1176,6 @@ catalogued; if it is done at all, it is done last.
 
 Reported by: altw and scanning, re-encoding, filtering and spatial, read path,
 geocode index.
-
-## HYG-015 - Write-side blob framing and dispatch are copied
-
-Anger: 9 - writer framing on a hot path.
-
-- The sync and pipelined paths share `frame_in_scratch`;
-  `reframe_raw_with_index_scratch` is a second framing assembly that skips the
-  `MAX_BLOB_DATASIZE` check (arguably right for passthrough, but nobody
-  decided). `encode_blob_header_into`'s WayMembers culprit heuristic
-  (`len > 1024`) guesses which field overflowed instead of computing sizes.
-- `write_primitive_block`, `write_primitive_block_no_indexdata` and
-  `write_primitive_block_owned` each carry about 70 identical lines; the test
-  `every_primitive_block_variant_stops_once_the_writer_thread_is_dead` exists
-  because a fix to one missed the others. They now differ only in where the
-  index comes from (scanned in the closure, precomputed, none).
-- `to_path_uring` and `to_path_parallel` carry the same spawn plus `init_rx`
-  match (messages differ by one word), all four constructors build the same
-  `WritePipeline` literal, and a test helper builds a fifth.
-  `to_path_uring`'s unbounded `init_rx.recv()` is documented and left.
-
-Fix: one `dispatch_framed(FrameRequest)`
-with `IndexSource::{Scan, Precomputed, None}`; one `WritePipeline::spawn`.
-Structural.
-
-Maintainer (2026-10-25): split into three entries, one commit each, since the
-three parts share no code path and differ in risk. This entry keeps the
-per-block part: the three `write_primitive_block*` variants become one
-dispatch with `IndexSource::{Scan, Precomputed, None}`. It is the only part on
-the per-block hot path, so it is the bisect point a planet regression would
-point at. `WritePipeline::spawn` is HYG-192; the two framing decisions are
-HYG-193.
-
-Reported by: write path.
 
 ## HYG-192 - The writer's four constructors build the same pipeline by hand
 

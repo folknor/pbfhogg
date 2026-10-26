@@ -236,7 +236,11 @@ pub(crate) fn merge_to(
     // order, so a forced run's Note and the missing-indexdata refusal still
     // precede a header decode failure. `merge_header_read_ms` therefore
     // times the whole front read: the open, the header frame, the probe to
-    // the first data blob's header and the decode, not the header alone.
+    // the first data blob's header (one pread) and the decode, not the header
+    // alone. The wider span is deliberate: the front read is one step that
+    // answers both the indexdata question and the header, so timing the
+    // header alone would time a fragment of it. Values recorded before
+    // `a3f1a1bc` exclude the probe and are not comparable with later ones.
     let header_start = crate::counters::Stopwatch::start();
     let mut front = InputFront::open(&base, direct_io, host)?;
     front.require_indexdata(

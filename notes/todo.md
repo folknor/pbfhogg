@@ -575,41 +575,22 @@ look on the consumer side:
 
 Deltas between markers are unchanged, so `--durations` output is unaffected.
 
-## Cross-repo: `brokkr verify` cannot reach the sequential diff path (2026-08-20)
+## Cross-repo: `brokkr verify` cannot vary the diff shard count (2026-08-20, reworded 2026-10-26)
 
 `brokkr verify diff` (and `verify all`, which includes it) runs `pbfhogg
-diff` with no `-j`, so it always exercises the DEFAULT parallel path.
-brokkr's verify surface exposes no `-j` at all. Consequence: the sequential
-block-pair merge in `src/osc/merge_join.rs` is never cross-validated against
-real Denmark indexdata by any verify run. Everything it does that the
-parallel path does not - `check_claimed_max`, the `osm_id_cmp` merge
-boundary and non-overlap tests, the residual bookkeeping in
-`merge_decoded_pair` - is covered only by synthetic fixtures in
-`cli/tests/cli_merge_join_trust.rs` and `cli/tests/cli_diff.rs`.
+diff` with no `-j`, so it always exercises the default shard count. brokkr's
+verify surface exposes no `-j` at all. Diff and derive over indexed inputs
+are one block-pair engine at every shard count (there is no separate
+sequential engine), so what no verify run cross-validates against real
+Denmark indexdata is the one-shard plan (`-j 1`, and the single shard a
+negative-ID input gets) against the multi-shard one. That is covered only by
+synthetic fixtures in `cli/tests/cli_merge_join_trust.rs` and
+`cli/tests/cli_diff.rs`.
 
-This is not hypothetical. The two paths genuinely disagreed until
-2026-08-20: on a PBF whose header stamps `Sort.Type_then_ID` while its blobs
-are not in canonical order, `pbfhogg diff` returned exit 2 with "blobs are
-not in canonical order" at `-j 1` and exit 0 with "Files are identical" at
-the default `-j`. Both now refuse, but the episode is the argument: a
-divergence between the two paths is exactly the class of defect a verify
-oracle should catch, and the oracle could only ever see one of them. The
-suite's own seq-vs-parallel parity test could not see it either, because its
-fixture generator can only emit canonically-ordered blobs.
-
-Two things would close it, and they are independent:
-
-- **brokkr side.** Add a `-j` (or a `--variant seq`) to `brokkr verify
-  <cmd>`, so `verify diff` can be run once per path and the osmium/osmosis
-  oracle adjudicates both. This is the higher-value half: it turns "the two
-  paths agree" from a unit-test assertion into a real-data one.
-- **pbfhogg side.** Nothing is blocked on brokkr. A tier-2 test that runs
-  both paths over a synthetic fixture with non-canonically-ordered blobs
-  and asserts byte-identical output would cover most of the same ground
-  without touching another repo.
-
-Until one of them lands, treat a green `brokkr verify all` as evidence about
-the parallel diff path only.
+The brokkr side is to add a `-j` to `brokkr verify <cmd>`, so `verify diff`
+can be run once per shard count and the osmium/osmosis oracle adjudicates
+both. Until it lands, treat a green `brokkr verify all` as evidence about the
+default shard count only.
 
 ## Cross-repo: `brokkr verify` has no `merge-changes` arm (2026-08-20)
 

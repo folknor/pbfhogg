@@ -199,12 +199,16 @@ pub fn diff<'a, 'b>(
 /// Count the differences between two sorted PBF files without producing
 /// any text.
 ///
-/// The comparison is the one [`diff`] runs with `suppress_common` and
+/// The comparison is the one [`diff`] runs with `suppress_common` on,
 /// `verbose` off and the same `type_filter` and `parallelism`: the same
 /// paths (parallel shards for indexed inputs, the sequential fallbacks
-/// otherwise), the same input checks and refusals, and on success the same
-/// counts. Only the formatting is skipped, so no output or scratch I/O
-/// happens at all, and a sharded comparison needs no scratch directory.
+/// otherwise) and the same input checks. Like `diff -c`, it skips a fresh
+/// pair of byte-equal blobs without decoding it, so `common` counts such a
+/// pair by the blobs' claimed `index.count` and a corrupt blob that is
+/// byte-identical on both sides is not noticed; `created`, `modified` and
+/// `deleted` are exact either way. Only the formatting is skipped, so no
+/// output or scratch I/O happens at all, and a sharded comparison needs no
+/// scratch directory.
 ///
 /// The inputs are pinned as in [`diff`], with the same refusals.
 #[hotpath::measure]
@@ -217,8 +221,9 @@ pub fn diff_stats<'a, 'b>(
     host: &crate::host::Host,
 ) -> Result<DiffStats> {
     host.cancel.check()?;
+    // Nothing is printed, so byte-equal blobs may be skipped (see above).
     let options = DiffOptions {
-        suppress_common: false,
+        suppress_common: true,
         verbose: false,
         type_filter,
         parallelism,
@@ -340,7 +345,8 @@ fn finish_scan(stats: DiffStats) -> DiffStats {
 ///
 /// `output` is `None` for a count-only run: every selected block is still
 /// read, decoded and merged exactly as for text (the byte-equal fast path
-/// follows `suppress_common`, not the absence of text), only nothing is
+/// follows `suppress_common`, not the absence of text, and `diff_stats`
+/// sets it), only nothing is
 /// formatted and no scratch is written. A text run of more than one shard
 /// writes each shard's text to `scratch` and streams it to `output` in
 /// shard order; a phase of one shard writes `output` directly.

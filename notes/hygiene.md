@@ -1320,6 +1320,10 @@ The judgement calls already known, to be checked first:
     and the driver's cancellation checks before each wait, not only after
     each result. The unordered pools now emit their counters from a drop
     guard, so a panicking run still emits them.
+- apply-changes accepts `-j 1` (`9744a9fc`): `Parallelism::Fixed(1)` and the
+  CLI's `-j 1` were refused before and are now accepted. A CLI and library
+  contract change, in the CHANGELOG, accepted by the maintainer 2026-10-26.
+  Unmeasured: what a one-worker run costs in wall and memory is not known.
 
 No findings remain open; the file stays until the list above is reviewed
 (rule 4).

@@ -94,6 +94,15 @@ usually small.
   rows undercount by the header on pipelined backends and by every raw
   write on synchronous ones. The synchronous writer's `writer_payload_*`
   counters, previously always zero, count too.
+- **Sidecar rows from `56a50e0d` until `c2409c45` do not compare on the
+  send-side counters.** `56a50e0d` sized the ordered engine's result channel
+  to the admission window, which no run can fill, so a converted pool's
+  sends never blocked there and the wait moved to the uncounted admission
+  gate: `s4_send_ms`, the `WAIT_S4_SEND` and `WAIT_P2_SEND` spans and
+  `altw_pass2_send_ms` read near zero for it. `c2409c45` restored the channel
+  depth, and the engine now records its own gate, send and receive waits
+  (`ordered_pool_*_wait_ns`) for every ordered pool. A row from that range
+  does not compare with either side on those counters.
 
 ## Cat passthrough (indexdata generation)
 
@@ -1453,6 +1462,15 @@ parallelise over the same ID-range shard plan.
 |---|---|---:|---:|---:|
 | `22a5eb55` | `-j 16` (text, temp-file shape) | **227.5 s (3m48s)** | 586 MB | **9.5×** |
 | `cdcaa4f1` | `-j 16 --format osc` (commit `16e3694`, 2026-04-26) | **293.8 s (4m54s)** | n/a | **7.6×** |
+
+The "vs sequential" ratios divide the wall by the old single-threaded
+streaming engine's planet wall, which the tree no longer contains (one
+block-pair engine now serves every shard count, so the ratios cannot be
+re-measured at a later commit): 2134 s for text (recorded at commit
+`a9d430f2`) and 2225.6 s for `--format osc` (the same engine's recorded
+planet run; its commit is not named in the tree). Dividing these by the
+walls above gives 9.4 and 7.6, so the text ratio's printed 9.5 is
+approximate.
 
 Both paths stream shard output to per-shard scratch temp files
 (`BufWriter<File>`) and concatenate in shard order; peak anon is just

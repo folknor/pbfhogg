@@ -1792,8 +1792,8 @@
   Every other run that may shard still makes its directory at startup and
   fails there when the location is unusable. Library callers of
   `diff::diff` pass `None` for the scratch argument in the one-shard case;
-  the new `diff::diff_stats` returns the same counts as an unsuppressed
-  `diff` without producing text, and takes no scratch at all.
+  the new `diff::diff_stats` returns the counts of a `diff` without
+  producing text, and takes no scratch at all.
 - **A file without a leading OSMHeader is the missing-header error in
   `check --index`, `check --refs` and `inspect --show`.** `check --index`
   reported a clean pass and `inspect --show` found or missed elements on
@@ -2641,6 +2641,14 @@
 
 ### Changed
 
+- **`diff -q` and `diff::diff_stats` skip byte-equal blobs.** A count-only
+  run now takes the same shortcut as `diff -c`: a pair of blobs with
+  identical claims and compressed bytes is not decoded, so `-q` is faster on
+  inputs that share blobs (one derived from the other by `apply-changes`).
+  The verdict and the created, modified and deleted counts are exact either
+  way. For library callers, `DiffStats.common` now counts such a pair by the
+  blobs' claimed element count, as `diff -c` reports it, and a corrupt blob
+  that is byte-identical on both sides is no longer noticed.
 - **`diff` and `diff --format osc` give the same answer at every `-j`, and
   `diff -v` runs at any `-j`.** Indexed inputs used to go through two
   engines: a streaming one at `-j 1` (and for `-v` and negative IDs) and a

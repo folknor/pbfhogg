@@ -426,8 +426,8 @@ ask.
 bug: after ordering-based merging by `operator<` (which is
 canonical), the "same id?" check uses raw `it1->id() != it2->id()`
 rather than the absolute-value comparator. Mixed-sign inputs can
-mis-trigger there. pbfhogg's diff routes negative-ID inputs away from
-its raw-compare shard planners instead; the gap is not pbfhogg-unique,
+mis-trigger there. pbfhogg's diff gives an indexed input holding a negative ID a
+single shard instead of planning shards by raw ID compare; the gap is not pbfhogg-unique,
 it is ecosystem-wide.
 
 **Impact:** Users with JOSM-local staging data must resolve negative

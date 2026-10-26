@@ -686,6 +686,26 @@ Files most relevant: `src/ordered_pool.rs`, `src/commands/altw/external/stage4.r
 The agents' claims have not been re-verified against the code yet, except
 the ones below.
 
+- Stale comments and doc text the slices flagged, checked against the
+  code on 2026-10-26 (comments and markdown only):
+  - **Corrected:** `BlobReader::next_frame`'s "no zero-fill" (and the same
+    claim in `FrameSource::append`'s doc: `FileReader` implements only
+    `read`, so std's default `read_buf` zero-fills); the `FramedBlobParts`
+    doc (every backend flattens through `into_vec`); stage 2's
+    `partition_point` comment ("non-overlapping", now non-decreasing with
+    equal boundaries allowed); renumber's "must not reach" (now says the
+    cost is unmeasured); the accumulate pool doc (the 14.59 GB planet figure
+    restored in the geocode pass 1.5 history sentence, provenance
+    `76347122`, 2026-04-17, run and host unrecorded); `notes/todo.md`'s
+    raw-frame item (removed; `raw_frame.rs` is gone and dedupe has no
+    byte-level reader); in `notes/hygiene.md`, the `DecompressPool` entry,
+    the shared-walker entry, the text-diff drivers entry (Slice A 17), the
+    diff input-checks sub-item (19c), the sort sub-item and the
+    "block devices pass" line.
+  - **Already right:** `build_node_blob_mapping`'s doc (it already says
+    equal boundaries are allowed and never said "non-overlapping"; only a
+    missing full stop was added).
+
 - Slice F, item 9 (`060c2f74`, `claim_holds` versus `check --index`):
   confirmed. `claim_holds` in `src/commands/blob_merge.rs` returns false
   for a claimed bbox with no scanned one, a case `check --index`'s

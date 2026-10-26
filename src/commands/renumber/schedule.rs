@@ -64,8 +64,9 @@ pub(super) fn build_all_blob_schedules(
     host: &crate::host::Host,
 ) -> Result<(Vec<BlobTask>, Vec<BlobTask>, Vec<BlobTask>)> {
     // Its own open, derived from the run's pin, on purpose: this walk's
-    // descriptor carries FADV_RANDOM, which must not reach the workers'
-    // shared body descriptor, and the caller's header reader (which
+    // descriptor carries FADV_RANDOM, which is kept off the workers' shared
+    // body descriptor (what handing it over would cost is unmeasured), and
+    // the caller's header reader (which
     // established that the file opens with an OsmHeader and is sorted) is a
     // sequential read, O_DIRECT under direct I/O, already closed. The walk
     // starts at the beginning and consumes the leading frame itself; the

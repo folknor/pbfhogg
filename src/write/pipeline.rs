@@ -52,9 +52,9 @@ pub(crate) enum OutputChunk {
 /// The three owned parts of a framed blob:
 /// `4 B big-endian header_len | BlobHeader | Blob protobuf body`.
 ///
-/// Kept split so backends that support scatter-gather I/O can issue one
-/// `writev` without an intermediate concat, while backends that need a
-/// single buffer flatten locally via [`into_vec`](Self::into_vec).
+/// Every backend flattens the parts into one buffer via
+/// [`into_vec`](Self::into_vec) before writing; none issues a scatter-gather
+/// write.
 pub(crate) struct FramedBlobParts {
     pub(crate) prefix: [u8; 4],
     pub(crate) header: Vec<u8>,

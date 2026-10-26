@@ -711,7 +711,9 @@ impl<R: Read + Send> BlobReader<R> {
             Err(err) => return Some(Err(err)),
         };
         // Sized to the declared payload, so the bounded read fills it with
-        // no reallocation and no zero-fill.
+        // no reallocation. It is not free of zero-fill: a reader that
+        // implements only `read` (`FileReader` does) gets std's default
+        // `read_buf`, which zero-fills the spare capacity before each read.
         let mut blob_data = Vec::with_capacity(header.data_size);
         if let Err(err) = self.frames.read_payload(&mut blob_data) {
             return Some(Err(err));

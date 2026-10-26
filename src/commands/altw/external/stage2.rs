@@ -424,9 +424,10 @@ pub(super) fn stage2_node_join(
 
                         // Find the contiguous run of node blobs whose
                         // [min_id, max_id] intersects [bucket_lo, bucket_hi).
-                        // PBFs are id-sorted so blob ranges are
-                        // monotonic and non-overlapping; intersecting
-                        // blobs form a contiguous slice.
+                        // The metadata scan guarantees blob ranges in
+                        // non-decreasing id order (equal boundaries
+                        // allowed), so both predicates are monotone and
+                        // intersecting blobs form a contiguous slice.
                         #[allow(clippy::cast_sign_loss)]
                         let lo_blob = mapping_ref.partition_point(|b| {
                             (b.max_id as u64) < bucket_lo

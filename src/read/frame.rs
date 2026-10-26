@@ -91,8 +91,10 @@ impl<R: Read> FrameSource for R {
     }
 
     /// A bounded `read_to_end` into the caller's buffer, reserved to `n`
-    /// first: no zero-fill, and a caller that sized `out` exactly gets no
-    /// reallocation. `Take` reports a short input as a short count.
+    /// first: a caller that sized `out` exactly gets no reallocation. Whether
+    /// the spare capacity is zero-filled is the reader's: one that implements
+    /// only `read` gets std's default `read_buf`, which zero-fills.
+    /// `Take` reports a short input as a short count.
     fn append(&mut self, n: usize, out: &mut Vec<u8>) -> std::io::Result<usize> {
         out.reserve(n);
         self.by_ref().take(n as u64).read_to_end(out)

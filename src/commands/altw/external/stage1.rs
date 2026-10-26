@@ -484,7 +484,7 @@ pub(super) fn stage1_pass_a(
 /// stage 2 uses to find which blobs cover each id bucket.
 ///
 /// Replaces the historical 82 GB `coords_by_rank` file. No decompression
-/// happens here - for each node blob we read its indexdata `(min_id, max_id)`
+/// happens here - for each node blob we read its indexdata `(min_id, max_id)`.
 /// Stage 2 partitions this slice by `[min_id, max_id]` to find blobs
 /// that intersect each id bucket. The ranges are well-formed, non-negative
 /// and in non-decreasing id order (equal boundaries allowed) because

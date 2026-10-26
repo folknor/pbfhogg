@@ -155,15 +155,16 @@ The judgement calls already known, to be checked first:
   `ErrorKind::InvalidData` rather than `Io` for every caller (getid ID files,
   extract configs and region files, the tags-filter expressions file), which
   library consumers matching on the kind will see.
-- The text diff's three drivers (sequential block-pair, element stream,
-  parallel shards) now take their writer as an `Option` so `diff_stats` can
-  share them without formatting: each write site gained an `if let Some`
-  branch, the shard writer became `Option<BufWriter<File>>`, and the
-  `diff` entry point moved its body into a shared `compare`. Argued
-  branch-predictable and below noise on the text path, not measured. The
-  count mode deliberately keeps the byte-equal fast path off (it follows
-  `suppress_common`, which `diff_stats` holds false) so its counts and
-  refusals equal an unsuppressed text diff's.
+- The text diff's drivers (the sharded block-pair engine, with an inline
+  single shard, and the element stream; the sequential block-pair merge the
+  commit also touched is gone) take their writer as an `Option`, which now
+  lives in `DiffSink`, so `diff_stats` can share them without formatting:
+  each write site has a branch on it, including per common element when
+  `-c` is off, and the `diff` entry point moved its body into a shared
+  `compare`. Argued branch-predictable and below noise on the text path, not
+  measured. The count mode takes the byte-equal fast path like `diff -c`
+  (`diff_stats` sets `suppress_common`, which the skip follows); see the
+  review audit's ruling on `diff -q`.
 - The CLI's inputs, outputs and scratch site now come from one
   `CommandPaths` (`cli/src/command_paths.rs`), which also made
   `build-geocode-index` refuse an `--output-dir` holding its input (or the
@@ -182,10 +183,12 @@ The judgement calls already known, to be checked first:
     element as `min_id` rather than 0, so it accepts valid mixed-sign
     layouts it used to refuse; it can no longer certify order inside such a
     range.
-  - The sequential block-pair merge runs the order guard on every blob it
-    reads and, under a filter excluding the trailing kinds, walks the rest
-    of both files' headers with a `HeaderWalker` (a pread per remaining
-    blob, nothing for unfiltered runs).
+  - Every indexed diff run, `-j 1` included, now starts with an up-front
+    `walk_pair` over both files' blob headers (`diff/shard.rs`: a
+    `HeaderWalker` per input, a pread per blob, `--direct-io` not
+    honoured), which checks canonical order and indexdata before any blob
+    is decoded. The per-blob order guard and the trailing walk this
+    sub-item first described went with the sequential block-pair merge.
   - The unindexed element stream now checks element order per merged
     element (one key compare), classifies each block not of the phase's
     kind by iterating its elements, and drops excluded kinds' blocks
@@ -389,29 +392,36 @@ The judgement calls already known, to be checked first:
     readahead state. Comments at apply-changes' opens, renumber's schedule
     walk and multi-extract's walk say so.
 - Whether sharing one input descriptor between a header walk and body
-  preads costs anything is unmeasured, and the tree does both: renumber
-  shares one fd across all phases (commit `db49c929`, its comment at the
-  open and `reference/performance.md` say so), and about eight commands
-  hand the `HeaderWalker`'s `FADV_RANDOM` fd to their pread workers through
-  `walker.input()` (classify, tags-filter, extract smart and multi,
+  preads costs anything is unmeasured, and the tree does both: about eight
+  commands hand the `HeaderWalker`'s `FADV_RANDOM` fd to their pread workers
+  through `walker.input()` (classify, tags-filter, extract smart and multi,
   getparents, geocode pass 1.5, diff's shard walk, altw's sparse
-  passthrough), while altw external, apply-changes and `InputFront` keep
-  separate descriptors on an argument (commit `a3f1a1bc`) that was never
-  measured. One matched `--bench 1` A/B per side, for example on altw
-  external stage 4 at Europe scale, would settle it.
-- The sequential diff and derive merges (indexed block-pair under `-j 1`
-  or `--verbose`, the unindexed element stream always) recycle their
-  decompression buffers through one `DecompressPool` per merge, shared by
-  both sides and every phase (`MergeBuffers` in `osc/merge_join.rs`),
-  instead of allocating a fresh buffer per block. Judgement calls, none
-  measured:
+  passthrough), while altw external and apply-changes keep separate
+  descriptors on an argument (commit `a3f1a1bc`) that was never measured.
+  Renumber is not on the shared-walker side: its schedule walk keeps its
+  own `FADV_RANDOM` descriptor, and what it shares (commit `db49c929`, its
+  comment at the open and `reference/performance.md` say so) is one plain
+  body descriptor across its data phases, a different question. `InputFront`
+  is not in either list: it is a precondition probe closed before any pass
+  runs. The split may track access pattern rather than accident (the
+  sharing commands are selective classify-style readers using `FADV_RANDOM`
+  plus a `WILLNEED` prefetch over the schedule; altw external stage 4 reads
+  every blob), so measure both shapes. One matched `--bench 1` A/B per
+  side, for example on altw external stage 4 at Europe scale, would settle
+  it.
+- The sequential unindexed diff and derive merges (the element stream)
+  recycle their decompression buffers through one `DecompressPool` per
+  merge, shared by both sides and every phase (`MergeBuffers` in
+  `osc/merge_join.rs`), instead of allocating a fresh buffer per block. The
+  indexed block-pair merge pooled too when this was written (`126cbce2`)
+  and no longer does (`2c12a955`). Judgement calls, none measured:
   - The gain is reasoned only: glibc malloc's dynamic mmap threshold
     probably already serves a freed buffer back after the first few blocks.
     Recycling cannot plausibly allocate more, but it adds an `Arc` owner
     allocation and an uncontended mutex per block.
   - Peak memory gains the pool's idle buffers, bounded by the most decoded
-    blocks the merge held at once (current per side, a stash, the block
-    alive while `drain_remaining` decodes the next) and by the pool's
+    blocks the merge held at once (a current block per side and a stashed
+    one) and by the pool's
     4 MiB-per-buffer and 64-buffer limits. Buffers over 4 MiB are dropped
     and now show in the diff and derive runs' `DECOMPRESS_POOL_METRICS`
     oversize-drop counters, which these paths never fed before.
@@ -702,8 +712,9 @@ The judgement calls already known, to be checked first:
   through the path and refuse a different inode (`InputReplaced`). Every
   derived descriptor is `fstat`-verified and opened `O_NONBLOCK`, then
   cleared with `F_SETFL`. Judgement calls, none measured:
-  - Pinning commands refuse FIFOs, sockets and character devices up front
-    (block devices pass), including arms that would have read once (the
+  - Pinning commands refuse FIFOs, sockets, character devices and block
+    devices up front (`b8acda7c`: a block device's `st_size` is 0, which
+    the walker would read as an empty file), including arms that would have read once (the
     time-filter history arm).
   - Per later open: one `open` through procfs, one `fstat`, two `fcntl`;
     per pin, one `O_PATH` open held for the run and one probe open. A
@@ -732,9 +743,12 @@ The judgement calls already known, to be checked first:
     probe that skipped the OSMHeader payload) to an `InputFront`, which
     reads that payload (a few hundred bytes) without decoding it, so a
     payload read failure now surfaces at the front rather than at pass 1's
-    walker. Every other open became one derived open: pass 1's walker, pass
-    2's source (still `dup`ed into the writer's copy source, one shared
-    description as before) and one per overlap-run worker. The
+    walker. Every other open became one derived open. Sort now opens three
+    times: the front read, the walker in `blob_merge.rs` and one pass-2
+    `InputFile` (still `dup`ed into the writer's copy source, one shared
+    description as before). The per-overlap-run-worker opens are gone with
+    the blob-merge engine (`79d2e923`); overlap sweeps share that
+    description. The
     `sort_total_bytes_in` counter now reads the pin's `fstat`; no test
     observes that conversion.
   - tags-filter adopted it in `tags_filter_to`, after the option and

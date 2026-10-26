@@ -707,16 +707,6 @@ atomicity, `src/read/pipeline.rs` on the seq-0 pool-failure push,
 
 ### Core infrastructure and CLI
 
-- [ ] **Raw-frame passthrough errors name neither file nor blob.** Round 4 gave
-  `BlobReader` and `HeaderWalker` an input identity (`Error::source_path()` /
-  `Error::blob_index()`), covering the decode and preflight paths, but
-  `src/read/raw_frame.rs` is generic over a bare `Read` and has no path to
-  report - so `pbfhogg cat a.pbf b.pbf` on a corrupt passthrough blob still
-  fails with a bare `failed to fill whole buffer`. Same gap in the byte-level
-  reader in `src/commands/cat/dedupe.rs`. Closing it means threading an
-  `Arc<Path>`, matching the two readers that now carry one, through the
-  raw-frame helpers and their callers.
-
 - [ ] **`ReorderBuffer::with_capacity(N)` is a tuning guess at ~20 sites.** The
   `N` passed is rarely the caller's true permit window - `time_filter` asks for
   64 with no matching semaphore anywhere in the file. Round 4 added a

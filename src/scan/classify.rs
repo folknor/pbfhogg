@@ -1095,8 +1095,10 @@ impl Drop for StopOnUnwind<'_> {
 /// so each worker's bitmap is bounded by ID space, not by its work. Geocode
 /// pass 1.5 left this pool for that reason: it writes one shared,
 /// pre-allocated `IdSet` with atomic sets from its own claim-counter pool
-/// (`geocode_index::builder::pass1_5`). If you add another caller like this,
-/// measure first.
+/// (`geocode_index::builder::pass1_5`). While it was here it shipped at a
+/// 14.59 GB peak RSS (planet), a figure this comment carried from
+/// `76347122` (2026-04-17) until `95eea09b` dropped it; its run and host are
+/// not recorded. If you add another caller like this, measure first.
 ///
 /// **A previous caller in this category was migrated to
 /// [`parallel_classify_phase`] on 2026-04-28** (commit `17b116c`,

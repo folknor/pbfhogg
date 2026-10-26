@@ -21,7 +21,7 @@ use super::direct_reader::DirectReader;
 pub enum FileReader {
     /// Standard buffered reader (256 KB buffer).
     Buffered(BufReader<File>),
-    /// O_DIRECT reader with page-aligned buffering (Linux only).
+    /// O_DIRECT reader with aligned buffering (Linux only).
     #[cfg(feature = "linux-direct-io")]
     Direct(DirectReader),
 }
@@ -91,7 +91,8 @@ impl FileReader {
         )))
     }
 
-    /// Open a file for O_DIRECT reading with page-aligned buffers.
+    /// Open a file for O_DIRECT reading with buffers aligned to the file's
+    /// direct I/O alignment.
     #[cfg(feature = "linux-direct-io")]
     pub fn direct(path: &Path) -> Result<Self> {
         Self::direct_from(InputSource::Path(path))
@@ -167,9 +168,9 @@ impl FileReader {
     /// a payload that doesn't deliver the declared `data_size` must
     /// hard-error here, not be deferred.
     ///
-    /// For `DirectReader`: consumes buffered bytes, then lseeks the fd.
-    /// `DirectReader::skip` already validates EOF and errors on past-end,
-    /// so no extra check is needed.
+    /// For `DirectReader`: consumes buffered bytes, then moves its read
+    /// position. `DirectReader::skip` already validates EOF and errors on
+    /// past-end, so no extra check is needed.
     pub(crate) fn skip(&mut self, n: u64) -> io::Result<()> {
         if n == 0 {
             return Ok(());

@@ -855,12 +855,54 @@ the ones below.
     `alloc_aligned_zeroed`'s safety argument (now a checked zero size),
     `reference/testing.md`'s list of classified direct opens, the sort
     front-read comment and the frame conformance module doc.
-  - Lateral, left open: `DirectReader::fill` (the sequential `O_DIRECT`
-    reader behind `FileReader::open(.., true)`, used by both commands'
-    front probes and many other commands) advances its fd position by a
-    short read's count and reads again from there; a short transfer that
-    is not a multiple of the alignment before EOF would issue an unaligned
-    read (`EINVAL`). Pre-existing; `read_aligned` shows the rebasing fix.
+  - Lateral: `DirectReader::fill` read again from an unaligned offset
+    after a short transfer. Resolved in the next entry.
+
+- Lateral from the entry above (`DirectReader::fill`, the sequential
+  `O_DIRECT` reader behind `FileReader::open(.., true)`): confirmed and
+  **resolved**.
+  - Confirmed in the code: `fill` issued `read(2)` at the fd offset, which
+    a short transfer had advanced by its count. `read_limit` (from
+    `ea17fd86`) only stopped the read at a regular file's own length, so a
+    short transfer before it whose count is not a multiple of the alignment
+    (a filesystem whose real alignment is finer than the statx-floored one,
+    or a partial transfer) made the next read unaligned, `EINVAL`. No
+    recorded run hit it; it needs a filesystem that returns a short count
+    before the end of the file.
+    Two more in `skip`'s unaligned path: a refill that fell short of the
+    target inside its block was reported as a skip past the end, and an
+    `Interrupted` refill escaped after the seek, leaving the reader at the
+    wrong logical position.
+  - Fix, fitted to `read_aligned`: the reader reads by `pread` at its own
+    tracked `file_pos` (the fd offset is no longer used or moved; the one
+    `raw_fd` contract already said explicit offsets). Each fill starts at
+    the aligned offset at or below `file_pos`, re-reading at most one
+    partial block, and the read position skips the bytes already served; a
+    transfer adding nothing past `file_pos` is the end of the file (a file
+    that shrank reads as one ending there, as before). `read_limit` stays
+    as the no-syscall stop at a regular file's length. `skip`'s unaligned
+    path refills from the aligned offset below the target until the buffer
+    covers it, retrying `Interrupted`; the aligned path is unchanged. Stale
+    docs from Slice B item 1 corrected on the way: `FileReader::direct`,
+    the `Direct` variant and `DirectReader::skip` no longer say page
+    alignment or lseek.
+  - Tests in `src/read/direct_reader.rs` drive `read` and `skip` over an
+    injected `pread` that asserts every call is aligned (offset, address,
+    length): whole-file reads under unaligned short transfers and
+    interruptions, a no-progress transfer ending the read, skips within
+    the buffer and to aligned and unaligned targets after short transfers
+    (one falling short inside the target's block), a skip to the unaligned
+    end, and skips past the end. Mutation-checked: dropping the rebase
+    fails three tests on the alignment assertion, a single refill in
+    `skip` fails the skip test. `brokkr check` (tier1, platform) passes;
+    `cat --clean` and `degrade --strip-indexdata` with `--direct-io` run
+    on Denmark.
+  - Left open, pre-existing: on a block device `file_len` is 0, so
+    `skip`'s aligned path refuses every aligned target past the buffer as
+    past the end, while the unaligned path reads through. `read_limit`
+    already treats block devices as unbounded; `skip` does not. Whether
+    block-device inputs are supported at all is the question to settle
+    first.
 
 Notes made while the audit ran, not findings of it:
 

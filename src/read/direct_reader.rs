@@ -1,7 +1,7 @@
 //! O_DIRECT file readers with aligned buffering.
 //!
 //! [`DirectReader`] maintains an aligned internal buffer and reads in
-//! aligned chunks via `read(2)`, at the alignment `crate::direct_io`
+//! aligned chunks via `pread(2)`, at the alignment `crate::direct_io`
 //! discovered for the file. This bypasses the kernel page cache entirely,
 //! preventing cache pollution during planet-scale (80 GB+) PBF reads.
 //!
@@ -75,22 +75,16 @@ impl AlignedReadBuffer {
         self.pos += n;
     }
 
-    /// Fill the buffer with one `read(2)` of its whole capacity (std's
-    /// `File::read`, which is that one call). Returns the number of bytes
-    /// read (0 on EOF); an interrupted read is returned as `Interrupted`.
-    ///
-    /// The read is aligned: the buffer address is aligned to the file's
-    /// alignment, the capacity is a multiple of it, and the fd offset is
-    /// aligned too (`DirectReader::fill` never reads past a regular file's
-    /// final short read, and `skip` seeks to aligned offsets only).
-    fn fill_from(&mut self, mut file: &File) -> io::Result<usize> {
+    /// Empty the buffer and return the whole capacity as a read target. Its
+    /// address is aligned to the file's alignment and its length is a
+    /// multiple of it, so a `pread` into it at an aligned offset is one
+    /// `O_DIRECT` allows.
+    fn clear_for_fill(&mut self) -> &mut [u8] {
         self.pos = 0;
         self.len = 0;
         // Safety: the allocation is `capacity` zeroed (so initialised) bytes,
         // exclusively owned through `&mut self`.
-        let dst = unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.capacity()) };
-        self.len = file.read(dst)?;
-        Ok(self.len)
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.capacity()) }
     }
 }
 
@@ -110,7 +104,8 @@ impl Drop for AlignedReadBuffer {
 /// All reads from the underlying file descriptor use an aligned buffer,
 /// aligned sizes and aligned offsets, at the file's direct I/O alignment.
 /// Data is served from the internal buffer, which is refilled via
-/// `read(2)` when exhausted.
+/// `pread(2)` when exhausted. The reads are positional, so the descriptor's
+/// own file offset is never used or moved.
 pub struct DirectReader {
     file: File,
     buf: AlignedReadBuffer,
@@ -123,15 +118,25 @@ pub struct DirectReader {
     /// reader's lifetime, so `skip` validates an aligned target against this
     /// instead of paying an `fstat` per skip.
     file_len: u64,
-    /// Where `fill` stops instead of issuing a read at the unaligned offset
-    /// the final short read left: `file_len` for a regular file, unbounded
-    /// otherwise, because a block device's metadata length is zero whatever
-    /// its capacity and its reads must still reach the device.
+    /// Where `fill` stops without a syscall: `file_len` for a regular file,
+    /// whose last read there would only re-read the final partial block to
+    /// learn it is at the end, and unbounded otherwise, because a block
+    /// device's metadata length is zero whatever its capacity and its reads
+    /// must still reach the device.
     read_limit: u64,
-    /// The fd's file offset: the byte just past the data in `buf`. Advanced
-    /// by every successful fill and set by every successful seek, so the
-    /// logical position is `fd_pos - buf.remaining()`.
-    fd_pos: u64,
+    /// The file offset just past the data in `buf`, possibly unaligned after
+    /// a short transfer. Advanced by every successful fill and set by every
+    /// skip that leaves the buffer, so the logical position is
+    /// `file_pos - buf.remaining()`.
+    file_pos: u64,
+}
+
+/// The raw positional read a [`DirectReader`] fill issues on its file. The
+/// reader's internals take it as a parameter so tests can inject any
+/// sequence of transfers.
+fn pread_file(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt as _;
+    file.read_at(buf, offset)
 }
 
 impl DirectReader {
@@ -147,78 +152,124 @@ impl DirectReader {
 
     /// Skip `n` bytes without materializing data.
     ///
-    /// Discards any buffered bytes that overlap the skip range, then seeks
-    /// the fd. The seek target is aligned down to a page boundary, and the
-    /// buffer is refilled so the read position lands at the correct logical
-    /// offset. This is necessary because O_DIRECT requires page-aligned
-    /// file offsets for `read()`.
+    /// Discards any buffered bytes that overlap the skip range. A target past
+    /// the buffer at an aligned offset is checked against the length captured
+    /// at open and left for the next read. An unaligned one cannot start a
+    /// direct read, so the buffer is refilled from the aligned offset below it
+    /// and the read position lands at the target inside it; a target past the
+    /// end of the file fails there.
     pub(crate) fn skip(&mut self, n: u64) -> io::Result<()> {
+        self.skip_with(n, &mut pread_file)
+    }
+
+    fn skip_with<P>(&mut self, n: u64, pread: &mut P) -> io::Result<()>
+    where
+        P: FnMut(&File, &mut [u8], u64) -> io::Result<usize>,
+    {
+        let past_end = || io::Error::new(io::ErrorKind::UnexpectedEof, "skip past end of file");
         let buffered = self.buf.remaining() as u64;
         if n <= buffered {
             #[allow(clippy::cast_possible_truncation)] // n <= buffered <= buf capacity (usize)
             self.buf.consume(n as usize);
             return Ok(());
         }
-        // Consume remaining buffer, then seek past the rest.
+        // `file_pos` is the byte immediately past the end of the data in
+        // `self.buf`, so the target is `past_buf` beyond it.
         let past_buf = n - buffered;
-        #[allow(clippy::cast_possible_truncation)] // buffered <= buf capacity (usize)
-        self.buf.consume(buffered as usize);
-
-        // `fd_pos` is the byte immediately past the end of the data in
-        // `self.buf`. After the `consume(buffered)` above the buffer is
-        // logically at `fd_pos - 0`, so adding `past_buf` gives the
-        // absolute target.
-        use std::io::{Seek, SeekFrom};
-        let target = self.fd_pos + past_buf;
+        let target = self.file_pos + past_buf;
         let aligned = target & !(self.align as u64 - 1);
-        self.file.seek(SeekFrom::Start(aligned))?;
-        self.fd_pos = aligned;
+        self.buf.clear_for_fill();
 
-        if aligned < target {
-            // Refill buffer from the aligned position, then skip the gap.
-            // gap < align <= buffer capacity, so it always fits in usize.
-            #[allow(clippy::cast_possible_truncation)]
-            let gap = (target - aligned) as usize;
-            let filled = self.fill()?;
-            if filled < gap {
-                self.eof = true;
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "skip past end of file",
-                ));
-            }
-            self.buf.consume(gap);
-        } else {
-            // Already aligned. Seeking can succeed beyond EOF, so validate
-            // the logical target before clearing the buffer.
+        if aligned == target {
+            // Validate the logical target now; the next read starts there.
             if target > self.file_len {
                 self.eof = true;
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "skip past end of file",
-                ));
+                return Err(past_end());
             }
-            // Clear the buffer so the next read refills at the target.
-            self.buf.pos = 0;
-            self.buf.len = 0;
+            self.file_pos = target;
+            return Ok(());
         }
+
+        // Fill from the aligned offset below the target until the buffer
+        // reaches it. A short transfer is rebased by `fill_with`, not taken
+        // for the end of the file, so this ends when the buffer covers the
+        // target or a fill delivers nothing new.
+        self.file_pos = aligned;
+        while self.file_pos < target {
+            match self.fill_with(pread) {
+                Ok(0) => {
+                    self.eof = true;
+                    return Err(past_end());
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        // The buffer starts at or below the target (each fill starts at or
+        // below the `file_pos` it was called with) and ends at `file_pos`.
+        #[allow(clippy::cast_possible_truncation)] // <= buffered bytes (usize)
+        let beyond = (self.file_pos - target) as usize;
+        self.buf.consume(self.buf.remaining() - beyond);
         Ok(())
     }
 
-    /// Refill the buffer from the fd, tracking the fd offset. At or past
-    /// `read_limit` it returns 0 without a syscall: the final short read left
-    /// the fd at an unaligned offset, and a direct read there is not one the
-    /// alignment contract allows. A short read before the limit is not
-    /// guessed to be EOF; the next fill issues its read as before.
-    fn fill(&mut self) -> io::Result<usize> {
-        if self.fd_pos >= self.read_limit {
-            self.buf.pos = 0;
-            self.buf.len = 0;
+    /// Refill the buffer from `file_pos`, returning the new bytes it holds
+    /// (0 at the end of the file). At or past `read_limit` it returns 0
+    /// without a syscall.
+    ///
+    /// `O_DIRECT` reads must start at an aligned offset, and `file_pos` is
+    /// unaligned after a short transfer whose count is not a multiple of the
+    /// alignment: a filesystem whose real alignment is finer than `align`,
+    /// or a regular file's final partial block. So the read starts at the
+    /// aligned offset at or below `file_pos`, re-reading at most one partial
+    /// block, and the read position skips the bytes already served, as
+    /// [`read_aligned`] does. A transfer that adds nothing past `file_pos` is
+    /// the end of the file (a file that shrank after open reads as one that
+    /// ends there).
+    fn fill_with<P>(&mut self, pread: &mut P) -> io::Result<usize>
+    where
+        P: FnMut(&File, &mut [u8], u64) -> io::Result<usize>,
+    {
+        let dst = self.buf.clear_for_fill();
+        if self.file_pos >= self.read_limit {
             return Ok(0);
         }
-        let filled = self.buf.fill_from(&self.file)?;
-        self.fd_pos += filled as u64;
-        Ok(filled)
+        let base = self.file_pos & !(self.align as u64 - 1);
+        #[allow(clippy::cast_possible_truncation)] // file_pos - base < align, a usize
+        let lead = (self.file_pos - base) as usize;
+        let cap = dst.len();
+        let n = pread(&self.file, dst, base)?.min(cap);
+        if n <= lead {
+            return Ok(0);
+        }
+        self.buf.len = n;
+        self.buf.pos = lead;
+        self.file_pos = base + n as u64;
+        Ok(n - lead)
+    }
+
+    fn read_with<P>(&mut self, out: &mut [u8], pread: &mut P) -> io::Result<usize>
+    where
+        P: FnMut(&File, &mut [u8], u64) -> io::Result<usize>,
+    {
+        if self.buf.remaining() == 0 {
+            if self.eof {
+                return Ok(0);
+            }
+            if self.fill_with(pread)? == 0 {
+                self.eof = true;
+                return Ok(0);
+            }
+        }
+        let n = out.len().min(self.buf.remaining());
+        // Safety: read_ptr() is valid for remaining() bytes, and `out` for
+        // `n <= out.len()`; the buffer and `out` are distinct allocations.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.buf.read_ptr(), out.as_mut_ptr(), n);
+        }
+        self.buf.consume(n);
+        Ok(n)
     }
 
     /// Open a file for reading with `O_DIRECT`.
@@ -253,42 +304,14 @@ impl DirectReader {
             eof: false,
             file_len,
             read_limit,
-            fd_pos: 0,
+            file_pos: 0,
         })
     }
 }
 
 impl Read for DirectReader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        // Serve from internal buffer if possible.
-        if self.buf.remaining() > 0 {
-            let n = out.len().min(self.buf.remaining());
-            // Safety: read_ptr() is valid for remaining() bytes.
-            unsafe {
-                std::ptr::copy_nonoverlapping(self.buf.read_ptr(), out.as_mut_ptr(), n);
-            }
-            self.buf.consume(n);
-            return Ok(n);
-        }
-
-        // Buffer exhausted - refill from fd.
-        if self.eof {
-            return Ok(0);
-        }
-
-        let filled = self.fill()?;
-        if filled == 0 {
-            self.eof = true;
-            return Ok(0);
-        }
-
-        // Now serve from the freshly filled buffer.
-        let n = out.len().min(self.buf.remaining());
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.buf.read_ptr(), out.as_mut_ptr(), n);
-        }
-        self.buf.consume(n);
-        Ok(n)
+        self.read_with(out, &mut pread_file)
     }
 }
 
@@ -607,6 +630,203 @@ mod tests {
             .read_exact_at(&mut out, ALIGN as u64 + 1)
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A file of bytes `i % 251` read by a fake `pread` that asserts every
+    /// call is aligned and serves at most `chunks[k]` bytes on call `k` (the
+    /// last entry repeating), or `Interrupted` for a zero entry.
+    struct FakeFile {
+        data: Vec<u8>,
+        chunks: Vec<usize>,
+        calls: usize,
+    }
+
+    impl FakeFile {
+        fn pread(&mut self, dst: &mut [u8], at: u64) -> io::Result<usize> {
+            assert_eq!(at % ALIGN as u64, 0, "unaligned offset {at}");
+            assert_eq!(dst.as_ptr() as usize % ALIGN, 0, "unaligned buffer");
+            assert_eq!(dst.len() % ALIGN, 0, "unaligned length {}", dst.len());
+            let chunk = self.chunks[self.calls.min(self.chunks.len() - 1)];
+            self.calls += 1;
+            if chunk == 0 {
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            let at =
+                usize::try_from(at).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let avail = self.data.len().saturating_sub(at);
+            let n = dst.len().min(avail).min(chunk);
+            if n > 0 {
+                dst[..n].copy_from_slice(&self.data[at..at + n]);
+            }
+            Ok(n)
+        }
+    }
+
+    /// A `DirectReader` whose fills are served by a [`FakeFile`] of `len`
+    /// bytes. The reader is opened over a real scratch file of the same
+    /// length (buffered: the fake ignores it), so the length and regular-file
+    /// limits are the ones `from_opened` takes from the metadata.
+    struct Harness {
+        _dir: tempfile::TempDir,
+        reader: DirectReader,
+        fake: FakeFile,
+    }
+
+    impl Harness {
+        fn new(len: usize, chunks: &[usize]) -> Self {
+            let dir = crate::path_guard::tests::scratch();
+            let path = dir.path().join("sequential.bin");
+            let data: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
+            std::fs::write(&path, &data).unwrap();
+            let file = File::open(&path).unwrap();
+            let reader = DirectReader::from_opened(file, ALIGN, &path).unwrap();
+            Self {
+                _dir: dir,
+                reader,
+                fake: FakeFile {
+                    data,
+                    chunks: chunks.to_vec(),
+                    calls: 0,
+                },
+            }
+        }
+
+        /// One `read` call; `Interrupted` is returned as is.
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let fake = &mut self.fake;
+            self.reader
+                .read_with(out, &mut |_: &File, dst: &mut [u8], at| fake.pread(dst, at))
+        }
+
+        /// Read exactly `want` bytes, retrying `Interrupted`.
+        fn read_exact(&mut self, want: usize) -> io::Result<Vec<u8>> {
+            let mut out = vec![0_u8; want];
+            let mut have = 0;
+            while have < want {
+                match self.read(&mut out[have..]) {
+                    Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                    Ok(n) => have += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(out)
+        }
+
+        /// Everything left, in reads of at most `step` bytes.
+        fn read_to_end(&mut self, step: usize) -> Vec<u8> {
+            let mut all = Vec::new();
+            let mut out = vec![0_u8; step];
+            loop {
+                match self.read(&mut out) {
+                    Ok(0) => return all,
+                    Ok(n) => all.extend_from_slice(&out[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        }
+
+        fn skip(&mut self, n: u64) -> io::Result<()> {
+            let fake = &mut self.fake;
+            self.reader
+                .skip_with(n, &mut |_: &File, dst: &mut [u8], at| fake.pread(dst, at))
+        }
+
+        fn expect(&self, from: usize, len: usize) -> Vec<u8> {
+            self.fake.data[from..from + len].to_vec()
+        }
+    }
+
+    #[test]
+    fn a_sequential_read_rebases_after_unaligned_short_transfers() {
+        // Spans several buffer fills and ends mid block.
+        let len = 3 * IO_BUF_BYTES + 777;
+        for chunks in [
+            &[usize::MAX][..],
+            // Short transfers whose counts are not multiples of ALIGN, as a
+            // filesystem whose real alignment is finer returns; the last
+            // leaves every fill unaligned.
+            &[512, usize::MAX][..],
+            &[ALIGN + 100, usize::MAX][..],
+            &[IO_BUF_BYTES - 1, 3 * ALIGN + 1][..],
+            // Interruptions between and before short transfers.
+            &[0, 700, 0, 0, usize::MAX][..],
+        ] {
+            let mut h = Harness::new(len, chunks);
+            let all = h.read_to_end(10_000);
+            assert!(all == h.fake.data, "{chunks:?}: wrong bytes");
+            // At the end it stays at the end, without another transfer.
+            let calls = h.fake.calls;
+            assert_eq!(h.read(&mut [0_u8; 8]).unwrap(), 0, "{chunks:?}");
+            assert_eq!(h.fake.calls, calls, "{chunks:?}");
+        }
+    }
+
+    #[test]
+    fn a_transfer_adding_nothing_past_the_position_is_the_end() {
+        // The second transfer, rebased to ALIGN, returns no byte past the
+        // 100 already served from that block: a file that shrank reads as
+        // one ending there rather than looping.
+        let mut h = Harness::new(8 * ALIGN, &[ALIGN + 100, 50]);
+        assert_eq!(h.read_to_end(1 << 20), h.expect(0, ALIGN + 100));
+        assert_eq!(h.fake.calls, 2);
+    }
+
+    #[test]
+    fn skips_land_on_their_target_after_short_transfers() {
+        let len = 3 * IO_BUF_BYTES + 777;
+        for chunks in [
+            &[usize::MAX][..],
+            &[512, usize::MAX][..],
+            &[2 * ALIGN + 1][..],
+            &[0, ALIGN + 100, 0, 2 * ALIGN + 1][..],
+            // The first skip's fill is interrupted, then stops 148 bytes
+            // short of its target inside the block: it is refilled, not
+            // taken for the end.
+            &[usize::MAX, 0, 300, usize::MAX][..],
+        ] {
+            let mut h = Harness::new(len, chunks);
+            let mut pos = 0_usize;
+            // `(target, read)`: within the buffer, to an unaligned target
+            // past it, to an aligned one, and to an unaligned one again.
+            for (target, read) in [
+                (0, 10),
+                (15, 100),
+                (IO_BUF_BYTES + 448, 2 * ALIGN),
+                (70 * ALIGN, 1),
+                (70 * ALIGN + IO_BUF_BYTES + 3, 5000),
+            ] {
+                let skip = u64::try_from(target - pos).unwrap();
+                h.skip(skip)
+                    .unwrap_or_else(|e| panic!("{chunks:?} to {target}: {e}"));
+                let got = h.read_exact(read).unwrap();
+                assert!(got == h.expect(target, read), "{chunks:?} at {target}");
+                pos = target + read;
+            }
+            // To the file's end, unaligned: fine, and the next read is EOF.
+            h.skip(u64::try_from(len - pos).unwrap()).unwrap();
+            assert_eq!(h.read_to_end(64), Vec::<u8>::new(), "{chunks:?}");
+        }
+    }
+
+    #[test]
+    fn a_skip_past_the_end_is_unexpected_eof() {
+        let len = 2 * IO_BUF_BYTES + 300;
+        // Unaligned past the end, aligned past the end, unaligned inside the
+        // final partial block's padding, and one byte past.
+        for target in [len as u64 + 5000, 4 * IO_BUF_BYTES as u64, len as u64 + 1] {
+            for chunks in [&[usize::MAX][..], &[2 * ALIGN + 1][..]] {
+                let mut h = Harness::new(len, chunks);
+                h.read_exact(10).unwrap();
+                let err = h.skip(target - 10).unwrap_err();
+                assert_eq!(
+                    err.kind(),
+                    io::ErrorKind::UnexpectedEof,
+                    "{target} {chunks:?}"
+                );
+            }
+        }
     }
 
     #[test]

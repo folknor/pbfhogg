@@ -311,189 +311,153 @@ where
         crate::tunables::DECODE_WORKERS_FALLBACK,
     );
 
-    type WorkerResult = (usize, crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>);
+    // Decode blobs go to the workers; verified passthrough blobs are copied
+    // by the consumer between them, in schedule order. Only a verified blob
+    // is copied raw. An unverified `Candidate` is decoded: its indexdata
+    // claim alone is not grounds to skip the filter.
+    let decode_at: Vec<usize> = schedule
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| !matches!(d.passthrough, Passthrough::Verified { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    let decode_at = &decode_at;
+    let mut consumer = PreadConsumer {
+        interleaved: crate::ordered_pool::Interleaved::new(decode_at, schedule.len()),
+        schedule,
+        file: &shared_file,
+        frame_read_buf: Vec::new(),
+        writer,
+        stats,
+        cancel: &host.cancel,
+    };
 
-    // Split schedule: decode blobs go to workers, passthrough blobs handled by consumer.
-    // Both are re-sequenced for the reorder buffer.
-    // (global_seq, data_offset, data_size, frame_offset)
-    let mut decode_items: Vec<(usize, u64, usize, u64)> = Vec::new();
-    // (global_seq, frame_offset, frame_size, observed node count)
-    let mut passthrough_items: Vec<(usize, u64, usize, u64)> = Vec::new();
-    for (i, d) in schedule.iter().enumerate() {
-        // Only a verified blob is copied raw. An unverified `Candidate` is
-        // decoded: its indexdata claim alone is not grounds to skip the
-        // filter.
-        if let Passthrough::Verified { nodes } = d.passthrough {
-            passthrough_items.push((i, d.frame_offset, d.frame_size, nodes));
-        } else {
-            decode_items.push((i, d.offset, d.size, d.frame_offset));
-        }
+    let mut workers = vec![(); decode_threads];
+    crate::ordered_pool::run_ordered(
+        consumer.interleaved.decode_count(),
+        &mut workers,
+        crate::ordered_pool::PoolConfig {
+            window: crate::ordered_pool::default_window(decode_threads),
+            cancel: &host.cancel,
+            waits: crate::ordered_pool::Waits::default(),
+        },
+        |_| PreadLocal {
+            read_buf: Vec::new(),
+            bb: BlockBuilder::new(),
+            output_blocks: Vec::new(),
+            pool: crate::blob::DecompressPool::new(),
+            st_scratch: Vec::new(),
+            gr_scratch: Vec::new(),
+        },
+        |(), local: &mut PreadLocal, ordinal| {
+            let d = &schedule[decode_at[ordinal]];
+            // Workers: pread -> decompress -> PrimitiveBlock -> extract -> OwnedBlocks.
+            (|| -> crate::error::Result<(Vec<OwnedBlock>, ExtractStats)> {
+                local.read_buf.resize(d.size, 0);
+                shared_file.read_exact_at(&mut local.read_buf, d.offset)?;
+                let mut buf = crate::blob::pool_get(
+                    Some(&local.pool),
+                    d.size * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
+                );
+                crate::blob::decompress_blob_raw(&local.read_buf, &mut buf)?;
+                let block = PrimitiveBlock::from_vec_pooled_with_scratch(
+                    buf,
+                    &local.pool,
+                    &mut local.st_scratch,
+                    &mut local.gr_scratch,
+                )?;
+                local.output_blocks.clear();
+                let block_stats = block_fn(&block, &mut local.bb, &mut local.output_blocks)?;
+                flush_local(&mut local.bb, &mut local.output_blocks)?;
+                Ok((std::mem::take(&mut local.output_blocks), block_stats))
+            })()
+            // Cold: only a failure builds the location.
+            .map_err(|e| {
+                e.locate(crate::error::Location::new(
+                    Some(source),
+                    None,
+                    Some(crate::ByteOffset(d.frame_offset)),
+                ))
+            })
+        },
+        &mut consumer,
+    )?;
+    for position in consumer.interleaved.rest() {
+        consumer.passthrough(position)?;
     }
+    Ok(())
+}
 
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize, u64)>(
-        crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
-    );
-    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (result_tx, result_rx) =
-        std::sync::mpsc::sync_channel::<WorkerResult>(crate::tunables::POOL_RESULT_CHANNEL_DEPTH);
+/// One `pread_execute` worker's thread-local state.
+struct PreadLocal {
+    read_buf: Vec<u8>,
+    bb: BlockBuilder,
+    output_blocks: Vec<OwnedBlock>,
+    pool: std::sync::Arc<crate::blob::DecompressPool>,
+    st_scratch: Vec<(u32, u32)>,
+    gr_scratch: Vec<(u32, u32)>,
+}
 
-    std::thread::scope(|scope| -> Result<()> {
-        // Dispatcher: feed decode-only blobs to workers.
-        // Passthrough blobs are handled directly by the consumer.
-        scope.spawn(move || {
-            for item in decode_items {
-                if desc_tx.send(item).is_err() {
-                    break;
-                }
-            }
-        });
+/// `pread_execute`'s consumer: worker `OwnedBlock`s and passthrough raw
+/// frames, merged in schedule order.
+///
+/// A raw frame keeps the input's BlobHeader, indexdata and tagdata
+/// included. Verification (see `Passthrough`) proved the payload belongs in
+/// the region, not that its header is true, so a false `count` or ID range
+/// carries into the output, where the next run believes it again.
+/// Deliberate: re-indexing would cost the scan the raw copy exists to skip,
+/// and claims are believed, not verified (reference/indexdata-trust.md).
+struct PreadConsumer<'a> {
+    interleaved: crate::ordered_pool::Interleaved<'a>,
+    schedule: &'a [BlobDesc],
+    file: &'a std::fs::File,
+    frame_read_buf: Vec<u8>,
+    writer: &'a mut PbfWriter<crate::file_writer::FileWriter>,
+    stats: &'a mut ExtractStats,
+    cancel: &'a crate::host::Cancel,
+}
 
-        // Workers: pread → decompress → PrimitiveBlock → extract → OwnedBlocks.
-        for _ in 0..decode_threads {
-            let rx = std::sync::Arc::clone(&desc_rx);
-            let tx = result_tx.clone();
-            let file = std::sync::Arc::clone(&shared_file);
-            let block_fn_ref = &block_fn;
-            scope.spawn(move || {
-                let mut read_buf: Vec<u8> = Vec::new();
-                let mut bb = BlockBuilder::new();
-                let mut output_blocks: Vec<OwnedBlock> = Vec::new();
-                let worker_pool = crate::blob::DecompressPool::new();
-                let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-                let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+impl PreadConsumer<'_> {
+    /// Read the raw frame at schedule position `position` and write it
+    /// without decode/re-encode.
+    fn passthrough(&mut self, position: usize) -> Result<()> {
+        use std::os::unix::fs::FileExt as _;
+        self.cancel.check()?;
+        let d = &self.schedule[position];
+        let Passthrough::Verified { nodes } = d.passthrough else {
+            return Err(crate::error::Error::internal(
+                "extract: a decode blob was scheduled as passthrough",
+            ));
+        };
+        self.frame_read_buf.resize(d.frame_size, 0);
+        self.file
+            .read_exact_at(&mut self.frame_read_buf, d.frame_offset)?;
+        self.writer
+            .write_raw_owned(std::mem::take(&mut self.frame_read_buf))?;
+        self.stats.nodes_in_bbox += nodes;
+        Ok(())
+    }
+}
 
-                loop {
-                    let (s, data_offset, data_size, frame_offset) = {
-                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match guard.recv() {
-                            Ok(d) => d,
-                            Err(_) => break,
-                        }
-                    };
-
-                    let r: crate::error::Result<(Vec<OwnedBlock>, ExtractStats)> =
-                        (|| -> crate::error::Result<(Vec<OwnedBlock>, ExtractStats)> {
-                            read_buf.resize(data_size, 0);
-                            file.read_exact_at(&mut read_buf, data_offset)?;
-
-                            // Decode path: full PrimitiveBlock, extract, OwnedBlocks.
-                            let mut buf = crate::blob::pool_get(
-                                Some(&worker_pool),
-                                data_size * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
-                            );
-                            crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
-                            let block = PrimitiveBlock::from_vec_pooled_with_scratch(
-                                buf,
-                                &worker_pool,
-                                &mut st_scratch,
-                                &mut gr_scratch,
-                            )?;
-                            output_blocks.clear();
-                            let block_stats = block_fn_ref(&block, &mut bb, &mut output_blocks)?;
-                            flush_local(&mut bb, &mut output_blocks)?;
-                            Ok((std::mem::take(&mut output_blocks), block_stats))
-                        })()
-                        // Cold: only a failure builds the location.
-                        .map_err(|e| {
-                            e.locate(crate::error::Location::new(
-                                Some(source),
-                                None,
-                                Some(crate::ByteOffset(frame_offset)),
-                            ))
-                        });
-                    if tx.send((s, r)).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        drop(desc_rx);
-        drop(result_tx);
-
-        // Consumer: merge two streams - worker OwnedBlocks + passthrough raw frames.
-        // Both use the reorder buffer keyed by global sequence number.
-        // Passthrough blobs: consumer reads raw frame directly, writes via write_raw_owned.
-        // Worker blobs: consumer receives OwnedBlocks, writes via write_primitive_block_owned.
-        //
-        // A raw frame keeps the input's BlobHeader, indexdata and tagdata
-        // included. Verification (see `Passthrough`) proved the payload
-        // belongs in the region, not that its header is true, so a false
-        // `count` or ID range carries into the output, where the next run
-        // believes it again. Deliberate: re-indexing would cost the scan the
-        // raw copy exists to skip, and claims are believed, not verified
-        // (reference/indexdata-trust.md).
-
-        enum ConsumerItem {
-            Decoded(crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>),
-            // (frame_offset, frame_size, node count observed by classify)
-            Passthrough(u64, usize, u64),
-        }
-
-        let mut reorder: crate::reorder_buffer::ReorderBuffer<ConsumerItem> =
-            crate::reorder_buffer::ReorderBuffer::with_capacity(
-                crate::tunables::POOL_REORDER_CAPACITY,
-            );
-
-        // Pre-insert passthrough items into the reorder buffer.
-        for &(seq, frame_offset, frame_size, count) in &passthrough_items {
-            reorder.push(
-                seq,
-                ConsumerItem::Passthrough(frame_offset, frame_size, count),
-            );
-        }
-
-        // Drain worker results into the reorder buffer.
-        let mut frame_read_buf: Vec<u8> = Vec::new();
-        // Cancellation is checked per result on this consumer; an early
-        // return drops the receiver (moved into this loop), which fails the
-        // workers' sends and then the dispatcher's.
-        for (s, item) in result_rx {
-            host.cancel.check()?;
-            reorder.push(s, ConsumerItem::Decoded(item));
-
-            while let Some(ci) = reorder.pop_ready() {
-                match ci {
-                    ConsumerItem::Decoded(r) => {
-                        let (blocks, block_stats) = r?;
-                        merge_extract_stats(stats, &block_stats);
-                        for block in blocks {
-                            writer.write_primitive_block_owned(block)?;
-                        }
-                    }
-                    ConsumerItem::Passthrough(frame_offset, frame_size, count) => {
-                        // Read raw frame directly and write without decode/re-encode.
-                        frame_read_buf.resize(frame_size, 0);
-                        shared_file.read_exact_at(&mut frame_read_buf, frame_offset)?;
-                        writer.write_raw_owned(std::mem::take(&mut frame_read_buf))?;
-                        stats.nodes_in_bbox += count;
-                    }
-                }
-            }
-        }
-
-        // Drain any remaining passthrough items after workers are done.
-        host.cancel.check()?;
-        while let Some(ci) = reorder.pop_ready() {
-            match ci {
-                ConsumerItem::Decoded(r) => {
-                    let (blocks, block_stats) = r?;
-                    merge_extract_stats(stats, &block_stats);
-                    for block in blocks {
-                        writer.write_primitive_block_owned(block)?;
-                    }
-                }
-                ConsumerItem::Passthrough(frame_offset, frame_size, count) => {
-                    frame_read_buf.resize(frame_size, 0);
-                    shared_file.read_exact_at(&mut frame_read_buf, frame_offset)?;
-                    writer.write_raw_owned(std::mem::take(&mut frame_read_buf))?;
-                    stats.nodes_in_bbox += count;
-                }
-            }
+impl crate::ordered_pool::OrderedConsumer<(Vec<OwnedBlock>, ExtractStats)> for PreadConsumer<'_> {
+    fn before_item(&mut self, ordinal: usize) -> crate::Result<()> {
+        for position in self.interleaved.before(ordinal) {
+            self.passthrough(position)?;
         }
         Ok(())
-    })?;
+    }
 
-    Ok(())
+    fn consume(
+        &mut self,
+        _ordinal: usize,
+        (blocks, block_stats): (Vec<OwnedBlock>, ExtractStats),
+    ) -> crate::Result<()> {
+        merge_extract_stats(self.stats, &block_stats);
+        for block in blocks {
+            self.writer.write_primitive_block_owned(block)?;
+        }
+        Ok(())
+    }
 }
 
 /// Convenience: build schedule + execute + flush. Used by complete/smart write passes.

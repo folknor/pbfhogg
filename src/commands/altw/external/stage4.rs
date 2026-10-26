@@ -31,7 +31,6 @@ use super::blob_meta::BlobMeta;
 /// index. Share eligibility policy, but keep these backend-specific fields
 /// and the measured dispatch/reorder pipelines local.
 struct BlobDescriptor {
-    seq: usize,
     /// Start of the on-disk 4-byte length prefix. Used by the consumer-side
     /// raw passthrough path to pread the entire framed blob (header + data)
     /// and hand it verbatim to `PbfWriter::write_raw_owned`.
@@ -144,6 +143,112 @@ fn load_ref_count_sidecar_in(path: &Path, total_slots: u64) -> Result<Vec<u64>> 
 // Stage 4: Assembly
 // ---------------------------------------------------------------------------
 
+/// One stage 4 decode worker's thread-local buffers, reused across blobs.
+struct S4Local {
+    read_buf: Vec<u8>,
+    decompress_buf: Vec<u8>,
+    bb: BlockBuilder,
+    output_blocks: Vec<OwnedBlock>,
+    way_reframe_scratch: WayReframeScratch,
+    reframe_output: Vec<u8>,
+    /// Per-blob coord payload buffer.
+    coord_payload_buf: Vec<u8>,
+}
+
+/// Stage 4's consumer: decoded blobs from the workers and passthrough raw
+/// frames it preads itself, written in schedule order. `write_raw_owned`
+/// hands the pre-framed bytes to the writer thread verbatim. Its counters
+/// are plain fields on the single consumer thread.
+struct S4Consumer<'a> {
+    interleaved: crate::ordered_pool::Interleaved<'a>,
+    schedule: &'a [BlobDescriptor],
+    file: &'a std::fs::File,
+    input: &'a Path,
+    frame_read_buf: Vec<u8>,
+    writer: &'a mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
+    total_stats: Stats,
+    bytes_written: u64,
+    write_calls: u64,
+    write_ms: u64,
+    passthrough_blobs: u64,
+    passthrough_pread_ms: u64,
+    passthrough_bytes: u64,
+    cancel: &'a crate::host::Cancel,
+}
+
+impl S4Consumer<'_> {
+    /// pread the passthrough frame at schedule position `position` and write
+    /// it verbatim.
+    fn passthrough(&mut self, position: usize) -> Result<()> {
+        use std::os::unix::fs::FileExt as _;
+        self.cancel.check()?;
+        let desc = &self.schedule[position];
+        let (frame_offset, frame_size) = (desc.frame_offset, desc.frame_size);
+        let t_pread = crate::counters::Stopwatch::start();
+        self.frame_read_buf.resize(frame_size, 0);
+        self.file
+            .read_exact_at(&mut self.frame_read_buf, frame_offset)
+            .map_err(|e| {
+                Error::from(e).locate(crate::error::Location::at_offset(self.input, frame_offset))
+            })?;
+        self.passthrough_pread_ms += t_pread.elapsed_ms();
+        self.passthrough_bytes += frame_size as u64;
+
+        let t_w = crate::counters::Stopwatch::start();
+        self.bytes_written += frame_size as u64;
+        self.write_calls += 1;
+        self.writer.write_raw_owned(std::mem::replace(
+            &mut self.frame_read_buf,
+            Vec::with_capacity(frame_size),
+        ))?;
+        self.write_ms += t_w.elapsed_ms();
+
+        self.passthrough_blobs += 1;
+        self.total_stats.blobs_passthrough += 1;
+        match desc.kind {
+            crate::ElementKind::Node => {
+                self.total_stats.nodes_read += desc.count;
+                self.total_stats.nodes_written += desc.count;
+            }
+            crate::ElementKind::Relation => {
+                self.total_stats.relations_written += desc.count;
+            }
+            crate::ElementKind::Way => {
+                // Ways never pass through (they need coord_payloads
+                // splicing). Fall through without touching stats;
+                // unreachable in practice but we avoid a hard panic here
+                // since this is on the output path.
+            }
+        }
+        Ok(())
+    }
+}
+
+impl crate::ordered_pool::OrderedConsumer<(Vec<OwnedBlock>, Stats)> for S4Consumer<'_> {
+    fn before_item(&mut self, ordinal: usize) -> crate::Result<()> {
+        for position in self.interleaved.before(ordinal) {
+            self.passthrough(position)?;
+        }
+        Ok(())
+    }
+
+    fn consume(
+        &mut self,
+        _ordinal: usize,
+        (blocks, block_stats): (Vec<OwnedBlock>, Stats),
+    ) -> crate::Result<()> {
+        self.total_stats.merge(&block_stats);
+        for block in blocks {
+            self.bytes_written += block.bytes.len() as u64;
+            self.write_calls += 1;
+            let t_w = crate::counters::Stopwatch::start();
+            self.writer.write_primitive_block_owned(block)?;
+            self.write_ms += t_w.elapsed_ms();
+        }
+        Ok(())
+    }
+}
+
 /// Assembly pass: re-read the PBF, attach coordinates from per-blob
 /// coord_payloads preads to ways.
 /// P2c: pread-from-workers with pre-scan schedule for parallel decompress + assembly.
@@ -183,7 +288,6 @@ pub(super) fn stage4_assembly(
     let mut schedule: Vec<BlobDescriptor> = Vec::new();
     let mut way_sidecar_idx: usize = 0;
     let mut skipped_node_blobs: u64 = 0;
-    let mut seq: usize = 0;
 
     // Stage 4 schedule diagnostics.
     let mut s4_node_blobs_total: u64 = 0;
@@ -249,7 +353,6 @@ pub(super) fn stage4_assembly(
         let frame_size = (meta.data_offset - meta.frame_offset) as usize + meta.data_size;
 
         schedule.push(BlobDescriptor {
-            seq,
             frame_offset: meta.frame_offset,
             frame_size,
             data_offset: meta.data_offset,
@@ -260,7 +363,6 @@ pub(super) fn stage4_assembly(
             count: meta.count,
             way_blob_idx,
         });
-        seq += 1;
     }
 
     // Verify all sidecar entries were consumed.
@@ -302,37 +404,24 @@ pub(super) fn stage4_assembly(
     crate::debug::emit_counter("s4_decode_thread_count", decode_threads);
 
     // Split schedule: passthrough-eligible blobs (relations always; node
-    // blobs when keep_untagged_nodes=true) are handled by the consumer
-    // thread via direct pread + write_raw_owned. Decode blobs (ways and
-    // the remaining filtered node blobs) go to workers. This mirrors the
-    // extract.rs pread_execute pattern so raw-frame traffic never hits
-    // the worker channel.
-    let (decode_items, passthrough_items): (Vec<BlobDescriptor>, Vec<BlobDescriptor>) =
-        schedule.into_iter().partition(|d| !d.is_passthrough);
-
-    type DecodedItem = (usize, crate::error::Result<(Vec<OwnedBlock>, Stats)>);
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(
-        crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
-    );
-    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    // Result channel depth: see `POOL_RESULT_CHANNEL_DEPTH` for why 32 is
-    // right here.
-    let (decoded_tx, decoded_rx) =
-        std::sync::mpsc::sync_channel::<DecodedItem>(crate::tunables::POOL_RESULT_CHANNEL_DEPTH);
-
-    let mut total_stats = Stats::default();
+    // blobs when keep_untagged_nodes=true) are copied by the consumer
+    // thread via direct pread + write_raw_owned, between the decoded ones.
+    // Decode blobs (ways and the remaining filtered node blobs) go to the
+    // workers of the ordered pool, which runs over them alone, so raw-frame
+    // traffic never takes a worker, a channel slot or a window slot. This
+    // mirrors extract's `pread_execute`.
+    let decode_at: Vec<usize> = schedule
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| !d.is_passthrough)
+        .map(|(i, _)| i)
+        .collect();
+    let decode_at = &decode_at;
+    let schedule = &schedule;
 
     // Worker-side cumulative counters.
     let worker_counters = Stage4WorkerCounters::new();
     let c = &worker_counters;
-    // Channel depth gauge (workers ++ before send, consumer -- after
-    // recv); its high-water is `Stage4WorkerCounters::channel_high_water`.
-    let s4_channel_depth = std::sync::atomic::AtomicUsize::new(0);
-    // Consumer-side passthrough telemetry.
-    let mut s4_passthrough_blobs: u64 = 0;
-    let mut s4_passthrough_pread_ms: u64 = 0;
-    let mut s4_passthrough_bytes: u64 = 0;
-    let s4_channel_depth_ref = &s4_channel_depth;
     let way_reframe_counters = WayReframeCounters::new();
     let way_reframe_cref = &way_reframe_counters;
 
@@ -341,421 +430,246 @@ pub(super) fn stage4_assembly(
     // `brokkr sidecar --durations`; `--stalls` reads `*_wait_ns` counters,
     // not these spans. Entered only after a failed try_send,
     // so unblocked sends never touch the gauge lock.
-    let s4_send_stall = super::StallGauge::new("WAIT_S4_SEND_START", "WAIT_S4_SEND_END");
-    let s4_send_stall_ref = &s4_send_stall;
+    let s4_send_stall = crate::counters::StallGauge::new("WAIT_S4_SEND_START", "WAIT_S4_SEND_END");
+    // The consumer's receive wait, in whole milliseconds per sample as it
+    // always was.
+    let s4_recv_ms = std::sync::atomic::AtomicU64::new(0);
 
-    // Consumer-side counters.
-    let mut s4_recv_ms: u64 = 0;
-    let mut s4_write_ms: u64 = 0;
-    let mut s4_bytes_written: u64 = 0;
-    let mut s4_write_calls: u64 = 0;
+    let mut consumer = S4Consumer {
+        interleaved: crate::ordered_pool::Interleaved::new(decode_at, schedule.len()),
+        schedule,
+        file: &shared_file,
+        input,
+        frame_read_buf: Vec::new(),
+        writer: &mut writer,
+        total_stats: Stats::default(),
+        bytes_written: 0,
+        write_calls: 0,
+        write_ms: 0,
+        passthrough_blobs: 0,
+        passthrough_pread_ms: 0,
+        passthrough_bytes: 0,
+        cancel: &host.cancel,
+    };
 
     // Worker errors are located against the input once per worker pool, not
     // per blob.
     let source_arc: std::sync::Arc<Path> = std::sync::Arc::from(input);
     let source = &source_arc;
-    std::thread::scope(|scope| -> Result<()> {
-        // Dispatcher: feed only decode-eligible blobs into the worker
-        // channel. Passthrough blobs bypass workers entirely (see
-        // consumer loop below) and never travel through this channel.
-        scope.spawn(move || {
-            for desc in decode_items {
-                if desc_tx.send(desc).is_err() {
-                    break;
-                }
-            }
-        });
-
-        // Worker threads: pread → decompress → PrimitiveBlock → assemble.
-        // Dedicated threads, NOT global rayon (PbfWriter uses rayon for compression).
-        for _ in 0..decode_threads {
-            let rx = std::sync::Arc::clone(&desc_rx);
-            let tx = decoded_tx.clone();
-            let file = std::sync::Arc::clone(&shared_file);
-            scope.spawn(move || {
-                use std::sync::atomic::Ordering::Relaxed;
-                let mut read_buf: Vec<u8> = Vec::new();
-                let mut decompress_buf: Vec<u8> = Vec::new();
-                let mut bb = BlockBuilder::new();
-                let mut output_blocks: Vec<OwnedBlock> = Vec::new();
-                let mut way_reframe_scratch = WayReframeScratch::new();
-                let mut reframe_output: Vec<u8> = Vec::new();
-                // Per-blob coord payload buffer (prototype path only). Reused
-                // across blobs within this worker.
-                let mut coord_payload_buf: Vec<u8> = Vec::new();
-
-                loop {
-                    let desc = {
-                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match guard.recv() {
-                            Ok(d) => d,
-                            Err(_) => break,
-                        }
-                    };
-
-                    // Only errors about the input frame itself are located
-                    // there. A router abort or a read of a worker scratch
-                    // file says nothing about this input blob and stays
-                    // unlocated.
-                    let at_frame = |e: Error| {
-                        e.locate(crate::error::Location::new(
-                            Some(source),
-                            None,
-                            Some(crate::ByteOffset(desc.frame_offset)),
-                        ))
-                    };
-                    let result: crate::error::Result<(Vec<OwnedBlock>, Stats)> =
-                        (|| -> crate::error::Result<(Vec<OwnedBlock>, Stats)> {
-                            // For way blobs: block on the router's readiness
-                            // BEFORE the input pread/decompress so a stalled
-                            // decode thread never holds an already-expanded
-                            // block + StringTable resident. Non-way blobs skip
-                            // this entirely - they never consume a coord payload.
-                            if desc.is_way_blob {
-                                let t_wait = crate::counters::Stopwatch::start();
-                                coord_payloads_reader.wait_ready(desc.way_blob_idx)?;
-                                // One sample feeds the total, the count and
-                                // the maximum.
-                                let wait_ns = t_wait.elapsed_ns();
-                                if wait_ns > 0 {
-                                    c.readiness_wait_ns.fetch_add(wait_ns, Relaxed);
-                                    c.readiness_wait_blobs.fetch_add(1, Relaxed);
-                                    record_max(&c.readiness_wait_max_ns, wait_ns);
-                                }
-                            }
-
-                            let t0 = crate::counters::Stopwatch::start();
-                            read_buf.resize(desc.data_size, 0);
-                            file.read_exact_at(&mut read_buf, desc.data_offset)
-                                .map_err(|e| at_frame(Error::from(e)))?;
-                            t0.record_ms(&c.pread_ms);
-                            c.bytes_read.fetch_add(desc.data_size as u64, Relaxed);
-                            c.pread_calls.fetch_add(1, Relaxed);
-
-                            let t1 = crate::counters::Stopwatch::start();
-                            crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
-                                .map_err(at_frame)?;
-                            t1.record_ms(&c.decompress_ms);
-
-                            let t2 = crate::counters::Stopwatch::start();
-                            output_blocks.clear();
-
-                            if desc.is_way_blob {
-                                // Read this blob's coord_payloads payload into a
-                                // worker-local buffer before reframe.
-                                let t_cpread = crate::counters::Stopwatch::start();
-                                coord_payloads_reader.pread_blob_payload(
-                                    desc.way_blob_idx,
-                                    &mut coord_payload_buf,
-                                )?;
-                                t_cpread.record_ms(&c.coord_payload_pread_ms);
-                                c.coord_payload_bytes
-                                    .fetch_add(coord_payload_buf.len() as u64, Relaxed);
-
-                                // Wire-format reframe: splice locations without
-                                // full PrimitiveBlock decode or BlockBuilder.
-                                let (way_count, min_id, max_id) = reframe_way_blob_with_locations(
-                                    &decompress_buf,
-                                    &coord_payload_buf,
-                                    per_way_rcs.blob_record(desc.way_blob_idx),
-                                    desc.way_blob_idx,
-                                    &mut reframe_output,
-                                    &mut way_reframe_scratch,
-                                    way_reframe_cref,
-                                    member_way_ids,
-                                    inject_prepass,
-                                )
-                                .map_err(at_frame)?;
-
-                                let index = crate::blob_meta::BlobIndex {
-                                    kind: crate::ElementKind::Way,
-                                    min_id,
-                                    max_id,
-                                    count: way_count,
-                                    bbox: None,
-                                };
-                                let taken = std::mem::take(&mut reframe_output);
-                                reframe_output.reserve(taken.len());
-                                output_blocks.push(OwnedBlock {
-                                    bytes: taken,
-                                    index,
-                                    tagdata: None,
-                                    way_members: inject_prepass.then(|| {
-                                        let payload =
-                                            crate::commands::altw::reframe::way_members_payload(
-                                                way_count,
-                                                &way_reframe_scratch.member_ways,
-                                            );
-                                        inject_metrics.record_blob(
-                                            way_reframe_scratch.pin_tally,
-                                            payload.len(),
-                                        );
-                                        payload
-                                    }),
-                                });
-
-                                let block_stats = Stats {
-                                    ways_written: way_count,
-                                    blobs_decoded: 1,
-                                    ..Stats::default()
-                                };
-                                // One sample, so the pair agrees exactly.
-                                let elapsed = t2.elapsed_ms();
-                                c.assemble_ms.fetch_add(elapsed, Relaxed);
-                                c.way_reframe_ms.fetch_add(elapsed, Relaxed);
-                                c.blobs.fetch_add(1, Relaxed);
-                                c.way_blobs_processed.fetch_add(1, Relaxed);
-                                return Ok((std::mem::take(&mut output_blocks), block_stats));
-                            }
-
-                            // Non-way blobs: full PrimitiveBlock decode + BlockBuilder.
-                            // `decompress_buf` is already an owned, unshared Vec, so
-                            // parse it in place with `from_vec`; the old
-                            // `PrimitiveBlock::new(Bytes::from(vec))` wrapped it as
-                            // Bytes only to copy it straight back out via `to_vec()`.
-                            let block =
-                                PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))
-                                    .map_err(at_frame)?;
-                            let mut block_stats = assemble_block(
-                                &block,
-                                &mut bb,
-                                &mut output_blocks,
-                                keep_untagged_nodes,
-                                relation_member_node_ids,
-                            )
-                            .map_err(at_frame)?;
-                            block_stats.blobs_decoded = 1;
-                            flush_local(&mut bb, &mut output_blocks).map_err(at_frame)?;
-                            let elapsed = t2.elapsed_ms();
-                            c.assemble_ms.fetch_add(elapsed, Relaxed);
-                            c.nonway_assemble_ms.fetch_add(elapsed, Relaxed);
-                            c.nonway_blobs_processed.fetch_add(1, Relaxed);
-
-                            if decompress_buf.capacity() == 0 {
-                                decompress_buf = Vec::new();
-                            }
-
-                            c.blobs.fetch_add(1, Relaxed);
-
-                            Ok((std::mem::take(&mut output_blocks), block_stats))
-                        })();
-
-                    // Track max live buffer bytes for this worker.
-                    {
-                        let worker_bytes = read_buf.capacity() as u64
-                            + decompress_buf.capacity() as u64
-                            + reframe_output.capacity() as u64;
-                        record_max(&c.max_worker_buf_bytes, worker_bytes);
-                    }
-
-                    let t3 = crate::counters::Stopwatch::start();
-                    // Bump channel depth before send and update the
-                    // high-water mark with the post-bump value (i.e.
-                    // the depth the channel will hold once this send
-                    // completes). Bounded `sync_channel` blocks here
-                    // when full, so the recorded value still reflects
-                    // a real moment of saturation.
-                    let depth_after =
-                        s4_channel_depth_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    record_max(&c.channel_high_water, depth_after as u64);
-                    match tx.try_send((desc.seq, result)) {
-                        Ok(()) => {}
-                        Err(std::sync::mpsc::TrySendError::Full(item)) => {
-                            let _stall = s4_send_stall_ref.track();
-                            if tx.send(item).is_err() {
-                                break;
-                            }
-                        }
-                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
-                    }
-                    t3.record_ms(&c.send_ms);
-                }
-            });
-        }
-        drop(desc_rx);
-        drop(decoded_tx);
-        // Owned by this closure, so any early return (a write error, a
-        // cancellation) drops it before the scope joins the workers. Borrowed,
-        // it outlived the closure, and a worker parked in a full `send` held
-        // the join forever.
-        let decoded_rx = decoded_rx;
-
-        // Consumer: reorder + write to PbfWriter. Decode results arrive
-        // from workers; passthrough items are pre-seeded and the consumer
-        // preads their raw frames inline when they become the head of the
-        // reorder buffer. `write_raw_owned` hands the pre-framed bytes to
-        // the writer thread verbatim.
-        enum ConsumerItem {
-            Decoded(crate::error::Result<(Vec<OwnedBlock>, Stats)>),
-            Passthrough {
-                frame_offset: u64,
-                frame_size: usize,
-                count: u64,
-                kind: crate::ElementKind,
+    // Worker threads: pread -> decompress -> PrimitiveBlock -> assemble.
+    // Dedicated threads, NOT global rayon (PbfWriter uses rayon for
+    // compression). Cancellation is checked on the consumer; workers parked
+    // in `wait_ready` are woken by stage 3, which observes the same token
+    // per bucket and aborts the router.
+    let mut workers = vec![(); decode_threads];
+    crate::ordered_pool::run_ordered(
+        decode_at.len(),
+        &mut workers,
+        crate::ordered_pool::PoolConfig {
+            window: crate::ordered_pool::default_window(decode_threads),
+            cancel: &host.cancel,
+            waits: crate::ordered_pool::Waits {
+                recv: Some(crate::ordered_pool::Timer::Ms(&s4_recv_ms)),
+                send: Some(crate::ordered_pool::Timer::Ms(&c.send_ms)),
+                send_stall: Some(&s4_send_stall),
+                queue_high_water: Some(&c.channel_high_water),
+                ..crate::ordered_pool::Waits::default()
             },
-        }
+        },
+        |_| S4Local {
+            read_buf: Vec::new(),
+            decompress_buf: Vec::new(),
+            bb: BlockBuilder::new(),
+            output_blocks: Vec::new(),
+            way_reframe_scratch: WayReframeScratch::new(),
+            reframe_output: Vec::new(),
+            coord_payload_buf: Vec::new(),
+        },
+        |(), l: &mut S4Local, ordinal| {
+            use std::sync::atomic::Ordering::Relaxed;
+            let desc = &schedule[decode_at[ordinal]];
+            let file = &shared_file;
 
-        // Pre-size to fit the full passthrough seed plus one in-flight decode
-        // result per worker. Without this the default-capacity buffer (32)
-        // grows as every passthrough descriptor is pushed below, and planet
-        // runs with `keep_untagged_nodes=true` seed ~40K entries.
-        let mut reorder: crate::reorder_buffer::ReorderBuffer<ConsumerItem> =
-            crate::reorder_buffer::ReorderBuffer::with_capacity(
-                passthrough_items.len() + decode_threads,
-            );
-
-        // Pre-seed passthrough items at their global seq positions.
-        // Every descriptor has a kind from the required indexdata.
-        for desc in &passthrough_items {
-            reorder.push(
-                desc.seq,
-                ConsumerItem::Passthrough {
-                    frame_offset: desc.frame_offset,
-                    frame_size: desc.frame_size,
-                    count: desc.count,
-                    kind: desc.kind,
-                },
-            );
-        }
-
-        let mut frame_read_buf: Vec<u8> = Vec::new();
-
-        // Drain helper: pop consecutive ready items. Shared between the
-        // main result loop and the final drain for schedules that end
-        // on a passthrough tail (no decode result arrives to push it).
-        let mut drain = |reorder: &mut crate::reorder_buffer::ReorderBuffer<ConsumerItem>,
-                         total_stats: &mut Stats,
-                         s4_bytes_written: &mut u64,
-                         s4_write_calls: &mut u64,
-                         s4_write_ms: &mut u64,
-                         s4_passthrough_blobs: &mut u64,
-                         s4_passthrough_pread_ms: &mut u64,
-                         s4_passthrough_bytes: &mut u64|
-         -> Result<()> {
-            while let Some(item) = reorder.pop_ready() {
-                match item {
-                    ConsumerItem::Decoded(result) => {
-                        let (blocks, block_stats) = result?;
-                        total_stats.merge(&block_stats);
-                        for block in blocks {
-                            *s4_bytes_written += block.bytes.len() as u64;
-                            *s4_write_calls += 1;
-                            let t_w = crate::counters::Stopwatch::start();
-                            writer.write_primitive_block_owned(block)?;
-                            *s4_write_ms += t_w.elapsed_ms();
-                        }
-                    }
-                    ConsumerItem::Passthrough {
-                        frame_offset,
-                        frame_size,
-                        count,
-                        kind,
-                    } => {
-                        let t_pread = crate::counters::Stopwatch::start();
-                        frame_read_buf.resize(frame_size, 0);
-                        shared_file
-                            .read_exact_at(&mut frame_read_buf, frame_offset)
-                            .map_err(|e| {
-                                Error::from(e)
-                                    .locate(crate::error::Location::at_offset(input, frame_offset))
-                            })?;
-                        *s4_passthrough_pread_ms += t_pread.elapsed_ms();
-                        *s4_passthrough_bytes += frame_size as u64;
-
-                        let t_w = crate::counters::Stopwatch::start();
-                        *s4_bytes_written += frame_size as u64;
-                        *s4_write_calls += 1;
-                        writer.write_raw_owned(std::mem::replace(
-                            &mut frame_read_buf,
-                            Vec::with_capacity(frame_size),
-                        ))?;
-                        *s4_write_ms += t_w.elapsed_ms();
-
-                        *s4_passthrough_blobs += 1;
-                        total_stats.blobs_passthrough += 1;
-                        match kind {
-                            crate::ElementKind::Node => {
-                                total_stats.nodes_read += count;
-                                total_stats.nodes_written += count;
-                            }
-                            crate::ElementKind::Relation => {
-                                total_stats.relations_written += count;
-                            }
-                            crate::ElementKind::Way => {
-                                // Ways never pass through (they need
-                                // coord_payloads splicing). Fall through
-                                // without touching stats; unreachable in
-                                // practice but we avoid a hard panic here
-                                // since this is on the output path.
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(())
-        };
-
-        // Drain any passthrough prefix before the first decode result.
-        drain(
-            &mut reorder,
-            &mut total_stats,
-            &mut s4_bytes_written,
-            &mut s4_write_calls,
-            &mut s4_write_ms,
-            &mut s4_passthrough_blobs,
-            &mut s4_passthrough_pread_ms,
-            &mut s4_passthrough_bytes,
-        )?;
-
-        loop {
-            // Cancellation is checked on this consumer, before each wait and
-            // on each arrival; the early return is the write-error exit.
-            // Workers parked in `wait_ready` are woken by stage 3, which
-            // observes the same token per bucket and aborts the router.
-            host.cancel.check()?;
-            let t_recv = crate::counters::Stopwatch::start();
-            let msg = decoded_rx.recv();
-            s4_recv_ms += t_recv.elapsed_ms();
-            let (seq_num, item) = match msg {
-                Ok(v) => {
-                    // Decrement channel depth on successful recv.
-                    s4_channel_depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    v
-                }
-                Err(_) => break,
+            // Only errors about the input frame itself are located
+            // there. A router abort or a read of a worker scratch
+            // file says nothing about this input blob and stays
+            // unlocated.
+            let at_frame = |e: Error| {
+                e.locate(crate::error::Location::new(
+                    Some(source),
+                    None,
+                    Some(crate::ByteOffset(desc.frame_offset)),
+                ))
             };
-            host.cancel.check()?;
+            let S4Local {
+                read_buf,
+                decompress_buf,
+                bb,
+                output_blocks,
+                way_reframe_scratch,
+                reframe_output,
+                coord_payload_buf,
+            } = l;
+            let result: crate::error::Result<(Vec<OwnedBlock>, Stats)> =
+                (|| -> crate::error::Result<(Vec<OwnedBlock>, Stats)> {
+                    // For way blobs: block on the router's readiness
+                    // BEFORE the input pread/decompress so a stalled
+                    // decode thread never holds an already-expanded
+                    // block + StringTable resident. Non-way blobs skip
+                    // this entirely - they never consume a coord payload.
+                    if desc.is_way_blob {
+                        let t_wait = crate::counters::Stopwatch::start();
+                        coord_payloads_reader.wait_ready(desc.way_blob_idx)?;
+                        // One sample feeds the total, the count and
+                        // the maximum.
+                        let wait_ns = t_wait.elapsed_ns();
+                        if wait_ns > 0 {
+                            c.readiness_wait_ns.fetch_add(wait_ns, Relaxed);
+                            c.readiness_wait_blobs.fetch_add(1, Relaxed);
+                            record_max(&c.readiness_wait_max_ns, wait_ns);
+                        }
+                    }
 
-            reorder.push(seq_num, ConsumerItem::Decoded(item));
-            drain(
-                &mut reorder,
-                &mut total_stats,
-                &mut s4_bytes_written,
-                &mut s4_write_calls,
-                &mut s4_write_ms,
-                &mut s4_passthrough_blobs,
-                &mut s4_passthrough_pread_ms,
-                &mut s4_passthrough_bytes,
-            )?;
-        }
+                    let t0 = crate::counters::Stopwatch::start();
+                    read_buf.resize(desc.data_size, 0);
+                    file.read_exact_at(read_buf, desc.data_offset)
+                        .map_err(|e| at_frame(Error::from(e)))?;
+                    t0.record_ms(&c.pread_ms);
+                    c.bytes_read.fetch_add(desc.data_size as u64, Relaxed);
+                    c.pread_calls.fetch_add(1, Relaxed);
 
-        // Final drain for passthrough tails: if the schedule ends on
-        // passthrough items (common - relations sit at EOF in sorted
-        // PBFs) there's no trailing decode push to trigger the last
-        // pop_ready, so do it here.
-        drain(
-            &mut reorder,
-            &mut total_stats,
-            &mut s4_bytes_written,
-            &mut s4_write_calls,
-            &mut s4_write_ms,
-            &mut s4_passthrough_blobs,
-            &mut s4_passthrough_pread_ms,
-            &mut s4_passthrough_bytes,
-        )?;
+                    let t1 = crate::counters::Stopwatch::start();
+                    crate::blob::decompress_blob_raw(read_buf, decompress_buf).map_err(at_frame)?;
+                    t1.record_ms(&c.decompress_ms);
 
-        Ok(())
-    })?;
+                    let t2 = crate::counters::Stopwatch::start();
+                    output_blocks.clear();
+
+                    if desc.is_way_blob {
+                        // Read this blob's coord_payloads payload into a
+                        // worker-local buffer before reframe.
+                        let t_cpread = crate::counters::Stopwatch::start();
+                        coord_payloads_reader
+                            .pread_blob_payload(desc.way_blob_idx, coord_payload_buf)?;
+                        t_cpread.record_ms(&c.coord_payload_pread_ms);
+                        c.coord_payload_bytes
+                            .fetch_add(coord_payload_buf.len() as u64, Relaxed);
+
+                        // Wire-format reframe: splice locations without
+                        // full PrimitiveBlock decode or BlockBuilder.
+                        let (way_count, min_id, max_id) = reframe_way_blob_with_locations(
+                            decompress_buf,
+                            coord_payload_buf,
+                            per_way_rcs.blob_record(desc.way_blob_idx),
+                            desc.way_blob_idx,
+                            reframe_output,
+                            way_reframe_scratch,
+                            way_reframe_cref,
+                            member_way_ids,
+                            inject_prepass,
+                        )
+                        .map_err(at_frame)?;
+
+                        let index = crate::blob_meta::BlobIndex {
+                            kind: crate::ElementKind::Way,
+                            min_id,
+                            max_id,
+                            count: way_count,
+                            bbox: None,
+                        };
+                        let taken = std::mem::take(reframe_output);
+                        reframe_output.reserve(taken.len());
+                        output_blocks.push(OwnedBlock {
+                            bytes: taken,
+                            index,
+                            tagdata: None,
+                            way_members: inject_prepass.then(|| {
+                                let payload = crate::commands::altw::reframe::way_members_payload(
+                                    way_count,
+                                    &way_reframe_scratch.member_ways,
+                                );
+                                inject_metrics
+                                    .record_blob(way_reframe_scratch.pin_tally, payload.len());
+                                payload
+                            }),
+                        });
+
+                        let block_stats = Stats {
+                            ways_written: way_count,
+                            blobs_decoded: 1,
+                            ..Stats::default()
+                        };
+                        // One sample, so the pair agrees exactly.
+                        let elapsed = t2.elapsed_ms();
+                        c.assemble_ms.fetch_add(elapsed, Relaxed);
+                        c.way_reframe_ms.fetch_add(elapsed, Relaxed);
+                        c.blobs.fetch_add(1, Relaxed);
+                        c.way_blobs_processed.fetch_add(1, Relaxed);
+                        return Ok((std::mem::take(output_blocks), block_stats));
+                    }
+
+                    // Non-way blobs: full PrimitiveBlock decode + BlockBuilder.
+                    // `decompress_buf` is already an owned, unshared Vec, so
+                    // parse it in place with `from_vec`; the old
+                    // `PrimitiveBlock::new(Bytes::from(vec))` wrapped it as
+                    // Bytes only to copy it straight back out via `to_vec()`.
+                    let block = PrimitiveBlock::from_vec(std::mem::take(decompress_buf))
+                        .map_err(at_frame)?;
+                    let mut block_stats = assemble_block(
+                        &block,
+                        bb,
+                        output_blocks,
+                        keep_untagged_nodes,
+                        relation_member_node_ids,
+                    )
+                    .map_err(at_frame)?;
+                    block_stats.blobs_decoded = 1;
+                    flush_local(bb, output_blocks).map_err(at_frame)?;
+                    let elapsed = t2.elapsed_ms();
+                    c.assemble_ms.fetch_add(elapsed, Relaxed);
+                    c.nonway_assemble_ms.fetch_add(elapsed, Relaxed);
+                    c.nonway_blobs_processed.fetch_add(1, Relaxed);
+
+                    if decompress_buf.capacity() == 0 {
+                        *decompress_buf = Vec::new();
+                    }
+
+                    c.blobs.fetch_add(1, Relaxed);
+
+                    Ok((std::mem::take(output_blocks), block_stats))
+                })();
+
+            // Track max live buffer bytes for this worker.
+            {
+                let worker_bytes = read_buf.capacity() as u64
+                    + decompress_buf.capacity() as u64
+                    + reframe_output.capacity() as u64;
+                record_max(&c.max_worker_buf_bytes, worker_bytes);
+            }
+
+            // The pool times the send (`s4_send_ms`), opens the
+            // WAIT_S4_SEND span only when the result channel is full,
+            // and records the channel's depth high-water
+            // (`s4_channel_high_water`): workers count up before a
+            // send and the consumer down after a receive.
+            result
+        },
+        &mut consumer,
+    )?;
+    for position in consumer.interleaved.rest() {
+        consumer.passthrough(position)?;
+    }
+    let S4Consumer {
+        total_stats,
+        bytes_written: s4_bytes_written,
+        write_calls: s4_write_calls,
+        write_ms: s4_write_ms,
+        passthrough_blobs: s4_passthrough_blobs,
+        passthrough_pread_ms: s4_passthrough_pread_ms,
+        passthrough_bytes: s4_passthrough_bytes,
+        ..
+    } = consumer;
+    let s4_recv_ms = s4_recv_ms.into_inner();
 
     // Time the final writer flush. `write_raw_owned` and
     // `write_primitive_block_owned` hand work to the writer thread

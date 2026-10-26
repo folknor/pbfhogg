@@ -487,13 +487,11 @@ pub(super) fn run_pass2(
     crate::debug::emit_marker("GEOCODE_PASS2A_START");
     {
         let referenced_ref = &referenced_nodes;
-        let mut merge_err: Option<Error> = None;
-        let mut semantic_err: Option<Error> = None;
-        let pool_result = crate::scan::classify::parallel_classify_phase_ordered(
+        crate::scan::classify::parallel_classify_phase_ordered(
             shared_file,
             node_schedule,
             None,
-            GEOCODE_MERGE_WINDOW_BLOBS,
+            std::num::NonZeroUsize::new(GEOCODE_MERGE_WINDOW_BLOBS),
             NodeBlobOut::default,
             |block, state: &mut NodeBlobOut| -> Result<NodeBlobOut> {
                 for element in block.elements_skip_metadata() {
@@ -582,9 +580,6 @@ pub(super) fn run_pass2(
                 }
             },
             |_seq, out| {
-                if merge_err.is_some() || semantic_err.is_some() {
-                    return;
-                }
                 for pap in out.addr_points {
                     let hn_off = strings.intern(&pap.hn);
                     let st_off = strings.intern(&pap.st);
@@ -596,31 +591,17 @@ pub(super) fn run_pass2(
                         street_offset: st_off,
                         postcode_offset: pc_off,
                     };
-                    if let Err(e) = addr_points_out.write_all(&ap.to_bytes()) {
-                        merge_err = Some(Error::from(e));
-                        return;
-                    }
-                    let Some(next_count) = addr_point_count.checked_add(1) else {
-                        semantic_err = Some(Error::invalid_data(
+                    addr_points_out.write_all(&ap.to_bytes())?;
+                    addr_point_count = addr_point_count.checked_add(1).ok_or_else(|| {
+                        Error::invalid_data(
                             "address point count exceeds u32::MAX; bump FORMAT_VERSION",
-                        ));
-                        return;
-                    };
-                    addr_point_count = next_count;
+                        )
+                    })?;
                 }
+                Ok(())
             },
             host,
-        );
-        // Errors the merge recorded came first: the pool's own (a
-        // cancellation observed at a later receive included) is the later
-        // one.
-        if let Some(e) = merge_err {
-            return Err(e);
-        }
-        if let Some(e) = semantic_err {
-            return Err(e);
-        }
-        pool_result?;
+        )?;
     }
     crate::debug::emit_marker("GEOCODE_PASS2A_END");
 
@@ -642,13 +623,12 @@ pub(super) fn run_pass2(
     {
         let referenced_ref = &referenced_nodes;
         let needed_admin_ways_ref = &needed_admin_ways;
-        let mut merge_err: Option<Error> = None;
 
-        let pool_result = crate::scan::classify::parallel_classify_phase_ordered(
+        crate::scan::classify::parallel_classify_phase_ordered(
             shared_file,
             way_schedule,
             None,
-            GEOCODE_MERGE_WINDOW_BLOBS,
+            std::num::NonZeroUsize::new(GEOCODE_MERGE_WINDOW_BLOBS),
             WayBlobOut::default,
             |block, state: &mut WayBlobOut| -> Result<WayBlobOut> {
                 for element in block.elements_skip_metadata() {
@@ -669,9 +649,6 @@ pub(super) fn run_pass2(
                 }
             },
             |_seq, out| {
-                if merge_err.is_some() {
-                    return;
-                }
                 missing_node_ref_count =
                     missing_node_ref_count.saturating_add(out.missing_node_ref_count);
                 for &way_id in &out.missing_ref_way_ids {
@@ -685,16 +662,12 @@ pub(super) fn run_pass2(
 
                 // Interpolation ways: push SlimInterpWay + stream node coords.
                 for pi in out.interps {
-                    let nc = match u16::try_from(pi.coords.len()) {
-                        Ok(n) => n,
-                        Err(_) => {
-                            merge_err = Some(Error::internal(format!(
-                                "interp way coord count {} overflows u16 at merge (classify should have caught)",
-                                pi.coords.len(),
-                            )));
-                            return;
-                        }
-                    };
+                    let nc = u16::try_from(pi.coords.len()).map_err(|_| {
+                        Error::internal(format!(
+                            "interp way coord count {} overflows u16 at merge (classify should have caught)",
+                            pi.coords.len(),
+                        ))
+                    })?;
                     let street_offset = strings.intern(&pi.street);
                     interp_ways.push(SlimInterpWay {
                         way_id: pi.way_id,
@@ -707,16 +680,13 @@ pub(super) fn run_pass2(
                         end_number: 0,
                     });
                     for &(lat, lon) in &pi.coords {
-                        if let Err(e) = interp_nodes_out.write_all(
+                        interp_nodes_out.write_all(
                             &NodeCoord {
                                 lat_e7: lat,
                                 lon_e7: lon,
                             }
                             .to_bytes(),
-                        ) {
-                            merge_err = Some(Error::from(e));
-                            return;
-                        }
+                        )?;
                     }
                     interp_node_offset += (pi.coords.len() * NodeCoord::SIZE) as u64;
                 }
@@ -733,70 +703,49 @@ pub(super) fn run_pass2(
                         street_offset: st_off,
                         postcode_offset: pc_off,
                     };
-                    if let Err(e) = addr_points_out.write_all(&ap.to_bytes()) {
-                        merge_err = Some(Error::from(e));
-                        return;
-                    }
-                    let Some(next_count) = addr_point_count.checked_add(1) else {
-                        merge_err = Some(Error::invalid_data(
+                    addr_points_out.write_all(&ap.to_bytes())?;
+                    addr_point_count = addr_point_count.checked_add(1).ok_or_else(|| {
+                        Error::invalid_data(
                             "address point count exceeds u32::MAX; bump FORMAT_VERSION",
-                        ));
-                        return;
-                    };
-                    addr_point_count = next_count;
+                        )
+                    })?;
                 }
 
                 // Streets
                 for ps in out.streets {
-                    let nc = match u16::try_from(ps.coords.len()) {
-                        Ok(n) => n,
-                        Err(_) => {
-                            merge_err = Some(Error::internal(format!(
-                                "street way coord count {} overflows u16 at merge (classify should have caught)",
-                                ps.coords.len(),
-                            )));
-                            return;
-                        }
-                    };
+                    let nc = u16::try_from(ps.coords.len()).map_err(|_| {
+                        Error::internal(format!(
+                            "street way coord count {} overflows u16 at merge (classify should have caught)",
+                            ps.coords.len(),
+                        ))
+                    })?;
                     let name_off = strings.intern(&ps.name);
                     let sw = StreetWay {
                         node_offset: street_node_offset,
                         name_offset: name_off,
                         node_count: nc,
                     };
-                    if let Err(e) = street_ways_out.write_all(&sw.to_bytes()) {
-                        merge_err = Some(Error::from(e));
-                        return;
-                    }
+                    street_ways_out.write_all(&sw.to_bytes())?;
                     for &(lat, lon) in &ps.coords {
-                        if let Err(e) = street_nodes_out.write_all(
+                        street_nodes_out.write_all(
                             &NodeCoord {
                                 lat_e7: lat,
                                 lon_e7: lon,
                             }
                             .to_bytes(),
-                        ) {
-                            merge_err = Some(Error::from(e));
-                            return;
-                        }
+                        )?;
                     }
                     street_node_offset += (ps.coords.len() * NodeCoord::SIZE) as u64;
-                    let Some(next_count) = street_way_count.checked_add(1) else {
-                        merge_err = Some(Error::invalid_data(
+                    street_way_count = street_way_count.checked_add(1).ok_or_else(|| {
+                        Error::invalid_data(
                             "street way count exceeds u32::MAX; bump FORMAT_VERSION",
-                        ));
-                        return;
-                    };
-                    street_way_count = next_count;
+                        )
+                    })?;
                 }
+                Ok(())
             },
             host,
-        );
-        // As in phase 2a: the merge's recorded error precedes the pool's.
-        if let Some(e) = merge_err {
-            return Err(e);
-        }
-        pool_result?;
+        )?;
     }
     crate::debug::emit_marker("GEOCODE_PASS2B_END");
 

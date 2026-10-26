@@ -950,10 +950,10 @@ fn cat_filtered(
 /// The ordered pool is what bounds memory here. Worker output is large
 /// (~1.6 MB framed per planet node blob, tens of thousands of node blobs), and
 /// ordering alone would not cap it: one slow blob at the head lets workers
-/// race ahead while their results wait for it. The pool's admission credit
-/// hands out schedule position `k` only once `k` is within the window of the
-/// earliest unmerged position, so at most a window of results is alive
-/// between decode and write, whatever the input size. Each result holds one
+/// race ahead while their results wait for it. The pool admits schedule
+/// position `k` only once `k` is within the window of the earliest unwritten
+/// position, so at most a window of results is alive between decode and the
+/// end of its write, whatever the input size. Each result holds one
 /// input blob's rebuilt output; a block that switches kind often frames into
 /// several smaller blobs, still bounded by that one block.
 fn run_filtered_pass(
@@ -968,18 +968,17 @@ fn run_filtered_pass(
     type PassResult = crate::Result<(Vec<Vec<u8>>, u64)>;
     let mut blobs_decoded: u64 = 0;
     let mut total_elements: u64 = 0;
-    let mut write_error: Option<Error> = None;
 
-    // BlockBuilder contains `Rc<str>` (string interning) which is not Send,
-    // so it can't ride the `S: Send` worker-state slot. Per-blob alloc inside
-    // the closure is cheap (BlockBuilder::new is just a few empty Vec/HashMap
-    // initialisers; no heap reservation until elements are added). A failed
-    // blob ends the pool, located with its input and ordinal.
-    let pool_result = crate::scan::classify::parallel_classify_phase_ordered(
+    // A fresh BlockBuilder per blob (BlockBuilder::new is just a few empty
+    // Vec/HashMap initialisers; no heap reservation until elements are
+    // added), as before the worker state could hold a non-Send one: keeping
+    // one per worker would change what each worker retains between blobs. A
+    // failed blob ends the pool, located with its input and ordinal.
+    crate::scan::classify::parallel_classify_phase_ordered(
         input,
         schedule,
         None,
-        crate::tunables::POOL_REORDER_CAPACITY_WIDE,
+        std::num::NonZeroUsize::new(crate::tunables::POOL_REORDER_CAPACITY_WIDE),
         || (),
         |block, _state| -> PassResult {
             let mut bb = BlockBuilder::new();
@@ -1009,31 +1008,16 @@ fn run_filtered_pass(
             Ok((framed, count))
         },
         |_position, (framed, count)| {
-            // Called in schedule order. The merge cannot fail, so a write
-            // error is captured, later results are dropped unwritten (the
-            // pool still runs to its end; its window bounds what is alive),
-            // and the error is returned once the pool is done.
-            if write_error.is_some() {
-                return;
-            }
+            // Called in schedule order; a write error ends the pass at once.
             blobs_decoded += 1;
             for blob in framed {
-                if let Err(e) = writer.write_raw_owned(blob) {
-                    write_error = Some(e);
-                    return;
-                }
+                writer.write_raw_owned(blob)?;
             }
             total_elements += count;
+            Ok(())
         },
         host,
-    );
-
-    // An error the merge recorded came first: the pool's own (a cancellation
-    // observed at a later receive included) is the later one.
-    if let Some(e) = write_error {
-        return Err(e);
-    }
-    pool_result?;
+    )?;
 
     Ok((blobs_decoded, total_elements))
 }

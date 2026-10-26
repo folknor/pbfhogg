@@ -1014,7 +1014,7 @@ fn tags_filter_two_pass(
         relation_dep_node_ids: &relation_dep_node_ids,
     };
 
-    // pread-from-workers: parallel decode + filter + write with reorder buffer.
+    // pread-from-workers: parallel decode + filter, written in schedule order.
     //
     // DO NOT add blob-level raw passthrough here (wire-format ID scanner,
     // "all elements in this blob are in the include set -> write blob raw").
@@ -1046,13 +1046,6 @@ fn tags_filter_two_pass(
     // planet safety (no cross-thread PrimitiveBlock retention), not for
     // passthrough.
     {
-        use std::os::unix::fs::FileExt as _;
-
-        // The walker's own handle and path: a failed blob is located with
-        // the input, its ordinal and its frame offset.
-        let input_ref = &input_file;
-        let shared_file = input_file.file();
-
         // A fixed parallelism caps this pool too, not only the classify
         // passes; `Auto` keeps the decode pool's host-derived sizing.
         let decode_threads = parallelism.resolve(|| {
@@ -1064,128 +1057,38 @@ fn tags_filter_two_pass(
             )
         });
 
-        let mut willneed = crate::scan::classify::WillneedPrefetch::new(&schedule);
-        let schedule_ref = &schedule;
-
-        type WorkerResult = (
-            usize,
-            crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats)>,
-        );
-        let (desc_tx, desc_rx) =
-            std::sync::mpsc::sync_channel::<usize>(crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH);
-        let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WorkerResult>(
-            crate::tunables::POOL_RESULT_CHANNEL_DEPTH,
-        );
-
-        std::thread::scope(|scope| -> Result<()> {
-            scope.spawn(move || {
-                for (position, entry) in schedule_ref.iter().enumerate() {
-                    willneed.before_dispatch(shared_file, entry);
-                    if desc_tx.send(position).is_err() {
-                        break;
-                    }
+        // The ordered classify pool: results in schedule order, bounded by
+        // its window, a failed blob located with the input, its ordinal and
+        // its frame offset. Each worker keeps one BlockBuilder and output
+        // vector across blobs, built on its own thread.
+        crate::scan::classify::parallel_classify_phase_ordered(
+            &input_file,
+            &schedule,
+            Some(decode_threads),
+            None,
+            || (BlockBuilder::new(), Vec::<OwnedBlock>::new()),
+            |block, (bb, output_blocks): &mut (BlockBuilder, Vec<OwnedBlock>)| {
+                output_blocks.clear();
+                let block_stats =
+                    filter_block_pass2(block, &id_sets, remove_tags, bb, output_blocks)?;
+                flush_local(bb, output_blocks)?;
+                Ok((std::mem::take(output_blocks), block_stats))
+            },
+            |_position, (blocks, block_stats): (Vec<OwnedBlock>, TagsFilterStats)| {
+                stats.nodes_matched += block_stats.nodes_matched;
+                stats.nodes_from_ways += block_stats.nodes_from_ways;
+                stats.nodes_from_relations += block_stats.nodes_from_relations;
+                stats.ways_matched += block_stats.ways_matched;
+                stats.ways_from_relations += block_stats.ways_from_relations;
+                stats.relations_matched += block_stats.relations_matched;
+                stats.relations_from_relations += block_stats.relations_from_relations;
+                for block in blocks {
+                    writer.write_primitive_block_owned(block)?;
                 }
-            });
-
-            for _ in 0..decode_threads {
-                let rx = std::sync::Arc::clone(&desc_rx);
-                let tx = result_tx.clone();
-                let file = std::sync::Arc::clone(shared_file);
-                let ids_ref = &id_sets;
-                scope.spawn(move || {
-                    let mut read_buf: Vec<u8> = Vec::new();
-                    let worker_pool = crate::blob::DecompressPool::new();
-                    let mut bb = BlockBuilder::new();
-                    let mut output_blocks: Vec<OwnedBlock> = Vec::new();
-                    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-                    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-
-                    loop {
-                        let s = {
-                            let guard =
-                                rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                            match guard.recv() {
-                                Ok(d) => d,
-                                Err(_) => break,
-                            }
-                        };
-                        let entry = &schedule_ref[s];
-
-                        let r: crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats)> = (|| {
-                            read_buf.resize(entry.data_size(), 0);
-                            file.read_exact_at(&mut read_buf, entry.data_offset())?;
-                            let mut buf = crate::blob::pool_get(
-                                Some(&worker_pool),
-                                entry.data_size() * crate::tunables::DECOMPRESS_EXPANSION_GUESS,
-                            );
-                            crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
-                            let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
-                                buf,
-                                &worker_pool,
-                                &mut st_scratch,
-                                &mut gr_scratch,
-                            )?;
-                            output_blocks.clear();
-                            let block_stats = filter_block_pass2(
-                                &block,
-                                ids_ref,
-                                remove_tags,
-                                &mut bb,
-                                &mut output_blocks,
-                            )?;
-                            flush_local(&mut bb, &mut output_blocks)?;
-                            Ok((std::mem::take(&mut output_blocks), block_stats))
-                        })(
-                        )
-                        .map_err(|e| input_ref.locate_blob(entry, e));
-                        if tx.send((s, r)).is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
-            drop(desc_rx);
-            drop(result_tx);
-
-            // Consumer: merge results via reorder buffer for file-order output.
-            let mut reorder: crate::reorder_buffer::ReorderBuffer<
-                crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats)>,
-            > = crate::reorder_buffer::ReorderBuffer::with_capacity(
-                crate::tunables::POOL_REORDER_CAPACITY,
-            );
-
-            let mut drain_ready =
-                |reorder: &mut crate::reorder_buffer::ReorderBuffer<_>| -> Result<()> {
-                    while let Some(r) = reorder.pop_ready() {
-                        let (blocks, block_stats): (Vec<OwnedBlock>, TagsFilterStats) = r?;
-                        stats.nodes_matched += block_stats.nodes_matched;
-                        stats.nodes_from_ways += block_stats.nodes_from_ways;
-                        stats.nodes_from_relations += block_stats.nodes_from_relations;
-                        stats.ways_matched += block_stats.ways_matched;
-                        stats.ways_from_relations += block_stats.ways_from_relations;
-                        stats.relations_matched += block_stats.relations_matched;
-                        stats.relations_from_relations += block_stats.relations_from_relations;
-                        for block in blocks {
-                            writer.write_primitive_block_owned(block)?;
-                        }
-                    }
-                    Ok(())
-                };
-
-            // Cancellation is checked here, on the consumer, per result: an
-            // early return drops the receiver (moved into this loop), failing
-            // the workers' sends and then the dispatcher's.
-            for (s, item) in result_rx {
-                host.cancel.check()?;
-                reorder.push(s, item);
-                drain_ready(&mut reorder)?;
-            }
-            host.cancel.check()?;
-            drain_ready(&mut reorder)?;
-
-            Ok(())
-        })?;
+                Ok(())
+            },
+            host,
+        )?;
     }
 
     writer.flush()?;

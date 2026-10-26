@@ -190,6 +190,9 @@ pub(crate) mod fadvise;
 pub mod geo;
 pub mod geocode_index; // format is always available; reader requires geocode-reader feature
 pub(crate) mod idset;
+// The one ordered worker pool and its admission gate: every pool that hands
+// results to the calling thread in schedule order bounds them through it.
+pub(crate) mod ordered_pool;
 pub mod osc;
 pub(crate) mod osm_id;
 pub mod output;

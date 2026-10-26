@@ -42,6 +42,10 @@ Alternative primitives used elsewhere in the codebase:
   (`src/scan/classify.rs`) - pread workers, no separate decode pool,
   no cross-thread-free churn, no oversubscription. Lower memory
   ceiling and lower thread count than pipelined decode.
+- `parallel_classify_phase_ordered` and the ordered pool beneath it
+  (`src/ordered_pool.rs`) - the same pread workers, results delivered
+  in schedule order and bounded by an admission window (see
+  [pipeline.md](pipeline.md) "Ordered pread pool").
 - Raw `Frames::next_raw` / `HeaderWalker` (`src/read/frame.rs`,
   `src/read/header_walker.rs`) - sequential or pread-based,
   bypass the decode pool entirely.
@@ -197,15 +201,18 @@ should stay that way:
 - `getparents` walker arm - `HeaderWalker` (pread-only). The FullScan
   arm IS a fused pipelined caller (see Callers above); ADR-0006 picks
   the arm by blob count.
-- `time-filter` snapshot path - `parallel_classify_phase`
+- `time-filter` snapshot path - `parallel_classify_phase_ordered`
 
 ## Adding a new pipelined caller
 
 Decision order:
 
 1. **Is per-blob work a pure function of one blob?** If yes, prefer
-   `parallel_classify_phase` (per-blob result) or
-   `parallel_classify_accumulate` (per-worker state). Lower memory
+   `parallel_classify_phase` (per-blob result),
+   `parallel_classify_phase_ordered` (per-blob result needed in schedule
+   order; never reorder `parallel_classify_phase`'s output by hand, which
+   bounds nothing) or `parallel_classify_accumulate` (per-worker state).
+   Lower memory
    ceiling, no oversubscription, no double rayon pool. Accumulate
    costs worker-count × per-worker state size at peak, so pick
    phase when the accumulator grows with blob count. See the safety

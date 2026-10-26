@@ -20,7 +20,6 @@ use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::owned::{dense_node_metadata, element_metadata, relation_members_into};
 use crate::read::header_walker::{HeaderWalker, ScanArm};
 use crate::read::input::{InputSource, PinnedInput};
-use crate::reorder_buffer::ReorderBuffer;
 use crate::tunables::FULL_SCAN_ARM_MIN_BLOBS;
 use crate::write::WriteOptions;
 use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
@@ -297,16 +296,15 @@ fn getparents_walker(
 
     crate::debug::emit_marker("GETPARENTS_DECODE_START");
     type ClassifyResult = crate::Result<(Vec<OwnedBlock>, (u64, u64, u64))>;
-    let mut reorder: ReorderBuffer<(Vec<OwnedBlock>, (u64, u64, u64))> =
-        ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY);
-    // Captured write error: `parallel_classify_phase`'s `merge` is `FnMut(usize, R)`
-    // and cannot return a Result. Capture the first error here and bail out
-    // at the end of the phase.
-    let mut write_err: Option<crate::Error> = None;
 
-    let pool_result = crate::scan::classify::parallel_classify_phase_abortable(
+    // Results arrive in schedule order through the ordered pool, whose window
+    // bounds the decoded output in flight. A write error ends the scan at
+    // once (at planet scale, finishing the decode first would cost the whole
+    // run before the error surfaced).
+    crate::scan::classify::parallel_classify_phase_ordered(
         &shared_file,
         &schedule,
+        None,
         None,
         // `BlockBuilder` contains `Rc<str>` (string table) and is not
         // Send, so it can't live as worker state across
@@ -321,38 +319,17 @@ fn getparents_walker(
             flush_local(&mut bb, &mut output)?;
             Ok((output, counts))
         },
-        // Returning `Break` on the first failure stops the scan. This used to
-        // just set `write_err` and return, which short-circuited the merge but
-        // left `parallel_classify_phase` running the whole schedule to
-        // completion - so at planet scale a failed first write cost the entire
-        // decode before the error surfaced.
-        |seq, result| {
-            use std::ops::ControlFlow;
-            if write_err.is_some() {
-                return ControlFlow::Break(());
+        |_position, (blocks, (n, w, r))| {
+            for block in blocks {
+                writer.write_primitive_block_owned(block)?;
             }
-            reorder.push(seq, result);
-            while let Some((blocks, (n, w, r))) = reorder.pop_ready() {
-                for block in blocks {
-                    if let Err(e) = writer.write_primitive_block_owned(block) {
-                        write_err = Some(e);
-                        return ControlFlow::Break(());
-                    }
-                }
-                stats.nodes_written += n;
-                stats.ways_written += w;
-                stats.relations_written += r;
-            }
-            ControlFlow::Continue(())
+            stats.nodes_written += n;
+            stats.ways_written += w;
+            stats.relations_written += r;
+            Ok(())
         },
         host,
-    );
-
-    // The merge's recorded error came first; the pool's own is the later one.
-    if let Some(e) = write_err {
-        return Err(e);
-    }
-    pool_result?;
+    )?;
 
     writer.flush()?;
     crate::debug::emit_marker("GETPARENTS_DECODE_END");

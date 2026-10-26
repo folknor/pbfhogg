@@ -1108,7 +1108,6 @@ fn run_kind_phase(
     writer: &mut PbfWriter<FileWriter>,
     host: &crate::host::Host,
 ) -> Result<PhaseStats> {
-    use crate::reorder_buffer::ReorderBuffer;
     let block_cap = cap.get();
 
     if schedule.is_empty() {
@@ -1120,8 +1119,6 @@ fn run_kind_phase(
     }
 
     type PhaseResult = crate::Result<WorkerOutput>;
-    let mut reorder: ReorderBuffer<WorkerOutput> =
-        ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY);
 
     let mut bb = BlockBuilder::with_element_cap_prealloc(cap, prealloc_bound);
     let mut output: Vec<OwnedBlock> = Vec::new();
@@ -1130,132 +1127,93 @@ fn run_kind_phase(
 
     let mut blobs: u64 = 0;
     let mut elements: u64 = 0;
-    let mut write_error: Option<Error> = None;
-    let mut classify_error: Option<Error> = None;
 
-    let pool_result = crate::scan::classify::parallel_classify_phase(
+    // Results arrive in schedule order through the ordered pool, whose window
+    // bounds the decoded payloads in flight. A write or encode error ends the
+    // phase at its position.
+    crate::scan::classify::parallel_classify_phase_ordered(
         shared_file,
         schedule,
+        None,
         None,
         || (),
         |block, _state| -> PhaseResult {
             worker_decode_kind(block, kind, cap, flags, &compression, drop)
         },
-        |seq, r| {
-            reorder.push(seq, r);
-            while let Some(out) = reorder.pop_ready() {
-                if write_error.is_some() {
-                    continue;
-                }
-
-                // Sort preservation: flush central BB before writing this
-                // input blob's worker frames. Anything left in central
-                // belongs to a strictly lower ID range than the next
-                // blob's full frames; flushing now keeps the output
-                // monotone. Empty central is a no-op.
-                //
-                // `--unsort` suppresses this flush so the central builder
-                // packs continuously to cap across input blobs and the
-                // boundary swap straddles a real output-blob boundary
-                // (cross-blob overlap). `--unsort-intra` and every plain
-                // decode-path mode keep the flush so output blobs mirror
-                // input blobs, which preserves sort order for
-                // `--strip-locations`. (`--unsort-intra` stays intra-blob
-                // because it swaps the first two same-kind elements, which
-                // always land inside the first output block - not because
-                // of this flush.)
-                //
-                // The guard protects output blob order under a sorted
-                // header: this blob's full frames are written directly,
-                // so any earlier lower-ID block still buffered in `bb`
-                // or queued in `pending` must be written first, or a
-                // later batch would land after higher IDs. Both are
-                // checked (as in repack) so correctness does not rest on
-                // `pending` being empty whenever `bb` is.
-                if !flags.suppress_boundary_flush() && (!bb.is_empty() || !pending.is_empty()) {
-                    if let Err(e) = flush_local(&mut bb, &mut output) {
-                        classify_error.get_or_insert(e);
-                        continue;
-                    }
-                    pending.append(&mut output);
-                    if !pending.is_empty() {
-                        let batch = std::mem::take(&mut pending);
-                        match frame_and_write_batch(
-                            batch,
-                            compression,
-                            writer,
-                            flags.strip_indexdata,
-                            flags.strip_tagdata,
-                            &host.executor,
-                        ) {
-                            Ok(written) => blobs += written,
-                            Err(e) => {
-                                write_error = Some(e);
-                                continue;
-                            }
-                        }
-                    }
-                }
-
-                let WorkerOutput { full_framed, tail } = out;
-                let full_count = full_framed.len() as u64 * block_cap as u64;
-                let tail_n = tail.len() as u64;
-
-                for framed in full_framed {
-                    if let Err(e) = writer.write_raw_owned(framed) {
-                        write_error = Some(e);
-                        break;
-                    }
-                    blobs += 1;
-                }
-                if write_error.is_some() {
-                    continue;
-                }
-
-                let consume_res: crate::Result<()> = if flags.unsort_any() {
-                    feed_tail_unsort(tail, &mut unsort, &mut bb, &mut output)
-                } else {
-                    feed_tail_plain(tail, &mut bb, &mut output)
-                };
-                if let Err(e) = consume_res {
-                    classify_error.get_or_insert(e);
-                    continue;
-                }
-
+        |_position, out| {
+            // Sort preservation: flush central BB before writing this
+            // input blob's worker frames. Anything left in central
+            // belongs to a strictly lower ID range than the next
+            // blob's full frames; flushing now keeps the output
+            // monotone. Empty central is a no-op.
+            //
+            // `--unsort` suppresses this flush so the central builder
+            // packs continuously to cap across input blobs and the
+            // boundary swap straddles a real output-blob boundary
+            // (cross-blob overlap). `--unsort-intra` and every plain
+            // decode-path mode keep the flush so output blobs mirror
+            // input blobs, which preserves sort order for
+            // `--strip-locations`. (`--unsort-intra` stays intra-blob
+            // because it swaps the first two same-kind elements, which
+            // always land inside the first output block - not because
+            // of this flush.)
+            //
+            // The guard protects output blob order under a sorted
+            // header: this blob's full frames are written directly,
+            // so any earlier lower-ID block still buffered in `bb`
+            // or queued in `pending` must be written first, or a
+            // later batch would land after higher IDs. Both are
+            // checked (as in repack) so correctness does not rest on
+            // `pending` being empty whenever `bb` is.
+            if !flags.suppress_boundary_flush() && (!bb.is_empty() || !pending.is_empty()) {
+                flush_local(&mut bb, &mut output)?;
                 pending.append(&mut output);
-                while pending.len() >= FRAME_BATCH {
-                    let batch: Vec<OwnedBlock> = pending.drain(..FRAME_BATCH).collect();
-                    match frame_and_write_batch(
+                if !pending.is_empty() {
+                    let batch = std::mem::take(&mut pending);
+                    blobs += frame_and_write_batch(
                         batch,
                         compression,
                         writer,
                         flags.strip_indexdata,
                         flags.strip_tagdata,
                         &host.executor,
-                    ) {
-                        Ok(written) => blobs += written,
-                        Err(e) => {
-                            write_error = Some(e);
-                            break;
-                        }
-                    }
+                    )?;
                 }
-
-                elements += full_count + tail_n;
             }
+
+            let WorkerOutput { full_framed, tail } = out;
+            let full_count = full_framed.len() as u64 * block_cap as u64;
+            let tail_n = tail.len() as u64;
+
+            for framed in full_framed {
+                writer.write_raw_owned(framed)?;
+                blobs += 1;
+            }
+
+            if flags.unsort_any() {
+                feed_tail_unsort(tail, &mut unsort, &mut bb, &mut output)?;
+            } else {
+                feed_tail_plain(tail, &mut bb, &mut output)?;
+            }
+
+            pending.append(&mut output);
+            while pending.len() >= FRAME_BATCH {
+                let batch: Vec<OwnedBlock> = pending.drain(..FRAME_BATCH).collect();
+                blobs += frame_and_write_batch(
+                    batch,
+                    compression,
+                    writer,
+                    flags.strip_indexdata,
+                    flags.strip_tagdata,
+                    &host.executor,
+                )?;
+            }
+
+            elements += full_count + tail_n;
+            Ok(())
         },
         host,
-    );
-
-    // Errors the merge recorded came first: the pool's own (a cancellation
-    // observed at a later receive included) is the later one.
-    if let Some(e) = write_error {
-        return Err(e);
-    }
-    if let Some(e) = classify_error {
-        return Err(e);
-    }
-    pool_result?;
+    )?;
 
     // End-of-phase: re-inject any held element (partial swap fire), then
     // flush the central builder one last time.

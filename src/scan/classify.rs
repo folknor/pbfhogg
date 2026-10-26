@@ -563,8 +563,10 @@ pub(crate) fn build_classify_schedules_split<'a>(
 /// `PrimitiveBlock`, run the `classify` closure, and send the result. The
 /// consumer calls `merge(position, r)` for each result, forwarding the blob's
 /// position in `schedule` so callers that care (e.g. `verify_ids`, which
-/// needs cross-blob monotonicity) can reorder via `ReorderBuffer` or
-/// similar. Callers that don't care ignore it.
+/// needs cross-blob monotonicity) can index by it. Callers that don't care
+/// ignore it. A caller that needs results in schedule order uses
+/// [`parallel_classify_phase_ordered`], whose window bounds what waits for a
+/// slow blob; reordering here by hand bounds nothing.
 ///
 /// `classify` is fallible: a failure of the work on one blob - the pread, the
 /// decompression, the decode or the callback itself - is located with the
@@ -748,216 +750,125 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
     Ok(())
 }
 
-/// Admission state of [`parallel_classify_phase_ordered`] (and of the
-/// overlap-run pipeline in `commands::blob_merge`): how many results the
-/// consumer has merged, and whether the scan is shutting down.
-pub(crate) type OrderedCredit = (std::sync::Mutex<(usize, bool)>, std::sync::Condvar);
-
-/// A fresh, open admission credit with nothing merged yet.
-pub(crate) fn ordered_credit() -> OrderedCredit {
-    (std::sync::Mutex::new((0, false)), std::sync::Condvar::new())
+/// One ordered-classify worker's thread-local state: its read buffer,
+/// decompress pool and block-parse scratch, beside the caller's state.
+struct ClassifyLocal<S> {
+    read_buf: Vec<u8>,
+    pool: std::sync::Arc<crate::blob::DecompressPool>,
+    st_scratch: Vec<(u32, u32)>,
+    gr_scratch: Vec<(u32, u32)>,
+    state: S,
 }
 
-/// Marks the ordered scan closed on drop, waking a dispatcher parked on
-/// admission credit. The consumer holds one for its whole loop (an early
-/// `Err` return or a panicking merge must not leave the dispatcher parked,
-/// or the scope never joins); each worker holds one that fires only when the
-/// worker panics, because the result it was producing will never arrive and
-/// the window could otherwise never advance past it.
-pub(crate) struct CloseOnDrop<'a> {
-    credit: &'a OrderedCredit,
-    only_if_panicking: bool,
+/// The calling thread's side of [`parallel_classify_phase_ordered`]: the
+/// caller's merge, and the sliding `WILLNEED` advice, which follows the
+/// window's edge (the furthest position a worker may claim next).
+struct ClassifyConsumer<'a, M> {
+    merge: M,
+    willneed: WillneedPrefetch,
+    schedule: &'a [ScheduledBlob],
+    file: &'a std::sync::Arc<std::fs::File>,
 }
 
-impl<'a> CloseOnDrop<'a> {
-    /// The consumer's guard: closes the credit whenever it drops.
-    pub(crate) fn consumer(credit: &'a OrderedCredit) -> Self {
-        Self {
-            credit,
-            only_if_panicking: false,
-        }
+impl<R, M: FnMut(usize, R) -> Result<()>> crate::ordered_pool::OrderedConsumer<R>
+    for ClassifyConsumer<'_, M>
+{
+    fn consume(&mut self, position: usize, item: R) -> crate::Result<()> {
+        (self.merge)(position, item)
     }
-}
 
-/// Park until schedule position `position` is admitted (`position < merged +
-/// window`). Returns `false` when the scan closed instead.
-pub(crate) fn wait_for_credit(credit: &OrderedCredit, position: usize, window: usize) -> bool {
-    let (lock, cvar) = credit;
-    let mut state = lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    while !state.1 && position >= state.0.saturating_add(window) {
-        state = cvar
-            .wait(state)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-    }
-    !state.1
-}
-
-/// Publish the consumer's merged count and wake the dispatcher.
-pub(crate) fn publish_merged(credit: &OrderedCredit, merged: usize) {
-    let (lock, cvar) = credit;
-    lock.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .0 = merged;
-    cvar.notify_one();
-}
-
-impl Drop for CloseOnDrop<'_> {
-    fn drop(&mut self) {
-        if self.only_if_panicking && !std::thread::panicking() {
-            return;
+    fn on_advance(&mut self, edge: usize) {
+        if let Some(entry) = edge.checked_sub(1).and_then(|last| self.schedule.get(last)) {
+            self.willneed.before_dispatch(self.file, entry);
         }
-        let (lock, cvar) = self.credit;
-        lock.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .1 = true;
-        cvar.notify_all();
     }
 }
 
 /// [`parallel_classify_phase`] whose `merge` runs in schedule order, with
-/// memory bounded by `window`.
+/// memory bounded by `window`, on the crate's ordered pool
+/// (`crate::ordered_pool`).
 ///
-/// Results still complete in worker order; the consumer parks each in a
-/// `window`-slot ring and merges the contiguous run from the earliest
-/// unmerged position. Ordering alone would not bound that ring - one slow
-/// blob at the head lets workers race arbitrarily far ahead - so dispatch
-/// carries an admission credit tied to the head: schedule position `k` is
-/// handed to a worker only once `k < merged + window`. At most `window`
-/// results are therefore alive between classify and merge, and workers only
-/// stall when the head blob is a full window behind the fastest one.
+/// Results still complete in worker order, and ordering alone would not bound
+/// them - one slow blob at the head lets workers race arbitrarily far ahead -
+/// so a worker may only start schedule position `k` once `k < merged +
+/// window`. At most `window` results are therefore alive between classify
+/// and the end of their merge, and workers only stall when the head blob is a
+/// full window behind the fastest one. `None` takes the pool's default window
+/// for the thread count.
 ///
-/// Unlike running fixed batches back to back, merge overlaps classification
-/// and the workers persist (with their `S` scratch and decompress pools)
-/// across the whole schedule; a batch barrier would idle every worker on the
-/// slowest blob of each batch and serialize the merge behind the workers,
-/// which matters on merge-heavy phases.
+/// The workers persist (with their `S` state, scratch and decompress pools)
+/// across the whole schedule, and merge overlaps classification; a batch
+/// barrier would idle every worker on the slowest blob of each batch and
+/// serialize the merge behind the workers, which matters on merge-heavy
+/// phases. `worker_init` runs on each worker's own thread, so `S` need not be
+/// `Send`.
 ///
-/// `merge` receives each entry's position in `schedule`, in order. Failures
-/// are located as in [`parallel_classify_phase`].
+/// `merge` receives each entry's position in `schedule`, in order, and may
+/// fail: its error ends the run at once. Failures surface in schedule order
+/// (the lowest failing position's classify error, or the merge's own at its
+/// position), located as in [`parallel_classify_phase`]. The sliding
+/// `WILLNEED` advice tracks the window's edge, advised before the positions
+/// it covers can be claimed.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn parallel_classify_phase_ordered<S: Send, R: Send>(
+pub(crate) fn parallel_classify_phase_ordered<S, R: Send>(
     input: &InputFile,
     schedule: &[ScheduledBlob],
     threads: Option<usize>,
-    window: usize,
-    worker_init: impl Fn() -> S + Send + Sync,
-    classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> Result<R> + Send + Sync,
-    mut merge: impl FnMut(usize, R),
+    window: Option<std::num::NonZeroUsize>,
+    worker_init: impl Fn() -> S + Sync,
+    classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> Result<R> + Sync,
+    merge: impl FnMut(usize, R) -> Result<()>,
     host: &crate::host::Host,
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
-    let mut willneed = WillneedPrefetch::new(schedule);
-    host.cancel.check()?;
-    if schedule.is_empty() {
-        return Ok(());
-    }
-    let window = window.max(1);
     let decode_threads = resolve_thread_count(threads, &*host.resources);
-
-    let credit = ordered_credit();
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<usize>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
-    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(
-        POOL_RESULT_CHANNEL_DEPTH,
-    );
-    let shared_file = input.file();
-
-    std::thread::scope(|scope| -> Result<()> {
-        let credit_ref = &credit;
-        scope.spawn(move || {
-            for (position, entry) in schedule.iter().enumerate() {
-                if !wait_for_credit(credit_ref, position, window) {
-                    break;
-                }
-                willneed.before_dispatch(shared_file, entry);
-                if desc_tx.send(position).is_err() {
-                    break;
-                }
-            }
-        });
-
-        for _ in 0..decode_threads {
-            let rx = std::sync::Arc::clone(&desc_rx);
-            let tx = result_tx.clone();
-            let file = std::sync::Arc::clone(shared_file);
-            let classify_ref = &classify;
-            let worker_init_ref = &worker_init;
-            scope.spawn(move || {
-                let _close = CloseOnDrop {
-                    credit: credit_ref,
-                    only_if_panicking: true,
-                };
-                let mut read_buf: Vec<u8> = Vec::new();
-                let worker_pool = crate::blob::DecompressPool::new();
-                let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-                let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-                let mut state = worker_init_ref();
-
-                loop {
-                    let position = {
-                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match guard.recv() {
-                            Ok(d) => d,
-                            Err(_) => break,
-                        }
-                    };
-                    let entry = &schedule[position];
-
-                    let r: crate::error::Result<R> = (|| {
-                        read_buf.resize(entry.data_size(), 0);
-                        file.read_exact_at(&mut read_buf, entry.data_offset())?;
-                        let mut buf = crate::blob::pool_get(
-                            Some(&worker_pool),
-                            entry.data_size() * DECOMPRESS_EXPANSION_GUESS,
-                        );
-                        crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
-                        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
-                            buf,
-                            &worker_pool,
-                            &mut st_scratch,
-                            &mut gr_scratch,
-                        )?;
-                        classify_ref(&block, &mut state)
-                    })()
-                    .map_err(|e| input.locate_blob(entry, e));
-                    if tx.send((position, r)).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        drop(desc_rx);
-        drop(result_tx);
-
-        let _close = CloseOnDrop::consumer(credit_ref);
-        // Position `k` is admitted only while `k < next + window`, so the
-        // live positions are distinct modulo the ring length.
-        let ring = window.min(schedule.len());
-        let mut pending: Vec<Option<(usize, R)>> = (0..ring).map(|_| None).collect();
-        let mut next = 0_usize;
-        // An early return (an error or a cancellation) drops `_close`, which
-        // wakes a dispatcher parked on credit, and the receiver (moved into
-        // this closure for that reason), which fails the workers' sends.
-        let result_rx = result_rx;
-        while let Some((position, result)) = recv_checked(&result_rx, &host.cancel)? {
-            pending[position % ring] = Some((position, result?));
-            let before = next;
-            while let Some((position, out)) = pending[next % ring].take() {
-                merge(position, out);
-                next += 1;
-            }
-            if next != before {
-                publish_merged(credit_ref, next);
-            }
-        }
-        Ok(())
-    })?;
-
-    Ok(())
+    let window = window.unwrap_or_else(|| crate::ordered_pool::default_window(decode_threads));
+    let file = input.file();
+    let mut workers = vec![(); decode_threads];
+    crate::ordered_pool::run_ordered(
+        schedule.len(),
+        &mut workers,
+        crate::ordered_pool::PoolConfig {
+            window,
+            cancel: &host.cancel,
+            waits: crate::ordered_pool::Waits::default(),
+        },
+        |_| ClassifyLocal {
+            read_buf: Vec::new(),
+            pool: crate::blob::DecompressPool::new(),
+            st_scratch: Vec::new(),
+            gr_scratch: Vec::new(),
+            state: worker_init(),
+        },
+        |(), local: &mut ClassifyLocal<S>, position| {
+            let entry = &schedule[position];
+            (|| {
+                local.read_buf.resize(entry.data_size(), 0);
+                file.read_exact_at(&mut local.read_buf, entry.data_offset())?;
+                let mut buf = crate::blob::pool_get(
+                    Some(&local.pool),
+                    entry.data_size() * DECOMPRESS_EXPANSION_GUESS,
+                );
+                crate::blob::decompress_blob_raw(&local.read_buf, &mut buf)?;
+                let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+                    buf,
+                    &local.pool,
+                    &mut local.st_scratch,
+                    &mut local.gr_scratch,
+                )?;
+                classify(&block, &mut local.state)
+            })()
+            .map_err(|e| input.locate_blob(entry, e))
+        },
+        &mut ClassifyConsumer {
+            merge,
+            willneed: WillneedPrefetch::new(schedule),
+            schedule,
+            file,
+        },
+    )
 }
 
 /// Per-blob streaming scan over decompressed blob bytes (no `PrimitiveBlock`
@@ -1367,7 +1278,7 @@ mod tests {
             &shared_file,
             &schedule,
             Some(3),
-            WINDOW,
+            std::num::NonZeroUsize::new(WINDOW),
             || (),
             |_block, ()| {
                 classified.fetch_add(1, Ordering::Relaxed);
@@ -1383,6 +1294,7 @@ mod tests {
                     merged.len()
                 );
                 merged.push(seq);
+                Ok(())
             },
             &crate::host::Host::for_tests(),
         )
@@ -1452,10 +1364,10 @@ mod tests {
             &input,
             &schedule,
             Some(2),
-            2,
+            std::num::NonZeroUsize::new(2),
             || (),
             |block, ()| fails_on_target(block),
-            |_, ()| {},
+            |_, ()| Ok(()),
             &host,
         )
         .unwrap_err();

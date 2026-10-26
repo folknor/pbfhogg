@@ -22,9 +22,8 @@ use crate::error::Error;
 use crate::scratch::{RunScratch, ScratchPath};
 use crate::tunables::{
     BUCKET_BUF_SIZE, DECODE_WORKERS_FALLBACK, DECODE_WORKERS_MIN, DECODE_WORKERS_RESERVED,
-    NUM_BUCKETS, PER_WAY_REFCOUNT_SIDECAR_BUF_BYTES, POOL_REORDER_CAPACITY_WIDE,
-    POOL_RESULT_CHANNEL_DEPTH, REF_COUNT_SIDECAR_BUF_BYTES, STAGE1_HEADROOM_FDS,
-    STAGE1_VARINT_BUF_CAPACITY,
+    NUM_BUCKETS, PER_WAY_REFCOUNT_SIDECAR_BUF_BYTES, REF_COUNT_SIDECAR_BUF_BYTES,
+    STAGE1_HEADROOM_FDS, STAGE1_VARINT_BUF_CAPACITY,
 };
 
 crate::counters::counter_set! {
@@ -85,6 +84,102 @@ pub(super) struct WayBlobTask {
     pub(super) seq: u32,
     pub(super) data_offset: u64,
     pub(super) data_size: usize,
+}
+
+/// One pass A worker's shard, owned by the caller so the id-shard writers
+/// can be flushed (and their errors surfaced) after the workers join.
+struct Stage1Shard<'a> {
+    worker_id: usize,
+    /// Lazy-initialised on the worker's first blob so a creation error
+    /// fails that blob, in order. All or nothing: the set is built aside and
+    /// installed whole, because a partial set would be indexed past its end
+    /// on the next blob.
+    id_shard_writers: Vec<BufWriter<TimedShardWriter<'a>>>,
+    id_rec_buf: [u8; ID_RECORD_SIZE],
+    id_bucket_local_counts: Vec<u64>,
+}
+
+/// One pass A worker's thread-local decode buffers.
+struct Stage1Local {
+    read_buf: Vec<u8>,
+    decompress_buf: Vec<u8>,
+    refs_buf: Vec<i64>,
+    group_starts: Vec<(usize, usize)>,
+}
+
+/// Pass A's consumer: writes the ref-count and per-way refcount sidecars in
+/// blob order.
+struct Stage1Consumer<'a> {
+    sidecar_writer: BufWriter<std::fs::File>,
+    per_way_writer: BufWriter<std::fs::File>,
+    varint_buf: Vec<u8>,
+    total_refs: u64,
+    counters: &'a PassACounters,
+}
+
+impl Stage1Consumer<'_> {
+    /// Write the ref-count sidecar's trailer and flush both sidecars;
+    /// returns the total ref count.
+    fn finish(mut self) -> Result<u64> {
+        self.sidecar_writer
+            .write_all(&self.total_refs.to_le_bytes())?;
+        self.sidecar_writer.flush()?;
+        self.per_way_writer.flush()?;
+        Ok(self.total_refs)
+    }
+}
+
+impl crate::ordered_pool::OrderedConsumer<(u64, Vec<u32>)> for Stage1Consumer<'_> {
+    fn consume(
+        &mut self,
+        _task: usize,
+        (ref_count, per_way_rcs): (u64, Vec<u32>),
+    ) -> crate::Result<()> {
+        self.sidecar_writer.write_all(&ref_count.to_le_bytes())?;
+        self.total_refs += ref_count;
+
+        self.varint_buf.clear();
+        protohoggr::encode_varint(&mut self.varint_buf, per_way_rcs.len() as u64);
+        for rc in &per_way_rcs {
+            protohoggr::encode_varint(&mut self.varint_buf, u64::from(*rc));
+        }
+        self.per_way_writer.write_all(&self.varint_buf)?;
+        self.counters.per_way_sidecar_bytes.fetch_add(
+            self.varint_buf.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(())
+    }
+}
+
+/// Flush every shard's id-shard writers, one thread per shard; the first
+/// failure (in shard order) names its shard file.
+fn flush_shards(shards: &mut [Stage1Shard<'_>], scratch: &RunScratch) -> Result<()> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = shards
+            .iter_mut()
+            .map(|shard| {
+                scope.spawn(move || -> Result<()> {
+                    for (bucket_idx, w) in shard.id_shard_writers.iter_mut().enumerate() {
+                        w.flush().map_err(|e| {
+                            shard_error(e, "flush", scratch, shard.worker_id, bucket_idx)
+                        })?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        let mut first = Ok(());
+        for handle in handles {
+            let result = handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            if first.is_ok() {
+                first = result;
+            }
+        }
+        first
+    })
 }
 
 /// Stage 1 output handed to stage 2: slot and id-bucket record counts,
@@ -167,300 +262,217 @@ pub(super) fn stage1_pass_a(
 
     crate::debug::emit_marker("EXTJOIN_S1_PASS_A_START");
 
-    let next_idx = std::sync::atomic::AtomicUsize::new(0);
-    let mut total_refs: u64 = 0;
-
     let counters = PassACounters::new();
-    let s1a_id_shard_flush_err: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
-    // Per-(id-bucket) record counts. Each worker tallies into a local
-    // `Vec<u64>` (no atomic in the hot loop - the per-record cost
-    // would dominate; europe sees ~4.7B records and a contended
-    // AtomicU64::fetch_add adds ~25 ns each, which alone explains a
-    // 30s+ wall regression vs the pre-A1 pass B baseline that used
-    // local counters). Workers push their tallies into this shared
-    // mutex on exit; the orchestrator merges into the
-    // `Stage1Output.id_bucket_counts` vector after the scope joins.
-    let s1a_id_bucket_counts_workers: std::sync::Mutex<Vec<Vec<u64>>> =
-        std::sync::Mutex::new(Vec::new());
-    {
-        type PassAItem = (u32, crate::Result<(u64, Vec<u32>)>);
-        let (tx, rx) = std::sync::mpsc::sync_channel::<PassAItem>(POOL_RESULT_CHANNEL_DEPTH);
-        let schedule_ref = schedule;
-        let next_ref = &next_idx;
-        let counters_ref = &counters;
-        let s1a_id_flush_err_ref = &s1a_id_shard_flush_err;
-        let s1a_id_bucket_counts_workers_ref = &s1a_id_bucket_counts_workers;
-        let layout_ref = layout;
-        let scratch_ref = scratch;
+    let counters_ref = &counters;
+    let layout_ref = layout;
+    let scratch_ref = scratch;
+    // One shard per worker, owned here: the id-shard writers and the
+    // per-(id-bucket) record counts. Each worker tallies into its shard's
+    // `Vec<u64>` (no atomic in the hot loop - the per-record cost would
+    // dominate; europe sees ~4.7B records and a contended
+    // AtomicU64::fetch_add adds ~25 ns each, which alone explains a 30s+
+    // wall regression vs the pre-A1 pass B baseline that used local
+    // counters); they are merged after the run.
+    let mut shards: Vec<Stage1Shard<'_>> = (0..num_workers)
+        .map(|worker_id| Stage1Shard {
+            worker_id,
+            id_shard_writers: Vec::new(),
+            id_rec_buf: [0u8; ID_RECORD_SIZE],
+            id_bucket_local_counts: vec![0; NUM_BUCKETS],
+        })
+        .collect();
+    let mut consumer = Stage1Consumer {
+        sidecar_writer: BufWriter::with_capacity(
+            REF_COUNT_SIDECAR_BUF_BYTES,
+            crate::scratch::create_file(ref_count_sidecar)?,
+        ),
+        per_way_writer: BufWriter::with_capacity(
+            PER_WAY_REFCOUNT_SIDECAR_BUF_BYTES,
+            crate::scratch::create_file(per_way_refcount_sidecar)?,
+        ),
+        varint_buf: Vec::with_capacity(STAGE1_VARINT_BUF_CAPACITY),
+        total_refs: 0,
+        counters: counters_ref,
+    };
 
-        std::thread::scope(|scope| -> Result<()> {
-            for worker_id in 0..num_workers {
-                let file = std::sync::Arc::clone(&shared_file);
-                let tx = tx.clone();
-                scope.spawn(move || {
-                    use std::sync::atomic::Ordering::Relaxed;
-                    let mut read_buf: Vec<u8> = Vec::new();
-                    let mut decompress_buf: Vec<u8> = Vec::new();
-                    let mut refs_buf: Vec<i64> = Vec::new();
-                    let mut group_starts: Vec<(usize, usize)> = Vec::new();
-                    // Lazy-initialised on first blob so creation errors
-                    // flow into the per-blob IIFE result and propagate
-                    // through the existing tx/rx channel. All or nothing:
-                    // the set is built aside and installed whole, because a
-                    // worker that sent a creation error still claims blobs
-                    // until the consumer drops the receiver, and a partial
-                    // set would be indexed past its end on the next one.
-                    let mut id_shard_writers: Vec<BufWriter<TimedShardWriter<'_>>> = Vec::new();
-                    let mut id_rec_buf = [0u8; ID_RECORD_SIZE];
-                    let mut id_bucket_local_counts: Vec<u64> = vec![0; NUM_BUCKETS];
+    // The ordered pool writes the two sidecars in blob order; cancellation
+    // is checked on its consumer.
+    let pool_result = crate::ordered_pool::run_ordered(
+        schedule.len(),
+        &mut shards,
+        crate::ordered_pool::PoolConfig {
+            window: crate::ordered_pool::default_window(num_workers),
+            cancel: &host.cancel,
+            waits: crate::ordered_pool::Waits::default(),
+        },
+        |_| Stage1Local {
+            read_buf: Vec::new(),
+            decompress_buf: Vec::new(),
+            refs_buf: Vec::new(),
+            group_starts: Vec::new(),
+        },
+        |shard: &mut Stage1Shard<'_>, local: &mut Stage1Local, idx| {
+            use std::sync::atomic::Ordering::Relaxed;
+            let Stage1Local {
+                read_buf,
+                decompress_buf,
+                refs_buf,
+                group_starts,
+            } = local;
+            let Stage1Shard {
+                worker_id,
+                id_shard_writers,
+                id_rec_buf,
+                id_bucket_local_counts,
+            } = shard;
+            let worker_id = *worker_id;
+            let file = &shared_file;
+            let task = &schedule[idx];
+            // A failure reading this blob is about the input:
+            // located with its path and the blob's payload
+            // offset (cold). Scratch failures name their shard.
+            let in_input = |e: Error| {
+                e.locate_blob(crate::error::Location::at_offset(input, task.data_offset))
+            };
 
-                    loop {
-                        let idx = next_ref.fetch_add(1, Relaxed);
-                        if idx >= schedule_ref.len() {
-                            break;
+            let result: crate::Result<(u64, Vec<u32>)> = (|| {
+                let t0 = crate::counters::Stopwatch::start();
+                read_buf.resize(task.data_size, 0);
+                file.read_exact_at(read_buf, task.data_offset)
+                    .map_err(|e| in_input(Error::from(e).context("pass A pread")))?;
+                t0.record_ms(&counters_ref.pread_ms);
+                counters_ref
+                    .bytes_read
+                    .fetch_add(task.data_size as u64, Relaxed);
+                counters_ref.pread_calls.fetch_add(1, Relaxed);
+
+                let t1 = crate::counters::Stopwatch::start();
+                crate::blob::decompress_blob_raw(read_buf, decompress_buf)
+                    .map_err(|e| in_input(e.context("pass A decompress")))?;
+                t1.record_ms(&counters_ref.decompress_ms);
+
+                let t2 = crate::counters::Stopwatch::start();
+                let mut blob_node_ids: Vec<i64> = Vec::new();
+                let mut per_way_rcs: Vec<u32> = Vec::new();
+                let mut closure_slots: Vec<bool> = Vec::new();
+                crate::scan::way::scan_way_refs(
+                    decompress_buf,
+                    refs_buf,
+                    group_starts,
+                    |_way_id, refs| {
+                        blob_node_ids.extend_from_slice(refs);
+                        // Closure flags exist only to feed the
+                        // stage-2 pin logic, which is gated on
+                        // the flag. Staging them unconditionally
+                        // cost 12.4 B pushes per planet run on
+                        // the plain path; `closure_slots` stays
+                        // empty when the flag is off and the
+                        // emission loop below must not index it.
+                        if inject_prepass {
+                            let closed = refs.len() >= 4 && refs.first() == refs.last();
+                            closure_slots
+                                .extend((0..refs.len()).map(|i| closed && i + 1 == refs.len()));
                         }
-                        let task = &schedule_ref[idx];
-                        // A failure reading this blob is about the input:
-                        // located with its path and the blob's payload
-                        // offset (cold). Scratch failures name their shard.
-                        let in_input = |e: Error| {
-                            e.locate_blob(crate::error::Location::at_offset(
-                                input,
-                                task.data_offset,
-                            ))
-                        };
+                        #[allow(clippy::cast_possible_truncation)]
+                        per_way_rcs.push(refs.len() as u32);
+                    },
+                )
+                .map_err(in_input)?;
+                t2.record_ms(&counters_ref.scan_way_refs_ms);
 
-                        let result: crate::Result<(u64, Vec<u32>)> = (|| {
-                            let t0 = crate::counters::Stopwatch::start();
-                            read_buf.resize(task.data_size, 0);
-                            file.read_exact_at(&mut read_buf, task.data_offset)
-                                .map_err(|e| in_input(Error::from(e).context("pass A pread")))?;
-                            t0.record_ms(&counters_ref.pread_ms);
-                            counters_ref
-                                .bytes_read
-                                .fetch_add(task.data_size as u64, Relaxed);
-                            counters_ref.pread_calls.fetch_add(1, Relaxed);
-
-                            let t1 = crate::counters::Stopwatch::start();
-                            crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
-                                .map_err(|e| in_input(e.context("pass A decompress")))?;
-                            t1.record_ms(&counters_ref.decompress_ms);
-
-                            let t2 = crate::counters::Stopwatch::start();
-                            let mut blob_node_ids: Vec<i64> = Vec::new();
-                            let mut per_way_rcs: Vec<u32> = Vec::new();
-                            let mut closure_slots: Vec<bool> = Vec::new();
-                            crate::scan::way::scan_way_refs(
-                                &decompress_buf,
-                                &mut refs_buf,
-                                &mut group_starts,
-                                |_way_id, refs| {
-                                    blob_node_ids.extend_from_slice(refs);
-                                    // Closure flags exist only to feed the
-                                    // stage-2 pin logic, which is gated on
-                                    // the flag. Staging them unconditionally
-                                    // cost 12.4 B pushes per planet run on
-                                    // the plain path; `closure_slots` stays
-                                    // empty when the flag is off and the
-                                    // emission loop below must not index it.
-                                    if inject_prepass {
-                                        let closed = refs.len() >= 4 && refs.first() == refs.last();
-                                        closure_slots.extend(
-                                            (0..refs.len()).map(|i| closed && i + 1 == refs.len()),
-                                        );
-                                    }
-                                    #[allow(clippy::cast_possible_truncation)]
-                                    per_way_rcs.push(refs.len() as u32);
-                                },
-                            )
-                            .map_err(in_input)?;
-                            t2.record_ms(&counters_ref.scan_way_refs_ms);
-
-                            // Emit IdRecords per ref into
-                            // id-bucket shards. Records for negative refs
-                            // or out-of-range node ids (> max_node_id)
-                            // are skipped; those slots stay unresolved
-                            // and stage 4 fills zero coordinates.
-                            let t_id = crate::counters::Stopwatch::start();
-                            if id_shard_writers.is_empty() {
-                                let mut fresh = Vec::with_capacity(NUM_BUCKETS);
-                                for bucket_idx in 0..NUM_BUCKETS {
-                                    let path = super::radix::id_shard_path(
-                                        scratch_ref,
-                                        worker_id,
-                                        bucket_idx,
-                                    )?;
-                                    let f = crate::scratch::create(&path).map_err(|e| {
-                                        Error::from(e)
-                                            .context(format!("create id shard {}", path.display()))
-                                    })?;
-                                    fresh.push(BufWriter::with_capacity(
-                                        BUCKET_BUF_SIZE,
-                                        TimedShardWriter {
-                                            file: f,
-                                            counters: counters_ref,
-                                        },
-                                    ));
-                                }
-                                id_shard_writers = fresh;
-                            }
-                            let mut blob_emitted: u64 = 0;
-                            let mut blob_skipped: u64 = 0;
-                            let mut blob_bytes: u64 = 0;
-                            for (i, &node_id) in blob_node_ids.iter().enumerate() {
-                                let blob_local_slot = u32::try_from(i).map_err(|_| {
-                                    Error::invalid_data(format!(
-                                        "way blob has > u32::MAX refs (i={i})"
-                                    ))
-                                })?;
-                                let location = if node_id < 0 {
-                                    None
-                                } else {
-                                    #[allow(clippy::cast_sign_loss)]
-                                    layout_ref.locate(node_id as u64)
-                                };
-                                if let Some((bucket_idx, local_node_id)) = location {
-                                    let rec = IdRecord {
-                                        local_node_id: local_node_id
-                                            | if inject_prepass && closure_slots[i] {
-                                                super::CLOSURE_FLAG
-                                            } else {
-                                                0
-                                            },
-                                        blob_idx: task.seq,
-                                        blob_local_slot,
-                                    };
-                                    rec.write_to(&mut id_rec_buf);
-                                    id_shard_writers[bucket_idx]
-                                        .write_all(&id_rec_buf)
-                                        .map_err(|e| {
-                                            shard_error(
-                                                e,
-                                                "write",
-                                                scratch_ref,
-                                                worker_id,
-                                                bucket_idx,
-                                            )
-                                        })?;
-                                    id_bucket_local_counts[bucket_idx] += 1;
-                                    blob_emitted += 1;
-                                    blob_bytes += ID_RECORD_SIZE as u64;
-                                } else {
-                                    blob_skipped += 1;
-                                }
-                            }
-                            t_id.record_ms(&counters_ref.id_emit_ms);
-                            counters_ref
-                                .id_records_emitted
-                                .fetch_add(blob_emitted, Relaxed);
-                            counters_ref
-                                .id_records_skipped
-                                .fetch_add(blob_skipped, Relaxed);
-                            counters_ref
-                                .id_shard_bytes_written
-                                .fetch_add(blob_bytes, Relaxed);
-
-                            Ok((blob_node_ids.len() as u64, per_way_rcs))
-                        })();
-
-                        if tx.send((task.seq, result)).is_err() {
-                            break;
-                        }
+                // Emit IdRecords per ref into
+                // id-bucket shards. Records for negative refs
+                // or out-of-range node ids (> max_node_id)
+                // are skipped; those slots stay unresolved
+                // and stage 4 fills zero coordinates.
+                let t_id = crate::counters::Stopwatch::start();
+                if id_shard_writers.is_empty() {
+                    let mut fresh = Vec::with_capacity(NUM_BUCKETS);
+                    for bucket_idx in 0..NUM_BUCKETS {
+                        let path = super::radix::id_shard_path(scratch_ref, worker_id, bucket_idx)?;
+                        let f = crate::scratch::create(&path).map_err(|e| {
+                            Error::from(e).context(format!("create id shard {}", path.display()))
+                        })?;
+                        fresh.push(BufWriter::with_capacity(
+                            BUCKET_BUF_SIZE,
+                            TimedShardWriter {
+                                file: f,
+                                counters: counters_ref,
+                            },
+                        ));
                     }
-
-                    // Flush id-shard writers before the worker thread
-                    // exits. Drop would silently swallow flush errors,
-                    // so do it explicitly and surface any failure via
-                    // the shared mutex; the orchestrator checks after
-                    // the scope joins.
-                    for (bucket_idx, w) in id_shard_writers.iter_mut().enumerate() {
-                        if let Err(e) = w.flush() {
-                            let mut slot = s1a_id_flush_err_ref
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if slot.is_none() {
-                                *slot = Some(shard_error(
-                                    e,
-                                    "flush",
-                                    scratch_ref,
-                                    worker_id,
-                                    bucket_idx,
-                                ));
-                            }
-                            break;
-                        }
-                    }
-
-                    // Hand the local per-bucket tally to the
-                    // orchestrator for post-scope merge.
-                    s1a_id_bucket_counts_workers_ref
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(id_bucket_local_counts);
-                });
-            }
-            drop(tx);
-
-            let mut sidecar_writer = BufWriter::with_capacity(
-                REF_COUNT_SIDECAR_BUF_BYTES,
-                crate::scratch::create_file(ref_count_sidecar)?,
-            );
-            let mut per_way_writer = BufWriter::with_capacity(
-                PER_WAY_REFCOUNT_SIDECAR_BUF_BYTES,
-                crate::scratch::create_file(per_way_refcount_sidecar)?,
-            );
-            let mut varint_buf: Vec<u8> = Vec::with_capacity(STAGE1_VARINT_BUF_CAPACITY);
-            let mut reorder: crate::reorder_buffer::ReorderBuffer<crate::Result<(u64, Vec<u32>)>> =
-                crate::reorder_buffer::ReorderBuffer::with_capacity(POOL_REORDER_CAPACITY_WIDE);
-
-            // Cancellation is checked per result on this consumer: an early
-            // return drops the receiver (moved into the loop), so every
-            // worker's next send fails and it stops claiming blobs.
-            for (seq_num, item) in rx {
-                host.cancel.check()?;
-                reorder.push(seq_num as usize, item);
-                while let Some(result) = reorder.pop_ready() {
-                    let (ref_count, per_way_rcs) = result?;
-                    sidecar_writer.write_all(&ref_count.to_le_bytes())?;
-                    total_refs += ref_count;
-
-                    varint_buf.clear();
-                    protohoggr::encode_varint(&mut varint_buf, per_way_rcs.len() as u64);
-                    for rc in &per_way_rcs {
-                        protohoggr::encode_varint(&mut varint_buf, u64::from(*rc));
-                    }
-                    per_way_writer.write_all(&varint_buf)?;
-                    counters_ref.per_way_sidecar_bytes.fetch_add(
-                        varint_buf.len() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    *id_shard_writers = fresh;
                 }
-            }
-            sidecar_writer.write_all(&total_refs.to_le_bytes())?;
-            sidecar_writer.flush()?;
-            per_way_writer.flush()?;
-            Ok(())
-        })?;
-    }
+                let mut blob_emitted: u64 = 0;
+                let mut blob_skipped: u64 = 0;
+                let mut blob_bytes: u64 = 0;
+                for (i, &node_id) in blob_node_ids.iter().enumerate() {
+                    let blob_local_slot = u32::try_from(i).map_err(|_| {
+                        Error::invalid_data(format!("way blob has > u32::MAX refs (i={i})"))
+                    })?;
+                    let location = if node_id < 0 {
+                        None
+                    } else {
+                        #[allow(clippy::cast_sign_loss)]
+                        layout_ref.locate(node_id as u64)
+                    };
+                    if let Some((bucket_idx, local_node_id)) = location {
+                        let rec = IdRecord {
+                            local_node_id: local_node_id
+                                | if inject_prepass && closure_slots[i] {
+                                    super::CLOSURE_FLAG
+                                } else {
+                                    0
+                                },
+                            blob_idx: task.seq,
+                            blob_local_slot,
+                        };
+                        rec.write_to(id_rec_buf);
+                        id_shard_writers[bucket_idx]
+                            .write_all(id_rec_buf.as_slice())
+                            .map_err(|e| {
+                                shard_error(e, "write", scratch_ref, worker_id, bucket_idx)
+                            })?;
+                        id_bucket_local_counts[bucket_idx] += 1;
+                        blob_emitted += 1;
+                        blob_bytes += ID_RECORD_SIZE as u64;
+                    } else {
+                        blob_skipped += 1;
+                    }
+                }
+                t_id.record_ms(&counters_ref.id_emit_ms);
+                counters_ref
+                    .id_records_emitted
+                    .fetch_add(blob_emitted, Relaxed);
+                counters_ref
+                    .id_records_skipped
+                    .fetch_add(blob_skipped, Relaxed);
+                counters_ref
+                    .id_shard_bytes_written
+                    .fetch_add(blob_bytes, Relaxed);
 
-    // Surface any worker-side flush errors from the id-shard writers.
-    let mut id_flush_slot = s1a_id_shard_flush_err
-        .lock()
-        .map_err(|_| Error::internal("id shard flush mutex poisoned"))?;
-    if let Some(err) = id_flush_slot.take() {
-        return Err(err);
-    }
-    drop(id_flush_slot);
+                Ok((blob_node_ids.len() as u64, per_way_rcs))
+            })();
+            result
+        },
+        &mut consumer,
+    );
+
+    // Flush the id-shard writers now the workers have joined: explicitly,
+    // since Drop would silently swallow a flush error, and in parallel, one
+    // thread per shard, as each worker used to flush its own on exit. Also
+    // after a pool error; that error wins over a flush failure.
+    let flush_result = flush_shards(&mut shards, scratch_ref);
+    pool_result?;
+    flush_result?;
+    let total_refs = consumer.finish()?;
 
     counters.emit_all();
     crate::debug::emit_marker("EXTJOIN_S1_PASS_A_END");
 
     let mut id_bucket_counts: Vec<u64> = vec![0; NUM_BUCKETS];
-    for worker_counts in s1a_id_bucket_counts_workers
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
-        for (i, &c) in worker_counts.iter().enumerate() {
+    for shard in &shards {
+        for (i, &c) in shard.id_bucket_local_counts.iter().enumerate() {
             id_bucket_counts[i] += c;
         }
     }

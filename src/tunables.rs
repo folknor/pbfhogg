@@ -94,14 +94,21 @@ pub(crate) const POOL_DESCRIPTOR_CHANNEL_DEPTH: usize = 16;
 /// the writer pipeline with no wall change.
 pub(crate) const POOL_RESULT_CHANNEL_DEPTH: usize = 32;
 
-/// Capacity of the reorder buffer behind a hand-rolled decode pool (the
-/// common case).
-pub(crate) const POOL_REORDER_CAPACITY: usize = 32;
-
 /// Capacity of the wider reorder buffers (time-filter and altw stage 1's
 /// per-way stream), and the admission window of cat `--clean`'s ordered
 /// pool (at most this many decoded results alive between decode and write).
 pub(crate) const POOL_REORDER_CAPACITY_WIDE: usize = 64;
+
+/// Default result window of the ordered pool (`crate::ordered_pool`), per
+/// worker: at most `workers x` this many tasks are admitted but not yet
+/// consumed. Large enough that a worker is never parked behind a slightly
+/// slow neighbour, small enough that buffered results stay bounded. Carried
+/// over from renumber's pool, where it was set; for every other pool it is a
+/// default, not a measurement.
+pub(crate) const ORDERED_POOL_WINDOW_PER_WORKER: usize = 8;
+
+/// Floor of the ordered pool's default result window.
+pub(crate) const ORDERED_POOL_WINDOW_MIN: usize = 32;
 
 /// How long a cooperative wait on an executor parks in `recv_timeout` once
 /// `yield_now` reports the executor idle, before polling again. Used by the
@@ -468,14 +475,6 @@ pub(crate) const ALTW_STAGE3_WORKERS_CAP: usize = 4;
 // ---------------------------------------------------------------------------
 // Renumber
 // ---------------------------------------------------------------------------
-
-/// Result window per worker. Large enough that a worker is never parked
-/// behind a slightly slow neighbour, small enough that the buffered
-/// rewritten blobs stay a few hundred MB at worst.
-pub(crate) const RENUMBER_WINDOW_PER_WORKER: usize = 8;
-
-/// Floor of the renumber pool's result window.
-pub(crate) const RENUMBER_WINDOW_MIN: usize = 32;
 
 /// Pass 1 worker count.
 pub(crate) const RENUMBER_PASS1_WORKERS: usize = 4;

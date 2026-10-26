@@ -195,6 +195,64 @@ impl Stopwatch {
     }
 }
 
+/// Depth-gated stall span shared by concurrent blockers.
+///
+/// `brokkr sidecar --durations` pairs `WAIT_<CATEGORY>_START/_END` markers
+/// by name, which breaks if N threads emit interleaved pairs for the
+/// same category. (These spans do not feed `--stalls`, which reads
+/// `*_wait_ns` counters; a blocking point meant to show there needs a
+/// counter, and emitting both is fine.) The gauge collapses concurrent
+/// blockers into one non-overlapping span per busy period: START when depth
+/// goes 0 -> 1, END when it returns to 0. The mutex is held only across the
+/// depth transition + marker emit, and callers must gate `track()` behind a
+/// try_* fast path so unblocked operations never touch it.
+pub(crate) struct StallGauge {
+    start_marker: &'static str,
+    end_marker: &'static str,
+    depth: std::sync::Mutex<u64>,
+}
+
+/// RAII exit for [`StallGauge::track`]; decrements depth on drop so
+/// early returns and error paths cannot leak an open WAIT span.
+pub(crate) struct StallGuard<'a>(&'a StallGauge);
+
+impl StallGauge {
+    pub(crate) fn new(start_marker: &'static str, end_marker: &'static str) -> Self {
+        Self {
+            start_marker,
+            end_marker,
+            depth: std::sync::Mutex::new(0),
+        }
+    }
+
+    /// Enter the stall; the returned guard exits it on drop.
+    pub(crate) fn track(&self) -> StallGuard<'_> {
+        let mut depth = self
+            .depth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *depth == 0 {
+            crate::debug::emit_marker(self.start_marker);
+        }
+        *depth += 1;
+        StallGuard(self)
+    }
+}
+
+impl Drop for StallGuard<'_> {
+    fn drop(&mut self) {
+        let mut depth = self
+            .0
+            .depth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *depth = depth.saturating_sub(1);
+        if *depth == 0 {
+            crate::debug::emit_marker(self.0.end_marker);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};

@@ -19,7 +19,7 @@
 //!
 //! The merge thread runs a single long-lived `BlockBuilder` per kind,
 //! configured with the requested cap, and consumes payloads in seq order
-//! via a `ReorderBuffer`. Per input blob, when that blob carries direct
+//! from the ordered classify pool. Per input blob, when that blob carries direct
 //! full blocks it first drains the central stream (flush the builder,
 //! write all pending) so the earlier lower-ID tails precede this blob's
 //! higher-ID full blocks, then writes the worker's full framed blocks
@@ -44,7 +44,6 @@ use super::{
 };
 use crate::ElementKind;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
-use crate::error::Error;
 use crate::owned::{
     OwnedNode, OwnedRelation, OwnedWay, dense_node_metadata, element_metadata, read_dense_node,
     read_node, read_relation, read_way, read_way_with_locations, relation_members_into,
@@ -405,7 +404,6 @@ fn run_kind_phase(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     host: &crate::host::Host,
 ) -> Result<PhaseStats> {
-    use crate::reorder_buffer::ReorderBuffer;
     let elements_per_blob = cap.get();
 
     if schedule.is_empty() {
@@ -420,10 +418,6 @@ fn run_kind_phase(
     }
 
     type PhaseResult = crate::Result<WorkerOutput>;
-    // Reorder buffer depth: enough to absorb decode-thread variance
-    // without holding too many decoded payloads in flight.
-    let mut reorder: ReorderBuffer<WorkerOutput> =
-        ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY);
 
     // Same bound as the workers', derived from the input instead of a block:
     // the file cannot deliver more elements than it has bytes (an element
@@ -438,150 +432,99 @@ fn run_kind_phase(
     let mut coalesces: u64 = 0;
     let mut worker_full_blobs: u64 = 0;
     let mut central_blobs: u64 = 0;
-    let mut write_error: Option<Error> = None;
-    let mut classify_error: Option<Error> = None;
 
-    let pool_result = crate::scan::classify::parallel_classify_phase(
+    // Results arrive in schedule order through the ordered pool, whose window
+    // bounds the decoded payloads in flight. A write or encode error ends the
+    // phase at its position.
+    crate::scan::classify::parallel_classify_phase_ordered(
         shared_file,
         schedule,
+        None,
         None,
         || (),
         |block, _state| -> PhaseResult {
             worker_split_blob(block, kind, cap, preserve_locations, &compression)
         },
-        |seq, r| {
-            reorder.push(seq, r);
-            while let Some(item) = reorder.pop_ready() {
-                if write_error.is_some() {
-                    continue;
+        |_position, item| {
+            let WorkerOutput { full_framed, tail } = item;
+            let full_count = full_framed.len() as u64 * elements_per_blob as u64;
+            let tail_n = tail.len();
+
+            // Ordering guard (restores Sort.Type_then_ID monotonicity
+            // across the two output streams). This input blob's full
+            // blocks carry IDs strictly above every tail accumulated so
+            // far: the source is type-then-ID sorted, and the worker
+            // splits the low `M - M%cap` IDs into `full_framed` and the
+            // high `M%cap` IDs into `tail`, so blob N's full blocks
+            // outrank blob N-1's tail. The central stream (`bb` +
+            // `pending`) holds those earlier lower-ID tails but is
+            // otherwise flushed only in FRAME_BATCH-sized batches - a
+            // delayed batch would land AFTER these direct writes and
+            // emit lower IDs after higher ones. So before any direct
+            // write, drain the central stream: flush `bb`, then write
+            // everything `pending` holds. This leaves pure-grow
+            // coalescing untouched - grows produce empty `full_framed`,
+            // so the guard never fires and the central builder still
+            // coalesces trailing slices across input-blob boundaries.
+            // In the shrink/mixed case it splits each accumulated tail
+            // into its own (possibly under-cap) block, which is the
+            // correct trade: coalescing there was buying little and was
+            // the source of the reordering.
+            if !full_framed.is_empty() && (!bb.is_empty() || !pending.is_empty()) {
+                flush_local(&mut bb, &mut output)?;
+                central_blobs += output.len() as u64;
+                pending.append(&mut output);
+                if !pending.is_empty() {
+                    let batch = std::mem::take(&mut pending);
+                    blobs += frame_and_write_batch(batch, compression, writer, &host.executor)?;
                 }
-                {
-                    {
-                        let WorkerOutput { full_framed, tail } = item;
-                        let full_count = full_framed.len() as u64 * elements_per_blob as u64;
-                        let tail_n = tail.len();
+            }
 
-                        // Ordering guard (restores Sort.Type_then_ID monotonicity
-                        // across the two output streams). This input blob's full
-                        // blocks carry IDs strictly above every tail accumulated so
-                        // far: the source is type-then-ID sorted, and the worker
-                        // splits the low `M - M%cap` IDs into `full_framed` and the
-                        // high `M%cap` IDs into `tail`, so blob N's full blocks
-                        // outrank blob N-1's tail. The central stream (`bb` +
-                        // `pending`) holds those earlier lower-ID tails but is
-                        // otherwise flushed only in FRAME_BATCH-sized batches - a
-                        // delayed batch would land AFTER these direct writes and
-                        // emit lower IDs after higher ones. So before any direct
-                        // write, drain the central stream: flush `bb`, then write
-                        // everything `pending` holds. This leaves pure-grow
-                        // coalescing untouched - grows produce empty `full_framed`,
-                        // so the guard never fires and the central builder still
-                        // coalesces trailing slices across input-blob boundaries.
-                        // In the shrink/mixed case it splits each accumulated tail
-                        // into its own (possibly under-cap) block, which is the
-                        // correct trade: coalescing there was buying little and was
-                        // the source of the reordering.
-                        if !full_framed.is_empty() && (!bb.is_empty() || !pending.is_empty()) {
-                            if let Err(e) = flush_local(&mut bb, &mut output) {
-                                classify_error.get_or_insert(e);
-                                continue;
-                            }
-                            central_blobs += output.len() as u64;
-                            pending.append(&mut output);
-                            if !pending.is_empty() {
-                                let batch = std::mem::take(&mut pending);
-                                match frame_and_write_batch(
-                                    batch,
-                                    compression,
-                                    writer,
-                                    &host.executor,
-                                ) {
-                                    Ok(written) => blobs += written,
-                                    Err(e) => {
-                                        write_error = Some(e);
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
+            // Write the worker's already-framed full blocks directly.
+            for framed in full_framed {
+                writer.write_raw_owned(framed)?;
+                blobs += 1;
+                worker_full_blobs += 1;
+            }
 
-                        // Write the worker's already-framed full blocks directly.
-                        for framed in full_framed {
-                            if let Err(e) = writer.write_raw_owned(framed) {
-                                write_error = Some(e);
-                                break;
-                            }
-                            blobs += 1;
-                            worker_full_blobs += 1;
-                        }
-                        if write_error.is_some() {
-                            continue;
-                        }
+            // Coalesce check: the trailing slice extends a non-empty
+            // central builder iff it's non-empty and the BB carries
+            // residual elements from a prior input blob's tail.
+            if tail_n > 0 && !bb.is_empty() {
+                coalesces += 1;
+            }
 
-                        // Coalesce check: the trailing slice extends a non-empty
-                        // central builder iff it's non-empty and the BB carries
-                        // residual elements from a prior input blob's tail.
-                        if tail_n > 0 && !bb.is_empty() {
-                            coalesces += 1;
-                        }
-
-                        let consume_res: crate::Result<()> = (|| {
-                            match tail {
-                                KindPayload::Nodes(nodes) => {
-                                    for node in &nodes {
-                                        write_single_node_local(node, &mut bb, &mut output)?;
-                                    }
-                                }
-                                KindPayload::Ways(ways) => {
-                                    for way in &ways {
-                                        write_single_way_local(way, &mut bb, &mut output)?;
-                                    }
-                                }
-                                KindPayload::Relations(rels) => {
-                                    for rel in &rels {
-                                        write_single_relation_local(rel, &mut bb, &mut output)?;
-                                    }
-                                }
-                            }
-                            Ok(())
-                        })();
-                        if let Err(e) = consume_res {
-                            classify_error.get_or_insert(e);
-                            continue;
-                        }
-                        // Anything in `output` came from a mid-stream cap fire on
-                        // the central builder; track for the warning logic, then
-                        // accumulate into `pending` for batched parallel framing.
-                        central_blobs += output.len() as u64;
-                        pending.append(&mut output);
-                        while pending.len() >= FRAME_BATCH {
-                            let batch: Vec<OwnedBlock> = pending.drain(..FRAME_BATCH).collect();
-                            match frame_and_write_batch(batch, compression, writer, &host.executor)
-                            {
-                                Ok(written) => blobs += written,
-                                Err(e) => {
-                                    write_error = Some(e);
-                                    break;
-                                }
-                            }
-                        }
-                        elements += full_count + tail_n;
+            match tail {
+                KindPayload::Nodes(nodes) => {
+                    for node in &nodes {
+                        write_single_node_local(node, &mut bb, &mut output)?;
+                    }
+                }
+                KindPayload::Ways(ways) => {
+                    for way in &ways {
+                        write_single_way_local(way, &mut bb, &mut output)?;
+                    }
+                }
+                KindPayload::Relations(rels) => {
+                    for rel in &rels {
+                        write_single_relation_local(rel, &mut bb, &mut output)?;
                     }
                 }
             }
+            // Anything in `output` came from a mid-stream cap fire on
+            // the central builder; track for the warning logic, then
+            // accumulate into `pending` for batched parallel framing.
+            central_blobs += output.len() as u64;
+            pending.append(&mut output);
+            while pending.len() >= FRAME_BATCH {
+                let batch: Vec<OwnedBlock> = pending.drain(..FRAME_BATCH).collect();
+                blobs += frame_and_write_batch(batch, compression, writer, &host.executor)?;
+            }
+            elements += full_count + tail_n;
+            Ok(())
         },
         host,
-    );
-
-    // Errors the merge recorded came first: the pool's own (a cancellation
-    // observed at a later receive included) is the later one.
-    if let Some(e) = write_error {
-        return Err(e);
-    }
-    if let Some(e) = classify_error {
-        return Err(e);
-    }
-    pool_result?;
+    )?;
 
     // Final flush: emit the residual block (if any) for this kind. Any
     // blocks `output` holds at this point are residuals, not mid-stream

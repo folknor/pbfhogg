@@ -73,7 +73,7 @@ Launch order: every queued entry has run.
 Every entry still open in this file and `notes/bugs.md` is owed a resolution
 in this drain, except what the maintainer moved to the CLI-surface redesign
 in `notes/todo.md` (the `--direct-io` reach and `--json` entries). HYG-002,
-HYG-011, HYG-036, HYG-053, HYG-081, HYG-181 and HYG-182 were deferred by the 2026-10-25 session, not dropped:
+HYG-011, HYG-036, HYG-081, HYG-181 and HYG-182 were deferred by the 2026-10-25 session, not dropped:
 "skipped for now" in their Maintainer paragraphs means that session did not
 take them, and the paragraphs are guidance on how to resolve them, not a
 ruling that they stay. BUG-009 is the maintainer's own project.
@@ -1115,6 +1115,46 @@ The judgement calls already known, to be checked first:
   segment and loops `while let` over the search stack (argued
   traversal-identical; geocode admin polygons depend on it); degrade's
   unsort hold takes the held element before writing the arriving one.
+- Every pool that delivers results in schedule order now runs on one
+  engine, `src/ordered_pool.rs` (the reorder-buffer bound drain; design
+  sparred with codex to consensus, `reference/pipeline.md` "Ordered pread
+  pool"): renumber's pool generalised, classify's `OrderedCredit` dispatcher
+  replaced, and the hand-built ordered pools converted (repack, degrade,
+  getparents, time-filter snapshot, tags-filter pass 2, extract
+  `pread_execute`, both multi-extract writers, altw sparse passthrough,
+  external stages 1 and 4); `blob_merge` shares only the gate. A bisect
+  candidate on several axes, none measured:
+  - Windows where there were none: every converted pool now admits at most
+    `default_window(threads)` tasks (8 per worker, floor 32) past the
+    consumed head, where before only the channel and an effectively
+    unbounded reorder buffer limited it. Workers can now park behind a slow
+    head blob; altw stage 4's way workers can park behind an unpublished
+    router slot. Window sizes were not tuned.
+  - Claim-based workers replace the dispatcher thread and
+    `Mutex<Receiver>` fan-out. The sliding WILLNEED advice (classify's
+    callers, tags-filter pass 2) moved from the dispatcher to the consumer,
+    advised for the window's edge before that credit is published.
+  - Credit returns after `consume` instead of before (renumber): the window
+    now includes the item being written, so renumber's effective window is
+    one smaller.
+  - Failures surface in schedule order (lowest failing position, or the
+    consumer's own) where classify's pools surfaced arrival order;
+    repack and degrade lost their write-before-classify latch; cat
+    `--clean`, geocode pass 2 and time-filter now stop at a write error
+    instead of decoding the rest of the input.
+  - Passthrough frames (extract, multi-extract nodes, altw passthrough,
+    stage 4) are copied by the consumer between decode results
+    (`Interleaved`), so a passthrough prefix is copied after decode
+    result 0 arrives rather than before any; each frame checks
+    cancellation; multi-extract's all-passthrough fast path is now the
+    same consumer with zero decode tasks.
+  - Altw stage 1's id-shard writers are flushed after the join, one thread
+    per shard, where each worker flushed its own on exit (overlapping
+    other workers' scans); a flush is still attempted after a pool error.
+  - Sidecar counters keep their names and units (`Timer::Ms` for the
+    inherited per-sample-truncated `_ms` counters); `s4_channel_high_water`
+    is now measured by the engine with the same workers-up, consumer-down
+    accounting.
 ---
 
 ## HYG-002 - Tunables are centralized but not injectable
@@ -1144,90 +1184,100 @@ Reported by: all nine scopes.
 
 ## HYG-011 - The pread-decompress-dispatch-reorder pool is hand-built about fifteen times
 
-Anger: 10 - unifies the read engine and the blob pools; the batched-pipeline rebuild was already measured and reverted.
+Anger: 10 - unifies the blob pools on measured paths; two earlier verdicts said don't (see History).
 
-The same machine (a dispatcher feeding `Arc<Mutex<Receiver>>`, N workers doing
-pread into a reused buffer, `decompress_blob_raw`, the per-blob work, a bounded
-result channel, a consumer with or without a `ReorderBuffer`, a first-error
-slot) is built in:
+Since the HYG-053 drain (2026-10-26), every pool that delivers results in
+schedule order runs on one engine, `src/ordered_pool.rs` (claim-based
+workers, an admission window, ordered failures, one cancellation and exit
+contract, optional wait/send/stall/queue counters): classify's ordered
+phase and through it repack, degrade, getparents, time-filter's snapshot
+path, tags-filter pass 2, multi-extract's region writer, cat `--clean` and
+geocode pass 2; renumber's stages; extract's `pread_execute`;
+multi-extract's node pass; altw sparse passthrough and external stages 1
+and 4. `blob_merge.rs` (sort, `cat --dedupe`) shares its gate. What is still
+built by hand is the unordered family - a dispatcher feeding
+`Arc<Mutex<Receiver>>`, N workers doing pread, `decompress_blob_raw` and the
+per-blob work, a result channel, a first-error slot - in:
 
-- `scan/classify.rs`: `parallel_classify_phase_abortable`,
-  `parallel_scan_blobs_raw`, `parallel_classify_accumulate`, three near-verbatim
-  copies in one file; only `_abortable` supports early exit, only the classify
-  ones use a `DecompressPool` and a WILLNEED window.
-- Altw: `external/stage1.rs` pass A (atomic-index dispatch, own reorder
-  buffer), `stage2.rs`, `stage3.rs`, `stage4.rs` and `passthrough.rs`
-  (`passthrough.rs`'s doc says it was "lifted from external/stage4.rs").
-- Renumber: now one pool in `renumber/pool.rs` with cancellation and a
-  claim window ahead of the write head, the properties the shared engine
-  needs; a candidate to generalise rather than another copy.
-- `repack` and `degrade`: each defines `FRAME_BATCH`, `KindPayload`,
-  `WorkerOutput`, `PhaseStats`, `run_kind_phase`, `frame_owned`,
-  `frame_and_write_batch`. (cat's `--clean` path left this family when it
-  became one ordered pass.) The sort-preservation guards now agree; repack
-  fires its guard only when the worker produced full frames, degrade on
-  every input blob (it mirrors input blobs one to one).
-- `extract/common.rs::pread_execute` (whose `ConsumerItem` match is written
-  twice verbatim in the same function for the post-drain tail),
-  `extract/simple.rs` (node and way classify), `extract/multi.rs` (node write,
-  way/relation write), `tags_filter/mod.rs` pass 2.
+- `scan/classify.rs`: `parallel_classify_phase_abortable` (and
+  `parallel_classify_phase` on it), `parallel_scan_blobs_raw`,
+  `parallel_classify_accumulate`, three near-verbatim copies in one file.
+- Altw external `stage2.rs` and `stage3.rs`, which dispatch buckets rather
+  than blobs.
 - `geocode_index/builder/pass1_5.rs`.
-- `commands/blob_merge.rs::write_plan` (sort and `cat --dedupe`): its work
-  items are multi-blob overlap runs that stream blocks back through one
-  bounded channel per run, so it is a variant rather than a copy; it
-  reuses classify's admission credit (`OrderedCredit`, `wait_for_credit`,
-  `CloseOnDrop`, `recv_checked`) instead of carrying its own.
+- The diff and derive shard runs, and apply-changes' scanner and workers
+  (HYG-081), which are their own designs.
 
-`getparents` and `getid --id-osm-file` use the shared helper; the rest do not.
-Divergence across copies is already fact:
+Divergence across the unordered copies:
 
-- Error policy: stage 1's flush slot and stage 2 keep the first error, stage 3
-  has both a first-wins `s3_error` and the router's `abort_error`;
-  repack/degrade latch and keep draining, renumber returns immediately (and
-  hangs), sort uses rayon's short-circuiting collect.
-- Cancellation: every pool now observes `host.cancel`, but each copy wires it
-  by hand - ordered pools in the consumer (`recv_checked` in classify,
-  renumber's `run_ordered`, the altw and extract consumers), unordered ones
-  in the worker (accumulate, stage 2 and 3 buckets, diff and derive shards,
-  pass1_5) - and each copy's early return has to drop its receiver before
-  the scope joins, which two copies (altw passthrough and stage 4) got wrong
-  until the cancellation work moved the receiver into the consumer closure.
-  Internal early exit still differs: stage 2 polls the error mutex per
-  bucket, classify relies on channel drop, stage 1 runs until the schedule
-  drains, getparents breaks the scan on first error with a comment on why
-  that matters at planet scale.
-- Prefetch: only classify gets the sliding WILLNEED window.
-- Stall counters: no hand pool emits `*_wait_ns`, so `--stalls` is blind to
-  extract, tags-filter pass 2 and most altw stages.
+- Error policy: stage 2 keeps the first error, stage 3 has both a first-wins
+  `s3_error` and the router's `abort_error`, classify relies on channel drop.
+- Cancellation: each copy wires `host.cancel` by hand, in the worker; stage 2
+  polls the error mutex per bucket.
+- Stall counters: none of these emit `*_wait_ns`.
 - The `Mutex<Receiver>` lock is held across a blocking `recv()`, so idle
   workers queue on the mutex, and it poisons silently
-  (`unwrap_or_else(PoisonError::into_inner)`).
+  (`unwrap_or_else(PoisonError::into_inner)`). A hygiene complaint, not a
+  speed one: the 2026-07-13 hybrid-batching research (deleted note,
+  `notes/hybrid-batching-research.md` before commit `856efc33`) put the
+  queueing at roughly 50-500 ms at Europe scale, under 1 % of wall, and no
+  profile has surfaced it. The ordered engine has no such lock.
 
-Fix: one `BlobPipeline` (schedule of `Decode | Passthrough` items, worker
-state factory, per-blob fn returning `crate::Result`, ordered or unordered
-consumer returning `ControlFlow`, cancellation token, one `FirstError` type,
-prefetch policy, pread error context, stall counters). `parallel_classify_phase`
-is already most of it. The external stages differ only in what they dispatch
-(blobs vs buckets). The `passthrough` / `stage4` fork becomes one assembly
-pipeline parameterised by a `CoordSource` trait (sparse `NodeIndex`, external
-router payloads), which also merges the two `reframe_way_blob_with_locations`
-(same name, different signatures). Enforce by dependency rule:
-`std::thread::scope`, `sync_channel` and `Arc::new(Mutex::new(` allowed only in
-the pipeline module.
-
-The ordered read engine (`read/pipeline.rs::run_pipeline`) is already one
-engine generic over its decode-worker transform; what it is not generic over
-is the frame source (it takes a sequential `BlobReader`, these pools pread a
-schedule) and the work item (one blob, where altw stages 2 and 3 dispatch
-buckets). Making it so is this entry's work, not a read-engine change, and
-so is making `ReorderBuffer` private to the pipeline module: the three
-writer paths (`write/pipeline.rs`, `parallel_writer.rs`, `uring_writer.rs`)
-use it as well as these pools, so the writer side would need its own answer
-first.
+Fix, if any remains worth doing: an unordered mode on the same engine (the
+claim counter and exit contract carry over; there is no reorder or window),
+and the altw `passthrough` / `stage4` fork, now two consumers of one engine,
+merged through a `CoordSource` trait (sparse `NodeIndex`, external router
+payloads), which also merges the two `reframe_way_blob_with_locations`.
+The read pipeline (`read/pipeline.rs::run_pipeline`) stays its own engine:
+its permit rides with each decoded item, which fits rayon tasks and
+filtered items.
 
 Maintainer (2026-10-25): skipped for now. A unified pool has been considered
 twice before and judged not worth doing once every implementation was
 catalogued; if it is done at all, it is done last.
+
+History (researched 2026-10-26 from deleted notes; read them with
+`git show <commit>^:<path>`):
+
+- March 2026, the full inventory. `notes/business-logic-consolidation-deep-dive-2026-03-03.md`
+  proposed one blob pipeline (shared frame source, passthrough sink, decode
+  batching); `notes/consolidation-review-3-blob-pipeline.md` (deleted in
+  `8bcc00b6`) catalogued every raw-frame pipeline of the time (cat,
+  add-locations-to-ways, sort, merge) and ruled "DO NOT DO", repeated by
+  `notes/consolidation-analysis-2026-03-07.md` (deleted in `97a8d697`).
+  Its sibling review of the rayon rewrite skeleton said the same. Its
+  reasons: orchestration differs per command and a pipeline would be
+  callback soup; sort is random access, so a streaming frame source is
+  useless to it; add-locations-to-ways' two-phase read is unique; merge is
+  bound up with diff-overlay semantics; upside "at best -2 %", downside
+  "+3 % to +12 %" (estimates, never measured). It predates every pread-worker
+  pool (the first landed 2026-03-28), so it judged a different family.
+- 2026-04-10, TODO "pread-from-workers boilerplate dedup (SKIP)", 4 of 4
+  reviewers (introduced in `025a8b07`): different payloads, consumers and
+  stats types make the generic helper harder to read than the duplication;
+  "only do this after the pread API shape stabilizes". Two copies (extract
+  and tags-filter), not the family.
+- Not an attempt: the July 2026 batched read-pipeline rebuild (measured,
+  reverted, `reference/performance-history.md` "Env-gated read-path
+  batch") ruled engine unification out of scope in its spec; it measured
+  `run_pipeline`'s seams, not pool unification.
+
+Which reasons are stale against today's tree: sort and `cat --dedupe` are
+one pread-schedule engine (`blob_merge.rs`), a header walk plus pread is the
+common shape rather than add-locations-to-ways' alone, and
+`parallel_classify_phase<S, R>` is already a closure-generic engine with
+many callers, so "callback soup" holds only for altw stages 2 and 3 (bucket
+dispatch) and the stage 4 / passthrough fork. Which still bind, and which a
+third attempt must answer: the API shape is still moving (three admission
+mechanisms, see HYG-053); the I/O mechanism must stay per command (ADR-0006
+measured a pipelined arm at 53.9 s against a 33.2 s sequential baseline);
+per-blob send and per-worker accumulation must both survive (accumulation
+is not planet-safe on dense paths); a credit window added to a pool that has
+none can park workers behind a slow head blob, which the July rebuild
+measured as deeper reorder skew, so its cost is per command; and
+apply-changes stays out. ADR-0014's route is the lighter alternative: share
+named primitives (first error, credit, cancellation wiring, counters) and
+leave the pools.
 
 Reported by: altw and scanning, re-encoding, filtering and spatial, read path,
 geocode index.
@@ -1258,46 +1308,6 @@ fails the build when an exemption goes stale), and ban
 
 Reported by: CLI and plumbing, filtering and spatial, change application, altw
 and scanning, re-encoding.
-
-## HYG-053 - Reorder buffers are bounded only statistically
-
-Anger: 10 - a credit scheme inside the read engine and blob pools.
-
-The channel bounds queued messages, but consumers drain the channel into the
-`ReorderBuffer` whether or not the head seq has arrived, so one slow blob lets
-the buffer grow by however many blobs the other workers finish meanwhile.
-This holds for the three renumber loops,
-repack/degrade, and the read pipeline's decode window, which uses
-`decode_ahead` for both admission and the decoded channel depth (one number for
-two meanings). `ReorderBuffer::with_capacity(capacity)` sets
-`max_window = DEFAULT_MAX_WINDOW.max(capacity)`; the only production caller
-of `with_max_window` is the OSC gzip writer, whose permits make its window a
-real bound, so every other buffer runs at 65 536 slots, and
-`altw/passthrough.rs` passes `passthrough_items.len() + decode_threads`, so its
-window is as large as the input. Stage 4 and `pread_execute` pre-insert every
-passthrough item before any worker result arrives, so ordering correctness
-rests on the buffer accepting an arbitrary number of out-of-window items; if
-the explicit-ceiling variant were used, inputs with more than 32 passthrough
-blobs would break. Fix: a credit scheme (a worker may not claim seq > head + K)
-in the shared engine of HYG-011. A working precedent now exists:
-`scan::classify::parallel_classify_phase_ordered` (used by the geocode
-builder's Pass 2 and cat's `--clean` pass) hands out schedule positions
-only within a fixed window ahead of the merged head. Its `merge` callback
-cannot fail, though, so a caller whose merge writes output (cat `--clean`)
-records a write error and lets the pool decode the rest of the input before
-returning it; an engine that lets the merge stop dispatch would fail fast.
-
-`ReorderBuffer::push` asserts on stale, duplicate and window-exceeded seqs,
-documented as programming errors because seqs come from `enumerate()`; that
-holds for the read pipeline, not structurally, since about fifteen callers
-feed it, some from worker-computed seqs, and a panicking consumer inside
-`thread::scope` re-raises at join. The 2026-10-25 triage left this here: with a
-credit scheme in one engine, `push` can return `Err` instead. That
-fallible form now exists as `ReorderBuffer::try_push` (the item comes back
-with the reason), used by the OSC gzip writer, whose permit-bounded window
-and record-then-discard handling are a second precedent.
-
-Reported by: re-encoding, read path, filtering and spatial, altw and scanning.
 
 ## HYG-081 - The apply-changes node-to-way barrier is a three-party protocol held together by polling
 

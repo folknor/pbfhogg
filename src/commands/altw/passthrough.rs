@@ -25,7 +25,7 @@
 
 use std::os::unix::fs::FileExt as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering::Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
 
 use crate::ElementKind;
 use crate::blob::{BlobKind, DecompressPool, decompress_blob_raw};
@@ -34,7 +34,6 @@ use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::idset::IdSet;
 use crate::read::header_walker::HeaderWalker;
 use crate::read::input::PinnedInput;
-use crate::reorder_buffer::ReorderBuffer;
 use crate::write::WriteOptions;
 use crate::writer::PbfWriter;
 
@@ -54,9 +53,9 @@ use super::{NodeIndex, Stats, process_block};
 /// passthrough eligibility policy is shared, not their measured pipelines.
 #[derive(Clone, Copy)]
 struct BlobDescriptor {
-    seq: usize,
     /// True 0-based blob index in the input, handed out by the header walk.
-    /// Provenance for locating a failure; `seq` is only an ordering key.
+    /// Provenance for locating a failure; the schedule position is the
+    /// ordering key.
     blob_index: u64,
     /// Start of the on-disk 4-byte length prefix. Used by the
     /// consumer-side passthrough path to pread the entire framed blob
@@ -125,7 +124,6 @@ fn build_schedule(
     let mut walker = HeaderWalker::open(input, host)?.refusing_partial_index();
     let mut header_bytes: Option<Vec<u8>> = None;
     let mut schedule: Vec<BlobDescriptor> = Vec::new();
-    let mut seq: usize = 0;
 
     while let Some(meta) = walker.next_header()? {
         match meta.blob_type {
@@ -155,7 +153,6 @@ fn build_schedule(
                 let is_passthrough = super::blob_is_passthrough(kind, keep_untagged_nodes);
 
                 schedule.push(BlobDescriptor {
-                    seq,
                     blob_index: meta.blob_index,
                     frame_offset: meta.frame_start,
                     frame_size: meta.frame_size,
@@ -166,7 +163,6 @@ fn build_schedule(
                     kind,
                     count,
                 });
-                seq += 1;
             }
         }
     }
@@ -390,14 +386,24 @@ pub(super) fn write_output_passthrough(
         crate::debug::emit_counter("altw_pass2_relation_blobs", relation_blobs);
     }
 
-    // Partition: passthrough items are pre-seeded into the reorder
-    // buffer at their global seq positions; decode items go through
-    // the worker channel.
-    let (decode_items, passthrough_items): (Vec<BlobDescriptor>, Vec<BlobDescriptor>) =
-        schedule.into_iter().partition(|d| !d.is_passthrough);
-    crate::debug::emit_counter("altw_pass2_decode_items", decode_items.len());
-    crate::debug::emit_counter("altw_pass2_passthrough_items", passthrough_items.len());
+    // Decode items go to the workers of the ordered pool, which runs over
+    // them alone; passthrough items are copied by the consumer between them,
+    // in schedule order, so input element ordering (nodes -> ways ->
+    // relations) is preserved.
+    let decode_at: Vec<usize> = schedule
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| !d.is_passthrough)
+        .map(|(i, _)| i)
+        .collect();
+    crate::debug::emit_counter("altw_pass2_decode_items", decode_at.len());
+    crate::debug::emit_counter(
+        "altw_pass2_passthrough_items",
+        schedule.len() - decode_at.len(),
+    );
     crate::debug::emit_counter("altw_pass2_decode_threads", decode_threads);
+    let decode_at = &decode_at;
+    let schedule = &schedule;
 
     // Worker-side cumulative counters + the depth-gated WAIT span for
     // workers blocked handing results to the consumer (same StallGauge
@@ -406,243 +412,86 @@ pub(super) fn write_output_passthrough(
     // --durations` can pair the markers; `--stalls` reads `*_wait_ns`
     // counters, not these spans; entered only after a failed try_send).
     let p2_counters = Pass2Counters::default();
-    let p2_send_stall = super::external::StallGauge::new("WAIT_P2_SEND_START", "WAIT_P2_SEND_END");
+    let p2_send_stall = crate::counters::StallGauge::new("WAIT_P2_SEND_START", "WAIT_P2_SEND_END");
     let p2_counters_ref = &p2_counters;
-    let p2_send_stall_ref = &p2_send_stall;
     // The input's identity, captured once; each worker borrows it.
     let source: std::sync::Arc<Path> = std::sync::Arc::from(input.path());
     let source = &source;
+    // The consumer's receive wait, in nanoseconds.
+    let p2_recv_ns = std::sync::atomic::AtomicU64::new(0);
 
-    // Consumer-side counters (single thread; plain locals).
-    let mut p2_recv_ns: u64 = 0;
-    let mut p2_write_ns: u64 = 0;
-    let mut p2_pt_pread_ns: u64 = 0;
-    let mut p2_pt_bytes: u64 = 0;
-    let mut p2_pt_blobs: u64 = 0;
+    let mut consumer = Pass2Consumer {
+        interleaved: crate::ordered_pool::Interleaved::new(decode_at, schedule.len()),
+        schedule,
+        file: &shared_file,
+        frame_read_buf: Vec::new(),
+        writer: &mut writer,
+        total_stats: Stats::default(),
+        write_ns: 0,
+        pt_pread_ns: 0,
+        pt_bytes: 0,
+        pt_blobs: 0,
+        blobs_dispatched: 0,
+        cancel: &host.cancel,
+    };
 
-    type DecodedItem = (usize, crate::Result<(Vec<OwnedBlock>, Stats)>);
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(
-        crate::tunables::POOL_DESCRIPTOR_CHANNEL_DEPTH,
-    );
-    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (decoded_tx, decoded_rx) =
-        std::sync::mpsc::sync_channel::<DecodedItem>(crate::tunables::POOL_RESULT_CHANNEL_DEPTH);
-
-    let batches_dispatched = AtomicI64::new(0);
-
-    let mut total_stats = Stats::default();
-
-    std::thread::scope(|scope| -> Result<()> {
-        // Dispatcher: feed only decode-eligible descriptors into the
-        // worker channel. Passthrough descriptors bypass workers and
-        // never travel through this channel.
-        scope.spawn(move || {
-            for desc in decode_items {
-                if desc_tx.send(desc).is_err() {
-                    break;
-                }
-            }
-        });
-
-        for _ in 0..decode_threads {
-            let rx = std::sync::Arc::clone(&desc_rx);
-            let tx = decoded_tx.clone();
-            let file = std::sync::Arc::clone(&shared_file);
-            scope.spawn(move || {
-                let mut scratch = WorkerScratch::new();
-                loop {
-                    let desc = {
-                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match guard.recv() {
-                            Ok(d) => d,
-                            Err(_) => break,
-                        }
-                    };
-                    let result = decode_one(
-                        &desc,
-                        &file,
-                        node_index,
-                        keep_untagged_nodes,
-                        relation_member_node_ids,
-                        relation_member_way_ids,
-                        shared_node_ids,
-                        inject_prepass,
-                        inject_metrics,
-                        &mut scratch,
-                        p2_counters_ref,
-                    )
-                    // Cold: only a failure builds the location, from the true
-                    // blob index and frame start the walker handed out.
-                    .map_err(|e| {
-                        e.locate(crate::error::Location::new(
-                            Some(source),
-                            Some(desc.blob_index),
-                            Some(crate::ByteOffset(desc.frame_offset)),
-                        ))
-                    });
-                    let t_send = crate::counters::Stopwatch::start();
-                    match tx.try_send((desc.seq, result)) {
-                        Ok(()) => {}
-                        Err(std::sync::mpsc::TrySendError::Full(item)) => {
-                            let _stall = p2_send_stall_ref.track();
-                            if tx.send(item).is_err() {
-                                break;
-                            }
-                        }
-                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
-                    }
-                    t_send.record_ns(&p2_counters_ref.send_ns);
-                }
-            });
-        }
-        drop(desc_rx);
-        drop(decoded_tx);
-        // Owned by this closure, so any early return (a write error, a
-        // cancellation) drops it before the scope joins the workers. Borrowed,
-        // it outlived the closure, and a worker parked in a full `send` held
-        // the join forever.
-        let decoded_rx = decoded_rx;
-
-        // Consumer: reorder + write. Pre-seed passthrough items at
-        // their global seq positions; decode results arrive on
-        // `decoded_rx` and are inserted by seq. The drain pops only
-        // contiguous ready items so input element ordering (nodes ->
-        // ways -> relations) is preserved.
-        enum ConsumerItem {
-            Decoded(crate::Result<(Vec<OwnedBlock>, Stats)>),
-            Passthrough {
-                frame_offset: u64,
-                frame_size: usize,
-                count: u64,
-                kind: Option<ElementKind>,
+    // Cancellation is checked on the consumer, before each wait and on each
+    // arrival; the early return is the write-error exit.
+    let mut workers = vec![(); decode_threads];
+    crate::ordered_pool::run_ordered(
+        decode_at.len(),
+        &mut workers,
+        crate::ordered_pool::PoolConfig {
+            window: crate::ordered_pool::default_window(decode_threads),
+            cancel: &host.cancel,
+            waits: crate::ordered_pool::Waits {
+                recv: Some(crate::ordered_pool::Timer::Ns(&p2_recv_ns)),
+                send: Some(crate::ordered_pool::Timer::Ns(&p2_counters.send_ns)),
+                send_stall: Some(&p2_send_stall),
+                ..crate::ordered_pool::Waits::default()
             },
-        }
-
-        let mut reorder: ReorderBuffer<ConsumerItem> =
-            ReorderBuffer::with_capacity(passthrough_items.len() + decode_threads);
-
-        for desc in &passthrough_items {
-            reorder.push(
-                desc.seq,
-                ConsumerItem::Passthrough {
-                    frame_offset: desc.frame_offset,
-                    frame_size: desc.frame_size,
-                    count: desc.count,
-                    kind: desc.kind,
-                },
-            );
-        }
-
-        let mut frame_read_buf: Vec<u8> = Vec::new();
-
-        let mut drain = |reorder: &mut ReorderBuffer<ConsumerItem>,
-                         total_stats: &mut Stats,
-                         frame_read_buf: &mut Vec<u8>,
-                         writer: &mut PbfWriter<crate::file_writer::FileWriter>|
-         -> Result<()> {
-            while let Some(item) = reorder.pop_ready() {
-                match item {
-                    ConsumerItem::Decoded(result) => {
-                        let (blocks, block_stats) = result?;
-                        total_stats.merge(&block_stats);
-                        let t_write = crate::counters::Stopwatch::start();
-                        for block in blocks {
-                            writer.write_primitive_block_owned(block)?;
-                        }
-                        p2_write_ns += t_write.elapsed_ns();
-                        // Emit the progress counter every 64 blobs (the
-                        // decode-all path's cadence); per-blob emission was
-                        // ~22 K FIFO writes at europe for no extra signal.
-                        let n = batches_dispatched
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            + 1;
-                        if n % 64 == 0 {
-                            crate::debug::emit_counter("altw_pass2_blobs_dispatched", n);
-                        }
-                    }
-                    ConsumerItem::Passthrough {
-                        frame_offset,
-                        frame_size,
-                        count,
-                        kind,
-                    } => {
-                        let t_pt = crate::counters::Stopwatch::start();
-                        frame_read_buf.resize(frame_size, 0);
-                        shared_file.read_exact_at(frame_read_buf, frame_offset)?;
-                        p2_pt_pread_ns += t_pt.elapsed_ns();
-                        p2_pt_bytes += frame_size as u64;
-                        p2_pt_blobs += 1;
-                        let t_write = crate::counters::Stopwatch::start();
-                        writer.write_raw_owned(std::mem::replace(
-                            frame_read_buf,
-                            Vec::with_capacity(frame_size),
-                        ))?;
-                        p2_write_ns += t_write.elapsed_ns();
-                        total_stats.blobs_passthrough += 1;
-                        match kind {
-                            Some(ElementKind::Node) => {
-                                total_stats.nodes_read += count;
-                                total_stats.nodes_written += count;
-                            }
-                            Some(ElementKind::Relation) => {
-                                total_stats.relations_written += count;
-                            }
-                            Some(ElementKind::Way) | None => {
-                                // Ways never pass through (they need
-                                // location splicing). `None` means a
-                                // blob with no indexdata reached the
-                                // consumer as passthrough, which the
-                                // schedule filter excludes by
-                                // construction (only Relation/Node
-                                // can be passthrough). Stats untouched.
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(())
-        };
-
-        // Drain any passthrough prefix before the first decode result.
-        drain(
-            &mut reorder,
-            &mut total_stats,
-            &mut frame_read_buf,
-            &mut writer,
-        )?;
-
-        loop {
-            // Cancellation is checked on this consumer, before each wait and
-            // on each arrival; the early return is the write-error exit.
-            host.cancel.check()?;
-            let t_recv = crate::counters::Stopwatch::start();
-            let msg = decoded_rx.recv();
-            p2_recv_ns += t_recv.elapsed_ns();
-            let (seq_num, item) = match msg {
-                Ok(v) => v,
-                Err(_) => break,
-            };
-            host.cancel.check()?;
-            reorder.push(seq_num, ConsumerItem::Decoded(item));
-            drain(
-                &mut reorder,
-                &mut total_stats,
-                &mut frame_read_buf,
-                &mut writer,
-            )?;
-        }
-
-        // Final drain for passthrough tails (relations sit at EOF in
-        // sorted PBFs - no trailing decode push to trigger pop_ready).
-        drain(
-            &mut reorder,
-            &mut total_stats,
-            &mut frame_read_buf,
-            &mut writer,
-        )?;
-
-        Ok(())
-    })?;
+        },
+        |_| WorkerScratch::new(),
+        |(), scratch: &mut WorkerScratch, ordinal| {
+            let desc = &schedule[decode_at[ordinal]];
+            decode_one(
+                desc,
+                &shared_file,
+                node_index,
+                keep_untagged_nodes,
+                relation_member_node_ids,
+                relation_member_way_ids,
+                shared_node_ids,
+                inject_prepass,
+                inject_metrics,
+                scratch,
+                p2_counters_ref,
+            )
+            // Cold: only a failure builds the location, from the true
+            // blob index and frame start the walker handed out.
+            .map_err(|e| {
+                e.locate(crate::error::Location::new(
+                    Some(source),
+                    Some(desc.blob_index),
+                    Some(crate::ByteOffset(desc.frame_offset)),
+                ))
+            })
+        },
+        &mut consumer,
+    )?;
+    for position in consumer.interleaved.rest() {
+        consumer.passthrough(position)?;
+    }
+    let Pass2Consumer {
+        total_stats,
+        write_ns: p2_write_ns,
+        pt_pread_ns: p2_pt_pread_ns,
+        pt_bytes: p2_pt_bytes,
+        pt_blobs: p2_pt_blobs,
+        blobs_dispatched,
+        ..
+    } = consumer;
+    let p2_recv_ns = p2_recv_ns.into_inner();
 
     writer.flush()?;
 
@@ -655,9 +504,95 @@ pub(super) fn write_output_passthrough(
     );
     crate::debug::emit_counter("altw_pass2_passthrough_bytes", p2_pt_bytes);
     crate::debug::emit_counter("altw_pass2_passthrough_blobs", p2_pt_blobs);
-    crate::debug::emit_counter(
-        "altw_pass2_blobs_dispatched",
-        batches_dispatched.load(std::sync::atomic::Ordering::Relaxed),
-    );
+    crate::debug::emit_counter("altw_pass2_blobs_dispatched", blobs_dispatched);
     Ok(total_stats)
+}
+
+/// Pass 2's consumer: decoded blobs from the workers and passthrough raw
+/// frames it preads itself, written in schedule order. Its counters are
+/// plain fields on the single consumer thread.
+struct Pass2Consumer<'a> {
+    interleaved: crate::ordered_pool::Interleaved<'a>,
+    schedule: &'a [BlobDescriptor],
+    file: &'a std::fs::File,
+    frame_read_buf: Vec<u8>,
+    writer: &'a mut PbfWriter<crate::file_writer::FileWriter>,
+    total_stats: Stats,
+    write_ns: u64,
+    pt_pread_ns: u64,
+    pt_bytes: u64,
+    pt_blobs: u64,
+    blobs_dispatched: u64,
+    cancel: &'a crate::host::Cancel,
+}
+
+impl Pass2Consumer<'_> {
+    /// pread the passthrough frame at schedule position `position` and write
+    /// it verbatim.
+    fn passthrough(&mut self, position: usize) -> Result<()> {
+        self.cancel.check()?;
+        let desc = &self.schedule[position];
+        let frame_size = desc.frame_size;
+        let t_pt = crate::counters::Stopwatch::start();
+        self.frame_read_buf.resize(frame_size, 0);
+        self.file
+            .read_exact_at(&mut self.frame_read_buf, desc.frame_offset)?;
+        self.pt_pread_ns += t_pt.elapsed_ns();
+        self.pt_bytes += frame_size as u64;
+        self.pt_blobs += 1;
+        let t_write = crate::counters::Stopwatch::start();
+        self.writer.write_raw_owned(std::mem::replace(
+            &mut self.frame_read_buf,
+            Vec::with_capacity(frame_size),
+        ))?;
+        self.write_ns += t_write.elapsed_ns();
+        self.total_stats.blobs_passthrough += 1;
+        match desc.kind {
+            Some(ElementKind::Node) => {
+                self.total_stats.nodes_read += desc.count;
+                self.total_stats.nodes_written += desc.count;
+            }
+            Some(ElementKind::Relation) => {
+                self.total_stats.relations_written += desc.count;
+            }
+            Some(ElementKind::Way) | None => {
+                // Ways never pass through (they need location splicing).
+                // `None` means a blob with no indexdata reached the consumer
+                // as passthrough, which the schedule filter excludes by
+                // construction (only Relation/Node can be passthrough).
+                // Stats untouched.
+            }
+        }
+        Ok(())
+    }
+}
+
+impl crate::ordered_pool::OrderedConsumer<(Vec<OwnedBlock>, Stats)> for Pass2Consumer<'_> {
+    fn before_item(&mut self, ordinal: usize) -> crate::Result<()> {
+        for position in self.interleaved.before(ordinal) {
+            self.passthrough(position)?;
+        }
+        Ok(())
+    }
+
+    fn consume(
+        &mut self,
+        _ordinal: usize,
+        (blocks, block_stats): (Vec<OwnedBlock>, Stats),
+    ) -> crate::Result<()> {
+        self.total_stats.merge(&block_stats);
+        let t_write = crate::counters::Stopwatch::start();
+        for block in blocks {
+            self.writer.write_primitive_block_owned(block)?;
+        }
+        self.write_ns += t_write.elapsed_ns();
+        // Emit the progress counter every 64 blobs (the decode-all path's
+        // cadence); per-blob emission was ~22 K FIFO writes at europe for no
+        // extra signal.
+        self.blobs_dispatched += 1;
+        if self.blobs_dispatched.is_multiple_of(64) {
+            crate::debug::emit_counter("altw_pass2_blobs_dispatched", self.blobs_dispatched);
+        }
+        Ok(())
+    }
 }

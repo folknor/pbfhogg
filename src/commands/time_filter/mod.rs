@@ -30,8 +30,9 @@ use crate::owned::{
     read_node, read_relation, read_way, relation_members_into,
 };
 use crate::read::input::{InputSource, PinnedInput};
-use crate::reorder_buffer::ReorderBuffer;
-use crate::scan::classify::{PartialIndex, build_classify_schedule, parallel_classify_phase};
+use crate::scan::classify::{
+    PartialIndex, build_classify_schedule, parallel_classify_phase_ordered,
+};
 use crate::write::WriteOptions;
 use crate::writer::{Compression, PbfWriter};
 use crate::{DenseNode, Element, ElementKind, ElementReader, Node, PrimitiveBlock, Relation, Way};
@@ -291,7 +292,9 @@ fn time_filter_history(
 
 /// Snapshot path migrated 2026-04-28 from the
 /// `for_each_primitive_block_batch_budgeted` + `par_iter().map(thread_local
-/// BB)` + drain shape to `parallel_classify_phase` + `ReorderBuffer`. The
+/// BB)` + drain shape to `parallel_classify_phase` + `ReorderBuffer` (since
+/// replaced by `parallel_classify_phase_ordered`, whose window bounds what the
+/// hand-kept reorder buffer did not). The
 /// pre-migration shape hit a structural ~28 GB anon ceiling at planet (five
 /// SIGKILL'd attempts, last three with full instrumentation) because the
 /// `par_iter().collect()` step materialises the full batch's
@@ -319,7 +322,8 @@ fn time_filter_snapshot(
     // by arena capping) doesn't apply: K=2 measured -69 % wall and
     // -24 % anon on the pre-migration code, but that pre-migration code
     // had thread-local BlockBuilder state surviving across blobs on the
-    // same rayon worker. parallel_classify_phase has no such state.
+    // same rayon worker. The classify pool's workers hold no builder across
+    // blobs here.
     host.process.cross_thread_alloc_pool();
 
     let mut stats = TimeFilterStats {
@@ -348,18 +352,16 @@ fn time_filter_snapshot(
     }
 
     type PhaseResult = crate::Result<(Vec<Vec<u8>>, TimeFilterStats)>;
-    let mut reorder: ReorderBuffer<(Vec<Vec<u8>>, TimeFilterStats)> =
-        ReorderBuffer::with_capacity(crate::tunables::POOL_REORDER_CAPACITY_WIDE);
-    let mut write_error: Option<crate::Error> = None;
 
-    // BlockBuilder contains `Rc<str>` (string interning) which is not
-    // Send, so it can't ride the `S: Send` worker-state slot. Per-blob
-    // alloc inside the closure is cheap (BlockBuilder::new is just a
-    // few empty Vec/HashMap initialisers; no heap reservation until
-    // elements are added). Same pattern as cat --clean's worker.
-    let pool_result = parallel_classify_phase(
+    // A fresh BlockBuilder per blob (BlockBuilder::new is just a few empty
+    // Vec/HashMap initialisers; no heap reservation until elements are
+    // added), deliberately: see the function doc on builders that survive
+    // across blobs. Same pattern as cat --clean's worker. The ordered pool's
+    // window bounds the framed results alive between decode and write.
+    parallel_classify_phase_ordered(
         &shared_file,
         &schedule,
+        None,
         None,
         || (),
         |block, _state| -> PhaseResult {
@@ -388,43 +390,21 @@ fn time_filter_snapshot(
             }
             Ok((framed, block_stats))
         },
-        |seq, r| {
-            // Always queue the result so the next-seq invariant holds;
-            // we can't drop a slot mid-phase without breaking the
-            // reorder buffer's contiguous-prefix expectation.
-            reorder.push(seq, r);
-            // Drain everything ready from the front. Once we hit a
-            // hole (next seq not yet delivered), stop and wait for the
-            // next merge call. A write error is captured into a local slot
-            // and propagated after parallel_classify_phase returns;
-            // further ready items are still drained so the buffer doesn't
-            // grow. A failed blob ends the pool, located with its input.
-            while let Some((framed, block_stats)) = reorder.pop_ready() {
-                if write_error.is_some() {
-                    continue;
-                }
-                stats.versions_seen += block_stats.versions_seen;
-                stats.versions_before_cutoff += block_stats.versions_before_cutoff;
-                stats.elements_written += block_stats.elements_written;
-                stats.dropped_deleted += block_stats.dropped_deleted;
-                stats.dropped_no_snapshot_version += block_stats.dropped_no_snapshot_version;
-                for blob in framed {
-                    if let Err(e) = writer.write_raw_owned(blob) {
-                        write_error = Some(e);
-                        break;
-                    }
-                }
+        |_position, (framed, block_stats)| {
+            // Called in schedule order; a write error ends the pass at once.
+            // A failed blob ends it too, located with its input.
+            stats.versions_seen += block_stats.versions_seen;
+            stats.versions_before_cutoff += block_stats.versions_before_cutoff;
+            stats.elements_written += block_stats.elements_written;
+            stats.dropped_deleted += block_stats.dropped_deleted;
+            stats.dropped_no_snapshot_version += block_stats.dropped_no_snapshot_version;
+            for blob in framed {
+                writer.write_raw_owned(blob)?;
             }
+            Ok(())
         },
         host,
-    );
-
-    // An error the merge recorded came first: the pool's own (a cancellation
-    // observed at a later receive included) is the later one.
-    if let Some(e) = write_error {
-        return Err(e);
-    }
-    pool_result?;
+    )?;
 
     // Brokkr stores named counters generically and reports changes in sidecar
     // comparisons; this sample is inert unless the CLI initialized the FIFO.

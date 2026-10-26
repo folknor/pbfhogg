@@ -43,6 +43,38 @@ Used by:
 `inspect tags` uses pread workers through `parallel_classify_phase`, with
 per-blob tag counts merged by the caller.
 
+### Ordered pread pool
+
+**Workers in any order, results in schedule order, bounded** -
+`src/ordered_pool.rs`
+
+Every pool that hands results to its caller in schedule order runs on one
+engine, `ordered_pool::run_ordered`: classify's ordered phase
+(`parallel_classify_phase_ordered`: cat `--clean`, geocode pass 2, repack,
+degrade, getparents, time-filter's snapshot path, tags-filter pass 2,
+multi-extract's region writer), renumber's rewrite stages, extract's
+`pread_execute`, multi-extract's node pass, and altw's sparse passthrough,
+external stage 1 pass A and external stage 4. Workers claim tasks from an
+atomic counter; a task may only be worked once it is inside a window of
+the results the consumer has finished with, so at most a window of tasks is
+admitted and not yet consumed however slow one blob is (the bound counts
+tasks, not bytes). The default window is `ORDERED_POOL_WINDOW_PER_WORKER` per
+worker with a floor of `ORDERED_POOL_WINDOW_MIN`. Worker failures surface
+in schedule order (the lowest failing task's error, or the consumer's own at
+its position), cancellation is checked on the consumer, and any consumer
+exit closes the gate and drops the result receiver before the scope joins;
+work already admitted is not interrupted.
+
+Where only some schedule positions are decoded and the rest are passthrough
+frames the consumer copies itself (extract, multi-extract's node pass, altw
+passthrough and stage 4), the pool runs over the decode items alone and the
+consumer emits the passthrough positions between them (`Interleaved`), so
+passthrough takes no worker, channel slot or window slot, and output and
+failure order are the full schedule's. `commands::blob_merge` (sort,
+`cat --dedupe`) streams each overlap run's blocks before the run finishes,
+so it is not one result per task; it shares only the admission gate
+(`OrderedGate`). The read pipeline above keeps its own permit gate.
+
 ### Blob Filtering (pre-decode)
 
 Skips entire blobs before decompression using metadata embedded in `BlobHeader`:
@@ -348,7 +380,7 @@ Multi-stage parallel rewrite using rank-indexed `IdSet` bitsets (not hashmaps) f
 
 Two paths, picked from the header's `HistoricalInformation` (`src/commands/time_filter/mod.rs`):
 - **History input**: single-pass grouped snapshot on the pipelined reader that read the header: maintains `PendingGroup` per object, emits latest version with `timestamp <= cutoff`, skips deleted (`visible=false`).
-- **Snapshot input**: each object appears once, so blocks are independent: a classify schedule walk feeds `parallel_classify_phase`, each worker filters and frames one blob, and a reorder buffer restores file order.
+- **Snapshot input**: each object appears once, so blocks are independent: a classify schedule walk feeds `parallel_classify_phase_ordered`, each worker filters and frames one blob, and the ordered pool delivers them in file order within its window.
 
 The input is pinned before the header read (see "One input, one file, across passes").
 

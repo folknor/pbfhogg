@@ -385,6 +385,18 @@ where
     // Early exit: returning from this helper drops `decoded_rx` before scoped
     // threads join. Blocked senders then fail, set shutdown, release permits,
     // wake the dispatcher, and let stage 1 stop at the raw channel.
+    // The admission gate is this buffer's bound, not its ceiling: at most
+    // `decode_ahead` decode tasks are admitted and not yet delivered, so
+    // `with_capacity`'s generous runaway ceiling is a safety net that never
+    // fires, and `decode_ahead` also sizing the decoded channel adds nothing
+    // the gate does not already cap. Deliberately not pinned with
+    // `with_max_window`: a reader error item rides without a permit, and an
+    // exact ceiling would turn any miscount in that reasoning into a panic on
+    // the hottest read path for no bound the gate does not already give.
+    // This engine keeps its own permit gate rather than the ordered pool's
+    // (`crate::ordered_pool`): the permit travels with each decoded item and
+    // is released on delivery or drop, which fits rayon tasks and filtered
+    // items.
     let mut pending: ReorderBuffer<(Option<Result<T>>, Option<Permit>)> =
         ReorderBuffer::with_capacity(decode_ahead);
 

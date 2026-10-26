@@ -36,15 +36,14 @@ use crate::blob_meta::{BlobIndex, scan_block_ids_checked};
 use crate::block_builder::{BlockBuilder, OwnedBlock};
 use crate::error::{Error, Result};
 use crate::file_writer::FileWriter;
+use crate::ordered_pool::{CloseOnDrop, OrderedGate};
 use crate::owned::{
     OwnedNode, OwnedRelation, OwnedWay, read_dense_node, read_node, read_relation, read_way,
     write_single_node_local, write_single_relation_local, write_single_way_local,
 };
 use crate::read::header_walker::{BlobHeaderMeta, HeaderWalker};
 use crate::read::input::{InputFile, PinnedInput};
-use crate::scan::classify::{
-    CloseOnDrop, ordered_credit, publish_merged, recv_checked, wait_for_credit,
-};
+use crate::scan::classify::recv_checked;
 use crate::writer::{PbfWriter, reframe_raw_with_index};
 
 // ---------------------------------------------------------------------------
@@ -495,10 +494,10 @@ enum RunMsg {
 /// blocks buffered plus one blocked send per worker, beside each active
 /// sweep's heap (bounded by its run's overlap depth, as before; up to
 /// `min(window, workers)` heaps at once). Shutdown: every receiver and the
-/// consumer's credit guard live in the scope closure, so any return from it
+/// consumer's gate guard live in the scope closure, so any return from it
 /// (an error, a cancellation, a write failure) drops them before the join:
-/// workers parked in a send fail it and stop, the dispatcher parked on credit
-/// wakes to a closed credit and drops the job queue, idle workers see it
+/// workers parked in a send fail it and stop, the dispatcher parked on the
+/// gate wakes to it closed and drops the job queue, idle workers see it
 /// close. The first error met in run order is returned, unless a worker
 /// panicked, which the scope re-raises at the join.
 ///
@@ -525,24 +524,31 @@ pub(crate) fn write_plan(
         crate::tunables::DECODE_WORKERS_FALLBACK,
     )
     .clamp(1, plan.runs.len());
-    let window = workers * crate::tunables::OVERLAP_RUN_WINDOW_PER_WORKER;
-    let credit = ordered_credit();
+    let window = std::num::NonZeroUsize::new(
+        workers.saturating_mul(crate::tunables::OVERLAP_RUN_WINDOW_PER_WORKER),
+    )
+    .unwrap_or(std::num::NonZeroUsize::MIN);
+    // The ordered pool's admission gate, shared rather than the pool itself:
+    // a run streams its blocks before it finishes, so it is not one result
+    // per task. Only `close` is used (never `stop_claims`): a closed gate
+    // admits nothing, which is this protocol's contract.
+    let gate = OrderedGate::new();
 
     std::thread::scope(|scope| -> Result<WriteCounts> {
-        let credit_ref = &credit;
+        let gate_ref = &gate;
         // Before any thread starts, so even a failed spawn unwinding out of
-        // this closure closes the credit a parked dispatcher waits on. Every
+        // this closure closes the gate a parked dispatcher waits on. Every
         // receiver is declared after it and so drops first (locals drop in
-        // reverse order): run receivers are gone before the credit closes,
+        // reverse order): run receivers are gone before the gate closes,
         // and both before the scope joins.
-        let _close = CloseOnDrop::consumer(credit_ref);
-        let (job_tx, job_rx) = sync_channel::<(usize, SyncSender<RunMsg>)>(window);
+        let _close = CloseOnDrop(gate_ref);
+        let (job_tx, job_rx) = sync_channel::<(usize, SyncSender<RunMsg>)>(window.get());
         let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
-        let (order_tx, order_rx) = sync_channel::<Receiver<RunMsg>>(window);
+        let (order_tx, order_rx) = sync_channel::<Receiver<RunMsg>>(window.get());
 
         scope.spawn(move || {
             for k in 0..plan.runs.len() {
-                if !wait_for_credit(credit_ref, k, window) {
+                if !gate_ref.admit(k, window) {
                     break;
                 }
                 let (tx, rx) = sync_channel(crate::tunables::OVERLAP_RUN_CHANNEL_DEPTH);
@@ -582,7 +588,7 @@ pub(crate) fn write_plan(
                 writer.write_primitive_block_owned(block)
             })?;
             drained += 1;
-            publish_merged(credit_ref, drained);
+            gate_ref.advance(drained);
             Ok(counts)
         })
     })

@@ -123,7 +123,7 @@ pub(super) struct ConcurrentBlobLocationRouter {
     // `brokkr sidecar --durations`; `--stalls` reads `*_wait_ns` counters.
     // Only the slow path below touches it, so the already-published fast
     // path stays lock-free.
-    wait_gauge: super::StallGauge,
+    wait_gauge: crate::counters::StallGauge,
     // Counters emitted by mod.rs after the scope joins.
     pub(super) stats: std::sync::Mutex<ConcurrentRouterStats>,
 }
@@ -174,7 +174,10 @@ impl ConcurrentBlobLocationRouter {
             aborted: std::sync::atomic::AtomicBool::new(false),
             producer_done: std::sync::atomic::AtomicBool::new(false),
             abort_error: std::sync::Mutex::new(None),
-            wait_gauge: super::StallGauge::new("WAIT_S4_ROUTER_START", "WAIT_S4_ROUTER_END"),
+            wait_gauge: crate::counters::StallGauge::new(
+                "WAIT_S4_ROUTER_START",
+                "WAIT_S4_ROUTER_END",
+            ),
             stats: std::sync::Mutex::new(stats),
         })
     }

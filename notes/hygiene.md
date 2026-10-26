@@ -73,7 +73,7 @@ Launch order: every queued entry has run.
 Every entry still open in this file and `notes/bugs.md` is owed a resolution
 in this drain, except what the maintainer moved to the CLI-surface redesign
 in `notes/todo.md` (the `--direct-io` reach and `--json` entries). HYG-002,
-HYG-011, HYG-036, HYG-081, HYG-181 and HYG-182 were deferred by the 2026-10-25 session, not dropped:
+HYG-011, HYG-036, HYG-081 and HYG-182 were deferred by the 2026-10-25 session, not dropped:
 "skipped for now" in their Maintainer paragraphs means that session did not
 take them, and the paragraphs are guidance on how to resolve them, not a
 ruling that they stay. BUG-009 is the maintainer's own project.
@@ -418,9 +418,10 @@ The judgement calls already known, to be checked first:
     and now show in the diff and derive runs' `DECOMPRESS_POOL_METRICS`
     oversize-drop counters, which these paths never fed before.
   - The parallel shard decoders, the measured default path, still
-    allocate per block; left alone (HYG-181). Since the one-engine merge
-    (below) the indexed block-pair merge no longer uses `MergeBuffers` at
-    all, at any `-j`; only the unindexed element stream still pools.
+    allocate per block; left alone (see the decode-buffer growth item
+    below). Since the one-engine merge (below) the indexed block-pair merge
+    no longer uses `MergeBuffers` at all, at any `-j`; only the unindexed
+    element stream still pools.
 - The indexdata trust model (`reference/indexdata-trust.md`) was written by
   folding the trust paragraphs of CORRECTNESS.md, pipeline.md and
   cli-reference.md into one page and correcting what had gone false
@@ -1155,6 +1156,33 @@ The judgement calls already known, to be checked first:
     inherited per-sample-truncated `_ms` counters); `s4_channel_high_water`
     is now measured by the engine with the same workers-up, consumer-down
     accounting.
+- Decode-buffer growth, a measurement candidate rather than a change
+  (resolving the diff shard-decoder pooling entry, sparred with codex; no
+  code changed, only the comments in `WireBlock::parse_and_inline_with_scratch`
+  and `BlockPairSide::decode`). A diagnostic test (not kept) showed that
+  `decompress_blob_raw` leaves a buffer with truthful `raw_size` exactly
+  full for zlib and zstd, and that std's `reserve` on a full 1.4 MB Vec
+  doubles it to 2.8 MB. So on every decode, `parse_and_inline_with_scratch`'s
+  inline-metadata reserve typically doubles a fresh buffer's capacity and
+  may move it (one payload copy, unless glibc grows it in place or, for an
+  mmapped chunk, remaps it: `__libc_realloc` / `_int_realloc` in
+  `research/glibc/malloc/malloc.c`). Its contribution to any command's
+  wall is unmeasured. Three things to compare once measurement is allowed:
+  - The fresh-buffer paths (the diff and derive shards, apply-changes'
+    streaming workers, getid, cat `--clean`, inspect, the sequential
+    reader, altw's relation scan) pay the growth per block.
+  - Pooled paths pay it on a buffer's first use and keep the doubled
+    capacity, which later decodes reuse; a final capacity past the pool's
+    4 MiB retain cap (common for payloads above about 2 MiB) is dropped
+    and re-grown each time. The 886.6 MB `parse_and_inline_with_scratch`
+    allocation share in the planet getparents alloc profile (`f83c8cf1`)
+    is probably this growth.
+  - A per-shard `DecompressPool` in `run_shard` shared by both sides would
+    hold at most two idle buffers per shard (up to 128 MiB of retained
+    capacity at `-j 16`). Rejected without measurement: `reserve_exact`
+    in the parse (it also hits pooled first use and changes which buffers
+    the pool retains) and a guessed headroom at decompression (changes
+    every read path's memory shape on a heuristic).
 ---
 
 ## HYG-002 - Tunables are centralized but not injectable
@@ -1358,25 +1386,5 @@ Maintainer (2026-10-25): skipped for now; dedupe's indexing is not to be
 touched in this drain.
 
 Reported by: the HYG-155 resolution (sparred with codex).
-
-## HYG-181 - The parallel diff and derive shard decoders allocate a fresh buffer per block
-
-Anger: 9 - the measured default path of diff and derive.
-
-`BlockPairSide::decode` in `src/osc/merge_join.rs` (the one block-pair
-engine, every shard at every `-j`) decompresses every blob into a fresh
-`Vec` and hands it to `PrimitiveBlock::from_vec_with_scratch`, so each shard
-worker allocates a new, often megabyte-sized, buffer per block. The
-unindexed streaming merge recycles its buffers through one `DecompressPool`
-per merge (`MergeBuffers` in `osc/merge_join.rs`); the classify workers keep
-one pool per worker. The same change fits here, one pool per shard worker, but this
-is the headline planet path (`diff-snapshots -j 16` in
-`reference/performance.md`), and the sequential change itself is unmeasured
-("Review once drained"). Whether glibc already recycles these frees well
-enough is unknown (rule 8).
-
-Maintainer (2026-10-25): skipped, no action. The current per-block
-allocation on this path is believed deliberate - the code has been
-performance-squeezed, and pooling here is not to be assumed a win.
 
 Reported by: the HYG-149 fix.

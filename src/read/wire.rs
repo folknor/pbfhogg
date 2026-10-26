@@ -367,7 +367,19 @@ impl<'a> WireBlock<'a> {
         // Phase 1 temp Vecs are still alive but immutable borrow of buf is released.
 
         // Phase 2: append entries as raw LE bytes to the buffer.
-        // Pre-reserve exact capacity to avoid reallocation during extend.
+        // Reserve room for the inline entries before appending, so the
+        // extends below never grow the buffer one at a time. This reserve is
+        // not exact: the decompressors size a fresh buffer to the blob's
+        // declared raw size, so it usually arrives here full, and Vec's
+        // amortized growth then typically doubles its capacity; the
+        // allocation may grow in place, be remapped or move (one payload
+        // copy). Pooled callers keep that headroom for later payloads and
+        // inline entries, and a final capacity past the pool's retain cap
+        // (common for payloads above about 2 MiB) is dropped rather than
+        // recycled. `reserve_exact` here, even only for a full buffer, would
+        // hit every pooled buffer's first use too and change which buffers
+        // the pool retains; the time and memory effects of changing this
+        // growth policy are unmeasured.
         let append_size = (st_entries.len() + group_entries.len()) * 8;
         buf.reserve(append_size);
 

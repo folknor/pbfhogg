@@ -761,8 +761,16 @@ impl<'a> BlockPairSide<'a> {
     /// when its claimed range crosses it.
     ///
     /// Each block gets a fresh buffer, as the parallel shard workers always
-    /// did: this is the default path of a measured planet command, and
-    /// whether a per-worker pool would beat the allocator here is unmeasured.
+    /// did, and that is kept for now on the default path of a measured
+    /// planet command. A fresh buffer arrives at the parse exactly full, so
+    /// appending the inline metadata typically doubles its capacity (see
+    /// `WireBlock::parse_and_inline_with_scratch`). A per-shard pool shared
+    /// by both sides could reuse that grown capacity, avoiding repeated
+    /// growth when later blocks fit; both sides hold a live block at once,
+    /// a larger block still grows, and a buffer past the pool's retain cap
+    /// is dropped. Allocation and free stay on the shard's thread either
+    /// way. The time and memory effects of a pool here are unmeasured, so
+    /// this allocation policy stays pending a measured comparison.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     fn decode(&mut self, desc: BlobDesc) -> Result<BlockState> {
         let mut decompressed: Vec<u8> = Vec::new();

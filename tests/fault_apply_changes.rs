@@ -1,7 +1,12 @@
 //! Fault-injection tests for `apply_changes::merge`, through the fault plan
 //! on the run's token (see `pbfhogg::test_hooks`): worker panic recovery
-//! (`apply_changes_panic_at_blob_seq`) and a base renamed over mid-run
-//! (`arm_input_replacement`).
+//! (`apply_changes_panic_at_blob_seq`), a base renamed over mid-run
+//! (`arm_input_replacement`), and the `--locations-on-ways` node-to-way
+//! barrier under deterministic orderings: a node boundary held until after
+//! the last node item, a worker panic while the scanner is in its barrier
+//! wait or blocked dispatching, and a cancellation during the barrier wait,
+//! on both output routes. A drain-side output failure releasing blocked
+//! producers is `fault_parallel_writer.rs`'s.
 //!
 //! Companion: `fault_parallel_writer.rs` covers apply-changes'
 //! default output backend.
@@ -158,6 +163,498 @@ mod apply_changes {
             !output.exists(),
             "a worker panic mid-stream must leave no output file at the destination"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // The --locations-on-ways node-to-way barrier
+    // ---------------------------------------------------------------------
+
+    /// The decimicro coordinate the fixtures give node `id`.
+    fn coord(id: i64) -> (i32, i32) {
+        let id = i32::try_from(id).unwrap();
+        (id * 1000, id * 2000)
+    }
+
+    /// A sorted LocationsOnWays base: nodes `node_ids` (`node_block` per
+    /// blob, at [`coord`]), then one way blob per way (refs carrying their
+    /// nodes' locations), then one relation blob per relation (a single way
+    /// member). Any part may be empty.
+    fn write_low_base(
+        path: &Path,
+        node_ids: &[i64],
+        node_block: usize,
+        ways: &[(i64, Vec<i64>)],
+        relations: &[(i64, i64)],
+    ) {
+        let file = File::create(path).expect("create base");
+        let mut writer = PbfWriter::new(file, Compression::default());
+        let header = block_builder::HeaderBuilder::new()
+            .sorted()
+            .optional_feature("LocationsOnWays")
+            .build()
+            .expect("build header");
+        writer.write_header(&header).expect("write header");
+        let mut bb = BlockBuilder::new();
+        let flush = |bb: &mut BlockBuilder, writer: &mut PbfWriter<File>| {
+            if let Some(bytes) = bb.take().expect("take") {
+                writer.write_primitive_block(bytes).expect("write block");
+            }
+        };
+        for chunk in node_ids.chunks(node_block.max(1)) {
+            for &id in chunk {
+                let (lat, lon) = coord(id);
+                bb.add_node(id, lat, lon, std::iter::empty(), None);
+            }
+            flush(&mut bb, &mut writer);
+        }
+        for (id, refs) in ways {
+            let locations: Vec<(i32, i32)> = refs.iter().map(|&r| coord(r)).collect();
+            bb.add_way_with_locations(*id, [("highway", "road")], refs, &locations, None);
+            flush(&mut bb, &mut writer);
+        }
+        for &(id, way) in relations {
+            let members = [block_builder::MemberData {
+                id: pbfhogg::MemberId::Way(way),
+                role: "outer",
+            }];
+            bb.add_relation(id, [("type", "multipolygon")], &members, None);
+            flush(&mut bb, &mut writer);
+        }
+        writer.flush().expect("flush base");
+    }
+
+    /// An OSC body (inside `<osmChange>`) as a gzipped file.
+    fn write_osc_body(path: &Path, body: &str) {
+        write_osc(
+            path,
+            &format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <osmChange version=\"0.6\">{body}</osmChange>"
+            ),
+        );
+    }
+
+    /// A node element at [`coord`] (degrees, as OSC writes them).
+    fn osc_node(id: i64, version: u32) -> String {
+        let (lat, lon) = coord(id);
+        format!(
+            "<node id=\"{id}\" lat=\"{:.7}\" lon=\"{:.7}\" version=\"{version}\"/>",
+            f64::from(lat) / 1e7,
+            f64::from(lon) / 1e7
+        )
+    }
+
+    fn osc_way(id: i64, version: u32, refs: &[i64]) -> String {
+        let nds: String = refs.iter().map(|r| format!("<nd ref=\"{r}\"/>")).collect();
+        format!("<way id=\"{id}\" version=\"{version}\">{nds}<tag k=\"highway\" v=\"road\"/></way>")
+    }
+
+    /// Every way's id and decoded locations, in file order.
+    fn way_locations(path: &Path) -> Vec<(i64, Vec<(i32, i32)>)> {
+        let mut ways = Vec::new();
+        pbfhogg::ElementReader::from_path(path)
+            .expect("open output")
+            .for_each(|element| {
+                if let pbfhogg::Element::Way(w) = element {
+                    let locs = w
+                        .node_locations()
+                        .map(|l| (l.decimicro_lat(), l.decimicro_lon()))
+                        .collect();
+                    ways.push((w.id(), locs));
+                }
+            })
+            .expect("read output");
+        ways
+    }
+
+    /// The barrier shapes the tests run, each a base and an OSC whose way
+    /// edits need coordinates from both the base and the OSC.
+    struct Shape {
+        name: &'static str,
+        write: fn(&Path, &Path),
+        /// Every way the output must hold, with the nodes its locations
+        /// must resolve to (each at [`coord`]).
+        ways: &'static [(i64, &'static [i64])],
+    }
+
+    const SHAPES: &[Shape] = &[
+        // Nodes, ways and a relation. Node 1 moves in the OSC; way 101 is
+        // rewritten onto it and an untouched base node; way 200 is created
+        // on base nodes.
+        Shape {
+            name: "ordinary",
+            write: |base, osc| {
+                write_low_base(
+                    base,
+                    &(1..=12).collect::<Vec<_>>(),
+                    2,
+                    &[
+                        (100, vec![1, 2]),
+                        (101, vec![3, 4]),
+                        (102, vec![5, 6]),
+                        (103, vec![7, 8]),
+                    ],
+                    &[(500, 100)],
+                );
+                write_osc_body(
+                    osc,
+                    &format!(
+                        "<modify>{}{}</modify><create>{}</create>",
+                        osc_node(1, 2),
+                        osc_way(101, 2, &[1, 5]),
+                        osc_way(200, 1, &[6, 7]),
+                    ),
+                );
+            },
+            ways: &[
+                (100, &[1, 2]),
+                (101, &[1, 5]),
+                (102, &[5, 6]),
+                (103, &[7, 8]),
+                (200, &[6, 7]),
+            ],
+        },
+        // No base blobs at all: every coordinate comes from the OSC.
+        Shape {
+            name: "empty",
+            write: |base, osc| {
+                write_low_base(base, &[], 1, &[], &[]);
+                write_osc_body(
+                    osc,
+                    &format!(
+                        "<create>{}{}{}</create>",
+                        osc_node(1, 1),
+                        osc_node(2, 1),
+                        osc_way(10, 1, &[1, 2]),
+                    ),
+                );
+            },
+            ways: &[(10, &[1, 2])],
+        },
+        // Nodes only: the boundary is sent at end of input.
+        Shape {
+            name: "node-only",
+            write: |base, osc| {
+                write_low_base(base, &(1..=6).collect::<Vec<_>>(), 2, &[], &[]);
+                write_osc_body(
+                    osc,
+                    &format!("<create>{}</create>", osc_way(10, 1, &[2, 5])),
+                );
+            },
+            ways: &[(10, &[2, 5])],
+        },
+        // Ways only: the boundary is the empty one, sent at the first way.
+        Shape {
+            name: "way-only",
+            write: |base, osc| {
+                write_low_base(base, &[], 1, &[(100, vec![1, 2]), (101, vec![3, 4])], &[]);
+                write_osc_body(
+                    osc,
+                    &format!(
+                        "<create>{}{}</create><modify>{}</modify>",
+                        osc_node(1, 1),
+                        osc_node(3, 1),
+                        osc_way(101, 2, &[1, 3]),
+                    ),
+                );
+            },
+            ways: &[(100, &[1, 2]), (101, &[1, 3])],
+        },
+    ];
+
+    fn low_options(jobs: usize) -> MergeOptions {
+        MergeOptions {
+            locations_on_ways: true,
+            parallelism: pbfhogg::Parallelism::from_jobs(jobs),
+            ..MergeOptions::default()
+        }
+    }
+
+    /// Run a `--locations-on-ways` merge of `base` and `osc` into `output`
+    /// under a fresh token, armed by `arm` (owned route when `owned`).
+    fn run_low(
+        base: &Path,
+        osc: &Path,
+        output: &Path,
+        jobs: usize,
+        owned: bool,
+        arm: impl FnOnce(&pbfhogg::test_hooks::FaultPlan),
+    ) -> (pbfhogg::Result<()>, pbfhogg::host::Host) {
+        let host = crate::common::test_host();
+        let faults = host.cancel.faults();
+        faults
+            .apply_changes_force_owned_route
+            .store(owned, std::sync::atomic::Ordering::SeqCst);
+        arm(faults);
+        let result = merge(
+            base,
+            osc,
+            common::out(output),
+            &low_options(jobs),
+            &pbfhogg::HeaderOverrides::default(),
+            &host,
+        )
+        .map(|_| ());
+        (result, host)
+    }
+
+    /// Worker counts the barrier is exercised at.
+    const JOBS: &[usize] = &[2, 3];
+
+    /// Every barrier shape, at every worker count, on both routes, with the
+    /// node boundary on time and held until after the last node item: the
+    /// output is the same bytes every time, and every way carries its
+    /// nodes' coordinates. The held runs prove their case ran (the drain saw
+    /// a boundary after it had processed every node item), which is the
+    /// ordering the drain once needed a 25 ms idle re-poll to survive.
+    #[test]
+    fn barrier_shapes_publish_the_same_output_however_the_boundary_lands() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        for shape in SHAPES {
+            let dir = crate::common::test_scratch();
+            let base = dir.path().join("base.osm.pbf");
+            let osc = dir.path().join("diff.osc.gz");
+            (shape.write)(&base, &osc);
+
+            let reference = dir.path().join("reference.osm.pbf");
+            let (result, _) = run_low(&base, &osc, &reference, 2, false, |_| {});
+            result.unwrap_or_else(|e| panic!("{}: reference run: {e}", shape.name));
+            let expected_ways: Vec<(i64, Vec<(i32, i32)>)> = shape
+                .ways
+                .iter()
+                .map(|(id, refs)| (*id, refs.iter().map(|&r| coord(r)).collect()))
+                .collect();
+            assert_eq!(
+                way_locations(&reference),
+                expected_ways,
+                "{}: every way must carry its nodes' coordinates",
+                shape.name
+            );
+            let expected = std::fs::read(&reference).expect("read reference");
+
+            for &jobs in JOBS {
+                for owned in [false, true] {
+                    for late in [false, true] {
+                        let label = format!("{} jobs={jobs} owned={owned} late={late}", shape.name);
+                        let output = dir.path().join("output.osm.pbf");
+                        let (result, host) = run_low(&base, &osc, &output, jobs, owned, |f| {
+                            f.apply_changes_late_boundary.store(late, SeqCst);
+                        });
+                        result.unwrap_or_else(|e| panic!("{label}: {e}"));
+                        let faults = host.cancel.faults();
+                        assert!(
+                            !faults.apply_changes_hook_timed_out.load(SeqCst),
+                            "{label}: a hook wait expired"
+                        );
+                        if late {
+                            assert_eq!(
+                                faults.apply_changes_late_boundaries_seen.load(SeqCst),
+                                1,
+                                "{label}: the boundary must arrive after the last node item"
+                            );
+                        }
+                        assert_eq!(
+                            std::fs::read(&output).expect("read output"),
+                            expected,
+                            "{label}: output differs from the reference"
+                        );
+                        std::fs::remove_file(&output).expect("remove output");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run the ordinary shape with `nodes` single-node blobs, armed by
+    /// `arm`, and require it to fail with `expect` in its message, publish
+    /// nothing and leave no scratch.
+    fn assert_barrier_failure(
+        label: &str,
+        nodes: i64,
+        jobs: usize,
+        owned: bool,
+        arm: impl FnOnce(&pbfhogg::test_hooks::FaultPlan),
+        expect: &str,
+    ) -> pbfhogg::host::Host {
+        let dir = crate::common::test_scratch();
+        let base = dir.path().join("base.osm.pbf");
+        let osc = dir.path().join("diff.osc.gz");
+        let output = dir.path().join("output.osm.pbf");
+        write_low_base(
+            &base,
+            &(1..=nodes).collect::<Vec<_>>(),
+            1,
+            &[(100, vec![1, 2]), (101, vec![3, 4])],
+            &[],
+        );
+        write_osc_body(
+            &osc,
+            &format!("<modify>{}</modify>", osc_way(101, 2, &[1, 4])),
+        );
+        let before = common::snapshot_dir(dir.path());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_low(&base, &osc, &output, jobs, owned, arm)
+        }));
+        let (result, host) = result.unwrap_or_else(|_| panic!("{label}: merge unwound"));
+        let err = result
+            .err()
+            .unwrap_or_else(|| panic!("{label}: merge must fail"));
+        assert!(
+            err.to_string().contains(expect),
+            "{label}: expected {expect:?}, got: {err}"
+        );
+        assert!(
+            !output.exists(),
+            "{label}: a failed run must publish nothing"
+        );
+        common::assert_scratch_unchanged(&before, &common::snapshot_dir(dir.path()));
+        assert!(
+            !host
+                .cancel
+                .faults()
+                .apply_changes_hook_timed_out
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "{label}: a hook wait expired, so the failure did not land where intended"
+        );
+        host
+    }
+
+    /// A worker that panics while the scanner is parked in its barrier wait
+    /// (the node phase can never complete, since that worker's item never
+    /// arrives) fails the run with the panic's own message instead of
+    /// hanging scanner, drain and the other workers.
+    #[test]
+    fn a_worker_panic_during_the_barrier_wait_fails_the_run() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for &jobs in JOBS {
+            for owned in [false, true] {
+                let label = format!("jobs={jobs} owned={owned}");
+                let host = assert_barrier_failure(
+                    &label,
+                    8,
+                    jobs,
+                    owned,
+                    |f| {
+                        f.apply_changes_panic_at_blob_seq.store(1, SeqCst);
+                        f.apply_changes_panic_waits_for_barrier_wait
+                            .store(true, SeqCst);
+                    },
+                    "panic_at_blob_seq=1 triggered",
+                );
+                assert!(
+                    host.cancel
+                        .faults()
+                        .apply_changes_scanner_in_barrier_wait
+                        .load(SeqCst),
+                    "{label}: the scanner must have reached its barrier wait"
+                );
+            }
+        }
+    }
+
+    /// A worker that panics while the scanner is blocked sending a candidate
+    /// on the full candidate channel (more node blobs than the channel and
+    /// the parked workers hold) fails the run instead of leaving the
+    /// scanner blocked.
+    #[test]
+    fn a_worker_panic_while_the_scanner_is_blocked_dispatching_fails_the_run() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for &jobs in JOBS {
+            for owned in [false, true] {
+                let label = format!("jobs={jobs} owned={owned}");
+                let host = assert_barrier_failure(
+                    &label,
+                    120,
+                    jobs,
+                    owned,
+                    |f| {
+                        f.apply_changes_panic_at_blob_seq.store(0, SeqCst);
+                        f.apply_changes_hold_workers_until_dispatch_blocked
+                            .store(true, SeqCst);
+                    },
+                    "panic_at_blob_seq=0 triggered",
+                );
+                assert!(
+                    host.cancel
+                        .faults()
+                        .apply_changes_dispatch_blocked
+                        .load(SeqCst),
+                    "{label}: the scanner must have blocked on a full candidate channel"
+                );
+            }
+        }
+    }
+
+    /// Cancelling while the scanner waits for the barrier (one worker parked
+    /// on a node blob, so the barrier cannot fire) returns `Cancelled`,
+    /// publishes nothing and joins every thread.
+    #[test]
+    fn cancelling_during_the_barrier_wait_stops_the_run() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for &jobs in JOBS {
+            for owned in [false, true] {
+                let label = format!("jobs={jobs} owned={owned}");
+                let dir = crate::common::test_scratch();
+                let base = dir.path().join("base.osm.pbf");
+                let osc = dir.path().join("diff.osc.gz");
+                let output = dir.path().join("output.osm.pbf");
+                write_low_base(
+                    &base,
+                    &(1..=8).collect::<Vec<_>>(),
+                    1,
+                    &[(100, vec![1, 2])],
+                    &[],
+                );
+                write_osc_body(
+                    &osc,
+                    &format!("<modify>{}</modify>", osc_way(100, 2, &[2, 3])),
+                );
+                let host = crate::common::test_host();
+                let faults = host.cancel.faults();
+                faults.apply_changes_force_owned_route.store(owned, SeqCst);
+                faults.apply_changes_park_at_blob_seq.store(1, SeqCst);
+                let before = common::snapshot_dir(dir.path());
+                let result = std::thread::scope(|scope| {
+                    let run = scope.spawn(|| {
+                        merge(
+                            &base,
+                            &osc,
+                            common::out(&output),
+                            &low_options(jobs),
+                            &pbfhogg::HeaderOverrides::default(),
+                            &host,
+                        )
+                    });
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while !faults.apply_changes_scanner_in_barrier_wait.load(SeqCst) {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "{label}: the scanner never reached its barrier wait"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    host.cancel.cancel();
+                    run.join().expect("merge must not unwind")
+                });
+                let err = result
+                    .err()
+                    .unwrap_or_else(|| panic!("{label}: merge must fail"));
+                assert!(
+                    matches!(err.kind(), pbfhogg::ErrorKind::Cancelled),
+                    "{label}: expected Cancelled, got: {err:?}"
+                );
+                assert!(
+                    !output.exists(),
+                    "{label}: a cancelled run must publish nothing"
+                );
+                common::assert_scratch_unchanged(&before, &common::snapshot_dir(dir.path()));
+                assert!(
+                    !faults.apply_changes_hook_timed_out.load(SeqCst),
+                    "{label}: the parked worker must see the cancellation"
+                );
+            }
+        }
     }
 
     const REPLACEMENT_OSC: &str = r#"<?xml version="1.0" encoding="UTF-8"?>

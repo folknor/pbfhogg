@@ -156,6 +156,37 @@ pub struct FaultPlan {
     // --- apply-changes streaming workers ---
     /// Blob sequence number at whose dequeue a streaming worker panics.
     pub apply_changes_panic_at_blob_seq: AtomicU64,
+    /// The armed panic first waits (bounded) until the scanner is in its
+    /// node-to-way barrier wait, so the failure provably lands there.
+    pub apply_changes_panic_waits_for_barrier_wait: AtomicBool,
+    /// Blob sequence number at whose dequeue a streaming worker parks
+    /// (bounded) until the run is cancelled, holding the node phase open.
+    pub apply_changes_park_at_blob_seq: AtomicU64,
+    /// Park every streaming worker at each dequeue (bounded) until the
+    /// scanner has found the candidate channel full, so a failure armed
+    /// alongside provably lands while the scanner is blocked dispatching.
+    pub apply_changes_hold_workers_until_dispatch_blocked: AtomicBool,
+    /// Set by the scanner when a candidate send finds the channel full.
+    pub apply_changes_dispatch_blocked: AtomicBool,
+
+    // --- apply-changes node-to-way barrier (`apply_changes::{scanner, drain}`) ---
+    /// Hold the scanner's node boundary (bounded) until the drain has
+    /// processed every seq below it, so the boundary arrives after the last
+    /// node item: the case the drain once needed an idle re-poll for.
+    pub apply_changes_late_boundary: AtomicBool,
+    /// The drain's next expected seq, published after each advance.
+    pub apply_changes_drain_next_seq: AtomicU64,
+    /// Boundaries the drain received after it had already processed every
+    /// seq below them, so a late-boundary test can prove its case ran.
+    pub apply_changes_late_boundaries_seen: AtomicU64,
+    /// Set by the scanner as it starts waiting for the barrier signal.
+    pub apply_changes_scanner_in_barrier_wait: AtomicBool,
+    /// Run with the owned route (workers pread passthroughs, no splice)
+    /// whatever the output backend supports.
+    pub apply_changes_force_owned_route: AtomicBool,
+    /// A bounded apply-changes hook wait expired: the handshake did not
+    /// happen, and a test relying on it proved nothing.
+    pub apply_changes_hook_timed_out: AtomicBool,
 
     // --- altw external stage 3 ---
     /// Slot bucket index at which the stage 3 worker claiming it panics.
@@ -248,6 +279,16 @@ impl FaultPlan {
             diff_shard_panic: AtomicUsize::new(usize::MAX),
             derive_shard_panic: AtomicUsize::new(usize::MAX),
             apply_changes_panic_at_blob_seq: AtomicU64::new(u64::MAX),
+            apply_changes_panic_waits_for_barrier_wait: AtomicBool::new(false),
+            apply_changes_park_at_blob_seq: AtomicU64::new(u64::MAX),
+            apply_changes_hold_workers_until_dispatch_blocked: AtomicBool::new(false),
+            apply_changes_dispatch_blocked: AtomicBool::new(false),
+            apply_changes_late_boundary: AtomicBool::new(false),
+            apply_changes_drain_next_seq: AtomicU64::new(0),
+            apply_changes_late_boundaries_seen: AtomicU64::new(0),
+            apply_changes_scanner_in_barrier_wait: AtomicBool::new(false),
+            apply_changes_force_owned_route: AtomicBool::new(false),
+            apply_changes_hook_timed_out: AtomicBool::new(false),
             altw_stage3_panic_at_bucket: AtomicUsize::new(usize::MAX),
             geocode_streets_panic_at_way: AtomicU32::new(u32::MAX),
             force_pin_path_reopen: AtomicBool::new(false),
@@ -523,11 +564,58 @@ impl FaultPlan {
         ))
     }
 
-    /// The apply-changes streaming panic selector, `None` when disarmed.
-    pub(crate) fn apply_changes_panic_seq(&self) -> Option<u64> {
-        match self.apply_changes_panic_at_blob_seq.load(Ordering::Relaxed) {
-            u64::MAX => None,
-            seq => Some(seq),
+    // ---- apply-changes ---------------------------------------------------
+
+    /// Called by a streaming worker right after it dequeues blob `seq`:
+    /// holds, parks or panics it as armed. `cancelled` reads the run's token.
+    pub(crate) fn on_apply_changes_dequeue(
+        &self,
+        seq: u64,
+        worker: usize,
+        cancelled: impl Fn() -> bool,
+    ) {
+        let timed_out = &self.apply_changes_hook_timed_out;
+        if self
+            .apply_changes_hold_workers_until_dispatch_blocked
+            .load(Ordering::SeqCst)
+        {
+            self.wait_until(timed_out, || {
+                self.apply_changes_dispatch_blocked.load(Ordering::SeqCst)
+            });
+        }
+        if seq == self.apply_changes_park_at_blob_seq.load(Ordering::SeqCst) {
+            self.wait_until(timed_out, &cancelled);
+        }
+        if seq == self.apply_changes_panic_at_blob_seq.load(Ordering::SeqCst) {
+            if self
+                .apply_changes_panic_waits_for_barrier_wait
+                .load(Ordering::SeqCst)
+            {
+                self.wait_until(timed_out, || {
+                    self.apply_changes_scanner_in_barrier_wait
+                        .load(Ordering::SeqCst)
+                });
+            }
+            panic!("test-hooks: panic_at_blob_seq={seq} triggered in worker {worker}");
+        }
+    }
+
+    /// Called by the scanner just before it sends its node boundary with
+    /// exclusive end `node_end_seq`.
+    pub(crate) fn before_apply_changes_boundary(&self, node_end_seq: u64) {
+        if self.apply_changes_late_boundary.load(Ordering::SeqCst) {
+            self.wait_until(&self.apply_changes_hook_timed_out, || {
+                self.apply_changes_drain_next_seq.load(Ordering::SeqCst) >= node_end_seq
+            });
+        }
+    }
+
+    /// Called by the drain when the node boundary arrives, with the seq it
+    /// expects next.
+    pub(crate) fn on_apply_changes_boundary(&self, node_end_seq: u64, next_seq: u64) {
+        if next_seq >= node_end_seq {
+            self.apply_changes_late_boundaries_seen
+                .fetch_add(1, Ordering::SeqCst);
         }
     }
 }

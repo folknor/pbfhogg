@@ -115,12 +115,11 @@ pub(super) struct StreamingConfig {
     pub route: Route<()>,
     /// Shared with the drain; see the module doc's "Failure" section.
     pub failure: Arc<FailureSlot>,
-    /// Test-only: panic in the worker loop when the dequeued blob's
-    /// `seq` matches: the run's fault plan's
-    /// `apply_changes_panic_at_blob_seq`, read once by the caller. Only
-    /// compiled under the `test-hooks` feature.
+    /// Test-only: the run's token, whose fault plan the worker loop consults
+    /// at each dequeue (`FaultPlan::on_apply_changes_dequeue`: panic, park or
+    /// hold). Only compiled under the `test-hooks` feature.
     #[cfg(feature = "test-hooks")]
-    pub panic_at_blob_seq: Option<u64>,
+    pub cancel: crate::host::Cancel,
 }
 
 /// Channels owned by the streaming pool.
@@ -206,7 +205,7 @@ pub(super) fn run_workers(
         route,
         failure,
         #[cfg(feature = "test-hooks")]
-        panic_at_blob_seq,
+        cancel,
     } = cfg;
     let StreamingChannels {
         candidate_rx,
@@ -263,6 +262,8 @@ pub(super) fn run_workers(
             let failure = &*failure;
             let ranges = &*ranges;
             let diff = &*diff;
+            #[cfg(feature = "test-hooks")]
+            let cancel = &cancel;
 
             scope.spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -282,7 +283,7 @@ pub(super) fn run_workers(
                         &compression,
                         route,
                         #[cfg(feature = "test-hooks")]
-                        panic_at_blob_seq,
+                        cancel,
                     )
                 }));
                 // Publish before this closure returns: `drain_tx` (moved in
@@ -323,7 +324,7 @@ fn worker_loop(
     needed_set: Option<&FxHashSet<i64>>,
     compression: &Compression,
     route: Route<()>,
-    #[cfg(feature = "test-hooks")] panic_at_blob_seq: Option<u64>,
+    #[cfg(feature = "test-hooks")] cancel: &crate::host::Cancel,
 ) -> Result<()> {
     let mut read_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
@@ -352,19 +353,18 @@ fn worker_loop(
             }
         };
 
-        // Test-only: arm this through the fault plan's
-        // `apply_changes_panic_at_blob_seq` (`crate::test_hooks`)
-        // to trigger a mid-stream worker panic at a deterministic point,
-        // exercising panic publication, barrier shutdown and scratch cleanup.
+        // Test-only: the fault plan (`crate::test_hooks`) can panic, park or
+        // hold this worker at a deterministic point, exercising panic
+        // publication, barrier shutdown, cancellation and scratch cleanup.
         // Production builds don't compile this block.
         #[cfg(feature = "test-hooks")]
         {
             let seq = match &item {
                 ScannedBlob::Candidate(d) | ScannedBlob::Passthrough(d) => d.seq,
             };
-            if panic_at_blob_seq == Some(seq) {
-                panic!("test-hooks: panic_at_blob_seq={seq} triggered in worker {_worker_id}");
-            }
+            cancel
+                .faults()
+                .on_apply_changes_dequeue(seq, _worker_id, || cancel.is_cancelled());
         }
 
         match item {

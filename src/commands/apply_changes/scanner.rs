@@ -252,7 +252,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
             // can pre-receive even while workers are still processing
             // queued Node candidates.
             if !boundary_sent && let Some(tx) = boundary_tx.as_ref() {
-                tx.send(node_boundary(last_node_seq)).map_err(send_err)?;
+                send_boundary(tx, last_node_seq, host)?;
                 boundary_sent = true;
             }
             pending_post_barrier.push(item);
@@ -273,6 +273,8 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
             &mut max_item_bytes_fastpath,
             &mut max_item_bytes_slowpath,
             approx_cost,
+            #[cfg(feature = "test-hooks")]
+            host.cancel.faults(),
         )?;
 
         seq += 1;
@@ -296,7 +298,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         && !boundary_sent
         && let Some(tx) = boundary_tx.as_ref()
     {
-        tx.send(node_boundary(last_node_seq)).map_err(send_err)?;
+        send_boundary(tx, last_node_seq, host)?;
     }
 
     // End of input. If we buffered way/relation descriptors under the
@@ -310,6 +312,11 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
     // and publishes on that receive; that is what unblocks this wait.
     if !barrier_open && let Some(ref rx) = barrier_rx {
         crate::debug::emit_marker("MERGE_SCANNER_BARRIER_WAIT_START");
+        #[cfg(feature = "test-hooks")]
+        host.cancel
+            .faults()
+            .apply_changes_scanner_in_barrier_wait
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         rx.recv().map_err(|_| {
             crate::Error::internal("drain closed barrier channel before signalling loc_map ready")
         })?;
@@ -325,6 +332,8 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
             &mut max_item_bytes_fastpath,
             &mut max_item_bytes_slowpath,
             approx_cost,
+            #[cfg(feature = "test-hooks")]
+            host.cancel.faults(),
         )?;
     }
 
@@ -363,6 +372,7 @@ fn dispatch_item(
     max_item_bytes_fast: &mut usize,
     max_item_bytes_slow: &mut usize,
     approx_cost: usize,
+    #[cfg(feature = "test-hooks")] faults: &crate::test_hooks::FaultPlan,
 ) -> Result<()> {
     match item {
         ScannerEmit::Drain(tx, drain_item) => {
@@ -371,6 +381,19 @@ fn dispatch_item(
         }
         ScannerEmit::Candidate(scanned) => {
             *max_item_bytes_slow = (*max_item_bytes_slow).max(approx_cost);
+            // Test-only: report a full candidate channel before blocking on
+            // it, so a fault can be timed to land while dispatch is blocked.
+            #[cfg(feature = "test-hooks")]
+            let scanned = match channels.candidate_tx.try_send(scanned) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TrySendError::Disconnected(scanned)) => scanned,
+                Err(mpsc::TrySendError::Full(scanned)) => {
+                    faults
+                        .apply_changes_dispatch_blocked
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    scanned
+                }
+            };
             channels.candidate_tx.send(scanned).map_err(send_err)?;
         }
     }
@@ -388,13 +411,21 @@ fn scanner_emit_cost(item: &ScannerEmit<'_>) -> usize {
     }
 }
 
-/// The boundary for the node descriptors dispatched so far: one past the
-/// last one's seq, or zero when there were none (an exclusive end, so no
-/// sentinel is needed).
-fn node_boundary(last_node_seq: Option<u64>) -> DrainMessage {
-    DrainMessage::NodeBoundary {
-        node_end_seq: last_node_seq.map_or(0, |seq| seq + 1),
-    }
+/// Send the boundary for the node descriptors dispatched so far: one past
+/// the last one's seq, or zero when there were none (an exclusive end, so
+/// no sentinel is needed).
+fn send_boundary(
+    tx: &mpsc::SyncSender<DrainMessage>,
+    last_node_seq: Option<u64>,
+    #[cfg_attr(not(feature = "test-hooks"), allow(unused_variables))] host: &crate::host::Host,
+) -> Result<()> {
+    let node_end_seq = last_node_seq.map_or(0, |seq| seq + 1);
+    #[cfg(feature = "test-hooks")]
+    host.cancel
+        .faults()
+        .before_apply_changes_boundary(node_end_seq);
+    tx.send(DrainMessage::NodeBoundary { node_end_seq })
+        .map_err(send_err)
 }
 
 fn send_err<T>(_: mpsc::SendError<T>) -> crate::error::Error {

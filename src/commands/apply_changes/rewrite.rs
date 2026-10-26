@@ -361,6 +361,14 @@ pub(crate) fn merge_to(
     // hand their walker's descriptor to their worker pools). All of them
     // derive from `base`, so they are descriptions of one file.
     let splice = backend.supports_copy_range();
+    // Test-only: exercise the owned route on any backend.
+    #[cfg(feature = "test-hooks")]
+    let splice = splice
+        && !host
+            .cancel
+            .faults()
+            .apply_changes_force_owned_route
+            .load(std::sync::atomic::Ordering::Relaxed);
     let splice_source = if splice {
         Some(crate::read::input::InputFile::open(&base)?)
     } else {
@@ -476,7 +484,7 @@ pub(crate) fn merge_to(
         route: worker_route,
         failure: Arc::clone(&failure),
         #[cfg(feature = "test-hooks")]
-        panic_at_blob_seq: host.cancel.faults().apply_changes_panic_seq(),
+        cancel: host.cancel.clone(),
     };
     let streaming_channels = StreamingChannels {
         candidate_rx,

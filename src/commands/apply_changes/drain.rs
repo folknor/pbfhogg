@@ -227,6 +227,10 @@ pub(super) fn run_drain(
             match drain_rx.recv_timeout(recv_timeout) {
                 Ok(DrainMessage::Item(item)) => Some(item),
                 Ok(DrainMessage::NodeBoundary { node_end_seq: end }) => {
+                    #[cfg(feature = "test-hooks")]
+                    cancel
+                        .faults()
+                        .on_apply_changes_boundary(end, state.next_seq);
                     if node_end_seq.replace(end).is_some() {
                         return Err(Error::internal(
                             "drain: the scanner sent its node boundary twice",
@@ -289,6 +293,11 @@ pub(super) fn run_drain(
             process_item(item, &cfg, &mut state, writer, &mut stats, counters)?;
             state.next_seq += 1;
         }
+        #[cfg(feature = "test-hooks")]
+        cancel
+            .faults()
+            .apply_changes_drain_next_seq
+            .store(state.next_seq, std::sync::atomic::Ordering::SeqCst);
 
         // The one barrier check, after every receive and advance: once the
         // boundary is known and every seq below it is processed, the node

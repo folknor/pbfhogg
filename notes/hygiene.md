@@ -1190,6 +1190,15 @@ The judgement calls already known, to be checked first:
   state. Found sparring HYG-011. Success path cost: one relaxed load per
   blob on extract simple, smart and multi, tags-filter's relation closure,
   getid and `inspect --nodes`; argued below noise, not measured.
+- `parallel_classify_phase_abortable` (and `parallel_classify_phase` on it)
+  and `parallel_scan_blobs_raw` are thin wrappers over one private driver,
+  `run_unordered_per_blob` in `scan/classify.rs`. Same dispatcher thread,
+  `Mutex<Receiver>`, channel depths, `WILLNEED` placement, worker-thread
+  init and consumer loop; the per-blob work is a monomorphized closure over
+  per-worker local state. Hotpath names stay on the wrappers. Reviewed by a
+  fresh codex session; codegen argued equivalent, not measured. Every
+  per-blob classify caller (the extract, tags-filter, getparents, check
+  and altw pass 0 scans) runs through it.
 ---
 
 ## HYG-011 - The pread-decompress-dispatch-reorder pool is hand-built about fifteen times

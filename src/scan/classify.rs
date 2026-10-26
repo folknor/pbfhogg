@@ -652,6 +652,65 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
     threads: Option<usize>,
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> Result<R> + Send + Sync,
+    merge: impl FnMut(usize, R) -> std::ops::ControlFlow<()>,
+    host: &crate::host::Host,
+) -> Result<()> {
+    run_unordered_per_blob(
+        input,
+        schedule,
+        threads,
+        || DecodeLocal {
+            pool: crate::blob::DecompressPool::new(),
+            st_scratch: Vec::new(),
+            gr_scratch: Vec::new(),
+            state: worker_init(),
+        },
+        |local: &mut DecodeLocal<S>, raw: &[u8]| {
+            let mut buf =
+                crate::blob::pool_get(Some(&local.pool), raw.len() * DECOMPRESS_EXPANSION_GUESS);
+            crate::blob::decompress_blob_raw(raw, &mut buf)?;
+            let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+                buf,
+                &local.pool,
+                &mut local.st_scratch,
+                &mut local.gr_scratch,
+            )?;
+            classify(&block, &mut local.state)
+        },
+        merge,
+        host,
+    )
+}
+
+/// One unordered per-blob worker's block-decode state: its decompress pool
+/// and block-parse scratch, beside the caller's state.
+struct DecodeLocal<S> {
+    pool: std::sync::Arc<crate::blob::DecompressPool>,
+    st_scratch: Vec<(u32, u32)>,
+    gr_scratch: Vec<(u32, u32)>,
+    state: S,
+}
+
+/// The unordered per-blob pool behind [`parallel_classify_phase_abortable`]
+/// and [`parallel_scan_blobs_raw`]: one dispatcher thread feeds schedule
+/// positions through a bounded channel to `threads` workers, each of which
+/// preads the blob's payload, runs `work` on it with its own local state and
+/// sends one located result per blob through a second bounded channel; the
+/// calling thread merges results in completion order.
+///
+/// `local` runs on each worker's own thread. The dispatcher, not the
+/// workers, advances the sliding `WILLNEED` advice, so the advice stays
+/// coupled to dispatch through the descriptor channel's bound. A merge
+/// returning `Break` drops the result receiver, which fails the workers'
+/// sends and then the dispatcher's. The ordered pools moved to
+/// `crate::ordered_pool`; this one keeps its dispatcher because that is
+/// where the advice lives, and no dispatch cost has been shown to recover.
+fn run_unordered_per_blob<L, R: Send>(
+    input: &InputFile,
+    schedule: &[ScheduledBlob],
+    threads: Option<usize>,
+    local: impl Fn() -> L + Sync,
+    work: impl Fn(&mut L, &[u8]) -> Result<R> + Sync,
     mut merge: impl FnMut(usize, R) -> std::ops::ControlFlow<()>,
     host: &crate::host::Host,
 ) -> Result<()> {
@@ -686,16 +745,20 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
             let rx = std::sync::Arc::clone(&desc_rx);
             let tx = result_tx.clone();
             let file = std::sync::Arc::clone(shared_file);
-            let classify_ref = &classify;
-            let worker_init_ref = &worker_init;
+            let work_ref = &work;
+            let local_ref = &local;
             scope.spawn(move || {
                 let mut read_buf: Vec<u8> = Vec::new();
-                let worker_pool = crate::blob::DecompressPool::new();
-                let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-                let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-                let mut state = worker_init_ref();
+                let mut state = local_ref();
 
                 loop {
+                    // The guard covers only receiving a schedule position;
+                    // the blob's work, the caller's callbacks and the result
+                    // send all run after it is released. The mutex guards no
+                    // application state that recovery could expose half
+                    // updated, so a poisoned guard lets the remaining workers
+                    // go on; a worker's panic still propagates when the scope
+                    // joins.
                     let position = {
                         let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         match guard.recv() {
@@ -708,18 +771,7 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
                     let r: crate::error::Result<R> = (|| {
                         read_buf.resize(entry.data_size(), 0);
                         file.read_exact_at(&mut read_buf, entry.data_offset())?;
-                        let mut buf = crate::blob::pool_get(
-                            Some(&worker_pool),
-                            entry.data_size() * DECOMPRESS_EXPANSION_GUESS,
-                        );
-                        crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
-                        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
-                            buf,
-                            &worker_pool,
-                            &mut st_scratch,
-                            &mut gr_scratch,
-                        )?;
-                        classify_ref(&block, &mut state)
+                        work_ref(&mut state, &read_buf)
                     })()
                     .map_err(|e| input.locate_blob(entry, e));
                     if tx.send((position, r)).is_err() {
@@ -897,81 +949,22 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
     mut merge: impl FnMut(usize, R),
     host: &crate::host::Host,
 ) -> Result<()> {
-    use std::os::unix::fs::FileExt as _;
-
-    let mut willneed = WillneedPrefetch::new(schedule);
-    host.cancel.check()?;
-    if schedule.is_empty() {
-        return Ok(());
-    }
-
-    let decode_threads = resolve_thread_count(threads, &*host.resources);
-
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<usize>(POOL_DESCRIPTOR_CHANNEL_DEPTH);
-    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(
-        POOL_RESULT_CHANNEL_DEPTH,
-    );
-    let shared_file = input.file();
-
-    std::thread::scope(|scope| -> Result<()> {
-        scope.spawn(move || {
-            for (position, entry) in schedule.iter().enumerate() {
-                willneed.before_dispatch(shared_file, entry);
-                if desc_tx.send(position).is_err() {
-                    break;
-                }
-            }
-        });
-
-        for _ in 0..decode_threads {
-            let rx = std::sync::Arc::clone(&desc_rx);
-            let tx = result_tx.clone();
-            let file = std::sync::Arc::clone(shared_file);
-            let classify_ref = &classify;
-            let worker_init_ref = &worker_init;
-            scope.spawn(move || {
-                let mut read_buf: Vec<u8> = Vec::new();
-                let mut decompress_buf: Vec<u8> = Vec::new();
-                let mut state = worker_init_ref();
-
-                loop {
-                    let position = {
-                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match guard.recv() {
-                            Ok(d) => d,
-                            Err(_) => break,
-                        }
-                    };
-                    let entry = &schedule[position];
-
-                    let r: crate::error::Result<R> = (|| {
-                        read_buf.resize(entry.data_size(), 0);
-                        file.read_exact_at(&mut read_buf, entry.data_offset())?;
-                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
-                        classify_ref(&decompress_buf, &mut state)
-                    })()
-                    .map_err(|e| input.locate_blob(entry, e));
-                    if tx.send((position, r)).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        drop(desc_rx);
-        drop(result_tx);
-
-        // Moved into this closure so every return drops it before the scope
-        // joins the workers (a borrow would keep it alive past the join and
-        // leave a worker parked in `send`).
-        let result_rx = result_rx;
-        while let Some((seq, result)) = recv_checked(&result_rx, &host.cancel)? {
-            merge(seq, result?);
-        }
-        Ok(())
-    })?;
-
-    Ok(())
+    run_unordered_per_blob(
+        input,
+        schedule,
+        threads,
+        || (Vec::<u8>::new(), worker_init()),
+        |local: &mut (Vec<u8>, S), raw: &[u8]| {
+            let (decompress_buf, state) = local;
+            crate::blob::decompress_blob_raw(raw, decompress_buf)?;
+            classify(decompress_buf, state)
+        },
+        |seq, r| {
+            merge(seq, r);
+            std::ops::ControlFlow::Continue(())
+        },
+        host,
+    )
 }
 
 /// Raises an accumulate run's stop flag if its worker unwinds, so a panic

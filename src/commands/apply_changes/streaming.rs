@@ -55,7 +55,7 @@ use crate::error::{Error, Result};
 use crate::writer::{Compression, frame_blob_pipelined, reframe_raw_with_index};
 
 use super::classify::block_overlaps_diff;
-use super::descriptor::{BlobDescriptor, DrainItem, Route, ScannedBlob};
+use super::descriptor::{BlobDescriptor, DrainItem, DrainMessage, Route, ScannedBlob};
 use super::diff_ranges::DiffRanges;
 use super::drain::LocMapHandle;
 use super::failure::FailureSlot;
@@ -133,7 +133,7 @@ pub(super) struct StreamingChannels {
     /// scanner's fast-path `DrainItem::CopyRange` and worker outputs
     /// merge into the same unbounded reorder buffer keyed by global
     /// seq).
-    pub drain_tx: mpsc::SyncSender<DrainItem>,
+    pub drain_tx: mpsc::SyncSender<DrainMessage>,
 }
 
 crate::counters::counter_set! {
@@ -313,7 +313,7 @@ fn worker_loop(
     file: &std::fs::File,
     source: &Arc<Path>,
     candidate_rx: &Mutex<mpsc::Receiver<ScannedBlob>>,
-    drain_tx: &mpsc::SyncSender<DrainItem>,
+    drain_tx: &mpsc::SyncSender<DrainMessage>,
     counters: &WorkerCounters,
     ranges: &DiffRanges,
     diff: &CompactDiffOverlay,
@@ -432,7 +432,7 @@ fn worker_loop(
 fn handle_candidate(
     file: &std::fs::File,
     desc: &mut BlobDescriptor,
-    drain_tx: &mpsc::SyncSender<DrainItem>,
+    drain_tx: &mpsc::SyncSender<DrainMessage>,
     counters: &WorkerCounters,
     ranges: &DiffRanges,
     diff: &CompactDiffOverlay,
@@ -529,7 +529,8 @@ fn handle_candidate(
 
     // Sync per-worker coords into the shared slot before emitting the
     // DrainItem. This guarantees the drain's barrier merge (which fires
-    // once `next_seq > last_node_seq`) sees coords for every node blob
+    // once it has processed every seq below the scanner's node boundary)
+    // sees coords for every node blob
     // whose output has been processed - the `local_coords` map is
     // private and the drain reads only the shared `CoordSlot`s. For
     // non-Node blobs `local_coords` is empty so this is a no-op.
@@ -752,7 +753,7 @@ fn single_kind_range(block: &crate::PrimitiveBlock) -> Result<Option<(ElementKin
 fn handle_owned_passthrough(
     file: &std::fs::File,
     desc: &BlobDescriptor,
-    drain_tx: &mpsc::SyncSender<DrainItem>,
+    drain_tx: &mpsc::SyncSender<DrainMessage>,
     counters: &WorkerCounters,
     read_buf: &mut Vec<u8>,
     count: u64,
@@ -826,9 +827,9 @@ fn flush_local_coords(
 /// Send to the drain. Fails only once the drain has dropped its receiver,
 /// which it does on its own error or cancellation; the worker propagates
 /// this error, which ends it, and the drain's cause is what the run reports.
-fn send_drain(drain_tx: &mpsc::SyncSender<DrainItem>, item: DrainItem) -> Result<()> {
+fn send_drain(drain_tx: &mpsc::SyncSender<DrainMessage>, item: DrainItem) -> Result<()> {
     drain_tx
-        .send(item)
+        .send(DrainMessage::Item(item))
         .map_err(|_| Error::internal("streaming: drain closed worker-to-drain channel"))
 }
 

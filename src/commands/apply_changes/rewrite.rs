@@ -13,7 +13,7 @@ use crate::commands::output_header::{Bbox, OutputFacts, Replication, Ways};
 use crate::commands::{HeaderOverrides, writer_from_header_bytes};
 use crate::read::input::PinnedInput;
 
-use super::descriptor::{DrainItem, Route};
+use super::descriptor::{DrainMessage, Route};
 use super::diff_ranges::DiffRanges;
 use super::drain::{
     self, DrainChannels, DrainConfig, DrainCounters, LocMapHandle, SeededLocations,
@@ -380,8 +380,9 @@ pub(crate) fn merge_to(
     // candidate receiver, releasing a scanner blocked in send.
     //
     // Normal barrier progress depends separately on the scanner's boundary
-    // message, the drain's 25 ms polling plus idle-fire check, and workers
-    // flushing coord slots before sending node outputs. These paths do not
+    // message (on the drain channel, acted on at receipt), the drain's one
+    // barrier check after each receive, and workers flushing coord slots
+    // before sending node outputs. These paths do not
     // by themselves demonstrate a remaining single-worker deadlock. Before
     // widening the supported configuration, exercise a boundary message
     // delayed until after the final node output, empty/node-only inputs,
@@ -399,11 +400,12 @@ pub(crate) fn merge_to(
     crate::debug::emit_counter("merge_worker_count", worker_count);
 
     // Channels.
-    let (drain_tx, drain_rx) = mpsc::sync_channel::<DrainItem>(DRAIN_CHANNEL_CAPACITY);
+    let (drain_tx, drain_rx) = mpsc::sync_channel::<DrainMessage>(DRAIN_CHANNEL_CAPACITY);
     let (candidate_tx, candidate_rx) =
         mpsc::sync_channel::<super::descriptor::ScannedBlob>(CANDIDATE_CHANNEL_CAPACITY);
-    // One decision, three views of it: the scanner holds a drain sender only
-    // on the splice route, the workers learn which route false positives
+    // One decision, three views of it: the scanner holds a passthrough drain
+    // sender only on the splice route (its node-boundary sender under
+    // `--locations-on-ways`, below, is separate), the workers learn which route false positives
     // take, and the drain gets the input file to splice from. Only clone the
     // sender for the scanner if we're going to use it: otherwise the unused
     // clone keeps `drain_rx` alive past worker exit and the drain thread
@@ -418,14 +420,14 @@ pub(crate) fn merge_to(
         None => (Route::Owned, Route::Owned, Route::Owned),
     };
 
-    // --locations-on-ways barrier wiring.
-    let (barrier_tx_opt, barrier_rx_opt, last_node_tx_opt, last_node_rx_opt) = if locations_on_ways
-    {
+    // --locations-on-ways barrier wiring. The scanner's node boundary goes
+    // to the drain on the drain channel itself, through the scanner's own
+    // sender (moved into the scanner, so it drops when the scanner does).
+    let (barrier_tx_opt, barrier_rx_opt, boundary_tx_opt) = if locations_on_ways {
         let (b_tx, b_rx) = mpsc::sync_channel::<()>(1);
-        let (n_tx, n_rx) = mpsc::sync_channel::<u64>(1);
-        (Some(b_tx), Some(b_rx), Some(n_tx), Some(n_rx))
+        (Some(b_tx), Some(b_rx), Some(drain_tx.clone()))
     } else {
-        (None, None, None, None)
+        (None, None, None)
     };
 
     let coord_slots: Option<CoordSlots> = if locations_on_ways {
@@ -456,7 +458,7 @@ pub(crate) fn merge_to(
             route: scanner_route,
         },
         barrier_rx: barrier_rx_opt,
-        last_node_seq_tx: last_node_tx_opt,
+        boundary_tx: boundary_tx_opt,
     };
 
     let streaming_cfg = StreamingConfig {
@@ -492,10 +494,7 @@ pub(crate) fn merge_to(
         seeded_locations: seeded_locations.map(|l| SeededLocations::new(Some(l))),
         failure: Arc::clone(&failure),
     };
-    let drain_channels = DrainChannels {
-        drain_rx,
-        last_node_seq_rx: last_node_rx_opt,
-    };
+    let drain_channels = DrainChannels { drain_rx };
 
     crate::debug::emit_marker("MERGE_LOOP_START");
     let pipeline_start = crate::counters::Stopwatch::start();

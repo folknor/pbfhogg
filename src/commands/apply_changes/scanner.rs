@@ -31,7 +31,7 @@ use crate::error::Result;
 use crate::read::header_walker::HeaderWalker;
 use crate::read::input::PinnedInput;
 
-use super::descriptor::{BlobDescriptor, DrainItem, Route, ScannedBlob};
+use super::descriptor::{BlobDescriptor, DrainItem, DrainMessage, Route, ScannedBlob};
 use super::diff_ranges::DiffRanges;
 
 /// Scanner channel configuration. Which channels are populated depends
@@ -47,7 +47,7 @@ pub(super) struct ScannerChannels {
     /// Where untouched blobs go. `Splice` carries the fast-path drain
     /// sender; `Owned` has none, and all passthroughs route through
     /// `candidate_tx`.
-    pub route: Route<mpsc::SyncSender<DrainItem>>,
+    pub route: Route<mpsc::SyncSender<DrainMessage>>,
 }
 
 /// Scanner configuration + I/O channels.
@@ -65,14 +65,14 @@ pub(super) struct ScannerConfig<'a> {
     /// Drain sends one unit value after it has processed the last node
     /// blob and published the merged `Arc<loc_map>`.
     pub barrier_rx: Option<mpsc::Receiver<()>>,
-    /// Scanner → drain signal carrying the seq of the last node blob
-    /// emitted (or `u64::MAX` if no node blobs were ever emitted, which
-    /// the drain treats as "publish now"). Sent at the first non-node
-    /// descriptor or at EOF, so the drain knows when to merge
-    /// `CoordSlots` and publish `Arc<loc_map>` without needing a way
-    /// item to trigger the transition. Present when `locations_on_ways`
-    /// is true.
-    pub last_node_seq_tx: Option<mpsc::SyncSender<u64>>,
+    /// The scanner's own sender on the drain channel, for its one
+    /// [`DrainMessage::NodeBoundary`], on both routes. Sent at the first
+    /// non-node descriptor or at EOF, so the drain knows when to merge
+    /// `CoordSlots` and publish `Arc<loc_map>` without needing a way item to
+    /// trigger the transition. Present when `locations_on_ways` is true, and
+    /// dropped with the scanner, so it never keeps the drain channel open
+    /// past the scanner's exit.
+    pub boundary_tx: Option<mpsc::SyncSender<DrainMessage>>,
 }
 
 /// Run the scanner to completion. Returns the number of OsmData
@@ -92,7 +92,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         locations_on_ways,
         channels,
         barrier_rx,
-        last_node_seq_tx,
+        boundary_tx,
     } = cfg;
     // The fast-path sender, present exactly on the splice route. Borrowed by
     // each `ScannerEmit::Drain` so an item can only be built where there is a
@@ -119,19 +119,20 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
     // A local vector cap is not a safe independent change: returning early
     // rejects otherwise valid large inputs, while waiting or releasing the
     // tail changes scanner/barrier scheduling. A bounded design should wait
-    // at the first non-node descriptor after announcing last_node_seq, with
-    // the drain's late-boundary idle-fire path and producer-failure shutdown
-    // preserved and validated. That needs an explicit barrier change; do not
-    // disguise it as a channel-capacity or telemetry adjustment here.
+    // at the first non-node descriptor after sending the node boundary, with
+    // the drain's publication on a late boundary and producer-failure
+    // shutdown preserved and validated. That needs an explicit barrier
+    // change; do not disguise it as a channel-capacity or telemetry
+    // adjustment here.
     let mut pending_post_barrier: Vec<ScannerEmit<'_>> = Vec::new();
     let mut barrier_open = !locations_on_ways; // open by default when not --locations-on-ways
     let mut max_item_bytes_fastpath: usize = 0;
     let mut max_item_bytes_slowpath: usize = 0;
-    // Tracks the seq of the most recently emitted Node descriptor.
-    // Used to send `last_node_seq` to the drain at the node→way
-    // transition (or at EOF if no way blobs exist).
+    // Tracks the seq of the most recently emitted Node descriptor, from
+    // which the node boundary sent to the drain at the node→way transition
+    // (or at EOF if no way blobs exist) is derived.
     let mut last_node_seq: Option<u64> = None;
-    let mut last_node_seq_sent = false;
+    let mut boundary_sent = false;
 
     while let Some(meta) = walker.next_header()? {
         // Skip OsmHeader - merge() reads it separately during setup.
@@ -250,10 +251,9 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
             // back. Send happens before the buffer push so the drain
             // can pre-receive even while workers are still processing
             // queued Node candidates.
-            if !last_node_seq_sent && let Some(tx) = last_node_seq_tx.as_ref() {
-                let payload = last_node_seq.unwrap_or(u64::MAX);
-                tx.send(payload).map_err(send_err)?;
-                last_node_seq_sent = true;
+            if !boundary_sent && let Some(tx) = boundary_tx.as_ref() {
+                tx.send(node_boundary(last_node_seq)).map_err(send_err)?;
+                boundary_sent = true;
             }
             pending_post_barrier.push(item);
             seq += 1;
@@ -288,16 +288,15 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
         }
     }
 
-    // End of input. If --locations-on-ways and we never sent
-    // last_node_seq (i.e., the file had no Way/Relation blobs at all),
-    // tell the drain now so it can publish `loc_map` for the trailing-
-    // creates path. The drain signals back via barrier_rx.
+    // End of input. If --locations-on-ways and we never sent the node
+    // boundary (i.e., the file had no Way/Relation blobs at all), send it
+    // now so the drain can publish `loc_map` for the trailing-creates path.
+    // The drain signals back via barrier_rx.
     if locations_on_ways
-        && !last_node_seq_sent
-        && let Some(tx) = last_node_seq_tx.as_ref()
+        && !boundary_sent
+        && let Some(tx) = boundary_tx.as_ref()
     {
-        let payload = last_node_seq.unwrap_or(u64::MAX);
-        tx.send(payload).map_err(send_err)?;
+        tx.send(node_boundary(last_node_seq)).map_err(send_err)?;
     }
 
     // End of input. If we buffered way/relation descriptors under the
@@ -306,11 +305,9 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
     // loc_map).
     //
     // At EOF with zero way/relation blobs this blocks on barrier_rx
-    // unconditionally; the drain's idle-fire path (see drain.rs's
-    // "Idle barrier fire" block) is the designed counterpart that
-    // unblocks us when the drain has no buffered items but the
-    // barrier condition is met. Do not remove the idle-fire without
-    // also rewriting this wait.
+    // unconditionally. The boundary travels on the drain channel, so the
+    // drain sees it even when it has already processed every node item,
+    // and publishes on that receive; that is what unblocks this wait.
     if !barrier_open && let Some(ref rx) = barrier_rx {
         crate::debug::emit_marker("MERGE_SCANNER_BARRIER_WAIT_START");
         rx.recv().map_err(|_| {
@@ -353,7 +350,7 @@ pub(super) fn run_scanner(cfg: ScannerConfig<'_>, host: &crate::host::Host) -> R
 enum ScannerEmit<'a> {
     /// Splice-capable fast-path: send `DrainItem::CopyRange` straight to
     /// the drain over the borrowed splice-route sender.
-    Drain(&'a mpsc::SyncSender<DrainItem>, DrainItem),
+    Drain(&'a mpsc::SyncSender<DrainMessage>, DrainItem),
     /// Slow-path or `--direct-io` passthrough: route through the worker
     /// pool as a `ScannedBlob`.
     Candidate(ScannedBlob),
@@ -370,7 +367,7 @@ fn dispatch_item(
     match item {
         ScannerEmit::Drain(tx, drain_item) => {
             *max_item_bytes_fast = (*max_item_bytes_fast).max(approx_cost);
-            tx.send(drain_item).map_err(send_err)?;
+            tx.send(DrainMessage::Item(drain_item)).map_err(send_err)?;
         }
         ScannerEmit::Candidate(scanned) => {
             *max_item_bytes_slow = (*max_item_bytes_slow).max(approx_cost);
@@ -388,6 +385,15 @@ fn scanner_emit_cost(item: &ScannerEmit<'_>) -> usize {
         ScannerEmit::Candidate(ScannedBlob::Passthrough(d) | ScannedBlob::Candidate(d)) => {
             DESCRIPTOR_OVERHEAD + d.tagdata.as_ref().map_or(0, |t| t.len())
         }
+    }
+}
+
+/// The boundary for the node descriptors dispatched so far: one past the
+/// last one's seq, or zero when there were none (an exclusive end, so no
+/// sentinel is needed).
+fn node_boundary(last_node_seq: Option<u64>) -> DrainMessage {
+    DrainMessage::NodeBoundary {
+        node_end_seq: last_node_seq.map_or(0, |seq| seq + 1),
     }
 }
 

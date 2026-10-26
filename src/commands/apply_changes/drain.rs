@@ -13,10 +13,6 @@
 //! 1. Type transition: when `item.kind != last_type`, flush the
 //!    `copy_file_range` coalescer + the `OwnedBytes` passthrough buffer,
 //!    then call [`flush_remaining_upserts`] for the previous type.
-//!    - At the **node→way** transition under `--locations-on-ways`,
-//!      additionally merge per-worker [`CoordSlots`] into the published
-//!      `Arc<loc_map>` and signal the scanner over `barrier_tx` (so
-//!      it can release its buffered way/relation descriptors).
 //! 2. Gap creates: when upserts of `item.kind` exist with `id <
 //!    item.min_id`, flush coalescers + emit gap-create elements into a
 //!    fresh `BlockBuilder` and flush.
@@ -33,6 +29,15 @@
 //!      cursor past `blob_osm_last_key(min_id, max_id)` (the
 //!      cursor-rule invariant - Rewrite advances, CopyRange/OwnedBytes
 //!      do NOT).
+//!
+//! ## Node→way barrier
+//!
+//! Under `--locations-on-ways` the barrier is separate from item processing:
+//! once the scanner's [`DrainMessage::NodeBoundary`] has arrived and every
+//! seq below it is processed, the drain merges per-worker [`CoordSlots`]
+//! into the published `Arc<loc_map>` and signals the scanner over
+//! `barrier_tx` (so it can release its buffered way/relation descriptors).
+//! No way or relation item can arrive before that.
 //!
 //! ## Trailing creates
 //!
@@ -54,7 +59,7 @@ use crate::file_writer::FileWriter;
 use crate::osc::CompactDiffOverlay;
 use crate::writer::PbfWriter;
 
-use super::descriptor::{DrainItem, Route};
+use super::descriptor::{DrainItem, DrainMessage, Route};
 use super::diff_ranges::{DiffRanges, UpsertCursors};
 use super::failure::FailureSlot;
 use super::loc_mode::LocMode;
@@ -124,20 +129,10 @@ pub(super) struct DrainConfig<'a> {
 
 /// Drain channels.
 pub(super) struct DrainChannels {
-    /// Unified DrainItem stream from scanner (fast-path CopyRange) and
+    /// Unified stream from scanner (fast-path CopyRange, and under
+    /// `--locations-on-ways` its one [`DrainMessage::NodeBoundary`]) and
     /// workers (Rewritten / converted FalsePositive CopyRange / OwnedBytes).
-    pub drain_rx: mpsc::Receiver<DrainItem>,
-    /// Scanner → drain signal carrying the seq of the last Node
-    /// descriptor emitted (or `u64::MAX` if there were no node blobs).
-    /// Drain triggers the `CoordSlots` merge + `loc_map` publish + scanner
-    /// barrier signal as soon as `state.next_seq > last_node_seq`.
-    /// `None` when `locations_on_ways == false`.
-    ///
-    /// The `u64::MAX` sentinel cannot collide with a real seq: blob seqs
-    /// are assigned by `enumerate()` on the scanner's pread stream, and
-    /// a realistic PBF tops out ~6 orders of magnitude below 2^44 blobs
-    /// let alone 2^64.
-    pub last_node_seq_rx: Option<mpsc::Receiver<u64>>,
+    pub drain_rx: mpsc::Receiver<DrainMessage>,
 }
 
 crate::counters::counter_set! {
@@ -184,25 +179,20 @@ pub(super) fn run_drain(
 ) -> Result<MergeStats> {
     crate::debug::emit_marker("MERGE_DRAIN_START");
 
-    let DrainChannels {
-        drain_rx,
-        last_node_seq_rx,
-    } = channels;
+    let DrainChannels { drain_rx } = channels;
 
     let mut state = DrainState::new();
     let mut stats = MergeStats::new();
-    let mut last_node_seq: Option<u64> = None;
+    // The scanner's node boundary under `--locations-on-ways`, once
+    // received: the exclusive end of the node seqs.
+    let mut node_end_seq: Option<u64> = None;
 
-    // Recv timeout for the main loop. Drain blocks up to this long on
-    // an empty `drain_rx` before polling `last_node_seq_rx` and the
-    // barrier-ready condition. The polling matters under
-    // `--locations-on-ways`: if drain consumes the last node DrainItem
-    // and then blocks on `recv()` *before* scanner sends
-    // `last_node_seq`, both sides deadlock (drain blocks on items, but
-    // workers can't emit any until scanner releases way descriptors,
-    // which scanner won't do until drain signals the barrier). The
-    // timeout breaks the cycle by letting drain re-poll `last_node_seq`
-    // and fire the barrier from idle.
+    // Recv timeout for the main loop. The node boundary arrives on this
+    // channel, so the barrier needs no polling; the timeout is what lets
+    // the drain notice a published producer failure or a cancellation when
+    // nothing else would wake it (a failed worker never delivers its seq,
+    // while the scanner can sit in its barrier wait and the surviving
+    // workers idle on the candidate channel).
     //
     // The 25 ms tradeoff is recorded on `crate::tunables::DRAIN_RECV_TIMEOUT`.
     let recv_timeout = crate::tunables::DRAIN_RECV_TIMEOUT;
@@ -235,7 +225,15 @@ pub(super) fn run_drain(
             None
         } else {
             match drain_rx.recv_timeout(recv_timeout) {
-                Ok(item) => Some(item),
+                Ok(DrainMessage::Item(item)) => Some(item),
+                Ok(DrainMessage::NodeBoundary { node_end_seq: end }) => {
+                    if node_end_seq.replace(end).is_some() {
+                        return Err(Error::internal(
+                            "drain: the scanner sent its node boundary twice",
+                        ));
+                    }
+                    None
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     drain_disconnected = true;
@@ -285,47 +283,28 @@ pub(super) fn run_drain(
             }
         }
 
-        // Pick up the scanner's `last_node_seq` if it's been sent
-        // (try_recv is cheap; sub-microsecond per iteration). Polled
-        // every loop iteration, including after a recv timeout, so the
-        // barrier-ready check below fires even when no items are
-        // arriving.
-        if cfg.locations_on_ways
-            && last_node_seq.is_none()
-            && let Some(rx) = last_node_seq_rx.as_ref()
-            && let Ok(n) = rx.try_recv()
-        {
-            last_node_seq = Some(n);
-        }
-
         // Advance through contiguous seqs.
         while let Some(item) = state.buffer.remove(&state.next_seq) {
             state.bytes_in_buffer = state.bytes_in_buffer.saturating_sub(item.byte_cost());
             process_item(item, &cfg, &mut state, writer, &mut stats, counters)?;
             state.next_seq += 1;
-
-            // Barrier check after each processed item: if all node
-            // items have been processed and the barrier hasn't fired
-            // yet, fire it now.
-            if cfg.locations_on_ways
-                && !state.barrier_done
-                && let Some(n) = last_node_seq
-                && (n == u64::MAX || state.next_seq > n)
-            {
-                barrier_publish_loc_map(&cfg, &mut state, counters)?;
-            }
         }
 
-        // Idle barrier fire: if drain has nothing in the buffer but
-        // the barrier is ready (e.g., the last node item was
-        // processed before scanner sent `last_node_seq`), fire it now
-        // so scanner unblocks. Without this, drain blocks on
-        // recv_timeout, scanner blocks on barrier_rx, workers block
-        // on candidate_rx -> three-way deadlock.
+        // The one barrier check, after every receive and advance: once the
+        // boundary is known and every seq below it is processed, the node
+        // phase is complete on sorted input (a node after a way on unsorted
+        // input falls past the boundary and is refused later by the
+        // output-order guard). Checking after the contiguous run rather than
+        // inside it is safe because, before publication, the scanner holds
+        // back every way and relation descriptor, so the run holds only node
+        // items (`process_item` refuses any other). It fires whichever comes
+        // last, the final node item or the boundary itself: when the
+        // boundary arrives after the drain has already processed every node
+        // item, this check publishes on that receive, which is the case the
+        // old separate boundary channel needed an idle re-poll for.
         if cfg.locations_on_ways
             && !state.barrier_done
-            && let Some(n) = last_node_seq
-            && (n == u64::MAX || state.next_seq > n)
+            && node_end_seq.is_some_and(|end| state.next_seq >= end)
         {
             barrier_publish_loc_map(&cfg, &mut state, counters)?;
         }
@@ -520,8 +499,10 @@ fn check_output_order(
 }
 
 /// Handle a type transition (`prev != item_kind`). Flushes coalescers,
-/// triggers the node→way barrier when the transition matches, then
-/// emits any remaining upserts of the previous kind.
+/// then emits any remaining upserts of the previous kind. The node→way
+/// barrier is never published here: under `--locations-on-ways` it has
+/// already fired before any way or relation item exists (see the one
+/// barrier check in `run_drain`).
 #[allow(clippy::too_many_arguments)]
 fn handle_type_transition(
     prev: ElementKind,
@@ -539,14 +520,6 @@ fn handle_type_transition(
         counters
             .passthrough_chunks_flushed
             .fetch_add(1, Ordering::Relaxed);
-    }
-
-    if cfg.locations_on_ways
-        && !state.barrier_done
-        && prev == ElementKind::Node
-        && matches!(item_kind, ElementKind::Way | ElementKind::Relation)
-    {
-        barrier_publish_loc_map(cfg, state, counters)?;
     }
 
     let loc = LocMode::new(cfg.locations_on_ways, state.loc_map.as_deref());
@@ -614,6 +587,17 @@ fn process_item(
     let Some((item_kind, (min_id, max_id))) = item.placement() else {
         return Ok(());
     };
+
+    // Before the coordinate map is published only node items can reach the
+    // drain: the scanner holds back every way and relation descriptor until
+    // the barrier signal, on both routes. A way or relation here would be
+    // written with no map to resolve against, so the protocol is broken.
+    if cfg.locations_on_ways && !state.barrier_done && item_kind != ElementKind::Node {
+        return Err(Error::internal(format!(
+            "drain: a {} item arrived before the node-to-way barrier",
+            item_kind.as_str()
+        )));
+    }
 
     if let Some(prev) = state.last_type
         && prev != item_kind
@@ -804,8 +788,9 @@ fn flush_copy_range(
 }
 
 /// Merge per-worker `CoordSlots` into the published `Arc<FxHashMap>`,
-/// then signal the scanner over `barrier_tx`. Called exactly once at
-/// the node→way transition under `--locations-on-ways`.
+/// then signal the scanner over `barrier_tx`. Called exactly once under
+/// `--locations-on-ways`, from the barrier check in `run_drain`, once every
+/// seq below the scanner's node boundary is processed.
 fn barrier_publish_loc_map(
     cfg: &DrainConfig<'_>,
     state: &mut DrainState,

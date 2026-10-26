@@ -1229,6 +1229,23 @@ The judgement calls already known, to be checked first:
   itself) are deliberately not counted. Once measurement is allowed, these
   counters are how to settle the `Mutex<Receiver>` question in
   `reference/performance-history.md`.
+- apply-changes' node-to-way barrier (the HYG-081 drain): the scanner's
+  node boundary travels on the drain channel as
+  `DrainMessage::NodeBoundary { node_end_seq }` (exclusive end, no
+  `u64::MAX` sentinel) instead of its own polled channel, and the drain's
+  three publication sites became one readiness check after each receive and
+  contiguous advance; `process_item` refuses a way or relation before the
+  barrier. Judgement calls on the planet `-l` path, none measured:
+  - Publication can now happen after a contiguous run of node items rather
+    than right after the last of them; argued equivalent because, before
+    publication, only node items exist in the drain.
+  - A late boundary publishes on its own receive, where it used to wait for
+    the next 25 ms timeout and the idle re-poll: up to one timeout earlier.
+  - The boundary shares the bounded drain channel with every item (256
+    slots), where it had a one-slot channel of its own; the scanner can
+    block sending it while the drain is behind, which it already could for
+    every splice item. Sparred with codex and reviewed by a fresh session,
+    which found no regression.
 
 ---
 

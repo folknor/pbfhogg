@@ -166,6 +166,31 @@ pub(super) enum DrainItem {
     Omitted { seq: u64 },
 }
 
+/// What the drain channel carries: a blob's [`DrainItem`], or the scanner's
+/// one control message.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "every blob's item is the large variant; boxing it would allocate per blob \
+              to shrink a message sent once per run"
+)]
+pub(super) enum DrainMessage {
+    Item(DrainItem),
+    /// Under `--locations-on-ways`, sent once by the scanner, at its first
+    /// way or relation descriptor or at end of input: every node descriptor
+    /// it dispatched before this has a seq below `node_end_seq` (zero when
+    /// there were none). The drain acts on it on receipt, outside seq order:
+    /// it is never buffered, counted or given a seq. Once the drain has
+    /// processed every seq below it, the node phase is complete on sorted
+    /// input and the coordinate map can be published. (On unsorted input a
+    /// node descriptor after a way is dispatched past the boundary, misses
+    /// publication, and is refused later by the drain's output-order guard.) It travels on the drain channel
+    /// itself, so the drain learns it from the one receive it already
+    /// blocks on, instead of polling a second channel.
+    NodeBoundary {
+        node_end_seq: u64,
+    },
+}
+
 impl BlobDescriptor {
     /// Convert this descriptor into a [`DrainItem::CopyRange`] for the
     /// scanner's fast-path. Returns `None` when the descriptor lacks

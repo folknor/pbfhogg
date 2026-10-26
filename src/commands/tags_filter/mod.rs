@@ -891,6 +891,7 @@ fn tags_filter_two_pass(
     if has_included_relation {
         let closure = collect_relation_member_closure(
             input,
+            direct_io,
             distrust_metadata,
             &mut included_relation_ids,
             &mut included_way_ids,
@@ -907,6 +908,7 @@ fn tags_filter_two_pass(
     crate::debug::emit_marker("TAGSFILTER_WAYDEPS_START");
     collect_way_node_dependencies(
         input,
+        direct_io,
         distrust_metadata,
         &included_way_ids,
         Some(&direct_way_ids),
@@ -1118,6 +1120,10 @@ struct RelationClosureSummary {
 #[allow(clippy::too_many_arguments)]
 fn collect_relation_member_closure(
     input: &PinnedInput,
+    // Not honoured yet: the schedule walk and the pool's payload reads both
+    // pread through the walker's buffered descriptor. Kept as the place the
+    // flag reaches once those reads honour it.
+    _direct_io: bool,
     distrust_metadata: bool,
     included_relation_ids: &mut IdSet,
     included_way_ids: &mut IdSet,
@@ -1245,6 +1251,10 @@ fn kind_schedule_filter(
 #[allow(clippy::too_many_arguments)]
 fn collect_way_node_dependencies(
     input: &PinnedInput,
+    // Not honoured yet: the schedule walk and the pool's payload reads both
+    // pread through the walker's buffered descriptor. Kept as the place the
+    // flag reaches once those reads honour it.
+    _direct_io: bool,
     distrust_metadata: bool,
     included_way_ids: &IdSet,
     skip_way_ids: Option<&IdSet>,

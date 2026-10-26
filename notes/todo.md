@@ -190,7 +190,9 @@ together so the surface changes once.
   to reads in passes 0 and 1, stage 1 or stage 2), diff's and derive's block-pair paths (`diff_block_pair`,
   `derive_changes_block_pair`: both pread through `HeaderWalker`, so
   `diff --direct-io` on indexed inputs reads buffered at every `-j`),
-  `getid::parse_ids_from_pbf`, and `check_refs` (`let _ = direct_io;`).
+  `getid::parse_ids_from_pbf`, tags-filter's `collect_relation_member_closure`
+  and `collect_way_node_dependencies` (both scans pread through the walker's
+  buffered descriptor), and `check_refs` (`let _ = direct_io;`).
   Extract's pread passes open buffered regardless (a comment explains
   alignment), multi-extract's single-pass path writes through
   `PbfWriter::new(BufWriter)` regardless, `export` has no I/O flag, and
@@ -201,8 +203,10 @@ together so the surface changes once.
   first-blob indexdata probe: sort (its front read only; the pass 1 header
   walk and pass 2 read buffered), renumber (header only), repack and degrade's
   decode path (the classify pools pread through a buffered shared fd),
-  time-filter's snapshot path, tags-filter's two-pass scans, and
-  getparents' dispatch probe all read their bulk data buffered. Writes are
+  time-filter's snapshot path, tags-filter's two-pass mode (pass 1, the
+  relation closure, the way dependencies and pass 2 pread through walker
+  descriptors; `-R`'s pipelined reader does honour it), and getparents'
+  dispatch probe all read their bulk data buffered. Writes are
   honoured by every PBF writer that goes through `Output::pbf_writer`,
   except multi-extract's single-pass path.
 

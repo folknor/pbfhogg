@@ -767,6 +767,37 @@ the ones below.
     compare wall, peak anon and stall counters but not per-kind rows; the
     HEAD repeat has them, approximately.
 
+- Slice D, tags-filter (`0f64d8f4`, the removed `_direct_io` parameters):
+  confirmed and **resolved** (sparred with codex to consensus).
+  - Confirmed in the code and history: `0f64d8f4` dropped `_direct_io`
+    from `collect_relation_member_closure` and
+    `collect_way_node_dependencies`. The parameter dates from `9f73bef7`,
+    which moved both scans from a sequential `BlobReader` that honoured the
+    flag onto the classify pools, so it is the same deliberate plumbing
+    `8192aa07` restored for diff. Codex checked every Slice D adoption
+    commit and the eight unlisted ones: these two are the only removals
+    there. Degrade's `passthrough_header_bytes` lost its `direct_io` in
+    `d9b3943c` legitimately, since it now takes the reader its caller
+    opened with `write.direct_reads`.
+  - Fix: both helpers take `_direct_io` again, right after `input`, with
+    diff's "not honoured yet" comment, and `tags_filter_two_pass` passes
+    its `direct_io`. No behaviour change and no test: the flag still does
+    not reach these reads. Honouring it was not taken: the pools pread
+    frame offsets and lengths through the walker's shared buffered
+    descriptor, which would need alignment handling throughout, the result
+    is correct today, and the flag's reach is the deferred CLI-surface
+    redesign.
+  - Notes corrected: the `notes/todo.md` ignored-parameter inventory names
+    the two helpers, and its reach paragraph says which tags-filter reads
+    honour the flag (the probe, both leading-header reads, `-R`'s reader)
+    and which do not. The `hygiene.md` pinning item records the removal
+    and restoration.
+  - Same family, left to its own fix: `79d2e923` also deleted sort's
+    `build_blob_index`, whose `_direct_io` was ignored, along with the
+    dedupe index pass that honoured the flag (Slice E item 5). The merge
+    engine in `src/commands/blob_merge.rs` has no `direct_io` parameter at
+    all now, so the sort side needs the plumbing back as well as dedupe.
+
 Notes made while the audit ran, not findings of it:
 
 - protohoggr 0.4.0 to 0.5.0 (bz `pbfhogg#15`) was applied after slices C,

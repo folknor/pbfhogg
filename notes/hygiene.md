@@ -748,7 +748,10 @@ The judgement calls already known, to be checked first:
     `impl Into<InputSource>` and probes through the pin directly (not via
     the public `has_indexdata`), skipping the OSMHeader payload as before;
     `cat` and `cat --dedupe` gained a `&&Path` deref. Every open became one
-    derived open, descriptions unchanged. Not done: the closure, way-deps
+    derived open, descriptions unchanged. The commit also removed the
+    ignored `_direct_io` parameters of `collect_relation_member_closure`
+    and `collect_way_node_dependencies`, the mistake the preamble names;
+    they were put back after the audit. Not done: the closure, way-deps
     and pass-2 schedules each walk the headers again where pass 1's walk
     could feed them all - repeated work on a measured planet path, not an
     identity hole, so it was left for a measured change of its own.

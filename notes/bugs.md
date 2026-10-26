@@ -39,28 +39,6 @@ behaviour; below that the work is progressively more contained.
 
 ---
 
-## BUG-191 - Narrow packed values that do not fit their type alias silently
-
-Anger: 9 - the fix is construction-time validation on every read path.
-
-Block construction now guarantees that every packed array decodes in full
-with `Cursor::read_varint` and that the parallel arrays agree in length,
-but not that each value fits the type the iterator narrows it to.
-`protohoggr`'s typed wrappers narrow after decoding: `PackedInt32Iter`
-casts the `u64` to `i32`, `PackedSint32Iter` truncates to `u32` before the
-zigzag step, and `PackedBoolIter` maps any nonzero value to `true`. So a
-`DenseInfo.version` of `2^32` reads as version 0, a `DenseInfo.uid` or
-`user_sid` delta of zigzag `2^32` reads as delta 0, a relation member type
-of `2^32` reads as a node member, and a `roles_sid` of `2^32 + n` aliases
-string `n`. The `uint32` tag-index arrays are already bounded in
-`packed_uint32_count`; the fix for the others is the same single-scan
-width check, for `int32` keeping sign-extended ten-byte negatives legal
-and for `sint32` bounding the raw varint to `u32`. Raised by codex in the
-dense-scanner spar; the narrowing casts were read in protohoggr 0.4.0, not
-verified with a test.
-
-Reported by: the BUG-183 resolution.
-
 ## BUG-009 - `apply-changes --locations-on-ways` does not update untouched base ways
 
 Anger: 10 - apply-changes -l loses its splice fast path.

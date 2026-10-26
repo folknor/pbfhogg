@@ -70,9 +70,12 @@ goes on "Review once drained" as a bisect candidate, named by commit.
 
 Launch order: every queued entry has run.
 
-Discussed and skipped for now: HYG-002, HYG-011, HYG-036, HYG-037, HYG-053,
-HYG-081, HYG-109, HYG-181, HYG-182. Not discussed yet: BUG-009 (the
-maintainer's own project), BUG-191.
+Every entry still open in this file and `notes/bugs.md` is owed a resolution
+in this drain. HYG-002, HYG-011, HYG-036, HYG-037, HYG-053, HYG-081, HYG-109,
+HYG-181 and HYG-182 were deferred by the 2026-10-25 session, not dropped:
+"skipped for now" in their Maintainer paragraphs means that session did not
+take them, and the paragraphs are guidance on how to resolve them, not a
+ruling that they stay. BUG-009 is the maintainer's own project.
 
 ---
 
@@ -1111,7 +1114,6 @@ The judgement calls already known, to be checked first:
   segment and loops `while let` over the search stack (argued
   traversal-identical; geocode admin polygons depend on it); degrade's
   unsort hold takes the held element before writing the arriving one.
-
 ---
 
 ## HYG-002 - Tunables are centralized but not injectable

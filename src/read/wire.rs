@@ -857,6 +857,13 @@ impl WireInfo {
         let mut cursor = Cursor::new(data);
         let mut info = Self::default();
 
+        // The 32-bit fields narrow with a cast, as protobuf specifies for a
+        // value outside the declared type, rather than being refused like the
+        // block scales (`read_int32`): only a malformed writer emits one,
+        // the user index it can produce resolves through a checked lookup that
+        // refuses a negative index, and this parse runs per `info()` call.
+        // See `reference/truncation-handling.md`. `visible` is protobuf's bool
+        // decoding: any nonzero varint is true.
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match (field, wire_type) {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]

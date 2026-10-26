@@ -1034,6 +1034,17 @@ fn validate_dense_keys_vals(keys_vals_data: &[u8], node_count: usize) -> Result<
 /// `None` for every node in that case, which is the same silent metadata loss
 /// as a short array. Either all five core arrays are present at full length or
 /// none of them is.
+///
+/// Values are not width-checked, deliberately: `version` (int32) and the
+/// `uid` / `user_sid` deltas (sint32) narrow as protobuf specifies, a cast and
+/// a truncation to 32 bits before the zigzag step, so only a malformed writer
+/// can make one alias another; a per-byte width scan on these per-node arrays
+/// was tried and rejected, since it adds per-byte work to every well-formed
+/// dense block to refuse only malformed input.
+/// Truncation is also what
+/// reads back the ten-byte sign-extended sint32 deltas `BlockBuilder` writes
+/// through `protohoggr::zigzag_encode_32`. See
+/// `reference/truncation-handling.md`, "Which varints count as complete".
 fn validate_dense_info_arrays(info_data: &[u8], node_count: usize) -> Result<()> {
     let info = WireDenseInfo::parse(info_data)?;
     let core = [
@@ -1123,6 +1134,14 @@ fn validate_way_geometry_arrays(way: &WireWay<'_>) -> Result<()> {
 /// any one runs out, so a short `types` array drops trailing members from a
 /// multipolygon without any error - the ring assembler then sees an incomplete
 /// relation and produces a wrong geometry rather than a failure.
+///
+/// `roles_sid` and `types` (int32) are counted, not width-checked: a value
+/// outside `i32` narrows with a cast, as protobuf specifies. The role then
+/// resolves through the checked string lookup and an unknown type is
+/// represented as `MemberType::Unknown`; the one exception is the debug-build
+/// raw-passthrough assertion in `BlockBuilder`, which reads roles as raw
+/// `u64`. Renumber's raw rewriter dispatches on the same truncated type. See
+/// `reference/truncation-handling.md`.
 #[inline]
 fn validate_relation_member_arrays(relation: &WireRelation<'_>) -> Result<()> {
     let roles = packed_varint_count(relation.roles_sid_data)?;

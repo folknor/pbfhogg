@@ -287,11 +287,43 @@ the three arrays independently, could pair an id with another
 node's coordinates. A unit test checks the count against the
 decoder itself.
 
-This is a decodability guarantee, not a value-range one. Apart
-from the `uint32` string-index arrays, which are bounded to `u32`,
-a value that decodes but does not fit the type its iterator
-narrows it to (an `int32` above `i32::MAX`, a `sint32` whose raw
-varint exceeds `u32`) is not refused at construction.
+This is a decodability guarantee, not a value-range one, and on
+purpose. A 32-bit field whose varint does not fit its type is
+decoded by narrowing, as protobuf specifies (a cast for `int32`
+and `uint32`, truncation to 32 bits before the zigzag step for
+`sint32`): `DenseInfo` `version`, `uid` and `user_sid`, relation
+`roles_sid` and `types`, and the scalar `Info` fields all read
+that way, so a version of `2^32` reads as 0. Only a malformed
+writer produces such a value, and the read path is built for speed
+on well-formed data: the width check that was tried and rejected
+added a per-byte state machine to the per-node metadata arrays of
+every dense block. What holds for a narrowed value: string indices
+resolve through checked lookups (a negative one is an error), an
+out-of-range member type is represented as `MemberType::Unknown`,
+and the dense deltas accumulate with wrapping arithmetic. One
+exception: in a debug build, `BlockBuilder`'s raw-passthrough
+assertion (`debug_assert_raw_strings`) checks role indices as raw
+`u64`, so a role of `2^32 + n` that the reader resolves as string
+`n` trips it; release builds pass the bytes through. Renumber's raw
+relation rewriter dispatches on the same truncated member type, so
+the two paths agree.
+
+The non-canonical form real files do carry is one this rule reads
+correctly: `protohoggr::zigzag_encode_32` (0.4.0) converts the
+zigzagged `i32` with `as u64`, which sign-extends a zigzag value
+with bit 31 set (a delta `v >= 2^30` or `v < -2^30`) to ten bytes,
+and `BlockBuilder` writes the dense `uid` and `user_sid` deltas
+through it. Truncation reads those back exactly. The fix for the
+encoder belongs in protohoggr.
+
+Two string-index bounds are the exception and stay: `keys` / `vals`
+must fit `u32`, and dense `keys_vals` entries must fit a
+nonnegative `int32`. Neither guards memory safety (tag lookups are
+checked). The first keeps the element decoder in agreement with
+the raw scanners that read the same indices and refuse oversized
+ones (`blob_meta`'s tag scan, way classification in `scan/way.rs`);
+the second keeps every index representable as the nonnegative
+`i32` that the dense raw-tag iterator narrows it to.
 
 ## Which wire forms of a packed field count as present
 

@@ -921,7 +921,11 @@ impl BlockBuilder {
     // Check the source-table contract here in debug builds, including values,
     // roles and users that are not represented in tag_key_indices.
     // Pre-seeding preserves slots, not validity: PrimitiveBlock construction
-    // checks index widths and structure, but does not prove table bounds.
+    // checks structure and the keys/vals index width, but does not prove table
+    // bounds, and relation roles and Info users narrow as protobuf casts
+    // (reference/truncation-handling.md). This check reads roles as raw u64,
+    // so a malformed role of 2^32 + n that the reader resolves as string n
+    // still trips it in a debug build; release passes the bytes through.
     // Thus release rewrites can preserve an invalid source sid. These internal
     // methods promise identity passthrough, not sanitization. Making these
     // assertions unconditional would decode values, roles and users again for

@@ -51,7 +51,6 @@ use std::thread::{Scope, ScopedJoinHandle};
 
 use crate::error::{Error, Result};
 use crate::tunables::{PER_WORKER_CAPACITY, POOL_SIZE};
-use crate::write::metrics::WRITER_METRICS;
 use crate::write::pipeline::{OutputSink, PipelineItem, SeqTotal, deliver_in_order};
 use crate::write::pool_failure::FirstFailure;
 
@@ -144,12 +143,13 @@ fn parallel_writer_thread_inner(
     // Write the header at offset 0. Everything after grows from
     // `framed_header.len()`.
     // A handoff like any chunk, though this thread writes it itself.
-    if let Err(e) = WRITER_METRICS.time_handoff(|| file.write_all_at(&framed_header, 0)) {
+    let metrics = &cancel.metrics().writer;
+    if let Err(e) = metrics.time_handoff(|| file.write_all_at(&framed_header, 0)) {
         let error = Error::from(e).context("header write");
         init_tx.send(Err(error.clone())).ok();
         return Err(error);
     }
-    WRITER_METRICS.record_accepted(framed_header.len() as u64);
+    metrics.record_accepted(framed_header.len() as u64);
 
     // Signal init success so the constructor can return.
     init_tx.send(Ok(())).ok();
@@ -165,7 +165,7 @@ fn parallel_writer_thread_inner(
 
     if finish == super::Finish::Durable {
         // A path-constructor writer's own durability.
-        crate::write::metrics::with_sync_observer(cancel, || WRITER_METRICS.sync_recorded(&file))?;
+        metrics.sync_recorded(&file)?;
     }
 
     Ok(())
@@ -220,6 +220,7 @@ fn run_pool<'scope, 'env>(
                     next_worker: 0,
                 },
                 expected,
+                &cancel.metrics().writer,
             )
         }));
         match dispatched {
@@ -372,8 +373,8 @@ fn worker_loop(
     #[cfg(not(feature = "test-hooks"))]
     let _ = index;
     while let Ok(op) = rx.recv() {
-        // One Acquire load per op - next to the Relaxed RMW on the shared
-        // `WRITER_METRICS` and a multi-hundred-KB pwrite.
+        // One Acquire load per op - next to the Relaxed RMW on the
+        // invocation's writer counters and a multi-hundred-KB pwrite.
         if failure.stopped() {
             return;
         }
@@ -412,7 +413,7 @@ fn worker_loop(
                 r
             }
         };
-        t.record_ns(&WRITER_METRICS.pool_write_ns);
+        t.record_ns(&cancel.metrics().writer.pool_write_ns);
         if let Err(e) = result {
             failure.record(e);
             return;
@@ -445,6 +446,7 @@ mod tests {
                 next_worker: 0,
             },
             expected,
+            &crate::write::metrics::WriterMetrics::new(),
         )
     }
 

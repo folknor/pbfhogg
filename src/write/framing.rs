@@ -17,7 +17,7 @@ use flate2::Status;
 use protohoggr::{encode_bytes_field, encode_bytes_field_always, encode_int32_field};
 
 use crate::read::blob_wire::{MAX_BLOB_DATASIZE, MAX_BLOB_HEADER_SIZE, MAX_BLOB_MESSAGE_SIZE};
-use crate::write::metrics::WRITER_METRICS;
+use crate::write::metrics::WriterMetrics;
 use std::sync::atomic::Ordering::Relaxed;
 
 use crate::read::wire_schema::{BlobHeaderField, HeaderBlockField, blob, blob_header};
@@ -72,10 +72,10 @@ impl FrameScratch {
     /// its warmed-up capacity for ordinary blocks. Buffers above the 4 MiB
     /// retention limit are handed out with their contents and capacity intact,
     /// while the scratch slot starts empty for its next frame.
-    fn take_with_capacity(buf: &mut Vec<u8>, cap: &mut usize) -> Vec<u8> {
+    fn take_with_capacity(buf: &mut Vec<u8>, cap: &mut usize, metrics: &WriterMetrics) -> Vec<u8> {
         let observed_capacity = buf.capacity();
         if observed_capacity > MAX_RETAINED_SCRATCH_CAPACITY {
-            Self::record_capped_capacity(observed_capacity);
+            Self::record_capped_capacity(observed_capacity, metrics);
             *cap = 0;
             return std::mem::take(buf);
         }
@@ -85,35 +85,33 @@ impl FrameScratch {
         std::mem::replace(buf, Vec::with_capacity(*cap))
     }
 
-    pub(super) fn trim_oversize_retained_buffers(&mut self) {
+    pub(super) fn trim_oversize_retained_buffers(&mut self, metrics: &WriterMetrics) {
         if self.blob_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
-            Self::record_capped_capacity(self.blob_buf.capacity());
+            Self::record_capped_capacity(self.blob_buf.capacity(), metrics);
             self.blob_buf = Vec::new();
             self.blob_cap = 0;
         }
         if self.header_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
-            Self::record_capped_capacity(self.header_buf.capacity());
+            Self::record_capped_capacity(self.header_buf.capacity(), metrics);
             self.header_buf = Vec::new();
             self.header_cap = 0;
         }
         if self.compress_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
-            Self::record_capped_capacity(self.compress_buf.capacity());
+            Self::record_capped_capacity(self.compress_buf.capacity(), metrics);
             self.compress_buf = Vec::new();
         }
     }
 
-    fn trim_oversize_compress_buffer(&mut self) {
+    fn trim_oversize_compress_buffer(&mut self, metrics: &WriterMetrics) {
         if self.compress_buf.capacity() > MAX_RETAINED_SCRATCH_CAPACITY {
-            Self::record_capped_capacity(self.compress_buf.capacity());
+            Self::record_capped_capacity(self.compress_buf.capacity(), metrics);
             self.compress_buf = Vec::new();
         }
     }
 
-    fn record_capped_capacity(capacity: usize) {
-        WRITER_METRICS
-            .frame_scratch_capped_buffers
-            .fetch_add(1, Relaxed);
-        WRITER_METRICS
+    fn record_capped_capacity(capacity: usize, metrics: &WriterMetrics) {
+        metrics.frame_scratch_capped_buffers.fetch_add(1, Relaxed);
+        metrics
             .frame_scratch_capped_capacity_bytes
             .fetch_add(u64::try_from(capacity).unwrap_or(u64::MAX), Relaxed);
     }
@@ -136,6 +134,7 @@ pub(crate) fn frame_blob(
     uncompressed: &[u8],
     compression: &Compression,
     indexdata: Option<&[u8]>,
+    metrics: &WriterMetrics,
 ) -> Result<Vec<u8>> {
     let mut scratch = FrameScratch::new();
     Ok(frame_blob_into(
@@ -146,6 +145,7 @@ pub(crate) fn frame_blob(
         None,
         None,
         &mut scratch,
+        metrics,
     )?
     .into_vec())
 }
@@ -155,12 +155,14 @@ pub(crate) fn frame_blob(
 /// Intended for rayon `par_iter` workers that produce fully framed blobs
 /// in the parallel phase, so the sequential write phase can use
 /// `write_raw_owned` with bounded backpressure (no second rayon dispatch).
+/// The framing counters record into `metrics`, the invocation's writer set.
 pub(crate) fn frame_blob_pipelined(
     uncompressed: &[u8],
     compression: &Compression,
     indexdata: Option<&[u8]>,
     tagdata: Option<&[u8]>,
     way_members: Option<&[u8]>,
+    metrics: &WriterMetrics,
 ) -> Result<FramedBlobParts> {
     PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
         frame_blob_into(
@@ -171,6 +173,7 @@ pub(crate) fn frame_blob_pipelined(
             tagdata,
             way_members,
             scratch,
+            metrics,
         )
     })
 }
@@ -213,6 +216,7 @@ pub(crate) fn frame_blob_pipelined(
 /// the cross-thread alloc/free pattern better than an explicit pool.
 /// Measured at commit 2bf438c.
 #[hotpath::measure]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn frame_blob_into(
     blob_type: &str,
     uncompressed: &[u8],
@@ -221,6 +225,7 @@ pub(super) fn frame_blob_into(
     tagdata: Option<&[u8]>,
     way_members: Option<&[u8]>,
     scratch: &mut FrameScratch,
+    metrics: &WriterMetrics,
 ) -> Result<FramedBlobParts> {
     let prefix = frame_in_scratch(
         blob_type,
@@ -230,6 +235,7 @@ pub(super) fn frame_blob_into(
         tagdata,
         way_members,
         scratch,
+        metrics,
     )?
     .prefix;
 
@@ -238,8 +244,10 @@ pub(super) fn frame_blob_into(
     // this used to clone; `take_with_capacity` preserves the warmed capacity
     // for ordinary blocks, while the retention cap lets outliers warm up again
     // on demand. The two per-blob memcpys stay gone.
-    let header = FrameScratch::take_with_capacity(&mut scratch.header_buf, &mut scratch.header_cap);
-    let blob = FrameScratch::take_with_capacity(&mut scratch.blob_buf, &mut scratch.blob_cap);
+    let header =
+        FrameScratch::take_with_capacity(&mut scratch.header_buf, &mut scratch.header_cap, metrics);
+    let blob =
+        FrameScratch::take_with_capacity(&mut scratch.blob_buf, &mut scratch.blob_cap, metrics);
     Ok(FramedBlobParts {
         prefix,
         header,
@@ -274,6 +282,7 @@ pub(super) struct ScratchFrame<'a> {
 /// scratch retention and the metrics stay here.
 ///
 /// On an error return, oversize retained buffers have been trimmed.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn frame_in_scratch<'a>(
     blob_type: &str,
     uncompressed: &[u8],
@@ -282,14 +291,15 @@ pub(super) fn frame_in_scratch<'a>(
     tagdata: Option<&[u8]>,
     way_members: Option<&[u8]>,
     scratch: &'a mut FrameScratch,
+    metrics: &WriterMetrics,
 ) -> Result<ScratchFrame<'a>> {
     let t_compress = crate::counters::Stopwatch::start();
-    scratch.trim_oversize_retained_buffers();
+    scratch.trim_oversize_retained_buffers(metrics);
     if let Err(error) = encode_blob_body(uncompressed, compression, scratch) {
-        scratch.trim_oversize_retained_buffers();
+        scratch.trim_oversize_retained_buffers(metrics);
         return Err(error);
     }
-    t_compress.record_ns(&WRITER_METRICS.compress_ns);
+    t_compress.record_ns(&metrics.compress_ns);
     let t_frame = crate::counters::Stopwatch::start();
 
     let prefix = match encode_frame_header(
@@ -299,23 +309,22 @@ pub(super) fn frame_in_scratch<'a>(
         tagdata,
         way_members,
         &mut scratch.header_buf,
+        metrics,
     ) {
         Ok(prefix) => prefix,
         Err(error) => {
-            scratch.trim_oversize_retained_buffers();
+            scratch.trim_oversize_retained_buffers(metrics);
             return Err(error);
         }
     };
     // `compress_buf` is never handed off, so drop an outlier before the next
     // blob can reuse this scratch. The error return above ran the full trim
     // already.
-    scratch.trim_oversize_compress_buffer();
+    scratch.trim_oversize_compress_buffer(metrics);
 
     let total_len = 4 + scratch.header_buf.len() + scratch.blob_buf.len();
-    t_frame.record_ns(&WRITER_METRICS.frame_ns);
-    WRITER_METRICS
-        .bytes_framed
-        .fetch_add(total_len as u64, Relaxed);
+    t_frame.record_ns(&metrics.frame_ns);
+    metrics.bytes_framed.fetch_add(total_len as u64, Relaxed);
     Ok(ScratchFrame {
         prefix,
         header: &scratch.header_buf,
@@ -346,6 +355,7 @@ fn encode_frame_header(
     tagdata: Option<&[u8]>,
     way_members: Option<&[u8]>,
     header_buf: &mut Vec<u8>,
+    metrics: &WriterMetrics,
 ) -> Result<[u8; 4]> {
     // pbfhogg caps a Blob body at `MAX_BLOB_DATASIZE`, and our own reader
     // enforces it on the way back in ("blob header declares datasize too
@@ -364,14 +374,16 @@ fn encode_frame_header(
     }
     let datasize = i32::try_from(body_len)
         .map_err(|_| Error::internal(format!("blob datasize overflow: {body_len} bytes")))?;
-    encode_blob_header_into(
+    if encode_blob_header_into(
         blob_type,
         datasize,
         indexdata,
         tagdata,
         way_members,
         header_buf,
-    )?;
+    )? {
+        metrics.tagdata_dropped_oversize.fetch_add(1, Relaxed);
+    }
     let header_len = u32::try_from(header_buf.len())
         .map_err(|_| Error::internal(format!("header too large: {} bytes", header_buf.len())))?;
     Ok(header_len.to_be_bytes())
@@ -535,8 +547,9 @@ fn compress_zlib(uncompressed: &[u8], level: u32, scratch: &mut FrameScratch) ->
 /// so a key list missing entries makes `tags-filter` skip blobs that *do*
 /// contain the key - wrong results, not merely slow ones. Absence, by
 /// contrast, is already the format's spelling of "decode this blob", so a
-/// dropped index costs only the skip optimization. Drops are counted in
-/// `WRITER_METRICS.tagdata_dropped_oversize` (sidecar counter
+/// dropped index costs only the skip optimization. Returns `true` when it
+/// dropped `tagdata`; [`encode_frame_header`] counts each drop in the
+/// invocation's `tagdata_dropped_oversize` (sidecar counter
 /// `writer_tagdata_dropped_oversize`) so the loss is observable rather than
 /// silent.
 ///
@@ -553,19 +566,16 @@ pub(crate) fn encode_blob_header_into(
     tagdata: Option<&[u8]>,
     way_members: Option<&[u8]>,
     buf: &mut Vec<u8>,
-) -> Result<()> {
+) -> Result<bool> {
     encode_blob_header_fields(blob_type, datasize, indexdata, tagdata, way_members, buf);
     if (buf.len() as u64) < MAX_BLOB_HEADER_SIZE {
-        return Ok(());
+        return Ok(false);
     }
     if tagdata.is_some() {
         // Retry without the skip index before giving up: see the doc block.
         encode_blob_header_fields(blob_type, datasize, indexdata, None, way_members, buf);
         if (buf.len() as u64) < MAX_BLOB_HEADER_SIZE {
-            WRITER_METRICS
-                .tagdata_dropped_oversize
-                .fetch_add(1, Relaxed);
-            return Ok(());
+            return Ok(true);
         }
     }
     // Name the culprit by computing it, not by guessing from the bitmap's
@@ -732,6 +742,7 @@ pub(crate) fn reframe_raw_with_index(
     blob_bytes: &[u8],
     indexdata: &[u8],
     tagdata: Option<&[u8]>,
+    metrics: &WriterMetrics,
 ) -> Result<Vec<u8>> {
     let mut header_buf = Vec::new();
     let prefix = encode_frame_header(
@@ -741,6 +752,7 @@ pub(crate) fn reframe_raw_with_index(
         tagdata,
         None,
         &mut header_buf,
+        metrics,
     )?;
     let total_len = 4 + header_buf.len() + blob_bytes.len();
 
@@ -779,8 +791,14 @@ mod tests {
     fn compressed_payload_at_raw_limit_can_be_framed() {
         let payload = vec![0; usize::try_from(MAX_BLOB_MESSAGE_SIZE).expect("limit fits")];
         for compression in [Compression::Zlib(1), Compression::Zstd(1)] {
-            frame_blob("OSMData", &payload, &compression, None)
-                .expect("raw limit is inclusive when the encoded body fits");
+            frame_blob(
+                "OSMData",
+                &payload,
+                &compression,
+                None,
+                &WriterMetrics::new(),
+            )
+            .expect("raw limit is inclusive when the encoded body fits");
         }
     }
 
@@ -915,6 +933,7 @@ mod tests {
             None,
             None,
             &mut scratch,
+            &WriterMetrics::new(),
         )
         .expect("first blob must frame");
         assert!(!first.blob.is_empty(), "framed blob must carry bytes");
@@ -944,6 +963,7 @@ mod tests {
             None,
             None,
             &mut scratch,
+            &WriterMetrics::new(),
         )
         .expect("second blob must frame");
         assert_eq!(second.blob.len(), 5, "3 payload bytes plus tag and length");
@@ -1256,12 +1276,11 @@ mod tests {
     /// the key - so the index is dropped whole.
     #[test]
     fn oversize_tagdata_is_dropped_not_truncated() {
-        let before = WRITER_METRICS.tagdata_dropped_oversize.load(Relaxed);
         let indexdata = vec![0xABu8; 42];
         let way_members = vec![0xCDu8; 64];
         let tagdata = vec![0x11u8; 70_000];
         let mut buf = Vec::new();
-        encode_blob_header_into(
+        let dropped = encode_blob_header_into(
             "OSMData",
             4242,
             Some(&indexdata),
@@ -1270,6 +1289,7 @@ mod tests {
             &mut buf,
         )
         .expect("an oversize tag index must be dropped, never fatal");
+        assert!(dropped, "the drop must be reported, so it can be counted");
 
         assert!(
             (buf.len() as u64) < MAX_BLOB_HEADER_SIZE,
@@ -1289,7 +1309,7 @@ mod tests {
         );
         assert_eq!(
             fields.iter().find(|(f, _)| *f == 2).map(|(_, v)| v.clone()),
-            Some(indexdata),
+            Some(indexdata.clone()),
             "indexdata must survive the retry"
         );
         assert_eq!(
@@ -1297,17 +1317,16 @@ mod tests {
             Some(way_members),
             "WayMembers-v1 must survive the retry"
         );
-        // Drop three more, so the observed delta cannot be explained by the
-        // single drop the sibling boundary test performs concurrently.
-        for _ in 0..3 {
-            encode_blob_header_into("OSMData", 1, None, Some(&tagdata), None, &mut buf)
+        // Each drop is counted into the framing invocation's set, exactly.
+        let metrics = WriterMetrics::new();
+        for _ in 0..4 {
+            reframe_raw_with_index(&[0u8; 8], &indexdata, Some(&tagdata), &metrics)
                 .expect("oversize tag index must be dropped");
         }
-        let delta = WRITER_METRICS.tagdata_dropped_oversize.load(Relaxed) - before;
-        assert!(
-            delta >= 4,
-            "a dropped tag index must be counted, not lost silently; \
-             saw only {delta} of 4 drops"
+        assert_eq!(
+            metrics.tagdata_dropped_oversize.load(Relaxed),
+            4,
+            "a dropped tag index must be counted, not lost silently"
         );
     }
 
@@ -1379,6 +1398,7 @@ mod tests {
             None,
             None,
             &mut scratch,
+            &WriterMetrics::new(),
         );
         let Err(err) = result else {
             panic!("a blob body past the datasize cap must not be written");
@@ -1490,10 +1510,11 @@ mod tests {
         let cap = usize::try_from(MAX_BLOB_DATASIZE).unwrap_or(usize::MAX);
         let index = [0u8; 42];
         let body = vec![0u8; cap];
-        let err = reframe_raw_with_index(&body, &index, None)
+        let metrics = WriterMetrics::new();
+        let err = reframe_raw_with_index(&body, &index, None, &metrics)
             .expect_err("a body at the datasize cap must not be reframed");
         assert_eq!(oversize_part_and_size(&err).0, OversizePart::Body);
-        reframe_raw_with_index(&body[..cap - 1], &index, None)
+        reframe_raw_with_index(&body[..cap - 1], &index, None, &metrics)
             .expect("the largest legal body must reframe");
     }
 }

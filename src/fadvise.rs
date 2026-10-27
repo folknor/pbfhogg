@@ -4,9 +4,9 @@
 //! Advice is a hint. The kernel may ignore it, and a failure (`ESPIPE` on a
 //! FIFO, `EINVAL` on a file with no page cache behind it) changes how fast a
 //! run is, never what it produces, so no caller handles one. Failures are
-//! counted instead: [`advise`] keeps a process total and emits it as the
-//! `fadvise_failures` sidecar counter on every failure, so a run whose hints
-//! did not take effect can be told apart from one whose hints did.
+//! counted instead: [`advise`] keeps the invocation's total and emits it as
+//! the `fadvise_failures` sidecar counter on every failure, so a run whose
+//! hints did not take effect can be told apart from one whose hints did.
 //!
 //! Why the library may advise at all: ADR-0016 (`decisions/`) gives process
 //! state and shared-host policy to the caller, and input page-cache eviction
@@ -53,7 +53,13 @@ pub(crate) enum Advice {
 /// finite request to the whole tail of the file. Neither `true` nor a
 /// successful return means any page was read or dropped.
 #[cfg(target_os = "linux")]
-pub(crate) fn advise(file: &File, offset: u64, len: u64, advice: Advice) -> bool {
+pub(crate) fn advise(
+    file: &File,
+    offset: u64,
+    len: u64,
+    advice: Advice,
+    invocation: &crate::host::Invocation,
+) -> bool {
     use std::os::unix::io::AsRawFd as _;
 
     let max = off_t_max();
@@ -86,7 +92,7 @@ pub(crate) fn advise(file: &File, offset: u64, len: u64, advice: Advice) -> bool
     let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), offset, len, flag) };
     // `posix_fadvise` returns the error number itself, not -1 and `errno`.
     if rc != 0 {
-        record_failure();
+        invocation.metrics().fadvise.record_failure();
     }
     true
 }
@@ -100,27 +106,50 @@ fn off_t_max() -> u64 {
 
 /// Off Linux there is no advice to give.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn advise(_file: &File, _offset: u64, _len: u64, _advice: Advice) -> bool {
+pub(crate) fn advise(
+    _file: &File,
+    _offset: u64,
+    _len: u64,
+    _advice: Advice,
+    _invocation: &crate::host::Invocation,
+) -> bool {
     false
 }
 
-/// Count one failed advice and emit the process total. Cold: a hint that
-/// failed once on a descriptor usually fails on every call, but a run that
-/// sees it at all is the exception.
-///
-/// The increment and the emission happen under one lock, so the totals
-/// reach the FIFO in increasing order; an atomic increment emitted after the
-/// fact could emit a smaller total after a larger one. Best effort, like
-/// every sidecar counter: a sample the FIFO drops is not repaired.
-#[cfg(target_os = "linux")]
-#[cold]
-fn record_failure() {
-    static FAILURES: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
-    let mut total = FAILURES
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *total = total.saturating_add(1);
-    crate::debug::emit_counter("fadvise_failures", *total);
+crate::counters::counter_set! {
+    /// Failed advice of one invocation.
+    pub(crate) struct FadviseMetrics {
+        /// `posix_fadvise` calls that returned an error.
+        failures => "fadvise_failures",
+    }
+    extra {
+        /// Serializes a failure's increment with its emission (see
+        /// [`FadviseMetrics::record_failure`]).
+        emit_order: std::sync::Mutex<()> = std::sync::Mutex::new(()),
+    }
+}
+
+impl FadviseMetrics {
+    /// Count one failed advice and emit the invocation's total. Cold: a hint
+    /// that failed once on a descriptor usually fails on every call, but a
+    /// run that sees it at all is the exception.
+    ///
+    /// The increment and the emission happen under one lock, so the totals
+    /// reach the FIFO in increasing order; an atomic increment emitted after
+    /// the fact could emit a smaller total after a larger one. The total
+    /// itself is an atomic, so reading it never takes the lock. Best effort,
+    /// like every sidecar counter: a sample the FIFO drops is not repaired.
+    #[cfg(target_os = "linux")]
+    #[cold]
+    fn record_failure(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _order = self
+            .emit_order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let total = self.failures.fetch_add(1, Relaxed).saturating_add(1);
+        crate::debug::emit_counter("fadvise_failures", total);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -152,13 +181,14 @@ pub(crate) mod tests {
         let file = crate::read::input::open(&path).unwrap();
         let max = off_t_max();
         let before = attempts(Advice::WillNeed);
-        assert!(!advise(&file, max + 1, 0, Advice::WillNeed));
+        let inv = crate::host::Invocation::new();
+        assert!(!advise(&file, max + 1, 0, Advice::WillNeed, &inv));
         // A finite request at the last offset has no room left: advising it
         // would mean "through EOF".
-        assert!(!advise(&file, max, 1, Advice::WillNeed));
+        assert!(!advise(&file, max, 1, Advice::WillNeed, &inv));
         assert_eq!(attempts(Advice::WillNeed), before, "nothing was attempted");
-        assert!(advise(&file, 0, 0, Advice::WillNeed));
-        assert!(advise(&file, 1, u64::MAX, Advice::WillNeed));
+        assert!(advise(&file, 0, 0, Advice::WillNeed, &inv));
+        assert!(advise(&file, 1, u64::MAX, Advice::WillNeed, &inv));
         assert_eq!(attempts(Advice::WillNeed), before + 2);
     }
 }

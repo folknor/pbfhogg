@@ -79,7 +79,6 @@ use std::os::unix::io::{AsRawFd as _, RawFd};
 
 use crate::error::{Error, Location, Result};
 use crate::read::input::InputFile;
-use crate::write::metrics::WRITER_METRICS;
 
 /// Where [`copy_range`] writes.
 #[derive(Clone, Copy, Debug)]
@@ -252,19 +251,16 @@ fn file_id(fd: RawFd) -> Option<(libc::dev_t, libc::ino_t)> {
 /// the run's note. Cold: the kernel path never gets here.
 #[cfg(target_os = "linux")]
 #[cold]
-fn record_fallback(len: u64, err: &io::Error) {
+fn record_fallback(len: u64, err: &io::Error, invocation: &crate::host::Invocation) {
     use std::sync::atomic::Ordering::Relaxed;
-    WRITER_METRICS
-        .copy_range_fallback_ranges
-        .fetch_add(1, Relaxed);
-    WRITER_METRICS
-        .copy_range_fallback_bytes
-        .fetch_add(len, Relaxed);
+    let metrics = &invocation.metrics().writer;
+    metrics.copy_range_fallback_ranges.fetch_add(1, Relaxed);
+    metrics.copy_range_fallback_bytes.fetch_add(len, Relaxed);
     if let Some(errno) = err.raw_os_error() {
         // First refusal wins; a later one (another worker, another output)
         // may have a different errno, which the note does not claim to cover.
         // `Err` is "an earlier refusal is already kept", which is the rule.
-        WRITER_METRICS
+        metrics
             .copy_range_fallback_errno
             .compare_exchange(0, errno, Relaxed, Relaxed)
             .ok();
@@ -391,7 +387,7 @@ fn copy_range_with(
                         len,
                     )
                 {
-                    record_fallback(len, &err);
+                    record_fallback(len, &err, cancel);
                     return copy_range_fallback(input, out, offset, len, cancel);
                 }
                 return Err(copy_error(err, input, start, end));
@@ -581,6 +577,29 @@ mod tests {
         out_at: u64,
         explicit: bool,
     ) -> (Result<()>, Vec<u8>, Vec<u8>, usize) {
+        let invocation = crate::host::Invocation::new();
+        run_in(
+            script,
+            input_len,
+            offset,
+            len,
+            out_at,
+            explicit,
+            &invocation,
+        )
+    }
+
+    /// [`run`] under `invocation`, whose counters the copy records into.
+    #[cfg(target_os = "linux")]
+    fn run_in(
+        script: &[Step],
+        input_len: usize,
+        offset: u64,
+        len: u64,
+        out_at: u64,
+        explicit: bool,
+        invocation: &crate::host::Invocation,
+    ) -> (Result<()>, Vec<u8>, Vec<u8>, usize) {
         use std::io::{Seek as _, SeekFrom};
         let dir = crate::path_guard::tests::scratch();
         let (input, bytes) = patterned_input(dir.path(), input_len);
@@ -605,7 +624,7 @@ mod tests {
             target,
             offset,
             len,
-            &crate::host::Invocation::new(),
+            invocation,
             |off_in, off_out, asked| {
                 calls += 1;
                 match script.pop_front().unwrap_or(Step::Copy(usize::MAX)) {
@@ -685,26 +704,28 @@ mod tests {
                 libc::EPERM,
                 libc::EINVAL,
             ] {
-                let before = WRITER_METRICS.copy_range_fallback_ranges.load(Relaxed);
+                let invocation = crate::host::Invocation::new();
+                let metrics = &invocation.metrics().writer;
                 // EINTR first: the decision is on the first answer that is
                 // not an interruption. The range is larger than the fallback
                 // buffer, and lands after 5 bytes already in the output.
                 let len = crate::write::IO_BUF_BYTES * 2 + 17;
                 let script = [Step::Errno(libc::EINTR), Step::Errno(errno)];
                 let (result, written, bytes, calls) =
-                    run(&script, len + 50, 50, len as u64, 5, explicit);
+                    run_in(&script, len + 50, 50, len as u64, 5, explicit, &invocation);
                 result.unwrap_or_else(|e| panic!("errno {errno}: {e}"));
                 assert_eq!(&written[..5], &[0xAA; 5], "errno {errno}");
                 assert_eq!(&written[5..], &bytes[50..], "errno {errno}");
                 assert_eq!(calls, 2, "errno {errno}: no kernel call after the fallback");
-                assert!(
-                    WRITER_METRICS.copy_range_fallback_ranges.load(Relaxed) > before,
-                    "errno {errno}: the fallback must be counted"
+                assert_eq!(
+                    metrics.copy_range_fallback_ranges.load(Relaxed),
+                    1,
+                    "errno {errno}: the fallback must be counted, once"
                 );
-                assert_ne!(
-                    WRITER_METRICS.copy_range_fallback_errno.load(Relaxed),
-                    0,
-                    "errno {errno}: a refusing errno must be kept"
+                assert_eq!(
+                    metrics.copy_range_fallback_errno.load(Relaxed),
+                    errno,
+                    "errno {errno}: the refusing errno must be kept"
                 );
             }
         }

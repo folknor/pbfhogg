@@ -1013,6 +1013,7 @@ fn write_passthrough(
                         blob,
                         &reindex.index.serialize(),
                         reindex.tagdata.as_deref(),
+                        &writer.cancel_token().metrics().writer,
                     )
                 })
                 .map_err(|e| source.locate_at(frame.file_offset, e))?;

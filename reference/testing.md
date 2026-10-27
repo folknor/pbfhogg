@@ -87,15 +87,12 @@ NAME` list each harness in turn to find one test.
 - **What the shared binary shares.** Every module of `all` runs
   concurrently in one process with: the global rayon pool; and
   `RLIMIT_NOFILE`, raised once per process by `common::test_host()`.
-  Child processes inherit that limit. The sidecar metric sets (`WRITER_METRICS`,
-  `PIPELINE_METRICS` and the worker pools' stall-counter sets among them) are process-global
-  accumulators by design (the sidecar reads them as process totals), so
-  concurrent tests contribute to the same totals and a delta of one
-  can be moved, either way, by another test. A test that needs one
-  run's exact count reads it from its token's fault plan instead:
-  `FaultPlan::sync_calls` for the fsyncs a run's output finish and
-  publication perform (`write::metrics::with_sync_observer`),
-  `reorder_filled_high_water` for the read pipeline's reorder bound.
+  Child processes inherit that limit. The sidecar metric sets (the
+  writers', the read pipeline's and the worker pools' stall counters)
+  are not shared: each belongs to the `Invocation` a run is given, so a
+  test that needs one run's exact count reads it from its own token
+  (`Invocation::for_each_counter`, or `metrics()` inside the crate),
+  never as a delta of anything another test can move.
   A test that needs anything else here to itself takes a target of its
   own.
 - **Process-wide panic hook.** The reader pipeline-death unit test temporarily

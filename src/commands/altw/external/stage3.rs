@@ -290,7 +290,7 @@ pub(super) fn stage3_slot_reorder(
                                 ))
                             },
                         )?;
-                        if advise_dontneed_file(&bucket_file) {
+                        if advise_dontneed_file(&bucket_file, cancel) {
                             c.fadvise_calls.fetch_add(1, Relaxed);
                             c.fadvise_bytes.fetch_add(data_buf.len() as u64, Relaxed);
                         }

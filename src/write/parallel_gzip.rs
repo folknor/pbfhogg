@@ -43,7 +43,7 @@ use crate::error::Error;
 use crate::reorder_buffer::ReorderBuffer;
 pub use crate::tunables::DEFAULT_CHUNK_SIZE;
 use crate::tunables::{GZIP_REORDER_PERMIT_POLL, QUEUE_SLOTS_PER_WORKER};
-use crate::write::metrics::WRITER_METRICS;
+use crate::write::metrics::WriterMetrics;
 use crate::write::pool_failure::FirstFailure;
 
 /// Compression level used for every gzip member. `Compression::fast`
@@ -121,9 +121,9 @@ pub struct ParallelGzipWriter<W: Write + Send + 'static> {
     writer_handle: Option<JoinHandle<Option<(W, usize)>>>,
     worker_handles: Vec<JoinHandle<()>>,
     failure: Arc<FirstFailure>,
-    /// The token whose fault plan (`crate::test_hooks`) the workers and
-    /// `flush` consult; the pool has no cancellation of its own.
-    #[cfg(feature = "test-hooks")]
+    /// The invocation the `writer_parallel_gzip_*` counters record into, and
+    /// whose fault plan (`crate::test_hooks`) the workers and `flush`
+    /// consult; the pool has no cancellation of its own.
     cancel: crate::host::Invocation,
 }
 
@@ -147,18 +147,15 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
     /// A zero `chunk_size` is treated as one byte.
     ///
     /// `cancel` is the invocation's token. The pool has no cancellation of
-    /// its own; under the `test-hooks` feature the workers and `flush` read
-    /// the token's fault plan (`crate::test_hooks`), and otherwise it is
-    /// unused.
+    /// its own; its `writer_parallel_gzip_*` counters record into the
+    /// invocation, and under the `test-hooks` feature the workers and `flush`
+    /// read the token's fault plan (`crate::test_hooks`).
     pub fn new(
         inner: W,
         chunk_size: usize,
         worker_count: usize,
         cancel: &crate::host::Invocation,
     ) -> Self {
-        #[cfg(not(feature = "test-hooks"))]
-        let _ = cancel;
-        #[cfg(feature = "test-hooks")]
         let cancel = cancel.clone();
         let chunk_size = chunk_size.max(1);
         let worker_count = worker_count.max(1);
@@ -230,6 +227,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
         drop(compressed_tx);
 
         let writer_failure = Arc::clone(&failure);
+        let writer_invocation = cancel.clone();
         let spawned = std::thread::Builder::new().spawn(move || {
             // Backstop as above: `writer_loop` runs every inner-writer call
             // under `guarded`. The receiver is owned out here so it is only
@@ -241,6 +239,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
                     &writer_failure,
                     &reorder_permit_tx,
                     reorder_window,
+                    &writer_invocation.metrics().writer,
                 )
             }));
             let out = caught.unwrap_or_else(|payload| {
@@ -269,7 +268,6 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
             writer_handle,
             worker_handles,
             failure,
-            #[cfg(feature = "test-hooks")]
             cancel,
         }
     }
@@ -297,7 +295,8 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
         }
 
         let start = crate::counters::Stopwatch::start();
-        WRITER_METRICS
+        let metrics = &self.cancel.metrics().writer;
+        metrics
             .parallel_gzip_reorder_blocked
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let result = loop {
@@ -315,7 +314,7 @@ impl<W: Write + Send + 'static> ParallelGzipWriter<W> {
                 }
             }
         };
-        start.record_ns(&WRITER_METRICS.parallel_gzip_reorder_wait_ns);
+        start.record_ns(&metrics.parallel_gzip_reorder_wait_ns);
         result
     }
 
@@ -678,6 +677,7 @@ fn writer_loop<W: Write>(
     failure: &FirstFailure,
     reorder_permit_tx: &SyncSender<()>,
     reorder_window: usize,
+    metrics: &WriterMetrics,
 ) -> Option<(W, usize)> {
     const WHO: &str = "parallel gzip writer thread";
     let mut pending: ReorderBuffer<Out> =
@@ -701,7 +701,7 @@ fn writer_loop<W: Write>(
             continue;
         }
         crate::counters::record_max(
-            &WRITER_METRICS.parallel_gzip_reorder_high_water,
+            &metrics.parallel_gzip_reorder_high_water,
             pending.filled_len() as u64,
         );
         while let Some(item) = pending.pop_ready() {
@@ -1195,7 +1195,14 @@ mod tests {
         // window of 2.
         tx.send((3, Out::Barrier(ack_tx))).unwrap();
         drop(tx);
-        let out = writer_loop(Vec::new(), &rx, &failure, &permit_tx, 2);
+        let out = writer_loop(
+            Vec::new(),
+            &rx,
+            &failure,
+            &permit_tx,
+            2,
+            &WriterMetrics::new(),
+        );
         assert!(out.is_none(), "a window breach must fail the stream");
         let reply = ack_rx.recv().expect("the barrier must be answered");
         let msg = reply.expect_err("answered with the failure").to_string();
@@ -1214,7 +1221,9 @@ mod tests {
         tx.send((0, Out::Bytes(b"ab".to_vec()))).unwrap();
         tx.send((2, Out::Bytes(b"cd".to_vec()))).unwrap();
         drop(tx);
-        let (inner, delivered) = writer_loop(Vec::new(), &rx, &failure, &permit_tx, 4).unwrap();
+        let metrics = WriterMetrics::new();
+        let (inner, delivered) =
+            writer_loop(Vec::new(), &rx, &failure, &permit_tx, 4, &metrics).unwrap();
         assert_eq!(inner, b"abcd");
         assert_eq!(delivered, 3);
         ack_rx.recv().unwrap().unwrap();

@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::reorder_buffer::ReorderBuffer;
 use crate::tunables::{EXECUTOR_IDLE_RECV_TIMEOUT, PIPELINE_DISPATCH_PERMITS, WRITE_AHEAD};
 use crate::write::file_writer::FileWriter;
-use crate::write::metrics::WRITER_METRICS;
+use crate::write::metrics::WriterMetrics;
 use std::io::Write;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
@@ -130,26 +130,30 @@ pub(crate) trait OutputSink {
 /// per successful constituent operation (`writer_bytes_written`). A free
 /// function rather than a trait method, so no backend can override the
 /// bookkeeping.
-fn hand_off<S: OutputSink>(sink: &mut S, chunk: OutputChunk) -> Result<()> {
-    fn accept<S: OutputSink>(sink: &mut S, bytes: Vec<u8>) -> Result<()> {
+fn hand_off<S: OutputSink>(
+    sink: &mut S,
+    chunk: OutputChunk,
+    metrics: &WriterMetrics,
+) -> Result<()> {
+    fn accept<S: OutputSink>(sink: &mut S, bytes: Vec<u8>, metrics: &WriterMetrics) -> Result<()> {
         let len = bytes.len() as u64;
         sink.write_owned(bytes)?;
-        WRITER_METRICS.record_accepted(len);
+        metrics.record_accepted(len);
         Ok(())
     }
     match chunk {
-        OutputChunk::Framed(parts) => accept(sink, parts.into_vec()),
-        OutputChunk::Raw(bytes) => accept(sink, bytes),
-        OutputChunk::RawChunks(chunks) => {
-            chunks.into_iter().try_for_each(|chunk| accept(sink, chunk))
-        }
+        OutputChunk::Framed(parts) => accept(sink, parts.into_vec(), metrics),
+        OutputChunk::Raw(bytes) => accept(sink, bytes, metrics),
+        OutputChunk::RawChunks(chunks) => chunks
+            .into_iter()
+            .try_for_each(|chunk| accept(sink, chunk, metrics)),
         OutputChunk::CopyRange {
             in_file,
             offset,
             len,
         } => {
             sink.copy_range(in_file, offset, len)?;
-            WRITER_METRICS.record_accepted(len);
+            metrics.record_accepted(len);
             Ok(())
         }
     }
@@ -158,9 +162,13 @@ fn hand_off<S: OutputSink>(sink: &mut S, chunk: OutputChunk) -> Result<()> {
 /// `write_all` `bytes` and, on success, count them as accepted
 /// (`writer_bytes_written`). The per-operation byte accounting shared by the
 /// buffered sink and the synchronous `PbfWriter`.
-pub(crate) fn write_accepted<W: Write + ?Sized>(writer: &mut W, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_accepted<W: Write + ?Sized>(
+    writer: &mut W,
+    bytes: &[u8],
+    metrics: &WriterMetrics,
+) -> Result<()> {
     writer.write_all(bytes)?;
-    WRITER_METRICS.record_accepted(bytes.len() as u64);
+    metrics.record_accepted(bytes.len() as u64);
     Ok(())
 }
 
@@ -171,8 +179,8 @@ pub(crate) fn write_accepted<W: Write + ?Sized>(writer: &mut W, bytes: &[u8]) ->
 pub(crate) struct FileOutputSink {
     writer: FileWriter,
     finish: super::Finish,
-    /// Checked between `copy_file_range` calls of a queued splice; observes
-    /// the finish's fsyncs for tests (`with_sync_observer`).
+    /// Checked between `copy_file_range` calls of a queued splice; the
+    /// writer's counters record into its invocation.
     cancel: crate::host::Invocation,
 }
 
@@ -231,11 +239,10 @@ impl FileOutputSink {
     /// A `Deferred` sink only finishes the file (for `O_DIRECT`, the tail
     /// padding and truncation); its owner syncs it.
     fn finish(mut self) -> Result<()> {
-        let (writer, finish) = (&mut self.writer, self.finish);
-        crate::write::metrics::with_sync_observer(&self.cancel, || match finish {
-            super::Finish::Durable => writer.sync(),
-            super::Finish::Deferred => Ok(writer.flush()?),
-        })
+        match self.finish {
+            super::Finish::Durable => self.writer.sync(),
+            super::Finish::Deferred => Ok(self.writer.flush()?),
+        }
     }
 }
 
@@ -264,6 +271,8 @@ pub(super) struct WritePipeline {
     /// poisons it, so the later `flush` (which finds no thread left to join
     /// and would otherwise succeed) cannot certify the output.
     pub(super) completion: Option<crate::output::Completion>,
+    /// The invocation whose writer counters the producer side records into.
+    pub(super) invocation: crate::host::Invocation,
 }
 
 impl WritePipeline {
@@ -274,6 +283,7 @@ impl WritePipeline {
         join_handle: JoinHandle<Result<()>>,
         expected: SeqTotal,
         executor: crate::host::Executor,
+        invocation: crate::host::Invocation,
     ) -> Self {
         let (permit_tx, permit_rx) = new_permit_pool();
         Self {
@@ -286,12 +296,17 @@ impl WritePipeline {
             writer_gone: WriterGone::new(),
             executor,
             completion: None,
+            invocation,
         }
     }
 
     /// Spawn a writer thread running `body` over a fresh channel and
     /// end-of-stream handshake, and wrap it in a pipeline.
-    pub(super) fn spawn<F>(executor: crate::host::Executor, body: F) -> Self
+    pub(super) fn spawn<F>(
+        executor: crate::host::Executor,
+        invocation: crate::host::Invocation,
+        body: F,
+    ) -> Self
     where
         F: FnOnce(Receiver<PipelineItem>, &SeqTotal) -> Result<()> + Send + 'static,
     {
@@ -299,7 +314,12 @@ impl WritePipeline {
         let expected = SeqTotal::new();
         let thread_expected = expected.clone();
         let handle = std::thread::spawn(move || body(rx, &thread_expected));
-        Self::new(tx, handle, expected, executor)
+        Self::new(tx, handle, expected, executor, invocation)
+    }
+
+    /// The writer counters of this pipeline's invocation.
+    pub(super) fn metrics(&self) -> &WriterMetrics {
+        &self.invocation.metrics().writer
     }
 
     /// [`spawn`](Self::spawn) for a thread that does its own setup (opening
@@ -313,6 +333,7 @@ impl WritePipeline {
     pub(super) fn spawn_with_init<F>(
         label: &str,
         executor: crate::host::Executor,
+        invocation: crate::host::Invocation,
         body: F,
     ) -> Result<Self>
     where
@@ -321,7 +342,9 @@ impl WritePipeline {
             + 'static,
     {
         let (init_tx, init_rx) = sync_channel(1);
-        let mut pipeline = Self::spawn(executor, move |rx, expected| body(rx, init_tx, expected));
+        let mut pipeline = Self::spawn(executor, invocation, move |rx, expected| {
+            body(rx, init_tx, expected)
+        });
         match init_rx.recv() {
             Ok(Ok(())) => Ok(pipeline),
             Ok(Err(e)) => {
@@ -366,6 +389,7 @@ impl WritePipeline {
 pub(super) fn recv_permit(
     rx: &Receiver<()>,
     executor: &crate::host::Executor,
+    metrics: &WriterMetrics,
 ) -> std::result::Result<(), std::sync::mpsc::RecvError> {
     use std::sync::mpsc::{RecvError, RecvTimeoutError, TryRecvError};
     if !executor.on_worker() {
@@ -387,7 +411,7 @@ pub(super) fn recv_permit(
             },
         }
     };
-    start.record_ns(&WRITER_METRICS.coop_wait_ns);
+    start.record_ns(&metrics.coop_wait_ns);
     result
 }
 
@@ -400,9 +424,13 @@ pub(super) fn recv_permit(
 /// waiting for items that framing closures queued on that pool are still to
 /// produce, and joining from the pool's only free thread would never let them
 /// run.
-pub(super) fn drain_permits(rx: &Receiver<()>, executor: &crate::host::Executor) {
+pub(super) fn drain_permits(
+    rx: &Receiver<()>,
+    executor: &crate::host::Executor,
+    metrics: &WriterMetrics,
+) {
     for _ in 0..PIPELINE_DISPATCH_PERMITS {
-        if recv_permit(rx, executor).is_err() {
+        if recv_permit(rx, executor, metrics).is_err() {
             break;
         }
     }
@@ -581,8 +609,8 @@ fn check_stream_complete(
     Ok(())
 }
 
-pub(super) fn record_send_wait(send_start: crate::counters::Stopwatch) {
-    send_start.record_ns(&WRITER_METRICS.pipeline_send_wait_ns);
+pub(super) fn record_send_wait(send_start: crate::counters::Stopwatch, metrics: &WriterMetrics) {
+    send_start.record_ns(&metrics.pipeline_send_wait_ns);
 }
 
 /// The one ordered-delivery loop every pipelined backend runs: receive
@@ -611,6 +639,7 @@ pub(super) fn deliver_in_order<S: OutputSink>(
     rx: &Receiver<PipelineItem>,
     sink: &mut S,
     expected: &SeqTotal,
+    metrics: &WriterMetrics,
 ) -> Result<()> {
     let mut pending: ReorderBuffer<Result<OutputChunk>> = ReorderBuffer::with_capacity(WRITE_AHEAD);
 
@@ -620,14 +649,14 @@ pub(super) fn deliver_in_order<S: OutputSink>(
             Ok(item) => item,
             Err(_) => break,
         };
-        WRITER_METRICS.record_recv_wait(t_recv);
+        metrics.record_recv_wait(t_recv);
         pending.push(item.seq, item.data);
-        WRITER_METRICS.record_reorder_high_water(pending.pending_len());
+        metrics.record_reorder_high_water(pending.pending_len());
 
         // Drain consecutive ready items from the front.
         while let Some(result) = pending.pop_ready() {
             let chunk = result?;
-            WRITER_METRICS.time_handoff(|| hand_off(sink, chunk))?;
+            metrics.time_handoff(|| hand_off(sink, chunk, metrics))?;
         }
 
         sink.after_drain()?;
@@ -659,7 +688,8 @@ pub(super) fn writer_thread(
     mut sink: FileOutputSink,
     expected: &SeqTotal,
 ) -> Result<()> {
-    deliver_in_order(&rx, &mut sink, expected)?;
+    let invocation = sink.cancel.clone();
+    deliver_in_order(&rx, &mut sink, expected, &invocation.metrics().writer)?;
     sink.finish()
 }
 
@@ -723,7 +753,8 @@ mod tests {
             written: Vec::new(),
             after_drains: 0,
         };
-        let result = deliver_in_order(&rx, &mut sink, &expected);
+        let metrics = crate::write::metrics::WriterMetrics::new();
+        let result = deliver_in_order(&rx, &mut sink, &expected, &metrics);
         (result, sink.written, sink.after_drains)
     }
 

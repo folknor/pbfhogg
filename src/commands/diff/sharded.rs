@@ -79,7 +79,13 @@ pub(super) fn run<R: ShardedReport>(
 ) -> Result<BlockPairMergeStats> {
     if jobs <= 1 || walked.has_negative {
         for file in [&walked.old.file, &walked.new.file] {
-            crate::fadvise::advise(file, 0, 0, crate::fadvise::Advice::Sequential);
+            crate::fadvise::advise(
+                file,
+                0,
+                0,
+                crate::fadvise::Advice::Sequential,
+                &host.invocation,
+            );
         }
     }
     let mut total = BlockPairMergeStats::default();

@@ -193,14 +193,14 @@ struct WorkerScratch {
 }
 
 impl WorkerScratch {
-    fn new() -> Self {
+    fn new(invocation: &crate::host::Invocation) -> Self {
         Self {
             read_buf: Vec::new(),
             decompress_buf: Vec::new(),
             bb: BlockBuilder::new(),
             refs_buf: Vec::new(),
             locations_buf: Vec::new(),
-            pool: DecompressPool::new(),
+            pool: DecompressPool::new(invocation),
             way_scratch: WayReframeScratch::default(),
             reframe_output: Vec::new(),
             output: Vec::new(),
@@ -451,7 +451,7 @@ pub(super) fn write_output_passthrough(
                 ..crate::ordered_pool::Waits::default()
             },
         },
-        |_| WorkerScratch::new(),
+        |_| WorkerScratch::new(&host.invocation),
         |(), scratch: &mut WorkerScratch, ordinal| {
             let desc = &schedule[decode_at[ordinal]];
             decode_one(

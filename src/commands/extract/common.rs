@@ -344,7 +344,7 @@ where
             read_buf: Vec::new(),
             bb: BlockBuilder::new(),
             output_blocks: Vec::new(),
-            pool: crate::blob::DecompressPool::new(),
+            pool: crate::blob::DecompressPool::new(&host.invocation),
             st_scratch: Vec::new(),
             gr_scratch: Vec::new(),
         },

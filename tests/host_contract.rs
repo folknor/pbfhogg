@@ -179,6 +179,102 @@ fn diagnostics_are_per_run() {
         }
     });
 }
+/// The value `invocation` holds for counter `name`.
+fn counter(invocation: &pbfhogg::host::Invocation, name: &str) -> u64 {
+    let mut found = None;
+    invocation.for_each_counter(|n, value| {
+        if n == name {
+            found = Some(value);
+        }
+    });
+    found.unwrap_or_else(|| panic!("no counter named {name}"))
+}
+
+/// Each run's counters are its own invocation's: two runs at once, on inputs
+/// of different sizes, each count exactly their own output, and a second run
+/// under the same token adds into the same totals. When these were
+/// process-global statics, the concurrent pair saw each other's bytes.
+#[test]
+fn counters_are_per_invocation() {
+    let sizes: Vec<(pbfhogg::host::Invocation, u64)> = std::thread::scope(|scope| {
+        let runs: Vec<_> = [3_i64, 40]
+            .into_iter()
+            .map(|count| {
+                scope.spawn(move || {
+                    let dir = crate::common::test_scratch();
+                    let raw = dir.path().join("raw.pbf");
+                    let nodes: Vec<_> = (1..=count)
+                        .map(|id| crate::common::TestNode {
+                            id,
+                            lat: 0,
+                            lon: 0,
+                            tags: vec![],
+                            meta: None,
+                        })
+                        .collect();
+                    crate::common::write_multi_block_test_pbf(&raw, &nodes, &[], &[], 1);
+                    let host = crate::common::test_host();
+                    let out = dir.path().join("indexed.pbf");
+                    pbfhogg::cat::cat(
+                        &[&raw],
+                        crate::common::out(&out),
+                        None,
+                        &Default::default(),
+                        &Default::default(),
+                        &Default::default(),
+                        &host,
+                    )
+                    .expect("cat");
+                    let size = std::fs::metadata(&out).expect("output").len();
+                    (host.invocation, size)
+                })
+            })
+            .collect();
+        runs.into_iter()
+            .map(|run| run.join().expect("run"))
+            .collect()
+    });
+    assert_ne!(
+        sizes[0].1, sizes[1].1,
+        "the two outputs must differ to tell them apart"
+    );
+    for (invocation, size) in &sizes {
+        assert_eq!(counter(invocation, "writer_bytes_written"), *size);
+        assert!(counter(invocation, "writer_sync_all_calls") > 0);
+    }
+
+    // A second run under the same token is the same invocation.
+    let dir = crate::common::test_scratch();
+    let base = input(dir.path());
+    let mut host = crate::common::test_host();
+    let first = crate::common::out(dir.path().join("first.pbf"));
+    let second = crate::common::out(dir.path().join("second.pbf"));
+    host.invocation = sizes[0].0.clone();
+    let before = counter(&host.invocation, "writer_bytes_written");
+    for output in [first, second] {
+        pbfhogg::cat::cat(
+            &[&base],
+            output,
+            None,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+            &host,
+        )
+        .expect("cat");
+    }
+    let total = std::fs::metadata(dir.path().join("first.pbf"))
+        .expect("first")
+        .len()
+        + std::fs::metadata(dir.path().join("second.pbf"))
+            .expect("second")
+            .len();
+    assert_eq!(
+        counter(&host.invocation, "writer_bytes_written") - before,
+        total
+    );
+}
+
 #[test]
 fn unrecognised_indexdata_warning_is_per_handle() {
     let sink = Arc::new(Recording::default());

@@ -229,7 +229,11 @@ fn read_header(
     host: &crate::host::Host,
 ) -> Result<crate::HeaderBlock> {
     let file = input.path();
-    let mut frames = Frames::of_input(FileReader::open(input, direct_io)?, file, host);
+    let mut frames = Frames::of_input(
+        FileReader::open_in(input, direct_io, &host.invocation)?,
+        file,
+        host,
+    );
     match frames.next_raw()? {
         Some(frame) if frame.blob_type == BlobKind::OsmHeader => {
             decode_blob_to_headerblock(frame.blob_bytes()).map_err(|e| frames.locate(frame.id, e))
@@ -334,7 +338,11 @@ fn cat_passthrough(
 
     for input in files {
         let file = input.path();
-        let mut frames = Frames::of_input(FileReader::open(input, direct_io)?, file, host);
+        let mut frames = Frames::of_input(
+            FileReader::open_in(input, direct_io, &host.invocation)?,
+            file,
+            host,
+        );
         // cat is the remedy for a partially indexed file: it indexes every
         // blob that lacks indexdata, so it is exempt from the refusal.
         frames.accept_partial_index();
@@ -395,6 +403,7 @@ fn cat_passthrough(
                             blob_bytes,
                             &index.serialize(),
                             tagdata_bytes.as_deref(),
+                            &writer.cancel_token().metrics().writer,
                         )?;
                         decompress_buf.clear();
                         writer.write_raw_owned(reframed)?;
@@ -695,7 +704,11 @@ fn cat_type_passthrough(
 
     for input in files {
         let file = input.path();
-        let mut frames = Frames::of_input(FileReader::open(input, direct_io)?, file, host);
+        let mut frames = Frames::of_input(
+            FileReader::open_in(input, direct_io, &host.invocation)?,
+            file,
+            host,
+        );
         // cat is the remedy for a partially indexed file, so `--type` is
         // exempt from the refusal: a blob without indexdata is decoded and
         // its selected elements re-encoded with fresh indexdata.
@@ -1046,6 +1059,7 @@ fn run_filtered_pass(
                     Some(indexdata.as_slice()),
                     tagdata.as_deref(),
                     way_members.as_deref(),
+                    &host.invocation.metrics().writer,
                 )?;
                 framed.push((index.kind, blob.into_vec()));
             }

@@ -375,7 +375,7 @@ pub struct BlobReader<R: Read + Send> {
     /// only when the caller opted in (`evict_page_cache(true)` or a host with
     /// `PageCachePolicy::Evict`).
     #[cfg(target_os = "linux")]
-    evict_prefix: Option<fn(&R, u64) -> bool>,
+    evict_prefix: Option<fn(&R, u64, &crate::host::Invocation) -> bool>,
     /// Count of `posix_fadvise(DONTNEED)` calls this reader has issued.
     ///
     /// Exists so a test can tell "never evicted anything" apart from "evicted,
@@ -396,12 +396,19 @@ impl<R: Read + Send> BlobReader<R> {
         self
     }
 
-    /// Stop at the next frame once `cancel` is tripped: iteration then
-    /// yields one `ErrorKind::Cancelled` (unlocated: the run was stopped,
-    /// nothing in the input is at fault) and ends.
+    /// Run this reader under `invocation`. It stops at the next frame once
+    /// the token is tripped: iteration then yields one
+    /// `ErrorKind::Cancelled` (unlocated: the run was stopped, nothing in the
+    /// input is at fault) and ends. Everything its reads record from here on
+    /// (page-cache advice, the pipelined engines' counters, their
+    /// decompression pools) counts into that invocation.
+    ///
+    /// Bind it before the first read. A reader built by a file constructor
+    /// has already advised readahead at open under a fresh token of its own;
+    /// [`BlobReader::open_with`] binds the invocation from the open.
     #[must_use]
-    pub fn cancel(mut self, cancel: crate::host::Invocation) -> Self {
-        self.frames.set_cancel(cancel);
+    pub fn invocation(mut self, invocation: crate::host::Invocation) -> Self {
+        self.frames.set_cancel(invocation);
         self
     }
 
@@ -647,8 +654,26 @@ impl BlobReader<FileReader> {
         Ok(Self::from_reader(reader, path.as_ref()))
     }
 
-    /// Open a file for a command run under `host`: buffered or O_DIRECT per
-    /// `direct`, with the host's diagnostics and page-cache policy. As a
+    /// Open a file under `host`: buffered or O_DIRECT per `direct`, with the
+    /// host's diagnostics, page-cache policy and invocation, bound from the
+    /// open on. Like the other public constructors it reads any file,
+    /// partially indexed or not.
+    pub fn open_with<'a>(
+        source: impl Into<crate::read::input::InputSource<'a>>,
+        direct: bool,
+        host: &crate::host::Host,
+    ) -> Result<Self> {
+        let source = source.into();
+        Ok(Self::from_reader(
+            FileReader::open_in(source, direct, &host.invocation)?,
+            source.path(),
+        )
+        .diagnostics(host.diagnostics.clone())
+        .invocation(host.invocation.clone())
+        .evict_page_cache(host.page_cache == crate::host::PageCachePolicy::Evict))
+    }
+
+    /// Open a file for a command run under `host` ([`Self::open_with`]). As a
     /// command input it refuses a partially indexed file
     /// (`Frames::refuse_partial_index`) unless the command opts out with
     /// [`Self::accepting_partial_index`]; the public constructors do not, so
@@ -658,11 +683,7 @@ impl BlobReader<FileReader> {
         direct: bool,
         host: &crate::host::Host,
     ) -> Result<Self> {
-        let source = source.into();
-        let mut reader = Self::from_reader(FileReader::open(source, direct)?, source.path())
-            .diagnostics(host.diagnostics.clone())
-            .cancel(host.invocation.clone())
-            .evict_page_cache(host.page_cache == crate::host::PageCachePolicy::Evict);
+        let mut reader = Self::open_with(source, direct, host)?;
         reader.frames.refuse_partial_index();
         Ok(reader)
     }
@@ -752,7 +773,7 @@ impl<R: Read + Send> BlobReader<R> {
         #[cfg(target_os = "linux")]
         if let Some(evict) = self.evict_prefix
             && let Some(offset) = self.frames.position()
-            && evict(&self.frames.src, offset)
+            && evict(&self.frames.src, offset, self.frames.cancel_token())
         {
             self.evict_calls += 1;
         }

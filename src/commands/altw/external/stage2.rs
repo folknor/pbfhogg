@@ -133,6 +133,7 @@ fn prepare_bucket(
     scratch: &RunScratch,
     num_shard_workers: usize,
     loader: &mut LoaderScratch,
+    invocation: &crate::host::Invocation,
 ) -> crate::Result<PreparedBucket> {
     loader.data_buf.clear();
     loader.records.clear();
@@ -164,7 +165,7 @@ fn prepare_bucket(
         loader.data_buf.resize(start + len, 0);
         std::io::Read::read_exact(&mut &file, &mut loader.data_buf[start..])
             .map_err(|e| named("read", e))?;
-        if advise_dontneed_file(&file) {
+        if advise_dontneed_file(&file, invocation) {
             fadvise_calls += 1;
             fadvise_bytes += len as u64;
         }
@@ -257,7 +258,7 @@ impl SharedSlotBuckets {
         Error::from(err).context(format!("failed to write slot bucket {path}"))
     }
 
-    pub(super) fn finish(&self) -> Result<()> {
+    pub(super) fn finish(&self, invocation: &crate::host::Invocation) -> Result<()> {
         for (bucket, writer_mutex) in self.writers.iter().enumerate() {
             let mut w = writer_mutex
                 .lock()
@@ -284,7 +285,7 @@ impl SharedSlotBuckets {
                 w.get_ref()
                     .sync_data()
                     .map_err(|e| self.sync_error(bucket, e))?;
-                advise_dontneed_file(w.get_ref());
+                advise_dontneed_file(w.get_ref(), invocation);
             }
         }
         Ok(())
@@ -396,7 +397,11 @@ pub(super) fn stage2_node_join(
                         // Load + sort id-bucket records.
                         let t_load = crate::counters::Stopwatch::start();
                         let bkt = prepare_bucket(
-                            bucket_idx, scratch, num_shard_workers, &mut loader,
+                            bucket_idx,
+                            scratch,
+                            num_shard_workers,
+                            &mut loader,
+                            &host.invocation,
                         )?;
                         t_load.record_ms(&c.bucket_load_ms);
                         c.bucket_loads.fetch_add(1, Relaxed);

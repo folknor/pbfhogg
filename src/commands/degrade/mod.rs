@@ -598,7 +598,11 @@ fn degrade_passthrough(
     // takes no pin of its own (a FIFO or stdin serves it, buffered) and the
     // decode path does; a caller's pin is opened as the file it pinned.
     let input = source.path();
-    let mut frames = Frames::of_input(FileReader::open(source, write.direct_reads)?, input, host);
+    let mut frames = Frames::of_input(
+        FileReader::open_in(source, write.direct_reads, &host.invocation)?,
+        input,
+        host,
+    );
     let header_bytes = passthrough_header_bytes(&mut frames, input, flags, overrides)?;
 
     let mut writer = writer_from_header_bytes(
@@ -1138,7 +1142,15 @@ fn run_kind_phase(
         None,
         || (),
         |block, _state| -> PhaseResult {
-            worker_decode_kind(block, kind, cap, flags, &compression, drop)
+            worker_decode_kind(
+                block,
+                kind,
+                cap,
+                flags,
+                &compression,
+                drop,
+                &host.invocation.metrics().writer,
+            )
         },
         |_position, out| {
             // Sort preservation: flush central BB before writing this
@@ -1257,6 +1269,7 @@ fn worker_decode_kind(
     flags: DegradeFlags,
     compression: &Compression,
     drop: Option<&FxHashSet<i64>>,
+    metrics: &crate::write::metrics::WriterMetrics,
 ) -> crate::Result<WorkerOutput> {
     let cap = cap_nz.get();
     // Trust: elements of a kind other than the one this blob's indexdata
@@ -1343,6 +1356,7 @@ fn worker_decode_kind(
                     compression,
                     flags.strip_indexdata,
                     flags.strip_tagdata,
+                    metrics,
                 )?);
             }
         } else {
@@ -1365,6 +1379,7 @@ fn worker_decode_kind(
             compression,
             flags.strip_indexdata,
             flags.strip_tagdata,
+            metrics,
         )?);
     }
 
@@ -1494,6 +1509,7 @@ fn frame_owned(
     compression: &Compression,
     strip_indexdata: bool,
     strip_tagdata: bool,
+    metrics: &crate::write::metrics::WriterMetrics,
 ) -> crate::Result<Vec<u8>> {
     let OwnedBlock {
         bytes: block_bytes,
@@ -1518,6 +1534,7 @@ fn frame_owned(
         indexdata,
         tagdata,
         way_members.as_deref(),
+        metrics,
     )?;
     Ok(blob.into_vec())
 }
@@ -1533,6 +1550,8 @@ fn frame_and_write_batch(
 ) -> Result<u64> {
     use rayon::prelude::*;
 
+    let invocation = writer.cancel_token().clone();
+    let metrics = &invocation.metrics().writer;
     let framed: Vec<Result<Vec<u8>>> = executor.install(|| {
         batch
             .into_par_iter()
@@ -1561,6 +1580,7 @@ fn frame_and_write_batch(
                         indexdata,
                         tagdata,
                         way_members.as_deref(),
+                        metrics,
                     )?;
                     Ok(blob.into_vec())
                 },

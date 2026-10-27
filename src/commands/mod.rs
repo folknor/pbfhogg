@@ -634,7 +634,7 @@ fn probe_first_data_blob<'a>(
     let source = input.into();
     let path = source.path();
     let mut frames = front_frames(
-        FileReader::open(source, direct_io)?,
+        FileReader::open_in(source, direct_io, cancel)?,
         path,
         diagnostics,
         cancel,

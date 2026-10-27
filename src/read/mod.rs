@@ -18,21 +18,21 @@ pub(crate) mod region_grid;
 pub(crate) mod wire;
 pub(crate) mod wire_schema;
 
-/// Emit the process-wide `pipeline_decompress_pool_*` sidecar counters, at
-/// most once per process.
+/// Emit `invocation`'s `pipeline_decompress_pool_*` sidecar counters, at
+/// most once per invocation.
 ///
 /// The read-side twin of [`crate::write::emit_writer_counters`]: call it once,
-/// on the way out, after every command thread has joined - the CLI does so on
-/// its single exit path, success or failure. The totals cover every
-/// decompression pool in the process (classify workers, command-specific
-/// readers, altw passthrough), not only the pipelined reader, which is why no
-/// per-pipeline path emits them. Counter names and FIFO framing are unchanged.
-/// Inert without an armed marker FIFO.
-pub fn emit_read_counters() {
-    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-    static EMITTED: AtomicBool = AtomicBool::new(false);
-    if EMITTED.swap(true, Relaxed) {
+/// on the way out, after every thread of the invocation has joined - the CLI
+/// does so on its single exit path, success or failure. The totals cover
+/// every decompression pool of the invocation (classify workers,
+/// command-specific readers, altw passthrough), not only the pipelined
+/// reader, which is why no per-pipeline path emits them. Counter names and
+/// FIFO framing are unchanged. Inert without an armed marker FIFO.
+pub fn emit_read_counters(invocation: &crate::host::Invocation) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let metrics = invocation.metrics();
+    if metrics.read_emitted.swap(true, Relaxed) {
         return;
     }
-    pipeline_metrics::emit_decompress_pool_counters();
+    pipeline_metrics::emit_decompress_pool_counters(&metrics.decompress);
 }

@@ -369,7 +369,7 @@ fn full_decode_scan(
     let path = input.path();
     let file_name = file_name_of(path);
 
-    let reader = FileReader::open(input, direct_io)?;
+    let reader = FileReader::open_in(input, direct_io, &host.invocation)?;
     // The size of the file this reader opened, not of whatever the path
     // names by now: a stat of the path is a second resolution of it.
     let file_size = reader

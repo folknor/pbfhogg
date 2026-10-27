@@ -89,7 +89,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::error::{Error, OutputError, Result, new_output_error};
 use crate::host::Diagnostics;
-use crate::write::metrics::WRITER_METRICS;
+use crate::write::metrics::WriterMetrics;
 
 /// Whether an output may replace an existing destination.
 ///
@@ -270,32 +270,36 @@ impl std::fmt::Debug for Hook {
 /// (repeated publications emit repeated values), so a reader can tell the
 /// syncs publication did from any a writer did. Markers and counters are
 /// best effort: the sidecar drops one when its pipe is full.
-struct PublishSpan {
+struct PublishSpan<'a> {
+    metrics: &'a WriterMetrics,
     sync_calls: u64,
     sync_ns: u64,
 }
 
-impl PublishSpan {
-    fn start() -> Self {
+impl<'a> PublishSpan<'a> {
+    fn start(metrics: &'a WriterMetrics) -> Self {
         use std::sync::atomic::Ordering::Relaxed;
         let span = Self {
-            sync_calls: WRITER_METRICS.sync_all_calls.load(Relaxed),
-            sync_ns: WRITER_METRICS.sync_all_ns.load(Relaxed),
+            metrics,
+            sync_calls: metrics.sync_all_calls.load(Relaxed),
+            sync_ns: metrics.sync_all_ns.load(Relaxed),
         };
         crate::debug::emit_marker("PUBLISH_START");
         span
     }
 }
 
-impl Drop for PublishSpan {
+impl Drop for PublishSpan<'_> {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         // Both read before either is emitted.
-        let calls = WRITER_METRICS
+        let calls = self
+            .metrics
             .sync_all_calls
             .load(Relaxed)
             .saturating_sub(self.sync_calls);
-        let ns = WRITER_METRICS
+        let ns = self
+            .metrics
             .sync_all_ns
             .load(Relaxed)
             .saturating_sub(self.sync_ns);
@@ -972,10 +976,10 @@ impl Target {
     }
 
     /// `fsync` the staged file or tree through the writer-metrics funnel.
-    fn sync_staged(&self) -> Result<()> {
+    fn sync_staged(&self, metrics: &WriterMetrics) -> Result<()> {
         let result = match &self.handle {
-            Some(handle) => WRITER_METRICS.sync_recorded(handle),
-            None => sync_tree(&self.write),
+            Some(handle) => metrics.sync_recorded(handle),
+            None => sync_tree(&self.write, metrics),
         };
         result.map_err(|e| {
             Error::from(e).context(format!(
@@ -999,11 +1003,16 @@ impl Target {
     /// destination aside first (directories and group members, which may
     /// need restoring); a lone file under `Replace` is replaced in one
     /// atomic rename instead.
-    fn install(&mut self, use_backup: bool, faults: &Faults) -> Result<()> {
+    fn install(
+        &mut self,
+        use_backup: bool,
+        faults: &Faults,
+        metrics: &WriterMetrics,
+    ) -> Result<()> {
         let identity = self.identity();
         match self.overwrite {
             Overwrite::Refuse => self.install_exclusive(identity, faults),
-            Overwrite::Replace => self.install_replacing(identity, use_backup, faults),
+            Overwrite::Replace => self.install_replacing(identity, use_backup, faults, metrics),
         }
     }
 
@@ -1081,6 +1090,7 @@ impl Target {
         identity: Option<Identity>,
         use_backup: bool,
         faults: &Faults,
+        metrics: &WriterMetrics,
     ) -> Result<()> {
         let present = match fs::symlink_metadata(&self.dest) {
             Ok(_) => true,
@@ -1123,7 +1133,8 @@ impl Target {
                         "injected backup sync fault",
                     ))
                 } else {
-                    sync_dir(&backup.container).and_then(|()| sync_dir(parent_dir(&self.dest)))
+                    sync_dir(&backup.container, metrics)
+                        .and_then(|()| sync_dir(parent_dir(&self.dest), metrics))
                 };
                 synced.map_err(|e| {
                     Error::from(e).context(format!(
@@ -1423,8 +1434,9 @@ impl Drop for Target {
 }
 
 /// Install every member, rolling back on the first failure, then commit and
-/// sync. The one publication routine behind every shape.
-fn publish_all(targets: &mut [Target], faults: &Faults) -> Result<()> {
+/// sync. The one publication routine behind every shape. Every sync records
+/// into `metrics`, the publishing invocation's writer set.
+fn publish_all(targets: &mut [Target], faults: &Faults, metrics: &WriterMetrics) -> Result<()> {
     // Every member is ready before anything runs, so a refusal leaves the
     // hooks unrun and every destination untouched.
     for target in targets.iter() {
@@ -1437,7 +1449,7 @@ fn publish_all(targets: &mut [Target], faults: &Faults) -> Result<()> {
             hook();
         }
     }
-    let _span = PublishSpan::start();
+    let _span = PublishSpan::start(metrics);
     for target in targets.iter() {
         // Again after the hooks: a hook is caller code and may have failed
         // a session (a write after the end of stream, say). A failure on
@@ -1451,7 +1463,7 @@ fn publish_all(targets: &mut [Target], faults: &Faults) -> Result<()> {
     // the previous output is gone. This is the only place an output file is
     // synced: writers only finish their files.
     for target in targets.iter() {
-        target.sync_staged()?;
+        target.sync_staged(metrics)?;
     }
     if fault_is!(faults, PublishFault::BeforeInstall) {
         return Err(injected("before install"));
@@ -1459,7 +1471,7 @@ fn publish_all(targets: &mut [Target], faults: &Faults) -> Result<()> {
     let group = targets.len() > 1;
     for i in 0..targets.len() {
         let use_backup = group || targets[i].shape == Shape::Dir;
-        let mut result = targets[i].install(use_backup, faults);
+        let mut result = targets[i].install(use_backup, faults, metrics);
         if result.is_ok() && fault_is!(faults, PublishFault::AfterInstalled(i)) {
             result = Err(injected("after a member was installed"));
         }
@@ -1474,7 +1486,7 @@ fn publish_all(targets: &mut [Target], faults: &Faults) -> Result<()> {
             // directories (and any backup kept by a failed restore) is all
             // that can be done for their durability on an error path.
             for parent in distinct_parents(touched) {
-                drop(sync_dir(&parent));
+                drop(sync_dir(&parent, metrics));
             }
             for target in touched.iter() {
                 if let State::BackedUp(backup)
@@ -1483,7 +1495,7 @@ fn publish_all(targets: &mut [Target], faults: &Faults) -> Result<()> {
                     ..
                 } = &target.state
                 {
-                    drop(sync_dir(&backup.container));
+                    drop(sync_dir(&backup.container, metrics));
                 }
             }
             if unresolved.is_empty() {
@@ -1508,7 +1520,7 @@ fn publish_all(targets: &mut [Target], faults: &Faults) -> Result<()> {
                 "injected directory sync fault",
             ))
         } else {
-            sync_dir(&parent)
+            sync_dir(&parent, metrics)
         };
         if let Err(source) = result
             && unsynced.is_none()
@@ -1530,7 +1542,7 @@ fn publish_all(targets: &mut [Target], faults: &Faults) -> Result<()> {
     };
     let mut kept_synced = true;
     for container in &kept {
-        kept_synced &= sync_dir(container).is_ok();
+        kept_synced &= sync_dir(container, metrics).is_ok();
     }
     // Cleanup warnings are emitted when the targets drop, after all of this.
     Err(new_output_error(OutputError::Unsynced {
@@ -1554,26 +1566,26 @@ fn distinct_parents(targets: &[Target]) -> Vec<PathBuf> {
 }
 
 #[cfg(unix)]
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    WRITER_METRICS.sync_recorded(&fs::File::open(dir)?)
+fn sync_dir(dir: &Path, metrics: &WriterMetrics) -> io::Result<()> {
+    metrics.sync_recorded(&fs::File::open(dir)?)
 }
 
 /// Sync every regular file under `dir`, then every directory, the root
 /// last.
-fn sync_tree(dir: &Path) -> io::Result<()> {
+fn sync_tree(dir: &Path, metrics: &WriterMetrics) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let kind = entry.file_type()?;
         if kind.is_dir() {
-            sync_tree(&entry.path())?;
+            sync_tree(&entry.path(), metrics)?;
         } else if kind.is_file() {
-            WRITER_METRICS.sync_recorded(&fs::File::open(entry.path())?)?;
+            metrics.sync_recorded(&fs::File::open(entry.path())?)?;
         }
     }
-    sync_dir(dir)
+    sync_dir(dir, metrics)
 }
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> io::Result<()> {
+fn sync_dir(_dir: &Path, _metrics: &WriterMetrics) -> io::Result<()> {
     Ok(())
 }
 
@@ -1845,9 +1857,11 @@ impl Output {
     pub fn publish(mut self, cancel: &crate::host::Invocation) -> Result<()> {
         cancel.check()?;
         let faults = self.faults();
-        crate::write::metrics::with_sync_observer(cancel, || {
-            publish_all(std::slice::from_mut(&mut self.target), &faults)
-        })
+        publish_all(
+            std::slice::from_mut(&mut self.target),
+            &faults,
+            &cancel.metrics().writer,
+        )
     }
 
     #[cfg(feature = "test-hooks")]
@@ -1942,9 +1956,11 @@ impl OutputDir {
         let faults = self.faults.clone();
         #[cfg(not(feature = "test-hooks"))]
         let faults = Faults;
-        crate::write::metrics::with_sync_observer(cancel, || {
-            publish_all(std::slice::from_mut(&mut self.target), &faults)
-        })
+        publish_all(
+            std::slice::from_mut(&mut self.target),
+            &faults,
+            &cancel.metrics().writer,
+        )
     }
 
     /// Test hook: inject a publication fault.
@@ -2063,7 +2079,7 @@ impl OutputSet {
         for member in self.members.drain(..) {
             targets.push(member.into_target());
         }
-        crate::write::metrics::with_sync_observer(cancel, || publish_all(&mut targets, &faults))
+        publish_all(&mut targets, &faults, &cancel.metrics().writer)
     }
 
     /// Test hook: inject a publication fault.
@@ -2505,10 +2521,13 @@ mod tests {
         )
         .unwrap();
         let completion = out.begin_write().unwrap();
-        let mut writer =
-            crate::write::writer::PbfWriter::to_staged_file(out.path(), Default::default())
-                .unwrap()
-                .with_completion(completion);
+        let mut writer = crate::write::writer::PbfWriter::to_staged_file(
+            out.path(),
+            Default::default(),
+            &crate::host::Invocation::new(),
+        )
+        .unwrap()
+        .with_completion(completion);
         assert!(writer.write_primitive_block(b"\xff\xff\xff").is_err());
         writer.flush().unwrap();
         let err = out.publish(&crate::host::Invocation::new()).unwrap_err();
@@ -2804,10 +2823,10 @@ mod tests {
         assert!(!*ran.lock().unwrap());
     }
 
-    /// Counted on the run's token, so exact: publication syncs the staged
-    /// file and its directory (Unix only: elsewhere `sync_dir` is a no-op).
-    /// The process-wide `WRITER_METRICS` total moves with concurrent tests.
-    #[cfg(all(feature = "test-hooks", unix))]
+    /// Counted on the run's own invocation, so exact: publication syncs the
+    /// staged file and its directory (Unix only: elsewhere `sync_dir` is a
+    /// no-op).
+    #[cfg(unix)]
     #[test]
     fn publication_syncs_through_the_writer_metrics_funnel() {
         use std::sync::atomic::Ordering::Relaxed;
@@ -2818,7 +2837,7 @@ mod tests {
         writer.write_all(b"data").unwrap();
         writer.finish().unwrap();
         out.publish(&token).unwrap();
-        assert_eq!(token.faults().sync_calls.load(Relaxed), 2);
+        assert_eq!(token.metrics().writer.sync_all_calls.load(Relaxed), 2);
     }
 
     /// The walk before a backup's recursive removal: something pbfhogg

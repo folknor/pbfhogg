@@ -176,9 +176,9 @@ impl DirectWriter {
     }
 
     /// Fsync the underlying file to ensure durability, through the
-    /// writer-metrics funnel.
-    pub(crate) fn sync_all(&self) -> io::Result<()> {
-        super::metrics::WRITER_METRICS.sync_recorded(&self.file)
+    /// writer-metrics funnel of `metrics`.
+    pub(crate) fn sync_all(&self, metrics: &super::metrics::WriterMetrics) -> io::Result<()> {
+        metrics.sync_recorded(&self.file)
     }
 }
 

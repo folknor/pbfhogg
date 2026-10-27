@@ -145,7 +145,7 @@ crate::counters::counter_set! {
         pub coop_wait_ns => "writer_coop_wait_ns",
     }
     extra {
-        /// Latch for [`WriterMetrics::emit_once`], so a process emits the
+        /// Latch for [`WriterMetrics::emit_once`], so an invocation emits the
         /// counter set exactly once no matter how many writers it flushes.
         emitted: AtomicBool = AtomicBool::new(false),
         /// The errno of the first `copy_file_range` refusal that routed a
@@ -165,8 +165,6 @@ impl WriterMetrics {
     fn record_sync_all(&self, start: Stopwatch) {
         start.record_ns(&self.sync_all_ns);
         self.sync_all_calls.fetch_add(1, Relaxed);
-        #[cfg(feature = "test-hooks")]
-        sync_observer::observe();
     }
 
     /// `fsync` `file` and record it, success or failure.
@@ -221,27 +219,27 @@ impl WriterMetrics {
         crate::counters::record_max(&self.reorder_high_water, len as u64);
     }
 
-    /// Emit the counters, at most once per process.
+    /// Emit the counters, at most once per invocation.
     ///
-    /// [`WriterMetrics`] is a process-global static that no writer instance
-    /// owns, so its numbers are process totals and nothing else. `emit` used
-    /// to be called from `PbfWriter::flush`, which meant a command that
-    /// constructs several writers - `multi-extract` builds one per region,
-    /// and holds them all open at once - emitted the same running cumulative
-    /// totals once per region. Verified on Denmark with `--regions 3`: three
-    /// `writer_bytes_framed` samples, all carrying the combined
-    /// three-region total. The totals were right; what they appeared to say
-    /// (one sample per region, therefore per-region numbers) was not.
+    /// The set belongs to the invocation, not to any writer, so its numbers
+    /// are the invocation's totals and nothing else (see the note at the end
+    /// of this module).
+    /// `emit` used to be called from `PbfWriter::flush`, which meant a
+    /// command that constructs several writers - `multi-extract` builds one
+    /// per region, and holds them all open at once - emitted the same running
+    /// cumulative totals once per region. Verified on Denmark with
+    /// `--regions 3`: three `writer_bytes_framed` samples, all carrying the
+    /// combined three-region total. The totals were right; what they appeared
+    /// to say (one sample per region, therefore per-region numbers) was not.
     ///
     /// Emitting exactly once removes the false per-writer reading. It does
-    /// **not** provide per-writer attribution - see the module docs on
-    /// [`WRITER_METRICS`] for what that would take.
+    /// **not** provide per-writer attribution.
     ///
-    /// A process that never wrote anything emits nothing at all: moving
-    /// emission to the process exit hook means every command reaches it,
-    /// including the read-only ones that never construct a `PbfWriter`, and
-    /// those would otherwise publish a full set of zeroes that a sidecar
-    /// reader has to recognise and discard.
+    /// An invocation that never wrote anything emits nothing at all: the
+    /// end-of-invocation emitter runs for every command, including the
+    /// read-only ones that never construct a `PbfWriter`, and those would
+    /// otherwise publish a full set of zeroes that a sidecar reader has to
+    /// recognise and discard.
     ///
     /// Returns `true` if this call did the emitting.
     pub fn emit_once(&self) -> bool {
@@ -257,7 +255,7 @@ impl WriterMetrics {
         let mut counters: Vec<(&'static str, u64)> = Vec::new();
         self.for_each(|name, value| counters.push((name, value)));
 
-        // An all-zero set means no writer ever ran in this process. Say
+        // An all-zero set means no writer ever ran in this invocation. Say
         // nothing rather than publishing thirty zeroes for every `inspect`.
         if counters.iter().all(|&(_, value)| value == 0) {
             return false;
@@ -269,105 +267,32 @@ impl WriterMetrics {
     }
 }
 
-/// Process-global writer counters.
-///
-/// # These are process totals, not per-writer numbers
-///
-/// Every `writer_*` sidecar counter is a total across every `PbfWriter` and
-/// output backend the process ever ran, plus publication's syncs of staged
-/// outputs (`writer_sync_all_*`): sums for the counts and times, the maximum
-/// for the `*_high_water` counters. For the single-writer commands - which is
-/// nearly all of them - that distinction is invisible. For `multi-extract`,
-/// which opens one `PbfWriter` per region and writes to all of them
-/// interleaved from parallel scopes, it means per-region attribution is
-/// simply not available: `writer_frame_ns` for a five-region run is the five
-/// regions' framing time added together. A library embedding that runs
-/// several commands in one process, or concurrently, gets their combined
-/// totals (`docs/guide/advanced.md` says so).
-///
-/// Emitting once per process ([`WriterMetrics::emit_once`]) makes that
-/// reading unambiguous rather than merely true.
-///
-/// # Why not one instance per writer
-///
-/// Weighed and declined. The sidecar reads these names as process totals
-/// (`*_wait_ns` are summed into `brokkr sidecar --stalls` as strictly
-/// monotonic values, maximum per name), so per-writer instances would have
-/// to be folded back into one process total before emission and would
-/// change nothing a sidecar reader sees; emitting them per writer, or under
-/// per-writer names, would break `--stalls` and every name-keyed comparison
-/// against stored runs. What per-instance ownership would buy is
-/// attribution nobody consumes, at the price of a handle at every recording
-/// site, including the framing jobs on the executor, which reach their
-/// scratch through a thread-local and have no writer to name. Tests that
-/// need an exact count of one run's fsyncs observe it per token instead
-/// (see [`with_sync_observer`]) rather than reading deltas of this total,
-/// which concurrent tests also move.
-pub(crate) static WRITER_METRICS: WriterMetrics = WriterMetrics::new();
-
-/// Run `f` with every `fsync` recorded on this thread also counted into
-/// `cancel`'s fault plan (`FaultPlan::sync_calls`), so a test can assert the
-/// exact number of fsyncs one run performed while other tests sync
-/// concurrently. Installed by each scope that finishes or publishes an
-/// output on its own thread: `FileOutputSink::finish`, the `pwrite` pool's
-/// and io_uring's durable finish, `PbfWriter`'s synchronous finalizer, and
-/// the three `publish` methods. A thread-local selects the active plan; the
-/// plan owns the count. The scope is a closure so the previous selection is
-/// always restored, on unwind too.
-///
-/// Without `test-hooks` this is `f()` and compiles to nothing.
-#[cfg(feature = "test-hooks")]
-pub(crate) fn with_sync_observer<R>(cancel: &crate::host::Invocation, f: impl FnOnce() -> R) -> R {
-    sync_observer::with(cancel, f)
-}
-
-/// See the `test-hooks` twin.
-#[cfg(not(feature = "test-hooks"))]
-#[inline(always)]
-pub(crate) fn with_sync_observer<R>(_cancel: &crate::host::Invocation, f: impl FnOnce() -> R) -> R {
-    f()
-}
-
-#[cfg(feature = "test-hooks")]
-mod sync_observer {
-    use std::cell::RefCell;
-
-    use crate::host::Invocation;
-
-    thread_local! {
-        /// The token whose plan counts this thread's fsyncs, if any. An owned
-        /// clone, so nothing can dangle.
-        static ACTIVE: RefCell<Option<Invocation>> = const { RefCell::new(None) };
-    }
-
-    /// Puts the previous selection back when the scope ends.
-    struct Restore(Option<Invocation>);
-
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let previous = self.0.take();
-            ACTIVE.with_borrow_mut(|active| *active = previous);
-        }
-    }
-
-    pub(super) fn with<R>(cancel: &Invocation, f: impl FnOnce() -> R) -> R {
-        let previous = ACTIVE.with_borrow_mut(|active| active.replace(cancel.clone()));
-        let _restore = Restore(previous);
-        // No borrow is held while `f` runs.
-        f()
-    }
-
-    pub(super) fn observe() {
-        ACTIVE.with_borrow(|active| {
-            if let Some(cancel) = active {
-                cancel
-                    .faults()
-                    .sync_calls
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
-    }
-}
+// # These are invocation totals, not per-writer numbers
+//
+// Every `writer_*` sidecar counter is a total across every `PbfWriter` and
+// output backend one invocation ran (the set lives on its
+// `crate::host::Invocation`, `crate::counters::InvocationMetrics`), plus
+// publication's syncs of its staged outputs (`writer_sync_all_*`): sums for
+// the counts and times, the maximum for the `*_high_water` counters. For the
+// single-writer commands - which is nearly all of them - that distinction is
+// invisible. For `multi-extract`, which opens one `PbfWriter` per region and
+// writes to all of them interleaved from parallel scopes, it means
+// per-region attribution is simply not available: `writer_frame_ns` for a
+// five-region run is the five regions' framing time added together. Two
+// invocations, concurrent or not, record into two sets.
+//
+// Emitting once per invocation (`WriterMetrics::emit_once`) makes that
+// reading unambiguous rather than merely true.
+//
+// # Why not one instance per writer
+//
+// Weighed and declined. The sidecar reads these names as totals (`*_wait_ns`
+// are summed into `brokkr sidecar --stalls` as strictly monotonic values,
+// maximum per name), so per-writer instances would have to be folded back
+// into one total before emission and would change nothing a sidecar reader
+// sees; emitting them per writer, or under per-writer names, would break
+// `--stalls` and every name-keyed comparison against stored runs. A test that
+// needs one run's exact count reads its own invocation's set.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -379,8 +304,7 @@ mod tests {
     /// Tested on the funnel rather than on one backend on purpose: a counter
     /// verified through a single backend is exactly how `sync_all_calls` came
     /// to be right in `FileWriter` and zero in the other two. On a fresh
-    /// instance, so the counts are exact: the global total moves with every
-    /// concurrent test that syncs.
+    /// instance, so the counts are exact.
     #[test]
     fn record_sync_all_bumps_calls_and_nanos_together() {
         let metrics = super::WriterMetrics::new();
@@ -400,10 +324,8 @@ mod tests {
 
     /// `emit_once` emits exactly once, however many times it is called.
     ///
-    /// Tested on a fresh instance rather than on the global static, because
-    /// the global's latch may already have been tripped by another test in
-    /// the same binary - which would make an assertion against it pass for
-    /// the wrong reason.
+    /// Tested on a fresh instance, whose latch no other test can have
+    /// tripped.
     #[test]
     fn emit_once_latches_after_the_first_call() {
         let metrics = super::WriterMetrics::new();
@@ -425,9 +347,9 @@ mod tests {
         }
     }
 
-    /// A process with no writer activity emits nothing.
+    /// An invocation with no writer activity emits nothing.
     ///
-    /// Emission moved to the CLI exit path, which every command reaches -
+    /// Emission is at the end of the invocation, which every command reaches -
     /// including `inspect` and the other read-only ones that never construct
     /// a `PbfWriter`. Without this gate each of them would publish a full set
     /// of zeroed `writer_*` counters.

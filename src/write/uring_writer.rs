@@ -30,7 +30,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc::{Receiver, SyncSender};
 
-use super::metrics::WRITER_METRICS;
+use super::metrics::WriterMetrics;
 use crate::direct_io::{alloc_aligned_zeroed, round_up};
 
 /// Registered file descriptor index for the output file.
@@ -161,6 +161,9 @@ struct UringState {
     logical_size: u64,
     /// Number of submitted but not yet completed SQEs.
     in_flight: u32,
+    /// The invocation whose writer counters the ring's submits, waits and
+    /// fsync record into.
+    invocation: crate::host::Invocation,
 }
 
 impl UringState {
@@ -266,8 +269,9 @@ impl UringState {
             .submitter()
             .submit()
             .map_err(|e| Error::from(e).context("io_uring submit failed"))?;
-        WRITER_METRICS.uring_submit_calls.fetch_add(1, Relaxed);
-        t_submit.record_ns(&WRITER_METRICS.uring_submit_ns);
+        let metrics = self.metrics();
+        metrics.uring_submit_calls.fetch_add(1, Relaxed);
+        t_submit.record_ns(&metrics.uring_submit_ns);
 
         self.write_offset += aligned_len as u64;
         self.in_flight += 1;
@@ -330,12 +334,9 @@ impl UringState {
                 .submit_and_wait(1)
                 .map_err(|e| Error::from(e).context("io_uring submit_and_wait failed"))?;
             let elapsed = t_wait.elapsed_ns();
-            WRITER_METRICS
-                .uring_submit_and_wait_calls
-                .fetch_add(1, Relaxed);
-            WRITER_METRICS
-                .uring_submit_and_wait_ns
-                .fetch_add(elapsed, Relaxed);
+            let metrics = self.metrics();
+            metrics.uring_submit_and_wait_calls.fetch_add(1, Relaxed);
+            metrics.uring_submit_and_wait_ns.fetch_add(elapsed, Relaxed);
         }
         for cqe in self.ring.completion() {
             let ud = cqe.user_data();
@@ -364,6 +365,11 @@ impl UringState {
             }
         }
         Ok(())
+    }
+
+    /// The writer counters of this ring's invocation.
+    fn metrics(&self) -> &WriterMetrics {
+        &self.invocation.metrics().writer
     }
 
     /// Drain all in-flight SQEs.
@@ -414,7 +420,7 @@ impl UringState {
         file.set_len(self.logical_size)?;
         if finish == super::Finish::Durable {
             // A path-constructor writer's own durability.
-            WRITER_METRICS.sync_recorded(file)?;
+            self.metrics().sync_recorded(file)?;
         }
         Ok(())
     }
@@ -704,11 +710,13 @@ fn uring_init_and_run(
         write_offset: 0,
         logical_size: 0,
         in_flight: 0,
+        invocation: cancel.clone(),
     };
 
     // Step 7: Write header, a handoff like any chunk.
-    WRITER_METRICS.time_handoff(|| state.write(framed_header))?;
-    WRITER_METRICS.record_accepted(framed_header.len() as u64);
+    let metrics = &cancel.metrics().writer;
+    metrics.time_handoff(|| state.write(framed_header))?;
+    metrics.record_accepted(framed_header.len() as u64);
 
     // Step 8: The shared ordered-delivery loop, into the ring's buffers. It
     // proves the stream complete before returning `Ok`; finalizing a short
@@ -720,10 +728,11 @@ fn uring_init_and_run(
             cancel,
         },
         expected,
+        metrics,
     )?;
 
     // Step 9: Flush and finalize.
-    crate::write::metrics::with_sync_observer(cancel, || state.flush_final(&file, finish))?;
+    state.flush_final(&file, finish)?;
 
     Ok(())
 }

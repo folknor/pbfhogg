@@ -70,8 +70,8 @@ and any consumer exit closes the gate and drops the result receiver before
 the scope joins. Work already admitted is not interrupted, but a failing run
 calls the consumer's `abandon` first, which altw stage 4 uses to abort its
 router so workers parked in its readiness wait are released before the
-join. Every run records its gate, send and receive waits into one
-process-wide set of stall counters (`ordered_pool_*_wait_ns`).
+join. Every run records its gate, send and receive waits into its
+invocation's one set of stall counters (`ordered_pool_*_wait_ns`).
 
 Where only some schedule positions are decoded and the rest are passthrough
 frames the consumer copies itself (extract, multi-extract's node pass, altw

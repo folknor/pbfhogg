@@ -39,17 +39,18 @@ mod string_table;
 
 pub(crate) mod metrics;
 
-/// Emit the `writer_*` sidecar counters, at most once per process.
+/// Emit `invocation`'s `writer_*` sidecar counters, at most once per
+/// invocation.
 ///
-/// Call this once, on the way out, after every `PbfWriter` in the process has
-/// been flushed - the CLI does so on its single exit path. Repeat calls are
-/// no-ops, so an early-return path may call it too.
+/// Call this once, on the way out, after every `PbfWriter` of the invocation
+/// has been flushed and its outputs published - the CLI does so on its single
+/// exit path. Repeat calls are no-ops, so an early-return path may call it
+/// too.
 ///
-/// The counters are process totals rather than per-writer numbers; see
-/// [`metrics::WRITER_METRICS`] for why, and for what per-writer attribution
-/// would cost.
-pub fn emit_writer_counters() {
-    metrics::WRITER_METRICS.emit_once();
+/// The counters are the invocation's totals rather than per-writer numbers;
+/// `write::metrics` says why.
+pub fn emit_writer_counters(invocation: &crate::host::Invocation) {
+    invocation.metrics().writer.emit_once();
 }
 
 /// Report, once each, the ways the writers' output or speed fell short of
@@ -65,11 +66,13 @@ pub fn emit_writer_counters() {
 ///   failure too.
 ///
 /// Call after dispatch, beside [`emit_writer_counters`]: the counts are the
-/// same process totals behind the `writer_tagdata_dropped_oversize` and
-/// `writer_copy_range_fallback_*` counters.
-pub fn report_writer_degradations(diagnostics: &crate::host::Diagnostics) {
+/// same invocation totals (of `host.invocation`) behind the
+/// `writer_tagdata_dropped_oversize` and `writer_copy_range_fallback_*`
+/// counters, reported to `host.diagnostics`.
+pub fn report_writer_degradations(host: &crate::host::Host) {
     use std::sync::atomic::Ordering::Relaxed;
-    let m = &metrics::WRITER_METRICS;
+    let diagnostics = &host.diagnostics;
+    let m = &host.invocation.metrics().writer;
     let dropped = m.tagdata_dropped_oversize.load(Relaxed);
     if dropped != 0 {
         crate::host::diag_once!(

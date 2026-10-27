@@ -16,7 +16,6 @@ use crate::tunables::{
 };
 
 use super::blob_wire::{BlobData, MAX_BLOB_MESSAGE_SIZE, WireBlob};
-use super::pipeline_metrics::DECOMPRESS_POOL_METRICS;
 
 thread_local! {
     /// Per-thread reusable zlib decompressor state (~32 KB inflate tables).
@@ -40,13 +39,18 @@ thread_local! {
 /// the `Bytes` (and the `PrimitiveBlock` holding slices of it) is dropped.
 pub(crate) struct DecompressPool {
     buffers: Mutex<Vec<Vec<u8>>>,
+    /// The invocation whose `pipeline_decompress_pool_*` counters this pool's
+    /// drops count into, also for a buffer returned after the call ended.
+    invocation: crate::host::Invocation,
 }
 
 impl DecompressPool {
-    /// Create a new empty pool wrapped in `Arc` for shared ownership.
-    pub fn new() -> Arc<Self> {
+    /// Create a new empty pool for `invocation`, wrapped in `Arc` for shared
+    /// ownership.
+    pub fn new(invocation: &crate::host::Invocation) -> Arc<Self> {
         Arc::new(Self {
             buffers: Mutex::new(Vec::new()),
+            invocation: invocation.clone(),
         })
     }
 
@@ -68,15 +72,16 @@ impl DecompressPool {
     /// Also enforces a count cap as defense-in-depth.
     fn put(&self, mut buf: Vec<u8>) {
         let capacity = buf.capacity();
+        let metrics = &self.invocation.metrics().decompress;
         if capacity > DECOMPRESS_POOL_MAX_RETAINED_CAPACITY {
-            DECOMPRESS_POOL_METRICS.record_oversize_drop(capacity);
+            metrics.record_oversize_drop(capacity);
             return;
         }
         buf.clear();
         match self.buffers.lock() {
             Ok(mut buffers) if buffers.len() < DECOMPRESS_POOL_MAX_BUFFERS => buffers.push(buf),
-            Ok(_) => DECOMPRESS_POOL_METRICS.record_full_drop(capacity),
-            Err(_) => DECOMPRESS_POOL_METRICS.record_poisoned_drop(capacity),
+            Ok(_) => metrics.record_full_drop(capacity),
+            Err(_) => metrics.record_poisoned_drop(capacity),
         }
     }
 }
@@ -561,7 +566,7 @@ mod tests {
 
     #[test]
     fn pooled_buffer_reserves_the_requested_capacity() {
-        let pool = DecompressPool::new();
+        let pool = DecompressPool::new(&crate::host::Invocation::new());
         let buffer = Vec::with_capacity(1024);
         let previous_capacity = buffer.capacity();
         pool.put(buffer);
@@ -574,6 +579,25 @@ mod tests {
             "pooled buffer capacity {} is below requested hint {requested_capacity}",
             buffer.capacity()
         );
+    }
+
+    /// A pool counts its drops into the invocation it was built for and no
+    /// other, so two invocations in one process keep their totals apart.
+    #[test]
+    fn pool_drops_count_into_their_own_invocation() {
+        use crate::tunables::DECOMPRESS_POOL_MAX_RETAINED_CAPACITY;
+        use std::sync::atomic::Ordering::Relaxed;
+        let ours = crate::host::Invocation::new();
+        let other = crate::host::Invocation::new();
+        let pool = DecompressPool::new(&ours);
+        let _other_pool = DecompressPool::new(&other);
+        pool.put(Vec::with_capacity(
+            DECOMPRESS_POOL_MAX_RETAINED_CAPACITY + 1,
+        ));
+        let ours = &ours.metrics().decompress;
+        assert_eq!(ours.oversize_drops.load(Relaxed), 1);
+        assert!(ours.oversize_drop_capacity_bytes.load(Relaxed) > 0);
+        assert_eq!(other.metrics().decompress.oversize_drops.load(Relaxed), 0);
     }
 
     /// Build a `WireBlob` whose *decompressed* payload is exactly `payload`.

@@ -386,6 +386,7 @@ fn time_filter_snapshot(
                     Some(indexdata.as_slice()),
                     tagdata.as_deref(),
                     way_members.as_deref(),
+                    &host.invocation.metrics().writer,
                 )?;
                 framed.push(blob.into_vec());
             }

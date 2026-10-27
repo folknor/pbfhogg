@@ -75,11 +75,15 @@ impl<R: Read + Send> ElementReader<R> {
         self
     }
 
-    /// Stop once `cancel` is tripped: every iteration method then returns
-    /// `ErrorKind::Cancelled` at its next blob instead of finishing the file.
+    /// Run this reader under `invocation` ([`BlobReader::invocation`]):
+    /// every iteration method returns `ErrorKind::Cancelled` at its next blob
+    /// once the token is tripped, and every counter the iteration records
+    /// counts into it. The header blob was read at construction, under the
+    /// reader's own token; [`ElementReader::open_with`] binds the invocation
+    /// from the open.
     #[must_use]
-    pub fn cancel(mut self, cancel: crate::host::Invocation) -> Self {
-        self.blob_iter = self.blob_iter.cancel(cancel);
+    pub fn invocation(mut self, invocation: crate::host::Invocation) -> Self {
+        self.blob_iter = self.blob_iter.invocation(invocation);
         self
     }
 
@@ -544,7 +548,7 @@ where
     );
     let queue = Arc::new(BatchQueue::new());
     let budget = Arc::new(ByteBudget::new(budget_cap));
-    let pool = DecompressPool::new();
+    let pool = DecompressPool::new(blob_iter.cancel_token());
     // Captured once; every worker borrows it to locate decode failures.
     let source = blob_iter.source().cloned();
     let source = source.as_ref();
@@ -1107,17 +1111,32 @@ impl ElementReader<FileReader> {
         self
     }
 
-    /// Open a file for a command run under `host`: buffered or O_DIRECT per
-    /// `direct`, with the host's diagnostics, resources and page-cache policy,
-    /// the latter applied before the header blob is read. As a command input
-    /// it refuses a partially indexed file in every iteration mode, whatever
-    /// blob filter is set ([`BlobReader::open_in`]).
+    /// Open a file under `host`: buffered or O_DIRECT per `direct`, with the
+    /// host's diagnostics, resources, page-cache policy and invocation, all
+    /// applied before the header blob is read. Like the other public
+    /// constructors it reads any file, partially indexed or not.
+    pub fn open_with<'a>(
+        source: impl Into<crate::read::input::InputSource<'a>>,
+        direct: bool,
+        host: &crate::host::Host,
+    ) -> Result<Self> {
+        Self::with_blobs(BlobReader::open_with(source, direct, host)?, host)
+    }
+
+    /// Open a file for a command run under `host` ([`Self::open_with`]). As a
+    /// command input it refuses a partially indexed file in every iteration
+    /// mode, whatever blob filter is set ([`BlobReader::open_in`]).
     pub(crate) fn open_in<'a>(
         source: impl Into<crate::read::input::InputSource<'a>>,
         direct: bool,
         host: &crate::host::Host,
     ) -> Result<Self> {
-        let mut blob_iter = BlobReader::open_in(source, direct, host)?;
+        Self::with_blobs(BlobReader::open_in(source, direct, host)?, host)
+    }
+
+    /// An element reader over `blob_iter`, opened under `host`: reads the
+    /// header blob.
+    fn with_blobs(mut blob_iter: BlobReader<FileReader>, host: &crate::host::Host) -> Result<Self> {
         let header = read_header_blob(&mut blob_iter)?;
         Ok(Self {
             blob_iter,

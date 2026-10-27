@@ -43,14 +43,15 @@ use std::time::Instant;
 /// ```
 ///
 /// Generates the struct (one `AtomicU64` per counter, then the extra fields),
-/// a `const fn new()` (so a set can back a `static`), `Default`, and two
-/// **private** methods: `for_each(|name, value|)`, which visits every counter
-/// in declaration order with its emitted name and its value (loaded, then
-/// divided by the optional divisor), and `emit_all()`, which publishes that
+/// a `const fn new()`, `Default`, and two methods: `for_each(|name, value|)`
+/// (crate-visible, read-only), which visits every counter in declaration
+/// order with its emitted name and its value (loaded, then divided by the
+/// optional divisor), and the **private** `emit_all()`, which publishes that
 /// visit through `crate::debug::emit_counter` (saturating at `i64::MAX`).
-/// Private inherent methods are reachable only from the module that invokes
+/// A private inherent method is reachable only from the module that invokes
 /// the macro and its children, so a set whose emission is restricted to one
-/// route (the process-exit hooks) keeps that route as its only public way out.
+/// route (the end-of-invocation emitters) keeps that route as its only way
+/// out.
 ///
 /// A counter written without `=> name` is declared in place (so it keeps its
 /// position among its neighbours) but neither visited nor emitted: its
@@ -100,7 +101,7 @@ macro_rules! counter_set {
             /// Visit every named counter in declaration order: its emitted
             /// name and its current value, divided by its divisor if it has
             /// one. Unnamed counters are skipped.
-            fn for_each(&self, mut visit: impl FnMut(&'static str, u64)) {
+            pub(crate) fn for_each(&self, mut visit: impl FnMut(&'static str, u64)) {
                 $($(
                     visit(
                         $emit,
@@ -123,6 +124,68 @@ macro_rules! counter_set {
     };
 }
 pub(crate) use counter_set;
+
+/// One metric set on cache lines of its own.
+///
+/// The sets of an [`InvocationMetrics`] sit in the invocation's allocation
+/// beside its cancellation flag, which every checkpoint reads on many
+/// threads. Aligning each set to 128 bytes (two lines, for the adjacent-line
+/// prefetcher) keeps a hot counter from sharing a line with the flag or with
+/// another set; within a set the counters share lines exactly as they did
+/// when each set was its own static.
+#[repr(align(128))]
+#[derive(Default)]
+pub(crate) struct Padded<T>(pub(crate) T);
+
+impl<T> std::ops::Deref for Padded<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+/// Every engine-level metric set of one invocation.
+///
+/// These used to be process-global statics that were never reset, so two
+/// library calls in one process, concurrent or one after the other, added
+/// into the same totals (ADR-0016 says the library owns no process state).
+/// Each [`crate::host::Invocation`] now owns one of these, and every pass of
+/// that invocation records into it: a run that reads twice still reports the
+/// sum of both passes under the same names, and the CLI, one invocation per
+/// process, reports exactly the totals it did when the sets were statics.
+///
+/// Each counter only grows for the life of the invocation (sums for counts
+/// and waits, maxima for the high-water and peak counters), which is what
+/// `brokkr sidecar --stalls` assumes when it takes the maximum per name.
+///
+/// Command-local sets (renumber's, altw's, apply-changes's) are not here:
+/// they were always locals of their run.
+#[derive(Default)]
+pub(crate) struct InvocationMetrics {
+    pub(crate) pipeline: Padded<crate::read::pipeline_metrics::PipelineMetrics>,
+    pub(crate) decompress: Padded<crate::read::pipeline_metrics::DecompressPoolMetrics>,
+    pub(crate) unordered: Padded<crate::scan::classify::UnorderedPoolMetrics>,
+    pub(crate) ordered: Padded<crate::ordered_pool::OrderedPoolMetrics>,
+    pub(crate) writer: Padded<crate::write::metrics::WriterMetrics>,
+    pub(crate) fadvise: Padded<crate::fadvise::FadviseMetrics>,
+    /// Latch for the end-of-invocation read emission
+    /// (`crate::read::emit_read_counters`), so repeat calls are no-ops.
+    pub(crate) read_emitted: std::sync::atomic::AtomicBool,
+}
+
+impl InvocationMetrics {
+    /// Visit every counter of every set, in a fixed order, with the name it
+    /// is emitted under and its current value.
+    pub(crate) fn for_each(&self, mut visit: impl FnMut(&'static str, u64)) {
+        self.pipeline.for_each(&mut visit);
+        self.decompress.for_each(&mut visit);
+        self.unordered.for_each(&mut visit);
+        self.ordered.for_each(&mut visit);
+        self.writer.for_each(&mut visit);
+        self.fadvise.for_each(&mut visit);
+    }
+}
 
 /// Raise `field` to `candidate` if `candidate` is larger.
 ///

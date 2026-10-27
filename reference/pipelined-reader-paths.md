@@ -80,13 +80,14 @@ decoding, blocked-on-send, channel-held, and reorder-held items are
 capped together. `pipeline_reorder_high_water` records filled slots
 and `pipeline_reorder_window_high_water` records the old gap-inclusive
 window diagnostic. Those and the other `pipeline_*` counters are
-process totals, never reset: every pipelined read adds into one set and
-emits the whole set after its stages have joined. Every counter only
-grows, so the maximum emitted value of each name is the process total
-(for sequential reads, simply the last emission; concurrent reads can
-emit out of order), which is how `brokkr sidecar --stalls` reads
-`*_wait_ns`. They are
-not per-read numbers by design; `src/read/pipeline_metrics.rs` says why.
+invocation totals, never reset: every pipelined read of one invocation
+(the `Invocation` its reader was opened under) adds into that
+invocation's set and emits the whole set after its stages have joined.
+Every counter only grows, so the maximum emitted value of each name is
+the invocation's total (for sequential reads, simply the last emission;
+concurrent reads can emit out of order), which is how `brokkr sidecar
+--stalls` reads `*_wait_ns`. They are not per-read numbers by design;
+`src/read/pipeline_metrics.rs` says why.
 Dropping `PipelinedBlocks` or returning an error
 from a block closure closes the decoded receiver before the scoped
 threads join, so stage 1 stops promptly instead of reading the rest of

@@ -49,7 +49,11 @@ pub(crate) fn payload_path(scratch: &RunScratch, index: usize) -> Result<Scratch
 /// management, not the caller's page-cache policy (ADR-0016), and it runs in
 /// every Linux build: it used to compile only with the `linux-direct-io`
 /// feature, which has nothing to do with it. Returns whether the advice was
-/// given (false off Linux), for the stage counters.
-pub(crate) fn advise_dontneed_file(file: &std::fs::File) -> bool {
-    crate::fadvise::advise(file, 0, 0, crate::fadvise::Advice::DontNeed)
+/// given (false off Linux), for the stage counters; a failure counts into
+/// `invocation`.
+pub(crate) fn advise_dontneed_file(
+    file: &std::fs::File,
+    invocation: &crate::host::Invocation,
+) -> bool {
+    crate::fadvise::advise(file, 0, 0, crate::fadvise::Advice::DontNeed, invocation)
 }

@@ -443,7 +443,14 @@ fn run_kind_phase(
         None,
         || (),
         |block, _state| -> PhaseResult {
-            worker_split_blob(block, kind, cap, preserve_locations, &compression)
+            worker_split_blob(
+                block,
+                kind,
+                cap,
+                preserve_locations,
+                &compression,
+                &host.invocation.metrics().writer,
+            )
         },
         |_position, item| {
             let WorkerOutput { full_framed, tail } = item;
@@ -602,6 +609,7 @@ fn worker_split_blob(
     cap_nz: std::num::NonZeroUsize,
     preserve_locations: bool,
     compression: &Compression,
+    metrics: &crate::write::metrics::WriterMetrics,
 ) -> crate::Result<WorkerOutput> {
     let cap = cap_nz.get();
     // Trust: the schedule put this blob in this kind's phase because its
@@ -702,7 +710,7 @@ fn worker_split_blob(
                 _ => {}
             }
             for owned_block in output.drain(..) {
-                full_framed.push(frame_owned(owned_block, compression)?);
+                full_framed.push(frame_owned(owned_block, compression, metrics)?);
             }
         } else {
             // Tail path: own and ship to the merge thread.
@@ -726,7 +734,7 @@ fn worker_split_blob(
     // multiple of `cap`, the BB holds the last cap elements unflushed.
     flush_local(&mut bb, &mut output)?;
     for owned_block in output.drain(..) {
-        full_framed.push(frame_owned(owned_block, compression)?);
+        full_framed.push(frame_owned(owned_block, compression, metrics)?);
     }
 
     Ok(WorkerOutput { full_framed, tail })
@@ -735,7 +743,11 @@ fn worker_split_blob(
 /// Frame a single `OwnedBlock` to wire bytes. Worker-side helper; uses
 /// the thread-local `PIPELINE_SCRATCH` so it's safe to call from any
 /// rayon / `parallel_classify_phase` worker.
-fn frame_owned(owned: OwnedBlock, compression: &Compression) -> crate::Result<Vec<u8>> {
+fn frame_owned(
+    owned: OwnedBlock,
+    compression: &Compression,
+    metrics: &crate::write::metrics::WriterMetrics,
+) -> crate::Result<Vec<u8>> {
     let OwnedBlock {
         bytes: block_bytes,
         index,
@@ -749,6 +761,7 @@ fn frame_owned(owned: OwnedBlock, compression: &Compression) -> crate::Result<Ve
         Some(indexdata.as_slice()),
         tagdata.as_deref(),
         way_members.as_deref(),
+        metrics,
     )?;
     Ok(blob.into_vec())
 }
@@ -765,6 +778,8 @@ fn frame_and_write_batch(
 ) -> Result<u64> {
     use rayon::prelude::*;
 
+    let invocation = writer.cancel_token().clone();
+    let metrics = &invocation.metrics().writer;
     let framed: Vec<Result<Vec<u8>>> = executor.install(|| {
         batch
             .into_par_iter()
@@ -783,6 +798,7 @@ fn frame_and_write_batch(
                         Some(indexdata.as_slice()),
                         tagdata.as_deref(),
                         way_members.as_deref(),
+                        metrics,
                     )?;
                     Ok(blob.into_vec())
                 },

@@ -560,9 +560,9 @@ impl BlockState {
 /// (see [`BlockPairSide::decode`]).
 pub(crate) type MergeBuffers = std::sync::Arc<crate::blob::DecompressPool>;
 
-/// A fresh, empty [`MergeBuffers`] for one merge.
-pub(crate) fn merge_buffers() -> MergeBuffers {
-    crate::blob::DecompressPool::new()
+/// A fresh, empty [`MergeBuffers`] for one merge of `invocation`.
+pub(crate) fn merge_buffers(invocation: &crate::host::Invocation) -> MergeBuffers {
+    crate::blob::DecompressPool::new(invocation)
 }
 
 /// Decompress and parse a blob's block into a buffer from `pool`, which the

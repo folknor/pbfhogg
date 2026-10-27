@@ -140,7 +140,7 @@ pub(super) fn try_extract_multi_single_pass(
         )?
         .bytes;
         let completion = output.begin_write()?;
-        let mut w = PbfWriter::to_staged_file(output.path(), compression)
+        let mut w = PbfWriter::to_staged_file(output.path(), compression, &host.invocation)
             .map_err(|e| e.context(format!("failed to create {}", display_path.display())))?
             .with_completion(completion);
         // The writer names its output in any error it returns.
@@ -844,7 +844,7 @@ where
             cancel: &host.invocation,
             waits: crate::ordered_pool::Waits::default(),
         },
-        |_| MultiLocal::new(n),
+        |_| MultiLocal::new(n, &host.invocation),
         |(), local: &mut MultiLocal, ordinal| {
             let entry = &schedule[decode_at[ordinal]];
             let block = local.decode(input, entry)?;
@@ -873,12 +873,12 @@ struct MultiLocal {
 }
 
 impl MultiLocal {
-    fn new(n: usize) -> Self {
+    fn new(n: usize, invocation: &crate::host::Invocation) -> Self {
         Self {
             read_buf: Vec::new(),
             bbs: (0..n).map(|_| BlockBuilder::new()).collect(),
             output: (0..n).map(|_| Vec::new()).collect(),
-            pool: crate::blob::DecompressPool::new(),
+            pool: crate::blob::DecompressPool::new(invocation),
             st_scratch: Vec::new(),
             gr_scratch: Vec::new(),
             i64_scratch: Vec::new(),
@@ -1054,7 +1054,7 @@ where
         schedule,
         None,
         None,
-        || MultiLocal::new(n),
+        || MultiLocal::new(n, &host.invocation),
         |block, local: &mut MultiLocal| local.classify(block, n, &block_fn),
         |_position, item| write_regions(item, writers, stats, stat_field),
         host,

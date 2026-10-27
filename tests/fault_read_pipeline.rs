@@ -56,7 +56,7 @@ fn admission_high_water_bounded_under_slow_first_decode() {
         handle: Some(std::thread::spawn(move || {
             let result = ElementReader::from_path(&path)
                 .unwrap()
-                .cancel(reader_cancel)
+                .invocation(reader_cancel)
                 .read_ahead(1)
                 .decode_ahead(2)
                 .for_each_block_pipelined(|_| Ok(()));

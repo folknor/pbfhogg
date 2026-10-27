@@ -81,7 +81,7 @@ impl<'a> InputFront<'a> {
         let source = source.into();
         let path = source.path();
         let mut frames = super::front_frames(
-            FileReader::open(source, direct_io)?,
+            FileReader::open_in(source, direct_io, &host.invocation)?,
             path,
             &host.diagnostics,
             &host.invocation,

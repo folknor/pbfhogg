@@ -11,16 +11,20 @@ use std::sync::atomic::Ordering::Relaxed;
 
 #[cfg(feature = "linux-direct-io")]
 use super::direct_writer::DirectWriter;
-use super::metrics::WRITER_METRICS;
+use super::metrics::WriterMetrics;
 
 /// A file writer that is either buffered (normal) or direct I/O (`O_DIRECT`).
 ///
-/// Implements [`Write`] by delegating to the active variant.
-// Making these variants private would break callers that construct or match
-// them. Keep that API: generic `PbfWriter::new` accepts caller-owned writers,
-// while `PbfWriter::to_path_sync` is the separate path-owned API with a fixed
-// buffer and explicit sync-on-flush behavior.
-pub enum FileWriter {
+/// Implements [`Write`] by delegating to the active variant. Its write and
+/// sync counters (`writer_buffered_write_*`, `writer_direct_write_*`,
+/// `writer_sync_all_*`) count into the invocation it was opened under; the
+/// public constructors open it under a fresh one of its own.
+pub struct FileWriter {
+    inner: Inner,
+    invocation: crate::host::Invocation,
+}
+
+enum Inner {
     /// Buffered output; `FileWriter::buffered` uses a 256 KiB buffer.
     Buffered(BufWriter<File>),
 
@@ -32,17 +36,35 @@ pub enum FileWriter {
 impl FileWriter {
     /// Create a buffered file writer (default path).
     pub fn buffered(path: &Path) -> crate::Result<Self> {
+        Self::buffered_in(path, &crate::host::Invocation::new())
+    }
+
+    /// [`FileWriter::buffered`] under `invocation`: its write and sync
+    /// counters record there. A `PbfWriter` composed over it
+    /// ([`PbfWriter::new_in`](crate::writer::PbfWriter::new_in)) should be
+    /// given the same invocation, or its totals are split across two.
+    pub fn buffered_in(path: &Path, invocation: &crate::host::Invocation) -> crate::Result<Self> {
         let file = super::create_backend_file(path)?;
-        Ok(FileWriter::Buffered(BufWriter::with_capacity(
-            crate::write::IO_BUF_BYTES,
-            file,
-        )))
+        Ok(Self {
+            inner: Inner::Buffered(BufWriter::with_capacity(crate::write::IO_BUF_BYTES, file)),
+            invocation: invocation.clone(),
+        })
     }
 
     /// Create an `O_DIRECT` file writer.
     #[cfg(feature = "linux-direct-io")]
     pub fn direct(path: &Path) -> crate::Result<Self> {
-        Ok(FileWriter::Direct(DirectWriter::create(path)?))
+        Self::direct_in(path, &crate::host::Invocation::new())
+    }
+
+    /// [`FileWriter::direct`] under `invocation` (see
+    /// [`FileWriter::buffered_in`]).
+    #[cfg(feature = "linux-direct-io")]
+    pub fn direct_in(path: &Path, invocation: &crate::host::Invocation) -> crate::Result<Self> {
+        Ok(Self {
+            inner: Inner::Direct(DirectWriter::create(path)?),
+            invocation: invocation.clone(),
+        })
     }
 
     /// Flush buffered bytes and then `fsync` the file: finish *and* make
@@ -66,10 +88,11 @@ impl FileWriter {
     /// `fsync` error, `EINVAL` included.
     pub fn sync(&mut self) -> crate::Result<()> {
         self.flush()?;
-        let result = match self {
-            FileWriter::Buffered(w) => sync_file(w.get_ref()),
+        let metrics = &self.invocation.metrics().writer;
+        let result = match &mut self.inner {
+            Inner::Buffered(w) => sync_file(w.get_ref(), metrics),
             #[cfg(feature = "linux-direct-io")]
-            FileWriter::Direct(w) => w.sync_all(),
+            Inner::Direct(w) => w.sync_all(metrics),
         };
         Ok(result?)
     }
@@ -79,8 +102,8 @@ impl FileWriter {
 /// "this target does not support synchronization" as success. The file type
 /// is only consulted after the `fsync` has already failed, so the
 /// regular-file success path is exactly one `fsync`.
-pub(super) fn sync_file(file: &File) -> io::Result<()> {
-    let synced = WRITER_METRICS.sync_recorded(file);
+pub(super) fn sync_file(file: &File, metrics: &WriterMetrics) -> io::Result<()> {
+    let synced = metrics.sync_recorded(file);
     match synced {
         Err(e) if sync_unsupported(e.raw_os_error(), || file_type(file)) => Ok(()),
         other => other,
@@ -142,35 +165,32 @@ impl FileWriter {
     /// wherever the copy leaves it. The returned borrow keeps this writer
     /// from being written meanwhile.
     pub(crate) fn flush_and_file(&mut self) -> io::Result<Option<&std::fs::File>> {
-        match self {
-            FileWriter::Buffered(w) => {
+        match &mut self.inner {
+            Inner::Buffered(w) => {
                 w.flush()?;
                 Ok(Some(w.get_ref()))
             }
             #[cfg(feature = "linux-direct-io")]
-            FileWriter::Direct(_) => Ok(None),
+            Inner::Direct(_) => Ok(None),
         }
     }
 }
 
 impl Write for FileWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            FileWriter::Buffered(w) => {
+        let metrics = &self.invocation.metrics().writer;
+        match &mut self.inner {
+            Inner::Buffered(w) => {
                 let n = w.write(buf)?;
-                WRITER_METRICS.buffered_write_calls.fetch_add(1, Relaxed);
-                WRITER_METRICS
-                    .buffered_write_bytes
-                    .fetch_add(n as u64, Relaxed);
+                metrics.buffered_write_calls.fetch_add(1, Relaxed);
+                metrics.buffered_write_bytes.fetch_add(n as u64, Relaxed);
                 Ok(n)
             }
             #[cfg(feature = "linux-direct-io")]
-            FileWriter::Direct(w) => {
+            Inner::Direct(w) => {
                 let n = w.write(buf)?;
-                WRITER_METRICS.direct_write_calls.fetch_add(1, Relaxed);
-                WRITER_METRICS
-                    .direct_write_bytes
-                    .fetch_add(n as u64, Relaxed);
+                metrics.direct_write_calls.fetch_add(1, Relaxed);
+                metrics.direct_write_bytes.fetch_add(n as u64, Relaxed);
                 Ok(n)
             }
         }
@@ -184,10 +204,10 @@ impl Write for FileWriter {
     /// that padding removal is part of pushing the bytes onward, not part of
     /// durability.
     fn flush(&mut self) -> io::Result<()> {
-        match self {
-            FileWriter::Buffered(w) => w.flush(),
+        match &mut self.inner {
+            Inner::Buffered(w) => w.flush(),
             #[cfg(feature = "linux-direct-io")]
-            FileWriter::Direct(w) => w.flush(),
+            Inner::Direct(w) => w.flush(),
         }
     }
 }
@@ -196,10 +216,7 @@ impl Write for FileWriter {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::FileWriter;
-    #[cfg(feature = "test-hooks")]
-    use crate::write::metrics::with_sync_observer;
     use std::io::Write;
-    #[cfg(feature = "test-hooks")]
     use std::sync::atomic::Ordering::Relaxed;
 
     /// `Write::flush` must push bytes onward, and must not `fsync`.
@@ -207,25 +224,21 @@ mod tests {
     /// `FileWriter::flush` used to call `sync_all()`, so every incidental
     /// flush - a wrapping `BufWriter`, a generic helper, a library consumer
     /// following `Write` semantics - bought a full fsync. The loop below is
-    /// exactly that kind of caller. The fsyncs are counted on this test's own
-    /// token (`with_sync_observer`), so the counts are exact; the process
-    /// total in `WRITER_METRICS` moves with every concurrent test that syncs.
-    #[cfg(feature = "test-hooks")]
+    /// exactly that kind of caller. The fsyncs are counted on this writer's
+    /// own invocation, so the counts are exact.
     #[test]
     fn flush_pushes_bytes_onward_without_fsyncing() {
         let dir = crate::path_guard::tests::scratch();
         let path = dir.path().join("flush-is-not-fsync.bin");
-        let mut w = FileWriter::buffered(&path).unwrap();
         let token = crate::host::Invocation::new();
-        let syncs = || token.faults().sync_calls.load(Relaxed);
+        let mut w = FileWriter::buffered_in(&path, &token).unwrap();
+        let syncs = || token.metrics().writer.sync_all_calls.load(Relaxed);
 
         const FLUSHES: usize = 64;
-        with_sync_observer(&token, || {
-            for i in 0..FLUSHES {
-                w.write_all(&[u8::try_from(i % 256).unwrap()]).unwrap();
-                w.flush().unwrap();
-            }
-        });
+        for i in 0..FLUSHES {
+            w.write_all(&[u8::try_from(i % 256).unwrap()]).unwrap();
+            w.flush().unwrap();
+        }
         assert_eq!(
             syncs(),
             0,
@@ -242,7 +255,7 @@ mod tests {
         );
 
         // The durability that `flush` gave up is available by name.
-        with_sync_observer(&token, || w.sync()).unwrap();
+        w.sync().unwrap();
         assert_eq!(syncs(), 1, "sync() must fsync exactly once");
     }
 

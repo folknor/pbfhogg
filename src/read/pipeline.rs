@@ -5,7 +5,7 @@
 
 use super::blob::{BlobReader, BlobType, DecompressPool};
 use super::block::PrimitiveBlock;
-use super::pipeline_metrics::PIPELINE_METRICS;
+use super::pipeline_metrics::PipelineMetrics;
 use crate::blob_meta::BlobFilter;
 use crate::error::Result;
 use crate::reorder_buffer::ReorderBuffer;
@@ -261,10 +261,11 @@ fn send_direct_error<T>(
     tx: &SyncSender<DecodedItem<T>>,
     seq: usize,
     e: crate::error::Error,
+    metrics: &PipelineMetrics,
 ) -> bool {
     let t_send = crate::counters::Stopwatch::start();
     let sent = tx.send((seq, Some(Err(e)), None)).is_ok();
-    t_send.record_ns(&PIPELINE_METRICS.decoded_send_wait_ns);
+    t_send.record_ns(&metrics.decoded_send_wait_ns);
     sent
 }
 
@@ -282,6 +283,8 @@ struct DecodeTask<'scope, X: DecodeTransform> {
     /// dispatcher (captured once per pipeline, no per-blob refcounting) so a
     /// decode failure can be located with the blob's true provenance.
     source: Option<&'scope Arc<Path>>,
+    /// The invocation's pipeline counters, borrowed like `source`.
+    metrics: &'scope PipelineMetrics,
     /// The run's fault plan (the decode gate), borrowed like `source`.
     #[cfg(feature = "test-hooks")]
     faults: &'scope crate::test_hooks::FaultPlan,
@@ -301,6 +304,7 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
         shutdown,
         transform,
         source,
+        metrics,
         #[cfg(feature = "test-hooks")]
         faults,
     } = task;
@@ -321,9 +325,7 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
                 && let Some(filter) = blob_filter.as_ref()
                 && should_skip_blob(filter, &blob)
             {
-                PIPELINE_METRICS
-                    .blobs_skipped_by_filter
-                    .fetch_add(1, Relaxed);
+                metrics.blobs_skipped_by_filter.fetch_add(1, Relaxed);
                 return None;
             }
             let decode = || {
@@ -333,8 +335,8 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
                             blob.to_primitiveblock_inline_with_scratch(&buffer_pool, st, gr);
                         // Per-thread scratch retention is the iter-5 residual
                         // alloc bucket. Record current capacity in (u32, u32)
-                        // pairs * 8 bytes for the global peak.
-                        PIPELINE_METRICS.record_scratch_capacity(
+                        // pairs * 8 bytes for the invocation's peak.
+                        metrics.record_scratch_capacity(
                             st.capacity().saturating_mul(8),
                             gr.capacity().saturating_mul(8),
                         );
@@ -359,7 +361,7 @@ fn spawn_decode_task<'scope, X: DecodeTransform>(
         if tx.send((seq, item, Some(permit))).is_err() {
             shutdown.store(true, Relaxed);
         }
-        t_send.record_ns(&PIPELINE_METRICS.decoded_send_wait_ns);
+        t_send.record_ns(&metrics.decoded_send_wait_ns);
     });
 }
 
@@ -400,18 +402,19 @@ where
     let mut pending: ReorderBuffer<(Option<Result<T>>, Option<Permit>)> =
         ReorderBuffer::with_capacity(decode_ahead);
 
+    let metrics = &cancel.metrics().pipeline;
     loop {
         cancel.check()?;
         let t_recv = crate::counters::Stopwatch::start();
         let next = decoded_rx.recv();
-        t_recv.record_ns(&PIPELINE_METRICS.decoded_recv_wait_ns);
+        t_recv.record_ns(&metrics.decoded_recv_wait_ns);
         let (seq, item, permit) = match next {
             Ok(pair) => pair,
             Err(_) => break,
         };
         cancel.check()?;
         pending.push(seq, (item, permit));
-        PIPELINE_METRICS.record_reorder_levels(pending.filled_len(), pending.pending_len());
+        metrics.record_reorder_levels(pending.filled_len(), pending.pending_len());
         #[cfg(feature = "test-hooks")]
         cancel.faults().record_reorder_filled(pending.filled_len());
 
@@ -504,12 +507,15 @@ where
     // reference, not the token.
     #[cfg(feature = "test-hooks")]
     let faults = cancel.faults();
+    let metrics: &PipelineMetrics = &cancel.metrics().pipeline;
+    // The decode pool's buffers count their drops into the same invocation.
+    let invocation = &cancel;
     let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead.get());
     let (decoded_tx, decoded_rx) =
         sync_channel::<DecodedItem<X::Out>>(pipeline_config.decode_ahead.get());
 
     // Declared before the scope so it drops after the scope has joined.
-    let _emit = EmitOnDrop;
+    let _emit = EmitOnDrop(metrics);
     let result = std::thread::scope(|scope| {
         // Stage 1: Sequential I/O reader thread
         scope.spawn(move || {
@@ -517,7 +523,7 @@ where
                 unindexed.observe(&blob_result, &diagnostics);
                 let t_send = crate::counters::Stopwatch::start();
                 let send_result = raw_tx.send((seq, blob_result));
-                t_send.record_ns(&PIPELINE_METRICS.raw_send_wait_ns);
+                t_send.record_ns(&metrics.raw_send_wait_ns);
                 if send_result.is_err() {
                     break; // receiver dropped, pipeline shutting down
                 }
@@ -581,7 +587,7 @@ where
                     return;
                 }
             };
-            let buffer_pool = DecompressPool::new();
+            let buffer_pool = DecompressPool::new(invocation);
             let gate = Arc::new(AdmissionGate::new(pipeline_config.decode_ahead));
             let shutdown = Arc::new(AtomicBool::new(false));
             // Tasks borrow the reader's path from this scope: one capture per
@@ -596,12 +602,12 @@ where
                         Ok(blob) => {
                             let t_admit = crate::counters::Stopwatch::start();
                             let blocked = gate.acquire();
-                            t_admit.record_ns(&PIPELINE_METRICS.decode_admit_wait_ns);
+                            t_admit.record_ns(&metrics.decode_admit_wait_ns);
                             if blocked {
-                                PIPELINE_METRICS.decode_admit_blocked.fetch_add(1, Relaxed);
+                                metrics.decode_admit_blocked.fetch_add(1, Relaxed);
                             }
                             let permit = Permit(Arc::clone(&gate));
-                            PIPELINE_METRICS.decode_tasks.fetch_add(1, Relaxed);
+                            metrics.decode_tasks.fetch_add(1, Relaxed);
                             spawn_decode_task(
                                 task_scope,
                                 DecodeTask {
@@ -614,13 +620,14 @@ where
                                     shutdown: Arc::clone(&shutdown),
                                     transform,
                                     source,
+                                    metrics,
                                     #[cfg(feature = "test-hooks")]
                                     faults,
                                 },
                             );
                         }
                         Err(e) => {
-                            if !send_direct_error(&dispatch_tx, seq, e) {
+                            if !send_direct_error(&dispatch_tx, seq, e, metrics) {
                                 break;
                             }
                         }
@@ -645,19 +652,20 @@ where
     // (the guard emits on unwind). So the snapshot includes the waits
     // recorded while the stages shut down (an error, a cancellation or an
     // early drop wakes blocked senders, which record their waits after the
-    // consumer has returned). Process-wide pool-drop totals are emitted
-    // separately by the host after dispatch.
+    // consumer has returned). The invocation's pool-drop totals are emitted
+    // separately, after dispatch.
     result
 }
 
-/// Emits [`PIPELINE_METRICS`] when dropped: after a run's scope has joined its
-/// stages, whether the run returned or unwound. The same mechanism as the
-/// ordered pool engine's and the unordered classify pools' guards.
-struct EmitOnDrop;
+/// Emits the invocation's [`PipelineMetrics`] when dropped: after a run's
+/// scope has joined its stages, whether the run returned or unwound. The same
+/// mechanism as the ordered pool engine's and the unordered classify pools'
+/// guards.
+struct EmitOnDrop<'a>(&'a PipelineMetrics);
 
-impl Drop for EmitOnDrop {
+impl Drop for EmitOnDrop<'_> {
     fn drop(&mut self) {
-        PIPELINE_METRICS.emit();
+        self.0.emit();
     }
 }
 

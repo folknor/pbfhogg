@@ -53,9 +53,14 @@ pub(crate) fn direct_reads_unsupported() -> Error {
 impl FileReader {
     /// Advise away a consumed prefix using the currently owned file.
     /// Returns whether an advisory syscall was issued; O_DIRECT has no cache.
-    /// The fd is borrowed only for this call, never cached by the caller.
+    /// The fd is borrowed only for this call, never cached by the caller. A
+    /// failed advice counts into `invocation`.
     #[cfg(target_os = "linux")]
-    pub(crate) fn evict_consumed_prefix(&self, offset: u64) -> bool {
+    pub(crate) fn evict_consumed_prefix(
+        &self,
+        offset: u64,
+        invocation: &crate::host::Invocation,
+    ) -> bool {
         match self {
             // An empty prefix is not advised: length zero would mean the
             // whole file.
@@ -66,6 +71,7 @@ impl FileReader {
                         0,
                         offset,
                         crate::fadvise::Advice::DontNeed,
+                        invocation,
                     )
             }
             #[cfg(feature = "linux-direct-io")]
@@ -79,12 +85,15 @@ impl FileReader {
     /// `posix_fadvise(POSIX_FADV_SEQUENTIAL)`, as osmium does, in every
     /// build: the hint is not tied to the `O_DIRECT` or `io_uring` features.
     pub fn buffered(path: &Path) -> Result<Self> {
-        Self::buffered_from(InputSource::Path(path))
+        Self::buffered_from(InputSource::Path(path), &crate::host::Invocation::new())
     }
 
-    fn buffered_from(source: InputSource<'_>) -> Result<Self> {
+    fn buffered_from(
+        source: InputSource<'_>,
+        invocation: &crate::host::Invocation,
+    ) -> Result<Self> {
         let f = source.open()?;
-        crate::fadvise::advise(&f, 0, 0, crate::fadvise::Advice::Sequential);
+        crate::fadvise::advise(&f, 0, 0, crate::fadvise::Advice::Sequential, invocation);
         Ok(Self::Buffered(BufReader::with_capacity(
             crate::write::IO_BUF_BYTES,
             f,
@@ -125,8 +134,19 @@ impl FileReader {
     /// file it pinned.
     ///
     /// Returns an error if `direct` is true but the `linux-direct-io` feature
-    /// is not enabled.
+    /// is not enabled. The open runs under a fresh invocation of its own; use
+    /// [`FileReader::open_in`] to open under a caller's.
     pub fn open<'a>(source: impl Into<InputSource<'a>>, direct: bool) -> Result<Self> {
+        Self::open_in(source, direct, &crate::host::Invocation::new())
+    }
+
+    /// [`FileReader::open`] under `invocation`: a failed readahead advice at
+    /// open counts into its `fadvise_failures`.
+    pub fn open_in<'a>(
+        source: impl Into<InputSource<'a>>,
+        direct: bool,
+        invocation: &crate::host::Invocation,
+    ) -> Result<Self> {
         let source = source.into();
         if direct {
             #[cfg(feature = "linux-direct-io")]
@@ -138,7 +158,7 @@ impl FileReader {
                 return Err(direct_reads_unsupported());
             }
         }
-        Self::buffered_from(source)
+        Self::buffered_from(source, invocation)
     }
 }
 

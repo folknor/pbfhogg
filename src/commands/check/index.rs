@@ -505,7 +505,11 @@ fn check_index_inner(
     host: &crate::host::Host,
 ) -> Result<IndexReport> {
     let path = input.path();
-    let mut frames = Frames::of_input(FileReader::open(input, opts.direct_io)?, path, host);
+    let mut frames = Frames::of_input(
+        FileReader::open_in(input, opts.direct_io, &host.invocation)?,
+        path,
+        host,
+    );
     // The verifier is exempt from the command-input refusal of a partially
     // indexed file: reporting it, as a violation, is part of its job.
     frames.accept_partial_index();

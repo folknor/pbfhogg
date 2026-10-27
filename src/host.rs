@@ -17,7 +17,8 @@ pub struct Host {
     /// instrumentation. Every command run under this host stops at its next
     /// checkpoint once the token is tripped and returns
     /// [`ErrorKind::Cancelled`](crate::ErrorKind::Cancelled). A token is
-    /// sticky and accumulates: give each independent invocation a fresh one.
+    /// sticky and its counters accumulate: give each independent invocation a
+    /// fresh one.
     pub invocation: Invocation,
 }
 
@@ -46,7 +47,10 @@ pub struct Invocation(Arc<InvocationState>);
 
 #[derive(Default)]
 struct InvocationState {
-    tripped: std::sync::atomic::AtomicBool,
+    /// On cache lines of its own: every checkpoint reads it on many threads,
+    /// and the `Arc`'s reference counts at the head of the allocation move
+    /// whenever a pool or a framing job clones the token.
+    tripped: crate::counters::Padded<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "test-hooks")]
     hook: std::sync::OnceLock<CheckHook>,
     #[cfg(feature = "test-hooks")]
@@ -55,6 +59,9 @@ struct InvocationState {
     /// token, so this is where a test's injected faults reach them.
     #[cfg(feature = "test-hooks")]
     faults: crate::test_hooks::FaultPlan,
+    /// Every engine-level metric set of the invocation. Each set is on cache
+    /// lines of its own (`counters::Padded`), apart from `tripped`.
+    metrics: crate::counters::InvocationMetrics,
 }
 
 /// A test-only callback run at every checkpoint with the checkpoint's
@@ -125,6 +132,31 @@ impl Invocation {
         let value = body()?;
         self.check()?;
         Ok(value)
+    }
+
+    /// The invocation's metric sets, for the recording sites.
+    #[inline]
+    pub(crate) fn metrics(&self) -> &crate::counters::InvocationMetrics {
+        &self.0.metrics
+    }
+
+    /// Visit every engine-level counter this invocation has recorded so
+    /// far, with the name it is emitted under on the sidecar stream and its
+    /// current value: the read pipeline's `pipeline_*`, the worker pools'
+    /// `classify_unordered_*` and `ordered_pool_*`, the writers' `writer_*`
+    /// and `fadvise_failures`. Every pass of the invocation adds into the
+    /// same counters (sums for counts and waits, maxima for the high-water
+    /// and peak counters), and nothing else does.
+    ///
+    /// A live snapshot, safe to take while the run is going: each value is
+    /// read on its own, so two counters are not read at one instant. The
+    /// values are final once the call has returned and every block it handed
+    /// out has been dropped (a dropped block's buffer returning to its pool
+    /// can still count a pool drop). Peaks of thread-local scratch observe
+    /// whatever the worker thread retained, from this invocation or an
+    /// earlier one on the same pool.
+    pub fn for_each_counter(&self, visit: impl FnMut(&'static str, u64)) {
+        self.0.metrics.for_each(visit);
     }
 
     #[cfg(feature = "test-hooks")]

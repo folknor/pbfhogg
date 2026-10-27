@@ -63,7 +63,7 @@
 //!
 //! # Stall counters
 //!
-//! Every run records where it blocked into one process-wide set
+//! Every run records where it blocked into its invocation's set
 //! ([`OrderedPoolMetrics`]): workers parked at the admission gate, workers
 //! blocked sending into a full result channel, and the consumer blocked on
 //! an empty one. These are `*_wait_ns` counters for `brokkr sidecar
@@ -137,14 +137,15 @@ crate::counters::counter_set! {
     /// One set for the engine, not one per command or phase, as with the
     /// unordered classify pools' set (`scan::classify`): the question these
     /// answer is about the mechanism, and per-caller names would need a name
-    /// threaded through every site. The set is emitted as the process totals
-    /// so far at the end of every run (success, failure or unwind), so each
-    /// emission lands inside the caller's own phase markers where it has
-    /// them. Every counter only grows, so the last emission is the process
-    /// total, which is what `--stalls` reads. The step from the previous
-    /// emission is one run's share only while runs are sequential: two
-    /// concurrent runs (two library calls, or nested pools) add into the same
-    /// totals.
+    /// threaded through every site. One set per invocation
+    /// (`crate::counters::InvocationMetrics`), emitted as the invocation's
+    /// totals so far at the end of every run (success, failure or unwind), so
+    /// each emission lands inside the caller's own phase markers where it has
+    /// them. Every counter only grows, so the last emission is the
+    /// invocation's total, which is what `--stalls` reads. The step from the
+    /// previous emission is one run's share only while the invocation's runs
+    /// are sequential: concurrent runs of one invocation (nested pools) add
+    /// into the same totals; two invocations never do.
     ///
     /// The unnamed counters are never emitted; they count how often each
     /// slow path was entered, which lets a test wait until a block has
@@ -187,9 +188,6 @@ crate::counters::counter_set! {
         job_recv_blocks,
     }
 }
-
-/// Process totals of every ordered pool run (see [`OrderedPoolMetrics`]).
-static ORDERED_POOL_METRICS: OrderedPoolMetrics = OrderedPoolMetrics::new();
 
 /// Emits a metrics set when dropped: after the run's scope has joined its
 /// workers, whether the run returned or unwound.
@@ -636,12 +634,12 @@ where
         local,
         work,
         consumer,
-        &ORDERED_POOL_METRICS,
+        &config.cancel.metrics().ordered,
     )
 }
 
-/// [`run_ordered`] recording into `metrics`: production passes the process
-/// set, a test its own.
+/// [`run_ordered`] recording into `metrics`: production passes the
+/// invocation's set, a test its own.
 fn run_ordered_in<S, L, T, I, W, C>(
     n_tasks: usize,
     shards: &mut [S],
@@ -979,12 +977,12 @@ where
         local,
         work,
         consumer,
-        &ORDERED_POOL_METRICS,
+        &config.cancel.metrics().ordered,
     )
 }
 
 /// [`run_ordered_streams`] recording into `metrics`: production passes the
-/// process set, a test its own.
+/// invocation's set, a test its own.
 fn run_ordered_streams_in<L, T, E, I, W, C>(
     n_tasks: usize,
     workers: usize,

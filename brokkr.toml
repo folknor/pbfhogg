@@ -1368,8 +1368,8 @@ message = "Do not interpolate an error into a new error's message; keep it as th
 # places that may move them. A backend that hand-rolled `sync_all_ns.fetch_add` left
 # `writer_sync_all_calls` reading zero for two of three backends, which no
 # test of the funnel can see. The names are forbidden outright in production
-# code (a rustfmt-wrapped `WRITER_METRICS\n.sync_all_ns\n.fetch_add` always
-# lands the field name on some line); tests may still read the counters.
+# code (a rustfmt-wrapped `metrics\n.sync_all_ns\n.fetch_add` always lands
+# the field name on some line); tests may still read the counters.
 # src/output.rs is excused: `PublishSpan` takes read-only snapshots of the
 # pair to report the syncs a publication did, and never writes them. The
 # scan covers every library file, so a new writer file cannot escape it.
@@ -1424,18 +1424,21 @@ region = "code"
 must_scan = ["src/write/parallel_gzip.rs"]
 message = "the OSC gzip writer keeps its own parallel_gzip_* counters and proves completeness in finish against its own sent count; the PBF loop's records would change what the PBF writer counters mean"
 
-# Writer counter emission. `WRITER_METRICS` is a process-global total, so
-# emitting it from a per-writer path (`PbfWriter::flush` once did) publishes N
-# sidecar samples of one process total that a reader takes for N per-writer
-# numbers, and the `emit_once` latch then turns the real process-exit call into
-# a no-op. Only the process-exit hook (`pbfhogg::write::emit_writer_counters`,
-# called once from the CLI's exit path) may emit. Both spellings are covered:
-# the direct `WRITER_METRICS.emit*` call and the hook call. Owners are
+# Writer counter emission. The writer set is an invocation total, so emitting
+# it from a per-writer path (`PbfWriter::flush` once did) publishes N sidecar
+# samples of one total that a reader takes for N per-writer numbers, and the
+# `emit_once` latch then turns the real end-of-invocation call into a no-op.
+# Only the end-of-invocation hook (`pbfhogg::write::emit_writer_counters`,
+# called once from the CLI's exit path) may emit. `emit` is private to
+# write/metrics.rs, so the argument-less `emit_once()` is the one spelling
+# to cover, inline (`metrics.writer.emit_once()`) or rustfmt-wrapped (a line
+# beginning with `.emit_once()`); the pattern matches both, and not
+# `Diagnostics::emit_once`, which takes arguments. Owners are
 # write/metrics.rs (defines emit and emit_once), write/mod.rs (the hook) and
 # cli/src/lib.rs (the exit path that calls it).
 [[textlint]]
 name = "writer-counters-emitted-only-from-the-exit-hook"
-pattern = '\bWRITER_METRICS\s*\.\s*emit'
+pattern = '\.\s*emit_once\s*\(\s*\)'
 paths = ["src/**/*.rs", "cli/src/**/*.rs"]
 exclude = ["src/write/metrics.rs", "src/write/mod.rs"]
 region = "code"
@@ -1448,30 +1451,7 @@ must_scan = [
     "src/write/pipeline.rs",
     "src/write/writer.rs",
 ]
-message = "writer counters are a process-global total; emit them only from the process-exit hook pbfhogg::write::emit_writer_counters, never from a per-writer path"
-
-# The rustfmt-wrapped spelling of the rule above. Every other `WRITER_METRICS`
-# chain in the writer files is wrapped (the long ones put `.field` on the next
-# line), so a wrapped `WRITER_METRICS\n    .emit_once()` is realistic. Textlint
-# sees one physical line, so match a line that begins with `.emit(` or
-# `.emit_once(` in any file that mentions WRITER_METRICS.
-[[textlint]]
-name = "writer-counters-emitted-only-from-the-exit-hook-wrapped"
-pattern = '^\s*\.emit(?:_once)?\('
-paths = ["src/**/*.rs", "cli/src/**/*.rs"]
-exclude = ["src/write/metrics.rs", "src/write/mod.rs"]
-only_if_file_matches = '\bWRITER_METRICS\b'
-region = "code"
-test_code = "skip"
-# direct_writer.rs never mentions WRITER_METRICS, so this rule cannot admit it.
-must_scan = [
-    "src/write/file_writer.rs",
-    "src/write/parallel_writer.rs",
-    "src/write/uring_writer.rs",
-    "src/write/pipeline.rs",
-    "src/write/writer.rs",
-]
-message = "writer counters are a process-global total; emit them only from the process-exit hook pbfhogg::write::emit_writer_counters, never from a per-writer path"
+message = "writer counters are an invocation total; emit them only from the end-of-invocation hook pbfhogg::write::emit_writer_counters, never from a per-writer path"
 
 # The hook spelling: a backend calling `emit_writer_counters()` (qualified or
 # imported) re-creates per-writer emission by the other route. Only the CLI's
@@ -1491,10 +1471,10 @@ must_scan = [
     "src/write/pipeline.rs",
     "src/write/writer.rs",
 ]
-message = "emit_writer_counters is the once-per-process exit hook; only the CLI exit path calls it"
+message = "emit_writer_counters is the once-per-invocation exit hook; only the CLI exit path calls it"
 
 # Read-side twin of the writer exit-hook rules. The pool-drop counters are
-# process totals, so only the one process-exit hook may emit them; a
+# invocation totals, so only the one end-of-invocation hook may emit them; a
 # per-pipeline emission would publish N samples of a total, and the latch
 # would turn the exit call into a no-op after the first. The per-pool emitter
 # is called only by the hook (read/mod.rs); the hook only by the CLI exit path.
@@ -1512,7 +1492,7 @@ must_scan = [
     "src/read/decompress.rs",
     "src/scan/classify.rs",
 ]
-message = "pool-drop counters are a process total; only pbfhogg::read::emit_read_counters (read/mod.rs) emits them"
+message = "pool-drop counters are an invocation total; only pbfhogg::read::emit_read_counters (read/mod.rs) emits them"
 
 [[textlint]]
 name = "read-counter-hook-called-only-from-the-cli-exit-path"
@@ -1528,7 +1508,7 @@ must_scan = [
     "src/read/decompress.rs",
     "src/scan/classify.rs",
 ]
-message = "emit_read_counters is the once-per-process exit hook; only the CLI exit path calls it"
+message = "emit_read_counters is the once-per-invocation exit hook; only the CLI exit path calls it"
 
 # Presence of the CLI exit-path hook calls, the function-scoped probe_lock
 # open flags, and no `as i64` cast inside an emit_counter call's arguments

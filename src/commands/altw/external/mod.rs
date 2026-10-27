@@ -943,7 +943,7 @@ pub(crate) fn external_join_in(
         inject_prepass,
         host,
     )?;
-    slot_buckets.finish()?;
+    slot_buckets.finish(&host.invocation)?;
     let s2_faults_after = crate::debug::read_page_faults();
     // Reclaim id-shard scratch before the heavier stage 3/4 streaming
     // handoff allocates its own temporary space.

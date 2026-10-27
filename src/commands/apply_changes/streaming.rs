@@ -134,10 +134,10 @@ pub(super) struct StreamingConfig {
     pub route: Route<()>,
     /// Shared with the drain; see the module doc's "Failure" section.
     pub failure: Arc<FailureSlot>,
-    /// Test-only: the run's token, whose fault plan the worker loop consults
-    /// at each dequeue (`FaultPlan::on_apply_changes_dequeue`: panic, park or
-    /// hold). Only compiled under the `test-hooks` feature.
-    #[cfg(feature = "test-hooks")]
+    /// The run's invocation: its writer counters record the workers'
+    /// framing, and under the `test-hooks` feature its fault plan is
+    /// consulted at each dequeue (`FaultPlan::on_apply_changes_dequeue`:
+    /// panic, park or hold).
     pub cancel: crate::host::Invocation,
 }
 
@@ -248,7 +248,6 @@ pub(super) fn run_workers(
         compression,
         route,
         failure,
-        #[cfg(feature = "test-hooks")]
         cancel,
     } = cfg;
     let StreamingChannels {
@@ -307,7 +306,6 @@ pub(super) fn run_workers(
             let ranges = &*ranges;
             let diff = &*diff;
             let probe = &*probe;
-            #[cfg(feature = "test-hooks")]
             let cancel = &cancel;
 
             scope.spawn(move || {
@@ -328,7 +326,6 @@ pub(super) fn run_workers(
                         probe,
                         &compression,
                         route,
-                        #[cfg(feature = "test-hooks")]
                         cancel,
                     )
                 }));
@@ -381,7 +378,7 @@ fn worker_loop(
     probe: &StaleProbe,
     compression: &Compression,
     route: Route<()>,
-    #[cfg(feature = "test-hooks")] cancel: &crate::host::Invocation,
+    cancel: &crate::host::Invocation,
 ) -> Result<()> {
     let mut read_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
@@ -449,6 +446,7 @@ fn worker_loop(
                     probe,
                     compression,
                     route,
+                    &cancel.metrics().writer,
                 )
                 .map_err(|e| blob_err(&desc, source, e))?;
             }
@@ -514,6 +512,7 @@ fn handle_candidate(
     probe: &StaleProbe,
     compression: &Compression,
     route: Route<()>,
+    metrics: &crate::write::metrics::WriterMetrics,
 ) -> Result<()> {
     counters.blobs_processed.fetch_add(1, Ordering::Relaxed);
 
@@ -739,8 +738,12 @@ fn handle_candidate(
             // prepass sidecar the input header carried is dropped, which
             // the output header allows: it declares no way enrichment
             // (`Ways::Reencoded` in `build_header_bytes`).
-            let frame_bytes =
-                reframe_raw_with_index(&read_buf[body], &index.serialize(), tagdata.as_deref())?;
+            let frame_bytes = reframe_raw_with_index(
+                &read_buf[body],
+                &index.serialize(),
+                tagdata.as_deref(),
+                metrics,
+            )?;
             return send_drain(
                 drain_tx,
                 DrainItem::OwnedBytes {
@@ -822,6 +825,7 @@ fn handle_candidate(
             Some(&indexdata),
             tagdata.as_deref(),
             way_members.as_deref(),
+            metrics,
         )?;
         framed_chunks.push(parts.into_vec());
     }

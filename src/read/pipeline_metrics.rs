@@ -1,35 +1,32 @@
 //! Sidecar counters for the 3-stage pipelined PBF reader (`run_pipeline`).
 //!
-//! # Process totals, re-emitted at the end of every pipelined read
+//! # Invocation totals, re-emitted at the end of every pipelined read
 //!
-//! [`PIPELINE_METRICS`] is one process-global set that is never reset. Every
-//! pipelined read in the process adds into it (sums for the counts and
-//! waits, the maximum for the high-water and peak counters), and every
-//! pipelined read emits the whole set once its stages have joined, on
-//! success and error alike. Every counter only grows, so for pipelined
-//! reads that run one after another each emission is a snapshot of the
-//! process so far and the last is the process total. Concurrent reads can
-//! emit out of order (one loads a value, the other emits a later total
-//! first), but the maximum of each name is still the total, and that is
-//! what the sidecar reads: `brokkr sidecar --stalls` takes the maximum of
-//! each `*_wait_ns` name as its total. The CLI runs one command per process,
-//! and a command that ran several pipelined reads still reports their sum.
+//! [`PipelineMetrics`] is one set per invocation
+//! (`crate::counters::InvocationMetrics`), never reset. Every pipelined read
+//! of the invocation adds into it (sums for the counts and waits, the
+//! maximum for the high-water and peak counters), and every pipelined read
+//! emits the whole set once its stages have joined, on success and error
+//! alike. Every counter only grows, so for pipelined reads that run one
+//! after another each emission is a snapshot of the invocation so far and
+//! the last is its total. Concurrent reads of one invocation can emit out of
+//! order (one loads a value, the other emits a later total first), but the
+//! maximum of each name is still the total, and that is what the sidecar
+//! reads: `brokkr sidecar --stalls` takes the maximum of each `*_wait_ns`
+//! name as its total. A command that ran several pipelined reads reports
+//! their sum.
 //!
 //! One instance per pipeline was weighed and declined. Emitting per-run
-//! values would make `--stalls` report only the largest pass of a process
-//! that reads twice and change what every stored run's counters mean;
-//! per-pass names would split each stall category by pass and break
-//! name-keyed comparisons; folding per-run instances back into a process
-//! total before emitting would change nothing a reader sees. A library
-//! embedding that runs pipelined reads concurrently gets their combined
-//! totals (`docs/guide/advanced.md` says so). A test that needs one run's
-//! exact numbers observes them on its token's fault plan, as the reorder
-//! bound tests do with `FaultPlan::reorder_filled_high_water`.
+//! values would make `--stalls` report only the largest pass of an
+//! invocation that reads twice and change what every stored run's counters
+//! mean; per-pass names would split each stall category by pass and break
+//! name-keyed comparisons. Two invocations, concurrent or not, record into
+//! two sets.
 //!
 //! Only the pipelined engines record here: `par_map_reduce` and the
 //! sequential `for_each` have none of these stages and emit nothing.
-//! Pool-drop counters are process totals of every decompression pool, not
-//! only this pipeline's, emitted by the host after dispatch through
+//! Pool-drop counters are invocation totals of every decompression pool, not
+//! only this pipeline's, emitted after dispatch through
 //! [`crate::read::emit_read_counters`]. Existing `pipeline_*` counter names
 //! remain stable for sidecar consumers.
 
@@ -58,14 +55,14 @@ crate::counters::counter_set! {
         /// Combined with `block_fn`'s own time this localises whether the
         /// consumer is starved by decode or by its own work.
         pub decoded_recv_wait_ns => "pipeline_decoded_recv_wait_ns",
-        /// Maximum filled slots any in-order reorder buffer in the process
-        /// has reached. This is the live decoded-block memory diagnostic. For
+        /// Maximum filled slots any in-order reorder buffer of the
+        /// invocation has reached. This is the live decoded-block memory diagnostic. For
         /// cross-run comparison with pre-change UUIDs, use
         /// `reorder_window_high_water` instead; old runs recorded window
         /// length including gaps under this counter name.
         pub reorder_high_water => "pipeline_reorder_high_water",
-        /// Maximum window length any in-order reorder buffer in the process
-        /// has reached, including gaps. This preserves the old
+        /// Maximum window length any in-order reorder buffer of the
+        /// invocation has reached, including gaps. This preserves the old
         /// `reorder_high_water` meaning as a completion-skew diagnostic.
         pub reorder_window_high_water => "pipeline_reorder_window_high_water",
         /// Maximum retained capacity (bytes) of the per-decode-thread
@@ -109,7 +106,7 @@ impl PipelineMetrics {
         record_max(&self.scratch_gr_capacity_peak_bytes, gr_bytes as u64);
     }
 
-    /// Emit the process totals so far (see the module docs), after every
+    /// Emit the invocation totals so far (see the module docs), after every
     /// `run_pipeline` has joined its stages.
     pub fn emit(&self) {
         self.emit_all();
@@ -117,18 +114,19 @@ impl PipelineMetrics {
 }
 
 crate::counters::counter_set! {
-    /// Decompression-pool drop counters: process totals across every pool
-    /// in the process (classify workers, command-specific readers, altw
+    /// Decompression-pool drop counters: invocation totals across every pool
+    /// the invocation ran (classify workers, command-specific readers, altw
     /// passthrough), not only the pipelined reader, so no per-pipeline path
     /// emits them. Their only way out is [`emit_decompress_pool_counters`],
-    /// which only the process-exit hook calls; the generated emitter is
-    /// private to this module.
+    /// which only the end-of-invocation emitter calls; the generated emitter
+    /// is private to this module. A pool records into the invocation it was
+    /// built for, also when a block it handed out is dropped after the call.
     pub(crate) struct DecompressPoolMetrics {
         /// Decompression buffers dropped because their capacity exceeded the
         /// retained-buffer limit.
-        oversize_drops => "pipeline_decompress_pool_oversize_drops",
+        pub(crate) oversize_drops => "pipeline_decompress_pool_oversize_drops",
         /// Sum of capacities of oversized decompression buffers dropped.
-        oversize_drop_capacity_bytes => "pipeline_decompress_pool_oversize_drop_capacity_bytes",
+        pub(crate) oversize_drop_capacity_bytes => "pipeline_decompress_pool_oversize_drop_capacity_bytes",
         /// Decompression buffers dropped because the retained pool was full.
         full_drops => "pipeline_decompress_pool_full_drops",
         /// Sum of capacities of buffers dropped because the retained pool was full.
@@ -170,11 +168,8 @@ impl DecompressPoolMetrics {
     }
 }
 
-/// Emit the process-wide pool-drop totals after all command work has joined.
+/// Emit an invocation's pool-drop totals after all its work has joined.
 /// Only `crate::read::emit_read_counters` calls this.
-pub fn emit_decompress_pool_counters() {
-    DECOMPRESS_POOL_METRICS.emit_all();
+pub(crate) fn emit_decompress_pool_counters(metrics: &DecompressPoolMetrics) {
+    metrics.emit_all();
 }
-
-pub(crate) static PIPELINE_METRICS: PipelineMetrics = PipelineMetrics::new();
-pub(crate) static DECOMPRESS_POOL_METRICS: DecompressPoolMetrics = DecompressPoolMetrics::new();

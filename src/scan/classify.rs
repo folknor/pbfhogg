@@ -195,16 +195,19 @@ pub(crate) struct WillneedPrefetch {
     ranges: Vec<(u64, u64)>,
     next_range: usize,
     next_offset: u64,
+    /// The invocation a failed advice counts into.
+    invocation: crate::host::Invocation,
 }
 
 impl WillneedPrefetch {
     /// Prepare unconditional sliding WILLNEED prefetching for a dispatch
-    /// schedule.
-    pub(crate) fn new(schedule: &[ScheduledBlob]) -> Self {
+    /// schedule of `invocation`.
+    pub(crate) fn new(schedule: &[ScheduledBlob], invocation: &crate::host::Invocation) -> Self {
         Self {
             ranges: coalesce_willneed_ranges(schedule),
             next_range: 0,
             next_offset: 0,
+            invocation: invocation.clone(),
         }
     }
 
@@ -252,7 +255,13 @@ impl WillneedPrefetch {
             // `size` is never zero here (zero-sized bodies are not coalesced
             // and the window end lies past `offset`), so this is never the
             // through-EOF form.
-            crate::fadvise::advise(shared_file, offset, size, crate::fadvise::Advice::WillNeed);
+            crate::fadvise::advise(
+                shared_file,
+                offset,
+                size,
+                crate::fadvise::Advice::WillNeed,
+                &self.invocation,
+            );
         }
     }
 }
@@ -624,15 +633,16 @@ crate::counters::counter_set! {
     /// (does the shared-receiver fan-out, the result channel or the consumer
     /// stall) is a question about the mechanism. Per-caller names would need a
     /// name threaded through every call site and would split one stall
-    /// category per phase. Phase attribution comes instead from when the set
-    /// is emitted: the process totals so far, at the end of every run (success
-    /// or failure), so each emission lands inside the caller's own phase
-    /// markers, where it has them, and the step from the previous emission is
-    /// that run's share.
-    /// Every counter only grows, so the last emission is the process total
-    /// and the maximum per name, which `--stalls` reads, is that total; the
-    /// read pipeline's `PIPELINE_METRICS` set is emitted the same way.
-    struct UnorderedPoolMetrics {
+    /// category per phase. One set per invocation
+    /// (`crate::counters::InvocationMetrics`). Phase attribution comes instead
+    /// from when the set is emitted: the invocation's totals so far, at the
+    /// end of every run (success or failure), so each emission lands inside
+    /// the caller's own phase markers, where it has them, and the step from
+    /// the previous emission is that run's share.
+    /// Every counter only grows, so the last emission is the invocation's
+    /// total and the maximum per name, which `--stalls` reads, is that total;
+    /// the read pipeline's `PipelineMetrics` set is emitted the same way.
+    pub(crate) struct UnorderedPoolMetrics {
         /// The dispatcher blocked on a full descriptor channel: every worker
         /// busy and the channel's queue of schedule positions full. Expected
         /// on any decode-bound phase (one thread parked, by design); it is
@@ -664,9 +674,6 @@ crate::counters::counter_set! {
         result_recv_wait_ns => "classify_unordered_result_recv_wait_ns",
     }
 }
-
-/// Process totals of every unordered pool run (see [`UnorderedPoolMetrics`]).
-static UNORDERED_POOL_METRICS: UnorderedPoolMetrics = UnorderedPoolMetrics::new();
 
 /// A worker's next schedule position from the shared descriptor receiver, or
 /// `None` once the dispatcher has finished (or gone). The guard covers only
@@ -727,7 +734,7 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
         schedule,
         threads,
         || DecodeLocal {
-            pool: crate::blob::DecompressPool::new(),
+            pool: crate::blob::DecompressPool::new(&host.invocation),
             st_scratch: Vec::new(),
             gr_scratch: Vec::new(),
             state: worker_init(),
@@ -746,7 +753,7 @@ pub(crate) fn parallel_classify_phase_abortable<S: Send, R: Send>(
         },
         merge,
         host,
-        &UNORDERED_POOL_METRICS,
+        &host.invocation.metrics().unordered,
     )
 }
 
@@ -776,8 +783,8 @@ struct DecodeLocal<S> {
 ///
 /// Its four blocking points (dispatcher send, descriptor lock and receive,
 /// result send, consumer receive) record into `metrics`, which is emitted
-/// once the run's threads have joined; production callers pass the process
-/// set [`UNORDERED_POOL_METRICS`], a test its own.
+/// once the run's threads have joined; production callers pass the
+/// invocation's set, a test its own.
 #[expect(
     clippy::too_many_arguments,
     reason = "a private driver: the wrappers' parameters plus the counter set a test substitutes"
@@ -794,7 +801,7 @@ fn run_unordered_per_blob<L, R: Send>(
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
-    let mut willneed = WillneedPrefetch::new(schedule);
+    let mut willneed = WillneedPrefetch::new(schedule, &host.invocation);
     host.invocation.check()?;
     if schedule.is_empty() {
         return Ok(());
@@ -980,7 +987,7 @@ pub(crate) fn parallel_classify_phase_ordered<S, R: Send>(
         },
         |_| ClassifyLocal {
             read_buf: Vec::new(),
-            pool: crate::blob::DecompressPool::new(),
+            pool: crate::blob::DecompressPool::new(&host.invocation),
             st_scratch: Vec::new(),
             gr_scratch: Vec::new(),
             state: worker_init(),
@@ -1007,7 +1014,7 @@ pub(crate) fn parallel_classify_phase_ordered<S, R: Send>(
         },
         &mut ClassifyConsumer {
             merge,
-            willneed: WillneedPrefetch::new(schedule),
+            willneed: WillneedPrefetch::new(schedule, &host.invocation),
             schedule,
             file,
         },
@@ -1055,7 +1062,7 @@ pub(crate) fn parallel_scan_blobs_raw<S: Send, R: Send>(
             std::ops::ControlFlow::Continue(())
         },
         host,
-        &UNORDERED_POOL_METRICS,
+        &host.invocation.metrics().unordered,
     )
 }
 
@@ -1150,7 +1157,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
-    let mut willneed = WillneedPrefetch::new(schedule);
+    let mut willneed = WillneedPrefetch::new(schedule, &host.invocation);
     host.invocation.check()?;
     if schedule.is_empty() {
         return Ok(());
@@ -1173,7 +1180,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
     let (result_tx, result_rx) =
         std::sync::mpsc::sync_channel::<crate::error::Result<S>>(decode_threads);
     let shared_file = input.file();
-    let metrics = &UNORDERED_POOL_METRICS;
+    let metrics = &host.invocation.metrics().unordered;
 
     // Emits after the scope has joined, so every thread's waits are in; on
     // a failure or an unwind too.
@@ -1202,7 +1209,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
             let worker_init_ref = &worker_init;
             scope.spawn(move || {
                 let mut read_buf: Vec<u8> = Vec::new();
-                let worker_pool = crate::blob::DecompressPool::new();
+                let worker_pool = crate::blob::DecompressPool::new(cancel);
                 let mut st_scratch: Vec<(u32, u32)> = Vec::new();
                 let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
                 let unwind_stops_peers = StopOnUnwind(stop);
@@ -1703,7 +1710,7 @@ mod tests {
     fn willneed_prefetch_defaults_to_coalesced_schedule() {
         let schedule = [ScheduledBlob::at(100, 20), ScheduledBlob::at(144, 5)];
 
-        let prefetch = WillneedPrefetch::new(&schedule);
+        let prefetch = WillneedPrefetch::new(&schedule, &crate::host::Invocation::new());
 
         assert_eq!(prefetch.ranges, vec![(100, 49)]);
         assert_eq!(prefetch.next_range, 0);

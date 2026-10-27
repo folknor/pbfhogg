@@ -3202,15 +3202,15 @@ pub fn run() -> process::ExitCode {
     })();
 
     // Emit the `writer_*` sidecar counters exactly once, here rather than
-    // from `PbfWriter::flush`. The counters are a process-global static, so
+    // from `PbfWriter::flush`. The counters are the invocation's totals, so
     // flush-time emission published the same running totals once per writer -
     // once per region for `multi-extract` - which reads as a per-region
     // breakdown and is not one. This is the single point every command path
     // passes through, success or failure, and it runs before the hotpath
-    // guard drops.
-    pbfhogg::write::emit_writer_counters();
-    pbfhogg::read::emit_read_counters();
-    pbfhogg::write::report_writer_degradations(&host.diagnostics);
+    // guard drops. The process runs one invocation, the host's.
+    pbfhogg::write::emit_writer_counters(&host.invocation);
+    pbfhogg::read::emit_read_counters(&host.invocation);
+    pbfhogg::write::report_writer_degradations(&host);
     #[cfg(feature = "test-hooks")]
     signals::test_hooks::write_count(&host.invocation);
     #[cfg(feature = "test-hooks")]
@@ -4675,12 +4675,16 @@ fn run_bench_read(
 
     // Every mode reads through the library's public constructors on purpose:
     // it measures the readers a library user gets, so, like them, it reads a
-    // partially indexed file the commands would refuse.
+    // partially indexed file the commands would refuse. Each binds the run's
+    // invocation from the open and evicts behind the read head whatever the
+    // host's page-cache policy, as bench-read always has.
+    let evicting = pbfhogg::host::Host {
+        page_cache: pbfhogg::host::PageCachePolicy::Evict,
+        ..host.clone()
+    };
     let (elapsed_ms, nodes, ways, rels): (u128, u64, u64, u64) = match mode {
         BenchReadMode::Sequential => {
-            let reader = pbfhogg::ElementReader::from_path_with_eviction(path, true)?
-                .diagnostics(host.diagnostics.clone())
-                .cancel(host.invocation.clone());
+            let reader = pbfhogg::ElementReader::open_with(path, false, &evicting)?;
             let mut nodes = 0u64;
             let mut ways = 0u64;
             let mut rels = 0u64;
@@ -4694,9 +4698,7 @@ fn run_bench_read(
             (start.elapsed().as_millis(), nodes, ways, rels)
         }
         BenchReadMode::Parallel => {
-            let reader = pbfhogg::ElementReader::from_path_with_eviction(path, true)?
-                .diagnostics(host.diagnostics.clone())
-                .cancel(host.invocation.clone());
+            let reader = pbfhogg::ElementReader::open_with(path, false, &evicting)?;
             let start = Instant::now();
             let (nodes, ways, rels) = reader.par_map_reduce(
                 |el| match el {
@@ -4713,9 +4715,7 @@ fn run_bench_read(
             (start.elapsed().as_millis(), nodes, ways, rels)
         }
         BenchReadMode::Pipelined => {
-            let reader = pbfhogg::ElementReader::from_path_with_eviction(path, true)?
-                .diagnostics(host.diagnostics.clone())
-                .cancel(host.invocation.clone());
+            let reader = pbfhogg::ElementReader::open_with(path, false, &evicting)?;
             let mut nodes = 0u64;
             let mut ways = 0u64;
             let mut rels = 0u64;
@@ -4732,10 +4732,7 @@ fn run_bench_read(
             // Route through the library's buffered path (256 KiB FileReader)
             // so this arm measures decode architecture, not the syscall
             // overhead of a default 8 KiB BufReader.
-            let mut reader = pbfhogg::BlobReader::from_path(path)?
-                .evict_page_cache(true)
-                .diagnostics(host.diagnostics.clone())
-                .cancel(host.invocation.clone());
+            let mut reader = pbfhogg::BlobReader::open_with(path, false, &evicting)?;
             let source: std::sync::Arc<std::path::Path> = std::sync::Arc::from(path);
             // The leading OsmHeader is required like everywhere else: a
             // zero-byte or header-less file is the one missing-header error,
@@ -4791,7 +4788,7 @@ fn bench_write_loop<W: std::io::Write>(
     // library reader, as bench-read uses: it accepts a partially indexed file.
     let mut reader = pbfhogg::BlobReader::new_named(BufReader::new(open_input(path)?), path)
         .diagnostics(host.diagnostics.clone())
-        .cancel(host.invocation.clone());
+        .invocation(host.invocation.clone());
     // The leading OsmHeader is required like everywhere else: a zero-byte or
     // header-less file is the one missing-header error, not an empty run.
     // Taken from this pass's own reader rather than a second open, and
@@ -4899,7 +4896,8 @@ fn run_bench_write(
             )]
             let file = std::fs::File::create("/dev/null")?;
             let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
-            let mut writer = pbfhogg::writer::PbfWriter::new(buf, compression);
+            let mut writer =
+                pbfhogg::writer::PbfWriter::new_in(buf, compression, host.invocation.clone());
             writer.write_header(&header_bytes)?;
             let start = Instant::now();
             let (nodes, ways, rels) = bench_write_loop(path, &mut writer, host)?;
@@ -4911,11 +4909,11 @@ fn run_bench_write(
             (elapsed_ms, nodes, ways, rels)
         }
         BenchWriterMode::Pipelined => {
-            let mut writer = pbfhogg::writer::PbfWriter::to_path(
+            let mut writer = pbfhogg::writer::PbfWriter::to_path_with(
                 std::path::Path::new("/dev/null"),
                 compression,
                 &header_bytes,
-                pbfhogg::host::Executor::Ambient,
+                host,
             )?;
             let start = Instant::now();
             let (nodes, ways, rels) = bench_write_loop(path, &mut writer, host)?;

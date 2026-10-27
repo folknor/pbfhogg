@@ -9,6 +9,21 @@
   its cancellation request and, from this release, its instrumentation.
   `cancel()`, `is_cancelled()` and `check()` are unchanged. A struct literal
   writes `invocation: Invocation::new()`.
+- **Engine counters belong to the invocation, not the process.** The
+  read pipeline's, the worker pools', the writers' and the `fadvise`
+  counters used to be process-global totals that every library call in a
+  process added into; each `Invocation` now owns its own, every pass of the
+  run adds into them, and `Invocation::for_each_counter` reads them (same
+  names as the sidecar stream). The CLI's totals are unchanged.
+  `pbfhogg::write::emit_writer_counters` and `pbfhogg::read::emit_read_counters`
+  take the invocation, `report_writer_degradations` takes the `Host`. Readers
+  and writers bind the invocation at construction: the `cancel(token)`
+  setters on `BlobReader` and `ElementReader` are `invocation(token)`, and
+  `BlobReader::open_with`, `ElementReader::open_with`, `FileReader::open_in`,
+  `FileWriter::buffered_in` / `direct_in`, `PbfWriter::to_path_with` and
+  `PbfWriter::new_in` open under a caller's host or token. A writer built by
+  a tokenless constructor counts into its own, `PbfWriter::invocation`.
+  `FileWriter` is a struct; its variants are no longer public.
 - **`check --refs` refuses negative IDs and unknown member types.** A
   negative ID it would compare (a node, a way under `--check-relations`, a
   relation, a way ref or relation member) fails the run with exit 2 naming

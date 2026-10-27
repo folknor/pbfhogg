@@ -502,7 +502,6 @@ pub(crate) fn merge_to<'a>(
         compression,
         route: worker_route,
         failure: Arc::clone(&failure),
-        #[cfg(feature = "test-hooks")]
         cancel: host.invocation.clone(),
     };
     let streaming_channels = StreamingChannels {

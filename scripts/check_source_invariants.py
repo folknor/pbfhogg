@@ -163,7 +163,7 @@ def code_only(source):
 
 cli = re.sub(r"\s+", "", code_only((root / "cli/src/lib.rs").read_text()))
 for hook in ("write::emit_writer_counters", "read::emit_read_counters"):
-    call = f"pbfhogg::{hook}()"
+    call = f"pbfhogg::{hook}(&host.invocation)"
     if call not in cli:
         errors.append(
             f"cli/src/lib.rs: the CLI must call {call} on its exit path, "
